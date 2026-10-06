@@ -1,0 +1,36 @@
+# Local credentials and machine-specific Android configuration
+local.properties
+.idea/
+*.iml
+
+# Build and Gradle outputs
+.gradle/
+**/build/
+**/outputs/
+**/intermediates/
+
+# Temporary probe data and generated diagnostics
+.tmp-*
+probes/**/logs/
+probes/**/generated/
+
+# Raw audio, biometric samples, and derived media
+Audio/
+**/*.wav
+**/*.mp3
+**/*.m4a
+
+# Model/runtime and packaged binary assets from throwaway probes
+**/*.onnx
+**/*.aar
+**/*.apk
+**/*.zip
+**/libs/
+probes/p0/native-audio/
+probes/p0/vendor/
+
+# IDE and OS noise
+.vscode/
+*.swp
+Thumbs.db
+.DS_Store
