@@ -19,6 +19,8 @@ probes/**/generated/
 
 # Raw audio, biometric samples, and derived media
 Audio/
+!audio-runtime/src/main/kotlin/edith/audio/
+!audio-runtime/src/test/kotlin/edith/audio/
 **/*.wav
 **/*.mp3
 **/*.m4a

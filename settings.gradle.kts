@@ -21,4 +21,5 @@ include(
     ":test-support",
     ":plugins-smart",
     ":plugins-interview",
+    ":audio-runtime",
 )
