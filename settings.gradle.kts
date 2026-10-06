@@ -23,4 +23,5 @@ include(
     ":plugins-interview",
     ":audio-runtime",
     ":storage-runtime",
+    ":model-runtime",
 )
