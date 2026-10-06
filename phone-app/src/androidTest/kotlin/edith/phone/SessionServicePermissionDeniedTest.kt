@@ -7,7 +7,6 @@ import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import androidx.core.content.ContextCompat
-import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import edith.contracts.SessionState
@@ -42,7 +41,7 @@ class SessionServicePermissionDeniedTest {
     }
 
     @Test fun deniedBluetoothStartThroughAndroidServiceLeavesNoInputOrForegroundSession() {
-        ActivityScenario.launch(MainActivity::class.java).use { scenario ->
+        ForegroundTestActivity.launch().use { scenario ->
             scenario.onActivity { activity ->
                 val token = app.composition.authorizeStart("p2-diagnostic")
                 activity.startService(Intent(activity, SessionService::class.java)
