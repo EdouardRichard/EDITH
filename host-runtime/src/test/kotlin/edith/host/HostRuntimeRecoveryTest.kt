@@ -5,6 +5,49 @@ import edith.plugin.*
 import kotlin.test.*
 
 class HostRuntimeRecoveryTest {
+    @Test fun `explicit configure prevents nested lifecycle changes`() {
+        val rig = HostTestRig()
+        val states = mutableListOf<SessionState>()
+        val plugin = object : PluginLifecycle, ConfiguredPlugin {
+            override val descriptor = PluginDescriptor("config", "1", 1, "config", emptyList(), ConfigSchema(1))
+            override fun validate(configuration: PluginConfiguration) { rig.host.stop(); states += rig.host.currentState }
+            override fun configure(configuration: PluginConfiguration) { rig.host.stop(); states += rig.host.currentState }
+            override fun activate(context: PluginContext) = Unit
+            override fun handle(event: HostEvent) = Unit
+            override fun deactivate(reason: DeactivationReason) = Unit
+        }
+        rig.host.register(plugin)
+        assertTrue(rig.host.configure("config", PluginConfiguration(1, emptyMap())))
+        assertEquals(listOf(SessionState.Ready, SessionState.Ready), states)
+        assertEquals(SessionState.Ready, rig.host.currentState)
+        assertEquals(ActivationResult.Activated, rig.host.activate("config"))
+    }
+
+    @Test fun `validation and configuration cannot stop activation midway`() {
+        val rig = HostTestRig()
+        val plugin = object : PluginLifecycle, ConfiguredPlugin {
+            override val descriptor = PluginDescriptor("reentrant", "1", 1, "probe", listOf(Capability.Audio), ConfigSchema(1))
+            var context: PluginContext? = null
+            val stopStates = mutableListOf<SessionState>()
+            override fun validate(configuration: PluginConfiguration) {
+                rig.host.stop()
+                stopStates += rig.host.currentState
+            }
+            override fun configure(configuration: PluginConfiguration) {
+                rig.host.stop()
+                stopStates += rig.host.currentState
+            }
+            override fun activate(context: PluginContext) { this.context = context }
+            override fun handle(event: HostEvent) = Unit
+            override fun deactivate(reason: DeactivationReason) = Unit
+        }
+        rig.host.register(plugin)
+        assertEquals(ActivationResult.Activated, rig.host.activate("reentrant"))
+        assertEquals(listOf(SessionState.Ready, SessionState.Ready), plugin.stopStates)
+        assertNotNull(plugin.context)
+        assertNotNull(rig.host.currentInputEpoch)
+    }
+
     @Test fun `activation waits for audio and pause fences old epoch`() {
         val rig = HostTestRig.readyWithAudioPlugin()
         assertEquals(ActivationResult.Activated, rig.host.activate("probe"))

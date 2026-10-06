@@ -9,11 +9,17 @@ import java.util.concurrent.atomic.AtomicBoolean
 class ResourceScope(val pluginId: String, val sessionId: SessionId, val generation: Generation) {
     private val lock = Any()
     private var revoked = false
+    private val admissionClosed = AtomicBoolean()
     private val handles = mutableSetOf<CancellationHandle>()
     init { require(pluginId.isNotBlank()) }
-    val isRevoked: Boolean get() = synchronized(lock) { revoked }
+    val isRevoked: Boolean get() = admissionClosed.get() || synchronized(lock) { revoked }
 
-    fun checkActive() { synchronized(lock) { if (revoked) throw ContractError.Cancelled() } }
+    internal fun closeAdmission() { admissionClosed.set(true) }
+
+    fun checkActive() {
+        if (admissionClosed.get()) throw ContractError.Cancelled()
+        synchronized(lock) { if (revoked || admissionClosed.get()) throw ContractError.Cancelled() }
+    }
 
     fun bind(handle: CancellationHandle): CancellationHandle {
         val cancelled = AtomicBoolean()
@@ -25,7 +31,7 @@ class ResourceScope(val pluginId: String, val sessionId: SessionId, val generati
                 }
             }
         }
-        val cancelNow = synchronized(lock) { if (revoked) true else { handles += bound; false } }
+        val cancelNow = synchronized(lock) { if (revoked || admissionClosed.get()) true else { handles += bound; false } }
         if (cancelNow) bound.cancel()
         return bound
     }
@@ -54,7 +60,8 @@ class ResourceScope(val pluginId: String, val sessionId: SessionId, val generati
         }
     }
     internal fun deliver(block: () -> Unit) {
-        val admitted = synchronized(lock) { !revoked }
+        if (admissionClosed.get()) return
+        val admitted = synchronized(lock) { !revoked && !admissionClosed.get() }
         if (admitted) block()
     }
 

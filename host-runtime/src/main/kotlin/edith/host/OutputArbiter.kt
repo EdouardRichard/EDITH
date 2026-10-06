@@ -70,9 +70,9 @@ class OutputArbiter private constructor(
         status(item, OutputStatus.Accepted)
         item.deadline = scheduler!!.at(item.hint.expiresAtNanos) { command { expire(item) } }
         val handle = try {
-            device!!.show(item.hint, item.revision) { state -> command {
-                if (displayed !== item || !valid(item.hint)) return@command
-                if (item.hint.expiresAtNanos <= nowNanos()) { expire(item); return@command }
+            device!!.show(item.hint, item.revision) { state -> executor.execute {
+                if (displayed !== item || !valid(item.hint)) return@execute
+                if (item.hint.expiresAtNanos <= nowNanos()) { expire(item); return@execute }
                 when (state) {
                     OutputStatus.Displayed, OutputStatus.Queued -> status(item, state)
                     OutputStatus.Expired, OutputStatus.Rejected -> { remove(item, state); next() }

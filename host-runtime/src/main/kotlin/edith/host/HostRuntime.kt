@@ -26,6 +26,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     private var inputEpoch: InputEpoch? = null
     private var inputSerial = 0L
     private var transitioning = false
+    private val eventGate = Any()
     @Volatile private var eventIdentity: Pair<SessionId, Generation>? = null
     private val timer = Executors.newSingleThreadScheduledExecutor { task -> Thread(task, "edith-deadlines").also { it.isDaemon = true } }
     private val deadlineScheduler = object : DeadlineScheduler {
@@ -41,9 +42,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
             "output-${java.util.UUID.randomUUID()}", environment.clock.nowNanos(), environment.clock.nowNanos()), hint.hintId, status))
     }
     private val drainScheduled = AtomicBoolean()
-    private val dispatcher = HostEventDispatcher(32, ::deliverEvent) { event ->
-        executor.execute { if (isCurrent(event)) interrupt() }
-    }
+    private val dispatcher = HostEventDispatcher(32, ::deliverEvent, ::onCriticalEventOverflow)
     val currentGeneration: Generation get() = command { generation }
     val currentState: SessionState get() = command { state }
     val currentInputEpoch: InputEpoch? get() = command { inputEpoch }
@@ -65,11 +64,12 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
         if (transitioning) return@command false
         val plugin = plugins[id] ?: return@command false
         if (active?.descriptor?.pluginId == id) return@command false
-        runCatching {
+        transitioning = true
+        try { runCatching {
             ConfigurationPolicy.validate(plugin, configuration)
             (plugin as? ConfiguredPlugin)?.configure(configuration)
             configurations[id] = configuration.copy(values = configuration.values.toMap())
-        }.isSuccess
+        }.isSuccess } finally { transitioning = false }
     }
 
     fun startSession(id: SessionId) = command {
@@ -101,7 +101,8 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
         val plugin = plugins[selectedId] ?: return ActivationResult.UnknownPlugin
         val session = sessionId ?: return ActivationResult.SessionNotReady
         val resource = ResourceScope(plugin.descriptor.pluginId, session, generation)
-        return runCatching {
+        transitioning = true
+        return try { runCatching {
             val configuration = configurations[plugin.descriptor.pluginId]
                 ?: PluginConfiguration(plugin.descriptor.configSchema.version, emptyMap())
             ConfigurationPolicy.validate(plugin, configuration)
@@ -118,6 +119,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
                     return if (capability == Capability.TextOutput) object : OutputSink {
                         override fun submit(assistance: Assistance): OutputSubmission {
                             resource.checkActive()
+                            if (eventIdentity != (session to generation)) throw ContractError.Cancelled()
                             return when (arbiter.submit(assistance)) {
                                 OutputStatus.Accepted, OutputStatus.Queued -> OutputSubmission.Accepted
                                 else -> OutputSubmission.Rejected
@@ -130,9 +132,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
             active = plugin
             state = SessionState.Ready
             eventIdentity = session to generation
-            transitioning = true
-            try { plugin.activate(PluginContext(session, generation, plugin.descriptor.capabilities, services)) }
-            finally { transitioning = false }
+            plugin.activate(PluginContext(session, generation, plugin.descriptor.capabilities, services))
             if (scope !== resource || resource.isRevoked) throw ContractError.Cancelled()
             if (Capability.Audio in plugin.descriptor.capabilities) {
                 val epoch = InputEpoch(session, generation, Math.incrementExact(inputSerial).also { inputSerial = it })
@@ -145,7 +145,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
             teardown(DeactivationReason.Error)
             state = SessionState.Paused
             ActivationResult.Failed
-        }
+        } } finally { transitioning = false }
     }
 
     fun switchTo(id: String): ActivationResult = command {
@@ -200,8 +200,10 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
 
     fun onEvent(event: HostEvent): Boolean {
-        if (eventIdentity != (event.envelope.sessionId to event.envelope.generation)) return false
-        val accepted = dispatcher.offer(event)
+        val accepted = synchronized(eventGate) {
+            if (eventIdentity != (event.envelope.sessionId to event.envelope.generation)) return false
+            dispatcher.offer(event)
+        }
         scheduleDrain()
         return accepted
     }
@@ -217,9 +219,20 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
 
     private fun isCurrent(event: HostEvent) = event.envelope.sessionId == sessionId && event.envelope.generation == generation
 
+    private fun onCriticalEventOverflow(event: HostEvent) {
+        synchronized(eventGate) {
+            if (eventIdentity != (event.envelope.sessionId to event.envelope.generation)) return
+            eventIdentity = null
+            scope?.closeAdmission()
+            dispatcher.clear()
+        }
+        executor.execute { if (isCurrent(event)) interrupt() }
+    }
+
     private fun deliverEvent(event: HostEvent) {
         val plugin = active ?: return
-        if (!isCurrent(event) || scope?.isRevoked != false) return
+        if (eventIdentity != (event.envelope.sessionId to event.envelope.generation) ||
+            !isCurrent(event) || scope?.isRevoked != false) return
         val capability = when (event) {
             is AudioEvent, is DiscontinuityEvent -> Capability.Audio
             is TranscriptEvent -> Capability.Asr
@@ -234,10 +247,9 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     private fun teardown(reason: DeactivationReason) {
         transitioning = true
         try {
-        eventIdentity = null
+        synchronized(eventGate) { eventIdentity = null; dispatcher.clear() }
         val epoch = inputEpoch
         inputEpoch = null
-        dispatcher.clear()
         epoch?.let { runCatching { environment.input.stop(it) } }
         scope?.revoke()
         scope = null

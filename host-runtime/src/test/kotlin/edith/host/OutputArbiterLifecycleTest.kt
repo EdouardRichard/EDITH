@@ -4,8 +4,34 @@ import edith.contracts.*
 import edith.plugin.*
 import edith.testsupport.*
 import kotlin.test.*
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import kotlin.concurrent.thread
 
 class OutputArbiterLifecycleTest {
+    @Test fun `device callback returns while show is blocked`() {
+        val inShow = CountDownLatch(1)
+        val releaseShow = CountDownLatch(1)
+        val callbackDone = CountDownLatch(1)
+        lateinit var callback: (OutputStatus) -> Unit
+        val slowDevice = object : HintDevice {
+            override fun show(assistance: Assistance, revision: Long, listener: (OutputStatus) -> Unit): CancellationHandle {
+                callback = listener
+                inShow.countDown()
+                check(releaseShow.await(5, TimeUnit.SECONDS))
+                return FakeCancellation()
+            }
+            override fun clear(sessionId: SessionId, generation: Generation) = Unit
+        }
+        val subject = OutputArbiter(clock, scheduler, slowDevice, { identity }) { _, _ -> }
+        val submitter = thread(isDaemon = true) { subject.submit(hint("blocked")) }
+        assertTrue(inShow.await(5, TimeUnit.SECONDS))
+        val caller = thread(isDaemon = true) { try { callback(OutputStatus.Displayed) } finally { callbackDone.countDown() } }
+        try { assertTrue(callbackDone.await(2, TimeUnit.SECONDS), "device callback waited for output owner") }
+        finally { releaseShow.countDown(); caller.join(5000); submitter.join(5000) }
+        subject.clear(SessionId("s"), Generation(1))
+    }
+
     private val clock = FakeClock()
     private val scheduler = ManualScheduler(clock)
     private val device = RecordingHintDevice()
@@ -57,8 +83,10 @@ class OutputArbiterLifecycleTest {
         arbiter.submit(hint("h")); arbiter.submit(hint("h").copy(text = "updated"))
         assertEquals(listOf(1L, 2L), device.shown.map { it.second })
         device.callbacks[0](OutputStatus.Displayed)
+        arbiter.submit(hint("barrier", 0))
         assertFalse(states.any { it.second == OutputStatus.Displayed })
         device.callbacks[1](OutputStatus.Displayed)
+        arbiter.submit(hint("barrier-2", 0))
         assertEquals(1, states.count { it.second == OutputStatus.Displayed })
     }
 
