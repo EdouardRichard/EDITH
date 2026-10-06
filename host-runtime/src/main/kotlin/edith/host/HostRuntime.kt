@@ -3,6 +3,8 @@ package edith.host
 import edith.contracts.*
 import edith.plugin.*
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.ExecutionException
 
 class HostRuntime(private val apiVersion: Int, private val environment: HostEnvironment) {
     constructor(apiVersion: Int) : this(apiVersion, MissingHostEnvironment)
@@ -22,12 +24,22 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     private var state = SessionState.Idle
     private var inputEpoch: InputEpoch? = null
     private var inputSerial = 0L
+    private var transitioning = false
+    @Volatile private var eventIdentity: Pair<SessionId, Generation>? = null
+    private val drainScheduled = AtomicBoolean()
+    private val dispatcher = HostEventDispatcher(32, ::deliverEvent) { event ->
+        executor.execute { if (isCurrent(event)) interrupt() }
+    }
     val currentGeneration: Generation get() = command { generation }
     val currentState: SessionState get() = command { state }
     val currentInputEpoch: InputEpoch? get() = command { inputEpoch }
 
-    private fun <T> command(block: () -> T): T =
-        if (Thread.currentThread() === ownerThread) block() else executor.submit<T> { block() }.get()
+    private fun <T> command(block: () -> T): T {
+        if (Thread.currentThread() === ownerThread) return block()
+        return try { executor.submit<T> { block() }.get() } catch (error: ExecutionException) {
+            throw (error.cause ?: error)
+        }
+    }
 
     fun register(plugin: PluginLifecycle) = command {
         require(plugin.descriptor.apiVersion == apiVersion) { "unsupported api version" }
@@ -36,6 +48,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
 
     fun configure(id: String, configuration: PluginConfiguration): Boolean = command {
+        if (transitioning) return@command false
         val plugin = plugins[id] ?: return@command false
         if (active?.descriptor?.pluginId == id) return@command false
         runCatching {
@@ -46,11 +59,12 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
 
     fun startSession(id: SessionId) = command {
+        check(!transitioning) { "lifecycle transition in progress" }
         teardown(DeactivationReason.Stopped)
         sessionId = id
         sceneReady = false
         selectedId = null
-        generation = Generation(0)
+        generation = Generation(Math.incrementExact(generation.value))
         state = SessionState.BuildingScene
     }
 
@@ -61,6 +75,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
 
     fun activate(id: String): ActivationResult = command {
+        if (transitioning) return@command ActivationResult.OwnerBusy
         if (!sceneReady || sessionId == null) return@command ActivationResult.SessionNotReady
         if (active != null) return@command ActivationResult.OwnerBusy
         if (id !in plugins) return@command ActivationResult.UnknownPlugin
@@ -84,7 +99,10 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
             scope = resource
             active = plugin
             state = SessionState.Ready
-            plugin.activate(PluginContext(session, generation, plugin.descriptor.capabilities, services))
+            eventIdentity = session to generation
+            transitioning = true
+            try { plugin.activate(PluginContext(session, generation, plugin.descriptor.capabilities, services)) }
+            finally { transitioning = false }
             if (scope !== resource || resource.isRevoked) throw ContractError.Cancelled()
             if (Capability.Audio in plugin.descriptor.capabilities) {
                 val epoch = InputEpoch(session, generation, Math.incrementExact(inputSerial).also { inputSerial = it })
@@ -101,6 +119,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
 
     fun switchTo(id: String): ActivationResult = command {
+        if (transitioning) return@command ActivationResult.OwnerBusy
         if (!sceneReady || sessionId == null) return@command ActivationResult.SessionNotReady
         if (id !in plugins) return@command ActivationResult.UnknownPlugin
         teardown(DeactivationReason.Switched)
@@ -110,6 +129,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
 
     fun pause() = command {
+        if (transitioning) return@command
         if (sessionId != null && state != SessionState.Paused) {
             teardown(DeactivationReason.Paused)
             generation = Generation(Math.incrementExact(generation.value))
@@ -118,12 +138,14 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
 
     fun resume(): ActivationResult = command {
+        if (transitioning) return@command ActivationResult.OwnerBusy
         if (!sceneReady || sessionId == null) return@command ActivationResult.SessionNotReady
         if (active != null) return@command ActivationResult.OwnerBusy
         activateSelected()
     }
 
     fun stop() = command {
+        if (transitioning) return@command
         if (sessionId != null) teardown(DeactivationReason.Stopped)
         sessionId = null
         selectedId = null
@@ -132,6 +154,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
 
     fun interrupt() = command {
+        if (transitioning) return@command
         if (sessionId != null) {
             teardown(DeactivationReason.Error)
             generation = Generation(Math.incrementExact(generation.value))
@@ -146,9 +169,45 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
         }
     }
 
+    fun onEvent(event: HostEvent): Boolean {
+        if (eventIdentity != (event.envelope.sessionId to event.envelope.generation)) return false
+        val accepted = dispatcher.offer(event)
+        scheduleDrain()
+        return accepted
+    }
+
+    private fun scheduleDrain() {
+        if (drainScheduled.compareAndSet(false, true)) executor.execute {
+            try { dispatcher.drain() } finally {
+                drainScheduled.set(false)
+                if (dispatcher.hasPending) scheduleDrain()
+            }
+        }
+    }
+
+    private fun isCurrent(event: HostEvent) = event.envelope.sessionId == sessionId && event.envelope.generation == generation
+
+    private fun deliverEvent(event: HostEvent) {
+        val plugin = active ?: return
+        if (!isCurrent(event) || scope?.isRevoked != false) return
+        val capability = when (event) {
+            is AudioEvent, is DiscontinuityEvent -> Capability.Audio
+            is TranscriptEvent -> Capability.Asr
+            is SpeakerEvent -> Capability.Speaker
+            is OutputStateEvent -> Capability.TextOutput
+            else -> null
+        }
+        if (capability != null && capability !in plugin.descriptor.capabilities) return
+        runCatching { plugin.handle(event) }.onFailure { pause() }
+    }
+
     private fun teardown(reason: DeactivationReason) {
+        transitioning = true
+        try {
+        eventIdentity = null
         val epoch = inputEpoch
         inputEpoch = null
+        dispatcher.clear()
         epoch?.let { runCatching { environment.input.stop(it) } }
         scope?.revoke()
         scope = null
@@ -156,6 +215,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
         active = null
         previous?.let { runCatching { it.deactivate(reason) } }
         sessionId?.let { runCatching { environment.output.clear(it, generation) } }
+        } finally { transitioning = false }
     }
 
     fun accept(assistance: Assistance): Boolean = command {

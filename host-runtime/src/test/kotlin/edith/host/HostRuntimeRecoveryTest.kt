@@ -91,4 +91,42 @@ class HostRuntimeRecoveryTest {
         assertEquals(ActivationResult.Activated, rig.host.resume())
         assertNotEquals(old, rig.host.currentInputEpoch)
     }
+
+    @Test fun `deactivation cannot resurrect resources during pause`() {
+        val rig = HostTestRig()
+        var attempted: ActivationResult? = null
+        val plugin = object : PluginLifecycle {
+            override val descriptor = PluginDescriptor("reentrant", "1", 1, "probe", listOf(Capability.Audio), ConfigSchema(1))
+            override fun activate(context: PluginContext) = Unit
+            override fun handle(event: HostEvent) = Unit
+            override fun deactivate(reason: DeactivationReason) { attempted = rig.host.resume() }
+        }
+        rig.host.register(plugin); rig.host.activate("reentrant")
+        rig.host.pause()
+        assertEquals(ActivationResult.OwnerBusy, attempted)
+        assertNull(rig.host.currentInputEpoch)
+        assertEquals(1, rig.input.started.size)
+        assertEquals(1, rig.input.stopped.size)
+    }
+
+    @Test fun `restarting same session identity rejects old output`() {
+        val rig = HostTestRig()
+        rig.host.activate("probe")
+        val old = rig.host.currentGeneration
+        rig.host.stop(); rig.host.startSession(SessionId("s")); rig.host.markSceneReady(); rig.host.activate("probe")
+        assertFalse(rig.host.accept(Assistance("old", SessionId("s"), old, null, 1, "test", null, 100)))
+    }
+
+    @Test fun `executor preserves original registration validation exceptions`() {
+        val host = HostRuntime(1)
+        host.register(ProbePlugin("p", emptyList()))
+        assertFailsWith<IllegalArgumentException> { host.register(ProbePlugin("p", emptyList())) }
+        val incompatible = object : PluginLifecycle {
+            override val descriptor = PluginDescriptor("bad", "1", 2, "bad", emptyList(), ConfigSchema(1))
+            override fun activate(context: PluginContext) = Unit
+            override fun handle(event: HostEvent) = Unit
+            override fun deactivate(reason: DeactivationReason) = Unit
+        }
+        assertFailsWith<IllegalArgumentException> { host.register(incompatible) }
+    }
 }
