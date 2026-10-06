@@ -11,15 +11,17 @@ import java.util.concurrent.TimeUnit
 
 class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEngine,
     private val speaker: SpeakerEngine, private val emit: (HostEvent) -> Unit,
-    private val cancelTurn: (String) -> Unit) {
+    private val cancelTurn: (String) -> Unit, val timeline: TurnTimeline = TurnTimeline()) {
     private data class Identity(val epoch: InputEpoch, val continuity: String, val rate: Int)
     private class Turn(val id: String, val first: PcmFrame) {
-        val timeline = TurnTimeline(id, first.startNanos)
+        val timeline = TurnRevision(id, first.startNanos)
         val pcm = ByteArrayOutputStream()
         var end = first
         var samples = 0L
+        var startupSpeakerRequested = false
     }
-    private class Pending(val turnId: String, val identity: Identity, val fence: Long, val window: SpeakerWindow) {
+    private class Pending(val turnId: String, val identity: Identity, val fence: Long, val window: SpeakerWindow,
+        val timelineAdmission: TurnTimeline.SpeakerAdmission) {
         var handle: CancellationHandle? = null
     }
     private inner class SpeakerTask(val request: Pending) : Runnable {
@@ -82,7 +84,6 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
                 preRoll.forEach { feed(turn!!, it, actions) }
                 preRoll.clear(); preRollSamples = 0
                 feed(turn!!, frame, actions)
-                requestSpeaker(turn!!, next, actions)
             } else if (turn != null) {
                 val active = turn!!
                 if (active.samples + frame.samples.size > frame.sampleRateHz.toLong() * 20) {
@@ -93,9 +94,18 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
             } else {
                 remember(frame)
             }
+            if (available() && turn != null) {
+                val active = turn!!
+                if (!active.startupSpeakerRequested &&
+                    (speaker as? LocalSpeakerService)?.startupDurationSatisfied(active.samples, next.rate) != false) {
+                    active.startupSpeakerRequested = true
+                    requestSpeaker(active, next, actions)
+                }
+            }
             if (available() && decision.endpoint && turn != null) {
                 val active = turn!!
                 active.timeline.revise(asr.finish().copy(final = true), envelope(frame))?.let {
+                    registerTranscript(active, it)
                     actions += { emit(TranscriptEvent(it)) }
                 }
                 requestSpeaker(active, next, actions)
@@ -157,9 +167,15 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
         active.end = frame
         asr.accept(frame).forEach { hypothesis ->
             active.timeline.revise(hypothesis, envelope(frame))?.let { revision ->
+                registerTranscript(active, revision)
                 actions += { emit(TranscriptEvent(revision)) }
             }
         }
+    }
+
+    private fun registerTranscript(active: Turn, revision: TranscriptRevision) {
+        timeline.registerTranscriptProvenance(active.id, active.first.epoch, active.first.range.continuityId)
+        timeline.applyTranscript(revision)
     }
 
     private fun remember(frame: PcmFrame) {
@@ -182,8 +198,11 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
         val window = SpeakerWindow(AudioSegment(windowEnvelope,
             AudioFormat.Pcm(identity.rate, 1, 16), active.pcm.toByteArray()),
             SampleRange(identity.continuity, active.first.range.first, active.end.range.endExclusive), false)
+        timeline.registerSpeakerWindow(window, identity.epoch)
+        (speaker as? LocalSpeakerService)?.registerWindow(window, identity.epoch)
+        val timelineAdmission = timeline.speakerAdmission(identity.epoch, identity.continuity)
         val request = synchronized(admission) {
-            if (pending.size >= 8) null else Pending(active.id, identity, fence, window).also { pending += it }
+            if (pending.size >= 8) null else Pending(active.id, identity, fence, window, timelineAdmission).also { pending += it }
         }
         if (request == null) {
             fault(windowEnvelope, "SPEECH_SPEAKER_BACKLOG", actions)
@@ -208,9 +227,12 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
                         assessment.startNanos < envelope.startNanos || assessment.endNanos > envelope.endNanos) false
                     else { pending.remove(request); true }
                 }
-                if (accepted) emit(SpeakerEvent(assessment.copy(envelope = EventEnvelope(
+                if (accepted) {
+                    timeline.applySpeaker(assessment, request.timelineAdmission)
+                    emit(SpeakerEvent(assessment.copy(envelope = EventEnvelope(
                     request.identity.epoch.sessionId, request.identity.epoch.generation,
                     UUID.randomUUID().toString(), assessment.startNanos, assessment.endNanos))))
+                }
             }
             val cancel = synchronized(admission) {
                 if (isCurrentLocked(request)) { request.handle = handle; false } else true
@@ -298,6 +320,7 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
             identity = null
             pending.toList().also { pending.clear() }
         }
+        timeline.clear()
         val turnIds = (requests.map { it.turnId } + listOfNotNull(turn?.id)).toSet()
         turn = null
         turnIds.forEach { id -> actions += { runCatching { cancelTurn(id) }; Unit } }

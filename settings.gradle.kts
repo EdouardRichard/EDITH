@@ -22,4 +22,5 @@ include(
     ":plugins-smart",
     ":plugins-interview",
     ":audio-runtime",
+    ":storage-runtime",
 )

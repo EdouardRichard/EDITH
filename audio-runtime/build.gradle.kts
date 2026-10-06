@@ -8,6 +8,7 @@ kotlin {
 dependencies {
     implementation(project(":core-contracts"))
     implementation(project(":plugin-api"))
+    implementation(project(":storage-runtime"))
     testImplementation(project(":test-support"))
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.test.junit5)
