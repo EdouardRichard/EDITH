@@ -121,4 +121,12 @@ class OutputArbiter private constructor(
         displayed?.takeIf { it.hint.sourceTurnId == turnId }?.let { remove(it, OutputStatus.Rejected) }
         next()
     }
+
+    fun cancelHint(turnId: String, hintId: String) = command {
+        queue.filter { it.hint.sourceTurnId == turnId && it.hint.hintId == hintId }
+            .toList().forEach { remove(it, OutputStatus.Rejected) }
+        displayed?.takeIf { it.hint.sourceTurnId == turnId && it.hint.hintId == hintId }
+            ?.let { remove(it, OutputStatus.Rejected) }
+        next()
+    }
 }

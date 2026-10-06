@@ -265,4 +265,16 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
             sessionId?.let { assistance.isCurrent(it, generation) } == true &&
             assistance.expiresAtNanos > environment.clock.nowNanos() && assistance.optionalSpeech == null
     }
+
+    fun cancelOutputTurn(sessionId: SessionId, generation: Generation, turnId: String) = command {
+        if (active != null && scope?.isRevoked == false && eventIdentity == (sessionId to generation)) {
+            arbiter.cancelTurn(turnId)
+        }
+    }
+
+    fun cancelOutputHint(sessionId: SessionId, generation: Generation, turnId: String, hintId: String) = command {
+        if (active != null && scope?.isRevoked == false && eventIdentity == (sessionId to generation)) {
+            arbiter.cancelHint(turnId, hintId)
+        }
+    }
 }

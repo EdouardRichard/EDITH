@@ -24,5 +24,7 @@ include(
     ":audio-runtime",
     ":storage-runtime",
     ":model-runtime",
+    ":output-runtime",
+    ":plugins-diagnostic",
     ":tools:p2-text-probe",
 )
