@@ -40,7 +40,7 @@ data class ModelProfile(
     init {
         require(listOf(id, name, service, baseUrl, protocolId, model, secret.id).all { it.isNotBlank() })
         require(revision >= 0)
-        require(usableWindowTokens > 0 && inputBudgetTokens > 0 && maxOutputTokens > 0 && safetyTokens >= 0)
+        require(usableWindowTokens > 0 && inputBudgetTokens > 0 && maxOutputTokens > 0 && safetyTokens > 0)
         require(inputBudgetTokens.toLong() + maxOutputTokens + safetyTokens <= usableWindowTokens.toLong())
         require(timeoutMillis > 0)
         require(inputs.isNotEmpty() && outputs.isNotEmpty())

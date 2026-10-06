@@ -33,6 +33,10 @@ class ModelServicesContractTest {
         assertFalse(OutputModality.AUDIO in profile.outputs)
     }
 
+    @Test fun `profile requires positive safety reserve`() {
+        assertFailsWith<IllegalArgumentException> { profile().copy(safetyTokens = 0) }
+    }
+
     @Test fun `request rejects malformed routing and suppresses body in diagnostics`() {
         val request = ModelRequest(EventEnvelope(SessionId("s"), Generation(0), "e", 0, 1),
             "q", "t", "p", 1, "private-instructions", listOf(InputPart.Text("private-input")),
