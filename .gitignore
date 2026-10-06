@@ -1,10 +1,13 @@
 # Local credentials and machine-specific Android configuration
 local.properties
+.local/
+.worktrees/
 .idea/
 *.iml
 
 # Build and Gradle outputs
 .gradle/
+.kotlin/
 **/build/
 **/outputs/
 **/intermediates/
