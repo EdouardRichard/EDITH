@@ -1,0 +1,8 @@
+: Synthetic compatibility-schema fixture, not a captured DeepSeek response.
+event: response.created
+data: {"type":"response.created","sequence_number":1,"response":{"id":"r"}}
+
+event: response.failed
+data: {"type":"response.failed","sequence_number":5,"response":{"id":"r","status":"failed","error":{"code":"server_error","message":"private provider message"},"usage":null}}
+
+
