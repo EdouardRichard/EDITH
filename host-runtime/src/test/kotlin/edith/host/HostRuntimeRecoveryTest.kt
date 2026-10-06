@@ -129,4 +129,19 @@ class HostRuntimeRecoveryTest {
         }
         assertFailsWith<IllegalArgumentException> { host.register(incompatible) }
     }
+
+    @Test fun `host services submit through TTL arbiter and pause cancels display`() {
+        val rig = HostTestRig()
+        rig.host.activate("probe")
+        val generation = rig.host.currentGeneration
+        val sink = rig.plugin.context!!.services.textOutput()
+        assertEquals(OutputSubmission.Accepted, sink.submit(Assistance("h", SessionId("s"), generation,
+            "t", 1, "test", null, 100)))
+        assertEquals(listOf("h"), rig.output.shown.map { it.first.hintId })
+        rig.host.pause()
+        rig.output.callbacks.single()(OutputStatus.Displayed)
+        assertEquals(1, rig.output.handles.single().cancelCount)
+        assertFailsWith<ContractError.Cancelled> { sink.submit(Assistance("late", SessionId("s"), generation,
+            "t", 1, "test", null, 100)) }
+    }
 }

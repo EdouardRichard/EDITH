@@ -18,10 +18,11 @@ class HostTestRig(capabilities: Set<Capability> = setOf(Capability.Audio, Capabi
             else -> error("rig unsupported capability")
         }
     }
-    val environment = object : HostEnvironment {
+    val environment = object : ScheduledHostEnvironment {
         override val clock = this@HostTestRig.clock
         override val input = this@HostTestRig.input
         override val output = this@HostTestRig.output
+        override val scheduler = this@HostTestRig.scheduler
         override val availableCapabilities = capabilities
         override fun services(scope: ResourceScope, granted: Set<Capability>) =
             ScopedHostServices(scope, granted, providers, FakeTaskScope())

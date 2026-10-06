@@ -11,6 +11,8 @@ interface HostEnvironment {
     fun services(scope: ResourceScope, granted: Set<Capability>): HostServices
 }
 
+interface ScheduledHostEnvironment : HostEnvironment { val scheduler: DeadlineScheduler }
+
 internal object MissingHostEnvironment : HostEnvironment {
     override val clock = object : MonotonicClock { override fun nowNanos() = System.nanoTime().coerceAtLeast(0) }
     override val availableCapabilities = emptySet<Capability>()

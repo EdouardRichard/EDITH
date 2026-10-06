@@ -5,6 +5,7 @@ import edith.plugin.*
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.ExecutionException
+import java.util.concurrent.TimeUnit
 
 class HostRuntime(private val apiVersion: Int, private val environment: HostEnvironment) {
     constructor(apiVersion: Int) : this(apiVersion, MissingHostEnvironment)
@@ -26,6 +27,19 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     private var inputSerial = 0L
     private var transitioning = false
     @Volatile private var eventIdentity: Pair<SessionId, Generation>? = null
+    private val timer = Executors.newSingleThreadScheduledExecutor { task -> Thread(task, "edith-deadlines").also { it.isDaemon = true } }
+    private val deadlineScheduler = object : DeadlineScheduler {
+        override fun at(deadlineNanos: Long, task: () -> Unit): CancellationHandle {
+            val future = timer.schedule(task, (deadlineNanos - environment.clock.nowNanos()).coerceAtLeast(0), TimeUnit.NANOSECONDS)
+            return object : CancellationHandle { override fun cancel() { future.cancel(false) } }
+        }
+    }
+    private val arbiter = OutputArbiter(environment.clock,
+        (environment as? ScheduledHostEnvironment)?.scheduler ?: deadlineScheduler,
+        environment.output, { eventIdentity }) { hint, status ->
+        onEvent(OutputStateEvent(EventEnvelope(hint.sessionId, hint.generation,
+            "output-${java.util.UUID.randomUUID()}", environment.clock.nowNanos(), environment.clock.nowNanos()), hint.hintId, status))
+    }
     private val drainScheduled = AtomicBoolean()
     private val dispatcher = HostEventDispatcher(32, ::deliverEvent) { event ->
         executor.execute { if (isCurrent(event)) interrupt() }
@@ -95,7 +109,23 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
                 throw ContractError.CapabilityMissing("required provider unavailable")
             }
             (plugin as? ConfiguredPlugin)?.configure(configuration)
-            val services = environment.services(resource, plugin.descriptor.capabilities)
+            val provided = environment.services(resource, plugin.descriptor.capabilities)
+            val services = object : HostServices {
+                override val tasks = provided.tasks
+                override fun require(capability: Capability): Any {
+                    resource.checkActive()
+                    val service = provided.require(capability)
+                    return if (capability == Capability.TextOutput) object : OutputSink {
+                        override fun submit(assistance: Assistance): OutputSubmission {
+                            resource.checkActive()
+                            return when (arbiter.submit(assistance)) {
+                                OutputStatus.Accepted, OutputStatus.Queued -> OutputSubmission.Accepted
+                                else -> OutputSubmission.Rejected
+                            }
+                        }
+                    } else service
+                }
+            }
             scope = resource
             active = plugin
             state = SessionState.Ready
@@ -214,7 +244,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
         val previous = active
         active = null
         previous?.let { runCatching { it.deactivate(reason) } }
-        sessionId?.let { runCatching { environment.output.clear(it, generation) } }
+        sessionId?.let { runCatching { arbiter.clear(it, generation) } }
         } finally { transitioning = false }
     }
 
