@@ -1,5 +1,6 @@
 pluginManagement {
     repositories {
+        google()
         gradlePluginPortal()
         mavenCentral()
     }
@@ -8,7 +9,12 @@ pluginManagement {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
+        google()
         mavenCentral()
+        exclusiveContent {
+            forRepository { maven { url = uri("https://maven.rokid.com/repository/maven-public/") } }
+            filter { includeGroup("com.rokid.cxr") }
+        }
     }
 }
 
@@ -27,4 +33,5 @@ include(
     ":output-runtime",
     ":plugins-diagnostic",
     ":tools:p2-text-probe",
+    ":phone-app",
 )

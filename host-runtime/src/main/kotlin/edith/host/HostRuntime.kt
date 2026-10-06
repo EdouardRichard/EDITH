@@ -6,8 +6,11 @@ import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.CountDownLatch
 
-class HostRuntime(private val apiVersion: Int, private val environment: HostEnvironment) {
+class HostRuntime(private val apiVersion: Int, private val environment: HostEnvironment) : AutoCloseable {
     constructor(apiVersion: Int) : this(apiVersion, MissingHostEnvironment)
 
     private var ownerThread: Thread? = null
@@ -22,8 +25,16 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     private var active: PluginLifecycle? = null
     private var scope: ResourceScope? = null
     private var generation = Generation(0)
-    private var state = SessionState.Idle
-    private var inputEpoch: InputEpoch? = null
+    @Volatile private var state = SessionState.Idle
+    @Volatile private var inputEpoch: InputEpoch? = null
+    @Volatile private var closed = false
+    private val closing = AtomicBoolean()
+    private val closeComplete = CountDownLatch(1)
+    private var publishedState = SessionState.Idle
+    private class StateObservation(val listener: (SessionState) -> Unit) {
+        val active = AtomicBoolean(true)
+    }
+    private val observations = CopyOnWriteArrayList<StateObservation>()
     private var inputSerial = 0L
     private var transitioning = false
     private val eventGate = Any()
@@ -43,13 +54,55 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
     private val drainScheduled = AtomicBoolean()
     private val dispatcher = HostEventDispatcher(32, ::deliverEvent, ::onCriticalEventOverflow)
-    val currentGeneration: Generation get() = command { generation }
-    val currentState: SessionState get() = command { state }
-    val currentInputEpoch: InputEpoch? get() = command { inputEpoch }
+    val currentGeneration: Generation get() = if (closed) generation else command { generation }
+    val currentState: SessionState get() = if (closed) state else command { state }
+    val currentInputEpoch: InputEpoch? get() = if (closed) inputEpoch else command { inputEpoch }
+
+    fun observeState(listener: (SessionState) -> Unit): CancellationHandle = command {
+        val observation = StateObservation(listener)
+        observations += observation
+        runCatching { listener(state) }
+        object : CancellationHandle {
+            override fun cancel() { observation.active.set(false); observations.remove(observation) }
+        }
+    }
+
+    private fun publishState() {
+        if (state == publishedState) return
+        publishedState = state
+        observations.forEach { if (it.active.get()) runCatching { it.listener(state) } }
+    }
+
+    override fun close() {
+        if (!closing.compareAndSet(false, true)) {
+            // An observer on the owner must not wait for the shutdown it is executing.
+            if (Thread.currentThread() !== ownerThread) closeComplete.await()
+            return
+        }
+        fun shutdown() {
+            try { stop() } finally {
+                closed = true
+                observations.forEach { it.active.set(false) }
+                observations.clear()
+                timer.shutdownNow()
+                executor.shutdown()
+                closeComplete.countDown()
+            }
+        }
+        if (Thread.currentThread() === ownerThread) shutdown()
+        else try { executor.submit { shutdown() }.get() } catch (error: ExecutionException) {
+            throw (error.cause ?: error)
+        }
+    }
 
     private fun <T> command(block: () -> T): T {
-        if (Thread.currentThread() === ownerThread) return block()
-        return try { executor.submit<T> { block() }.get() } catch (error: ExecutionException) {
+        fun execute(): T {
+            check(!closed) { "HOST_CLOSED" }
+            try { return block() } finally { publishState() }
+        }
+        check(!closed && (!closing.get() || Thread.currentThread() === ownerThread)) { "HOST_CLOSED" }
+        if (Thread.currentThread() === ownerThread) return execute()
+        return try { executor.submit<T> { execute() }.get() } catch (error: ExecutionException) {
             throw (error.cause ?: error)
         }
     }
@@ -194,12 +247,17 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
 
     fun onAudioReceived(epoch: InputEpoch) {
-        executor.execute {
-            if (epoch == inputEpoch && sceneReady && active != null && scope?.isRevoked == false) state = SessionState.Listening
-        }
+        if (closed) return
+        try { executor.execute {
+            if (!closed && epoch == inputEpoch && sceneReady && active != null && scope?.isRevoked == false) {
+                state = SessionState.Listening
+                publishState()
+            }
+        } } catch (_: RejectedExecutionException) { /* Close fenced this callback. */ }
     }
 
     fun onEvent(event: HostEvent): Boolean {
+        if (closed) return false
         val accepted = synchronized(eventGate) {
             if (eventIdentity != (event.envelope.sessionId to event.envelope.generation)) return false
             dispatcher.offer(event)
@@ -209,12 +267,13 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
 
     private fun scheduleDrain() {
-        if (drainScheduled.compareAndSet(false, true)) executor.execute {
+        if (closed) return
+        if (drainScheduled.compareAndSet(false, true)) try { executor.execute {
             try { dispatcher.drain() } finally {
                 drainScheduled.set(false)
                 if (dispatcher.hasPending) scheduleDrain()
             }
-        }
+        } } catch (_: RejectedExecutionException) { drainScheduled.set(false) }
     }
 
     private fun isCurrent(event: HostEvent) = event.envelope.sessionId == sessionId && event.envelope.generation == generation
@@ -250,9 +309,9 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
         synchronized(eventGate) { eventIdentity = null; dispatcher.clear() }
         val epoch = inputEpoch
         inputEpoch = null
-        epoch?.let { runCatching { environment.input.stop(it) } }
         scope?.revoke()
         scope = null
+        epoch?.let { runCatching { environment.input.stop(it) } }
         val previous = active
         active = null
         previous?.let { runCatching { it.deactivate(reason) } }

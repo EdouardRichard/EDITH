@@ -1,5 +1,6 @@
 plugins {
     alias(libs.plugins.kotlin.jvm) apply false
+    alias(libs.plugins.android.application) apply false
 }
 
 allprojects {
@@ -13,10 +14,10 @@ subprojects {
         targetCompatibility = "17"
     }
 
-    tasks.withType<Test>().configureEach {
-        useJUnitPlatform()
-        testLogging {
-            events("passed", "skipped", "failed")
+    pluginManager.withPlugin("org.jetbrains.kotlin.jvm") {
+        tasks.withType<Test>().configureEach {
+            useJUnitPlatform()
+            testLogging { events("passed", "skipped", "failed") }
         }
     }
 }
