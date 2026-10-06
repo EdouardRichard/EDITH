@@ -13,6 +13,38 @@ import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.*
 
 class ControlledModelClientTest {
+    @Test fun `503 zero waits for application retry scheduler before second POST`() = Rig().use { rig ->
+        repeat(2) { rig.server.enqueue(MockResponse().setResponseCode(503).addHeader("Retry-After", "0")) }
+        rig.start()
+        val retry = rig.timers.awaitRetry()
+        assertEquals(0L, retry.deadline)
+        assertEquals(1, rig.server.requestCount, "only the application scheduler may repeat a POST")
+        assertTrue(rig.ends().isEmpty())
+    }
+
+    @Test fun `503 zero on both attempts sends at most two identical POSTs`() = Rig().use { rig ->
+        repeat(4) { rig.server.enqueue(MockResponse().setResponseCode(503).addHeader("Retry-After", "0")) }
+        rig.start()
+        rig.timers.fire(rig.timers.awaitRetry())
+        rig.awaitTerminal()
+        assertEquals(2, rig.server.requestCount)
+        assertEquals(listOf(ModelEnd.FAILED), rig.ends())
+        val first = rig.awaitRequest()
+        val second = rig.awaitRequest()
+        assertEquals("POST", first.method)
+        assertEquals("/v1/responses", first.path)
+        assertEquals("Bearer dummy-key", first.getHeader("Authorization"))
+        assertEquals("text/event-stream", first.getHeader("Accept"))
+        assertEquals("application/json", first.getHeader("Content-Type"))
+        assertEquals(first.headers, second.headers)
+        val bytes = first.body.readByteArray()
+        assertContentEquals(bytes, second.body.readByteArray())
+        assertEquals(bytes.size.toString(), first.getHeader("Content-Length"))
+        val json = kotlinx.serialization.json.Json.parseToJsonElement(bytes.toString(Charsets.UTF_8))
+        assertEquals(kotlinx.serialization.json.Json.parseToJsonElement(
+            """{"model":"model","instructions":"synthetic instructions","stream":true,"max_output_tokens":256,"input":[{"role":"user","content":"synthetic question"}]}"""), json)
+    }
+
     @Test fun `injected authenticator cannot replay 401`() = Rig(authenticator = Authenticator { _, response ->
         response.request.newBuilder().header("X-Synthetic-Auth", "retry").build()
     }).use { rig ->
@@ -290,6 +322,160 @@ class ControlledModelClientTest {
         assertTrue(rig.repository.get("p")!!.verifications.isEmpty())
     }
 
+    @Test fun `unverified probe 401 records Failed and denies ordinary admission`() = Rig().use { rig ->
+        rig.profile = rig.repository.save(rig.profile)
+        rig.consent = RequestConsent(true, false, false, true)
+        rig.server.enqueue(MockResponse().setResponseCode(401))
+        ControlledProfileTester(rig.client, rig.repository, rig.clock, rig.wall).testText("p", rig::event)
+        rig.awaitTerminal()
+        assertEquals(listOf(ModelEnd.FAILED), rig.ends())
+        assertEquals(listOf(verification(state = VerificationState.Failed, revision = rig.profile.revision,
+            time = rig.wall.millis())), rig.repository.get("p")!!.verifications)
+        assertProbeFailureDeniesOrdinaryRequest(rig)
+    }
+
+    @Test fun `verified probe 401 supersedes equal timestamp evidence and denies ordinary admission`() = Rig().use { rig ->
+        rig.repository.verify("p", verification(revision = rig.profile.revision, time = rig.wall.millis()))
+        val previous = rig.repository.get("p")!!.verifications
+        rig.consent = RequestConsent(true, false, false, true)
+        rig.server.enqueue(MockResponse().setResponseCode(401))
+        ControlledProfileTester(rig.client, rig.repository, rig.clock, rig.wall).testText("p", rig::event)
+        rig.awaitTerminal()
+        assertEquals(listOf(ModelEnd.FAILED), rig.ends())
+        assertEquals(previous + verification(state = VerificationState.Failed, revision = rig.profile.revision,
+            time = rig.wall.millis()), rig.repository.get("p")!!.verifications)
+        assertProbeFailureDeniesOrdinaryRequest(rig)
+    }
+
+    @Test fun `unsuccessful provider and incomplete EOF probes record Failed`() {
+        for ((body, end) in listOf(FAILED to ModelEnd.FAILED, INCOMPLETE to ModelEnd.INCOMPLETE,
+            CREATED to ModelEnd.INCOMPLETE)) Rig().use { rig ->
+            rig.consent = RequestConsent(true, false, false, true)
+            rig.server.enqueue(sse(body))
+            ControlledProfileTester(rig.client, rig.repository, rig.clock, rig.wall).testText("p", rig::event)
+            rig.awaitTerminal()
+            assertEquals(listOf(end), rig.ends())
+            assertEquals(verification(state = VerificationState.Failed, revision = rig.profile.revision,
+                time = rig.wall.millis()), rig.repository.get("p")!!.verifications.last())
+            assertProbeFailureDeniesOrdinaryRequest(rig)
+        }
+    }
+
+    @Test fun `deadline probe records Failed and denies ordinary admission`() = Rig().use { rig ->
+        rig.consent = RequestConsent(true, false, false, true)
+        rig.server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        ControlledProfileTester(rig.client, rig.repository, rig.clock, rig.wall).testText("p", rig::event)
+        rig.awaitRequest()
+        rig.timers.fire(rig.timers.entries.single())
+        rig.awaitTerminal()
+        assertEquals(listOf(ModelEnd.DEADLINE), rig.ends())
+        assertTrue(rig.failed.await(5, TimeUnit.SECONDS))
+        assertEquals(verification(state = VerificationState.Failed, revision = rig.profile.revision,
+            time = rig.wall.millis()), rig.repository.get("p")!!.verifications.last())
+        assertProbeFailureDeniesOrdinaryRequest(rig)
+    }
+
+    @Test fun `cancelled probe preserves current Verified evidence`() = Rig().use { rig ->
+        val previous = rig.repository.get("p")!!.verifications
+        rig.consent = RequestConsent(true, false, false, true)
+        rig.server.enqueue(MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE))
+        val handle = ControlledProfileTester(rig.client, rig.repository, rig.clock, rig.wall).testText("p", rig::event)
+        rig.awaitRequest()
+        handle.cancel(); handle.cancel()
+        rig.awaitTerminal()
+        assertTrue(rig.failed.await(5, TimeUnit.SECONDS))
+        assertEquals(listOf(ModelEnd.CANCELLED), rig.ends())
+        assertEquals(previous, rig.repository.get("p")!!.verifications)
+        assertEquals(1, rig.server.requestCount)
+    }
+
+    @Test fun `probe rejection before admission preserves evidence without network failure inference`() {
+        for (reason in listOf("consent", "endpoint", "secret")) Rig().use { rig ->
+            rig.consent = RequestConsent(true, false, false, reason != "consent")
+            if (reason == "endpoint") {
+                rig.profile = rig.repository.save(rig.profile.copy(baseUrl = "https://user:pass@example.test"))
+                rig.verify()
+            }
+            if (reason == "secret") rig.resolver.revoke(rig.profile.secret)
+            val previous = rig.repository.get("p")!!.verifications
+            val tester = ControlledProfileTester(rig.client, rig.repository, rig.clock, rig.wall)
+            if (reason == "consent") assertFailsWith<ContractError.CapabilityMissing> { tester.testText("p", rig::event) }
+            else assertFailsWith<ContractError.ConfigurationRejected> { tester.testText("p", rig::event) }
+            assertEquals(previous, rig.repository.get("p")!!.verifications)
+            assertTrue(rig.events.isEmpty())
+            assertEquals(0, rig.server.requestCount)
+            assertEquals(if (reason == "secret") 1 else 0, rig.resolutions.get())
+        }
+    }
+
+    @Test fun `probe terminal racing profile edit cannot overwrite current evidence`() {
+        for (response in listOf(sse(COMPLETED), MockResponse().setResponseCode(401))) Rig().use { rig ->
+            rig.consent = RequestConsent(true, false, false, true)
+            val entered = CountDownLatch(1)
+            val release = CountDownLatch(1)
+            val repository = object : ProfileRepository by rig.repository {
+                override fun verify(id: String, result: CapabilityVerification) {
+                    entered.countDown()
+                    assertTrue(release.await(5, TimeUnit.SECONDS))
+                    rig.repository.verify(id, result)
+                }
+            }
+            rig.server.enqueue(response)
+            try {
+                ControlledProfileTester(rig.client, repository, rig.clock, rig.wall).testText("p", rig::event)
+                assertTrue(entered.await(5, TimeUnit.SECONDS), "probe terminal must attempt an evidence write")
+                val edited = rig.repository.save(rig.profile.copy(name = "current"))
+                val current = verification(revision = edited.revision, time = rig.wall.millis() + 1)
+                rig.repository.verify("p", current)
+                release.countDown()
+                rig.awaitTerminal()
+                assertEquals(listOf(current), rig.repository.get("p")!!.verifications)
+                assertEquals(edited.revision, rig.repository.get("p")!!.revision)
+                assertEquals(1, rig.ends().size)
+            } finally { release.countDown() }
+        }
+    }
+
+    @Test fun `synchronous deadline probe writes before listener edit and never writes again`() = Rig().use { rig ->
+        rig.consent = RequestConsent(true, false, false, true)
+        val now = AtomicLong(0)
+        val clock = object : MonotonicClock { override fun nowNanos() = now.get() }
+        val scheduler = object : DeadlineScheduler {
+            override fun at(deadlineNanos: Long, task: () -> Unit): CancellationHandle {
+                now.set(deadlineNanos); task()
+                return object : CancellationHandle { override fun cancel() {} }
+            }
+        }
+        ControlledModelClient(OkHttpClient(), rig.repository, rig.resolver, CapabilityGate(), ContextBudgeter(), clock,
+            scheduler, { rig.consent }, rig.wall, allowLocalHttp = true).use { client ->
+            var observed: CapabilityVerification? = null
+            var current: CapabilityVerification? = null
+            val handle = ControlledProfileTester(client, rig.repository, clock, rig.wall).testText("p") { event ->
+                if (event is ModelStreamEvent.Terminal) {
+                    observed = rig.repository.get("p")!!.verifications.last()
+                    val edited = rig.repository.save(rig.profile.copy(name = "listener edit"))
+                    current = verification(revision = edited.revision, time = rig.wall.millis() + 1)
+                    rig.repository.verify("p", current!!)
+                }
+                rig.event(event)
+            }
+            handle.cancel()
+            assertEquals(listOf(ModelEnd.DEADLINE), rig.ends())
+            assertEquals(verification(state = VerificationState.Failed, revision = rig.profile.revision,
+                time = rig.wall.millis()), observed)
+            assertEquals(listOf(current), rig.repository.get("p")!!.verifications)
+            assertEquals(0, rig.server.requestCount)
+        }
+    }
+
+    private fun assertProbeFailureDeniesOrdinaryRequest(rig: Rig) {
+        assertEquals(1, rig.server.requestCount)
+        assertEquals(1, rig.resolutions.get())
+        assertFailsWith<ContractError.CapabilityMissing> { rig.start() }
+        assertEquals(1, rig.resolutions.get(), "denied ordinary request must not resolve another secret")
+        assertEquals(1, rig.server.requestCount, "denied ordinary request must not send another POST")
+    }
+
     @Test fun `endpoint preserves path and rejects credential carrying urls`() {
         assertEquals("http://127.0.0.1/responses", ModelEndpoint.responses("http://127.0.0.1", true).toString())
         assertEquals("https://example.test/v1/responses", ModelEndpoint.responses("https://example.test/v1/").toString())
@@ -357,5 +543,7 @@ class ControlledModelClientTest {
         const val CREATED = "data: {\"type\":\"response.created\",\"sequence_number\":0,\"response\":{\"id\":\"s\"}}\n\n"
         const val DELTA = "data: {\"type\":\"response.output_text.delta\",\"sequence_number\":1,\"item_id\":\"m\",\"content_index\":0,\"delta\":\"hi\"}\n\n"
         const val COMPLETED = "data: {\"type\":\"response.completed\",\"sequence_number\":2,\"response\":{\"id\":\"s\",\"status\":\"completed\"}}\n\n"
+        const val FAILED = "data: {\"type\":\"response.failed\",\"sequence_number\":2,\"response\":{\"id\":\"s\",\"status\":\"failed\"}}\n\n"
+        const val INCOMPLETE = "data: {\"type\":\"response.incomplete\",\"sequence_number\":2,\"response\":{\"id\":\"s\",\"status\":\"incomplete\"}}\n\n"
     }
 }

@@ -6,6 +6,7 @@ import okhttp3.OkHttpClient
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
+import okio.BufferedSink
 import java.time.Clock
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
@@ -81,7 +82,15 @@ class ControlledModelClient(
     private fun execute(pending: Pending, request: Request, attempt: Int) {
         if (!pending.active()) return
         if (clock.nowNanos() >= pending.deadline) { pending.end(ModelEnd.DEADLINE, "DEADLINE"); return }
-        val call = transport.newCall(request)
+        // OkHttp status follow-ups bypass retryOnConnectionFailure; only our scheduler may repeat a POST.
+        val body = requireNotNull(request.body)
+        val attemptBody = object : RequestBody() {
+            override fun contentType() = body.contentType()
+            override fun contentLength() = body.contentLength()
+            override fun writeTo(sink: BufferedSink) = body.writeTo(sink)
+            override fun isOneShot() = true
+        }
+        val call = transport.newCall(request.newBuilder().post(attemptBody).build())
         if (!pending.attachCall(call)) return
         try { executor.execute {
             try {
