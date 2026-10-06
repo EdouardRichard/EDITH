@@ -39,8 +39,40 @@ class ResourceScope(val pluginId: String, val sessionId: SessionId, val generati
         pending.forEach { it.cancel() }
     }
 
-    // Provider starts and registration share the revocation boundary; providers must return promptly.
+    // Admission reserves cancellation before external work; a late returned handle is cancelled immediately.
     internal fun <T> active(block: () -> T): T = synchronized(lock) { checkActive(); block() }
-    internal fun start(block: () -> CancellationHandle): CancellationHandle = active { bind(block()) }
-    internal fun deliver(block: () -> Unit) { synchronized(lock) { if (!revoked) block() } }
+    internal fun start(block: () -> CancellationHandle): CancellationHandle {
+        val pending = DeferredCancellation()
+        val bound = synchronized(lock) { checkActive(); bind(pending) }
+        return try {
+            checkActive()
+            pending.attach(block())
+            bound
+        } catch (error: Throwable) {
+            bound.cancel()
+            throw error
+        }
+    }
+    internal fun deliver(block: () -> Unit) {
+        val admitted = synchronized(lock) { !revoked }
+        if (admitted) block()
+    }
+
+    private class DeferredCancellation : CancellationHandle {
+        private val lock = Any()
+        private var cancelled = false
+        private var delegate: CancellationHandle? = null
+        fun attach(handle: CancellationHandle) {
+            val cancelNow = synchronized(lock) { if (cancelled) true else { delegate = handle; false } }
+            if (cancelNow) runCatching { handle.cancel() }
+        }
+        override fun cancel() {
+            val handle = synchronized(lock) {
+                if (cancelled) return
+                cancelled = true
+                delegate.also { delegate = null }
+            }
+            handle?.let { runCatching { it.cancel() } }
+        }
+    }
 }

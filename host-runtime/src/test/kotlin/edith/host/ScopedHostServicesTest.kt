@@ -101,6 +101,51 @@ class ScopedHostServicesTest {
         assertContentEquals(byteArrayOf(1), values["k"])
     }
 
+    @Test fun `task scope cancellation reaches each task once`() {
+        val scope = scope()
+        val provider = FakeTaskScope()
+        val services = ScopedHostServices(scope, emptySet(), emptyMap(), provider)
+        services.tasks.launch {}
+        services.tasks.cancelAll(); scope.revoke()
+        assertEquals(listOf(1), provider.handles.map { it.cancelCount })
+    }
+
+    @Test fun `running task can wait for its own cancellation without blocking revoke`() {
+        val scope = scope()
+        val entered = CountDownLatch(1)
+        val cancelled = CountDownLatch(1)
+        lateinit var worker: Thread
+        val provider = object : TaskScope {
+            override fun launch(block: () -> Unit): CancellationHandle {
+                worker = thread { block() }
+                return object : CancellationHandle { override fun cancel() { cancelled.countDown() } }
+            }
+            override fun cancelAll() = Unit
+        }
+        val services = ScopedHostServices(scope, emptySet(), emptyMap(), provider)
+        var cancelledInTime = false
+        services.tasks.launch { entered.countDown(); cancelledInTime = cancelled.await(2, TimeUnit.SECONDS) }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        scope.revoke()
+        worker.join(5000)
+        assertTrue(cancelledInTime)
+    }
+
+    @Test fun `cancelAll fences queued task whose provider ignores cancellation`() {
+        lateinit var queued: () -> Unit
+        val raw = FakeCancellation()
+        val provider = object : TaskScope {
+            override fun launch(block: () -> Unit): CancellationHandle { queued = block; return raw }
+            override fun cancelAll() = Unit
+        }
+        val services = ScopedHostServices(scope(), emptySet(), emptyMap(), provider)
+        var ran = false
+        services.tasks.launch { ran = true }
+        services.tasks.cancelAll(); queued()
+        assertFalse(ran)
+        assertEquals(1, raw.cancelCount)
+    }
+
     @Test fun `revocation fences late network audio asr speaker and display callbacks`() {
         val scope = scope()
         val callbacks = mutableListOf<() -> Unit>()

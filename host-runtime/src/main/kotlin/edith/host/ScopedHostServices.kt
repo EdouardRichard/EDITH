@@ -29,12 +29,12 @@ class ScopedHostServices(
         val child = ResourceScope(scope.pluginId, scope.sessionId, scope.generation)
         val tasksCancelled = AtomicBoolean()
         fun cancelTasks() {
-            if (tasksCancelled.compareAndSet(false, true)) { child.revoke(); taskScope.cancelAll() }
+            if (tasksCancelled.compareAndSet(false, true)) child.revoke()
         }
         scope.bind(object : CancellationHandle { override fun cancel() = cancelTasks() })
         tasks = object : TaskScope {
             override fun launch(block: () -> Unit): CancellationHandle = scope.start {
-                child.start { taskScope.launch { scope.deliver { child.deliver(block) } } }
+                subscription({ callback -> taskScope.launch { callback(Unit) } }, { _: Unit -> block() }, child)
             }
             override fun cancelAll() = cancelTasks()
         }
@@ -47,9 +47,10 @@ class ScopedHostServices(
     private fun wrong(capability: Capability): Nothing =
         throw ContractError.ConfigurationRejected("wrong provider type: $capability")
 
-    private fun <T> subscription(start: ((T) -> Unit) -> CancellationHandle, listener: (T) -> Unit) = scope.start {
+    private fun <T> subscription(start: ((T) -> Unit) -> CancellationHandle, listener: (T) -> Unit,
+        owner: ResourceScope = scope) = owner.start {
         val child = ResourceScope(scope.pluginId, scope.sessionId, scope.generation)
-        child.bind(start { value -> scope.deliver { child.deliver { listener(value) } } })
+        child.bind(start { value -> scope.deliver { owner.deliver { child.deliver { listener(value) } } } })
         object : CancellationHandle { override fun cancel() = child.revoke() }
     }
 
