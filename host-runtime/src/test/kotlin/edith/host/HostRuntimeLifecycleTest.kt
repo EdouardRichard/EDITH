@@ -25,7 +25,7 @@ class HostRuntimeLifecycleTest {
     }
 
     private fun readyHost(): HostRuntime {
-        val host = HostRuntime(1)
+        val host = HostRuntime(1, HostTestRig(setOf(Capability.TextOutput)).environment)
         host.register(plugin)
         host.startSession(SessionId("s"))
         host.markSceneReady()

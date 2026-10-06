@@ -8,7 +8,7 @@ class HostRuntimeSwitchingTest {
     @Test fun `stale output is rejected after switch`() {
         val first = NoopPlugin("one")
         val second = NoopPlugin("two")
-        val host = HostRuntime(1)
+        val host = HostRuntime(1, HostTestRig(setOf(Capability.TextOutput)).environment)
         host.register(first); host.register(second)
         host.startSession(SessionId("s")); host.markSceneReady()
         assertEquals(ActivationResult.Activated, host.activate("one"))
