@@ -18,9 +18,17 @@ probes/**/logs/
 probes/**/generated/
 
 # Raw audio, biometric samples, and derived media
-Audio/
+# NOTE: this rule used to be the unanchored `Audio/`, which git applies to *any* directory of that name at any depth.
+# Because ignore matching is case-insensitive on Windows it also swallowed the `edith/audio/` **package** directory, so
+# 16 engine sources under audio-android/ never entered version control: a fresh checkout - and the merged main tree -
+# compiled that module as NO-SOURCE and then failed to compile phone-app. The media-file patterns below are the real
+# guard; the directory pattern stays root-anchored so a top-level recordings folder is ignored without touching source.
+/Audio/
 !audio-runtime/src/main/kotlin/edith/audio/
 !audio-runtime/src/test/kotlin/edith/audio/
+!audio-android/src/main/kotlin/edith/audio/
+!audio-android/src/test/kotlin/edith/audio/
+!audio-android/src/androidTest/kotlin/edith/audio/
 **/*.wav
 **/*.mp3
 **/*.m4a
