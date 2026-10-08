@@ -3,6 +3,7 @@ package edith.phone
 import android.Manifest
 import android.app.Application
 import android.app.NotificationManager
+import android.os.Bundle
 import android.content.Context
 import android.content.Intent
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -20,8 +21,50 @@ import org.junit.runner.RunWith
 import java.util.concurrent.CopyOnWriteArrayList
 
 class PhoneTestRunner : AndroidJUnitRunner() {
-    override fun newApplication(cl: ClassLoader?, className: String?, context: Context?): Application =
-        super.newApplication(cl, FakePhoneApplication::class.java.name, context)
+    /**
+     * Applies any `targetProps` extra as system properties before the application is created.
+     *
+     * The T17 uplink run needs the phone's CXR session pointed at our own glasses application, and `CxrGlassesTarget`
+     * reads that from system properties. The application is created before the tests run, so the properties must be
+     * set here rather than inside a test - otherwise the composition would already have been built against the default
+     * pairing.
+     */
+    /**
+     * Applies the CXR target override read from a file pushed to the device, before the application is created.
+     *
+     * A file is used rather than an `am instrument` extra because `am` re-parses an extra whose value contains `=` or
+     * spaces, and either aborts with "Unknown option" or swallows the rest of the command line as another argument.
+     * The only extra this runner needs to pass reliably is `class`, whose value has neither character.
+     *
+     * The file is read from the raw context handed to `newApplication`, not from `InstrumentationRegistry`: that
+     * registry is not yet populated inside `onCreate`, and asking it there throws "No instrumentation registered" and
+     * crashes the process before any test runs. The file is optional - without it the composition keeps the frozen
+     * default pairing.
+     */
+    override fun newApplication(cl: ClassLoader?, className: String?, context: Context?): Application {
+        context?.let { raw ->
+            val file = java.io.File(raw.filesDir, OVERRIDE_FILE)
+            if (file.isFile) {
+                runCatching {
+                    file.readLines()
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() && !it.startsWith("#") }
+                        .mapNotNull { line ->
+                            val separator = line.indexOf('=')
+                            if (separator <= 0) null
+                            else line.substring(0, separator) to line.substring(separator + 1)
+                        }
+                        .forEach { (key, value) -> System.setProperty(key.removePrefix("-D"), value) }
+                }
+            }
+        }
+        return super.newApplication(cl, FakePhoneApplication::class.java.name, context)
+    }
+
+    private companion object {
+        /** The override file the orchestrator pushes into the test app's files directory. */
+        const val OVERRIDE_FILE = "cxr-target.properties"
+    }
 }
 
 class FakePhoneApplication : EdithApplication() {
@@ -29,6 +72,11 @@ class FakePhoneApplication : EdithApplication() {
     val stoppedEpochs = CopyOnWriteArrayList<InputEpoch>()
     @Volatile var resource: ResourceScope? = null
     override fun createComposition(): HostCompositionRoot {
+        // The T17 controlled format bring-up needs a composition that owns a real CXR connection, because
+        // only the App's own composition can receive the AI-App authorization result through its Activity.
+        bringUpRawPcmObserver?.let { observer ->
+            return HostCompositionRoot.create(this).also { it.installRawPcmObserver(observer) }
+        }
         val env = object : HostEnvironment {
             override val clock = object : MonotonicClock { override fun nowNanos() = System.nanoTime() }
             override val input = object : InputPort {
@@ -55,6 +103,11 @@ class FakePhoneApplication : EdithApplication() {
             override fun request(request: ModelRequest, listener: (ModelStreamEvent) -> Unit): CancellationHandle =
                 throw AssertionError("instrumentation must never request a model")
         }, env)
+    }
+
+    companion object {
+        /** Armed by the T17 bring-up test before the lazily created composition exists; test-only. */
+        @Volatile var bringUpRawPcmObserver: ((ByteArray) -> Unit)? = null
     }
 }
 

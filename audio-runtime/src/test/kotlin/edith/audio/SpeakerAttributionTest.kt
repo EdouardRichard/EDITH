@@ -12,6 +12,187 @@ import java.lang.management.ManagementFactory
 import kotlin.test.*
 
 class SpeakerAttributionTest {
+    @Test fun `conflict crossing retirement frontier cannot become a confident source`() {
+        val t = TurnTimeline()
+        proven(t, "short", 0, 1_000_000_000)
+        t.registerTranscriptProvenance("retained", epoch, "b")
+        assertTrue(t.applyTranscript(transcript("retained", 1_000_000_000, 4_000_000_000)))
+        t.registerSpeakerWindow(window(0, 4_000_000_000, "a"), epoch)
+        t.registerSpeakerWindow(window(1_000_000_000, 4_000_000_000, "b"), epoch)
+        assertTrue(t.applySpeaker(assessment(2_000_000_000, 3_000_000_000), t.speakerAdmission(epoch, "b")).isEmpty())
+        assertEquals(SpeakerLabel.UNKNOWN, t.speakerFor("retained"))
+        repeat(127) { index ->
+            val start = 5_000_000_000 + index * 2_000_000_000L
+            proven(t, "later-$index", start, start + 1_000_000_000)
+        }
+        t.applySpeaker(assessment(2_000_000_000, 3_000_000_000))
+        assertEquals(SpeakerLabel.UNKNOWN, t.speakerFor("retained"))
+    }
+
+    @Test fun `cancelled work still counts toward executor retention capacity`() {
+        val jobs = mutableListOf<Runnable>()
+        val service = LocalSpeakerService(EmbeddingExtractor { error("cancelled extraction") }, MemorySpeakerProfileStore(),
+            SpeakerPolicy(1000, .8, .3), executor = Executor { jobs += it })
+        val w = window(); service.registerWindow(w, epoch)
+        try {
+            repeat(300) { service.assess(w) {}.cancel() }
+            assertTrue(jobs.size <= 8, "external executor must never accumulate more than eight tasks")
+            jobs.forEach { it.run() }
+            assertEquals(0, service.retentionCounts().pending)
+        } finally { service.close() }
+    }
+
+    @Test fun `oversized enrollment list rejects before accessing its elements`() {
+        val service = LocalSpeakerService(EmbeddingExtractor { error("not admitted") }, MemorySpeakerProfileStore(),
+            SpeakerPolicy(1000, .8, .3), { true }, goodQuality)
+        val oversized = object : AbstractList<SpeakerWindow>() {
+            override val size = 9
+            override fun get(index: Int): SpeakerWindow = error("oversized list accessed")
+        }
+        var delivered = false
+        try {
+            service.enroll(oversized) { assertNull(it); delivered = true }
+            assertTrue(delivered)
+        } finally { service.close() }
+    }
+
+    @Test fun `revocation saturation blocks new and queued enrollment`() {
+        val jobs = mutableListOf<Runnable>(); var extracts = 0; var saves = 0; var successes = 0
+        val store = object : SpeakerProfileStore {
+            override fun save(embedding: FloatArray): SpeakerProfileRef { saves++; return SpeakerProfileRef("new", 0) }
+            override fun load(ref: SpeakerProfileRef) = floatArrayOf(1f, 0f)
+            override fun delete(ref: SpeakerProfileRef) {}
+        }
+        val service = LocalSpeakerService(EmbeddingExtractor { extracts++; floatArrayOf(1f, 0f) }, store,
+            SpeakerPolicy(1000, .8, .3), { true }, goodQuality, Executor { jobs += it })
+        val w = window(); service.registerWindow(w, epoch)
+        try {
+            service.enroll(listOf(w)) { if (it != null) successes++ }
+            repeat(1025) { service.delete(SpeakerProfileRef("deleted-$it", 0)) }
+            service.enroll(listOf(w)) { if (it != null) successes++ }
+            jobs.forEach { it.run() }
+            assertEquals(0, extracts); assertEquals(0, saves); assertEquals(0, successes)
+        } finally { service.close() }
+    }
+
+    @Test fun `saturation during enrollment save deletes the unpublished profile`() {
+        val memory = MemorySpeakerProfileStore(); lateinit var service: LocalSpeakerService
+        var saved: SpeakerProfileRef? = null; var successes = 0
+        val store = object : SpeakerProfileStore {
+            override fun save(embedding: FloatArray): SpeakerProfileRef {
+                saved = memory.save(embedding)
+                repeat(1025) { service.delete(SpeakerProfileRef("deleted-$it", 0)) }
+                return saved!!
+            }
+            override fun load(ref: SpeakerProfileRef) = memory.load(ref)
+            override fun delete(ref: SpeakerProfileRef) = memory.delete(ref)
+        }
+        service = LocalSpeakerService(EmbeddingExtractor { floatArrayOf(1f, 0f) }, store,
+            SpeakerPolicy(1000, .8, .3), { true }, goodQuality)
+        val w = window(); service.registerWindow(w, epoch)
+        try {
+            service.enroll(listOf(w)) { if (it != null) successes++ }
+            assertNotNull(saved); assertNull(memory.load(saved!!)); assertEquals(0, successes)
+        } finally { service.close() }
+    }
+
+    @Test fun `full speaker budget abstains while ASR continues to final`() {
+        val queue = QueueExecutor(); val service = LocalSpeakerService(EmbeddingExtractor { error("full budget") },
+            MemorySpeakerProfileStore(), SpeakerPolicy(1, .8, .3), executor = queue)
+        val w = window(); service.registerWindow(w, epoch)
+        repeat(8) { service.enroll(listOf(w)) {} }
+        val vad = ScriptedVad(); val events = java.util.concurrent.CopyOnWriteArrayList<HostEvent>()
+        val asr = RecordingAsr(); val delivered = CountDownLatch(1)
+        val pipeline = SpeechPipeline(vad, asr, service, { events += it; if (it is SpeakerEvent) delivered.countDown() }, {})
+        try {
+            pipeline.accept(pipelineFrame(0))
+            assertTrue(delivered.await(2, TimeUnit.SECONDS), "capacity must deliver UNKNOWN, not pause ASR")
+            vad.decision = VadDecision(false, true); pipeline.accept(pipelineFrame(1))
+            assertTrue(events.filterIsInstance<TranscriptEvent>().any { it.revision.final })
+            assertTrue(events.none { it is ServiceFaultEvent || it is SessionStateEvent && it.state == SessionState.Paused })
+            assertTrue(events.filterIsInstance<SpeakerEvent>().all { it.assessment.label == SpeakerLabel.UNKNOWN })
+        } finally { pipeline.close(); queue.drain() }
+    }
+
+    @Test fun `continuous timeline retires old turns but retains recent attribution`() {
+        val timeline = TurnTimeline()
+        repeat(600) { index ->
+            val start = index * 2_000_000_000L
+            proven(timeline, "turn-$index", start, start + 1_000_000_000)
+            timeline.registerSpeakerWindow(window(start, start + 1_000_000_000), epoch)
+            timeline.applySpeaker(assessment(start, start + 1_000_000_000))
+            val counts = timeline.retentionCounts()
+            assertTrue(counts.turns <= 128 && counts.provenance <= 128 && counts.sources <= 256 &&
+                counts.windows <= 256 && counts.assessments <= 256)
+        }
+        assertEquals(SpeakerLabel.UNKNOWN, timeline.speakerFor("turn-0"))
+        assertEquals(SpeakerLabel.SELF, timeline.speakerFor("turn-599"))
+        timeline.registerTranscriptProvenance("turn-0", epoch, "c")
+        assertFalse(timeline.applyTranscript(transcript("turn-0", 0, 1_000_000_000, 1)))
+        assertTrue(timeline.applySpeaker(assessment(0, 1_000_000_000)).isEmpty())
+    }
+
+    @Test fun `retired overlapping evidence never turns an ambiguous assessment into a unique match`() {
+        val timeline = TurnTimeline()
+        proven(timeline, "old", 0, 2_000_000_000)
+        proven(timeline, "overlap", 1_000_000_000, 3_000_000_000)
+        timeline.registerSpeakerWindow(window(0, 3_000_000_000), epoch)
+        timeline.applySpeaker(assessment(1_000_000_000, 2_000_000_000))
+        assertEquals(SpeakerLabel.UNKNOWN, timeline.speakerFor("overlap"))
+        repeat(128) { index ->
+            val start = 4_000_000_000 + index * 2_000_000_000L
+            proven(timeline, "next-$index", start, start + 1_000_000_000)
+        }
+        timeline.registerTranscriptProvenance("overlap", epoch, "c")
+        assertFalse(timeline.applyTranscript(transcript("overlap", 1_000_000_000, 3_000_000_000, 1)))
+        timeline.registerSpeakerWindow(window(1_000_000_000, 3_000_000_000), epoch)
+        assertTrue(timeline.applySpeaker(assessment(1_000_000_000, 2_000_000_000)).isEmpty())
+        assertEquals(SpeakerLabel.UNKNOWN, timeline.speakerFor("overlap"))
+    }
+
+    @Test fun `service proof eviction fences pending work and leaves a recent window usable`() {
+        val queue = QueueExecutor(); val store = MemorySpeakerProfileStore()
+        val ref = store.save(floatArrayOf(1f, 0f)); var extracts = 0
+        val service = LocalSpeakerService(EmbeddingExtractor { extracts++; floatArrayOf(1f, 0f) }, store,
+            SpeakerPolicy(1000, .8, .3), quality = goodQuality, executor = queue)
+        try {
+            assertTrue(service.selectProfile(ref)); val old = window()
+            service.registerWindow(old, epoch); var oldCallbacks = 0
+            service.assess(old) { oldCallbacks++ }
+            repeat(300) { index ->
+                val start = (index + 1) * 2_000_000_000L
+                service.registerWindow(window(start, start + 1_000_000_000), epoch)
+                val counts = service.retentionCounts()
+                assertTrue(counts.proofs <= 256 && counts.sources <= 512 && counts.pending <= 8)
+            }
+            queue.drain()
+            assertEquals(0, oldCallbacks); assertEquals(0, extracts)
+            var label: SpeakerLabel? = null
+            service.assess(old) { label = it.label }; queue.drain()
+            assertEquals(SpeakerLabel.UNKNOWN, label)
+            val recent = window(600_000_000_000, 601_000_000_000)
+            service.assess(recent) { label = it.label }; queue.drain()
+            assertEquals(SpeakerLabel.SELF, label); assertEquals(1, extracts)
+        } finally { service.close() }
+    }
+
+    @Test fun `finite revocation storage closes profile admission rather than forgetting deleted refs`() {
+        val store = object : SpeakerProfileStore {
+            override fun save(embedding: FloatArray) = SpeakerProfileRef("unused", 0)
+            override fun load(ref: SpeakerProfileRef) = floatArrayOf(1f, 0f)
+            override fun delete(ref: SpeakerProfileRef) {}
+        }
+        val service = LocalSpeakerService(EmbeddingExtractor { floatArrayOf(1f, 0f) }, store, SpeakerPolicy(1000, .8, .3))
+        try {
+            repeat(1025) { service.delete(SpeakerProfileRef("deleted-$it", 0)) }
+            service.reset()
+            assertTrue(service.retentionCounts().revoked <= 1024)
+            assertFalse(service.selectProfile(SpeakerProfileRef("deleted-0", 0)))
+            assertFalse(service.selectProfile(SpeakerProfileRef("deleted-1024", 0)))
+            assertFalse(service.selectProfile(SpeakerProfileRef("fresh", 0)))
+        } finally { service.close() }
+    }
+
     private val epoch = InputEpoch(SessionId("synthetic"), Generation(1), 0)
     private fun envelope(start: Long, end: Long, epoch: InputEpoch = this.epoch) =
         EventEnvelope(epoch.sessionId, epoch.generation, "synthetic-event", start, end)

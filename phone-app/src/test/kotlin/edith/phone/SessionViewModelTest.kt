@@ -178,10 +178,19 @@ class SessionViewModelTest {
         val root = HostCompositionRoot.create(nullContext())
         try {
             SessionViewModel(root).start("smart-assistant")
+            // T18 gave the production assembly a real host environment, so the refusal now happens where it belongs -
+            // at activation, once the transport reports the scene ready - rather than at session start. The property
+            // this test exists for is unchanged: nothing is activated and nothing is listening.
+            root.onSceneReady()
             assertEquals(SessionState.Paused, root.state.value.session)
             assertEquals("CAPABILITY_MISSING", root.state.value.errorCode)
-            assertTrue(root.state.value.capabilityReasons.containsKey(Capability.Audio))
-            assertTrue(root.state.value.capabilityReasons.containsKey(Capability.Model))
+            // Providers that are genuinely wired are no longer reported missing; the ones that are not still are.
+            assertTrue("Audio is not wired and must be reported missing",
+                root.state.value.capabilityReasons.containsKey(Capability.Audio))
+            assertTrue("Speaker is not wired and must be reported missing",
+                root.state.value.capabilityReasons.containsKey(Capability.Speaker))
+            assertFalse("the model client is wired, so it must not be reported missing",
+                root.state.value.capabilityReasons.containsKey(Capability.Model))
         } finally { root.close() }
     }
 

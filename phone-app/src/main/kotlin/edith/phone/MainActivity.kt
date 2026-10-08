@@ -23,6 +23,8 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import edith.contracts.SessionState
 import edith.plugin.Capability
+import edith.phone.model.ProfileViewModel
+import edith.phone.model.ProfileListScreen
 
 class MainActivity : ComponentActivity() {
     private val root get() = (application as EdithApplication).composition
@@ -41,11 +43,14 @@ class MainActivity : ComponentActivity() {
         val viewModel = ViewModelProvider(this, object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = SessionViewModel(root) as T
         })[SessionViewModel::class.java]
+        val profileViewModel = if (root.profileTester != null) ViewModelProvider(this, object : ViewModelProvider.Factory {
+            @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = requireNotNull(root.profileViewModel()) as T
+        })[ProfileViewModel::class.java] else null
         setContent {
             MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF126B50), secondary = Color(0xFF405B79))) {
                 val state by viewModel.state.collectAsStateWithLifecycle()
-                PhoneScreen(state, root, viewModel, ::requestStart,
-                    { SessionService.commandFromUi(this, it) }, notificationsGranted())
+                PhoneScreen(state, root, viewModel, profileViewModel, ::requestStart,
+                    { SessionService.commandFromUi(this, it) }, notificationsGranted(), { root.connectCxr(this) })
             }
         }
     }
@@ -59,18 +64,32 @@ class MainActivity : ComponentActivity() {
         else { pendingPlugin = pluginId; permissions.launch(requested.toTypedArray()) }
     }
 
+    /**
+     * The CXR AI-App authorization prompt is started by the SDK through
+     * `requestAuthorization(activity, ...)`, so its result arrives here. It must reach the transport
+     * (the only SDK access path) instead of being dropped, otherwise the token never completes.
+     */
+    @Deprecated("SDK authorization uses startActivityForResult; the transport is the only consumer")
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        root.onCxrAuthorizationResult(resultCode, data)
+    }
+
     private fun notificationsGranted() = Build.VERSION.SDK_INT < 33 ||
         ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 }
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable private fun PhoneScreen(state: SessionUiState, root: HostCompositionRoot, viewModel: SessionViewModel,
-    start: (String) -> Unit, command: (String) -> Unit, notificationsGranted: Boolean) {
+    profileViewModel: ProfileViewModel?,
+    start: (String) -> Unit, command: (String) -> Unit, notificationsGranted: Boolean,
+    connectCxr: () -> Boolean) {
     var page by remember { mutableStateOf(0) }
     val plugins = buildList {
         add("smart-assistant" to "智能助手")
         add("interview-assistant" to "面试助手")
         if (BuildConfig.DEBUG) add("p2-diagnostic" to "诊断")
+        if (BuildConfig.DEBUG && root.diagnosticHintSender != null) add("p2-hint" to "提示探针（调试）")
     }
     Scaffold(topBar = { Text("EDITH", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(20.dp)) }) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
@@ -107,18 +126,38 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         state.errorCode?.let { Text(errorLabel(it), color = MaterialTheme.colorScheme.error) }
+                        // Debug-only acceptance affordance: with the shipped plugins still shells, this is the only
+                        // way a wearer can check what the glasses actually show. Hidden whenever no probe is
+                        // registered, so a release build never shows it.
+                        root.diagnosticHintSender?.let { sender ->
+                            var sent by remember { mutableStateOf<String?>(null) }
+                            OutlinedButton(onClick = {
+                                sent = if (selected == "p2-hint" && sender()) "已提交一条测试提示，请看眼镜"
+                                else "未能提交：请先选择「提示探针（调试）」并开始，且眼镜显示已就绪"
+                            }) { Text("发送测试提示（眼镜）") }
+                            sent?.let { Text(it) }
+                        }
                         if (!notificationsGranted) Text("通知未获授权", color = MaterialTheme.colorScheme.error)
                         HorizontalDivider()
+                        val cxrReady = state.capabilityReasons[Capability.Audio] == null
+                        if (BuildConfig.DEBUG || !cxrReady) {
+                            var connectResult by remember { mutableStateOf<String?>(null) }
+                            OutlinedButton(onClick = {
+                                connectResult = if (connectCxr()) "已请求连接眼镜，请在 AI App 中确认授权"
+                                else "眼镜连接未装配（TRANSPORT_MISSING）"
+                            }) { Text(if (cxrReady) "重连眼镜" else "连接眼镜（CXR）") }
+                            connectResult?.let { Text(it) }
+                        }
                         state.capabilityReasons.forEach { (capability, _) ->
                             ListItem(headlineContent = { Text(capabilityLabel(capability)) }, supportingContent = { Text("尚不可用") }, leadingContent = { Icon(Icons.Default.Info, null) })
                         }
                     }
                     1 -> {
-                        Text("模型档案", style = MaterialTheme.typography.titleLarge)
-                        val profiles = root.profiles.list()
-                        if (profiles.isEmpty()) Text("暂无模型档案")
-                        profiles.forEach { profile -> ListItem(headlineContent = { Text(profile.name) }, supportingContent = { Text("未验证") }) }
-                        Text("凭证存储尚不可用", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        if (profileViewModel == null) Text("档案服务不可用")
+                        else {
+                            val profileState by profileViewModel.state.collectAsStateWithLifecycle()
+                            ProfileListScreen(profileViewModel, profileState, plugins)
+                        }
                     }
                     2 -> {
                         Text("诊断", style = MaterialTheme.typography.titleLarge)

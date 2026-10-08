@@ -26,6 +26,16 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     private var scope: ResourceScope? = null
     private var generation = Generation(0)
     @Volatile private var state = SessionState.Idle
+
+    /**
+     * Why the last activation failed, or null after one that succeeded.
+     *
+     * `ActivationResult.Failed` deliberately carries no detail, and the failure is swallowed at the call site, so this
+     * is the only way an operator can tell a refused configuration from a provider that threw.
+     */
+    @Volatile var lastActivationCause: Throwable? = null
+        private set
+
     @Volatile private var inputEpoch: InputEpoch? = null
     @Volatile private var closed = false
     private val closing = AtomicBoolean()
@@ -192,8 +202,12 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
                 inputEpoch = epoch
                 environment.input.start(epoch)
             }
-            ActivationResult.Activated
-        }.getOrElse {
+            ActivationResult.Activated.also { lastActivationCause = null }
+        }.getOrElse { cause ->
+            // Kept rather than discarded: every caller sees only `ActivationResult.Failed`, so without this a device
+            // run cannot tell a refused configuration from a provider that threw (found while chasing a device-only
+            // activation failure on 2026-10-08, where the cause was invisible in both the App and the log).
+            lastActivationCause = cause
             resource.revoke()
             teardown(DeactivationReason.Error)
             state = SessionState.Paused

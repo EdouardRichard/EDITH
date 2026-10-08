@@ -51,7 +51,11 @@ dependencies {
     implementation(project(":host-runtime"))
     implementation(project(":storage-runtime"))
     implementation(project(":model-runtime"))
+    implementation(project(":audio-runtime"))
+    implementation(project(":audio-android"))
+    implementation(project(":transport-rokid"))
     implementation(libs.okhttp)
+    implementation(libs.kotlinx.serialization.json)
     implementation(project(":output-runtime"))
     implementation(project(":plugins-smart"))
     implementation(project(":plugins-interview"))
@@ -74,5 +78,9 @@ dependencies {
 }
 dependencyLocking { lockAllConfigurations() }
 
-// Compose group mapping is optional metadata and has no published 2.2.20 artifact.
-tasks.matching { it.name == "produceDebugComposeMapping" }.configureEach { enabled = false }
+// Compose mapping is optional metadata and its unpublished producer is unavailable offline.
+tasks.matching {
+    it.name == "produceDebugComposeMapping" ||
+        it.name == "reportDebugComposeMappingErrors" ||
+        it.name == "mergeDebugComposeMapping"
+}.configureEach { enabled = false }

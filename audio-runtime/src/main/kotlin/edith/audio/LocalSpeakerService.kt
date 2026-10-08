@@ -19,13 +19,19 @@ class LocalSpeakerService(private val extractor: EmbeddingExtractor, private val
     private data class WindowKey(val session: SessionId, val generation: Generation, val start: Long,
         val end: Long, val range: SampleRange, val format: AudioFormat, val pcmFingerprint: List<Byte>)
     private data class Source(val key: WindowKey, val epoch: InputEpoch)
-    private class Request(val sources: List<Source>, val profile: SpeakerProfileRef?)
+    private class Request(val copies: List<SpeakerWindow>, val sources: List<Source>, val profile: SpeakerProfileRef?) {
+        var work: (() -> Unit)? = null
+        var running = false
+    }
     private val lock = Any()
     private val windows = mutableMapOf<WindowKey, MutableSet<InputEpoch>>()
     private val pending = mutableSetOf<Request>()
+    private val retained = mutableSetOf<Request>()
     private val revoked = mutableSetOf<SpeakerProfileRef>()
     private var selected: SpeakerProfileRef? = null
     private var closed = false
+    private var retiredThroughNanos = 0L
+    private var revocationSaturated = false
 
     internal fun startupDurationSatisfied(sampleCount: Long, sampleRateHz: Int): Boolean =
         sampleCount > 0 && sampleRateHz > 0 && sampleCount * 1000 / sampleRateHz >= policy.minVoicedMillis
@@ -33,9 +39,16 @@ class LocalSpeakerService(private val extractor: EmbeddingExtractor, private val
     fun registerWindow(window: SpeakerWindow, epoch: InputEpoch) {
         synchronized(lock) {
             check(!closed)
+            if (duration(window) == null) return
             val key = key(window)
-            if (key.session == epoch.sessionId && key.generation == epoch.generation && duration(window) != null)
-                windows.getOrPut(key) { mutableSetOf() } += epoch
+            if (key.session == epoch.sessionId && key.generation == epoch.generation && duration(window) != null &&
+                key.start >= retiredThroughNanos) {
+                if (key !in windows && windows.size >= 256) retireProofsThrough(windows.keys.minOf { it.end })
+                if (key.start >= retiredThroughNanos) {
+                    val sources = windows.getOrPut(key) { mutableSetOf() }
+                    if (sources.size < 2) sources += epoch
+                }
+            }
         }
     }
 
@@ -44,8 +57,8 @@ class LocalSpeakerService(private val extractor: EmbeddingExtractor, private val
         try {
             return synchronized(lock) {
                 check(!closed)
-                if (ref in revoked) false else {
-                    if (selected != ref) pending.removeAll { it.profile != null }
+                if (revocationSaturated || ref in revoked) false else {
+                    if (selected != ref) invalidate { it.profile != null }
                     selected = ref
                     true
                 }
@@ -54,8 +67,8 @@ class LocalSpeakerService(private val extractor: EmbeddingExtractor, private val
     }
 
     override fun enroll(windows: List<SpeakerWindow>, listener: (SpeakerProfileRef?) -> Unit): CancellationHandle {
-        val copies = windows.map { copy(it) }
-        val request = request(copies, false)
+        val request = prepare(windows, false) ?: return abstain { listener(null) }
+        val copies = request.copies
         return submit(request) {
             val vectors = mutableListOf<FloatArray>()
             var saved: SpeakerProfileRef? = null
@@ -105,8 +118,11 @@ class LocalSpeakerService(private val extractor: EmbeddingExtractor, private val
     }
 
     override fun assess(window: SpeakerWindow, listener: (SpeakerAssessment) -> Unit): CancellationHandle {
-        val copy = copy(window)
-        val request = request(listOf(copy), true)
+        val request = prepare(listOf(window), true) ?: return abstain {
+            val e = window.segment.envelope.copy(eventId = UUID.randomUUID().toString())
+            listener(SpeakerAssessment(e, SpeakerLabel.UNKNOWN, null, e.startNanos, e.endNanos))
+        }
+        val copy = request.copies.single()
         return submit(request) {
             var reference: FloatArray? = null
             var vector: FloatArray? = null
@@ -124,9 +140,7 @@ class LocalSpeakerService(private val extractor: EmbeddingExtractor, private val
                 }
                 if (reference != null && request.profile != null && !profileAvailable(request.profile)) {
                     synchronized(lock) {
-                        revoked += request.profile
-                        if (selected == request.profile) selected = null
-                        pending.removeAll { it.profile == request.profile }
+                        revokeProfile(request.profile)
                     }
                 }
                 if (admit(request)) {
@@ -140,15 +154,13 @@ class LocalSpeakerService(private val extractor: EmbeddingExtractor, private val
     override fun delete(profile: SpeakerProfileRef) {
         synchronized(lock) {
             check(!closed)
-            revoked += profile
-            if (selected == profile) selected = null
-            pending.removeAll { it.profile == profile }
+            revokeProfile(profile)
         }
         store.delete(profile)
     }
 
-    override fun reset() { synchronized(lock) { check(!closed); pending.clear(); windows.clear() } }
-    override fun close() { synchronized(lock) { closed = true; pending.clear(); windows.clear(); selected = null } }
+    override fun reset() { synchronized(lock) { check(!closed); invalidate { true }; windows.clear(); retiredThroughNanos = 0 } }
+    override fun close() { synchronized(lock) { closed = true; invalidate { true }; windows.clear(); selected = null } }
 
     private fun key(window: SpeakerWindow): WindowKey {
         val e = window.segment.envelope
@@ -156,19 +168,25 @@ class LocalSpeakerService(private val extractor: EmbeddingExtractor, private val
             MessageDigest.getInstance("SHA-256").digest(window.segment.pcm).toList())
     }
 
-    private fun request(copies: List<SpeakerWindow>, comparison: Boolean): Request = synchronized(lock) {
+    private fun prepare(input: List<SpeakerWindow>, comparison: Boolean): Request? = synchronized(lock) {
         check(!closed)
+        if (revocationSaturated || retained.size >= 8 || input.size !in 1..8) return null
+        if (input.any { duration(it) == null }) return null
+        val bytes = input.sumOf { it.segment.pcm.size.toLong() }
+        val retainedBytes = retained.sumOf { request -> request.copies.sumOf { it.segment.pcm.size.toLong() } }
+        if (bytes > 10_240_000 - retainedBytes) return null
+        val copies = input.map { copy(it) }
         val sources = copies.mapNotNull { window ->
             val key = key(window)
             windows[key]?.singleOrNull()?.let { Source(key, it) }
         }
         // An absent source remains an abstaining request; it must never reach the extractor.
-        Request(if (sources.size == copies.size) sources else emptyList(), if (comparison) selected else null)
-            .also { pending += it }
+        Request(copies, if (sources.size == copies.size) sources else emptyList(), if (comparison) selected else null)
+            .also { pending += it; retained += it }
     }
 
     private fun current(request: Request) = synchronized(lock) { currentLocked(request) }
-    private fun currentLocked(request: Request) = !closed && request in pending &&
+    private fun currentLocked(request: Request) = !closed && !revocationSaturated && request in pending &&
         (request.profile == null || request.profile !in revoked && selected == request.profile) &&
         request.sources.all { windows[it.key]?.singleOrNull() == it.epoch }
 
@@ -178,20 +196,72 @@ class LocalSpeakerService(private val extractor: EmbeddingExtractor, private val
         admitted
     }
 
+    internal data class RetentionCounts(val proofs: Int, val sources: Int, val pending: Int, val revoked: Int,
+        val retainedTasks: Int, val retainedPcmBytes: Long)
+    internal fun retentionCounts() = synchronized(lock) {
+        RetentionCounts(windows.size, windows.values.sumOf { it.size }, pending.size, revoked.size,
+            retained.size, retained.sumOf { request -> request.copies.sumOf { it.segment.pcm.size.toLong() } })
+    }
+
+    private fun retireProofsThrough(endNanos: Long) {
+        retiredThroughNanos = maxOf(retiredThroughNanos, endNanos)
+        // Retiring a crossing window must also fence its entire remaining interval.
+        while (true) {
+            val extended = windows.keys.filter { it.start < retiredThroughNanos }.maxOfOrNull { it.end } ?: break
+            if (extended <= retiredThroughNanos) break
+            retiredThroughNanos = extended
+        }
+        windows.keys.removeAll { it.start < retiredThroughNanos }
+        invalidate { request -> request.sources.any { it.key.start < retiredThroughNanos } }
+    }
+
+    private fun revokeProfile(profile: SpeakerProfileRef) {
+        if (profile !in revoked && revoked.size >= 1024) {
+            revocationSaturated = true
+            selected = null
+            invalidate { true }
+        } else {
+            revoked += profile
+            if (selected == profile) selected = null
+            invalidate { it.profile == profile }
+        }
+    }
+
     private fun submit(request: Request, work: () -> Unit): CancellationHandle {
+        synchronized(lock) { if (currentLocked(request)) request.work = work }
         try {
-            executor.execute {
-                if (current(request)) {
-                    try { work() } finally { synchronized(lock) { pending.remove(request) } }
-                }
-            }
+            executor.execute { execute(request) }
         } catch (failure: RuntimeException) {
-            synchronized(lock) { pending.remove(request) }
+            finish(request)
             throw failure
         }
         return object : CancellationHandle {
-            override fun cancel() { synchronized(lock) { pending.remove(request) } }
+            override fun cancel() { synchronized(lock) { invalidate { it === request } } }
         }
+    }
+
+    private fun execute(request: Request) {
+        val work = synchronized(lock) {
+            if (!currentLocked(request)) null else request.work.also { request.running = true; request.work = null }
+        }
+        try { work?.invoke() } finally { finish(request) }
+    }
+
+    private fun finish(request: Request) = synchronized(lock) {
+        pending.remove(request); retained.remove(request); request.work = null
+        request.copies.forEach { it.segment.pcm.fill(0) }
+    }
+
+    private fun invalidate(predicate: (Request) -> Boolean) {
+        pending.filter(predicate).forEach { request ->
+            pending.remove(request); request.work = null
+            if (!request.running) request.copies.forEach { it.segment.pcm.fill(0) }
+        }
+    }
+
+    private fun abstain(deliver: () -> Unit): CancellationHandle {
+        deliver()
+        return object : CancellationHandle { override fun cancel() {} }
     }
 
     private fun copy(window: SpeakerWindow) = window.copy(segment = window.segment.copy(pcm = window.segment.pcm.copyOf()))

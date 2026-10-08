@@ -15,3 +15,14 @@ dependencies {
     testImplementation(libs.kotlin.test.junit5)
 }
 
+// Emits a structurally valid EngineMetrics document so tools/p2 can verify the reporter contract
+// without a device run. Output is generated fixture data, never T16 evidence.
+tasks.register<JavaExec>("metricsDocument") {
+    group = "verification"
+    description = "Write a generated EngineMetrics document for reporter-contract checks"
+    mainClass.set("edith.testsupport.MetricsDocumentFixture")
+    classpath = sourceSets["main"].runtimeClasspath
+    val outPath = providers.gradleProperty("outPath").orNull ?: "build/metrics-document.json"
+    args("--out", layout.projectDirectory.file(outPath).asFile.absolutePath)
+}
+

@@ -28,6 +28,8 @@ class TurnTimeline {
     private val windows = mutableSetOf<Window>()
     private val assessments = mutableListOf<Assessment>()
     private var version = 0L
+    private var retiredThroughNanos = 0L
+    private var exhausted = false
 
     @Synchronized internal fun speakerAdmission(epoch: InputEpoch, continuity: String) =
         SpeakerAdmission(version, epoch, continuity)
@@ -40,32 +42,52 @@ class TurnTimeline {
 
     @Synchronized fun registerTranscriptProvenance(turnId: String, epoch: InputEpoch, continuityId: String) {
         require(turnId.isNotBlank() && continuityId.isNotBlank())
-        provenance.getOrPut(turnId) { mutableSetOf() } += Provenance(epoch, continuityId)
+        if (exhausted) return
+        if (turnId !in provenance && provenance.size >= 128) {
+            val oldest = turns.values.minByOrNull { it.endNanos }
+            if (oldest == null) { exhausted = true; return }
+            retireThrough(oldest.endNanos)
+            if (provenance.size >= 128) { exhausted = true; return }
+        }
+        val sources = provenance.getOrPut(turnId) { mutableSetOf() }
+        // Two distinct sources already prove ambiguity; retaining more cannot resolve it.
+        if (sources.size < 2) sources += Provenance(epoch, continuityId)
     }
 
     @Synchronized fun registerSpeakerWindow(window: SpeakerWindow, epoch: InputEpoch) {
         val envelope = window.segment.envelope
-        if (envelope.sessionId == epoch.sessionId && envelope.generation == epoch.generation &&
+        if (!exhausted && envelope.startNanos >= retiredThroughNanos &&
+            envelope.sessionId == epoch.sessionId && envelope.generation == epoch.generation &&
             window.range.endExclusive > window.range.first && envelope.endNanos > envelope.startNanos) {
-            windows += Window(envelope, Provenance(epoch, window.range.continuityId), window.overlap)
+            val value = Window(envelope, Provenance(epoch, window.range.continuityId), window.overlap)
+            if (value in windows) return
+            if (windows.size >= 256) retireThrough(windows.minOf { it.envelope.endNanos })
+            if (envelope.startNanos >= retiredThroughNanos) windows += value
         }
     }
 
     @Synchronized fun applyTranscript(revision: TranscriptRevision): Boolean {
+        if (exhausted || revision.startNanos < retiredThroughNanos) return false
         val old = turns[revision.turnId]
         if (old != null && (old.final || !revision.isNewerThan(old) || revision.startNanos != old.startNanos ||
                 revision.endNanos < old.endNanos)) return false
+        if (old == null && turns.size >= 128) retireThrough(turns.values.minOf { it.endNanos })
+        if (revision.startNanos < retiredThroughNanos) return false
         turns[revision.turnId] = revision
         return true
     }
 
     @Synchronized fun applySpeaker(assessment: SpeakerAssessment): Set<String> {
-        if (assessment.endNanos <= assessment.startNanos) return emptySet()
+        if (exhausted || assessment.startNanos < retiredThroughNanos || assessment.endNanos <= assessment.startNanos)
+            return emptySet()
+        if (assessments.size >= 256) retireThrough(assessments.minOf { it.value.endNanos })
+        if (assessment.startNanos < retiredThroughNanos) return emptySet()
         assessments += Assessment(assessment, sourceFor(assessment))
         return turns.values.filter { matches(it, assessment) }.map { it.turnId }.toSet()
     }
 
     @Synchronized fun speakerFor(turnId: String): SpeakerLabel {
+        if (exhausted) return SpeakerLabel.UNKNOWN
         val turn = turns[turnId] ?: return SpeakerLabel.UNKNOWN
         val source = provenance[turnId]?.singleOrNull() ?: return SpeakerLabel.UNKNOWN
         if (source.epoch.sessionId != turn.envelope.sessionId || source.epoch.generation != turn.envelope.generation)
@@ -83,10 +105,34 @@ class TurnTimeline {
     @Synchronized fun clear() {
         version = Math.addExact(version, 1)
         provenance.clear(); turns.clear(); windows.clear(); assessments.clear()
+        retiredThroughNanos = 0; exhausted = false
+    }
+
+    internal data class RetentionCounts(val turns: Int, val provenance: Int, val sources: Int,
+        val windows: Int, val assessments: Int)
+    @Synchronized internal fun retentionCounts() = RetentionCounts(turns.size, provenance.size,
+        provenance.values.sumOf { it.size }, windows.size, assessments.size)
+
+    private fun retireThrough(endNanos: Long) {
+        retiredThroughNanos = maxOf(retiredThroughNanos, endNanos)
+        // Extend through every crossing interval before forgetting conflicting evidence.
+        while (true) {
+            val ends = turns.values.filter { it.startNanos < retiredThroughNanos }.map { it.endNanos } +
+                windows.filter { it.envelope.startNanos < retiredThroughNanos }.map { it.envelope.endNanos } +
+                assessments.filter { it.value.startNanos < retiredThroughNanos }.map { it.value.endNanos }
+            val extended = ends.maxOrNull() ?: break
+            if (extended <= retiredThroughNanos) break
+            retiredThroughNanos = extended
+        }
+        val retired = turns.values.filter { it.startNanos < retiredThroughNanos }.map { it.turnId }
+        retired.forEach { turns.remove(it); provenance.remove(it) }
+        windows.removeAll { it.envelope.startNanos < retiredThroughNanos }
+        assessments.removeAll { it.value.startNanos < retiredThroughNanos }
     }
 
     private fun sameSession(a: EventEnvelope, b: EventEnvelope) = a.sessionId == b.sessionId && a.generation == b.generation
     private fun sourceFor(assessment: SpeakerAssessment): Provenance? {
+        if (exhausted || assessment.startNanos < retiredThroughNanos) return null
         val intersecting = windows.filter { sameSession(it.envelope, assessment.envelope) &&
             overlaps(it.envelope.startNanos, it.envelope.endNanos, assessment.startNanos, assessment.endNanos) }
         if (intersecting.any { it.overlap } || intersecting.none {
