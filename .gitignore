@@ -17,6 +17,9 @@ local.properties
 probes/**/logs/
 probes/**/generated/
 
+# Locally fetched vendor documentation (raw crawl output, machine-local cache; the curated notes live in docs/)
+/.rokid-docs-raw/
+
 # Raw audio, biometric samples, and derived media
 # NOTE: this rule used to be the unanchored `Audio/`, which git applies to *any* directory of that name at any depth.
 # Because ignore matching is case-insensitive on Windows it also swallowed the `edith/audio/` **package** directory, so
