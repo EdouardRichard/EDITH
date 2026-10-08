@@ -8,6 +8,12 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    // The vendored CXR AARs sit at <root>/probes/p0/vendor in a plain checkout. A git worktree created two levels
+    // below the root (…/.worktrees/<name>) reaches the same files through ../../probes, and pinning that one layout
+    // made the repository resolve to a directory outside the repository (D:/probes) whenever the project was built
+    // from the root checkout - the merged main tree therefore could not configure transport-rokid or glasses-app.
+    val verifiedCxrDir = listOf(rootDir.resolve("probes/p0/vendor"), rootDir.resolve("../../probes/p0/vendor"))
+        .firstOrNull { it.isDirectory } ?: rootDir.resolve("probes/p0/vendor")
     repositories {
         google()
         mavenCentral()
@@ -15,7 +21,7 @@ dependencyResolutionManagement {
             forRepository {
                 ivy {
                     name = "verifiedCxrRuntime"
-                    url = uri("../../probes/p0/vendor")
+                    url = uri(verifiedCxrDir)
                     patternLayout { artifact("[artifact]-[revision].[ext]") }
                     metadataSources { artifact() }
                 }
