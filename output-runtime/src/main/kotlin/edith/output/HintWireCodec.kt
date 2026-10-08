@@ -1,0 +1,308 @@
+package edith.output
+
+import edith.contracts.OutputStatus
+
+/**
+ * Versioned hint wire shared by the phone and the glasses CustomApp (wire version 1).
+ *
+ * Clock domains are distinguished in the field names on purpose: `phoneSentNanos` is a phone instant and
+ * `validUntilGlassNanos` is a glasses instant, so a raw phone nanosecond can never be mistaken for a glasses
+ * clock reading. The transfer is carried inside a `Caps` string via `rk_custom_client`; the reply channel is
+ * `rk_custom_key`.
+ *
+ * This type is the untrusted boundary. The SDK promises nothing about ordering, size or duplication, so
+ * [decode] refuses anything it does not fully understand and never throws at the caller.
+ */
+sealed interface HintCommand {
+    data class Hello(val sessionId: String, val generation: Long) : HintCommand
+    data class Ping(val syncId: String, val p0: Long) : HintCommand
+    data class Pong(val syncId: String, val p0: Long, val g1: Long, val g2: Long) : HintCommand
+    data class Sync(val syncId: String, val offsetLowerNanos: Long, val offsetUpperNanos: Long,
+        val validUntilGlassNanos: Long) : HintCommand
+    data class Show(val sessionId: String, val generation: Long, val sequence: Long, val hintId: String,
+        val revision: Long, val syncId: String, val phoneSentNanos: Long, val remainingTtlMillis: Long,
+        val text: String) : HintCommand
+    data class Clear(val sessionId: String, val generation: Long, val sequence: Long) : HintCommand
+    data class Ack(val sessionId: String, val generation: Long, val sequence: Long, val hintId: String,
+        val revision: Long, val status: OutputStatus) : HintCommand
+}
+
+object HintWireCodec {
+    const val WIRE_VERSION = 1
+    /** Control text is bounded so a hint can never be used to push a document onto the glasses. */
+    const val MAX_TEXT_CODEPOINTS = 120
+    /** Hard bound on an inbound message, checked before parsing. */
+    const val MAX_MESSAGE_CHARS = 65_536
+
+    private val TEXT_BEARING = setOf("SHOW")
+
+    /**
+     * Encodes a command. Refuses anything that would violate the wire contract rather than sending it: a
+     * blank identifier, control text over [MAX_TEXT_CODEPOINTS] codepoints, or a payload over the bound.
+     */
+    fun encode(command: HintCommand): String {
+        validate(command)
+        val fields = LinkedHashMap<String, Any>()
+        fields["wireVersion"] = WIRE_VERSION
+        when (command) {
+            is HintCommand.Hello -> {
+                fields["command"] = "HELLO"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+            }
+            is HintCommand.Ping -> {
+                fields["command"] = "PING"
+                fields["syncId"] = command.syncId
+                fields["p0"] = command.p0
+            }
+            is HintCommand.Pong -> {
+                fields["command"] = "PONG"
+                fields["syncId"] = command.syncId
+                fields["p0"] = command.p0
+                fields["g1"] = command.g1
+                fields["g2"] = command.g2
+            }
+            is HintCommand.Sync -> {
+                fields["command"] = "SYNC"
+                fields["syncId"] = command.syncId
+                fields["offsetLowerNanos"] = command.offsetLowerNanos
+                fields["offsetUpperNanos"] = command.offsetUpperNanos
+                fields["validUntilGlassNanos"] = command.validUntilGlassNanos
+            }
+            is HintCommand.Show -> {
+                fields["command"] = "SHOW"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["sequence"] = command.sequence
+                fields["hintId"] = command.hintId
+                fields["revision"] = command.revision
+                fields["syncId"] = command.syncId
+                fields["phoneSentNanos"] = command.phoneSentNanos
+                fields["remainingTtlMillis"] = command.remainingTtlMillis
+                fields["text"] = command.text
+            }
+            is HintCommand.Clear -> {
+                fields["command"] = "CLEAR"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["sequence"] = command.sequence
+            }
+            is HintCommand.Ack -> {
+                fields["command"] = "ACK"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["sequence"] = command.sequence
+                fields["hintId"] = command.hintId
+                fields["revision"] = command.revision
+                fields["status"] = command.status.name
+            }
+        }
+        val json = buildString {
+            append('{')
+            fields.entries.forEachIndexed { position, (key, value) ->
+                if (position > 0) append(',')
+                append('"').append(key).append("\":")
+                when (value) {
+                    is String -> append('"').append(escape(value)).append('"')
+                    is Long -> append(value)
+                    is Int -> append(value)
+                    else -> error("unsupported wire value for $key")
+                }
+            }
+            append('}')
+        }
+        require(json.length <= MAX_MESSAGE_CHARS) { "MESSAGE_TOO_LARGE" }
+        return json
+    }
+
+    /** Returns null for anything not fully understood: malformed JSON, wrong version, missing or mistyped. */
+    fun decode(json: String): HintCommand? {
+        if (json.isBlank() || json.length > MAX_MESSAGE_CHARS) return null
+        val fields = parseFlatObject(json) ?: return null
+        if (fields["wireVersion"] != WIRE_VERSION.toString()) return null
+        return when (val command = fields["command"]) {
+            "HELLO" -> HintCommand.Hello(
+                sessionId = fields.text("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null)
+            "PING" -> HintCommand.Ping(
+                syncId = fields.text("syncId") ?: return null,
+                p0 = fields.long("p0") ?: return null)
+            "PONG" -> HintCommand.Pong(
+                syncId = fields.text("syncId") ?: return null,
+                p0 = fields.long("p0") ?: return null,
+                g1 = fields.long("g1") ?: return null,
+                g2 = fields.long("g2") ?: return null)
+            "SYNC" -> HintCommand.Sync(
+                syncId = fields.text("syncId") ?: return null,
+                offsetLowerNanos = fields.long("offsetLowerNanos") ?: return null,
+                offsetUpperNanos = fields.long("offsetUpperNanos") ?: return null,
+                validUntilGlassNanos = fields.long("validUntilGlassNanos") ?: return null)
+            "SHOW" -> {
+                val text = fields.text("text") ?: return null
+                if (text.codePointCount() > MAX_TEXT_CODEPOINTS) return null
+                HintCommand.Show(
+                    sessionId = fields.text("sessionId") ?: return null,
+                    generation = fields.long("generation") ?: return null,
+                    sequence = fields.long("sequence") ?: return null,
+                    hintId = fields.text("hintId") ?: return null,
+                    revision = fields.long("revision") ?: return null,
+                    syncId = fields.text("syncId") ?: return null,
+                    phoneSentNanos = fields.long("phoneSentNanos") ?: return null,
+                    remainingTtlMillis = fields.long("remainingTtlMillis") ?: return null,
+                    text = text)
+            }
+            "CLEAR" -> HintCommand.Clear(
+                sessionId = fields.text("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                sequence = fields.long("sequence") ?: return null)
+            "ACK" -> {
+                val status = fields.text("status")?.let { name ->
+                    OutputStatus.entries.firstOrNull { it.name == name }
+                } ?: return null
+                HintCommand.Ack(
+                    sessionId = fields.text("sessionId") ?: return null,
+                    generation = fields.long("generation") ?: return null,
+                    sequence = fields.long("sequence") ?: return null,
+                    hintId = fields.text("hintId") ?: return null,
+                    revision = fields.long("revision") ?: return null,
+                    status = status)
+            }
+            else -> null
+        }
+    }
+
+    private fun validate(command: HintCommand) {
+        when (command) {
+            is HintCommand.Hello -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+            is HintCommand.Ping -> require(command.syncId.isNotBlank()) { "SYNC_ID_REQUIRED" }
+            is HintCommand.Pong -> require(command.syncId.isNotBlank()) { "SYNC_ID_REQUIRED" }
+            is HintCommand.Sync -> {
+                require(command.syncId.isNotBlank()) { "SYNC_ID_REQUIRED" }
+                require(command.offsetUpperNanos >= command.offsetLowerNanos) { "INCONSISTENT_OFFSET_INTERVAL" }
+            }
+            is HintCommand.Show -> {
+                require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+                require(command.hintId.isNotBlank()) { "HINT_ID_REQUIRED" }
+                require(command.syncId.isNotBlank()) { "SYNC_ID_REQUIRED" }
+                require(command.remainingTtlMillis > 0) { "REMAINING_TTL_MUST_BE_POSITIVE" }
+                require(command.text.isNotBlank()) { "TEXT_REQUIRED" }
+                require(command.text.codePointCount() <= MAX_TEXT_CODEPOINTS) { "TEXT_TOO_LONG" }
+            }
+            is HintCommand.Clear -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+            is HintCommand.Ack -> {
+                require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+                require(command.hintId.isNotBlank()) { "HINT_ID_REQUIRED" }
+            }
+        }
+    }
+
+    private fun String.codePointCount(): Int = codePointCount(0, length)
+
+    /**
+     * Minimal flat-object reader. The wire carries only a flat object of strings and integers, so a full JSON
+     * parser is unnecessary surface; anything nested, duplicated or escaped beyond the supported set fails
+     * the parse and the caller refuses the message.
+     */
+    private fun parseFlatObject(json: String): Map<String, String>? {
+        val text = json.trim()
+        if (text.length < 2 || text.first() != '{' || text.last() != '}') return null
+        val body = text.substring(1, text.length - 1)
+        if (body.isEmpty()) return emptyMap()
+        val fields = LinkedHashMap<String, String>()
+        var index = 0
+        while (index < body.length) {
+            while (index < body.length && body[index] == ',') index++
+            if (index >= body.length) break
+            if (body[index] != '"') return null
+            val key = StringBuilder()
+            index++
+            while (index < body.length && body[index] != '"') {
+                val character = body[index]
+                if (character == '\\') {
+                    val escaped = body.getOrNull(index + 1) ?: return null
+                    key.append(
+                        when (escaped) {
+                            '"' -> '"'; '\\' -> '\\'; 'n' -> '\n'; 'r' -> '\r'; 't' -> '\t'
+                            'b' -> '\b'; '/' -> '/'
+                            'u' -> {
+                                val hex = body.substring(index + 2, minOf(index + 6, body.length))
+                                if (hex.length < 4) return null
+                                val code = hex.toIntOrNull(16) ?: return null
+                                index += 4
+                                code.toChar()
+                            }
+                            else -> return null
+                        }
+                    )
+                    index += 2
+                } else {
+                    key.append(character)
+                    index++
+                }
+            }
+            if (index >= body.length) return null
+            index++ // closing quote
+            if (body.getOrNull(index) != ':') return null
+            index++
+            if (fields.containsKey(key.toString())) return null // duplicates are ambiguous
+            when (body.getOrNull(index)) {
+                '"' -> {
+                    val value = StringBuilder()
+                    index++
+                    while (index < body.length && body[index] != '"') {
+                        val character = body[index]
+                        if (character == '\\') {
+                            val escaped = body.getOrNull(index + 1) ?: return null
+                            value.append(
+                                when (escaped) {
+                                    '"' -> '"'; '\\' -> '\\'; 'n' -> '\n'; 'r' -> '\r'; 't' -> '\t'
+                                    'b' -> '\b'; '/' -> '/'
+                                    'u' -> {
+                                        val hex = body.substring(index + 2, minOf(index + 6, body.length))
+                                        if (hex.length < 4) return null
+                                        val code = hex.toIntOrNull(16) ?: return null
+                                        index += 4
+                                        code.toChar()
+                                    }
+                                    else -> return null
+                                }
+                            )
+                            index += 2
+                        } else {
+                            value.append(character)
+                            index++
+                        }
+                    }
+                    if (index >= body.length) return null
+                    index++ // closing quote
+                    fields[key.toString()] = value.toString()
+                }
+                else -> {
+                    val start = index
+                    if (body.getOrNull(index) == '-') index++
+                    while (index < body.length && body[index] in '0'..'9') index++
+                    if (index == start) return null // only integers are carried
+                    fields[key.toString()] = body.substring(start, index)
+                }
+            }
+        }
+        return fields
+    }
+
+    private fun Map<String, String>.long(key: String): Long? = get(key)?.toLongOrNull()
+    private fun Map<String, String>.text(key: String): String? = get(key)
+
+    private fun escape(value: String): String = buildString {
+        for (character in value) {
+            when (character) {
+                '"' -> append("\\\"")
+                '\\' -> append("\\\\")
+                '\n' -> append("\\n")
+                '\r' -> append("\\r")
+                '\t' -> append("\\t")
+                '\b' -> append("\\b")
+                else -> if (character < ' ') append("\\u%04x".format(character.code)) else append(character)
+            }
+        }
+    }
+}

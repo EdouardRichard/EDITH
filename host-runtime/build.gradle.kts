@@ -13,5 +13,9 @@ dependencies {
     implementation(libs.kotlinx.coroutines.core)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.test.junit5)
+    testImplementation(project(":test-support"))
+    testImplementation(project(":plugins-smart"))
+    testImplementation(project(":plugins-interview"))
+    testImplementation(project(":plugins-diagnostic"))
+    testImplementation(project(":output-runtime"))
 }
-

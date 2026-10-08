@@ -1,0 +1,8 @@
+: Synthetic compatibility-schema fixture, not a captured DeepSeek response.
+event: response.created
+data: {"type":"response.created","sequence_number":1,"response":{"id":"r"}}
+
+event: response.incomplete
+data: {"type":"response.incomplete","sequence_number":5,"response":{"id":"r","status":"incomplete","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":null,"output_tokens":7}}}
+
+

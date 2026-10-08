@@ -1,11 +1,19 @@
 [versions]
 kotlin = "2.2.20"
 coroutines = "1.10.2"
+okhttp = "4.12.0"
+serialization = "1.9.0"
+agp = "9.2.1"
+android-compose = "2.3.10"
 
 [libraries]
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
 kotlin-test-junit5 = { module = "org.jetbrains.kotlin:kotlin-test-junit5", version.ref = "kotlin" }
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
+mockwebserver = { module = "com.squareup.okhttp3:mockwebserver", version.ref = "okhttp" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+android-application = { id = "com.android.application", version.ref = "agp" }

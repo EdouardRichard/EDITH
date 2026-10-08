@@ -1,0 +1,19 @@
+plugins {
+    alias(libs.plugins.kotlin.jvm)
+    application
+}
+
+kotlin {
+    jvmToolchain(21)
+    compilerOptions.jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+}
+
+application { mainClass.set("edith.probe.MainKt") }
+dependencyLocking { lockAllConfigurations() }
+
+dependencies {
+    implementation(project(":model-runtime"))
+    implementation(project(":storage-runtime"))
+    implementation(project(":plugin-api"))
+    implementation(libs.okhttp)
+}
