@@ -64,8 +64,13 @@ val verifiedBridge = "cxr-service-bridge-1.0-20260715.121510-107.aar" to
     "0A76387E106A51578F82169AEB2DA904372A9569B26AF1E6C87CEBE7A76B94FC"
 run {
     val (name, expected) = verifiedBridge
-    val artifact = rootProject.file("../../probes/p0/vendor/$name")
-    check(artifact.isFile) { "Missing indexed public CXR artifact: $name" }
+    // Same two-layout resolution as transport-rokid: a plain checkout keeps the AARs at <root>/probes/p0/vendor, a
+    // worktree two levels below the root reaches them via ../../probes. See that module for why this must not be pinned.
+    val artifact = listOf(
+        rootProject.file("probes/p0/vendor/$name"),
+        rootProject.file("../../probes/p0/vendor/$name"),
+    ).firstOrNull { it.isFile } ?: rootProject.file("probes/p0/vendor/$name")
+    check(artifact.isFile) { "Missing indexed public CXR artifact: $name (looked in probes/p0/vendor and ../../probes/p0/vendor of $rootDir)" }
     val digest = MessageDigest.getInstance("SHA-256")
     artifact.inputStream().use { input ->
         val buffer = ByteArray(8192)
