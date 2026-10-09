@@ -226,8 +226,13 @@ internal fun smartToolCall(
     name: String,
     argsJson: String = "{}",
     itemId: String = id,
+    /**
+     * The request the event echoes back. Non-blank by contract (`ToolCallTerminal` rejects a blank id), so a caller
+     * with a live request passes that request's own id.
+     */
+    requestId: String = "request-$id",
 ): ModelStreamEvent.ToolCallTerminal = ModelStreamEvent.ToolCallTerminal(
-    requestId = "",
+    requestId = requestId,
     itemId = itemId,
     callId = id,
     name = name,
@@ -297,6 +302,8 @@ internal class SmartTestRig(
         maxLevel: String? = null,
         whitelist: String? = null,
         requestConsent: String? = null,
+        proactiveCooldownMillis: String? = null,
+        proactiveSensitivity: String? = null,
         overrides: Map<Capability, Any> = emptyMap(),
         // A host that keeps one plugin instance re-activates it for the next session/generation; the defaults here are
         // the rig's own, so a test can model that re-activation explicitly.
@@ -310,6 +317,8 @@ internal class SmartTestRig(
             maxLevel?.let { put("maxLevel", it) }
             whitelist?.let { put("whitelist", it) }
             requestConsent?.let { put("requestConsent", it) }
+            proactiveCooldownMillis?.let { put("proactiveCooldownMillis", it) }
+            proactiveSensitivity?.let { put("proactiveSensitivity", it) }
         }
         val configuration = edith.plugin.PluginConfiguration(1, values)
         plugin.validate(configuration)

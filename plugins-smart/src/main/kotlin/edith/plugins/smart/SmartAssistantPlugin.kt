@@ -6,12 +6,17 @@ import edith.agent.AgentRequest
 import edith.agent.AgentRun
 import edith.agent.AuditEntry
 import edith.agent.BoundedAuditLog
+import edith.agent.GatewayTurn
 import edith.agent.ModelClientGateway
 import edith.agent.ProgressGuard
 import edith.agent.ToolRegistry
 import edith.agent.WhitelistActionPolicy
 import edith.agent.WhitelistEntry
+import edith.contracts.AcousticEvent
+import edith.contracts.AcousticLabel
 import edith.contracts.Assistance
+import edith.contracts.ContractError
+import edith.contracts.ContextChanged
 import edith.contracts.EventEnvelope
 import edith.contracts.Generation
 import edith.contracts.HostEvent
@@ -28,7 +33,9 @@ import edith.plugin.ConfigSchema
 import edith.plugin.ConfiguredPlugin
 import edith.plugin.DeactivationReason
 import edith.plugin.DeadlineScheduler
+import edith.plugin.MessageRole
 import edith.plugin.ModelEnd
+import edith.plugin.ModelHistoryItem
 import edith.plugin.ModelProfile
 import edith.plugin.MonotonicClock
 import edith.plugin.OutputSink
@@ -39,10 +46,15 @@ import edith.plugin.PluginDescriptor
 import edith.plugin.PluginLifecycle
 import edith.plugin.RiskLevel
 import edith.plugin.actions
+import edith.plugin.context
 import edith.plugin.model
 import edith.plugin.textOutput
 import edith.plugin.wakeWord
 import java.util.UUID
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 
 private const val CONFIG_SCHEMA_VERSION = 1
 private const val DEFAULT_WAKE_WORDS = "伊迪丝,edith"
@@ -61,8 +73,30 @@ private const val DEFAULT_HINT_GRACE_MILLIS = 5_000L
 private const val DEFAULT_LISTEN_WINDOW_MILLIS = 15_000L
 private const val AUDIT_CAPACITY = 512
 
+/**
+ * The proactive cooldown and sensitivity the plugin uses when its configuration names neither of the two P3.2 keys:
+ * the brief's own defaults (`MEDIUM`, 60 s). A configured plugin gets its numbers from `Config` (Task 9).
+ */
+private const val DEFAULT_PROACTIVE_COOLDOWN_NANOS = 60_000_000_000L
+
+/** The `ContextChanged` key the foreground app arrives under; the key set is fixed (spec §16.6). */
+private const val FOREGROUND_KEY = "app.foreground"
+
+/**
+ * The context key the host publishes its 「主动辅助」 state under.
+ *
+ * Mirrors `edith.phone.model.ProactiveArming.CONTEXT_KEY`: the plugin cannot import the App's class (module
+ * direction), so the string is duplicated with a pinning test on each side. The switch has to be readable *now*
+ * because local transcription continues while it is off - see [SmartAssistantPlugin.armedNow].
+ */
+internal const val PROACTIVE_ARMED_KEY = "proactive.armed"
+
+/** Lenient for the same reason the loop is: model-authored arguments are not always strictly formed JSON. */
+private val proactiveJson = Json { isLenient = true }
+
 /** Configuration keys this plugin understands; anything else is refused rather than silently ignored. */
-private val KNOWN_KEYS = setOf("profileId", "profileRevision", "wakeWords", "maxLevel", "whitelist", "requestConsent")
+private val KNOWN_KEYS = setOf("profileId", "profileRevision", "wakeWords", "maxLevel", "whitelist", "requestConsent",
+    "proactiveCooldownMillis", "proactiveSensitivity")
 
 /** The fixed, honest sentence for each non-`COMPLETED` terminal state; never a success-looking hint. */
 private val FAILURE_HINTS = mapOf(
@@ -97,8 +131,9 @@ private const val BLANK_UTTERANCE_HINT = "没有听清内容，请再说一次�
  * - **nothing is replayed across sessions** — the remembered final transcript belongs to the session that produced it,
  *   so `Help` after a re-activation runs this session's utterance or nothing at all.
  *
- * The descriptor declares exactly `WakeWord, Asr, Model, Actions, TextOutput`. `Capability.Context` is deliberately
- * absent: nothing provides it yet, and declaring it would make host activation fail.
+ * The descriptor declares exactly `WakeWord, Asr, Model, Actions, TextOutput, Context`. `Capability.Context` is what
+ * P3.2's proactive path runs on: the host produces the perception signals, so a plugin that did not declare it could
+ * never be armed.
  */
 class SmartAssistantPlugin(
     private val clock: MonotonicClock = SystemMonotonicClock,
@@ -129,6 +164,9 @@ class SmartAssistantPlugin(
             Capability.Model,
             Capability.Actions,
             Capability.TextOutput,
+            // P3.2 Task 8: the proactive path is driven by the host's perception signals, and the host only delivers
+            // `AcousticEvent`/`ContextChanged` to a plugin that declares `Context` (HostRuntime's capability gate).
+            Capability.Context,
         ),
         ConfigSchema(CONFIG_SCHEMA_VERSION),
     )
@@ -168,6 +206,9 @@ class SmartAssistantPlugin(
         val maxLevel: RiskLevel,
         val whitelist: List<WhitelistEntry>,
         val requestConsent: Boolean,
+        /** P3.2: how long the proactive path stays quiet after a request, and how willing it is to interrupt. */
+        val proactiveCooldownMillis: Long,
+        val proactiveSensitivity: ProactiveSensitivity,
     )
 
     private val gate = Any()
@@ -178,6 +219,59 @@ class SmartAssistantPlugin(
     private var turn: SmartTurn? = null
     private var lastFinalTranscript: String? = null
     private var lastFinalTurnId: String? = null
+
+    // ---------------------------------------------------------------- proactive state (P3.2)
+
+    /**
+     * The plugin's **own** arming evidence: the host produced a perception signal in this session.
+     *
+     * Spec §16.2 makes arming the host's decision - with 「主动辅助」 off, no `AcousticEvent` and no `ContextChanged`
+     * are produced at all - so this flag is the second, defensive half: a transcript that somehow arrives with no
+     * perception behind it is refused as `DISARMED` rather than turned into a request.
+     */
+    private var perceptionArmed = false
+    private var lastAcousticLabel: AcousticLabel? = null
+    private var lastContextValues: Map<String, String> = emptyMap()
+    /**
+     * The proactive filter. Rebuilt by [configure] from the two configured keys; until a configuration arrives it is
+     * the brief's defaults, so a plugin that is somehow driven before it is configured still refuses rather than
+     * guessing.
+     */
+    private var proactive = SmartProactive(DEFAULT_PROACTIVE_COOLDOWN_NANOS, ProactiveSensitivity.MEDIUM)
+    private var proactiveHint: ProactiveHint? = null
+
+    /**
+     * The hint a proactive turn submitted, and the little state its ACK needs.
+     *
+     * Deliberately not a [SmartTurn]: a proactive turn has no listening window, no transcript to adopt and no loop, so
+     * reusing the wake turn's machinery would arm waits that can never be satisfied. It owns only what the display
+     * conversation needs - its identity, its expiry and the submit/ACK race - and is the vehicle [Stop][stopAll]
+     * cancels.
+     */
+    private class ProactiveHint(val hintId: String, val turnId: String) {
+        /**
+         * When the hint stops being displayable, stamped **at submit time**.
+         *
+         * Anchoring it at the trigger would give a reply that lands late only the remainder of the request deadline -
+         * a hint the wearer cannot read. Zero until the hint is submitted, so an ACK that somehow arrives earlier
+         * cannot count.
+         */
+        var expiryNanos: Long = 0L
+        var submitting = false
+        var readable = false
+        var pendingAck = false
+        var displayed = false
+        @Volatile var cancelled = false
+    }
+
+    /**
+     * True while a proactive request is on the wire.
+     *
+     * The wake path's [turn] cannot answer this (a proactive turn has no `SmartTurn`) and the cooldown only starts
+     * after the reply, so without this flag two triggers inside one request's window would both reach the model -
+     * which is exactly what the plan's "one turn at a time" invariant forbids. Read and written under [gate].
+     */
+    private var proactiveInFlight = false
 
     // ---------------------------------------------------------------- configuration
 
@@ -190,6 +284,9 @@ class SmartAssistantPlugin(
         val replaced = synchronized(gate) {
             val current = config
             config = parsed
+            // P3.2: the filter's thresholds are the configured ones, rebuilt with the configuration so a reconfigure
+            // (a settings save plus restart) cannot leave the old cooldown behind.
+            proactive = SmartProactive(parsed.proactiveCooldownMillis * 1_000_000L, parsed.proactiveSensitivity)
             if (current == parsed) null else detach()
         }
         teardown(replaced)
@@ -213,7 +310,18 @@ class SmartAssistantPlugin(
             require(it == "true" || it == "false") { "requestConsent must be 'true' or 'false'" }
             it == "true"
         } ?: false
-        return Config(profileId, revision, wakeWords, maxLevel, whitelist, consent)
+        val proactiveCooldownMillis = configuration.values["proactiveCooldownMillis"]?.let {
+            val millis = it.toLongOrNull()
+            require(millis != null && millis >= 0) { "proactiveCooldownMillis must be a non-negative integer, was '$it'" }
+            millis
+        } ?: (DEFAULT_PROACTIVE_COOLDOWN_NANOS / 1_000_000L)
+        val proactiveSensitivity = configuration.values["proactiveSensitivity"]?.let {
+            val level = ProactiveSensitivity.entries.firstOrNull { level -> level.name == it.trim().uppercase() }
+            require(level != null) { "proactiveSensitivity must be LOW, MEDIUM or HIGH, was '$it'" }
+            level
+        } ?: ProactiveSensitivity.MEDIUM
+        return Config(profileId, revision, wakeWords, maxLevel, whitelist, consent,
+            proactiveCooldownMillis, proactiveSensitivity)
     }
 
     private fun parseRiskLevel(raw: String): RiskLevel {
@@ -252,6 +360,9 @@ class SmartAssistantPlugin(
             // would be replayed under the new session's envelope (and its stale turn id adopted as `sourceTurnId`).
             lastFinalTranscript = null
             lastFinalTurnId = null
+            // P3.2: the perception state is session state too. A label or an arming left over from the previous
+            // session would let the new session perceive before the host has produced anything for it.
+            resetPerception()
         }
         // Best effort: a host that refuses the declaration leaves `current()` unchanged, and that is not a reason to
         // fail activation.
@@ -266,9 +377,20 @@ class SmartAssistantPlugin(
             // `Help` in a later session would replay it. `activate` clears it too, so both ends of the handover do.
             lastFinalTranscript = null
             lastFinalTurnId = null
+            resetPerception()
             detach()
         }
         teardown(stranded)
+    }
+
+    /** Must hold [gate]: forgets the session's perception, so nothing survives into the next one. */
+    private fun resetPerception() {
+        perceptionArmed = false
+        lastAcousticLabel = null
+        lastContextValues = emptyMap()
+        proactiveHint?.cancelled = true
+        proactiveHint = null
+        proactiveInFlight = false
     }
 
     private fun configuredWakeWords(): List<String> =
@@ -288,14 +410,32 @@ class SmartAssistantPlugin(
                 }
             }
 
+            // P3.2: the host's perception signals. They are remembered rather than acted on here - the utterance is
+            // what carries a request, and the label/context are what that request is judged and built with.
+            is AcousticEvent -> synchronized(gate) {
+                if (matches(event.envelope)) {
+                    lastAcousticLabel = event.label
+                    perceptionArmed = true
+                }
+            }
+
+            is ContextChanged -> synchronized(gate) {
+                if (matches(event.envelope)) lastContextValues = event.values
+            }
+
             is TranscriptEvent -> {
-                val started = synchronized(gate) {
-                    if (!matches(event.envelope)) null else acceptTranscript(event.revision)
+                val (started, proactive) = synchronized(gate) {
+                    if (!matches(event.envelope)) null to null
+                    else acceptTranscript(event.revision) to proactiveTrigger(event.revision)
                 }
                 if (started != null) runTurn(started.first, started.second)
+                else if (proactive != null) runProactive(proactive)
             }
             is OutputStateEvent -> synchronized(gate) {
-                if (matches(event.envelope)) acceptDisplayed(event)
+                if (matches(event.envelope)) {
+                    acceptDisplayed(event)
+                    acceptProactiveDisplayed(event)
+                }
             }
 
             is UserAction -> when (event.action) {
@@ -582,6 +722,280 @@ class SmartAssistantPlugin(
         )
     }
 
+    // ---------------------------------------------------------------- proactive turn (P3.2)
+
+    /**
+     * Whether this final transcript should become a proactive request.
+     *
+     * Must hold [gate]; returns the trigger to run, or null after recording why not. The admission itself is
+     * [SmartProactive]'s (Task 7), and this method's own contributions are the two facts only the plugin knows: the
+     * remembered perception (label, foreground) and whether another turn is in flight.
+     *
+     * A skipped trigger is logged with its reason - including `DISARMED`, which is the trace of the host not producing
+     * perception. It is one cheap local line per utterance, and it is the only evidence the device log has that the
+     * gate is where the spec says it is.
+     */
+    /**
+     * Whether the host is armed **right now**.
+     *
+     * [perceptionArmed] only proves that a perception event arrived once; it cannot notice the switch being turned
+     * off afterwards, and local transcription deliberately continues while it is off - so without this the off switch
+     * would not stop proactive uploads (a review finding: the switch is the user's only in-session control).
+     *
+     * The host publishes its current state as [PROACTIVE_ARMED_KEY]; that answer wins when the provider is wired, and
+     * the sticky flag is the fallback for a host without one (and for the plugin's own tests).
+     */
+    private fun armedNow(): Boolean {
+        val flag = runCatching {
+            currentContext()?.services?.context()?.snapshot()?.values?.get(PROACTIVE_ARMED_KEY)
+        }.getOrNull()
+        return when (flag) {
+            null -> perceptionArmed
+            "true" -> true
+            else -> false
+        }
+    }
+
+    /** Must hold [gate]; returns the trigger to run, or null after recording why not. */
+    private fun proactiveTrigger(revision: TranscriptRevision): ProactiveTrigger? {
+        if (!revision.final) return null
+        val text = revision.text.trim()
+        if (!isUsableUtterance(text)) return null
+        val trigger = ProactiveTrigger(text, lastAcousticLabel, lastContextValues[FOREGROUND_KEY], clock.nowNanos())
+        // "Busy" means a turn is genuinely in flight - waiting for its transcript, running its loop, or a proactive
+        // request on the wire. A turn that has **finished** stays installed as `turn` until something replaces or
+        // stops it (the wake path does that on purpose, so a late ACK still finds its identity), and counting it as
+        // busy would refuse every proactive trigger for the rest of the session. Found on the K40: after one wake turn
+        // ended, the first real utterance produced `skip reason=BUSY` instead of a request.
+        val busy = turn?.let { it.phase != SmartTurnPhase.Idle } == true || proactiveInFlight
+        val skip = proactive.admit(trigger, armed = armedNow(), busy = busy)
+        if (skip != null) {
+            P3Log.line("P3_PROACTIVE skip reason=$skip")
+            return null
+        }
+        return trigger
+    }
+
+    /**
+     * One proactive round trip: **one** request, one tool table, and a decision that is either a sentence or silence.
+     *
+     * The gateway is called directly rather than through an `AgentLoop`, because the loop's whole purpose - feeding
+     * tool results back and retrying until it makes progress - is exactly what a proactive turn must not do: the
+     * `propose_hint` call *is* the answer, it is never executed, and there is no second turn to run. The request runs
+     * **outside** [gate] for the same reason the wake loop does: it blocks on the transport, and `Stop` must be able to
+     * mark it cancelled while it waits.
+     */
+    private fun runProactive(trigger: ProactiveTrigger) {
+        val (current, configured, filter) = synchronized(gate) {
+            val c = context ?: return
+            val cfg = config ?: return
+            Triple(c, cfg, proactive)
+        }
+        val started = clock.nowNanos()
+        val (message, contextEntries) = proactiveMessage(trigger)
+        val hint = ProactiveHint(hintId = "hint-${UUID.randomUUID()}", turnId = "proactive-${UUID.randomUUID()}")
+        synchronized(gate) {
+            if (context !== current) return
+            proactiveHint?.cancelled = true
+            proactiveHint = hint
+            proactiveInFlight = true
+        }
+        P3Log.line("P3_PROACTIVE request ctx=$contextEntries chars=${trigger.transcript.length}")
+        // Off the host's dispatcher: the request blocks on the transport, and running it inside `handle` would hold
+        // the host's single drain thread for up to the deadline - delaying `Stop` (and its UI thread) and the next
+        // wake turn. The task re-checks ownership under `gate` before writing anything back. A test host runs the task
+        // inline, which is what keeps the plugin's own tests deterministic.
+        current.services.tasks.launch {
+            try {
+                deliverProactive(current, configured, filter, hint, trigger, message, started)
+            } finally {
+                synchronized(gate) { proactiveInFlight = false }
+            }
+        }
+    }
+
+    /** The blocking half of one proactive turn; runs on the task scope, never under [gate]. */
+    private fun deliverProactive(current: PluginContext, configured: Config, filter: SmartProactive,
+        hint: ProactiveHint, trigger: ProactiveTrigger, message: String, started: Long) {
+        val gateway = ModelClientGateway(
+            client = runCatching { current.services.model() }.getOrElse { failure ->
+                P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")
+                discard(hint)
+                return
+            },
+            profileLookup = profileLookup,
+            clock = clock,
+            scheduler = scheduler,
+            envelopeFor = { requestId, startNanos, endNanos ->
+                EventEnvelope(current.sessionId, current.generation, requestId, startNanos, endNanos)
+            },
+            stop = { hint.cancelled },
+        )
+        val reply = try {
+            gateway.turn(GatewayTurn(
+                turnId = hint.turnId,
+                profileId = configured.profileId,
+                instructions = SmartPrompts.proactiveInstructions(),
+                // The gateway lifts a trailing USER turn into `input`, which is what puts the utterance and the
+                // perception last on the wire - the same shape the passive path uses.
+                history = listOf(ModelHistoryItem.Text(MessageRole.USER, message)),
+                tools = listOf(SmartPrompts.PROPOSE_HINT),
+                deadlineNanos = SmartTurn.saturatingAdd(started, SmartPrompts.PROACTIVE_DEADLINE_MILLIS * 1_000_000L),
+            ))
+        } catch (failure: Throwable) {
+            // A capability refusal is the App's upload gate answering before any HTTP (the profile verification
+            // shares the same vocabulary), so it is a skip and starts the cooldown rather than a per-sentence retry.
+            if (failure is ContractError.CapabilityMissing) {
+                filter.noteGateRefused(clock.nowNanos())
+                P3Log.line("P3_PROACTIVE skip reason=${ProactiveSkip.GATE}")
+            } else {
+                P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")
+            }
+            discard(hint)
+            return
+        }
+        val elapsed = elapsedMillis(started)
+        when {
+            reply.terminal == ModelEnd.CANCELLED -> silence(hint, "CANCELLED", elapsed)
+            reply.terminal == ModelEnd.DEADLINE -> silence(hint, "DEADLINE", elapsed)
+            reply.terminal != ModelEnd.COMPLETED -> silence(hint, "FAILED", elapsed)
+            else -> {
+                val call = reply.toolCalls.firstOrNull { it.name == SmartPrompts.PROPOSE_HINT.name }
+                val text = call?.let { parseHint(it.argsJson) }
+                when {
+                    call == null -> silence(hint, "NO_CALL", elapsed)
+                    text == null -> silence(hint, "UNPARSABLE", elapsed)
+                    text.codePointCount(0, text.length) > SmartPrompts.PROACTIVE_HINT_MAX_CHARS ->
+                        silence(hint, "TOO_LONG", elapsed)
+                    else -> {
+                        filter.noteRequest(clock.nowNanos())
+                        filter.noteDedup(trigger)
+                        P3Log.line("P3_PROACTIVE hint chars=${text.length} ms=$elapsed")
+                        submitProactiveHint(hint, text)
+                    }
+                }
+            }
+        }
+    }
+
+    /** The context message one proactive request carries, and how many perception entries it attached. */
+    private fun proactiveMessage(trigger: ProactiveTrigger): Pair<String, Int> {
+        val values = currentContextValues()
+        val entries = values.size + listOfNotNull(trigger.label, trigger.foreground).size
+        val message = buildString {
+            append("用户没有对你说话。本回合的感知上下文：")
+            append("\n最近一句转写：").append(trigger.transcript)
+            trigger.label?.let { append("\n声学标签：").append(it.name) }
+            trigger.foreground?.let { append("\n前台应用：").append(it) }
+            values.toSortedMap().forEach { (key, value) -> append("\n").append(key).append("=").append(value) }
+        }
+        return message to entries
+    }
+
+    /**
+     * The freshest context available: the provider's own snapshot, with anything a delivered `ContextChanged` carried
+     * filling the gaps (the provider may be unwired, and then the remembered values are all there is).
+     *
+     * Reading the provider here is also what drives the host's change detection - the composition reports a
+     * `ContextChanged` when a snapshot differs from the previous one - so an unread context stays invisible. Found on
+     * the K40: the first device request carried `ctx=1` (the acoustic label alone) because nothing sampled the
+     * provider at all.
+     */
+    private fun currentContextValues(): Map<String, String> {
+        val remembered = synchronized(gate) { lastContextValues }
+        val fresh = runCatching { currentContext()?.services?.context()?.snapshot()?.values }.getOrNull()
+        return if (fresh == null) remembered else remembered + fresh
+    }
+
+    /** The hint text in one tool call's arguments, or null when they are not a JSON object with a non-blank `text`. */
+    private fun parseHint(argsJson: String): String? =
+        runCatching { proactiveJson.parseToJsonElement(argsJson).jsonObject["text"]?.jsonPrimitive?.contentOrNull }
+            .getOrNull()
+            ?.takeIf { it.isNotBlank() }
+
+    /** Records a proactive outcome that shows nothing, and releases the hint slot. */
+    private fun silence(hint: ProactiveHint, reason: String, elapsedMillis: Long) {
+        P3Log.line("P3_PROACTIVE silence reason=$reason ms=$elapsedMillis")
+        discard(hint)
+    }
+
+    /** Must hold [gate]: releases the hint only if it is still the current one. */
+    private fun discard(hint: ProactiveHint) {
+        synchronized(gate) {
+            hint.cancelled = true
+            if (proactiveHint === hint) proactiveHint = null
+        }
+    }
+
+    /**
+     * Submits the sentence, with the diagnostic plugin's submit/ACK discipline and the same privacy line as the
+     * passive path: the log carries the hint's identity and size, never the text.
+     */
+    private fun submitProactiveHint(hint: ProactiveHint, text: String) {
+        val current = currentContext() ?: return
+        val now = clock.nowNanos()
+        val assistance = synchronized(gate) {
+            if (proactiveHint !== hint || hint.cancelled) return
+            // The visible window starts here, not at the trigger: a reply that used most of the request deadline must
+            // still give the wearer a full window (a review finding).
+            val expiry = SmartTurn.saturatingAdd(now, SmartPrompts.PROACTIVE_HINT_TTL_MILLIS * 1_000_000L)
+            hint.expiryNanos = expiry
+            hint.submitting = true
+            hint.pendingAck = false
+            Assistance(
+                hintId = hint.hintId,
+                sessionId = current.sessionId,
+                generation = current.generation,
+                sourceTurnId = hint.turnId,
+                priority = 0,
+                text = text,
+                optionalSpeech = null,
+                expiresAtNanos = expiry,
+            )
+        }
+        val sink: OutputSink? = runCatching { current.services.textOutput() }.getOrNull()
+        val result = if (sink != null) {
+            P3Log.line("P3_HINT show hint=${assistance.hintId} chars=${assistance.text.length}")
+            runCatching { sink.submit(assistance) }.getOrNull()
+        } else {
+            null
+        }
+        synchronized(gate) {
+            hint.submitting = false
+            if (result == OutputSubmission.Accepted && proactiveHint === hint && !hint.cancelled) {
+                hint.readable = true
+                if (hint.pendingAck && !hint.displayed && clock.nowNanos() < hint.expiryNanos) {
+                    hint.pendingAck = false
+                    hint.displayed = true
+                    P3Log.line("P3_HINT ack hint=${hint.hintId} status=${OutputStatus.Displayed}")
+                    onDisplayedAck()
+                }
+            } else if (result != OutputSubmission.Accepted) {
+                // Refused by the host's display gate: one line, no retry, no second request.
+                P3Log.line("P3_PROACTIVE hint rejected chars=${assistance.text.length}")
+                hint.cancelled = true
+                if (proactiveHint === hint) proactiveHint = null
+            }
+        }
+    }
+
+    /** Renders a `Displayed` ACK of the proactive hint; a rejected, repeated or expired hint never counts twice. */
+    private fun acceptProactiveDisplayed(event: OutputStateEvent) {
+        val hint = proactiveHint ?: return
+        if (hint.cancelled || hint.displayed) return
+        if (event.hintId != hint.hintId || event.status != OutputStatus.Displayed) return
+        if (hint.expiryNanos == 0L || clock.nowNanos() >= hint.expiryNanos) return
+        if (hint.submitting) {
+            hint.pendingAck = true
+        } else if (hint.readable) {
+            hint.displayed = true
+            P3Log.line("P3_HINT ack hint=${hint.hintId} status=${event.status}")
+            onDisplayedAck()
+        }
+    }
+
+    private fun elapsedMillis(startedNanos: Long): Long = (clock.nowNanos() - startedNanos) / 1_000_000L
+
     // ---------------------------------------------------------------- output
 
     /**
@@ -699,7 +1113,16 @@ class SmartAssistantPlugin(
      * raised in another session (or for an older generation of this one) must not be able to cancel this plugin's turn.
      */
     private fun stopAll(envelope: EventEnvelope) {
-        val stopped = synchronized(gate) { if (matches(envelope)) detach() else null }
+        val stopped = synchronized(gate) {
+            if (!matches(envelope)) null
+            else {
+                // P3.2: a proactive request is in flight outside this lock; marking its hint cancelled is what the
+                // gateway's `stop` predicate reads, and what stops a late reply from being shown.
+                proactiveHint?.cancelled = true
+                proactiveHint = null
+                detach()
+            }
+        }
         teardown(stopped)
     }
 

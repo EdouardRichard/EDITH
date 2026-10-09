@@ -24,6 +24,28 @@ import kotlin.test.*
  */
 class SmartAssistantPluginTest {
 
+    @Test fun `the proactive configuration keys are validated and an unknown key is still refused`() {
+        val plugin = SmartAssistantPlugin()
+        fun configuration(extra: Map<String, String>) = PluginConfiguration(1,
+            mapOf("profileId" to "p-1", "profileRevision" to "1") + extra)
+
+        // The two P3.2 keys, at their bounds and with every level the enum names.
+        plugin.validate(configuration(mapOf("proactiveCooldownMillis" to "5000", "proactiveSensitivity" to "LOW")))
+        plugin.validate(configuration(mapOf("proactiveCooldownMillis" to "600000", "proactiveSensitivity" to "MEDIUM")))
+        plugin.validate(configuration(mapOf("proactiveCooldownMillis" to "0", "proactiveSensitivity" to "HIGH")))
+        // Absent is fine: the plugin's own defaults are the brief's.
+        plugin.validate(configuration(emptyMap()))
+
+        // Case is normalised rather than refused, exactly like `maxLevel` next to it; the store normalises too, so
+        // this is defence in depth rather than a second, stricter spelling rule.
+        plugin.validate(configuration(mapOf("proactiveSensitivity" to "low")))
+
+        assertFailsWith<IllegalArgumentException> { plugin.validate(configuration(mapOf("proactiveSensitivity" to "LOUD"))) }
+        assertFailsWith<IllegalArgumentException> { plugin.validate(configuration(mapOf("proactiveCooldownMillis" to "-1"))) }
+        assertFailsWith<IllegalArgumentException> { plugin.validate(configuration(mapOf("proactiveCooldownMillis" to "abc"))) }
+        assertFailsWith<IllegalArgumentException> { plugin.validate(configuration(mapOf("proactiveNonsense" to "1"))) }
+    }
+
     @Test fun `descriptor is stable and lifecycle toggles active`() {
         val rig = SmartTestRig()
         val plugin: PluginLifecycle = rig.plugin
@@ -32,10 +54,13 @@ class SmartAssistantPluginTest {
         assertEquals("Smart Assistant", plugin.descriptor.displayName)
         assertEquals(ConfigSchema(1), plugin.descriptor.configSchema)
         assertEquals(
-            setOf(Capability.WakeWord, Capability.Asr, Capability.Model, Capability.Actions, Capability.TextOutput),
+            setOf(Capability.WakeWord, Capability.Asr, Capability.Model, Capability.Actions, Capability.TextOutput,
+                Capability.Context),
             plugin.descriptor.capabilities,
         )
-        assertFalse(plugin.descriptor.capabilities.contains(Capability.Context), "nothing provides Context yet")
+        // P3.2 Task 8: `Context` is no longer absent. It is what the proactive path runs on - the host delivers
+        // `AcousticEvent`/`ContextChanged` only to a plugin that declares it - and the composition now provides it.
+        assertTrue(Capability.Context in plugin.descriptor.capabilities)
         assertFalse(rig.plugin.active)
         rig.plugin.deactivate(DeactivationReason.Stopped)
         assertFalse(rig.plugin.active)
