@@ -27,6 +27,7 @@ import edith.contracts.TranscriptEvent
 import edith.contracts.TranscriptRevision
 import edith.contracts.UserAction
 import edith.contracts.WakeDetected
+import edith.output.HintReadingBudget
 import edith.plugin.Capability
 import edith.plugin.CancellationHandle
 import edith.plugin.ConfigSchema
@@ -1069,7 +1070,11 @@ class SmartAssistantPlugin(
             if (current.closed) return
             val context = context ?: return
             val now = clock.nowNanos()
-            val expiry = minOf(SmartTurn.saturatingAdd(now, HINT_LIFETIME_MILLIS * 1_000_000L), current.hintValidUntil)
+            // P3.2-CLIP: a hint taller than the glasses' window is slid through at a reading pace, so a fixed five
+            // seconds cleared the text mid-sentence. The budget adds the slide's own duration; a hint that fits keeps
+            // exactly `HINT_LIFETIME_MILLIS`.
+            val lifetime = HintReadingBudget.readMillis(text.length, HINT_LIFETIME_MILLIS)
+            val expiry = minOf(SmartTurn.saturatingAdd(now, lifetime * 1_000_000L), current.hintValidUntil)
             if (expiry <= now) return
             current.submitting = true
             current.pendingAck = false

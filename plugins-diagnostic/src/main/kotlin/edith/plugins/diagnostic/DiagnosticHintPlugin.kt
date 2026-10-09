@@ -2,6 +2,7 @@ package edith.plugins.diagnostic
 
 import edith.contracts.Assistance
 import edith.contracts.HostEvent
+import edith.output.HintReadingBudget
 import edith.plugin.Capability
 import edith.plugin.ConfigSchema
 import edith.plugin.DeactivationReason
@@ -102,7 +103,9 @@ class DiagnosticHintPlugin(
             priority = 1,
             text = text,
             optionalSpeech = null,
-            expiresAtNanos = now + ttlMillis * 1_000_000,
+            // P3.2-CLIP: this instrument exists to push hints the panel cannot show at once, so it has to hold them
+            // long enough to slide through; the base 10 s is kept and the slide is added on top.
+            expiresAtNanos = now + HintReadingBudget.readMillis(text.length, ttlMillis) * 1_000_000,
         )
         val sink = runCatching {
             pluginContext.services.require(Capability.TextOutput) as OutputSink
