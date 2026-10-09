@@ -16,13 +16,15 @@ class SpeechPipelineTest {
         index * 20_000_000L, (index + 1) * 20_000_000L)
     private fun envelope(frame: PcmFrame) = EventEnvelope(frame.epoch.sessionId, frame.epoch.generation,
         "synthetic-gap", frame.startNanos, frame.endNanos)
-    private class Fixture(private val observe: (HostEvent) -> Unit = {}) : AutoCloseable {
+    private class Fixture(onFrameSignal: ((PcmFrame, Boolean) -> Unit)? = null,
+        private val observe: (HostEvent) -> Unit = {}) : AutoCloseable {
         val vad = ScriptedVad()
         val asr = RecordingAsr()
         val speaker = PendingSpeaker()
         val events = CopyOnWriteArrayList<HostEvent>()
         val cancelled = CopyOnWriteArrayList<String>()
-        val pipeline = SpeechPipeline(vad, asr, speaker, { events += it; observe(it) }, cancelled::add)
+        val pipeline = SpeechPipeline(vad, asr, speaker, { events += it; observe(it) }, cancelled::add,
+            onFrameSignal = onFrameSignal)
         val transcripts get() = events.filterIsInstance<TranscriptEvent>().map { it.revision }
         override fun close() { speaker.block?.countDown(); pipeline.close() }
     }
@@ -490,6 +492,18 @@ class SpeechPipelineTest {
             assertEquals(replacementTurn, f.transcripts.last().turnId)
             assertEquals("replacement remains active", f.transcripts.last().text)
             assertFalse(replacementTurn in f.cancelled)
+        }
+    }
+
+    @Test fun `frame signal observes every accepted frame exactly once with its VAD decision`() {
+        val seen = mutableListOf<Pair<Long, Boolean>>()
+        Fixture(onFrameSignal = { input, speech -> seen += input.range.first to speech }).use { f ->
+            f.vad.decision = VadDecision(false, false)
+            f.pipeline.accept(frame(0))
+            f.pipeline.accept(frame(1))
+            f.vad.decision = VadDecision(true, false)
+            f.pipeline.accept(frame(2))
+            assertEquals(listOf(0L to false, 320L to false, 640L to true), seen)
         }
     }
 }

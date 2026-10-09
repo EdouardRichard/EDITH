@@ -11,7 +11,8 @@ import java.util.concurrent.TimeUnit
 
 class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEngine,
     private val speaker: SpeakerEngine, private val emit: (HostEvent) -> Unit,
-    private val cancelTurn: (String) -> Unit, val timeline: TurnTimeline = TurnTimeline()) {
+    private val cancelTurn: (String) -> Unit, val timeline: TurnTimeline = TurnTimeline(),
+    private val onFrameSignal: ((PcmFrame, Boolean) -> Unit)? = null) {
     private data class Identity(val epoch: InputEpoch, val continuity: String, val rate: Int)
     private class Turn(val id: String, val first: PcmFrame) {
         val timeline = TurnRevision(id, first.startNanos)
@@ -79,6 +80,9 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
             }
             synchronized(admission) { identity = next }
             val decision = vad.accept(frame)
+            // Per-frame observation for the acoustic gate; deferred like every other callback so it never runs
+            // while the worker lock is held.
+            onFrameSignal?.let { signal -> actions += { signal(frame, decision.speech) } }
             if (turn == null && decision.speech) {
                 turn = Turn(UUID.randomUUID().toString(), preRoll.firstOrNull() ?: frame)
                 preRoll.forEach { feed(turn!!, it, actions) }
