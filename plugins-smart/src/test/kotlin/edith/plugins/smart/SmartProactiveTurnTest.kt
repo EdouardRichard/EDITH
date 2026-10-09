@@ -503,6 +503,39 @@ class SmartProactiveTurnTest {
         }
     }
 
+    @Test
+    fun `an utterance consumed by a wake turn logs no proactive skip`() {
+        val rig = SmartTestRig()
+        rig.activate()
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+
+        withLines { lines ->
+            rig.plugin.handle(rig.wakeEvent())
+            rig.plugin.handle(TranscriptEvent(rig.transcript("第一句话请回答我", turnId = "asr-1")))
+
+            // The wake path consumed it; a `P3_PROACTIVE skip` line here would only pollute the acceptance vocabulary.
+            assertTrue(lines.none { it.startsWith("P3_PROACTIVE") }, lines.toString())
+        }
+    }
+
+    @Test
+    fun `a non string hint argument is unparsable rather than coerced`() {
+        val rig = SmartTestRig()
+        rig.activate()
+        rig.model.onRequest = { request, listener ->
+            listener(smartToolCall("c1", "propose_hint", """{"text":42}""", requestId = request.requestId))
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+
+        withLines { lines ->
+            arm(rig)
+            rig.plugin.handle(TranscriptEvent(rig.transcript("这句话是不是值得提醒一下")))
+
+            assertTrue(rig.output.hints.isEmpty(), "a number is not a hint")
+            assertTrue(lines.any { it.startsWith("P3_PROACTIVE silence reason=UNPARSABLE") }, lines.toString())
+        }
+    }
+
     // ---- the request's context -------------------------------------------------------------------------------------
 
     @Test

@@ -163,7 +163,7 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
                 // missing key, so an old store keeps loading instead of being treated as corrupt.
                 proactiveCooldownMillis = json["proactiveCooldownMillis"]?.jsonPrimitive?.longOrNull
                     ?: SmartSettings().proactiveCooldownMillis,
-                proactiveSensitivity = json["proactiveSensitivity"]?.jsonPrimitive?.content
+                proactiveSensitivity = json["proactiveSensitivity"]?.jsonPrimitive?.contentOrNull
                     ?: SmartSettings().proactiveSensitivity,
             )
         }.getOrNull()

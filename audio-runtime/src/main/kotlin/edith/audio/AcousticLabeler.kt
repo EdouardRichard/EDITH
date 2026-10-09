@@ -58,8 +58,23 @@ class AcousticLabeler(
         return settled
     }
 
-    /** The condition this frame supports, or null for the mid band that supports none of the three labels. */
-    private fun condition(rms: Float, speech: Boolean): AcousticLabel? {
+    /**
+     * Forgets the current label and every hold window.
+     *
+     * The pipeline calls this whenever it drops its accumulated state (a gap, a format change, a fault, or a close),
+     * because a labeler that kept believing the last label would swallow the first transition after the break: the
+     * frame after a gap is compared against a label derived from audio from before it. A fresh hold then has to elapse
+     * again, which is what makes this a *reset* rather than a re-arm.
+     */
+    fun reset() {
+        label = null
+        speechSince = null
+        silenceSince = null
+        noiseSince = null
+        resetNoise()
+    }
+
+    /** The condition this frame supports, or null for the mid band that supports none of the three labels. */    private fun condition(rms: Float, speech: Boolean): AcousticLabel? {
         val noiseBand = !speech && rms >= noiseFloor
         val steady = if (noiseBand) observeNoise(rms) else { resetNoise(); false }
         return when {

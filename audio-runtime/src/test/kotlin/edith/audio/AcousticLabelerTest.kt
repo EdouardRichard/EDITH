@@ -45,4 +45,30 @@ class AcousticLabelerTest {
         assertTrue((0 until 39).all { labeler.accept(silence(it), speech = false) == null })
         assertEquals(AcousticLabel.Silence, labeler.accept(silence(39), speech = false))
     }
+
+    @Test fun `a reset forgets the current label and restarts the hold windows`() {
+        val labeler = AcousticLabeler()
+        assertEquals(AcousticLabel.Silence,
+            (0 until 40).map { labeler.accept(silence(it), speech = false) }.filterNotNull().single())
+
+        // The pipeline dropped its state (a gap, a format change, a fault): the labeler must not keep believing the
+        // room is still silent, or the first transition after the break is swallowed.
+        labeler.reset()
+        val afterReset = (100 until 140).map { labeler.accept(silence(it), speech = false) }
+
+        assertEquals(listOf(AcousticLabel.Silence), afterReset.filterNotNull(),
+            "the same transition is reported again after a reset")
+    }
+
+    @Test fun `a reset before the first hold was reported means no transition is invented`() {
+        val labeler = AcousticLabeler()
+        repeat(20) { assertNull(labeler.accept(silence(it), speech = false)) }
+
+        labeler.reset()
+
+        // The hold restarts from the reset, not from the first frame the labeler ever saw.
+        assertNull(labeler.accept(silence(20), speech = false))
+        assertTrue((21 until 59).all { labeler.accept(silence(it), speech = false) == null })
+        assertEquals(AcousticLabel.Silence, labeler.accept(silence(59), speech = false))
+    }
 }

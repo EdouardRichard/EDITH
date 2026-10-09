@@ -1387,7 +1387,10 @@ internal class CxrAudioChain private constructor(
                 emit = { event -> holder[0]?.onEvent(event); emit(event) }, cancelTurn = cancelTurn,
                 onFrameSignal = { frame, speech ->
                     labeler.accept(frame, speech)?.let { label -> chainHolder[0]?.acousticEmit?.invoke(label) }
-                })
+                },
+                // The pipeline's own state is dropped on a gap/format change/fault/close; the labeler's must go with
+                // it, or the first transition after the break is compared against a pre-break verdict.
+                onReset = { labeler.reset() })
             val session = SherpaAsrSession(pipeline)
             holder[0] = session
             return CxrAudioChain(ingress, framer, pipeline, wake, scheduler, clock, onFault, onOffer, session,

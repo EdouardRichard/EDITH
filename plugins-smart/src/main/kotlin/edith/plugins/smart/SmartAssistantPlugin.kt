@@ -52,9 +52,8 @@ import edith.plugin.textOutput
 import edith.plugin.wakeWord
 import java.util.UUID
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 
 private const val CONFIG_SCHEMA_VERSION = 1
 private const val DEFAULT_WAKE_WORDS = "伊迪丝,edith"
@@ -426,7 +425,13 @@ class SmartAssistantPlugin(
             is TranscriptEvent -> {
                 val (started, proactive) = synchronized(gate) {
                     if (!matches(event.envelope)) null to null
-                    else acceptTranscript(event.revision) to proactiveTrigger(event.revision)
+                    else {
+                        val consumed = acceptTranscript(event.revision)
+                        // The proactive path is only consulted when no wake turn took the utterance: a wake turn's own
+                        // transcript is not a proactive candidate, and evaluating it anyway only wrote a
+                        // `P3_PROACTIVE skip` line into the acceptance vocabulary.
+                        consumed to (if (consumed == null) proactiveTrigger(event.revision) else null)
+                    }
                 }
                 if (started != null) runTurn(started.first, started.second)
                 else if (proactive != null) runProactive(proactive)
@@ -913,11 +918,19 @@ class SmartAssistantPlugin(
         return fresh ?: remembered
     }
 
-    /** The hint text in one tool call's arguments, or null when they are not a JSON object with a non-blank `text`. */
-    private fun parseHint(argsJson: String): String? =
-        runCatching { proactiveJson.parseToJsonElement(argsJson).jsonObject["text"]?.jsonPrimitive?.contentOrNull }
-            .getOrNull()
-            ?.takeIf { it.isNotBlank() }
+    /**
+     * The hint text in one tool call's arguments, or null when they are not a JSON object whose `text` is a non-blank
+     * **string**.
+     *
+     * The schema asks for a string, so a number or an object is a model error, not a hint: coercing `42` into `"42"`
+     * would put text on the wearer's screen that no instruction asked for.
+     */
+    private fun parseHint(argsJson: String): String? = runCatching {
+        val element = proactiveJson.parseToJsonElement(argsJson).jsonObject["text"] ?: return null
+        val primitive = element as? JsonPrimitive ?: return null
+        if (!primitive.isString) return null
+        primitive.content.takeIf { it.isNotBlank() }
+    }.getOrNull()
 
     /** Records a proactive outcome that shows nothing, and releases the hint slot. */
     private fun silence(hint: ProactiveHint, reason: String, elapsedMillis: Long) {

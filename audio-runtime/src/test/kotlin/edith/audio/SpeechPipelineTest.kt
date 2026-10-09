@@ -17,6 +17,7 @@ class SpeechPipelineTest {
     private fun envelope(frame: PcmFrame) = EventEnvelope(frame.epoch.sessionId, frame.epoch.generation,
         "synthetic-gap", frame.startNanos, frame.endNanos)
     private class Fixture(onFrameSignal: ((PcmFrame, Boolean) -> Unit)? = null,
+        onReset: (() -> Unit)? = null,
         private val observe: (HostEvent) -> Unit = {}) : AutoCloseable {
         val vad = ScriptedVad()
         val asr = RecordingAsr()
@@ -24,7 +25,7 @@ class SpeechPipelineTest {
         val events = CopyOnWriteArrayList<HostEvent>()
         val cancelled = CopyOnWriteArrayList<String>()
         val pipeline = SpeechPipeline(vad, asr, speaker, { events += it; observe(it) }, cancelled::add,
-            onFrameSignal = onFrameSignal)
+            onFrameSignal = onFrameSignal, onReset = onReset)
         val transcripts get() = events.filterIsInstance<TranscriptEvent>().map { it.revision }
         override fun close() { speaker.block?.countDown(); pipeline.close() }
     }
@@ -504,6 +505,22 @@ class SpeechPipelineTest {
             f.vad.decision = VadDecision(true, false)
             f.pipeline.accept(frame(2))
             assertEquals(listOf(0L to false, 320L to false, 640L to true), seen)
+        }
+    }
+
+    @Test fun `a discontinuity and a close both reset the frame observer`() {
+        var resets = 0
+        Fixture(onReset = { resets++ }).use { f ->
+            f.pipeline.accept(frame(0))
+            assertEquals(0, resets, "a plain frame is not a reset")
+
+            // The pipeline just dropped its accumulated state, so anything deriving from its frames has to drop its
+            // own - otherwise the first transition after the break is compared against a stale label.
+            f.pipeline.discontinuity(envelope(frame(1)), GapReason.OVERFLOW)
+            assertEquals(1, resets)
+
+            f.pipeline.close()
+            assertEquals(2, resets, "closing drops the state too")
         }
     }
 }

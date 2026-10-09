@@ -19,8 +19,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
@@ -176,36 +180,52 @@ class MainActivity : ComponentActivity() {
                         // P3.2 Stage B: the perception sources that need a system grant. Each entry opens the system
                         // screen for its own special access and says, truthfully, what the assistant cannot see
                         // without it - a refused source contributes **no** context key, never a placeholder.
+                        //
+                        // The grant is a plain property, not observable state, and the user changes it *outside* this
+                        // App - so returning from Settings recomposes nothing and the copy would keep the answer it
+                        // was built with. `grantEpoch` is bumped on every resume to re-read all three.
+                        val lifecycleOwner = LocalLifecycleOwner.current
+                        var grantEpoch by remember { mutableStateOf(0) }
+                        DisposableEffect(lifecycleOwner) {
+                            val observer = LifecycleEventObserver { _, event ->
+                                if (event == Lifecycle.Event.ON_RESUME) grantEpoch++
+                            }
+                            lifecycleOwner.lifecycle.addObserver(observer)
+                            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+                        }
                         root.foregroundAppSource?.let { foreground ->
                             val activityContext = LocalContext.current
+                            val granted = remember(grantEpoch) { foreground.isGranted }
                             OutlinedButton(onClick = {
                                 runCatching {
                                     activityContext.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
                                 }
                             }) { Text("前台 App 感知授权（使用情况访问）") }
-                            if (!foreground.isGranted) {
+                            if (!granted) {
                                 Text("未授予使用情况访问，主动辅助看不到前台 App。", color = MaterialTheme.colorScheme.error)
                             }
                         }
                         root.notificationCategorySource?.let { notifications ->
                             val activityContext = LocalContext.current
+                            val connected = remember(grantEpoch) { notifications.isConnected }
                             OutlinedButton(onClick = {
                                 runCatching {
                                     activityContext.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                                 }
                             }) { Text("通知分类感知授权（通知使用权）") }
-                            if (!notifications.isConnected) {
+                            if (!connected) {
                                 Text("未连接通知监听，主动辅助看不到通知分类（只读分类，不读通知内容）。",
                                     color = MaterialTheme.colorScheme.error)
                             }
                         }
                         root.calendarSource?.let { calendar ->
+                            val granted = remember(grantEpoch) { calendar.isGranted }
                             val requestCalendar = rememberLauncherForActivityResult(
-                                ActivityResultContracts.RequestPermission()) { }
+                                ActivityResultContracts.RequestPermission()) { grantEpoch++ }
                             OutlinedButton(onClick = { requestCalendar.launch(Manifest.permission.READ_CALENDAR) }) {
                                 Text("日程标题感知授权（日历权限）")
                             }
-                            if (!calendar.isGranted) {
+                            if (!granted) {
                                 Text("未授予日历权限，主动辅助看不到今天的日程标题。", color = MaterialTheme.colorScheme.error)
                             }
                         }

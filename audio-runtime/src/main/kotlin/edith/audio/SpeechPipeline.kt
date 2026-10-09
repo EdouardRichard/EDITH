@@ -12,7 +12,15 @@ import java.util.concurrent.TimeUnit
 class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEngine,
     private val speaker: SpeakerEngine, private val emit: (HostEvent) -> Unit,
     private val cancelTurn: (String) -> Unit, val timeline: TurnTimeline = TurnTimeline(),
-    private val onFrameSignal: ((PcmFrame, Boolean) -> Unit)? = null) {
+    private val onFrameSignal: ((PcmFrame, Boolean) -> Unit)? = null,
+    /**
+     * Called whenever the pipeline drops its accumulated state - a discontinuity, a fault, or a close.
+     *
+     * A consumer that derives its own state from the frames ([onFrameSignal]) has to drop that state at the same
+     * moment: keeping it would compare post-break audio against a pre-break verdict. Like the frame signal, it is
+     * invoked from the deferred action batch, never while the worker lock is held.
+     */
+    private val onReset: (() -> Unit)? = null) {
     private data class Identity(val epoch: InputEpoch, val continuity: String, val rate: Int)
     private class Turn(val id: String, val first: PcmFrame) {
         val timeline = TurnRevision(id, first.startNanos)
@@ -325,6 +333,7 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
             pending.toList().also { pending.clear() }
         }
         timeline.clear()
+        onReset?.let { hook -> actions += { hook() } }
         val turnIds = (requests.map { it.turnId } + listOfNotNull(turn?.id)).toSet()
         turn = null
         turnIds.forEach { id -> actions += { runCatching { cancelTurn(id) }; Unit } }

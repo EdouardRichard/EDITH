@@ -3,16 +3,17 @@ package edith.plugins.smart
 import edith.contracts.AcousticLabel
 
 /**
- * How sensitive the proactive path is, as a threshold pair rather than a numeric dial.
+ * How sensitive the proactive path is.
  *
- * [minSpeechMillis] is the shortest stretch of speech worth considering (the acoustic labeler already holds its own
- * windows; this is the *business* floor) and [minTranscriptChars] is the shortest transcript worth a model request.
- * A six-character utterance is routine small talk at `LOW` and a plausible request at `HIGH`.
+ * The dial is the **shortest transcript worth a model request**: a six-character utterance is routine small talk at
+ * `LOW` and a plausible request at `HIGH`. There is deliberately no speech-duration half: the plugin receives a
+ * transcript, not an audio timeline, so a millisecond threshold here would be a number nothing could ever measure -
+ * the acoustic labeler already applies its own hold windows before a label is reported at all.
  */
-internal enum class ProactiveSensitivity(val minSpeechMillis: Long, val minTranscriptChars: Int) {
-    LOW(1200, 12),
-    MEDIUM(800, 8),
-    HIGH(400, 4),
+internal enum class ProactiveSensitivity(val minTranscriptChars: Int) {
+    LOW(12),
+    MEDIUM(8),
+    HIGH(4),
 }
 
 /**

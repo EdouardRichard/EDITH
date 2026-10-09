@@ -129,7 +129,8 @@ object SmartSettingsForm {
         return level
     }
 
-    private fun parseWhitelist(text: String, errors: MutableList<String>): List<String> {        val accepted = mutableListOf<String>()
+    private fun parseWhitelist(text: String, errors: MutableList<String>): List<String> {
+        val accepted = mutableListOf<String>()
         text.split(',', '，').forEach { raw ->
             val entry = raw.trim()
             if (entry.isEmpty()) return@forEach
