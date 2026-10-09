@@ -17,8 +17,16 @@ import java.util.concurrent.atomic.AtomicInteger
  * interval in which the App itself is emitting sound, and nothing else.
  *
  * The depth is a counter rather than a flag because playbacks can nest (one hint's speech starting before the
- * previous one finished): the gate stays closed until the **last** playback ends. [end] never drives the depth
- * below zero, so an unbalanced `end` from a failed playback cannot leave the gate looking open forever.
+ * previous one finished): the gate stays closed until the **last** playback ends.
+ *
+ * **The counter does not clamp (fixed 2026-10-09, found by the P3.2 full regression).** It used to stop `end` at zero,
+ * which reads as a guard against an unbalanced call but is not: `begin` and `end` arrive on different threads, so
+ * `end` routinely runs ahead of its matching `begin`, and every decrement the clamp discarded was a **lost update** -
+ * a balanced pair could leave the gate closed for good, silently suppressing the wake word from then on. A plain
+ * decrement makes "balanced begin/end leaves nothing playing" true for every interleaving, which is the property that
+ * matters. The accepted trade-off is the opposite one: an unmatched `end` leaves a *credit* that swallows one later
+ * `begin`, costing a single un-suppressed playback (mild, transient) rather than a gate that never opens (severe,
+ * permanent). [isPlaying] is `depth > 0`, so a negative depth still reads as "not playing".
  *
  * Written from the playback/audio thread and read from the detection loop, so every operation is atomic.
  */
@@ -31,9 +39,9 @@ class PlaybackGate {
         depth.incrementAndGet()
     }
 
-    /** A playback finished. Idempotent: an unmatched call does not push the depth below zero. */
+    /** A playback finished. Unmatched calls leave a credit rather than being discarded; see the class note. */
     fun end() {
-        depth.updateAndGet { current -> if (current > 0) current - 1 else 0 }
+        depth.decrementAndGet()
     }
 
     /** True while at least one playback is in flight. */

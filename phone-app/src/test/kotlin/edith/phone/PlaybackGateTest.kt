@@ -59,15 +59,18 @@ class PlaybackGateTest {
     }
 
     @Test
-    fun endingWithoutBeginningNeverDrivesTheDepthBelowZero() {
+    fun anUnmatchedEndNeverMakesTheGateLookPlaying() {
         val gate = PlaybackGate()
 
         gate.end()
         gate.end()
 
-        assertFalse("an unbalanced end must not make the gate look open for the rest of the session", gate.isPlaying)
-        gate.begin()
-        assertTrue("the next real playback must still close the gate", gate.isPlaying)
+        assertFalse("an unbalanced end must not make the gate look busy", gate.isPlaying)
+        // The old form of this test also demanded that "the next real playback must still close the gate", i.e. that a
+        // stray end be *discarded*. That is the requirement `beginAndEndFromTwoThreadsLeaveTheGateOpenAgain` cannot
+        // live with: with the clamp in place, an `end` that runs ahead of its matching `begin` is a lost update and a
+        // balanced pair can leave the gate closed for the rest of the session. The clamp is gone; a stray end is now
+        // credit, and `aStrayEndIsRecordedAsCreditRatherThanSwallowingTheNextRealBegin` pins that direction.
     }
 
     @Test
@@ -106,6 +109,29 @@ class PlaybackGateTest {
         starter.join(); ender.join()
 
         assertFalse("balanced begin/end from two threads leave nothing playing", gate.isPlaying)
+    }
+
+    @Test
+    fun aStrayEndIsRecordedAsCreditRatherThanSwallowingTheNextRealBegin() {
+        // The defect behind this test (found in the P3.2 full regression, 2026-10-09): `end` used to clamp the depth at
+        // zero, so when `end` ran ahead of `begin` - which is what threads do - those decrements were **discarded** and
+        // a balanced pair could still leave the gate closed forever, silently muting the wake word from then on.
+        // The accepted trade-off is the opposite one: one stray `end` leaves a credit that swallows the *next* begin,
+        // which costs one un-suppressed playback (mild, transient) instead of a gate that never opens (severe,
+        // permanent). This test pins that documented direction.
+        val gate = PlaybackGate()
+
+        gate.end()
+        assertFalse("an unmatched end never makes the gate look busy", gate.isPlaying)
+
+        // ...and the credit it left is exactly one, so the next playback is not counted: the depth is -1 + 1 = 0.
+        gate.begin()
+        assertFalse("the stray end is a credit, not a lost update", gate.isPlaying)
+
+        gate.begin()
+        assertTrue("a second real playback closes the gate again", gate.isPlaying)
+        gate.end()
+        assertFalse(gate.isPlaying)
     }
 
     // ---- the wiring: the real detector over the real gate --------------------------------------------
