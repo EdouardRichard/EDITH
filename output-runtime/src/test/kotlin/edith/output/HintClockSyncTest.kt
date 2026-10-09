@@ -91,6 +91,74 @@ class HintClockSyncTest {
         assertEquals(2, sent.filterIsInstance<HintCommand.Ping>().size, "another exchange must be attempted")
     }
 
+    /**
+     * D5, measured on the K40 2026-10-09: once a session's clock mapping was live, a lost `PING` left the exchange
+     * outstanding forever - no renewal is ever scheduled from a mapping that was never published, so the mapping simply
+     * expired and the display stayed dead until the wearer stopped and restarted the session.
+     *
+     * The break these tests catch: a lost exchange **after a live mapping** must be retried, the retry must be a
+     * **new** exchange, the abandoned identifier must not be resurrected by a late `PONG`, and the retry must stay out
+     * of the opening window - that window is `CxrHintLink`'s bounded `HELLO`+`PING` plan (D15), and a second unbounded
+     * retry armed here would quietly turn "gives up after five tries" into "never gives up".
+     */
+    @Test
+    fun aLostRenewalIsExchangedAgainInsteadOfStallingTheDisplay() {
+        val handler = sync()
+        handler.sessionEstablished("s-1", 1L)
+        completeExchange(latencyNanos = 1_000_000, offsetNanos = 0, handler = handler)
+
+        scheduler.fireAll()
+        assertEquals(2, sent.filterIsInstance<HintCommand.Ping>().size)
+
+        scheduler.fireAll()
+
+        val pings = sent.filterIsInstance<HintCommand.Ping>()
+        assertEquals(3, pings.size, "a lost exchange must be retried, not left outstanding for the session: $sent")
+        assertTrue(pings.last().syncId != pings[1].syncId,
+            "the retry is a new exchange, not a reuse of an identifier no mapping was published for")
+    }
+
+    @Test
+    fun anAnsweredRetryMakesTheDisplayUsableAgain() {
+        val handler = sync()
+        handler.sessionEstablished("s-1", 1L)
+        completeExchange(latencyNanos = 1_000_000, offsetNanos = 0, handler = handler)
+        scheduler.fireAll()
+        scheduler.fireAll()
+
+        val retry = sent.filterIsInstance<HintCommand.Ping>().last()
+        completeExchange(latencyNanos = 1_000_000, offsetNanos = 0, handler = handler)
+
+        assertTrue(handler.hasLiveMapping(), "a retry that is answered must recover the display: $sent")
+        assertEquals(retry.syncId, handler.syncId())
+    }
+
+    @Test
+    fun aPongForTheAbandonedExchangeIsNotAdopted() {
+        val handler = sync()
+        handler.sessionEstablished("s-1", 1L)
+        val live = completeExchange(latencyNanos = 1_000_000, offsetNanos = 0, handler = handler)
+        scheduler.fireAll()
+        val abandoned = sent.filterIsInstance<HintCommand.Ping>().last()
+        scheduler.fireAll()
+
+        assertFalse(handler.onCommand(HintCommand.Pong(abandoned.syncId, abandoned.p0, abandoned.p0, abandoned.p0)),
+            "a late answer to an abandoned exchange must not publish a mapping")
+        assertEquals(live.syncId, handler.syncId(),
+            "the live mapping must stay the one that was actually published")
+    }
+
+    @Test
+    fun theOpeningExchangeIsLeftToTheLinksBoundedRepeat() {
+        val handler = sync()
+        handler.sessionEstablished("s-1", 1L)
+
+        scheduler.fireAll()
+
+        assertEquals(1, sent.filterIsInstance<HintCommand.Ping>().size,
+            "no mapping was ever published, so this retry must stay out of the opening window: $sent")
+    }
+
     @Test
     fun theMappingIsRenewedBeforeItExpiresAndStaysLiveUntilThen() {
         val handler = sync()

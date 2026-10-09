@@ -115,7 +115,10 @@ class MainActivity : ComponentActivity() {
                                 plugins.forEach { (id, label) -> DropdownMenuItem(text = { Text(label) }, onClick = { viewModel.selectPlugin(id); expanded = false }) }
                             }
                         }
-                        if (selected != "p2-diagnostic") Text("业务功能尚未交付", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        // D7: 智能助手's business functions are delivered (P3.1), so the blanket "尚未交付" was false
+                        // for it. Only the interview assistant is still a shell - it needs Speaker, which the
+                        // environment deliberately does not advertise - so the line stays for that one.
+                        if (selected == "interview-assistant") Text("面试助手功能尚未交付（P4）", color = MaterialTheme.colorScheme.onSurfaceVariant)
                         var helpResult by remember { mutableStateOf<String?>(null) }
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             val inactive = state.session == SessionState.Idle || state.session == SessionState.Paused
@@ -175,8 +178,8 @@ class MainActivity : ComponentActivity() {
                             }) { Text(if (cxrReady) "重连眼镜" else "连接眼镜（CXR）") }
                             connectResult?.let { Text(it) }
                         }
-                        state.capabilityReasons.forEach { (capability, _) ->
-                            ListItem(headlineContent = { Text(capabilityLabel(capability)) }, supportingContent = { Text("尚不可用") }, leadingContent = { Icon(Icons.Default.Info, null) })
+                        state.capabilityReasons.forEach { (capability, reason) ->
+                            ListItem(headlineContent = { Text(capabilityLabel(capability)) }, supportingContent = { Text("尚不可用（${capabilityReasonLabel(reason)}）") }, leadingContent = { Icon(Icons.Default.Info, null) })
                         }
                         HorizontalDivider()
                         SmartSettingsSection(loadSettings, saveSettings)

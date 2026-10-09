@@ -143,6 +143,13 @@ class HostCompositionRoot internal constructor(
      */
     internal var diagnosticHintSender: (() -> Boolean)? = null
 
+    /**
+     * Debug-only: submits a hint of a **given** text through the diagnostic probe plugin, or null when no probe is
+     * registered. Unlike [diagnosticHintSender] this is driven from a host shell (P3.2 Stage 0's capacity probe) and
+     * its text must reach the display unchanged, so the caller owns the length. Never present in a release build.
+     */
+    internal var diagnosticHintTextSender: ((String) -> Boolean)? = null
+
     init {
         // Activation runs when the scene becomes ready, which is before the first clock mapping exists, so a plugin
         // whose only missing capability is the display is refused at that moment. Two signals retry it, because the
@@ -150,28 +157,51 @@ class HostCompositionRoot internal constructor(
         // was not live before, and **every** successful exchange - the link's steady state is "live and re-syncing
         // in place", which fires no transition at all (D10, measured on the K40 2026-10-09, where a refused
         // activation stayed unretryable for a whole session while `mapping live` recurred every ~20 s).
-        hintLink?.onDisplayBecameLive = { retryActivationForDisplay() }
-        hintLink?.onMappingLive = { retryActivationForDisplay() }
+        //
+        // D7: the same two signals are also the only moments the answerable set can grow, so the capability panel is
+        // recomputed here as well - **outside** that retry's `awaitingDisplayForActivation` gate, which is closed
+        // whenever nothing was refused and would otherwise leave the panel stale for a perfectly healthy session.
+        hintLink?.onDisplayBecameLive = { onDisplaySignal() }
+        hintLink?.onMappingLive = { onDisplaySignal() }
     }
-    private val reasons = Capability.entries.filter { it !in (environment?.availableCapabilities ?: emptySet()) }
-        .associateWith { when (it) {
-            Capability.Audio -> "TRANSPORT_MISSING"
-            Capability.Asr, Capability.Speaker -> "ENGINE_MISSING"
-            Capability.Model -> "MODEL_OPERATION_UNAVAILABLE"
-            Capability.TextOutput -> "DISPLAY_MISSING"
-            Capability.SpeechOutput -> "SPEECH_OUTPUT_MISSING"
-            Capability.Storage -> "HOST_STORAGE_PROVIDER_MISSING"
-            Capability.Actions -> "ACTION_PROVIDER_MISSING"
-            Capability.Context -> "CONTEXT_PROVIDER_MISSING"
-            Capability.WakeWord -> "WAKE_PROVIDER_MISSING"
-        } }
-    private val mutableState = MutableStateFlow(SessionUiState(SessionState.Idle, null, reasons, null))
+
+    /** One display signal: the panel follows what is wired now, then an activation refused for the display is retried. */
+    private fun onDisplaySignal() {
+        mutableState.update { it.copy(capabilityReasons = capabilityReasons()) }
+        retryActivationForDisplay()
+    }
+    /**
+     * What each capability the environment cannot answer is reported as, **recomputed on every read** (D7).
+     *
+     * This used to be a `val` computed once at construction and stored in the UI state. The environment's
+     * `availableCapabilities` is a live derivation - `TextOutput` appears only once a clock mapping makes the display
+     * real - so the stored copy was a start-up snapshot: measured on the K40 on 2026-10-09, the 会话 page still read
+     * `眼镜显示/尚不可用` after the display had become real and a plugin had activated on the strength of it. Nothing
+     * gates on this map; it is the panel's, which is exactly why it must not be able to lie about the present.
+     */
+    private fun capabilityReasons(): Map<Capability, String> =
+        Capability.entries.filter { it !in (environment?.availableCapabilities ?: emptySet()) }
+            .associateWith { reasonFor(it) }
+
+    private fun reasonFor(capability: Capability): String = when (capability) {
+        Capability.Audio -> "TRANSPORT_MISSING"
+        Capability.Asr, Capability.Speaker -> "ENGINE_MISSING"
+        Capability.Model -> "MODEL_OPERATION_UNAVAILABLE"
+        Capability.TextOutput -> "DISPLAY_MISSING"
+        Capability.SpeechOutput -> "SPEECH_OUTPUT_MISSING"
+        Capability.Storage -> "HOST_STORAGE_PROVIDER_MISSING"
+        Capability.Actions -> "ACTION_PROVIDER_MISSING"
+        Capability.Context -> "CONTEXT_PROVIDER_MISSING"
+        Capability.WakeWord -> "WAKE_PROVIDER_MISSING"
+    }
+    private val mutableState =
+        MutableStateFlow(SessionUiState(SessionState.Idle, null, capabilityReasons(), null))
     val state: StateFlow<SessionUiState> = mutableState.asStateFlow()
     private val observation = host.observeState { session ->
         // D13: the upload grant is scoped to one session, and every path back to Idle ends it - including the ones
         // that call `host.stop()` directly (a denied start) and never reach this composition's `stop`.
         if (session == SessionState.Idle) sessionUploadConsent.deactivate()
-        mutableState.update { it.copy(session = session) }
+        mutableState.update { it.copy(session = session, capabilityReasons = capabilityReasons()) }
     }
     private var closed = false
     private var activatedPlugin: String? = null
@@ -738,7 +768,10 @@ class HostCompositionRoot internal constructor(
             // D13: the one instance the UI's switch writes and the model client reads. Session state only - nothing
             // here is persisted, and it starts off.
             val sessionUploadConsent = SessionUploadConsent()
-            val http = OkHttpClient()
+            // The model request had no production line before the P3.1 wrap-up: the client was built with no
+            // interceptor, so a successful request was silent and that hop rested on its effects. This is the one line
+            // that closes the gap, and it carries nothing but method, status and duration (`ModelHttpLog`).
+            val http = OkHttpClient.Builder().addInterceptor(ModelHttpLog(clock::nowNanos)).build()
             val model = ControlledModelClient(http, profiles, resolver, CapabilityGate(), ContextBudgeter(), clock, scheduler,
                 consentSource(sessionUploadConsent, probeGate::requestConsent))
             val controlledTester = ControlledProfileTester(model, profiles, clock)
