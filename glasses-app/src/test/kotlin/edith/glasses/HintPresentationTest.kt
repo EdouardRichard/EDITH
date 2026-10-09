@@ -65,14 +65,15 @@ class HintPresentationTest {
     fun aRenderedHintReportsItsLineCountAndSizeWithoutItsText() {
         // P3.2 Stage 0: the layout's own limit was invisible - a hint that overflowed six lines was clipped with
         // nothing said about it. This line is the measurement instrument for the capacity probe, and it must never
-        // carry the hint's text. P3.2-CLIP appended `pages`: the same overflow is now walked through, not lost.
-        assertEquals("hint rendered lines=5 maxLines=6 chars=53 clipped=false pages=1",
+        // carry the hint's text. P3.2-CLIP appended `scrollMillis`: the same overflow is now slid through, not lost.
+        assertEquals("hint rendered lines=5 maxLines=6 chars=53 clipped=false scrollMillis=0",
             HintPresentation.renderReport(lines = 5, chars = 53))
     }
 
     @Test
-    fun aHintTallerThanTheWindowIsReportedWithThePagesItTakesToShowIt() {
-        assertEquals("hint rendered lines=11 maxLines=6 chars=120 clipped=true pages=2",
-            HintPresentation.renderReport(lines = 11, chars = 120))
+    fun aHintTallerThanTheWindowIsReportedWithHowLongItsSlideTakes() {
+        // Seven lines is one hidden line, so the slide lasts exactly one reading pace.
+        assertEquals("hint rendered lines=7 maxLines=6 chars=81 clipped=true scrollMillis=1400",
+            HintPresentation.renderReport(lines = 7, chars = 81))
     }
 }

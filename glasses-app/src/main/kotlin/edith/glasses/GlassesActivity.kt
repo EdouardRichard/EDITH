@@ -1,15 +1,15 @@
 package edith.glasses
 
+import android.animation.ValueAnimator
 import android.app.Activity
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.os.PowerManager
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.WindowManager
+import android.view.animation.LinearInterpolator
 import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -69,8 +69,8 @@ class GlassesActivity : Activity() {
     private lateinit var hintScroll: ScrollView
     private lateinit var statusView: TextView
 
-    /** Drives [scheduleAutoScroll]; every callback is cleared on the next render, so a stale walk cannot outlive a hint. */
-    private val scrollHandler = Handler(Looper.getMainLooper())
+    /** Drives [scheduleAutoScroll]: one slide per hint, cancelled the moment the hint changes or leaves the screen. */
+    private var scrollAnimator: ValueAnimator? = null
 
     private val powerManager by lazy { getSystemService(PowerManager::class.java) }
 
@@ -101,13 +101,15 @@ class GlassesActivity : Activity() {
         super.onPause()
         // Leaving the foreground ends the visible hint's claim on the panel; the controller clears the text too.
         holdAwakeFor(false)
-        // ...and with it the auto-scroll walk, so no posted page can slide a hint that is no longer on screen.
-        scrollHandler.removeCallbacksAndMessages(null)
+        // ...and with it the slide, so a hint that is no longer on screen cannot keep moving.
+        scrollAnimator?.cancel()
+        scrollAnimator = null
     }
 
     override fun onDestroy() {
         // Leaving the screen must never leave text on the glasses, and the endpoint must not keep a dead Activity.
-        scrollHandler.removeCallbacksAndMessages(null)
+        scrollAnimator?.cancel()
+        scrollAnimator = null
         runCatching { controller.disconnect() }
         holdAwakeFor(false)
         RokidBridgeEndpoint.instance.setListener(null)
@@ -154,15 +156,6 @@ class GlassesActivity : Activity() {
          * remaining TTL, 10 s for the debug probe) and a safety net for a hint whose clear never arrives.
          */
         const val HINT_HOLD_MILLIS = 15_000L
-
-        /**
-         * How many times the auto-scroll walk repeats within one hint.
-         *
-         * The phone's TTL is 5 s (passive) and 8 s (proactive) while one pass over a ten-line answer takes four times
-         * [HintAutoScroll.DWELL_MILLIS]; two rounds mean the tail is reachable even for a wearer who looks up late.
-         * The walk stops when the hint leaves the screen, so a longer hold costs nothing.
-         */
-        const val AUTO_SCROLL_ROUNDS = 2
     }
 
     private fun render(text: String?) {
@@ -186,31 +179,34 @@ class GlassesActivity : Activity() {
     }
 
     /**
-     * Walks a hint taller than the window through its pages (P3.2 `P3.2-CLIP`).
+     * Slides a hint taller than the window down to its end (P3.2 `P3.2-CLIP`).
      *
      * The ring's middle key cannot be intercepted (vendor FAQ), so there is no input path for the wearer to scroll and
-     * a `maxLines` window silently dropped everything past six lines - an 89-character wake answer lost its tail. The
-     * view is therefore placed in a [ScrollView] and stepped by [HintAutoScroll]'s plan, looping until the hint leaves
-     * the screen: every callback is removed on the next render, on a clear, and on stop, so a stale walk can never
-     * outlive the hint it belongs to.
+     * a `maxLines` window silently dropped everything past six lines - an 81-character wake answer lost its last line.
+     * The view is therefore placed in a [ScrollView] and moved here.
+     *
+     * **One continuous animation, not page jumps.** The first build stepped a whole page at a time and the owner
+     * rejected the effect on the device: it must slide slowly, and only after a moment long enough to read what is
+     * already on screen. [HintAutoScroll] owns both numbers (a 1.5 s hold, then a line per 1.4 s), and a linear
+     * interpolator keeps the speed constant so there is no lurch at either end. The animation is cancelled on the next
+     * render, on a clear, and on pause, so a stale slide can never outlive the hint it belongs to.
      */
     private fun scheduleAutoScroll() {
-        scrollHandler.removeCallbacksAndMessages(null)
+        scrollAnimator?.cancel()
+        scrollAnimator = null
         hintScroll.scrollTo(0, 0)
         hintView.post {
             val stepPx = hintView.lineHeight.takeIf { it > 0 } ?: return@post
-            val pages = HintAutoScroll.offsets(hintView.lineCount)
-            if (pages.size <= 1) return@post
-            // The loop repeats the walk: the phone's own TTL is 5-8 s, which is one pass for a ten-line answer.
-            for (round in 0 until AUTO_SCROLL_ROUNDS) {
-                pages.forEachIndexed { index, offset ->
-                    if (index == 0) return@forEachIndexed
-                    val delay = (round * pages.size + index) * HintAutoScroll.DWELL_MILLIS
-                    scrollHandler.postDelayed({ hintScroll.scrollTo(0, offset * stepPx) }, delay)
-                }
+            val duration = HintAutoScroll.scrollMillis(hintView.lineCount)
+            if (duration <= 0L) return@post
+            val endPx = (hintView.lineCount - HintAutoScroll.VISIBLE_LINES).coerceAtLeast(0) * stepPx
+            scrollAnimator = ValueAnimator.ofInt(0, endPx).apply {
+                this.duration = duration
+                startDelay = HintAutoScroll.READ_DELAY_MILLIS
+                interpolator = LinearInterpolator()
+                addUpdateListener { animation -> hintScroll.scrollTo(0, animation.animatedValue as Int) }
+                start()
             }
-            val backToTop = AUTO_SCROLL_ROUNDS * pages.size * HintAutoScroll.DWELL_MILLIS
-            scrollHandler.postDelayed({ hintScroll.scrollTo(0, 0) }, backToTop)
         }
     }
 

@@ -50,9 +50,10 @@ object HintPresentation {
      * What the layout actually did with the hint, as one greppable line.
      *
      * `maxLines` is the **window** the fixed layout shows at once ([HintAutoScroll.VISIBLE_LINES]); `clipped` keeps its
-     * P3.2 Stage 0 meaning - the laid-out text is taller than that window - and `pages` says how many stills the
-     * auto-scroll walks through to show all of it (`1` when everything fits, and the field the Stage 0 probe reads is
-     * unchanged).
+     * P3.2 Stage 0 meaning - the laid-out text is taller than that window - and `scrollMillis` says how long the slide
+     * that reveals the rest takes (`0` when everything fits). The field the Stage 0 probe reads (`clipped`) is
+     * unchanged; `pages` from the first P3.2-CLIP build was replaced by `scrollMillis` when page jumps became a smooth
+     * slide.
      *
      * The line count is only knowable after a layout pass, so the caller reports it from a `post {}` - and this
      * formatter is separate from the reading so it stays testable off-device. Carries counts and sizes, never the
@@ -60,5 +61,5 @@ object HintPresentation {
      */
     fun renderReport(lines: Int, chars: Int): String =
         "hint rendered lines=$lines maxLines=${HintAutoScroll.VISIBLE_LINES} chars=$chars " +
-            "clipped=${lines > HintAutoScroll.VISIBLE_LINES} pages=${HintAutoScroll.pages(lines)}"
+            "clipped=${lines > HintAutoScroll.VISIBLE_LINES} scrollMillis=${HintAutoScroll.scrollMillis(lines)}"
 }
