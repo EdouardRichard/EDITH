@@ -12,13 +12,20 @@ import android.content.Intent
  * panel actually show, and does 120 overflow?" therefore needs hints of a **known** length pushed through the real
  * chain (phone arbiter → CXR → glasses view), not a mocked renderer.
  *
- * The text is **synthetic only** (`测` repeated `chars` times): this instrument exists to measure layout capacity, and a
- * real transcript or note would put private content on the panel and into a screenshot. Nothing but counts is logged.
+ * **Two payloads, two questions (P3.2-CLIP).** The capacity probe needs a known length, which is the synthetic `测`
+ * filler. Judging the auto-scroll and legibility at wearing distance needs text a person can read: the owner's verdict
+ * on the filler was "都是测测测，一样的字，辨识度不搞", so a caller-supplied text is accepted too. Both are bounded by
+ * the wire's own limit.
+ *
+ * The filler is synthetic on purpose - a real transcript or note would put private content on the panel and into a
+ * screenshot. A **supplied** text comes from the host shell that is already driving the device, and nothing but counts
+ * is ever logged.
  *
  * Driven from a host shell (the phone serial must be given, or the glasses get the APK):
  *
  * ```
  * adb -s <phone> shell am broadcast -a edith.DEBUG_HINT -n edith.phone/.DebugHintInjector --ei chars 120
+ * adb -s <phone> shell am broadcast -a edith.DEBUG_HINT -n edith.phone/.DebugHintInjector --es text '今晚八点前把周报发给张工'
  * ```
  *
  * It exists **only in the debug source set** (see `src/debug/AndroidManifest.xml`) and is `exported` so `am broadcast`
@@ -30,8 +37,7 @@ class DebugHintInjector : BroadcastReceiver() {
         if (intent.action != ACTION_HINT) return
         val application = context.applicationContext as? EdithApplication
         val sender = application?.composition?.diagnosticHintTextSender
-        val chars = intent.getIntExtra(EXTRA_CHARS, 0)
-        val text = synthetic(chars)
+        val text = payload(intent.getStringExtra(EXTRA_TEXT), intent.getIntExtra(EXTRA_CHARS, 0))
         val accepted = when {
             sender == null -> false
             text.isEmpty() -> false
@@ -41,16 +47,10 @@ class DebugHintInjector : BroadcastReceiver() {
         android.util.Log.i("EdithP3", "P3_HINT_INJECT chars=${text.length} accepted=$accepted")
     }
 
-    /** The measured payload: one long point of `chars` codepoints, so the count on the panel is the count requested. */
-    private fun synthetic(chars: Int): String {
-        if (chars <= 0) return ""
-        val bounded = chars.coerceAtMost(MAX_CHARS)
-        return "测".repeat(bounded)
-    }
-
-    private companion object {
+    companion object {
         const val ACTION_HINT = "edith.DEBUG_HINT"
         const val EXTRA_CHARS = "chars"
+        const val EXTRA_TEXT = "text"
 
         /**
          * The wire refuses more than this anyway (`HintWireCodec.MAX_TEXT_CODEPOINTS`), so asking for more would only
@@ -58,5 +58,17 @@ class DebugHintInjector : BroadcastReceiver() {
          * meaning is the wire's.
          */
         const val MAX_CHARS = 120
+
+        /**
+         * What to inject: a supplied text when there is one, otherwise one long point of `chars` filler codepoints.
+         *
+         * Pure so the rule is testable on the JVM without a device or a `BroadcastReceiver`.
+         */
+        fun payload(text: String?, chars: Int): String {
+            val supplied = text?.takeIf { it.isNotBlank() }
+            if (supplied != null) return supplied.take(MAX_CHARS)
+            if (chars <= 0) return ""
+            return "测".repeat(chars.coerceAtMost(MAX_CHARS))
+        }
     }
 }
