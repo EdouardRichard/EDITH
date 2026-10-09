@@ -1,11 +1,14 @@
 package edith.phone
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
@@ -17,6 +20,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
@@ -169,6 +173,42 @@ class MainActivity : ComponentActivity() {
                         }
                         Text("需同时打开上面的上传开关才会发出模型请求；本会话停止后自动关闭且不写入存储。",
                             style = MaterialTheme.typography.bodySmall)
+                        // P3.2 Stage B: the perception sources that need a system grant. Each entry opens the system
+                        // screen for its own special access and says, truthfully, what the assistant cannot see
+                        // without it - a refused source contributes **no** context key, never a placeholder.
+                        root.foregroundAppSource?.let { foreground ->
+                            val activityContext = LocalContext.current
+                            OutlinedButton(onClick = {
+                                runCatching {
+                                    activityContext.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                                }
+                            }) { Text("前台 App 感知授权（使用情况访问）") }
+                            if (!foreground.isGranted) {
+                                Text("未授予使用情况访问，主动辅助看不到前台 App。", color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                        root.notificationCategorySource?.let { notifications ->
+                            val activityContext = LocalContext.current
+                            OutlinedButton(onClick = {
+                                runCatching {
+                                    activityContext.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                                }
+                            }) { Text("通知分类感知授权（通知使用权）") }
+                            if (!notifications.isConnected) {
+                                Text("未连接通知监听，主动辅助看不到通知分类（只读分类，不读通知内容）。",
+                                    color = MaterialTheme.colorScheme.error)
+                            }
+                        }
+                        root.calendarSource?.let { calendar ->
+                            val requestCalendar = rememberLauncherForActivityResult(
+                                ActivityResultContracts.RequestPermission()) { }
+                            OutlinedButton(onClick = { requestCalendar.launch(Manifest.permission.READ_CALENDAR) }) {
+                                Text("日程标题感知授权（日历权限）")
+                            }
+                            if (!calendar.isGranted) {
+                                Text("未授予日历权限，主动辅助看不到今天的日程标题。", color = MaterialTheme.colorScheme.error)
+                            }
+                        }
                         state.errorCode?.let { Text(errorLabel(it), color = MaterialTheme.colorScheme.error) }
                         // Debug-only acceptance affordance: with the shipped plugins still shells, this is the only
                         // way a wearer can check what the glasses actually show. Hidden whenever no probe is

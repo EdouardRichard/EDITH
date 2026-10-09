@@ -38,6 +38,9 @@ import edith.phone.actions.AppLaunchResolver
 import edith.phone.actions.ContextIntentLauncher
 import edith.phone.actions.IntentActionExecutor
 import edith.phone.actions.PackageManagerAppCatalog
+import edith.phone.context.CalendarSource
+import edith.phone.context.ForegroundAppSource
+import edith.phone.context.NotificationCategorySource
 import edith.phone.model.ProactiveArming
 import edith.phone.model.ProfileViewModel
 import edith.phone.model.ProbeConsent
@@ -159,6 +162,20 @@ class HostCompositionRoot internal constructor(
      * its text must reach the display unchanged, so the caller owns the length. Never present in a release build.
      */
     internal var diagnosticHintTextSender: ((String) -> Boolean)? = null
+
+    /**
+     * The Stage B foreground-app source (Task 11), or null for a root built outside `create` (tests, harnesses).
+     *
+     * Exposed because the settings screen has to tell the user whether the special permission is granted - the source
+     * knows, and a second app-op check in the UI would be a second answer to the same question.
+     */
+    internal var foregroundAppSource: ForegroundAppSource? = null
+
+    /** The Stage B notification-category source (Task 12), or null outside `create`. */
+    internal var notificationCategorySource: NotificationCategorySource? = null
+
+    /** The Stage B calendar source (Task 13), or null outside `create`. */
+    internal var calendarSource: CalendarSource? = null
 
     init {
         // Activation runs when the scene becomes ready, which is before the first clock mapping exists, so a plugin
@@ -859,7 +876,18 @@ class HostCompositionRoot internal constructor(
             // session produces no `ContextChanged` at all - the plugin's only context signal is the acoustic event.
             // The arming state itself is published as a source, because the plugin has to be able to read the switch's
             // **current** answer at request time (local transcription continues while it is off).
-            val contextSignals = CxrContextSignals(clock, listOf(CxrContextSignals.armingSource(proactiveArming)))
+            val foregroundApp = ForegroundAppSource.android(context)
+            val notificationCategory = NotificationCategorySource(
+                connected = NotificationCategoryService::isConnected,
+                latest = NotificationCategoryService::latest,
+            )
+            val calendar = CalendarSource.android(context)
+            val contextSignals = CxrContextSignals(clock, listOf(
+                CxrContextSignals.armingSource(proactiveArming),
+                foregroundApp::values,
+                notificationCategory::values,
+                calendar::values,
+            ))
             contextSignals.listen(armedContextSink({ hostHolder[0] }, clock, proactiveArming))
             val audio = provisionAudioChain(
                 context = context,
@@ -959,6 +987,9 @@ class HostCompositionRoot internal constructor(
             root.observerHolder = observerHolder
             root.armObserver(initialObserver)
             root.audioChain = audio
+            root.foregroundAppSource = foregroundApp
+            root.notificationCategorySource = notificationCategory
+            root.calendarSource = calendar
             rootHolder[0] = root
             scene.composition = root
             // Task 14a item 1: the real plugin, not `SmartAssistantPlugin()` with defaults. Its configuration is

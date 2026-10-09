@@ -1,5 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
@@ -13,6 +14,13 @@
          App's own packages and every open_app would refuse APP_NOT_VISIBLE. The alternative is an explicit <queries>
          allowlist (kept below for the Rokid/glasses packages), which cannot resolve an arbitrary spoken name. -->
     <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <!-- P3.2 Stage B (Task 11): the foreground app is the one context signal that needs this **special** permission.
+         It cannot be requested at runtime; the user grants it in Settings → Special app access → Usage access, and
+         without it `ForegroundAppSource` contributes no key at all (never a placeholder). `tools:ignore` is required
+         because the protection level makes lint treat it as a protected permission. -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
+    <!-- P3.2 Stage B (Task 13): today's event titles. A runtime permission, requested from the session page. -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
     <queries>
         <package android:name="com.rokid.sprite.aiapp" />
         <package android:name="com.rokid.sprite.global.aiapp" />
@@ -28,5 +36,14 @@
             </intent-filter>
         </activity>
         <service android:name=".SessionService" android:exported="false" android:foregroundServiceType="connectedDevice" />
+        <!-- P3.2 Stage B (Task 12): notification access is the user's grant, made in Settings. The service only ever
+             reads a notification's category/channel id (see NotificationCategoryService); the permission it binds
+             with is declared by the platform, not by us. -->
+        <service android:name=".NotificationCategoryService" android:exported="false"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
     </application>
 </manifest>
