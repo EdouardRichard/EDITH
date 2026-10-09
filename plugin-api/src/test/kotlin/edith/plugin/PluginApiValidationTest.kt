@@ -21,4 +21,24 @@ class PluginApiValidationTest {
     @Test fun `deactivation reason is explicit`() {
         assertEquals(DeactivationReason.Switched, DeactivationReason.Switched)
     }
+
+    @Test fun `capability enum keeps the declared order`() {
+        assertEquals(
+            listOf(
+                "Audio", "Asr", "Speaker", "Model", "Storage", "TextOutput", "SpeechOutput",
+                "Actions", "Context", "WakeWord",
+            ),
+            Capability.entries.map { it.name },
+        )
+    }
+
+    @Test fun `descriptor accepts passive loop capabilities and still rejects duplicates`() {
+        val requested = listOf(Capability.Actions, Capability.Context, Capability.WakeWord)
+        assertEquals(requested.toSet(),
+            PluginDescriptor("smart", "1.0.0", 1, "Smart", requested, ConfigSchema(1)).capabilities)
+        assertFailsWith<IllegalArgumentException> {
+            PluginDescriptor("smart", "1.0.0", 1, "Smart",
+                listOf(Capability.WakeWord, Capability.WakeWord), ConfigSchema(1))
+        }
+    }
 }

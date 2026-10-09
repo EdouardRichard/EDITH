@@ -24,6 +24,9 @@ class ScopedHostServices(
                 Capability.Storage -> scopedStorage(provider as? StorageHandle ?: wrong(capability))
                 Capability.TextOutput -> scopedOutput(provider as? OutputSink ?: wrong(capability))
                 Capability.SpeechOutput -> throw ContractError.CapabilityMissing("speech output unavailable")
+                Capability.Actions -> scopedActions(provider as? ActionExecutor ?: wrong(capability))
+                Capability.Context -> scopedContext(provider as? ContextSignals ?: wrong(capability))
+                Capability.WakeWord -> scopedWakeWord(provider as? WakeWordRegistry ?: wrong(capability))
             }
         }
         val child = ResourceScope(scope.pluginId, scope.sessionId, scope.generation)
@@ -87,5 +90,18 @@ class ScopedHostServices(
             if (!assistance.isCurrent(scope.sessionId, scope.generation)) OutputSubmission.Rejected
             else provider.submit(assistance)
         }
+    }
+    private fun scopedActions(provider: ActionExecutor) = object : ActionExecutor {
+        override fun descriptors() = scope.active { provider.descriptors() }
+        override fun execute(name: String, argsJson: String) = scope.active { provider.execute(name, argsJson) }
+        override fun cancel() = scope.active { provider.cancel() }
+    }
+    private fun scopedContext(provider: ContextSignals) = object : ContextSignals {
+        override fun snapshot() = scope.active { provider.snapshot() }
+        override fun listen(listener: (ContextSnapshot) -> Unit) = subscription(provider::listen, listener)
+    }
+    private fun scopedWakeWord(provider: WakeWordRegistry) = object : WakeWordRegistry {
+        override fun declare(words: List<String>) = scope.active { provider.declare(words) }
+        override fun current() = scope.active { provider.current() }
     }
 }

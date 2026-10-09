@@ -49,6 +49,13 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     private var transitioning = false
     private val eventGate = Any()
     @Volatile private var eventIdentity: Pair<SessionId, Generation>? = null
+
+    /**
+     * Transition-only memory for the high-rate [AcousticEvent] producer. A repeat of the last delivered label is
+     * dropped: the dispatcher has capacity 32 and a full queue for a non-`TranscriptEvent` is a critical overflow
+     * (`DiscontinuityEvent(OVERFLOW)` + `interrupt()`), so only label transitions may reach it.
+     */
+    private var lastAcousticLabel: AcousticLabel? = null
     private val timer = Executors.newSingleThreadScheduledExecutor { task -> Thread(task, "edith-deadlines").also { it.isDaemon = true } }
     private val deadlineScheduler = object : DeadlineScheduler {
         override fun at(deadlineNanos: Long, task: () -> Unit): CancellationHandle {
@@ -67,6 +74,16 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     val currentGeneration: Generation get() = if (closed) generation else command { generation }
     val currentState: SessionState get() = if (closed) state else command { state }
     val currentInputEpoch: InputEpoch? get() = if (closed) inputEpoch else command { inputEpoch }
+
+    /**
+     * The identity [onEvent] currently gates delivery by, or null when no plugin owns the session.
+     *
+     * Read-only and intentionally narrow: an event producer outside this class (the App's wake layer) has to tag its
+     * event with exactly the pair this host accepts, and there is no other way to learn it. Returning null while
+     * nothing is active is the honest answer - the host would drop any event in that state - and it keeps the value
+     * from being mistaken for a session that merely exists.
+     */
+    fun currentIdentity(): Pair<SessionId, Generation>? = if (closed) eventIdentity else command { eventIdentity }
 
     fun observeState(listener: (SessionState) -> Unit): CancellationHandle = command {
         val observation = StateObservation(listener)
@@ -195,6 +212,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
             active = plugin
             state = SessionState.Ready
             eventIdentity = session to generation
+            lastAcousticLabel = null
             plugin.activate(PluginContext(session, generation, plugin.descriptor.capabilities, services))
             if (scope !== resource || resource.isRevoked) throw ContractError.Cancelled()
             if (Capability.Audio in plugin.descriptor.capabilities) {
@@ -311,16 +329,23 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
             is TranscriptEvent -> Capability.Asr
             is SpeakerEvent -> Capability.Speaker
             is OutputStateEvent -> Capability.TextOutput
+            is WakeDetected -> Capability.WakeWord
+            is AcousticEvent, is ContextChanged -> Capability.Context
+            is ConfirmationResult -> Capability.Actions
             else -> null
         }
         if (capability != null && capability !in plugin.descriptor.capabilities) return
+        if (event is AcousticEvent) {
+            if (event.label == lastAcousticLabel) return
+            lastAcousticLabel = event.label
+        }
         runCatching { plugin.handle(event) }.onFailure { pause() }
     }
 
     private fun teardown(reason: DeactivationReason) {
         transitioning = true
         try {
-        synchronized(eventGate) { eventIdentity = null; dispatcher.clear() }
+        synchronized(eventGate) { eventIdentity = null; lastAcousticLabel = null; dispatcher.clear() }
         val epoch = inputEpoch
         inputEpoch = null
         scope?.revoke()

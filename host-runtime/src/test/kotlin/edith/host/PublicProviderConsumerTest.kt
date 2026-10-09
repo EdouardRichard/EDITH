@@ -53,6 +53,15 @@ class PublicProviderConsumerTest {
             val rig = Providers(); val host = rig.host
             val smart = SmartAssistantPlugin(); val interview = InterviewAssistantPlugin()
             host.register(smart); host.register(interview)
+            // Task 13 made `plugins-smart` a real configured plugin, so the host's `ConfigurationPolicy.validate` now
+            // runs before activation: an unconfigured smart plugin is *refused*, not silently activated with an empty
+            // profile. The lifecycle assertions below are unchanged; only the configuration step is new.
+            assertTrue(
+                host.configure(
+                    "smart-assistant",
+                    PluginConfiguration(1, mapOf("profileId" to "dummy", "profileRevision" to "3")),
+                ),
+            )
             val first = if (smartFirst) smart else interview
             val second = if (smartFirst) interview else smart
             host.startSession(SessionId("s")); host.markSceneReady()
@@ -60,7 +69,7 @@ class PublicProviderConsumerTest {
             assertEquals(first.descriptor.capabilities, rig.grants.last())
             val old = rig.services.last(); val generation = host.currentGeneration
             host.onEvent(UserAction(rig.envelope(generation), UserAction.Action.Help)); host.currentState
-            assertTrue(rig.requests.isEmpty(), "Shell must not acquire a business Help trigger")
+            assertTrue(rig.requests.isEmpty(), "no wake and no final transcript: Help has nothing to run")
             var delivered = 0
             old.model().request(rig.request(generation)) { delivered++ }
             assertEquals(ActivationResult.Activated, host.switchTo(second.descriptor.pluginId))
@@ -171,6 +180,19 @@ class PublicProviderConsumerTest {
                 override fun write(key: String, value: ByteArray) { storage[key] = value }
                 override fun delete(key: String) { storage.remove(key) }
                 override fun clear() = storage.clear()
+            },
+            // Task 13 turned `plugins-smart` from a 12-line shell into the real passive loop and widened its
+            // descriptor to `WakeWord, Asr, Model, Actions, TextOutput`. The host refuses to activate a plugin whose
+            // declared capabilities are not all advertised, so this map now has to name every one of them — that is
+            // the same "no fake success" rule the Speaker entry above exists for, not a new behaviour.
+            Capability.WakeWord to object : WakeWordRegistry {
+                override fun declare(words: List<String>) = true
+                override fun current() = emptyList<String>()
+            },
+            Capability.Actions to object : ActionExecutor {
+                override fun descriptors() = emptyList<ActionDescriptor>()
+                override fun execute(name: String, argsJson: String) = ActionResult(ActionOutcome.Done, "done")
+                override fun cancel() = Unit
             },
         )
         val host = HostRuntime(1, object : ScheduledHostEnvironment {

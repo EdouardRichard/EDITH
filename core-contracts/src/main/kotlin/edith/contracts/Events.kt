@@ -49,3 +49,42 @@ data class AudioEvent(val segment: AudioSegment) : HostEvent { override val enve
 data class UserAction(override val envelope: EventEnvelope, val action: Action) : HostEvent {
     enum class Action { Pause, Resume, Stop, Help }
 }
+
+data class WakeDetected(
+    override val envelope: EventEnvelope,
+    val word: String,
+    val confidence: Double,
+) : HostEvent {
+    init {
+        require(word.isNotBlank())
+        require(confidence in 0.0..1.0)
+    }
+}
+
+enum class AcousticLabel { Speech, Silence, Noisy }
+
+data class AcousticEvent(
+    override val envelope: EventEnvelope,
+    val label: AcousticLabel,
+) : HostEvent
+
+/** Raw fields rather than `plugin-api`'s `ContextSnapshot`: `core-contracts` must not depend on `plugin-api`. */
+data class ContextChanged(
+    override val envelope: EventEnvelope,
+    val capturedAtNanos: Long,
+    val values: Map<String, String>,
+) : HostEvent {
+    init {
+        require(capturedAtNanos >= 0)
+        require(values.keys.all { it.isNotBlank() })
+        require(values.keys.size == values.keys.toSet().size)
+    }
+}
+
+data class ConfirmationResult(
+    override val envelope: EventEnvelope,
+    val requestId: String,
+    val approved: Boolean,
+) : HostEvent {
+    init { require(requestId.isNotBlank()) }
+}

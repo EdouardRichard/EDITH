@@ -6,3 +6,6 @@ fun HostServices.asr(): AsrSession = require(Capability.Asr) as AsrSession
 fun HostServices.speaker(): SpeakerService = require(Capability.Speaker) as SpeakerService
 fun HostServices.storage(): StorageHandle = require(Capability.Storage) as StorageHandle
 fun HostServices.textOutput(): OutputSink = require(Capability.TextOutput) as OutputSink
+fun HostServices.actions(): ActionExecutor = require(Capability.Actions) as ActionExecutor
+fun HostServices.context(): ContextSignals = require(Capability.Context) as ContextSignals
+fun HostServices.wakeWord(): WakeWordRegistry = require(Capability.WakeWord) as WakeWordRegistry
