@@ -4,6 +4,9 @@ local.properties
 .worktrees/
 .idea/
 *.iml
+# Real model API key file, kept at the checkout root. Probe tools and local runs read it from disk; it is never
+# versioned and never belongs in a commit or a shared archive.
+/api_key.yaml
 
 # Build and Gradle outputs
 .gradle/
@@ -11,6 +14,8 @@ local.properties
 **/build/
 **/outputs/
 **/intermediates/
+# JVM crash dumps (a phone-app crash dropped java_pid*.hprof into the repository root). These embed heap contents.
+*.hprof
 
 # Temporary probe data and generated diagnostics
 .tmp-*
