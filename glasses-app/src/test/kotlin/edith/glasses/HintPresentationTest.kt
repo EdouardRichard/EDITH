@@ -21,17 +21,23 @@ class HintPresentationTest {
     }
 
     @Test
-    fun atMostThreePointsAreShownAndTheShortfallIsReported() {
+    fun everySentenceOfAnAllowedHintIsShownSoNothingIsDroppedBeforeTheView() {
+        // P3.2-CLIP: the old rule handed the view at most three points, so a four-sentence answer lost its tail
+        // before layout ever saw it. The wire already bounds the text (HintWireCodec), so this layer shows all of it.
         val long = "一。二。三。四。五"
 
-        assertEquals(listOf("一", "二", "三"), HintPresentation.points(long))
-        assertTrue("hiding the rest must be visible to the caller", HintPresentation.truncated(long))
+        assertEquals(listOf("一", "二", "三", "四", "五"), HintPresentation.points(long))
+        assertFalse("nothing is dropped at this layer any more", HintPresentation.truncated(long))
     }
 
     @Test
-    fun exactlyThreePointsAreNotReportedAsTruncated() {
-        assertEquals(listOf("一", "二", "三"), HintPresentation.points("一；二；三"))
-        assertFalse(HintPresentation.truncated("一；二；三"))
+    fun onlyTextBeyondTheWireBoundIsReportedAsTruncated() {
+        // The one loss this layer still guards against is a hint the phone should never have sent.
+        val oversized = "字".repeat(edith.output.HintWireCodec.MAX_TEXT_CODEPOINTS + 1)
+
+        assertTrue(HintPresentation.truncated(oversized))
+        assertEquals(edith.output.HintWireCodec.MAX_TEXT_CODEPOINTS,
+            HintPresentation.displayText(oversized).length)
     }
 
     @Test
@@ -51,21 +57,22 @@ class HintPresentationTest {
 
     @Test
     fun asciiSeparatorsBehaveTheSameWayAsChineseOnes() {
-        assertEquals(listOf("first", "second", "third"), HintPresentation.points("first; second! third? fourth"))
+        assertEquals(listOf("first", "second", "third", "fourth"),
+            HintPresentation.points("first; second! third? fourth"))
     }
 
     @Test
     fun aRenderedHintReportsItsLineCountAndSizeWithoutItsText() {
         // P3.2 Stage 0: the layout's own limit was invisible - a hint that overflowed six lines was clipped with
         // nothing said about it. This line is the measurement instrument for the capacity probe, and it must never
-        // carry the hint's text.
-        assertEquals("hint rendered lines=5 maxLines=6 chars=53 clipped=false",
+        // carry the hint's text. P3.2-CLIP appended `pages`: the same overflow is now walked through, not lost.
+        assertEquals("hint rendered lines=5 maxLines=6 chars=53 clipped=false pages=1",
             HintPresentation.renderReport(lines = 5, chars = 53))
     }
 
     @Test
-    fun aHintThatOverflowsTheLayoutIsReportedAsClipped() {
-        assertEquals("hint rendered lines=11 maxLines=6 chars=120 clipped=true",
+    fun aHintTallerThanTheWindowIsReportedWithThePagesItTakesToShowIt() {
+        assertEquals("hint rendered lines=11 maxLines=6 chars=120 clipped=true pages=2",
             HintPresentation.renderReport(lines = 11, chars = 120))
     }
 }

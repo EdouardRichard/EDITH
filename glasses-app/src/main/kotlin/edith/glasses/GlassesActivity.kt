@@ -4,12 +4,15 @@ import android.app.Activity
 import android.graphics.Color
 import android.graphics.Typeface
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.PowerManager
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.WindowManager
 import android.widget.FrameLayout
 import android.widget.LinearLayout
+import android.widget.ScrollView
 import android.widget.TextView
 import edith.output.GlassHintController
 import edith.output.HintCommand
@@ -33,7 +36,8 @@ import java.util.concurrent.TimeUnit
  * a view update that had merely been *posted* would have acknowledged something the wearer could not see yet.
  *
  * A light `TextView` is deliberate (plan Task 18 Step 3): the layout is fixed, the safe area is padding rather than a
- * measurement, and at most [HintPresentation.MAX_POINTS] short points are shown, so text can never squeeze the region.
+ * measurement, and hints are short - but a hint taller than the six-line window is now **walked through** by
+ * [HintAutoScroll] rather than clipped (P3.2 `P3.2-CLIP`), still with no measurement and no input path.
  */
 class GlassesActivity : Activity() {
 
@@ -62,7 +66,11 @@ class GlassesActivity : Activity() {
     }
 
     private lateinit var hintView: TextView
+    private lateinit var hintScroll: ScrollView
     private lateinit var statusView: TextView
+
+    /** Drives [scheduleAutoScroll]; every callback is cleared on the next render, so a stale walk cannot outlive a hint. */
+    private val scrollHandler = Handler(Looper.getMainLooper())
 
     private val powerManager by lazy { getSystemService(PowerManager::class.java) }
 
@@ -93,10 +101,13 @@ class GlassesActivity : Activity() {
         super.onPause()
         // Leaving the foreground ends the visible hint's claim on the panel; the controller clears the text too.
         holdAwakeFor(false)
+        // ...and with it the auto-scroll walk, so no posted page can slide a hint that is no longer on screen.
+        scrollHandler.removeCallbacksAndMessages(null)
     }
 
     override fun onDestroy() {
         // Leaving the screen must never leave text on the glasses, and the endpoint must not keep a dead Activity.
+        scrollHandler.removeCallbacksAndMessages(null)
         runCatching { controller.disconnect() }
         holdAwakeFor(false)
         RokidBridgeEndpoint.instance.setListener(null)
@@ -131,8 +142,9 @@ class GlassesActivity : Activity() {
     /**
      * The line count the current hint actually laid out into.
      *
-     * Exposed for the same reason as [hintText]: a `TextView` with `maxLines` clips the overflow **silently**, so
-     * "the hint was clipped" is only observable from the view itself. Valid after a layout pass.
+     * Exposed for the same reason as [hintText]: the window shows a fixed number of lines, so nothing said about the
+     * overflow would leave "the hint was taller than the screen" unobservable. Valid after a layout pass. Since
+     * `P3.2-CLIP` an overflow is scrolled rather than clipped, and this count is what the scroll plan is built from.
      */
     fun renderedLineCount(): Int = hintView.lineCount
 
@@ -142,23 +154,63 @@ class GlassesActivity : Activity() {
          * remaining TTL, 10 s for the debug probe) and a safety net for a hint whose clear never arrives.
          */
         const val HINT_HOLD_MILLIS = 15_000L
+
+        /**
+         * How many times the auto-scroll walk repeats within one hint.
+         *
+         * The phone's TTL is 5 s (passive) and 8 s (proactive) while one pass over a ten-line answer takes four times
+         * [HintAutoScroll.DWELL_MILLIS]; two rounds mean the tail is reachable even for a wearer who looks up late.
+         * The walk stops when the hint leaves the screen, so a longer hold costs nothing.
+         */
+        const val AUTO_SCROLL_ROUNDS = 2
     }
 
     private fun render(text: String?) {
         val display = HintPresentation.displayText(text)
         if (HintPresentation.truncated(text)) {
-            // Recorded rather than silently dropped: the phone bounded the hint, this is the layout's own limit.
-            android.util.Log.i("EdithGlasses", "hint carried more than ${HintPresentation.MAX_POINTS} points; extras hidden")
+            // Recorded rather than silently dropped: the phone bounded the hint, so this means it sent more than the
+            // wire allows.
+            android.util.Log.i("EdithGlasses", "hint exceeded the wire bound; extras hidden")
         }
         // A pushed screen message is the only thing that needs the panel, so it is woken with the hint and released
         // when the hint leaves the screen - including the expiry path, which calls this with null.
         holdAwakeFor(display.isNotEmpty())
         hintView.text = display
         statusView.text = if (display.isEmpty()) "等待提示" else "EDITH"
+        scheduleAutoScroll()
         // P3.2 Stage 0: the layout's own limit is reported only **after** it has laid the text out - reading it here
         // would read the previous layout (or none). Counts and size only, never the text.
         hintView.post {
             android.util.Log.i("EdithGlasses", HintPresentation.renderReport(hintView.lineCount, display.length))
+        }
+    }
+
+    /**
+     * Walks a hint taller than the window through its pages (P3.2 `P3.2-CLIP`).
+     *
+     * The ring's middle key cannot be intercepted (vendor FAQ), so there is no input path for the wearer to scroll and
+     * a `maxLines` window silently dropped everything past six lines - an 89-character wake answer lost its tail. The
+     * view is therefore placed in a [ScrollView] and stepped by [HintAutoScroll]'s plan, looping until the hint leaves
+     * the screen: every callback is removed on the next render, on a clear, and on stop, so a stale walk can never
+     * outlive the hint it belongs to.
+     */
+    private fun scheduleAutoScroll() {
+        scrollHandler.removeCallbacksAndMessages(null)
+        hintScroll.scrollTo(0, 0)
+        hintView.post {
+            val stepPx = hintView.lineHeight.takeIf { it > 0 } ?: return@post
+            val pages = HintAutoScroll.offsets(hintView.lineCount)
+            if (pages.size <= 1) return@post
+            // The loop repeats the walk: the phone's own TTL is 5-8 s, which is one pass for a ten-line answer.
+            for (round in 0 until AUTO_SCROLL_ROUNDS) {
+                pages.forEachIndexed { index, offset ->
+                    if (index == 0) return@forEachIndexed
+                    val delay = (round * pages.size + index) * HintAutoScroll.DWELL_MILLIS
+                    scrollHandler.postDelayed({ hintScroll.scrollTo(0, offset * stepPx) }, delay)
+                }
+            }
+            val backToTop = AUTO_SCROLL_ROUNDS * pages.size * HintAutoScroll.DWELL_MILLIS
+            scrollHandler.postDelayed({ hintScroll.scrollTo(0, 0) }, backToTop)
         }
     }
 
@@ -216,8 +268,20 @@ class GlassesActivity : Activity() {
             setTextSize(TypedValue.COMPLEX_UNIT_SP, 22f)
             typeface = Typeface.DEFAULT_BOLD
             gravity = Gravity.CENTER
-            maxLines = HintPresentation.MAX_POINTS * 2
+            // No `maxLines` any more: the window is the ScrollView below, and a taller hint is walked through instead
+            // of being cut at six lines with nothing said (P3.2-CLIP).
             text = ""
+        }
+        // The window the wearer sees: exactly [HintAutoScroll.VISIBLE_LINES] lines tall, so the auto-scroll plan and
+        // the drawing agree on what "one page" is. The hint is centred while it fits, and slides once it does not -
+        // the view itself never measures anything; the height comes from the text size set just above.
+        val windowPx = hintView.lineHeight.takeIf { it > 0 }
+            ?: (22f * resources.displayMetrics.scaledDensity).toInt()
+        hintScroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = false
+            isFillViewport = false
+            addView(hintView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
         }
         statusView = TextView(this).apply {
             setTextColor(Color.parseColor("#9E9E9E"))
@@ -225,8 +289,8 @@ class GlassesActivity : Activity() {
             gravity = Gravity.CENTER
             text = "等待提示"
         }
-        column.addView(hintView, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+        column.addView(hintScroll, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, windowPx * HintAutoScroll.VISIBLE_LINES))
         column.addView(statusView, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         root.addView(column, FrameLayout.LayoutParams(
