@@ -31,7 +31,7 @@ object SmartSettingsForm {
         /** P3.2: the proactive cooldown in milliseconds, as typed; defaults to the shipped value like the level below. */
         val proactiveCooldown: String = "60000",
         /** P3.2: the sensitivity level; a set of three, so the screen edits it as a chooser. */
-        val proactiveSensitivity: String = "MEDIUM",
+        val proactiveSensitivity: String = "LOW",
     )
 
     /**

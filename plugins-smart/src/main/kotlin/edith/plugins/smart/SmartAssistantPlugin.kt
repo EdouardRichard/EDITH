@@ -73,8 +73,12 @@ private const val DEFAULT_LISTEN_WINDOW_MILLIS = 15_000L
 private const val AUDIT_CAPACITY = 512
 
 /**
- * The proactive cooldown and sensitivity the plugin uses when its configuration names neither of the two P3.2 keys:
- * the brief's own defaults (`MEDIUM`, 60 s). A configured plugin gets its numbers from `Config` (Task 9).
+ * The proactive cooldown and sensitivity the plugin uses when its configuration names neither of the two P3.2 keys.
+ *
+ * The pair mirrors `SmartSettings`' shipped defaults (60 s, `LOW`): the sensitivity was tightened on 2026-10-09 to
+ * answer the measured false-trigger rate (`P3.2-FT`, both measured false triggers were 9-12 character phrases) while
+ * the cooldown kept its original value by the owner's decision. A plugin driven with no configuration at all must not
+ * be more willing to interrupt than a configured one.
  */
 private const val DEFAULT_PROACTIVE_COOLDOWN_NANOS = 60_000_000_000L
 
@@ -236,7 +240,7 @@ class SmartAssistantPlugin(
      * the brief's defaults, so a plugin that is somehow driven before it is configured still refuses rather than
      * guessing.
      */
-    private var proactive = SmartProactive(DEFAULT_PROACTIVE_COOLDOWN_NANOS, ProactiveSensitivity.MEDIUM)
+    private var proactive = SmartProactive(DEFAULT_PROACTIVE_COOLDOWN_NANOS, ProactiveSensitivity.LOW)
     private var proactiveHint: ProactiveHint? = null
 
     /**
@@ -318,7 +322,7 @@ class SmartAssistantPlugin(
             val level = ProactiveSensitivity.entries.firstOrNull { level -> level.name == it.trim().uppercase() }
             require(level != null) { "proactiveSensitivity must be LOW, MEDIUM or HIGH, was '$it'" }
             level
-        } ?: ProactiveSensitivity.MEDIUM
+        } ?: ProactiveSensitivity.LOW
         return Config(profileId, revision, wakeWords, maxLevel, whitelist, consent,
             proactiveCooldownMillis, proactiveSensitivity)
     }

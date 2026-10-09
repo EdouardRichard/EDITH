@@ -22,7 +22,7 @@ class SmartSettingsFormTest {
         profileId: String? = null,
         cooldownMillis: Long = 3000L,
         proactiveCooldownMillis: Long = 60_000L,
-        proactiveSensitivity: String = "MEDIUM",
+        proactiveSensitivity: String = "LOW",
     ) = SmartSettings(wakeWords, maxLevel, whitelist, profileId, cooldownMillis,
         proactiveCooldownMillis, proactiveSensitivity)
 

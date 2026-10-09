@@ -146,9 +146,13 @@ class SmartSettingsStoreTest {
     fun theProactiveDefaultsAreTheOnesTheSpecNames() {
         val settings = SmartSettings()
 
+        // Tuned on 2026-10-09 after two ambient windows measured ~1.8 admitted triggers per ten minutes against the
+        // spec's ceiling of one (P3.2-FT): the shipped sensitivity is now the stricter `LOW`, which refuses a
+        // transcript shorter than twelve characters (both measured false triggers were 9-12 character phrases). The
+        // cooldown deliberately keeps its original 60 s - only the length threshold changed.
         assertEquals(60_000L, settings.proactiveCooldownMillis)
-        assertEquals("MEDIUM", settings.proactiveSensitivity)
-        assertEquals("MEDIUM", settings.effectiveProactiveSensitivity())
+        assertEquals("LOW", settings.proactiveSensitivity)
+        assertEquals("LOW", settings.effectiveProactiveSensitivity())
     }
 
     @Test
@@ -168,21 +172,21 @@ class SmartSettingsStoreTest {
         assertEquals("L2", loaded.maxLevel)
         assertEquals(4500L, loaded.cooldownMillis)
         assertEquals(60_000L, loaded.proactiveCooldownMillis)
-        assertEquals("MEDIUM", loaded.proactiveSensitivity)
+        assertEquals("LOW", loaded.proactiveSensitivity)
     }
 
     @Test
     fun theProactiveKeysRoundTripAndAreSentUnderTheNamesThePluginKnows() {
         val blobs = TestBlobs()
         val store = SmartSettingsStore(blobs)
-        store.save(SmartSettings(proactiveCooldownMillis = 120_000L, proactiveSensitivity = "high"))
+        store.save(SmartSettings(proactiveCooldownMillis = 300_000L, proactiveSensitivity = "high"))
 
         val loaded = store.load()
-        assertEquals(120_000L, loaded.proactiveCooldownMillis)
+        assertEquals(300_000L, loaded.proactiveCooldownMillis)
         assertEquals("HIGH", loaded.effectiveProactiveSensitivity())
 
         val values = loaded.pluginValues(profile("p-1"))
-        assertEquals("120000", values["proactiveCooldownMillis"])
+        assertEquals("300000", values["proactiveCooldownMillis"])
         assertEquals("HIGH", values["proactiveSensitivity"])
     }
 
@@ -190,7 +194,7 @@ class SmartSettingsStoreTest {
     fun anUnrecognisedStoredSensitivityFallsBackRatherThanRefusingThePlugin() {
         // Same rule as `maxLevel`: the plugin refuses a level it does not know, and a refused configuration takes the
         // whole activation down, so the store normalises it.
-        assertEquals("MEDIUM", SmartSettings(proactiveSensitivity = "loud").effectiveProactiveSensitivity())
+        assertEquals("LOW", SmartSettings(proactiveSensitivity = "loud").effectiveProactiveSensitivity())
     }
 
     @Test

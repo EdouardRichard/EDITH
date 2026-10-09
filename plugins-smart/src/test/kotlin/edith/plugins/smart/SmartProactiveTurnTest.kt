@@ -217,7 +217,7 @@ class SmartProactiveTurnTest {
         try {
             withLines { lines ->
                 arm(rig)
-                rig.plugin.handle(TranscriptEvent(rig.transcript("第二句话是不是值得提醒", turnId = "asr-2")))
+                rig.plugin.handle(TranscriptEvent(rig.transcript("第二句话是不是值得提醒一下", turnId = "asr-2")))
 
                 assertEquals(1, rig.model.requests.size,
                     "a proactive turn must not run beside the in-flight wake turn")
@@ -242,7 +242,7 @@ class SmartProactiveTurnTest {
 
         rig.model.onRequest = proposing()
         arm(rig)
-        rig.plugin.handle(TranscriptEvent(rig.transcript("第二句话是不是值得提醒", turnId = "asr-2")))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("第二句话是不是值得提醒一下", turnId = "asr-2")))
 
         assertEquals(2, rig.model.requests.size, "a finished turn must not make the next trigger busy")
     }
@@ -343,7 +343,7 @@ class SmartProactiveTurnTest {
 
         withLines { lines ->
             arm(rig)
-            rig.plugin.handle(TranscriptEvent(rig.transcript("另一句话是不是值得提醒", turnId = "asr-2")))
+            rig.plugin.handle(TranscriptEvent(rig.transcript("另一句话是不是值得提醒一下呢", turnId = "asr-2")))
             assertEquals(1, rig.model.requests.size,
                 "inside the configured five seconds the second trigger gives way")
             assertTrue(lines.any { it == "P3_PROACTIVE skip reason=COOLDOWN" }, lines.toString())
@@ -352,7 +352,7 @@ class SmartProactiveTurnTest {
         // Past the configured window - not past the un-configured sixty seconds - it is admitted again.
         rig.clock.advance(6_000_000_000L)
         arm(rig)
-        rig.plugin.handle(TranscriptEvent(rig.transcript("第三句话是不是值得提醒", turnId = "asr-3")))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("第三句话是不是值得提醒一下呢", turnId = "asr-3")))
         assertEquals(2, rig.model.requests.size, "past the configured cooldown it is admitted again")
     }
 
@@ -385,7 +385,7 @@ class SmartProactiveTurnTest {
         rig.model.onRequest = proposing()
 
         arm(rig)
-        rig.plugin.handle(TranscriptEvent(rig.transcript("第一句值得提醒的话", turnId = "asr-1")))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("第一句值得提醒的话是什么呢", turnId = "asr-1")))
         assertEquals(1, rig.model.requests.size, "the armed session must still work")
 
         // The user turns 「主动辅助」 off mid-session. The host stops producing perception, but transcripts keep
@@ -395,7 +395,7 @@ class SmartProactiveTurnTest {
         rig.clock.advance(120_000_000_000L)
 
         withLines { lines ->
-            rig.plugin.handle(TranscriptEvent(rig.transcript("第二句值得提醒的话", turnId = "asr-2")))
+            rig.plugin.handle(TranscriptEvent(rig.transcript("第二句值得提醒的话是什么呢", turnId = "asr-2")))
 
             assertEquals(1, rig.model.requests.size, "a disarmed session must not reach the model")
             assertTrue(lines.any { it == "P3_PROACTIVE skip reason=DISARMED" }, lines.toString())
@@ -415,14 +415,14 @@ class SmartProactiveTurnTest {
         }
         arm(rig)
 
-        val worker = Thread { rig.plugin.handle(TranscriptEvent(rig.transcript("第一句值得提醒的话", turnId = "asr-1"))) }
+        val worker = Thread { rig.plugin.handle(TranscriptEvent(rig.transcript("第一句值得提醒的话是什么呢", turnId = "asr-1"))) }
         worker.isDaemon = true
         worker.start()
         assertTrue(entered.await(2, TimeUnit.SECONDS), "the first proactive request must be in flight")
 
         try {
             withLines { lines ->
-                rig.plugin.handle(TranscriptEvent(rig.transcript("第二句值得提醒的话", turnId = "asr-2")))
+                rig.plugin.handle(TranscriptEvent(rig.transcript("第二句值得提醒的话是什么呢", turnId = "asr-2")))
 
                 assertEquals(1, rig.model.requests.size, "only one proactive request may be in flight at a time")
                 assertTrue(lines.any { it == "P3_PROACTIVE skip reason=BUSY" }, lines.toString())

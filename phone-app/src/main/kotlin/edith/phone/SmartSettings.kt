@@ -30,9 +30,17 @@ data class SmartSettings(
      * how often the assistant may interrupt without being asked. The sensitivity picks one of the plugin's three
      * threshold pairs; the string is normalised through [effectiveProactiveSensitivity] before it is sent, because the
      * plugin refuses a level it does not know.
+     *
+     * **The sensitivity default was tightened to `LOW` on 2026-10-09** after two ambient windows measured ~1.8
+     * admitted triggers per ten minutes against the spec's ceiling of one (`P3.2-FT`): at `MEDIUM` only ten of
+     * twenty-two ambient finals were refused as too short, and both admitted triggers were 9-12 character phrases.
+     * `LOW` raises that floor to twelve characters. **The cooldown stays at its original 60 s by the owner's decision**
+     * — only the length threshold changed, so the assistant's *rhythm* is unchanged and just its tolerance for short
+     * phrases is lower. The trade-off belongs to the nuisance side: a short but genuine request is now more likely to
+     * be missed than to interrupt.
      */
     val proactiveCooldownMillis: Long = 60_000L,
-    val proactiveSensitivity: String = "MEDIUM",
+    val proactiveSensitivity: String = "LOW",
 ) {
     /**
      * The plugin's own cooldown parameter.
