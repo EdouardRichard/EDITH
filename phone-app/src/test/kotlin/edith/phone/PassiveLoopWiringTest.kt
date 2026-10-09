@@ -39,6 +39,8 @@ import edith.plugin.Capability
 import edith.plugin.CapabilityVerification
 import edith.plugin.ConfigSchema
 import edith.plugin.ConfiguredPlugin
+import edith.plugin.ContextSignals
+import edith.plugin.ContextSnapshot
 import edith.plugin.DeactivationReason
 import edith.plugin.HintDevice
 import edith.plugin.InputModality
@@ -133,6 +135,17 @@ class PassiveLoopWiringTest {
 
     private class StubAsrSession : AsrSession {
         override fun listen(listener: (edith.contracts.TranscriptRevision) -> Unit): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+    }
+
+    /**
+     * The provider that answers the smart plugin's declared `Context` capability in these rigs (P3.2 Task 8): the
+     * plugin's proactive path runs on perception events, so a rig that activates it must provide the capability the
+     * way `HostCompositionRoot.create` now does. It reports nothing - these tests are about the passive loop.
+     */
+    private class EmptyContextSignals : ContextSignals {
+        override fun snapshot() = ContextSnapshot(0L, emptyMap())
+        override fun listen(listener: (ContextSnapshot) -> Unit): CancellationHandle =
             object : CancellationHandle { override fun cancel() = Unit }
     }
 
@@ -300,6 +313,9 @@ class PassiveLoopWiringTest {
                     Capability.Asr to chain.asrSession,
                     Capability.Actions to NoActions(),
                     Capability.WakeWord to wakes,
+                    // P3.2: the smart plugin declares `Context` (its proactive path runs on perception events), so a
+                    // rig that activates it must answer that capability the way the composition does.
+                    Capability.Context to EmptyContextSignals(),
                 ),
                 storageFor = { StubStorage() })
             host = HostRuntime(1, environment)
@@ -646,6 +662,7 @@ class PassiveLoopWiringTest {
                 Capability.Asr to StubAsrSession(),
                 Capability.Actions to NoActions(),
                 Capability.WakeWord to wiring.wakeWords,
+                Capability.Context to EmptyContextSignals(),
             ),
             storageFor = { StubStorage() })
         val root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
@@ -706,7 +723,7 @@ class PassiveLoopWiringTest {
             val advertised = rig.environment.availableCapabilities
 
             assertEquals(setOf(Capability.Model, Capability.Storage, Capability.TextOutput, Capability.Asr,
-                Capability.Actions, Capability.WakeWord), advertised)
+                Capability.Actions, Capability.WakeWord, Capability.Context), advertised)
             val services = rig.environment.services(ResourceScope("smart-assistant", session, Generation(1)), advertised)
             advertised.forEach { capability ->
                 assertNull("$capability is advertised, so it must be answerable",
@@ -755,7 +772,8 @@ class PassiveLoopWiringTest {
     fun theConfigurationNamesEachKeyThePluginKnows() {
         val values = SmartSettings(profileId = "p-1").pluginConfiguration(profile("p-1")).values
 
-        assertEquals(setOf("profileId", "profileRevision", "wakeWords", "maxLevel", "whitelist"), values.keys)
+        assertEquals(setOf("profileId", "profileRevision", "wakeWords", "maxLevel", "whitelist",
+            "proactiveCooldownMillis", "proactiveSensitivity"), values.keys)
     }
 
     @Test
@@ -817,6 +835,7 @@ class PassiveLoopWiringTest {
                 Capability.Asr to StubAsrSession(),
                 Capability.Actions to NoActions(),
                 Capability.WakeWord to wiring.wakeWords,
+                Capability.Context to EmptyContextSignals(),
             ),
             storageFor = { StubStorage() })
         val root = HostCompositionRoot(HostRuntime(1, environment), repository, InertModel(),

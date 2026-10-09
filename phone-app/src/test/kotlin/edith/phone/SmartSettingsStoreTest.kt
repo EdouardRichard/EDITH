@@ -1,6 +1,7 @@
 package edith.phone
 
 import edith.phone.model.TestBlobs
+import edith.phone.storage.writeJson
 import edith.plugin.CancellationHandle
 import edith.plugin.CapabilityVerification
 import edith.plugin.InputModality
@@ -8,6 +9,10 @@ import edith.plugin.ModelProfile
 import edith.plugin.OutputModality
 import edith.plugin.SecretHandle
 import edith.storage.ProfileRepository
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -135,6 +140,57 @@ class SmartSettingsStoreTest {
     @Test
     fun aStoredLevelIsNormalisedToThePluginsOwnSpelling() {
         assertEquals("L2", SmartSettings(maxLevel = " l2 ").effectiveMaxLevel())
+    }
+
+    @Test
+    fun theProactiveDefaultsAreTheOnesTheSpecNames() {
+        val settings = SmartSettings()
+
+        assertEquals(60_000L, settings.proactiveCooldownMillis)
+        assertEquals("MEDIUM", settings.proactiveSensitivity)
+        assertEquals("MEDIUM", settings.effectiveProactiveSensitivity())
+    }
+
+    @Test
+    fun aBlobWrittenBeforeTheProactiveKeysExistedStillLoadsWithTheNewDefaults() {
+        val blobs = TestBlobs()
+        // Exactly the shape the store wrote before P3.2: no proactive keys anywhere.
+        writeJson(blobs, SmartSettingsStore.BLOB_ID, buildJsonObject {
+            put("version", 1)
+            put("wakeWords", buildJsonArray { add("伊迪丝") })
+            put("maxLevel", "L2")
+            put("whitelist", buildJsonArray { })
+            put("cooldownMillis", 4500L)
+        })
+
+        val loaded = SmartSettingsStore(blobs).load()
+
+        assertEquals("L2", loaded.maxLevel)
+        assertEquals(4500L, loaded.cooldownMillis)
+        assertEquals(60_000L, loaded.proactiveCooldownMillis)
+        assertEquals("MEDIUM", loaded.proactiveSensitivity)
+    }
+
+    @Test
+    fun theProactiveKeysRoundTripAndAreSentUnderTheNamesThePluginKnows() {
+        val blobs = TestBlobs()
+        val store = SmartSettingsStore(blobs)
+        store.save(SmartSettings(proactiveCooldownMillis = 120_000L, proactiveSensitivity = "high"))
+
+        val loaded = store.load()
+        assertEquals(120_000L, loaded.proactiveCooldownMillis)
+        assertEquals("HIGH", loaded.effectiveProactiveSensitivity())
+
+        val values = loaded.pluginValues(profile("p-1"))
+        assertEquals("120000", values["proactiveCooldownMillis"])
+        assertEquals("HIGH", values["proactiveSensitivity"])
+    }
+
+    @Test
+    fun anUnrecognisedStoredSensitivityFallsBackRatherThanRefusingThePlugin() {
+        // Same rule as `maxLevel`: the plugin refuses a level it does not know, and a refused configuration takes the
+        // whole activation down, so the store normalises it.
+        assertEquals("MEDIUM", SmartSettings(proactiveSensitivity = "loud").effectiveProactiveSensitivity())
     }
 
     @Test

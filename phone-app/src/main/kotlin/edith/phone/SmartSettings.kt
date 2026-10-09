@@ -23,6 +23,16 @@ data class SmartSettings(
     val whitelist: List<String> = emptyList(),
     val profileId: String? = null,
     val cooldownMillis: Long = 3000L,
+    /**
+     * P3.2: the proactive cooldown and sensitivity (spec §16.1#4).
+     *
+     * The cooldown is the same kind of number as [cooldownMillis] (the wake path's), but it bounds a different thing:
+     * how often the assistant may interrupt without being asked. The sensitivity picks one of the plugin's three
+     * threshold pairs; the string is normalised through [effectiveProactiveSensitivity] before it is sent, because the
+     * plugin refuses a level it does not know.
+     */
+    val proactiveCooldownMillis: Long = 60_000L,
+    val proactiveSensitivity: String = "MEDIUM",
 ) {
     /**
      * The plugin's own cooldown parameter.
@@ -66,6 +76,8 @@ data class SmartSettings(
         "wakeWords" to wakeWords.joinToString(","),
         "maxLevel" to effectiveMaxLevel(),
         "whitelist" to whitelist.joinToString(","),
+        "proactiveCooldownMillis" to proactiveCooldownMillis.toString(),
+        "proactiveSensitivity" to effectiveProactiveSensitivity(),
     )
 
     /** The plugin's `PluginConfiguration`, at the schema version the plugin declares. */
@@ -82,6 +94,17 @@ data class SmartSettings(
         RiskLevel.entries.firstOrNull { it.name.equals(maxLevel.trim(), ignoreCase = true) }?.name
             ?: SmartSettings().maxLevel
 
+    /**
+     * The sensitivity as the plugin's own enum name, or the shipped default when the stored text is not a level.
+     *
+     * The same normalisation as [effectiveMaxLevel] and for the same reason: the plugin requires one of three exact
+     * names and refuses the whole configuration otherwise, so a hand-edited or corrupted blob must not be able to take
+     * the activation (and with it the passive loop) down.
+     */
+    fun effectiveProactiveSensitivity(): String =
+        SENSITIVITIES.firstOrNull { it.equals(proactiveSensitivity.trim(), ignoreCase = true) }
+            ?: SmartSettings().proactiveSensitivity
+
     companion object {
         const val SCHEMA_VERSION = 1
 
@@ -92,6 +115,9 @@ data class SmartSettings(
          * turn cannot run - which is the honest outcome for "no model is configured", not a crash.
          */
         const val UNRESOLVED_PROFILE = "__unconfigured__"
+
+        /** The three levels the plugin's own enum names; kept here so the store never sends a fourth. */
+        val SENSITIVITIES = listOf("LOW", "MEDIUM", "HIGH")
     }
 }
 
@@ -118,6 +144,8 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
             put("whitelist", buildJsonArray { settings.whitelist.forEach(::add) })
             settings.profileId?.let { put("profileId", it) }
             put("cooldownMillis", settings.cooldownMillis)
+            put("proactiveCooldownMillis", settings.proactiveCooldownMillis)
+            put("proactiveSensitivity", settings.effectiveProactiveSensitivity())
         })
     }
 
@@ -131,6 +159,12 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
                 whitelist = strings(json, "whitelist") ?: emptyList(),
                 profileId = json["profileId"]?.jsonPrimitive?.contentOrNull,
                 cooldownMillis = json["cooldownMillis"]?.jsonPrimitive?.longOrNull ?: SmartSettings().cooldownMillis,
+                // Absent in a blob written before P3.2: the field takes its default, exactly like every other
+                // missing key, so an old store keeps loading instead of being treated as corrupt.
+                proactiveCooldownMillis = json["proactiveCooldownMillis"]?.jsonPrimitive?.longOrNull
+                    ?: SmartSettings().proactiveCooldownMillis,
+                proactiveSensitivity = json["proactiveSensitivity"]?.jsonPrimitive?.content
+                    ?: SmartSettings().proactiveSensitivity,
             )
         }.getOrNull()
     }

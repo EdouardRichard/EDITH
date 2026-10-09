@@ -182,12 +182,17 @@ class PublicProviderConsumerTest {
                 override fun clear() = storage.clear()
             },
             // Task 13 turned `plugins-smart` from a 12-line shell into the real passive loop and widened its
-            // descriptor to `WakeWord, Asr, Model, Actions, TextOutput`. The host refuses to activate a plugin whose
+            // descriptor to `WakeWord, Asr, Model, Actions, TextOutput`; P3.2's Task 8 added `Context` (the plugin's
+            // proactive path runs on the host's perception events). The host refuses to activate a plugin whose
             // declared capabilities are not all advertised, so this map now has to name every one of them — that is
             // the same "no fake success" rule the Speaker entry above exists for, not a new behaviour.
             Capability.WakeWord to object : WakeWordRegistry {
                 override fun declare(words: List<String>) = true
                 override fun current() = emptyList<String>()
+            },
+            Capability.Context to object : ContextSignals {
+                override fun snapshot() = ContextSnapshot(0L, emptyMap())
+                override fun listen(listener: (ContextSnapshot) -> Unit): CancellationHandle = FakeCancellation()
             },
             Capability.Actions to object : ActionExecutor {
                 override fun descriptors() = emptyList<ActionDescriptor>()

@@ -155,6 +155,20 @@ class MainActivity : ComponentActivity() {
                         Text("开始会话后可开启。开启后，本会话的语音转写文本会随请求离开设备、发送到所配置的模型服务" +
                             "（含该轮请求所需的会话上下文）；默认关闭，会话停止后自动恢复为关闭，该开关也不会写入存储。",
                             style = MaterialTheme.typography.bodySmall)
+                        // P3.2: the arming switch. It is not a second upload grant - with it on, the App only starts
+                        // *perceiving* (acoustic labels and context changes); a proactive turn is still a model
+                        // request and still needs the upload switch above. Session-scoped and off by default, like
+                        // that switch, and reset by the composition when the session stops.
+                        val proactiveArmed by root.proactiveArming.enabled.collectAsStateWithLifecycle()
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Switch(checked = proactiveArmed,
+                                onCheckedChange = { root.proactiveArming.set(it) },
+                                enabled = state.session != SessionState.Idle)
+                            Spacer(Modifier.width(8.dp))
+                            Text("主动辅助（未唤醒时给一句短提示）")
+                        }
+                        Text("需同时打开上面的上传开关才会发出模型请求；本会话停止后自动关闭且不写入存储。",
+                            style = MaterialTheme.typography.bodySmall)
                         state.errorCode?.let { Text(errorLabel(it), color = MaterialTheme.colorScheme.error) }
                         // Debug-only acceptance affordance: with the shipped plugins still shells, this is the only
                         // way a wearer can check what the glasses actually show. Hidden whenever no probe is
@@ -239,6 +253,25 @@ class MainActivity : ComponentActivity() {
         ExposedDropdownMenu(expanded = levelExpanded, onDismissRequest = { levelExpanded = false }) {
             levels.forEach { level -> DropdownMenuItem(text = { Text(level) },
                 onClick = { draft = draft.copy(maxLevel = level); errors = emptyList(); levelExpanded = false; saved = false }) }
+        }
+    }
+    // P3.2: the proactive pair. The cooldown is a number the user types (5-600 s, in milliseconds), and the
+    // sensitivity is one of three levels - the same chooser shape as the ceiling above.
+    OutlinedTextField(value = draft.proactiveCooldown, onValueChange = {
+        draft = draft.copy(proactiveCooldown = it); errors = emptyList(); saved = false
+    }, label = { Text("主动辅助冷却（毫秒，5000-600000）") }, modifier = Modifier.fillMaxWidth())
+    var sensitivityExpanded by remember { mutableStateOf(false) }
+    ExposedDropdownMenuBox(expanded = sensitivityExpanded, onExpandedChange = { sensitivityExpanded = !sensitivityExpanded }) {
+        OutlinedTextField(value = draft.proactiveSensitivity, onValueChange = {}, readOnly = true,
+            label = { Text("主动辅助敏感度") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(sensitivityExpanded) },
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth())
+        ExposedDropdownMenu(expanded = sensitivityExpanded, onDismissRequest = { sensitivityExpanded = false }) {
+            SmartSettings.SENSITIVITIES.forEach { level -> DropdownMenuItem(text = { Text(level) },
+                onClick = {
+                    draft = draft.copy(proactiveSensitivity = level)
+                    errors = emptyList(); sensitivityExpanded = false; saved = false
+                }) }
         }
     }
     errors.forEach { Text(it, color = MaterialTheme.colorScheme.error) }

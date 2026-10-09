@@ -3,6 +3,7 @@ package edith.phone
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import edith.audio.AcousticLabeler
 import edith.audio.LocalSpeakerService
 import edith.audio.KeywordSpotterWakeWordEngine
 import edith.audio.PcmFramer
@@ -37,6 +38,7 @@ import edith.phone.actions.AppLaunchResolver
 import edith.phone.actions.ContextIntentLauncher
 import edith.phone.actions.IntentActionExecutor
 import edith.phone.actions.PackageManagerAppCatalog
+import edith.phone.model.ProactiveArming
 import edith.phone.model.ProfileViewModel
 import edith.phone.model.ProbeConsent
 import edith.phone.model.ProfileProbeGate
@@ -95,6 +97,14 @@ class HostCompositionRoot internal constructor(
      * grant can never outlive the session it was given for.
      */
     internal val sessionUploadConsent: SessionUploadConsent = SessionUploadConsent(),
+    /**
+     * P3.2: the session-scoped 「主动辅助」 arming switch (spec §16.2).
+     *
+     * Session state, not a stored secret, and **off by default**. It is the host's gate on producing perception
+     * events - see [armedAcousticSink] - so `create`'s chain emits no `AcousticEvent` while it is off, and [stop]
+     * (and every transition back to `Idle`) returns it to off so an arming can never outlive its session.
+     */
+    internal val proactiveArming: ProactiveArming = ProactiveArming(),
 ) : AutoCloseable {
     /**
      * RAM-only tee of the live CXR PCM used by the T17 controlled format bring-up. Defaulted to a no-op
@@ -201,6 +211,9 @@ class HostCompositionRoot internal constructor(
         // D13: the upload grant is scoped to one session, and every path back to Idle ends it - including the ones
         // that call `host.stop()` directly (a denied start) and never reach this composition's `stop`.
         if (session == SessionState.Idle) sessionUploadConsent.deactivate()
+        // P3.2: arming is session-scoped too, and for the same reason - a switch left on after the session it was
+        // given for would let the next session perceive without the user asking again.
+        if (session == SessionState.Idle) proactiveArming.deactivate()
         mutableState.update { it.copy(session = session, capabilityReasons = capabilityReasons()) }
     }
     private var closed = false
@@ -686,6 +699,9 @@ class HostCompositionRoot internal constructor(
         // transition below, because `stop` is also reached when no transition happens (a stop after an interrupt, or
         // before the first start), and a session-scoped grant must never survive it.
         sessionUploadConsent.deactivate()
+        // P3.2: and so does the arming switch. Done here as well as on the Idle transition, because `stop` is also
+        // reached when no transition happens (a stop before the first start), and an arming must never survive it.
+        proactiveArming.deactivate()
         // D15: a stopped session must not keep repeating its opening handshake to the glasses.
         hintLink?.sessionEnded()
         // Before `host.stop()`: the epoch named by `runningAudioEpoch` is the one the loop is polling under, and
@@ -768,6 +784,9 @@ class HostCompositionRoot internal constructor(
             // D13: the one instance the UI's switch writes and the model client reads. Session state only - nothing
             // here is persisted, and it starts off.
             val sessionUploadConsent = SessionUploadConsent()
+            // P3.2: the arming switch and its gate. One instance for the UI, the chain's acoustic sink and the
+            // reset paths, exactly as the upload consent is one instance for the UI and the model client.
+            val proactiveArming = ProactiveArming()
             // The model request had no production line before the P3.1 wrap-up: the client was built with no
             // interceptor, so a successful request was silent and that hop rested on its effects. This is the one line
             // that closes the gap, and it carries nothing but method, status and duration (`ModelHttpLog`).
@@ -835,6 +854,13 @@ class HostCompositionRoot internal constructor(
             // local gate here is what made `root.playbackGate.begin()` suppress nothing.
             val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
             val hostHolder = arrayOfNulls<HostRuntime>(1)
+            // P3.2 Task 6: the context provider. Stage A exposes the zero-permission time keys; Stage B appends its
+            // three permissioned sources to the same list. The listener is the production arming gate, so a disarmed
+            // session produces no `ContextChanged` at all - the plugin's only context signal is the acoustic event.
+            // The arming state itself is published as a source, because the plugin has to be able to read the switch's
+            // **current** answer at request time (local transcription continues while it is off).
+            val contextSignals = CxrContextSignals(clock, listOf(CxrContextSignals.armingSource(proactiveArming)))
+            contextSignals.listen(armedContextSink({ hostHolder[0] }, clock, proactiveArming))
             val audio = provisionAudioChain(
                 context = context,
                 clock = clock, scheduler = scheduler, ingress = { connection[0]?.ingress },
@@ -861,6 +887,10 @@ class HostCompositionRoot internal constructor(
                 // - and a wake that arrives after the session ended is dropped by `onEvent` instead of opening a turn
                 // under a generation that no longer exists.
                 wakeEmit = { word, confidence -> hostHolder[0]?.let { host -> emitWakeDetected(host, clock, word, confidence) } },
+                // Task 4 (P3.2): the same per-emission identity resolution for the acoustic gate, so a label that
+                // arrives after the session ended is dropped by `onEvent` instead of opening anything under a
+                // generation that no longer exists. Task 5: the host only produces the event while 「主动辅助」 is on.
+                acousticEmit = armedAcousticSink({ hostHolder[0] }, clock, proactiveArming),
                 cooldownNanos = smartSettings.cooldownNanos,
                 suppressWhile = playbackSuppression { rootHolder[0] })
             // The smart plugin is registered and configured here, with the composition's own clock, scheduler,
@@ -883,6 +913,10 @@ class HostCompositionRoot internal constructor(
                     // registry - the instance the plugin declares its configured words to - so there is one word set,
                     // not a second registry built from the same settings (Task 14a-fix item 5).
                     put(Capability.WakeWord, smartWiring.wakeWords)
+                    // P3.2 Task 6: `Capability.Context` stops being an advertised-but-unanswerable capability. The
+                    // provider is the composition's own signals object, so the values a plugin reads and the events
+                    // the host delivers describe one source, not two.
+                    put(Capability.Context, contextSignals)
                 },
                 storageFor = namespaceFactory,
                 taskScope = ExecutorTaskScope(pluginTasks))
@@ -918,7 +952,8 @@ class HostCompositionRoot internal constructor(
                 hintLink = hintLink,
                 smartWiring = smartWiring,
                 smartSettingsStore = smartSettingsStore,
-                sessionUploadConsent = sessionUploadConsent)
+                sessionUploadConsent = sessionUploadConsent,
+                proactiveArming = proactiveArming)
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
             // connection that has not been built yet.
             root.observerHolder = observerHolder
@@ -995,6 +1030,67 @@ class HostCompositionRoot internal constructor(
                 bounded,
             ))
         }
+
+        /**
+         * Turns one acoustic label transition into the event the host delivers (Task 4).
+         *
+         * Built here and with the host's **current** identity, exactly like [emitWakeDetected]: the label is the only
+         * payload, so the line and the event carry no audio and no transcript. A label that arrives after the session
+         * ended is dropped by `onEvent` rather than delivered under a generation that no longer exists.
+         */
+        internal fun emitAcoustic(host: HostRuntime, clock: MonotonicClock, label: AcousticLabel) {
+            val identity = host.currentIdentity() ?: return
+            val now = clock.nowNanos()
+            // The label is a coarse category, never the audio that produced it.
+            P3Log.line("P3_ACOUSTIC label=$label")
+            host.onEvent(AcousticEvent(
+                EventEnvelope(identity.first, identity.second, "acoustic-${UUID.randomUUID()}", now, now),
+                label,
+            ))
+        }
+
+        /**
+         * The **arming gate**: the acoustic sink the chain is assembled with, which produces nothing unless
+         * [ProactiveArming.enabled] is on (P3.2, spec §16.2).
+         *
+         * A named production seam rather than a lambda inside `create`, for the same reason as [playbackSuppression]:
+         * the gate is the whole mechanism by which the switch works, so a JVM test drives **this** function instead of
+         * a copy of it. The check happens before [emitAcoustic], so a disarmed composition emits no event *and* writes
+         * no `P3_ACOUSTIC` line - nothing downstream can observe the label at all.
+         *
+         * `host` is a function because `create` provisions the chain before the composition's host holder is filled;
+         * resolving it per label is also what makes a late label drop out through the host's own identity gate.
+         */
+        internal fun armedAcousticSink(host: () -> HostRuntime?, clock: MonotonicClock,
+            arming: ProactiveArming): (AcousticLabel) -> Unit =
+            { label -> if (arming.enabled.value) host()?.let { emitAcoustic(it, clock, label) } }
+
+        /**
+         * Turns one context change into the event the host delivers (Task 6).
+         *
+         * Only the **key names** reach the log: a value can be a foreground package or, in Stage B, a calendar title,
+         * and neither belongs in a log line. The values themselves travel only inside the event, to a plugin the host
+         * has already granted `Context`.
+         */
+        internal fun emitContextChanged(host: HostRuntime, clock: MonotonicClock, snapshot: ContextSnapshot) {
+            val identity = host.currentIdentity() ?: return
+            val now = clock.nowNanos()
+            P3Log.line("P3_CONTEXT keys=${snapshot.values.keys.sorted().joinToString(",")}")
+            host.onEvent(ContextChanged(
+                EventEnvelope(identity.first, identity.second, "context-${UUID.randomUUID()}", now, now),
+                snapshot.capturedAtNanos,
+                snapshot.values,
+            ))
+        }
+
+        /**
+         * The arming gate for context, exactly as [armedAcousticSink] is for the acoustic labels: with 「主动辅助」 off
+         * the composition produces no `ContextChanged`, so a plugin receives no context signal (spec §16.2, pre-flight
+         * P4).
+         */
+        internal fun armedContextSink(host: () -> HostRuntime?, clock: MonotonicClock,
+            arming: ProactiveArming): (ContextSnapshot) -> Unit =
+            { snapshot -> if (arming.enabled.value) host()?.let { emitContextChanged(it, clock, snapshot) } }
     }
 }
 
@@ -1133,6 +1229,15 @@ internal class CxrAudioChain private constructor(
      * production factory assigns it immediately, before the chain can poll a single frame.
      */
     var wakeEmit: (word: String, confidence: Double) -> Unit = { _, _ -> },
+    /**
+     * The acoustic label sink, as the composition installs it (Task 4).
+     *
+     * Same shape and same reason as [wakeEmit]: the pipeline is built before the chain that owns it, so the
+     * per-frame signal reads this property through a holder rather than capturing a value. Assignable, so a JVM test
+     * can call it exactly as the labeler would - and the production factory assigns it before a single frame can be
+     * polled.
+     */
+    var acousticEmit: (AcousticLabel) -> Unit = {},
 ) : AutoCloseable {
 
     private val lock = Any()
@@ -1234,15 +1339,28 @@ internal class CxrAudioChain private constructor(
              * deliver a wake must not pretend it did.
              */
             wakeEmit: (word: String, confidence: Double) -> Unit = { _, _ -> },
+            /**
+             * The acoustic label sink, as the composition installs it; see [CxrAudioChain.acousticEmit]. Defaulted
+             * inert for the harnesses that build a chain without a live host.
+             */
+            acousticEmit: (AcousticLabel) -> Unit = {},
         ): CxrAudioChain {
             // The session needs the pipeline and the pipeline's emit needs the session: the holder breaks the cycle
             // so both the host's delivery and the plugin-facing provider see every revision, in order.
             val holder = arrayOfNulls<SherpaAsrSession>(1)
+            // The labeler is derived from these same frames and reaches the chain's sink through a second holder, for
+            // the same construction-order reason as the wake detector's emission.
+            val chainHolder = arrayOfNulls<CxrAudioChain>(1)
+            val labeler = AcousticLabeler()
             val pipeline = SpeechPipeline(vad, asr, speaker,
-                emit = { event -> holder[0]?.onEvent(event); emit(event) }, cancelTurn = cancelTurn)
+                emit = { event -> holder[0]?.onEvent(event); emit(event) }, cancelTurn = cancelTurn,
+                onFrameSignal = { frame, speech ->
+                    labeler.accept(frame, speech)?.let { label -> chainHolder[0]?.acousticEmit?.invoke(label) }
+                })
             val session = SherpaAsrSession(pipeline)
             holder[0] = session
-            return CxrAudioChain(ingress, framer, pipeline, wake, scheduler, clock, onFault, onOffer, session, wakeEmit)
+            return CxrAudioChain(ingress, framer, pipeline, wake, scheduler, clock, onFault, onOffer, session,
+                wakeEmit, acousticEmit).also { chainHolder[0] = it }
         }
     }
 }
@@ -1282,6 +1400,7 @@ private fun provisionAudioChain(
     onFault: (String) -> Unit,
     onOffer: (PcmOffer) -> Unit,
     wakeEmit: (word: String, confidence: Double) -> Unit,
+    acousticEmit: (AcousticLabel) -> Unit,
     cooldownNanos: Long,
     suppressWhile: () -> Boolean,
 ): CxrAudioChain? = try {
@@ -1304,6 +1423,7 @@ private fun provisionAudioChain(
         onFault = onFault,
         onOffer = onOffer,
         wakeEmit = wakeEmit,
+        acousticEmit = acousticEmit,
     )
 } catch (unavailable: Exception) {
     android.util.Log.i("EdithHost", "audio chain unavailable: ${unavailable.javaClass.name}: ${unavailable.message}")
@@ -1371,6 +1491,11 @@ internal fun provisionAudioChainFrom(
      * rather than throwing into the audio loop's tick.
      */
     wakeEmit: (word: String, confidence: Double) -> Unit = { _, _ -> },
+    /**
+     * The acoustic label sink the audio chain reports transitions to (Task 4); the composition turns it into an
+     * `AcousticEvent` tagged with the host's current identity.
+     */
+    acousticEmit: (AcousticLabel) -> Unit = {},
 ): CxrAudioChain? = try {
     val verified = PcmFormatEvidence.resolve(CxrGlassesTarget.GLASSES_FIRMWARE, CXR_SDK_VERSION)
     if (verified == null) {
@@ -1421,7 +1546,8 @@ internal fun provisionAudioChainFrom(
                     CxrAudioChain.assemble(ingress = ingress, framer = PcmFramer(verified, frameMillis),
                         vad = candidate.vad, asr = candidate.asr, speaker = candidate.speaker,
                         wake = wake, scheduler = scheduler, clock = clock, emit = emit, cancelTurn = cancelTurn,
-                        onFault = onFault, onOffer = onOffer, wakeEmit = wakeEmit).also { chainHolder[0] = it }
+                        onFault = onFault, onOffer = onOffer, wakeEmit = wakeEmit,
+                        acousticEmit = acousticEmit).also { chainHolder[0] = it }
                 } catch (unavailable: Throwable) {
                     runCatching { candidate.vad.close() }
                     runCatching { candidate.asr.close() }

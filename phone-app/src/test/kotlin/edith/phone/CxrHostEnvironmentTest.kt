@@ -6,6 +6,8 @@ import edith.contracts.SessionId
 import edith.host.ResourceScope
 import edith.plugin.CancellationHandle
 import edith.plugin.Capability
+import edith.plugin.ContextSignals
+import edith.plugin.ContextSnapshot
 import edith.plugin.DeadlineScheduler
 import edith.plugin.HintDevice
 import edith.plugin.HostServices
@@ -78,6 +80,29 @@ class CxrHostEnvironmentTest {
         device = FakeHintDevice()
 
         assertTrue(Capability.TextOutput in env.availableCapabilities)
+    }
+
+    @Test
+    fun aProvidedContextProviderIsAdvertisedAndAnswerable() {
+        // P3.2 Task 6: the first real `Context` provider. The rule above still holds in both directions - with no
+        // provider the capability stays unwired, which is why the negative list below still names what this rig does
+        // not supply - and with one it must be advertised *and* answerable, or a plugin would activate and then fail
+        // at `require`.
+        val signals = object : ContextSignals {
+            override fun snapshot() = ContextSnapshot(1L, mapOf("time.local" to "09:00"))
+            override fun listen(listener: (ContextSnapshot) -> Unit): CancellationHandle =
+                object : CancellationHandle { override fun cancel() = Unit }
+        }
+        val env = CxrHostEnvironment(clock = clock, input = input, liveOutput = { FakeHintDevice() },
+            scheduler = scheduler, providers = mapOf(Capability.Context to signals))
+
+        assertTrue(Capability.Context in env.availableCapabilities)
+        val services = env.services(ResourceScope("p-1", SessionId("s-1"), Generation(1)),
+            setOf(Capability.Context))
+        // The host hands a scope-bound wrapper over the provider (so a revoked scope stops answering), so the
+        // assertion is on what it returns rather than on identity.
+        val answered = services.require(Capability.Context) as ContextSignals
+        assertEquals("an advertised capability must be answerable", signals.snapshot(), answered.snapshot())
     }
 
     @Test

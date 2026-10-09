@@ -24,7 +24,15 @@ package edith.phone
 object SmartSettingsForm {
 
     /** The editable text, exactly as typed. */
-    data class Draft(val wakeWords: String, val maxLevel: String, val whitelist: String)
+    data class Draft(
+        val wakeWords: String,
+        val maxLevel: String,
+        val whitelist: String,
+        /** P3.2: the proactive cooldown in milliseconds, as typed; defaults to the shipped value like the level below. */
+        val proactiveCooldown: String = "60000",
+        /** P3.2: the sensitivity level; a set of three, so the screen edits it as a chooser. */
+        val proactiveSensitivity: String = "MEDIUM",
+    )
 
     /**
      * The result of one edit.
@@ -38,10 +46,19 @@ object SmartSettingsForm {
     private const val MAX_WORD_LENGTH = 16
     private val LEVELS = (0..4).map { "L$it" }
 
+    /**
+     * The proactive cooldown's bounds: 5 s is the shortest that is not a per-sentence retry, and 10 minutes is the
+     * longest the wake path's own per-session horizon makes sense for.
+     */
+    private const val MIN_PROACTIVE_COOLDOWN_MILLIS = 5_000L
+    private const val MAX_PROACTIVE_COOLDOWN_MILLIS = 600_000L
+
     fun fromSettings(settings: SmartSettings): Draft = Draft(
         wakeWords = settings.wakeWords.joinToString(","),
         maxLevel = settings.effectiveMaxLevel(),
         whitelist = settings.whitelist.joinToString(","),
+        proactiveCooldown = settings.proactiveCooldownMillis.toString(),
+        proactiveSensitivity = settings.effectiveProactiveSensitivity(),
     )
 
     /**
@@ -59,12 +76,16 @@ object SmartSettingsForm {
         val words = parseWakeWords(draft.wakeWords, errors)
         val level = parseLevel(draft.maxLevel, errors)
         val whitelist = parseWhitelist(draft.whitelist, errors)
+        val proactiveCooldown = parseProactiveCooldown(draft.proactiveCooldown, errors)
+        val proactiveSensitivity = parseProactiveSensitivity(draft.proactiveSensitivity, errors)
 
         Result(
             settings = base.copy(
                 wakeWords = if (words.isEmpty()) base.wakeWords else words,
                 maxLevel = level ?: base.effectiveMaxLevel(),
                 whitelist = whitelist,
+                proactiveCooldownMillis = proactiveCooldown ?: base.proactiveCooldownMillis,
+                proactiveSensitivity = proactiveSensitivity ?: base.effectiveProactiveSensitivity(),
             ),
             errors = errors,
         )
@@ -108,8 +129,7 @@ object SmartSettingsForm {
         return level
     }
 
-    private fun parseWhitelist(text: String, errors: MutableList<String>): List<String> {
-        val accepted = mutableListOf<String>()
+    private fun parseWhitelist(text: String, errors: MutableList<String>): List<String> {        val accepted = mutableListOf<String>()
         text.split(',', '，').forEach { raw ->
             val entry = raw.trim()
             if (entry.isEmpty()) return@forEach
@@ -125,5 +145,25 @@ object SmartSettingsForm {
             accepted += entry
         }
         return accepted
+    }
+
+    /** The proactive cooldown must be a whole number of milliseconds inside the documented window. */
+    private fun parseProactiveCooldown(text: String, errors: MutableList<String>): Long? {
+        val millis = text.trim().toLongOrNull()
+        if (millis == null || millis < MIN_PROACTIVE_COOLDOWN_MILLIS || millis > MAX_PROACTIVE_COOLDOWN_MILLIS) {
+            errors += "主动辅助冷却需为 $MIN_PROACTIVE_COOLDOWN_MILLIS-$MAX_PROACTIVE_COOLDOWN_MILLIS 毫秒的整数，未保存"
+            return null
+        }
+        return millis
+    }
+
+    /** The sensitivity is the plugin's three-level enum, normalised to its own spelling. */
+    private fun parseProactiveSensitivity(text: String, errors: MutableList<String>): String? {
+        val level = text.trim().uppercase()
+        if (level !in SmartSettings.SENSITIVITIES) {
+            errors += "敏感度「${text.trim()}」不是有效档位，请选择 LOW/MEDIUM/HIGH"
+            return null
+        }
+        return level
     }
 }

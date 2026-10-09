@@ -21,7 +21,59 @@ class SmartSettingsFormTest {
         whitelist: List<String> = emptyList(),
         profileId: String? = null,
         cooldownMillis: Long = 3000L,
-    ) = SmartSettings(wakeWords, maxLevel, whitelist, profileId, cooldownMillis)
+        proactiveCooldownMillis: Long = 60_000L,
+        proactiveSensitivity: String = "MEDIUM",
+    ) = SmartSettings(wakeWords, maxLevel, whitelist, profileId, cooldownMillis,
+        proactiveCooldownMillis, proactiveSensitivity)
+
+    // ---- P3.2: the proactive cooldown and sensitivity fields ----------------------------------------
+
+    @Test
+    fun aProactiveCooldownOutsideTheAllowedRangeIsRefusedAndTheStoredValueSurvives() {
+        val base = settings(proactiveCooldownMillis = 60_000L)
+
+        listOf("4999", "600001", "abc", "", "12.5", "-1").forEach { raw ->
+            val draft = SmartSettingsForm.fromSettings(base).copy(proactiveCooldown = raw)
+            val result = SmartSettingsForm.toSettings(draft, base)
+
+            assertEquals("raw=$raw", listOf("主动辅助冷却需为 5000-600000 毫秒的整数，未保存"), result.errors)
+            assertEquals("raw=$raw", 60_000L, result.settings.proactiveCooldownMillis)
+        }
+    }
+
+    @Test
+    fun aProactiveCooldownAtEitherBoundIsAcceptedAndRoundTrips() {
+        listOf(5_000L, 600_000L).forEach { millis ->
+            val base = settings(proactiveCooldownMillis = millis)
+            val result = SmartSettingsForm.toSettings(SmartSettingsForm.fromSettings(base), base)
+
+            assertTrue("millis=$millis errors=${result.errors}", result.errors.isEmpty())
+            assertEquals(millis, result.settings.proactiveCooldownMillis)
+            assertEquals("$millis", SmartSettingsForm.fromSettings(base).proactiveCooldown)
+        }
+    }
+
+    @Test
+    fun anUnknownSensitivityIsRefusedAndTheStoredLevelSurvives() {
+        val base = settings(proactiveSensitivity = "HIGH")
+
+        val result = SmartSettingsForm.toSettings(
+            SmartSettingsForm.fromSettings(base).copy(proactiveSensitivity = "LOUD"), base)
+
+        assertEquals(listOf("敏感度「LOUD」不是有效档位，请选择 LOW/MEDIUM/HIGH"), result.errors)
+        assertEquals("a refused level must not be stored", "HIGH", result.settings.proactiveSensitivity)
+    }
+
+    @Test
+    fun theSensitivityIsNormalisedToThePluginsOwnSpelling() {
+        val base = settings(proactiveSensitivity = "low")
+
+        assertEquals("LOW", SmartSettingsForm.fromSettings(base).proactiveSensitivity)
+        val result = SmartSettingsForm.toSettings(SmartSettingsForm.fromSettings(base), base)
+
+        assertTrue(result.errors.toString(), result.errors.isEmpty())
+        assertEquals("LOW", result.settings.effectiveProactiveSensitivity())
+    }
 
     // ---- 1. round trip ------------------------------------------------------------------------------
 
