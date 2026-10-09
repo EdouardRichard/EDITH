@@ -22,13 +22,17 @@ internal object SherpaNativeConfiguration {
             decodingMethod = "greedy_search")
     }
 
-    fun vad(bundle: ValidatedModelBundle): VadModelConfig {
-        val files = bundle.validatedPaths()
-        val manifest = bundle.manifest
-        return VadModelConfig(sileroVadModelConfig = SileroVadModelConfig(
-            model = files.getValue("vad").toString(), threshold = 0.5f,
+    fun vad(bundle: ValidatedModelBundle): VadModelConfig = vad(bundle.validatedPaths().getValue("vad"), bundle.manifest)
+
+    /**
+     * The same configuration from an already-resolved `vad` artifact. Task 11b's `SherpaVadFactory` resolves
+     * the bundle's paths once (so the validated map is not computed twice) and still gets a VAD tuned exactly
+     * like the pipeline's.
+     */
+    fun vad(vadArtifact: java.nio.file.Path, manifest: EngineManifest): VadModelConfig =
+        VadModelConfig(sileroVadModelConfig = SileroVadModelConfig(
+            model = vadArtifact.toString(), threshold = 0.5f,
             minSilenceDuration = manifest.endpointMillis / 1000f, minSpeechDuration = 0.25f,
             windowSize = 512, maxSpeechDuration = 20f),
             sampleRate = 16000, numThreads = manifest.threadCount, provider = manifest.provider)
-    }
 }

@@ -9,11 +9,20 @@ import java.util.concurrent.TimeUnit
 
 internal class ScriptedVad : VadEngine {
     var decision = VadDecision(true, false)
+
+    /**
+     * Optional per-frame override of [decision], for scripts whose speech/silence pattern depends on the frame
+     * (the D11 regression needs a gate that opens part-way through the clip). Null means "always [decision]".
+     */
+    var decisionFor: ((PcmFrame) -> VadDecision)? = null
     var failure: RuntimeException? = null
     var resetFailure: RuntimeException? = null
     var resets = 0
     var closes = 0
-    override fun accept(frame: PcmFrame): VadDecision { failure?.let { throw it }; return decision }
+    override fun accept(frame: PcmFrame): VadDecision {
+        failure?.let { throw it }
+        return decisionFor?.invoke(frame) ?: decision
+    }
     override fun reset() { resets++; resetFailure?.let { throw it } }
     override fun close() { closes++ }
 }

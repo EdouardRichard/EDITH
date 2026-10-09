@@ -83,7 +83,12 @@ private class SherpaRecognizerStream(private val recognizer: OnlineRecognizer,
     }
 }
 
-private class SherpaVadOwner(private val vad: Vad) : VadOwner {
+/**
+ * Internal rather than private since Task 11b: `SherpaVadFactory` builds a VAD-only engine from an already
+ * validated bundle through this same owner, so the wake path's VAD is created, reset and released exactly like
+ * the pipeline's. Nothing else about the class changes.
+ */
+internal class SherpaVadOwner(private val vad: Vad) : VadOwner {
     private var closed = false
     override fun accept(samples: FloatArray) { check(!closed); vad.acceptWaveform(samples) }
     override fun speechDetected(): Boolean { check(!closed); return vad.isSpeechDetected() }
