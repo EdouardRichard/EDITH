@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      P3.0 T3b throwaway probe. It reads the accessibility tree and dispatches gestures on this phone only, while the
+      operator watches. It uploads nothing, stores nothing and holds no credentials.
+    -->
+    <application
+        android:allowBackup="false"
+        android:label="EDITH P3 T3b"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity
+            android:name=".A11yProbeActivity"
+            android:exported="true"
+            android:label="EDITH P3 T3b">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          Enabled by the user in system settings; the probe cannot and must not enable itself. `canPerformGestures` is
+          required for `dispatchGesture` (the coordinate mode), and `canRetrieveWindowContent` for the node mode.
+        -->
+        <service
+            android:name=".A11yProbeService"
+            android:exported="false"
+            android:label="EDITH P3 T3b probe"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/a11y_probe_config" />
+        </service>
+    </application>
+
+</manifest>

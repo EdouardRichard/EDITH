@@ -146,6 +146,7 @@ class DiagnosticTextPlugin(
                     if (event.requestId != o.requestId) return
                     if (event.text.isNotEmpty() && !o.firstToken) { o.firstToken = true; mark(TraceMark.FIRST_TOKEN, o) }
                 }
+                is ModelStreamEvent.ToolCallDelta, is ModelStreamEvent.ToolCallTerminal -> Unit
                 is ModelStreamEvent.Terminal -> {
                     if (event.requestId != o.requestId) return
                     o.terminal = true; handle = o.handle; o.handle = null
@@ -155,6 +156,9 @@ class DiagnosticTextPlugin(
         when (event) {
             is ModelStreamEvent.TextDelta -> o.assembler.append(event.text)
             is ModelStreamEvent.Terminal -> o.assembler.finish(event.end)
+            // This plugin declares no tools, so a tool event carries nothing it can act on: it must not end the turn
+            // (a terminal tool call is not the model's text answer) and must not be rendered.
+            is ModelStreamEvent.ToolCallDelta, is ModelStreamEvent.ToolCallTerminal -> Unit
         }
         handle?.cancel()
     }

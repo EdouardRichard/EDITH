@@ -1,12 +1,770 @@
 package edith.plugins.smart
 
+import edith.agent.AgentLoop
+import edith.agent.AgentOutcome
+import edith.agent.AgentRequest
+import edith.agent.AgentRun
+import edith.agent.AuditEntry
+import edith.agent.BoundedAuditLog
+import edith.agent.ModelClientGateway
+import edith.agent.ProgressGuard
+import edith.agent.ToolRegistry
+import edith.agent.WhitelistActionPolicy
+import edith.agent.WhitelistEntry
+import edith.contracts.Assistance
+import edith.contracts.EventEnvelope
+import edith.contracts.Generation
 import edith.contracts.HostEvent
-import edith.plugin.*
+import edith.contracts.OutputStateEvent
+import edith.contracts.OutputStatus
+import edith.contracts.SessionId
+import edith.contracts.TranscriptEvent
+import edith.contracts.TranscriptRevision
+import edith.contracts.UserAction
+import edith.contracts.WakeDetected
+import edith.plugin.Capability
+import edith.plugin.CancellationHandle
+import edith.plugin.ConfigSchema
+import edith.plugin.ConfiguredPlugin
+import edith.plugin.DeactivationReason
+import edith.plugin.DeadlineScheduler
+import edith.plugin.ModelEnd
+import edith.plugin.ModelProfile
+import edith.plugin.MonotonicClock
+import edith.plugin.OutputSink
+import edith.plugin.OutputSubmission
+import edith.plugin.PluginConfiguration
+import edith.plugin.PluginContext
+import edith.plugin.PluginDescriptor
+import edith.plugin.PluginLifecycle
+import edith.plugin.RiskLevel
+import edith.plugin.actions
+import edith.plugin.model
+import edith.plugin.textOutput
+import edith.plugin.wakeWord
+import java.util.UUID
 
-class SmartAssistantPlugin : PluginLifecycle {
-    override val descriptor = PluginDescriptor("smart-assistant", "1.0.0", 1, "Smart Assistant", listOf(Capability.Model, Capability.TextOutput), ConfigSchema(1))
-    var active = false
-    override fun activate(context: PluginContext) { active = true }
-    override fun handle(event: HostEvent) { if (active) Unit }
-    override fun deactivate(reason: DeactivationReason) { active = false }
+private const val CONFIG_SCHEMA_VERSION = 1
+private const val DEFAULT_WAKE_WORDS = "伊迪丝,edith"
+private const val DEFAULT_MAX_LEVEL = "L1"
+private const val HINT_LIFETIME_MILLIS = 5_000L
+private const val DEFAULT_HINT_GRACE_MILLIS = 5_000L
+
+/**
+ * How long a wake-opened turn listens for a usable utterance when its configured profile has no timeout to borrow.
+ *
+ * The window is the profile's own `timeoutMillis` whenever there is one, because that is the number the user chose for
+ * this assistant; this is the documented fallback for the configurations that have no profile (or whose profile has
+ * gone missing). It is deliberately longer than the ~5.5 s the device measured between the wake segment's blank final
+ * and the request's own final.
+ */
+private const val DEFAULT_LISTEN_WINDOW_MILLIS = 15_000L
+private const val AUDIT_CAPACITY = 512
+
+/** Configuration keys this plugin understands; anything else is refused rather than silently ignored. */
+private val KNOWN_KEYS = setOf("profileId", "profileRevision", "wakeWords", "maxLevel", "whitelist", "requestConsent")
+
+/** The fixed, honest sentence for each non-`COMPLETED` terminal state; never a success-looking hint. */
+private val FAILURE_HINTS = mapOf(
+    AgentOutcome.INSUFFICIENT to "我没听清这句请求，再说一次试试。",
+    AgentOutcome.NO_PROGRESS to "这个操作一直没能推进，我先停下。",
+    AgentOutcome.DEADLINE to "回答超时了，稍后再试。",
+    AgentOutcome.CANCELLED to "已按你的要求取消。",
+    AgentOutcome.FAILED to "智能助手这次没能给出结果。",
+)
+
+private const val BLANK_UTTERANCE_HINT = "没有听清内容，请再说一次。"
+
+/**
+ * The smart assistant plugin: the passive loop from wake to a hint on the glasses.
+ *
+ * One turn is: a `WakeDetected` opens it (`ScenePolicy` decides whether the wake is inside the cooldown), it **listens**
+ * for a usable final `TranscriptEvent`, `agent-runtime`'s `AgentLoop` drives the model and tool calls, and the terminal
+ * run is rendered through `output-runtime`'s `ReadableHintAssembler` into the host's `OutputSink`.
+ *
+ * The invariants this class is built around:
+ * - **one loop per turn** — `AgentLoop` is explicitly single-use, so a loop is constructed for each turn inside the
+ *   run and never reused; `Stop`/`deactivate` cancel the loop that is actually in flight;
+ * - **a wake listens for a usable utterance, not for the first final** — the ASR finalises the segment that carried
+ *   the wake word on its own, seconds before the request's own segment, so a blank final (or one that is only the
+ *   wake word, with or without punctuation) is ignored and the bounded window is re-armed instead of ending the turn
+ *   (D12). A window that really expires ends `INSUFFICIENT`/`NO_UTTERANCE`, never `BLANK_UTTERANCE`;
+ * - **only a final transcript runs the loop** — a partial revision never reaches the model;
+ * - **never silence, never a false success** — every run that reaches a terminal state submits a hint: the model's own
+ *   text for `COMPLETED`, and a fixed honest sentence for every other outcome;
+ * - **`Stop` is final and session-scoped** — it cancels the loop, the armed listening window and the pending output,
+ *   and must not submit anything afterwards, and only a `Stop` for this session/generation may do so;
+ * - **nothing is replayed across sessions** — the remembered final transcript belongs to the session that produced it,
+ *   so `Help` after a re-activation runs this session's utterance or nothing at all.
+ *
+ * The descriptor declares exactly `WakeWord, Asr, Model, Actions, TextOutput`. `Capability.Context` is deliberately
+ * absent: nothing provides it yet, and declaring it would make host activation fail.
+ */
+class SmartAssistantPlugin(
+    private val clock: MonotonicClock = SystemMonotonicClock,
+    private val scheduler: DeadlineScheduler = NoDeadlineScheduler,
+    private val profileLookup: (String) -> ModelProfile? = { null },
+    private val cancelOutputTurn: (SessionId, Generation, String) -> Unit = { _, _, _ -> },
+    private val cooldownNanos: Long = 3_000_000_000L,
+    /**
+     * Test-only observation hook: called when a `Displayed` acknowledgement is accepted. The host's output arbiter
+     * owns the real display state, so the plugin keeps none of it public; this exists so a JVM test can prove the ACK
+     * was admitted without the plugin growing a production-only accessor.
+     */
+    private val onDisplayedAck: () -> Unit = {},
+) : PluginLifecycle, ConfiguredPlugin {
+
+    init {
+        require(cooldownNanos >= 0) { "cooldownNanos must not be negative, was $cooldownNanos" }
+    }
+
+    override val descriptor = PluginDescriptor(
+        "smart-assistant",
+        "1.0.0",
+        1,
+        "Smart Assistant",
+        listOf(
+            Capability.WakeWord,
+            Capability.Asr,
+            Capability.Model,
+            Capability.Actions,
+            Capability.TextOutput,
+        ),
+        ConfigSchema(CONFIG_SCHEMA_VERSION),
+    )
+
+    /**
+     * Whether this plugin currently owns the session. Read by the phone UI and the host tests; written only by
+     * [activate] and [deactivate].
+     */
+    @Volatile
+    var active: Boolean = false
+        private set
+
+    /**
+     * Whether the configuration explicitly asked for consent (`requestConsent = true`).
+     *
+     * Parsed and retained deliberately, but **not** used to gate anything: the brief keeps the host's text-upload
+     * consent as the only gate for anything leaving the device, and a plugin-side second gate would be a silent
+     * refusal the host could neither see nor override. Exposed `internal` so a test can assert the flag is parsed
+     * without this class growing a public accessor.
+     */
+    internal val requestConsentConfigured: Boolean get() = synchronized(gate) { config?.requestConsent == true }
+
+    /**
+     * Test-only observation of the plugin's own audit trail.
+     *
+     * A wake the scene refuses has no turn to key an audit line by, so a JVM test can only prove the refusal was
+     * recorded — rather than dropped without a trace — by reading the sink the plugin already owns. The underlying
+     * `BoundedAuditLog.entries()` hands out a defensive copy, so this exposes no mutable state and no production
+     * caller has any reason to reach for it.
+     */
+    internal fun auditTrail(): List<AuditEntry> = audit.entries()
+
+    private data class Config(
+        val profileId: String,
+        val profileRevision: Long,
+        val wakeWords: List<String>,
+        val maxLevel: RiskLevel,
+        val whitelist: List<WhitelistEntry>,
+        val requestConsent: Boolean,
+    )
+
+    private val gate = Any()
+    private val scene = ScenePolicy(cooldownNanos)
+    private val audit = BoundedAuditLog(AUDIT_CAPACITY, clock)
+    private var config: Config? = null
+    private var context: PluginContext? = null
+    private var turn: SmartTurn? = null
+    private var lastFinalTranscript: String? = null
+    private var lastFinalTurnId: String? = null
+
+    // ---------------------------------------------------------------- configuration
+
+    override fun validate(configuration: PluginConfiguration) {
+        parse(configuration)
+    }
+
+    override fun configure(configuration: PluginConfiguration) {
+        val parsed = parse(configuration)
+        val replaced = synchronized(gate) {
+            val current = config
+            config = parsed
+            if (current == parsed) null else detach()
+        }
+        teardown(replaced)
+    }
+
+    private fun parse(configuration: PluginConfiguration): Config {
+        require(configuration.schemaVersion == CONFIG_SCHEMA_VERSION) {
+            "smart-assistant schema version must be $CONFIG_SCHEMA_VERSION, was ${configuration.schemaVersion}"
+        }
+        val unknown = configuration.values.keys - KNOWN_KEYS
+        require(unknown.isEmpty()) { "unknown smart-assistant configuration keys: $unknown" }
+        val profileId = configuration.values["profileId"]
+        require(!profileId.isNullOrBlank()) { "profileId is required" }
+        val revision = configuration.values["profileRevision"]?.toLongOrNull()
+        require(revision != null && revision >= 0) { "profileRevision must be a non-negative integer" }
+        val wakeWords = splitList(configuration.values["wakeWords"] ?: DEFAULT_WAKE_WORDS)
+        require(wakeWords.isNotEmpty()) { "wakeWords must contain at least one word" }
+        val maxLevel = parseRiskLevel(configuration.values["maxLevel"] ?: DEFAULT_MAX_LEVEL)
+        val whitelist = parseWhitelist(configuration.values["whitelist"] ?: "")
+        val consent = configuration.values["requestConsent"]?.let {
+            require(it == "true" || it == "false") { "requestConsent must be 'true' or 'false'" }
+            it == "true"
+        } ?: false
+        return Config(profileId, revision, wakeWords, maxLevel, whitelist, consent)
+    }
+
+    private fun parseRiskLevel(raw: String): RiskLevel {
+        val level = RiskLevel.entries.firstOrNull { it.name.equals(raw.trim(), ignoreCase = true) }
+        require(level != null) { "maxLevel must be one of L0..L4, was '$raw'" }
+        return level
+    }
+
+    /**
+     * Parses `action|scope,...` entries.
+     *
+     * An entry naming an `L3`/`L4` action is kept as written rather than filtered by name: the plugin has not been
+     * shown that action's descriptor, so inventing a risk level for it would be a guess. `WhitelistActionPolicy`
+     * already refuses to grant `L3`/`L4` at any ceiling, which is what makes such an entry harmless. What this method
+     * does refuse is a malformed entry, so a typo cannot silently become a grant of something else.
+     */
+    private fun parseWhitelist(raw: String): List<WhitelistEntry> = splitList(raw).map { entry ->
+        val parts = entry.split('|')
+        require(parts.size == 2 && parts[0].isNotBlank() && parts[1].isNotBlank()) {
+            "whitelist entries must be 'action|scope', was '$entry'"
+        }
+        WhitelistEntry(parts[0].trim(), parts[1].trim())
+    }
+
+    private fun splitList(raw: String): List<String> = raw.split(',').map { it.trim() }.filter { it.isNotEmpty() }
+
+    // ---------------------------------------------------------------- lifecycle
+
+    override fun activate(context: PluginContext) {
+        deactivate(DeactivationReason.Switched)
+        synchronized(gate) {
+            this.context = context
+            active = true
+            // `Help` may only ever run a transcript from the session being activated: the host keeps **one** plugin
+            // instance and re-activates it per session/generation, so a transcript left over from the previous session
+            // would be replayed under the new session's envelope (and its stale turn id adopted as `sourceTurnId`).
+            lastFinalTranscript = null
+            lastFinalTurnId = null
+        }
+        // Best effort: a host that refuses the declaration leaves `current()` unchanged, and that is not a reason to
+        // fail activation.
+        runCatching { context.services.wakeWord().declare(configuredWakeWords()) }
+    }
+
+    override fun deactivate(reason: DeactivationReason) {
+        val stranded = synchronized(gate) {
+            context = null
+            active = false
+            // The remembered transcript is session state, not plugin state: leaving it behind is exactly the bug
+            // `Help` in a later session would replay it. `activate` clears it too, so both ends of the handover do.
+            lastFinalTranscript = null
+            lastFinalTurnId = null
+            detach()
+        }
+        teardown(stranded)
+    }
+
+    private fun configuredWakeWords(): List<String> =
+        synchronized(gate) { config?.wakeWords } ?: splitList(DEFAULT_WAKE_WORDS)
+
+    // ---------------------------------------------------------------- events
+
+    override fun handle(event: HostEvent) {
+        when (event) {
+            is WakeDetected -> synchronized(gate) {
+                if (matches(event.envelope)) {
+                    openTurn(clock.nowNanos(), event.envelope, refusedWakeWord = event.word)?.let { opened ->
+                        // The plugin's half of P3_WAKE: the phone-side builder logs the word/confidence on emission,
+                        // and this names the turn the wake opened. A refused wake opens nothing and logs no turn line.
+                        P3Log.line("P3_WAKE turn=${opened.turnId}")
+                    }
+                }
+            }
+
+            is TranscriptEvent -> {
+                val started = synchronized(gate) {
+                    if (!matches(event.envelope)) null else acceptTranscript(event.revision)
+                }
+                if (started != null) runTurn(started.first, started.second)
+            }
+            is OutputStateEvent -> synchronized(gate) {
+                if (matches(event.envelope)) acceptDisplayed(event)
+            }
+
+            is UserAction -> when (event.action) {
+                UserAction.Action.Stop -> stopAll(event.envelope)
+                UserAction.Action.Help -> handleHelp(event.envelope)
+                UserAction.Action.Pause, UserAction.Action.Resume -> Unit
+            }
+
+            else -> Unit
+        }
+    }
+
+    /** True when the event belongs to the session/generation this plugin was activated for. */
+    private fun matches(envelope: EventEnvelope): Boolean {
+        val current = context ?: return false
+        return envelope.sessionId == current.sessionId && envelope.generation == current.generation
+    }
+
+    /**
+     * Opens a turn for a wake, unless the scene cooldown refuses it or a turn is already waiting for its transcript.
+     *
+     * A manual `Help` is an explicit user action, so it passes [bypassWakeGates]: neither the awaiting-transcript guard
+     * nor the wake cooldown applies to it, and the turn it replaces is still torn down (so two loops never run side by
+     * side). It remains subject to the caller's own requirement of a current-session final transcript.
+     *
+     * A cooldown-refused wake is **recorded**, not dropped without a trace: it has no turn to key an audit line by, so
+     * the [`WakeDetected`][edith.contracts.WakeDetected] envelope's `eventId` is used instead. A refusal by the
+     * awaiting-transcript guard is a different, already-visible condition (a turn is provably in flight) and is not
+     * recorded as a cooldown refusal.
+     *
+     * Must be called under [gate]; returns the new turn, or null when the wake was refused.
+     */
+    private fun openTurn(
+        nowNanos: Long,
+        envelope: EventEnvelope,
+        runsImmediately: Boolean = false,
+        transcriptTurnId: String? = null,
+        bypassWakeGates: Boolean = false,
+        refusedWakeWord: String? = null,
+    ): SmartTurn? {
+        val current = context ?: return null
+        if (!bypassWakeGates) {
+            if (turn?.phase == SmartTurnPhase.AwaitingTranscript) return null
+            if (!scene.admit(nowNanos, envelope.eventId)) {
+                if (refusedWakeWord != null) {
+                    audit.record(envelope.eventId, "wake", refusedWakeWord, "CooldownRefused")
+                }
+                return null
+            }
+        }
+        scene.noteTurn(nowNanos)
+        val replaced = turn?.also { it.closed = true }
+        val created = buildTurn(nowNanos, current, runsImmediately, transcriptTurnId)
+        turn = created
+        teardown(replaced)
+        // Armed only after the turn is installed, so a scheduled expiry can never find a turn that is not yet the
+        // current one. `Help` runs immediately and has nothing to wait for.
+        if (!runsImmediately) armListening(created)
+        return created
+    }
+
+    /** Must be called under [gate]; builds the turn, its hint window and its hint assembler. */
+    private fun buildTurn(
+        nowNanos: Long,
+        current: PluginContext,
+        runsImmediately: Boolean,
+        transcriptTurnId: String?,
+    ): SmartTurn {
+        val created = SmartTurn.awaiting(
+            turnId = "smart-${UUID.randomUUID()}",
+            sessionId = current.sessionId,
+            generation = current.generation,
+            clock = clock,
+            scheduler = scheduler,
+            deadlineNanos = SmartTurn.saturatingAdd(nowNanos, listeningWindowNanos()),
+            hintGraceNanos = DEFAULT_HINT_GRACE_MILLIS * 1_000_000L,
+            hintId = "hint-${UUID.randomUUID()}",
+            onEmit = { text -> emit(text) },
+        )
+        if (transcriptTurnId != null) created.adoptTranscriptTurnId(transcriptTurnId)
+        if (runsImmediately) created.running()
+        return created
+    }
+
+    /**
+     * The window a wake-opened turn waits for a usable utterance in.
+     *
+     * The configured profile's own timeout when there is one — the assistant's deadline is the number the user chose —
+     * otherwise [DEFAULT_LISTEN_WINDOW_MILLIS]. A profile that has gone missing therefore still gets a real window
+     * rather than a zero-length one: an unrelated configuration problem must not turn every wake into an instant
+     * failure.
+     */
+    private fun listeningWindowNanos(): Long {
+        val configuredMillis = config?.let { profileLookup(it.profileId) }?.timeoutMillis ?: 0L
+        return if (configuredMillis > 0L) configuredMillis * 1_000_000L else DEFAULT_LISTEN_WINDOW_MILLIS * 1_000_000L
+    }
+
+    /**
+     * Arms (or re-arms) the turn's bounded listening window. Must be called under [gate] with [owned] installed.
+     *
+     * A blank or wake-word-only final proves the request has not been spoken yet, so it re-arms the window from that
+     * moment instead of ending the turn. The recogniser only finalises a segment after speech, so this cannot spin,
+     * and the turn is still released by `Stop`, `deactivate`, `Help` replacing it or its own next wake's turn.
+     */
+    private fun armListening(owned: SmartTurn) {
+        owned.extendDeadline(SmartTurn.saturatingAdd(clock.nowNanos(), listeningWindowNanos()))
+        owned.listeningExpiry?.cancel()
+        owned.listeningExpiry = scheduler.at(owned.deadlineNanos) { expireListening(owned) }
+    }
+
+    /**
+     * The listening window expired with nothing usable in it.
+     *
+     * The turn kept its tentative identity — no transcript was ever adopted — and never ran, so it ends with the
+     * honest `INSUFFICIENT` outcome under its own `NO_UTTERANCE` code and submits the fixed "did not catch it"
+     * sentence. A single blank final must never be able to short-circuit a turn into `BLANK_UTTERANCE`; only a window
+     * that really ran out ends it here.
+     */
+    private fun expireListening(owned: SmartTurn) {
+        val stillWaiting = synchronized(gate) {
+            if (turn !== owned || owned.closed || owned.phase != SmartTurnPhase.AwaitingTranscript) {
+                false
+            } else {
+                owned.listeningExpiry = null
+                owned.idle()
+                true
+            }
+        }
+        if (!stillWaiting) return
+        // No `P3_TURN start`: the loop was never about to run. The terminal line is the whole story, and its code
+        // says why there was nothing to run.
+        P3Log.line("P3_TURN end turn=${owned.turnId} outcome=${AgentOutcome.INSUFFICIENT} code=NO_UTTERANCE steps=0")
+        finishWithFailure(owned, FAILURE_HINTS.getValue(AgentOutcome.INSUFFICIENT))
+    }
+
+    /**
+     * The final-transcript gate.
+     *
+     * Must be called under [gate]. A **usable** final transcript is remembered whether or not a turn is waiting,
+     * because `Help` is the spec's manual entry point and has to be able to run the last thing the wearer said even
+     * though no wake opened a turn for it. The loop only runs when a turn is actually waiting for its transcript, and
+     * only on a final revision: a partial never reaches the model, and a repeat after the turn has started does not
+     * restart it.
+     *
+     * A final that is blank, or that is only the wake word, is the segment that carried the wake finalising — not the
+     * request (D12: measured on the device, the request is transcribed in a later segment ~5.5 s afterwards). It is
+     * neither remembered nor adopted, and it re-arms the waiting turn's bounded window instead of ending it.
+     */
+    private fun acceptTranscript(revision: TranscriptRevision): Pair<SmartTurn, String>? {
+        if (revision.final) {
+            val adopted = revision.text.trim()
+            if (isUsableUtterance(adopted)) {
+                lastFinalTranscript = adopted
+                lastFinalTurnId = revision.turnId
+            }
+            // The adopted text is remembered above; the line carries only its revision and size, never the text.
+            P3Log.line("P3_TRANSCRIPT turn=${revision.turnId} rev=${revision.revision} final=${revision.final} " +
+                "chars=${adopted.length}")
+        }
+        val current = turn ?: return null
+        if (current.phase != SmartTurnPhase.AwaitingTranscript) return null
+        if (!revision.final) return null
+        val text = revision.text.trim()
+        if (!isUsableUtterance(text)) {
+            armListening(current)
+            return null
+        }
+        current.cancelListening()
+        // The transcript's own turn id becomes the turn id from here on: the host keys `cancelOutputTurn` and the UI
+        // correlate a hint by it, so the run and its hint must carry the ASR turn id rather than the wake's placeholder.
+        current.adoptTranscriptTurnId(revision.turnId)
+        current.running()
+        return current to text
+    }
+
+    /** Whether a trimmed final can be the utterance: not empty, and not the wake segment's own echo of the word. */
+    private fun isUsableUtterance(text: String): Boolean = text.isNotBlank() && !isWakeWordOnly(text)
+
+    /**
+     * True when a trimmed final is just a configured wake word, wrapped in at most punctuation.
+     *
+     * The recogniser's own punctuation around the word (`伊迪丝。`, `，伊迪丝，`, `EDITH.`) does not make the wake
+     * segment a request. Both ends are stripped of anything that is not a letter or a digit and the comparison ignores
+     * case, so `EDITH` matches the configured `edith` while `伊迪丝，帮我记一条笔记` remains a real utterance.
+     */
+    private fun isWakeWordOnly(text: String): Boolean {
+        val normalized = text.trim().trim { !it.isLetterOrDigit() }
+        if (normalized.isEmpty()) return false
+        return configuredWakeWords().any { it.equals(normalized, ignoreCase = true) }
+    }
+
+    // ---------------------------------------------------------------- the run
+
+    /**
+     * Drives one turn through the agent loop and turns its terminal state into a hint.
+     *
+     * The loop runs **outside** [gate]: the gateway blocks on the transport, and holding the plugin lock across that
+     * would stop `Stop` and `deactivate` from ever cancelling it. Ownership is re-checked under the lock before
+     * anything is written back to the turn — the same discipline the diagnostic plugin uses for its streaming path.
+     */
+    private fun runTurn(owned: SmartTurn, text: String) {
+        val (current, configured) = synchronized(gate) {
+            val c = context ?: return
+            val cfg = config ?: return
+            c to cfg
+        }
+        // The turn id is final by now (the final transcript's ASR id has replaced the wake's placeholder), so the
+        // start/end pair and the transcript line all name the same turn.
+        P3Log.line("P3_TURN start turn=${owned.turnId}")
+        if (text.isBlank()) {
+            P3Log.line("P3_TURN end turn=${owned.turnId} outcome=${AgentOutcome.FAILED} code=BLANK_UTTERANCE steps=0")
+            finishWithFailure(owned, BLANK_UTTERANCE_HINT)
+            return
+        }
+        val run = try {
+            val loop = buildLoop(current, configured, owned)
+            synchronized(gate) {
+                if (turn !== owned || owned.closed) return
+                owned.loop = loop
+            }
+            loop.run(
+                AgentRequest(
+                    turnId = owned.turnId,
+                    utterance = text,
+                    instructions = SmartPrompts.instructions(),
+                    profileId = configured.profileId,
+                    deadlineNanos = owned.deadlineNanos,
+                ),
+            )
+        } catch (failure: Throwable) {
+            // `ModelClientGateway` documents that an escaping transport exception must not be disguised as a finished
+            // turn. The plugin's own contract is that a turn always produces an honest hint, so it is translated into
+            // the `FAILED` terminal state here instead of escaping into the host's dispatcher.
+            //
+            // The cause is reported by **class name only**: `PLUGIN_RUN_THREW` cannot say which layer refused (a
+            // missing capability, a rejected configuration, a tool schema), and the message is exactly where a URL,
+            // a profile id or user content would leak into the log. The class is the part that is safe and useful.
+            P3Log.line("P3_RUN error=${failure::class.simpleName ?: failure.javaClass.name}")
+            AgentRun(AgentOutcome.FAILED, "PLUGIN_RUN_THREW", null, emptyList())
+        }
+        val stillOurs = synchronized(gate) {
+            if (turn !== owned || owned.closed) {
+                false
+            } else {
+                owned.idle()
+                owned.loop = null
+                true
+            }
+        }
+        // The run terminated, so its steps and its outcome are reported even when the turn was detached underneath
+        // it: that terminal outcome is exactly what P3.1 has to prove. `AgentStep.result` is `ok` or the stable safe
+        // code the loop fed back to the model - never the model's text and never an executor detail that could carry
+        // user content (P3.1 privacy rules).
+        run.steps.forEach { step ->
+            P3Log.line("P3_TOOL call=${step.action} ok=${step.result == "ok"} detail=${step.result}")
+        }
+        P3Log.line("P3_TURN end turn=${owned.turnId} outcome=${run.outcome} code=${run.safeCode ?: "-"} " +
+            "steps=${run.steps.size}")
+        if (!stillOurs) return
+        submitOutcome(owned, run)
+    }
+
+    /** Builds the single-use loop for one turn: registry, tightened policy, guard, audit and gateway. */
+    private fun buildLoop(context: PluginContext, configured: Config, owned: SmartTurn): AgentLoop {
+        val registry = ToolRegistry(listOf(context.services.actions()))
+        val policy = WhitelistActionPolicy(configured.maxLevel, configured.whitelist)
+        val gateway = ModelClientGateway(
+            client = context.services.model(),
+            profileLookup = profileLookup,
+            clock = clock,
+            scheduler = scheduler,
+            envelopeFor = { requestId, startNanos, endNanos ->
+                EventEnvelope(context.sessionId, context.generation, requestId, startNanos, endNanos)
+            },
+            stop = { owned.closed },
+        )
+        return AgentLoop(
+            gateway = gateway,
+            registry = registry,
+            policy = policy,
+            guard = ProgressGuard(),
+            audit = audit,
+            clock = clock,
+        )
+    }
+
+    // ---------------------------------------------------------------- output
+
+    /**
+     * Turns one terminal run into the hint the wearer sees.
+     *
+     * `COMPLETED` renders the model's own text; every other outcome renders a fixed honest sentence. There is no path
+     * here that submits nothing: a turn that reached a terminal state always says something.
+     */
+    private fun submitOutcome(owned: SmartTurn, run: AgentRun) {
+        val assembler = synchronized(gate) {
+            if (turn !== owned || owned.closed) return
+            owned.assembler
+        } ?: return
+        val finalText = run.finalText
+        if (run.outcome == AgentOutcome.COMPLETED && !finalText.isNullOrBlank()) {
+            assembler.append(finalText)
+            assembler.finish(ModelEnd.COMPLETED)
+        } else {
+            assembler.append(FAILURE_HINTS[run.outcome] ?: FAILURE_HINTS.getValue(AgentOutcome.FAILED))
+            assembler.finish(ModelEnd.FAILED)
+        }
+    }
+
+    /** A terminal state reached before the loop could run at all (a blank utterance, or an expired listening window). */
+    private fun finishWithFailure(owned: SmartTurn, text: String) {
+        val assembler = synchronized(gate) {
+            if (turn !== owned || owned.closed) return
+            owned.idle()
+            owned.assembler
+        } ?: return
+        assembler.append(text)
+        assembler.finish(ModelEnd.FAILED)
+    }
+
+    /**
+     * The assembler's emit callback: builds the `Assistance` and submits it, with the diagnostic plugin's
+     * submit/ACK discipline.
+     *
+     * The context is read under [gate] but the submit itself happens outside it, so a synchronous `OutputStateEvent`
+     * delivered from inside `submit` (the phone UI is live during a run) can re-enter [handle] without deadlocking.
+     * If that ACK arrives mid-submit it is only *remembered* ([SmartTurn.pendingAck]) and admitted after
+     * [OutputSubmission.Accepted] comes back.
+     */
+    private fun emit(text: String) {
+        var owned: SmartTurn? = null
+        val hint = synchronized(gate) {
+            val current = turn ?: return
+            if (current.closed) return
+            val context = context ?: return
+            val now = clock.nowNanos()
+            val expiry = minOf(SmartTurn.saturatingAdd(now, HINT_LIFETIME_MILLIS * 1_000_000L), current.hintValidUntil)
+            if (expiry <= now) return
+            current.submitting = true
+            current.pendingAck = false
+            current.hintExpiry = expiry
+            owned = current
+            Assistance(
+                hintId = current.hintId,
+                sessionId = context.sessionId,
+                generation = context.generation,
+                sourceTurnId = current.turnId,
+                priority = 0,
+                text = text,
+                optionalSpeech = null,
+                expiresAtNanos = expiry,
+            )
+        }
+        val current = owned ?: return
+        val sink: OutputSink? = runCatching { currentContext()?.services?.textOutput() }.getOrNull()
+        val stillCurrent = synchronized(gate) { turn === current }
+        val result = if (stillCurrent && sink != null) {
+            // On submit: the hint's identity and size only. The text itself is the display content and never logged.
+            P3Log.line("P3_HINT show hint=${hint.hintId} chars=${hint.text.length}")
+            runCatching { sink.submit(hint) }.getOrNull()
+        } else {
+            null
+        }
+        synchronized(gate) {
+            current.submitting = false
+            if (result == OutputSubmission.Accepted && turn === current && !current.closed) {
+                current.readable = true
+                if (current.pendingAck && !current.displayed && clock.nowNanos() < current.hintExpiry) {
+                    current.displayed = true
+                    P3Log.line("P3_HINT ack hint=${current.hintId} status=${OutputStatus.Displayed}")
+                    onDisplayedAck()
+                }
+            }
+            current.pendingAck = false
+        }
+    }
+
+    /** Renders a `Displayed` ACK into the turn's own bookkeeping, never into another turn's. Must hold [gate]. */
+    private fun acceptDisplayed(event: OutputStateEvent) {
+        val owned = turn ?: return
+        if (owned.closed || owned.displayed) return
+        if (event.hintId != owned.hintId) return
+        if (event.status != OutputStatus.Displayed) return
+        if (clock.nowNanos() >= owned.hintExpiry) return
+        if (owned.submitting) {
+            owned.pendingAck = true
+        } else if (owned.readable) {
+            owned.displayed = true
+            P3Log.line("P3_HINT ack hint=${owned.hintId} status=${event.status}")
+            onDisplayedAck()
+        }
+    }
+
+    // ---------------------------------------------------------------- stop / teardown
+
+    /**
+     * `Stop` is the emergency brake: cancel the in-flight loop, cancel the pending output, clear the turn. Nothing is
+     * submitted afterwards — a run that returns a late `CANCELLED` finds its turn already gone.
+     *
+     * It is scoped to the session/generation this plugin was activated for, exactly like every other branch: a `Stop`
+     * raised in another session (or for an older generation of this one) must not be able to cancel this plugin's turn.
+     */
+    private fun stopAll(envelope: EventEnvelope) {
+        val stopped = synchronized(gate) { if (matches(envelope)) detach() else null }
+        teardown(stopped)
+    }
+
+    /**
+     * Manual entry point (spec keeps `Help` as the non-wake path): run the most recent final transcript **of this
+     * session**. It is an explicit user action, so it bypasses the wake cooldown and the awaiting-transcript guard;
+     * with no current-session final transcript it does nothing.
+     */
+    private fun handleHelp(envelope: EventEnvelope) {
+        val started = synchronized(gate) {
+            if (!matches(envelope)) return
+            val text = lastFinalTranscript?.takeIf { it.isNotBlank() } ?: return
+            // The reused turn keeps the transcript's own turn id, exactly as a wake-opened turn does.
+            openTurn(
+                clock.nowNanos(),
+                envelope,
+                runsImmediately = true,
+                transcriptTurnId = lastFinalTurnId,
+                bypassWakeGates = true,
+            )?.let { it to text }
+        } ?: return
+        runTurn(started.first, started.second)
+    }
+
+    /** Detaches the current turn: marks it closed and hands it to the caller for teardown. Must hold [gate]. */
+    private fun detach(): SmartTurn? = turn?.also {
+        it.closed = true
+        turn = null
+    }
+
+    /** Cancels everything a detached turn owns; the exact teardown the brief requires. */
+    private fun teardown(owned: SmartTurn?) {
+        if (owned == null) return
+        // The armed listening window is part of what the turn owns: releasing it here is what makes a `Stop` during
+        // the wait, and a `deactivate`, provably unable to submit anything later.
+        owned.cancelListening()
+        runCatching { owned.loop?.cancel() }
+        owned.cancelAssembler()
+        val sessionId = owned.sessionId ?: return
+        val generation = owned.generation ?: return
+        runCatching { cancelOutputTurn(sessionId, generation, owned.turnId) }
+        runCatching { currentContext()?.services?.actions()?.cancel() }
+    }
+
+    private fun currentContext(): PluginContext? = synchronized(gate) { context }
+
+    private companion object {
+        val SystemMonotonicClock = object : MonotonicClock {
+            override fun nowNanos(): Long = System.nanoTime()
+        }
+
+        /**
+         * The scheduler a bare construction gets when the host wiring is absent.
+         *
+         * Production always injects the host's own scheduler (`SmartWiring`) and the JVM rigs inject their fake, so
+         * this exists only so a plugin built without one cannot crash the host dispatcher on a wake: a deadline handed
+         * to it is accepted and never released, which is exactly the pre-D12 behaviour of a turn whose window never
+         * ends. It is deliberately not a throwing default any more, because the wake path now always arms a window.
+         */
+        val NoDeadlineScheduler = object : DeadlineScheduler {
+            override fun at(deadlineNanos: Long, task: () -> Unit): CancellationHandle = NoCancellation
+        }
+
+        val NoCancellation = object : CancellationHandle {
+            override fun cancel() = Unit
+        }
+    }
 }

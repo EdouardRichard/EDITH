@@ -209,4 +209,17 @@ class DiagnosticTextPluginTest {
         assertEquals(listOf(outputs.first().hintId), hintClears)
         assertEquals(listOf("旧建议。", "新建议。"), outputs.map { it.text })
     }
+
+    @Test fun `tool events are ignored without ending the turn or emitting content`() {
+        val t = trace(); val p = plugin(trace = t)
+        duringRequest = { r, cb ->
+            cb(ModelStreamEvent.ToolCallDelta(r.requestId, "fc_1", "record_note", "{\"title\":\"回电话\"}"))
+            cb(ModelStreamEvent.ToolCallTerminal(r.requestId, "fc_1", "call_1", "record_note", "{\"title\":\"回电话\"}"))
+            cb(ModelStreamEvent.TextDelta(r.requestId, "建议。"))
+            cb(ModelStreamEvent.Terminal(r.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        p.handle(transcript()); help(p); tick()
+        // The diagnostic plugin drives no tools, so a tool event must not produce a hint by itself.
+        assertEquals(listOf("建议。"), outputs.map { it.text })
+    }
 }

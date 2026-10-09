@@ -1,16 +1,36 @@
 package edith.phone
 
+import edith.audio.AsrHypothesis
+import edith.audio.PcmFramer
+import edith.audio.PcmFrame
+import edith.audio.PcmIngress
+import edith.audio.SpeakerEngine
+import edith.audio.SpeechPipeline
+import edith.audio.StreamingAsrEngine
+import edith.audio.VadDecision
+import edith.audio.VadEngine
 import edith.contracts.Assistance
+import edith.contracts.AudioFormat
 import edith.contracts.ContractError
 import edith.contracts.Generation
 import edith.contracts.HostEvent
 import edith.contracts.InputEpoch
 import edith.contracts.OutputStatus
+import edith.contracts.PcmEncoding
 import edith.contracts.SessionId
+import edith.contracts.SpeakerAssessment
+import edith.contracts.TranscriptEvent
+import edith.contracts.TranscriptRevision
+import edith.contracts.VerifiedPcm
 import edith.host.HostRuntime
 import edith.host.ResourceScope
 import edith.output.HintCommand
 import edith.output.HintWireCodec
+import edith.plugin.ActionDescriptor
+import edith.plugin.ActionExecutor
+import edith.plugin.ActionOutcome
+import edith.plugin.ActionResult
+import edith.plugin.AsrSession
 import edith.plugin.CancellationHandle
 import edith.plugin.Capability
 import edith.plugin.ConfigSchema
@@ -25,8 +45,11 @@ import edith.plugin.MonotonicClock
 import edith.plugin.PluginContext
 import edith.plugin.PluginDescriptor
 import edith.plugin.PluginLifecycle
+import edith.plugin.SpeakerWindow
 import edith.plugin.StorageHandle
 import edith.storage.MemoryProfileRepository
+import edith.testsupport.FakeClock as TestClock
+import edith.testsupport.ManualScheduler
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -44,8 +67,9 @@ import org.junit.Test
  * would keep a working plugin from ever starting.
  *
  * Two capabilities must stay absent until approved in their own right: `Audio` (advertising it would add a
- * microphone-start path, because the host starts `input` for audio-requiring plugins) and `Speaker` (a real extractor
- * would have to decode microphone audio against the decision-labelled PCM format, and enrolment is not authorized).
+ * microphone-start path, because the host starts `input` for audio-requiring plugins, and the delivery path has no
+ * `AudioSubscription` provider - transcripts reach a plugin through `AsrSession`) and `Speaker` (a real extractor
+ * would have to decode audio against the decision-labelled PCM format, and enrolment is not authorized).
  */
 class CxrHostServicesTest {
     private class FakeClock(var nanos: Long = 1_000_000_000L) : MonotonicClock {
@@ -66,6 +90,14 @@ class CxrHostServicesTest {
         override fun stop(epoch: InputEpoch) = Unit
     }
 
+    /** A port that really accepts the epoch, so the arming path can be asserted without the deliberate refusal above. */
+    private class AcceptingInput : InputPort {
+        val started = mutableListOf<InputEpoch>()
+        val stopped = mutableListOf<InputEpoch>()
+        override fun start(epoch: InputEpoch) { started += epoch }
+        override fun stop(epoch: InputEpoch) { stopped += epoch }
+    }
+
     private class StubDevice : HintDevice {
         override fun show(assistance: Assistance, revision: Long,
             listener: (OutputStatus) -> Unit): CancellationHandle =
@@ -78,6 +110,32 @@ class CxrHostServicesTest {
             object : CancellationHandle { override fun cancel() = Unit }
     }
 
+    private class StubAsr : AsrSession {
+        override fun listen(listener: (TranscriptRevision) -> Unit): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+    }
+
+    /**
+     * A stand-in for the wake-word provider. Task 14a made `Capability.WakeWord` real (the composition now supplies
+     * its own configured registry), so the advertised set includes it and it must therefore be answerable here too.
+     */
+    private class StubWakeWords : edith.plugin.WakeWordRegistry {
+        private val words = mutableListOf<String>()
+        override fun declare(words: List<String>): Boolean { this.words.clear(); this.words += words; return true }
+        override fun current(): List<String> = words.toList()
+    }
+
+    /**
+     * A stand-in for the Task 12 action provider. The environment only type-checks the provider here; the executor's
+     * own behaviour is pinned in `edith.phone.actions`.
+     */
+    private class StubActions : ActionExecutor {
+        override fun descriptors(): List<ActionDescriptor> = emptyList()
+        override fun execute(name: String, argsJson: String): ActionResult =
+            ActionResult(ActionOutcome.Refused, "UNKNOWN_ACTION")
+        override fun cancel() = Unit
+    }
+
     private class StubStorage(val pluginId: String) : StorageHandle {
         private val values = mutableMapOf<String, ByteArray>()
         override fun read(key: String): ByteArray? = values[key]
@@ -88,32 +146,53 @@ class CxrHostServicesTest {
 
     private fun scope(pluginId: String) = ResourceScope(pluginId, SessionId("s-1"), Generation(1))
 
-    private fun environment(displayLive: Boolean, storage: Boolean = true, input: InputPort = RecordingInput()) =
+    private fun environment(displayLive: Boolean, storage: Boolean = true, input: InputPort = RecordingInput(),
+        asr: AsrSession? = null, actions: ActionExecutor? = null, wakeWords: edith.plugin.WakeWordRegistry? = StubWakeWords()) =
         CxrHostEnvironment(
             clock = FakeClock(),
             input = input,
             liveOutput = { if (displayLive) StubDevice() else null },
             scheduler = FakeScheduler(),
-            providers = mapOf(Capability.Model to StubModel()),
+            providers = buildMap {
+                put(Capability.Model, StubModel())
+                asr?.let { put(Capability.Asr, it) }
+                actions?.let { put(Capability.Actions, it) }
+                wakeWords?.let { put(Capability.WakeWord, it) }
+            },
             storageFor = if (storage) { { id -> StubStorage(id) } } else null,
         )
 
     @Test
     fun everyAdvertisedCapabilityIsAnswerableAndNothingElseIs() {
-        val env = environment(displayLive = true)
+        val env = environment(displayLive = true, asr = StubAsr(), actions = StubActions())
         val advertised = env.availableCapabilities
 
-        assertEquals(setOf(Capability.Model, Capability.Storage, Capability.TextOutput), advertised)
+        // Task 11 ruling: with the engine chain wired the Asr provider is advertised; Audio stays out because there is
+        // no AudioSubscription provider (transcripts arrive through AsrSession). Task 12 adds the action provider, so
+        // Actions joins the set - and must therefore be answerable below. Task 14a adds the wake-word provider, which
+        // is what finally lets `smart-assistant` (which declares WakeWord) pass the host's capability gate.
+        assertEquals(setOf(Capability.Model, Capability.Storage, Capability.TextOutput, Capability.Asr,
+            Capability.Actions, Capability.WakeWord), advertised)
         val services = env.services(scope("smart-assistant"), advertised)
         advertised.forEach { capability ->
             assertNull("$capability is advertised, so it must be answerable",
                 runCatching { services.require(capability) }.exceptionOrNull())
         }
-        listOf(Capability.Audio, Capability.Asr, Capability.Speaker, Capability.SpeechOutput).forEach { capability ->
-            assertFalse("$capability must not be advertised", capability in advertised)
-            assertNotNull("$capability must not be answerable",
-                runCatching { services.require(capability) }.exceptionOrNull())
-        }
+        listOf(Capability.Audio, Capability.Speaker, Capability.SpeechOutput, Capability.Context)
+            .forEach { capability ->
+                assertFalse("$capability must not be advertised", capability in advertised)
+                assertNotNull("$capability must not be answerable",
+                    runCatching { services.require(capability) }.exceptionOrNull())
+            }
+    }
+
+    @Test
+    fun wakeWordIsRefusedRatherThanAdvertisedWhenTheCompositionSuppliesNoProvider() {
+        val env = environment(displayLive = true, wakeWords = null)
+
+        assertFalse(Capability.WakeWord in env.availableCapabilities)
+        assertNotNull(runCatching { env.services(scope("smart-assistant"), setOf(Capability.WakeWord))
+            .require(Capability.WakeWord) }.exceptionOrNull())
     }
 
     @Test
@@ -172,7 +251,7 @@ class CxrHostServicesTest {
         override fun deactivate(reason: DeactivationReason) { activated = false }
     }
 
-    private class FakeConnection : CxrConnection {
+    private class FakeConnection(private val transport: InputPort? = null) : CxrConnection {
         override var ready = false
         val sent = mutableListOf<String>()
         var inbound: ((String) -> Unit)? = null
@@ -181,6 +260,7 @@ class CxrHostServicesTest {
         override fun sendCommand(json: String): Boolean { if (!ready) return false; sent += json; return true }
         override fun onInboundCommand(listener: (String) -> Unit) { inbound = listener }
         override fun close() = Unit
+        override fun inputPortOrNull(): InputPort? = transport
     }
 
     private class UnusedModel : ModelClient {
@@ -188,10 +268,14 @@ class CxrHostServicesTest {
             error("not used")
     }
 
-    private class ActivationRig(descriptor: PluginDescriptor) : AutoCloseable {
+    /**
+     * [input] is the environment's own poll loop. [transport] is the CXR connection's port, which Task 15c D1 also
+     * arms (it is the call that opens the ingress), so a rig that asserts the loop was started must carry one.
+     */
+    private class ActivationRig(descriptor: PluginDescriptor, val input: InputPort = RecordingInput(),
+        transport: InputPort = AcceptingInput()) : AutoCloseable {
         val clock = FakeClock()
-        val connection = FakeConnection()
-        val input = RecordingInput()
+        val connection = FakeConnection(transport)
         val plugin = ShellPlugin(descriptor)
         val link: CxrHintLink
         val root: HostCompositionRoot
@@ -200,12 +284,15 @@ class CxrHostServicesTest {
             val holder = arrayOfNulls<CxrConnection>(1)
             link = CxrHintLink(clock, FakeScheduler(), sendJson = { json -> holder[0]?.sendCommand(json) ?: false })
             val environment = CxrHostEnvironment(clock = clock, input = input, liveOutput = link::liveOutput,
-                scheduler = FakeScheduler(), providers = mapOf(Capability.Model to StubModel()),
+                scheduler = FakeScheduler(), providers = mapOf(Capability.Model to StubModel(),
+                    Capability.WakeWord to StubWakeWords()),
                 storageFor = { id -> StubStorage(id) })
             val host = HostRuntime(1, environment)
-            host.register(plugin)
             root = HostCompositionRoot(host, MemoryProfileRepository(), UnusedModel(), environment,
                 rokidConnectionFactory = { connection.also { holder[0] = it } }, hintLink = link)
+            // Registered through the composition, which owns the descriptor its activation side effects are gated
+            // on (Task 14a-fix item 4): registering straight on the host leaves it unknown and nothing arms.
+            root.registerPlugin(plugin)
         }
 
         override fun close() = root.close()
@@ -262,12 +349,177 @@ class CxrHostServicesTest {
 
     @Test
     fun theHostStartsNoMicrophonePathForAPluginThatDoesNotRequireAudio() {
-        ActivationRig(smartDescriptor()).use { rig ->
+        val input = RecordingInput()
+        ActivationRig(smartDescriptor(), input).use { rig ->
             rig.startAndReportReady("smart-assistant")
             rig.completeExchange()
 
             assertTrue(rig.plugin.activated)
-            assertTrue("the host must not start the microphone path for a non-audio plugin", rig.input.started.isEmpty())
+            assertTrue("the host must not start the microphone path for a non-audio plugin", input.started.isEmpty())
+        }
+    }
+
+    @Test
+    fun theAudioEpochIsArmedOnlyForThePluginThatActuallyDeclaresTheWakeWord() {
+        // Task 14a arms the ears on activation. That arming must follow the *capability*, not "a plugin activated":
+        // a display-only plugin has nothing to do with the wake path, and starting its epoch would put a poll loop on
+        // the CXR ingress for a plugin that never listens - exactly the microphone-start side effect `Audio` is kept
+        // unadvertised for.
+        val displayOnly = PluginDescriptor("smart-assistant", "1.0.0", 1, "smart",
+            listOf(Capability.Model, Capability.TextOutput), ConfigSchema(1))
+        val input = AcceptingInput()
+        ActivationRig(displayOnly, input).use { rig ->
+            rig.startAndReportReady("smart-assistant")
+            rig.completeExchange()
+
+            assertTrue(rig.plugin.activated)
+            assertTrue("a plugin without the WakeWord capability must not arm the ears", input.started.isEmpty())
+        }
+    }
+
+    @Test
+    fun theAudioEpochIsArmedForAWakeWordPluginAndStoppedOnTeardown() {
+        val wakeDescriptor = PluginDescriptor("smart-assistant", "1.0.0", 1, "smart",
+            listOf(Capability.Model, Capability.TextOutput, Capability.WakeWord), ConfigSchema(1))
+        val input = AcceptingInput()
+        ActivationRig(wakeDescriptor, input).use { rig ->
+            rig.startAndReportReady("smart-assistant")
+            rig.completeExchange()
+
+            assertTrue(rig.plugin.activated)
+            assertEquals("the declared wake-word plugin is what the ears exist for", 1, input.started.size)
+
+            rig.root.stop()
+
+            assertEquals(listOf(input.started.single()), input.stopped)
+        }
+    }
+
+    /**
+     * Task 15c D1's ordering, on the composed display path: the first activation is refused (no clock mapping, so no
+     * display), which arms **neither** port; when the mapping goes live the existing retry re-runs the activation, and
+     * by then the CXR connection exists - so that retry is what arms both the connection's port and the poll loop,
+     * under one epoch. The device run's `armed=true state=Paused` retry line is exactly this step.
+     */
+    @Test
+    fun theDisplayLiveRetryArmsTheConnectionPortAndThePollLoopTogether() {
+        val wakeDescriptor = PluginDescriptor("smart-assistant", "1.0.0", 1, "smart",
+            listOf(Capability.Model, Capability.TextOutput, Capability.WakeWord), ConfigSchema(1))
+        val loop = AcceptingInput()
+        val transport = AcceptingInput()
+        ActivationRig(wakeDescriptor, loop, transport).use { rig ->
+            rig.startAndReportReady("smart-assistant")
+
+            assertFalse("the display is not real before the PONG, so the activation is refused", rig.plugin.activated)
+            assertTrue("a refused activation must not arm the loop", loop.started.isEmpty())
+            assertTrue("nor open the ingress through the connection's port", transport.started.isEmpty())
+
+            rig.completeExchange()
+
+            assertTrue("the display became real, so the refused activation must be retried", rig.plugin.activated)
+            assertEquals("the retry arms the poll loop", 1, loop.started.size)
+            assertEquals("and the port that opens the ingress it polls", 1, transport.started.size)
+            assertEquals("both halves under the same epoch", loop.started.single(), transport.started.single())
+        }
+    }
+
+    // ---- Task 11: the ASR provider and the audio input the App actually wires -----------------------------
+
+    /** Speech is present on both scripted frames; the second is the endpoint that finishes the turn. */
+    private class ScriptedVad : VadEngine {
+        private val endpoints = ArrayDeque(listOf(false, true))
+        override fun accept(frame: PcmFrame) =
+            VadDecision(true, if (endpoints.isEmpty()) false else endpoints.removeFirst())
+        override fun reset() = Unit
+        override fun close() = Unit
+    }
+
+    private class ScriptedAsr(private val partial: String, private val finalText: String) : StreamingAsrEngine {
+        override fun accept(frame: PcmFrame): List<AsrHypothesis> = listOf(AsrHypothesis(partial, false))
+        override fun finish() = AsrHypothesis(finalText, true)
+        override fun reset() = Unit
+        override fun close() = Unit
+    }
+
+    private class SilentSpeaker : SpeakerEngine {
+        override fun assess(window: SpeakerWindow, listener: (SpeakerAssessment) -> Unit): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+        override fun reset() = Unit
+        override fun close() = Unit
+    }
+
+    /**
+     * The environment exactly as `HostCompositionRoot` now builds it: the chain's polled ingress loop as the input
+     * port and its `SherpaAsrSession` as the `Asr` provider.
+     *
+     * Stubbing either half would let the advertised set pass while the delivery path stayed disconnected, which is
+     * the failure this test exists to catch.
+     */
+    private class AudioWiringRig {
+        val clock = TestClock(0)
+        val scheduler = ManualScheduler(clock)
+        val epoch = InputEpoch(SessionId("s-1"), Generation(1), 0)
+        val verified = VerifiedPcm(AudioFormat.Pcm(16000, 1, 16), PcmEncoding.SIGNED_LE, "test-format")
+        val ingress = PcmIngress(clock)
+        val emitted = mutableListOf<HostEvent>()
+        val chain = CxrAudioChain.assemble(ingress = { ingress }, framer = PcmFramer(verified, 20),
+            vad = ScriptedVad(), asr = ScriptedAsr("你好", "你好世界"), speaker = SilentSpeaker(), wake = null,
+            scheduler = scheduler, clock = clock, emit = { event -> emitted += event })
+        val environment = CxrHostEnvironment(clock = clock, input = chain.input, liveOutput = { StubDevice() },
+            scheduler = scheduler,
+            providers = mapOf(Capability.Model to StubModel(), Capability.Asr to chain.asrSession,
+                Capability.Actions to StubActions(), Capability.WakeWord to StubWakeWords()),
+            storageFor = { id -> StubStorage(id) })
+    }
+
+    @Test
+    fun theAppWiresThePolledIngressLoopAndTheProductionAsrSession() {
+        val rig = AudioWiringRig()
+        try {
+            assertEquals(setOf(Capability.Model, Capability.Storage, Capability.TextOutput, Capability.Asr,
+                Capability.Actions, Capability.WakeWord), rig.environment.availableCapabilities)
+            assertTrue("the input port must be the polled audio loop, not the refusing placeholder",
+                rig.environment.input === rig.chain.input)
+
+            val resource = scope("smart-assistant")
+            val services = rig.environment.services(resource, rig.environment.availableCapabilities)
+            rig.environment.availableCapabilities.forEach { capability ->
+                assertNull("$capability is advertised, so it must be answerable",
+                    runCatching { services.require(capability) }.exceptionOrNull())
+            }
+            assertTrue("the granted Asr provider must be an AsrSession",
+                services.require(Capability.Asr) is AsrSession)
+
+            val handle = (services.require(Capability.Asr) as AsrSession).listen { }
+            handle.cancel()
+            resource.revoke()
+        } finally {
+            rig.chain.close()
+        }
+    }
+
+    @Test
+    fun aCxrChunkBecomesAPluginVisibleTranscriptThroughTheAssembledChain() {
+        val rig = AudioWiringRig()
+        try {
+            val received = mutableListOf<TranscriptRevision>()
+            rig.chain.asrSession.listen { received += it }
+            rig.ingress.open(rig.epoch, rig.verified)
+            rig.ingress.offer(rig.epoch, ByteArray(640))
+            rig.ingress.offer(rig.epoch, ByteArray(640))
+
+            rig.chain.input.start(rig.epoch)
+            rig.clock.advance(20_000_000); rig.scheduler.runDue()
+            rig.clock.advance(20_000_000); rig.scheduler.runDue()
+            rig.chain.input.stop(rig.epoch)
+
+            assertEquals(listOf("你好", "你好世界"), received.map { it.text })
+            assertEquals(listOf(false, true), received.map { it.final })
+            assertEquals("the host's own delivery must see the same revisions",
+                listOf("你好", "你好世界"),
+                rig.emitted.filterIsInstance<TranscriptEvent>().map { it.revision.text })
+        } finally {
+            rig.chain.close()
         }
     }
 }

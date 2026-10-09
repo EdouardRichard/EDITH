@@ -41,7 +41,15 @@ dependencyResolutionManagement {
         }
         exclusiveContent {
             forRepository { maven { url = uri("https://maven.rokid.com/repository/maven-public/") } }
-            filter { includeGroup("com.rokid.cxr") }
+            filter {
+                includeGroup("com.rokid.cxr")
+                // P3.0 T0/T1 probe: `com.rokid.security:glass3.open.sdk:2.2.0-E` (the Glasses-side open SDK that owns
+                // the offline wake-word service). Its POM was read before this line was written; it pulls two further
+                // Rokid groups of its own, so all three are routed here rather than only `com.rokid.security`.
+                includeGroup("com.rokid.security")
+                includeGroup("com.rokid.utils")
+                includeGroup("com.rokid.logger")
+            }
         }
     }
 }
@@ -60,12 +68,26 @@ include(
     ":transport-rokid",
     ":storage-runtime",
     ":model-runtime",
+    // P3.1 agent loop: platform-independent tool protocol, registry and loop (Tasks 4-8).
+    ":agent-runtime",
     ":output-runtime",
     ":plugins-diagnostic",
     ":tools:p2-text-probe",
+    // P3.0 throwaway probe (T4): can a `tools` array round-trip through the Responses endpoint, and does the reply
+    // carry a `function_call` item? Not a delivery tool.
+    ":tools:p3-toolcall-probe",
+    // P3.0 agent probe: an LLM-driven loop that chooses tools and has them executed on a real device through adb.
+    // This is the end-to-end verification of the Agent harness, not a hand-run matrix. Not a delivery tool.
+    ":tools:p3-agent-probe",
     ":phone-app",
     // Glasses-side audio capture probe: runs on the glasses (YodaOS-Sprite / Android 12), not on the phone.
     ":glasses-audio-probe",
     // Glasses-side CustomApp: renders the phone's hints through the CXR-S bridge (T18).
     ":glasses-app",
+    // P3.0 throwaway probe (T0/T1): can the Glasses-side open SDK and the CXR-S bridge live in one glasses app, and
+    // can the offline wake-word lexicon be customised without stealing the microphone? Not a delivery module.
+    ":glasses-sdk-coexistence-probe",
+    // P3.0 throwaway probe (T3b): how often does a semantic (accessibility-node) cross-app click actually land,
+    // compared with a coordinate tap at the same node's bounds? Not a delivery module.
+    ":phone-accessibility-probe",
 )

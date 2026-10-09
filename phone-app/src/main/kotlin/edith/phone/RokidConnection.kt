@@ -11,10 +11,19 @@ import edith.rokid.RokidSessionTransport
 
 /** Explicit connection seam; engine/display capability selection remains with App assembly. */
 class RokidConnection(activity: Activity, config: RokidConnectionConfig, host: HostRuntime,
-    onSceneReady: () -> Unit, clock: MonotonicClock, onRawPcm: (ByteArray) -> Unit = {}) : CxrConnection {
+    onSceneReady: () -> Unit, clock: MonotonicClock, onRawPcm: (ByteArray) -> Unit = {},
+    /**
+     * Reports what the connection's own [PcmIngress] decided about each offered datagram (Task 14a item 5).
+     *
+     * Additive and defaulted: every existing call site keeps compiling and behaving identically. Without it the
+     * receiver's `ACCEPTED`/`OVERFLOW`/`UNKNOWN_FORMAT`/`STALE_EPOCH` result died inside `transport-rokid`, so
+     * `INGRESS_OVERFLOW` and `UNKNOWN_FORMAT` could never be reported as faults.
+     */
+    onOffer: (edith.audio.PcmOffer) -> Unit = {},
+) : CxrConnection {
     val ingress = PcmIngress(clock)
     val input = RokidSessionTransport.create(activity.applicationContext, config, ingress,
-        onSceneReady, host::onAudioReceived, host::interrupt, onRawPcm)
+        onSceneReady, host::onAudioReceived, host::interrupt, onRawPcm, onOffer)
 
     /**
      * The T17 audio uplink receiver, attached to the binary channel rather than the JSON reply path.

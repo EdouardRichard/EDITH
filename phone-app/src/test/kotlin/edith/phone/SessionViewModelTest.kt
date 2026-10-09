@@ -191,6 +191,10 @@ class SessionViewModelTest {
                 root.state.value.capabilityReasons.containsKey(Capability.Speaker))
             assertFalse("the model client is wired, so it must not be reported missing",
                 root.state.value.capabilityReasons.containsKey(Capability.Model))
+            // Task 12: the L0/L1 action provider is built by the production composition, so the App must stop
+            // reporting the capability as missing - the same advertised/answerable rule the environment tests pin.
+            assertFalse("the action provider is wired, so it must not be reported missing",
+                root.state.value.capabilityReasons.containsKey(Capability.Actions))
         } finally { root.close() }
     }
 

@@ -111,13 +111,19 @@ interface CxrConnection : AutoCloseable {
      * (its framing is self-identifying) rather than assuming the channel is exclusively one or the other.
      */
     fun onInboundCommand(listener: (String) -> Unit)
-}
 
-/**
- * The one live CXR connection's real transport. Null only in assembly tests whose connection is not a
- * [RokidConnection]; production and device bring-up always see the transport.
- */
-fun CxrConnection.inputPortOrNull(): edith.plugin.InputPort? = (this as? RokidConnection)?.input
+    /**
+     * The live transport's own [edith.plugin.InputPort], or null when this connection is not a real transport.
+     *
+     * The composition arms the CXR audio epoch through this port as well as through its own poll loop (Task 15c D1):
+     * opening the ingress and asking the glasses for the stream happens only inside `RokidSessionTransport.start`,
+     * so a composition that started just the loop polled an ingress nothing had opened and no PCM ever arrived.
+     *
+     * A member with a default rather than an extension function, so a test double can answer it; the default is the
+     * cast the previous extension performed, which keeps every existing `CxrConnection` double answering null.
+     */
+    fun inputPortOrNull(): edith.plugin.InputPort? = (this as? RokidConnection)?.input
+}
 
 /** Thrown when a wiring caller passes something that is not an [Activity] where one is required. */
 class CxrActivityRequired : IllegalStateException("CXR_CONNECT_REQUIRES_ACTIVITY")

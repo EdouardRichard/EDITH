@@ -15,11 +15,13 @@ import edith.plugins.diagnostic.DiagnosticTextPlugin
  */
 internal object DiagnosticRegistration {
     fun register(root: HostCompositionRoot, clock: MonotonicClock, scheduler: DeadlineScheduler): (() -> Boolean)? {
-        root.host.register(DiagnosticTextPlugin(clock, scheduler, root.trace, root.profiles::get,
+        // Registered through the composition rather than straight on the host, so the activation side effects can
+        // see what these plugins declare (Task 14a-fix item 4).
+        root.registerPlugin(DiagnosticTextPlugin(clock, scheduler, root.trace, root.profiles::get,
             hostTextAllowed = { false }, cancelOutputTurn = root.host::cancelOutputTurn,
             cancelOutputHint = root.host::cancelOutputHint))
         val hintProbe = DiagnosticHintPlugin(clock)
-        root.host.register(hintProbe)
+        root.registerPlugin(hintProbe)
         return hintProbe::submitNext
     }
 }

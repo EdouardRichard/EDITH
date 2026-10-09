@@ -14,6 +14,7 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
@@ -50,7 +51,8 @@ class MainActivity : ComponentActivity() {
             MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF126B50), secondary = Color(0xFF405B79))) {
                 val state by viewModel.state.collectAsStateWithLifecycle()
                 PhoneScreen(state, root, viewModel, profileViewModel, ::requestStart,
-                    { SessionService.commandFromUi(this, it) }, notificationsGranted(), { root.connectCxr(this) })
+                    { SessionService.commandFromUi(this, it) }, notificationsGranted(), { root.connectCxr(this) },
+                    { root.storedSettings() }, { settings -> root.saveSmartSettings(settings) })
             }
         }
     }
@@ -83,7 +85,8 @@ class MainActivity : ComponentActivity() {
 @Composable private fun PhoneScreen(state: SessionUiState, root: HostCompositionRoot, viewModel: SessionViewModel,
     profileViewModel: ProfileViewModel?,
     start: (String) -> Unit, command: (String) -> Unit, notificationsGranted: Boolean,
-    connectCxr: () -> Boolean) {
+    connectCxr: () -> Boolean,
+    loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit) {
     var page by remember { mutableStateOf(0) }
     val plugins = buildList {
         add("smart-assistant" to "智能助手")
@@ -113,6 +116,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                         if (selected != "p2-diagnostic") Text("业务功能尚未交付", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                        var helpResult by remember { mutableStateOf<String?>(null) }
                         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
                             val inactive = state.session == SessionState.Idle || state.session == SessionState.Paused
                             Button(onClick = { if (state.session == SessionState.Paused) command(SessionService.RESUME) else start(selected) }, enabled = inactive) {
@@ -124,7 +128,30 @@ class MainActivity : ComponentActivity() {
                             OutlinedButton(onClick = { command(SessionService.STOP) }, enabled = state.session != SessionState.Idle) {
                                 Icon(Icons.Default.Stop, contentDescription = null); Spacer(Modifier.width(4.dp)); Text("停止")
                             }
+                            // Task 15c D2: the spec's non-wake entry point. The plugin runs its most recent final
+                            // transcript of this session; a request with no live session is dropped by the host, and
+                            // the label says so instead of pretending it was delivered.
+                            OutlinedButton(onClick = {
+                                helpResult = if (root.requestHelp()) "已请求帮助：将回应本会话最近一次最终转写"
+                                else "当前没有可响应的会话（需已开始并处于就绪/监听中）"
+                            }) { Icon(Icons.Default.HelpOutline, contentDescription = null); Spacer(Modifier.width(4.dp)); Text("手动求助") }
                         }
+                        helpResult?.let { Text(it) }
+                        HorizontalDivider()
+                        // D13: the only path by which a real turn's text may leave the device. Session-scoped, off by
+                        // default, and reset by the composition when the session stops - the switch only ever writes
+                        // the composition's one consent object, and nothing about it is persisted.
+                        val uploadAllowed by root.sessionUploadConsent.enabled.collectAsStateWithLifecycle()
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Switch(checked = uploadAllowed,
+                                onCheckedChange = { root.sessionUploadConsent.set(it) },
+                                enabled = state.session != SessionState.Idle)
+                            Spacer(Modifier.width(8.dp))
+                            Text("允许上传本会话的语音转写")
+                        }
+                        Text("开始会话后可开启。开启后，本会话的语音转写文本会随请求离开设备、发送到所配置的模型服务" +
+                            "（含该轮请求所需的会话上下文）；默认关闭，会话停止后自动恢复为关闭，该开关也不会写入存储。",
+                            style = MaterialTheme.typography.bodySmall)
                         state.errorCode?.let { Text(errorLabel(it), color = MaterialTheme.colorScheme.error) }
                         // Debug-only acceptance affordance: with the shipped plugins still shells, this is the only
                         // way a wearer can check what the glasses actually show. Hidden whenever no probe is
@@ -151,6 +178,8 @@ class MainActivity : ComponentActivity() {
                         state.capabilityReasons.forEach { (capability, _) ->
                             ListItem(headlineContent = { Text(capabilityLabel(capability)) }, supportingContent = { Text("尚不可用") }, leadingContent = { Icon(Icons.Default.Info, null) })
                         }
+                        HorizontalDivider()
+                        SmartSettingsSection(loadSettings, saveSettings)
                     }
                     1 -> {
                         if (profileViewModel == null) Text("档案服务不可用")
@@ -170,6 +199,65 @@ class MainActivity : ComponentActivity() {
             }
         }
     }
+}
+
+/**
+ * The minimal settings entry point (Task 14b): the three things the user can set, plus the inline errors.
+ *
+ * Everything that can be validated lives in [SmartSettingsForm] (JVM-tested); this function only holds the text
+ * fields and prints the errors, so the untested part is wiring. Two facts the copy must state truthfully
+ * (Task 14b-fix item 4): the composition is a process-lifetime singleton and reads the settings **once** in
+ * `HostCompositionRoot.create`, so only a full App restart re-reads them - restarting a session does not; and `L1`
+ * is the ceiling the phase ships with while `L3`/`L4` are an explicit user choice.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable private fun SmartSettingsSection(loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit) {
+    var draft by remember { mutableStateOf(SmartSettingsForm.fromSettings(loadSettings())) }
+    var errors by remember { mutableStateOf(emptyList<String>()) }
+    var saved by remember { mutableStateOf(false) }
+    var levelExpanded by remember { mutableStateOf(false) }
+    val levels = listOf("L0", "L1", "L2", "L3", "L4")
+
+    Text("唤醒与权限设置", style = MaterialTheme.typography.titleLarge)
+    Text("设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；默认上限为 L1，如需 L3/L4 请在此明确选择。",
+        style = MaterialTheme.typography.bodyMedium)
+    // Task 14b-fix item 5: an edit invalidates whatever the last save reported, so the stale error text cannot
+    // outlive the input it was about.
+    OutlinedTextField(value = draft.wakeWords, onValueChange = {
+        draft = draft.copy(wakeWords = it); errors = emptyList(); saved = false
+    }, label = { Text("唤醒词（逗号分隔，1-16 个字符）") }, modifier = Modifier.fillMaxWidth())
+    OutlinedTextField(value = draft.whitelist, onValueChange = {
+        draft = draft.copy(whitelist = it); errors = emptyList(); saved = false
+    }, label = { Text("白名单（action|scope，逗号分隔）") }, modifier = Modifier.fillMaxWidth())
+    ExposedDropdownMenuBox(expanded = levelExpanded, onExpandedChange = { levelExpanded = !levelExpanded }) {
+        OutlinedTextField(value = draft.maxLevel, onValueChange = {}, readOnly = true, label = { Text("权限上限") },
+            trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(levelExpanded) },
+            modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth())
+        ExposedDropdownMenu(expanded = levelExpanded, onDismissRequest = { levelExpanded = false }) {
+            levels.forEach { level -> DropdownMenuItem(text = { Text(level) },
+                onClick = { draft = draft.copy(maxLevel = level); errors = emptyList(); levelExpanded = false; saved = false }) }
+        }
+    }
+    errors.forEach { Text(it, color = MaterialTheme.colorScheme.error) }
+    if (saved) {
+        if (errors.isEmpty()) Text("已保存，将于下次重启 App 后生效")
+        else Text("可用字段已保存，被拒绝的输入请按上述提示修改")
+    }
+    Button(onClick = {
+        // Task 14b-fix item 6: the store can refuse (a locked keystore, or a composition without one), and an
+        // exception thrown out of a Compose click handler would propagate into the UI. It becomes inline text.
+        runCatching {
+            val result = SmartSettingsForm.toSettings(draft, loadSettings())
+            saveSettings(result.settings)
+            result
+        }.onSuccess { result ->
+            errors = result.errors
+            saved = true
+        }.onFailure { failure ->
+            errors = listOf("保存失败：${failure.message ?: failure.javaClass.simpleName}")
+            saved = false
+        }
+    }) { Text("保存") }
 }
 
 private fun sessionLabel(state: SessionState) = when (state) {
@@ -192,6 +280,9 @@ private fun capabilityLabel(capability: Capability) = when (capability) {
     Capability.TextOutput -> "眼镜显示"
     Capability.SpeechOutput -> "语音输出"
     Capability.Storage -> "持久存储"
+    Capability.Actions -> "指令执行"
+    Capability.Context -> "上下文感知"
+    Capability.WakeWord -> "唤醒词"
 }
 private fun errorLabel(code: String) = when (code) {
     "BLUETOOTH_PERMISSION_DENIED" -> "蓝牙权限未获授权"

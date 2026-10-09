@@ -8,6 +8,11 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- API 30+ package visibility: the L0 "打开 App" action resolves a spoken app name to a package, so the App must
+         be able to see the other installed apps. Without this permission getInstalledApplications returns only the
+         App's own packages and every open_app would refuse APP_NOT_VISIBLE. The alternative is an explicit <queries>
+         allowlist (kept below for the Rokid/glasses packages), which cannot resolve an arbitrary spoken name. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
     <queries>
         <package android:name="com.rokid.sprite.aiapp" />
         <package android:name="com.rokid.sprite.global.aiapp" />

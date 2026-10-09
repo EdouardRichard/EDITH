@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug-source-set manifest additions. Merged into the debug variant only; every release build is built from
+  `src/main/AndroidManifest.xml` alone and therefore contains none of this.
+
+  `DebugAudioInjector` is a **debug-only PCM injection instrument** (P3.1 device diagnosis): it offers a WAV file's
+  PCM straight to the live CXR `PcmIngress` so keyword-spotting recall can be measured without the acoustic path.
+  It is `exported="true"` because the only caller is an `adb shell am broadcast` running as the shell UID - an
+  unexported receiver cannot be reached that way and the instrument would be unusable. That export is exactly why
+  this file must never be merged into a release build: no shipped APK may contain a component that accepts audio
+  injection from a host shell.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name=".DebugAudioInjector"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_INJECT" />
+            </intent-filter>
+        </receiver>
+    </application>
+</manifest>

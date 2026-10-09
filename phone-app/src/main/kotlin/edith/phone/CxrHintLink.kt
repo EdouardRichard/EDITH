@@ -5,6 +5,7 @@ import edith.output.HintCommand
 import edith.output.HintExchange
 import edith.output.HintWireCodec
 import edith.output.RokidHintDevice
+import edith.plugin.CancellationHandle
 import edith.plugin.DeadlineScheduler
 import edith.plugin.HintDevice
 import edith.plugin.MonotonicClock
@@ -30,8 +31,8 @@ import edith.plugin.MonotonicClock
  * device. The device run that would confirm the glasses' side of it is deliberately deferred.
  */
 class CxrHintLink(
-    clock: MonotonicClock,
-    scheduler: DeadlineScheduler,
+    private val clock: MonotonicClock,
+    private val scheduler: DeadlineScheduler,
     private val sendJson: (String) -> Boolean,
     /**
      * Where the handshake's few transitions go; wired to the log by the composition.
@@ -41,7 +42,22 @@ class CxrHintLink(
      * a broken transport look identical on a device.
      */
     private val diagnostics: (String) -> Unit = {},
+    /**
+     * D15: how long an unanswered opening handshake waits before it is repeated.
+     *
+     * The glasses app answers the opening `HELLO`/`PING` only once it has subscribed to the command channel; measured
+     * on 2026-10-09 that took 3.45 s after `onOpenAppResult:true`, so the first attempt was sent into the void and
+     * that whole session had no display and no audio. Repeats are cheap (two small JSON commands) and bounded.
+     */
+    private val retryDelayMillis: Long = OPENING_RETRY_DELAY_MILLIS,
+    /** D15: the bound on repeats; zero disables them. */
+    private val maxRetries: Int = OPENING_MAX_RETRIES,
 ) : AutoCloseable {
+    init {
+        require(retryDelayMillis > 0) { "RETRY_DELAY_OUT_OF_RANGE" }
+        require(maxRetries >= 0) { "RETRY_BOUND_OUT_OF_RANGE" }
+    }
+
     /**
      * Every outbound command goes through here.
      *
@@ -71,11 +87,46 @@ class CxrHintLink(
      * Activation is attempted when the scene becomes ready, which is **before** the first clock mapping exists, so a
      * plugin whose only missing capability is the display is refused at that moment. Without this signal nothing would
      * ever try again and a display that has just become usable would stay unused. Renewals replace a live mapping with
-     * another live mapping and therefore do **not** fire it, so activation is not retried on every renewal.
+     * another live mapping and therefore do **not** fire it - see [onMappingLive] for those.
      */
     var onDisplayBecameLive: (() -> Unit)? = null
 
+    /**
+     * Called on **every** successful exchange that leaves a mapping live - the first one and each renewal in place.
+     *
+     * Additive rather than a replacement for [onDisplayBecameLive]: that one is a transition, and the link's steady
+     * state is "live and re-syncing", which produces no transition at all. A renewal replaces a live mapping with a
+     * fresh one every ~20 s, and `sessionEstablished` re-arms the exchange for a new session while the display never
+     * goes not-live. Measured on the K40 on 2026-10-09, a session whose activation had been refused for the missing
+     * display therefore saw `mapping live` every ~20 s and **never** a transition: the refusal was unretryable for
+     * the whole session and nothing was ever displayed or listened to.
+     *
+     * Fired only for a mapping that is genuinely live: a `PONG` that publishes nothing (not this exchange, or an
+     * unusable interval) is not a sync and fires nothing.
+     */
+    var onMappingLive: (() -> Unit)? = null
+
+    /**
+     * The identifier of the mapping that is live **right now**, or null while nothing can be displayed.
+     *
+     * A fresh `syncId` is minted per exchange, so this is the identity of one mapping. A caller that must act once
+     * per mapping - the App's activation retry, which receives both [onDisplayBecameLive] and [onMappingLive] for the
+     * same exchange - can use it to tell "the same sync, reported twice" from "a later renewal".
+     */
+    fun liveSyncId(): String? = clockSync.syncId()
+
     private var displayWasLive = false
+
+    /**
+     * D15: the session whose opening handshake is still unconfirmed, and how many times it has been repeated.
+     *
+     * Non-null only between [sessionEstablished] and the first live mapping (or [sessionEnded]/[linkLost]); it is the
+     * identity a repeat must still belong to, so a repeat can never introduce a session that has already ended.
+     */
+    private var openingSession: String? = null
+    private var openingGeneration = 0L
+    private var openingRetries = 0
+    private var openingRetry: CancellationHandle? = null
 
     /**
      * True only while a hint could actually be displayed: a live clock mapping exists, so the glasses would accept
@@ -84,7 +135,60 @@ class CxrHintLink(
     fun liveOutput(): HintDevice? = if (clockSync.hasLiveMapping()) rokidDevice else null
 
     /** Establishes the session on the glasses and starts the clock exchange. */
-    fun sessionEstablished(sessionId: String, generation: Long) = clockSync.sessionEstablished(sessionId, generation)
+    fun sessionEstablished(sessionId: String, generation: Long) {
+        openingSession = sessionId
+        openingGeneration = generation
+        openingRetries = 0
+        cancelOpeningRetry()
+        clockSync.sessionEstablished(sessionId, generation)
+        scheduleOpeningRetry()
+    }
+
+    /**
+     * D15: the session ended without the link being torn down, so the opening handshake must not be repeated again.
+     *
+     * Separate from [linkLost] on purpose: this is the composition's `stop`, which keeps the link (and the clock
+     * mapping it already published) exactly as it is today, and only ends the repeat. A stopped session must not keep
+     * introducing itself to the glasses.
+     */
+    fun sessionEnded() {
+        openingSession = null
+        cancelOpeningRetry()
+    }
+
+    /** Cancels a scheduled repeat, if any. Idempotent. */
+    private fun cancelOpeningRetry() {
+        openingRetry?.cancel()
+        openingRetry = null
+    }
+
+    /**
+     * Schedules one repeat of an opening handshake that has not been answered (D15).
+     *
+     * Unacknowledged by design: the glasses answer a `HELLO` only with the `SYNC` that follows their `PONG`, so "no
+     * live mapping after the grace period" is the only signal that the first attempt cannot have been seen. Each
+     * repeat is the same `HELLO`+`PING` on the same session - no new command and no new field - and stops at the
+     * first of: a live mapping, the session ending, or the bound. A repeat of a session that has meanwhile ended can
+     * therefore never introduce it.
+     */
+    private fun scheduleOpeningRetry() {
+        val session = openingSession ?: return
+        cancelOpeningRetry()
+        openingRetry = scheduler.at(clock.nowNanos() + retryDelayMillis * 1_000_000) {
+            if (openingSession != session) return@at
+            if (clockSync.hasLiveMapping()) return@at
+            if (openingRetries >= maxRetries) {
+                diagnostics("handshake: opening handshake still unanswered after $maxRetries retries - giving up")
+                openingRetry = null
+                return@at
+            }
+            openingRetries++
+            diagnostics("handshake: no mapping yet - repeating the opening handshake " +
+                "(attempt $openingRetries/$maxRetries)")
+            clockSync.sessionEstablished(session, openingGeneration)
+            scheduleOpeningRetry()
+        }
+    }
 
     /** Handles one inbound message; returns true when it was understood. */
     fun onInbound(json: String): Boolean {
@@ -101,21 +205,28 @@ class CxrHintLink(
         return rokidDevice.onCommand(json)
     }
 
-    /** Fires [onDisplayBecameLive] only on a not-live -> live transition. */
+    /** Fires [onDisplayBecameLive] only on a not-live -> live transition, and [onMappingLive] on every live mapping. */
     private fun notifyDisplayLiveness() {
         val live = clockSync.hasLiveMapping()
         if (live && !displayWasLive) diagnostics("display became live")
+        // D15: an answered exchange confirms the opening handshake, so nothing was lost and nothing may be repeated.
+        if (live) { openingSession = null; cancelOpeningRetry() }
         if (live && !displayWasLive) onDisplayBecameLive?.invoke()
         displayWasLive = live
+        // Deliberately after the transition callback, and fired even when the transition just fired: this signal is
+        // "a mapping is live", not "the display changed". The consumer de-duplicates, so the double report for one
+        // exchange costs nothing - while missing it for a renewal in place is the D10 defect.
+        if (live) onMappingLive?.invoke()
     }
 
     /** The link is gone: the mapping is dropped so no stale interval can be used for a fresh deadline. */
     fun linkLost() {
+        sessionEnded()
         clockSync.linkLost()
         displayWasLive = false
     }
 
-    override fun close() = clockSync.close()
+    override fun close() = linkLost()
 
     /** Enough of a command to tell a usable `SHOW` from an unusable one in a log. */
     private fun describe(command: HintCommand): String = when (command) {
@@ -124,5 +235,19 @@ class CxrHintLink(
         is HintCommand.Clear -> "Clear sequence=${command.sequence}"
         is HintCommand.Ack -> "Ack sequence=${command.sequence}"
         else -> command::class.simpleName ?: "unknown"
+    }
+
+    companion object {
+        /**
+         * D15: the wait before an unanswered opening handshake is repeated.
+         *
+         * One second is far longer than a live link's round trip (the exchange itself is measured in milliseconds),
+         * and five of them cover the 3.45 s the glasses needed to subscribe on 2026-10-09 - while an answered
+         * handshake cancels them at once, so a healthy link sends exactly one.
+         */
+        const val OPENING_RETRY_DELAY_MILLIS = 1_000L
+
+        /** D15: the bound on repeats of the opening handshake, after which the link reports and stops. */
+        const val OPENING_MAX_RETRIES = 5
     }
 }

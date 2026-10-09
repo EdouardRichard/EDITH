@@ -45,11 +45,21 @@ class CxrHintLinkTest {
     }
 
     private class FakeScheduler : DeadlineScheduler {
-        private val tasks = mutableListOf<Pair<Long, () -> Unit>>()
+        private class Entry(val deadline: Long, val task: () -> Unit) { var cancelled = false }
+        private val tasks = mutableListOf<Entry>()
         override fun at(deadlineNanos: Long, task: () -> Unit): CancellationHandle {
-            val entry = deadlineNanos to task
+            val entry = Entry(deadlineNanos, task)
             tasks += entry
-            return object : CancellationHandle { override fun cancel() { tasks.remove(entry) } }
+            return object : CancellationHandle { override fun cancel() { entry.cancelled = true } }
+        }
+
+        /** Runs every non-cancelled task that has come due, as the composition's real scheduler would. */
+        fun fireDue(nowNanos: Long) {
+            while (true) {
+                val next = tasks.filter { !it.cancelled && it.deadline <= nowNanos }.minByOrNull { it.deadline } ?: return
+                tasks.remove(next)
+                next.task()
+            }
         }
     }
 
@@ -219,6 +229,34 @@ class CxrHintLinkTest {
                 SessionState.Ready, rig.host.currentState)
             assertEquals("and a successful retry must clear the refusal it was retried from",
                 null, rig.root.state.value.errorCode)
+        }
+    }
+
+    /**
+     * D15: a `HELLO`/`PING` sent before the glasses app has subscribed is lost forever.
+     *
+     * The composition-level half of the bounded repeat: it must happen for a session whose opening exchange was never
+     * answered, and `stop()` must end it - a stopped session must not keep being introduced to the glasses.
+     */
+    @Test
+    fun theOpeningHandshakeIsRepeatedUntilTheSessionStops() {
+        Rig().use { rig ->
+            rig.root.connectCxr(activity = Any())
+            rig.connection.ready = true
+            rig.root.onSceneReady()
+            rig.root.start("p2-diagnostic")
+            fun hellos() = rig.connection.sent.mapNotNull(HintWireCodec::decode).count { it is HintCommand.Hello }
+            assertEquals("the session is introduced once on start", 1, hellos())
+
+            // Nothing answered, because the glasses had not subscribed yet: the opening handshake must be repeated.
+            rig.clock.nanos = 1_000_000_000
+            rig.scheduler.fireDue(rig.clock.nanos)
+            assertEquals("an unanswered opening handshake must be repeated", 2, hellos())
+
+            rig.root.stop()
+            rig.clock.nanos = 5_000_000_000
+            rig.scheduler.fireDue(rig.clock.nanos)
+            assertEquals("a stopped session must not keep being introduced", 2, hellos())
         }
     }
 
