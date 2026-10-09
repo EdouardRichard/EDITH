@@ -478,6 +478,31 @@ class SmartProactiveTurnTest {
             "the visible window must be measured from the submit, not from the trigger: remaining=$remaining")
     }
 
+    @Test
+    fun `a context key the provider stopped reporting is not carried from an earlier change`() {
+        val signals = MutableContextSignals(mapOf("proactive.armed" to "true", "app.foreground" to "com.stale"))
+        val rig = SmartTestRig()
+        rig.activate(overrides = mapOf(edith.plugin.Capability.Context to signals))
+        rig.model.onRequest = proposing()
+        // The host delivered a change that included the foreground app...
+        rig.plugin.handle(ContextChanged(rig.envelope(), 7L,
+            mapOf("proactive.armed" to "true", "app.foreground" to "com.stale")))
+        // ...and then the user revoked usage access: the provider stops reporting it. Found on the K40 - the request
+        // still carried the revoked value, because the remembered change map was merged into the fresh snapshot.
+        signals.values = mapOf("proactive.armed" to "true", "time.local" to "21:05")
+
+        withLines { lines ->
+            arm(rig)
+            rig.plugin.handle(TranscriptEvent(rig.transcript("这句话是不是值得提醒一下")))
+
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertFalse(input.contains("com.stale"), "a revoked context value must not survive in the request: $input")
+            assertTrue(input.contains("21:05"), "the fresh snapshot is what the request carries: $input")
+            // Two fresh values plus the acoustic label; the stale key and the foreground double-count are both gone.
+            assertTrue(lines.any { it.startsWith("P3_PROACTIVE request ctx=3") }, lines.toString())
+        }
+    }
+
     // ---- the request's context -------------------------------------------------------------------------------------
 
     @Test

@@ -761,7 +761,8 @@ class SmartAssistantPlugin(
         if (!revision.final) return null
         val text = revision.text.trim()
         if (!isUsableUtterance(text)) return null
-        val trigger = ProactiveTrigger(text, lastAcousticLabel, lastContextValues[FOREGROUND_KEY], clock.nowNanos())
+        val values = currentContextValues()
+        val trigger = ProactiveTrigger(text, lastAcousticLabel, values[FOREGROUND_KEY], clock.nowNanos())
         // "Busy" means a turn is genuinely in flight - waiting for its transcript, running its loop, or a proactive
         // request on the wire. A turn that has **finished** stays installed as `turn` until something replaces or
         // stops it (the wake path does that on purpose, so a late ACK still finds its identity), and counting it as
@@ -881,7 +882,9 @@ class SmartAssistantPlugin(
     /** The context message one proactive request carries, and how many perception entries it attached. */
     private fun proactiveMessage(trigger: ProactiveTrigger): Pair<String, Int> {
         val values = currentContextValues()
-        val entries = values.size + listOfNotNull(trigger.label, trigger.foreground).size
+        // One entry per context value, plus the acoustic label. The foreground app is already one of the values, so it
+        // is not counted twice (`ctx` is what the message carried, not a sum of overlapping sources).
+        val entries = values.size + if (trigger.label != null) 1 else 0
         val message = buildString {
             append("用户没有对你说话。本回合的感知上下文：")
             append("\n最近一句转写：").append(trigger.transcript)
@@ -893,18 +896,21 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * The freshest context available: the provider's own snapshot, with anything a delivered `ContextChanged` carried
-     * filling the gaps (the provider may be unwired, and then the remembered values are all there is).
+     * The context the request carries: the provider's own snapshot, or the last delivered change when no provider
+     * answers at all.
+     *
+     * The snapshot **wins outright**; it is not merged with the remembered change. Merging looked defensive and was
+     * wrong: a key the host stopped reporting - a permission the user just revoked - survived in the merged map, so
+     * the request still told the model about a foreground app the App may no longer see. Found on the K40 by revoking
+     * usage access (`ctx` stayed high after `app.foreground` had left the host's own key line).
      *
      * Reading the provider here is also what drives the host's change detection - the composition reports a
-     * `ContextChanged` when a snapshot differs from the previous one - so an unread context stays invisible. Found on
-     * the K40: the first device request carried `ctx=1` (the acoustic label alone) because nothing sampled the
-     * provider at all.
+     * `ContextChanged` when a snapshot differs from the previous one - so an unread context stays invisible.
      */
     private fun currentContextValues(): Map<String, String> {
         val remembered = synchronized(gate) { lastContextValues }
         val fresh = runCatching { currentContext()?.services?.context()?.snapshot()?.values }.getOrNull()
-        return if (fresh == null) remembered else remembered + fresh
+        return fresh ?: remembered
     }
 
     /** The hint text in one tool call's arguments, or null when they are not a JSON object with a non-blank `text`. */
