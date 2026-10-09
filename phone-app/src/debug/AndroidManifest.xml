@@ -20,5 +20,18 @@
                 <action android:name="edith.DEBUG_INJECT" />
             </intent-filter>
         </receiver>
+        <!--
+          P3.2 Stage 0 hint-length instrument. Same reasoning as `DebugAudioInjector`: the only caller is an
+          `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
+          release build. It carries synthetic text only and logs counts only.
+        -->
+        <receiver
+            android:name=".DebugHintInjector"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_HINT" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

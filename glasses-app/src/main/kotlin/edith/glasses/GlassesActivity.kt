@@ -128,6 +128,14 @@ class GlassesActivity : Activity() {
     /** The hint text as the wearer sees it, exposed so an instrumentation test can assert the committed view. */
     fun hintText(): String = hintView.text?.toString().orEmpty()
 
+    /**
+     * The line count the current hint actually laid out into.
+     *
+     * Exposed for the same reason as [hintText]: a `TextView` with `maxLines` clips the overflow **silently**, so
+     * "the hint was clipped" is only observable from the view itself. Valid after a layout pass.
+     */
+    fun renderedLineCount(): Int = hintView.lineCount
+
     private companion object {
         /**
          * Upper bound on one hint's claim on the panel: longer than any hint the phone bounds (its `SHOW` carries the
@@ -147,6 +155,11 @@ class GlassesActivity : Activity() {
         holdAwakeFor(display.isNotEmpty())
         hintView.text = display
         statusView.text = if (display.isEmpty()) "等待提示" else "EDITH"
+        // P3.2 Stage 0: the layout's own limit is reported only **after** it has laid the text out - reading it here
+        // would read the previous layout (or none). Counts and size only, never the text.
+        hintView.post {
+            android.util.Log.i("EdithGlasses", HintPresentation.renderReport(hintView.lineCount, display.length))
+        }
     }
 
     /**

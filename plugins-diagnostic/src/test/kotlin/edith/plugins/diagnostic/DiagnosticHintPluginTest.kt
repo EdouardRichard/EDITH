@@ -127,4 +127,41 @@ class DiagnosticHintPluginTest {
 
         assertEquals(0, sink.submitted.size)
     }
+
+    /**
+     * P3.2 Stage 0: the capacity probe must drive the panel with a hint of a **known length**, which the fixed list
+     * cannot do. The break this catches: an entry point that silently reshapes or trims the text (the measurement
+     * would then be of the wrong length), one that submits while inactive, and one that disturbs the fixed-list
+     * rotation the worn-readability procedure depends on.
+     */
+    @Test
+    fun aGivenTextIsSubmittedUnchangedAndDoesNotDisturbTheFixedList() {
+        val sink = RecordingSink()
+        val plugin = DiagnosticHintPlugin(FakeClock())
+
+        assertFalse(plugin.submitText("字".repeat(30)), "an inactive probe must not claim it submitted anything")
+
+        plugin.activate(contextWith(sink))
+        assertFalse(plugin.submitText("   \n  "), "a blank hint must be refused, not rendered as an empty line")
+        assertEquals(0, sink.submitted.size)
+
+        val probe = "字".repeat(120)
+        assertTrue(plugin.submitText(probe))
+        assertEquals(1, sink.submitted.size)
+        assertEquals(probe, sink.submitted.single().text, "the measured text must reach the display unchanged")
+        assertEquals(120, sink.submitted.single().text.length)
+
+        // The next fixed sentence is still the first one: the probe's own list must not have advanced.
+        assertTrue(plugin.submitNext())
+        assertEquals(DiagnosticHintPlugin.HINTS.first(), sink.submitted.last().text)
+    }
+
+    @Test
+    fun aGivenTextThatTheSinkRefusesIsNotReportedAsSubmitted() {
+        val sink = RecordingSink(accept = false)
+        val plugin = DiagnosticHintPlugin(FakeClock())
+        plugin.activate(contextWith(sink))
+
+        assertFalse(plugin.submitText("字".repeat(60)))
+    }
 }

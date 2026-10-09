@@ -41,6 +41,9 @@ class DiagnosticHintPlugin(
     private var context: PluginContext? = null
     private var submitted = 0
 
+    /** Given-text submissions, counted apart from [submitted] so a measurement never shifts the fixed-list rotation. */
+    private var measured = 0
+
     override fun activate(context: PluginContext) {
         synchronized(gate) { this.context = context }
     }
@@ -65,10 +68,34 @@ class DiagnosticHintPlugin(
             c to submitted
         }
         val (pluginContext, index) = current
-        val text = HINTS[(index - 1) % HINTS.size]
+        return submit(pluginContext, "hint-probe-$index", HINTS[(index - 1) % HINTS.size])
+    }
+
+    /**
+     * Submits [text] exactly as given, through the same sink and with the same TTL as [submitNext].
+     *
+     * P3.2 Stage 0's capacity probe: the fixed list above is deliberately short, so measuring what the glasses do with
+     * a hint of a **known** length needs an entry point that neither reshapes nor trims the text - otherwise the
+     * measurement would be of a different length than the one recorded. A blank text is refused rather than rendered
+     * as an empty hint, and the fixed-list rotation is left untouched so a worn-readability pass can still be run
+     * afterwards from the same probe.
+     */
+    fun submitText(text: String): Boolean {
+        if (text.isBlank()) return false
+        val current = synchronized(gate) {
+            val c = context ?: return false
+            measured++
+            c to measured
+        }
+        val (pluginContext, index) = current
+        return submit(pluginContext, "hint-probe-measured-$index", text)
+    }
+
+    /** The one submission path: resolve the sink the host gave this plugin, submit, and report acceptance honestly. */
+    private fun submit(pluginContext: PluginContext, hintId: String, text: String): Boolean {
         val now = clock.nowNanos()
         val assistance = Assistance(
-            hintId = "hint-probe-$index",
+            hintId = hintId,
             sessionId = pluginContext.sessionId,
             generation = pluginContext.generation,
             sourceTurnId = null,

@@ -29,4 +29,17 @@ object HintPresentation {
         if (text.isNullOrBlank()) return false
         return text.split(separators).count { it.isNotBlank() } > MAX_POINTS
     }
+
+    /**
+     * What the layout actually did with the hint, as one greppable line.
+     *
+     * [MAX_POINTS] bounds how many points are handed to the view; the **view** then wraps them, and a plain
+     * `TextView` with `maxLines` clips whatever does not fit **without saying so** (measured limitation, P3.2 Stage 0).
+     * The line count is only knowable after a layout pass, so the caller reports it from a `post {}` - and this
+     * formatter is separate from the reading so it stays testable off-device.
+     *
+     * Carries the count and the size, never the text: the same rule as every other `P3_` line.
+     */
+    fun renderReport(lines: Int, chars: Int): String =
+        "hint rendered lines=$lines maxLines=${MAX_POINTS * 2} chars=$chars clipped=${lines > MAX_POINTS * 2}"
 }

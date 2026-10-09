@@ -22,6 +22,8 @@ internal object DiagnosticRegistration {
             cancelOutputHint = root.host::cancelOutputHint))
         val hintProbe = DiagnosticHintPlugin(clock)
         root.registerPlugin(hintProbe)
+        // P3.2 Stage 0: the capacity probe needs a hint of a known length, which the fixed list cannot express.
+        root.diagnosticHintTextSender = hintProbe::submitText
         return hintProbe::submitNext
     }
 }

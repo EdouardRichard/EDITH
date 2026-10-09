@@ -53,4 +53,19 @@ class HintPresentationTest {
     fun asciiSeparatorsBehaveTheSameWayAsChineseOnes() {
         assertEquals(listOf("first", "second", "third"), HintPresentation.points("first; second! third? fourth"))
     }
+
+    @Test
+    fun aRenderedHintReportsItsLineCountAndSizeWithoutItsText() {
+        // P3.2 Stage 0: the layout's own limit was invisible - a hint that overflowed six lines was clipped with
+        // nothing said about it. This line is the measurement instrument for the capacity probe, and it must never
+        // carry the hint's text.
+        assertEquals("hint rendered lines=5 maxLines=6 chars=53 clipped=false",
+            HintPresentation.renderReport(lines = 5, chars = 53))
+    }
+
+    @Test
+    fun aHintThatOverflowsTheLayoutIsReportedAsClipped() {
+        assertEquals("hint rendered lines=11 maxLines=6 chars=120 clipped=true",
+            HintPresentation.renderReport(lines = 11, chars = 120))
+    }
 }
