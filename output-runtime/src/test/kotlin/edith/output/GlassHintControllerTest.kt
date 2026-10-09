@@ -208,6 +208,65 @@ class GlassHintControllerTest {
         assertEquals(1, acks.size, "and it must be acknowledged once rendered")
     }
 
+    /**
+     * The phone's session generation is a **per-process** counter, and the glasses' is for the life of *their*
+     * process.
+     *
+     * `HostRuntime` starts at 0 and increments on every `startSession`, so a phone app run that started three
+     * sessions sends `HELLO` with generation 3, while the next app run starts again at generation 1 - and the glasses
+     * process (and the session it stored) outlives the phone's. Measured on the K40 + glasses on 2026-10-09: after
+     * such a restart every `SHOW` was refused for the rest of the glasses process's life
+     * (`Show refused: session 393e1238-… != 49dedb25-…`), so no hint could ever be displayed again.
+     *
+     * A `HELLO` naming a **different** session is a new session and must replace the stored one; only a `HELLO` for
+     * the **same** session with an older generation is stale, which is the ordering rule this gate was written for.
+     */
+    @Test fun aHelloForANewSessionReplacesTheStoredOneEvenWhenThePhonesGenerationRestartedLower() {
+        val controller = controller()
+        controller.accept(HintCommand.Hello("old-session", generation = 3))
+        controller.accept(HintCommand.Sync("sync", 0, 1_000_000, 10_000_000_000L))
+        controller.accept(HintCommand.Show("old-session", 3, 1, "h", 1, "sync", 0, 5_000, "old"))
+
+        // The phone app is restarted: a new session, and its own generation counter is back at 1.
+        controller.accept(HintCommand.Hello("new-session", generation = 1))
+        controller.accept(HintCommand.Sync("sync2", 0, 1_000_000, 10_000_000_000L))
+        controller.accept(HintCommand.Show("new-session", 1, sequence = 1, hintId = "h2", revision = 1,
+            syncId = "sync2", phoneSentNanos = 0, remainingTtlMillis = 5_000, text = "new"))
+
+        assertEquals(listOf<String?>("old", null, "new"), rendered,
+            "a HELLO for a different session must be adopted even when its generation is lower")
+        assertEquals(2, acks.size, "and the new session's hint must be acknowledged")
+    }
+
+    /** The ordering rule the generation gate exists for: an older `HELLO` for the *same* session is still ignored. */
+    @Test fun aHelloForTheSameSessionWithAnOlderGenerationIsStillIgnored() {
+        val controller = controller()
+        controller.accept(HintCommand.Hello("s", generation = 5))
+        controller.accept(HintCommand.Hello("s", generation = 4))
+        controller.accept(HintCommand.Sync("sync", 0, 1_000_000, 10_000_000_000L))
+        controller.accept(HintCommand.Show("s", 5, 1, "h", 1, "sync", 0, 5_000, "text"))
+        assertEquals(listOf<String?>("text"), rendered, "the newer generation of the same session must survive")
+    }
+
+    /**
+     * The gate that hid D14 for three rounds: a `HELLO` that was ignored looked exactly like one that never arrived.
+     * Both outcomes are now reported with the session/generation that was stored, so the glasses' log can tell
+     * "this process kept an old session" from "the HELLO never reached it".
+     */
+    @Test fun aHelloReportsWhetherItWasAdoptedAndWhatItReplaced() {
+        val lines = mutableListOf<String>()
+        val controller = GlassHintController(clock, scheduler, { rendered += it }, { acks += it },
+            diagnostics = { lines += it })
+        controller.accept(HintCommand.Hello("s-1", generation = 3))
+        controller.accept(HintCommand.Hello("s-2", generation = 1))
+        controller.accept(HintCommand.Hello("s-2", generation = 0))
+        assertEquals(listOf(
+            "Hello accepted: session=s-1 generation=3",
+            "Hello accepted: session=s-2 generation=1 (replaced session=s-1 generation=3)",
+            "Hello refused: generation 0 < 1 for session s-2",
+        ), lines)
+    }
+
     private class FakeClock(var nanos: Long = 0) : MonotonicClock {
         override fun nowNanos(): Long = nanos
     }

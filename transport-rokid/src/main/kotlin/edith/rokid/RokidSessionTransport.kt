@@ -71,6 +71,15 @@ class RokidSessionTransport(
     private val resolveFormat: () -> VerifiedPcm? = { PcmFormatEvidence.resolve("1.26.011", "1.1.2") },
     /** Optional RAM-only observer for T17 controlled format verification; the transport never retains it. */
     private val rawPcmObserver: (ByteArray) -> Unit = {},
+    /**
+     * Reports what the epoch's [PcmIngress] decided about each offered datagram.
+     *
+     * Additive and defaulted so every existing call site keeps its behaviour: `PcmIngress.offer` already returned the
+     * outcome, but the return value was consumed inside this class and thrown away, which made
+     * `INGRESS_OVERFLOW`/`UNKNOWN_FORMAT`/`STALE_EPOCH` unobservable outside it. Forwarded **as decided**, never
+     * reinterpreted here: whether an outcome is a fault is the ingress loop's contract, not the transport's.
+     */
+    private val onOffer: (edith.audio.PcmOffer) -> Unit = {},
 ) : InputPort, AutoCloseable {
     private val gate = Any()
     @Volatile private var closed = false
@@ -122,7 +131,9 @@ class RokidSessionTransport(
                     runCatching { rawPcmObserver(data) }
                     val accepted = synchronized(gate) {
                         if (closed || audio !== this || state.epoch != epoch) return
-                        ingress.offer(epoch, data) != edith.audio.PcmOffer.STALE_EPOCH
+                        val offer = ingress.offer(epoch, data)
+                        onOffer(offer)
+                        offer != edith.audio.PcmOffer.STALE_EPOCH
                     }
                     if (accepted && notified.compareAndSet(false, true)) enqueue {
                         synchronized(gate) {
@@ -247,11 +258,11 @@ class RokidSessionTransport(
     companion object {
         fun create(context: android.content.Context, config: RokidConnectionConfig, ingress: PcmIngress,
             onSceneReady: () -> Unit, onInput: (InputEpoch) -> Unit, onInterrupted: () -> Unit,
-            onRawPcm: (ByteArray) -> Unit = {}): RokidSessionTransport {
+            onRawPcm: (ByteArray) -> Unit = {}, onOffer: (edith.audio.PcmOffer) -> Unit = {}): RokidSessionTransport {
             val worker = Executors.newSingleThreadExecutor { Thread(it, "edith-cxr-transport").apply { isDaemon = true } }
             return RokidSessionTransport(ingress, onSceneReady, onInput, onInterrupted,
                 CxrBackend(context.applicationContext, config, worker), worker,
-                { PcmFormatEvidence.resolve(config.firmware, "1.1.2") }, onRawPcm)
+                { PcmFormatEvidence.resolve(config.firmware, "1.1.2") }, onRawPcm, onOffer)
         }
     }
     fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?) {

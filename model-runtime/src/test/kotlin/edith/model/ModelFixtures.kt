@@ -15,6 +15,7 @@ internal fun verification(operation: String = "TEXT_REQUEST", state: Verificatio
     revision: Long = 1, time: Long = 1) = CapabilityVerification(revision, operation, state, time)
 
 internal fun requestFixture(input: List<InputPart> = listOf(InputPart.Text("synthetic question")),
-    output: OutputModality = OutputModality.TEXT) = ModelRequest(
+    output: OutputModality = OutputModality.TEXT,
+    history: List<ModelHistoryItem> = emptyList()) = ModelRequest(
     EventEnvelope(SessionId("s"), Generation(1), "e", 0, 1), "r", "t", "p", 1,
-    "synthetic instructions", input, emptyList(), emptyList(), output, 10_000_000_000)
+    "synthetic instructions", input, history, emptyList(), output, 10_000_000_000)

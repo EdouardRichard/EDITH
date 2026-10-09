@@ -21,6 +21,9 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
     private val items = mutableMapOf<String, String>()
     private val outputItems = mutableMapOf<Long, String>()
     private val parts = mutableMapOf<ContentId, String>()
+    private val toolCalls = mutableMapOf<String, String>()
+    private val toolArgs = mutableMapOf<String, StringBuilder>()
+    private val toolNames = mutableMapOf<String, String>()
 
     fun accept(frame: SseFrame): List<ModelStreamEvent> {
         if (ended) return emptyList()
@@ -52,6 +55,7 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
                     "response.content_part.added", "response.content_part.done" -> trackPart(root)
                     "response.output_text.delta" -> delta(root)
                     "response.output_text.done" -> done(root)
+                    "response.function_call_arguments.delta" -> toolDelta(root)
                     "response.completed", "response.incomplete", "response.failed" -> finish(type, root)
                     else -> emptyList()
                 }
@@ -147,7 +151,53 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
             if (text.keys.any { it.item == id && it !in fullContent })
                 return terminal(ModelEnd.INCOMPLETE, null, "TEXT_DELIVERY_INCOMPLETE")
         }
+        if (type == "function_call") {
+            // `call_id` and `name` are optional here so an added/done pair that only carries them once still works; the
+            // terminal event is the point at which both must exist.
+            string(item, "call_id")?.let { if (it.isNotBlank()) toolCalls.putIfAbsent(id, it) }
+            string(item, "name")?.let { if (it.isNotBlank()) toolNames.putIfAbsent(id, it) }
+            if (root["type"] == JsonPrimitive("response.output_item.done"))
+                return toolTerminal(id, item)
+        }
         return emptyList()
+    }
+
+    /**
+     * Arguments stream in fragments; the `output_item.done` item is authoritative. A *partial* stream that disagrees
+     * with the item means the stream is not internally coherent, so this refuses rather than handing the upper layer a
+     * call it never fully observed — the same failure mode `TEXT_DELIVERY_INCOMPLETE` covers for text. An item that
+     * arrives without any delta at all is not a disagreement: the whole document came inline in the item.
+     */
+    private fun toolTerminal(id: String, item: JsonObject): List<ModelStreamEvent> {
+        val callId = string(item, "call_id")?.takeIf { it.isNotBlank() } ?: toolCalls[id]
+            ?: invalid("MISSING_CALL_ID")
+        val name = string(item, "name")?.takeIf { it.isNotBlank() } ?: toolNames[id]
+            ?: invalid("MISSING_TOOL_NAME")
+        val arguments = string(item, "arguments") ?: ""
+        val streamed = toolArgs[id]?.toString()
+        if (streamed != null && streamed != arguments)
+            return terminal(ModelEnd.INCOMPLETE, null, "TOOL_CALL_DELIVERY_INCOMPLETE")
+        done += ContentId(id, FUNCTION_CALL_INDEX)
+        return listOf(ModelStreamEvent.ToolCallTerminal(request, id, callId, name, arguments))
+    }
+
+    private fun functionCall(root: JsonObject): String {
+        val item = string(root, "item_id", required = true)!!
+        if (item.isBlank()) invalid("MISSING_CONTENT_ID")
+        val bound = items[item]
+        if (bound != null && bound != "function_call") invalid("CONTENT_TYPE_CONFLICT")
+        items.putIfAbsent(item, "function_call")
+        number(root["output_index"])?.let { bindItem(it, item) }
+        return item
+    }
+
+    private fun toolDelta(root: JsonObject): List<ModelStreamEvent> {
+        val key = functionCall(root)
+        if (ContentId(key, FUNCTION_CALL_INDEX) in done) invalid("DELTA_AFTER_DONE")
+        val value = string(root, "delta", required = true)!!
+        toolArgs.getOrPut(key) { StringBuilder() }.append(value)
+        return if (value.isEmpty()) emptyList()
+        else listOf(ModelStreamEvent.ToolCallDelta(request, key, toolNames[key], value))
     }
 
     private fun trackPart(root: JsonObject): List<ModelStreamEvent> {
@@ -208,12 +258,21 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
         }
         if (end == ModelEnd.COMPLETED && !terminalTextMatches(response))
             return terminal(ModelEnd.INCOMPLETE, usage, "TEXT_DELIVERY_INCOMPLETE")
+        // The same gate for calls: text is gated on `text.keys.all { it in delivered }`, and a call whose
+        // `output_item.done` never arrived has no terminal event. Accepting `completed` there would hand the upper
+        // layer a successful empty turn and silently swallow the call.
+        if (end == ModelEnd.COMPLETED && !terminalToolMatches())
+            return terminal(ModelEnd.INCOMPLETE, usage, "TOOL_CALL_DELIVERY_INCOMPLETE")
         return terminal(end, usage, when (end) {
             ModelEnd.FAILED -> "PROVIDER_FAILED"
             ModelEnd.INCOMPLETE -> "PROVIDER_INCOMPLETE"
             else -> null
         })
     }
+
+    /** Mirrors the text path's `text.keys.all { it in delivered }`: every observed call must have its done sentinel. */
+    private fun terminalToolMatches(): Boolean =
+        items.filterValues { it == "function_call" }.keys.all { ContentId(it, FUNCTION_CALL_INDEX) in done }
 
     private fun terminalTextMatches(response: JsonObject): Boolean {
         val output = response["output"] ?: return true
@@ -223,6 +282,9 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
         var matches = true
         for ((outputIndex, element) in array.withIndex()) {
             val item = objectValue(element, required = true)!!
+            // P2 tolerance: only `message` items carry text to validate, so every other item type is skipped before
+            // any field is required of it. Requiring `id` on every item turned an id-less non-message item into
+            // FAILED/MISSING_FIELD, which P2 ignored. Message items keep the position binding added for them.
             if (string(item, "type") != "message") continue
             val id = string(item, "id", required = true)!!
             bindItem(outputIndex.toLong(), id)
@@ -242,6 +304,12 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
         if (ended) return emptyList()
         ended = true
         text.clear(); done.clear(); items.clear(); parts.clear(); outputItems.clear()
+        toolCalls.clear(); toolArgs.clear(); toolNames.clear()
         return listOf(ModelStreamEvent.Terminal(request, end, usage, code))
+    }
+
+    private companion object {
+        /** Content ids are `(item, content index)`; tool arguments have no content index, so one sentinel is used. */
+        const val FUNCTION_CALL_INDEX = -1L
     }
 }

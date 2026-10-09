@@ -114,7 +114,7 @@ class ProfileGateTest {
         CapabilityGate().check(profile, request, support, consent, false)
         denied(profile, request, support, consent.copy(text = false))
         for (textRequest in listOf(request.copy(context = listOf(ContextPart("c", "synthetic", 1))),
-            request.copy(history = listOf(TextMessage(MessageRole.USER, "synthetic"), TextMessage(MessageRole.ASSISTANT, "reply"))))) {
+            request.copy(history = listOf(ModelHistoryItem.Text(MessageRole.USER, "synthetic"), ModelHistoryItem.Text(MessageRole.ASSISTANT, "reply"))))) {
             denied(profile, textRequest, support)
             val declaredText = profile.copy(inputs = setOf(InputModality.TEXT, InputModality.AUDIO))
             val fullSupport = support.copy(inputs = declaredText.inputs)
@@ -122,6 +122,22 @@ class ProfileGateTest {
             denied(declaredText, textRequest, fullSupport)
             CapabilityGate().check(declaredText.copy(verifications = profile.verifications + verification()), textRequest, fullSupport, consent, false)
         }
+    }
+
+    @Test fun `a history only request is still charged as a text input operation`() {
+        // The post-tool continuation carries no `input` of its own, but its transcript is text, so the gate must
+        // charge it as a TEXT_REQUEST (and require that operation's verification) rather than admit it input-free.
+        val request = requestFixture(
+            input = emptyList(),
+            history = listOf(
+                ModelHistoryItem.Text(MessageRole.USER, "synthetic"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "calling record_note"),
+                ModelHistoryItem.ToolCall("call_1", "record_note", "{}", "fc_1"),
+                ModelHistoryItem.ToolOutput("call_1", "noted"),
+            ),
+        )
+        CapabilityGate().check(profileFixture(), request, textSupport, consent, false)
+        denied(profileFixture(verifications = listOf(verification("AUDIO_REQUEST"))), request, textSupport)
     }
 
     @Test fun `latest timestamp and last tie determine verification state`() {

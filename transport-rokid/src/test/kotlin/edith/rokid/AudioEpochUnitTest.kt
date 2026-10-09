@@ -143,6 +143,35 @@ class AudioEpochUnitTest {
         assertEquals("AUDIO_STREAM_FAILED", rig.transport.state.errorCode)
         assertEquals(1, rig.interruptions)
     }
+    /**
+     * The receiver's own outcome used to be visible only inside this class: the composition could not tell an
+     * accepted chunk from an overflow, so `INGRESS_OVERFLOW` had no way to become a report. The new defaulted sink
+     * is that seam, and it must forward exactly what the ingress decided - including `STALE_EPOCH`, which this
+     * class must not reinterpret.
+     */
+    @Test fun theIngressOfferOutcomeIsForwardedToTheAdditiveSink() {
+        val rig = Rig(VerifiedPcm(AudioFormat.Pcm(16000, 1, 16), PcmEncoding.SIGNED_LE, "synthetic-test"))
+        rig.ready(); rig.transport.start(rig.first); rig.worker.drain()
+
+        rig.audio().received(byteArrayOf(1, 2, 3, 4)); rig.worker.drain()
+        assertEquals(listOf(PcmOffer.ACCEPTED), rig.offers)
+
+        // A closed ingress answers STALE_EPOCH; the transport must report the ingress's own decision unchanged.
+        rig.ingress.close()
+        rig.audio().received(byteArrayOf(5, 6, 7, 8)); rig.worker.drain()
+        assertEquals(listOf(PcmOffer.ACCEPTED, PcmOffer.STALE_EPOCH), rig.offers)
+    }
+
+    @Test fun audioOfferedBeforeTheEpochIsRevokedIsNotReportedAsAnOffer() {
+        val rig = Rig(VerifiedPcm(AudioFormat.Pcm(16000, 1, 16), PcmEncoding.SIGNED_LE, "synthetic-test"))
+        rig.ready(); rig.transport.start(rig.first); rig.worker.drain()
+        val old = rig.audio()
+
+        rig.transport.stop(rig.first); old.received(ByteArray(640)); rig.worker.drain()
+
+        assertTrue("a callback from a revoked epoch must not reach the ingress at all", rig.offers.isEmpty())
+    }
+
     @Test fun verifiedIngressCopiesSdkArrayAndPreservesCallbackTimestamp() {
         val rig = Rig(VerifiedPcm(AudioFormat.Pcm(16000, 1, 16), PcmEncoding.SIGNED_LE, "synthetic-test"))
         rig.ready(); rig.transport.start(rig.first); rig.worker.drain()
@@ -160,11 +189,13 @@ class AudioEpochUnitTest {
         val backend = Backend()
         val ingress = PcmIngress(object : MonotonicClock { override fun nowNanos() = 10L })
         val inputs = mutableListOf<InputEpoch>()
+        val offers = mutableListOf<PcmOffer>()
         var interruptions = 0
         var readyNotifications = 0
         val first = InputEpoch(SessionId("s"), Generation(1), 1)
         val second = InputEpoch(SessionId("s"), Generation(2), 2)
-        val transport = RokidSessionTransport(ingress, { readyNotifications++ }, inputs::add, { interruptions++ }, backend, worker, { format })
+        val transport = RokidSessionTransport(ingress, { readyNotifications++ }, inputs::add, { interruptions++ }, backend, worker,
+            { format }, onOffer = offers::add)
         init { transport.connect(Activity()) }
         fun ready() { backend.events!!.ready(); worker.drain() }
         fun audio(): RokidBackend.Audio {

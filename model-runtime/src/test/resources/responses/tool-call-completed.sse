@@ -1,0 +1,16 @@
+: Synthetic compatibility-schema fixture, not a captured DeepSeek response.
+event: response.created
+data: {"type":"response.created","sequence_number":8,"response":{"id":"resp_kws_1","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":10,"output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"record_note"}}
+
+event: response.function_call_arguments.delta
+data: {"type":"response.function_call_arguments.delta","sequence_number":13,"output_index":0,"item_id":"fc_1","delta":"{\"title\":\"\u56de\u7535\u8bdd\"}"}
+
+event: response.output_item.done
+data: {"type":"response.output_item.done","sequence_number":15,"output_index":0,"item":{"id":"fc_1","type":"function_call","call_id":"call_1","name":"record_note","arguments":"{\"title\":\"\u56de\u7535\u8bdd\"}"}}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":21,"response":{"id":"resp_kws_1","status":"completed","output":[{"id":"fc_1","type":"function_call","call_id":"call_1","name":"record_note","arguments":"{\"title\":\"\u56de\u7535\u8bdd\"}"}],"usage":{"input_tokens":11,"output_tokens":7,"unknown":true}}}
+

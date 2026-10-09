@@ -228,6 +228,69 @@ class HintClockSyncTest {
         assertEquals(listOf<String?>("先讲结论"), rendered)
     }
 
+    /**
+     * The measured device failure, end to end in-process on two clocks: the phone app is restarted, so its session
+     * counter goes back to 1, while the glasses process still holds the session and generation from the run before.
+     *
+     * Before the fix the glasses kept the old session and refused the new session's `SHOW`
+     * (`Show refused: session <new> != <stale>`), so the phone saw only `Queued` and the hint never became visible -
+     * exactly the K40 + glasses measurement of 2026-10-09. The phone's own `HELLO`/`SYNC`/`SHOW` bytes are unchanged:
+     * this is the glasses-side acceptance rule, not a wire change.
+     */
+    @Test
+    fun theHandshakeRecoversWhenAPhoneRestartSendsALowerGenerationForANewSession() {
+        val phoneClock = FakeClock()
+        val glassesClock = FakeClock()
+        val latency = 5_000_000L
+        val offset = 1_000_000_000L
+        val rendered = mutableListOf<String?>()
+        lateinit var currentPhone: RokidHintDevice
+        lateinit var link: HintClockSync
+
+        val controller = GlassHintController(glassesClock, FakeScheduler(), { rendered += it }, { ack ->
+            currentPhone.onCommand(HintWireCodec.encode(ack))
+        })
+        link = HintClockSync(phoneClock, FakeScheduler(), { command ->
+            controller.accept(command)
+            if (command is HintCommand.Ping) {
+                val received = command.p0 + offset + latency
+                phoneClock.nanos = command.p0 + 2 * latency
+                link.onCommand(HintCommand.Pong(command.syncId, command.p0, received, received))
+            }
+            true
+        }, syncIds())
+
+        // One phone app run: a fresh device per run, because a restart also restarts the phone's own sequence.
+        fun newPhone(): Pair<RokidHintDevice, MutableList<OutputStatus>> {
+            val statuses = mutableListOf<OutputStatus>()
+            val device = RokidHintDevice(phoneClock, { json ->
+                controller.accept(requireNotNull(HintWireCodec.decode(json)) { "the phone only emits decodable commands" })
+                true
+            }, syncId = { link.syncId() ?: HintExchange.UNSYNCED_SYNC_ID })
+            currentPhone = device
+            return device to statuses
+        }
+
+        // Run one: this phone process had already started three sessions, so its generation is 3.
+        link.sessionEstablished("s-1", 3L)
+        glassesClock.nanos = phoneClock.nanos + offset
+        val (firstPhone, firstStatuses) = newPhone()
+        firstPhone.show(Assistance("h-1", SessionId("s-1"), Generation(3), null, 1, "旧会话",
+            null, phoneClock.nanos + 2_000_000_000), revision = 1L) { firstStatuses += it }
+        assertEquals(listOf(OutputStatus.Queued, OutputStatus.Displayed), firstStatuses)
+
+        // Run two: the phone app restarted, so a brand new session whose generation counter is back at 1.
+        link.sessionEstablished("s-2", 1L)
+        glassesClock.nanos = phoneClock.nanos + offset
+        val (secondPhone, secondStatuses) = newPhone()
+        secondPhone.show(Assistance("h-2", SessionId("s-2"), Generation(1), null, 1, "新会话",
+            null, phoneClock.nanos + 2_000_000_000), revision = 1L) { secondStatuses += it }
+
+        assertEquals(listOf(OutputStatus.Queued, OutputStatus.Displayed), secondStatuses,
+            "the restarted generation must not make the glasses refuse the new session's hint")
+        assertEquals(listOf<String?>("旧会话", null, "新会话"), rendered)
+    }
+
     private class FakeClock(var nanos: Long = 0L) : MonotonicClock {
         override fun nowNanos(): Long = nanos
     }

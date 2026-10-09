@@ -13,7 +13,11 @@ import edith.plugin.MonotonicClock
  * ordering and expiry rules testable as plain JVM behaviour.
  *
  * Ordering rules:
- * - [HintCommand.Hello] establishes (or replaces) the session; `generation` must not go backwards.
+ * - [HintCommand.Hello] establishes (or replaces) the session. A `HELLO` naming a **different** session always
+ *   replaces the stored one; only a `HELLO` for the **same** session is refused when its `generation` goes backwards.
+ *   The phone's generation is a per-process session counter (`HostRuntime` starts at 0 and increments on every
+ *   `startSession`), so a restarted phone app legitimately sends a *lower* generation for a brand new session while
+ *   this process - and the session it stored - is still alive.
  * - A `SHOW`/`CLEAR` for another session, an older generation, or a revision at or below one already shown for
  *   the same hint is refused.
  * - `CLEAR` raises a fence at its `sequence`; a late `SHOW` at or below the fence is refused. A strictly
@@ -79,7 +83,19 @@ class GlassHintController(
     }
 
     private fun onHello(command: HintCommand.Hello) {
-        if (command.generation < generation) return
+        // Stale means "the same session, an older generation" - the case this ordering rule was written for. A HELLO
+        // for a **different** session is a new session and must be adopted even when its generation is lower: the
+        // phone's generation is a per-process counter that restarts at 1, while this process (and the session it
+        // stored) outlives the phone's app. Measured on the K40 + glasses on 2026-10-09: after one phone restart this
+        // process refused every SHOW for the rest of its life (`Show refused: session 393e1238-… != 49dedb25-…`),
+        // because every later HELLO carried generation 1 against a stored generation that was already higher (≥2:
+        // the phone had sent generations 2 and 3 in one earlier app run, and only a later app run could send 1).
+        if (command.sessionId == sessionId && command.generation < generation) {
+            return refuse("Hello", "generation ${command.generation} < $generation for session ${command.sessionId}")
+        }
+        // Reported because a HELLO that is silently ignored and a HELLO that never arrived were indistinguishable
+        // here, which is exactly what made this gate impossible to attribute on the device.
+        val replaced = sessionId?.let { " (replaced session=$it generation=$generation)" }.orEmpty()
         sessionId = command.sessionId
         generation = command.generation
         clearFence = Long.MIN_VALUE
@@ -91,6 +107,7 @@ class GlassHintController(
             visible = false
             render(null)
         }
+        diagnostics("Hello accepted: session=${command.sessionId} generation=${command.generation}$replaced")
     }
 
     private fun onSync(command: HintCommand.Sync) {
