@@ -12,6 +12,17 @@
     -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!--
+      P3.0 A1's popup scenario measures the accessibility click on a *system* runtime-permission dialog, and it needs a
+      permission that is (a) not auto-granted and (b) not in the normal-use path of this probe, so requesting it changes
+      nothing for the other modes. `READ_CALENDAR` is exactly that: the probe never reads a calendar. The permission is
+      declared here and never *used* - the measurement is the dialog and the state flip.
+
+      The Lead revokes it with `pm revoke` before a run; an already-GRANTED state is reported as `popupSkipped`, because
+      the probe cannot revoke a permission from inside its own process.
+    -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+
     <application
         android:allowBackup="false"
         android:label="EDITH P3 T3b"
@@ -23,6 +34,21 @@
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          A1's runner. Deliberately NOT a launcher and NOT auto-running: it is reachable only by an explicit
+          `am start` carrying the A1 action plus `confirm=true`, so opening the app or a stray intent cannot make the
+          probe tap through a permission dialog. It shares the service below; the T3b activity above is untouched.
+        -->
+        <activity
+            android:name=".A11yIntentActivity"
+            android:exported="true"
+            android:label="EDITH P3 A1">
+            <intent-filter>
+                <action android:name="edith.phone.a11yprobe.intent.A1_RUN" />
+                <category android:name="android.intent.category.DEFAULT" />
             </intent-filter>
         </activity>
 

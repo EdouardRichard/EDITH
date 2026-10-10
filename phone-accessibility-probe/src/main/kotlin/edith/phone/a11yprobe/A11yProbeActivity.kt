@@ -144,6 +144,9 @@ class A11yProbeActivity : Activity() {
          * A Settings entry whose label is stable across the two target builds. Chinese first (MIUI/Redmi), English second
          * (AOSP-style); the probe records which one matched only through the failure text, which is enough to interpret a
          * zero.
+         *
+         * Public so A1 (`A11yIntentActivity`) can name the same entry when it is asked to re-measure the *shallow*
+         * target: "scrolling changed the success rate" is only a meaningful statement if both modes aim at the same row.
          */
         val TARGET_LABELS = listOf("网络和互联网", "Network & internet", "WLAN", "Wi-Fi")
     }
