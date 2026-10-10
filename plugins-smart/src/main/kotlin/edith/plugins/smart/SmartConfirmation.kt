@@ -104,6 +104,12 @@ internal class SmartConfirmation(
         }
 
         entry.latch.await(timeoutMillis + LATCH_SLACK_MILLIS, TimeUnit.MILLISECONDS)
+        // The gate's own deadline is the authority on a timeout, and it always settles *through* [finish]. Waking up with
+        // no outcome means that deadline never arrived (a scheduler that lost it), so this slack is what releases the
+        // question - and it has to release it the same way, or `pending` stays armed forever and every later question is
+        // refused as BUSY. `finish` is the only exit from `pending`, so the fallback goes through it too; it is
+        // idempotent, so a gate that settles concurrently still logs and counts down exactly once.
+        if (entry.outcome.get() == null) finish(requestId)
         return entry.outcome.get() ?: ConfirmationOutcome(false, ConfirmationSource.TIMEOUT)
     }
 

@@ -179,4 +179,25 @@ class SmartConfirmationTest {
         subject.onConfirmationResult(tap("c1", true))
         assertEquals(ConfirmationOutcome(true, ConfirmationSource.PHONE), first.join())
     }
+
+    @Test fun `a gate that never settles still releases the question when the latch gives up`() {
+        // The deadline thread is the gate's only way to settle a silent question (P3.3 review, Minor 1). If it is lost,
+        // `request` returns on its own slack - and it must clear the slot on the way out, or every later question is
+        // refused as BUSY and the only symptom is "confirmation stopped working".
+        val channel = FakeChannel()
+        val log = mutableListOf<String>()
+        val gate = ConfirmationGate(clock, scheduler, timeoutNanos = 50_000_000L)   // scheduler never runs due
+        val subject = SmartConfirmation(channel, gate, timeoutMillis = 50L, log = { log += it })
+        val first = ask(subject, requestId = "c1")
+
+        assertEquals(ConfirmationOutcome(false, ConfirmationSource.TIMEOUT), first.join())
+        assertEquals(0, subject.pendingCount, "the pending slot must be released, not left armed forever")
+        assertEquals(1, channel.cancelled, "the host's card must come down when the fallback gives up")
+        assertTrue(log.any { "request=c1" in it && "source=timeout" in it },
+            "the fallback must log the same timeout line the gate would")
+
+        val second = ask(subject, requestId = "c2")
+        assertTrue(subject.onConfirmationResult(tap("c2", true)), "the next question must be answerable, not BUSY")
+        assertEquals(ConfirmationOutcome(true, ConfirmationSource.PHONE), second.join())
+    }
 }
