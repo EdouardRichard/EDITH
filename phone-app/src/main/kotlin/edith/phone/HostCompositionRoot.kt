@@ -296,6 +296,16 @@ class HostCompositionRoot internal constructor(
 
     private fun notifier(): ConfirmationNotifier? = notificationSurface?.let { ConfirmationNotifier(it) }
 
+    /**
+     * P3.3 (§17.4): raises the session page - which carries the question's card - to the front.
+     *
+     * Owner directive 2026-10-10: a question the user cannot see has to reach them like a system popup, not as a shade
+     * entry they must go looking for. Returns false when this build cannot raise anything (no overlay permission, or a
+     * platform that refuses the background start), in which case the notification is the surface. Injectable so the rule
+     * below is pinned on the JVM instead of only on a phone.
+     */
+    internal var raiseConfirmationUi: (() -> Boolean)? = null
+
     /** One root probe for one read, so the row and its note cannot cost two timeouts. Null when no probe is wired. */
     private fun rootStatus(): RootStatus? = rootStatusProbe?.let { probe -> runCatching { probe() }.getOrNull() }
 
@@ -568,11 +578,26 @@ class HostCompositionRoot internal constructor(
         return answered
     }
 
-    /** P3.3: puts the question the host was asked to present on the session page - and, if nobody can see that page,
-     * in the notification shade as well. */
+    /** P3.3: puts the question the host was asked to present on the session page - and, when nobody can see that page,
+     * both raises the page and puts the question in the notification shade. */
     internal fun showConfirmation(requestId: String, summary: String) {
-        mutableState.update { it.copy(pendingConfirmation = PendingConfirmation(requestId, summary)) }
-        if (!uiIsVisible) notifier()?.post(requestId, summary)
+        mutableState.update {
+            it.copy(
+                pendingConfirmation = PendingConfirmation(
+                    requestId,
+                    summary,
+                    // The countdown the UI ticks: the same window the plugin's gate enforces, on the wall clock the
+                    // phone can read (owner directive 2026-10-10).
+                    System.currentTimeMillis() + ConfirmationNotifier.WINDOW_MILLIS,
+                ),
+            )
+        }
+        if (!uiIsVisible) {
+            // Loud first: the page comes to the front (owner directive), and the notification still carries the
+            // sound/vibration and stays as the fallback for a build or a device where raising is refused.
+            raiseConfirmationUi?.invoke()
+            notifier()?.post(requestId, summary)
+        }
     }
 
     /** P3.3: takes a question off the session page - on an answer, a timeout, 急停 or session teardown - and out of
@@ -1359,6 +1384,30 @@ class HostCompositionRoot internal constructor(
             root.confirmationPresenter = confirmationPresenter
             // P3.3 (§17.4): the notification shade, so a question can be answered while this App is not in front.
             root.notificationSurface = AndroidNotificationSurface(context)
+            root.raiseConfirmationUi = {
+                // Owner directive 2026-10-10: a time-boxed question must reach the user as a popup. Starting an
+                // Activity from the background is allowed on Android 10+ only under an exemption, and holding the
+                // overlay permission is one; MIUI adds its own "后台弹出界面" switch on top. Neither is assumed: when the
+                // permission is missing this refuses and the notification (already posted) is the surface.
+                if (!android.provider.Settings.canDrawOverlays(context)) {
+                    P3Log.line("P3_CONFIRM_RAISE raised=false reason=NO_OVERLAY_PERMISSION")
+                    false
+                } else {
+                    runCatching {
+                        context.startActivity(
+                            Intent(context, MainActivity::class.java)
+                                .setAction(MainActivity.ACTION_SHOW_CONFIRMATION)
+                                .addFlags(
+                                    Intent.FLAG_ACTIVITY_NEW_TASK or
+                                        Intent.FLAG_ACTIVITY_SINGLE_TOP or
+                                        Intent.FLAG_ACTIVITY_REORDER_TO_FRONT,
+                                ),
+                        )
+                        P3Log.line("P3_CONFIRM_RAISE raised=true")
+                        true
+                    }.getOrElse { false }
+                }
+            }
             root.scriptedModelWire = scriptedWire
             rootHolder[0] = root
             scene.composition = root

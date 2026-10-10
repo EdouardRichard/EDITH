@@ -1,7 +1,9 @@
 package edith.phone
 
+import android.app.NotificationManager
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -58,8 +60,21 @@ class ConfirmationNotificationsTest {
         assertEquals(listOf("允许", "拒绝", "急停"), posted.actions.all.map { it.label })
         assertEquals("the three buttons must be distinguishable, or the receiver cannot tell them apart",
             3, posted.actions.all.map { it.id }.toSet().size)
-        assertTrue("the fallback cleanup must outlive the question window (10 s), or it would hide a live question",
-            posted.ttlMillis > 10_000L)
+        assertTrue("the fallback cleanup must outlive the question window (${ConfirmationNotifier.WINDOW_MILLIS} ms), " +
+            "or it would hide a live question", posted.ttlMillis > ConfirmationNotifier.WINDOW_MILLIS)
+    }
+
+    @Test
+    fun theChannelIsBuiltToBeNoticed() {
+        // Owner directive 2026-10-10: the first channel had no vibration on this device and was noticed by nobody, so a
+        // time-boxed question simply expired. Android cannot change an existing channel's sound or vibration, which is
+        // why the perceivable shape lives on a new id and why that fact is pinned here.
+        assertEquals(NotificationManager.IMPORTANCE_HIGH, ConfirmationChannel.IMPORTANCE)
+        assertNotEquals(ConfirmationChannel.LEGACY_ID, ConfirmationChannel.ID)
+        assertTrue("a channel that does not vibrate is a channel nobody notices in a pocket",
+            ConfirmationChannel.VIBRATION_PATTERN.isNotEmpty())
+        assertTrue("the buzz must last long enough to be felt",
+            ConfirmationChannel.VIBRATION_PATTERN.sum() >= 500L)
     }
 
     @Test

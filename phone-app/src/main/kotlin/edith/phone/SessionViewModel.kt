@@ -6,7 +6,15 @@ import edith.plugin.Capability
 import kotlinx.coroutines.flow.StateFlow
 
 /** P3.3 (spec §17.4): the question the session page is showing, if one is up. */
-data class PendingConfirmation(val requestId: String, val summary: String)
+data class PendingConfirmation(
+    val requestId: String,
+    val summary: String,
+    /**
+     * When this question stops being answerable, on the wall clock the phone UI can read (owner directive 2026-10-10:
+     * the user gets an explicit countdown, and the question closes itself when it runs out).
+     */
+    val expiresAtMillis: Long = 0L,
+)
 
 data class SessionUiState(
     val session: SessionState,

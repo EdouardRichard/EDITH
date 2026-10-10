@@ -9,17 +9,22 @@ import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.graphics.drawable.Icon
+import android.media.AudioAttributes
+import android.provider.Settings
 
 /**
  * The Android notification shade (spec §17.4).
  *
- * Three deliberate choices, each because a confirmation is a *time-critical question about something about to happen*:
- * - `IMPORTANCE_HIGH` on a dedicated channel, because a silent notification inside a 10 s window is a notification
- *   nobody sees;
+ * The shape follows from what the question *is* - a time-boxed approval of something about to happen - and from what
+ * the device measured (owner directives 2026-10-10):
+ * - a dedicated channel at `IMPORTANCE_HIGH` with an **explicit sound and vibration**; the first version relied on the
+ *   platform defaults, and on this phone that meant no vibration at all and a question nobody noticed;
  * - `VISIBILITY_PUBLIC`, so someone holding the locked phone can read **what** they are approving - a blind tap on a
  *   hidden notification would be worse than showing the summary;
- * - `setOngoing(true)`, so a stray swipe cannot hide a question that is still live. [ConfirmationNotifier.TTL_MILLIS]
- *   is the fallback that keeps a killed process from leaving a dead question in the shade.
+ * - `setOngoing(true)`, so a stray swipe cannot hide a question that is still live, with
+ *   [ConfirmationNotifier.TTL_MILLIS] as the fallback that keeps a killed process from leaving a dead question behind;
+ * - a **full-screen intent** plus a content intent onto the session page: with the screen locked or dark the question
+ *   comes to the front instead of waiting in the shade, and with the screen on the heads-up is the surface.
  */
 internal class AndroidNotificationSurface(private val context: Context) : NotificationSurface {
 
@@ -37,12 +42,14 @@ internal class AndroidNotificationSurface(private val context: Context) : Notifi
         actions: ConfirmationActions,
     ) {
         val target = manager ?: return
-        target.createNotificationChannel(
-            NotificationChannel(CHANNEL_ID, CHANNEL_NAME, NotificationManager.IMPORTANCE_HIGH).apply {
-                description = CHANNEL_DESCRIPTION
-            },
-        )
-        val notification = Notification.Builder(context, CHANNEL_ID)
+        target.createNotificationChannel(channel())
+        // The first channel's sound and vibration cannot be changed in place (Android only updates name/description on
+        // an existing id), so this one is a new id - and the old one is removed rather than left as a dead row in the
+        // user's notification settings.
+        runCatching { target.deleteNotificationChannel(ConfirmationChannel.LEGACY_ID) }
+
+        val openApp = openAppIntent()
+        val notification = Notification.Builder(context, ConfirmationChannel.ID)
             .setSmallIcon(R.drawable.ic_edith_confirm)
             .setContentTitle(title)
             .setContentText(text)
@@ -51,6 +58,8 @@ internal class AndroidNotificationSurface(private val context: Context) : Notifi
             .setAutoCancel(false)
             .setVisibility(Notification.VISIBILITY_PUBLIC)
             .setTimeoutAfter(ttlMillis)
+            .setContentIntent(openApp)
+            .setFullScreenIntent(openApp, true)
             .apply { actions.all.forEach { addAction(action(it, requestId)) } }
             .build()
         target.notify(NOTIFICATION_ID, notification)
@@ -60,6 +69,21 @@ internal class AndroidNotificationSurface(private val context: Context) : Notifi
     override fun cancel(requestId: String) { manager?.cancel(NOTIFICATION_ID) }
 
     override fun cancelAll() { manager?.cancel(NOTIFICATION_ID) }
+
+    private fun channel(): NotificationChannel =
+        NotificationChannel(ConfirmationChannel.ID, ConfirmationChannel.NAME, ConfirmationChannel.IMPORTANCE).apply {
+            description = ConfirmationChannel.DESCRIPTION
+            // Explicit on purpose: a channel vibrates only if it is asked to, and an unnoticed question is a denied one.
+            enableVibration(true)
+            vibrationPattern = ConfirmationChannel.VIBRATION_PATTERN
+            setSound(
+                Settings.System.DEFAULT_NOTIFICATION_URI,
+                AudioAttributes.Builder()
+                    .setUsage(AudioAttributes.USAGE_NOTIFICATION)
+                    .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                    .build(),
+            )
+        }
 
     private fun action(action: ConfirmationAction, requestId: String): Notification.Action =
         Notification.Action.Builder(
@@ -82,11 +106,20 @@ internal class AndroidNotificationSurface(private val context: Context) : Notifi
         )
     }
 
-    companion object {
-        const val CHANNEL_ID = "edith-confirmations"
-        const val NOTIFICATION_ID = 0x0ED17
+    /** The session page, where the question's own card waits - the target of both the tap and the full-screen intent. */
+    private fun openAppIntent(): PendingIntent {
+        val intent = Intent(context, MainActivity::class.java)
+            .setAction(MainActivity.ACTION_SHOW_CONFIRMATION)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+        return PendingIntent.getActivity(
+            context,
+            0,
+            intent,
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+    }
 
-        private const val CHANNEL_NAME = "动作确认"
-        private const val CHANNEL_DESCRIPTION = "有动作需要你在手机上确认时提醒你"
+    companion object {
+        const val NOTIFICATION_ID = 0x0ED17
     }
 }

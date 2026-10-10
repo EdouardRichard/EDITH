@@ -34,8 +34,14 @@ import edith.contracts.SessionState
 import edith.plugin.Capability
 import edith.phone.model.ProfileViewModel
 import edith.phone.model.ProfileListScreen
+import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        /** The intent action the confirmation notification (and its full-screen intent) uses to raise this page. */
+        const val ACTION_SHOW_CONFIRMATION = "edith.phone.SHOW_CONFIRMATION"
+    }
+
     private val root get() = (application as EdithApplication).composition
     private var pendingPlugin: String? = null
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
@@ -49,6 +55,14 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // Owner directive 2026-10-10: a confirmation must reach the user. Over a locked or dark screen the notification's
+        // full-screen intent raises this page, and these two flags are what let it appear over the keyguard and light
+        // the panel - the question's own card is then on screen and answers through the usual path.
+        if (intent?.action == ACTION_SHOW_CONFIRMATION) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+            raisedForConfirmation = true
+        }
         val viewModel = ViewModelProvider(this, object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = SessionViewModel(root) as T
         })[SessionViewModel::class.java]
@@ -58,12 +72,59 @@ class MainActivity : ComponentActivity() {
         setContent {
             MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF126B50), secondary = Color(0xFF405B79))) {
                 val state by viewModel.state.collectAsStateWithLifecycle()
+                val pending = state.pendingConfirmation
+                // Owner directive 2026-10-10: an explicit countdown instead of a sentence about what silence means, and
+                // the question closes itself when the count runs out (the plugin's gate settles it as a denial at the
+                // same moment, which clears `pendingConfirmation` behind it).
+                val remainingSeconds = rememberRemainingSeconds(pending?.requestId, pending?.expiresAtMillis ?: 0L)
+                // Owner directive 2026-10-10: when this page was *raised* for a confirmation, the question has to be the
+                // thing the user sees - the inline card sits below the fold, and "pop up the page and make them scroll"
+                // is not a popup. The dialog is modal, shows the same summary as the card and the glasses, and answers
+                // through the very same path.
+                if (raisedForConfirmation && pending != null && remainingSeconds > 0L &&
+                    dismissedRequestId != pending.requestId
+                ) {
+                    AlertDialog(
+                        onDismissRequest = { dismissedRequestId = pending.requestId },
+                        title = { Text("需要你确认的动作") },
+                        text = { Text(pending.summary) },
+                        confirmButton = {
+                            Button(onClick = {
+                                raisedForConfirmation = false
+                                root.answerConfirmation(true)
+                            }) { Text("允许 ($remainingSeconds)") }
+                        },
+                        dismissButton = {
+                            Row {
+                                OutlinedButton(onClick = {
+                                    raisedForConfirmation = false
+                                    root.answerConfirmation(false)
+                                }) { Text("拒绝") }
+                                Spacer(Modifier.width(8.dp))
+                                OutlinedButton(onClick = {
+                                    raisedForConfirmation = false
+                                    root.emergencyStop()
+                                }) { Text("急停") }
+                            }
+                        },
+                    )
+                }
                 PhoneScreen(state, root, viewModel, profileViewModel, ::requestStart,
                     { SessionService.commandFromUi(this, it) }, notificationsGranted(), { root.connectCxr(this) },
-                    { root.storedSettings() }, { settings -> root.saveSmartSettings(settings) })
+                    { root.storedSettings() }, { settings -> root.saveSmartSettings(settings) }, remainingSeconds)
             }
         }
     }
+
+    /**
+     * True while this page is front for a confirmation question, i.e. the composition raised it (see
+     * `HostCompositionRoot.raiseConfirmationUi`). Snapshotted so the dialog above appears instead of the
+     * below-the-fold card.
+     */
+    private var raisedForConfirmation by mutableStateOf(false)
+
+    /** The question the user waved away; it must not be pushed at them again while it is still the same one. */
+    private var dismissedRequestId by mutableStateOf<String?>(null)
 
     /**
      * P3.3 (§17.4): **visibility**, reported to the composition so a confirmation question can reach the notification
@@ -79,6 +140,20 @@ class MainActivity : ComponentActivity() {
     override fun onStop() {
         super.onStop()
         root.uiVisible(false)
+    }
+
+    /**
+     * The confirmation popup, arriving at a page that is already running (`SINGLE_TOP`): same flags as in [onCreate],
+     * because Android delivers the raise here rather than through a fresh instance.
+     */
+    override fun onNewIntent(intent: android.content.Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == ACTION_SHOW_CONFIRMATION) {
+            setShowWhenLocked(true)
+            setTurnScreenOn(true)
+            raisedForConfirmation = true
+        }
     }
 
     private fun requestStart(pluginId: String) {
@@ -105,12 +180,34 @@ class MainActivity : ComponentActivity() {
         ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 }
 
+/**
+ * The seconds left on the live question.
+ *
+ * Owner directive 2026-10-10: the user reads an explicit countdown, and the question closes itself when it reaches
+ * zero - at that same moment the plugin's gate settles it as a denial, which clears `pendingConfirmation` and takes
+ * both the card and the dialog with it. This ticker is only what the user *sees*; the gate remains the authority.
+ */
+@Composable private fun rememberRemainingSeconds(requestId: String?, expiresAtMillis: Long): Long {
+    var remaining by remember(requestId) { mutableStateOf(secondsLeft(expiresAtMillis)) }
+    LaunchedEffect(requestId) {
+        remaining = secondsLeft(expiresAtMillis)
+        while (remaining > 0L) {
+            delay(250)
+            remaining = secondsLeft(expiresAtMillis)
+        }
+    }
+    return remaining
+}
+
+private fun secondsLeft(expiresAtMillis: Long): Long =
+    ((expiresAtMillis - System.currentTimeMillis()) / 1000).coerceAtLeast(0L)
+
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable private fun PhoneScreen(state: SessionUiState, root: HostCompositionRoot, viewModel: SessionViewModel,
     profileViewModel: ProfileViewModel?,
     start: (String) -> Unit, command: (String) -> Unit, notificationsGranted: Boolean,
     connectCxr: () -> Boolean,
-    loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit) {
+    loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit, remainingSeconds: Long) {
     var page by remember { mutableStateOf(0) }
     val plugins = buildList {
         add("smart-assistant" to "智能助手")
@@ -258,11 +355,10 @@ class MainActivity : ComponentActivity() {
                                     Text("需要你确认的动作", style = MaterialTheme.typography.titleMedium)
                                     Text(pending.summary)
                                     Row {
-                                        Button(onClick = { root.answerConfirmation(true) }) { Text("允许") }
+                                        Button(onClick = { root.answerConfirmation(true) }) { Text("允许 ($remainingSeconds)") }
                                         Spacer(Modifier.width(8.dp))
                                         OutlinedButton(onClick = { root.answerConfirmation(false) }) { Text("拒绝") }
                                     }
-                                    Text("10 秒内不作答视为拒绝。", style = MaterialTheme.typography.bodySmall)
                                 }
                             }
                         }

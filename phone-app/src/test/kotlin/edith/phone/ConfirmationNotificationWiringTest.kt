@@ -180,6 +180,47 @@ class ConfirmationNotificationWiringTest {
     }
 
     @Test
+    fun aQuestionNobodyCanSeeRaisesThePageAsWellAsTheShade() {
+        // Owner directive 2026-10-10: the question must reach the user like a system popup, not as a shade entry they
+        // have to go looking for. The page is raised *and* the notification posted: the popup is what makes it
+        // unmissable, the notification carries the sound/vibration and stays as the fallback.
+        val rig = Rig()
+        try {
+            var raised = 0
+            rig.root.raiseConfirmationUi = { raised++; true }
+
+            rig.present("c1", "调整屏幕亮度")
+            assertEquals("with the card on screen there is nothing to raise", 0, raised)
+
+            rig.root.uiVisible(false)
+            rig.root.showConfirmation("c2", "卸载 App：probe")
+
+            assertEquals("a question the user cannot see must be raised to the front", 1, raised)
+            assertEquals("and still reach the shade as the fallback", listOf("c1" to "调整屏幕亮度", "c2" to "卸载 App：probe"),
+                rig.surface.posted)
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun theQuestionCarriesTheDeadlineTheUiCountsDown() {
+        // Owner directive 2026-10-10: the phone shows a countdown and closes the question when it runs out, so the
+        // state the UI reads has to carry the real window - not a number the UI invents for itself.
+        val rig = Rig()
+        try {
+            rig.present("c1", "调整屏幕亮度")
+
+            val pending = requireNotNull(rig.root.state.value.pendingConfirmation)
+            val remaining = pending.expiresAtMillis - System.currentTimeMillis()
+            assertTrue("the deadline must be the window the plugin enforces, was ${remaining}ms left",
+                remaining in (ConfirmationNotifier.WINDOW_MILLIS - 2_000L)..ConfirmationNotifier.WINDOW_MILLIS)
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
     fun anUnavailableShadeLeavesTheQuestionOnThePageOnly() {
         val rig = Rig()
         try {

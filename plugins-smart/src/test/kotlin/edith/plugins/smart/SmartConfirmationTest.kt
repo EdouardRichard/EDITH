@@ -180,6 +180,13 @@ class SmartConfirmationTest {
         assertEquals(ConfirmationOutcome(true, ConfirmationSource.PHONE), first.join())
     }
 
+    @Test fun `the owner set the question window to 120 s`() {
+        // 2026-10-10 owner directive, after three device attempts settled as `timeout` because a person has no
+        // realistic chance to notice a notification and act on it inside 10 s. Pinned here because it is a product
+        // decision, not an implementation detail.
+        assertEquals(120_000L, SmartConfirmation.DEFAULT_TIMEOUT_MILLIS)
+    }
+
     @Test fun `a gate that never settles still releases the question when the latch gives up`() {
         // The deadline thread is the gate's only way to settle a silent question (P3.3 review, Minor 1). If it is lost,
         // `request` returns on its own slack - and it must clear the slot on the way out, or every later question is

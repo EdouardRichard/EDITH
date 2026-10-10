@@ -175,8 +175,15 @@ internal class SmartConfirmation(
     }
 
     companion object {
-        /** Spec §7.4's default, and the one the phone UI counts down. */
-        const val DEFAULT_TIMEOUT_MILLIS = 10_000L
+        /**
+         * How long a question waits for an answer, and the window the phone UI counts down.
+         *
+         * **Owner directive 2026-10-10: 10 s → 120 s.** Measured on the phone: with 10 s a person had no realistic
+         * chance to notice the notification (which on this device showed neither sound nor vibration) and act on it -
+         * the three device attempts all settled as `timeout`. The window is the *plugin's* to own (§17.4: the gate is
+         * the authority on what silence means), and the host builds its presenter with the same value.
+         */
+        const val DEFAULT_TIMEOUT_MILLIS = 120_000L
 
         /** The exact words that answer a question. Deliberately closed: a paraphrase is not an approval. */
         val APPROVALS = setOf("确认", "允许")

@@ -9,6 +9,15 @@
     <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
     <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- P3.3 (§17.4, owner directive 2026-10-10): a confirmation question is time-boxed, and a question that only lands
+         in the shade is one nobody notices. On a locked or dark screen the full-screen intent brings the session page
+         (and its card) forward instead. On Android 13 this is an install-time permission. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- P3.3 (§17.4, owner directive 2026-10-10): the question must reach the user like a system popup, not as an entry
+         in the shade. Raising the session page from the background is one of Android 10+'s documented background-activity
+         exemptions **only** with this permission, and MIUI gates it behind its own "后台弹出界面" switch as well; when
+         either is missing the App keeps its notification path instead. Granted by the user in Settings, never assumed. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
     <!-- P3.3 Task 9: the L2 `dial` action places a real call. Requested at runtime; without the grant `dial` refuses
          with CALL_PERMISSION_MISSING rather than opening the dialer instead. -->
     <uses-permission android:name="android.permission.CALL_PHONE" />
