@@ -54,8 +54,8 @@ class KeywordSpotterDeviceTest {
      * Case 1 also asserts the bundle the *app under test* sees, because the whole point of the asset step is
      * that the generated `kws/` directory merged from `:audio-android` into the `:phone-app` APK.
      *
-     * The run is pinned to the **phone**: this is P3.1's debugging carrier (Redmi K40, the Redmi K70 is the
-     * target carrier), and the glasses is a different SoC and a different app. Gradle's
+     * The run is pinned to the **phone**: this is P3.1's carrier and, since `D46` (2026-10-10), the delivery target
+     * (Redmi K40 / Android 13), and the glasses is a different SoC and a different app. Gradle's
      * `connectedDebugAndroidTest` refuses to run when no device is selected, so rather than let the suite
      * install the phone APK on the glasses and silently `Assume`-skip there, the off-carrier run is skipped by
      * name with the reason stated.

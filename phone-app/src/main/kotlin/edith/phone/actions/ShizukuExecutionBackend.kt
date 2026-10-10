@@ -178,10 +178,15 @@ class ShizukuExecutionBackend(
 
     private fun clearData(pkg: String): ActionResult {
         val result = shell.run("pm clear $pkg")
+        // The read happens **unconditionally**, exactly as in the four actions below: `readable()` answers about the read
+        // that just happened, so a short-circuit here (the command failed, so `&&` stops) would leave it answering about
+        // some earlier one - and the failure would be reported as `STATE_UNCHANGED` on the first call of a session and
+        // as `ACTION_CHANNEL_UNAVAILABLE` on later ones, for no reason the device can see.
+        val stillInstalled = state.installed(pkg)
+        if (!stateIsReadable()) return refused(ACTION_CHANNEL_UNAVAILABLE)
         // The OS's own marker is the only evidence `pm clear` offers; the package surviving is the second half (a
         // `pm clear` that uninstalled its target would be a very different outcome).
-        val cleared = result.exitCode == 0 && result.stdout.contains("Success") && state.installed(pkg)
-        if (!stateIsReadable()) return refused(ACTION_CHANNEL_UNAVAILABLE)
+        val cleared = result.exitCode == 0 && result.stdout.contains("Success") && stillInstalled
         return if (cleared) done("cleared $pkg") else failed(STATE_UNCHANGED)
     }
 

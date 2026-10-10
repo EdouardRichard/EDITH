@@ -24,8 +24,15 @@ class ConfirmationActionReceiver : BroadcastReceiver() {
         val outcome = routeConfirmationAction(intent.action, requestId, port)
 
         val surface = AndroidNotificationSurface(context)
-        if (outcome == ConfirmationActionOutcome.STOPPED) surface.cancelAll()
-        else surface.cancel(requestId.orEmpty())
+        when {
+            outcome == ConfirmationActionOutcome.STOPPED -> surface.cancelAll()
+            // Settled: the question is answered, so its notification comes down. No composition at all: the tap names a
+            // question that expired long ago, so the shade must stop offering buttons that cannot work.
+            outcome == ConfirmationActionOutcome.SETTLED || port == null -> surface.cancel(requestId.orEmpty())
+            // Anything else (a stale tap, a malformed one) settles nothing - and must **not** touch the shade: the one
+            // notification there belongs to whatever question is live now, which may not be the one this tap named.
+            else -> Unit
+        }
     }
 
     companion object {

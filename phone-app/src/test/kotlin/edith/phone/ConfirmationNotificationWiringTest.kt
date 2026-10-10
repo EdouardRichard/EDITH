@@ -155,6 +155,31 @@ class ConfirmationNotificationWiringTest {
     }
 
     @Test
+    fun aHideThatNamesAnAlreadySettledQuestionLeavesTheLiveOneInTheShade() {
+        // The shade holds one notification for every question, so "which question does this take down?" is a real
+        // question: a late hide(c1) after c2 went up must not remove c2's only surface, because the user is away from
+        // the page and would never see c2 at all (leftover review of this round, Important 1).
+        val rig = Rig()
+        try {
+            rig.present("c1", "调整屏幕亮度")
+            rig.root.uiVisible(false)
+            assertEquals(listOf("c1" to "调整屏幕亮度"), rig.surface.posted)
+
+            rig.root.showConfirmation("c2", "卸载 App：probe")
+            rig.surface.cancelled.clear()
+
+            rig.root.hideConfirmation("c1")
+
+            assertTrue("a late hide for c1 must not remove c2's notification: ${rig.surface.cancelled}",
+                rig.surface.cancelled.isEmpty())
+            assertEquals("the live question must survive the late hide",
+                "c2", rig.root.state.value.pendingConfirmation?.requestId)
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
     fun anUnavailableShadeLeavesTheQuestionOnThePageOnly() {
         val rig = Rig()
         try {

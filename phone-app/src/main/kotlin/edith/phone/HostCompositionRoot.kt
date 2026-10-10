@@ -289,7 +289,9 @@ class HostCompositionRoot internal constructor(
      */
     internal var notificationSurface: NotificationSurface? = null
 
-    /** Whether the session page is on screen; `MainActivity.onStart`/`onStop` keeps this current. */
+    /** Whether the session page is on screen; `MainActivity.onStart`/`onStop` keeps this current. Volatile because the
+     * turn thread reads it when a question goes up while the UI thread writes it. */
+    @Volatile
     private var uiIsVisible = true
 
     private fun notifier(): ConfirmationNotifier? = notificationSurface?.let { ConfirmationNotifier(it) }
@@ -523,12 +525,6 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
-     * P3.3 (spec §17.4): the session page's answer to the question that is up.
-     *
-     * `false` when nothing is pending - a tap that arrives after the question was withdrawn answers nothing, rather than
-     * being delivered under a request id no gate is waiting on.
-     */
-    /**
      * P3.3 (§17.4): the **notification's** answer, which names the question it answers.
      *
      * The card can answer "whatever is up", because it is drawn from that same state. A notification cannot: it outlives
@@ -547,6 +543,12 @@ class HostCompositionRoot internal constructor(
         return answerConfirmation(approved)
     }
 
+    /**
+     * P3.3 (spec §17.4): the session page's answer to the question that is up.
+     *
+     * `false` when nothing is pending - a tap that arrives after the question was withdrawn answers nothing, rather than
+     * being delivered under a request id no gate is waiting on.
+     */
     @Synchronized fun answerConfirmation(approved: Boolean): Boolean {
         val pending = state.value.pendingConfirmation ?: return false
         val presenter = confirmationPresenter ?: run {
@@ -578,8 +580,12 @@ class HostCompositionRoot internal constructor(
     internal fun hideConfirmation(requestId: String) {
         if (mutableState.value.pendingConfirmation?.requestId == requestId) {
             mutableState.update { it.copy(pendingConfirmation = null) }
+            // Only a hide that **actually cleared this question** may take the notification down. The shade holds one
+            // notification for every question, so a late hide(c1) arriving after c2 went up would otherwise remove the
+            // live question's only surface - and the user, being away from the page, would never see c2 at all
+            // (review of this round, Important 1).
+            notifier()?.cancel(requestId)
         }
-        notifier()?.cancel(requestId)
     }
 
     /**

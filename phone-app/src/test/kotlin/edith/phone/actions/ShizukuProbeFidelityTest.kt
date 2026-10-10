@@ -108,4 +108,34 @@ class ShizukuProbeFidelityTest {
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("ACTION_CHANNEL_UNAVAILABLE", result.detail)
     }
+
+    /** A command that fails outright, so a `&&` chain would stop before ever reading the state. */
+    private class FailingShell : PrivilegedShell {
+        override fun run(command: String): ShellResult = ShellResult(command, 1, "", "Error: not cleared")
+    }
+
+    /** A state that can never be read, and counts how many times it was asked. */
+    private class CountingUnreadableState : TargetState {
+        var reads = 0
+        override fun installed(pkg: String): Boolean { reads++; return false }
+        override fun disabled(pkg: String) = false
+        override fun permissionGranted(pkg: String, permission: String) = false
+        override fun setting(name: String): String? = null
+        override fun readable() = false
+    }
+
+    @Test fun `a failed clear still reads the state before it judges`() {
+        // `readable()` answers about the read that just happened, so the read has to happen even when the command failed
+        // and the `&&` chain would otherwise stop: a short-circuit leaves it describing an earlier read, and the same
+        // failure is then reported as STATE_UNCHANGED on the first call of a session and as
+        // ACTION_CHANNEL_UNAVAILABLE on later ones (leftover review of this round, Minor 1).
+        val state = CountingUnreadableState()
+        val backend = ShizukuExecutionBackend(FailingShell(), state) { true }
+
+        val result = backend.execute("clear_data", """{"package":"com.example.app"}""")
+
+        assertEquals("the state read must happen even when the command itself failed", 1, state.reads)
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("ACTION_CHANNEL_UNAVAILABLE", result.detail)
+    }
 }

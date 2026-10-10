@@ -15,7 +15,7 @@ import android.widget.TextView
  *
  * The target is deliberately an entry *inside* the system Settings app driven through a public intent: it is
  * cross-app (the point of the probe), it exists on every Android phone, and it needs no credentials, no account and
- * no network. The candidate labels cover Chinese and English so one build measures both a MIUI/K40 and an AOSP/K70.
+ * no network. The candidate labels cover Chinese and English so one build measures both a MIUI/Redmi and an AOSP-style device.
  *
  * The run is bounded (default 20 rounds) and only ever acts on Settings; it never touches another app the operator has
  * not opened. Nothing is stored or uploaded — the numbers go to logcat and nothing else.
@@ -141,8 +141,8 @@ class A11yProbeActivity : Activity() {
         const val SETTLE_MILLIS = 900L
 
         /**
-         * A Settings entry whose label is stable across the two target builds. Chinese first (MIUI/K40), English second
-         * (AOSP/K70); the probe records which one matched only through the failure text, which is enough to interpret a
+         * A Settings entry whose label is stable across the two target builds. Chinese first (MIUI/Redmi), English second
+         * (AOSP-style); the probe records which one matched only through the failure text, which is enough to interpret a
          * zero.
          */
         val TARGET_LABELS = listOf("网络和互联网", "Network & internet", "WLAN", "Wi-Fi")

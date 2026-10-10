@@ -6,7 +6,8 @@ android {
 
     defaultConfig {
         applicationId = "edith.phone.a11yprobe"
-        // The product target is K70 / Android 16; the debug phone is a K40 / API 33. Both are >= 28.
+        // The delivery target is the Redmi K40 / Android 13 (D46, 2026-10-10: K70/Android 16 support was dropped).
+        // That device and any older supported device are >= 28.
         minSdk = 28
         targetSdk = 33
         versionCode = 1

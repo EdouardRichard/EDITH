@@ -201,7 +201,7 @@ class SmartConfirmationTest {
         assertEquals(ConfirmationOutcome(true, ConfirmationSource.PHONE), second.join())
     }
 
-    @Test fun `a gate that settles after the slack gave up cannot rewrite a released question`() {
+    @Test fun `a gate that settles after the slack gave up adds nothing to a released question`() {
         // The residual the leftover-sweep review asked to pin: when the fallback releases the slot, the gate may still
         // hold its own entry (it is cancelled by its own deadline, and here that deadline never ran). A *late* settle
         // from the gate must therefore be a no-op on the plugin side: the question was already answered to the user as
@@ -223,10 +223,12 @@ class SmartConfirmationTest {
 
         assertEquals(1, log.count { "request=c1" in it }, "exactly one settlement, exactly one line")
         assertEquals(0, subject.pendingCount)
-        assertEquals(
-            ConfirmationOutcome(false, ConfirmationSource.TIMEOUT),
-            ask.result,
-            "the late approval must not rewrite what the user was already told",
-        )
+
+        // Observable proof that the late "yes" changed nothing on the plugin's side: the slot is still free for the
+        // next question. (Asserting on `ask.result` here would prove nothing - it is an immutable value the worker
+        // already returned; the leftover review of this round caught that as an unfalsifiable assertion.)
+        val next = ask(subject, requestId = "c2")
+        assertTrue(subject.onConfirmationResult(tap("c2", true)))
+        assertEquals(ConfirmationOutcome(true, ConfirmationSource.PHONE), next.join())
     }
 }

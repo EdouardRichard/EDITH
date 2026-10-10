@@ -89,6 +89,19 @@ class ConfirmationNotificationsTest {
     }
 
     @Test
+    fun theAllowButtonCarriesTheAllowActionAndTheDenyButtonTheDenyAction() {
+        // Fail-dangerous binding (leftover review of this round, Important 2): swapping these two would make a user's
+        // 拒绝 approve an L3/L4 destructive action, and every other test in this file would still pass. The labels are
+        // pinned in order above; this pins which action each one carries.
+        assertEquals(ConfirmationNotifier.ACTION_ALLOW, ConfirmationNotifier.ACTIONS.allow.id)
+        assertEquals(ConfirmationNotifier.ACTION_DENY, ConfirmationNotifier.ACTIONS.deny.id)
+        assertEquals(ConfirmationNotifier.ACTION_STOP, ConfirmationNotifier.ACTIONS.stop.id)
+        assertEquals("允许", ConfirmationNotifier.ACTIONS.allow.label)
+        assertEquals("拒绝", ConfirmationNotifier.ACTIONS.deny.label)
+        assertEquals("急停", ConfirmationNotifier.ACTIONS.stop.label)
+    }
+
+    @Test
     fun cancellingForwardsToTheSurfaceSoNoDeadQuestionIsLeftInTheShade() {
         val surface = FakeSurface()
         val subject = notifier(surface)
