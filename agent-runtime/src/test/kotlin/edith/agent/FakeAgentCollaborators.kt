@@ -23,12 +23,41 @@ internal class ScriptedPolicy(
  */
 internal data class RecordedAuditEntry(val turnId: String, val action: String, val summary: String, val outcome: String)
 
-/** Test-only [AuditSink]: keeps every line in call order. */
+/** The structured half of a line (P3.3): what P3.1's four fields did not carry. */
+internal data class RecordedAuditFields(
+    val scope: String?,
+    val risk: String?,
+    val decision: String?,
+    val confirmationSource: ConfirmationSource?,
+)
+
+/** Test-only [AuditSink]: keeps every line in call order, four-field view plus the P3.3 structured fields. */
 internal class RecordingAuditSink : AuditSink {
     val entries = mutableListOf<RecordedAuditEntry>()
+    val structured = mutableListOf<RecordedAuditFields>()
 
-    override fun record(turnId: String, action: String, summary: String, outcome: String) {
+    override fun record(
+        turnId: String,
+        action: String,
+        summary: String,
+        outcome: String,
+        scope: String?,
+        risk: String?,
+        decision: String?,
+        confirmationSource: ConfirmationSource?,
+    ) {
         entries += RecordedAuditEntry(turnId, action, summary, outcome)
+        structured += RecordedAuditFields(scope, risk, decision, confirmationSource)
+    }
+}
+
+/** A [ConfirmationPort] that answers once and records what it was asked. */
+internal class ScriptedConfirmation(private val outcome: ConfirmationOutcome) : ConfirmationPort {
+    val asked = mutableListOf<Pair<String, String>>()
+
+    override fun request(requestId: String, summary: String): ConfirmationOutcome {
+        asked += requestId to summary
+        return outcome
     }
 }
 

@@ -35,6 +35,7 @@ import edith.plugin.ActionOutcome
 import edith.plugin.ActionResult
 import edith.plugin.AsrSession
 import edith.plugin.CancellationHandle
+import edith.plugin.ConfirmationChannel
 import edith.plugin.Capability
 import edith.plugin.CapabilityVerification
 import edith.plugin.ConfigSchema
@@ -117,6 +118,16 @@ class PassiveLoopWiringTest {
         override fun descriptors(): List<ActionDescriptor> = emptyList()
         override fun execute(name: String, argsJson: String) = ActionResult(ActionOutcome.Refused, "UNKNOWN_ACTION")
         override fun cancel() = Unit
+    }
+
+    /**
+     * P3.3: the smart plugin declares `Capability.Confirmation`, so these rigs must advertise it or the host refuses to
+     * activate the plugin (`CAPABILITY_MISSING`) - which is exactly what the host's capability gate is for. This fake
+     * presents nothing and answers nothing: these tests are about the wake path, not about confirming.
+     */
+    private class NoConfirmations : ConfirmationChannel {
+        override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
     }
 
     private class LiveDisplay : HintDevice {
@@ -312,6 +323,7 @@ class PassiveLoopWiringTest {
                     Capability.Model to model,
                     Capability.Asr to chain.asrSession,
                     Capability.Actions to NoActions(),
+                    Capability.Confirmation to NoConfirmations(),
                     Capability.WakeWord to wakes,
                     // P3.2: the smart plugin declares `Context` (its proactive path runs on perception events), so a
                     // rig that activates it must answer that capability the way the composition does.
@@ -661,6 +673,9 @@ class PassiveLoopWiringTest {
                 Capability.Model to InertModel(),
                 Capability.Asr to StubAsrSession(),
                 Capability.Actions to NoActions(),
+                // P3.3: the smart plugin declares `Capability.Confirmation`, so a composition-shaped rig must answer
+                // it too - the same rule the `Context` line below records for P3.2.
+                Capability.Confirmation to NoConfirmations(),
                 Capability.WakeWord to wiring.wakeWords,
                 Capability.Context to EmptyContextSignals(),
             ),
@@ -723,7 +738,7 @@ class PassiveLoopWiringTest {
             val advertised = rig.environment.availableCapabilities
 
             assertEquals(setOf(Capability.Model, Capability.Storage, Capability.TextOutput, Capability.Asr,
-                Capability.Actions, Capability.WakeWord, Capability.Context), advertised)
+                Capability.Actions, Capability.WakeWord, Capability.Context, Capability.Confirmation), advertised)
             val services = rig.environment.services(ResourceScope("smart-assistant", session, Generation(1)), advertised)
             advertised.forEach { capability ->
                 assertNull("$capability is advertised, so it must be answerable",
@@ -834,6 +849,9 @@ class PassiveLoopWiringTest {
                 Capability.Model to InertModel(),
                 Capability.Asr to StubAsrSession(),
                 Capability.Actions to NoActions(),
+                // P3.3: the smart plugin declares `Capability.Confirmation`, so a composition-shaped rig must answer
+                // it too - the same rule the `Context` line below records for P3.2.
+                Capability.Confirmation to NoConfirmations(),
                 Capability.WakeWord to wiring.wakeWords,
                 Capability.Context to EmptyContextSignals(),
             ),

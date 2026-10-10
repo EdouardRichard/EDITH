@@ -27,7 +27,22 @@ sealed interface PolicyDecision {
  * The local audit trail port (spec §7.4): one line per tool decision and per executed step.
  *
  * Task 8 owns the implementation; the loop only writes.
+ *
+ * P3.3 (spec §17.5) widened the line with the four fields spec §7.4 asks for beyond the identity: the action's
+ * [scope] and [risk], the [decision] the policy took, and which channel settled a [confirmationSource]. Every one of
+ * them has a default, so a P3.1-era call site and a test fake that only knows the original four keep compiling and
+ * keep meaning the same thing. [summary] is the *only* free-text field and it carries nothing but the target argument
+ * the executor itself declared safe (`ActionDescriptor.auditTargetArgument`).
  */
 interface AuditSink {
-    fun record(turnId: String, action: String, summary: String, outcome: String)
+    fun record(
+        turnId: String,
+        action: String,
+        summary: String,
+        outcome: String,
+        scope: String? = null,
+        risk: String? = null,
+        decision: String? = null,
+        confirmationSource: ConfirmationSource? = null,
+    )
 }

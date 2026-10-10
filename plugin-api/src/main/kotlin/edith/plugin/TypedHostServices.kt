@@ -9,3 +9,4 @@ fun HostServices.textOutput(): OutputSink = require(Capability.TextOutput) as Ou
 fun HostServices.actions(): ActionExecutor = require(Capability.Actions) as ActionExecutor
 fun HostServices.context(): ContextSignals = require(Capability.Context) as ContextSignals
 fun HostServices.wakeWord(): WakeWordRegistry = require(Capability.WakeWord) as WakeWordRegistry
+fun HostServices.confirmation(): ConfirmationChannel = require(Capability.Confirmation) as ConfirmationChannel

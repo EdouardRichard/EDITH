@@ -25,6 +25,7 @@ import edith.plugin.OutputSink
 import edith.plugin.OutputSubmission
 import edith.plugin.RiskLevel
 import edith.plugin.SecretHandle
+import edith.plugin.StorageHandle
 import edith.plugin.TaskScope
 import edith.plugin.WakeWordRegistry
 import java.util.concurrent.atomic.AtomicBoolean
@@ -161,15 +162,48 @@ internal class SmartFakeOutput : OutputSink {
     }
 }
 
-/** The host services the plugin is activated with: a capability map plus a no-op task scope. */
+/**
+ * The host services the plugin is activated with: a capability map plus a task scope.
+ *
+ * The default scope runs the block **inline**, which is what keeps the plugin's own tests deterministic (the same
+ * reason the P3.2 proactive tests rely on). [OffThreadTasks] models production instead: there the plugin's task pool is
+ * a real pool, and a test that asserts "handing work over returned the caller" needs the work to actually leave the
+ * calling thread.
+ */
 internal class SmartFakeHost(
     private val providers: Map<Capability, Any>,
+    override val tasks: TaskScope = InlineTasks,
 ) : HostServices {
-    override val tasks: TaskScope = object : TaskScope {
-        override fun launch(block: () -> Unit): CancellationHandle { block(); return SmartFakeCancellation() }
-        override fun cancelAll() = Unit
-    }
     override fun require(capability: Capability): Any = providers[capability] ?: error("missing fake provider: $capability")
+}
+
+/** The default fake scope: the block runs on the calling thread before `launch` returns. */
+internal object InlineTasks : TaskScope {
+    override fun launch(block: () -> Unit): CancellationHandle { block(); return SmartFakeCancellation() }
+    override fun cancelAll() = Unit
+}
+
+/**
+ * A production-shaped scope: one real worker thread per launch, so a caller is never held by the work it handed over.
+ *
+ * `cancelAll` is inert on purpose - these tests answer or time out the question; they never need to cancel a worker,
+ * and a non-inert cancel would only add a second mechanism to reason about.
+ */
+internal class OffThreadTasks : TaskScope {
+    private val workers = java.util.Collections.synchronizedList(mutableListOf<Thread>())
+
+    override fun launch(block: () -> Unit): CancellationHandle {
+        val worker = Thread({ block() }, "smart-task-test")
+        worker.isDaemon = true
+        workers += worker
+        worker.start()
+        return SmartFakeCancellation()
+    }
+
+    override fun cancelAll() = Unit
+
+    /** Joins every worker that has been started, so a test can assert on what they wrote without racing. */
+    fun joinAll(millis: Long = 5_000) { workers.toList().forEach { it.join(millis) } }
 }
 
 /** Minimal but valid `ModelProfile` fixture; the plugin only reads `id`, `revision` and `timeoutMillis`. */
@@ -285,7 +319,7 @@ internal class SmartTestRig(
         sessionId: SessionId = this.sessionId,
     ) = TranscriptRevision(envelope(generation, sessionId), turnId, revision, text, final, 1, clock.nowNanos())
 
-    fun host(overrides: Map<Capability, Any> = emptyMap()): HostServices = SmartFakeHost(
+    fun host(overrides: Map<Capability, Any> = emptyMap(), tasks: TaskScope? = null): HostServices = SmartFakeHost(
         buildMap {
             put(Capability.Model, model)
             put(Capability.TextOutput, output)
@@ -293,6 +327,7 @@ internal class SmartTestRig(
             put(Capability.Actions, actions)
             putAll(overrides)
         },
+        tasks ?: InlineTasks,
     )
 
     fun activate(
@@ -305,6 +340,8 @@ internal class SmartTestRig(
         proactiveCooldownMillis: String? = null,
         proactiveSensitivity: String? = null,
         overrides: Map<Capability, Any> = emptyMap(),
+        /** How blocking turn work is scheduled; `null` keeps the deterministic inline scope. */
+        tasks: TaskScope? = null,
         // A host that keeps one plugin instance re-activates it for the next session/generation; the defaults here are
         // the rig's own, so a test can model that re-activation explicitly.
         sessionId: SessionId = this.sessionId,
@@ -324,7 +361,7 @@ internal class SmartTestRig(
         plugin.validate(configuration)
         plugin.configure(configuration)
         plugin.activate(
-            edith.plugin.PluginContext(sessionId, generation, Capability.entries.toSet(), host(overrides)),
+            edith.plugin.PluginContext(sessionId, generation, Capability.entries.toSet(), host(overrides, tasks)),
         )
         return plugin
     }
@@ -349,6 +386,15 @@ internal class SmartTestRig(
 
     /** The plugin's audit trail, through its `internal` observation accessor. */
     val auditEntries: List<edith.agent.AuditEntry> get() = plugin.auditTrail()
+}
+
+/** The namespace a host grants: a plain in-memory map, so a test can read exactly what was persisted. */
+internal class SmartFakeStorage : StorageHandle {
+    val values = mutableMapOf<String, ByteArray>()
+    override fun read(key: String) = values[key]
+    override fun write(key: String, value: ByteArray) { values[key] = value }
+    override fun delete(key: String) { values.remove(key) }
+    override fun clear() = values.clear()
 }
 
 /** An `AtomicBoolean` guard used by the async-model tests to fail loudly if a stream is not torn down. */

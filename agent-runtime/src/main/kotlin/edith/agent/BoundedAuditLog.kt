@@ -16,6 +16,11 @@ data class AuditEntry(
     val summary: String,
     val outcome: String,
     val atNanos: Long,
+    /** P3.3 (spec §17.5): the action's scope, risk level, policy decision and confirming channel, when known. */
+    val scope: String? = null,
+    val risk: String? = null,
+    val decision: String? = null,
+    val confirmationSource: ConfirmationSource? = null,
 )
 
 /**
@@ -41,8 +46,20 @@ class BoundedAuditLog(
         require(capacity >= 1) { "BoundedAuditLog capacity must be at least 1, was $capacity" }
     }
 
-    override fun record(turnId: String, action: String, summary: String, outcome: String) {
-        buffer += AuditEntry(turnId, action, flatten(summary), outcome, clock.nowNanos())
+    override fun record(
+        turnId: String,
+        action: String,
+        summary: String,
+        outcome: String,
+        scope: String?,
+        risk: String?,
+        decision: String?,
+        confirmationSource: ConfirmationSource?,
+    ) {
+        buffer += AuditEntry(
+            turnId, action, flatten(summary), outcome, clock.nowNanos(),
+            scope, risk, decision, confirmationSource,
+        )
         while (buffer.size > capacity) buffer.removeFirst()
     }
 

@@ -23,7 +23,8 @@ android {
             keyPassword = "android"
         }
     }
-    buildFeatures { compose = true; buildConfig = true }
+    // `aidl` is what compiles the `IRemoteShell` interface the UserService is reached through (P3.3 Task 8).
+    buildFeatures { compose = true; buildConfig = true; aidl = true }
     buildTypes {
         getByName("debug") {
             isMinifyEnabled = true
@@ -58,6 +59,9 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(project(":output-runtime"))
     implementation(project(":plugins-smart"))
+    // P3.3 Task 1: the shell-UID execution channel (spec §17.2). `provider` is what the `api` binds to at runtime.
+    implementation(libs.shizuku.api)
+    implementation(libs.shizuku.provider)
     implementation(project(":plugins-interview"))
     debugImplementation(project(":plugins-diagnostic"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")

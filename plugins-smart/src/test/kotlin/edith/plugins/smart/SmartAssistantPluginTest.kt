@@ -55,7 +55,7 @@ class SmartAssistantPluginTest {
         assertEquals(ConfigSchema(1), plugin.descriptor.configSchema)
         assertEquals(
             setOf(Capability.WakeWord, Capability.Asr, Capability.Model, Capability.Actions, Capability.TextOutput,
-                Capability.Context),
+                Capability.Context, Capability.Storage, Capability.Confirmation),
             plugin.descriptor.capabilities,
         )
         // P3.2 Task 8: `Context` is no longer absent. It is what the proactive path runs on - the host delivers
@@ -230,6 +230,37 @@ class SmartAssistantPluginTest {
         assertEquals(refused.envelope.eventId, entry.turnId, "the wake's own eventId keys the line; no turn exists yet")
         assertEquals("wake", entry.action)
         assertEquals(refused.word, entry.summary)
+    }
+
+    @Test fun `a recorded audit line reaches the namespace the host granted`() {
+        val storage = SmartFakeStorage()
+        val rig = SmartTestRig()
+        rig.activate(overrides = mapOf(Capability.Storage to storage))
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+        rig.wakeAndFinal("第一句", turnId = "asr-1")
+        // A wake the cooldown refuses still records - it is the one line that exists with no turn to key it by, which
+        // makes it the cheapest honest proof that the trail in use is the one the host handed over.
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("第二句", turnId = "asr-2")))
+        rig.tick()
+
+        val raw = storage.read(AuditTrail.KEY)
+        assertNotNull(raw, "the namespace the host granted must receive the audit document")
+        val document = String(raw, Charsets.UTF_8)
+        assertTrue("CooldownRefused" in document, "the refusal line must be in the persisted document")
+        assertFalse("答案" in document, "the audit document must never carry an answer or a hint text")
+    }
+
+    @Test fun `without storage the trail still records and says nothing about a file`() {
+        val rig = SmartTestRig()
+        rig.activate()
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+        rig.wakeAndFinal("第一句", turnId = "asr-1")
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("第二句", turnId = "asr-2")))
+        rig.tick()
+
+        assertEquals(1, rig.auditEntries.count { it.outcome == "CooldownRefused" })
     }
 
     @Test fun `a stale final transcript never survives deactivate and activate`() {

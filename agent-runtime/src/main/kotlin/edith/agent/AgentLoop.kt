@@ -5,6 +5,10 @@ import edith.plugin.ModelEnd
 import edith.plugin.ModelHistoryItem
 import edith.plugin.MonotonicClock
 import edith.plugin.ToolSpec
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.longOrNull
 
 /** The six terminal states of one agent run (spec §6.3). */
 enum class AgentOutcome { COMPLETED, INSUFFICIENT, NO_PROGRESS, DEADLINE, CANCELLED, FAILED }
@@ -43,6 +47,8 @@ data class AgentRun(
 
 private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
 private const val CONFIRMATION_UNAVAILABLE = "CONFIRMATION_UNAVAILABLE"
+private const val CONFIRMATION_DENIED = "CONFIRMATION_DENIED"
+private const val CONFIRMATION_TIMEOUT = "CONFIRMATION_TIMEOUT"
 private const val EMPTY_TURN = "EMPTY_TURN"
 private const val INCOMPLETE_TURNS = "INCOMPLETE_TURNS"
 private const val NO_PROGRESS = "NO_PROGRESS"
@@ -57,6 +63,13 @@ private const val AUDIT_EXECUTED = "executed"
 private const val AUDIT_UNKNOWN_TOOL = "UnknownTool"
 private const val AUDIT_REFUSED = "Refused"
 private const val AUDIT_CONFIRMATION_UNAVAILABLE = "ConfirmationUnavailable"
+/** P3.3 (spec §17.5): the policy decision values a structured audit line carries. */
+private const val AUDIT_ALLOW = "allow"
+private const val AUDIT_REFUSE = "refuse"
+private const val AUDIT_REQUIRE_CONFIRMATION = "require_confirmation"
+
+/** The audit summary is read from the model's own arguments string, which is kotlinx-lenient by construction. */
+private val auditArguments = Json { isLenient = true }
 
 /**
  * The agent loop: one [run] drives model turns and tool steps until a terminal state.
@@ -90,6 +103,11 @@ class AgentLoop(
     private val clock: MonotonicClock,
     private val maxEmptyTurns: Int = 3,
     private val maxSteps: Int = 24,
+    /**
+     * P3.3 (spec §17.4): the channel a `RequireConfirmation` decision is put through. `null` keeps P3.1's behaviour
+     * exactly - the action is refused with `CONFIRMATION_UNAVAILABLE` and never runs.
+     */
+    private val confirmation: ConfirmationPort? = null,
 ) {
     @Volatile
     private var started = false
@@ -214,20 +232,57 @@ class AgentLoop(
                     audit.record(request.turnId, call.name, AUDIT_UNKNOWN_TOOL, outcomeOf(unknown))
                     unknown
                 } else {
-                    when (policy.decide(registered.descriptor)) {
+                    val shape = registered.descriptor
+                    when (val decision = policy.decide(shape)) {
                         PolicyDecision.Allow -> {
                             val executed = registry.execute(call)
-                            audit.record(request.turnId, call.name, AUDIT_EXECUTED, outcomeOf(executed))
+                            // P3.1's summary stays verbatim on a plain allow: only the structured fields are new, and
+                            // rewriting a P3.1-era audit line's four original fields would be a silent record change.
+                            audit.record(
+                                request.turnId, call.name, AUDIT_EXECUTED, outcomeOf(executed),
+                                scope = shape.scope, risk = shape.risk.name, decision = AUDIT_ALLOW,
+                            )
                             executed
                         }
                         PolicyDecision.Refuse -> {
-                            audit.record(request.turnId, call.name, AUDIT_POLICY, AUDIT_REFUSED)
+                            audit.record(
+                                request.turnId, call.name, AUDIT_POLICY, AUDIT_REFUSED,
+                                scope = shape.scope, risk = shape.risk.name, decision = AUDIT_REFUSE,
+                            )
                             ToolResult.error(call.id, REFUSED_BY_POLICY)
                         }
                         is PolicyDecision.RequireConfirmation -> {
-                            // P3.1 has no confirmation channel: never execute an unconfirmed action.
-                            audit.record(request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE)
-                            ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE)
+                            val outcome = confirmation?.request(call.id, decision.summary)
+                            when {
+                                // No channel at all: P3.1's behaviour, and an unconfirmed action never runs.
+                                outcome == null -> {
+                                    audit.record(
+                                        request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE,
+                                        scope = shape.scope, risk = shape.risk.name,
+                                        decision = AUDIT_REQUIRE_CONFIRMATION,
+                                    )
+                                    ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE)
+                                }
+                                outcome.approved -> {
+                                    val executed = registry.execute(call)
+                                    audit.record(
+                                        request.turnId, call.name, auditSummary(shape, call.argsJson),
+                                        outcomeOf(executed), scope = shape.scope, risk = shape.risk.name,
+                                        decision = AUDIT_REQUIRE_CONFIRMATION, confirmationSource = outcome.source,
+                                    )
+                                    executed
+                                }
+                                else -> {
+                                    val code = if (outcome.source == ConfirmationSource.TIMEOUT) CONFIRMATION_TIMEOUT
+                                    else CONFIRMATION_DENIED
+                                    audit.record(
+                                        request.turnId, call.name, code, code, scope = shape.scope,
+                                        risk = shape.risk.name, decision = AUDIT_REQUIRE_CONFIRMATION,
+                                        confirmationSource = outcome.source,
+                                    )
+                                    ToolResult.error(call.id, code)
+                                }
+                            }
                         }
                     }
                 }
@@ -277,4 +332,20 @@ class AgentLoop(
     }
 
     private fun outcomeOf(result: ToolResult) = if (result.ok) "ok" else result.payload
+
+    /**
+     * The one argument an audit line may carry (spec §17.5).
+     *
+     * The executor declares which member is a benign identifier; this reads **only** that member, and only as a string
+     * or a number. An action that declares nothing (`null` — what `dial` declares) contributes an empty summary, so a
+     * phone number can never reach the trail. A missing member and an unparsable payload are empty summaries too: an
+     * audit line must never become the place where a malformed argument first becomes visible.
+     */
+    private fun auditSummary(descriptor: ToolDescriptor, argsJson: String): String {
+        val name = descriptor.auditTargetArgument ?: return ""
+        val member = runCatching {
+            (auditArguments.parseToJsonElement(argsJson) as? JsonObject)?.get(name) as? JsonPrimitive
+        }.getOrNull() ?: return ""
+        return if (member.isString) "$name=${member.content}" else member.longOrNull?.let { "$name=$it" } ?: ""
+    }
 }

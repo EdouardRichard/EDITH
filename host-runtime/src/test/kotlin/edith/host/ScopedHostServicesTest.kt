@@ -195,4 +195,40 @@ class ScopedHostServicesTest {
             Assistance("h", SessionId("s"), Generation(0), "t", 1, "test", null, 100)) }
         assertEquals(0, submissions)
     }
+
+    @Test fun `a granted Confirmation channel forwards the question and a revoked scope refuses it`() {
+        val seen = mutableListOf<Triple<String, String, Long>>()
+        val provider = object : ConfirmationChannel {
+            override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle {
+                seen += Triple(requestId, summary, timeoutMillis)
+                return object : CancellationHandle { override fun cancel() = Unit }
+            }
+        }
+        val scope = scope()
+        val services = ScopedHostServices(scope, setOf(Capability.Confirmation),
+            mapOf(Capability.Confirmation to provider), FakeTaskScope())
+
+        services.confirmation().present("r1", "卸载探针 App", 10_000L)
+        assertEquals(listOf(Triple("r1", "卸载探针 App", 10_000L)), seen)
+
+        scope.revoke()
+        assertFailsWith<ContractError.Cancelled> { services.confirmation().present("r2", "x", 1_000L) }
+        assertEquals(1, seen.size)
+    }
+
+    @Test fun `a plugin without the Confirmation capability is refused`() {
+        val services = ScopedHostServices(scope(), emptySet(), emptyMap(), FakeTaskScope())
+        assertFailsWith<ContractError.CapabilityMissing> { services.confirmation() }
+    }
+
+    @Test fun `a blank confirmation id and a non positive window are rejected at the port`() {
+        val provider = object : ConfirmationChannel {
+            override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle =
+                object : CancellationHandle { override fun cancel() = Unit }
+        }
+        val services = ScopedHostServices(scope(), setOf(Capability.Confirmation),
+            mapOf(Capability.Confirmation to provider), FakeTaskScope())
+        assertFailsWith<IllegalArgumentException> { services.confirmation().present("  ", "s", 1_000L) }
+        assertFailsWith<IllegalArgumentException> { services.confirmation().present("r1", "s", 0L) }
+    }
 }

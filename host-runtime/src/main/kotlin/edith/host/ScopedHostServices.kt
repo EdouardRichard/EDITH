@@ -27,6 +27,7 @@ class ScopedHostServices(
                 Capability.Actions -> scopedActions(provider as? ActionExecutor ?: wrong(capability))
                 Capability.Context -> scopedContext(provider as? ContextSignals ?: wrong(capability))
                 Capability.WakeWord -> scopedWakeWord(provider as? WakeWordRegistry ?: wrong(capability))
+                Capability.Confirmation -> scopedConfirmation(provider as? ConfirmationChannel ?: wrong(capability))
             }
         }
         val child = ResourceScope(scope.pluginId, scope.sessionId, scope.generation)
@@ -103,5 +104,21 @@ class ScopedHostServices(
     private fun scopedWakeWord(provider: WakeWordRegistry) = object : WakeWordRegistry {
         override fun declare(words: List<String>) = scope.active { provider.declare(words) }
         override fun current() = scope.active { provider.current() }
+    }
+
+    /**
+     * P3.3 (spec §17.4): the confirmation channel is *presented* through a scoped wrapper, never answered through one.
+     *
+     * The two `require`s are the port's own contract: a blank request id could never be addressed by the answer event,
+     * and a non-positive window would ask the user a question whose deadline already passed. Refusing here means the
+     * plugin's tool call fails with a contract error instead of arming a question nobody can settle.
+     */
+    private fun scopedConfirmation(provider: ConfirmationChannel) = object : ConfirmationChannel {
+        override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle {
+            scope.checkActive()
+            require(requestId.isNotBlank()) { "confirmation request id must not be blank" }
+            require(timeoutMillis > 0) { "confirmation window must be positive, was $timeoutMillis" }
+            return provider.present(requestId, summary, timeoutMillis)
+        }
     }
 }

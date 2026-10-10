@@ -111,4 +111,5 @@ private fun ActionDescriptor.toToolDescriptor() = ToolDescriptor(
     idempotent = idempotent,
     reversible = reversible,
     scope = scope,
+    auditTargetArgument = auditTargetArgument,
 )

@@ -4,7 +4,14 @@
     <!--
       P3.0 T3b throwaway probe. It reads the accessibility tree and dispatches gestures on this phone only, while the
       operator watches. It uploads nothing, stores nothing and holds no credentials.
+
+      P3.3 Task 17 gives it one more job: it is also the **L3/L4 target** (spec §17.1#2, §17.3) - the app the privileged
+      channel is allowed to clear, uninstall, disable and grant/revoke, because we built it and can reinstall it. The
+      permission below is the L4 target for `set_permission`: a normal, revocable runtime permission whose granted state
+      is readable back with `dumpsys package`, which is how the acceptance checks the *state* rather than an exit code.
     -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
     <application
         android:allowBackup="false"
         android:label="EDITH P3 T3b"

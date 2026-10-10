@@ -6,6 +6,7 @@ import edith.plugin.MessageRole
 import edith.plugin.ModelEnd
 import edith.plugin.ModelHistoryItem
 import edith.plugin.MonotonicClock
+import edith.plugin.RiskLevel
 import edith.plugin.ToolSpec
 import edith.testsupport.FakeClock
 import java.util.concurrent.CountDownLatch
@@ -38,7 +39,8 @@ class AgentLoopTest {
         clock: MonotonicClock = FakeClock(),
         maxEmptyTurns: Int = 3,
         maxSteps: Int = 24,
-    ) = AgentLoop(gateway, registry, policy, guard, audit, clock, maxEmptyTurns, maxSteps)
+        confirmation: ConfirmationPort? = null,
+    ) = AgentLoop(gateway, registry, policy, guard, audit, clock, maxEmptyTurns, maxSteps, confirmation)
 
     // ---------------------------------------------------------------- turn state
 
@@ -435,6 +437,126 @@ class AgentLoopTest {
             ),
             audit.entries,
         )
+    }
+
+    @Test fun `an approved confirmation executes the action exactly once`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("device.set_volume")))
+        val confirmation = ScriptedConfirmation(ConfirmationOutcome(true, ConfirmationSource.PHONE))
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "调低了")),
+        )
+
+        val run = newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("device.set_volume" to PolicyDecision.RequireConfirmation("调低音量?"))),
+            confirmation = confirmation,
+        ).run(request())
+
+        // The port is addressed by the tool call id, not the tool name: the answer event has to be addressable back to
+        // the exact in-flight call.
+        assertEquals(listOf("c1" to "调低音量?"), confirmation.asked)
+        assertEquals(1, executor.calls.size)
+        assertEquals(listOf(AgentStep(1, "device.set_volume", "ok")), run.steps)
+    }
+
+    @Test fun `a denied confirmation never executes and feeds back CONFIRMATION_DENIED`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("app.uninstall",
+            risk = RiskLevel.L3, scope = "app", auditTargetArgument = "package")))
+        val audit = RecordingAuditSink()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "app.uninstall", """{"package":"edith.phone.a11yprobe"}"""))),
+                reply(text = "那就不动")),
+        )
+
+        val run = newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("app.uninstall" to PolicyDecision.RequireConfirmation("卸载?"))),
+            audit = audit,
+            confirmation = ScriptedConfirmation(ConfirmationOutcome(false, ConfirmationSource.PHONE)),
+        ).run(request())
+
+        assertTrue(executor.calls.isEmpty(), "a denied action must never execute")
+        assertEquals("CONFIRMATION_DENIED", run.steps.single().result)
+        assertEquals(
+            RecordedAuditEntry("turn-7", "app.uninstall", "CONFIRMATION_DENIED", "CONFIRMATION_DENIED"),
+            audit.entries.single(),
+        )
+        assertEquals(ConfirmationSource.PHONE, audit.structured.single().confirmationSource)
+    }
+
+    @Test fun `a timed out confirmation never executes and feeds back CONFIRMATION_TIMEOUT`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("app.uninstall")))
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "app.uninstall"))), reply(text = "超时了")),
+        )
+
+        val run = newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("app.uninstall" to PolicyDecision.RequireConfirmation("卸载?"))),
+            confirmation = ScriptedConfirmation(ConfirmationOutcome(false, ConfirmationSource.TIMEOUT)),
+        ).run(request())
+
+        assertTrue(executor.calls.isEmpty(), "an expired question must never execute")
+        assertEquals("CONFIRMATION_TIMEOUT", run.steps.single().result)
+    }
+
+    @Test fun `the audit line carries the risk scope decision source and the declared audit target`() {
+        val executor = RecordingActionExecutor(
+            listOf(
+                actionDescriptor(
+                    "app.uninstall",
+                    risk = RiskLevel.L3,
+                    scope = "app",
+                    auditTargetArgument = "package",
+                    parametersJson = """{"type":"object","properties":{"package":{"type":"string"}}}""",
+                ),
+            ),
+        )
+        val audit = RecordingAuditSink()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "app.uninstall", """{"package":"edith.phone.a11yprobe"}"""))),
+                reply(text = "卸载了")),
+        )
+
+        newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("app.uninstall" to PolicyDecision.RequireConfirmation("卸载?"))),
+            audit = audit,
+            confirmation = ScriptedConfirmation(ConfirmationOutcome(true, ConfirmationSource.VOICE)),
+        ).run(request())
+
+        assertEquals(
+            RecordedAuditEntry("turn-7", "app.uninstall", "package=edith.phone.a11yprobe", "ok"),
+            audit.entries.last(),
+        )
+        assertEquals(listOf("L3"), audit.structured.map { it.risk })
+        assertEquals(listOf("app"), audit.structured.map { it.scope })
+        assertEquals(listOf("require_confirmation"), audit.structured.map { it.decision })
+        assertEquals(listOf(ConfirmationSource.VOICE), audit.structured.map { it.confirmationSource })
+    }
+
+    @Test fun `an action that declares no audit target records no argument at all`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("dial")))
+        val audit = RecordingAuditSink()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "dial", """{"number":"12345678901"}"""))), reply(text = "拨了")),
+        )
+
+        newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("dial" to PolicyDecision.RequireConfirmation("拨号?"))),
+            audit = audit,
+            confirmation = ScriptedConfirmation(ConfirmationOutcome(true, ConfirmationSource.PHONE)),
+        ).run(request())
+
+        val summary = audit.entries.last().summary
+        assertFalse("12345678901" in summary, "a declared-safe argument is the only thing an audit line may carry")
+        assertEquals("", summary)
     }
 
     @Test fun `a throwing tool is a step that keeps the loop going`() {

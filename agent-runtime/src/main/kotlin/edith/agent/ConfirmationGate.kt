@@ -17,8 +17,14 @@ import edith.plugin.MonotonicClock
  * instead of producing a second, possibly contradicting, decision.
  *
  * P3.1 declares the port only and has no confirmation channel wired (see [PolicyDecision.RequireConfirmation]); the
- * summary carried by [request] is stored for the channel that later renders the question. Delivery is single-threaded:
- * [resolve]/[cancelAll] must be called from the thread the [scheduler] delivers on.
+ * summary carried by [request] is stored for the channel that later renders the question.
+ *
+ * **Thread safety.** P3.1 assumed delivery was single-threaded; P3.3 is not. The plugin asks from the turn's worker, the
+ * host answers from its event dispatcher, 急停 cancels from the UI thread, and the timeout fires on the deadline thread
+ * - so [request], [resolve] and [cancelAll] may all arrive at once. Every entry point is therefore synchronized, and
+ * [settle] removes the entry **while holding that lock**, which is what keeps "settled at most once" true under
+ * concurrency and not just under a single thread. A listener that re-enters the gate does so on the same thread (the
+ * intrinsic lock is re-entrant) and finds its request already gone.
  */
 class ConfirmationGate(
     private val clock: MonotonicClock,
@@ -43,6 +49,7 @@ class ConfirmationGate(
      * A duplicate id is rejected rather than silently replacing the pending question: overwriting would strand a
      * listener that the caller still believes is live.
      */
+    @Synchronized
     fun request(requestId: String, summary: String, listener: (Boolean) -> Unit): CancellationHandle {
         require(requestId.isNotBlank()) { "ConfirmationGate request id must not be blank" }
         require(requestId !in pending) { "ConfirmationGate already has a pending request with id: $requestId" }
@@ -58,13 +65,16 @@ class ConfirmationGate(
     }
 
     /** Delivers [approved] to a still-pending request. `false` when the id is unknown or already settled. */
+    @Synchronized
     fun resolve(requestId: String, approved: Boolean): Boolean = settle(requestId, approved)
 
     /** 急停: settles every pending request as denied and clears its timer, so nothing is left to fire later. */
+    @Synchronized
     fun cancelAll() {
         pending.keys.toList().forEach { settle(it, approved = false) }
     }
 
+    @Synchronized
     private fun settle(requestId: String, approved: Boolean): Boolean {
         // Removal is the settlement marker, and it happens first so a re-entrant listener cannot settle twice.
         val entry = pending.remove(requestId) ?: return false

@@ -51,6 +51,14 @@ dependencyResolutionManagement {
                 includeGroup("com.rokid.logger")
             }
         }
+        // P3.3 Task 1: `dev.rikka.shizuku:api|provider` lives on Maven Central only. Without this filter Gradle asks
+        // `google()` first and a blocked `dl.google.com` (measured 2026-10-10: TCP 443 timeout on this host) aborts the
+        // whole resolution for the module instead of falling through to the next repository. `exclusiveContent` pins the
+        // group to the one repository that actually serves it; every other module keeps its existing order.
+        exclusiveContent {
+            forRepository { mavenCentral() }
+            filter { includeGroup("dev.rikka.shizuku") }
+        }
     }
 }
 

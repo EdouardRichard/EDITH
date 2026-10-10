@@ -26,11 +26,23 @@ data class ActionDescriptor(
     val idempotent: Boolean,
     val reversible: Boolean,
     val scope: String,
+    /**
+     * P3.3 (spec §17.5): the name of the one argument, if any, this action's executor declares **safe to audit**.
+     *
+     * The audit trail records an action's target so a line answers "what did it touch", but raw arguments never leave
+     * the executor: the executor is the only side that knows which member is a benign identifier (`page`, `package`,
+     * `permission`) and which is user content. `null` — the default, and what `dial` declares — means no argument is
+     * ever recorded for this action, so a phone number cannot reach the trail.
+     */
+    val auditTargetArgument: String? = null,
 ) {
     init {
         require(name.isNotBlank())
         require(title.isNotBlank())
         require(scope.isNotBlank())
+        require(auditTargetArgument == null || auditTargetArgument.isNotBlank()) {
+            "auditTargetArgument must be null or non-blank"
+        }
         require(parametersJson.isNotBlank())
         require(parametersJson.length <= MAX_PARAMETERS_JSON_LENGTH) {
             "parametersJson must be at most $MAX_PARAMETERS_JSON_LENGTH characters"

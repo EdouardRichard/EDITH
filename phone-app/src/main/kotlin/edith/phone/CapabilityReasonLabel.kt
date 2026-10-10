@@ -22,5 +22,6 @@ internal fun capabilityReasonLabel(reason: String): String = when (reason) {
     "ACTION_PROVIDER_MISSING" -> "指令执行未装配"
     "CONTEXT_PROVIDER_MISSING" -> "上下文感知未装配"
     "WAKE_PROVIDER_MISSING" -> "唤醒词未装配"
+    "CONFIRMATION_PROVIDER_MISSING" -> "确认通道未装配"
     else -> reason
 }

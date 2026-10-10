@@ -136,7 +136,12 @@ class MainActivity : ComponentActivity() {
                             OutlinedButton(onClick = { command(SessionService.PAUSE) }, enabled = !inactive) {
                                 Icon(Icons.Default.Pause, contentDescription = null); Spacer(Modifier.width(4.dp)); Text("暂停")
                             }
-                            OutlinedButton(onClick = { command(SessionService.STOP) }, enabled = state.session != SessionState.Idle) {
+                            OutlinedButton(onClick = {
+                                // P3.3 急停: a question that is still up is withdrawn and the turn in flight is
+                                // cancelled, then the session is stopped the way the service owns it.
+                                root.emergencyStop()
+                                command(SessionService.STOP)
+                            }, enabled = state.session != SessionState.Idle) {
                                 Icon(Icons.Default.Stop, contentDescription = null); Spacer(Modifier.width(4.dp)); Text("停止")
                             }
                             // Task 15c D2: the spec's non-wake entry point. The plugin runs its most recent final
@@ -229,6 +234,22 @@ class MainActivity : ComponentActivity() {
                                 Text("未授予日历权限，主动辅助看不到今天的日程标题。", color = MaterialTheme.colorScheme.error)
                             }
                         }
+                        // P3.3 (spec §17.4): the question the plugin is blocked on. The summary is what the action
+                        // would do - who it messages, which package it uninstalls - never a bare "确认吗".
+                        state.pendingConfirmation?.let { pending ->
+                            Card {
+                                Column(Modifier.padding(12.dp)) {
+                                    Text("需要你确认的动作", style = MaterialTheme.typography.titleMedium)
+                                    Text(pending.summary)
+                                    Row {
+                                        Button(onClick = { root.answerConfirmation(true) }) { Text("允许") }
+                                        Spacer(Modifier.width(8.dp))
+                                        OutlinedButton(onClick = { root.answerConfirmation(false) }) { Text("拒绝") }
+                                    }
+                                    Text("10 秒内不作答视为拒绝。", style = MaterialTheme.typography.bodySmall)
+                                }
+                            }
+                        }
                         state.errorCode?.let { Text(errorLabel(it), color = MaterialTheme.colorScheme.error) }
                         // Debug-only acceptance affordance: with the shipped plugins still shells, this is the only
                         // way a wearer can check what the glasses actually show. Hidden whenever no probe is
@@ -257,6 +278,7 @@ class MainActivity : ComponentActivity() {
                         }
                         HorizontalDivider()
                         SmartSettingsSection(loadSettings, saveSettings)
+                        root.auditLog?.let { AuditSection(it) }
                     }
                     1 -> {
                         if (profileViewModel == null) Text("档案服务不可用")
@@ -356,6 +378,31 @@ class MainActivity : ComponentActivity() {
     }) { Text("保存") }
 }
 
+/**
+ * P3.3 (spec §17.5): the audit trail its owner can read and delete.
+ *
+ * The copy says what is **not** in there as plainly as what is, because the value of this page is the user being able to
+ * check that claim: the document has no field for a notification body, a screen line, a transcript or a phone number.
+ */
+@Composable
+private fun AuditSection(view: AuditLogView) {
+    var revision by remember { mutableStateOf(0) }
+    val lines = remember(revision) { view.lines() }
+    Text("审计记录", style = MaterialTheme.typography.titleLarge)
+    Text(
+        "本地加密保存；只记录动作、风险级别、裁决、确认来源与执行结果，不含通知正文、屏幕文字、转写内容或电话号码。" +
+            "最多保留最近 200 条。",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    if (lines.isEmpty()) Text("暂无记录")
+    lines.forEach { Text(it, style = MaterialTheme.typography.bodySmall) }
+    OutlinedButton(onClick = {
+        view.clear()
+        revision++
+    }) { Text("清空审计记录") }
+    HorizontalDivider()
+}
+
 private fun sessionLabel(state: SessionState) = when (state) {
     SessionState.Idle -> "未开始"
     SessionState.Ready -> "已就绪"
@@ -379,6 +426,7 @@ private fun capabilityLabel(capability: Capability) = when (capability) {
     Capability.Actions -> "指令执行"
     Capability.Context -> "上下文感知"
     Capability.WakeWord -> "唤醒词"
+    Capability.Confirmation -> "动作确认"
 }
 private fun errorLabel(code: String) = when (code) {
     "BLUETOOTH_PERMISSION_DENIED" -> "蓝牙权限未获授权"

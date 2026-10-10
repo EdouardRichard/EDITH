@@ -78,13 +78,16 @@ class IntentActionExecutorTest {
     fun descriptorsDeclareExactlyTheFiveL0AndL1Tools() {
         val byName = Rig().executor.descriptors().associateBy { it.name }
 
-        assertEquals(setOf("open_app", "open_url", "open_settings", "set_alarm", "compose_note"), byName.keys)
+        // P3.3 Task 9 added the first L2 action. The five L0/L1 tools are unchanged, and `dial` is the one row above
+        // them - so this test now names six and checks the level of each rather than asserting "L0/L1 only".
+        assertEquals(setOf("open_app", "open_url", "open_settings", "set_alarm", "compose_note", "dial"), byName.keys)
         val expected = mapOf(
             "open_app" to Triple(RiskLevel.L0, "device", true),
             "open_url" to Triple(RiskLevel.L0, "device", true),
             "open_settings" to Triple(RiskLevel.L0, "device", true),
             "set_alarm" to Triple(RiskLevel.L1, "local", false),
             "compose_note" to Triple(RiskLevel.L1, "local", false),
+            "dial" to Triple(RiskLevel.L2, "phone.number", false),
         )
         byName.forEach { (name, descriptor) ->
             val (risk, scope, idempotent) = expected.getValue(name)
@@ -97,7 +100,64 @@ class IntentActionExecutorTest {
             assertEquals("$name reversible", false, descriptor.reversible)
             assertTrue("$name needs a human-auditable title", descriptor.title.isNotBlank())
         }
-        assertTrue("this phase ships L0/L1 only", byName.values.all { it.risk.ordinal <= RiskLevel.L1.ordinal })
+        assertTrue("the five P3.1 tools stay at or below L1",
+            byName.filterKeys { it != "dial" }.values.all { it.risk.ordinal <= RiskLevel.L1.ordinal })
+        assertEquals("dial is the phase's one L2 row", RiskLevel.L2, byName.getValue("dial").risk)
+    }
+
+    // ---- dial (L2) -----------------------------------------------------------------------------------------
+
+    private fun dialRig(permission: Boolean): Pair<IntentActionExecutor, RecordingLauncher> {
+        val launcher = RecordingLauncher()
+        val executor = IntentActionExecutor(
+            AppLaunchResolver(FakeCatalog(emptyList())),
+            launcher,
+            null,
+            CallPermission { permission },
+        )
+        return executor to launcher
+    }
+
+    @Test
+    fun dialCallsTheExactTelUriWhenTheCallPermissionIsGranted() {
+        val (executor, launcher) = dialRig(permission = true)
+
+        val result = executor.execute("dial", """{"number":"12345678901"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(listOf(RecordingLauncher.Call(Intent.ACTION_CALL, "tel:12345678901", emptyMap())), launcher.calls)
+    }
+
+    @Test
+    fun dialWithoutTheCallPermissionRefusesAndNeverLaunches() {
+        val (executor, launcher) = dialRig(permission = false)
+
+        val result = executor.execute("dial", """{"number":"12345678901"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("CALL_PERMISSION_MISSING", result.detail)
+        assertTrue("a refusal must perform no side effect", launcher.calls.isEmpty())
+    }
+
+    @Test
+    fun dialNeverSilentlyFallsBackToTheDialerScreen() {
+        val (executor, launcher) = dialRig(permission = true)
+
+        executor.execute("dial", """{"number":"12345678901"}""")
+
+        assertTrue("the dialer is not a substitute for a direct call", launcher.calls.none { it.action == Intent.ACTION_DIAL })
+    }
+
+    @Test
+    fun dialRefusesANumberOutsideTheDialAlphabet() {
+        val (executor, launcher) = dialRig(permission = true)
+
+        listOf("12345678901; id", "1234 5678", "tel:123", "").forEach { number ->
+            val result = executor.execute("dial", """{"number":"$number"}""")
+            assertEquals("refused: $number", ActionOutcome.Refused, result.outcome)
+            assertEquals("refused: $number", "ARGUMENTS_INVALID", result.detail)
+        }
+        assertTrue(launcher.calls.isEmpty())
     }
 
     @Test
@@ -108,6 +168,8 @@ class IntentActionExecutorTest {
             "open_settings" to listOf("page"),
             "set_alarm" to listOf("hour", "minute", "label"),
             "compose_note" to listOf("title", "body"),
+            // P3.3 Task 9's L2 action. Its schema is the same shape as the rest: a JSON object naming what it needs.
+            "dial" to listOf("number"),
         )
         val descriptors = Rig().executor.descriptors()
         // Asserted here too, so this test cannot pass vacuously over an empty descriptor list.

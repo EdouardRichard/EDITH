@@ -105,6 +105,22 @@ class BoundedAuditLogTest {
         assertEquals(2, log.entries().size)
     }
 
+    @Test fun `a structured line keeps its scope risk decision and source`() {
+        val log = BoundedAuditLog(capacity = 8, clock = clock)
+
+        log.record(
+            "turn-1", "app.uninstall", "package=edith.phone.a11yprobe", "ok",
+            scope = "app", risk = "L3", decision = "require_confirmation",
+            confirmationSource = ConfirmationSource.VOICE,
+        )
+
+        val entry = log.entries().single()
+        assertEquals("app", entry.scope)
+        assertEquals("L3", entry.risk)
+        assertEquals("require_confirmation", entry.decision)
+        assertEquals(ConfirmationSource.VOICE, entry.confirmationSource)
+    }
+
     @Test fun `a capacity below one is rejected`() {
         assertFailsWith<IllegalArgumentException> { BoundedAuditLog(capacity = 0, clock = clock) }
     }

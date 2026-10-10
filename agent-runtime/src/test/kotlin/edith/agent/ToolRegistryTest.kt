@@ -21,6 +21,21 @@ class ToolRegistryTest {
         assertEquals("terminal", SCOPE_TERMINAL)
     }
 
+    @Test fun `the descriptor carries the argument the executor declared safe to audit`() {
+        val executor = RecordingActionExecutor(
+            listOf(actionDescriptor("app.uninstall", risk = RiskLevel.L3, auditTargetArgument = "package")),
+        )
+        val registry = ToolRegistry(listOf(executor))
+
+        assertEquals("package", registry.descriptors().single().auditTargetArgument)
+        assertNull(ToolRegistry(listOf(RecordingActionExecutor(listOf(actionDescriptor("dial")))))
+            .descriptors().single().auditTargetArgument)
+    }
+
+    @Test fun `an audit argument name must not be blank when it is declared`() {
+        assertFailsWith<IllegalArgumentException> { actionDescriptor("a", auditTargetArgument = "  ") }
+    }
+
     @Test fun `descriptors expose the plugin action fields as tool metadata`() {
         val executor = RecordingActionExecutor(
             listOf(

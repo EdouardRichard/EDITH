@@ -21,6 +21,9 @@ private const val OPEN_SETTINGS = "open_settings"
 private const val SET_ALARM = "set_alarm"
 private const val COMPOSE_NOTE = "compose_note"
 
+/** P3.3 Task 9: the phase's one L2 action, placed through a standard intent but only with the user's own permission. */
+private const val DIAL = "dial"
+
 private const val ARGUMENTS_INVALID = "ARGUMENTS_INVALID"
 private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
 private const val APP_NOT_VISIBLE = "APP_NOT_VISIBLE"
@@ -30,6 +33,13 @@ private const val INVALID_SETTINGS_PAGE = "INVALID_SETTINGS_PAGE"
 private const val INVALID_TIME = "INVALID_TIME"
 private const val STORAGE_UNAVAILABLE = "STORAGE_UNAVAILABLE"
 private const val INVALID_NOTE = "INVALID_NOTE"
+private const val CALL_PERMISSION_MISSING = "CALL_PERMISSION_MISSING"
+
+/**
+ * A dialable number and nothing else. Same rule as the privileged channel's package name: the model's string is
+ * refused unless it is exactly a number, so no part of it can become an intent payload we did not intend.
+ */
+private val DIALABLE_NUMBER = Regex("""\+?[0-9*#]{3,20}""")
 
 private const val UNTITLED = "untitled"
 
@@ -42,6 +52,7 @@ private const val MINUTE = "minute"
 private const val LABEL = "label"
 private const val TITLE = "title"
 private const val BODY = "body"
+private const val NUMBER = "number"
 
 /**
  * Lenient on purpose, exactly like `agent-runtime`'s arguments pass: the model's tool call is the input, and kotlinx
@@ -133,6 +144,20 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
         reversible = false,
         scope = "local",
     ),
+    ActionDescriptor(
+        name = DIAL,
+        title = "拨打电话",
+        parametersJson = """{"type":"object","properties":{"number":{"type":"string","description":"电话号码"}},""" +
+            """"required":["number"],"additionalProperties":false}""",
+        risk = RiskLevel.L2,
+        requiresConfirmation = false,
+        idempotent = false,
+        reversible = false,
+        scope = "phone.number",
+        // Deliberately null: a phone number is personal data, so no part of it ever reaches the audit trail
+        // (spec §17.5). The line still records the action, its scope and its outcome.
+        auditTargetArgument = null,
+    ),
 )
 
 /**
@@ -154,10 +179,32 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
  * [noteStorage] is the `smart-assistant` namespace the composition hands in; `null` means storage is not wired, which
  * makes `compose_note` honestly refuse with `STORAGE_UNAVAILABLE`.
  */
+/**
+ * The App-side action provider: the five L0/L1 tools P3.1 delivered, plus P3.3's one L2 action, through standard
+ * Android intents and the App's own encrypted storage.
+ *
+ * Scope is a product boundary, not a style choice. L0/L1 are the levels the user has already accepted outright; `dial`
+ * is the first action that reaches another person, so it is L2 and the policy layer asks before it runs. Nothing here
+ * sends messages, deletes data, uninstalls, changes permissions or changes security settings - L3/L4 belong to the
+ * privileged channel. `open_settings` is therefore an allowlist of benign pages, never a passthrough of a model-chosen
+ * action string, and `dial` refuses without `CALL_PHONE` rather than silently opening the dialer instead.
+ *
+ * Failure policy, which the registry depends on:
+ * - a refusal is [ActionOutcome.Refused] with the code **exactly** as its detail, so the model sees
+ *   `"Refused: <CODE>"` rather than a broken-tool failure;
+ * - nothing throws: malformed arguments, an unknown tool name, a missing capability and a declining launcher all
+ *   become refusals;
+ * - a refusal performs no side effect.
+ *
+ * [noteStorage] is the `smart-assistant` namespace the composition hands in; `null` means storage is not wired, which
+ * makes `compose_note` honestly refuse with `STORAGE_UNAVAILABLE`.
+ */
 class IntentActionExecutor(
     private val resolver: AppLaunchResolver,
     private val launcher: IntentLauncher,
     private val noteStorage: StorageHandle?,
+    /** P3.3 Task 9: denies by default, so an unwired app refuses to dial instead of pretending it may. */
+    private val callPermission: CallPermission = CallPermission { false },
 ) : ActionExecutor {
 
     /** Makes note keys unique even when two notes share a title inside the same millisecond. */
@@ -171,6 +218,7 @@ class IntentActionExecutor(
         OPEN_SETTINGS -> openSettings(argsJson)
         SET_ALARM -> setAlarm(argsJson)
         COMPOSE_NOTE -> composeNote(argsJson)
+        DIAL -> dial(argsJson)
         else -> refused(UNKNOWN_ACTION)
     }
 
@@ -220,6 +268,23 @@ class IntentActionExecutor(
         val launched = launcher.launch(AlarmClock.ACTION_SET_ALARM, null, extras)
         return if (launched) done("alarm set: %02d:%02d %s".format(hour, minute, label.trim()))
         else refused(LAUNCH_REFUSED)
+    }
+
+    /**
+     * P3.3 Task 9: a direct call, and **only** a direct call.
+     *
+     * Without `CALL_PHONE` this refuses with `CALL_PERMISSION_MISSING`. It deliberately does not fall back to
+     * `ACTION_DIAL`: a dialer screen is a different action with a different meaning ("prepare a call") and quietly
+     * substituting it would make the model's step look done when nothing was placed. The number itself is validated
+     * against [DIALABLE_NUMBER] before it becomes an intent payload.
+     */
+    private fun dial(argsJson: String): ActionResult {
+        val args = objectArguments(argsJson) ?: return refused(ARGUMENTS_INVALID)
+        val number = (args.string(NUMBER) ?: return refused(ARGUMENTS_INVALID)).trim()
+        if (!DIALABLE_NUMBER.matches(number)) return refused(ARGUMENTS_INVALID)
+        if (!callPermission.granted()) return refused(CALL_PERMISSION_MISSING)
+        val launched = launcher.launch(Intent.ACTION_CALL, "tel:$number", emptyMap())
+        return if (launched) done("dialing $number") else refused(LAUNCH_REFUSED)
     }
 
     private fun composeNote(argsJson: String): ActionResult {

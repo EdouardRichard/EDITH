@@ -45,6 +45,8 @@ data class ToolDescriptor(
     val idempotent: Boolean,
     val reversible: Boolean,
     val scope: String,
+    /** P3.3: projected from the plugin's descriptor; see `ActionDescriptor.auditTargetArgument`. */
+    val auditTargetArgument: String? = null,
 )
 
 /** A descriptor bound to the executor that declared it. */

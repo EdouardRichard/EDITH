@@ -35,6 +35,16 @@ import edith.rokid.PcmFormatEvidence
 import edith.storage.*
 import edith.phone.storage.*
 import edith.phone.actions.AppLaunchResolver
+import edith.phone.actions.CallPermission
+import edith.phone.actions.ExecutionRouter
+import edith.phone.actions.IntentExecutionBackend
+import edith.phone.actions.RootProbe
+import edith.phone.actions.ShizukuExecutionBackend
+import edith.phone.actions.ShizukuTargetState
+import edith.phone.actions.ShizukuUserServiceShell
+import edith.phone.a11y.AccessibilityExecutionBackend
+import edith.phone.a11y.AccessibilityUi
+import edith.phone.a11y.EdithAccessibilityService
 import edith.phone.actions.ContextIntentLauncher
 import edith.phone.actions.IntentActionExecutor
 import edith.phone.actions.PackageManagerAppCatalog
@@ -220,6 +230,8 @@ class HostCompositionRoot internal constructor(
         Capability.Actions -> "ACTION_PROVIDER_MISSING"
         Capability.Context -> "CONTEXT_PROVIDER_MISSING"
         Capability.WakeWord -> "WAKE_PROVIDER_MISSING"
+        // P3.3: the row the confirmation channel reports when its presenter is not wired (until Task 13 provides it).
+        Capability.Confirmation -> "CONFIRMATION_PROVIDER_MISSING"
     }
     private val mutableState =
         MutableStateFlow(SessionUiState(SessionState.Idle, null, capabilityReasons(), null))
@@ -236,6 +248,54 @@ class HostCompositionRoot internal constructor(
     private var closed = false
     private var activatedPlugin: String? = null
     private var activeConnection: CxrConnection? = null
+
+    /** P3.3: the settings page's reader over the plugin's audit document; null when storage is not wired. */
+    internal val auditLog: AuditLogView? by lazy {
+        namespaceFactory?.let { factory -> AuditLogView(factory("smart-assistant")) }
+    }
+
+    /**
+     * P3.3 (spec §17.2): one probe per execution channel, logged once per session as `P3_EXEC channel=… available=…`.
+     *
+     * The pair is id to a **live** question, not a cached answer: the accessibility service is switched off in system
+     * settings and Shizuku's binder dies, both while the App runs. The line is what a device stage reads to tell "the
+     * channel is down" from "the channel is up but refused the call".
+     */
+    internal var channelProbes: List<Pair<String, () -> Boolean>> = emptyList()
+
+    /** P3.3: brings the privileged channel up (bind, and ask for its permission when it is not granted yet). */
+    private var executionChannelBringUp: (() -> Unit)? = null
+
+    /** P3.3: the question-asker the plugin blocks on, kept so `stop` can withdraw anything still up. */
+    private var confirmationPresenter: ConfirmationPresenter? = null
+
+    /**
+     * The debug-only scripted model wire (see [ScriptedModelWire]), or null before `create` has installed it.
+     *
+     * It is reachable only from the debug source set's broadcast receiver, and [armScriptedModelAnswer] refuses outside
+     * a debug build, so a release APK carries an inert interceptor and no way to arm it.
+     */
+    private var scriptedModelWire: ScriptedModelWire? = null
+
+    /**
+     * Debug-only: answers the model request from a script rather than the network.
+     *
+     * Spec §17.8's Stage C needs an L3/L4 call to travel the real policy, the real confirmation gate, the real
+     * privileged executor and the real audit; the configured model would not emit one on the K40 (four attempts, all
+     * `steps=0`). Scripting the transport removes only the model's willingness from the question - consent, the
+     * capability gate, the budget, the policy, the gate and the executor all still run. Returns `false` in a release
+     * build, where it can never arm anything.
+     */
+    fun armScriptedModelAnswer(action: String, argsJson: String, text: String): Boolean {
+        if (!BuildConfig.DEBUG) return false
+        return scriptedModelWire?.arm(action, argsJson, text) ?: false
+    }
+
+    /** Debug-only counterpart of [armScriptedModelAnswer]: hands the transport back to the real network. */
+    fun disarmScriptedModelAnswer() {
+        if (!BuildConfig.DEBUG) return
+        scriptedModelWire?.disarm()
+    }
 
     /**
      * The self-audio gate the wake detector consults (Task 14b), and the **only** gate this composition has.
@@ -377,6 +437,56 @@ class HostCompositionRoot internal constructor(
         // `HELLO` for the whole session, so every hint would be refused as an unknown session.
         maybeMarkSceneReady()
         if (environment == null) { host.pause(); error("CAPABILITY_MISSING") }
+        // P3.3: bring the privileged channel up **before** probing, so the probe line describes the state this session
+        // is starting in rather than the state it inherited. A channel that is down is reported here *and* is absent
+        // from the advertised tool set (the router filters on the same question).
+        runCatching { executionChannelBringUp?.invoke() }
+        channelProbes.forEach { (id, up) ->
+            P3Log.line("P3_EXEC channel=$id available=${runCatching { up() }.getOrDefault(false)}")
+        }
+    }
+
+    /**
+     * P3.3 (spec §17.4): the session page's answer to the question that is up.
+     *
+     * `false` when nothing is pending - a tap that arrives after the question was withdrawn answers nothing, rather than
+     * being delivered under a request id no gate is waiting on.
+     */
+    @Synchronized fun answerConfirmation(approved: Boolean): Boolean {        val pending = state.value.pendingConfirmation ?: return false
+        val presenter = confirmationPresenter ?: run {
+            P3Log.line("P3_CONFIRM_HOST answer=none request=${pending.requestId} reason=NO_PRESENTER")
+            return false
+        }
+        val answered = presenter.answer(pending.requestId, approved)
+        if (answered) mutableState.update { it.copy(pendingConfirmation = null) }
+        // The host half of §17.4's hard criterion, and the only line that says whether a tap actually settled the
+        // question the plugin is blocked on: `settled=false` means the card was answered but nothing was waiting for
+        // that id, which is indistinguishable from a dropped tap without this line. It carries the request id (a tool
+        // call id) and never the summary or the action's arguments.
+        P3Log.line(
+            "P3_CONFIRM_HOST answer=${if (approved) "allow" else "deny"} request=${pending.requestId} " +
+                "settled=$answered",
+        )
+        return answered
+    }
+
+    /** P3.3: puts the question the host was asked to present on the session page. */
+    internal fun showConfirmation(requestId: String, summary: String) {
+        mutableState.update { it.copy(pendingConfirmation = PendingConfirmation(requestId, summary)) }
+    }
+
+    /** P3.3: takes a question off the session page - on an answer, a timeout, 急停 or session teardown. */
+    internal fun hideConfirmation(requestId: String) {
+        if (mutableState.value.pendingConfirmation?.requestId == requestId) {
+            mutableState.update { it.copy(pendingConfirmation = null) }
+        }
+    }
+
+    /** P3.3: 急停 - withdraws every open question and cancels what is in flight. */
+    @Synchronized fun emergencyStop() {
+        confirmationPresenter?.withdrawAll()
+        mutableState.update { it.copy(pendingConfirmation = null) }
+        stop()
     }
     @Synchronized fun onSceneReady() {
         if (closed) return
@@ -728,7 +838,10 @@ class HostCompositionRoot internal constructor(
         activatedPlugin = null
         awaitingDisplayForActivation = false
         retriedMappingSyncId = null
-        mutableState.update { it.copy(errorCode = null) }
+        // P3.3: a question does not outlive the session it was asked for. Withdrawing it here means the next session's
+        // tap cannot answer this session's action.
+        confirmationPresenter?.withdrawAll()
+        mutableState.update { it.copy(errorCode = null, pendingConfirmation = null) }
     }
     @Synchronized fun selectPlugin(pluginId: String) {
         if (closed || state.value.selectedPluginId == pluginId) return
@@ -807,7 +920,12 @@ class HostCompositionRoot internal constructor(
             // The model request had no production line before the P3.1 wrap-up: the client was built with no
             // interceptor, so a successful request was silent and that hop rested on its effects. This is the one line
             // that closes the gap, and it carries nothing but method, status and duration (`ModelHttpLog`).
-            val http = OkHttpClient.Builder().addInterceptor(ModelHttpLog(clock::nowNanos)).build()
+            val scriptedWire = ScriptedModelWire()
+            val http = OkHttpClient.Builder()
+                // Debug-only scripted wire, first so a canned answer still passes through `ModelHttpLog` below and the
+                // `P3_HTTP` line keeps telling the truth about what the client saw. Inert until armed.
+                .addInterceptor(scriptedWire)
+                .addInterceptor(ModelHttpLog(clock::nowNanos)).build()
             val model = ControlledModelClient(http, profiles, resolver, CapabilityGate(), ContextBudgeter(), clock, scheduler,
                 consentSource(sessionUploadConsent, probeGate::requestConsent))
             val controlledTester = ControlledProfileTester(model, profiles, clock)
@@ -823,8 +941,11 @@ class HostCompositionRoot internal constructor(
             val hintLink = CxrHintLink(clock, scheduler,
                 sendJson = { json -> connection[0]?.sendCommand(json) ?: false },
                 diagnostics = { message -> android.util.Log.i("EdithHint", message) })
-            // Plugin background work gets its own single thread: the deadline executor must not be delayed by it.
-            val pluginTasks = Executors.newSingleThreadExecutor { Thread(it, "edith-plugin-tasks").apply { isDaemon = true } }
+            // Plugin background work gets its own pool: the deadline executor must not be delayed by it, **and** a turn
+            // blocked on a confirmation question (P3.3) must not stall perception or ACK handling behind it.
+            val pluginTasks = Executors.newFixedThreadPool(2) { runnable ->
+                Thread(runnable, "edith-plugin-tasks").apply { isDaemon = true }
+            }
             val allowedNamespaces = setOf("smart-assistant", "interview-assistant") +
                 (if (BuildConfig.DEBUG) setOf("p2-diagnostic") else emptySet())
             val namespaceFactory: (String) -> StorageHandle = { pluginId ->
@@ -840,7 +961,14 @@ class HostCompositionRoot internal constructor(
             val actions = IntentActionExecutor(
                 resolver = AppLaunchResolver(PackageManagerAppCatalog(context)),
                 launcher = ContextIntentLauncher(context),
-                noteStorage = namespaceFactory("smart-assistant"))
+                noteStorage = namespaceFactory("smart-assistant"),
+                // P3.3 Task 9: the L2 dial action reads the user's own grant. Without it `dial` refuses; the app never
+                // falls back to a dialer screen, and it never asks for the permission itself.
+                callPermission = CallPermission {
+                    context.checkSelfPermission(android.Manifest.permission.CALL_PHONE) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                },
+            )
             // The environment advertises exactly the capabilities it can answer: the composition's own gated model
             // client, the per-plugin namespace, the display once a clock mapping makes it real, and - since Task 11 -
             // the ASR provider over the CXR audio chain when a validated engine bundle is present. `Audio` stays
@@ -927,6 +1055,92 @@ class HostCompositionRoot internal constructor(
             val smartWiring = SmartWiring(smartSettings, profiles, clock, scheduler) { sessionId, generation, turnId ->
                 hostHolder[0]?.cancelOutputTurn(sessionId, generation, turnId)
             }
+            // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
+            // One router is the single `Capability.Actions` provider, so the advertised tool set is exactly the set of
+            // channels that are up. Each channel is asked at read time, never cached.
+            val shizukuShell = ShizukuUserServiceShell(context, BuildConfig.VERSION_CODE, BuildConfig.DEBUG,
+                // The bind is asynchronous, so the session's first probe can honestly read "not yet". This line is the
+                // moment the channel actually becomes usable - and it is what a device stage reads instead of guessing.
+                onReady = { P3Log.line("P3_EXEC channel=shizuku available=true") })
+            val rootProbe = RootProbe.onDevice()
+            val accessibilityUi = object : AccessibilityUi {
+                private fun live() = EdithAccessibilityService.ui()
+                override fun clickText(text: String) = live()?.clickText(text) ?: false
+                override fun setText(text: String) = live()?.setText(text) ?: false
+                override fun screenFingerprint() = live()?.screenFingerprint() ?: ""
+            }
+            val executionRouter = ExecutionRouter(
+                listOf(
+                    IntentExecutionBackend(actions),
+                    ShizukuExecutionBackend(shizukuShell, ShizukuTargetState(shizukuShell)) { shizukuShell.ready() },
+                    AccessibilityExecutionBackend(
+                        ui = accessibilityUi,
+                        connected = { EdithAccessibilityService.connected() },
+                    ),
+                ),
+            )
+            val confirmationUi = object : ConfirmationUi {
+                // Through the holder: this object is built inside `create`, where no composition instance exists yet,
+                // and the question is shown only after a session starts - by which time the holder is filled.
+                override fun show(requestId: String, summary: String) {
+                    rootHolder[0]?.showConfirmation(requestId, summary)
+                }
+
+                override fun hide(requestId: String) {
+                    rootHolder[0]?.hideConfirmation(requestId)
+                }
+            }
+            val confirmationPresenter = ConfirmationPresenter(
+                summary = SummaryDisplayer { text, ttlMillis ->
+                    val device = hintLink.liveOutput() ?: return@SummaryDisplayer false
+                    val identity = hostHolder[0]?.currentIdentity() ?: return@SummaryDisplayer false
+                    val now = clock.nowNanos()
+                    runCatching {
+                        device.show(
+                            Assistance(
+                                hintId = "confirm-${UUID.randomUUID()}",
+                                sessionId = identity.first,
+                                generation = identity.second,
+                                sourceTurnId = null,
+                                priority = 3,
+                                text = text,
+                                // The host refuses an assistance that carries speech, and P3.3 ships no speech path.
+                                optionalSpeech = null,
+                                expiresAtNanos = now + ttlMillis * 1_000_000L,
+                            ),
+                            revision = now,
+                            listener = { },
+                        )
+                        true
+                    }.getOrDefault(false)
+                },
+                ui = confirmationUi,
+                // The host owns the identity: the result is rebuilt and emitted through the same path every other
+                // host-originated event uses, so a stale session's answer is dropped by `onEvent` instead of delivered.
+                deliver = { result ->
+                    // The other half of §17.4's hard criterion. An answer the presenter settles but the plugin never
+                    // receives is indistinguishable from a dropped tap from the outside, so both halves are logged:
+                    // `identityPresent=false` means the envelope carried no session identity, which `HostRuntime.onEvent`
+                    // rejects as a foreign event - a "yes" that silently becomes a timeout-as-denial.
+                    val identity = hostHolder[0]?.currentIdentity()
+                    val accepted = hostHolder[0]?.onEvent(result) ?: false
+                    P3Log.line("P3_CONFIRM_HOST delivered=$accepted identityPresent=${identity != null}")
+                    accepted
+                },
+                clock = clock,
+                scheduler = scheduler,
+                envelopeFor = { requestId ->
+                    val identity = hostHolder[0]?.currentIdentity()
+                    val now = clock.nowNanos()
+                    EventEnvelope(
+                        identity?.first ?: SessionId(""),
+                        identity?.second ?: Generation(0),
+                        requestId,
+                        now,
+                        now,
+                    )
+                },
+            )
             val environment = CxrHostEnvironment(clock = clock, input = audio?.input ?: UnwiredInputPort,
                 liveOutput = hintLink::liveOutput, scheduler = scheduler,
                 providers = buildMap {
@@ -934,7 +1148,11 @@ class HostCompositionRoot internal constructor(
                     audio?.let { put(Capability.Asr, it.asrSession) }
                     // Task 12: always answerable - the five L0/L1 actions need no engine, no transport and no
                     // permission at assembly time, so the advertised set and the answerable set stay equal.
-                    put(Capability.Actions, actions)
+                    // P3.3 Task 13: it is now the *router*, which advertises only the channels that are up.
+                    put(Capability.Actions, executionRouter)
+                    // P3.3: the confirmation channel is answerable whenever the composition has a screen to show the
+                    // question on; a host that cannot ask must refuse the action, and this provider is what lets it ask.
+                    put(Capability.Confirmation, confirmationPresenter)
                     // Task 14a item 2: the configured word list is answerable without a model, a transport or a
                     // permission, so `Capability.WakeWord` joins the advertised set and the smart plugin (which
                     // declares it) can finally pass the host's capability gate. The provider is the wiring's own
@@ -990,6 +1208,19 @@ class HostCompositionRoot internal constructor(
             root.foregroundAppSource = foregroundApp
             root.notificationCategorySource = notificationCategory
             root.calendarSource = calendar
+            // P3.3 (spec §17.2/§17.4): the execution channels, their probe lines, their bring-up, and the question-asker.
+            root.channelProbes = listOf(
+                "intent" to { true },
+                "accessibility" to { EdithAccessibilityService.connected() },
+                "shizuku" to { shizukuShell.ready() },
+                "root" to { rootProbe.available() },
+            )
+            root.executionChannelBringUp = {
+                shizukuShell.bind()
+                shizukuShell.requestPermissionIfNeeded()
+            }
+            root.confirmationPresenter = confirmationPresenter
+            root.scriptedModelWire = scriptedWire
             rootHolder[0] = root
             scene.composition = root
             // Task 14a item 1: the real plugin, not `SmartAssistantPlugin()` with defaults. Its configuration is

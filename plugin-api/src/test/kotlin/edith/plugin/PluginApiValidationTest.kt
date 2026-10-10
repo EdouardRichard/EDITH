@@ -23,10 +23,13 @@ class PluginApiValidationTest {
     }
 
     @Test fun `capability enum keeps the declared order`() {
+        // The guard is that a new capability may only be **appended**: reordering or inserting would renumber every
+        // existing entry for a plugin that compared ordinals. P3.3 (spec §17.6) appended `Confirmation`, so it is here
+        // last, and the ten entries before it are unchanged.
         assertEquals(
             listOf(
                 "Audio", "Asr", "Speaker", "Model", "Storage", "TextOutput", "SpeechOutput",
-                "Actions", "Context", "WakeWord",
+                "Actions", "Context", "WakeWord", "Confirmation",
             ),
             Capability.entries.map { it.name },
         )

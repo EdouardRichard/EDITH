@@ -6,6 +6,7 @@ import edith.agent.AgentRequest
 import edith.agent.AgentRun
 import edith.agent.AuditEntry
 import edith.agent.BoundedAuditLog
+import edith.agent.ConfirmationGate
 import edith.agent.GatewayTurn
 import edith.agent.ModelClientGateway
 import edith.agent.ProgressGuard
@@ -17,6 +18,7 @@ import edith.contracts.AcousticLabel
 import edith.contracts.Assistance
 import edith.contracts.ContractError
 import edith.contracts.ContextChanged
+import edith.contracts.ConfirmationResult
 import edith.contracts.EventEnvelope
 import edith.contracts.Generation
 import edith.contracts.HostEvent
@@ -47,8 +49,10 @@ import edith.plugin.PluginDescriptor
 import edith.plugin.PluginLifecycle
 import edith.plugin.RiskLevel
 import edith.plugin.actions
+import edith.plugin.confirmation
 import edith.plugin.context
 import edith.plugin.model
+import edith.plugin.storage
 import edith.plugin.textOutput
 import edith.plugin.wakeWord
 import java.util.UUID
@@ -171,6 +175,13 @@ class SmartAssistantPlugin(
             // P3.2 Task 8: the proactive path is driven by the host's perception signals, and the host only delivers
             // `AcousticEvent`/`ContextChanged` to a plugin that declares `Context` (HostRuntime's capability gate).
             Capability.Context,
+            // P3.3 (spec §17.5): the audit trail persists into this plugin's own encrypted namespace. Declared so the
+            // host hands the namespace over at activation; a host that cannot provide one still activates the plugin
+            // and leaves the trail in memory, which `activate` treats as a degradation rather than a failure.
+            Capability.Storage,
+            // P3.3 (spec §17.4): without this the host never hands over a channel to ask the user, and every action the
+            // policy flags is refused as unavailable - which is the correct behaviour for a host that cannot ask.
+            Capability.Confirmation,
         ),
         ConfigSchema(CONFIG_SCHEMA_VERSION),
     )
@@ -217,7 +228,24 @@ class SmartAssistantPlugin(
 
     private val gate = Any()
     private val scene = ScenePolicy(cooldownNanos)
-    private val audit = BoundedAuditLog(AUDIT_CAPACITY, clock)
+    /**
+     * P3.3 (spec §17.5): P3.1's in-memory ring, now persisted into the plugin's own encrypted namespace.
+     *
+     * The storage handle is attached in [activate]; until then (and on a host that grants none) the trail is
+     * memory-only, which is why the ring's behaviour is unchanged and its tests still hold.
+     */
+    private val audit = AuditTrail(null, BoundedAuditLog(AUDIT_CAPACITY, clock))
+
+    /**
+     * P3.3 (spec §17.4): the question-asker the loop blocks on.
+     *
+     * Built once per plugin, not per turn: the gate's invariant is "one live question at a time", and the host channel
+     * only exists after activation, so the channel is attached in [activate] and withdrawn in [deactivate].
+     */
+    private val confirmation = SmartConfirmation(
+        channel = null,
+        gate = ConfirmationGate(clock, scheduler, SmartConfirmation.DEFAULT_TIMEOUT_MILLIS * 1_000_000L),
+    )
     private var config: Config? = null
     private var context: PluginContext? = null
     private var turn: SmartTurn? = null
@@ -371,6 +399,12 @@ class SmartAssistantPlugin(
         // Best effort: a host that refuses the declaration leaves `current()` unchanged, and that is not a reason to
         // fail activation.
         runCatching { context.services.wakeWord().declare(configuredWakeWords()) }
+        // P3.3: same rule for the audit trail's namespace. A missing grant degrades the trail to memory-only; it must
+        // not take the passive loop down, and `AuditTrail` logs a write failure rather than pretending it recorded.
+        audit.attach(runCatching { context.services.storage() }.getOrNull())
+        // P3.3: the same rule for the confirmation channel. A host that cannot ask the user leaves this null, and the
+        // loop then refuses every flagged action (`CONFIRMATION_UNAVAILABLE`) instead of acting unasked.
+        confirmation.attach(runCatching { context.services.confirmation() }.getOrNull())
     }
 
     override fun deactivate(reason: DeactivationReason) {
@@ -384,6 +418,10 @@ class SmartAssistantPlugin(
             resetPerception()
             detach()
         }
+        // P3.3: a session that ends withdraws any question it asked. Leaving one pending would let the *next* session's
+        // tap answer this session's action - the same class of leak the display and transcript resets exist to prevent.
+        confirmation.cancelAll()
+        confirmation.attach(null)
         teardown(stranded)
     }
 
@@ -430,17 +468,27 @@ class SmartAssistantPlugin(
             is TranscriptEvent -> {
                 val (started, proactive) = synchronized(gate) {
                     if (!matches(event.envelope)) null to null
+                    // P3.3: a final that answers a live question is consumed here and nowhere else - it must not open
+                    // a wake turn or be reconsidered by the proactive path.
+                    else if (confirmation.onTranscript(event.revision)) null to null
                     else {
                         val consumed = acceptTranscript(event.revision)
+                        // The segment that opened the turn is the one segment that may never also answer a question
+                        // the turn goes on to ask.
+                        if (consumed != null) confirmation.excludeSegment(event.revision.turnId)
                         // The proactive path is only consulted when no wake turn took the utterance: a wake turn's own
                         // transcript is not a proactive candidate, and evaluating it anyway only wrote a
                         // `P3_PROACTIVE skip` line into the acceptance vocabulary.
                         consumed to (if (consumed == null) proactiveTrigger(event.revision) else null)
                     }
                 }
-                if (started != null) runTurn(started.first, started.second)
+                if (started != null) launchTurn(started.first, started.second)
                 else if (proactive != null) runProactive(proactive)
             }
+
+            // P3.3 (spec §17.4): the host's answer to a question this plugin asked. It settles the gate; the loop,
+            // which is blocked on that gate on the turn's own thread, then either executes or refuses.
+            is ConfirmationResult -> confirmation.onConfirmationResult(event)
             is OutputStateEvent -> synchronized(gate) {
                 if (matches(event.envelope)) {
                     acceptDisplayed(event)
@@ -640,6 +688,28 @@ class SmartAssistantPlugin(
     // ---------------------------------------------------------------- the run
 
     /**
+     * Hands one turn to the plugin's task scope instead of running it on the caller's thread.
+     *
+     * The caller is the host's **single** event dispatcher: `HostRuntime.deliverEvent` calls `handle` on the
+     * `edith-host` thread. [runTurn] blocks twice — the gateway waits on the transport, and the confirmation gate
+     * waits on the wearer — so running it inline occupied that dispatcher for the whole question. Both halves of
+     * spec §17.4 then break at once:
+     *
+     * 1. the answer is itself a `ConfirmationResult` **event**, and the host delivers events through the very
+     *    dispatcher the question is holding, so a phone tap could never be delivered while the question was open;
+     * 2. the App's UI thread blocked in `HostRuntime.command` behind that dispatcher — reported by the platform as
+     *    an ANR (`Input dispatching timed out … Waited 5001ms for MotionEvent(action=UP)`) on the K40.
+     *
+     * `runProactive` has handed its blocking half over for exactly this reason since P3.2, including in its comment;
+     * this is the same rule applied to the wake turn, which was missed. [runTurn] re-checks ownership under [gate]
+     * before writing anything back, so a turn detached while it was queued stays detached.
+     */
+    private fun launchTurn(owned: SmartTurn, text: String) {
+        val services = synchronized(gate) { context?.services } ?: return
+        services.tasks.launch { runTurn(owned, text) }
+    }
+
+    /**
      * Drives one turn through the agent loop and turns its terminal state into a hint.
      *
      * The loop runs **outside** [gate]: the gateway blocks on the transport, and holding the plugin lock across that
@@ -729,6 +799,8 @@ class SmartAssistantPlugin(
             guard = ProgressGuard(),
             audit = audit,
             clock = clock,
+            // P3.3: the loop asks before it acts on anything the policy flagged, and never acts without an answer.
+            confirmation = confirmation,
         )
     }
 
@@ -1172,7 +1244,7 @@ class SmartAssistantPlugin(
                 bypassWakeGates = true,
             )?.let { it to text }
         } ?: return
-        runTurn(started.first, started.second)
+        launchTurn(started.first, started.second)
     }
 
     /** Detaches the current turn: marks it closed and hands it to the caller for teardown. Must hold [gate]. */

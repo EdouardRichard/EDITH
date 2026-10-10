@@ -40,6 +40,7 @@ internal fun actionDescriptor(
     idempotent: Boolean = true,
     reversible: Boolean = true,
     scope: String = "test",
+    auditTargetArgument: String? = null,
 ) = ActionDescriptor(
     name = name,
     title = "Title of $name",
@@ -49,6 +50,7 @@ internal fun actionDescriptor(
     idempotent = idempotent,
     reversible = reversible,
     scope = scope,
+    auditTargetArgument = auditTargetArgument,
 )
 
 /** An executor offering exactly one tool, described by [actionDescriptor] defaults. */

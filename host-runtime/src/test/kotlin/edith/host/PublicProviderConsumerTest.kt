@@ -199,6 +199,13 @@ class PublicProviderConsumerTest {
                 override fun execute(name: String, argsJson: String) = ActionResult(ActionOutcome.Done, "done")
                 override fun cancel() = Unit
             },
+            // P3.3 (Task 13): the smart plugin declares `Confirmation` too (spec §17.6), and `activateSelected`
+            // refuses a plugin whose declared capabilities are not all advertised. This rig therefore has to answer
+            // it exactly as the App's composition does. Nothing in this test asks a question, so the channel never
+            // presents one; it exists so that "declared" and "answerable" stay the same statement.
+            Capability.Confirmation to object : ConfirmationChannel {
+                override fun present(requestId: String, summary: String, timeoutMillis: Long) = FakeCancellation()
+            },
         )
         val host = HostRuntime(1, object : ScheduledHostEnvironment {
             override val clock = this@Providers.clock
