@@ -281,6 +281,19 @@ class HostCompositionRoot internal constructor(
      */
     internal var rootStatusProbe: (() -> RootStatus)? = null
 
+    /**
+     * P3.3 (spec §17.4): the notification shade, or null when this composition has none (several test rigs build one).
+     *
+     * The question reaches it only while the session page is **not** visible - that is the entire point of the
+     * notification (user decision 2026-10-10), and a second copy of a question the user is already looking at is noise.
+     */
+    internal var notificationSurface: NotificationSurface? = null
+
+    /** Whether the session page is on screen; `MainActivity.onStart`/`onStop` keeps this current. */
+    private var uiIsVisible = true
+
+    private fun notifier(): ConfirmationNotifier? = notificationSurface?.let { ConfirmationNotifier(it) }
+
     /** One root probe for one read, so the row and its note cannot cost two timeouts. Null when no probe is wired. */
     private fun rootStatus(): RootStatus? = rootStatusProbe?.let { probe -> runCatching { probe() }.getOrNull() }
 
@@ -314,8 +327,14 @@ class HostCompositionRoot internal constructor(
     /** P3.3: brings the privileged channel up (bind, and ask for its permission when it is not granted yet). */
     private var executionChannelBringUp: (() -> Unit)? = null
 
-    /** P3.3: the question-asker the plugin blocks on, kept so `stop` can withdraw anything still up. */
-    private var confirmationPresenter: ConfirmationPresenter? = null
+    /**
+     * P3.3: the question-asker the plugin blocks on, kept so `stop` can withdraw anything still up.
+     *
+     * `internal` rather than private for the same reason [channelProbes] and [notificationSurface] are: the answer path
+     * is a seam a JVM test has to be able to build, and the alternative is proving "a stale tap settles nothing" only
+     * on a device.
+     */
+    internal var confirmationPresenter: ConfirmationPresenter? = null
 
     /**
      * The debug-only scripted model wire (see [ScriptedModelWire]), or null before `create` has installed it.
@@ -509,6 +528,25 @@ class HostCompositionRoot internal constructor(
      * `false` when nothing is pending - a tap that arrives after the question was withdrawn answers nothing, rather than
      * being delivered under a request id no gate is waiting on.
      */
+    /**
+     * P3.3 (§17.4): the **notification's** answer, which names the question it answers.
+     *
+     * The card can answer "whatever is up", because it is drawn from that same state. A notification cannot: it outlives
+     * the moment it was posted for (it sits in the shade, and a tap can come late), so a tap naming a different question
+     * settles nothing. The alternative - answering whatever happens to be pending now - would answer a question the user
+     * never saw.
+     */
+    @Synchronized fun answerConfirmation(requestId: String, approved: Boolean): Boolean {
+        if (state.value.pendingConfirmation?.requestId != requestId) {
+            P3Log.line(
+                "P3_CONFIRM_HOST answer=${if (approved) "allow" else "deny"} request=$requestId " +
+                    "settled=false reason=STALE",
+            )
+            return false
+        }
+        return answerConfirmation(approved)
+    }
+
     @Synchronized fun answerConfirmation(approved: Boolean): Boolean {
         val pending = state.value.pendingConfirmation ?: return false
         val presenter = confirmationPresenter ?: run {
@@ -528,21 +566,39 @@ class HostCompositionRoot internal constructor(
         return answered
     }
 
-    /** P3.3: puts the question the host was asked to present on the session page. */
+    /** P3.3: puts the question the host was asked to present on the session page - and, if nobody can see that page,
+     * in the notification shade as well. */
     internal fun showConfirmation(requestId: String, summary: String) {
         mutableState.update { it.copy(pendingConfirmation = PendingConfirmation(requestId, summary)) }
+        if (!uiIsVisible) notifier()?.post(requestId, summary)
     }
 
-    /** P3.3: takes a question off the session page - on an answer, a timeout, 急停 or session teardown. */
+    /** P3.3: takes a question off the session page - on an answer, a timeout, 急停 or session teardown - and out of
+     * the shade with it. */
     internal fun hideConfirmation(requestId: String) {
         if (mutableState.value.pendingConfirmation?.requestId == requestId) {
             mutableState.update { it.copy(pendingConfirmation = null) }
         }
+        notifier()?.cancel(requestId)
+    }
+
+    /**
+     * P3.3 (§17.4): whether the session page is on screen.
+     *
+     * `MainActivity` reports **visibility** (`onStart`/`onStop`), not focus (`onResume`/`onPause`): a Shizuku grant
+     * dialog or the MIUI install prompt pauses the Activity without hiding it, and posting "answer this on your phone"
+     * while the user is looking at the question on the phone is exactly the noise this trigger exists to avoid.
+     */
+    @Synchronized fun uiVisible(visible: Boolean) {
+        uiIsVisible = visible
+        val pending = state.value.pendingConfirmation ?: return
+        if (visible) notifier()?.cancel(pending.requestId) else notifier()?.post(pending.requestId, pending.summary)
     }
 
     /** P3.3: 急停 - withdraws every open question and cancels what is in flight. */
     @Synchronized fun emergencyStop() {
         confirmationPresenter?.withdrawAll()
+        notifier()?.cancelAll()
         mutableState.update { it.copy(pendingConfirmation = null) }
         stop()
     }
@@ -897,8 +953,10 @@ class HostCompositionRoot internal constructor(
         awaitingDisplayForActivation = false
         retriedMappingSyncId = null
         // P3.3: a question does not outlive the session it was asked for. Withdrawing it here means the next session's
-        // tap cannot answer this session's action.
+        // tap cannot answer this session's action - and the shade is cleared with it, so a dead question cannot keep
+        // offering buttons.
         confirmationPresenter?.withdrawAll()
+        notifier()?.cancelAll()
         mutableState.update { it.copy(errorCode = null, pendingConfirmation = null) }
     }
     @Synchronized fun selectPlugin(pluginId: String) {
@@ -1291,6 +1349,8 @@ class HostCompositionRoot internal constructor(
                 shizukuShell.requestPermissionIfNeeded()
             }
             root.confirmationPresenter = confirmationPresenter
+            // P3.3 (§17.4): the notification shade, so a question can be answered while this App is not in front.
+            root.notificationSurface = AndroidNotificationSurface(context)
             root.scriptedModelWire = scriptedWire
             rootHolder[0] = root
             scene.composition = root

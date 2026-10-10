@@ -65,6 +65,22 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    /**
+     * P3.3 (§17.4): **visibility**, reported to the composition so a confirmation question can reach the notification
+     * shade exactly when this page cannot be seen. `onStart`/`onStop` rather than `onResume`/`onPause`: a Shizuku grant
+     * dialog or the MIUI install prompt pauses the Activity without hiding it, and a notification asking about a
+     * question that is on screen is noise.
+     */
+    override fun onStart() {
+        super.onStart()
+        root.uiVisible(true)
+    }
+
+    override fun onStop() {
+        super.onStop()
+        root.uiVisible(false)
+    }
+
     private fun requestStart(pluginId: String) {
         val requested = buildList {
             if (Build.VERSION.SDK_INT >= 31) { add(Manifest.permission.BLUETOOTH_CONNECT); add(Manifest.permission.BLUETOOTH_SCAN) }

@@ -50,6 +50,10 @@
             </intent-filter>
         </activity>
         <service android:name=".SessionService" android:exported="false" android:foregroundServiceType="connectedDevice" />
+        <!-- P3.3 (§17.4): the notification's three buttons (允许/拒绝/急停). `exported="false"` is load-bearing, not a
+             formality: an exported receiver would let any App on the phone answer a confirmation on the user's behalf.
+             The PendingIntents that reach it are explicit and immutable. -->
+        <receiver android:name=".ConfirmationActionReceiver" android:exported="false" />
         <!-- P3.3 Task 10: the accessibility channel. The user enables it in system settings; the service cannot and must
              not enable itself, and the host stops advertising the channel the moment the system unbinds it. -->
         <service android:name=".a11y.EdithAccessibilityService" android:exported="false"
