@@ -976,10 +976,10 @@ class HostCompositionRoot internal constructor(
                 sendJson = { json -> connection[0]?.sendCommand(json) ?: false },
                 diagnostics = { message -> android.util.Log.i("EdithHint", message) })
             // Plugin background work gets its own pool: the deadline executor must not be delayed by it, **and** a turn
-            // blocked on a confirmation question (P3.3) must not stall perception or ACK handling behind it.
-            val pluginTasks = Executors.newFixedThreadPool(2) { runnable ->
-                Thread(runnable, "edith-plugin-tasks").apply { isDaemon = true }
-            }
+            // blocked on a confirmation question (P3.3) must not stall perception or ACK handling behind it. The factory
+            // names each thread apart, because P3.3's ANR was read off a thread dump and one repeated name there hides
+            // which thread is blocked (P3.3 review, Minor 4).
+            val pluginTasks = Executors.newFixedThreadPool(2, pluginTaskThreadFactory())
             val allowedNamespaces = setOf("smart-assistant", "interview-assistant") +
                 (if (BuildConfig.DEBUG) setOf("p2-diagnostic") else emptySet())
             val namespaceFactory: (String) -> StorageHandle = { pluginId ->
