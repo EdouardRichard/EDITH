@@ -183,9 +183,21 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
         }
         return owned
     }
-    fun onAuthorizationResult(resultCode: Int, data: Intent?) {
-        fence.dispatch { authCallback?.invoke(manager.parseAuthorizationResult(resultCode, data)) }
-    }
+    /**
+     * Delivers an activity result to the pending authorization request and reports whether it **was** that answer.
+     *
+     * The AI-App prompt is started with `requestAuthorization(activity, ...)`, so its answer arrives at the activity -
+     * but so does every other result that activity starts for, including the App's own permission dialogs. The only
+     * proof that a result belongs to the prompt is the callback `connect` armed for it (armed as the connection starts
+     * asking, cleared the moment it is answered); guessing from a request code would be inventing a fact about the
+     * vendor's SDK. The flag is therefore what the App is allowed to report, and the SDK's own parser still decides
+     * what the answer means.
+     */
+    fun onAuthorizationResult(resultCode: Int, data: Intent?): Boolean = fence.dispatch {
+        val pending = authCallback ?: return@dispatch false
+        pending(manager.parseAuthorizationResult(resultCode, data))
+        true
+    } ?: false
     override fun cancelAuthorization() {
         fence.close()
         request.incrementAndGet()

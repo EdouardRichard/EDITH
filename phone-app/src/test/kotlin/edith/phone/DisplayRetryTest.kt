@@ -64,7 +64,7 @@ class DisplayRetryTest {
         val sent = mutableListOf<String>()
         private var inbound: ((String) -> Unit)? = null
         override fun connect(activity: Any) = Unit
-        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?) = Unit
+        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean = false
         override fun sendCommand(json: String): Boolean {
             if (!ready) return false
             sent += json

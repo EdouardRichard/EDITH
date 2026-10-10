@@ -265,9 +265,12 @@ class RokidSessionTransport(
                 { PcmFormatEvidence.resolve(config.firmware, "1.1.2") }, onRawPcm, onOffer)
         }
     }
-    fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?) {
-        (backend as? CxrBackend)?.onAuthorizationResult(resultCode, data)
-    }
+    /**
+     * Routes an activity result to the backend and reports whether it was the pending AI-App authorization answer
+     * (review I-3): the caller may only turn a claimed result into a fact about authorization.
+     */
+    fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean =
+        (backend as? CxrBackend)?.onAuthorizationResult(resultCode, data) ?: false
 
     /**
      * Routes raw payloads on [channelKey] to [listener] instead of the JSON reply correlation.

@@ -228,7 +228,7 @@ class PassiveLoopWiringTest {
     private class FakeTransportConnection(private val port: InputPort?) : CxrConnection {
         override var ready = true
         override fun connect(activity: Any) = Unit
-        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?) = Unit
+        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean = false
         override fun sendCommand(json: String) = true
         override fun onInboundCommand(listener: (String) -> Unit) = Unit
         override fun close() = Unit

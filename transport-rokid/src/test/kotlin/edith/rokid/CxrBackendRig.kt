@@ -81,6 +81,12 @@ internal class CxrBackendRig {
                 val callback = args!![2] as (AuthResult) -> Unit
                 auth = callback; duringAuthorization(); null
             }
+            // The SDK's own parser is what turns an activity result into an answer. Modelled only since review I-3 gave
+            // the result path something to assert: before that nothing ever called it, because no test drove a result
+            // through the activity.
+            "parseAuthorizationResult" -> AuthResult(
+                (args!![0] as Int) == Activity.RESULT_OK, "memory-only-test-token", null, null,
+            )
             else -> null
         }
     }

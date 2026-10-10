@@ -94,8 +94,16 @@ interface CxrConnection : AutoCloseable {
      */
     val ready: Boolean
 
-    /** Delivers the AI-App authorization result the SDK asked the activity for. */
-    fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?)
+    /**
+     * Delivers the AI-App authorization result the SDK asked the activity for.
+     *
+     * Returns true only when this result **was** the answer to a prompt this connection is waiting on (review I-3):
+     * that is, the authorization callback armed by `connect` is still pending. `onActivityResult` fires for every
+     * result this activity starts for - including the App's own `permissions.launch(...)` dialogs - so a caller that
+     * reported all of them as "the SDK's authorization answer" invented a fact. The transport knows whether it asked;
+     * the App may only repeat what it says.
+     */
+    fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean
 
     /**
      * Sends a hint command that expects no correlated reply; answers are matched by their own payload instead.

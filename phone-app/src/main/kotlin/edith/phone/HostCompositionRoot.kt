@@ -82,7 +82,13 @@ class HostCompositionRoot internal constructor(
     val rokidConnectionFactory: ((Any) -> CxrConnection)? = null,
     /** Initial RAM-only tee of the live CXR PCM; see [installRawPcmObserver]. */
     internal val initialRawPcmObserver: (ByteArray) -> Unit = {},
-    private val authorizeResult: (Int, Intent?) -> Unit = { _, _ -> },
+    /**
+     * The second route an activity result can take into the transport: the connection instance this composition keeps
+     * in its own holder (in production the same object `activeConnection` points at). It must report the **same claim**
+     * as [CxrConnection.onAuthorizationResult], so the page state below stays a fact the transport asserted rather than
+     * one this class inferred (review I-3).
+     */
+    private val authorizeResult: (Int, Intent?) -> Boolean = { _, _ -> false },
     /** T18 display path for a live CXR connection; null keeps the assembly without one (tests, unwired builds). */
     private val hintLink: CxrHintLink? = null,
     /**
@@ -831,15 +837,19 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
-     * Routes the AI-App authorization result back into the transport; a no-op without a connection.
+     * Routes the AI-App authorization result back into the transport, and records it as **page state** only when the
+     * transport says the result was the answer to a prompt it is waiting on.
      *
-     * The result is also recorded as **page state** (owner-reported defect 2026-10-10): the connect button used to
-     * announce "请在 AI App 中确认授权" on every tap, whether or not the SDK ever asked, so the one moment the subject is
-     * real - the SDK's own answer - is what the page now reports.
+     * Two owner-reported defects meet here. The connect button used to announce "请在 AI App 中确认授权" on every tap,
+     * so the page now reports the SDK's own answer instead (2026-10-10). And that answer used to be read off any
+     * activity result at all - `onActivityResult` also carries the App's own permission dialogs (review I-3) - so the
+     * page could announce "眼镜授权被取消" for a result the SDK never asked for. The claim comes from the transport,
+     * which is the only party that knows whether a prompt is pending.
      */
     fun onCxrAuthorizationResult(resultCode: Int, data: Intent?) {
-        activeConnection?.onAuthorizationResult(resultCode, data)
-        authorizeResult(resultCode, data)
+        val claimed = (activeConnection?.onAuthorizationResult(resultCode, data) ?: false) or
+            authorizeResult(resultCode, data)
+        if (!claimed) return
         mutableState.update {
             it.copy(
                 cxrAuthorization = when (resultCode) {
@@ -1374,7 +1384,7 @@ class HostCompositionRoot internal constructor(
                         // Task 14a item 5: the receiver's offer outcome is what turns an overflow into a report.
                         onOffer = { offer -> rootHolder[0]?.onPcmOffer(offer) }).also { connection[0] = it }
                 },
-                authorizeResult = { resultCode, data -> connection[0]?.onAuthorizationResult(resultCode, data) },
+                authorizeResult = { resultCode, data -> connection[0]?.onAuthorizationResult(resultCode, data) ?: false },
                 hintLink = hintLink,
                 smartWiring = smartWiring,
                 smartSettingsStore = smartSettingsStore,

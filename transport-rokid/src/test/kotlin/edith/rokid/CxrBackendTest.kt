@@ -97,6 +97,30 @@ class CxrBackendTest {
         assertNull(callbackFailure.get())
         assertEquals(0L, revoked.count)
     }
+    @Test fun anActivityResultIsClaimedOnlyWhileAPromptIsPending() {
+        // Review I-3: the App may only report an authorization answer for a result the SDK actually asked for. The
+        // proof is the callback `connect` armed (it arms it as the connection starts asking and clears it the moment it
+        // is answered) - not a guessed request code - so the claim is good exactly once per real prompt.
+        val rig = CxrBackendRig()
+        assertFalse("nothing asked, so an unrelated result is not an answer", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
+
+        rig.backend.connect(Activity(), Events())
+        rig.ui.removeFirst().invoke()
+        assertEquals(1, rig.authorizationRequests)
+
+        assertTrue("the prompt's own answer must be claimed", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
+        assertFalse("the same result cannot answer twice", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
+    }
+
+    @Test fun anActivityResultAfterRevocationIsNotClaimed() {
+        val rig = CxrBackendRig()
+        rig.backend.connect(Activity(), Events())
+        rig.ui.removeFirst().invoke()
+        rig.backend.cancelAuthorization()
+
+        assertFalse("a revoked attempt has no pending prompt", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
+    }
+
     private class Events : RokidBackend.Events {
         override fun ready() = Unit
         override fun interrupted() = Unit

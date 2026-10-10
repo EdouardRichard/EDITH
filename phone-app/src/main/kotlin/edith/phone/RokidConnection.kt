@@ -55,7 +55,8 @@ class RokidConnection(activity: Activity, config: RokidConnectionConfig, host: H
     fun connect(activity: Activity) = input.connect(activity)
     override fun connect(activity: Any) = connect(activity.asCxrActivity())
     override val ready: Boolean get() = input.state.ready
-    override fun onAuthorizationResult(resultCode: Int, data: Intent?) = input.onAuthorizationResult(resultCode, data)
+    override fun onAuthorizationResult(resultCode: Int, data: Intent?): Boolean =
+        input.onAuthorizationResult(resultCode, data)
     override fun sendCommand(json: String): Boolean = input.sendCommand(json)
     override fun onInboundCommand(listener: (String) -> Unit) { inbound = listener }
     override fun close() {

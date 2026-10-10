@@ -100,9 +100,10 @@ class CxrWiringTest {
         var inbound: ((String) -> Unit)? = null
         override var ready: Boolean = false
         override fun connect(activity: Any) { connectedWith += activity }
-        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?) {
+        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean {
             this.resultCode = resultCode
             sawIntent = data != null
+            return false
         }
         override fun sendCommand(json: String): Boolean {
             if (!ready) return false
