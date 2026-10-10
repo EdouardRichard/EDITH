@@ -1160,9 +1160,14 @@ class HostCompositionRoot internal constructor(
                     // receives is indistinguishable from a dropped tap from the outside, so both halves are logged:
                     // `identityPresent=false` means the envelope carried no session identity, which `HostRuntime.onEvent`
                     // rejects as a foreign event - a "yes" that silently becomes a timeout-as-denial.
-                    val identity = hostHolder[0]?.currentIdentity()
+                    //
+                    // The identity is read off the result itself, which the presenter captured when the question went
+                    // up. It used to be a `currentIdentity()` round trip **on this thread** (the session page's UI
+                    // thread) in the same stack frame as the P3.3 ANR; the value it produced is the same one that went
+                    // into the envelope, so the line keeps its meaning and the UI thread stops waiting on the host.
                     val accepted = hostHolder[0]?.onEvent(result) ?: false
-                    P3Log.line("P3_CONFIRM_HOST delivered=$accepted identityPresent=${identity != null}")
+                    P3Log.line("P3_CONFIRM_HOST delivered=$accepted " +
+                        "identityPresent=${result.envelope.sessionId.value.isNotBlank()}")
                     accepted
                 },
                 clock = clock,

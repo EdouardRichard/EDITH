@@ -177,4 +177,33 @@ class ConfirmationsTest {
         assertThrows(IllegalArgumentException::class.java) { rig.presenter.present("c1", "动作", 0L) }
         assertEquals(0, rig.presenter.pendingCount)
     }
+
+    @Test
+    fun theIdentityIsReadWhenTheQuestionGoesUpAndNeverAgainOnTheAnswerPath() {
+        // P3.3 review, Minor 5. `answer` runs on the session page's UI thread, and the identity round trip it used to
+        // make there (`HostRuntime.command` -> `FutureTask.get`) is the same stack frame the P3.3 ANR was caught in - it
+        // only ever survived because the host's dispatcher happened to be idle. The question already knows which
+        // session asked it, so the answer must not go back to the host to ask again.
+        var reads = 0
+        val delivered = mutableListOf<ConfirmationResult>()
+        val presenter = ConfirmationPresenter(
+            summary = FakeSummary(),
+            ui = FakeUi(),
+            deliver = { delivered += it },
+            clock = clock,
+            scheduler = scheduler,
+            envelopeFor = { requestId ->
+                reads++
+                EventEnvelope(SessionId("s"), Generation(7), requestId, 0, 1)
+            },
+        )
+
+        presenter.present("c1", "卸载探针 App", 10_000L)
+        assertEquals("the question must carry the identity of the session that asked it", 1, reads)
+
+        assertTrue(presenter.answer("c1", approved = true))
+        assertEquals("answering must not ask the host for an identity again", 1, reads)
+        assertEquals(Generation(7), delivered.single().envelope.generation)
+        assertEquals("c1", delivered.single().requestId)
+    }
 }

@@ -47,7 +47,7 @@ class ConfirmationPresenter(
     private val envelopeFor: (String) -> EventEnvelope,
 ) : ConfirmationChannel {
 
-    private class Pending(val requestId: String, val summary: String) {
+    private class Pending(val requestId: String, val summary: String, val envelope: EventEnvelope) {
         var timer: CancellationHandle? = null
         /** A second `present` with a live id gets this no-op handle: it never displaces the question already up. */
         val ignoredBy = object : CancellationHandle { override fun cancel() = Unit }
@@ -63,10 +63,19 @@ class ConfirmationPresenter(
         require(requestId.isNotBlank()) { "confirmation request id must not be blank" }
         require(timeoutMillis > 0) { "confirmation window must be positive, was $timeoutMillis" }
         val text = truncate(summary)
+        // A duplicate question keeps the one already up, and must not even ask for an identity it will not use.
+        synchronized(lock) { pending[requestId]?.let { return it.ignoredBy } }
+        // The identity is read **while the question goes up** - on the turn's own thread - and never on the answer path:
+        // `answer` runs on the session page's UI thread, and a host round trip there is the same stack frame the P3.3
+        // ANR was caught in (`HostCompositionRoot.answerConfirmation` -> `ConfirmationPresenter.answer` ->
+        // `HostRuntime.command`). A question therefore carries the session that asked it, and the answer names that
+        // session. Deliberately outside the lock: `envelopeFor` reaches back into the composition, and no lock of ours
+        // may be held across that.
+        val envelope = envelopeFor(requestId)
         synchronized(lock) {
             val live = pending[requestId]
-            if (live != null) return live.ignoredBy
-            pending[requestId] = Pending(requestId, text)
+            if (live != null) return live.ignoredBy   // lost the race for this id: the live question keeps it
+            pending[requestId] = Pending(requestId, text, envelope)
         }
 
         // Both screens, and neither failure is fatal: the phone is the fallback screen, and a question that cannot be
@@ -87,7 +96,7 @@ class ConfirmationPresenter(
         val live = synchronized(lock) { pending.remove(requestId) } ?: return false
         live.timer?.cancel()
         runCatching { ui.hide(requestId) }
-        deliver(ConfirmationResult(envelopeFor(requestId), requestId, approved))
+        deliver(ConfirmationResult(live.envelope, requestId, approved))
         return true
     }
 
