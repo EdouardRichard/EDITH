@@ -638,6 +638,9 @@ class HostCompositionRoot internal constructor(
         // Remembered rather than only acted on: readiness can arrive before a session is started, and the signal is
         // delivered exactly once by the transport.
         linkReady = true
+        // The page needs the same fact to word itself honestly (F4). It is a property of this process rather than a
+        // live heartbeat, so it is only ever set here and never re-read.
+        mutableState.update { it.copy(cxrLinkReady = true) }
         maybeMarkSceneReady()
     }
 
@@ -824,10 +827,25 @@ class HostCompositionRoot internal constructor(
         return true
     }
 
-    /** Routes the AI-App authorization result back into the transport; a no-op without a connection. */
+    /**
+     * Routes the AI-App authorization result back into the transport; a no-op without a connection.
+     *
+     * The result is also recorded as **page state** (owner-reported defect 2026-10-10): the connect button used to
+     * announce "请在 AI App 中确认授权" on every tap, whether or not the SDK ever asked, so the one moment the subject is
+     * real - the SDK's own answer - is what the page now reports.
+     */
     fun onCxrAuthorizationResult(resultCode: Int, data: Intent?) {
         activeConnection?.onAuthorizationResult(resultCode, data)
         authorizeResult(resultCode, data)
+        mutableState.update {
+            it.copy(
+                cxrAuthorization = when (resultCode) {
+                    Activity.RESULT_OK -> CxrAuthorizationOutcome.CONFIRMED
+                    Activity.RESULT_CANCELED -> CxrAuthorizationOutcome.CANCELLED
+                    else -> CxrAuthorizationOutcome.UNEXPECTED
+                },
+            )
+        }
     }
 
     /** The live CXR transport, for callers that must drive an audio epoch (T17/T18 device bring-up). */

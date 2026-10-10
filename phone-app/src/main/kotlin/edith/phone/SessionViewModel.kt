@@ -25,6 +25,19 @@ data class SessionUiState(
     val pendingConfirmation: PendingConfirmation? = null,
     /** P3.3 (spec §17.2 rule 1): the execution channels, named individually so a down one cannot hide. */
     val executionChannels: List<ExecutionChannelStatus> = emptyList(),
+    /**
+     * The SDK's answer to the CXR authorization prompt, once it actually asked (owner-reported defect 2026-10-10: the
+     * connect button used to *claim* an authorization step on every tap). Null means "the SDK has not asked in this run",
+     * which is not the same as "not authorized" and must not be rendered as one.
+     */
+    val cxrAuthorization: CxrAuthorizationOutcome? = null,
+    /**
+     * Whether the transport has reported a live glasses session in this process (`HostCompositionRoot.linkReady`).
+     *
+     * Not a live heartbeat: it is set once, never re-read, and the SDK's disconnect callback is not wired (spec
+     * 不做/未测). The page's wording relies on that boundary - it says 已连接眼镜, never 在线.
+     */
+    val cxrLinkReady: Boolean = false,
 )
 
 class SessionViewModel(private val root: HostCompositionRoot) : ViewModel() {

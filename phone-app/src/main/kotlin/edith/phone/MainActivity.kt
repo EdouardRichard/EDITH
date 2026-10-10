@@ -376,15 +376,21 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                         }
                         if (!notificationsGranted) Text("通知未获授权", color = MaterialTheme.colorScheme.error)
                         HorizontalDivider()
-                        val cxrReady = state.capabilityReasons[Capability.Audio] == null
-                        if (BuildConfig.DEBUG || !cxrReady) {
-                            var connectResult by remember { mutableStateOf<String?>(null) }
+                        // Facts only (owner-reported defect 2026-10-10). Readiness is the **transport's** own signal
+                        // (`linkReady` → state), never `Capability.Audio`: `CxrHostEnvironment` deliberately never
+                        // advertises it, so that branch was dead on a phone. The status line is always shown; only the
+                        // connect affordance is hidden once a release build has a live link.
+                        val linkReady = state.cxrLinkReady
+                        var requested by remember { mutableStateOf(false) }
+                        var transportMissing by remember { mutableStateOf(false) }
+                        if (BuildConfig.DEBUG || !linkReady) {
                             OutlinedButton(onClick = {
-                                connectResult = if (connectCxr()) "已请求连接眼镜，请在 AI App 中确认授权"
-                                else "眼镜连接未装配（TRANSPORT_MISSING）"
-                            }) { Text(if (cxrReady) "重连眼镜" else "连接眼镜（CXR）") }
-                            connectResult?.let { Text(it) }
+                                transportMissing = !connectCxr()
+                                requested = true
+                            }) { Text(if (linkReady) "重连眼镜" else "连接眼镜（CXR）") }
                         }
+                        Text(cxrStatusLabel(transportMissing, requested, linkReady))
+                        state.cxrAuthorization?.let { Text(cxrAuthorizationLabel(it)) }
                         // P3.3 (spec §17.2 rule 1): the execution channels, named one by one. Without this the panel read
                         // 指令执行 as available while every L2-L4 tool had silently gone from the model's table - the
                         // capability is up, its privileged half is not, and only a per-channel row can say which.
