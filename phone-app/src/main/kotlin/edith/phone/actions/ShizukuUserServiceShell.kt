@@ -87,7 +87,7 @@ class ShizukuUserServiceShell(
         val service = remote ?: return ShellResult(command, -1, "", "SHELL_NOT_BOUND")
         val reply = runCatching { service.run(command) }.getOrNull()
         return ShellReply.decode(reply)?.copy(command = command)
-            ?: ShellResult(command, -1, "", "SHELL_REPLY_INVALID")
+            ?: ShellResult(command, -1, "", SHELL_REPLY_INVALID)
     }
 
     private fun binderAlive(): Boolean = runCatching {
@@ -115,16 +115,29 @@ class ShizukuUserServiceShell(
  */
 class ShizukuTargetState(private val shell: PrivilegedShell) : TargetState {
 
-    override fun installed(pkg: String): Boolean = lists("pm list packages $pkg", pkg)
+    /**
+     * Whether the probe that just ran produced a reply this build could parse.
+     *
+     * Starts `false`: before anything has been read, nothing may be claimed. Every probe goes through [read], so the
+     * answer always describes the read the backend is about to judge.
+     */
+    @Volatile
+    private var lastReplyReadable = false
 
-    override fun disabled(pkg: String): Boolean = lists("pm list packages -d $pkg", pkg)
+    override fun readable(): Boolean = lastReplyReadable
+
+    override fun installed(pkg: String): Boolean =
+        read("pm list packages $pkg").stdout.lineSequence().any { it.trim() == "package:$pkg" }
+
+    override fun disabled(pkg: String): Boolean =
+        read("pm list packages -d $pkg").stdout.lineSequence().any { it.trim() == "package:$pkg" }
 
     override fun permissionGranted(pkg: String, permission: String): Boolean =
-        shell.run("dumpsys package $pkg").stdout.contains("$permission: granted=true")
+        read("dumpsys package $pkg").stdout.contains("$permission: granted=true")
 
     override fun setting(name: String): String? =
-        shell.run("settings get system $name").stdout.trim().takeIf { it.isNotEmpty() && it != "null" }
+        read("settings get system $name").stdout.trim().takeIf { it.isNotEmpty() && it != "null" }
 
-    private fun lists(command: String, pkg: String): Boolean =
-        shell.run(command).stdout.lineSequence().any { it.trim() == "package:$pkg" }
+    private fun read(command: String): ShellResult =
+        shell.run(command).also { lastReplyReadable = it.isAStateReply() }
 }

@@ -14,6 +14,12 @@ import kotlin.concurrent.thread
  *
  * The returned pair keeps the two streams apart: `ShellReply` reports them separately, and the app side's judging
  * (`ShizukuTargetState`) reads stdout while stderr is what a human reads when an exit code lies.
+ *
+ * **Residual (P3.3 review, Minor 6).** This removes the *guaranteed* deadlock; it does not invent a timeout. A child that
+ * goes quiet with both pipes open still parks the calling thread, because a blocking read on an arbitrary
+ * `InputStream` is not interruptible - only the trailing `join` is. The bound is therefore the caller's
+ * (`ShizukuUserServiceShell`'s binder call), and an interrupt that does arrive must surface rather than be swallowed
+ * into a partial success; `ShellStreamsTest` pins exactly that.
  */
 internal fun drainStreams(stdout: InputStream, stderr: InputStream): Pair<String, String> {
     var err = ""

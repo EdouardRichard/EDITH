@@ -1,11 +1,15 @@
 package edith.phone.actions
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
+import kotlin.concurrent.thread
 
 /**
  * P3.3 review, Minor 3: `EdithShellService.run` drained stdout to completion before touching stderr, so a command whose
@@ -46,5 +50,28 @@ class ShellStreamsTest {
 
         assertEquals("", out)
         assertEquals(payload.length, err.length)
+    }
+
+    @Test(timeout = 10_000)
+    fun anInterruptedCallerIsNotParkedOnTheJoinForever() {
+        // Minor 6's residual, pinned rather than papered over: a blocking read cannot be interrupted, so the bound on a
+        // silent child is the caller's (the binder call). What must never happen is the interrupt being swallowed and
+        // reported as a successful command.
+        val stdout = ByteArrayInputStream(ByteArray(0))
+        val stderrThatNeverAnswers = object : InputStream() {
+            override fun read(): Int { CountDownLatch(1).await(); return -1 }
+        }
+        val failure = AtomicReference<Throwable?>(null)
+        val worker = thread(isDaemon = true) {
+            try { drainStreams(stdout, stderrThatNeverAnswers) } catch (t: Throwable) { failure.set(t) }
+        }
+
+        Thread.sleep(200)
+        worker.interrupt()
+        worker.join(3_000)
+
+        assertFalse("the caller must not stay parked after an interrupt", worker.isAlive)
+        assertTrue("the interrupt must surface, not be swallowed into a partial success: ${failure.get()}",
+            failure.get() is InterruptedException)
     }
 }

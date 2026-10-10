@@ -2,6 +2,8 @@ package edith.phone.actions
 
 import edith.plugin.ActionOutcome
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
@@ -61,6 +63,49 @@ class ShizukuProbeFidelityTest {
         val result = backend.execute("disable_app", """{"package":"com.example.app"}""")
 
         assertEquals("an unreadable state must never be a completed action", ActionOutcome.Refused, result.outcome)
+        assertEquals("ACTION_CHANNEL_UNAVAILABLE", result.detail)
+    }
+
+    /** The channel is up, but every reply this build gets back is one it cannot parse (`SHELL_REPLY_INVALID`). */
+    private class GarbledShell : PrivilegedShell {
+        override fun run(command: String): ShellResult = ShellResult(command, -1, "", SHELL_REPLY_INVALID)
+    }
+
+    /** A shell that answers properly, so the readable path is pinned next to the unreadable one. */
+    private class PackageListShell(private val stdout: String) : PrivilegedShell {
+        override fun run(command: String): ShellResult = ShellResult(command, 0, stdout, "")
+    }
+
+    @Test fun `the target state says whether its last read could be parsed at all`() {
+        val state = ShizukuTargetState(GarbledShell())
+        assertFalse("nothing has been read yet, so nothing may be claimed", state.readable())
+
+        state.installed("com.example.app")
+
+        assertFalse("a garbled reply is a failed read, not an answer about the target", state.readable())
+
+        val readable = ShizukuTargetState(PackageListShell("package:com.example.app\n"))
+        readable.installed("com.example.app")
+        assertTrue("a parseable read is readable", readable.readable())
+    }
+
+    @Test fun `a channel that is up but whose state reply cannot be parsed is not reported as done`() {
+        // The residual the P3.3 review left open: the channel probe still answers "up" here, so the channel cannot be
+        // the discriminator - the state read has to say whether it read anything at all.
+        val backend = ShizukuExecutionBackend(GarbledShell(), ShizukuTargetState(GarbledShell())) { true }
+
+        val result = backend.execute("uninstall", """{"package":"com.example.app"}""")
+
+        assertEquals("a state that could not be read must never be a completed action", ActionOutcome.Refused, result.outcome)
+        assertEquals("ACTION_CHANNEL_UNAVAILABLE", result.detail)
+    }
+
+    @Test fun `the same rule covers the brightness write`() {
+        val backend = ShizukuExecutionBackend(GarbledShell(), ShizukuTargetState(GarbledShell())) { true }
+
+        val result = backend.execute("set_brightness", """{"value":150}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("ACTION_CHANNEL_UNAVAILABLE", result.detail)
     }
 }

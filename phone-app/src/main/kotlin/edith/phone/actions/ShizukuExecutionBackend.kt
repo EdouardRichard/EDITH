@@ -165,32 +165,38 @@ class ShizukuExecutionBackend(
     /**
      * Whether a state answer may be trusted **after** the command has run.
      *
-     * [TargetState] answers `false` both for "the target is not installed" and for "I could not read the package list",
-     * so judging by it once the channel went down turns a command that never ran into `Done` - into the model's tool
-     * output, the `P3_TOOL` line and the audit record. The channel probe is the discriminator available here: when it
-     * is down, nothing about the outcome may be claimed, and the stable code says exactly that.
+     * Two collapses have to be caught, and they are different failures:
+     * - [TargetState] answers `false` for "the target is not installed" **and** for "I could not read the package list",
+     *   so with the channel down a command that never ran becomes `Done`;
+     * - the channel can also be **up** while the reply itself is unparseable (`SHELL_REPLY_INVALID`), which collapses
+     *   the same way and which the channel probe cannot see.
+     *
+     * The second is why every action below reads the state *first* and asks [TargetState.readable] afterwards: the
+     * answer describes the read that just happened, so the order is load-bearing, not stylistic.
      */
-    private fun stateIsReadable(): Boolean = available()
+    private fun stateIsReadable(): Boolean = available() && state.readable()
 
     private fun clearData(pkg: String): ActionResult {
         val result = shell.run("pm clear $pkg")
-        if (!stateIsReadable()) return refused(ACTION_CHANNEL_UNAVAILABLE)
         // The OS's own marker is the only evidence `pm clear` offers; the package surviving is the second half (a
         // `pm clear` that uninstalled its target would be a very different outcome).
         val cleared = result.exitCode == 0 && result.stdout.contains("Success") && state.installed(pkg)
+        if (!stateIsReadable()) return refused(ACTION_CHANNEL_UNAVAILABLE)
         return if (cleared) done("cleared $pkg") else failed(STATE_UNCHANGED)
     }
 
     private fun uninstall(pkg: String): ActionResult {
         shell.run("pm uninstall --user 0 $pkg")
+        val installed = state.installed(pkg)
         if (!stateIsReadable()) return refused(ACTION_CHANNEL_UNAVAILABLE)
-        return if (!state.installed(pkg)) done("uninstalled $pkg") else failed(STATE_UNCHANGED)
+        return if (!installed) done("uninstalled $pkg") else failed(STATE_UNCHANGED)
     }
 
     private fun disable(pkg: String): ActionResult {
         shell.run("pm disable-user --user 0 $pkg")
+        val disabled = state.disabled(pkg)
         if (!stateIsReadable()) return refused(ACTION_CHANNEL_UNAVAILABLE)
-        return if (state.disabled(pkg)) done("disabled $pkg") else failed(STATE_UNCHANGED)
+        return if (disabled) done("disabled $pkg") else failed(STATE_UNCHANGED)
     }
 
     private fun setPermission(args: JsonObject): ActionResult {
@@ -201,8 +207,9 @@ class ShizukuExecutionBackend(
             ?.booleanOrNull ?: return refused(ARGUMENTS_INVALID)
         val verb = if (granted) "grant" else "revoke"
         shell.run("pm $verb $pkg $permission")
+        val nowGranted = state.permissionGranted(pkg, permission)
         if (!stateIsReadable()) return refused(ACTION_CHANNEL_UNAVAILABLE)
-        return if (state.permissionGranted(pkg, permission) == granted) done("permission $permission=$granted")
+        return if (nowGranted == granted) done("permission $permission=$granted")
         else failed(STATE_UNCHANGED)
     }
 
@@ -212,8 +219,9 @@ class ShizukuExecutionBackend(
             ?: return refused(ARGUMENTS_INVALID)
         if (value !in BRIGHTNESS_RANGE) return refused(ARGUMENTS_INVALID)
         shell.run("settings put system $BRIGHTNESS_SETTING $value")
+        val readBack = state.setting(BRIGHTNESS_SETTING)
         if (!stateIsReadable()) return refused(ACTION_CHANNEL_UNAVAILABLE)
-        return if (state.setting(BRIGHTNESS_SETTING)?.trim() == value.toString()) done("brightness $value")
+        return if (readBack?.trim() == value.toString()) done("brightness $value")
         else failed(STATE_UNCHANGED)
     }
 
