@@ -35,9 +35,9 @@ class EdithShellService : IRemoteShell.Stub {
 
     override fun run(command: String): String {
         val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
-        // Both streams are drained before waiting: a full pipe would otherwise block the command forever.
-        val stdout = process.inputStream.bufferedReader().use { it.readText() }
-        val stderr = process.errorStream.bufferedReader().use { it.readText() }
+        // Both streams are drained **concurrently** (see `drainStreams`): a child whose stderr fills the pipe blocks in
+        // the child, so "stdout first, then stderr" waits on a process that is waiting for us (P3.3 review, Minor 3).
+        val (stdout, stderr) = drainStreams(process.inputStream, process.errorStream)
         val exit = process.waitFor()
         return ShellReply.encode(exit, stdout, stderr)
     }
