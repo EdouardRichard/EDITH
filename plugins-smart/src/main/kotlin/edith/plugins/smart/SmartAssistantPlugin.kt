@@ -743,6 +743,11 @@ class SmartAssistantPlugin(
                     instructions = SmartPrompts.instructions(),
                     profileId = configured.profileId,
                     deadlineNanos = owned.deadlineNanos,
+                    // D49: the profile's timeout caps **one model request**; the turn's own budget is the number above,
+                    // and it no longer pays for the time a person spends deciding.
+                    requestTimeoutNanos = modelRequestTimeoutNanos(
+                        config?.let { profileLookup(it.profileId) }?.timeoutMillis,
+                    ),
                 ),
             )
         } catch (failure: Throwable) {

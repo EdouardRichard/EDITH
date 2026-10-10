@@ -19,7 +19,9 @@ enum class AgentOutcome { COMPLETED, INSUFFICIENT, NO_PROGRESS, DEADLINE, CANCEL
  * [instructions] is composed by the plugin (any context is folded in there, per the P3.1 interface ruling);
  * [utterance] is the user's own text for this turn and opens the model history. [profileId] rides along for the wiring
  * that owns a model profile — the loop never reads one itself. [deadlineNanos] is a wall-clock boundary on the same
- * [MonotonicClock] the loop is given, not a capability budget.
+ * [MonotonicClock] the loop is given, not a capability budget; it bounds **machine** time only, because time spent
+ * waiting on a confirmation is shifted out of it (D49). [requestTimeoutNanos] bounds **one model request** instead, so
+ * a caller may keep them separate.
  */
 data class AgentRequest(
     val turnId: String,
@@ -27,6 +29,13 @@ data class AgentRequest(
     val instructions: String,
     val profileId: String,
     val deadlineNanos: Long,
+    /**
+     * How long one model request may take, or `0` for "the turn deadline is also the request cap" — the behaviour before
+     * D49, kept as the default so an existing caller is unaffected. The wiring that owns a profile passes that profile's
+     * `timeoutMillis`: a request that hangs is the transport's problem to bound, while a **person** deciding is not the
+     * transport's timeout to spend.
+     */
+    val requestTimeoutNanos: Long = 0L,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -172,7 +181,13 @@ class AgentLoop(
                     request.instructions,
                     history.toList(),
                     tools,
-                    turnDeadlineNanos,
+                    // D49: the turn's budget and one request's cap are different numbers. A caller that supplies no cap
+                    // keeps the old shape exactly.
+                    if (request.requestTimeoutNanos > 0L) {
+                        minOf(turnDeadlineNanos, clock.nowNanos() + request.requestTimeoutNanos)
+                    } else {
+                        turnDeadlineNanos
+                    },
                 ),
             )
             // A turn that was blocked when `cancel()` arrived must not complete the run with a late answer.

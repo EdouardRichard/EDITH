@@ -22,12 +22,13 @@ import kotlin.test.assertTrue
 
 class AgentLoopTest {
 
-    private fun request(deadlineNanos: Long = Long.MAX_VALUE) = AgentRequest(
+    private fun request(deadlineNanos: Long = Long.MAX_VALUE, requestTimeoutNanos: Long = 0L) = AgentRequest(
         turnId = "turn-7",
         utterance = "把音量调小一点",
         instructions = "You are Edith.",
         profileId = "deepseek-default",
         deadlineNanos = deadlineNanos,
+        requestTimeoutNanos = requestTimeoutNanos,
     )
 
     private fun newLoop(
@@ -960,5 +961,31 @@ class AgentLoopTest {
 
         assertEquals(AgentOutcome.DEADLINE, run.outcome, "只有等人的时间被排除，机器的时间仍要计入预算")
         assertEquals(1, gateway.requests.size)
+    }
+
+    // --------------------------------------------- the per-request cap is not the turn budget (D49)
+
+    @Test fun `a per-request timeout caps the gateway turn without touching the turn budget`() {
+        val clock = FakeClock(0)
+        val gateway = ScriptedGateway(listOf(reply(text = "好")))
+
+        newLoop(gateway, clock = clock).run(
+            request(deadlineNanos = 60_000_000_000L, requestTimeoutNanos = 500_000_000L),
+        )
+
+        assertEquals(
+            500_000_000L,
+            gateway.requests.single().deadlineNanos,
+            "单次模型请求的上限是档案超时，不是整个回合的预算",
+        )
+    }
+
+    @Test fun `a zero request timeout keeps the old deadline semantics`() {
+        val clock = FakeClock(0)
+        val gateway = ScriptedGateway(listOf(reply(text = "好")))
+
+        newLoop(gateway, clock = clock).run(request(deadlineNanos = 4_242L))
+
+        assertEquals(4_242L, gateway.requests.single().deadlineNanos, "0 = 旧行为：仍拿回合 deadline 当请求上限")
     }
 }
