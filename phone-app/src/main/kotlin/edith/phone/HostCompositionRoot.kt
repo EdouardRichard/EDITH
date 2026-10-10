@@ -814,6 +814,9 @@ class HostCompositionRoot internal constructor(
      * on first use so the app does not open a CXR worker thread unless the user actually connects.
      */
     @Synchronized fun connectCxr(activity: Any): Boolean {
+        // A new attempt invalidates the previous answer (review I-2): a cancelled prompt must not sit on the page next
+        // to a link that came up afterwards, and `null` is what the render treats as "the SDK has not asked".
+        mutableState.update { it.copy(cxrAuthorization = null) }
         val factory = rokidConnectionFactory ?: return false
         if (closed) return false
         val connection = activeConnection ?: factory(activity).also { built ->

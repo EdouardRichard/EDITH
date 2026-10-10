@@ -929,6 +929,25 @@ class AgentLoopTest {
         assertEquals(2, gateway.requests.size)
     }
 
+    @Test fun `an absent confirmation channel behaves exactly as before`() {
+        // Review M-1: the plan promised this one and it was missing. The null channel must keep P3.1's shape even with a
+        // finite turn deadline and a non-zero per-request cap - the `finally` around the confirmation call shifts by the
+        // measured wait, which is zero here, so nothing about the old path may move.
+        val clock = FakeClock(0)
+        val executor = gatedExecutor()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "没有通道就先不动")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), clock = clock)
+            .run(request(deadlineNanos = 60_000_000_000L, requestTimeoutNanos = 500_000_000L))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome, "没有确认通道时回合结果必须与旧版一致")
+        assertEquals(AgentStep(1, "device.set_volume", "CONFIRMATION_UNAVAILABLE"), run.steps.single())
+        assertTrue(executor.calls.isEmpty(), "没有通道的确认动作永不执行")
+        assertEquals(500_000_000L, gateway.requests.first().deadlineNanos, "单次请求上限照常生效")
+    }
+
     @Test fun `a cancel during the wait ends the turn as CANCELLED`() {
         val clock = FakeClock(0)
         val executor = gatedExecutor()
@@ -936,7 +955,14 @@ class AgentLoopTest {
             listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "不该到达")),
         )
         lateinit var loop: AgentLoop
-        val confirmation = WaitingConfirmation(clock, waitNanos = 5_000_000_000L, onWait = { loop.cancel() })
+        // A real 急停: the gate settles as a refusal *and* the turn is cancelled - never "approved and cancelled", which
+        // no production path produces (review M-2).
+        val confirmation = WaitingConfirmation(
+            clock,
+            waitNanos = 5_000_000_000L,
+            outcome = ConfirmationOutcome(false, ConfirmationSource.CANCEL),
+            onWait = { loop.cancel() },
+        )
         loop = newLoop(
             gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), clock = clock,
             confirmation = confirmation,
@@ -946,6 +972,7 @@ class AgentLoopTest {
 
         assertEquals(AgentOutcome.CANCELLED, run.outcome, "等待期间被取消就是取消，顺延不得把它变成完成")
         assertEquals(1, gateway.requests.size, "取消之后不得再问模型")
+        assertTrue(executor.calls.isEmpty(), "被取消的确认不得因为顺延而多走一步")
     }
 
     @Test fun `machine time still spends the budget`() {

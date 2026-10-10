@@ -88,14 +88,16 @@ class MainActivity : ComponentActivity() {
                         onDismissRequest = { dismissedRequestId = pending.requestId },
                         title = { Text("需要你确认的动作") },
                         text = { Text(pending.summary) },
+                        // All three buttons travel in **one** slot: Material3 re-flows `confirmButton` against
+                        // `dismissButton` as their widths change, which is what made the row jump between one and two
+                        // lines as the countdown shrank (user report 2026-10-11). One explicit Row, one fixed Allow
+                        // width, one arrangement - 拒绝 / 急停 / 允许, always on a single line.
                         confirmButton = {
-                            Button(onClick = {
-                                raisedForConfirmation = false
-                                root.answerConfirmation(true)
-                            }) { Text("允许 ($remainingSeconds)") }
-                        },
-                        dismissButton = {
-                            Row {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.End,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
                                 OutlinedButton(onClick = {
                                     raisedForConfirmation = false
                                     root.answerConfirmation(false)
@@ -105,8 +107,17 @@ class MainActivity : ComponentActivity() {
                                     raisedForConfirmation = false
                                     root.emergencyStop()
                                 }) { Text("急停") }
+                                Spacer(Modifier.width(8.dp))
+                                Button(
+                                    modifier = Modifier.width(CONFIRM_BUTTON_WIDTH),
+                                    onClick = {
+                                        raisedForConfirmation = false
+                                        root.answerConfirmation(true)
+                                    },
+                                ) { Text("允许 ($remainingSeconds)") }
                             }
                         },
+                        dismissButton = {},
                     )
                 }
                 PhoneScreen(state, root, viewModel, profileViewModel, ::requestStart,
@@ -179,6 +190,13 @@ class MainActivity : ComponentActivity() {
     private fun notificationsGranted() = Build.VERSION.SDK_INT < 33 ||
         ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 }
+
+/**
+ * The countdown lives on the Allow button (owner directive 2026-10-10), so its **geometry** must not move: the label
+ * shrinks from `允许 (120)` to `允许 (9)` once a second, and an unconstrained button re-flows the dialog's button row
+ * under the user's finger (user report 2026-10-11). A fixed width keeps the layout still while the number ticks.
+ */
+private val CONFIRM_BUTTON_WIDTH = 140.dp
 
 /**
  * The seconds left on the live question.
@@ -355,7 +373,10 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                                     Text("需要你确认的动作", style = MaterialTheme.typography.titleMedium)
                                     Text(pending.summary)
                                     Row {
-                                        Button(onClick = { root.answerConfirmation(true) }) { Text("允许 ($remainingSeconds)") }
+                                        Button(
+                                            modifier = Modifier.width(CONFIRM_BUTTON_WIDTH),
+                                            onClick = { root.answerConfirmation(true) },
+                                        ) { Text("允许 ($remainingSeconds)") }
                                         Spacer(Modifier.width(8.dp))
                                         OutlinedButton(onClick = { root.answerConfirmation(false) }) { Text("拒绝") }
                                     }

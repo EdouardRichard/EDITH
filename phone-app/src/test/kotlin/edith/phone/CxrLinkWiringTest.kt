@@ -68,4 +68,17 @@ class CxrLinkWiringTest {
 
         assertTrue("the SDK's live-session signal must reach the page", rig.root.state.value.cxrLinkReady)
     }
+
+    @Test
+    fun aNewConnectAttemptClearsThePreviousAuthorizationAnswer() {
+        // Review I-2: a cancelled prompt used to stay on the page forever, next to a link that came up afterwards. The
+        // answer describes one attempt, so a new attempt starts it empty again.
+        val rig = Rig()
+        rig.root.onCxrAuthorizationResult(Activity.RESULT_CANCELED, null)
+        assertEquals(CxrAuthorizationOutcome.CANCELLED, rig.root.state.value.cxrAuthorization)
+
+        rig.root.connectCxr(rig.root)
+
+        assertNull("a new attempt must not carry the previous verdict", rig.root.state.value.cxrAuthorization)
+    }
 }
