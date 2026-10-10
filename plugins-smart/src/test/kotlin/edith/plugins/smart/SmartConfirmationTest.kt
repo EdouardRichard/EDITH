@@ -200,4 +200,33 @@ class SmartConfirmationTest {
         assertTrue(subject.onConfirmationResult(tap("c2", true)), "the next question must be answerable, not BUSY")
         assertEquals(ConfirmationOutcome(true, ConfirmationSource.PHONE), second.join())
     }
+
+    @Test fun `a gate that settles after the slack gave up cannot rewrite a released question`() {
+        // The residual the leftover-sweep review asked to pin: when the fallback releases the slot, the gate may still
+        // hold its own entry (it is cancelled by its own deadline, and here that deadline never ran). A *late* settle
+        // from the gate must therefore be a no-op on the plugin side: the question was already answered to the user as
+        // a denial, and a slow "yes" cannot retroactively become one.
+        val channel = FakeChannel()
+        val log = mutableListOf<String>()
+        val gate = ConfirmationGate(clock, scheduler, timeoutNanos = 50_000_000L)
+        val subject = SmartConfirmation(channel, gate, timeoutMillis = 50L, log = { log += it })
+        val ask = ask(subject, requestId = "c1")
+
+        assertEquals(ConfirmationOutcome(false, ConfirmationSource.TIMEOUT), ask.join())
+
+        // The fallback must have released and logged **before** the gate gets there: these two are what make the late
+        // settle below a no-op rather than the real settlement.
+        assertEquals(0, subject.pendingCount, "the fallback already released the slot")
+        assertEquals(1, log.count { "request=c1" in it }, "the fallback already told the user")
+
+        assertTrue(gate.resolve("c1", approved = true), "the gate still held its own entry, so it settles it now")
+
+        assertEquals(1, log.count { "request=c1" in it }, "exactly one settlement, exactly one line")
+        assertEquals(0, subject.pendingCount)
+        assertEquals(
+            ConfirmationOutcome(false, ConfirmationSource.TIMEOUT),
+            ask.result,
+            "the late approval must not rewrite what the user was already told",
+        )
+    }
 }

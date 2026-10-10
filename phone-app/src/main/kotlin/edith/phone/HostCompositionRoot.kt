@@ -1246,8 +1246,10 @@ class HostCompositionRoot internal constructor(
                     //
                     // The identity is read off the result itself, which the presenter captured when the question went
                     // up. It used to be a `currentIdentity()` round trip **on this thread** (the session page's UI
-                    // thread) in the same stack frame as the P3.3 ANR; the value it produced is the same one that went
-                    // into the envelope, so the line keeps its meaning and the UI thread stops waiting on the host.
+                    // thread) in the same stack frame as the P3.3 ANR. The old code re-read the host at *answer* time, so
+                    // the two agree only while the session has not been replaced - and when it has, the envelope names
+                    // the session that asked, which `onEvent` drops as not current. Either way the field keeps its
+                    // meaning, and the UI thread stops waiting on the host.
                     val accepted = hostHolder[0]?.onEvent(result) ?: false
                     P3Log.line("P3_CONFIRM_HOST delivered=$accepted " +
                         "identityPresent=${result.envelope.sessionId.value.isNotBlank()}")

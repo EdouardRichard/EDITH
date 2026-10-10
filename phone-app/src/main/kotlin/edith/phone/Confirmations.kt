@@ -63,14 +63,17 @@ class ConfirmationPresenter(
         require(requestId.isNotBlank()) { "confirmation request id must not be blank" }
         require(timeoutMillis > 0) { "confirmation window must be positive, was $timeoutMillis" }
         val text = truncate(summary)
-        // A duplicate question keeps the one already up, and must not even ask for an identity it will not use.
+        // A question that is **already up** keeps its slot and does not even ask for an identity it will not use. (A
+        // duplicate that lands between this check and the registration below still reads one identity and throws it
+        // away; that is the deliberate price of not holding our lock across `envelopeFor`.)
         synchronized(lock) { pending[requestId]?.let { return it.ignoredBy } }
         // The identity is read **while the question goes up** - on the turn's own thread - and never on the answer path:
         // `answer` runs on the session page's UI thread, and a host round trip there is the same stack frame the P3.3
         // ANR was caught in (`HostCompositionRoot.answerConfirmation` -> `ConfirmationPresenter.answer` ->
         // `HostRuntime.command`). A question therefore carries the session that asked it, and the answer names that
-        // session. Deliberately outside the lock: `envelopeFor` reaches back into the composition, and no lock of ours
-        // may be held across that.
+        // session. (The composition's own `SummaryDisplayer` still reads the host identity once per question for the
+        // glasses hint: a second round trip, but on this same turn thread, never on the UI thread.) Deliberately
+        // outside the lock: `envelopeFor` reaches back into the composition, and no lock of ours may be held across that.
         val envelope = envelopeFor(requestId)
         synchronized(lock) {
             val live = pending[requestId]
