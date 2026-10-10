@@ -484,7 +484,8 @@ class HostCompositionRoot internal constructor(
      * `false` when nothing is pending - a tap that arrives after the question was withdrawn answers nothing, rather than
      * being delivered under a request id no gate is waiting on.
      */
-    @Synchronized fun answerConfirmation(approved: Boolean): Boolean {        val pending = state.value.pendingConfirmation ?: return false
+    @Synchronized fun answerConfirmation(approved: Boolean): Boolean {
+        val pending = state.value.pendingConfirmation ?: return false
         val presenter = confirmationPresenter ?: run {
             P3Log.line("P3_CONFIRM_HOST answer=none request=${pending.requestId} reason=NO_PRESENTER")
             return false
@@ -930,7 +931,8 @@ class HostCompositionRoot internal constructor(
         /** The debug-only diagnostic text plugin's id; its configuration shape is not the smart plugin's. */
         private const val DIAGNOSTIC_PLUGIN_ID = "p2-diagnostic"
 
-        fun create(context: Context, initialObserver: (ByteArray) -> Unit = {}): HostCompositionRoot {            // Transport, audio engines and glasses output remain separate device gates.
+        fun create(context: Context, initialObserver: (ByteArray) -> Unit = {}): HostCompositionRoot {
+            // Transport, audio engines and glasses output remain separate device gates.
             val clock = object : MonotonicClock { override fun nowNanos() = System.nanoTime().coerceAtLeast(0) }
             val timer = Executors.newSingleThreadScheduledExecutor { Thread(it, "edith-phone-deadlines").apply { isDaemon = true } }
             val scheduler = object : DeadlineScheduler {
