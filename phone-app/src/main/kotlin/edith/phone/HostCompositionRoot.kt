@@ -1,6 +1,5 @@
 package edith.phone
 
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import edith.audio.AcousticLabeler
@@ -31,6 +30,7 @@ import edith.output.TraceRecorder
 import edith.plugin.*
 import edith.plugins.smart.SmartAssistantPlugin
 import edith.plugins.interview.InterviewAssistantPlugin
+import edith.rokid.CxrAuthorizationOutcome
 import edith.rokid.PcmFormatEvidence
 import edith.storage.*
 import edith.phone.storage.*
@@ -84,11 +84,11 @@ class HostCompositionRoot internal constructor(
     internal val initialRawPcmObserver: (ByteArray) -> Unit = {},
     /**
      * The second route an activity result can take into the transport: the connection instance this composition keeps
-     * in its own holder (in production the same object `activeConnection` points at). It must report the **same claim**
-     * as [CxrConnection.onAuthorizationResult], so the page state below stays a fact the transport asserted rather than
-     * one this class inferred (review I-3).
+     * in its own holder (in production the same object `activeConnection` points at). It must report the **same
+     * verdict** as [CxrConnection.onAuthorizationResult], so the page state below stays a fact the transport asserted
+     * rather than one this class inferred (review I-3, Minor 6); `null` means "not this transport's answer".
      */
-    private val authorizeResult: (Int, Intent?) -> Boolean = { _, _ -> false },
+    private val authorizeResult: (Int, Intent?) -> CxrAuthorizationOutcome? = { _, _ -> null },
     /** T18 display path for a live CXR connection; null keeps the assembly without one (tests, unwired builds). */
     private val hintLink: CxrHintLink? = null,
     /**
@@ -845,20 +845,16 @@ class HostCompositionRoot internal constructor(
      * activity result at all - `onActivityResult` also carries the App's own permission dialogs (review I-3) - so the
      * page could announce "眼镜授权被取消" for a result the SDK never asked for. The claim comes from the transport,
      * which is the only party that knows whether a prompt is pending.
+     *
+     * What is written is the **transport's verdict** - derived by the transport from the vendor SDK's parsed
+     * `AuthResult`, not from the bare result code (review Minor 6). This class never reads [resultCode] itself: a
+     * `RESULT_OK` result the SDK's parser refused would otherwise reach the page as "眼镜授权确认已完成", which is a
+     * fact about the activity result rather than about the authorization.
      */
     fun onCxrAuthorizationResult(resultCode: Int, data: Intent?) {
-        val claimed = (activeConnection?.onAuthorizationResult(resultCode, data) ?: false) or
-            authorizeResult(resultCode, data)
-        if (!claimed) return
-        mutableState.update {
-            it.copy(
-                cxrAuthorization = when (resultCode) {
-                    Activity.RESULT_OK -> CxrAuthorizationOutcome.CONFIRMED
-                    Activity.RESULT_CANCELED -> CxrAuthorizationOutcome.CANCELLED
-                    else -> CxrAuthorizationOutcome.UNEXPECTED
-                },
-            )
-        }
+        val verdict = activeConnection?.onAuthorizationResult(resultCode, data) ?: authorizeResult(resultCode, data)
+        if (verdict == null) return
+        mutableState.update { it.copy(cxrAuthorization = verdict) }
     }
 
     /** The live CXR transport, for callers that must drive an audio epoch (T17/T18 device bring-up). */
@@ -1384,7 +1380,7 @@ class HostCompositionRoot internal constructor(
                         // Task 14a item 5: the receiver's offer outcome is what turns an overflow into a report.
                         onOffer = { offer -> rootHolder[0]?.onPcmOffer(offer) }).also { connection[0] = it }
                 },
-                authorizeResult = { resultCode, data -> connection[0]?.onAuthorizationResult(resultCode, data) ?: false },
+                authorizeResult = { resultCode, data -> connection[0]?.onAuthorizationResult(resultCode, data) },
                 hintLink = hintLink,
                 smartWiring = smartWiring,
                 smartSettingsStore = smartSettingsStore,

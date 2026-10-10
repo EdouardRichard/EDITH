@@ -18,6 +18,7 @@ import edith.plugin.PluginContext
 import edith.plugin.PluginDescriptor
 import edith.plugin.PluginLifecycle
 import edith.plugins.diagnostic.DiagnosticHintPlugin
+import edith.rokid.CxrAuthorizationOutcome
 import edith.storage.MemoryProfileRepository
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -69,7 +70,7 @@ class CxrHintLinkTest {
         var inbound: ((String) -> Unit)? = null
         var connected = 0
         override fun connect(activity: Any) { connected++ }
-        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean = false
+        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): CxrAuthorizationOutcome? = null
         override fun sendCommand(json: String): Boolean {
             if (!ready) return false
             sent += json

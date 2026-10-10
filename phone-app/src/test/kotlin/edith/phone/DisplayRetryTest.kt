@@ -19,6 +19,7 @@ import edith.plugin.PluginContext
 import edith.plugin.PluginDescriptor
 import edith.plugin.PluginLifecycle
 import edith.plugin.WakeWordRegistry
+import edith.rokid.CxrAuthorizationOutcome
 import edith.storage.MemoryProfileRepository
 import edith.testsupport.FakeClock
 import edith.testsupport.ManualScheduler
@@ -64,7 +65,7 @@ class DisplayRetryTest {
         val sent = mutableListOf<String>()
         private var inbound: ((String) -> Unit)? = null
         override fun connect(activity: Any) = Unit
-        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean = false
+        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): CxrAuthorizationOutcome? = null
         override fun sendCommand(json: String): Boolean {
             if (!ready) return false
             sent += json

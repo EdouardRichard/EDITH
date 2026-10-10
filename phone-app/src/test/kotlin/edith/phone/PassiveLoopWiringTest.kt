@@ -60,6 +60,7 @@ import edith.plugin.SpeakerWindow
 import edith.plugin.StorageHandle
 import edith.plugins.diagnostic.DiagnosticHintPlugin
 import edith.plugins.smart.SmartAssistantPlugin
+import edith.rokid.CxrAuthorizationOutcome
 import edith.storage.MemoryProfileRepository
 import edith.storage.ProfileRepository
 import edith.testsupport.FakeClock
@@ -228,7 +229,7 @@ class PassiveLoopWiringTest {
     private class FakeTransportConnection(private val port: InputPort?) : CxrConnection {
         override var ready = true
         override fun connect(activity: Any) = Unit
-        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean = false
+        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): CxrAuthorizationOutcome? = null
         override fun sendCommand(json: String) = true
         override fun onInboundCommand(listener: (String) -> Unit) = Unit
         override fun close() = Unit

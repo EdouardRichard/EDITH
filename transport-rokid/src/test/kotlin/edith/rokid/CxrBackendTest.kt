@@ -100,16 +100,19 @@ class CxrBackendTest {
     @Test fun anActivityResultIsClaimedOnlyWhileAPromptIsPending() {
         // Review I-3: the App may only report an authorization answer for a result the SDK actually asked for. The
         // proof is the callback `connect` armed (it arms it as the connection starts asking and clears it the moment it
-        // is answered) - not a guessed request code - so the claim is good exactly once per real prompt.
+        // is answered) - not a guessed request code - so the answer is good exactly once per real prompt.
         val rig = CxrBackendRig()
-        assertFalse("nothing asked, so an unrelated result is not an answer", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
+        assertNull("nothing asked, so an unrelated result is not an answer", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
 
         rig.backend.connect(Activity(), Events())
         rig.ui.removeFirst().invoke()
         assertEquals(1, rig.authorizationRequests)
 
-        assertTrue("the prompt's own answer must be claimed", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
-        assertFalse("the same result cannot answer twice", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
+        assertEquals(
+            "the prompt's own answer must be claimed, with the verdict the SDK's parse produced",
+            CxrAuthorizationOutcome.CONFIRMED, rig.backend.onAuthorizationResult(Activity.RESULT_OK, null),
+        )
+        assertNull("the same result cannot answer twice", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
     }
 
     @Test fun anActivityResultAfterRevocationIsNotClaimed() {
@@ -118,7 +121,61 @@ class CxrBackendTest {
         rig.ui.removeFirst().invoke()
         rig.backend.cancelAuthorization()
 
-        assertFalse("a revoked attempt has no pending prompt", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
+        assertNull("a revoked attempt has no pending prompt", rig.backend.onAuthorizationResult(Activity.RESULT_OK, null))
+    }
+
+    @Test fun aResultOkTheSdkParsedAsAFailureIsReportedAsAnAnomaly() {
+        // Review Minor 6: the page's verdict used to come from the bare result code, so a `RESULT_OK` whose `AuthResult`
+        // is a failure still read "眼镜授权确认已完成". The vendor's parser does exactly that for an `auth_result` extra
+        // it does not recognise (javap of the pinned `client-l-1.1.2.aar`: `AuthorizationHelper.parseAuthorizationResult`
+        // -> `AuthResult$AuthFail`), so the verdict has to come from the parsed answer.
+        val rig = CxrBackendRig()
+        rig.parsedAuthorizationSuccess = false
+        rig.backend.connect(Activity(), Events())
+        rig.ui.removeFirst().invoke()
+
+        assertEquals(
+            "a parsed failure is not a confirmation, however the activity result was coded",
+            CxrAuthorizationOutcome.UNEXPECTED, rig.backend.onAuthorizationResult(Activity.RESULT_OK, null),
+        )
+    }
+
+    @Test fun aResultOkWithoutATokenIsNotAConfirmationEither() {
+        // The same rule the authorization callback applies before it creates a session (`!result.isSuccess ||
+        // token.isNullOrBlank()` => AUTHORIZATION_FAILED): a parsed "success" that carries no usable token cannot
+        // complete a session, so the page must not be told the authorization was confirmed.
+        val rig = CxrBackendRig()
+        rig.parsedAuthorizationToken = "   "
+        rig.backend.connect(Activity(), Events())
+        rig.ui.removeFirst().invoke()
+
+        assertEquals(
+            CxrAuthorizationOutcome.UNEXPECTED, rig.backend.onAuthorizationResult(Activity.RESULT_OK, null),
+        )
+    }
+
+    @Test fun aCancelledPromptIsReportedAsCancelledRatherThanAsAnAnomaly() {
+        // A decline is a legitimate answer, not a fault, and it is the code (not the intent) that carries it.
+        val rig = CxrBackendRig()
+        rig.backend.connect(Activity(), Events())
+        rig.ui.removeFirst().invoke()
+
+        assertEquals(
+            CxrAuthorizationOutcome.CANCELLED, rig.backend.onAuthorizationResult(Activity.RESULT_CANCELED, null),
+        )
+    }
+
+    @Test fun aParsedFailureIsNotTheCancelVerdict() {
+        // The complement of the test above, on a fresh connection (the armed callback is good for exactly one answer):
+        // only the cancel code earns `CANCELLED`, so a parsed failure that arrives as `RESULT_OK` cannot hide behind it.
+        val rig = CxrBackendRig()
+        rig.parsedAuthorizationSuccess = false
+        rig.backend.connect(Activity(), Events())
+        rig.ui.removeFirst().invoke()
+
+        assertEquals(
+            CxrAuthorizationOutcome.UNEXPECTED, rig.backend.onAuthorizationResult(Activity.RESULT_OK, null),
+        )
     }
 
     private class Events : RokidBackend.Events {

@@ -47,6 +47,7 @@ import edith.plugin.PluginDescriptor
 import edith.plugin.PluginLifecycle
 import edith.plugin.SpeakerWindow
 import edith.plugin.StorageHandle
+import edith.rokid.CxrAuthorizationOutcome
 import edith.storage.MemoryProfileRepository
 import edith.testsupport.FakeClock as TestClock
 import edith.testsupport.ManualScheduler
@@ -256,7 +257,7 @@ class CxrHostServicesTest {
         val sent = mutableListOf<String>()
         var inbound: ((String) -> Unit)? = null
         override fun connect(activity: Any) = Unit
-        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean = false
+        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): CxrAuthorizationOutcome? = null
         override fun sendCommand(json: String): Boolean { if (!ready) return false; sent += json; return true }
         override fun onInboundCommand(listener: (String) -> Unit) { inbound = listener }
         override fun close() = Unit

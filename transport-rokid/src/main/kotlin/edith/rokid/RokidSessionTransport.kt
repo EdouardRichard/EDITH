@@ -21,6 +21,29 @@ data class RokidCommandRoute(val outbound: String, val replyChannel: String) {
 /** Caller validates its wire identity and never reuses it within this connection. */
 fun interface RokidReplyCorrelation { fun matches(json: String): Boolean }
 
+/**
+ * What the vendor SDK actually said about an AI-App authorization prompt.
+ *
+ * One of the three answers the phone can honestly carry, and the only thing the App is allowed to put on the 会话 page.
+ * It is decided **here**, from the SDK's own parse (`CxrSessionManager.parseAuthorizationResult` -> `AuthResult`), never
+ * from the bare activity `resultCode`: the vendor's parser reports a fail for a `RESULT_OK` result whose `auth_result`
+ * extra it does not recognise, or whose `auth_token` is missing/blank (javap of the pinned `client-l-1.1.2.aar`,
+ * `AuthorizationHelper.parseAuthorizationResult`), so a verdict read off the code would announce an authorization the
+ * SDK refused.
+ *
+ * Lives beside the transport rather than in the App because the parse result never leaves this module.
+ */
+enum class CxrAuthorizationOutcome {
+    /** The parser returned a success with a token the session path will accept. */
+    CONFIRMED,
+
+    /** The user declined the prompt; a legitimate answer rather than a fault. */
+    CANCELLED,
+
+    /** Any other answer, including a parse the SDK refused. */
+    UNEXPECTED,
+}
+
 interface RokidBackend : AutoCloseable {
     interface Events {
         fun ready()
@@ -59,6 +82,15 @@ interface RokidBackend : AutoCloseable {
      * Default refuses, so a test backend that has not modelled this path cannot look like it delivered something.
      */
     fun sendCommand(route: RokidCommandRoute, json: String): Boolean = false
+
+    /**
+     * Reports the verdict of the vendor SDK's own parse of an authorization activity result, or `null` when no prompt
+     * this backend asked for is pending.
+     *
+     * Defaulted to `null` - "not mine to answer" - so a test backend that has not modelled the authorization path
+     * cannot look like it answered a prompt (the same honest default as [sendCommand]).
+     */
+    fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): CxrAuthorizationOutcome? = null
 }
 
 class RokidSessionTransport(
@@ -266,11 +298,12 @@ class RokidSessionTransport(
         }
     }
     /**
-     * Routes an activity result to the backend and reports whether it was the pending AI-App authorization answer
-     * (review I-3): the caller may only turn a claimed result into a fact about authorization.
+     * Routes an activity result to the backend and reports the verdict of the SDK's own parse, or `null` when the result
+     * was not the pending AI-App authorization answer (review I-3): the caller may only turn the transport's verdict into
+     * a fact about authorization, never the bare result code (review Minor 6).
      */
-    fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean =
-        (backend as? CxrBackend)?.onAuthorizationResult(resultCode, data) ?: false
+    fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): CxrAuthorizationOutcome? =
+        (backend as? CxrBackend)?.onAuthorizationResult(resultCode, data)
 
     /**
      * Routes raw payloads on [channelKey] to [listener] instead of the JSON reply correlation.

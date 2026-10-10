@@ -30,6 +30,17 @@ internal class CxrBackendRig {
     var duringAuthorization: () -> Unit = {}
 
     /**
+     * What the SDK's own result parser reports back.
+     *
+     * Configurable because the parser is the party the page's verdict must come from (review Minor 6): the vendor's
+     * `AuthorizationHelper.parseAuthorizationResult` reports a **fail** for a `RESULT_OK` result whose `auth_result`
+     * extra it does not recognise, and a blank/missing `auth_token` is a fail too - both are outcomes no bare result
+     * code can express, so a rig that could only model a successful parse could not tell the two rules apart.
+     */
+    var parsedAuthorizationSuccess = true
+    var parsedAuthorizationToken: String = "memory-only-test-token"
+
+    /**
      * The installer the backend must use for audio.
      *
      * It is recorded rather than faked away because the device evidence is precisely about *where* the callback gets
@@ -85,7 +96,7 @@ internal class CxrBackendRig {
             // the result path something to assert: before that nothing ever called it, because no test drove a result
             // through the activity.
             "parseAuthorizationResult" -> AuthResult(
-                (args!![0] as Int) == Activity.RESULT_OK, "memory-only-test-token", null, null,
+                parsedAuthorizationSuccess, parsedAuthorizationToken, null, null,
             )
             else -> null
         }

@@ -5,6 +5,7 @@ import android.content.Intent
 import edith.audio.PcmIngress
 import edith.host.HostRuntime
 import edith.plugin.MonotonicClock
+import edith.rokid.CxrAuthorizationOutcome
 import edith.rokid.CxrInboundPayload
 import edith.rokid.RokidConnectionConfig
 import edith.rokid.RokidSessionTransport
@@ -55,7 +56,7 @@ class RokidConnection(activity: Activity, config: RokidConnectionConfig, host: H
     fun connect(activity: Activity) = input.connect(activity)
     override fun connect(activity: Any) = connect(activity.asCxrActivity())
     override val ready: Boolean get() = input.state.ready
-    override fun onAuthorizationResult(resultCode: Int, data: Intent?): Boolean =
+    override fun onAuthorizationResult(resultCode: Int, data: Intent?): CxrAuthorizationOutcome? =
         input.onAuthorizationResult(resultCode, data)
     override fun sendCommand(json: String): Boolean = input.sendCommand(json)
     override fun onInboundCommand(listener: (String) -> Unit) { inbound = listener }

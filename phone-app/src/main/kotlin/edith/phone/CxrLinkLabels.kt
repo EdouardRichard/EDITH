@@ -1,5 +1,7 @@
 package edith.phone
 
+import edith.rokid.CxrAuthorizationOutcome
+
 /**
  * What the glasses-connection area of 会话 may say, and what the SDK's authorization result is allowed to say.
  *
@@ -21,14 +23,15 @@ internal fun cxrStatusLabel(transportMissing: Boolean, requested: Boolean, linkR
 }
 
 /**
- * The SDK's authorization result in the wearer's words. A cancellation is not an error: the user declining a prompt is a
- * legitimate answer, and only an unrecognised code is reported as unexpected.
+ * The transport's verdict on the SDK's authorization result, in the wearer's words. A cancellation is not an error: the
+ * user declining a prompt is a legitimate answer.
+ *
+ * [CxrAuthorizationOutcome.UNEXPECTED] is any answer that did **not** come back as a usable token, so it carries both
+ * an unrecognised code and a parse the SDK itself refused (review Minor 6) - the transport derives it from the parsed
+ * `AuthResult`, never from the bare result code.
  */
 internal fun cxrAuthorizationLabel(outcome: CxrAuthorizationOutcome): String = when (outcome) {
     CxrAuthorizationOutcome.CONFIRMED -> "眼镜授权确认已完成"
     CxrAuthorizationOutcome.CANCELLED -> "眼镜授权被取消"
     CxrAuthorizationOutcome.UNEXPECTED -> "眼镜授权结果异常"
 }
-
-/** The three shapes the SDK's authorization result can take, as far as the phone can tell. */
-enum class CxrAuthorizationOutcome { CONFIRMED, CANCELLED, UNEXPECTED }

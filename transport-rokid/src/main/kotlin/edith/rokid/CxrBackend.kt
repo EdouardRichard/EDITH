@@ -184,20 +184,43 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
         return owned
     }
     /**
-     * Delivers an activity result to the pending authorization request and reports whether it **was** that answer.
+     * Delivers an activity result to the pending authorization request and reports the verdict the SDK's own parse of
+     * it produced.
      *
      * The AI-App prompt is started with `requestAuthorization(activity, ...)`, so its answer arrives at the activity -
      * but so does every other result that activity starts for, including the App's own permission dialogs. The only
      * proof that a result belongs to the prompt is the callback `connect` armed for it (armed as the connection starts
      * asking, cleared the moment it is answered); guessing from a request code would be inventing a fact about the
-     * vendor's SDK. The flag is therefore what the App is allowed to report, and the SDK's own parser still decides
-     * what the answer means.
+     * vendor's SDK. `null` is therefore the answer for a result this backend did not ask for.
+     *
+     * The verdict comes from the SDK's parser (`parseAuthorizationResult` -> `AuthResult`), never from the bare result
+     * code (review Minor 6). That parser reports a **failure** for a `RESULT_OK` result whose `auth_result` extra it
+     * does not recognise or whose token is missing/blank, so reading the code would let the page announce a
+     * confirmation the SDK refused. The token-testing rule is the same one the authorization callback above applies
+     * before it creates a session, so the page and the session path can never disagree about what "confirmed" means.
      */
-    fun onAuthorizationResult(resultCode: Int, data: Intent?): Boolean = fence.dispatch {
-        val pending = authCallback ?: return@dispatch false
-        pending(manager.parseAuthorizationResult(resultCode, data))
-        true
-    } ?: false
+    override fun onAuthorizationResult(resultCode: Int, data: Intent?): CxrAuthorizationOutcome? = fence.dispatch {
+        val pending = authCallback ?: return@dispatch null
+        // Parsed once: the vendor's parser is the single reader of the intent, and the callback below must receive the
+        // very answer the verdict was derived from.
+        val parsed = manager.parseAuthorizationResult(resultCode, data)
+        val verdict = verdictOf(resultCode, parsed)
+        // The one line that makes the verdict checkable on a device: "the page says CONFIRMED" and "the SDK parsed a
+        // success with a usable token" are then separable facts in the log rather than one inference from a code, which
+        // is what review Minor 6 was about. Never the token itself - only whether one was usable.
+        Log.i(TAG, "authorization result: resultCode=$resultCode parsedSuccess=${parsed.isSuccess} " +
+            "tokenUsable=${!parsed.token.isNullOrBlank()} verdict=$verdict")
+        pending(parsed)
+        verdict
+    }
+
+    private fun verdictOf(resultCode: Int, parsed: AuthResult): CxrAuthorizationOutcome = when {
+        // The user declining a prompt is a legitimate answer rather than an anomaly, and it is the platform's fact
+        // rather than something read out of the intent.
+        resultCode == Activity.RESULT_CANCELED -> CxrAuthorizationOutcome.CANCELLED
+        !parsed.isSuccess || parsed.token.isNullOrBlank() -> CxrAuthorizationOutcome.UNEXPECTED
+        else -> CxrAuthorizationOutcome.CONFIRMED
+    }
     override fun cancelAuthorization() {
         fence.close()
         request.incrementAndGet()

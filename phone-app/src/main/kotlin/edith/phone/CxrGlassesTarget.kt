@@ -1,6 +1,7 @@
 package edith.phone
 
 import android.app.Activity
+import edith.rokid.CxrAuthorizationOutcome
 import edith.rokid.RokidConnectionConfig
 
 /**
@@ -95,15 +96,21 @@ interface CxrConnection : AutoCloseable {
     val ready: Boolean
 
     /**
-     * Delivers the AI-App authorization result the SDK asked the activity for.
+     * Delivers the AI-App authorization result the SDK asked the activity for, and reports the **verdict the
+     * transport's own parse of that result produced**.
      *
-     * Returns true only when this result **was** the answer to a prompt this connection is waiting on (review I-3):
-     * that is, the authorization callback armed by `connect` is still pending. `onActivityResult` fires for every
-     * result this activity starts for - including the App's own `permissions.launch(...)` dialogs - so a caller that
-     * reported all of them as "the SDK's authorization answer" invented a fact. The transport knows whether it asked;
-     * the App may only repeat what it says.
+     * `null` means the result was not this connection's to answer: the authorization callback armed by `connect` is no
+     * longer pending (review I-3). `onActivityResult` fires for every result this activity starts for - including the
+     * App's own `permissions.launch(...)` dialogs - so a caller that reported all of them as "the SDK's authorization
+     * answer" invented a fact.
+     *
+     * A non-null value is the transport's [CxrAuthorizationOutcome], derived from the vendor SDK's own
+     * `AuthResult` rather than from the bare result code (review Minor 6): the vendor's parser reports a failure for a
+     * `RESULT_OK` result whose `auth_result` extra it does not recognise, or whose token is missing/blank, and the page
+     * must repeat that instead of announcing "眼镜授权确认已完成". The transport knows what the SDK parsed; the App may
+     * only repeat what it says.
      */
-    fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean
+    fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): CxrAuthorizationOutcome?
 
     /**
      * Sends a hint command that expects no correlated reply; answers are matched by their own payload instead.

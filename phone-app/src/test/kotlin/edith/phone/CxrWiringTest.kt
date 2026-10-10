@@ -2,6 +2,7 @@ package edith.phone
 
 import edith.host.HostRuntime
 import edith.plugin.*
+import edith.rokid.CxrAuthorizationOutcome
 import edith.storage.MemoryProfileRepository
 import org.junit.Assert.*
 import org.junit.Test
@@ -100,10 +101,10 @@ class CxrWiringTest {
         var inbound: ((String) -> Unit)? = null
         override var ready: Boolean = false
         override fun connect(activity: Any) { connectedWith += activity }
-        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): Boolean {
+        override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): CxrAuthorizationOutcome? {
             this.resultCode = resultCode
             sawIntent = data != null
-            return false
+            return null
         }
         override fun sendCommand(json: String): Boolean {
             if (!ready) return false

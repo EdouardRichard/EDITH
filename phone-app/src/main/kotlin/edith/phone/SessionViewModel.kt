@@ -3,6 +3,7 @@ package edith.phone
 import androidx.lifecycle.ViewModel
 import edith.contracts.SessionState
 import edith.plugin.Capability
+import edith.rokid.CxrAuthorizationOutcome
 import kotlinx.coroutines.flow.StateFlow
 
 /** P3.3 (spec §17.4): the question the session page is showing, if one is up. */
