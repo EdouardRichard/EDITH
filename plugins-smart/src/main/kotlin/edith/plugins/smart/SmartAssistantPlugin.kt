@@ -730,13 +730,19 @@ class SmartAssistantPlugin(
             finishWithFailure(owned, BLANK_UTTERANCE_HINT)
             return
         }
+        // The loop is held outside the `try` so the failure path below can still read the human wait it had measured
+        // before it threw (review I-1): a transport failure after a late answer is otherwise the one path where the
+        // number is lost, and the honest "没能给出结果" sentence would be dropped as expired - the phone acted and the
+        // glasses stayed blank.
+        var loop: AgentLoop? = null
         val run = try {
-            val loop = buildLoop(current, configured, owned)
+            val built = buildLoop(current, configured, owned)
+            loop = built
             synchronized(gate) {
                 if (turn !== owned || owned.closed) return
-                owned.loop = loop
+                owned.loop = built
             }
-            loop.run(
+            built.run(
                 AgentRequest(
                     turnId = owned.turnId,
                     utterance = text,
@@ -759,7 +765,12 @@ class SmartAssistantPlugin(
             // missing capability, a rejected configuration, a tool schema), and the message is exactly where a URL,
             // a profile id or user content would leak into the log. The class is the part that is safe and useful.
             P3Log.line("P3_RUN error=${failure::class.simpleName ?: failure.javaClass.name}")
-            AgentRun(AgentOutcome.FAILED, "PLUGIN_RUN_THREW", null, emptyList())
+            // A run that threw never handed its report over, so the measurement is taken from the loop itself - the wait
+            // it had already excluded from its budget is exactly what keeps this turn's hint window open.
+            AgentRun(
+                AgentOutcome.FAILED, "PLUGIN_RUN_THREW", null, emptyList(),
+                loop?.measuredHumanWaitNanos ?: 0L,
+            )
         }
         val stillOurs = synchronized(gate) {
             if (turn !== owned || owned.closed) {
@@ -780,6 +791,17 @@ class SmartAssistantPlugin(
         P3Log.line("P3_TURN end turn=${owned.turnId} outcome=${run.outcome} code=${run.safeCode ?: "-"} " +
             "steps=${run.steps.size}")
         if (!stillOurs) return
+        // Review I-1: the loop shifts its *own* budget by the time a person spent deciding (D49), but this turn's hint
+        // window is derived from **its** deadline (`hintValidUntil` = deadline + grace). Without moving that too, a
+        // result assembled after a late answer is dropped as expired: the phone executes the approved action and the
+        // glasses stay blank. The measurement comes back with the run, so the two numbers cannot drift apart.
+        if (run.humanWaitNanos > 0L) {
+            synchronized(gate) {
+                if (turn === owned && !owned.closed) {
+                    owned.extendDeadline(SmartTurn.saturatingAdd(owned.deadlineNanos, run.humanWaitNanos))
+                }
+            }
+        }
         submitOutcome(owned, run)
     }
 

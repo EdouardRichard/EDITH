@@ -46,12 +46,19 @@ data class AgentStep(val index: Int, val action: String, val result: String)
  *
  * [safeCode] carries the provider's reason (or the loop's own stable code for `INSUFFICIENT` / `NO_PROGRESS` /
  * `STEP_LIMIT`) and is `null` when nothing meaningful applies. [finalText] is set only for [AgentOutcome.COMPLETED].
+ *
+ * [humanWaitNanos] is the wall clock this run spent waiting for a **person** (the confirmation port), and it is
+ * additive: `0` is the behaviour every caller and test had before it existed. The loop shifts its own budget by this
+ * amount (D49) but knows nothing about what the caller derives from the deadline — the plugin's hint window is
+ * `deadline + grace`, so without this number a result assembled after a late answer is reported as already expired and
+ * the glasses stay blank (review I-1). Reporting the measurement is what lets the caller move the window it owns.
  */
 data class AgentRun(
     val outcome: AgentOutcome,
     val safeCode: String?,
     val finalText: String?,
     val steps: List<AgentStep>,
+    val humanWaitNanos: Long = 0L,
 )
 
 private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
@@ -139,6 +146,24 @@ class AgentLoop(
         private set
 
     /**
+     * The human wait this run has measured so far, per-run state like the guard: it is reset on entry and read by every
+     * terminal path through [finish], so a run that ends **after** a confirmation still reports the time the person
+     * spent (and no call site can forget to pass it along).
+     */
+    private var humanWaitNanos = 0L
+
+    /**
+     * The wall clock this run has measured waiting for a person **so far** — the same number the returned [AgentRun]
+     * carries, exposed for the caller that never gets an [AgentRun] at all.
+     *
+     * A transport failure makes [run] throw by design (`ModelClientGateway` lets it escape), and a caller whose own
+     * windows are derived from the deadline still has to move them or its honest failure sentence is dropped as
+     * expired: the phone would have acted and the glasses would stay blank (review I-1). Read-only; the loop owns the
+     * measurement.
+     */
+    val measuredHumanWaitNanos: Long get() = humanWaitNanos
+
+    /**
      * Requests that the run stop at its next check. Safe to call from another thread, including while a gateway turn
      * is in flight: the loop reads the flag again as soon as that turn returns.
      */
@@ -160,6 +185,7 @@ class AgentLoop(
         // A guard may be shared with (or reused after) another run: this run's first observation must be a first
         // observation, not the continuation of an inherited streak.
         guard.reset()
+        humanWaitNanos = 0L
         val tools = registry.descriptors().map { ToolSpec(it.name, it.description, it.parametersJson) }
         // The user's turn opens the history: the loop has no other channel to hand the model what was asked.
         val history = mutableListOf<ModelHistoryItem>(ModelHistoryItem.Text(MessageRole.USER, request.utterance))
@@ -273,12 +299,18 @@ class AgentLoop(
                         is PolicyDecision.RequireConfirmation -> {
                             // Waiting on a person is not the turn spending its own budget (D49): measure the call and
                             // shift the deadline by the same amount. `finally` so a channel that throws is not punished
-                            // for the time it already spent waiting.
+                            // for the time it already spent waiting. The same measurement is **published** as it is taken
+                            // ([measuredHumanWaitNanos]), so a caller whose own windows derive from the deadline can move
+                            // them even when this run ends by throwing instead of returning (review I-1).
                             val waitStartedNanos = clock.nowNanos()
                             val outcome = try {
                                 confirmation?.request(call.id, decision.summary)
                             } finally {
-                                turnDeadlineNanos += clock.nowNanos() - waitStartedNanos
+                                val waitedNanos = clock.nowNanos() - waitStartedNanos
+                                if (waitedNanos > 0L) {
+                                    humanWaitNanos += waitedNanos
+                                    turnDeadlineNanos += waitedNanos
+                                }
                             }
                             when {
                                 // No channel at all: P3.1's behaviour, and an unconfirmed action never runs.
@@ -345,7 +377,7 @@ class AgentLoop(
             history += ModelHistoryItem.Text(MessageRole.ASSISTANT, closingText.ifBlank { CLOSED_TURN_TEXT })
         }
         lastTranscript = history.toList()
-        return AgentRun(outcome, safeCode, finalText, steps.toList())
+        return AgentRun(outcome, safeCode, finalText, steps.toList(), humanWaitNanos)
     }
 
     /**

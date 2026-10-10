@@ -929,6 +929,37 @@ class AgentLoopTest {
         assertEquals(2, gateway.requests.size)
     }
 
+    @Test fun `a run reports the wall clock it spent waiting for a person`() {
+        // Review I-1: the caller owns windows derived from the turn deadline (the plugin's hint window is
+        // `deadline + grace`), so the loop has to hand back what it excluded - otherwise a caller can only guess.
+        val clock = FakeClock(0)
+        val executor = gatedExecutor()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "已经调低了")),
+        )
+
+        val run = newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), clock = clock,
+            confirmation = WaitingConfirmation(clock, waitNanos = 5_000_000_000L),
+        ).run(request(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(5_000_000_000L, run.humanWaitNanos, "等人的墙钟必须随 run 交回调用方")
+    }
+
+    @Test fun `machine time is not reported as a human wait`() {
+        val clock = FakeClock(0)
+        val executor = gatedExecutor()
+        val gateway = ClockMovingGateway(
+            clock, nanosPerTurn = 2_000_000_000L,
+            replies = listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "不该到达")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), clock = clock)
+            .run(request(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(0L, run.humanWaitNanos, "只有等人算人时；机器时间不得被报成人时")
+    }
+
     @Test fun `an absent confirmation channel behaves exactly as before`() {
         // Review M-1: the plan promised this one and it was missing. The null channel must keep P3.1's shape even with a
         // finite turn deadline and a non-zero per-request cap - the `finally` around the confirmation call shifts by the
