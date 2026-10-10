@@ -33,5 +33,20 @@
                 <action android:name="edith.DEBUG_HINT" />
             </intent-filter>
         </receiver>
+        <!--
+          P3.3 Stage C instrument. Same reasoning and the same export rule as the two above: the only caller is an
+          `adb shell am broadcast`, so it must be exported and must therefore never exist in a release build. It arms
+          the scripted model wire, which answers the model request from a script instead of the network so the L3/L4
+          half of the execution layer can be exercised through the real policy, gate, executor and audit. It bypasses
+          nothing but the transport, and it logs the action name only - never the arguments.
+        -->
+        <receiver
+            android:name=".DebugToolCallInjector"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_TOOLCALL" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>
