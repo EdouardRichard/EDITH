@@ -858,4 +858,107 @@ class AgentLoopTest {
         assertEquals("done", run.finalText)
         assertEquals(2, run.steps.size)
     }
+
+    // ------------------------------------------------- the confirmation wait is not the turn's budget (D49)
+
+    /** A confirmation channel that spends the **user's** time: the clock moves while it waits. */
+    private class WaitingConfirmation(
+        private val clock: FakeClock,
+        private val waitNanos: Long,
+        private val outcome: ConfirmationOutcome = ConfirmationOutcome(true, ConfirmationSource.PHONE),
+        private val onWait: () -> Unit = {},
+    ) : ConfirmationPort {
+        override fun request(requestId: String, summary: String): ConfirmationOutcome {
+            clock.nowNanos += waitNanos
+            onWait()
+            return outcome
+        }
+    }
+
+    /** A gateway that spends **machine** time on every turn: that time is the loop's own budget and must still count. */
+    private class ClockMovingGateway(
+        private val clock: FakeClock,
+        private val nanosPerTurn: Long,
+        replies: List<GatewayReply>,
+    ) : ModelGateway {
+        private val inner = ScriptedGateway(replies)
+        val requests: List<GatewayTurn> get() = inner.requests
+        override fun turn(request: GatewayTurn): GatewayReply {
+            clock.nowNanos += nanosPerTurn
+            return inner.turn(request)
+        }
+    }
+
+    private fun gatedExecutor() =
+        RecordingActionExecutor(listOf(actionDescriptor("device.set_volume", requiresConfirmation = true)))
+
+    private fun gatedPolicy() =
+        ScriptedPolicy(mapOf("device.set_volume" to PolicyDecision.RequireConfirmation("调低音量?")))
+
+    @Test fun `a confirmation that waits past the deadline does not end the turn`() {
+        val clock = FakeClock(0)
+        val executor = gatedExecutor()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "已经调低了")),
+        )
+
+        val run = newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), clock = clock,
+            confirmation = WaitingConfirmation(clock, waitNanos = 5_000_000_000L),
+        ).run(request(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome, "等人的时间不该算进回合预算")
+        assertEquals(1, executor.calls.size, "批准过的动作必须真的执行")
+        assertEquals(2, gateway.requests.size, "顺延之后模型还要能被再问一次")
+    }
+
+    @Test fun `a full-window confirmation still lets the turn finish`() {
+        val clock = FakeClock(0)
+        val executor = gatedExecutor()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "已经调低了")),
+        )
+
+        val run = newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), clock = clock,
+            confirmation = WaitingConfirmation(clock, waitNanos = 120_000_000_000L),
+        ).run(request(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome, "把 120 s 窗口用满也不该让回合变成超时")
+        assertEquals(2, gateway.requests.size)
+    }
+
+    @Test fun `a cancel during the wait ends the turn as CANCELLED`() {
+        val clock = FakeClock(0)
+        val executor = gatedExecutor()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "不该到达")),
+        )
+        lateinit var loop: AgentLoop
+        val confirmation = WaitingConfirmation(clock, waitNanos = 5_000_000_000L, onWait = { loop.cancel() })
+        loop = newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), clock = clock,
+            confirmation = confirmation,
+        )
+
+        val run = loop.run(request(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(AgentOutcome.CANCELLED, run.outcome, "等待期间被取消就是取消，顺延不得把它变成完成")
+        assertEquals(1, gateway.requests.size, "取消之后不得再问模型")
+    }
+
+    @Test fun `machine time still spends the budget`() {
+        val clock = FakeClock(0)
+        val executor = gatedExecutor()
+        val gateway = ClockMovingGateway(
+            clock, nanosPerTurn = 2_000_000_000L,
+            replies = listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "不该到达")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), clock = clock)
+            .run(request(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(AgentOutcome.DEADLINE, run.outcome, "只有等人的时间被排除，机器的时间仍要计入预算")
+        assertEquals(1, gateway.requests.size)
+    }
 }

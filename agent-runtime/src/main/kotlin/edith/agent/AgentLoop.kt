@@ -156,10 +156,14 @@ class AgentLoop(
         val history = mutableListOf<ModelHistoryItem>(ModelHistoryItem.Text(MessageRole.USER, request.utterance))
         val steps = mutableListOf<AgentStep>()
         var unproductiveTurns = 0
+        // The turn's budget counts **machine** time only. A confirmation spends the *user's* time, so the deadline is
+        // shifted forward by however long that call waits (D49): with a 120 s decision window (D47) charging the wait to
+        // the turn would make every considered answer end the turn as DEADLINE.
+        var turnDeadlineNanos = request.deadlineNanos
 
         while (true) {
             if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "")
-            if (clock.nowNanos() >= request.deadlineNanos) return finish(AgentOutcome.DEADLINE, null, null, steps, history, "")
+            if (clock.nowNanos() >= turnDeadlineNanos) return finish(AgentOutcome.DEADLINE, null, null, steps, history, "")
 
             val reply = gateway.turn(
                 GatewayTurn(
@@ -168,7 +172,7 @@ class AgentLoop(
                     request.instructions,
                     history.toList(),
                     tools,
-                    request.deadlineNanos,
+                    turnDeadlineNanos,
                 ),
             )
             // A turn that was blocked when `cancel()` arrived must not complete the run with a late answer.
@@ -252,7 +256,15 @@ class AgentLoop(
                             ToolResult.error(call.id, REFUSED_BY_POLICY)
                         }
                         is PolicyDecision.RequireConfirmation -> {
-                            val outcome = confirmation?.request(call.id, decision.summary)
+                            // Waiting on a person is not the turn spending its own budget (D49): measure the call and
+                            // shift the deadline by the same amount. `finally` so a channel that throws is not punished
+                            // for the time it already spent waiting.
+                            val waitStartedNanos = clock.nowNanos()
+                            val outcome = try {
+                                confirmation?.request(call.id, decision.summary)
+                            } finally {
+                                turnDeadlineNanos += clock.nowNanos() - waitStartedNanos
+                            }
                             when {
                                 // No channel at all: P3.1's behaviour, and an unconfirmed action never runs.
                                 outcome == null -> {
@@ -295,7 +307,7 @@ class AgentLoop(
                     return finish(AgentOutcome.COMPLETED, null, result.payload, steps, history, "")
                 }
                 if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "")
-                if (clock.nowNanos() >= request.deadlineNanos) return finish(AgentOutcome.DEADLINE, null, null, steps, history, "")
+                if (clock.nowNanos() >= turnDeadlineNanos) return finish(AgentOutcome.DEADLINE, null, null, steps, history, "")
             }
         }
     }
