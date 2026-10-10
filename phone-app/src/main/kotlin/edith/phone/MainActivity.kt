@@ -90,8 +90,13 @@ class MainActivity : ComponentActivity() {
                         text = { Text(pending.summary) },
                         // All three buttons travel in **one** slot: Material3 re-flows `confirmButton` against
                         // `dismissButton` as their widths change, which is what made the row jump between one and two
-                        // lines as the countdown shrank (user report 2026-10-11). One explicit Row, one fixed Allow
-                        // width, one arrangement - 拒绝 / 急停 / 允许, always on a single line.
+                        // lines as the countdown shrank (user report 2026-10-11). One explicit Row, one arrangement -
+                        // 拒绝 / 急停 / 允许 - and a Row does not wrap, so the arrangement is fixed by construction.
+                        // Measured on the K40 (2026-10-11): the declared [CONFIRM_BUTTON_WIDTH] is **clamped** by what
+                        // the row has left, so what really holds the geometry still is that the Allow button absorbs
+                        // exactly that remainder - a quantity the countdown cannot change (the other two buttons are
+                        // content-sized). The button containers' bounds were identical at `允许 (110)` and
+                        // `允许 (87)`.
                         confirmButton = {
                             Row(
                                 modifier = Modifier.fillMaxWidth(),
@@ -193,8 +198,13 @@ class MainActivity : ComponentActivity() {
 
 /**
  * The countdown lives on the Allow button (owner directive 2026-10-10), so its **geometry** must not move: the label
- * shrinks from `允许 (120)` to `允许 (9)` once a second, and an unconstrained button re-flows the dialog's button row
- * under the user's finger (user report 2026-10-11). A fixed width keeps the layout still while the number ticks.
+ * shrinks from `允许 (120)` to `允许 (9)` once a second.
+ *
+ * Honest scope of this number, measured on the K40 (2026-10-11): the dialog's row has less space than this asks for, so
+ * the declared width is **clamped** by the incoming constraint (`Modifier.width` enforces it) - the button rendered
+ * 284 px (≈103 dp at 440 dpi) rather than 385 px. It is kept as the declared upper bound (it binds whenever the row is
+ * wide enough, e.g. a wider dialog), but the invariant the user reported is carried by the single-slot Row: the Allow
+ * button takes the row's remainder, and the two content-sized buttons beside it never change.
  */
 private val CONFIRM_BUTTON_WIDTH = 140.dp
 
