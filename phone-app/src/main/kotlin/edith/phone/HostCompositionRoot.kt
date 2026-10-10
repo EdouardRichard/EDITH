@@ -39,6 +39,7 @@ import edith.phone.actions.CallPermission
 import edith.phone.actions.ExecutionRouter
 import edith.phone.actions.IntentExecutionBackend
 import edith.phone.actions.RootProbe
+import edith.phone.actions.RootStatus
 import edith.phone.actions.ShizukuExecutionBackend
 import edith.phone.actions.ShizukuTargetState
 import edith.phone.actions.ShizukuUserServiceShell
@@ -271,18 +272,33 @@ class HostCompositionRoot internal constructor(
     internal var channelProbes: List<Pair<String, () -> Boolean>> = emptyList()
 
     /**
-     * The Root row's informational line, taken from the probe itself.
+     * The Root row's informational line's **source**: the probe, asked once per read.
      *
      * The panel states the device's own answer (`Root：不可用（设备无 su）`) rather than a bare code, because a missing
-     * `su` is a fact about the phone and not a fault of this App - spec §17.2 asks for a 告知行 here.
+     * `su` is a fact about the phone and not a fault of this App - spec §17.2 asks for a 告知行 here. It is the probe
+     * rather than a pre-rendered line because the line must say *why*: a `su` that never answered is a different fact
+     * from an absent binary, and the row may only state what the probe observed (leftover-sweep review, Important 1+2).
      */
-    internal var rootChannelNote: (() -> String)? = null
+    internal var rootStatusProbe: (() -> RootStatus)? = null
 
-    /** The panel's channel rows, from the **same** probes the `P3_EXEC` lines use. */
-    private fun executionChannels(): List<ExecutionChannelStatus> = executionChannelStatuses(
-        channelProbes.map { (id, up) -> id to runCatching { up() }.getOrDefault(false) },
-        rootChannelNote?.invoke(),
-    )
+    /** One root probe for one read, so the row and its note cannot cost two timeouts. Null when no probe is wired. */
+    private fun rootStatus(): RootStatus? = rootStatusProbe?.let { probe -> runCatching { probe() }.getOrNull() }
+
+    /**
+     * The panel's channel rows, from the **same** probes the `P3_EXEC` lines use.
+     *
+     * `status` is a parameter so a caller that already probed root for its log line can hand that one answer to both.
+     * The Root row appears whenever a root probe is wired - a composition built without one (several test rigs) has no
+     * Root row and no `P3_EXEC channel=root` line, exactly as before this change.
+     */
+    private fun executionChannels(status: RootStatus? = rootStatus()): List<ExecutionChannelStatus> {
+        val rootRow = if (rootStatusProbe == null) emptyList() else
+            listOf(ROOT_CHANNEL to (status == RootStatus.AVAILABLE))
+        return executionChannelStatuses(
+            channelProbes.map { (id, up) -> id to runCatching { up() }.getOrDefault(false) } + rootRow,
+            status?.let(RootProbe::noteFor),
+        )
+    }
 
     /**
      * Republishes the channel rows when a channel changes state **without** the session changing.
@@ -475,6 +491,15 @@ class HostCompositionRoot internal constructor(
         runCatching { executionChannelBringUp?.invoke() }
         channelProbes.forEach { (id, up) ->
             P3Log.line("P3_EXEC channel=$id available=${runCatching { up() }.getOrDefault(false)}")
+        }
+        // The root channel is asked **once**: that one answer is both the fourth probe line and the panel's Root row, so
+        // a `su` waiting on a permission prompt costs this session start one timeout instead of two (P3.3
+        // leftover-sweep review, Important 1). Nothing is logged or published when no root probe is wired, so a
+        // composition built without one keeps producing exactly the lines and rows it did before.
+        val rootStatus = rootStatus()
+        if (rootStatusProbe != null) {
+            P3Log.line("P3_EXEC channel=$ROOT_CHANNEL available=${rootStatus == RootStatus.AVAILABLE}")
+            mutableState.update { it.copy(executionChannels = executionChannels(rootStatus)) }
         }
     }
 
@@ -1256,9 +1281,11 @@ class HostCompositionRoot internal constructor(
                 INTENT_CHANNEL to { true },
                 A11Y_CHANNEL to { EdithAccessibilityService.connected() },
                 SHIZUKU_CHANNEL to { shizukuShell.ready() },
-                ROOT_CHANNEL to { rootProbe.available() },
             )
-            root.rootChannelNote = { rootProbe.describe() }
+            // Root is asked through `rootStatusProbe` rather than a `channelProbes` entry, so the panel gets the row
+            // **and** the reason from one probe (leftover-sweep review, Important 1); the row itself is appended by
+            // `executionChannels`, which keeps the four `P3_EXEC` ids and their order.
+            root.rootStatusProbe = { rootProbe.status() }
             root.executionChannelBringUp = {
                 shizukuShell.bind()
                 shizukuShell.requestPermissionIfNeeded()

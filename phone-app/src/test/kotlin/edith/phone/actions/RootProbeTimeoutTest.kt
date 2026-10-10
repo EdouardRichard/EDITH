@@ -2,19 +2,21 @@ package edith.phone.actions
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
-import org.junit.Assert.assertNull
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.ByteArrayInputStream
 import java.io.ByteArrayOutputStream
+import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /**
- * P3.3 review, Minor 2: on a rooted device the `su` probe can block forever (an `su` waiting for a permission prompt),
- * and `HostCompositionRoot.start` asks it on the session page's thread, so the page would hang.
+ * P3.3 review, Minor 2, and the leftover-sweep review's Important 1 + 2: on a rooted device the `su` probe can block
+ * forever (an `su` waiting for a permission prompt) and it is asked from the session page's thread, so the page would
+ * hang - and once it is bounded, the panel must still say *which* way it failed.
  *
- * `probeWithTimeout` is deliberately a plain function over [Process] rather than a lambda inside `onDevice()`: the
- * timeout policy is then pinned here, on the JVM, with no device and no real `su`.
+ * `probeStatus` is deliberately a plain function over [Process] rather than a lambda inside `onDevice()`: the timeout
+ * policy and the reason it reports are then pinned here, on the JVM, with no device and no real `su`.
  */
 class RootProbeTimeoutTest {
 
@@ -33,25 +35,43 @@ class RootProbeTimeoutTest {
         override fun destroyForcibly(): Process { killedForcibly = true; return this }
     }
 
+    private fun probe(process: Process): RootStatus =
+        probeStatus(listOf("su", "-c", "id"), 2_000L) { process }
+
     @Test
-    fun aProbeThatNeverAnswersIsReportedAsNoRootInsteadOfBlockingTheSessionPage() {
+    fun aProbeThatNeverAnswersIsReportedAsNoAnswerAndNeverAsRoot() {
         val process = StubProcess(finishes = false)
 
-        val result = probeWithTimeout(listOf("su", "-c", "id"), 2_000L) { process }
+        val status = probe(process)
 
-        assertNull("an unanswered probe is not a root grant", result)
+        assertEquals(RootStatus.NO_ANSWER, status)
         assertTrue("the stuck process must be killed, not leaked", process.killedForcibly)
         assertFalse("the probe must use the bounded wait, never the unbounded one", process.unboundedWaitUsed)
     }
 
     @Test
-    fun aProbeThatAnswersStillReportsItsExitCodeAndOutput() {
-        val process = StubProcess(finishes = true)
+    fun aSilentSuIsNotReportedAsAMissingBinary() {
+        // The distinction the panel's Root row now prints: these two must not collapse into one wording.
+        val silent = probe(StubProcess(finishes = false))
 
-        val result = probeWithTimeout(listOf("su", "-c", "id"), 2_000L) { process }
+        assertNotEquals("a su that did not answer is a different fact from a device with no su",
+            RootStatus.ABSENT, silent)
+        assertTrue("the timeout line must stay informational: " + RootProbe.noteFor(silent),
+            "不可用" in RootProbe.noteFor(silent))
+    }
 
-        assertEquals(0, result?.exitCode)
-        assertTrue("the stdout check is what separates root from a su that answers as the shell identity",
-            result!!.stdout.contains("uid=0"))
+    @Test
+    fun aProbeThatAnswersStillReportsWhatItFound() {
+        assertEquals(RootStatus.AVAILABLE, probe(StubProcess(finishes = true)))
+        assertEquals(RootStatus.NOT_ROOT,
+            probe(StubProcess(finishes = true, out = "uid=2000(shell) gid=2000(shell)\n")))
+    }
+
+    @Test
+    fun aMissingBinaryIsAbsentRatherThanAnException() {
+        val status = probeStatus(listOf("su", "-c", "id"), 2_000L) { throw IOException("su: not found") }
+
+        assertEquals(RootStatus.ABSENT, status)
+        assertEquals("Root：不可用（设备无 su）", RootProbe.noteFor(status))
     }
 }

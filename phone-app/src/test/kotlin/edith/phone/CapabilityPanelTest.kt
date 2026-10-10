@@ -1,6 +1,7 @@
 package edith.phone
 
 import edith.host.HostRuntime
+import edith.phone.actions.RootStatus
 import edith.plugin.CancellationHandle
 import edith.plugin.Capability
 import edith.plugin.ModelClient
@@ -67,5 +68,35 @@ class CapabilityPanelTest {
         assertEquals("眼镜未连接", capabilityReasonLabel("TRANSPORT_MISSING"))
         assertEquals("a code this build does not know must stay visible rather than be replaced by a comforting label",
             "SOME_FUTURE_CODE", capabilityReasonLabel("SOME_FUTURE_CODE"))
+    }
+
+    @Test
+    fun onePanelReadAsksTheRootChannelExactlyOnce() {
+        // Leftover-sweep review, Important 1: the panel row read `rootProbe.available()` through `channelProbes` and
+        // then the Root note read it *again* through `rootChannelNote`, so every panel computation ran `su -c id` twice
+        // - and a `su` waiting on a permission prompt costs the full probe timeout each time, on the session page.
+        val clock = FakeClock(0)
+        val scheduler = ManualScheduler(clock)
+        val environment = CxrHostEnvironment(clock = clock, input = RecordingInputPort(),
+            liveOutput = { null }, scheduler = scheduler)
+        val root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), UnusedModel(), environment)
+        try {
+            var rootProbes = 0
+            root.channelProbes = listOf(
+                INTENT_CHANNEL to { true },
+                A11Y_CHANNEL to { false },
+                SHIZUKU_CHANNEL to { false },
+            )
+            root.rootStatusProbe = { rootProbes++; RootStatus.ABSENT }
+
+            root.refreshExecutionChannels()
+            val rows = root.state.value.executionChannels
+
+            assertEquals("one panel read must ask the root channel exactly once", 1, rootProbes)
+            assertEquals("the root row must still be named, with the reason the probe observed",
+                "Root：不可用（设备无 su）", rows.first { it.id == ROOT_CHANNEL }.note)
+        } finally {
+            root.close()
+        }
     }
 }

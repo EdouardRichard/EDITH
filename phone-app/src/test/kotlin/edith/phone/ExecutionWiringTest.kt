@@ -1,6 +1,9 @@
 package edith.phone
 
+import edith.phone.actions.RootProbe
+import edith.phone.actions.RootStatus
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -66,5 +69,19 @@ class ExecutionWiringTest {
         assertEquals("未启用无障碍", capabilityReasonLabel("A11Y_DISABLED"))
         assertEquals("Shizuku 未运行或未授权", capabilityReasonLabel("SHIZUKU_UNAVAILABLE"))
         assertEquals("设备无 su", capabilityReasonLabel("ROOT_UNAVAILABLE"))
+    }
+
+    @Test fun `the root row says why root is unavailable, and a silent su is never called absent`() {
+        // Leftover-sweep review, Important 2: the row used to print "设备无 su" for *any* negative probe, so a rooted
+        // phone whose owner ignored the permission prompt was told it had no `su` - a device fact it never observed.
+        assertEquals("Root：不可用（设备无 su）", RootProbe.noteFor(RootStatus.ABSENT))
+        assertFalse("a su that only failed to answer is not a missing binary",
+            "设备无 su" in RootProbe.noteFor(RootStatus.NO_ANSWER))
+        assertFalse("a su that answered as the shell identity is not a missing binary",
+            "设备无 su" in RootProbe.noteFor(RootStatus.NOT_ROOT))
+        assertFalse("设备无 su" in RootProbe.noteFor(RootStatus.AVAILABLE))
+        assertTrue("the timeout line must still be an informational line, not an error: " +
+            RootProbe.noteFor(RootStatus.NO_ANSWER),
+            "不可用" in RootProbe.noteFor(RootStatus.NO_ANSWER))
     }
 }

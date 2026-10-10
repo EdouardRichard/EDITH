@@ -17,13 +17,13 @@ class RootProbeTest {
 
     @Test
     fun aMissingSuBinaryIsUnavailable() {
-        assertFalse(RootProbe { null }.available())
-        assertFalse(RootProbe { throw java.io.IOException("su: not found") }.available())
+        assertFalse(RootProbe.fromRunner { null }.available())
+        assertFalse(RootProbe.fromRunner { throw java.io.IOException("su: not found") }.available())
     }
 
     @Test
     fun suReportingUidZeroIsAvailable() {
-        val probe = RootProbe { ShellResult("su -c id", 0, "uid=0(root) gid=0(root) groups=0(root)", "") }
+        val probe = RootProbe.fromRunner { ShellResult("su -c id", 0, "uid=0(root) gid=0(root) groups=0(root)", "") }
 
         assertTrue(probe.available())
         assertEquals("ROOT_AVAILABLE", probe.reason())
@@ -32,7 +32,7 @@ class RootProbeTest {
     @Test
     fun suThatExistsButIsNotRootIsUnavailable() {
         // A binary that runs but reports the shell identity is not root - the distinction the exit code cannot make.
-        val probe = RootProbe { ShellResult("su -c id", 0, "uid=2000(shell) gid=2000(shell)", "") }
+        val probe = RootProbe.fromRunner { ShellResult("su -c id", 0, "uid=2000(shell) gid=2000(shell)", "") }
 
         assertFalse(probe.available())
         assertEquals("ROOT_UNAVAILABLE", probe.reason())
@@ -40,7 +40,7 @@ class RootProbeTest {
 
     @Test
     fun theRootRowIsAnInformationalLineRatherThanAnError() {
-        val description = RootProbe { null }.describe()
+        val description = RootProbe.fromRunner { null }.describe()
 
         assertTrue("the row must say it is unavailable: $description", "不可用" in description)
         assertFalse("an absent su is the device's nature, not a failure: $description", "错误" in description)
@@ -49,7 +49,7 @@ class RootProbeTest {
 
     @Test
     fun theProbeDeclaresNoActions() {
-        val probe = RootProbe { ShellResult("su -c id", 0, "uid=0(root)", "") }
+        val probe = RootProbe.fromRunner { ShellResult("su -c id", 0, "uid=0(root)", "") }
 
         assertTrue("root declares nothing, so an L4 path can never be advertised from it", probe.actions().isEmpty())
     }
