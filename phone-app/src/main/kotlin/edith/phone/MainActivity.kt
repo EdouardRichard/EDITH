@@ -273,6 +273,28 @@ class MainActivity : ComponentActivity() {
                             }) { Text(if (cxrReady) "重连眼镜" else "连接眼镜（CXR）") }
                             connectResult?.let { Text(it) }
                         }
+                        // P3.3 (spec §17.2 rule 1): the execution channels, named one by one. Without this the panel read
+                        // 指令执行 as available while every L2-L4 tool had silently gone from the model's table - the
+                        // capability is up, its privileged half is not, and only a per-channel row can say which.
+                        state.executionChannels.forEach { channel ->
+                            ListItem(
+                                headlineContent = { Text(executionChannelLabel(channel.id)) },
+                                supportingContent = {
+                                    Text(
+                                        when {
+                                            channel.available -> "可用"
+                                            channel.note != null -> channel.note
+                                            channel.reason != null ->
+                                                "尚不可用（${capabilityReasonLabel(channel.reason)}）"
+                                            else -> "尚不可用"
+                                        },
+                                    )
+                                },
+                                leadingContent = {
+                                    Icon(if (channel.available) Icons.Default.Check else Icons.Default.Info, null)
+                                },
+                            )
+                        }
                         state.capabilityReasons.forEach { (capability, reason) ->
                             ListItem(headlineContent = { Text(capabilityLabel(capability)) }, supportingContent = { Text("尚不可用（${capabilityReasonLabel(reason)}）") }, leadingContent = { Icon(Icons.Default.Info, null) })
                         }

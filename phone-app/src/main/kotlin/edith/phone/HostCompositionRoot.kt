@@ -204,7 +204,7 @@ class HostCompositionRoot internal constructor(
 
     /** One display signal: the panel follows what is wired now, then an activation refused for the display is retried. */
     private fun onDisplaySignal() {
-        mutableState.update { it.copy(capabilityReasons = capabilityReasons()) }
+        mutableState.update { it.copy(capabilityReasons = capabilityReasons(), executionChannels = executionChannels()) }
         retryActivationForDisplay()
     }
     /**
@@ -234,7 +234,14 @@ class HostCompositionRoot internal constructor(
         Capability.Confirmation -> "CONFIRMATION_PROVIDER_MISSING"
     }
     private val mutableState =
-        MutableStateFlow(SessionUiState(SessionState.Idle, null, capabilityReasons(), null))
+        MutableStateFlow(
+            SessionUiState(
+                SessionState.Idle, null, capabilityReasons(), null,
+                // Empty rather than computed here: the probes are installed by `create` after this flow exists, and
+                // at Idle the panel has no session whose channels it could be describing.
+                executionChannels = emptyList(),
+            ),
+        )
     val state: StateFlow<SessionUiState> = mutableState.asStateFlow()
     private val observation = host.observeState { session ->
         // D13: the upload grant is scoped to one session, and every path back to Idle ends it - including the ones
@@ -243,7 +250,7 @@ class HostCompositionRoot internal constructor(
         // P3.2: arming is session-scoped too, and for the same reason - a switch left on after the session it was
         // given for would let the next session perceive without the user asking again.
         if (session == SessionState.Idle) proactiveArming.deactivate()
-        mutableState.update { it.copy(session = session, capabilityReasons = capabilityReasons()) }
+        mutableState.update { it.copy(session = session, capabilityReasons = capabilityReasons(), executionChannels = executionChannels()) }
     }
     private var closed = false
     private var activatedPlugin: String? = null
@@ -262,6 +269,31 @@ class HostCompositionRoot internal constructor(
      * channel is down" from "the channel is up but refused the call".
      */
     internal var channelProbes: List<Pair<String, () -> Boolean>> = emptyList()
+
+    /**
+     * The Root row's informational line, taken from the probe itself.
+     *
+     * The panel states the device's own answer (`Root：不可用（设备无 su）`) rather than a bare code, because a missing
+     * `su` is a fact about the phone and not a fault of this App - spec §17.2 asks for a 告知行 here.
+     */
+    internal var rootChannelNote: (() -> String)? = null
+
+    /** The panel's channel rows, from the **same** probes the `P3_EXEC` lines use. */
+    private fun executionChannels(): List<ExecutionChannelStatus> = executionChannelStatuses(
+        channelProbes.map { (id, up) -> id to runCatching { up() }.getOrDefault(false) },
+        rootChannelNote?.invoke(),
+    )
+
+    /**
+     * Republishes the channel rows when a channel changes state **without** the session changing.
+     *
+     * The privileged channel binds asynchronously, so a session's first probe honestly reads "not yet" and the channel
+     * becomes usable a moment later; nothing else would refresh the panel, and a panel that keeps saying a channel is
+     * down after it came up is lying about the present - the one thing this map must never do.
+     */
+    internal fun refreshExecutionChannels() {
+        mutableState.update { it.copy(executionChannels = executionChannels()) }
+    }
 
     /** P3.3: brings the privileged channel up (bind, and ask for its permission when it is not granted yet). */
     private var executionChannelBringUp: (() -> Unit)? = null
@@ -1061,7 +1093,11 @@ class HostCompositionRoot internal constructor(
             val shizukuShell = ShizukuUserServiceShell(context, BuildConfig.VERSION_CODE, BuildConfig.DEBUG,
                 // The bind is asynchronous, so the session's first probe can honestly read "not yet". This line is the
                 // moment the channel actually becomes usable - and it is what a device stage reads instead of guessing.
-                onReady = { P3Log.line("P3_EXEC channel=shizuku available=true") })
+                onReady = {
+                    P3Log.line("P3_EXEC channel=shizuku available=true")
+                    // Through the holder: this shell is built inside `create`, before any composition instance exists.
+                    rootHolder[0]?.refreshExecutionChannels()
+                })
             val rootProbe = RootProbe.onDevice()
             val accessibilityUi = object : AccessibilityUi {
                 private fun live() = EdithAccessibilityService.ui()
@@ -1210,11 +1246,12 @@ class HostCompositionRoot internal constructor(
             root.calendarSource = calendar
             // P3.3 (spec §17.2/§17.4): the execution channels, their probe lines, their bring-up, and the question-asker.
             root.channelProbes = listOf(
-                "intent" to { true },
-                "accessibility" to { EdithAccessibilityService.connected() },
-                "shizuku" to { shizukuShell.ready() },
-                "root" to { rootProbe.available() },
+                INTENT_CHANNEL to { true },
+                A11Y_CHANNEL to { EdithAccessibilityService.connected() },
+                SHIZUKU_CHANNEL to { shizukuShell.ready() },
+                ROOT_CHANNEL to { rootProbe.available() },
             )
+            root.rootChannelNote = { rootProbe.describe() }
             root.executionChannelBringUp = {
                 shizukuShell.bind()
                 shizukuShell.requestPermissionIfNeeded()

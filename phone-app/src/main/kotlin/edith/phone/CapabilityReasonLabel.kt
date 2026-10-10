@@ -23,5 +23,10 @@ internal fun capabilityReasonLabel(reason: String): String = when (reason) {
     "CONTEXT_PROVIDER_MISSING" -> "上下文感知未装配"
     "WAKE_PROVIDER_MISSING" -> "唤醒词未装配"
     "CONFIRMATION_PROVIDER_MISSING" -> "确认通道未装配"
+    // P3.3 (spec §17.2 rule 1): the execution channels' own codes. These are the reason 指令执行 can be *up* while the
+    // privileged half of it is down, which is why they are shown per channel and not folded into one row.
+    "A11Y_DISABLED" -> "未启用无障碍"
+    "SHIZUKU_UNAVAILABLE" -> "Shizuku 未运行或未授权"
+    "ROOT_UNAVAILABLE" -> "设备无 su"
     else -> reason
 }

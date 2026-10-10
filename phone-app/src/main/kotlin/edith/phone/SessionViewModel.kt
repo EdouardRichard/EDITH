@@ -15,6 +15,8 @@ data class SessionUiState(
     val errorCode: String?,
     /** The confirmation currently awaiting an answer on the phone, or null. */
     val pendingConfirmation: PendingConfirmation? = null,
+    /** P3.3 (spec §17.2 rule 1): the execution channels, named individually so a down one cannot hide. */
+    val executionChannels: List<ExecutionChannelStatus> = emptyList(),
 )
 
 class SessionViewModel(private val root: HostCompositionRoot) : ViewModel() {
