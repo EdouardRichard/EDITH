@@ -1004,14 +1004,11 @@ class SmartAssistantPlugin(
                 deadlineNanos = SmartTurn.saturatingAdd(started, SmartPrompts.PROACTIVE_DEADLINE_MILLIS * 1_000_000L),
             ))
         } catch (failure: Throwable) {
-            // A capability refusal is the App's upload gate answering before any HTTP (the profile verification
-            // shares the same vocabulary), so it is a skip and starts the cooldown rather than a per-sentence retry.
-            if (failure is ContractError.CapabilityMissing) {
-                filter.noteGateRefused(clock.nowNanos())
-                P3Log.line("P3_PROACTIVE skip reason=${ProactiveSkip.GATE}")
-            } else {
-                P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")
-            }
+            // `D53`① (2026-10-11): there is no session upload gate any more, so a refusal here is never "the gate said
+            // no" - it is the model client refusing for its own reasons (an unverified profile operation, a missing
+            // capability). That is an honest **failure** of this turn, not a skip with a reason the vocabulary no
+            // longer has, and the cooldown is already the cooldown's job on the next request.
+            P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")
             discard(hint)
             return
         }

@@ -105,10 +105,27 @@ class SmartProactiveTest {
     }
 
     @Test
-    fun `a refusal by the upload gate also starts the cooldown`() {
+    fun `a refusal after a settled request already restarts the window`() {
         val proactive = filter()
-        proactive.noteGateRefused(0)
+        // The upload gate's refusal path is gone (D53①), but the *behaviour* its note method shared with the cooldown -
+        // a refusal must not let the next utterance retry immediately - is still the cooldown's job, and already was.
+        proactive.noteRequest(0)
 
         assertEquals(ProactiveSkip.COOLDOWN, proactive.admit(trigger(ADMITTED, 1), true, false))
+    }
+
+    /**
+     * `D53`① removed the session upload consent, so there is no upload refusal left to report.
+     *
+     * Pinned as a **vocabulary** test because the skip reasons are the device log's contract (`P3_PROACTIVE skip
+     * reason=…`): leaving `GATE` in the enum would let a future caller log a refusal that can no longer happen, and an
+     * acceptance run would then read a gate that does not exist.
+     */
+    @Test
+    fun `there is no upload gate skip reason any more`() {
+        assertFalse(
+            ProactiveSkip.entries.any { it.name == "GATE" },
+            "D53①: nothing may report an upload-gate skip: ${ProactiveSkip.entries}",
+        )
     }
 }

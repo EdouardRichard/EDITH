@@ -28,9 +28,12 @@ internal enum class ProactiveSensitivity(val minTranscriptChars: Int) {
  * - [SHORT] kept for the length-only refusal the old rule reported. New candidates are refused as [VAGUE].
  * - [COOLDOWN] too soon after the last request, or after a refusal that started the cooldown.
  * - [DEDUP] this sentence (about this foreground app) was already handled recently.
- * - [GATE] the session's upload consent refused the request, so nothing left the device.
+ *
+ * There is deliberately **no** upload-gate reason any more (`D53`①): the session-level upload consent was removed, so
+ * "the gate refused" is not a state the proactive path can reach. The vocabulary is the device log's contract
+ * (`P3_PROACTIVE skip reason=…`), so a reason that can no longer happen must not stay wordable.
  */
-internal enum class ProactiveSkip { DISARMED, BUSY, NOISY, SHORT, VAGUE, COOLDOWN, DEDUP, GATE }
+internal enum class ProactiveSkip { DISARMED, BUSY, NOISY, SHORT, VAGUE, COOLDOWN, DEDUP }
 
 /** One candidate: what was heard, what the acoustic layer called it, what is in front of the user, and when. */
 internal data class ProactiveTrigger(
@@ -44,8 +47,8 @@ internal data class ProactiveTrigger(
  * The cheap filter in front of every proactive model request (spec §5.2, §16.1#4).
  *
  * It is entirely local: [admit] answers whether a trigger may become a request, and the caller notes what actually
- * happened afterwards ([noteRequest], [noteDedup], [noteGateRefused]). Nothing here calls a model, so a refusal costs
- * nothing and the expensive path is only reached by an admitted trigger.
+ * happened afterwards ([noteRequest], [noteDedup]). Nothing here calls a model, so a refusal costs nothing and the
+ * expensive path is only reached by an admitted trigger.
  *
  * Rules, in the order they are applied - the order matters because it decides the *reason* when several apply:
  * `DISARMED -> BUSY -> NOISY -> VAGUE -> COOLDOWN -> DEDUP`.
@@ -117,9 +120,6 @@ internal class SmartProactive(
     fun noteDedup(trigger: ProactiveTrigger) {
         synchronized(lock) { seen[key(trigger)] = trigger.nowNanos + dedupTtlNanos }
     }
-
-    /** The request was refused by the session's upload gate (zero HTTP); do not re-decide on every sentence. */
-    fun noteGateRefused(nowNanos: Long) { synchronized(lock) { cooldownStartedNanos = nowNanos } }
 
     /** Must hold [lock]. */
     private fun isDuplicateLocked(trigger: ProactiveTrigger): Boolean {

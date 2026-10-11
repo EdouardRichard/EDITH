@@ -56,7 +56,6 @@ import edith.phone.model.ProactiveArming
 import edith.phone.model.ProfileViewModel
 import edith.phone.model.ProbeConsent
 import edith.phone.model.ProfileProbeGate
-import edith.phone.model.SessionUploadConsent
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -109,14 +108,6 @@ class HostCompositionRoot internal constructor(
      * the next load read one blob.
      */
     private val smartSettingsStore: SmartSettingsStore? = null,
-    /**
-     * D13: the session-scoped text-upload toggle.
-     *
-     * Session state, not a stored secret, and **off by default**. The gated model client consults it through
-     * [consentSource] for real turns; the 会话 page's switch is its only writer, and [stop] returns it to off so a
-     * grant can never outlive the session it was given for.
-     */
-    internal val sessionUploadConsent: SessionUploadConsent = SessionUploadConsent(),
     /**
      * P3.2: the session-scoped 「主动辅助」 arming switch (spec §16.2).
      *
@@ -251,9 +242,6 @@ class HostCompositionRoot internal constructor(
         )
     val state: StateFlow<SessionUiState> = mutableState.asStateFlow()
     private val observation = host.observeState { session ->
-        // D13: the upload grant is scoped to one session, and every path back to Idle ends it - including the ones
-        // that call `host.stop()` directly (a denied start) and never reach this composition's `stop`.
-        if (session == SessionState.Idle) sessionUploadConsent.deactivate()
         // P3.2: arming is session-scoped too, and for the same reason - a switch left on after the session it was
         // given for would let the next session perceive without the user asking again.
         if (session == SessionState.Idle) proactiveArming.deactivate()
@@ -1092,12 +1080,9 @@ class HostCompositionRoot internal constructor(
     @Synchronized fun stop() {
         if (closed) return
         pendingStart = null
-        // D13: the upload grant does not outlive the session it was given for. Done here as well as on the Idle
-        // transition below, because `stop` is also reached when no transition happens (a stop after an interrupt, or
-        // before the first start), and a session-scoped grant must never survive it.
-        sessionUploadConsent.deactivate()
-        // P3.2: and so does the arming switch. Done here as well as on the Idle transition, because `stop` is also
-        // reached when no transition happens (a stop before the first start), and an arming must never survive it.
+        // P3.2: the arming switch does not outlive its session. Done here as well as on the Idle transition, because
+        // `stop` is also reached when no transition happens (a stop before the first start), and an arming must never
+        // survive it. (D53① removed the upload consent that used to be reset in the same breath.)
         proactiveArming.deactivate()
         // D15: a stopped session must not keep repeating its opening handshake to the glasses.
         hintLink?.sessionEnded()
@@ -1189,11 +1174,8 @@ class HostCompositionRoot internal constructor(
             val resolver = KeystoreVault(blobs)
             val profiles = AndroidProfileRepository(blobs, resolver)
             val probeGate = ProfileProbeGate(profiles)
-            // D13: the one instance the UI's switch writes and the model client reads. Session state only - nothing
-            // here is persisted, and it starts off.
-            val sessionUploadConsent = SessionUploadConsent()
-            // P3.2: the arming switch and its gate. One instance for the UI, the chain's acoustic sink and the
-            // reset paths, exactly as the upload consent is one instance for the UI and the model client.
+            // P3.2: the arming switch and its gate. One instance for the UI, the chain's acoustic sink and the reset
+            // paths. (D53① removed the session upload consent that used to sit beside it.)
             val proactiveArming = ProactiveArming()
             // The model request had no production line before the P3.1 wrap-up: the client was built with no
             // interceptor, so a successful request was silent and that hop rested on its effects. This is the one line
@@ -1205,7 +1187,7 @@ class HostCompositionRoot internal constructor(
                 .addInterceptor(scriptedWire)
                 .addInterceptor(ModelHttpLog(clock::nowNanos)).build()
             val model = ControlledModelClient(http, profiles, resolver, CapabilityGate(), ContextBudgeter(), clock, scheduler,
-                consentSource(sessionUploadConsent, probeGate::requestConsent))
+                consentSource(probeGate::requestConsent))
             val controlledTester = ControlledProfileTester(model, profiles, clock)
             val tester = object : ProfileTester {
                 override fun testText(profileId: String, listener: (ModelStreamEvent) -> Unit): CancellationHandle {
@@ -1487,7 +1469,6 @@ class HostCompositionRoot internal constructor(
                 hintLink = hintLink,
                 smartWiring = smartWiring,
                 smartSettingsStore = smartSettingsStore,
-                sessionUploadConsent = sessionUploadConsent,
                 proactiveArming = proactiveArming)
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
             // connection that has not been built yet.
@@ -1558,16 +1539,20 @@ class HostCompositionRoot internal constructor(
         }
 
         /**
-         * D13: the consent the gated model client consults, and the **only** one it is given.
+         * `D53`① (2026-10-11): the consent the gated model client consults, and the **only** one it is given.
          *
-         * A named production seam for the same reason as [playbackSuppression]: the composition that has the probe
-         * gate and the session toggle is built by `create`, which needs a real Android `Context` and so cannot be
-         * driven from a JVM test. Both answers have to reach the one source, and the rule that matters - the session
-         * toggle adds `text` for a real turn and **never** the probe flag - is then provable against the real
-         * `ControlledModelClient` rather than against a copy of the merge.
+         * The session-level upload switch is gone - the owner's ruling was "zero knobs": **"会话在运行"即允许** the
+         * transcript and its turn context to reach the configured model service, and the only consenting action is
+         * pressing 开始. The gated client asks this for every real turn, and the session is running exactly when a turn
+         * can be built, so `text` is allowed unconditionally here.
+         *
+         * What must **not** change: only `text` is added. `image` and `audio` stay the probe gate's answer, and the
+         * probe flow's own `syntheticProbe` flag is never invented by this source - otherwise a real turn would quietly
+         * satisfy the probe confirmation that flow requires. A named production seam for the same reason as
+         * [playbackSuppression]: `create` needs a real Android `Context`, so the merge is driven from a JVM test here.
          */
-        internal fun consentSource(session: SessionUploadConsent, probe: () -> RequestConsent): () -> RequestConsent =
-            { session.requestConsent(probe()) }
+        internal fun consentSource(probe: () -> RequestConsent): () -> RequestConsent =
+            { probe().copy(text = true) }
 
         /**
          * The wake detector's self-audio guard over the composition's one [HostCompositionRoot.playbackGate]

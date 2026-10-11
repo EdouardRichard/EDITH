@@ -298,24 +298,14 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                         }
                         helpResult?.let { Text(it) }
                         HorizontalDivider()
-                        // D13: the only path by which a real turn's text may leave the device. Session-scoped, off by
-                        // default, and reset by the composition when the session stops - the switch only ever writes
-                        // the composition's one consent object, and nothing about it is persisted.
-                        val uploadAllowed by root.sessionUploadConsent.enabled.collectAsStateWithLifecycle()
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Switch(checked = uploadAllowed,
-                                onCheckedChange = { root.sessionUploadConsent.set(it) },
-                                enabled = state.session != SessionState.Idle)
-                            Spacer(Modifier.width(8.dp))
-                            Text("允许上传本会话的语音转写")
-                        }
-                        Text("开始会话后可开启。开启后，本会话的语音转写文本会随请求离开设备、发送到所配置的模型服务" +
-                            "（含该轮请求所需的会话上下文）；默认关闭，会话停止后自动恢复为关闭，该开关也不会写入存储。",
-                            style = MaterialTheme.typography.bodySmall)
-                        // P3.2: the arming switch. It is not a second upload grant - with it on, the App only starts
-                        // *perceiving* (acoustic labels and context changes); a proactive turn is still a model
-                        // request and still needs the upload switch above. Session-scoped and off by default, like
-                        // that switch, and reset by the composition when the session stops.
+                        // `D53`① (2026-10-11): there is **no** upload switch any more. The owner's ruling was "zero
+                        // knobs" - **"会话在运行"即允许** the transcript and its turn context to reach the configured
+                        // model service, and the only consenting action is the 开始 button above. What did **not**
+                        // change (and is asserted elsewhere): logs and evidence carry counts and ids only, memory
+                        // writes make no network request, and nothing goes anywhere but the configured service.
+                        // P3.2: the arming switch. It is not an upload grant - with it on, the App only starts
+                        // *perceiving* (acoustic labels and context changes). Session-scoped and off by default, reset
+                        // by the composition when the session stops.
                         val proactiveArmed by root.proactiveArming.enabled.collectAsStateWithLifecycle()
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Switch(checked = proactiveArmed,
@@ -324,8 +314,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                             Spacer(Modifier.width(8.dp))
                             Text("主动辅助（未唤醒时给一句短提示）")
                         }
-                        Text("需同时打开上面的上传开关才会发出模型请求；本会话停止后自动关闭且不写入存储。",
-                            style = MaterialTheme.typography.bodySmall)
+                        Text("会话停止后自动关闭且不写入存储。", style = MaterialTheme.typography.bodySmall)
                         // P3.2 Stage B: the perception sources that need a system grant. Each entry opens the system
                         // screen for its own special access and says, truthfully, what the assistant cannot see
                         // without it - a refused source contributes **no** context key, never a placeholder.
@@ -587,7 +576,7 @@ private fun MemorySection(view: MemoryLogView) {
     Text("长期记忆", style = MaterialTheme.typography.titleLarge)
     Text(
         "本地加密保存；只记录你的事实、偏好与常做任务。被检索到的那几条会随请求发到所配置的模型服务" +
-            "（前提是本会话的上传开关已打开）；可随时单条删除或全部清空。",
+            "（会话在运行时即允许，见「开始」）；可随时单条删除或全部清空。",
         style = MaterialTheme.typography.bodySmall,
     )
     if (lines.isEmpty()) Text("暂无记忆")
