@@ -142,4 +142,19 @@ class TriggerScorerTest {
         assertEquals("negative", labels[1].label)
         assertTrue(labels.none { it.id == "id" }, "表头不得被当成数据")
     }
+
+    /**
+     * W2/F19: the report must say out loud that its trigger count is a **lower bound**.
+     *
+     * The device's `request=` count is what the campaign could *record*: a row whose window happens to contain no
+     * decision line records nothing, and any `skip reason=DEDUP` line proves an earlier hint that was never recorded
+     * (`noteDedup` sits next to `noteRequest` in the success branch). Printing a bare "recall" off that number is how
+     * P3.4's 0% came to look like a measurement instead of a floor.
+     */
+    @Test fun `the report always states that the recorded count is a lower bound`() {
+        val notice = lowerBoundNotice()
+
+        assertTrue(notice.contains("LOWER BOUND"), "the floor must be named: $notice")
+        assertTrue(notice.contains("DEDUP"), "the proof of an unrecorded hint must be named: $notice")
+    }
 }

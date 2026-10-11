@@ -7,6 +7,19 @@ import kotlin.system.exitProcess
 internal data class Observations(val observed: List<Observed>, val harnessErrors: List<String>)
 
 /**
+ * W2/F19: the sentence every report must carry.
+ *
+ * The device's `request=` count is what the campaign could **record**, not what happened: a row whose window contains
+ * no decision line records nothing (it is a `harness_error` now, not a `none`), and any `skip reason=DEDUP` line proves
+ * an earlier hint that was never recorded, because `noteDedup` sits next to `noteRequest` in the success branch. A
+ * bare "recall" computed off that number is a **lower bound** - which is exactly how P3.4's 0% had to be read, and
+ * saying so in the output is what keeps the next reader from treating it as a measurement.
+ */
+internal fun lowerBoundNotice(): String =
+    "NOTE: triggered = triggers RECORDED on the device (a LOWER BOUND): a row with no log line proves nothing, " +
+        "and any 'skip reason=DEDUP' line proves an earlier hint that was never recorded."
+
+/**
  * P3.4 §6.4: the trigger-metric harness's command line.
  *
  * ```
@@ -17,8 +30,9 @@ internal data class Observations(val observed: List<Observed>, val harnessErrors
  * line for an id wins, so a re-run settles a row it could not settle before.
  *
  * **A `harness_error` row blocks the verdict.** It means the campaign could not tell whether that row triggered (the
- * injection never finished, the log came back empty); scoring it as "no trigger" would fold an instrument failure into
- * the model's silence and quietly lower recall. `--allow-errors` scores anyway and says so.
+ * injection never finished, the log came back empty, no decision line arrived, or the instrument's own cooldown
+ * suppressed it); scoring it as "no trigger" would fold an instrument outcome into the model's silence and quietly
+ * lower recall. `--allow-errors` scores anyway and says so.
  *
  * The harness never talks to a device: the campaign drives the injections, this prints the verdict.
  */
@@ -59,6 +73,7 @@ fun main(args: Array<String>) {
     }
 
     val result = score(labels, parsed.observed, windowMinutes)
+    println(lowerBoundNotice())
     println("corpus rows=${labels.size} observed=${parsed.observed.size} windowMinutes=$windowMinutes")
     for ((scenario, figures) in result.perScenario) {
         println(
