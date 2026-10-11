@@ -219,6 +219,24 @@ function Get-EdithCooldownReportLine {
     return ("cooldown-suppressed (unresolved, re-run): " + $Count)
 }
 
+# The batch report's count block, as pure strings.
+#
+# Pure rather than inline `Write-Host`s (review I3) because the **nesting** is the thing that was wrong: the report used
+# to print "none : 10" followed by an indented "of which WITHOUT a decision line … : 1", while that row was in fact one
+# of the `harness_error`s. A reader could not tell which parent the second number belonged to, and the pilot artifact
+# proved it was the wrong one. Keeping the shape in one place lets a test assert the nesting instead of trusting it.
+function Get-EdithBatchReportLines {
+    param([int]$Triggered, [int]$None, [int]$HarnessErrors, [int]$NoDecision, [int]$Cooldown)
+    return @(
+        ("rows run        : " + ($Triggered + $None + $HarnessErrors)),
+        ("triggered       : " + $Triggered),
+        ("none            : " + $None + "   (the decider answered: SHORT/VAGUE/DEDUP/NOISY/BUSY/DISARMED)"),
+        (Get-EdithCooldownReportLine -Count $Cooldown),
+        ("  of the harness_errors, WITHOUT a decision line in the window: " + $NoDecision),
+        ("harness_error   : " + $HarnessErrors + "   (unresolved: never scored as a model silence)")
+    )
+}
+
 # =====================================================================================
 # Side-effecting helpers
 # =====================================================================================
@@ -581,8 +599,10 @@ foreach ($row in $runRows) {
         $verdictInfo = Get-EdithRowVerdict -Tail $tail
         $verdict = $verdictInfo.Verdict
         $reason = $verdictInfo.Reason
-        if ($reason -eq 'no_decision_line_in_window') { $noDecision++ }
-        if ($verdictInfo.CooldownSuppressed) { $cooldownSuppressed++ }
+        # Both counters are scoped to rows that are actually UNRESOLVED. Counting a `triggered` window's stray COOLDOWN
+        # line here (review I3) would put a delivered hint under a line labelled "unresolved, re-run".
+        if ($verdict -eq 'harness_error' -and $reason -eq 'no_decision_line_in_window') { $noDecision++ }
+        if ($verdict -eq 'harness_error' -and $verdictInfo.CooldownSuppressed) { $cooldownSuppressed++ }
     }
 
     $evidence = @(Select-EdithEvidenceLine -Tail $tail)
@@ -592,11 +612,12 @@ foreach ($row in $runRows) {
     foreach ($line in $evidence) {
         Write-EdithLine -Path $evidenceFull -Text ($row.Id + "`t" + (Get-EdithLogTime -Line $line) + "`t" + $line)
     }
-    if ($evidence.Count -eq 0) {
-        Write-EdithLine -Path $evidenceFull -Text ($row.Id + "`tnone`t" + $reason + "`tlogLines=" + $tail.Count)
-    } else {
-        Write-EdithLine -Path $evidenceFull -Text ($row.Id + "`t" + $verdict + "`t" + $reason + "`tnoDecisionLine=" + ($reason -eq 'no_decision_line_in_window') + "`tcriteria=" + $evidence.Count + "`tlogLines=" + $tail.Count)
-    }
+    # The **verdict**, not the literal `none` (review I3): a row with no criterion line and a `harness_error` verdict used
+    # to be recorded here as `none`, so the audited artifact said "the model said no" for an instrument outcome - the one
+    # thing W2 exists to stop, still visible in the file the report cites.
+    Write-EdithLine -Path $evidenceFull -Text ($row.Id + "`t" + $verdict + "`t" + $reason +
+        "`tnoDecisionLine=" + ($reason -eq 'no_decision_line_in_window') + "`tcriteria=" + $evidence.Count +
+        "`tlogLines=" + $tail.Count)
 
     # The observation line is written LAST and alone, so it is never half-written.
     Write-EdithLine -Path $obsFull -Text ($row.Id + "=" + $verdict)
@@ -611,11 +632,8 @@ Write-Host "== batch report =="
 Write-Host "RECORDED TRIGGERS ARE A LOWER BOUND: a row with no log line proves nothing, and any 'skip reason=DEDUP'"
 Write-Host "line proves an earlier hint that was NOT recorded (noteDedup sits next to noteRequest in the success branch)."
 Write-Host ("rows run        : " + $runRows.Count)
-Write-Host ("triggered       : " + $counts.triggered)
-Write-Host ("none            : " + $counts.none)
-Write-Host ("  of which WITHOUT a decision line in the window (instrument gap, unresolved): " + $noDecision)
-Write-Host (Get-EdithCooldownReportLine -Count $cooldownSuppressed)
-Write-Host ("harness_error   : " + $counts.harness_error)
+Get-EdithBatchReportLines -Triggered $counts.triggered -None $counts.none -HarnessErrors $counts.harness_error `
+    -NoDecision $noDecision -Cooldown $cooldownSuppressed | ForEach-Object { Write-Host $_ }
 Write-Host ("synthesized now : " + $synthesized.Count)
 Write-Host ''
 Write-Host "triggered by scenario/label (cumulative, read back from the observations file):"

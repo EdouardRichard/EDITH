@@ -175,6 +175,20 @@ Assert-Equal 'harness_error' $verdicts['K-P-02'] 'the unresolved row is recorded
 $settled = Get-EdithObservationVerdict -Lines @('K-P-02=harness_error', 'K-P-02=triggered')
 Assert-Equal 0 (@($settled.Keys | Where-Object { $settled[$_] -eq 'harness_error' })).Count 'a re-run settles the row'
 
+# --- review I3: instrument counts must not be nested under `none`, and a triggered row is never unresolved -----
+# `CooldownSuppressed` is true for any window containing a COOLDOWN line, *including one that also triggered*.
+# Counting such a row under a line labelled "unresolved, re-run" would report a delivered hint as an unresolved row,
+# which is why the run loop scopes both counters to `harness_error` verdicts.
+$v = Get-EdithRowVerdict -Tail @('P3_INJECT state=end', 'P3_PROACTIVE request=', 'P3_PROACTIVE skip reason=COOLDOWN')
+Assert-Equal 'triggered' $v.Verdict 'a window that triggered is triggered'
+Assert-Equal $true $v.CooldownSuppressed 'even though it also carries a cooldown line'
+
+$report = @(Get-EdithBatchReportLines -Triggered 1 -None 10 -HarnessErrors 2 -NoDecision 1 -Cooldown 0)
+Assert-Equal 0 (@($report | Where-Object { $_ -match 'of which' }).Count) 'no line nests an instrument outcome under none'
+Assert-Equal 1 (@($report | Where-Object { $_ -match 'none\s+: 10' }).Count) 'the none line carries only its own count'
+Assert-Equal 1 (@($report | Where-Object { $_ -match 'harness_error\s+: 2' }).Count) 'harness_error carries its own count'
+Assert-Equal 1 (@($report | Where-Object { $_ -match 'of the harness_errors, WITHOUT a decision line' }).Count) 'the no-decision count is nested under harness_error'
+
 if ($failures.Count -gt 0) {
     Write-Host ''
     $failures | ForEach-Object { Write-Host $_ }
