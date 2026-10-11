@@ -321,6 +321,32 @@ class SmartProactiveTurnTest {
     // ---- the configured thresholds (Task 9) ------------------------------------------------------------------------
 
     @Test
+    fun `a refused request starts the cooldown so the next utterance does not retry immediately`() {
+        // Review I1: with a profile the client keeps refusing, the failure path must not let *every* final utterance
+        // log `P3_PROACTIVE request` and attempt a call. `noteRequest` runs only on a successful hint, so the refusal
+        // path has to start the cooldown itself - the earlier revision dropped that call and claimed it was covered.
+        val rig = SmartTestRig()
+        rig.activate(proactiveCooldownMillis = "60000")
+        rig.model.onRequest = { _, _ -> throw edith.contracts.ContractError.CapabilityMissing("refused") }
+
+        withLines { lines ->
+            arm(rig)
+            rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+            awaitRequests(rig, 1)
+
+            arm(rig)
+            rig.plugin.handle(TranscriptEvent(rig.transcript("今天星期几", turnId = "asr-2")))
+
+            assertEquals(
+                1,
+                lines.count { it.startsWith("P3_PROACTIVE request") },
+                "the second utterance is inside the cooldown and must not attempt again: $lines",
+            )
+            assertEquals(1, lines.count { it.startsWith("P3_PROACTIVE silence reason=FAILED") }, lines.toString())
+        }
+    }
+
+    @Test
     fun `the feature rule decides admission, so the sensitivity dial no longer gates a short question`() {
         // P3.5 §W3 replaced the length gate with `admitByFeatures`. The old behaviour this test pinned - "MEDIUM refuses
         // a five-character utterance, HIGH admits it" - was the defect: a five-character *real question* was refused for

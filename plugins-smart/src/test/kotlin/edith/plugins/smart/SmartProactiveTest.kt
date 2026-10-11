@@ -107,9 +107,8 @@ class SmartProactiveTest {
     @Test
     fun `a refusal after a settled request already restarts the window`() {
         val proactive = filter()
-        // The upload gate's refusal path is gone (D53①), but the *behaviour* its note method shared with the cooldown -
-        // a refusal must not let the next utterance retry immediately - is still the cooldown's job, and already was.
-        proactive.noteRequest(0)
+        // Same effect as a request: a refusal must not let the next utterance retry immediately.
+        proactive.noteRefused(0)
 
         assertEquals(ProactiveSkip.COOLDOWN, proactive.admit(trigger(ADMITTED, 1), true, false))
     }

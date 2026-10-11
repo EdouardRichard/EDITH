@@ -117,6 +117,16 @@ internal class SmartProactive(
     /** A request was actually made; the cooldown starts here, not at the trigger. */
     fun noteRequest(nowNanos: Long) { synchronized(lock) { cooldownStartedNanos = nowNanos } }
 
+    /**
+     * An attempt was **refused** - before any HTTP (a capability the model client will not grant) or by the transport.
+     *
+     * Same effect as [noteRequest] on the cooldown, and for the measured reason: without it a profile the client keeps
+     * refusing would make **every** final utterance log `P3_PROACTIVE request` and attempt a call, instead of one
+     * attempt per cooldown window. `D53`① removed the *upload gate*, so this is no longer about consent - it is about
+     * not re-deciding on every sentence when the answer cannot change that fast.
+     */
+    fun noteRefused(nowNanos: Long) { synchronized(lock) { cooldownStartedNanos = nowNanos } }
+
     /** The hint this trigger produced must not be produced again for the same (sentence, app) within its TTL. */
     fun noteDedup(trigger: ProactiveTrigger) {
         synchronized(lock) { seen[key(trigger)] = trigger.nowNanos + dedupTtlNanos }

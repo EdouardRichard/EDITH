@@ -1007,10 +1007,15 @@ class SmartAssistantPlugin(
                 deadlineNanos = SmartTurn.saturatingAdd(started, SmartPrompts.PROACTIVE_DEADLINE_MILLIS * 1_000_000L),
             ))
         } catch (failure: Throwable) {
-            // `D53`① (2026-10-11): there is no session upload gate any more, so a refusal here is never "the gate said
-            // no" - it is the model client refusing for its own reasons (an unverified profile operation, a missing
-            // capability). That is an honest **failure** of this turn, not a skip with a reason the vocabulary no
-            // longer has, and the cooldown is already the cooldown's job on the next request.
+            // `D53`① (2026-10-11): this is no longer "the upload gate said no" - there is no such gate any more. It is
+            // the model client refusing for its own reasons (an unverified profile operation, a missing capability),
+            // which is an honest **failure** of this turn, and the reason vocabulary therefore says `FAILED`.
+            //
+            // What must **not** change is the cooldown: `noteRequest` runs only on a *successful* hint, so without this
+            // call a profile the client keeps refusing would log `P3_PROACTIVE request` and attempt a call on **every**
+            // final utterance instead of once per cooldown window (review I1: the earlier revision dropped this call
+            // and its comment wrongly claimed the cooldown was already covered).
+            filter.noteRefused(clock.nowNanos())
             P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")
             discard(hint)
             return
