@@ -224,7 +224,12 @@ Assert-Equal 1 (@($evidence | Where-Object { $_ -match 'P3_ASR' }).Count) 'the a
 $expectedMarkers = @(
     'P3_PROACTIVE skip', 'P3_PROACTIVE request', 'P3_PROACTIVE admit', 'P3_ACOUSTIC', 'P3_SCRIPT',
     'P3_ASR', 'P3_TRANSCRIPT',
-    'P3_HTTP', 'P3_HINT', 'P3_PROACTIVE silence', 'P3_PROACTIVE hint')
+    'P3_HTTP', 'P3_HINT', 'P3_PROACTIVE silence', 'P3_PROACTIVE hint',
+    # `P3_INJECT` is how the instrument reports its OWN outcome: `state=start|refused|end`. Without it in the capture
+    # list, an injection that was refused (`state=refused reason=NO_EPOCH`, the app restarted with no armed session)
+    # is visible in the artifact only as "no inject end" - indistinguishable from a product that never decided. That
+    # cost a diagnosis on 2026-10-12 04:35, found only by reading live logcat.
+    'P3_INJECT')
 foreach ($marker in $expectedMarkers) {
     # The expectation list is written out HERE rather than read from $NoiseMarkers: a loop over the list itself would
     # still pass after someone deleted a marker from it, which is exactly how P3_ASR went missing for a whole batch.

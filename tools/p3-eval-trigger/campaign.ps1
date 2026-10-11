@@ -78,7 +78,12 @@ $CooldownMarker = 'P3_PROACTIVE skip reason=COOLDOWN'
 # request that produced nothing looks exactly like one that showed a hint.
 $NoiseMarkers = @(
     'P3_PROACTIVE skip', 'P3_PROACTIVE request', 'P3_PROACTIVE admit', 'P3_PROACTIVE silence', 'P3_PROACTIVE hint',
-    'P3_ACOUSTIC', 'P3_SCRIPT', 'P3_ASR', 'P3_TRANSCRIPT', 'P3_HTTP', 'P3_HINT')
+    'P3_ACOUSTIC', 'P3_SCRIPT', 'P3_ASR', 'P3_TRANSCRIPT', 'P3_HTTP', 'P3_HINT',
+    # The instrument's own `state=start|refused|end`. `refused reason=...` is the ONLY line that distinguishes "the
+    # injection was rejected" (e.g. NO_EPOCH after the app restarted with no armed session) from "the app decided
+    # nothing": on 2026-10-12 04:35 a block of rows was written as `no_inject_end_in_window`, and the reason was
+    # visible only in the live logcat - not in the artifact the scorer reads.
+    'P3_INJECT')
 $SynthScriptName = 'synth-campaign.ps1'
 
 # =====================================================================================
