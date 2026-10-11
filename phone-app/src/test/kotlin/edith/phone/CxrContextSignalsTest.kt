@@ -139,13 +139,14 @@ class CxrContextSignalsTest {
         val signals = CxrContextSignals(clock, listOf(CxrContextSignals.armingSource(arming)),
             localTime = { LocalTime.of(9, 0) })
 
+        // `D53`②: the switch is a persisted global setting and defaults **on**, so the first snapshot says true.
+        assertEquals("true", signals.snapshot().values[ProactiveArming.CONTEXT_KEY])
+
+        arming.set(false)
         assertEquals("false", signals.snapshot().values[ProactiveArming.CONTEXT_KEY])
 
         arming.set(true)
         assertEquals("true", signals.snapshot().values[ProactiveArming.CONTEXT_KEY])
-
-        arming.deactivate()
-        assertEquals("false", signals.snapshot().values[ProactiveArming.CONTEXT_KEY])
     }
 
     // ---- the delivered event, behind the arming gate ---------------------------------------------------------------
@@ -196,7 +197,10 @@ class CxrContextSignalsTest {
 
     @Test
     fun aDisarmedChangeProducesNoContextChangedAtAll() {
-        val rig = Rig(ProactiveArming(), session, clock)
+        // `D53`②: the switch defaults on now, so the disarmed state is set up explicitly.
+        val arming = ProactiveArming()
+        arming.set(false)
+        val rig = Rig(arming, session, clock)
         try {
             rig.changeAndSettle()
 

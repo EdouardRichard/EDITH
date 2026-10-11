@@ -242,9 +242,9 @@ class HostCompositionRoot internal constructor(
         )
     val state: StateFlow<SessionUiState> = mutableState.asStateFlow()
     private val observation = host.observeState { session ->
-        // P3.2: arming is session-scoped too, and for the same reason - a switch left on after the session it was
-        // given for would let the next session perceive without the user asking again.
-        if (session == SessionState.Idle) proactiveArming.deactivate()
+        // `D53`② (2026-10-11): the 「主动辅助」 switch is a **persisted global setting**, so nothing here resets it -
+        // a session ending must not disarm a feature the user asked to have on, and it must not re-arm one they turned
+        // off either. There is deliberately no `deactivate()` call on this path any more.
         mutableState.update { it.copy(session = session, capabilityReasons = capabilityReasons(), executionChannels = executionChannels()) }
     }
     private var closed = false
@@ -1080,10 +1080,10 @@ class HostCompositionRoot internal constructor(
     @Synchronized fun stop() {
         if (closed) return
         pendingStart = null
-        // P3.2: the arming switch does not outlive its session. Done here as well as on the Idle transition, because
-        // `stop` is also reached when no transition happens (a stop before the first start), and an arming must never
-        // survive it. (D53① removed the upload consent that used to be reset in the same breath.)
-        proactiveArming.deactivate()
+        // `D53`② (2026-10-11): stopping does **not** touch the 「主动辅助」 switch. It is a persisted global setting -
+        // the user configures it once and it holds across sessions, reconnects, App restarts and phone restarts - so
+        // there is no reset here and no `deactivate()` to call. (`D53`① removed the upload consent that used to be
+        // reset in the same breath; both are pinned by tests.)
         // D15: a stopped session must not keep repeating its opening handshake to the glasses.
         hintLink?.sessionEnded()
         // Before `host.stop()`: the epoch named by `runningAudioEpoch` is the one the loop is polling under, and
@@ -1174,9 +1174,12 @@ class HostCompositionRoot internal constructor(
             val resolver = KeystoreVault(blobs)
             val profiles = AndroidProfileRepository(blobs, resolver)
             val probeGate = ProfileProbeGate(profiles)
-            // P3.2: the arming switch and its gate. One instance for the UI, the chain's acoustic sink and the reset
-            // paths. (D53① removed the session upload consent that used to sit beside it.)
-            val proactiveArming = ProactiveArming()
+            // Task 14a/14b: the one settings store, built here rather than further down because the arming switch
+            // below persists through it. A save and the next load therefore read the same blob.
+            val smartSettingsStore = SmartSettingsStore(blobs)
+            // P3.2 / `D53`②: the arming switch and its gate. One instance for the UI, the chain's acoustic sink and the
+            // settings store. It is **persisted** (default on) and loaded once here, at assembly time.
+            val proactiveArming = ProactiveArming(smartSettingsStore).also { it.load() }
             // The model request had no production line before the P3.1 wrap-up: the client was built with no
             // interceptor, so a successful request was silent and that hop rested on its effects. This is the one line
             // that closes the gap, and it carries nothing but method, status and duration (`ModelHttpLog`).
@@ -1248,7 +1251,6 @@ class HostCompositionRoot internal constructor(
             // Task 14b: this is also the store the settings screen writes through, so a save and the next load read
             // the same blob. The composition's own settings stay the ones read here; the screen's copy is explicit
             // that only a full App restart re-reads them (this root is a process-lifetime singleton).
-            val smartSettingsStore = SmartSettingsStore(blobs)
             val smartSettings = smartSettingsStore.load(profiles)
             // Task 14b: the self-audio seam. P3.1 emits no audio at all, so the gate stays open and this wiring
             // changes nothing today; it is what P3.2 hands to the speech output path. See `PlaybackGate`.

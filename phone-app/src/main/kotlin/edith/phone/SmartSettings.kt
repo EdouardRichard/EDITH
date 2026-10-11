@@ -41,6 +41,15 @@ data class SmartSettings(
      */
     val proactiveCooldownMillis: Long = 60_000L,
     val proactiveSensitivity: String = "LOW",
+    /**
+     * `D53`② (2026-10-11): the 「主动辅助」 switch, now a **persisted global setting** rather than per-session state.
+     *
+     * **On by default**: the owner's ruling is that it takes effect as soon as the App is installed, holds across
+     * sessions, reconnects, App restarts and phone restarts, and - once the user turns it off - is **not** turned back
+     * on by any path. The default lives here (so a fresh install and a pre-P3.5 blob both get it) and the switch writes
+     * through [ProactiveArming] to this same field.
+     */
+    val proactiveEnabled: Boolean = true,
 ) {
     /**
      * The plugin's own cooldown parameter.
@@ -154,6 +163,7 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
             put("cooldownMillis", settings.cooldownMillis)
             put("proactiveCooldownMillis", settings.proactiveCooldownMillis)
             put("proactiveSensitivity", settings.effectiveProactiveSensitivity())
+            put("proactiveEnabled", settings.proactiveEnabled)
         })
     }
 
@@ -173,6 +183,11 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
                     ?: SmartSettings().proactiveCooldownMillis,
                 proactiveSensitivity = json["proactiveSensitivity"]?.jsonPrimitive?.contentOrNull
                     ?: SmartSettings().proactiveSensitivity,
+                // Absent in a blob written before P3.5: like every other missing key it takes its default, which is
+                // **on** (`D53`②). A pre-P3.5 blob therefore comes up armed, which is the ruling's intent - the switch
+                // is a global default, not a per-session grant the user has to re-give.
+                proactiveEnabled = json["proactiveEnabled"]?.jsonPrimitive?.booleanOrNull
+                    ?: SmartSettings().proactiveEnabled,
             )
         }.getOrNull()
     }

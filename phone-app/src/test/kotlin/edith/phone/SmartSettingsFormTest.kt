@@ -1,6 +1,7 @@
 package edith.phone
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -23,8 +24,9 @@ class SmartSettingsFormTest {
         cooldownMillis: Long = 3000L,
         proactiveCooldownMillis: Long = 60_000L,
         proactiveSensitivity: String = "LOW",
+        proactiveEnabled: Boolean = true,
     ) = SmartSettings(wakeWords, maxLevel, whitelist, profileId, cooldownMillis,
-        proactiveCooldownMillis, proactiveSensitivity)
+        proactiveCooldownMillis, proactiveSensitivity, proactiveEnabled)
 
     // ---- P3.2: the proactive cooldown and sensitivity fields ----------------------------------------
 
@@ -279,5 +281,17 @@ class SmartSettingsFormTest {
         assertNotEquals("a rejected level must not become a level the plugin refuses", "L9", result.settings.maxLevel)
         assertEquals("p-1", result.settings.profileId)
         assertEquals(7000L, result.settings.cooldownMillis)
+    }
+
+    @Test
+    fun theFormKeepsThePersistedProactiveSwitch() {
+        // `D53`②: 「主动辅助」 is a persisted global setting and this form does not own it, so an edit made on the
+        // settings screen must carry it through rather than fall back to the field's default (`true`). A form that
+        // silently re-armed a switch the user had turned off would be exactly the "auto re-open" the ruling forbids.
+        val base = settings(proactiveEnabled = false)
+
+        val result = SmartSettingsForm.toSettings(SmartSettingsForm.fromSettings(base), base)
+
+        assertFalse("a save from the form must not re-arm it", result.settings.proactiveEnabled)
     }
 }

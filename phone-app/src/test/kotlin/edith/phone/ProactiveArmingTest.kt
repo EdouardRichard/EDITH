@@ -152,21 +152,26 @@ class ProactiveArmingTest {
     // ---- the switch ----------------------------------------------------------------------------------------------
 
     @Test
-    fun proactiveAssistanceIsOffByDefaultAndFollowsTheSwitch() {
+    fun proactiveAssistanceIsOnByDefaultAndFollowsTheSwitch() {
         val arming = ProactiveArming()
 
-        assertFalse("主动辅助 must be off until the user asks for it", arming.enabled.value)
-        arming.set(true)
-        assertTrue(arming.enabled.value)
-        arming.deactivate()
-        assertFalse("the session ending must return it to off", arming.enabled.value)
+        // `D53`②: 默认开、装一次即生效. The old model ("off until the user asks, off again when the session ends") is
+        // exactly what the ruling replaced - and the reset it relied on (`deactivate()`) no longer exists, because no
+        // path may re-arm a switch the user turned off.
+        assertTrue("D53-②: 主动辅助 默认开", arming.enabled.value)
+        arming.set(false)
+        assertFalse("and the user's own switch turns it off", arming.enabled.value)
     }
 
     // ---- the arming gate -----------------------------------------------------------------------------------------
 
     @Test
     fun aDisarmedCompositionProducesNoAcousticEventEvenThoughTheChainReportsOne() {
-        val rig = Rig(ProactiveArming(), session, verified)
+        // `D53`②: the switch now defaults on, so "disarmed" is a state the test must set up explicitly rather than
+        // inherit. That is the test's subject, not a default it can rely on.
+        val arming = ProactiveArming()
+        arming.set(false)
+        val rig = Rig(arming, session, verified)
         try {
             assertEquals(ActivationResult.Activated, rig.activate())
             withP3Sink { lines ->
@@ -206,33 +211,51 @@ class ProactiveArmingTest {
         HostRuntime(1), MemoryProfileRepository(), InertModel(), null, proactiveArming = arming)
 
     @Test
-    fun stoppingTheCompositionDisarmsTheSwitch() {
+    fun stoppingTheCompositionLeavesTheSwitchAlone() {
         val arming = ProactiveArming()
         val root = root(arming)
         try {
+            // `D53`②: a persisted global switch is the user's, not the session's. The old behaviour this test pinned -
+            // "the arming must not outlive the session it was given for" - is exactly what the ruling removed, because
+            // a stop that disarms silently turns off a feature the user configured once and expects to stay on.
             arming.set(true)
 
             root.stop()
 
-            assertFalse("the arming must not outlive the session it was given for", arming.enabled.value)
+            assertTrue("停止 must not change the user's global setting", arming.enabled.value)
         } finally {
             root.close()
         }
     }
 
     @Test
-    fun aDirectHostStopThatNeverReachesTheCompositionStopAlsoDisarms() {
+    fun aDirectHostStopAlsoLeavesTheSwitchAlone() {
         val arming = ProactiveArming()
         val root = root(arming)
         try {
             root.host.startSession(session)
             arming.set(true)
 
-            // The path the D13 comment calls out: a host-level stop that this composition's `stop` never sees must
-            // still end the session-scoped grant.
+            // A host-level stop that this composition's `stop` never sees is the same rule: nothing resets the switch.
             root.host.stop()
 
-            assertFalse("every path back to Idle must disarm", arming.enabled.value)
+            assertTrue("no path back to Idle may change a global setting", arming.enabled.value)
+        } finally {
+            root.close()
+        }
+    }
+
+    @Test
+    fun aDisarmedUserSwitchIsNotReArmedByStartingASession() {
+        val arming = ProactiveArming()
+        val root = root(arming)
+        try {
+            arming.set(false)
+
+            root.host.startSession(session)
+            root.stop()
+
+            assertFalse("D53-②: 关掉后不得被任何路径自动打开", arming.enabled.value)
         } finally {
             root.close()
         }

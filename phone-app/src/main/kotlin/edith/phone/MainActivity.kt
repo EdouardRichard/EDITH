@@ -303,18 +303,21 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                         // model service, and the only consenting action is the 开始 button above. What did **not**
                         // change (and is asserted elsewhere): logs and evidence carry counts and ids only, memory
                         // writes make no network request, and nothing goes anywhere but the configured service.
-                        // P3.2: the arming switch. It is not an upload grant - with it on, the App only starts
-                        // *perceiving* (acoustic labels and context changes). Session-scoped and off by default, reset
-                        // by the composition when the session stops.
+                        // P3.2 / `D53`②: the arming switch, now a **persisted global setting** - on by default, taking
+                        // effect at install time and holding across sessions, reconnects, App restarts and phone
+                        // restarts. It is therefore **not** disabled outside a session: it is a setting, not a
+                        // per-session grant, and nothing re-arms it once the user turns it off. It is still not an
+                        // upload grant - with it on the App only starts *perceiving* (acoustic labels and context
+                        // changes), and per `D53`① "the session is running" is what allows the request itself.
                         val proactiveArmed by root.proactiveArming.enabled.collectAsStateWithLifecycle()
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Switch(checked = proactiveArmed,
-                                onCheckedChange = { root.proactiveArming.set(it) },
-                                enabled = state.session != SessionState.Idle)
+                                onCheckedChange = { root.proactiveArming.set(it) })
                             Spacer(Modifier.width(8.dp))
                             Text("主动辅助（未唤醒时给一句短提示）")
                         }
-                        Text("会话停止后自动关闭且不写入存储。", style = MaterialTheme.typography.bodySmall)
+                        Text("一次配置、长期生效：跨会话、重连、重启 App 或手机都保持；关掉后不会被任何路径自动打开。",
+                            style = MaterialTheme.typography.bodySmall)
                         // P3.2 Stage B: the perception sources that need a system grant. Each entry opens the system
                         // screen for its own special access and says, truthfully, what the assistant cannot see
                         // without it - a refused source contributes **no** context key, never a placeholder.
