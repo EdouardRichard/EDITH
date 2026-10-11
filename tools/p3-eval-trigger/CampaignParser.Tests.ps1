@@ -189,6 +189,17 @@ Assert-Equal 1 (@($report | Where-Object { $_ -match 'none\s+: 10' }).Count) 'th
 Assert-Equal 1 (@($report | Where-Object { $_ -match 'harness_error\s+: 2' }).Count) 'harness_error carries its own count'
 Assert-Equal 1 (@($report | Where-Object { $_ -match 'of the harness_errors, WITHOUT a decision line' }).Count) 'the no-decision count is nested under harness_error'
 
+# --- W4: the diagnosis can only work if its own line is captured as evidence ------------------
+# `P3_ASR` is what makes "why did this row reach no decision" answerable. It was added to the plugin but NOT to the
+# campaign's evidence markers, so the first W4 batch recorded zero asr lines and the diagnosis could only say UNKNOWN -
+# the instrument was invisible to the harness that consumes it. This pins the marker list itself.
+$evidence = @(Select-EdithEvidenceLine -Tail @(
+    '10-11 19:07:26.163 I/EdithP3 (18428): P3_ASR revision=6 final=true chars=15 usable=true',
+    '10-11 19:07:26.163 I/EdithP3 (18428): P3_ACOUSTIC label=Speech',
+    '10-11 19:07:29.000 I/EdithP3 (18428): P3_PROACTIVE skip reason=VAGUE'))
+Assert-Equal 3 $evidence.Count 'every criterion line the diagnosis needs is captured'
+Assert-Equal 1 (@($evidence | Where-Object { $_ -match 'P3_ASR' }).Count) 'the asr trace is captured'
+
 if ($failures.Count -gt 0) {
     Write-Host ''
     $failures | ForEach-Object { Write-Host $_ }

@@ -61,7 +61,7 @@ $InjectComponent = 'edith.phone/.DebugAudioInjector'
 $InjectEndMarker = 'P3_INJECT state=end'
 $TriggerMarker = 'P3_PROACTIVE request='
 $CooldownMarker = 'P3_PROACTIVE skip reason=COOLDOWN'
-$NoiseMarkers = @('P3_PROACTIVE skip', 'P3_ACOUSTIC', 'P3_SCRIPT')
+$NoiseMarkers = @('P3_PROACTIVE skip', 'P3_ACOUSTIC', 'P3_SCRIPT', 'P3_ASR')
 $SynthScriptName = 'synth-campaign.ps1'
 
 # =====================================================================================
