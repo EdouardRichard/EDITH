@@ -41,12 +41,15 @@ internal class ProactiveArming(
     /**
      * Reads the persisted answer. Called once by `create` at assembly time.
      *
-     * A store that cannot be read answers with the defaults ([SmartSettingsStore.load] never throws), so the composition
-     * still comes up; and because the default is **on**, a failed read arms rather than silently disarming the feature
-     * the user asked to have on.
+     * A store that cannot be read leaves the switch **where it already is** and says so. The tempting alternative -
+     * treat a failed read as "the default", which is on - would re-arm a switch the user had deliberately turned off,
+     * which `D53`② forbids in as many words. The log line is what keeps the failure from being silent.
      */
     fun load() {
-        val stored = runCatching { store?.load() }.getOrNull() ?: return
+        val target = store ?: return
+        val stored = runCatching { target.load() }.onFailure {
+            android.util.Log.i("EdithHost", "proactive switch: settings unreadable, keeping the current value")
+        }.getOrNull() ?: return
         on.value = stored.proactiveEnabled
     }
 
@@ -54,14 +57,18 @@ internal class ProactiveArming(
      * The user's switch. Turning it on is the only way perception events are produced, and it is also the only writer
      * of the persisted value.
      *
-     * The write is "re-read the settings, change this one bit, save" rather than "save a settings object this class
-     * happens to hold": the settings screen can write the same blob, and saving a stale copy would silently revert
-     * whatever it changed in between.
+     * **A failed read aborts the write.** [SmartSettingsStore.load] answers with the **defaults** when the blob is
+     * missing or unreadable, so saving `load().copy(one field)` would quietly persist those defaults over the user's
+     * real settings - wake words, risk ceiling, whitelist, profile, cooldowns, sensitivity. The switch still moves in
+     * memory (the UI must respond), and the next successful read reconciles; losing one preference change is
+     * recoverable, silently wiping the rest is not.
      */
     fun set(enabled: Boolean) {
         on.value = enabled
         val target = store ?: return
-        runCatching { target.save(target.load().copy(proactiveEnabled = enabled)) }
+        runCatching { target.load() }.onFailure {
+            android.util.Log.i("EdithHost", "proactive switch: settings unreadable, not persisting this change")
+        }.getOrNull()?.let { stored -> runCatching { target.save(stored.copy(proactiveEnabled = enabled)) } }
     }
 
     companion object {

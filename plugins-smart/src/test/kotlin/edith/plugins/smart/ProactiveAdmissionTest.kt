@@ -89,4 +89,33 @@ class ProactiveAdmissionTest {
         assertTrue(AdmissionFeature.LENGTH in long.fired, "long: ${long.fired}")
         assertEquals(long.normalizedLength > short.normalizedLength, true, "length is measured, not judged")
     }
+
+    /**
+     * `PRONOUN_SELF` matches 我 *and* 咱.
+     *
+     * This test exists because the first version wrote the 我 pattern as a **regex string** and matched it with the
+     * literal `String.contains`, so the feature could only ever fire on 咱 - a defect that no other test noticed,
+     * because this feature is corroboration rather than a decision on its own. Pinning both halves is the only thing
+     * that keeps the two spellings honest.
+     */
+    @Test
+    fun `the first person feature matches both spellings`() {
+        assertTrue(
+            AdmissionFeature.PRONOUN_SELF in admissionFeatures("我该怎么办", foreground = null).fired,
+            "我 is first person",
+        )
+        assertTrue(
+            AdmissionFeature.PRONOUN_SELF in admissionFeatures("咱走吧", foreground = null).fired,
+            "咱 is first person",
+        )
+    }
+
+    /** The negative lookbehind is the whole reason 我 is not a plain substring: "你吃了吗" is not the speaker's need. */
+    @Test
+    fun `a second person sentence is not first person`() {
+        assertFalse(
+            AdmissionFeature.PRONOUN_SELF in admissionFeatures("你吃了吗", foreground = null).fired,
+            "a question addressed to someone else is not mine",
+        )
+    }
 }

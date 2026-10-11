@@ -131,7 +131,7 @@ internal fun admissionFeatures(
     }
     if (IMPERATIVE.any { text.contains(it) }) fired += AdmissionFeature.IMPERATIVE
     if (TIME_TERMS.any { text.contains(it) }) fired += AdmissionFeature.TIME
-    if (SELF_PRONOUNS.any { text.contains(it) }) fired += AdmissionFeature.PRONOUN_SELF
+    if (SELF_PRONOUNS.any { it.containsMatchIn(text) }) fired += AdmissionFeature.PRONOUN_SELF
     if (foreground != null && foregroundAnchored(text, foreground)) fired += AdmissionFeature.FOREGROUND_ANCHOR
     if (text.length >= lengthHintChars) fired += AdmissionFeature.LENGTH
     return AdmissionFeatures(fired, text.length)
@@ -331,4 +331,4 @@ private val IMPERATIVE = listOf(
     "帮我", "给我", "帮我看", "帮我查", "打开", "设置", "查一下", "查查", "告诉", "记一下", "记下", "提醒",
 )
 private val TIME_TERMS = listOf("几点", "今天", "明天", "昨天", "多久", "哪年", "现在", "星期", "周几", "上个月", "下周")
-private val SELF_PRONOUNS = listOf("(?<!你)我", "咱")
+private val SELF_PRONOUNS = listOf(Regex("(?<!你)我"), Regex("咱"))

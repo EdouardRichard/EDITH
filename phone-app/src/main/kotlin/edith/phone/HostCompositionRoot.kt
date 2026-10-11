@@ -870,8 +870,13 @@ class HostCompositionRoot internal constructor(
     /**
      * Explicit CXR entry point. Returns false when this assembly has no glasses transport (the audio
      * capability stays missing) and true when the connection was requested; the transport reports
-     * readiness asynchronously through [onSceneReady], never through this call. The connection is built
-     * on first use so the app does not open a CXR worker thread unless the user actually connects.
+     * readiness asynchronously through [onSceneReady], never through this call.
+     *
+     * **When this actually runs (corrected 2026-10-11, review).** It used to be reachable only from a 会话-page
+     * button, so the lazy build meant "no CXR worker thread unless the user connects". Since `D53`③ that button is
+     * gone: [attachCxrActivity] is called from `MainActivity.onCreate`, so **a connect attempt now happens at App
+     * launch**, before 开始 - which is the point (F17/F18: the link may not depend on a UI combination being rendered).
+     * The device log in the W1 evidence shows exactly that order (connect `12:26:38`, 开始 `12:26:44`).
      *
      * Every call really asks the transport to connect (the transport itself is idempotent for an impatient second
      * tap and renews a session that died - `TransportConnectIdempotencyTest`), so `开始` can mean "make sure it is

@@ -198,12 +198,15 @@ class SmartAssistantPlugin(
         private set
 
     /**
-     * Whether the configuration explicitly asked for consent (`requestConsent = true`).
+     * Whether the configuration asked for consent (`requestConsent = true`).
      *
-     * Parsed and retained deliberately, but **not** used to gate anything: the brief keeps the host's text-upload
-     * consent as the only gate for anything leaving the device, and a plugin-side second gate would be a silent
-     * refusal the host could neither see nor override. Exposed `internal` so a test can assert the flag is parsed
-     * without this class growing a public accessor.
+     * Parsed and retained deliberately, but **not** used to gate anything - and since `D53`① (2026-10-11) there is no
+     * longer a host-side consent gate for it to mirror either: the session-level upload consent was removed, and
+     * "the session is running" is what allows a request to reach the configured model service. This flag is therefore
+     * **vestigial**: nothing reads it in production, and the host still sends `requestConsent = false` to the
+     * diagnostic text plugin (which is why that plugin is inert on the phone). Kept, rather than dropped from
+     * `KNOWN_KEYS`, only because removing a configuration key is a contract-shaped change this phase did not need.
+     * Exposed `internal` so a test can assert the flag is parsed without this class growing a public accessor.
      */
     internal val requestConsentConfigured: Boolean get() = synchronized(gate) { config?.requestConsent == true }
 
