@@ -496,6 +496,15 @@ class SmartAssistantPlugin(
             }
 
             is TranscriptEvent -> {
+                // W4 (P3.5 §M): one line per revision, carrying **counts and flags only**. Without it the
+                // "why did this row reach no decision" question is unanswerable - the offline diagnosis of P3.4's
+                // evidence returned UNKNOWN for all 18 no-decision rows precisely because nothing recorded whether a
+                // final ever arrived. `usable` is [isUsableUtterance], so "the recogniser never finished" and "a final
+                // arrived but was not a usable utterance" become distinguishable after the fact. Never the text.
+                P3Log.line(
+                    "P3_ASR revision=${event.revision.revision} final=${event.revision.final} " +
+                        "chars=${event.revision.text.trim().length} usable=${isUsableUtterance(event.revision.text.trim())}",
+                )
                 val (started, proactive) = synchronized(gate) {
                     if (!matches(event.envelope)) null to null
                     // P3.3: a final that answers a live question is consumed here and nowhere else - it must not open

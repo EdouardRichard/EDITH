@@ -595,6 +595,32 @@ class SmartAssistantPluginTest {
         assertTrue(rig.hintTexts.isEmpty(), "a reconfigured-away turn must not submit")
     }
 
+    @Test fun `the transcript trace carries counts and never the text`() {
+        // W4 (P3.5 §M). Without this line the "why did this row reach no decision" question is unanswerable: P3.4's
+        // logs could not tell "the recogniser never produced a final" from "a final arrived and was dropped", which is
+        // exactly what the offline diagnosis reported as UNKNOWN for all 18 rows it found.
+        //
+        // The line deliberately carries **counts and flags only** - never the transcript - so it can be logged and
+        // quoted in evidence without touching the no-正文 boundary.
+        val rig = SmartTestRig()
+        rig.activate()
+
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了", turnId = "asr-9", final = true)))
+        } finally {
+            P3Log.sink = previous
+        }
+
+        val trace = lines.single { it.startsWith("P3_ASR") }
+        assertTrue(trace.contains("final=true"), "the line must report finality: $trace")
+        assertTrue(trace.contains("chars=5"), "and the length: $trace")
+        assertTrue(trace.contains("usable=true"), "and whether the utterance was usable: $trace")
+        assertFalse(trace.contains("现在几点了"), "the transcript itself must never appear: $trace")
+    }
+
     @Test fun `requestConsent stays the host's gate, not a second one inside the plugin`() {
         // The brief is explicit: `requestConsent` is "true only when explicitly configured — the host's text-upload
         // consent remains the gate for anything leaving the device". `plugins-smart` therefore parses and keeps the
