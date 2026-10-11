@@ -553,7 +553,7 @@ class PassiveLoopWiringTest {
                 )
                 assertEquals(
                     listOf("P3_AUDIO state=armed generation=${armed.generation.value} transport=true loop=true"),
-                    lines.filter { it.startsWith("P3_AUDIO") },
+                    audioLines(lines),
                 )
 
                 root.stop()
@@ -564,7 +564,7 @@ class PassiveLoopWiringTest {
                         "P3_AUDIO state=disarmed generation=${armed.generation.value} " +
                             "transport=false loop=false reason=DISARMED",
                     ),
-                    lines.filter { it.startsWith("P3_AUDIO") },
+                    audioLines(lines),
                 )
             }
         } finally {
@@ -581,8 +581,15 @@ class PassiveLoopWiringTest {
                 root.start("smart-assistant")
                 root.onSceneReady()
 
-                assertEquals(lines.toString(), 1, lines.size)
-                val line = lines.single()
+                // W1: a composition with no CXR assembly now says so at the start - which is exactly the line whose
+                // absence made F17/F18 read as "no CXR activity at all".
+                assertEquals(
+                    listOf("P3_CXR connect attempt=start result=transport_missing"),
+                    lines.filter { it.startsWith("P3_CXR") },
+                )
+                val audio = audioLines(lines)
+                assertEquals(audio.toString(), 1, audio.size)
+                val line = audio.single()
                 assertTrue(line, line.startsWith("P3_AUDIO state=disarmed"))
                 assertTrue(line, line.endsWith("transport=false loop=false reason=TRANSPORT_MISSING"))
                 assertTrue("the reason line still names the generation", line.contains("generation="))
@@ -700,13 +707,16 @@ class PassiveLoopWiringTest {
 
     /** Starts a session through the root and reports whether the smart plugin actually ended up listening. */
     private fun activateThroughRoot(root: HostCompositionRoot): Boolean {
+        // W1: the Activity comes first (as `MainActivity.onCreate` does), and the **start path** establishes the link -
+        // there is no connect button any more, so the rig must not wire the connection in behind the composition.
+        root.attachCxrActivity(activity = Any())
         root.start("smart-assistant")
-        // The real flow needs a live transport before the scene is ready; `connectCxr` is the user's button, so the
-        // rig goes through the composition rather than wiring the connection in behind it.
-        root.connectCxr(activity = Any())
         root.onSceneReady()
         return root.state.value.errorCode == null && root.currentAudioEpoch() != null
     }
+
+    /** The `P3_AUDIO` lines of a capture, in order: what the ear-vocabulary assertions below are about. */
+    private fun audioLines(lines: List<String>): List<String> = lines.filter { it.startsWith("P3_AUDIO") }
 
     // ---- item 5: the fault seam is reachable ----------------------------------------------------------------------
 

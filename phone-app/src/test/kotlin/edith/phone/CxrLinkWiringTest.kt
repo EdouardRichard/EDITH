@@ -72,7 +72,9 @@ class CxrLinkWiringTest {
      */
     private class CodeVerdictConnection : CxrConnection {
         override var ready: Boolean = false
-        override fun connect(activity: Any) = Unit
+        /** Every `connect` the composition asked for; W1's evidence that a session start really establishes the link. */
+        var connects: Int = 0
+        override fun connect(activity: Any) { connects++ }
         override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): CxrAuthorizationOutcome? =
             when (resultCode) {                Activity.RESULT_OK -> CxrAuthorizationOutcome.CONFIRMED
                 Activity.RESULT_CANCELED -> CxrAuthorizationOutcome.CANCELLED
@@ -81,6 +83,44 @@ class CxrLinkWiringTest {
         override fun sendCommand(json: String): Boolean = false
         override fun onInboundCommand(listener: (String) -> Unit) = Unit
         override fun close() = Unit
+    }
+
+    /**
+     * W1 (F17/F18): **开始** establishes the link, with no other tap anywhere.
+     *
+     * The device symptom was "point 开始, then `准备中` forever, and the new process never even *tried* to connect" -
+     * the only first-use entry point was a Compose button in one UI combination. The session start path now calls the
+     * link itself, so the count below must grow on `start()` and not only on `attachCxrActivity`.
+     */
+    @Test
+    fun startingASessionEstablishesTheLinkWithoutAnyOtherTap() {
+        val rig = Rig()
+        try {
+            rig.root.attachCxrActivity(Any())
+            assertEquals("the composition is wired and connected once the Activity exists", 1, rig.connection.connects)
+            rig.root.stop()
+            assertEquals("停止 disarms but keeps the built connection", 1, rig.connection.connects)
+
+            rig.root.start("p2-diagnostic")
+
+            assertEquals("开始 itself must (re)establish the link", 2, rig.connection.connects)
+        } finally { rig.root.close() }
+    }
+
+    /** A start while already armed is a no-op for the link; only 停止 disarms it (D53-③). */
+    @Test
+    fun aSecondStartWhileAlreadyConnectedDoesNotAskTheSdkAgain() {
+        val rig = Rig()
+        try {
+            rig.root.attachCxrActivity(Any())
+            rig.root.start("p2-diagnostic")
+            val armed = rig.connection.connects
+            assertEquals("开始 on an armed link must not reconnect", armed, rig.connection.connects)
+            rig.root.stop()
+            rig.root.start("p2-diagnostic")
+
+            assertEquals("but a stop+start cycle must", armed + 1, rig.connection.connects)
+        } finally { rig.root.close() }
     }
 
     @Test

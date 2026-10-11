@@ -63,6 +63,10 @@ class MainActivity : ComponentActivity() {
             setTurnScreenOn(true)
             raisedForConfirmation = true
         }
+        // W1 (F17/F18): the vendor SDK's `connect` needs an Activity, and only this page has one. Handing it over here
+        // is what lets the session start path (which runs inside `SessionService`) establish the CXR link itself
+        // instead of depending on one UI combination happening to be composed. Held weakly by the composition.
+        root.attachCxrActivity(this)
         val viewModel = ViewModelProvider(this, object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = SessionViewModel(root) as T
         })[SessionViewModel::class.java]

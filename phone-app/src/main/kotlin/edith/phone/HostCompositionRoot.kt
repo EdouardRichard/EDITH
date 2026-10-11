@@ -522,6 +522,11 @@ class HostCompositionRoot internal constructor(
         host.startSession(session)
         activeSessionId = session.value
         activatedPlugin = null
+        // W1 (F17/F18), D53-③: **开始 ＝ 确保连接（必要时重连）**. Establishing the link used to hang off one UI
+        // combination's composition, so a cold start could reach `BuildingScene` and never even *attempt* a CXR
+        // connection - and the ears, gated on `linkReady`, then never armed. This only adjusts **when we call** the
+        // vendor transport; the call shape is unchanged (official demo).
+        ensureCxrLink()
         // A new session re-arms the clock exchange (`sessionEstablished` drops the old mapping), so the next live
         // mapping is a fresh one and must be retried against even if it somehow carried the previous identifier.
         retriedMappingSyncId = null
@@ -844,6 +849,18 @@ class HostCompositionRoot internal constructor(
      *   Activity to build it with).
      */
     @Synchronized internal fun ensureCxrLink(): Boolean {
+        // "This build has no CXR transport" is the more fundamental fact and wins the line: with no assembly, a missing
+        // Activity is not the reason nothing can connect, and reporting it would hide the real gap (the very confusion
+        // F17/F18 produced).
+        if (rokidConnectionFactory == null) {
+            mutableState.update { it.copy(cxrAuthorization = null) }
+            if (closed) {
+                P3Log.line("P3_CXR connect attempt=start result=closed")
+                return false
+            }
+            P3Log.line("P3_CXR connect attempt=start result=transport_missing")
+            return false
+        }
         val activity = pendingActivity?.get() ?: run {
             // A new attempt invalidates the previous answer (review I-2) even when it cannot proceed: a cancelled
             // prompt must not sit on the page next to a link that came up afterwards, and `null` is what the render
@@ -1089,6 +1106,11 @@ class HostCompositionRoot internal constructor(
         activatedPlugin = null
         awaitingDisplayForActivation = false
         retriedMappingSyncId = null
+        // D53-③: **停止 收起连接**. The built connection object is kept (the transport renews a session that died, so
+        // rebuilding is not needed), but the link is marked armed-again-needed: the next 开始 reconnects. Ownership
+        // stays with the composition, so `close()` still releases it exactly once.
+        if (linkBuilt) P3Log.line("P3_CXR connect after=stop result=cleared")
+        linkBuilt = false
         // P3.3: a question does not outlive the session it was asked for. Withdrawing it here means the next session's
         // tap cannot answer this session's action - and the shade is cleared with it, so a dead question cannot keep
         // offering buttons.
