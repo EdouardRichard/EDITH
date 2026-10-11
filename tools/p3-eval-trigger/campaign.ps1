@@ -59,13 +59,18 @@ $CorpusIdPattern = '^[A-Z]{1,3}-[PN]-[0-9]{2}$'
 $InjectAction = 'edith.DEBUG_INJECT'
 $InjectComponent = 'edith.phone/.DebugAudioInjector'
 $InjectEndMarker = 'P3_INJECT state=end'
-$TriggerMarker = 'P3_PROACTIVE request='
+# The SUCCESS marker. The product logs `P3_PROACTIVE request ctx=5 chars=7` - the `=` belongs to `ctx`, NOT to
+# `request`. This constant used to read 'P3_PROACTIVE request=', which matched nothing on any device: every real
+# trigger was scored `no_decision_line_in_window`, which is the structural cause of the recorded recall 0 in P3.4
+# (F19's `DEDUP` rows were the clue: successful hints really were happening and really were not being recorded).
+# Matched WITHOUT the `=` so it holds for the real shape and would still hold if a future line adds one.
+$TriggerMarker = 'P3_PROACTIVE request'
 $CooldownMarker = 'P3_PROACTIVE skip reason=COOLDOWN'
-# The criterion lines the per-row evidence keeps. `P3_ASR` (W4 diagnosis) and `P3_TRANSCRIPT` (did a final reach the
-# plugin?) are both needed: with only `P3_PROACTIVE`/`P3_ACOUSTIC` captured, a row that produced a final and NO decision
-# line is indistinguishable from a row whose transcript never reached the plugin at all - which is exactly the ambiguity
-# that stalled the W4 diagnosis.
-$NoiseMarkers = @('P3_PROACTIVE skip', 'P3_PROACTIVE admit', 'P3_ACOUSTIC', 'P3_SCRIPT', 'P3_ASR', 'P3_TRANSCRIPT')
+# The criterion lines the per-row evidence keeps. `P3_ASR` (W4 diagnosis), `P3_TRANSCRIPT` (did a final reach the
+# plugin?) and `P3_PROACTIVE request` (THE TRIGGER) are all needed: with only `P3_PROACTIVE skip`/`P3_ACOUSTIC`
+# captured, a row that produced a final and NO recorded decision line is indistinguishable from a row whose trigger was
+# never captured at all - which is exactly what the missing trigger marker produced.
+$NoiseMarkers = @('P3_PROACTIVE skip', 'P3_PROACTIVE request', 'P3_PROACTIVE admit', 'P3_ACOUSTIC', 'P3_SCRIPT', 'P3_ASR', 'P3_TRANSCRIPT')
 $SynthScriptName = 'synth-campaign.ps1'
 
 # =====================================================================================
@@ -263,24 +268,6 @@ function Write-EdithLine {
     }
 }
 
-function Get-EdithLogcat {
-    # The FULL buffer, read with -d. Never pipe this into Select-Object -First: that closes
-    # the pipe under a live process and adb dies with it.
-    # Function-scoped preference: `adb` writes progress to stderr, and this script runs with 'Stop', which would turn
-    # a normal "1 file pushed" notice into a terminating NativeCommandError. The exit code is the verdict.
-    $previous = $ErrorActionPreference
-    $ErrorActionPreference = 'Continue'
-    try {
-        $raw = & adb -s $DeviceSerial logcat -d -v time 2>$null
-        $code = $LASTEXITCODE
-    } finally {
-        $ErrorActionPreference = $previous
-    }
-    if ($code -ne 0) { throw "adb logcat failed with exit code $code" }
-    if ($null -eq $raw) { return @() }
-    return @($raw)
-}
-
 function Get-EdithLogcatTail {
     param([int]$Lines = 400)
     # `-t` reads only the buffer's tail: cheap enough to poll with inside a row's window, and it never truncates adb.
@@ -293,6 +280,52 @@ function Get-EdithLogcatTail {
         $ErrorActionPreference = $previous
     }
     if ($code -ne 0) { throw "adb logcat tail failed with exit code $code" }
+    if ($null -eq $raw) { return @() }
+    return @($raw)
+}
+
+function Get-EdithDeviceTimestamp {
+    # The device's own wall clock, in the exact shape `logcat -t '<time>'` accepts (MM-DD HH:MM:SS.mmm).
+    #
+    # Read FROM the device rather than from the host: `logcat -t` is compared against the timestamps logcat itself
+    # prints, so a host clock a few seconds off would silently move the window.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $raw = & adb -s $DeviceSerial shell "date '+%m-%d %H:%M:%S.000'" 2>$null
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($code -ne 0) { throw "adb shell date failed with exit code $code" }
+    $stamp = (@($raw) | Where-Object { $_ } | Select-Object -First 1)
+    if (-not $stamp) { throw "adb shell date returned nothing" }
+    return $stamp.Trim()
+}
+
+function Get-EdithLogcatSince {
+    param([Parameter(Mandatory = $true)][string]$Since)
+    # Only the lines **since the row started**, asked of logcat itself.
+    #
+    # This replaces "read the whole buffer, then slice from the previous row's line count" (review of the W4 run).
+    # Index slicing was wrong twice over:
+    #   * it read the ENTIRE buffer on every 3 s poll. Measured on the K40: 111,658 lines held, so a 16 s window moved
+    #     ~5x that per row - which is where the ~75 s per row went (the gap is only 61 s of it);
+    #   * it broke whenever the ring buffer **rotated** between two reads. The count then does not grow, the slice comes
+    #     back empty, and the row is recorded `harness_error / no_inject_end_in_window` with `logLines=0` - 50 of 171
+    #     rows in the W4 run, which is an instrument outcome, not a measurement.
+    # This project had already learned this ("a logcat window compared by index is defeated by buffer rotation; filter by
+    # timestamp") and the campaign had not been changed to match. `-t <time>` cannot rotate: the buffer either still has
+    # the window or the window is genuinely gone, and a row's window is seconds old against an ~11 MiB buffer.
+    $previous = $ErrorActionPreference
+    $ErrorActionPreference = 'Continue'
+    try {
+        $raw = & adb -s $DeviceSerial logcat -d -v time -t $Since 2>$null
+        $code = $LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previous
+    }
+    if ($code -ne 0) { throw "adb logcat -t failed with exit code $code" }
     if ($null -eq $raw) { return @() }
     return @($raw)
 }
@@ -491,7 +524,7 @@ if ($DryRun) {
         Write-Host ("    text chars=" + $row.Text.Length + "  wav=" + $wav)
         Write-Host ("    push  : adb -s " + $DeviceSerial + " push <wav> " + ($DeviceDir.TrimEnd('/') + '/' + $row.Id + '.wav'))
         Write-Host ("    inject: adb -s " + $DeviceSerial + " shell `"am broadcast -a " + $InjectAction + " -n " + $InjectComponent + " --es path " + ($DeviceDir.TrimEnd('/') + '/' + $row.Id + '.wav') + "`"")
-        Write-Host ("    wait  : " + $WaitSeconds + " s, then adb -s " + $DeviceSerial + " logcat -d -v time (full buffer, filtered in memory)")
+        Write-Host ("    wait  : " + $WaitSeconds + " s, then adb -s " + $DeviceSerial + " logcat -d -v time -t <row start> (this row's window only)")
         Write-Host ("    record: " + $row.Id + "=<triggered|none|harness_error> -> " + $obsFull)
     }
     if ($runRows.Count -eq 0) { Write-Host '  (nothing to run)' }
@@ -523,10 +556,6 @@ Write-EdithLine -Path $evidenceFull -Text ("# campaign start " + (Get-Date -Form
     " scenario=[" + ($scenarioFilter -join ',') + "] label=[" + ($labelFilter -join ',') + "]")
 Write-EdithLine -Path $evidenceFull -Text "# evidence carries ids, device timestamps, criterion lines and counts only - never corpus text or model output"
 
-$baseline = @(Get-EdithLogcat)
-Write-Host ''
-Write-Host ("logcat baseline lines: " + $baseline.Count)
-
 $counts = @{ triggered = 0; none = 0; harness_error = 0 }
 $noDecision = 0
 $cooldownSuppressed = 0
@@ -540,6 +569,10 @@ foreach ($row in $runRows) {
 
     # Spacing first, injection second: the gap has to sit between two utterances, not between an utterance and its window.
     if ($GapSeconds -gt 0) { Start-Sleep -Seconds $GapSeconds }
+
+    # This row's window starts here, on the DEVICE clock, and every read below is bounded by it (see Get-EdithLogcatSince).
+    # Taken after the gap and before the injection so the window holds this row's utterance and nothing older.
+    $windowStart = Get-EdithDeviceTimestamp
 
     if (-not $pushedIds.Contains($row.Id)) {
         $push = Invoke-EdithAdb -Arguments @('push', $wav, $remote)
@@ -569,25 +602,23 @@ foreach ($row in $runRows) {
     # Poll instead of sleeping the whole window. A row is settled the moment **this row's** window contains a decision
     # (`P3_PROACTIVE skip reason=` or `request=`), and the remaining wait only slows the campaign down.
     #
-    # The poll compares against the row's own baseline by **index**, exactly like the verdict below: reading the device
-    # tail alone would see the *previous* row's decision line and exit instantly, which silently packed the rows ~5 s
-    # apart and made the product's cooldown - not the gate under test - decide most of them. That bug was measured
-    # (config B: `COOLDOWN=62 / SHORT=32`) before it was fixed, and it is why this loop is index-based.
+    # The window is bounded by **device timestamp**, not by a line-count baseline. The earlier index-based version had to
+    # be index-based for a real reason - reading the device tail alone sees the *previous* row's decision line and exits
+    # instantly, which silently packed rows ~5 s apart and let the product's cooldown decide most of them (measured:
+    # config B `COOLDOWN=62 / SHORT=32`) - but it also read the whole 111k-line buffer per poll and broke on buffer
+    # rotation. `-t $windowStart` keeps the "only this row's lines" property without either cost.
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 3
         $peek = @()
-        try { $peek = @(Get-EdithLogcat) } catch { }
-        if ($peek.Count -le $baseline.Count) { continue }
-        $peekTail = @($peek[$baseline.Count..($peek.Count - 1)])
-        if (@($peekTail | Where-Object { $_ -match 'P3_PROACTIVE (skip reason=|request=)' }).Count -gt 0) { break }
+        try { $peek = @(Get-EdithLogcatSince -Since $windowStart) } catch { }
+        if (@($peek | Where-Object { $_ -match 'P3_PROACTIVE (skip reason=|request)' }).Count -gt 0) { break }
     }
 
     $captureFailed = $false
     $after = @()
-    try { $after = @(Get-EdithLogcat) } catch { $captureFailed = $true }
-    $tail = @()
-    if (-not $captureFailed -and $after.Count -gt $baseline.Count) { $tail = @($after[$baseline.Count..($after.Count - 1)]) }
+    try { $after = @(Get-EdithLogcatSince -Since $windowStart) } catch { $captureFailed = $true }
+    $tail = $after
 
     # Verdict rules, in order (W2/F19: instrument outcomes are unresolved, never a model "no"):
     #   empty/failed capture            -> harness_error
@@ -626,8 +657,6 @@ foreach ($row in $runRows) {
     # The observation line is written LAST and alone, so it is never half-written.
     Write-EdithLine -Path $obsFull -Text ($row.Id + "=" + $verdict)
     Write-Host ("  " + $verdict + " (" + $reason + ")")
-
-    $baseline = $after
 }
 
 # --- 6. batch report ------------------------------------------------------------------

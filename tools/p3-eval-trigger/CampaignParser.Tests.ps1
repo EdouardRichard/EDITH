@@ -159,6 +159,22 @@ Assert-Equal 'no_inject_end_in_window' $v.Reason 'the missing injection end wins
 $v = Get-EdithRowVerdict -Tail @('P3_INJECT state=end', 'P3_PROACTIVE request=')
 Assert-Equal 'triggered' $v.Verdict 'a trigger inside a completed window is triggered'
 
+# --- THE REAL LINE FORMAT (verbatim from the device) --------------------------------------------
+# The assertion above uses a FABRICATED line ('P3_PROACTIVE request=') that matches the marker only because the marker
+# was written the same wrong way. The product actually logs `P3_PROACTIVE request ctx=5 chars=7` - `ctx=` follows
+# `request`; there is no `request=`. The marker `'P3_PROACTIVE request='` therefore matched NOTHING and every real
+# trigger was scored "no decision line": the structural cause of P3.4's recorded recall 0, and the mechanism behind F19
+# (the 9 `DEDUP` rows proving unrecorded successful hints - the clue was right, the marker was not).
+# This is a verbatim device line (K40, 2026-10-12 01:38:17.723).
+$realTrigger = '10-12 01:38:17.723 I/System.out(18428): EdithSmart P3_PROACTIVE request ctx=5 chars=7'
+$realEnd = '10-12 01:38:19.500 I/EdithP3 (18428): P3_INJECT state=end chunks=120 accepted=120 drained=true'
+Assert-Equal 'triggered' (Get-EdithRowVerdict -Tail @($realTrigger, $realEnd)).Verdict 'a REAL device trigger line must score as triggered'
+Assert-Equal 1 (@(Select-EdithEvidenceLine -Tail @($realTrigger)).Count) 'the trigger line must be captured as evidence'
+# A skip line must keep working too (its shape really does carry `reason=`), pinned alongside so a future change to one
+# marker cannot silently break the other.
+$realSkip = '10-12 01:38:17.723 I/System.out(18428): EdithSmart P3_PROACTIVE skip reason=VAGUE'
+Assert-Equal 'none' (Get-EdithRowVerdict -Tail @($realSkip, $realEnd)).Verdict 'a real skip line is still a decision'
+
 # The instrument-suppressed count must be nameable on its own, or a naive re-run skips exactly the
 # rows that need re-running (they are `harness_error`, so they are not treated as settled).
 Assert-Equal 'cooldown-suppressed (unresolved, re-run): 3' (Get-EdithCooldownReportLine -Count 3) 'cooldown report line'
