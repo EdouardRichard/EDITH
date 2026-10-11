@@ -235,11 +235,9 @@ fun admitByFeatures(transcript: String, foreground: String?, minChars: Int = LEN
     //     own, which is what "a short real question must get through" means;
     //   * a **weak** interrogative (bare 什么/哪/谁) plus a second, independent signal - which is what stops a bare
     //     interrogative from carrying a sentence that chat and rhetorical questions also use.
-    val admitted = !refused && (
-        strongNeed ||
-            AdmissionFeature.IMPERATIVE in fired ||
-            weakOnly && otherThanNeed
-        )
+    // `strongNeed` already covers IMPERATIVE (a clear request is a signal on its own). The third clause keeps a bare
+    // interrogative from carrying a sentence that chat and rhetorical questions also use.
+    val admitted = !refused && (strongNeed || weakOnly && otherThanNeed)
     return AdmissionVerdict(admitted, score, fired)
 }
 

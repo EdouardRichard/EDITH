@@ -113,8 +113,10 @@ class CxrLinkWiringTest {
         val rig = Rig()
         try {
             rig.root.attachCxrActivity(Any())
-            rig.root.start("p2-diagnostic")
+            // Captured **before** `start()`. Capturing after it and comparing to itself was tautological (review M2):
+            // it could never fail, so the `linkBuilt` guard it was meant to pin was not pinned at all.
             val armed = rig.connection.connects
+            rig.root.start("p2-diagnostic")
             assertEquals("开始 on an armed link must not reconnect", armed, rig.connection.connects)
             rig.root.stop()
             rig.root.start("p2-diagnostic")
