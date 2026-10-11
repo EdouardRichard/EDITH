@@ -256,6 +256,18 @@ Assert-Equal $false (Test-EdithBatchIsDead -RowWindows @(
         'P3_INJECT state=end',
         'P3_INJECT state=end')) 'two silent windows are not enough evidence to abort'
 
+# --- review I1, second half: a TRIGGERING row is not settled when its `request` line appears ------------------
+# Adding the chain markers to $NoiseMarkers was not enough. The poll loop breaks the moment a decision line appears and
+# the capture is taken immediately, while the model call, the hint and its display ack arrive ~0.2-2 s AFTER `request`.
+# Measured on the first chain-audit row: K-P-01 captured `P3_PROACTIVE request` and ZERO `P3_HTTP`/`P3_HINT` lines - so
+# the artifact still could not show the chain it was extended for. A triggering row now gets a short settle wait before
+# the capture; a refusing row (`skip reason=...`) must not pay it, and neither must an empty peek.
+Assert-Equal 5 (Get-EdithChainSettleSeconds -PeekLines @(
+        '10-12 06:39:00.000 I/System.out(13534): EdithSmart P3_PROACTIVE request ctx=5 chars=7')) 'a triggering peek waits for the chain tail'
+Assert-Equal 0 (Get-EdithChainSettleSeconds -PeekLines @(
+        '10-12 06:39:00.000 I/System.out(13534): EdithSmart P3_PROACTIVE skip reason=VAGUE')) 'a refusing peek does not wait'
+Assert-Equal 0 (Get-EdithChainSettleSeconds -PeekLines @()) 'an empty peek does not wait'
+
 if ($failures.Count -gt 0) {
     Write-Host ''
     $failures | ForEach-Object { Write-Host $_ }

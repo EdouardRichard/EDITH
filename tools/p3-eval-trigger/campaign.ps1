@@ -281,6 +281,20 @@ function Test-EdithBatchIsDead {
     return $true
 }
 
+# How long to keep collecting after the poll has seen THIS row's decision, before the final capture.
+#
+# Only a TRIGGER needs it. `P3_PROACTIVE request` is logged when the plugin decides to call the model; the call, the
+# hint and the display ack follow ~0.2-2 s later (measured: request -> P3_HTTP 200 at +0.16 s -> hint at +1.6 s ->
+# `P3_HINT ack status=Displayed` at +1.67 s). The poll breaks as soon as any decision line appears and the capture
+# used to be taken immediately afterwards, so the artifact could hold `request` and NOTHING of the chain it was
+# extended to show (measured on the first chain-audit row: request=1, P3_HTTP=0, P3_HINT=0). A refusing row
+# (`skip reason=...`) is complete the moment it is logged, so it must not pay the wait.
+function Get-EdithChainSettleSeconds {
+    param([string[]]$PeekLines, [int]$SettleSeconds = 5)
+    if (@($PeekLines | Where-Object { $_ -match 'P3_PROACTIVE request' }).Count -gt 0) { return $SettleSeconds }
+    return 0
+}
+
 # =====================================================================================
 # Side-effecting helpers
 # =====================================================================================
@@ -645,12 +659,19 @@ foreach ($row in $runRows) {
     # config B `COOLDOWN=62 / SHORT=32`) - but it also read the whole 111k-line buffer per poll and broke on buffer
     # rotation. `-t $windowStart` keeps the "only this row's lines" property without either cost.
     $deadline = (Get-Date).AddSeconds($WaitSeconds)
+    $chainSettle = 0
     while ((Get-Date) -lt $deadline) {
         Start-Sleep -Seconds 3
         $peek = @()
         try { $peek = @(Get-EdithLogcatSince -Since $windowStart) } catch { }
-        if (@($peek | Where-Object { $_ -match 'P3_PROACTIVE (skip reason=|request)' }).Count -gt 0) { break }
+        if (@($peek | Where-Object { $_ -match 'P3_PROACTIVE (skip reason=|request)' }).Count -gt 0) {
+            # A triggering row is NOT settled yet: the model call, the hint and its display ack come ~0.2-2 s later
+            # (review I1, second half). Capturing here is why the artifact held `request` and no `P3_HTTP`/`P3_HINT`.
+            $chainSettle = Get-EdithChainSettleSeconds -PeekLines $peek
+            break
+        }
     }
+    if ($chainSettle -gt 0) { Start-Sleep -Seconds $chainSettle }
 
     $captureFailed = $false
     $after = @()
