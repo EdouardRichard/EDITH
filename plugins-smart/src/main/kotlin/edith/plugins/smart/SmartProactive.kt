@@ -25,15 +25,16 @@ internal enum class ProactiveSensitivity(val minTranscriptChars: Int) {
  * - [NOISY] the acoustic label says the environment is steady noise, not speech.
  * - [VAGUE] the utterance carries no interpretable request (P3.5 §W3's feature rule; this replaced the old `SHORT`
  *   length gate, which refused 141 of 210 corpus rows - most of them real short questions).
- * - [SHORT] kept for the length-only refusal the old rule reported. New candidates are refused as [VAGUE].
  * - [COOLDOWN] too soon after the last request, or after a refusal that started the cooldown.
  * - [DEDUP] this sentence (about this foreground app) was already handled recently.
  *
- * There is deliberately **no** upload-gate reason any more (`D53`①): the session-level upload consent was removed, so
- * "the gate refused" is not a state the proactive path can reach. The vocabulary is the device log's contract
- * (`P3_PROACTIVE skip reason=…`), so a reason that can no longer happen must not stay wordable.
+ * There is deliberately **no** `SHORT` and **no** upload-gate reason any more: with the length gate replaced by the
+ * feature rule, no candidate is refused for being short, and with `D53`① removing the session upload consent, "the gate
+ * refused" is not a state the proactive path can reach. The vocabulary is the device log's contract
+ * (`P3_PROACTIVE skip reason=…`), so a reason that can no longer happen must not stay wordable - `SHORT` was removed
+ * for exactly the reason `GATE` was.
  */
-internal enum class ProactiveSkip { DISARMED, BUSY, NOISY, SHORT, VAGUE, COOLDOWN, DEDUP }
+internal enum class ProactiveSkip { DISARMED, BUSY, NOISY, VAGUE, COOLDOWN, DEDUP }
 
 /** One candidate: what was heard, what the acoustic layer called it, what is in front of the user, and when. */
 internal data class ProactiveTrigger(

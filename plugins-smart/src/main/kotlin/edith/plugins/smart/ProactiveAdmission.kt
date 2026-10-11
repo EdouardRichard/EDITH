@@ -244,15 +244,6 @@ fun admitByFeatures(transcript: String, foreground: String?, minChars: Int = LEN
 }
 
 /**
- * How many features a candidate needs.
- *
- * Two, because one feature is never enough to tell a request from its echo: "你说呢" fires the question shape, and
- * "我吃了吗" fires it too. Requiring a second, independent feature is what makes the pair *evidence* rather than a
- * coincidence - and it is calibrated on the frozen corpus rather than chosen for comfort.
- */
-internal const val ADMISSION_SCORE_THRESHOLD = 2
-
-/**
  * One corpus evaluation: how many rows of each kind the rule would admit.
  *
  * Counts only - no text - so this can be printed into evidence. The chat count is carried separately because §11.3's

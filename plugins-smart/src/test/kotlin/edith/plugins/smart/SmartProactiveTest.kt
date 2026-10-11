@@ -128,4 +128,19 @@ class SmartProactiveTest {
             "D53①: nothing may report an upload-gate skip: ${ProactiveSkip.entries}",
         )
     }
+
+    /**
+     * The same rule as `GATE`, applied to the reason the feature rule retired.
+     *
+     * `SHORT` meant "below the length threshold", and no candidate is refused for length any more - the length signal is
+     * one feature among several. Leaving it in the enum would let a caller log a refusal the rule cannot produce, and an
+     * acceptance run would then read a length gate that no longer exists.
+     */
+    @Test
+    fun `there is no length-only skip reason any more`() {
+        assertFalse(
+            ProactiveSkip.entries.any { it.name == "SHORT" },
+            "P3.5 §W3: 长度不再是门，不得再报 SHORT: ${ProactiveSkip.entries}",
+        )
+    }
 }
