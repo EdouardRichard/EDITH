@@ -163,6 +163,18 @@ Assert-Equal 'triggered' $v.Verdict 'a trigger inside a completed window is trig
 # rows that need re-running (they are `harness_error`, so they are not treated as settled).
 Assert-Equal 'cooldown-suppressed (unresolved, re-run): 3' (Get-EdithCooldownReportLine -Count 3) 'cooldown report line'
 
+# --- a harness_error row must be re-runnable, and a real verdict must not be ------------------
+# The resume logic skips anything that is not `harness_error`. The rows the new rule produces are
+# `harness_error`, so a plain re-run retries exactly them - no -Force, no -Limit, no bookkeeping.
+$verdicts = Get-EdithObservationVerdict -Lines @('K-P-01=none', 'K-P-02=harness_error', 'K-P-03=triggered')
+$reRunnable = @($verdicts.Keys | Where-Object { $verdicts[$_] -eq 'harness_error' })
+Assert-Equal 1 $reRunnable.Count 'exactly one row is re-runnable'
+Assert-Equal 'K-P-02' $reRunnable[0] 'and it is the unresolved one'
+Assert-Equal 'harness_error' $verdicts['K-P-02'] 'the unresolved row is recorded as such'
+# A later line for the same id settles it (the file is append-only; the last line is current state).
+$settled = Get-EdithObservationVerdict -Lines @('K-P-02=harness_error', 'K-P-02=triggered')
+Assert-Equal 0 (@($settled.Keys | Where-Object { $settled[$_] -eq 'harness_error' })).Count 'a re-run settles the row'
+
 if ($failures.Count -gt 0) {
     Write-Host ''
     $failures | ForEach-Object { Write-Host $_ }

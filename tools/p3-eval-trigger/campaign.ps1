@@ -374,12 +374,15 @@ Write-Host ("selected by filters: " + $selected.Count)
 Write-EdithScenarioCounts -Rows $selected
 
 # --- 2. resume ------------------------------------------------------------------------
-# A row is "settled" when it already has a real verdict (triggered/none). A harness_error line
-# is deliberately NOT settled: it records that the row never got a fair run, so the default
-# behaviour is to try it again. That is what makes the ids in the batch report's RE-RUN
-# REQUIRED list actionable - otherwise the obvious re-run would silently skip exactly the rows
-# that need re-running, and the scorer (which reads any non-`triggered` value as "none") would
-# quietly score a harness failure as a model "no".
+# A row is "settled" when it already has a real verdict (`triggered`, or `none` from a decision the
+# decider really made). A `harness_error` line is deliberately NOT settled: it records that the row
+# never got a fair run, so the default behaviour is to try it again.
+#
+# W2/F19 widened what lands in that class: a window with **no decision line at all**, and a window
+# whose only decision was a **COOLDOWN suppression**, are both `harness_error` now (they used to be
+# written `none`). That is what makes the ids in the batch report's RE-RUN REQUIRED list actionable -
+# otherwise the obvious re-run would silently skip exactly the rows that need re-running, and the
+# scorer would quietly score an instrument outcome as a model "no".
 $existingVerdicts = @{}
 if (Test-Path $obsFull) {
     $existingVerdicts = Get-EdithObservationVerdict -Lines ([System.IO.File]::ReadAllLines($obsFull, [System.Text.UTF8Encoding]::new($false)))
