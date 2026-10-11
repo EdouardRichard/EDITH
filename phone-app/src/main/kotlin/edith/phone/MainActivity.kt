@@ -130,7 +130,7 @@ class MainActivity : ComponentActivity() {
                     )
                 }
                 PhoneScreen(state, root, viewModel, profileViewModel, ::requestStart,
-                    { SessionService.commandFromUi(this, it) }, notificationsGranted(), { root.connectCxr(this) },
+                    { SessionService.commandFromUi(this, it) }, notificationsGranted(),
                     { root.storedSettings() }, { settings -> root.saveSmartSettings(settings) }, remainingSeconds)
             }
         }
@@ -238,7 +238,6 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
 @Composable private fun PhoneScreen(state: SessionUiState, root: HostCompositionRoot, viewModel: SessionViewModel,
     profileViewModel: ProfileViewModel?,
     start: (String) -> Unit, command: (String) -> Unit, notificationsGranted: Boolean,
-    connectCxr: () -> Boolean,
     loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit, remainingSeconds: Long) {
     var page by remember { mutableStateOf(0) }
     val plugins = buildList {
@@ -411,20 +410,11 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                         }
                         if (!notificationsGranted) Text("通知未获授权", color = MaterialTheme.colorScheme.error)
                         HorizontalDivider()
-                        // Facts only (owner-reported defect 2026-10-10). Readiness is the **transport's** own signal
-                        // (`linkReady` → state), never `Capability.Audio`: `CxrHostEnvironment` deliberately never
-                        // advertises it, so that branch was dead on a phone. The status line is always shown; only the
-                        // connect affordance is hidden once a release build has a live link.
-                        val linkReady = state.cxrLinkReady
-                        var requested by remember { mutableStateOf(false) }
-                        var transportMissing by remember { mutableStateOf(false) }
-                        if (BuildConfig.DEBUG || !linkReady) {
-                            OutlinedButton(onClick = {
-                                transportMissing = !connectCxr()
-                                requested = true
-                            }) { Text(if (linkReady) "重连眼镜" else "连接眼镜（CXR）") }
-                        }
-                        Text(cxrStatusLabel(transportMissing, requested, linkReady))
+                        // Facts only, and since `D53`③ **no connect entry at all**: 开始/停止/暂停 own the link, so the
+                        // page has nothing to offer here - it only states the link's own facts. Readiness is the
+                        // **transport's** signal (`linkReady` → state), never `Capability.Audio`: `CxrHostEnvironment`
+                        // deliberately never advertises it, so that branch was dead on a phone.
+                        Text(cxrStatusLabel(state.cxrTransportMissing, state.cxrLinkReady))
                         state.cxrAuthorization?.let { Text(cxrAuthorizationLabel(it)) }
                         // P3.3 (spec §17.2 rule 1): the execution channels, named one by one. Without this the panel read
                         // 指令执行 as available while every L2-L4 tool had silently gone from the model's table - the

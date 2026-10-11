@@ -7,18 +7,20 @@ import edith.rokid.CxrAuthorizationOutcome
  *
  * Owner-reported defect (2026-10-10): every tap printed "已请求连接眼镜，请在 AI App 中确认授权" - after authorization had
  * long been granted. The sentence was a **guess dressed as a state**, so the wearer kept waiting for a prompt that never
- * came. The page now reports only what it knows: whether this build has a transport, whether the user asked to connect,
- * and whether the transport has reported a live session.
+ * came. The page reports only what it knows.
+ *
+ * `D53`③ (2026-10-11) went further: the standalone 「连接眼镜 / 重连眼镜」 entry is gone, and 开始/停止/暂停 own the link.
+ * There is therefore no "the user asked and we are waiting" state any more, which is why the `requested` half of the old
+ * signature was removed rather than kept unused - a state the page can no longer reach must not stay wordable.
  *
  * [linkReady] is `HostCompositionRoot.linkReady` (the SDK's live-session signal, delivered once) — a property of **this
  * process**, not a live heartbeat: no disconnect callback is wired (spec 不做/未测). The wording therefore never says
  * 在线, exactly as it never says 授权.
  */
-internal fun cxrStatusLabel(transportMissing: Boolean, requested: Boolean, linkReady: Boolean): String = when {
+internal fun cxrStatusLabel(transportMissing: Boolean, linkReady: Boolean): String = when {
     // The strongest fact wins: a live session outranks a stale "no transport" flag.
     linkReady -> "已连接眼镜"
-    transportMissing && requested -> "眼镜连接未装配（TRANSPORT_MISSING）"
-    requested -> "已请求，等待就绪…"
+    transportMissing -> "眼镜连接未装配（TRANSPORT_MISSING）"
     else -> "未连接"
 }
 

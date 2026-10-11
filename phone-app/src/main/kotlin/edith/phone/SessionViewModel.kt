@@ -39,6 +39,13 @@ data class SessionUiState(
      * 不做/未测). The page's wording relies on that boundary - it says 已连接眼镜, never 在线.
      */
     val cxrLinkReady: Boolean = false,
+    /**
+     * Whether this build has **no CXR transport assembly at all** (`HostCompositionRoot.rokidConnectionFactory == null`).
+     *
+     * A fact about the build, not about a tap: `D53`③ removed the connect entry, so the page's only job here is to say
+     * honestly why nothing can come up. Set by the start path's own link attempt (`ensureCxrLink`).
+     */
+    val cxrTransportMissing: Boolean = false,
 )
 
 class SessionViewModel(private val root: HostCompositionRoot) : ViewModel() {

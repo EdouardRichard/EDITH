@@ -853,7 +853,7 @@ class HostCompositionRoot internal constructor(
         // Activity is not the reason nothing can connect, and reporting it would hide the real gap (the very confusion
         // F17/F18 produced).
         if (rokidConnectionFactory == null) {
-            mutableState.update { it.copy(cxrAuthorization = null) }
+            mutableState.update { it.copy(cxrAuthorization = null, cxrTransportMissing = true) }
             if (closed) {
                 P3Log.line("P3_CXR connect attempt=start result=closed")
                 return false
@@ -861,6 +861,8 @@ class HostCompositionRoot internal constructor(
             P3Log.line("P3_CXR connect attempt=start result=transport_missing")
             return false
         }
+        // The assembly is real, so any earlier "unassembled" claim is stale (D53-③: this is a fact about the build).
+        mutableState.update { it.copy(cxrTransportMissing = false) }
         val activity = pendingActivity?.get() ?: run {
             // A new attempt invalidates the previous answer (review I-2) even when it cannot proceed: a cancelled
             // prompt must not sit on the page next to a link that came up afterwards, and `null` is what the render
