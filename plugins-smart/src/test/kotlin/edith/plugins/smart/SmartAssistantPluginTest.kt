@@ -1,5 +1,7 @@
 package edith.plugins.smart
 
+import edith.contracts.AcousticEvent
+import edith.contracts.AcousticLabel
 import edith.contracts.Generation
 import edith.contracts.OutputStateEvent
 import edith.contracts.OutputStatus
@@ -595,6 +597,45 @@ class SmartAssistantPluginTest {
         assertTrue(rig.hintTexts.isEmpty(), "a reconfigured-away turn must not submit")
     }
 
+    // NOTE ON BOUNDING: this suite runs on kotlin.test / **JUnit 5**, so there is no in-annotation timeout available
+    // (JUnit 5's `@Timeout` is not on the classpath and its config-file default is off). A test that blocks therefore
+    // hangs the whole module's test task, which is what the first version of this one did.
+    //
+    // What it blocked on, from a thread dump: `deliverProactive -> ModelClientGateway.turn -> waitForStep`. The
+    // proactive turn leaves the host dispatcher, and this rig's **default model never answers** - every other proactive
+    // test sets `rig.model.onRequest` first. So the fix was to give the rig a model, not to bound the wait.
+    @Test
+    fun `an admitted trigger says which features let it through and never the text`() {
+        // P3.5 §W3 / plan Task 11: on a device the only explainability for "why did this fire" has to be the log, and
+        // the log may not carry the transcript. Feature **names** and a score are the explainable part.
+        val rig = SmartTestRig()
+        rig.activate()
+        // Armed, or the trigger is refused before the admission rule runs (`DISARMED`) and there is no admit line to
+        // assert on - which is what the first version of this test actually measured.
+        rig.plugin.handle(AcousticEvent(rig.envelope(), AcousticLabel.Speech))
+        // And a model, or the proactive turn parks in `ModelClientGateway.waitForStep` forever (the rig's default never
+        // answers). This is the assertion's *setup*, not its subject.
+        rig.model.onRequest = { request, listener ->
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了", turnId = "asr-9", final = true)))
+        } finally {
+            P3Log.sink = previous
+        }
+
+        val admit = lines.firstOrNull { it.startsWith("P3_PROACTIVE admit") }
+        assertTrue(admit != null, "an admitted trigger must report its features; logged: $lines")
+        assertTrue(admit!!.contains("score="), "the score must be reported: $admit")
+        assertTrue(admit.contains("features="), "and the features: $admit")
+        assertTrue(admit.contains("CONTENT_NEED"), "a real question fires the content need: $admit")
+        assertFalse(admit.contains("现在几点了"), "the transcript must never appear: $admit")
+    }
+
     @Test fun `the transcript trace carries counts and never the text`() {
         // W4 (P3.5 §M). Without this line the "why did this row reach no decision" question is unanswerable: P3.4's
         // logs could not tell "the recogniser never produced a final" from "a final arrived and was dropped", which is
@@ -605,7 +646,7 @@ class SmartAssistantPluginTest {
         val rig = SmartTestRig()
         rig.activate()
 
-        val lines = mutableListOf<String>()
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
         val previous = P3Log.sink
         P3Log.sink = { lines += it }
         try {

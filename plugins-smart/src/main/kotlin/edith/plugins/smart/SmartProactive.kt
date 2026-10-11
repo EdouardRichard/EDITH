@@ -75,6 +75,15 @@ internal class SmartProactive(
     private val dedupTtlNanos: Long = 600_000_000_000L,
 ) {
     private val minTranscriptChars = sensitivity.minTranscriptChars
+
+    /**
+     * The length boundary this filter was configured with.
+     *
+     * Exposed so the plugin's explainability line can re-read the same rule it just applied (`P3_PROACTIVE admit
+     * score=… features=…`) without a second source of truth for the number: a value copied into the plugin would drift
+     * from the one `admit` used.
+     */
+    val minTranscriptCharsBoundary: Int get() = minTranscriptChars
     private var cooldownStartedNanos: Long? = null
 
     /**

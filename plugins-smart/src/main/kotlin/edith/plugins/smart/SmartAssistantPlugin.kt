@@ -943,6 +943,15 @@ class SmartAssistantPlugin(
             P3Log.line("P3_PROACTIVE skip reason=$skip")
             return null
         }
+        // P3.5 §W3: an admitted trigger says **which features** let it through, so a device log can answer "why did this
+        // one fire" without the transcript (feature **names**, never the text). The rule is deterministic, so re-reading
+        // it here reports the same verdict `admit` just used; recomputing is cheaper and clearer than threading the
+        // verdict out through the cooldown/dedup branches, which return their own reasons.
+        val verdict = admitByFeatures(trigger.transcript, trigger.foreground, proactive.minTranscriptCharsBoundary)
+        P3Log.line(
+            "P3_PROACTIVE admit score=${verdict.score} " +
+                "features=${verdict.fired.joinToString(",") { it.name }}",
+        )
         return trigger
     }
 
