@@ -129,6 +129,40 @@ Assert-Equal 0 (@(ConvertTo-EdithFilter '').Count) 'empty filter means no filter
 Assert-Equal 0 (@(ConvertTo-EdithFilter '   ').Count) 'whitespace filter means no filter'
 Assert-Equal 'knowledge' (@(ConvertTo-EdithFilter 'Knowledge'))[0] 'filter is lowercased'
 
+# --- row verdicts: an unresolved row must never be scored as a model "no" ------------------
+# The old rule wrote `none` for a window with no decision line at all, and for a window whose only
+# decision was a COOLDOWN suppression. Both are INSTRUMENT outcomes: the decider never got to
+# answer. Scoring them as "the model said no" is what made P3.4's recall a floor (0%) rather than a
+# measurement, so they are `harness_error` now - unresolved, and re-runnable.
+$v = Get-EdithRowVerdict -Tail @('P3_INJECT state=end', 'P3_PROACTIVE skip reason=SHORT')
+Assert-Equal 'none' $v.Verdict 'a real decider line is a none'
+Assert-Equal $true $v.DecisionSeen 'decision seen'
+Assert-Equal $false $v.CooldownSuppressed 'not a cooldown row'
+
+$v = Get-EdithRowVerdict -Tail @('P3_INJECT state=end', 'P3_ACOUSTIC label=Speech')
+Assert-Equal 'harness_error' $v.Verdict 'no decision line is unresolved, not a model no'
+Assert-Equal 'no_decision_line_in_window' $v.Reason 'unresolved reason is named'
+Assert-Equal $false $v.DecisionSeen 'no decision was seen'
+
+$v = Get-EdithRowVerdict -Tail @('P3_INJECT state=end', 'P3_PROACTIVE skip reason=COOLDOWN')
+Assert-Equal 'harness_error' $v.Verdict 'a cooldown-suppressed row is unresolved'
+Assert-Equal 'instrument_cooldown_suppressed' $v.Reason 'cooldown reason is named'
+Assert-Equal $true $v.CooldownSuppressed 'cooldown flagged'
+
+$v = Get-EdithRowVerdict -Tail @('P3_INJECT state=end', 'P3_PROACTIVE skip reason=DEDUP')
+Assert-Equal 'none' $v.Verdict 'dedup is still a decision (and DEDUP proves an earlier hint)'
+
+$v = Get-EdithRowVerdict -Tail @('P3_PROACTIVE request ctx=3 chars=7')
+Assert-Equal 'harness_error' $v.Verdict 'a trigger without the injection end is unresolved'
+Assert-Equal 'no_inject_end_in_window' $v.Reason 'the missing injection end wins over a stray trigger'
+
+$v = Get-EdithRowVerdict -Tail @('P3_INJECT state=end', 'P3_PROACTIVE request=')
+Assert-Equal 'triggered' $v.Verdict 'a trigger inside a completed window is triggered'
+
+# The instrument-suppressed count must be nameable on its own, or a naive re-run skips exactly the
+# rows that need re-running (they are `harness_error`, so they are not treated as settled).
+Assert-Equal 'cooldown-suppressed (unresolved, re-run): 3' (Get-EdithCooldownReportLine -Count 3) 'cooldown report line'
+
 if ($failures.Count -gt 0) {
     Write-Host ''
     $failures | ForEach-Object { Write-Host $_ }

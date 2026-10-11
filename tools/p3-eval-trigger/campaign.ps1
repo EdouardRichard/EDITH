@@ -60,6 +60,7 @@ $InjectAction = 'edith.DEBUG_INJECT'
 $InjectComponent = 'edith.phone/.DebugAudioInjector'
 $InjectEndMarker = 'P3_INJECT state=end'
 $TriggerMarker = 'P3_PROACTIVE request='
+$CooldownMarker = 'P3_PROACTIVE skip reason=COOLDOWN'
 $NoiseMarkers = @('P3_PROACTIVE skip', 'P3_ACOUSTIC', 'P3_SCRIPT')
 $SynthScriptName = 'synth-campaign.ps1'
 
@@ -164,6 +165,58 @@ function Select-EdithEvidenceLine {
         }
     }
     return $hits
+}
+
+# =====================================================================================
+# Pure verdict rule (W2 / F19)
+# =====================================================================================
+
+# One row's outcome from its own window, as a pure function so the rule is testable without adb.
+#
+# The rule this replaces wrote `none` for two INSTRUMENT outcomes and thereby folded them into "the
+# decider said no":
+#
+#   * a window with **no decision line at all** (`none` + reason `no decision line in window`),
+#   * a window whose only decision was a **COOLDOWN suppression** (`none` + a COOLDOWN skip line),
+#
+# and those are exactly the rows P3.4's recall rested on. A `COOLDOWN` suppression is not the decider
+# answering - `admit()` applies the length check BEFORE the cooldown check, so a cooldown-suppressed
+# row had already passed every content judgement and was silenced by the *instrument's own* spacing.
+# Both are `harness_error`: unresolved, therefore re-runnable and never scored as a model silence.
+#
+# `none` now means one thing only: the decider spoke and the reason was not the instrument.
+function Get-EdithRowVerdict {
+    param([string[]]$Tail)
+    $hits = @($Tail | Where-Object { $null -ne $_ })
+    $injectEnd = @($hits | Where-Object { $_ -like "*$InjectEndMarker*" }).Count -gt 0
+    $decision = @($hits | Where-Object { $_ -match 'P3_PROACTIVE skip reason=' }).Count -gt 0
+    $cooldown = @($hits | Where-Object { $_ -like "*$CooldownMarker*" }).Count -gt 0
+    $trigger = @($hits | Where-Object { $_ -like "*$TriggerMarker*" }).Count -gt 0
+    if (-not $injectEnd) {
+        return [pscustomobject]@{ Verdict = 'harness_error'; Reason = 'no_inject_end_in_window'
+            DecisionSeen = $decision; CooldownSuppressed = $cooldown; InjectEndSeen = $false }
+    }
+    if ($trigger) {
+        return [pscustomobject]@{ Verdict = 'triggered'; Reason = 'P3_PROACTIVE request'
+            DecisionSeen = $true; CooldownSuppressed = $cooldown; InjectEndSeen = $true }
+    }
+    if ($cooldown) {
+        return [pscustomobject]@{ Verdict = 'harness_error'; Reason = 'instrument_cooldown_suppressed'
+            DecisionSeen = $decision; CooldownSuppressed = $true; InjectEndSeen = $true }
+    }
+    if ($decision) {
+        return [pscustomobject]@{ Verdict = 'none'; Reason = 'P3_PROACTIVE skip reason'
+            DecisionSeen = $true; CooldownSuppressed = $false; InjectEndSeen = $true }
+    }
+    return [pscustomobject]@{ Verdict = 'harness_error'; Reason = 'no_decision_line_in_window'
+        DecisionSeen = $false; CooldownSuppressed = $false; InjectEndSeen = $true }
+}
+
+# The batch report's own sentence for the instrument-suppressed count, as a pure string so the wording
+# cannot drift away from the rule above (and so a test can pin it).
+function Get-EdithCooldownReportLine {
+    param([int]$Count)
+    return ("cooldown-suppressed (unresolved, re-run): " + $Count)
 }
 
 # =====================================================================================
@@ -451,6 +504,7 @@ Write-Host ("logcat baseline lines: " + $baseline.Count)
 
 $counts = @{ triggered = 0; none = 0; harness_error = 0 }
 $noDecision = 0
+$cooldownSuppressed = 0
 $harnessErrors = New-Object System.Collections.ArrayList
 $index = 0
 foreach ($row in $runRows) {
@@ -510,32 +564,22 @@ foreach ($row in $runRows) {
     $tail = @()
     if (-not $captureFailed -and $after.Count -gt $baseline.Count) { $tail = @($after[$baseline.Count..($after.Count - 1)]) }
 
-    # Verdict rules, in order:
+    # Verdict rules, in order (W2/F19: instrument outcomes are unresolved, never a model "no"):
     #   empty/failed capture            -> harness_error
     #   no injection completion in tail -> harness_error (the row was never actually played)
+    #   any COOLDOWN suppression        -> harness_error (the instrument's own spacing silenced the row)
+    #   no decision line at all         -> harness_error (nothing was decided; the old `none` hid this)
     #   P3_PROACTIVE request=           -> triggered
-    #   anything else                   -> none (a real "did not fire")
+    #   any other decision line         -> none (the decider really did answer)
     if ($captureFailed -or $after.Count -eq 0) {
         $verdict = 'harness_error'
         $reason = 'logcat_empty_or_failed'
-    } elseif (@($tail | Where-Object { $_ -like "*$InjectEndMarker*" }).Count -eq 0) {
-        $verdict = 'harness_error'
-        $reason = 'no_inject_end_in_window'
-    } elseif (@($tail | Where-Object { $_ -like "*$TriggerMarker*" }).Count -gt 0) {
-        $verdict = 'triggered'
-        $reason = 'P3_PROACTIVE request'
     } else {
-        $verdict = 'none'
-        $decisionSeen = @($tail | Where-Object { $_ -match 'P3_PROACTIVE skip reason=' }).Count -gt 0
-        if ($decisionSeen) {
-            $reason = 'P3_PROACTIVE skip reason'
-        } else {
-            # No decision line at all inside the window: the row is still "not triggered", but the reason is an
-            # instrument gap rather than the decider saying no. Counted and marked, so the report can state how many
-            # rows rest on this and so they can be re-run with a longer window.
-            $reason = 'no decision line in window'
-            $noDecision++
-        }
+        $verdictInfo = Get-EdithRowVerdict -Tail $tail
+        $verdict = $verdictInfo.Verdict
+        $reason = $verdictInfo.Reason
+        if ($reason -eq 'no_decision_line_in_window') { $noDecision++ }
+        if ($verdictInfo.CooldownSuppressed) { $cooldownSuppressed++ }
     }
 
     $evidence = @(Select-EdithEvidenceLine -Tail $tail)
@@ -548,7 +592,7 @@ foreach ($row in $runRows) {
     if ($evidence.Count -eq 0) {
         Write-EdithLine -Path $evidenceFull -Text ($row.Id + "`tnone`t" + $reason + "`tlogLines=" + $tail.Count)
     } else {
-        Write-EdithLine -Path $evidenceFull -Text ($row.Id + "`t" + $verdict + "`t" + $reason + "`tnoDecisionLine=" + ($reason -eq 'no decision line in window') + "`tcriteria=" + $evidence.Count + "`tlogLines=" + $tail.Count)
+        Write-EdithLine -Path $evidenceFull -Text ($row.Id + "`t" + $verdict + "`t" + $reason + "`tnoDecisionLine=" + ($reason -eq 'no_decision_line_in_window') + "`tcriteria=" + $evidence.Count + "`tlogLines=" + $tail.Count)
     }
 
     # The observation line is written LAST and alone, so it is never half-written.
@@ -561,10 +605,13 @@ foreach ($row in $runRows) {
 # --- 6. batch report ------------------------------------------------------------------
 Write-Host ''
 Write-Host "== batch report =="
+Write-Host "RECORDED TRIGGERS ARE A LOWER BOUND: a row with no log line proves nothing, and any 'skip reason=DEDUP'"
+Write-Host "line proves an earlier hint that was NOT recorded (noteDedup sits next to noteRequest in the success branch)."
 Write-Host ("rows run        : " + $runRows.Count)
 Write-Host ("triggered       : " + $counts.triggered)
 Write-Host ("none            : " + $counts.none)
-Write-Host ("  of which WITHOUT a decision line in the window (instrument gap, re-run with a longer window): " + $noDecision)
+Write-Host ("  of which WITHOUT a decision line in the window (instrument gap, unresolved): " + $noDecision)
+Write-Host (Get-EdithCooldownReportLine -Count $cooldownSuppressed)
 Write-Host ("harness_error   : " + $counts.harness_error)
 Write-Host ("synthesized now : " + $synthesized.Count)
 Write-Host ''
