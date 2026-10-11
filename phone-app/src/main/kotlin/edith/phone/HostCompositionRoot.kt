@@ -109,11 +109,16 @@ class HostCompositionRoot internal constructor(
      */
     private val smartSettingsStore: SmartSettingsStore? = null,
     /**
-     * P3.2: the session-scoped 「主动辅助」 arming switch (spec §16.2).
+     * `D53`② (2026-10-11): the **persisted, global** 「主动辅助」 switch - it replaced P3.2's session-scoped one.
      *
-     * Session state, not a stored secret, and **off by default**. It is the host's gate on producing perception
-     * events - see [armedAcousticSink] - so `create`'s chain emits no `AcousticEvent` while it is off, and [stop]
-     * (and every transition back to `Idle`) returns it to off so an arming can never outlive its session.
+     * A stored settings value (`SmartSettings.proactiveEnabled`), **on by default**, written through the same blob as
+     * the cooldown and sensitivity. It survives a stop, a transition back to `Idle`, a reconnect, an app restart and a
+     * phone restart, and **no path re-arms it** except the user's own call to [ProactiveArming.set]. It is still the
+     * host's gate on producing perception events - see [armedAcousticSink] - so `create`'s chain emits no
+     * `AcousticEvent` while it is off; that is what makes turning it off a real off switch on the device rather than a
+     * UI state. (The old KDoc here promised the opposite - session-scoped, off by default, returned to off by [stop] -
+     * which `D53`② repealed; the code had already moved on, and a claim that can no longer happen must not stay
+     * wordable.)
      */
     internal val proactiveArming: ProactiveArming = ProactiveArming(),
 ) : AutoCloseable {

@@ -216,6 +216,41 @@ $evidence = @(Select-EdithEvidenceLine -Tail @(
 Assert-Equal 3 $evidence.Count 'every criterion line the diagnosis needs is captured'
 Assert-Equal 1 (@($evidence | Where-Object { $_ -match 'P3_ASR' }).Count) 'the asr trace is captured'
 
+# --- review I1: the artifact must show that a recorded trigger became a SHOWN hint --------------------------
+# A row whose window logs `request` and then `silence reason=NO_CALL` used to be indistinguishable, in the artifact,
+# from one that displayed a hint: the causal chain P3.5-C cites (`request` -> `P3_HTTP 200` -> `hint` -> `ack
+# Displayed`) could only be quoted from ad-hoc logcat, never from the frozen file the scorer reads. These five lines
+# are the product's real shapes (ModelHttpLog.kt:29, SmartAssistantPlugin.kt:1057/1115/1155/1167).
+$expectedMarkers = @(
+    'P3_PROACTIVE skip', 'P3_PROACTIVE request', 'P3_PROACTIVE admit', 'P3_ACOUSTIC', 'P3_SCRIPT',
+    'P3_ASR', 'P3_TRANSCRIPT',
+    'P3_HTTP', 'P3_HINT', 'P3_PROACTIVE silence', 'P3_PROACTIVE hint')
+foreach ($marker in $expectedMarkers) {
+    # The expectation list is written out HERE rather than read from $NoiseMarkers: a loop over the list itself would
+    # still pass after someone deleted a marker from it, which is exactly how P3_ASR went missing for a whole batch.
+    Assert-Equal $true ($NoiseMarkers -contains $marker) ("the marker list keeps " + $marker)
+    Assert-Equal 1 (@(Select-EdithEvidenceLine -Tail @("10-12 02:29:56.420 I/EdithP3 (18428): " + $marker + " sample=1")).Count) `
+        ("captured as evidence: " + $marker)
+}
+
+# --- review I2: a batch the app is not processing must stop at row 3, not after 210 rows --------------------
+# The documented failure (W4c, 2026-10-11): a run injected into a session the operator had already STOPPED, and wrote
+# 10 rows with 849 window lines and ZERO feature lines each - an artifact that reads exactly like a product finding.
+# Three consecutive windows with no criterion line of any kind cannot happen while the app is processing audio: every
+# real injection in the artifacts produced at least `P3_ACOUSTIC label=Speech`. Rows already written are harness_error,
+# so they are not settled and a re-run picks them up once the session is running.
+Assert-Equal $true (Test-EdithBatchIsDead -RowWindows @(
+        "P3_INJECT state=start`nP3_INJECT state=ambient_stopped`nP3_INJECT state=end",
+        'P3_INJECT state=end chunks=148 accepted=148 drained=true',
+        'P3_INJECT state=end chunks=120 accepted=120 drained=true')) 'three windows with no criterion line mean a dead batch'
+Assert-Equal $false (Test-EdithBatchIsDead -RowWindows @(
+        'P3_INJECT state=end',
+        '10-12 01:57:18.239 I/EdithP3 (18428): P3_ACOUSTIC label=Speech',
+        'P3_INJECT state=end')) 'one reacting window is enough to keep running'
+Assert-Equal $false (Test-EdithBatchIsDead -RowWindows @(
+        'P3_INJECT state=end',
+        'P3_INJECT state=end')) 'two silent windows are not enough evidence to abort'
+
 if ($failures.Count -gt 0) {
     Write-Host ''
     $failures | ForEach-Object { Write-Host $_ }

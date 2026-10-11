@@ -70,7 +70,15 @@ $CooldownMarker = 'P3_PROACTIVE skip reason=COOLDOWN'
 # plugin?) and `P3_PROACTIVE request` (THE TRIGGER) are all needed: with only `P3_PROACTIVE skip`/`P3_ACOUSTIC`
 # captured, a row that produced a final and NO recorded decision line is indistinguishable from a row whose trigger was
 # never captured at all - which is exactly what the missing trigger marker produced.
-$NoiseMarkers = @('P3_PROACTIVE skip', 'P3_PROACTIVE request', 'P3_PROACTIVE admit', 'P3_ACOUSTIC', 'P3_SCRIPT', 'P3_ASR', 'P3_TRANSCRIPT')
+#
+# The tail of the chain (`P3_HTTP`, `P3_PROACTIVE hint`, `P3_HINT show`/`ack`, `P3_PROACTIVE silence`) is here for the
+# same reason one step later: the verdict only needs the `request` line, but the ARTIFACT has to be able to show
+# whether that request became a displayed hint (`request` -> `P3_HTTP 200` -> `hint` -> `ack Displayed`) instead of a
+# `silence reason=NO_CALL`. Without them the causal chain P3.5-C cites can only be quoted from ad-hoc logcat, and a
+# request that produced nothing looks exactly like one that showed a hint.
+$NoiseMarkers = @(
+    'P3_PROACTIVE skip', 'P3_PROACTIVE request', 'P3_PROACTIVE admit', 'P3_PROACTIVE silence', 'P3_PROACTIVE hint',
+    'P3_ACOUSTIC', 'P3_SCRIPT', 'P3_ASR', 'P3_TRANSCRIPT', 'P3_HTTP', 'P3_HINT')
 $SynthScriptName = 'synth-campaign.ps1'
 
 # =====================================================================================
@@ -231,7 +239,7 @@ function Get-EdithCooldownReportLine {
 # The batch report's count block, as pure strings.
 #
 # Pure rather than inline `Write-Host`s (review I3) because the **nesting** is the thing that was wrong: the report used
-# to print "none : 10" followed by an indented "of which WITHOUT a decision line … : 1", while that row was in fact one
+# to print "none : 10" followed by an indented "of which WITHOUT a decision line ... : 1", while that row was in fact one
 # of the `harness_error`s. A reader could not tell which parent the second number belonged to, and the pilot artifact
 # proved it was the wrong one. Keeping the shape in one place lets a test assert the nesting instead of trusting it.
 function Get-EdithBatchReportLines {
@@ -244,6 +252,28 @@ function Get-EdithBatchReportLines {
         ("  of the harness_errors, WITHOUT a decision line in the window: " + $NoDecision),
         ("harness_error   : " + $HarnessErrors + "   (unresolved: never scored as a model silence)")
     )
+}
+
+# A batch the app is not processing at all: the first few windows carry no criterion line of any kind.
+#
+# Why this, and not a pre-flight `P3_AUDIO state=armed` test (review I2 asked for that): measured on the K40, the main
+# ring buffer is 2 MiB / ~60k lines, which is 1.5-2 hours of this campaign - `adb logcat -d -t 60000` mid-batch returned
+# 60976 lines (the whole buffer, "beginning of main") and ZERO `P3_AUDIO state=` lines, because the session's arm line
+# had long rotated out. A guard that refuses unless the newest arm line says armed would therefore refuse every
+# legitimate mid-session re-run, and one that passes when the line is absent cannot catch the case it exists for.
+# What a running session can always be asked is whether it reacts to injected audio at all - and that is the failure
+# that actually cost a batch (W4c: injections into a stopped session wrote 10 rows with 849 window lines and zero
+# feature lines, an artifact that reads like a product finding). Three consecutive silent windows cannot happen while
+# the app is processing audio: every real injection in the artifacts produced at least `P3_ACOUSTIC label=Speech`.
+function Test-EdithBatchIsDead {
+    param([string[]]$RowWindows, [int]$MinimumRows = 3)
+    $seen = @($RowWindows | Where-Object { $null -ne $_ })
+    if ($seen.Count -lt $MinimumRows) { return $false }
+    for ($i = 0; $i -lt $MinimumRows; $i++) {
+        $lines = @($seen[$i] -split "`n")
+        if (@($lines | Where-Object { $_ -match 'P3_ACOUSTIC|P3_ASR|P3_TRANSCRIPT|P3_PROACTIVE' }).Count -gt 0) { return $false }
+    }
+    return $true
 }
 
 # =====================================================================================
@@ -560,6 +590,8 @@ $counts = @{ triggered = 0; none = 0; harness_error = 0 }
 $noDecision = 0
 $cooldownSuppressed = 0
 $harnessErrors = New-Object System.Collections.ArrayList
+$earlyWindows = New-Object System.Collections.ArrayList
+$abortedDead = $false
 $index = 0
 foreach ($row in $runRows) {
     $index++
@@ -600,7 +632,7 @@ foreach ($row in $runRows) {
     }
 
     # Poll instead of sleeping the whole window. A row is settled the moment **this row's** window contains a decision
-    # (`P3_PROACTIVE skip reason=` or `request=`), and the remaining wait only slows the campaign down.
+    # (`P3_PROACTIVE skip reason=...` or `P3_PROACTIVE request`), and the remaining wait only slows the campaign down.
     #
     # The window is bounded by **device timestamp**, not by a line-count baseline. The earlier index-based version had to
     # be index-based for a real reason - reading the device tail alone sees the *previous* row's decision line and exits
@@ -620,12 +652,28 @@ foreach ($row in $runRows) {
     try { $after = @(Get-EdithLogcatSince -Since $windowStart) } catch { $captureFailed = $true }
     $tail = $after
 
+    # Stop a batch the app is not processing at all, at row 3 instead of after 210 rows (review I2). The rows already
+    # written are `harness_error`, so nothing is lost - the next run retries them once the session is running.
+    if ($index -le 3) {
+        [void]$earlyWindows.Add(($tail -join "`n"))
+        if ($index -eq 3 -and (Test-EdithBatchIsDead -RowWindows $earlyWindows)) {
+            Write-Host ''
+            Write-Host "ABORT: no criterion line in three consecutive windows - the app is not processing audio."
+            Write-Host "       Start a session (tap START), confirm a P3_AUDIO state=armed line in logcat, then re-run:"
+            Write-Host "       these rows are harness_error, so the next run retries them without -Force."
+            Write-EdithLine -Path $evidenceFull -Text ("# batch ABORTED at row " + $index +
+                ": no criterion line in three consecutive windows (is the session running?)")
+            $abortedDead = $true
+            break
+        }
+    }
+
     # Verdict rules, in order (W2/F19: instrument outcomes are unresolved, never a model "no"):
     #   empty/failed capture            -> harness_error
     #   no injection completion in tail -> harness_error (the row was never actually played)
     #   any COOLDOWN suppression        -> harness_error (the instrument's own spacing silenced the row)
     #   no decision line at all         -> harness_error (nothing was decided; the old `none` hid this)
-    #   P3_PROACTIVE request=           -> triggered
+    #   P3_PROACTIVE request (ctx=...)   -> triggered
     #   any other decision line         -> none (the decider really did answer)
     if ($captureFailed -or $after.Count -eq 0) {
         $verdict = 'harness_error'
@@ -662,6 +710,11 @@ foreach ($row in $runRows) {
 # --- 6. batch report ------------------------------------------------------------------
 Write-Host ''
 Write-Host "== batch report =="
+if ($abortedDead) {
+    Write-Host "BATCH ABORTED: three consecutive windows carried no criterion line of any kind, so the app was not"
+    Write-Host "processing audio (a stopped session looks exactly like a product that never decides). Start a session"
+    Write-Host "and re-run: every row written so far is harness_error and is retried without -Force."
+}
 Write-Host "RECORDED TRIGGERS ARE A LOWER BOUND: a row with no log line proves nothing, and any 'skip reason=DEDUP'"
 Write-Host "line proves an earlier hint that was NOT recorded (noteDedup sits next to noteRequest in the success branch)."
 Write-Host ("rows run        : " + $runRows.Count)
