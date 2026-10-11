@@ -53,6 +53,15 @@ class SmartProactiveTurnTest {
         while (rig.model.requests.size < expected && System.nanoTime() < deadline) Thread.sleep(5)
     }
 
+    /**
+     * Settles the asynchronous half so a **negative** assertion is meaningful.
+     *
+     * `awaitRequests` cannot help when the expectation is "no further request": it would return immediately. The only
+     * honest way to assert that something did *not* happen on another thread is to give it a bounded chance to happen,
+     * which is what this does. The window is deliberately tiny - it only has to outlast a task-pool hand-off.
+     */
+    private fun settle(millis: Long = 200) = Thread.sleep(millis)
+
     /** Swaps [P3Log]'s sink for a collector and always restores it. */
     private fun <T> withLines(block: (MutableList<String>) -> T): T {
         val lines = mutableListOf<String>()
@@ -93,6 +102,7 @@ class SmartProactiveTurnTest {
         arm(rig)
         rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
 
+        awaitRequests(rig, 1)
         assertEquals(1, rig.model.requests.size, "one trigger, one request")
         assertEquals(1, rig.output.hints.size, "exactly one hint must be submitted")
         assertEquals("现在正适合提醒他一句", rig.output.hints.single().text)
@@ -161,6 +171,7 @@ class SmartProactiveTurnTest {
             rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
 
             assertTrue(rig.output.hints.isEmpty())
+            awaitRequests(rig, 1)
             assertEquals(1, rig.model.requests.size, "the proactive turn is one request, never a retry loop")
             assertTrue(lines.any { it.startsWith("P3_PROACTIVE silence reason=UNPARSABLE") }, lines.toString())
         }
@@ -231,6 +242,7 @@ class SmartProactiveTurnTest {
                 arm(rig)
                 rig.plugin.handle(TranscriptEvent(rig.transcript("今天星期几", turnId = "asr-2")))
 
+                awaitRequests(rig, 1)
                 assertEquals(1, rig.model.requests.size,
                     "a proactive turn must not run beside the in-flight wake turn")
                 assertTrue(lines.any { it == "P3_PROACTIVE skip reason=BUSY" }, lines.toString())
@@ -250,12 +262,14 @@ class SmartProactiveTurnTest {
         // "a turn exists" must not be read as "a turn is in flight".
         rig.plugin.handle(rig.wakeEvent())
         rig.plugin.handle(TranscriptEvent(rig.transcript("第一句话先回答我", turnId = "asr-1")))
+        awaitRequests(rig, 1)
         assertEquals(1, rig.model.requests.size)
 
         rig.model.onRequest = proposing()
         arm(rig)
         rig.plugin.handle(TranscriptEvent(rig.transcript("今天星期几", turnId = "asr-2")))
 
+        awaitRequests(rig, 2)
         assertEquals(2, rig.model.requests.size, "a finished turn must not make the next trigger busy")
     }
 
@@ -296,6 +310,9 @@ class SmartProactiveTurnTest {
             arm(rig)
             rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
 
+            // "must not retry" is a **negative** claim about work on another thread, so it needs a bounded chance for a
+            // retry to appear before it can be believed; `awaitRequests` would return immediately here.
+            settle()
             assertEquals(1, rig.model.requests.size, "a rejected display must not cause a retry")
             assertTrue(lines.any { it.startsWith("P3_PROACTIVE hint rejected") }, lines.toString())
             assertEquals(0, rig.displayedAcks)
@@ -384,6 +401,7 @@ class SmartProactiveTurnTest {
 
         arm(rig)
         rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+        awaitRequests(rig, 1)
         assertEquals(1, rig.model.requests.size)
 
         withLines { lines ->
@@ -469,6 +487,7 @@ class SmartProactiveTurnTest {
             withLines { lines ->
                 rig.plugin.handle(TranscriptEvent(rig.transcript("第二句值得提醒的话是什么呢", turnId = "asr-2")))
 
+                awaitRequests(rig, 1)
                 assertEquals(1, rig.model.requests.size, "only one proactive request may be in flight at a time")
                 assertTrue(lines.any { it == "P3_PROACTIVE skip reason=BUSY" }, lines.toString())
             }
