@@ -98,4 +98,8 @@ include(
     // P3.0 throwaway probe (T3b): how often does a semantic (accessibility-node) cross-app click actually land,
     // compared with a coordinate tap at the same node's bounds? Not a delivery module.
     ":phone-accessibility-probe",
+    // P3.4 evaluation harness: scores the frozen corpus against what the real trigger path actually did (precision /
+    // recall per scenario, the chat mis-trigger window). Reads logs; never touches the device itself. Not a delivery
+    // module.
+    ":tools:p3-eval-trigger",
 )

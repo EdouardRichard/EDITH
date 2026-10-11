@@ -55,6 +55,9 @@ import edith.plugin.model
 import edith.plugin.storage
 import edith.plugin.textOutput
 import edith.plugin.wakeWord
+import edith.plugins.smart.memory.MemoryExtraction
+import edith.plugins.smart.memory.MemoryLog
+import edith.plugins.smart.memory.SmartMemoryRetrieval
 import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -237,6 +240,21 @@ class SmartAssistantPlugin(
     private val audit = AuditTrail(null, BoundedAuditLog(AUDIT_CAPACITY, clock))
 
     /**
+     * P3.4: the long-term-memory boundary for the session being activated.
+     *
+     * Rebuilt on every `activate` so it points at the namespace **that** session was granted, and cleared on
+     * `deactivate` - a lookup must never reach a namespace the host has already taken back. `null` means "no session",
+     * and the gateways then inject nothing at all.
+     */
+    @Volatile private var memoryRetrieval: SmartMemoryRetrieval? = null
+
+    /**
+     * P3.4: what a finished turn is allowed to write. Same lifetime and the same namespace as [memoryRetrieval]; `null`
+     * means "no session", and a turn then writes nothing.
+     */
+    @Volatile private var memoryExtraction: MemoryExtraction? = null
+
+    /**
      * P3.3 (spec §17.4): the question-asker the loop blocks on.
      *
      * Built once per plugin, not per turn: the gate's invariant is "one live question at a time", and the host channel
@@ -402,6 +420,12 @@ class SmartAssistantPlugin(
         // P3.3: same rule for the audit trail's namespace. A missing grant degrades the trail to memory-only; it must
         // not take the passive loop down, and `AuditTrail` logs a write failure rather than pretending it recorded.
         audit.attach(runCatching { context.services.storage() }.getOrNull())
+        // P3.4: the same rule again for long-term memory. Without a namespace the store is empty and every lookup
+        // answers nothing; either way a turn is unaffected, because the gateway degrades a failed retrieval to an empty
+        // context.
+        val memoryLog = MemoryLog(runCatching { context.services.storage() }.getOrNull())
+        memoryRetrieval = SmartMemoryRetrieval(memoryLog)
+        memoryExtraction = MemoryExtraction(memoryLog)
         // P3.3: the same rule for the confirmation channel. A host that cannot ask the user leaves this null, and the
         // loop then refuses every flagged action (`CONFIRMATION_UNAVAILABLE`) instead of acting unasked.
         confirmation.attach(runCatching { context.services.confirmation() }.getOrNull())
@@ -416,6 +440,9 @@ class SmartAssistantPlugin(
             lastFinalTranscript = null
             lastFinalTurnId = null
             resetPerception()
+            // P3.4: a session that ends takes its memory boundary with it (the namespace was scoped to it).
+            memoryRetrieval = null
+            memoryExtraction = null
             detach()
         }
         // P3.3: a session that ends withdraws any question it asked. Leaving one pending would let the *next* session's
@@ -802,7 +829,25 @@ class SmartAssistantPlugin(
                 }
             }
         }
+        // P3.4 §3.2: what this turn leaves behind. Written **before** the outcome is submitted because the turn still
+        // owns its hint window here - an acknowledgement emitted afterwards would be dropped as expired, which is
+        // exactly the "silent remember" the explicit path exists to avoid.
+        rememberFromTurn(text, run)
         submitOutcome(owned, run)
+    }
+
+    /**
+     * P3.4 §3.2: what this turn earned, into long-term memory, plus the one sentence an explicit instruction is owed.
+     *
+     * Only steps whose result is `ok` count towards a habit - a refused or failed action is not something the user
+     * "keeps doing". Nothing here is logged with content: [MemoryLog] and [MemoryExtraction] print counts, kinds and
+     * reason codes only.
+     */
+    private fun rememberFromTurn(utterance: String, run: AgentRun) {
+        val extraction = memoryExtraction ?: return
+        val succeeded = run.steps.filter { it.result == "ok" }.map { it.action }
+        val report = extraction.afterTurn(utterance, succeeded)
+        if (report.explicit) emit(MemoryExtraction.ACKNOWLEDGEMENT)
     }
 
     /** Builds the single-use loop for one turn: registry, tightened policy, guard, audit and gateway. */
@@ -818,6 +863,9 @@ class SmartAssistantPlugin(
                 EventEnvelope(context.sessionId, context.generation, requestId, startNanos, endNanos)
             },
             stop = { owned.closed },
+            // P3.4 §3.3: the turn's context parts come from long-term memory, and only from it (the gateway asks about
+            // the in-flight utterance).
+            memoryRetrieval = memoryRetrieval,
         )
         return AgentLoop(
             gateway = gateway,
@@ -940,6 +988,9 @@ class SmartAssistantPlugin(
                 EventEnvelope(current.sessionId, current.generation, requestId, startNanos, endNanos)
             },
             stop = { hint.cancelled },
+            // P3.4 §3.3: the proactive request carries retrieved memory too - it is a request to the same model about
+            // the same person, and it passes the same upload gate.
+            memoryRetrieval = memoryRetrieval,
         )
         val reply = try {
             gateway.turn(GatewayTurn(

@@ -450,6 +450,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                         HorizontalDivider()
                         SmartSettingsSection(loadSettings, saveSettings)
                         root.auditLog?.let { AuditSection(it) }
+                        root.memoryLogView?.let { MemorySection(it) }
                     }
                     1 -> {
                         if (profileViewModel == null) Text("档案服务不可用")
@@ -571,6 +572,44 @@ private fun AuditSection(view: AuditLogView) {
         view.clear()
         revision++
     }) { Text("清空审计记录") }
+    HorizontalDivider()
+}
+
+/**
+ * P3.4 §3.4 (spec §6.5's 可查看、可删除): the long-term memory the assistant keeps, one line per memory.
+ *
+ * The sentence says the whole boundary out loud, because this page is where a user forms their model of it: the
+ * document is local and encrypted, it holds their own facts/preferences/habits, the few entries retrieved for a request
+ * travel to the configured model service **only** once this session's upload switch is on, and anything here can be
+ * deleted on the spot. Deleting writes the document; it is not a hidden flag.
+ *
+ * It reads the same way `AuditSection` does - one snapshot per [revision] - so a memory written during a turn appears
+ * after this section recomposes (a session stop/start does that, and so does any delete).
+ */
+@Composable
+private fun MemorySection(view: MemoryLogView) {
+    var revision by remember { mutableStateOf(0) }
+    val lines = remember(revision) { view.lines() }
+    Text("长期记忆", style = MaterialTheme.typography.titleLarge)
+    Text(
+        "本地加密保存；只记录你的事实、偏好与常做任务。被检索到的那几条会随请求发到所配置的模型服务" +
+            "（前提是本会话的上传开关已打开）；可随时单条删除或全部清空。",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    if (lines.isEmpty()) Text("暂无记忆")
+    lines.forEach { line ->
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text(view.render(line), style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+            TextButton(onClick = {
+                view.delete(line.id)
+                revision++
+            }) { Text("删除") }
+        }
+    }
+    OutlinedButton(onClick = {
+        view.clear()
+        revision++
+    }) { Text("清空长期记忆") }
     HorizontalDivider()
 }
 

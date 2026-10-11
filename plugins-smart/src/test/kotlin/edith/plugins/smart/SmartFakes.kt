@@ -397,6 +397,14 @@ internal class SmartFakeStorage : StorageHandle {
     override fun clear() = values.clear()
 }
 
+/** A namespace that refuses everything: the worst case a host can hand a store, and the one that must not throw. */
+internal class SmartExplodingStorage : StorageHandle {
+    override fun read(key: String): ByteArray? = throw IllegalStateException("boom")
+    override fun write(key: String, value: ByteArray): Unit = throw IllegalStateException("boom")
+    override fun delete(key: String): Unit = throw IllegalStateException("boom")
+    override fun clear(): Unit = throw IllegalStateException("boom")
+}
+
 /** An `AtomicBoolean` guard used by the async-model tests to fail loudly if a stream is not torn down. */
 internal class SmartGate {
     val open = AtomicBoolean(false)

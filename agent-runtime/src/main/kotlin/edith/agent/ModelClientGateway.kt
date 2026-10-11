@@ -2,6 +2,7 @@ package edith.agent
 
 import edith.contracts.EventEnvelope
 import edith.plugin.CancellationHandle
+import edith.plugin.ContextPart
 import edith.plugin.DeadlineScheduler
 import edith.plugin.InputPart
 import edith.plugin.MessageRole
@@ -31,6 +32,9 @@ private const val TOOL_CALL_DELIVERY_INCOMPLETE = "TOOL_CALL_DELIVERY_INCOMPLETE
  */
 private const val WAIT_STEP_MILLIS = 10L
 
+/** P3.4 §3.3: at most this many memory parts per request; the character budget belongs to the retrieval itself. */
+private const val MEMORY_RETRIEVAL_LIMIT = 5
+
 /**
  * The one [ModelGateway] over `plugin-api`'s streaming [ModelClient]: it turns the loop's [GatewayTurn] into a
  * stateless [ModelRequest], accumulates the stream into a [GatewayReply], and owns the turn's wall-clock bound.
@@ -57,6 +61,14 @@ class ModelClientGateway(
     private val scheduler: DeadlineScheduler,
     private val envelopeFor: (requestId: String, startNanos: Long, endNanos: Long) -> EventEnvelope,
     private val stop: () -> Boolean = { false },
+    /**
+     * P3.4 §3.3: the long-term-memory boundary this adapter fills `ModelRequest.context` from.
+     *
+     * `null` reproduces the behaviour every caller had before it existed (an empty context). A retrieval that throws
+     * answers an empty context instead of failing the turn, because memory is an optimisation - the implementation owns
+     * its own honest logging of a storage failure, and nothing about memory may take a turn down.
+     */
+    private val memoryRetrieval: MemoryRetrieval? = null,
 ) : ModelGateway {
 
     override fun turn(request: GatewayTurn): GatewayReply {
@@ -77,7 +89,7 @@ class ModelClientGateway(
             instructions = request.instructions,
             input = transcript.input,
             history = transcript.history,
-            context = emptyList(),
+            context = memoryFor(transcript),
             output = OutputModality.TEXT,
             deadlineNanos = request.deadlineNanos,
             tools = request.tools,
@@ -157,6 +169,28 @@ class ModelClientGateway(
      * stays last. A transcript with no user turn at all is refused here as `NO_USER_TURN`, because `ContextBudgeter`
      * requires the history to open with a `USER` text and such a request could never be sent.
      */
+    /**
+     * What long-term memory is asked about (P3.4 §3.3): the in-flight user turn when the request has one, otherwise the
+     * user turn the transcript still opens with. A continuation request - the shape after a tool round - carries no
+     * `input`, and asking memory about an empty string would retrieve nothing at all.
+     *
+     * A blank query skips the retrieval entirely, and a retrieval that throws answers an empty context: a memory that
+     * cannot be read must cost a lookup, never a turn.
+     */
+    private fun memoryFor(transcript: Transcript): List<ContextPart> {
+        val retrieval = memoryRetrieval ?: return emptyList()
+        val inFlight = transcript.input.filterIsInstance<InputPart.Text>().joinToString(" ") { it.text }.trim()
+        val fromHistory = transcript.history
+            .filterIsInstance<ModelHistoryItem.Text>()
+            .lastOrNull { it.role == MessageRole.USER }
+            ?.text
+            ?.trim()
+            .orEmpty()
+        val query = inFlight.ifEmpty { fromHistory }
+        if (query.isEmpty()) return emptyList()
+        return runCatching { retrieval.retrieve(query, MEMORY_RETRIEVAL_LIMIT) }.getOrElse { emptyList() }
+    }
+
     private fun split(history: List<ModelHistoryItem>): Transcript? {
         val index = history.indexOfLast { it is ModelHistoryItem.Text && it.role == MessageRole.USER }
         if (index < 0) return null

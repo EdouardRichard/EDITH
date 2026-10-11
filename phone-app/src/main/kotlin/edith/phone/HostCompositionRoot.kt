@@ -269,6 +269,14 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
+     * P3.4: the session page's reader over the plugin's long-term-memory document (the same namespace, a different
+     * key); null when storage is not wired, which is exactly when the plugin itself has no memory to show.
+     */
+    internal val memoryLogView: MemoryLogView? by lazy {
+        namespaceFactory?.let { factory -> MemoryLogView(factory("smart-assistant")) }
+    }
+
+    /**
      * P3.3 (spec §17.2): one probe per execution channel, logged once per session as `P3_EXEC channel=… available=…`.
      *
      * The pair is id to a **live** question, not a cached answer: the accessibility service is switched off in system
