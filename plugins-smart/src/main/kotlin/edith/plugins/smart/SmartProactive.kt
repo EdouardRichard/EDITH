@@ -23,12 +23,14 @@ internal enum class ProactiveSensitivity(val minTranscriptChars: Int) {
  * - [DISARMED] the session's 「主动辅助」 switch is off.
  * - [BUSY] a turn is already in flight (a wake turn, or another proactive one).
  * - [NOISY] the acoustic label says the environment is steady noise, not speech.
- * - [SHORT] the transcript is below the sensitivity threshold.
+ * - [VAGUE] the utterance carries no interpretable request (P3.5 §W3's feature rule; this replaced the old `SHORT`
+ *   length gate, which refused 141 of 210 corpus rows - most of them real short questions).
+ * - [SHORT] kept for the length-only refusal the old rule reported. New candidates are refused as [VAGUE].
  * - [COOLDOWN] too soon after the last request, or after a refusal that started the cooldown.
  * - [DEDUP] this sentence (about this foreground app) was already handled recently.
  * - [GATE] the session's upload consent refused the request, so nothing left the device.
  */
-internal enum class ProactiveSkip { DISARMED, BUSY, NOISY, SHORT, COOLDOWN, DEDUP, GATE }
+internal enum class ProactiveSkip { DISARMED, BUSY, NOISY, SHORT, VAGUE, COOLDOWN, DEDUP, GATE }
 
 /** One candidate: what was heard, what the acoustic layer called it, what is in front of the user, and when. */
 internal data class ProactiveTrigger(
@@ -46,12 +48,16 @@ internal data class ProactiveTrigger(
  * nothing and the expensive path is only reached by an admitted trigger.
  *
  * Rules, in the order they are applied - the order matters because it decides the *reason* when several apply:
- * `DISARMED -> BUSY -> NOISY -> SHORT -> COOLDOWN -> DEDUP`.
+ * `DISARMED -> BUSY -> NOISY -> VAGUE -> COOLDOWN -> DEDUP`.
+ *
+ * The content judgement is **P3.5 §W3's feature rule** ([admitByFeatures]), not a length threshold: length is one weak
+ * signal among several, so a short real question ("现在几点了") is admitted while a longer piece of reported speech
+ * ("他说他儿子发烧了") is not. The sensitivity dial still supplies the length signal's boundary.
  *
  * The cooldown is a **sliding** window: a trigger refused by [ProactiveSkip.COOLDOWN] or [ProactiveSkip.DEDUP]
  * restarts it. So while the user keeps talking the assistant keeps quiet (and reports one skip per utterance, which
  * is exactly what the acceptance log reads), and the window only runs out once the conversation pauses. [DISARMED],
- * [BUSY], [NOISY] and [SHORT] deliberately do **not** touch it: the first is not an attempt, and the other three are
+ * [BUSY], [NOISY] and [VAGUE] deliberately do **not** touch it: the first is not an attempt, and the other three are
  * properties of one utterance that a later one may not share.
  *
  * Dedup keys on the normalized transcript **and** the foreground app, so the same sentence about a different app is
@@ -85,7 +91,11 @@ internal class SmartProactive(
         if (!armed) return ProactiveSkip.DISARMED
         if (busy) return ProactiveSkip.BUSY
         if (trigger.label == AcousticLabel.Noisy) return ProactiveSkip.NOISY
-        if (normalize(trigger.transcript).length < minTranscriptChars) return ProactiveSkip.SHORT
+        // P3.5 §W3: the content judgement is the feature rule, not a length gate. `minTranscriptChars` survives only as
+        // the LENGTH feature's boundary, which is why a short real question now gets through.
+        if (!admitByFeatures(trigger.transcript, trigger.foreground, minTranscriptChars).admitted) {
+            return ProactiveSkip.VAGUE
+        }
         synchronized(lock) {
             val started = cooldownStartedNanos
             if (started != null && trigger.nowNanos - started < cooldownNanos) {

@@ -1,5 +1,7 @@
 package edith.probe.eval
 
+import edith.plugins.smart.admissionReport
+import edith.plugins.smart.admitByFeatures
 import java.io.File
 import kotlin.system.exitProcess
 
@@ -43,9 +45,14 @@ fun main(args: Array<String>) {
         agentReport(positional)
         return
     }
+    if (args.firstOrNull() == "--admission") {
+        admissionReportFor(positional.firstOrNull(), detail = args.any { it == "--admission-detail" })
+        return
+    }
     if (positional.size < 2) {
         System.err.println("usage: p3-eval-trigger <corpus.md> <observations.txt> [windowMinutes] [--allow-errors]")
-        System.err.println("       p3-eval-trigger --agent <logcat.txt>")
+        System.err.println("       p3-eval-trigger --agent <logcat.txt> [audit-page-dump.txt]")
+        System.err.println("       p3-eval-trigger --admission <corpus.md>")
         exitProcess(2)
     }
     val labels = parseLabels(File(positional[0]).readText(Charsets.UTF_8))
@@ -87,6 +94,62 @@ fun main(args: Array<String>) {
         "chat triggers=${result.chatTriggers} perTenMinutes=${round(result.chatTriggersPerTenMinutes)} " +
             "(threshold: precision >= 0.90, recall >= 0.80, chat <= 1 per 10 min)",
     )
+}
+
+/**
+ * W3: the offline admission calibration - the plugin's own rule, over the frozen corpus.
+ *
+ * Prints counts with their denominators and the §11.3 gates beside them, because an admission rate without its
+ * denominator is the shape of claim this phase exists to stop making. A missing corpus path is an error: an empty
+ * corpus would print a perfect-looking report.
+ */
+private fun admissionReportFor(corpusPath: String?, detail: Boolean) {
+    if (corpusPath == null) {
+        System.err.println("usage: p3-eval-trigger --admission <corpus.md> [--admission-detail]")
+        exitProcess(2)
+    }
+    val rows = admissionRowsFrom(File(corpusPath))
+    if (rows.isEmpty()) {
+        System.err.println("no label rows found in $corpusPath - refusing to report on an empty corpus")
+        exitProcess(2)
+    }
+    val confusion = admissionReport(rows.map { Triple(it.scenario, it.label, it.text) })
+    println("corpus rows=${rows.size} positives=${confusion.positives} negatives=${confusion.negatives} chat=${confusion.chat}")
+    println(
+        "admission positives=${confusion.positives} admitted=${confusion.admittedPositives} " +
+            "recall=${round(confusion.recall)}",
+    )
+    println(
+        "admission negatives=${confusion.negatives} admitted=${confusion.admittedNegatives} " +
+            "precision=${round(confusion.precision)}",
+    )
+    println("admission chat=${confusion.chat} admitted=${confusion.admittedChat}")
+    println("(gates: admission recall >= 0.80, precision >= 0.90, chat admitted = 0; offline only - the device re-run decides)")
+    // Local diagnostic only: which rows the rule refuses/admits wrongly. The corpus is the project's own frozen
+    // calibration input (not user data), and this never runs on a device - it is what makes the rule correctable.
+    if (detail) {
+        val verdicts = rows.map { it to admitByFeatures(it.text, foreground = null) }
+        println("[detail] refused positives:")
+        verdicts.filter { it.first.label == "positive" && !it.second.admitted }
+            .forEach { println("  ${it.first.id} score=${it.second.score} fired=${it.second.fired}") }
+        println("[detail] admitted negatives:")
+        verdicts.filter { it.first.label == "negative" && it.second.admitted }
+            .forEach { println("  ${it.first.id} ${it.first.scenario} score=${it.second.score} fired=${it.second.fired}") }
+        // The achievable operating points: how the *raw feature score* separates the two classes, with no admission
+        // rule applied at all. This is what says whether a different threshold could reach the gates, or whether the
+        // features themselves do not separate the classes on this corpus.
+        println("[sweep] score>=N: positives admitted / negatives admitted / recall / precision / chat")
+        for (threshold in 1..5) {
+            val pos = rows.count { it.label == "positive" && admitByFeatures(it.text, null).score >= threshold }
+            val neg = rows.count { it.label == "negative" && admitByFeatures(it.text, null).score >= threshold }
+            val chat = rows.count { it.scenario == "chat" && admitByFeatures(it.text, null).score >= threshold }
+            val p = rows.count { it.label == "positive" }
+            val recall = pos.toDouble() / p
+            val precision = if (pos + neg == 0) 1.0 else pos.toDouble() / (pos + neg)
+            println("  score>=$threshold: $pos/$p positives, $neg/${rows.size - p} negatives, " +
+                "recall=${round(recall)} precision=${round(precision)} chat=$chat")
+        }
+    }
 }
 
 /**
