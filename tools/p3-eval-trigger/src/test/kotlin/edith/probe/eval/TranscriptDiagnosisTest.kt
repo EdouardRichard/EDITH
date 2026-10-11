@@ -62,6 +62,25 @@ class TranscriptDiagnosisTest {
     }
 
     @Test
+    fun `a normal end-of-speech silence is not a cause`() {
+        // The pipeline emits `P3_ACOUSTIC label=Silence` at the end of EVERY utterance. Treating a trailing Silence as
+        // "the environment was not speech" classified every real no-decision row as LABEL_NOT_SPEECH on the device - it
+        // was reading the labeler's ordinary end-of-speech transition as a cause. Only `Noisy` is a cause.
+        val cause = classifyNoDecision(
+            listOf(
+                "P3_ASR revision=6 final=true chars=15 usable=true",
+                "P3_ACOUSTIC label=Speech",
+                "P3_ACOUSTIC label=Silence",
+            ),
+        )
+
+        assertTrue(
+            cause != NoDecisionCause.LABEL_NOT_SPEECH,
+            "an ordinary end-of-speech silence must not be read as a cause: $cause",
+        )
+    }
+
+    @Test
     fun `without the asr line the cause is unknown rather than guessed`() {
         // This is the honest answer for the P3.4 evidence: no `P3_ASR` line existed, so "no final" and "no transcript
         // event reached the plugin at all" cannot be told apart from the log.

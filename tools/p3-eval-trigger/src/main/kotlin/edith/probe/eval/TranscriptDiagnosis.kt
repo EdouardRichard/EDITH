@@ -48,7 +48,6 @@ internal fun classifyNoDecision(windowLines: List<String>): NoDecisionCause {
     val finals = lines.filter { it.contains("final=true") }
     val sawAsr = lines.any { it.startsWith("P3_ASR") }
     val noisy = lines.any { it.contains("P3_ACOUSTIC label=Noisy") || it.contains("skip reason=NOISY") }
-    val silentLast = lines.lastOrNull { it.contains("P3_ACOUSTIC label=") }?.contains("label=Silence") == true
     val gated = lines.any { it.contains("skip reason=BUSY") || it.contains("skip reason=DISMED") }
     val unusable = lines.any { it.contains("usable=false") }
 
@@ -57,7 +56,14 @@ internal fun classifyNoDecision(windowLines: List<String>): NoDecisionCause {
         return NoDecisionCause.UNKNOWN
     }
     if (finals.isEmpty()) return NoDecisionCause.NO_FINAL
-    if (noisy || silentLast) return NoDecisionCause.LABEL_NOT_SPEECH
+    // **Only `Noisy` counts**, never a trailing `Silence`.
+    //
+    // The first version also treated a window whose last `P3_ACOUSTIC` line was `label=Silence` as not-speech, and on
+    // the real artifact that classified **every** no-decision row as [LABEL_NOT_SPEECH] - because the pipeline emits
+    // `Silence` at the end of *every* utterance as a matter of course. It was measuring the labeler's ordinary
+    // end-of-speech transition and calling it a cause. That is the exact failure §M's "diagnose before you change
+    // anything" rule exists to prevent: it would have sent someone off to re-tune the acoustic gate.
+    if (noisy) return NoDecisionCause.LABEL_NOT_SPEECH
     if (gated) return NoDecisionCause.GATED
     if (unusable) return NoDecisionCause.ASR_DRIFT
     // A final that was usable and drew no decision line at all: the utterance never reached the admission rule.
