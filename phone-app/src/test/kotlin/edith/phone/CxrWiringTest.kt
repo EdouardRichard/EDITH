@@ -92,6 +92,79 @@ class CxrWiringTest {
         } finally { root.close() }
     }
 
+    /**
+     * W1 (F17/F18): the session start path establishes the link itself.
+     *
+     * `start()` runs inside `SessionService`, which has no Activity, and mixing a placeholder in would hand the
+     * vendor adapter something it cannot cast. So the attempt is **deferred and said out loud** until the Activity
+     * that `MainActivity` hands over exists - and then it really connects, exactly once.
+     */
+    @Test fun ensureCxrLinkDefersWithoutAnActivityAndConnectsOnceOneExists() {
+        val model = UnusedModel()
+        val connection = FakeConnection()
+        var factories = 0
+        val root = HostCompositionRoot(HostRuntime(1), MemoryProfileRepository(), model, null,
+            rokidConnectionFactory = { factories++; connection })
+        try {
+            withP3Sink { lines ->
+                assertFalse("nothing can be built without the Activity the SDK needs", root.ensureCxrLink())
+                assertEquals("no connection may be built out of a placeholder", 0, factories)
+                assertEquals("and nothing may be connected", 0, connection.connectedWith.size)
+                assertTrue("the deferred attempt must be visible, never silent",
+                    lines.any { it == "P3_CXR connect attempt=start result=no_activity" })
+                assertFalse("and it must not claim a result it does not have",
+                    lines.any { it.contains("result=ok") })
+            }
+            withP3Sink { lines ->
+                root.attachCxrActivity(Any())
+                assertTrue("with an Activity the start path must establish the link", root.ensureCxrLink())
+                assertEquals(1, factories)
+                assertEquals(1, connection.connectedWith.size)
+                assertTrue(lines.any { it.contains("result=ok") })
+                assertTrue("a second ensure must reuse the connection", root.ensureCxrLink())
+                assertEquals("one connection per composition", 1, factories)
+            }
+        } finally { root.close() }
+    }
+
+    /** A composition with no CXR assembly must not be silent about it (F17/F18: "no CXR line at all" was the symptom). */
+    @Test fun aCompositionWithoutATransportLogsMissingInsteadOfSilence() {
+        val model = UnusedModel()
+        val root = HostCompositionRoot(HostRuntime(1), MemoryProfileRepository(), model, null)
+        try {
+            root.attachCxrActivity(Any())
+            withP3Sink { lines ->
+                assertFalse("an unwired app must not claim a link", root.ensureCxrLink())
+                assertTrue("the missing transport must be a log line, not silence",
+                    lines.any { it == "P3_CXR connect attempt=start result=transport_missing" })
+            }
+        } finally { root.close() }
+    }
+
+    /** The wiring that replaces the old UI button: `MainActivity` hands over the Activity, and the session start's own call keeps the link, without a second connect. */
+    @Test fun aWiredCompositionConnectsFromTheStartPathAlone() {
+        val model = UnusedModel()
+        val connection = FakeConnection()
+        val root = HostCompositionRoot(HostRuntime(1), MemoryProfileRepository(), model, null,
+            rokidConnectionFactory = { connection })
+        try {
+            withP3Sink { lines ->
+                root.attachCxrActivity(Any())
+                assertTrue(lines.any { it == "P3_CXR connect attempt=start result=ok" })
+            }
+            // The invariant the mutation "make ensureCxrLink connect unconditionally" breaks: `start()` reaches this
+            // method on every session start while `onCreate` already connected, so a second ask would be a real
+            // duplicate - exactly the crash the transport had to be hardened against.
+            withP3Sink { lines ->
+                assertTrue("the start path must find the link already established", root.ensureCxrLink())
+                assertTrue("and again", root.ensureCxrLink())
+                assertEquals("but must never ask the SDK a second time", 1, connection.connectedWith.size)
+                assertTrue("nothing new had to happen, so nothing is claimed",
+                    lines.none { it.contains("result=ok") })
+            }
+        } finally { root.close() }
+    }
+
     private class FakeConnection : CxrConnection {
         val connectedWith = mutableListOf<Any>()
         var resultCode: Int? = null

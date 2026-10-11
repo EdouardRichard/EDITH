@@ -822,17 +822,68 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
+     * The single point that establishes the CXR link, and the one the session start path calls.
+     *
+     * Split out of [connectCxr] because the session start runs inside `SessionService`, which has no `Activity`: this
+     * method takes whatever Activity [attachCxrActivity] last remembered, and the actual `connect` waits for the one
+     * thing the vendor SDK needs. Idempotent - a connection already built is reused, never rebuilt.
+     *
+     * **Building needs the Activity too** (`activity.asCxrActivity()`), so with none remembered yet the attempt is
+     * only **said out loud** (`result=no_activity`) and reported false. Passing a placeholder would hand the vendor
+     * adapter something it cannot cast - a crash on the device that no JVM test would see.
+     *
+     * Every call really asks the transport to connect; the transport itself is idempotent for an impatient second
+     * tap and renews a session that died (`TransportConnectIdempotencyTest`). That is what lets `开始` mean "make sure
+     * it is connected, and reconnect if it is not" without a second button.
+     *
+     * **Idempotent within one armed link**: both `MainActivity.onCreate` and `start()` reach this method, and asking
+     * the SDK to connect twice per session start is exactly the duplicate the transport had to be hardened against.
+     * [stop] clears that state, so the next session connects again.
+     *
+     * @return true when this assembly has a connection to use; false when it has none yet (no transport, or no
+     *   Activity to build it with).
+     */
+    @Synchronized internal fun ensureCxrLink(): Boolean {
+        val activity = pendingActivity?.get() ?: run {
+            // A new attempt invalidates the previous answer (review I-2) even when it cannot proceed: a cancelled
+            // prompt must not sit on the page next to a link that came up afterwards, and `null` is what the render
+            // treats as "the SDK has not asked".
+            mutableState.update { it.copy(cxrAuthorization = null) }
+            if (closed) {
+                P3Log.line("P3_CXR connect attempt=start result=closed")
+                return false
+            }
+            P3Log.line("P3_CXR connect attempt=start result=no_activity")
+            return false
+        }
+        if (linkBuilt && !closed) return true
+        return connectCxr(activity)
+    }
+
+    /**
      * Explicit CXR entry point. Returns false when this assembly has no glasses transport (the audio
      * capability stays missing) and true when the connection was requested; the transport reports
      * readiness asynchronously through [onSceneReady], never through this call. The connection is built
      * on first use so the app does not open a CXR worker thread unless the user actually connects.
+     *
+     * Every call really asks the transport to connect (the transport itself is idempotent for an impatient second
+     * tap and renews a session that died - `TransportConnectIdempotencyTest`), so `开始` can mean "make sure it is
+     * connected, and reconnect if it is not" without a second button.
      */
     @Synchronized fun connectCxr(activity: Any): Boolean {
+        pendingActivity = java.lang.ref.WeakReference(activity)
         // A new attempt invalidates the previous answer (review I-2): a cancelled prompt must not sit on the page next
         // to a link that came up afterwards, and `null` is what the render treats as "the SDK has not asked".
         mutableState.update { it.copy(cxrAuthorization = null) }
-        val factory = rokidConnectionFactory ?: return false
-        if (closed) return false
+        if (closed) {
+            P3Log.line("P3_CXR connect attempt=start result=closed")
+            return false
+        }
+        val factory = rokidConnectionFactory ?: run {
+            P3Log.line("P3_CXR connect attempt=start result=transport_missing")
+            return false
+        }
+        val reuse = linkBuilt
         val connection = activeConnection ?: factory(activity).also { built ->
             activeConnection = built
             resources.add(built)
@@ -841,8 +892,28 @@ class HostCompositionRoot internal constructor(
         // clock exchange is answered there. The device owns neither the channel nor the routing decision.
         connection.onInboundCommand { json -> hintLink?.onInbound(json) }
         connection.connect(activity)
+        linkBuilt = true
+        P3Log.line("P3_CXR connect attempt=${if (reuse) "reuse" else "start"} result=ok")
         return true
     }
+
+    /**
+     * Takes the Activity the vendor SDK needs, and connects if that has not happened yet.
+     *
+     * `MainActivity` is the only party that can supply it, and it may appear **after** a session start (the start runs
+     * in a Service) or **before** one. Held weakly and deliberately: this composition is a process-lifetime singleton,
+     * so a strong Activity reference here would leak it.
+     */
+    @Synchronized fun attachCxrActivity(activity: Any) {
+        pendingActivity = java.lang.ref.WeakReference(activity)
+        if (!linkBuilt) ensureCxrLink()
+    }
+
+    /** True once the live connection has been asked to connect. Cleared by [stop] (D53-③). */
+    private var linkBuilt = false
+
+    /** The Activity the SDK needs, held weakly; null until a UI exists (the start path can run before one does). */
+    private var pendingActivity: java.lang.ref.WeakReference<Any>? = null
 
     /**
      * Routes the AI-App authorization result back into the transport, and records it as **page state** only when the

@@ -543,9 +543,17 @@ class PassiveLoopWiringTest {
             withP3Sink { lines ->
                 assertTrue(activateThroughRoot(root))
                 val armed = requireNotNull(root.currentAudioEpoch())
+                // W1: the session start path now establishes the CXR link itself, and it says so **before** the ears
+                // report arming - which is the causal order a device run reads. The exact lists below stay about the
+                // `P3_AUDIO` vocabulary (that is what "carries no frame payload" is a claim about).
+                assertEquals(
+                    "the link attempt must be visible, and only as a result code",
+                    listOf("P3_CXR connect attempt=start result=ok"),
+                    lines.filter { it.startsWith("P3_CXR") },
+                )
                 assertEquals(
                     listOf("P3_AUDIO state=armed generation=${armed.generation.value} transport=true loop=true"),
-                    lines.toList(),
+                    lines.filter { it.startsWith("P3_AUDIO") },
                 )
 
                 root.stop()
@@ -556,7 +564,7 @@ class PassiveLoopWiringTest {
                         "P3_AUDIO state=disarmed generation=${armed.generation.value} " +
                             "transport=false loop=false reason=DISARMED",
                     ),
-                    lines.toList(),
+                    lines.filter { it.startsWith("P3_AUDIO") },
                 )
             }
         } finally {
