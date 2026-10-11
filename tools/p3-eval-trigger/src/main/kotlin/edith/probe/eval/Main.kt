@@ -49,10 +49,15 @@ fun main(args: Array<String>) {
         admissionReportFor(positional.firstOrNull(), detail = args.any { it == "--admission-detail" })
         return
     }
+    if (args.firstOrNull() == "--diagnose") {
+        diagnosisReportFor(positional.firstOrNull())
+        return
+    }
     if (positional.size < 2) {
         System.err.println("usage: p3-eval-trigger <corpus.md> <observations.txt> [windowMinutes] [--allow-errors]")
         System.err.println("       p3-eval-trigger --agent <logcat.txt> [audit-page-dump.txt]")
         System.err.println("       p3-eval-trigger --admission <corpus.md>")
+        System.err.println("       p3-eval-trigger --diagnose <campaign-evidence.txt>")
         exitProcess(2)
     }
     val labels = parseLabels(File(positional[0]).readText(Charsets.UTF_8))
@@ -150,6 +155,27 @@ private fun admissionReportFor(corpusPath: String?, detail: Boolean) {
                 "recall=${round(recall)} precision=${round(precision)} chat=$chat")
         }
     }
+}
+
+/**
+ * W4 §M: why the rows that reached no decision reached none.
+ *
+ * Prints ids and counts only - never a transcript - and states plainly when the instrument of the day cannot answer the
+ * question, because "we do not know" is the result that justifies changing the instrument.
+ */
+private fun diagnosisReportFor(evidencePath: String?) {
+    if (evidencePath == null) {
+        System.err.println("usage: p3-eval-trigger --diagnose <campaign-evidence.txt>")
+        exitProcess(2)
+    }
+    val windows = readNoDecisionWindows(File(evidencePath))
+    val rows = noDecisionRows(windows)
+    println("windows=${windows.size} no-decision rows=${rows.size}")
+    val breakdown = diagnosisBreakdown(rows.map { classifyNoDecision(it.lines) })
+    for ((cause, count) in breakdown) {
+        println("cause=$cause count=$count")
+    }
+    println("[ids] ${rows.joinToString(" ") { it.id }}")
 }
 
 /**
