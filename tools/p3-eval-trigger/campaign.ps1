@@ -61,7 +61,11 @@ $InjectComponent = 'edith.phone/.DebugAudioInjector'
 $InjectEndMarker = 'P3_INJECT state=end'
 $TriggerMarker = 'P3_PROACTIVE request='
 $CooldownMarker = 'P3_PROACTIVE skip reason=COOLDOWN'
-$NoiseMarkers = @('P3_PROACTIVE skip', 'P3_ACOUSTIC', 'P3_SCRIPT', 'P3_ASR')
+# The criterion lines the per-row evidence keeps. `P3_ASR` (W4 diagnosis) and `P3_TRANSCRIPT` (did a final reach the
+# plugin?) are both needed: with only `P3_PROACTIVE`/`P3_ACOUSTIC` captured, a row that produced a final and NO decision
+# line is indistinguishable from a row whose transcript never reached the plugin at all - which is exactly the ambiguity
+# that stalled the W4 diagnosis.
+$NoiseMarkers = @('P3_PROACTIVE skip', 'P3_PROACTIVE admit', 'P3_ACOUSTIC', 'P3_SCRIPT', 'P3_ASR', 'P3_TRANSCRIPT')
 $SynthScriptName = 'synth-campaign.ps1'
 
 # =====================================================================================
