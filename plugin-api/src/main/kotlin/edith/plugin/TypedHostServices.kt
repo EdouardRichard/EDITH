@@ -6,11 +6,19 @@ fun HostServices.speech(): SpeechPlayer = require(Capability.SpeechOutput) as Sp
  * Returns the audio segment source for the current session. When the host has no audio capture wired, the returned
  * source's [AudioSegmentSource.fetch] always returns null rather than throwing.
  */
-fun HostServices.audioSegments(): AudioSegmentSource {
-    // Try to get from the Audio capability first; fall back to a no-op source.
-    return try { require(Capability.Audio) as? AudioSegmentSource ?: NoOpAudioSegmentSource }
-    catch (_: Exception) { NoOpAudioSegmentSource }
-}
+/**
+ * Returns the audio segment source for the current session.
+ *
+ * P5 (C2 fix): the source is set by the host composition via [setGlobalAudioSegmentSource] rather than going through
+ * the capability-based [require] path, because the smart plugin does not declare [Capability.Audio] and the segment
+ * service is host-owned infrastructure, not a plugin-granted capability.
+ */
+fun HostServices.audioSegments(): AudioSegmentSource = globalAudioSegmentSource ?: NoOpAudioSegmentSource
+
+@Volatile private var globalAudioSegmentSource: AudioSegmentSource? = null
+
+/** Called by the host composition to register the audio segment bridge. */
+fun setGlobalAudioSegmentSource(source: AudioSegmentSource?) { globalAudioSegmentSource = source }
 
 private object NoOpAudioSegmentSource : AudioSegmentSource {
     override fun fetch(turnId: String): AudioSegmentHandle? = null

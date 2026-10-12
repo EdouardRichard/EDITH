@@ -20,12 +20,17 @@ class ControlledModelClient(
     private val gate: CapabilityGate, private val budgeter: ContextBudgeter, private val clock: MonotonicClock,
     private val scheduler: DeadlineScheduler, private val consent: () -> RequestConsent,
     private val wallClock: Clock = Clock.systemUTC(), private val allowLocalHttp: Boolean = false,
+    /** P5 (C1 fix): real MediaSource for resolving audio segment refs at encode time. Null = no audio path. */
+    private val mediaSource: MediaSource? = null,
 ) : ModelClient, AutoCloseable {
     private val transport = http.newBuilder().followRedirects(false).followSslRedirects(false)
         .retryOnConnectionFailure(false).authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE).build()
     private val executor = Executors.newCachedThreadPool { runnable -> Thread(runnable, "edith-model-http").apply { isDaemon = true } }
     private val deepSeekAdapter = DeepSeekResponsesAdapter()
-    private val openAiAdapter = OpenAiChatCompletionsAdapter(NoOpMediaSource)
+    // Mutable media source: starts as no-op, can be replaced after construction when the audio bridge is ready.
+    @Volatile private var activeMediaSource: MediaSource = mediaSource ?: NoOpMediaSource
+    private val openAiAdapter get() = OpenAiChatCompletionsAdapter(activeMediaSource)
+    fun setMediaSource(source: MediaSource) { activeMediaSource = source }
     private object NoOpMediaSource : MediaSource { override fun resolveAudio(ref: String) = null }
     private val lock = Any()
     private val requests = linkedSetOf<Pending>()

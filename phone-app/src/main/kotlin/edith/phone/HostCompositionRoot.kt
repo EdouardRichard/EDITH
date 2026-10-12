@@ -1310,6 +1310,9 @@ class HostCompositionRoot internal constructor(
                 calendar::values,
             ))
             contextSignals.listen(armedContextSink({ hostHolder[0] }, clock, proactiveArming))
+            // P5 (spec §S4): one PlaybackGate shared between the speech player, the wake/acoustic suppression, and
+            // the ASR ingestion guard. Created before the audio chain so it can be passed to provisionAudioChain.
+            val playbackGate = PlaybackGate()
             val audio = provisionAudioChain(
                 context = context,
                 clock = clock, scheduler = scheduler, ingress = { connection[0]?.ingress },
@@ -1341,7 +1344,17 @@ class HostCompositionRoot internal constructor(
                 // generation that no longer exists. Task 5: the host only produces the event while 「主动辅助」 is on.
                 acousticEmit = armedAcousticSink({ hostHolder[0] }, clock, proactiveArming),
                 cooldownNanos = smartSettings.cooldownNanos,
-                suppressWhile = playbackSuppression { rootHolder[0] })
+                suppressWhile = playbackSuppression { rootHolder[0] },
+                playbackGate = playbackGate)
+            // P5 (C1+C2+C3 fix): bridge audio capture → segment source → media source.
+            val audioBridge = audio?.let { AudioSegmentBridge(it.audioCapture) }
+            audioBridge?.let {
+                model.setMediaSource(it)
+                setGlobalAudioSegmentSource(it)
+                // Wire the bridge into the pipeline's emit callback so sealForTurn fires on final transcripts.
+                audio.bridgeRef?.set(it)
+            }
+
             // The smart plugin is registered and configured here, with the composition's own clock, scheduler,
             // profile lookup, output-turn cancellation and configured cooldown - Task 13 made it a real
             // `ConfiguredPlugin`, so the bare constructor would be refused by the host's configuration policy.
@@ -1448,8 +1461,6 @@ class HostCompositionRoot internal constructor(
             // P5 (spec §S1/S5): construct the speech player only when the user switch is on AND the engine is ready.
             // The player is passed to the environment so OutputArbiter can use it; null means no speech capability.
             val speechEnabledNow = runCatching { smartSettingsStore.load().speechEnabled }.getOrNull() ?: false
-            // P5 (spec §S4): one PlaybackGate shared between the speech player and the wake/acoustic suppression.
-            val playbackGate = PlaybackGate()
             val speechPlayer: edith.plugin.SpeechPlayer? = if (speechEnabledNow) {
                 AndroidSpeechPlayer.create(context, playbackGate)
             } else null
@@ -1849,6 +1860,8 @@ internal class CxrAudioChain private constructor(
     var acousticEmit: (AcousticLabel) -> Unit = {},
     /** P5 (spec §A1): the audio segment capture fed from the pipeline's VAD signal. */
     val audioCapture: AudioSegmentCapture = AudioSegmentCapture(),
+    /** P5 (C3 fix): the bridge ref shared with the pipeline's emit callback. Set after construction. */
+    internal var bridgeRef: java.util.concurrent.atomic.AtomicReference<AudioSegmentBridge?>? = null,
 ) : AutoCloseable {
 
     private val lock = Any()
@@ -1955,6 +1968,8 @@ internal class CxrAudioChain private constructor(
              * inert for the harnesses that build a chain without a live host.
              */
             acousticEmit: (AcousticLabel) -> Unit = {},
+            /** P5 (I2 fix): playback gate for echo suppression during TTS. */
+            playbackGate: PlaybackGate = PlaybackGate(),
         ): CxrAudioChain {
             // The session needs the pipeline and the pipeline's emit needs the session: the holder breaks the cycle
             // so both the host's delivery and the plugin-facing provider see every revision, in order.
@@ -1965,12 +1980,23 @@ internal class CxrAudioChain private constructor(
             val labeler = AcousticLabeler()
             // P5 (spec §A1): bounded audio segment capture, fed from the pipeline's per-frame VAD signal.
             val audioCapture = AudioSegmentCapture()
+            // P5 (C3 fix): bridge holder for sealing audio segments on transcript finalization.
+            // The bridge is set after construction via CxrAudioChain.bridgeHolderRef.
+            val bridgeRef = java.util.concurrent.atomic.AtomicReference<AudioSegmentBridge?>(null)
             val pipeline = SpeechPipeline(vad, asr, speaker,
-                emit = { event -> holder[0]?.onEvent(event); emit(event) }, cancelTurn = cancelTurn,
-                onFrameSignal = { frame, speech ->
+                emit = { event ->
+                    holder[0]?.onEvent(event); emit(event)
+                    // Seal the audio segment when a final transcript arrives.
+                    if (event is edith.contracts.TranscriptEvent && event.revision.final) {
+                        bridgeRef.get()?.sealForTurn(event.revision.turnId)
+                    }
+                }, cancelTurn = cancelTurn,
+                onFrameSignal = frameSignal@{ frame, speech ->
+                    // P5 (I2 fix, spec §S4): suppress ingestion during TTS playback to prevent echo self-trigger.
+                    // When the gate is closed, discard the frame entirely — don't feed VAD, ASR, labeler, or capture.
+                    if (playbackGate.isPlaying) return@frameSignal
                     labeler.accept(frame, speech)?.let { label -> chainHolder[0]?.acousticEmit?.invoke(label) }
                     // Feed the capture with PCM bytes and VAD speech flag.
-                    // Convert float samples to PCM16 bytes for the capture.
                     val pcmBytes = ByteArray(frame.samples.size * 2)
                     frame.samples.forEachIndexed { i, sample ->
                         val value = (sample * 32768f).toInt().coerceIn(-32768, 32767)
@@ -1985,7 +2011,10 @@ internal class CxrAudioChain private constructor(
             val session = SherpaAsrSession(pipeline)
             holder[0] = session
             return CxrAudioChain(ingress, framer, pipeline, wake, scheduler, clock, onFault, onOffer, session,
-                wakeEmit, acousticEmit, audioCapture).also { chainHolder[0] = it }
+                wakeEmit, acousticEmit, audioCapture).also {
+                    chainHolder[0] = it
+                    it.bridgeRef = bridgeRef
+                }
         }
     }
 }
@@ -2028,6 +2057,7 @@ private fun provisionAudioChain(
     acousticEmit: (AcousticLabel) -> Unit,
     cooldownNanos: Long,
     suppressWhile: () -> Boolean,
+    playbackGate: PlaybackGate = PlaybackGate(),
 ): CxrAudioChain? = try {
     val application = requireNotNull(context.applicationContext) { "APPLICATION_CONTEXT_UNAVAILABLE" }
     val store = DebugImportDirectory.store(application)
@@ -2049,6 +2079,7 @@ private fun provisionAudioChain(
         onOffer = onOffer,
         wakeEmit = wakeEmit,
         acousticEmit = acousticEmit,
+        playbackGate = playbackGate,
     )
 } catch (unavailable: Exception) {
     android.util.Log.i("EdithHost", "audio chain unavailable: ${unavailable.javaClass.name}: ${unavailable.message}")
@@ -2121,6 +2152,8 @@ internal fun provisionAudioChainFrom(
      * `AcousticEvent` tagged with the host's current identity.
      */
     acousticEmit: (AcousticLabel) -> Unit = {},
+    /** P5 (I2 fix): the playback gate for echo suppression during TTS. */
+    playbackGate: PlaybackGate = PlaybackGate(),
 ): CxrAudioChain? = try {
     val verified = PcmFormatEvidence.resolve(CxrGlassesTarget.GLASSES_FIRMWARE, CXR_SDK_VERSION)
     if (verified == null) {
@@ -2172,7 +2205,7 @@ internal fun provisionAudioChainFrom(
                         vad = candidate.vad, asr = candidate.asr, speaker = candidate.speaker,
                         wake = wake, scheduler = scheduler, clock = clock, emit = emit, cancelTurn = cancelTurn,
                         onFault = onFault, onOffer = onOffer, wakeEmit = wakeEmit,
-                        acousticEmit = acousticEmit).also { chainHolder[0] = it }
+                        acousticEmit = acousticEmit, playbackGate = playbackGate).also { chainHolder[0] = it }
                 } catch (unavailable: Throwable) {
                     runCatching { candidate.vad.close() }
                     runCatching { candidate.asr.close() }

@@ -10,6 +10,8 @@ interface HostEnvironment {
     val availableCapabilities: Set<Capability>
     /** Optional speech player; null when the device has no TTS engine or the user switch is off. */
     val speech: SpeechPlayer? get() = null
+    /** P5 (C2 fix): optional audio segment source for the direct-audio path. Null when not wired. */
+    val audioSegmentSource: AudioSegmentSource? get() = null
     fun services(scope: ResourceScope, granted: Set<Capability>): HostServices
 }
 

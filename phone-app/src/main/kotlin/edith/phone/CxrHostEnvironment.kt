@@ -61,6 +61,8 @@ class CxrHostEnvironment(
     private val taskScope: TaskScope = UnavailableTaskScope,
     /** P5 (spec §S1): the speech player, or null when TTS is unavailable or the user switch is off. */
     override val speech: edith.plugin.SpeechPlayer? = null,
+    /** P5 (C2 fix): audio segment source for the direct-audio path, or null when not wired. */
+    override val audioSegmentSource: edith.plugin.AudioSegmentSource? = null,
 ) : ScheduledHostEnvironment {
 
     init {

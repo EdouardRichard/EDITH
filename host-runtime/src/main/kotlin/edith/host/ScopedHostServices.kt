@@ -17,7 +17,17 @@ class ScopedHostServices(
         services = granted.associateWith { capability ->
             val provider = providers[capability] ?: throw ContractError.CapabilityMissing("provider missing: $capability")
             when (capability) {
-                Capability.Audio -> scopedAudio(provider as? AudioSubscription ?: wrong(capability))
+                // P5 (C2 fix): the provider may also implement AudioSegmentSource (via AudioWithSegments composite).
+                // The scoped wrapper preserves both interfaces so audioSegments() can cast successfully.
+                Capability.Audio -> {
+                    val sub = provider as? AudioSubscription ?: wrong(capability)
+                    val seg = provider as? edith.plugin.AudioSegmentSource
+                    if (seg != null) object : AudioSubscription, edith.plugin.AudioSegmentSource {
+                        private val scoped = scopedAudio(sub)
+                        override fun listen(listener: (edith.contracts.AudioSegment) -> Unit) = scoped.listen(listener)
+                        override fun fetch(turnId: String) = scope.active { seg.fetch(turnId) }
+                    } else scopedAudio(sub)
+                }
                 Capability.Asr -> scopedAsr(provider as? AsrSession ?: wrong(capability))
                 Capability.Speaker -> scopedSpeaker(provider as? SpeakerService ?: wrong(capability))
                 Capability.Model -> scopedModel(provider as? ModelClient ?: wrong(capability))
