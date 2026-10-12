@@ -1842,6 +1842,8 @@ internal class CxrAudioChain private constructor(
      * polled.
      */
     var acousticEmit: (AcousticLabel) -> Unit = {},
+    /** P5 (spec §A1): the audio segment capture fed from the pipeline's VAD signal. */
+    val audioCapture: AudioSegmentCapture = AudioSegmentCapture(),
 ) : AutoCloseable {
 
     private val lock = Any()
@@ -1956,18 +1958,29 @@ internal class CxrAudioChain private constructor(
             // the same construction-order reason as the wake detector's emission.
             val chainHolder = arrayOfNulls<CxrAudioChain>(1)
             val labeler = AcousticLabeler()
+            // P5 (spec §A1): bounded audio segment capture, fed from the pipeline's per-frame VAD signal.
+            val audioCapture = AudioSegmentCapture()
             val pipeline = SpeechPipeline(vad, asr, speaker,
                 emit = { event -> holder[0]?.onEvent(event); emit(event) }, cancelTurn = cancelTurn,
                 onFrameSignal = { frame, speech ->
                     labeler.accept(frame, speech)?.let { label -> chainHolder[0]?.acousticEmit?.invoke(label) }
+                    // Feed the capture with PCM bytes and VAD speech flag.
+                    // Convert float samples to PCM16 bytes for the capture.
+                    val pcmBytes = ByteArray(frame.samples.size * 2)
+                    frame.samples.forEachIndexed { i, sample ->
+                        val value = (sample * 32768f).toInt().coerceIn(-32768, 32767)
+                        pcmBytes[i * 2] = value.toByte()
+                        pcmBytes[i * 2 + 1] = (value shr 8).toByte()
+                    }
+                    audioCapture.offer(pcmBytes, speech)
                 },
                 // The pipeline's own state is dropped on a gap/format change/fault/close; the labeler's must go with
                 // it, or the first transition after the break is compared against a pre-break verdict.
-                onReset = { labeler.reset() })
+                onReset = { labeler.reset(); /* P5: reset capture state on pipeline reset */ })
             val session = SherpaAsrSession(pipeline)
             holder[0] = session
             return CxrAudioChain(ingress, framer, pipeline, wake, scheduler, clock, onFault, onOffer, session,
-                wakeEmit, acousticEmit).also { chainHolder[0] = it }
+                wakeEmit, acousticEmit, audioCapture).also { chainHolder[0] = it }
         }
     }
 }
