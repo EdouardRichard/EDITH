@@ -17,10 +17,15 @@ class ChatCompletionsDecoder(private val requestId: String) {
     private var bytes = 0
     private val limit = 1048576
 
+    private var receivedContent = false
+
     fun accept(frame: SseFrame): List<ModelStreamEvent> {
         if (ended) return emptyList()
-        // "[DONE]" sentinel ends the stream
-        if (frame.data.trim() == "[DONE]") return endOfInput()
+        // "[DONE]" sentinel ends the stream — treat as COMPLETED if we received content
+        if (frame.data.trim() == "[DONE]") {
+            return if (receivedContent) terminal(ModelEnd.COMPLETED, null, null)
+            else terminal(ModelEnd.INCOMPLETE, null, "EOF_INCOMPLETE")
+        }
         val size = frame.data.toByteArray(Charsets.UTF_8).size
         if (bytes + size > limit) return terminal(ModelEnd.FAILED, null, "RESPONSE_LIMIT")
         bytes += size
@@ -29,15 +34,17 @@ class ChatCompletionsDecoder(private val requestId: String) {
             val choices = root["choices"]?.jsonArray ?: return emptyList()
             val events = mutableListOf<ModelStreamEvent>()
             for (choice in choices) {
-                val obj = choice.jsonObject
-                val delta = obj["delta"]?.jsonObject
+                val obj = choice as? JsonObject ?: continue
+                val delta = obj["delta"] as? JsonObject
+                // Qwen-Omni returns both reasoning_content and content; only emit content as text deltas
                 val content = delta?.get("content")?.jsonPrimitive?.contentOrNull
                 if (content != null && content.isNotEmpty()) {
+                    receivedContent = true
                     events += ModelStreamEvent.TextDelta(requestId, content)
                 }
                 val finishReason = obj["finish_reason"]?.jsonPrimitive?.contentOrNull
                 if (finishReason != null) {
-                    val usage = root["usage"]?.jsonObject?.let {
+                    val usage = (root["usage"] as? JsonObject)?.let {
                         ModelUsage(
                             it["prompt_tokens"]?.jsonPrimitive?.longOrNull,
                             it["completion_tokens"]?.jsonPrimitive?.longOrNull,
@@ -61,7 +68,9 @@ class ChatCompletionsDecoder(private val requestId: String) {
 
     fun endOfInput(): List<ModelStreamEvent> {
         if (ended) return emptyList()
-        return terminal(ModelEnd.INCOMPLETE, null, "EOF_INCOMPLETE")
+        // If we received content but no finish_reason/[DONE], treat as completed (some providers omit it)
+        return if (receivedContent) terminal(ModelEnd.COMPLETED, null, null)
+        else terminal(ModelEnd.INCOMPLETE, null, "EOF_INCOMPLETE")
     }
 
     private fun terminal(end: ModelEnd, usage: ModelUsage?, code: String?): List<ModelStreamEvent> {
