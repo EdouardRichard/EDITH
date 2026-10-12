@@ -25,7 +25,10 @@ class CapabilityGate {
         if (!consent.text || (InputModality.IMAGE in inputs && !consent.image) ||
             (InputModality.AUDIO in inputs && !consent.audio)) missing()
         if (probe) {
-            if (!consent.syntheticProbe || inputs != setOf(InputModality.TEXT) || request.output != OutputModality.TEXT) missing()
+            // P5 Task 12: probe mode allows AUDIO input when syntheticProbe consent is given, so the AUDIO_REQUEST
+            // verification can use a fixed synthetic WAV without requiring a prior Verified record (chicken-and-egg).
+            val allowedInputs = if (consent.audio) setOf(InputModality.TEXT, InputModality.AUDIO) else setOf(InputModality.TEXT)
+            if (!consent.syntheticProbe || !inputs.all { it in allowedInputs } || request.output != OutputModality.TEXT) missing()
             return
         }
         val operations = inputs.map {
