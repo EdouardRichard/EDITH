@@ -240,12 +240,10 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     start: (String) -> Unit, command: (String) -> Unit, notificationsGranted: Boolean,
     loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit, remainingSeconds: Long) {
     var page by remember { mutableStateOf(0) }
-    val plugins = buildList {
-        add("smart-assistant" to "智能助手")
-        add("interview-assistant" to "面试助手")
-        if (BuildConfig.DEBUG) add("p2-diagnostic" to "诊断")
-        if (BuildConfig.DEBUG && root.diagnosticHintSender != null) add("p2-hint" to "提示探针（调试）")
-    }
+    val plugins = pluginPickerOptions(
+        debug = BuildConfig.DEBUG,
+        diagnosticHintSenderPresent = root.diagnosticHintSender != null,
+    )
     Scaffold(topBar = { Text("EDITH", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(20.dp)) }) { padding ->
         Column(Modifier.padding(padding).fillMaxSize()) {
             TabRow(selectedTabIndex = page) {
