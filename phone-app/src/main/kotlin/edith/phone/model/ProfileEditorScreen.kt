@@ -10,7 +10,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.input.KeyboardType
-import androidx.compose.ui.text.input.PasswordVisualTransformation
+
 import androidx.compose.ui.unit.dp
 import edith.plugin.*
 import java.util.UUID
@@ -39,18 +39,24 @@ import java.util.UUID
         Field("名称", name, { name = it }); Field("服务", service, { service = it })
         Field("基础 URL", url, { url = it }, KeyboardType.Uri); Field("模型", model, { model = it })
         ExposedDropdownMenuBox(expanded, { expanded = !expanded }) {
-            OutlinedTextField(if (protocol == "DEEPSEEK_RESPONSES") "OpenAI Responses API（文本）" else "自定义协议 · 未接入",
+            val protocolLabel = when (protocol) {
+                "DEEPSEEK_RESPONSES" -> "OpenAI Responses API（文本）"
+                "OPENAI_CHAT_COMPLETIONS" -> "OpenAI Chat Completions（文本+音频）"
+                else -> "自定义协议 · 未接入"
+            }
+            OutlinedTextField(protocolLabel,
                 {}, readOnly = true, label = { Text("协议") }, trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) },
                 modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth())
             ExposedDropdownMenu(expanded, { expanded = false }) {
                 DropdownMenuItem(text = { Text("OpenAI Responses API（文本）") }, onClick = { protocol = "DEEPSEEK_RESPONSES"; expanded = false })
+                DropdownMenuItem(text = { Text("OpenAI Chat Completions（文本+音频）") }, onClick = { protocol = "OPENAI_CHAT_COMPLETIONS"; expanded = false })
                 DropdownMenuItem(text = { Text("自定义协议 · 未接入") }, onClick = { protocol = "CUSTOM"; expanded = false })
             }
         }
-        if (protocol != "DEEPSEEK_RESPONSES") Field("自定义协议 ID", custom, { custom = it })
+        if (protocol != "DEEPSEEK_RESPONSES" && protocol != "OPENAI_CHAT_COMPLETIONS") Field("自定义协议 ID", custom, { custom = it })
         OutlinedTextField(String(secret), { value -> secret.fill('\u0000'); secret = value.toCharArray() },
-            label = { Text(if (profile == null) "API Key" else "API Key（留空保留）") }, visualTransformation = PasswordVisualTransformation(),
-            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password), singleLine = true, modifier = Modifier.fillMaxWidth())
+            label = { Text(if (profile == null) "API Key" else "API Key（留空保留）") },
+            singleLine = true, modifier = Modifier.fillMaxWidth())
         Text("声明输入", style = MaterialTheme.typography.titleMedium)
         FlowRow { InputModality.entries.forEach { item ->
             Row(Modifier.toggleable(item in inputs, onValueChange = { checked -> inputs = if (checked) inputs + item else inputs - item })) {
@@ -63,7 +69,12 @@ import java.util.UUID
                 Checkbox(item in outputs, null); Text(item.name, Modifier.padding(top = 12.dp, end = 12.dp))
             }
         } }
-        Text(if (protocol == "DEEPSEEK_RESPONSES") "Responses API：TEXT → TEXT" else "协议未接入", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        val protocolDesc = when (protocol) {
+            "DEEPSEEK_RESPONSES" -> "Responses API：TEXT → TEXT"
+            "OPENAI_CHAT_COMPLETIONS" -> "Chat Completions：TEXT+AUDIO → TEXT"
+            else -> "协议未接入"
+        }
+        Text(protocolDesc, color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (InputModality.IMAGE in inputs) Text("图片请求：当前无图片适配器")
         // P5 (spec §A4): AUDIO input is only available with OPENAI_CHAT_COMPLETIONS protocol.
         if (protocol == "OPENAI_CHAT_COMPLETIONS" && InputModality.AUDIO in inputs) {
@@ -79,8 +90,12 @@ import java.util.UUID
         FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Button(onClick = {
                 try {
+                    val resolvedProtocol = when (protocol) {
+                        "DEEPSEEK_RESPONSES", "OPENAI_CHAT_COMPLETIONS" -> protocol
+                        else -> custom
+                    }
                     val form = ProfileForm(name, service, url, model,
-                        if (protocol == "DEEPSEEK_RESPONSES") protocol else custom, window, output, timeout, inputs, outputs)
+                        resolvedProtocol, window, output, timeout, inputs, outputs)
                     val draft = form.draft(id, profile, secret.any { !it.isWhitespace() })
                     if (saveProfileDraft(draft, secret, save)) { secret = charArrayOf(); error = null }
                     else error = "SAVE_FAILED"

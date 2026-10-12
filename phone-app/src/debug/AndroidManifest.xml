@@ -48,5 +48,14 @@
                 <action android:name="edith.DEBUG_TOOLCALL" />
             </intent-filter>
         </receiver>
+        <!-- P5 Task 12: creates a model profile from .local/p5-omni.properties for AUDIO_REQUEST verification. -->
+        <receiver
+            android:name=".DebugProfileCreator"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_CREATE_PROFILE" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

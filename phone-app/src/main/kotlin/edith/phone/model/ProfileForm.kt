@@ -7,7 +7,7 @@ import java.math.BigDecimal
 internal enum class ProfileField { NAME, SERVICE, BASE_URL, MODEL, PROTOCOL, API_KEY, MAX_INPUT, MAX_OUTPUT, TIMEOUT, INPUTS, OUTPUTS }
 internal class ProfileFormException(val field: ProfileField, val code: String) : IllegalArgumentException(code)
 
-internal data class ProfileForm(
+data class ProfileForm(
     val name: String, val service: String, val baseUrl: String, val model: String, val protocolId: String,
     val maxInputK: String, val maxOutputK: String, val timeoutMillis: String,
     val inputs: Set<InputModality>, val outputs: Set<OutputModality>,
