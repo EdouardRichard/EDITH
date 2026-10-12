@@ -81,11 +81,11 @@ class MainActivity : ComponentActivity() {
                 // the question closes itself when the count runs out (the plugin's gate settles it as a denial at the
                 // same moment, which clears `pendingConfirmation` behind it).
                 val remainingSeconds = rememberRemainingSeconds(pending?.requestId, pending?.expiresAtMillis ?: 0L)
-                // Owner directive 2026-10-10: when this page was *raised* for a confirmation, the question has to be the
-                // thing the user sees - the inline card sits below the fold, and "pop up the page and make them scroll"
-                // is not a popup. The dialog is modal, shows the same summary as the card and the glasses, and answers
-                // through the very same path.
-                if (raisedForConfirmation && pending != null && remainingSeconds > 0L &&
+                // User directive 2026-10-12: always show the confirmation as a modal dialog, never as an inline card.
+                // The previous `raisedForConfirmation` gate meant the dialog only appeared when the system raised the
+                // page via ACTION_SHOW_CONFIRMATION; when the user was already in the app, only the below-the-fold card
+                // showed. Now the dialog is the sole confirmation surface regardless of how the page got here.
+                if (pending != null && remainingSeconds > 0L &&
                     dismissedRequestId != pending.requestId
                 ) {
                     AlertDialog(
@@ -108,19 +108,16 @@ class MainActivity : ComponentActivity() {
                                 verticalAlignment = Alignment.CenterVertically,
                             ) {
                                 OutlinedButton(onClick = {
-                                    raisedForConfirmation = false
                                     root.answerConfirmation(false)
                                 }) { Text("拒绝") }
                                 Spacer(Modifier.width(8.dp))
                                 OutlinedButton(onClick = {
-                                    raisedForConfirmation = false
                                     root.emergencyStop()
                                 }) { Text("急停") }
                                 Spacer(Modifier.width(8.dp))
                                 Button(
                                     modifier = Modifier.width(CONFIRM_BUTTON_WIDTH),
                                     onClick = {
-                                        raisedForConfirmation = false
                                         root.answerConfirmation(true)
                                     },
                                 ) { Text("允许 ($remainingSeconds)") }
@@ -379,24 +376,25 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                                 Text("未授予日历权限，主动辅助看不到今天的日程标题。", color = MaterialTheme.colorScheme.error)
                             }
                         }
-                        // P3.3 (spec §17.4): the question the plugin is blocked on. The summary is what the action
-                        // would do - who it messages, which package it uninstalls - never a bare "确认吗".
-                        state.pendingConfirmation?.let { pending ->
-                            Card {
-                                Column(Modifier.padding(12.dp)) {
-                                    Text("需要你确认的动作", style = MaterialTheme.typography.titleMedium)
-                                    Text(pending.summary)
-                                    Row {
-                                        Button(
-                                            modifier = Modifier.width(CONFIRM_BUTTON_WIDTH),
-                                            onClick = { root.answerConfirmation(true) },
-                                        ) { Text("允许 ($remainingSeconds)") }
-                                        Spacer(Modifier.width(8.dp))
-                                        OutlinedButton(onClick = { root.answerConfirmation(false) }) { Text("拒绝") }
-                                    }
-                                }
-                            }
+                        // SYSTEM_ALERT_WINDOW: needed for the confirmation dialog to pop up over other apps or a locked
+                        // screen. Without it the question only appears when the user is already looking at this page.
+                        val activityContextForOverlay = LocalContext.current
+                        val overlayGranted = remember(grantEpoch) {
+                            android.provider.Settings.canDrawOverlays(activityContextForOverlay)
                         }
+                        OutlinedButton(onClick = {
+                            runCatching {
+                                activityContextForOverlay.startActivity(
+                                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                        android.net.Uri.parse("package:${activityContextForOverlay.packageName}")))
+                            }
+                        }) { Text("悬浮窗授权（确认弹窗需要）") }
+                        if (!overlayGranted) {
+                            Text("未授予悬浮窗权限，确认弹窗无法在其他 App 上方弹出。",
+                                color = MaterialTheme.colorScheme.error)
+                        }
+                        // P3.3 confirmation is now shown exclusively as the modal AlertDialog above (user directive
+                        // 2026-10-12). The inline card was removed so there is one surface, not two.
                         state.errorCode?.let { Text(errorLabel(it), color = MaterialTheme.colorScheme.error) }
                         // Debug-only acceptance affordance: with the shipped plugins still shells, this is the only
                         // way a wearer can check what the glasses actually show. Hidden whenever no probe is
