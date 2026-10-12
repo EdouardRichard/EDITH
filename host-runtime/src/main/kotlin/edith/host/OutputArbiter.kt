@@ -1,8 +1,6 @@
 package edith.host
 
 import edith.contracts.*
-import edith.output.SpeechPlayback
-import edith.output.SpeechPlayer
 import edith.plugin.*
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors

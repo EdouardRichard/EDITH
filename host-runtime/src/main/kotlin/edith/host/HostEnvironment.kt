@@ -1,7 +1,6 @@
 package edith.host
 
 import edith.contracts.*
-import edith.output.SpeechPlayer
 import edith.plugin.*
 
 interface HostEnvironment {
