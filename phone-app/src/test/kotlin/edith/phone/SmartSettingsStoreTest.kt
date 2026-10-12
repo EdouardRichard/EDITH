@@ -204,6 +204,41 @@ class SmartSettingsStoreTest {
     }
 
     @Test
+    fun speechIsOffByDefaultOnAFreshBlob() {
+        val settings = SmartSettings()
+        assertEquals(false, settings.speechEnabled)
+    }
+
+    @Test
+    fun speechSurvivesASaveAndLoad() {
+        val blobs = TestBlobs()
+        val store = SmartSettingsStore(blobs)
+        store.save(SmartSettings(speechEnabled = true))
+        assertEquals(true, SmartSettingsStore(blobs).load().speechEnabled)
+    }
+
+    @Test
+    fun aBlobWithoutTheSpeechFieldKeepsItsDefault() {
+        // Old blob written before P5: no speechEnabled key. Must load with default (false), not fail.
+        val blobs = TestBlobs()
+        writeJson(blobs, SmartSettingsStore.BLOB_ID, buildJsonObject {
+            put("version", 1)
+            put("wakeWords", buildJsonArray { add("伊迪丝") })
+            put("maxLevel", "L1")
+            put("whitelist", buildJsonArray {})
+            put("cooldownMillis", 3000L)
+            put("proactiveCooldownMillis", 60000L)
+            put("proactiveSensitivity", "LOW")
+            put("proactiveEnabled", true)
+        })
+        val loaded = SmartSettingsStore(blobs).load()
+        assertEquals(false, loaded.speechEnabled)
+        // Other fields must still load correctly
+        assertEquals("L1", loaded.maxLevel)
+        assertEquals(true, loaded.proactiveEnabled)
+    }
+
+    @Test
     fun anUnreadableProfileRepositoryDoesNotStopTheSettingsFromResolving() {
         // The composition reads the settings while it assembles the plugin. The profile repository can genuinely
         // refuse (`ContractError.ConfigurationRejected("Storage unavailable; reconfigure")` when the keystore cannot

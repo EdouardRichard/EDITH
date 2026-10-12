@@ -50,6 +50,14 @@ data class SmartSettings(
      * through [ProactiveArming] to this same field.
      */
     val proactiveEnabled: Boolean = true,
+    /**
+     * P5 (spec §S5): the 「语音朗读」 switch, persisted globally and **off by default**.
+     *
+     * When off, `SpeechOutput` is not advertised and any in-progress playback is stopped. Once the user turns it off,
+     * no path may turn it back on automatically (`D53`② same-shape rule). A blob written before P5 lacks this key
+     * and takes the default (off), which is the safe upgrade path.
+     */
+    val speechEnabled: Boolean = false,
 ) {
     /**
      * The plugin's own cooldown parameter.
@@ -164,6 +172,7 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
             put("proactiveCooldownMillis", settings.proactiveCooldownMillis)
             put("proactiveSensitivity", settings.effectiveProactiveSensitivity())
             put("proactiveEnabled", settings.proactiveEnabled)
+            put("speechEnabled", settings.speechEnabled)
         })
     }
 
@@ -188,6 +197,9 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
                 // is a global default, not a per-session grant the user has to re-give.
                 proactiveEnabled = json["proactiveEnabled"]?.jsonPrimitive?.booleanOrNull
                     ?: SmartSettings().proactiveEnabled,
+                // Absent in a blob written before P5: takes the default (off), which is the safe upgrade path.
+                speechEnabled = json["speechEnabled"]?.jsonPrimitive?.booleanOrNull
+                    ?: SmartSettings().speechEnabled,
             )
         }.getOrNull()
     }

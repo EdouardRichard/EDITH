@@ -123,6 +123,25 @@ class HostCompositionRoot internal constructor(
     internal val proactiveArming: ProactiveArming = ProactiveArming(),
 ) : AutoCloseable {
     /**
+     * P5 (spec §S5): the 「语音朗读」 switch state, persisted globally and **off by default**.
+     * Loaded from [SmartSettings.speechEnabled] at assembly time; written back through the same store.
+     */
+    private val speechOn = MutableStateFlow(false)
+    internal val speechEnabled: StateFlow<Boolean> = speechOn.asStateFlow()
+
+    /**
+     * P5 (spec §S5): the user's switch for 「语音朗读」. Writes through [smartSettingsStore] so the choice persists.
+     * A failed read aborts the write (same pattern as [ProactiveArming.set]): the UI still moves, but the blob is not
+     * silently overwritten with defaults.
+     */
+    internal fun setSpeechEnabled(enabled: Boolean) {
+        speechOn.value = enabled
+        val target = smartSettingsStore ?: return
+        runCatching { target.load() }.onFailure {
+            android.util.Log.i("EdithHost", "speech toggle: settings unreadable, not persisting this change")
+        }.getOrNull()?.let { stored -> runCatching { target.save(stored.copy(speechEnabled = enabled)) } }
+    }
+    /**
      * RAM-only tee of the live CXR PCM used by the T17 controlled format bring-up. Defaulted to a no-op
      * so normal app behaviour is unchanged; the observer must never persist or export the bytes. It stays
      * assignable because the bring-up harness arms it after the App composition exists but before the lazy
@@ -1487,6 +1506,9 @@ class HostCompositionRoot internal constructor(
             root.observerHolder = observerHolder
             root.armObserver(initialObserver)
             root.audioChain = audio
+            // P5 (spec §S5): load the speech toggle from the same store. Off by default; a pre-P5 blob takes the
+            // default (off) because SmartSettings.speechEnabled defaults to false.
+            root.speechOn.value = runCatching { smartSettingsStore.load().speechEnabled }.getOrNull() ?: false
             root.foregroundAppSource = foregroundApp
             root.notificationCategorySource = notificationCategory
             root.calendarSource = calendar

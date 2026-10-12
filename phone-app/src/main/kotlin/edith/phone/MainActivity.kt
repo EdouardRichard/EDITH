@@ -316,6 +316,17 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                         }
                         Text("一次配置、长期生效：跨会话、重连、重启 App 或手机都保持；关掉后不会被任何路径自动打开。",
                             style = MaterialTheme.typography.bodySmall)
+                        // P5 (spec §S5): the 「语音朗读」 switch. Off by default, persisted globally. When off,
+                        // SpeechOutput is not advertised and any in-progress playback is stopped.
+                        val speechOn by root.speechEnabled.collectAsStateWithLifecycle()
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            Switch(checked = speechOn,
+                                onCheckedChange = { root.setSpeechEnabled(it) })
+                            Spacer(Modifier.width(8.dp))
+                            Text("语音朗读（提示会朗读出来）")
+                        }
+                        Text("关闭后不会自动打开；引擎缺失时提示照常显示、只是不出声。",
+                            style = MaterialTheme.typography.bodySmall)
                         // P3.2 Stage B: the perception sources that need a system grant. Each entry opens the system
                         // screen for its own special access and says, truthfully, what the assistant cannot see
                         // without it - a refused source contributes **no** context key, never a placeholder.
