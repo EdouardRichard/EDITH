@@ -90,10 +90,15 @@ class OutputArbiterLifecycleTest {
         assertEquals(1, states.count { it.second == OutputStatus.Displayed })
     }
 
-    @Test fun `stale identity long unicode and speech requests are rejected`() {
+    @Test fun `stale identity long unicode are rejected and speech hints are accepted structurally`() {
         assertEquals(OutputStatus.Rejected, arbiter.submit(hint("old").copy(generation = Generation(0))))
-        assertEquals(OutputStatus.Rejected, arbiter.submit(hint("speech").copy(optionalSpeech = SpeechRequest())))
+        // Spec §S2: optionalSpeech no longer disqualifies a hint at the policy/runtime gate. Whether it gets spoken
+        // is decided by the speech capability (player present AND user switch on); without a player the hint still
+        // displays normally (see OutputArbiterSpeechTest for the spoken/not-spoken split).
+        assertEquals(OutputStatus.Accepted, arbiter.submit(hint("speech").copy(optionalSpeech = SpeechRequest())))
         assertEquals(OutputStatus.Rejected, arbiter.submit(hint("long").copy(text = "x".repeat(121))))
+        // Clear the displayed speech hint so the unicode hint can take the slot (shared arbiter across asserts).
+        arbiter.clear(SessionId("s"), Generation(1))
         assertEquals(OutputStatus.Accepted, arbiter.submit(hint("unicode").copy(text = "\uD83D\uDE00".repeat(120))))
     }
 }

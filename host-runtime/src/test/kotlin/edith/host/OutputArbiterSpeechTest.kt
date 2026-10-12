@@ -1,0 +1,143 @@
+package edith.host
+
+import edith.contracts.*
+import edith.output.SpeechPlayback
+import edith.output.SpeechPlayer
+import edith.plugin.CancellationHandle
+import edith.plugin.HintDevice
+import edith.plugin.MonotonicClock
+import edith.testsupport.*
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertTrue
+
+class OutputArbiterSpeechTest {
+    private val clock = FakeClock()
+    private val scheduler = ManualScheduler(clock)
+    private val device = RecordingHintDevice()
+    private var identity: Pair<SessionId, Generation>? = SessionId("s") to Generation(1)
+    private val states = mutableListOf<Pair<String, OutputStatus>>()
+
+    private class RecordingSpeechPlayer : SpeechPlayer {
+        val played = mutableListOf<String>()
+        val events = mutableListOf<String>()
+        override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit): CancellationHandle {
+            played += assistance.hintId
+            events += "play:${assistance.hintId}"
+            onState(SpeechPlayback.STARTED)
+            return object : CancellationHandle {
+                var cancelled = false
+                override fun cancel() {
+                    if (!cancelled) {
+                        cancelled = true
+                        events += "stop:${assistance.hintId}"
+                    }
+                }
+            }
+        }
+    }
+
+    private fun hint(id: String, priority: Int = 1, expiry: Long = 100, speech: SpeechRequest? = null) =
+        Assistance(id, SessionId("s"), Generation(1), "turn-$id", priority, "text-$id", speech, expiry)
+
+    private fun arbiterWith(speech: SpeechPlayer?) = OutputArbiter(clock, scheduler, device, speech, { identity }) { h, s ->
+        states += h.hintId to s
+    }
+
+    @Test fun `the speaker is asked exactly when the hint goes on screen`() {
+        val speech = RecordingSpeechPlayer()
+        val arbiter = arbiterWith(speech)
+        arbiter.submit(hint("h", speech = SpeechRequest()))
+        assertEquals(listOf("h"), speech.played)
+        // device.show must have been called before speech.play
+        assertTrue(device.shown.isNotEmpty())
+        assertEquals("h", device.shown.first().first.hintId)
+    }
+
+    @Test fun `a queued hint is not spoken until it is shown`() {
+        val speech = RecordingSpeechPlayer()
+        val arbiter = arbiterWith(speech)
+        arbiter.submit(hint("first", priority = 2, speech = SpeechRequest()))
+        arbiter.submit(hint("second", priority = 1, speech = SpeechRequest()))
+        // only first should be spoken
+        assertEquals(listOf("first"), speech.played)
+        // now remove first => second gets shown and spoken
+        arbiter.cancelTurn("turn-first")
+        assertEquals(listOf("first", "second"), speech.played)
+    }
+
+    @Test fun `replacing a hint stops the previous speech first`() {
+        // Use a shared timeline to verify stop happens BEFORE the second play (and before device.clear).
+        val timeline = mutableListOf<String>()
+        val speech = object : SpeechPlayer {
+            override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit): CancellationHandle {
+                timeline += "play:${assistance.hintId}"
+                onState(SpeechPlayback.STARTED)
+                return object : CancellationHandle {
+                    var cancelled = false
+                    override fun cancel() { if (!cancelled) { cancelled = true; timeline += "stop:${assistance.hintId}" } }
+                }
+            }
+        }
+        val timelineDevice = object : HintDevice {
+            override fun show(assistance: Assistance, revision: Long, listener: (OutputStatus) -> Unit): CancellationHandle {
+                timeline += "show:${assistance.hintId}"
+                return FakeCancellation()
+            }
+            override fun clear(sessionId: SessionId, generation: Generation) { timeline += "clear" }
+        }
+        val arbiter = OutputArbiter(clock as MonotonicClock, scheduler, timelineDevice, speech, { identity }) { _, _ -> }
+        arbiter.submit(hint("first", speech = SpeechRequest()))
+        arbiter.submit(hint("first").copy(text = "updated", optionalSpeech = SpeechRequest()))
+        // stop:first must appear before the second play:first
+        val stopIdx = timeline.indexOf("stop:first")
+        val secondPlayIdx = timeline.lastIndexOf("play:first")
+        assertTrue(stopIdx in 0 until secondPlayIdx, "expected stop before second play, got $timeline")
+    }
+
+    @Test fun `expiry stops speech and clears the screen`() {
+        val timeline = mutableListOf<String>()
+        val speech = object : SpeechPlayer {
+            override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit): CancellationHandle {
+                timeline += "play:${assistance.hintId}"
+                onState(SpeechPlayback.STARTED)
+                return object : CancellationHandle {
+                    var cancelled = false
+                    override fun cancel() { if (!cancelled) { cancelled = true; timeline += "stop:${assistance.hintId}" } }
+                }
+            }
+        }
+        val timelineDevice = object : HintDevice {
+            override fun show(assistance: Assistance, revision: Long, listener: (OutputStatus) -> Unit): CancellationHandle {
+                timeline += "show:${assistance.hintId}"
+                return FakeCancellation()
+            }
+            override fun clear(sessionId: SessionId, generation: Generation) { timeline += "clear" }
+        }
+        val arbiter = OutputArbiter(clock as MonotonicClock, scheduler, timelineDevice, speech, { identity }) { _, _ -> }
+        arbiter.submit(hint("h", expiry = 50, speech = SpeechRequest()))
+        clock.advance(50); scheduler.runDue()
+        // stop must come before clear
+        val stopIdx = timeline.indexOf("stop:h")
+        val clearIdx = timeline.indexOf("clear")
+        assertTrue(stopIdx >= 0, "expected stop event, got $timeline")
+        assertTrue(clearIdx >= 0, "expected clear, got $timeline")
+        assertTrue(stopIdx < clearIdx, "expected stop before clear, got $timeline")
+    }
+
+    @Test fun `a refused hint is never spoken`() {
+        val speech = RecordingSpeechPlayer()
+        val arbiter = arbiterWith(speech)
+        // expired hint => Rejected, no speech
+        arbiter.submit(hint("old", expiry = 0, speech = SpeechRequest()))
+        assertEquals(emptyList(), speech.played)
+    }
+
+    @Test fun `a hint without speech does not call the player`() {
+        val speech = RecordingSpeechPlayer()
+        val arbiter = arbiterWith(speech)
+        arbiter.submit(hint("plain")) // no optionalSpeech
+        assertEquals(emptyList(), speech.played)
+        assertEquals(1, device.shown.size) // still displayed
+    }
+}

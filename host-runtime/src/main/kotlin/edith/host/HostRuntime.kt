@@ -65,7 +65,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
     private val arbiter = OutputArbiter(environment.clock,
         (environment as? ScheduledHostEnvironment)?.scheduler ?: deadlineScheduler,
-        environment.output, { eventIdentity }) { hint, status ->
+        environment.output, environment.speech, { eventIdentity }) { hint, status ->
         onEvent(OutputStateEvent(EventEnvelope(hint.sessionId, hint.generation,
             "output-${java.util.UUID.randomUUID()}", environment.clock.nowNanos(), environment.clock.nowNanos()), hint.hintId, status))
     }
@@ -358,10 +358,12 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
         } finally { transitioning = false }
     }
 
+    // Spec §S2: structural eligibility is independent of speech capability. optionalSpeech no longer disqualifies a
+    // hint here; whether it gets spoken is decided by the speech capability gate (player present AND user switch on).
     fun accept(assistance: Assistance): Boolean = command {
         active != null && Capability.TextOutput in active!!.descriptor.capabilities &&
             sessionId?.let { assistance.isCurrent(it, generation) } == true &&
-            assistance.expiresAtNanos > environment.clock.nowNanos() && assistance.optionalSpeech == null
+            assistance.expiresAtNanos > environment.clock.nowNanos()
     }
 
     fun cancelOutputTurn(sessionId: SessionId, generation: Generation, turnId: String) = command {

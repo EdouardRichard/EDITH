@@ -1,6 +1,7 @@
 package edith.host
 
 import edith.contracts.*
+import edith.output.SpeechPlayer
 import edith.plugin.*
 
 interface HostEnvironment {
@@ -8,6 +9,8 @@ interface HostEnvironment {
     val input: InputPort
     val output: HintDevice
     val availableCapabilities: Set<Capability>
+    /** Optional speech player; null when the device has no TTS engine or the user switch is off. */
+    val speech: SpeechPlayer? get() = null
     fun services(scope: ResourceScope, granted: Set<Capability>): HostServices
 }
 

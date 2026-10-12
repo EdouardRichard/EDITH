@@ -10,6 +10,7 @@ kotlin {
 dependencies {
     implementation(project(":core-contracts"))
     implementation(project(":plugin-api"))
+    implementation(project(":output-runtime"))
     implementation(libs.kotlinx.coroutines.core)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.test.junit5)

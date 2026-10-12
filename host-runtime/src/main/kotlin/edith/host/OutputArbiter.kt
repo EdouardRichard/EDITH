@@ -1,6 +1,8 @@
 package edith.host
 
 import edith.contracts.*
+import edith.output.SpeechPlayback
+import edith.output.SpeechPlayer
 import edith.plugin.*
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
@@ -9,20 +11,25 @@ class OutputArbiter private constructor(
     private val nowNanos: () -> Long,
     private val scheduler: DeadlineScheduler?,
     private val device: HintDevice?,
+    private val speech: SpeechPlayer?,
     private val current: (() -> Pair<SessionId, Generation>?)?,
     private val onState: (Assistance, OutputStatus) -> Unit,
 ) {
-    constructor(nowNanos: () -> Long) : this(nowNanos, null, null, null, { _, _ -> })
+    constructor(nowNanos: () -> Long) : this(nowNanos, null, null, null, null, { _, _ -> })
     constructor(clock: MonotonicClock, scheduler: DeadlineScheduler, device: HintDevice,
         current: () -> Pair<SessionId, Generation>?, onState: (Assistance, OutputStatus) -> Unit) :
-        this(clock::nowNanos, scheduler, device, current, onState)
+        this(clock::nowNanos, scheduler, device, null, current, onState)
+    constructor(clock: MonotonicClock, scheduler: DeadlineScheduler, device: HintDevice,
+        speech: SpeechPlayer?, current: () -> Pair<SessionId, Generation>?, onState: (Assistance, OutputStatus) -> Unit) :
+        this(clock::nowNanos, scheduler, device, speech, current, onState)
 
     private var ownerThread: Thread? = null
     private val executor = Executors.newSingleThreadExecutor { task ->
         Thread(task, "edith-output").also { it.isDaemon = true; ownerThread = it }
     }
     private data class Item(val hint: Assistance, val revision: Long, val sequence: Long,
-        var output: CancellationHandle? = null, var deadline: CancellationHandle? = null)
+        var output: CancellationHandle? = null, var deadline: CancellationHandle? = null,
+        var speechHandle: CancellationHandle? = null)
     private val policy = HintPolicy()
     private val queue = mutableListOf<Item>()
     private var displayed: Item? = null
@@ -81,6 +88,9 @@ class OutputArbiter private constructor(
             } }
         } catch (_: Exception) { remove(item, OutputStatus.Rejected); next(); return }
         if (displayed === item) item.output = handle else runCatching { handle.cancel() }
+        if (displayed === item && item.hint.optionalSpeech != null && speech != null) {
+            item.speechHandle = speech.play(item.hint) { /* FINISHED/FAILED only bookkeep; lifecycle unchanged */ }
+        }
     }
 
     private fun expire(item: Item) {
@@ -91,6 +101,8 @@ class OutputArbiter private constructor(
         val wasDisplayed = displayed === item
         if (wasDisplayed) displayed = null else queue.remove(item)
         item.deadline?.cancel()
+        // Stop speech BEFORE clearing the screen (spec §S3: "先停播再撤屏").
+        item.speechHandle?.let { runCatching { it.cancel() } }
         item.output?.let { runCatching { it.cancel() } }
         if (wasDisplayed) runCatching { device!!.clear(item.hint.sessionId, item.hint.generation) }
         status(item, state)
