@@ -62,6 +62,7 @@ internal class PlatformTtsEngine(context: Context) : TtsEngine {
  */
 internal class AndroidSpeechPlayer(
     private val engine: TtsEngine,
+    private val gate: PlaybackGate = PlaybackGate(),
 ) : SpeechPlayer, AutoCloseable {
 
     companion object {
@@ -70,7 +71,7 @@ internal class AndroidSpeechPlayer(
          * available. The caller decides what to do with the null (typically: leave [HostEnvironment.speech] as null so
          * [Capability.SpeechOutput] is not advertised).
          */
-        fun create(context: Context): AndroidSpeechPlayer? {
+        fun create(context: Context, gate: PlaybackGate = PlaybackGate()): AndroidSpeechPlayer? {
             val engine = PlatformTtsEngine(context)
             // Wait briefly for init callback (it fires on the main thread; in practice it is near-instant).
             Thread.sleep(200)
@@ -84,7 +85,7 @@ internal class AndroidSpeechPlayer(
                 engine.shutdown()
                 return null
             }
-            return AndroidSpeechPlayer(engine)
+            return AndroidSpeechPlayer(engine, gate)
         }
     }
 
@@ -96,12 +97,14 @@ internal class AndroidSpeechPlayer(
         engine.setOnProgressListener(object : UtteranceProgressListener() {
             override fun onStart(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(false, true)) {
+                    gate.begin()
                     P3Log.line("P5_SPEECH state=start hintId=$uid chars=$charCount")
                     onState(SpeechPlayback.STARTED)
                 }
             }
             override fun onDone(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(true, false)) {
+                    gate.end()
                     P3Log.line("P5_SPEECH state=end hintId=$uid chars=$charCount")
                     onState(SpeechPlayback.FINISHED)
                 }
@@ -109,6 +112,7 @@ internal class AndroidSpeechPlayer(
             @Suppress("DEPRECATION")
             override fun onError(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(true, false)) {
+                    gate.end()
                     P3Log.line("P5_SPEECH state=failed hintId=$uid chars=$charCount")
                     onState(SpeechPlayback.FAILED)
                 }
@@ -121,6 +125,7 @@ internal class AndroidSpeechPlayer(
                 if (cancelled.compareAndSet(false, true)) {
                     engine.stop()
                     if (active.compareAndSet(true, false)) {
+                        gate.end()
                         P3Log.line("P5_SPEECH state=cancelled hintId=$utteranceId chars=$charCount")
                         onState(SpeechPlayback.FINISHED)
                     }

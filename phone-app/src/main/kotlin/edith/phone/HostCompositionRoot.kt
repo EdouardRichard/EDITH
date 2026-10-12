@@ -121,6 +121,8 @@ class HostCompositionRoot internal constructor(
      * wordable.)
      */
     internal val proactiveArming: ProactiveArming = ProactiveArming(),
+    /** P5 (spec §S4): shared gate between speech player and wake/acoustic suppression. */
+    val playbackGate: PlaybackGate = PlaybackGate(),
 ) : AutoCloseable {
     /**
      * P5 (spec §S5): the 「语音朗读」 switch state, persisted globally and **off by default**.
@@ -412,9 +414,9 @@ class HostCompositionRoot internal constructor(
      * inert).
      *
      * In P3.1 it is always open and inert: hints carry no speech and no provider answers `Capability.SpeechOutput`,
-     * so there is nothing to suppress yet.
+     * so there is nothing to suppress yet. P5 drives it from the speech player's begin/end callbacks.
+     * Moved to constructor parameter for P5 so the speech player and the composition share one instance.
      */
-    val playbackGate = PlaybackGate()
 
     /**
      * The settings the composition was assembled with, read back from the same store the screen writes through.
@@ -1446,8 +1448,10 @@ class HostCompositionRoot internal constructor(
             // P5 (spec §S1/S5): construct the speech player only when the user switch is on AND the engine is ready.
             // The player is passed to the environment so OutputArbiter can use it; null means no speech capability.
             val speechEnabledNow = runCatching { smartSettingsStore.load().speechEnabled }.getOrNull() ?: false
+            // P5 (spec §S4): one PlaybackGate shared between the speech player and the wake/acoustic suppression.
+            val playbackGate = PlaybackGate()
             val speechPlayer: edith.plugin.SpeechPlayer? = if (speechEnabledNow) {
-                AndroidSpeechPlayer.create(context)
+                AndroidSpeechPlayer.create(context, playbackGate)
             } else null
             val environment = CxrHostEnvironment(clock = clock, input = audio?.input ?: UnwiredInputPort,
                 liveOutput = hintLink::liveOutput, scheduler = scheduler, speech = speechPlayer,
@@ -1506,7 +1510,8 @@ class HostCompositionRoot internal constructor(
                 hintLink = hintLink,
                 smartWiring = smartWiring,
                 smartSettingsStore = smartSettingsStore,
-                proactiveArming = proactiveArming)
+                proactiveArming = proactiveArming,
+                playbackGate = playbackGate)
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
             // connection that has not been built yet.
             root.observerHolder = observerHolder
