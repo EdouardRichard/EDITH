@@ -59,6 +59,8 @@ class CxrHostEnvironment(
     private val storageFor: ((String) -> StorageHandle)? = null,
     /** Plugin background work; [UnavailableTaskScope] refuses rather than silently running work inline. */
     private val taskScope: TaskScope = UnavailableTaskScope,
+    /** P5 (spec §S1): the speech player, or null when TTS is unavailable or the user switch is off. */
+    override val speech: edith.plugin.SpeechPlayer? = null,
 ) : ScheduledHostEnvironment {
 
     init {
@@ -83,6 +85,8 @@ class CxrHostEnvironment(
             addAll(providers.keys)
             if (storageFor != null) add(Capability.Storage)
             if (liveOutput() != null) add(Capability.TextOutput)
+            // P5 (spec §S1): SpeechOutput is advertised only when the player exists (engine ready AND switch on).
+            if (speech != null) add(Capability.SpeechOutput)
         }
 
     /**

@@ -1443,8 +1443,14 @@ class HostCompositionRoot internal constructor(
                     )
                 },
             )
+            // P5 (spec §S1/S5): construct the speech player only when the user switch is on AND the engine is ready.
+            // The player is passed to the environment so OutputArbiter can use it; null means no speech capability.
+            val speechEnabledNow = runCatching { smartSettingsStore.load().speechEnabled }.getOrNull() ?: false
+            val speechPlayer: edith.plugin.SpeechPlayer? = if (speechEnabledNow) {
+                AndroidSpeechPlayer.create(context)
+            } else null
             val environment = CxrHostEnvironment(clock = clock, input = audio?.input ?: UnwiredInputPort,
-                liveOutput = hintLink::liveOutput, scheduler = scheduler,
+                liveOutput = hintLink::liveOutput, scheduler = scheduler, speech = speechPlayer,
                 providers = buildMap {
                     put(Capability.Model, model)
                     audio?.let { put(Capability.Asr, it.asrSession) }
@@ -1506,9 +1512,8 @@ class HostCompositionRoot internal constructor(
             root.observerHolder = observerHolder
             root.armObserver(initialObserver)
             root.audioChain = audio
-            // P5 (spec §S5): load the speech toggle from the same store. Off by default; a pre-P5 blob takes the
-            // default (off) because SmartSettings.speechEnabled defaults to false.
-            root.speechOn.value = runCatching { smartSettingsStore.load().speechEnabled }.getOrNull() ?: false
+            // P5 (spec §S5): sync the UI state with what was loaded above.
+            root.speechOn.value = speechEnabledNow
             root.foregroundAppSource = foregroundApp
             root.notificationCategorySource = notificationCategory
             root.calendarSource = calendar
