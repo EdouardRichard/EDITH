@@ -127,15 +127,23 @@ class ControlledModelClient(
                         pending.end(ModelEnd.FAILED, "CONTENT_TYPE"); return@use
                     }
                     val framing = SseDecoder()
-                    val decoder = ResponsesDecoder(pending.input.requestId)
+                    // P5: route to the right SSE decoder by protocol. Chat Completions uses a different wire format
+                    // (choices[].delta.content + finish_reason) than the Responses API (response.output_text.delta).
+                    val isChatCompletions = repository.get(pending.input.profileId)?.protocolId == "OPENAI_CHAT_COMPLETIONS"
+                    val chatDecoder = if (isChatCompletions) ChatCompletionsDecoder(pending.input.requestId) else null
+                    val responsesDecoder = if (!isChatCompletions) ResponsesDecoder(pending.input.requestId) else null
                     fun frames(frames: List<SseFrame>) {
                         for (frame in frames) {
                             if (!pending.active()) break
-                            val type = try { (Json.parseToJsonElement(frame.data) as? JsonObject)?.get("type")?.jsonPrimitive?.content }
-                                catch (_: Exception) { null }
-                                catch (_: StackOverflowError) { null }
-                            if (type == "response.output_text.delta") pending.delta.set(true)
-                            decoder.accept(frame).forEach(pending::deliver)
+                            if (chatDecoder != null) {
+                                chatDecoder.accept(frame).forEach(pending::deliver)
+                            } else {
+                                val type = try { (Json.parseToJsonElement(frame.data) as? JsonObject)?.get("type")?.jsonPrimitive?.content }
+                                    catch (_: Exception) { null }
+                                    catch (_: StackOverflowError) { null }
+                                if (type == "response.output_text.delta") pending.delta.set(true)
+                                responsesDecoder!!.accept(frame).forEach(pending::deliver)
+                            }
                         }
                     }
                     body.byteStream().use { stream ->
@@ -145,7 +153,7 @@ class ControlledModelClient(
                             val count = stream.read(bytes)
                             if (count == -1) {
                                 frames(framing.finish())
-                                if (pending.active()) decoder.endOfInput().forEach(pending::deliver)
+                                if (pending.active()) (chatDecoder?.endOfInput() ?: responsesDecoder!!.endOfInput()).forEach(pending::deliver)
                                 break
                             }
                             total += count
