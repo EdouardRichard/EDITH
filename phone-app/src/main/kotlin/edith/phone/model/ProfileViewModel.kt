@@ -71,7 +71,9 @@ class ProfileViewModel(private val repository: AndroidProfileRepository, private
         cancelTest()
         try {
             val profile = repository.get(id) ?: throw IllegalArgumentException()
-            if (profile.protocolId != "DEEPSEEK_RESPONSES" || InputModality.TEXT !in profile.inputs || OutputModality.TEXT !in profile.outputs)
+            // P5: both DEEPSEEK_RESPONSES and OPENAI_CHAT_COMPLETIONS support text-only probe requests.
+            if (profile.protocolId !in setOf("DEEPSEEK_RESPONSES", "OPENAI_CHAT_COMPLETIONS") ||
+                InputModality.TEXT !in profile.inputs || OutputModality.TEXT !in profile.outputs)
                 throw ContractError.CapabilityMissing("Text test unavailable")
             mutable.value = mutable.value.copy(confirmation = ProbeConsent(id, profile.revision, domain(profile.baseUrl)), error = null)
         } catch (error: Exception) { refresh(if (error is ContractError.CapabilityMissing) "CAPABILITY_MISSING" else "STORAGE_RECONFIGURE") }

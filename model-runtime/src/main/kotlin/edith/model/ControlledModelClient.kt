@@ -48,7 +48,9 @@ class ControlledModelClient(
         }
         gate.check(profile, input, support.takeIf { it.id == profile.protocolId }, consent(), probe)
         val prepared = budgeter.prepare(profile, input)
-        val endpoint = ModelEndpoint.responses(profile.baseUrl, allowLocalHttp)
+        val endpoint = if (profile.protocolId == "OPENAI_CHAT_COMPLETIONS")
+            ModelEndpoint.chatCompletions(profile.baseUrl, allowLocalHttp)
+        else ModelEndpoint.responses(profile.baseUrl, allowLocalHttp)
         val deadline = minOf(input.deadlineNanos, saturatedAdd(clock.nowNanos(), millisNanos(profile.timeoutMillis)))
         val pending = Pending(input, profile.revision, deadline, listener)
         val superseded: List<Pending>

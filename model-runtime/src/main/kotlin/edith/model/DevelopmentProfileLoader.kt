@@ -35,9 +35,10 @@ class DevelopmentProfileLoader(private val resolver: MemorySecretResolver) {
                 value("usableWindowTokens").toInt(), value("inputBudgetTokens", "contextBudgetTokens").toInt(),
                 value("maxOutputTokens").toInt(), value("safetyTokens").toInt(), value("timeoutMillis").toLong(),
                 inputs, setOf(OutputModality.TEXT), emptyList())
-            // Only validate endpoint format for DeepSeek; OpenAI-compatible endpoints are user-managed.
-            if (protocolId == "DEEPSEEK_RESPONSES") {
-                ModelEndpoint.responses(profile.baseUrl)
+            // Validate endpoint format for known protocols.
+            when (protocolId) {
+                "DEEPSEEK_RESPONSES" -> ModelEndpoint.responses(profile.baseUrl)
+                "OPENAI_CHAT_COMPLETIONS" -> ModelEndpoint.chatCompletions(profile.baseUrl)
             }
             val handle = resolver.put(key.toCharArray())
             owned?.let(resolver::revoke)
