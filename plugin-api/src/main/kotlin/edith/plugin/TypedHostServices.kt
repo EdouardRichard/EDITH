@@ -1,5 +1,6 @@
 package edith.plugin
 
+fun HostServices.speech(): SpeechPlayer = require(Capability.SpeechOutput) as SpeechPlayer
 fun HostServices.model(): ModelClient = require(Capability.Model) as ModelClient
 fun HostServices.audio(): AudioSubscription = require(Capability.Audio) as AudioSubscription
 fun HostServices.asr(): AsrSession = require(Capability.Asr) as AsrSession

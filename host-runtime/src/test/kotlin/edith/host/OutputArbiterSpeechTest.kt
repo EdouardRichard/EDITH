@@ -1,11 +1,7 @@
 package edith.host
 
 import edith.contracts.*
-import edith.output.SpeechPlayback
-import edith.output.SpeechPlayer
-import edith.plugin.CancellationHandle
-import edith.plugin.HintDevice
-import edith.plugin.MonotonicClock
+import edith.plugin.*
 import edith.testsupport.*
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -139,5 +135,20 @@ class OutputArbiterSpeechTest {
         arbiter.submit(hint("plain")) // no optionalSpeech
         assertEquals(emptyList(), speech.played)
         assertEquals(1, device.shown.size) // still displayed
+    }
+
+    @Test fun `a speech hint still displays without a player`() {
+        // Spec §S2: speech capability missing => hint still shows, just not spoken. Must NOT become Rejected.
+        val arbiter = arbiterWith(null) // no speech player
+        val status = arbiter.submit(hint("h", speech = SpeechRequest()))
+        assertEquals(OutputStatus.Accepted, status)
+        assertEquals(1, device.shown.size)
+    }
+
+    @Test fun `a speech hint without a player does not attempt playback`() {
+        val arbiter = arbiterWith(null)
+        arbiter.submit(hint("h", speech = SpeechRequest()))
+        // No exception, no crash; device.show called normally
+        assertEquals(1, device.shown.size)
     }
 }

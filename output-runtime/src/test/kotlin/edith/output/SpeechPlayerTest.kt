@@ -4,6 +4,8 @@ import edith.contracts.Assistance
 import edith.contracts.SessionId
 import edith.contracts.Generation
 import edith.plugin.CancellationHandle
+import edith.plugin.SpeechPlayback
+import edith.plugin.SpeechPlayer
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull

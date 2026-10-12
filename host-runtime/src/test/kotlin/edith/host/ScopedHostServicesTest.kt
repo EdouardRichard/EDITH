@@ -221,6 +221,21 @@ class ScopedHostServicesTest {
         assertFailsWith<ContractError.CapabilityMissing> { services.confirmation() }
     }
 
+    @Test fun `a speech provider is handed over when granted`() {
+        val player = object : SpeechPlayer {
+            override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit) = FakeCancellation()
+        }
+        val services = ScopedHostServices(scope(), setOf(Capability.SpeechOutput),
+            mapOf(Capability.SpeechOutput to player), FakeTaskScope())
+        val got = services.require(Capability.SpeechOutput)
+        assertTrue(got is SpeechPlayer)
+    }
+
+    @Test fun `without a speech provider the capability still throws`() {
+        val services = ScopedHostServices(scope(), emptySet(), emptyMap(), FakeTaskScope())
+        assertFailsWith<ContractError.CapabilityMissing> { services.require(Capability.SpeechOutput) }
+    }
+
     @Test fun `a blank confirmation id and a non positive window are rejected at the port`() {
         val provider = object : ConfirmationChannel {
             override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle =

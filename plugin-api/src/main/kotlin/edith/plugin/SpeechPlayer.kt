@@ -1,7 +1,6 @@
-package edith.output
+package edith.plugin
 
 import edith.contracts.Assistance
-import edith.plugin.CancellationHandle
 
 /**
  * Playback state reported by a [SpeechPlayer] for a single utterance.

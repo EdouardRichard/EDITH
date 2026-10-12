@@ -23,7 +23,7 @@ class ScopedHostServices(
                 Capability.Model -> scopedModel(provider as? ModelClient ?: wrong(capability))
                 Capability.Storage -> scopedStorage(provider as? StorageHandle ?: wrong(capability))
                 Capability.TextOutput -> scopedOutput(provider as? OutputSink ?: wrong(capability))
-                Capability.SpeechOutput -> throw ContractError.CapabilityMissing("speech output unavailable")
+                Capability.SpeechOutput -> scopedSpeech(provider as? SpeechPlayer ?: wrong(capability))
                 Capability.Actions -> scopedActions(provider as? ActionExecutor ?: wrong(capability))
                 Capability.Context -> scopedContext(provider as? ContextSignals ?: wrong(capability))
                 Capability.WakeWord -> scopedWakeWord(provider as? WakeWordRegistry ?: wrong(capability))
@@ -85,6 +85,12 @@ class ScopedHostServices(
         override fun write(key: String, value: ByteArray) = scope.active { provider.write(key, value) }
         override fun delete(key: String) = scope.active { provider.delete(key) }
         override fun clear() = scope.active { provider.clear() }
+    }
+    private fun scopedSpeech(provider: SpeechPlayer) = object : SpeechPlayer {
+        override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit): CancellationHandle {
+            scope.checkActive()
+            return provider.play(assistance, onState)
+        }
     }
     private fun scopedOutput(provider: OutputSink) = object : OutputSink {
         override fun submit(assistance: Assistance) = scope.active {
