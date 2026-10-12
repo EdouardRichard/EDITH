@@ -2,6 +2,7 @@ package edith.plugins.diagnostic
 
 import edith.contracts.Assistance
 import edith.contracts.HostEvent
+import edith.contracts.SpeechRequest
 import edith.output.HintReadingBudget
 import edith.plugin.Capability
 import edith.plugin.ConfigSchema
@@ -102,7 +103,9 @@ class DiagnosticHintPlugin(
             sourceTurnId = null,
             priority = 1,
             text = text,
-            optionalSpeech = null,
+            // P5: diagnostic hints carry speech so the TTS path can be exercised on device. The host's capability
+            // gate decides whether it actually plays; without a player the hint still displays normally (§S2).
+            optionalSpeech = SpeechRequest(),
             // P3.2-CLIP: this instrument exists to push hints the panel cannot show at once, so it has to hold them
             // long enough to slide through; the base 10 s is kept and the slide is added on top.
             expiresAtNanos = now + HintReadingBudget.readMillis(text.length, ttlMillis) * 1_000_000,

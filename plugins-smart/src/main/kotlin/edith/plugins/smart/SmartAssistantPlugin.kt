@@ -25,6 +25,7 @@ import edith.contracts.HostEvent
 import edith.contracts.OutputStateEvent
 import edith.contracts.OutputStatus
 import edith.contracts.SessionId
+import edith.contracts.SpeechRequest
 import edith.contracts.TranscriptEvent
 import edith.contracts.TranscriptRevision
 import edith.contracts.UserAction
@@ -1146,7 +1147,9 @@ class SmartAssistantPlugin(
                 sourceTurnId = hint.turnId,
                 priority = 0,
                 text = text,
-                optionalSpeech = null,
+                // P5 (spec §S6): proactive hints carry speech so the TTS path is exercised. The host's capability
+                // gate decides whether it actually plays; without a player the hint still displays normally (§S2).
+                optionalSpeech = SpeechRequest(),
                 expiresAtNanos = expiry,
             )
         }
