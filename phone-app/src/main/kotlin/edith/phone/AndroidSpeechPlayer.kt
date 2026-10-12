@@ -92,20 +92,24 @@ internal class AndroidSpeechPlayer(
 
     override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit): CancellationHandle {
         val utteranceId = assistance.hintId
+        val charCount = assistance.text.length
         engine.setOnProgressListener(object : UtteranceProgressListener() {
             override fun onStart(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(false, true)) {
+                    P3Log.line("P5_SPEECH state=start hintId=$uid chars=$charCount")
                     onState(SpeechPlayback.STARTED)
                 }
             }
             override fun onDone(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(true, false)) {
+                    P3Log.line("P5_SPEECH state=end hintId=$uid chars=$charCount")
                     onState(SpeechPlayback.FINISHED)
                 }
             }
-            @Deprecated("Deprecated in Java")
+            @Suppress("DEPRECATION")
             override fun onError(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(true, false)) {
+                    P3Log.line("P5_SPEECH state=failed hintId=$uid chars=$charCount")
                     onState(SpeechPlayback.FAILED)
                 }
             }
@@ -117,6 +121,7 @@ internal class AndroidSpeechPlayer(
                 if (cancelled.compareAndSet(false, true)) {
                     engine.stop()
                     if (active.compareAndSet(true, false)) {
+                        P3Log.line("P5_SPEECH state=cancelled hintId=$utteranceId chars=$charCount")
                         onState(SpeechPlayback.FINISHED)
                     }
                 }
