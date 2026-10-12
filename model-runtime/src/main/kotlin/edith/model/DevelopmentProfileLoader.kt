@@ -27,13 +27,18 @@ class DevelopmentProfileLoader(private val resolver: MemorySecretResolver) {
             val key = value("apiKey")
             require(key.all { it.code in 33..126 })
             val placeholder = object : SecretHandle { override val id = "unregistered" }
-            val profile = ModelProfile("development", 0, "Development text probe", value("service"),
-                value("baseUrl"), value("protocolId", "protocol"), value("model"), placeholder,
+            val protocolId = value("protocolId", "protocol")
+            val inputs = if (protocolId == "OPENAI_CHAT_COMPLETIONS")
+                setOf(InputModality.TEXT, InputModality.AUDIO) else setOf(InputModality.TEXT)
+            val profile = ModelProfile("development", 0, "Development probe", value("service"),
+                value("baseUrl"), protocolId, value("model"), placeholder,
                 value("usableWindowTokens").toInt(), value("inputBudgetTokens", "contextBudgetTokens").toInt(),
                 value("maxOutputTokens").toInt(), value("safetyTokens").toInt(), value("timeoutMillis").toLong(),
-                setOf(InputModality.TEXT), setOf(OutputModality.TEXT), emptyList())
-            ModelEndpoint.responses(profile.baseUrl)
-            require(profile.protocolId == "DEEPSEEK_RESPONSES")
+                inputs, setOf(OutputModality.TEXT), emptyList())
+            // Only validate endpoint format for DeepSeek; OpenAI-compatible endpoints are user-managed.
+            if (protocolId == "DEEPSEEK_RESPONSES") {
+                ModelEndpoint.responses(profile.baseUrl)
+            }
             val handle = resolver.put(key.toCharArray())
             owned?.let(resolver::revoke)
             owned = handle

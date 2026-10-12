@@ -50,6 +50,17 @@ class DevelopmentProfileLoaderTest {
         val path = Files.createTempFile(Path.of(".local/tmp").toAbsolutePath().also(Files::createDirectories), "dummy-profile-", ".properties")
         try { Files.writeString(path, body); block(path) } finally { Files.deleteIfExists(path) }
     }
+    @Test fun `openai chat completions profile loads with audio input modality`() = MemorySecretResolver().use { resolver ->
+        withConfig(openAiValid) { path ->
+            val config = DevelopmentProfileLoader(resolver).load(path)
+            assertNull(config.safeCode, "expected no error, got ${config.safeCode}")
+            val profile = assertNotNull(config.profile)
+            assertEquals("OPENAI_CHAT_COMPLETIONS", profile.protocolId)
+            assertTrue(edith.plugin.InputModality.AUDIO in profile.inputs, "AUDIO must be in inputs for OpenAI protocol")
+            assertTrue(edith.plugin.InputModality.TEXT in profile.inputs)
+        }
+    }
+
     companion object {
         val valid = """
             service=synthetic
@@ -62,6 +73,19 @@ class DevelopmentProfileLoaderTest {
             maxOutputTokens=256
             safetyTokens=128
             timeoutMillis=10000
+        """.trimIndent()
+        val openAiValid = """
+            service=alibaba
+            baseUrl=https://example.test/compatible-mode/v1
+            protocolId=OPENAI_CHAT_COMPLETIONS
+            model=qwen-omni-test
+            apiKey=dummy-omni-key
+            usableWindowTokens=4096
+            inputBudgetTokens=3000
+            maxOutputTokens=256
+            safetyTokens=128
+            timeoutMillis=10000
+            purpose=DEVELOPMENT_TEST
         """.trimIndent()
     }
 }

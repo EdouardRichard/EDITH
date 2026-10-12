@@ -24,7 +24,9 @@ class ControlledModelClient(
     private val transport = http.newBuilder().followRedirects(false).followSslRedirects(false)
         .retryOnConnectionFailure(false).authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE).build()
     private val executor = Executors.newCachedThreadPool { runnable -> Thread(runnable, "edith-model-http").apply { isDaemon = true } }
-    private val adapter = DeepSeekResponsesAdapter()
+    private val deepSeekAdapter = DeepSeekResponsesAdapter()
+    private val openAiAdapter = OpenAiChatCompletionsAdapter(NoOpMediaSource)
+    private object NoOpMediaSource : MediaSource { override fun resolveAudio(ref: String) = null }
     private val lock = Any()
     private val requests = linkedSetOf<Pending>()
     private data class Owner(val generation: Long, val turn: String)
@@ -40,7 +42,11 @@ class ControlledModelClient(
 
     private fun admit(input: ModelRequest, listener: (ModelStreamEvent) -> Unit, probe: Boolean): CancellationHandle {
         val profile = repository.get(input.profileId) ?: rejected()
-        gate.check(profile, input, adapter.support.takeIf { it.id == profile.protocolId }, consent(), probe)
+        val support = when (profile.protocolId) {
+            "OPENAI_CHAT_COMPLETIONS" -> openAiAdapter.support
+            else -> deepSeekAdapter.support
+        }
+        gate.check(profile, input, support.takeIf { it.id == profile.protocolId }, consent(), probe)
         val prepared = budgeter.prepare(profile, input)
         val endpoint = ModelEndpoint.responses(profile.baseUrl, allowLocalHttp)
         val deadline = minOf(input.deadlineNanos, saturatedAdd(clock.nowNanos(), millisNanos(profile.timeoutMillis)))
@@ -60,7 +66,10 @@ class ControlledModelClient(
         }
         superseded.forEach { it.end(ModelEnd.CANCELLED, "TURN_REPLACED") }
         if (!pending.active()) return pending
-        val payload = adapter.encode(profile, prepared)
+        val payload = when (profile.protocolId) {
+            "OPENAI_CHAT_COMPLETIONS" -> openAiAdapter.encode(profile, prepared)
+            else -> deepSeekAdapter.encode(profile, prepared)
+        }
         var encoded: Request? = null
         try {
             resolver.withSecret(profile.secret) { chars ->
