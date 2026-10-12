@@ -65,7 +65,12 @@ import java.util.UUID
         } }
         Text(if (protocol == "DEEPSEEK_RESPONSES") "Responses API：TEXT → TEXT" else "协议未接入", color = MaterialTheme.colorScheme.onSurfaceVariant)
         if (InputModality.IMAGE in inputs) Text("图片请求：当前无图片适配器")
-        if (InputModality.AUDIO in inputs || OutputModality.AUDIO in outputs) Text("语音请求 / 输出：当前无语音适配器")
+        // P5 (spec §A4): AUDIO input is only available with OPENAI_CHAT_COMPLETIONS protocol.
+        if (protocol == "OPENAI_CHAT_COMPLETIONS" && InputModality.AUDIO in inputs) {
+            Text("音频输入：需通过一次验证（AUDIO_REQUEST）", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        } else if (protocol != "OPENAI_CHAT_COMPLETIONS" && InputModality.AUDIO in inputs) {
+            Text("音频输入：仅 OPENAI_CHAT_COMPLETIONS 协议支持", color = MaterialTheme.colorScheme.error)
+        }
         Field("最大输入（K tokens）", window, { window = it }, KeyboardType.Decimal)
         Field("最大输出（K tokens）", output, { output = it }, KeyboardType.Decimal)
         Text("1 K = 1024 tokens · 容量为用户声明", color = MaterialTheme.colorScheme.onSurfaceVariant)
