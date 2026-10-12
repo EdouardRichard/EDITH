@@ -49,8 +49,9 @@ class ModelClientGatewayTest {
         client: edith.plugin.ModelClient,
         stop: () -> Boolean = { false },
         memoryRetrieval: MemoryRetrieval? = null,
+        audioParts: (() -> List<InputPart>)? = null,
     ) =
-        ModelClientGateway(client, { lookup(it) }, clock, scheduler, envelopeFor, stop, memoryRetrieval)
+        ModelClientGateway(client, { lookup(it) }, clock, scheduler, envelopeFor, stop, memoryRetrieval, audioParts)
 
     /** A retrieval that records the query it was asked, so "what was memory asked about" is an assertion. */
     private class RecordingRetrieval(private val parts: List<edith.plugin.ContextPart>) : MemoryRetrieval {
@@ -521,5 +522,25 @@ class ModelClientGatewayTest {
         }
         assertFalse(out.toString("UTF-8").contains(sentinel), "the adapter must not print the request body")
         assertFalse(err.toString("UTF-8").contains(sentinel), "the adapter must not log the request body")
+    }
+
+    @Test fun `audioParts null keeps request input text only`() {
+        val client = FakeModelClient { _, listener ->
+            listener(ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null))
+        }
+        gateway(client).turn(turn())
+        val req = client.requests.single()
+        assertTrue(req.input.all { it is InputPart.Text }, "expected all Text parts, got ${req.input.map { it::class.simpleName }}")
+    }
+
+    @Test fun `audioParts appends audio after transcript text`() {
+        val client = FakeModelClient { _, listener ->
+            listener(ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null))
+        }
+        gateway(client, audioParts = { listOf(InputPart.Audio("ref-1")) }).turn(turn())
+        val req = client.requests.single()
+        assertTrue(req.input.last() is InputPart.Audio, "last part should be Audio")
+        assertEquals("ref-1", (req.input.last() as InputPart.Audio).localRef)
+        assertTrue(req.input.any { it is InputPart.Text }, "text part must still be present")
     }
 }

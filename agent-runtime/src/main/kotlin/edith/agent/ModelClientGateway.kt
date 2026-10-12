@@ -69,6 +69,12 @@ class ModelClientGateway(
      * its own honest logging of a storage failure, and nothing about memory may take a turn down.
      */
     private val memoryRetrieval: MemoryRetrieval? = null,
+    /**
+     * P5 (spec §A2): optional audio parts appended to the request input after the transcript. Null reproduces the
+     * pre-P5 text-only behaviour byte for byte. A lambda rather than a value so the segment is resolved at request
+     * time, not at gateway construction time.
+     */
+    private val audioParts: (() -> List<InputPart>)? = null,
 ) : ModelGateway {
 
     override fun turn(request: GatewayTurn): GatewayReply {
@@ -87,7 +93,7 @@ class ModelClientGateway(
             profileId = profile.id,
             profileRevision = profile.revision,
             instructions = request.instructions,
-            input = transcript.input,
+            input = transcript.input + (audioParts?.invoke() ?: emptyList()),
             history = transcript.history,
             context = memoryFor(transcript),
             output = OutputModality.TEXT,
