@@ -630,6 +630,8 @@ private fun capabilityLabel(capability: Capability) = when (capability) {
     Capability.Context -> "上下文感知"
     Capability.WakeWord -> "唤醒词"
     Capability.Confirmation -> "动作确认"
+    Capability.SystemOne -> "决策模型"
+    Capability.Embedding -> "语义嵌入"
 }
 private fun errorLabel(code: String) = when (code) {
     "BLUETOOTH_PERMISSION_DENIED" -> "蓝牙权限未获授权"

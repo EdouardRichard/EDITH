@@ -256,6 +256,9 @@ class HostCompositionRoot internal constructor(
         Capability.WakeWord -> "WAKE_PROVIDER_MISSING"
         // P3.3: the row the confirmation channel reports when its presenter is not wired (until Task 13 provides it).
         Capability.Confirmation -> "CONFIRMATION_PROVIDER_MISSING"
+        // edith-0.2 Phase A: local model services
+        Capability.SystemOne -> "SYSTEM_ONE_MODEL_MISSING"
+        Capability.Embedding -> "EMBEDDING_MODEL_MISSING"
     }
     private val mutableState =
         MutableStateFlow(
