@@ -30,6 +30,7 @@ import edith.host.systemone.SystemOneServiceImpl
 import edith.host.embedding.EmbeddingServiceImpl
 import edith.phone.laya.LayaInferenceEngineImpl
 import edith.phone.laya.LayaOfficialHost
+import edith.phone.litert.EmbeddingGemmaLiteRTEngine
 import edith.model.*
 import edith.output.TraceRecorder
 import edith.plugin.*
@@ -1324,11 +1325,18 @@ class HostCompositionRoot internal constructor(
                 modelPath = File(context.filesDir, LAYA_MAIN_GRAPH).absolutePath,
                 engine = LayaInferenceEngineImpl(context),
             )
-            // The embedding model is a directory of artifacts rather than one file, so the service is pointed at the
-            // directory the engine loads from. `EmbeddingGemmaLiteRTEngine.embed` is still a placeholder - see the
-            // Phase B closure record - so `isAvailable` means "loaded", not "produces semantic vectors".
+            // edith-0.2 Phase B (C4/B5): the embedding service gets the LiteRT engine and the directory the
+            // artifacts are actually provisioned to. Both halves were wrong before: no engine was passed, so the
+            // service silently kept its JVM `StubEmbeddingEngine` (vectors built from `text.hashCode()`), and the
+            // path was `filesDir/engine-models`, which nothing provisions — so `isAvailable` was false and B9's hard
+            // dependency refused every turn. `EmbeddingGemmaLiteRTEngine.embed` is the real tokenizer + forward
+            // pass; the service still owns the 768 → 256 truncation and the L2 re-normalization that goes with it.
             val embedding = EmbeddingServiceImpl(
-                modelPath = File(context.filesDir, EMBEDDING_DIRECTORY).absolutePath,
+                modelPath = EmbeddingModelDirectory.locate(
+                    context.getExternalFilesDir(null),
+                    context.filesDir,
+                ).absolutePath,
+                engine = EmbeddingGemmaLiteRTEngine(),
             )
             val contextSignals = CxrContextSignals(clock, listOf(
                 CxrContextSignals.armingSource(proactiveArming),
@@ -1769,14 +1777,51 @@ private const val ENGINE_MANIFEST_ASSET = "engine-manifest.json"
  * trust is the debug-only gate above, not the manifest's origin.
  */
 /**
- * edith-0.2 Phase B: where the two local models live.
+ * edith-0.2 Phase B: the Laya graph.
  *
- * Both are resolved from the app's **internal** `filesDir`, which is the publisher's own constraint — `LayaEngine`
- * reads its assets from there and checks for them at construction, so making the location a setting would mean
- * patching the vendored host.
+ * Resolved from the app's **internal** `filesDir`, which is the publisher's own constraint — `LayaEngine` reads its
+ * assets from there and checks for them at construction, so making the location a setting would mean patching the
+ * vendored host. The embedding model does **not** live there; see [EmbeddingModelDirectory].
  */
 private const val LAYA_MAIN_GRAPH = "laya_ml_s256_embeds_wfp16.tflite"
-private const val EMBEDDING_DIRECTORY = "engine-models"
+
+/**
+ * edith-0.2 Phase B (C4): where the EmbeddingGemma graph and its SentencePiece vocabulary are read from.
+ *
+ * These artifacts are **not** in the app's internal `filesDir`, and no code in this repository provisions them: they
+ * were pushed to the external files directory by hand with adb, and the push command is recorded in
+ * `docs/project/evidence/2026-10-13-phase-a-performance-k40.md`. The location is still a code decision rather than a
+ * setting, because it is the difference between the plugin's hard dependency serving and refusing a turn, and a
+ * wrong guess here (the invented `filesDir/engine-models`) is what made every turn refuse.
+ */
+internal object EmbeddingModelDirectory {
+    /** Relative to `Context.getExternalFilesDir(null)`. */
+    const val RELATIVE_PATH = "models/embeddinggemma"
+
+    /** A directory name nothing creates. See [locate]. */
+    private const val UNREACHABLE_PREFIX = "no-external-files-dir"
+
+    /**
+     * @param externalFilesDir `Context.getExternalFilesDir(null)`, or null when external storage is not mounted.
+     * @param internalFilesDir `Context.getFilesDir()`, or null when there is no usable context at all — not
+     *        hypothetical: the JVM rig builds the production composition root over a `ContextWrapper(null)`, where
+     *        both read as null. Both parameters are nullable for that reason; routing a null through a non-null one
+     *        threw `NullPointerException: getFilesDir(...) must not be null` out of `create()` and the app could not
+     *        assemble, which is worse than a refusal.
+     *
+     *        The fallback is deliberately a path that cannot exist rather than the internal `filesDir`: falling back
+     *        to a directory that might hold something else would answer "the model is here" with whatever happened to
+     *        be there, and refusing the turn is the honest state when the artifacts are unreachable.
+     */
+    fun locate(externalFilesDir: File?, internalFilesDir: File?): File =
+        if (externalFilesDir != null) {
+            File(externalFilesDir, RELATIVE_PATH)
+        } else {
+            // `File("")` keeps the result relative when even the internal directory is absent; it still cannot exist,
+            // which is the property that matters.
+            File(File(internalFilesDir ?: File(""), UNREACHABLE_PREFIX), RELATIVE_PATH)
+        }
+}
 
 internal object DebugImportDirectory {    const val STORE_DIRECTORY = "engine-models"
     const val IMPORT_DIRECTORY = "engine-models-import"

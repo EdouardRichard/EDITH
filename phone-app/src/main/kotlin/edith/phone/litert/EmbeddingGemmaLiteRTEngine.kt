@@ -2,59 +2,108 @@ package edith.phone.litert
 
 import edith.plugin.EmbeddingInferenceEngine
 import org.tensorflow.lite.Interpreter
-import kotlin.math.sqrt
+import java.io.File
 
 /**
- * LiteRT-backed EmbeddingGemma engine.
+ * LiteRT-backed EmbeddingGemma engine: the tokenizer and the forward pass, and nothing else.
  *
- * Loads the EmbeddingGemma seq256 mixed-precision model and produces 256-dim embeddings
- * via Matryoshka truncation + L2 normalization.
+ * The graph is the publisher's `embeddinggemma-300M_seq256_mixed-precision.tflite`, exported for a fixed window:
+ * one INT32 `[1,256]` input, one FLOAT32 `[1,768]` output (measured on the K40 in Phase A,
+ * `LiteRTPerformanceTest.embeddingGraphContractAndLatency`). [embed] builds that frame from text and returns the
+ * graph's own 768 floats **unchanged**.
  *
- * Current implementation: validates model loading. Full SentencePiece tokenization
- * is a follow-up task (requires sentencepiece.model from the model directory).
+ * ## Why it returns 768 and not the service's 256
+ *
+ * Dimension policy is not this class's job. `EmbeddingServiceImpl.toOutputDimensions` truncates the graph's 768 to
+ * 256 and re-normalizes in the same step, because the graph's own 768-dim vector is unit-norm (measured 1.0000)
+ * while its first 256 dimensions are not (0.643). Truncating here as well would truncate the *second* time — 768 →
+ * 256 → 256 — and normalize a vector the class below is about to normalize again. The class comment on
+ * `EmbeddingInferenceEngine` used to claim the engine owned both steps; that described the placeholder
+ * implementation, and it was corrected to match this layering.
+ *
+ * ## What this class does not do
+ *
+ * It does not decide whether the model is provisioned, and it does not pretend to work without it: [embed] before a
+ * successful [initialize] throws rather than answering with a vector, because a plausible-looking vector is what
+ * turns the plugin's hard dependency into a green light on garbage. `isAvailable` on `EmbeddingServiceImpl` is the
+ * only place that answers "can this be used", and it is set from whether [initialize] returned true.
+ *
+ * The vocabulary is read from `<modelPath>/sentencepiece.model` — the publisher's own file, parsed per
+ * [SentencePieceBpe] — rather than shipped as a derived asset, so there is no second copy of 4.7 MB to keep in step.
+ *
+ * @param injectedVocabulary test seam: the vocabulary to encode with. Production passes nothing and
+ *        [initialize] loads the one next to the graph. Injectable because a JVM unit test cannot build an
+ *        [Interpreter] over a 179 MB graph, and the frame is the part of `embed` that can be pinned without one.
  */
 class EmbeddingGemmaLiteRTEngine(
-    private val outputDimensions: Int = 256,
+    private val injectedVocabulary: SentencePieceBpe? = null,
 ) : EmbeddingInferenceEngine {
+
     private var interpreter: Interpreter? = null
+    private var vocabulary: SentencePieceBpe? = injectedVocabulary
 
     override fun initialize(modelPath: String): Boolean {
         return try {
-            val options = Interpreter.Options().apply {
-                numThreads = 4
-            }
-
-            val modelFile = java.io.File("$modelPath/embeddinggemma-300M_seq256_mixed-precision.tflite")
-            if (!modelFile.exists()) {
-                android.util.Log.e("EmbeddingGemma", "Model file not found: ${modelFile.absolutePath}")
+            val graph = File(modelPath, GRAPH_FILE)
+            val loadedVocabulary = vocabulary
+                ?: File(modelPath, VOCABULARY_FILE).takeIf { it.isFile }?.let { SentencePieceBpe.load(it) }
+            if (!graph.isFile || loadedVocabulary == null) {
+                // Both artifacts are required, and both are checked before the graph is touched: a directory that
+                // has the vocabulary but not the graph must report *unavailable*, not "loaded, will fail later".
+                System.err.println(
+                    "[EmbeddingGemma] Not provisioned at $modelPath " +
+                        "(needs $GRAPH_FILE and $VOCABULARY_FILE)",
+                )
                 return false
             }
 
-            interpreter = Interpreter(modelFile, options)
-            android.util.Log.i("EmbeddingGemma", "Model loaded. Inputs: ${interpreter?.inputTensorCount}, Outputs: ${interpreter?.outputTensorCount}")
+            val loaded = Interpreter(graph, Interpreter.Options().apply { numThreads = THREADS })
+            interpreter = loaded
+            vocabulary = loadedVocabulary
             true
         } catch (e: Exception) {
-            android.util.Log.e("EmbeddingGemma", "Failed to load model: ${e.message}", e)
+            System.err.println("[EmbeddingGemma] Load failed: ${e.message}")
             false
         }
     }
 
+    /**
+     * The `[1, 256]` INT32 frame this engine feeds the graph: `<bos>`, the pieces, `<eos>`, padded to the window
+     * the graph was exported for.
+     *
+     * Public because it is the half of [embed] a JVM test can observe — the other half needs the graph — and
+     * because the window is a property of the export rather than of this class's taste.
+     */
+    fun frame(text: String): IntArray {
+        val loaded = vocabulary ?: error("EmbeddingGemmaLiteRTEngine.frame before initialize")
+        return loaded.encodeForModel(text, SEQUENCE_LENGTH)
+    }
+
     override fun embed(text: String): FloatArray {
-        // TODO: Implement full SentencePiece tokenization using sentencepiece.model
-        // For now, return a deterministic unit-norm vector as placeholder
-        // Real implementation needs:
-        // 1. Tokenize text using SentencePiece (sentencepiece.model)
-        // 2. Pad/truncate to seq256
-        // 3. Run inference → get embedding vector (768-dim full output)
-        // 4. Truncate to outputDimensions (Matryoshka)
-        // 5. L2 normalize
-        val raw = FloatArray(outputDimensions) { (text.hashCode().toFloat() + it) / outputDimensions }
-        val norm = sqrt(raw.map { it * it }.sum())
-        return if (norm > 0f) raw.map { it / norm }.toFloatArray() else raw
+        val loaded = interpreter ?: error("EmbeddingGemmaLiteRTEngine.embed before initialize")
+        val output = Array(1) { FloatArray(GRAPH_OUTPUT_DIMENSIONS) }
+        // Serialized by the caller: `EmbeddingServiceImpl.embed` holds its lock across this call. `Interpreter` is
+        // not safe to run concurrently, so that lock is the contract rather than a courtesy.
+        loaded.run(arrayOf(frame(text)), output)
+        return output[0]
     }
 
     override fun close() {
         interpreter?.close()
         interpreter = null
+        vocabulary = injectedVocabulary
+    }
+
+    companion object {
+        /** The window the checkpoint was exported for; the graph rejects any other shape. */
+        const val SEQUENCE_LENGTH = 256
+
+        /** The graph's own output width, before the service applies Matryoshka truncation. */
+        const val GRAPH_OUTPUT_DIMENSIONS = 768
+
+        const val GRAPH_FILE = "embeddinggemma-300M_seq256_mixed-precision.tflite"
+        const val VOCABULARY_FILE = "sentencepiece.model"
+
+        private const val THREADS = 4
     }
 }

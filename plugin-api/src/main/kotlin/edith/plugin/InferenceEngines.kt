@@ -30,8 +30,11 @@ interface LayaInferenceEngine {
 /**
  * Abstraction over an embedding model inference backend.
  *
- * Implementations wrap a specific runtime and handle tokenization, forward pass,
- * and Matryoshka truncation + L2 normalization to the target dimension.
+ * Implementations wrap a specific runtime and handle tokenization and the forward pass. They return the model's
+ * **own** vector at the graph's native width; the dimension policy — Matryoshka truncation to the service's 256,
+ * together with the L2 re-normalization that truncation makes necessary — belongs to [EmbeddingService], whose
+ * implementation keeps it in one place. An engine that truncated as well would truncate twice and normalize a
+ * vector that is about to be normalized again.
  */
 interface EmbeddingInferenceEngine {
     /** Initialize the engine with the given model path. Returns true on success. */
