@@ -73,6 +73,7 @@ import edith.plugins.smart.memory.MemoryLog
 import edith.plugins.smart.memory.MemoryModule
 import edith.plugins.smart.memory.MemoryModuleRetrieval
 import edith.plugins.smart.memory.SmartMemoryRetrieval
+import edith.plugins.smart.skill.Skill
 import edith.plugins.smart.skill.SkillManager
 import edith.plugins.smart.skill.StorageAccessSkillDirectory
 import java.util.UUID
@@ -314,6 +315,18 @@ class SmartAssistantPlugin(
     @Volatile private var memoryRetrieval: MemoryRetrieval? = null
 
     /**
+     * edith-0.2 Phase B (B1/B3/B6): the **session's** prompt assembly and compressor.
+     *
+     * Built in [activate] rather than injected, because both hold session state — a conversation, and an ordering that
+     * has to follow this session's writes — while the host keeps one plugin instance and re-activates it per session.
+     * Injection at construction time would share one transcript across sessions, which is the replay the plugin's own
+     * activation clears exist to prevent. The constructor parameters of the same names stay as test seams: a test that
+     * supplies one is used verbatim.
+     */
+    @Volatile private var activeContextForTurn: ContextManager? = null
+    @Volatile private var activeCompressor: ContextCompressor? = null
+
+    /**
      * P3.4: what a finished turn is allowed to write. Same lifetime and the same namespace as [memoryRetrieval]; `null`
      * means "no session", and a turn then writes nothing.
      */
@@ -520,6 +533,19 @@ class SmartAssistantPlugin(
             log = memoryLog,
             write = { kind, text, source -> memory.remember(text, kind, source) },
         )
+        // B1/B3/B6: the session's transcript and compressor (see the field comments for why they are built here).
+        activeContextForTurn = contextForTurn ?: ContextManager(memory = memoryRetrieval)
+        activeCompressor = compressor ?: ContextCompressor(
+            memory = memory,
+            // No production summarizer yet. The compressor's own contract makes that an ordinary degradation —
+            // permanent plain truncation, which is never worse than truncation — rather than a failure; the async
+            // summary is the one half of spec §4.4 that has no implementation, and that is recorded rather than
+            // implied by a green suite.
+            summarizer = null,
+            // The plugin's task pool: `compressIfNeeded` runs inside the turn, and an inline summary would hold the
+            // caller's thread for a cloud round trip (the same defect the gate had before review C2).
+            scope = context.services.tasks,
+        )
         // B4: the SKILL library. A host that granted no directory leaves this null and the prompt is simply the
         // system instructions - "no SKILLs installed" is a normal state (spec §3.7), not a degraded one.
         skillManager = runCatching { context.services.storageAccess() }.getOrNull()
@@ -541,6 +567,10 @@ class SmartAssistantPlugin(
             // P3.4: a session that ends takes its memory boundary with it (the namespace was scoped to it).
             memoryRetrieval = null
             memoryExtraction = null
+            // The session's conversation and compressor go with it: `activate` rebuilds both, and a transcript left
+            // behind would be the previous session's words under the new session's envelope.
+            activeContextForTurn = null
+            activeCompressor = null
         skillManager = null
             detach()
         }
@@ -896,6 +926,13 @@ class SmartAssistantPlugin(
         var loop: AgentLoop? = null
         // One ledger per turn, handed to the `notify_user` tool the loop carries (spec §6.3's guard is per-turn).
         val ledger = NotifyLedger()
+        // B1/B6/spec §4.2: the session's own assembly — instructions (with the SKILL section), the transcript this
+        // turn continues, and the memory for the utterance. Read once per turn so the three come from one snapshot.
+        // `null` when the wiring supplied no manager, which is every test that is about the passive loop; the request
+        // then falls back to the pre-Phase-B shape and the gateway retrieves memory itself.
+        val prompt = activeContextForTurn?.let { contexts ->
+            runCatching { contexts.buildPrompt(ContextRoute.WAKE, text, skillsForTurn()) }.getOrNull()
+        }
         val run = try {
             val built = buildLoop(current, configured, owned, ledger)
             loop = built
@@ -907,7 +944,7 @@ class SmartAssistantPlugin(
                 AgentRequest(
                     turnId = owned.turnId,
                     utterance = text,
-                    instructions = instructionsFor(SmartPrompts.instructions()),
+                    instructions = prompt?.instructions ?: instructionsFor(SmartPrompts.instructions()),
                     profileId = configured.profileId,
                     deadlineNanos = owned.deadlineNanos,
                     // D49: the profile's timeout caps **one model request**; the turn's own budget is the number above,
@@ -915,6 +952,12 @@ class SmartAssistantPlugin(
                     requestTimeoutNanos = modelRequestTimeoutNanos(
                         config?.let { profileLookup(it.profileId) }?.timeoutMillis,
                     ),
+                    // `buildPrompt` ends its history on this turn's user message while the loop appends the utterance
+                    // itself, so the last item is dropped: passing it whole would ask the model the same thing twice.
+                    history = prompt?.history?.dropLast(1).orEmpty(),
+                    // A non-null context is how the caller says "the memory is already assembled": the gateway then
+                    // does not retrieve, which is what keeps the query from being embedded twice per turn.
+                    context = prompt?.context,
                 ),
             )
         } catch (failure: Throwable) {
@@ -996,11 +1039,11 @@ class SmartAssistantPlugin(
      * not supply a [ContextManager], which is the pre-Phase-B shape.
      */
     private fun recordTurnAndCompress(userText: String, run: AgentRun) {
-        val contexts = contextForTurn ?: return
+        val contexts = activeContextForTurn ?: return
         val context = contexts.context(ContextRoute.WAKE)
         context.appendUser(userText)
         run.finalText?.takeIf { it.isNotBlank() }?.let { contexts.appendAssistantMessage(ContextRoute.WAKE, it) }
-        compressor?.compressIfNeeded(context, contexts.historyBudgetTokens())
+        activeCompressor?.compressIfNeeded(context, contexts.historyBudgetTokens())
     }
 
     /** Builds the single-use loop for one turn: registry, tightened policy, guard, audit and gateway. */    private fun buildLoop(context: PluginContext, configured: Config, owned: SmartTurn, ledger: NotifyLedger): AgentLoop {
@@ -1162,6 +1205,12 @@ class SmartAssistantPlugin(
         val section = runCatching { skillManager?.injection() }.getOrNull().orEmpty()
         return if (section.isEmpty()) base else "$base\n\n$section"
     }
+
+    /**
+     * The enabled SKILLs for a turn's assembly, or none when the host granted no directory (D60: every enabled SKILL,
+     * no selection, no cap — the filtering is `enabled()`'s and the formatting is the assembly's).
+     */
+    private fun skillsForTurn(): List<Skill> = runCatching { skillManager?.enabled() }.getOrNull().orEmpty()
 
     /** The gate's input, assembled from the same signals the request carries (spec §4.7). */    private fun gateState(trigger: ProactiveTrigger): ProactiveGateState {
         val values = currentContextValues()

@@ -1,5 +1,6 @@
 package edith.agent
 
+import edith.plugin.ContextPart
 import edith.plugin.MessageRole
 import edith.plugin.ModelEnd
 import edith.plugin.ModelHistoryItem
@@ -46,6 +47,16 @@ data class AgentRequest(
      * many turns it happened to take.
      */
     val history: List<ModelHistoryItem> = emptyList(),
+    /**
+     * The memory parts this turn's requests carry, or `null` for "let the gateway retrieve them" — which is what every
+     * caller did before a caller could supply them.
+     *
+     * **An empty list is not the same as `null`**: it says "this turn has no memory", and the gateway then does not
+     * retrieve. That distinction is what keeps a caller who already retrieved — the plugin, which does it once inside
+     * `ContextManager.buildPrompt` so spec §4.3's budget can count it — from paying for a second embedding pass over
+     * the same query on every turn.
+     */
+    val context: List<ContextPart>? = null,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -233,6 +244,9 @@ class AgentLoop(
                     } else {
                         turnDeadlineNanos
                     },
+                    // A caller that already assembled its memory (with the token accounting that needs) says so with
+                    // a list; `null` leaves the gateway to retrieve, which is the older shape.
+                    context = request.context,
                 ),
             )
             // A turn that was blocked when `cancel()` arrived must not complete the run with a late answer.

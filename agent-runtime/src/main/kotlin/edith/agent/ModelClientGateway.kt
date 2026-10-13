@@ -95,7 +95,7 @@ class ModelClientGateway(
             instructions = request.instructions,
             input = transcript.input + (audioParts?.invoke() ?: emptyList()),
             history = transcript.history,
-            context = memoryFor(transcript),
+            context = request.context ?: memoryFor(transcript),
             output = OutputModality.TEXT,
             deadlineNanos = request.deadlineNanos,
             tools = request.tools,
