@@ -33,3 +33,5 @@ fun HostServices.actions(): ActionExecutor = require(Capability.Actions) as Acti
 fun HostServices.context(): ContextSignals = require(Capability.Context) as ContextSignals
 fun HostServices.wakeWord(): WakeWordRegistry = require(Capability.WakeWord) as WakeWordRegistry
 fun HostServices.confirmation(): ConfirmationChannel = require(Capability.Confirmation) as ConfirmationChannel
+fun HostServices.systemOne(): SystemOneService = require(Capability.SystemOne) as SystemOneService
+fun HostServices.embedding(): EmbeddingService = require(Capability.Embedding) as EmbeddingService
