@@ -328,6 +328,176 @@ class LiteRTPerformanceTest {
         )
     }
 
+    /**
+     * Do the two CPU APIs compute the same thing?
+     *
+     * This test exists because the `CompiledModel` result needed it and the first round of measurements
+     * skipped it. `CompiledModel` on the CPU read 569 ms for Laya against the `Interpreter`'s 1815 ms, a
+     * 3.2x "win" - but the graph is 322M fp32 parameters at a 256-token window, i.e. roughly
+     * 2 x 322e6 x 256 = 165 GFLOP per forward pass, and the Snapdragon 870's four big cores peak at about
+     * 167 GFLOP/s of fp32 NEON (A77: 2 x 128-bit FMA = 16 FLOP/cycle) with 60-75 % of that achievable in
+     * practice. 569 ms implies **290 GFLOP/s, which is 1.7x the chip's theoretical fp32 peak** - so either
+     * the fast path is not doing the same arithmetic (XNNPACK can dynamically quantize fully-connected
+     * weights to int8, which buys about 4x for a small accuracy cost), or one of the two readings is not
+     * measuring the work at all. 1815 ms lands right where an honest fp32 run should, which is what makes
+     * the fast one the suspect rather than the slow one.
+     *
+     * A latency comparison between two paths that do not compute the same thing is not a comparison. This
+     * reports the actual agreement so the speedup can be quoted with its precision cost attached - or
+     * withdrawn.
+     */
+    @Test
+    fun bothCpuApisComputeTheSameThing() {
+        org.junit.Assume.assumeTrue(layaMain.isFile && embeddingModel.isFile)
+
+        val ids = IntArray(256) { 1000 + it % 100 }
+        val idsF = FloatArray(256) { ids[it].toFloat() }
+        val mask = FloatArray(256) { 1f }
+        val qtype = floatArrayOf(1f, 0f, 0f)
+
+        fun interpreterOutputs(path: String, asInt: Boolean, extraFloats: List<FloatArray>):
+            List<FloatArray> {
+            val interp = Interpreter(mapModel(File(path)), Interpreter.Options().setNumThreads(4))
+            return try {
+                if (asInt && extraFloats.isEmpty()) {
+                    val out = Array(1) { FloatArray(768) }
+                    interp.run(arrayOf(ids), out)
+                    listOf(out[0])
+                } else {
+                    val ins = arrayOf<Any>(arrayOf(ids), Array(1) { mask }, Array(1) { qtype })
+                    val outs = mutableMapOf<Int, Any>(0 to Array(1) { FloatArray(256) },
+                        1 to Array(1) { FloatArray(768) })
+                    interp.runForMultipleInputsOutputs(ins, outs)
+                    listOf((outs[0] as Array<FloatArray>)[0], (outs[1] as Array<FloatArray>)[0])
+                }
+            } finally {
+                interp.close()
+            }
+        }
+
+        val env = com.google.ai.edge.litert.Environment.create()
+
+        fun compiledOutputs(path: String, inputs: List<FloatArray>, intIdx: Set<Int>): List<FloatArray> {
+            val options = com.google.ai.edge.litert.CompiledModel.Options(
+                com.google.ai.edge.litert.Accelerator.CPU)
+            options.cpuOptions = com.google.ai.edge.litert.CompiledModel.CpuOptions(numThreads = 4)
+            val model = com.google.ai.edge.litert.CompiledModel.create(path, options, env)
+            return try {
+                val ins = model.createInputBuffers()
+                val outs = model.createOutputBuffers()
+                for ((i, buf) in ins.withIndex()) {
+                    if (i in intIdx) buf.writeInt(inputs[i].map { it.toInt() }.toIntArray())
+                    else buf.writeFloat(inputs[i])
+                }
+                model.run(ins, outs)
+                outs.map { it.readFloat().toList().toFloatArray() }
+            } finally {
+                model.close()
+            }
+        }
+
+        fun report(name: String, a: List<FloatArray>, b: List<FloatArray>) {
+            for (i in a.indices) {
+                if (i >= b.size) break
+                val x = a[i]
+                val y = b[i]
+                val maxAbs = x.indices.maxOf { kotlin.math.abs(x[it] - y[it]) }
+                val scale = x.maxOf { kotlin.math.abs(it) }
+                val rel = if (scale > 0f) maxAbs / scale else 0f
+                Log.i(TAG, "API_AGREEMENT_${name}_out$i maxAbsDiff=$maxAbs valueScale=$scale " +
+                    "relative=$rel argmaxInterpreter=${x.indices.maxByOrNull { x[it] }} " +
+                    "argmaxCompiled=${y.indices.maxByOrNull { y[it] }}")
+            }
+        }
+
+        report("EMBED", interpreterOutputs(embeddingModel.absolutePath, asInt = true, extraFloats = emptyList()),
+            compiledOutputs(embeddingModel.absolutePath, listOf(idsF), setOf(0)))
+        report("LAYA",
+            interpreterOutputs(layaMain.absolutePath, asInt = false, extraFloats = listOf(mask, qtype)),
+            compiledOutputs(layaMain.absolutePath, listOf(idsF, mask, qtype), setOf(0)))
+    }
+
+    /**
+     * How much of the 569 ms is arithmetic and how much is per-call overhead?
+     *
+     * The two CPU APIs turned out to produce **bit-identical** output for both graphs (maxAbsDiff = 0.0 on
+     * all three tensors), which rules out the quantization explanation for the 3.2x gap and means the two
+     * paths run the same kernels. A 1.2-second difference between identical arithmetic has to be
+     * preparation that `CompiledModel` hoists out of the call and `Interpreter` does inside it.
+     *
+     * That distinction is what any cross-device prediction rests on: **compute scales with the SoC,
+     * overhead does not.** Thread scaling separates them - a compute-bound graph speeds up roughly with
+     * core count, an overhead-bound one barely moves. The same logic applies to the `Interpreter` path,
+     * so both are swept.
+     */
+    @Test
+    fun threadScalingSeparatesComputeFromOverhead() {
+        org.junit.Assume.assumeTrue(layaMain.isFile && embeddingModel.isFile)
+
+        val ids = IntArray(256) { 1000 + it % 100 }
+        val idsF = FloatArray(256) { ids[it].toFloat() }
+        val mask = FloatArray(256) { 1f }
+        val qtype = floatArrayOf(1f, 0f, 0f)
+        val env = com.google.ai.edge.litert.Environment.create()
+
+        fun compiledMedian(path: String, inputs: List<FloatArray>, intIdx: Set<Int>, threads: Int): Double {
+            val options = com.google.ai.edge.litert.CompiledModel.Options(
+                com.google.ai.edge.litert.Accelerator.CPU)
+            options.cpuOptions = com.google.ai.edge.litert.CompiledModel.CpuOptions(numThreads = threads)
+            val model = com.google.ai.edge.litert.CompiledModel.create(path, options, env)
+            return try {
+                val ins = model.createInputBuffers()
+                val outs = model.createOutputBuffers()
+                fun fill() {
+                    for ((i, buf) in ins.withIndex()) {
+                        if (i in intIdx) buf.writeInt(inputs[i].map { it.toInt() }.toIntArray())
+                        else buf.writeFloat(inputs[i])
+                    }
+                }
+                fill()
+                model.run(ins, outs)
+                val t = DoubleArray(5) {
+                    fill()
+                    val s = System.nanoTime()
+                    model.run(ins, outs)
+                    (System.nanoTime() - s) / 1_000_000.0
+                }.sorted()
+                t[2]
+            } finally {
+                model.close()
+            }
+        }
+
+        fun interpreterMedian(path: String, threads: Int, isEmbed: Boolean): Double {
+            val interp = Interpreter(mapModel(File(path)), Interpreter.Options().setNumThreads(threads))
+            return try {
+                val times = DoubleArray(5) {
+                    val s = System.nanoTime()
+                    if (isEmbed) {
+                        interp.run(arrayOf(ids), Array(1) { FloatArray(768) })
+                    } else {
+                        val outs = mutableMapOf<Int, Any>(0 to Array(1) { FloatArray(256) },
+                            1 to Array(1) { FloatArray(768) })
+                        interp.runForMultipleInputsOutputs(
+                            arrayOf<Any>(arrayOf(ids), Array(1) { mask }, Array(1) { qtype }), outs)
+                    }
+                    (System.nanoTime() - s) / 1_000_000.0
+                }.sorted()
+                times[2]
+            } finally {
+                interp.close()
+            }
+        }
+
+        for (threads in listOf(1, 2, 4)) {
+            val embed = compiledMedian(embeddingModel.absolutePath, listOf(idsF), setOf(0), threads)
+            val laya = compiledMedian(layaMain.absolutePath, listOf(idsF, mask, qtype), setOf(0), threads)
+            val layaInterp = interpreterMedian(layaMain.absolutePath, threads, isEmbed = false)
+            Log.i(TAG, "THREAD_SCALING threads=$threads COMPILED_EMBED_MS=$embed COMPILED_LAYA_MS=$laya " +
+                "INTERPRETER_LAYA_MS=$layaInterp")
+        }
+    }
+
     private companion object {
         const val TAG = "LiteRTPerf"
     }
