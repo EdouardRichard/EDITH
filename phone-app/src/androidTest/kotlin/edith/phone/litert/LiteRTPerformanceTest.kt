@@ -221,7 +221,7 @@ class LiteRTPerformanceTest {
         val env = com.google.ai.edge.litert.Environment.create()
         val threads = 4
 
-        class Result(val medianMs: Double, val outputs: List<FloatArray>)
+        class Result(val medianMs: Double, val outputs: List<FloatArray>, val thermal: String)
 
         fun run(
             accelerator: com.google.ai.edge.litert.Accelerator,
@@ -276,6 +276,7 @@ class LiteRTPerformanceTest {
                 // Time only post-quiescence runs.
                 repeat(rounds) { runOnce() }
                 val samples = 5
+                val thermalBefore = thermalStatus()
                 val times = DoubleArray(samples) {
                     val start = System.nanoTime()
                     runOnce()
@@ -283,8 +284,13 @@ class LiteRTPerformanceTest {
                 }
                 model.close()
                 val median = times.sorted()[samples / 2]
-                Log.i(TAG, "COMPILED_${tag}_MS median=$median samples=${times.toList()}")
-                return Result(median, outputs)
+                // Thermal state is logged because it is not a detail on this device: the same CPU
+                // measurement read 196 ms on a cool phone and 844 ms after this class had run its
+                // interpreter benchmarks back to back. Two numbers taken in different thermal states are
+                // not a comparison, which is why the CPU/GPU verdict below is reported per state.
+                Log.i(TAG, "COMPILED_${tag}_MS median=$median samples=${times.toList()} " +
+                    "thermalBefore=$thermalBefore thermalAfter=${thermalStatus()}")
+                return Result(median, outputs, thermalBefore)
             } catch (e: Throwable) {
                 Log.e(TAG, "COMPILED_${tag}_FAILED: ${e::class.java.simpleName}: ${e.message}")
                 null
@@ -323,8 +329,19 @@ class LiteRTPerformanceTest {
             Log.i(TAG, "COMPILED_${name}_CPU_VS_GPU maxAbsDiff=$maxAbs cpuScale=$scale agrees=$agrees " +
                 "cpuArgmax=${c.indices.maxByOrNull { c[it] }} gpuArgmax=${g.indices.maxByOrNull { g[it] }}")
             if (agrees) {
-                Log.i(TAG, "COMPILED_${name}_GPU_VERIFIED cpuMs=${cpu.medianMs} gpuMs=${gpu.medianMs} " +
-                    "speedup=${"%.2f".format(cpu.medianMs / gpu.medianMs)}")
+                // The thermal state of each side is part of the claim, not decoration: on a cool K40 the
+                // CPU wins this graph, and after this class has run its interpreter benchmarks the same CPU
+                // measurement triples while the GPU does not, so the ratio flips. A bare "speedup" would be
+                // true of one state and false of the other.
+                val comparable = cpu.thermal == gpu.thermal
+                Log.i(TAG, "COMPILED_${name}_GPU_VERIFIED cpuMs=${cpu.medianMs}(thermal=${cpu.thermal}) " +
+                    "gpuMs=${gpu.medianMs}(thermal=${gpu.thermal}) " +
+                    "cpuOverGpu=${"%.2f".format(cpu.medianMs / gpu.medianMs)} " +
+                    "sameThermalState=$comparable")
+                if (!comparable) {
+                    Log.w(TAG, "COMPILED_${name}_RATIO_IS_CROSS_THERMAL: the two sides were measured in " +
+                        "different thermal states, so cpuOverGpu is not a property of the accelerators.")
+                }
             } else {
                 Log.e(TAG, "COMPILED_${name}_GPU_UNVERIFIED: the GPU's output does not match the CPU's " +
                     "(maxAbsDiff=$maxAbs). Its ${gpu.medianMs} ms is NOT a measurement of inference and no " +
@@ -515,221 +532,41 @@ class LiteRTPerformanceTest {
         }
     }
 
-    /**
-     * Why does the GPU's Laya output not match the CPU's? The K40 compiles and runs both graphs on the
-     * Adreno 650, so "unmeasurable" is not an acceptable resting place - the question is answerable here.
+    /*
+     * Two GPU experiments used to live here and have been removed after they cost more than they bought.
+     * Their conclusions are kept because they are still the reasons this class treats the GPU the way it
+     * does; the evidence file carries the raw readings.
      *
-     * Two candidate causes, separated decisively by one experiment:
+     * **1. The precision setting is honoured; forcing FP16 produces NaN.** On the fp32-weight graph,
+     * `Precision.FP16` made every Laya output NaN, which is exactly the overflow the model card documents
+     * for this graph (attention masks at -1e4, LayerNorm inputs whose squares reach 1e8). That settles the
+     * question it was written to settle - the delegate is not silently downgrading FP32 - and the card
+     * independently advises explicit FP32 on the GPU. It is not re-run: it costs a GPU instantiation, and
+     * a NaN-producing compile is a poor thing to leave in a shared driver's state.
      *
-     * 1. **`Precision.FP32` is ignored and the delegate runs fp16 anyway.** The model card documents this
-     *    graph's fp16 hazards in detail (attention masks at -1e4, LayerNorm inputs whose squares reach
-     *    1e8), and its 2026-09-29 revision exists specifically to stop those overflowing fp16. Avoiding
-     *    *overflow* is not the same as fp16 *precision*: with activations in the 1e3 range and a 2^-11
-     *    mantissa, absolute error in the units digit accumulates across 24 layers, which is the size of
-     *    the mismatch actually seen (3.31).
-     * 2. **The input buffers are in a different order than `Interpreter` reports.** `createInputBuffers()`
-     *    follows the signature's order, which nothing documents for this graph.
+     * **2. The input order is the Interpreter's, and the tensor names are these.** A write-width probe put
+     * `qtype_onehot` at buffer [2] by its 12-byte footprint rejecting 256-element writes, and the
+     * Interpreter reports the names `serving_default_input_ids` (INT32),
+     * `serving_default_attention_mask` (FLOAT32), `serving_default_qtype_onehot` (FLOAT32), with outputs
+     * `serving_default_token_logits_output` and `serving_default_pooled_cls_output`. An attempt to use the
+     * name-keyed API (`createInputBuffer(signature, tensorName)` + the `Map<String, TensorBuffer>` run)
+     * failed with "Signature not found" for both signatures that were tried, so the positional API is what
+     * this class uses; the names are recorded here for whoever picks that thread up.
      *
-     * The discriminator: run the GPU twice, once declaring FP32 and once FP16, and compare both against
-     * the CPU. Identical FP32 and FP16 results mean the setting is being ignored. Different results with
-     * FP32 tracking the CPU mean the setting works and something else was wrong (the earlier GPU reading
-     * was taken while submissions were still asynchronous, which the sample lists show).
+     * **Why both are gone rather than kept behind a flag: they exhaust the GPU.**
+     * `LiteRT CompiledModel.create` on the Adreno 650 fails outright after a handful of GPU instantiations
+     * in one process -
+     *   `COMPILED_GPU_EMBED_FAILED: LiteRtException ... litert_compiled_model.cc:139`
+     * reproducibly, when this class runs end to end, while the same code succeeds in a fresh process. The
+     * failure is at *create*, not at *run*, so it is a resource the driver does not return rather than a
+     * numeric problem. Counting the instantiations that preceded it - two from the FP16 experiment, one
+     * from the named-buffer attempt, and then these - the budget is roughly three per process.
+     *
+     * That is a constraint on the product, and the spec already satisfies it: §2.5 requires the model to
+     * be loaded once and stay resident with no pause/resume. It is this class that has to respect it too,
+     * which is why [compiledModelCpuVersusGpu] creates exactly one GPU model per graph and nothing else in
+     * this class touches the GPU accelerator.
      */
-    @Test
-    fun whyDoesTheGpuDisagree() {
-        org.junit.Assume.assumeTrue(layaMain.isFile)
-
-        val ids = FloatArray(256) { (1000 + it % 100).toFloat() }
-        val mask = FloatArray(256) { 1f }
-        val qtype = floatArrayOf(1f, 0f, 0f)
-        val inputs = listOf(ids, mask, qtype)
-        val env = com.google.ai.edge.litert.Environment.create()
-
-        fun runGpu(precision: com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision): List<FloatArray> {
-            val options = com.google.ai.edge.litert.CompiledModel.Options(
-                com.google.ai.edge.litert.Accelerator.GPU)
-            options.gpuOptions = com.google.ai.edge.litert.CompiledModel.GpuOptions(precision = precision)
-            val model = com.google.ai.edge.litert.CompiledModel.create(layaMain.absolutePath, options, env)
-            return try {
-                val ins = model.createInputBuffers()
-                val outs = model.createOutputBuffers()
-                Log.i(TAG, "GPU_INPUT_COUNT=${ins.size} OUTPUT_COUNT=${outs.size}")
-                // Buffer footprint discriminates the slots: [1,256] int32 and [1,256] float32 are both
-                // 1024 B, while qtype_onehot [1,3] float32 is 12 B. Writing a wrong-width array throws, so
-                // this probe both locates qtype and proves which slots accept which width.
-                for ((i, buf) in ins.withIndex()) {
-                    val intOk = try { buf.writeInt(IntArray(256)); true } catch (e: Throwable) { false }
-                    val smallOk = try { buf.writeInt(IntArray(3)); true } catch (e: Throwable) { false }
-                    val float256Ok = try { buf.writeFloat(FloatArray(256)); true } catch (e: Throwable) { false }
-                    val float3Ok = try { buf.writeFloat(FloatArray(3)); true } catch (e: Throwable) { false }
-                    Log.i(TAG, "GPU_INPUT[$i] accepts int256=$intOk int3=$smallOk float256=$float256Ok float3=$float3Ok")
-                }
-                for ((i, buf) in ins.withIndex()) {
-                    if (i == 0) buf.writeInt(inputs[0].map { it.toInt() }.toIntArray()) else buf.writeFloat(inputs[i])
-                }
-                // Three runs: the first submissions return before the GPU has finished (see the GPU sample
-                // lists elsewhere in this class), so the last one is the one whose buffers are complete.
-                repeat(3) { model.run(ins, outs) }
-                outs.map { it.readFloat().toList().toFloatArray() }
-            } finally {
-                model.close()
-            }
-        }
-
-        fun cpuReference(): List<FloatArray> {
-            val options = com.google.ai.edge.litert.CompiledModel.Options(
-                com.google.ai.edge.litert.Accelerator.CPU)
-            options.cpuOptions = com.google.ai.edge.litert.CompiledModel.CpuOptions(numThreads = 4)
-            val model = com.google.ai.edge.litert.CompiledModel.create(layaMain.absolutePath, options, env)
-            return try {
-                val ins = model.createInputBuffers()
-                val outs = model.createOutputBuffers()
-                for ((i, buf) in ins.withIndex()) {
-                    if (i == 0) buf.writeInt(inputs[0].map { it.toInt() }.toIntArray()) else buf.writeFloat(inputs[i])
-                }
-                model.run(ins, outs)
-                outs.map { it.readFloat().toList().toFloatArray() }
-            } finally {
-                model.close()
-            }
-        }
-
-        val cpu = cpuReference()
-        val gpuFp32 = try { runGpu(com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision.FP32) }
-            catch (e: Throwable) { Log.e(TAG, "GPU_FP32_FAILED: ${e.message}"); null }
-        val gpuFp16 = try { runGpu(com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision.FP16) }
-            catch (e: Throwable) { Log.e(TAG, "GPU_FP16_FAILED: ${e.message}"); null }
-
-        fun diff(a: List<FloatArray>, b: List<FloatArray>, name: String) {
-            for (i in a.indices) {
-                if (i >= b.size) continue
-                val maxAbs = a[i].indices.maxOf { kotlin.math.abs(a[i][it] - b[i][it]) }
-                Log.i(TAG, "GPU_DIAG_$name out$i maxAbsDiff=$maxAbs " +
-                    "scale=${a[i].maxOf { kotlin.math.abs(it) }} " +
-                    "argmaxA=${a[i].indices.maxByOrNull { a[i][it] }} argmaxB=${b[i].indices.maxByOrNull { b[i][it] }}")
-            }
-        }
-
-        if (gpuFp32 != null) diff(cpu, gpuFp32, "CPU_vs_GPU_FP32")
-        if (gpuFp16 != null) diff(cpu, gpuFp16, "CPU_vs_GPU_FP16")
-        if (gpuFp32 != null && gpuFp16 != null) {
-            diff(gpuFp32, gpuFp16, "GPU_FP32_vs_GPU_FP16")
-            val same = gpuFp32.indices.all { i ->
-                gpuFp32[i].indices.all { gpuFp32[i][it] == gpuFp16[i][it] }
-            }
-            Log.i(TAG, "GPU_PRECISION_SETTING_HONOURED=${!same} " +
-                "(FP32 and FP16 outputs bit-identical means the requested precision is ignored)")
-        }
-    }
-
-    /**
-     * Resolves the GPU mismatch by removing the guesswork instead of testing permutations.
-     *
-     * The previous experiment settled two things and left one open:
-     * - **The precision setting is honoured.** Forcing `Precision.FP16` on the fp32-weight graph produces
-     *   **NaN** - exactly the overflow the model card documents for this graph - and differs from the FP32
-     *   output. So FP32 is not being silently downgraded, and precision is not the cause.
-     * - **`qtype_onehot` is buffer [2]**, confirmed by its 12-byte footprint rejecting 256-element writes.
-     * - **Buffers [0] and [1] accept any width, so their order is genuinely ambiguous.**
-     *   `createInputBuffers()` follows the signature's order, which nothing documents. If `input_ids` and
-     *   `attention_mask` are swapped relative to the `Interpreter`'s order, an int32 array written into a
-     *   float32 buffer becomes denormal garbage and a float mask written into an int32 buffer becomes
-     *   token ids around 1.06e9 - either of which would produce a mismatch of exactly the observed size.
-     *
-     * Rather than permute, this uses the name-keyed API: `createInputBuffer(signature, tensorName)` and the
-     * `Map<String, TensorBuffer>` overload of `run`. Names come from the model card's graph contract, and
-     * the test asserts the buffers were created rather than silently swallowing a wrong name.
-     */
-    @Test
-    fun gpuByTensorName() {
-        org.junit.Assume.assumeTrue(layaMain.isFile)
-
-        val sig = "serving_default"
-        val ids = IntArray(256) { 1000 + it % 100 }
-        val mask = FloatArray(256) { 1f }
-        val qtype = floatArrayOf(1f, 0f, 0f)
-        val env = com.google.ai.edge.litert.Environment.create()
-
-        // Report the names and element types the model actually declares, so a wrong guess fails loudly.
-        runCatching {
-            val interp = Interpreter(mapModel(layaMain), Interpreter.Options().setNumThreads(4))
-            try {
-                for (i in 0 until interp.inputTensorCount) {
-                    Log.i(TAG, "NAMED_INPUT[$i] name='${interp.getInputTensor(i).name()}' " +
-                        "dtype=${interp.getInputTensor(i).dataType()}")
-                }
-                for (i in 0 until interp.outputTensorCount) {
-                    Log.i(TAG, "NAMED_OUTPUT[$i] name='${interp.getOutputTensor(i).name()}'")
-                }
-            } finally { interp.close() }
-        }
-
-        fun run(named: Boolean, accelerator: com.google.ai.edge.litert.Accelerator,
-            precision: com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision?):
-            List<FloatArray>? {
-            return try {
-                val options = com.google.ai.edge.litert.CompiledModel.Options(accelerator)
-                if (accelerator == com.google.ai.edge.litert.Accelerator.CPU) {
-                    options.cpuOptions = com.google.ai.edge.litert.CompiledModel.CpuOptions(numThreads = 4)
-                } else if (precision != null) {
-                    options.gpuOptions = com.google.ai.edge.litert.CompiledModel.GpuOptions(precision = precision)
-                }
-                val model = com.google.ai.edge.litert.CompiledModel.create(layaMain.absolutePath, options, env)
-                try {
-                    if (named) {
-                        val ins = linkedMapOf(
-                            "input_ids" to model.createInputBuffer(sig, "input_ids"),
-                            "attention_mask" to model.createInputBuffer(sig, "attention_mask"),
-                            "qtype_onehot" to model.createInputBuffer(sig, "qtype_onehot"),
-                        )
-                        val outs = linkedMapOf(
-                            "token_logits" to model.createOutputBuffer(sig, "token_logits"),
-                            "pooled_cls" to model.createOutputBuffer(sig, "pooled_cls"),
-                        )
-                        ins.getValue("input_ids").writeInt(ids)
-                        ins.getValue("attention_mask").writeFloat(mask)
-                        ins.getValue("qtype_onehot").writeFloat(qtype)
-                        // Repeat: the first GPU submissions return before the work is done.
-                        repeat(3) { model.run(ins, outs, sig) }
-                        listOf(outs.getValue("token_logits").readFloat(),
-                            outs.getValue("pooled_cls").readFloat())
-                    } else {
-                        val ins = model.createInputBuffers()
-                        val outs = model.createOutputBuffers()
-                        ins[0].writeInt(ids)
-                        ins[1].writeFloat(mask)
-                        ins[2].writeFloat(qtype)
-                        repeat(3) { model.run(ins, outs) }
-                        listOf(outs[0].readFloat(), outs[1].readFloat())
-                    }
-                } finally { model.close() }
-            } catch (e: Throwable) {
-                Log.e(TAG, "NAMED_RUN_FAILED named=$named accel=$accelerator: " +
-                    "${e::class.java.simpleName}: ${e.message}")
-                null
-            }
-        }
-
-        fun compare(tag: String, a: List<FloatArray>?, b: List<FloatArray>?) {
-            if (a == null || b == null) { Log.e(TAG, "NAMED_$tag unavailable"); return }
-            for (i in a.indices) {
-                val maxAbs = a[i].indices.maxOf { kotlin.math.abs(a[i][it] - b[i][it]) }
-                Log.i(TAG, "NAMED_${tag} out$i maxAbsDiff=$maxAbs " +
-                    "scale=${a[i].maxOf { kotlin.math.abs(it) }} " +
-                    "argmaxA=${a[i].indices.maxByOrNull { a[i][it] }} " +
-                    "argmaxB=${b[i].indices.maxByOrNull { b[i][it] }}")
-            }
-        }
-
-        val cpuNamed = run(named = true, com.google.ai.edge.litert.Accelerator.CPU, null)
-        val cpuPositional = run(named = false, com.google.ai.edge.litert.Accelerator.CPU, null)
-        compare("CPU_NAMED_vs_CPU_POSITIONAL", cpuNamed, cpuPositional)
-
-        val gpuNamed = run(named = true, com.google.ai.edge.litert.Accelerator.GPU,
-            com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision.FP32)
-        compare("CPU_NAMED_vs_GPU_NAMED", cpuNamed, gpuNamed)
-    }
-
     /**
      * Runs [runOnce] until two consecutive reads of the outputs agree to within [tolerance], and reports
      * how many rounds that took.
@@ -761,6 +598,23 @@ class LiteRTPerformanceTest {
             previous = now
         }
         return null
+    }
+
+    /** The platform's own thermal bucket, which needs no permission and is what the numbers must be read with. */
+    private fun thermalStatus(): String = try {
+        val pm = context.getSystemService(android.os.PowerManager::class.java)
+        when (pm?.currentThermalStatus) {
+            android.os.PowerManager.THERMAL_STATUS_NONE -> "NONE"
+            android.os.PowerManager.THERMAL_STATUS_LIGHT -> "LIGHT"
+            android.os.PowerManager.THERMAL_STATUS_MODERATE -> "MODERATE"
+            android.os.PowerManager.THERMAL_STATUS_SEVERE -> "SEVERE"
+            android.os.PowerManager.THERMAL_STATUS_CRITICAL -> "CRITICAL"
+            android.os.PowerManager.THERMAL_STATUS_EMERGENCY -> "EMERGENCY"
+            android.os.PowerManager.THERMAL_STATUS_SHUTDOWN -> "SHUTDOWN"
+            else -> "UNKNOWN"
+        }
+    } catch (e: Throwable) {
+        "unavailable(${e::class.java.simpleName})"
     }
 
     /** True when every element of [b] is within [tolerance] of the corresponding element of [a]. */
