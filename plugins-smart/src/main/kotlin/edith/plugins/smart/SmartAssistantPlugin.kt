@@ -55,6 +55,7 @@ import edith.plugin.context
 import edith.plugin.embedding
 import edith.plugin.model
 import edith.plugin.storage
+import edith.plugin.storageAccess
 import edith.plugin.systemOne
 import edith.plugin.textOutput
 import edith.plugin.wakeWord
@@ -69,6 +70,8 @@ import edith.plugins.smart.proactive.ProactiveGate
 import edith.plugins.smart.proactive.ProactiveGateState
 import edith.plugins.smart.memory.MemoryLog
 import edith.plugins.smart.memory.SmartMemoryRetrieval
+import edith.plugins.smart.skill.SkillManager
+import edith.plugins.smart.skill.StorageAccessSkillDirectory
 import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -314,6 +317,14 @@ class SmartAssistantPlugin(
     @Volatile private var memoryExtraction: MemoryExtraction? = null
 
     /**
+     * edith-0.2 Phase B (B4): the user's SKILL library, or `null` when the host granted no directory.
+     *
+     * Built in `activate` from the session's own grant and re-read on every turn — spec §3.5 does no file watching,
+     * so "restart or refresh picks up an edit" is only true if nothing caches the list.
+     */
+    @Volatile private var skillManager: SkillManager? = null
+
+    /**
      * P3.3 (spec §17.4): the question-asker the loop blocks on.
      *
      * Built once per plugin, not per turn: the gate's invariant is "one live question at a time", and the host channel
@@ -492,6 +503,10 @@ class SmartAssistantPlugin(
         val memoryLog = MemoryLog(runCatching { context.services.storage() }.getOrNull())
         memoryRetrieval = SmartMemoryRetrieval(memoryLog)
         memoryExtraction = MemoryExtraction(memoryLog)
+        // B4: the SKILL library. A host that granted no directory leaves this null and the prompt is simply the
+        // system instructions - "no SKILLs installed" is a normal state (spec §3.7), not a degraded one.
+        skillManager = runCatching { context.services.storageAccess() }.getOrNull()
+            ?.let { SkillManager(StorageAccessSkillDirectory(it)) }
         // P3.3: the same rule for the confirmation channel. A host that cannot ask the user leaves this null, and the
         // loop then refuses every flagged action (`CONFIRMATION_UNAVAILABLE`) instead of acting unasked.
         confirmation.attach(runCatching { context.services.confirmation() }.getOrNull())
@@ -509,6 +524,7 @@ class SmartAssistantPlugin(
             // P3.4: a session that ends takes its memory boundary with it (the namespace was scoped to it).
             memoryRetrieval = null
             memoryExtraction = null
+        skillManager = null
             detach()
         }
         // P3.3: a session that ends withdraws any question it asked. Leaving one pending would let the *next* session's
@@ -874,7 +890,7 @@ class SmartAssistantPlugin(
                 AgentRequest(
                     turnId = owned.turnId,
                     utterance = text,
-                    instructions = SmartPrompts.instructions(),
+                    instructions = instructionsFor(SmartPrompts.instructions()),
                     profileId = configured.profileId,
                     deadlineNanos = owned.deadlineNanos,
                     // D49: the profile's timeout caps **one model request**; the turn's own budget is the number above,
@@ -1118,6 +1134,18 @@ class SmartAssistantPlugin(
         }
     }
 
+    /**
+     * The system prompt plus the SKILL library (B4 / D60: every enabled SKILL, whole, in name order, no cap).
+     *
+     * The library is re-read here, per turn, which is what makes spec §3.5's "no file watching; an edit takes effect
+     * on the next turn" true. A directory that cannot be read contributes nothing rather than failing the turn:
+     * "no SKILLs installed" and "the grant was refused" both leave the assistant answering from its system prompt.
+     */
+    private fun instructionsFor(base: String): String {
+        val section = runCatching { skillManager?.injection() }.getOrNull().orEmpty()
+        return if (section.isEmpty()) base else "$base\n\n$section"
+    }
+
     /** The gate's input, assembled from the same signals the request carries (spec §4.7). */    private fun gateState(trigger: ProactiveTrigger): ProactiveGateState {
         val values = currentContextValues()
         return ProactiveGateState.of(
@@ -1219,7 +1247,7 @@ class SmartAssistantPlugin(
             gateway.turn(GatewayTurn(
                 turnId = hint.turnId,
                 profileId = configured.profileId,
-                instructions = SmartPrompts.proactiveInstructions(),
+                instructions = instructionsFor(SmartPrompts.proactiveInstructions()),
                 // The gateway lifts a trailing USER turn into `input`, which is what puts the utterance and the
                 // perception last on the wire - the same shape the passive path uses.
                 history = listOf(ModelHistoryItem.Text(MessageRole.USER, message)),

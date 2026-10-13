@@ -37,6 +37,14 @@ class SkillManager(
     /** The SKILLs to inject, sorted by name so one request is reproducible (spec §3.6 step 3). */
     fun enabled(): List<Skill> = all().filter { it.enabled }
 
+    /**
+     * The prompt section every enabled SKILL contributes: each body **whole**, in name order, with no cap (C9/D60).
+     *
+     * Empty when nothing is installed, which is the normal state on a device where the user has written none — and
+     * which must not become a heading with nothing under it.
+     */
+    fun injection(): String = injectionFor(enabled())
+
     /** Everything that parsed, enabled or not — the phone UI's list shows a disabled SKILL so the user can see it. */
     fun all(): List<Skill> = load()
 

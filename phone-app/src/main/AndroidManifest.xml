@@ -2,6 +2,21 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!--
+      edith-0.2 Phase B (B4): the SKILL library lives at /sdcard/EDITH/skills (spec §3.5), which is outside the app's
+      own directories, so reading it needs shared-storage access. On API 33 the legacy READ_EXTERNAL_STORAGE does not
+      cover an arbitrary directory the user created, so "All files access" is what actually makes the library
+      readable; the legacy permission stays for API <= 32 with maxSdkVersion. Both are requested at runtime.
+      NOTE FOR THE OWNER: MANAGE_EXTERNAL_STORAGE is Play-policy-sensitive. If a store listing matters more than the
+      fixed /sdcard/EDITH path, the alternatives are a directory the user picks through SAF, or moving the library
+      into the app's own external directory.
+    -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />

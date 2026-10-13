@@ -22,6 +22,20 @@ data class Skill(
 /** Spec §3.3. Nothing reads `HIGH`/`LOW` yet — D60 removed selection, so ordering is the only place it could act. */
 enum class SkillPriority { HIGH, NORMAL, LOW }
 
+/**
+ * The injectable form of a SKILL list: every body **whole**, in `name` order (C9/D60 — no scoring, no ranking, no
+ * cap). One formatter, used by both the plugin's instruction assembly and `ContextManager`'s, so the two cannot
+ * disagree about what a SKILL looks like in a prompt.
+ */
+internal fun injectionFor(skills: List<Skill>): String =
+    skills.sortedBy { it.name }.joinToString("\n\n") { skill ->
+        buildString {
+            append("## SKILL: ").append(skill.name).append('\n')
+            append(skill.description).append('\n')
+            append(skill.body)
+        }
+    }
+
 /** The outcome of parsing one file. */
 sealed class SkillParse {
     data class Ok(val skill: Skill) : SkillParse()
