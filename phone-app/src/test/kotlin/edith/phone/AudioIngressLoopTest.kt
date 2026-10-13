@@ -31,11 +31,15 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * The polled phone-side ingress loop: one `PcmIngress.poll()` per scheduled tick, framed once and delivered to
- * **both** consumers, with every ingress outcome either reported or deliberately silent.
+ * The polled phone-side ingress loop: the scheduled tick drains what the ingress has queued, frames it, and hands the
+ * frames to **both** consumers, with every ingress outcome either reported or deliberately silent.
  *
- * The rule the tests pin is that the loop is the single reader of the ingress: polling twice per tick would deliver
- * every second chunk twice, and polling after `stop` would keep a dead epoch alive.
+ * The rule the tests pin is that the loop is the **single** reader of the ingress — a second loop, or a second poll of
+ * the same chunk, would deliver audio twice and double every transcript. The number of chunks one tick takes is a
+ * policy the first version got wrong: polling exactly once per 20 ms tick consumes half of what a ~10 ms uplink
+ * offers, which is what made the ingress overflow every two seconds on the K40 (see
+ * `aTickDrainsEveryQueuedChunkSoAFastProducerCannotBackTheIngressUp`). `PcmIngress.poll()` is a plain FIFO pop, so
+ * draining still delivers each chunk once and in order.
  *
  * The one PCM stream has two consumers and they are fed the same [PcmFrame]: the wake detector (which VAD-gates its
  * own engine) and the speech pipeline (which VAD-gates a turn). The tests below observe both through their own
@@ -96,24 +100,15 @@ class AudioIngressLoopTest {
     private fun Rig.offerWholeFrame() = offer(640)
 
     @Test
-    fun eachScheduledTickPollsExactlyOnceAndStopEndsTheLoop() {
+    fun aTickDrainsTheQueueAndAStoppedLoopEndsPolling() {
         val rig = Rig()
         rig.open()
         repeat(3) { rig.offerWholeFrame() }
-        val queued = rig.ingress.queuedBytes
-        assertEquals(1920, queued)
-
         rig.loop.start(rig.epoch)
         assertEquals("nothing is polled before a tick is due", 0, rig.asr.frames.size)
 
         rig.tick()
-        assertEquals("one tick consumes exactly one chunk", queued - 640, rig.ingress.queuedBytes)
-        assertEquals(1, rig.asr.frames.size)
-        rig.tick()
-        assertEquals(queued - 1280, rig.ingress.queuedBytes)
-        assertEquals(2, rig.asr.frames.size)
-        rig.tick()
-        assertEquals(0, rig.ingress.queuedBytes)
+        assertEquals("a tick drains what is queued rather than one chunk of it", 0, rig.ingress.queuedBytes)
         assertEquals(3, rig.asr.frames.size)
         rig.tick()
         assertEquals("an empty ingress must not fabricate a frame", 3, rig.asr.frames.size)
@@ -122,6 +117,51 @@ class AudioIngressLoopTest {
         rig.offerWholeFrame()
         rig.tick()
         assertEquals("a stopped loop must not poll", 3, rig.asr.frames.size)
+    }
+
+    @Test
+    fun aTickDrainsEveryQueuedChunkSoAFastProducerCannotBackTheIngressUp() {
+        // The device's uplink offers ~10 ms chunks while the loop ticks every 20 ms, so a tick that polls exactly once
+        // consumes half of what arrives. The queue then fills, and `PcmIngress` answers a full queue with a
+        // **whole-queue** OVERFLOW reset — one to two seconds of audio discarded at a time. That is what the K40 run
+        // of 2026-10-14 measured: `GAP:OVERFLOW` every ~2 s for nine minutes, most ASR finals reading `chars=0`, and
+        // no `P3_WAKE` in ten attempts, against `overflow=0 gaps=0` in the 2026-10-09 run that fired the wake word.
+        //
+        // Draining what is queued is what keeps the consumer level with the producer. `PcmIngress.poll()` is a plain
+        // FIFO pop, so every chunk is still delivered exactly once and in order — the older rule ("exactly one poll
+        // per tick") was a policy that encoded the defect, not a property of the ingress.
+        val rig = Rig()
+        rig.open()
+        repeat(5) { rig.offerWholeFrame() }
+        rig.loop.start(rig.epoch)
+
+        rig.tick()
+
+        assertEquals("a tick must leave nothing queued when it can drain it", 0, rig.ingress.queuedBytes)
+        assertEquals(listOf(0L, 320L, 640L, 960L, 1280L), rig.asr.frames.map { it.range.first })
+        assertEquals("the wake path sees the same frames", 5, rig.wakeEngine.frames.size)
+    }
+
+    @Test
+    fun aTickDrainsAtMostItsBoundSoOneTickCannotStallTheLoop() {
+        // Catching up must not become an unbounded amount of work on the scheduler's thread: a tick takes at most
+        // [AudioIngressLoop.MAX_CHUNKS_PER_TICK] chunks and leaves the rest for the next one.
+        val rig = Rig()
+        rig.open()
+        repeat(AudioIngressLoop.MAX_CHUNKS_PER_TICK + 10) { rig.offerWholeFrame() }
+        rig.loop.start(rig.epoch)
+
+        rig.tick()
+        assertEquals(AudioIngressLoop.MAX_CHUNKS_PER_TICK, rig.asr.frames.size)
+        assertTrue("the rest stays queued for the next tick", rig.ingress.queuedBytes > 0)
+
+        rig.tick()
+        assertEquals(
+            "two ticks must clear the backlog",
+            AudioIngressLoop.MAX_CHUNKS_PER_TICK + 10,
+            rig.asr.frames.size,
+        )
+        assertEquals(0, rig.ingress.queuedBytes)
     }
 
     @Test
@@ -211,17 +251,27 @@ class AudioIngressLoopTest {
         rig.loop.start(rig.epoch)
         rig.loop.start(rig.epoch) // must not create a second loop
         rig.offerWholeFrame()
-        rig.offerWholeFrame()
+        // One chunk, two ticks: a second loop polling the same ingress would deliver it twice.
+        rig.tick()
         rig.tick()
         assertEquals("a second start must not double-poll", 1, rig.asr.frames.size)
-        assertEquals(640, rig.ingress.queuedBytes)
+        assertEquals("the chunk was consumed exactly once", 0, rig.ingress.queuedBytes)
+
+        rig.offerWholeFrame()
+        rig.offerWholeFrame()
+        rig.tick()
+        assertEquals(
+            "both queued chunks reach the consumers, in order",
+            listOf(0L, 320L, 640L),
+            rig.asr.frames.map { it.range.first },
+        )
 
         rig.loop.stop(rig.epoch)
         rig.loop.stop(rig.epoch) // idempotent
         rig.loop.start(rig.epoch) // restart without reopening the ingress
         rig.offerWholeFrame()
         rig.tick()
-        assertEquals(2, rig.asr.frames.size)
+        assertEquals(4, rig.asr.frames.size)
         assertEquals("a restart must reset the framer so offsets do not continue", 0L, rig.asr.frames.last().range.first)
     }
 

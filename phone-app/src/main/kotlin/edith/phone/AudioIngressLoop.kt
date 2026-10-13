@@ -27,8 +27,12 @@ private const val FRAME_SUMMARY_NANOS = 5_000_000_000L
  *
  * Rules it exists to keep:
  *
- * - **One reader.** [PcmIngress.poll] is called at most once per tick, so a chunk is delivered once. Polling twice
- *   would deliver every second chunk twice and double every transcript.
+ * - **One reader, and it drains.** [PcmIngress.poll] is called repeatedly by the tick, up to
+ *   [MAX_CHUNKS_PER_TICK], so every queued chunk is delivered exactly once and in order. It used to be called
+ *   **once** per tick, which was wrong once the uplink began offering ~10 ms chunks against a 20 ms tick: the
+ *   consumer took half of what arrived, the ingress's two-second buffer filled, and each overflow discarded the whole
+ *   queue (the 2026-10-14 K40 run measured one such gap every ~2 s and no wake word in ten attempts). Draining is
+ *   safe because `poll()` is a plain FIFO pop — the old "at most once" rule was a policy, not a property.
  * - **One PCM stream, two consumers.** The same [PcmFrame] goes to `wake.accept` and `pipeline.accept`; neither
  *   consumer re-reads the ingress, so the VADs inside them cannot drift apart.
  * - **Silence is reported, never hidden.** [onOffer] turns the receiver's ingress outcome into a fault code and
@@ -203,11 +207,11 @@ class AudioIngressLoop(
 
     private fun tick(epoch: InputEpoch) {
         val faults = mutableListOf<String>()
-        val frames: List<PcmFrame>
+        val frames = ArrayList<PcmFrame>()
         var summary: String? = null
         synchronized(lock) {
             if (running != epoch) return
-            // Gaps first: a discontinuity restarts framing, so the chunk polled below is framed from offset 0
+            // Gaps first: a discontinuity restarts framing, so the chunks drained below are framed from offset 0
             // rather than appended to bytes that belonged to the previous continuity.
             var gap = ingress.pollGap()
             while (gap != null) {
@@ -216,8 +220,19 @@ class AudioIngressLoop(
                 gapCount++
                 gap = ingress.pollGap()
             }
-            val chunk = ingress.poll()
-            frames = if (chunk == null) emptyList() else framer.accept(chunk)
+            // **Drain what is queued**, not one chunk per tick. The uplink offers ~10 ms chunks while this loop ticks
+            // every 20 ms, so a single poll per tick consumes half of what arrives; the queue then fills and
+            // `PcmIngress` answers a full queue with a **whole-queue** OVERFLOW reset, i.e. one to two seconds of
+            // audio discarded at a time. The 2026-10-14 K40 run measured exactly that (`GAP:OVERFLOW` every ~2 s, most
+            // ASR finals `chars=0`, no `P3_WAKE` in ten attempts) against `overflow=0` in the 2026-10-09 run where
+            // the wake word fired. `PcmIngress.poll()` is a plain FIFO pop, so draining still delivers every chunk
+            // once and in order; the bound keeps one tick from becoming unbounded work on the scheduler's thread.
+            var drained = 0
+            while (drained < MAX_CHUNKS_PER_TICK) {
+                val chunk = ingress.poll() ?: break
+                drained++
+                frames += framer.accept(chunk)
+            }
             frameCount += frames.size
             byteCount += frames.sumOf { it.samples.size.toLong() * 2 }
             summary = summaryIfDue()
@@ -232,6 +247,16 @@ class AudioIngressLoop(
         }
         // Outside the lock: the summary is an observer of the tick, never part of it.
         summary?.let { P3Log.line(it) }
+    }
+
+    companion object {
+        /**
+         * The most chunks one tick may drain.
+         *
+         * 64 chunks of a 10 ms uplink is 640 ms of audio: enough to clear the ingress's two-second buffer in a few
+         * ticks, and small enough that a catch-up tick never becomes unbounded work on the scheduler's thread.
+         */
+        const val MAX_CHUNKS_PER_TICK = 64
     }
 
     /**
