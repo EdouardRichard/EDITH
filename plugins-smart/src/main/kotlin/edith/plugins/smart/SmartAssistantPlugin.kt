@@ -358,6 +358,13 @@ class SmartAssistantPlugin(
      */
     private var proactiveInFlight = false
 
+    /**
+     * The one proactive trigger a wake turn made wait (spec §4.6: "WAKE 激活时 PROACTIVE 暂停执行（不丢弃，等待恢复）").
+     *
+     * Held under [gate] and cleared by [resetPerception], so it cannot outlive the session that produced it.
+     */
+    private var parkedProactive: ProactiveTrigger? = null
+
     // ---------------------------------------------------------------- configuration
 
     override fun validate(configuration: PluginConfiguration) {
@@ -495,6 +502,9 @@ class SmartAssistantPlugin(
         proactiveHint?.cancelled = true
         proactiveHint = null
         proactiveInFlight = false
+        // A parked trigger describes a session that is ending; running it later would act on a stale world under a
+        // session that never observed it.
+        parkedProactive = null
     }
 
     private fun configuredWakeWords(): List<String> =
@@ -894,6 +904,7 @@ class SmartAssistantPlugin(
         // lose exactly the content compression exists to preserve.
         recordTurnAndCompress(text, run)
         submitOutcome(owned, run, ledger)
+        releaseParkedProactive()
     }
 
     /**
@@ -1008,7 +1019,16 @@ class SmartAssistantPlugin(
         val busy = turn?.let { it.phase != SmartTurnPhase.Idle } == true || proactiveInFlight
         val skip = proactive.admit(trigger, armed = armedNow(), busy = busy)
         if (skip != null) {
-            P3Log.line("P3_PROACTIVE skip reason=$skip")
+            // B10 / spec §4.6: WAKE outranks PROACTIVE, and a trigger refused *only* because a wake turn is in flight
+            // is **paused rather than discarded**. Every other reason is a decision about this trigger and stands.
+            // The slot holds one trigger: an unbounded queue would let a long wake turn accumulate observations that
+            // are stale by the time it runs, and the newest one is the one that describes the world now.
+            if (skip == ProactiveSkip.BUSY) {
+                parkedProactive = trigger
+                P3Log.line("P3_PROACTIVE park reason=BUSY")
+            } else {
+                P3Log.line("P3_PROACTIVE skip reason=$skip")
+            }
             return null
         }
         // P3.5 §W3: an admitted trigger says **which features** let it through, so a device log can answer "why did this
@@ -1306,6 +1326,22 @@ class SmartAssistantPlugin(
             assembler.append(FAILURE_HINTS[run.outcome] ?: FAILURE_HINTS.getValue(AgentOutcome.FAILED))
             assembler.finish(ModelEnd.FAILED)
         }
+    }
+
+    /**
+     * The turn a wake opened has finished, so the proactive work it made wait may run (spec §4.6).
+     *
+     * Takes the slot under [gate] before running, so two turns finishing at once cannot both run the same trigger,
+     * and runs it outside the lock because `runProactive` starts a task of its own.
+     */
+    private fun releaseParkedProactive() {
+        val parked = synchronized(gate) {
+            val held = parkedProactive
+            parkedProactive = null
+            held
+        } ?: return
+        P3Log.line("P3_PROACTIVE resume reason=WAKE_DONE")
+        runProactive(parked)
     }
 
     /**

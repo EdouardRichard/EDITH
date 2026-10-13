@@ -250,7 +250,10 @@ class SmartProactiveTurnTest {
                 awaitRequests(rig, 1)
                 assertEquals(1, rig.model.requests.size,
                     "a proactive turn must not run beside the in-flight wake turn")
-                assertTrue(lines.any { it == "P3_PROACTIVE skip reason=BUSY" }, lines.toString())
+                // edith-0.2 Phase B (B10, spec §4.6): a trigger refused because a wake turn is in flight is now
+                // **parked** rather than skipped - it runs once that turn is done. "Gives way" still holds; only the
+                // vocabulary changed, and the assertion above is what pins that nothing ran beside the wake turn.
+                assertTrue(lines.any { it == "P3_PROACTIVE park reason=BUSY" }, lines.toString())
             }
         } finally {
             release.countDown()
@@ -494,7 +497,10 @@ class SmartProactiveTurnTest {
 
                 awaitRequests(rig, 1)
                 assertEquals(1, rig.model.requests.size, "only one proactive request may be in flight at a time")
-                assertTrue(lines.any { it == "P3_PROACTIVE skip reason=BUSY" }, lines.toString())
+                // edith-0.2 Phase B (B10, spec §4.6): a trigger refused because a wake turn is in flight is now
+                // **parked** rather than skipped - it runs once that turn is done. "Gives way" still holds; only the
+                // vocabulary changed, and the assertion above is what pins that nothing ran beside the wake turn.
+                assertTrue(lines.any { it == "P3_PROACTIVE park reason=BUSY" }, lines.toString())
             }
         } finally {
             release.countDown()
