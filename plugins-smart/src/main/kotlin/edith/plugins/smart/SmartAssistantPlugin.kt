@@ -1013,7 +1013,7 @@ class SmartAssistantPlugin(
         // B6 / spec §4.9: the transcript and the compression come **after** the memory write, in that order, so a
         // message that compression is about to discard is already in the store. Doing it the other way round would
         // lose exactly the content compression exists to preserve.
-        recordTurnAndCompress(text, run)
+        recordTurnAndCompress(ContextRoute.WAKE, text, run)
         submitOutcome(owned, run, ledger)
         releaseParkedProactive()
     }
@@ -1033,16 +1033,21 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * Edits the session transcript for the turn that just ended, then compresses it if it has outgrown its budget.
+     * Edits a route's session transcript for the turn that just ended, then compresses it if it has outgrown its
+     * budget.
      *
-     * Must be called **after** [rememberFromTurn] (spec §4.9 steps ③→⑤). Both halves are skipped when the wiring did
-     * not supply a [ContextManager], which is the pre-Phase-B shape.
+     * Must be called **after** the turn's memory write (spec §4.9 steps ③→⑤). Both halves are skipped when the wiring
+     * did not supply a [ContextManager], which is the pre-Phase-B shape.
+     *
+     * The route is a parameter because both routes own a turn to record and each has its own transcript: the wake
+     * route records the utterance it answered, the proactive route the observation it reacted to. Passing `WAKE` here
+     * from the proactive path was the other way "two independent conversations" was half-true.
      */
-    private fun recordTurnAndCompress(userText: String, run: AgentRun) {
+    private fun recordTurnAndCompress(route: ContextRoute, userText: String, run: AgentRun) {
         val contexts = activeContextForTurn ?: return
-        val context = contexts.context(ContextRoute.WAKE)
+        val context = contexts.context(route)
         context.appendUser(userText)
-        run.finalText?.takeIf { it.isNotBlank() }?.let { contexts.appendAssistantMessage(ContextRoute.WAKE, it) }
+        run.finalText?.takeIf { it.isNotBlank() }?.let { contexts.appendAssistantMessage(route, it) }
         activeCompressor?.compressIfNeeded(context, contexts.historyBudgetTokens())
     }
 
@@ -1309,14 +1314,29 @@ class SmartAssistantPlugin(
             // the same person, and it passes the same upload gate.
             memoryRetrieval = memoryRetrieval,
         )
+        // B1/B3/B6 / spec §4.2: the proactive route consumes the **session's own** assembly exactly as the wake route
+        // does — its instructions (with the SKILL section) and its own transcript come from `buildPrompt` under
+        // `ContextRoute.PROACTIVE`. Before this, the route hand-built `SmartPrompts.proactiveInstructions()` plus one
+        // history item, so the manager's PROACTIVE context was constructed and never read: "two independent
+        // conversations" held for the wake route only. `null` is the pre-Phase-B shape a test without a manager gets.
+        val prompt = activeContextForTurn?.let { contexts ->
+            runCatching { contexts.buildPrompt(ContextRoute.PROACTIVE, trigger.transcript, skillsForTurn()) }
+                .getOrNull()
+        }
         val reply = try {
             gateway.turn(GatewayTurn(
                 turnId = hint.turnId,
                 profileId = configured.profileId,
-                instructions = instructionsFor(SmartPrompts.proactiveInstructions()),
+                instructions = prompt?.instructions ?: instructionsFor(SmartPrompts.proactiveInstructions()),
                 // The gateway lifts a trailing USER turn into `input`, which is what puts the utterance and the
-                // perception last on the wire - the same shape the passive path uses.
-                history = listOf(ModelHistoryItem.Text(MessageRole.USER, message)),
+                // perception last on the wire - the same shape the passive path uses. The assembly's history ends on
+                // this turn's trigger, so that last item is dropped and the full message below becomes the input:
+                // passing it whole would put the observation to the model twice.
+                history = (prompt?.history?.dropLast(1).orEmpty() +
+                    ModelHistoryItem.Text(MessageRole.USER, message)),
+                // A non-null context is how the caller says "the memory is already assembled" (B5): the gateway then
+                // does not retrieve, which is what keeps the query from being embedded twice per turn.
+                context = prompt?.context,
                 tools = listOf(SmartPrompts.PROPOSE_HINT),
                 deadlineNanos = SmartTurn.saturatingAdd(started, SmartPrompts.PROACTIVE_DEADLINE_MILLIS * 1_000_000L),
             ))
@@ -1351,11 +1371,38 @@ class SmartAssistantPlugin(
                         filter.noteRequest(clock.nowNanos())
                         filter.noteDedup(trigger)
                         P3Log.line("P3_PROACTIVE hint chars=${text.length} ms=$elapsed")
+                        // B3/B6 / spec §4.9: the proactive route records its own turn into its own transcript and
+                        // compresses it against the same budget, **before** the hint is submitted. The order is the
+                        // submission's, not the compressor's: the compressor's truncation is what writes the dropped
+                        // messages to memory, and the trigger belongs to the conversation whether or not the display
+                        // accepted it.
+                        recordProactiveTurn(trigger.transcript, text)
                         submitProactiveHint(hint, text)
                     }
                 }
             }
         }
+    }
+
+    /**
+     * Records one spoken proactive turn into the PROACTIVE transcript, then compresses it (spec §4.9 steps ④→⑤).
+     *
+     * The **trigger** is what the route records as its user side, not the synthesized perception message: the message
+     * is this turn's model input (perception is not something the wearer said), while the transcript is the
+     * conversation, and a later proactive turn asking "what did we already talk about" must not be told that the
+     * assistant heard a block of key-values.
+     *
+     * `finalText` is the hint itself, so the ordinary [recordTurnAndCompress] shape applies unchanged. Only a hint is
+     * recorded: a turn that ended in silence said nothing, and a proactive turn has no memory-extraction candidate
+     * (spec §5.5's habits are what the *wearer* keeps doing, which a proactive hint is not).
+     */
+    private fun recordProactiveTurn(triggerTranscript: String, hintText: String) {
+        if (triggerTranscript.isBlank()) return
+        recordTurnAndCompress(
+            ContextRoute.PROACTIVE,
+            triggerTranscript,
+            AgentRun(AgentOutcome.COMPLETED, null, hintText, emptyList()),
+        )
     }
 
     /** The context message one proactive request carries, and how many perception entries it attached. */
