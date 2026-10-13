@@ -13,9 +13,12 @@ import edith.plugin.ActionResult
 import edith.plugin.CancellationHandle
 import edith.plugin.Capability
 import edith.plugin.DeadlineScheduler
+import edith.plugin.EmbedResult
+import edith.plugin.EmbeddingService
 import edith.plugin.HostServices
 import edith.plugin.InputModality
 import edith.plugin.ModelClient
+import edith.plugin.ModelInfo
 import edith.plugin.ModelProfile
 import edith.plugin.ModelRequest
 import edith.plugin.ModelStreamEvent
@@ -26,6 +29,11 @@ import edith.plugin.OutputSubmission
 import edith.plugin.RiskLevel
 import edith.plugin.SecretHandle
 import edith.plugin.StorageHandle
+import edith.plugin.SystemOneAnswer
+import edith.plugin.SystemOneQuestion
+import edith.plugin.SystemOneResult
+import edith.plugin.SystemOneService
+import edith.plugin.SystemOneStatus
 import edith.plugin.TaskScope
 import edith.plugin.WakeWordRegistry
 import java.util.concurrent.atomic.AtomicBoolean
@@ -304,8 +312,7 @@ internal class SmartTestRig(
         )
     }
 
-    fun envelope(generation: Generation = this.generation, sessionId: SessionId = this.sessionId) =
-        EventEnvelope(sessionId, generation, "e-${clock.nowNanos()}", clock.nowNanos(), clock.nowNanos())
+    fun envelope(generation: Generation = this.generation, sessionId: SessionId = this.sessionId) =        EventEnvelope(sessionId, generation, "e-${clock.nowNanos()}", clock.nowNanos(), clock.nowNanos())
 
     fun wakeEvent(generation: Generation = this.generation, word: String = "伊迪丝") =
         WakeDetected(envelope(generation), word, 0.9)
@@ -325,6 +332,11 @@ internal class SmartTestRig(
             put(Capability.TextOutput, output)
             put(Capability.WakeWord, wake)
             put(Capability.Actions, actions)
+            // edith-0.2 Phase B (B9): the plugin declares both local models as hard dependencies, so a
+            // composition-shaped rig has to answer them or the host refuses to activate it. A test that wants the
+            // refusal overrides these with `SmartFakeSystemOne(available = false)` / `SmartFakeEmbedding(false)`.
+            put(Capability.SystemOne, SmartFakeSystemOne())
+            put(Capability.Embedding, SmartFakeEmbedding())
             putAll(overrides)
         },
         tasks ?: InlineTasks,
@@ -413,4 +425,28 @@ internal class SmartGate {
         val deadline = System.nanoTime() + millis * 1_000_000
         while (!open.get() && System.nanoTime() < deadline) Thread.sleep(5)
     }
+}
+
+/**
+ * edith-0.2 Phase B (B9): the two local models the plugin now declares as hard dependencies.
+ *
+ * They live in the shared harness rather than in `HardDependencyTest` because the rig's default host answers both —
+ * a composition-shaped host that could not would refuse to activate the plugin at all, which is the contract B9
+ * adds. A test that wants the refusal passes `SmartFakeSystemOne(available = false)` or `SmartFakeEmbedding(false)`.
+ */
+internal class SmartFakeSystemOne(private val available: Boolean = true) : SystemOneService {
+    override fun ask(state: String, question: SystemOneQuestion): SystemOneResult =
+        SystemOneResult.Success(SystemOneAnswer.Noul(probability = 0.5, confidence = 0.5), latencyMs = 1.0)
+
+    override val isAvailable: Boolean get() = available
+    override val status: SystemOneStatus
+        get() = if (available) SystemOneStatus.READY else SystemOneStatus.UNAVAILABLE
+    override val modelInfo: ModelInfo? get() = null
+}
+
+internal class SmartFakeEmbedding(private val available: Boolean = true) : EmbeddingService {
+    override fun embed(text: String): EmbedResult = EmbedResult.Success(FloatArray(dimensions))
+    override val isAvailable: Boolean get() = available
+    override val modelInfo: ModelInfo? get() = null
+    override val dimensions: Int get() = 256
 }

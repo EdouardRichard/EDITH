@@ -52,8 +52,10 @@ import edith.plugin.RiskLevel
 import edith.plugin.actions
 import edith.plugin.confirmation
 import edith.plugin.context
+import edith.plugin.embedding
 import edith.plugin.model
 import edith.plugin.storage
+import edith.plugin.systemOne
 import edith.plugin.textOutput
 import edith.plugin.wakeWord
 import edith.plugins.smart.memory.MemoryExtraction
@@ -120,6 +122,15 @@ private val FAILURE_HINTS = mapOf(
 )
 
 private const val BLANK_UTTERANCE_HINT = "没有听清内容，请再说一次。"
+
+/**
+ * The one sentence the assistant says when a hard dependency is missing (spec §1.3 C2).
+ *
+ * It is deliberately about the assistant rather than about the model: the wearer asked for something and cannot get
+ * it, and "本地模型还没准备好" is true, actionable (wait or reinstall) and reveals nothing about which component
+ * failed — that belongs in the log line, as a code.
+ */
+private const val DEPENDENCY_HINT = "本地模型还没准备好，暂时不能用。"
 
 /**
  * The smart assistant plugin: the passive loop from wake to a hint on the glasses.
@@ -190,6 +201,12 @@ class SmartAssistantPlugin(
             // `Capability.Storage` - that one is the app-private key/value namespace. Without it the plugin has no
             // file system at all and the SKILL library is empty forever (spec §3.5).
             Capability.StorageAccess,
+            // edith-0.2 Phase B (B9, spec §1.3 C2): the two local models are **hard dependencies**. Declaring them is
+            // what makes the host hand them over, and the check that refuses service is what makes their absence a
+            // refusal rather than a silent degradation. D60 recorded the accepted consequence: with Laya as the
+            // intervention gate, "Laya unavailable" also stops the wake-word path.
+            Capability.SystemOne,
+            Capability.Embedding,
         ),
         ConfigSchema(CONFIG_SCHEMA_VERSION),
     )
@@ -766,6 +783,16 @@ class SmartAssistantPlugin(
             val cfg = config ?: return
             c to cfg
         }
+        // B9 (spec §1.3 C2): a hard dependency that is missing refuses the turn *here*, before the loop is built and
+        // before the listening window has anything to wait for. A refusal is a per-turn judgement, not a latch: the
+        // models are resident and their state can change between turns, so a slow load that finishes later serves
+        // the next turn instead of leaving the plugin dead.
+        serviceRefusal()?.let { reason ->
+            P3Log.line("P3_DEPENDENCY reason=$reason")
+            P3Log.line("P3_TURN end turn=${owned.turnId} outcome=${AgentOutcome.FAILED} code=$reason steps=0")
+            finishWithFailure(owned, DEPENDENCY_HINT)
+            return
+        }
         // The turn id is final by now (the final transcript's ASR id has replaced the wake's placeholder), so the
         // start/end pair and the transcript line all name the same turn.
         P3Log.line("P3_TURN start turn=${owned.turnId}")
@@ -974,6 +1001,14 @@ class SmartAssistantPlugin(
             val c = context ?: return
             val cfg = config ?: return
             Triple(c, cfg, proactive)
+        }
+        // B9 applied at the other entry point. The proactive path is the one the decision model *is* the gate for, so
+        // a proactive turn reaching the cloud model with no local model behind it would be the exact cost the
+        // dependency exists to avoid. Same judgement, same code, same sentence as `runTurn`.
+        serviceRefusal()?.let { reason ->
+            P3Log.line("P3_DEPENDENCY reason=$reason")
+            P3Log.line("P3_PROACTIVE silence reason=$reason ms=0")
+            return
         }
         val started = clock.nowNanos()
         val (message, contextEntries) = proactiveMessage(trigger)
@@ -1377,10 +1412,30 @@ class SmartAssistantPlugin(
 
     private fun currentContext(): PluginContext? = synchronized(gate) { context }
 
+    /**
+     * Whether a hard dependency is missing, as a stable reason code, or `null` when both models are ready.
+     *
+     * A missing *grant* and an unavailable *model* are the same answer on purpose: a host that never provided the
+     * capability and one whose model failed to load both leave the assistant unable to serve, and the caller only
+     * needs to know which one to name.
+     */
+    private fun serviceRefusal(): String? {
+        val services = synchronized(gate) { context?.services } ?: return null
+        val systemOne = runCatching { services.systemOne() }.getOrNull()
+        if (systemOne == null || !systemOne.isAvailable) return REASON_SYSTEM_ONE
+        val embedding = runCatching { services.embedding() }.getOrNull()
+        if (embedding == null || !embedding.isAvailable) return REASON_EMBEDDING
+        return null
+    }
+
     private companion object {
         val SystemMonotonicClock = object : MonotonicClock {
             override fun nowNanos(): Long = System.nanoTime()
         }
+
+        /** B9 reason codes. Safe to log: they name a component, never the user or a message. */
+        const val REASON_SYSTEM_ONE = "SYSTEM_ONE_UNAVAILABLE"
+        const val REASON_EMBEDDING = "EMBEDDING_UNAVAILABLE"
 
         /**
          * The scheduler a bare construction gets when the host wiring is absent.

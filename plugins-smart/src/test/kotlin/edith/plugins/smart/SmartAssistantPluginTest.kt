@@ -57,7 +57,8 @@ class SmartAssistantPluginTest {
         assertEquals(ConfigSchema(1), plugin.descriptor.configSchema)
         assertEquals(
             setOf(Capability.WakeWord, Capability.Asr, Capability.Model, Capability.Actions, Capability.TextOutput,
-                Capability.Context, Capability.Storage, Capability.Confirmation, Capability.StorageAccess),
+                Capability.Context, Capability.Storage, Capability.Confirmation, Capability.StorageAccess,
+                Capability.SystemOne, Capability.Embedding),
             plugin.descriptor.capabilities,
         )
         // P3.2 Task 8: `Context` is no longer absent. It is what the proactive path runs on - the host delivers

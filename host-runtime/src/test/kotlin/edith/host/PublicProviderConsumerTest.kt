@@ -214,6 +214,22 @@ class PublicProviderConsumerTest {
                 override fun readFile(path: String): String? = null
                 override fun deleteFile(path: String): Boolean = false
             },
+            // edith-0.2 Phase B (B9, spec §1.3 C2): the smart plugin now declares both local models as hard
+            // dependencies. This rig's rule is that "declared" and "answerable" are the same statement, and the
+            // App's composition provides both - so both are answered here, in the ready state.
+            Capability.SystemOne to object : SystemOneService {
+                override fun ask(state: String, question: SystemOneQuestion): SystemOneResult =
+                    SystemOneResult.Success(SystemOneAnswer.Noul(probability = 0.5, confidence = 0.5), latencyMs = 1.0)
+                override val isAvailable = true
+                override val status = SystemOneStatus.READY
+                override val modelInfo: ModelInfo? = null
+            },
+            Capability.Embedding to object : EmbeddingService {
+                override fun embed(text: String): EmbedResult = EmbedResult.Success(FloatArray(256))
+                override val isAvailable = true
+                override val modelInfo: ModelInfo? = null
+                override val dimensions = 256
+            },
         )
         val host = HostRuntime(1, object : ScheduledHostEnvironment {
             override val clock = this@Providers.clock

@@ -59,6 +59,14 @@ import edith.plugin.SecretHandle
 import edith.plugin.SpeakerWindow
 import edith.plugin.StorageAccess
 import edith.plugin.StorageHandle
+import edith.plugin.SystemOneAnswer
+import edith.plugin.SystemOneQuestion
+import edith.plugin.SystemOneResult
+import edith.plugin.SystemOneService
+import edith.plugin.SystemOneStatus
+import edith.plugin.EmbedResult
+import edith.plugin.EmbeddingService
+import edith.plugin.ModelInfo
 import edith.plugins.diagnostic.DiagnosticHintPlugin
 import edith.plugins.smart.SmartAssistantPlugin
 import edith.rokid.CxrAuthorizationOutcome
@@ -174,6 +182,26 @@ class PassiveLoopWiringTest {
         override fun listFiles(dirPath: String, suffix: String): List<String> = emptyList()
         override fun readFile(path: String): String? = null
         override fun deleteFile(path: String): Boolean = false
+    }
+
+    /**
+     * edith-0.2 Phase B (B9, spec §1.3 C2): the plugin declares both local models as hard dependencies, so the rig
+     * answers them **ready**. An unavailable model is refused service, which is exactly what `HardDependencyTest`
+     * covers in `plugins-smart`; here the point is that a normal composition runs a normal turn.
+     */
+    private class ReadySystemOne : SystemOneService {
+        override fun ask(state: String, question: SystemOneQuestion): SystemOneResult =
+            SystemOneResult.Success(SystemOneAnswer.Noul(probability = 0.5, confidence = 0.5), latencyMs = 1.0)
+        override val isAvailable = true
+        override val status = SystemOneStatus.READY
+        override val modelInfo: ModelInfo? = null
+    }
+
+    private class ReadyEmbedding : EmbeddingService {
+        override fun embed(text: String): EmbedResult = EmbedResult.Success(FloatArray(256))
+        override val isAvailable = true
+        override val modelInfo: ModelInfo? = null
+        override val dimensions = 256
     }
 
     private class StubStorage : StorageHandle {
@@ -345,6 +373,8 @@ class PassiveLoopWiringTest {
                     // rig that activates it must answer that capability the way the composition does.
                     Capability.Context to EmptyContextSignals(),
                     Capability.StorageAccess to NoStorageAccess(),
+                    Capability.SystemOne to ReadySystemOne(),
+                    Capability.Embedding to ReadyEmbedding(),
                 ),
                 storageFor = { StubStorage() })
             host = HostRuntime(1, environment)
@@ -711,6 +741,8 @@ class PassiveLoopWiringTest {
                 Capability.WakeWord to wiring.wakeWords,
                 Capability.Context to EmptyContextSignals(),
                 Capability.StorageAccess to NoStorageAccess(),
+                Capability.SystemOne to ReadySystemOne(),
+                Capability.Embedding to ReadyEmbedding(),
             ),
             storageFor = { StubStorage() })
         val root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
@@ -775,7 +807,7 @@ class PassiveLoopWiringTest {
 
             assertEquals(setOf(Capability.Model, Capability.Storage, Capability.TextOutput, Capability.Asr,
                 Capability.Actions, Capability.WakeWord, Capability.Context, Capability.Confirmation,
-                Capability.StorageAccess), advertised)
+                Capability.StorageAccess, Capability.SystemOne, Capability.Embedding), advertised)
             val services = rig.environment.services(ResourceScope("smart-assistant", session, Generation(1)), advertised)
             advertised.forEach { capability ->
                 assertNull("$capability is advertised, so it must be answerable",
@@ -892,6 +924,8 @@ class PassiveLoopWiringTest {
                 Capability.WakeWord to wiring.wakeWords,
                 Capability.Context to EmptyContextSignals(),
                 Capability.StorageAccess to NoStorageAccess(),
+                Capability.SystemOne to ReadySystemOne(),
+                Capability.Embedding to ReadyEmbedding(),
             ),
             storageFor = { StubStorage() })
         val root = HostCompositionRoot(HostRuntime(1, environment), repository, InertModel(),
