@@ -15,3 +15,15 @@
 # with/without measurement; restore before any device build.
 -keep class com.rokid.cxr.** { *; }
 -keep class com.rokid.sprite.aiapp.externalapp.** { *; }
+
+# edith-0.2 Phase A: the LiteRT inference surface (Laya and EmbeddingGemma run in this process).
+#
+# The AAR ships consumer rules, but they keep only members annotated @UsedByReflection, and the
+# `Interpreter` API is not annotated. R8 therefore strips every Interpreter member the app's own code
+# does not happen to call - which broke the on-device performance measurement with
+#   NoSuchMethodError: no direct method <init>(Ljava/nio/ByteBuffer;Lorg/tensorflow/lite/Interpreter$Options;)V
+# and would equally break the product the first time the native side or a new call site needs a member
+# R8 had already removed. Measured cost of the whole keep (checkpoint edith-0.2-phase-a-exec-20261013-01):
+# org/tensorflow/lite is 29 class files / 151 KB of classes.jar; the AAR's bulk is the jni/ native libraries,
+# which R8 never touches. Same shape of problem as the com.rokid.cxr.** keep above, same remedy.
+-keep class org.tensorflow.lite.** { *; }

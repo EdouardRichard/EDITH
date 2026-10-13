@@ -62,8 +62,16 @@ dependencies {
     // P3.3 Task 1: the shell-UID execution channel (spec §17.2). `provider` is what the `api` binds to at runtime.
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
-    // edith-0.2 Phase A: LiteRT for on-device Laya + EmbeddingGemma inference
-    implementation(libs.litert)
+    // edith-0.2 Phase A: LiteRT for on-device Laya + EmbeddingGemma inference.
+    // LiteRT drags in Play Asset Delivery (its NPU-accelerator download path) and, through it,
+    // androidx.work. This app's models ship on the device rather than through Play, and work-runtime's
+    // androidx.startup initializer crashes the process under this app's minified debug build because
+    // Room's generated WorkDatabase_Impl is stripped. Neither is used, so both are excluded rather than
+    // kept alive with a keep rule.
+    implementation(libs.litert) {
+        exclude(group = "com.google.android.play", module = "asset-delivery")
+        exclude(group = "androidx.work", module = "work-runtime")
+    }
     implementation(project(":plugins-interview"))
     debugImplementation(project(":plugins-diagnostic"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")

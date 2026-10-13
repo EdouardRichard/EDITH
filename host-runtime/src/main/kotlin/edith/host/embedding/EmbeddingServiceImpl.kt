@@ -78,7 +78,7 @@ class EmbeddingServiceImpl(
                 )
             }
             return try {
-                EmbedResult.Success(vector = engine.embed(text))
+                EmbedResult.Success(vector = toOutputDimensions(engine.embed(text)))
             } catch (e: Exception) {
                 EmbedResult.Error(
                     reason = FailureReason.ENGINE_UNAVAILABLE,
@@ -86,5 +86,27 @@ class EmbeddingServiceImpl(
                 )
             }
         }
+    }
+
+    /**
+     * Applies the service's dimension policy to whatever the engine returned.
+     *
+     * The real EmbeddingGemma graph emits 768 dimensions with the full vector already L2-normalized
+     * (measured on K40; the graph's own norm reads 1.0000). Truncating that to the 256 dimensions this
+     * service promises yields a vector whose norm is **not** 1 - the same measurement read 0.643 - and
+     * cosine similarity against it is off by exactly that factor. So truncation and re-normalization are
+     * one operation here, not two independent ones.
+     *
+     * A zero vector is returned unchanged rather than divided by its zero norm into NaN; callers get an
+     * all-zero embedding they can recognize, not a poisoned one.
+     */
+    private fun toOutputDimensions(raw: FloatArray): FloatArray {
+        val truncated = if (raw.size == OUTPUT_DIMENSIONS) raw.copyOf() else raw.copyOf(OUTPUT_DIMENSIONS)
+        var sumSquares = 0f
+        for (v in truncated) sumSquares += v * v
+        if (sumSquares == 0f) return truncated
+        val norm = kotlin.math.sqrt(sumSquares)
+        for (i in truncated.indices) truncated[i] /= norm
+        return truncated
     }
 }
