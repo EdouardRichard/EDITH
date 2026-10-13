@@ -50,7 +50,23 @@ import java.util.concurrent.atomic.AtomicInteger
 
 /** A clock the test drives by hand; the plugin never sees wall time. */
 internal class SmartFakeClock(var nowNanos: Long = 1_000_000_000L) : MonotonicClock {
-    override fun nowNanos(): Long = nowNanos
+    /**
+     * When non-zero, every read moves the clock forward by this much.
+     *
+     * A **monotonic** fake clock and a bounded wait are a deadlock waiting to happen: `ModelClientGateway` polls
+     * `clock.nowNanos() >= deadlineNanos` after each 10 ms condition wait, so a stream that never delivers a terminal
+     * spins forever against a clock that never moves — a hang, not a failure. Tests that want the poll loop to reach
+     * its deadline (rather than the test advancing the clock itself) turn this on; the default of zero keeps every
+     * existing test's behaviour byte for byte.
+     */
+    var autoAdvanceNanos: Long = 0L
+
+    override fun nowNanos(): Long {
+        val at = nowNanos
+        if (autoAdvanceNanos != 0L) nowNanos += autoAdvanceNanos
+        return at
+    }
+
     fun advance(nanos: Long) { nowNanos += nanos }
 }
 

@@ -63,6 +63,7 @@ import edith.plugin.wakeWord
 import edith.plugins.smart.context.ContextCompressor
 import edith.plugins.smart.context.ContextManager
 import edith.plugins.smart.context.ContextRoute
+import edith.plugins.smart.context.ModelSummarizer
 import edith.plugins.smart.memory.MemoryExtraction
 import edith.plugins.smart.proactive.ChoiceGate
 import edith.plugins.smart.proactive.GateForm
@@ -107,6 +108,15 @@ private const val AUDIT_CAPACITY = 512
  * be more willing to interrupt than a configured one.
  */
 private const val DEFAULT_PROACTIVE_COOLDOWN_NANOS = 60_000_000_000L
+
+/**
+ * How long one **summary** request may take (spec §4.4 step 3).
+ *
+ * It is deliberately shorter than a turn's own budget: a summary is a background improvement to a transcript that is
+ * already complete and usable, so waiting longer than a wearer would notice buys nothing. When the bound is reached the
+ * request answers nothing and the compression stays plain truncation, which is §4.4's own degradation.
+ */
+private const val SUMMARY_DEADLINE_MILLIS = 8_000L
 
 /** The `ContextChanged` key the foreground app arrives under; the key set is fixed (spec §16.6). */
 private const val FOREGROUND_KEY = "app.foreground"
@@ -535,13 +545,27 @@ class SmartAssistantPlugin(
         )
         // B1/B3/B6: the session's transcript and compressor (see the field comments for why they are built here).
         activeContextForTurn = contextForTurn ?: ContextManager(memory = memoryRetrieval)
+        // B3 / spec §4.4's asynchronous half. It is built per activation for the same reason the transcript is: it
+        // carries a request deadline and must reach **this** session's model client, and it is `null` when the host
+        // granted no model service, which the compressor's own contract turns into plain truncation.
+        val summarizer = runCatching { context.services.model() }.getOrNull()?.let { client ->
+            ModelSummarizer(
+                client = client,
+                profileLookup = profileLookup,
+                profileId = config?.profileId ?: return@let null,
+                clock = clock,
+                scheduler = scheduler,
+                envelopeFor = { requestId, startNanos, endNanos ->
+                    // A summary is not a turn, so it carries a distinguishable request id; the envelope's session and
+                    // generation are still this session's, because it is a request made on its behalf.
+                    EventEnvelope(context.sessionId, context.generation, requestId, startNanos, endNanos)
+                },
+                deadlineNanos = { clock.nowNanos() + SUMMARY_DEADLINE_MILLIS * 1_000_000L },
+            )
+        }
         activeCompressor = compressor ?: ContextCompressor(
             memory = memory,
-            // No production summarizer yet. The compressor's own contract makes that an ordinary degradation —
-            // permanent plain truncation, which is never worse than truncation — rather than a failure; the async
-            // summary is the one half of spec §4.4 that has no implementation, and that is recorded rather than
-            // implied by a green suite.
-            summarizer = null,
+            summarizer = summarizer,
             // The plugin's task pool: `compressIfNeeded` runs inside the turn, and an inline summary would hold the
             // caller's thread for a cloud round trip (the same defect the gate had before review C2).
             scope = context.services.tasks,
