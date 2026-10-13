@@ -1,0 +1,108 @@
+package edith.plugins.smart.memory
+
+import edith.plugin.Capability
+import edith.plugin.EmbedResult
+import edith.plugin.EmbeddingService
+import edith.plugin.FailureReason
+import edith.plugin.ModelInfo
+import edith.plugins.smart.SmartFakeStorage
+import edith.plugins.smart.SmartTestRig
+import edith.plugins.smart.streamText
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertTrue
+
+/** The index is 256-dim in production, so the fixture is too — a narrower vector is rejected by `VectorIndex`. */
+private const val DIM = 256
+
+private fun unit(vararg first: Float): FloatArray {
+    val v = FloatArray(DIM)
+    first.forEachIndexed { index, value -> v[index] = value }
+    return v
+}
+
+/**
+ * edith-0.2 Phase B (B5): the **production** retrieval path, driven through the plugin's own activation.
+ *
+ * Why this file exists instead of another `MemoryModuleTest`: `MemoryModule` and `SemanticRetriever` have had tests
+ * since the day they were written, and for just as long they had **no production caller** — the plugin kept
+ * retrieving through the lexical `SmartMemoryRetrieval`, so "semantic retrieval" was a property of a class nothing
+ * ran. A test that builds the module itself cannot tell the difference. This one activates the plugin the way the
+ * composition does and reads the context parts out of the request the model actually received.
+ *
+ * The fixture is built so the two rankings **disagree**: the query is 香菜, the lexically strongest memory is
+ * 我不吃香菜 (it shares both query characters), and the embedding says the related one is the memory that shares
+ * none of them.
+ */
+class MemoryRetrievalWiringTest {
+
+    private class ScriptedEmbeddings(private val failWith: FailureReason? = null) : EmbeddingService {
+        val embedded = mutableListOf<String>()
+
+        override fun embed(text: String): EmbedResult {
+            embedded += text
+            if (failWith != null) return EmbedResult.Error(failWith, "synthetic")
+            // Anything about the green vegetable (and the query itself) points at axis 0; everything else at axis 1.
+            return EmbedResult.Success(
+                if (text.contains("绿色的菜") || text == "香菜") unit(1f) else unit(0f, 1f),
+            )
+        }
+
+        /**
+         * Always true, even in the failing case: the embedding service is a **hard dependency** (B9), so a service
+         * that reports itself unavailable refuses the whole turn and never reaches retrieval at all. The degradation
+         * spec §5.1 describes is a *call* that fails while the service is up, which is what [failWith] models.
+         */
+        override val isAvailable = true
+        override val modelInfo: ModelInfo? = null
+        override val dimensions = DIM
+    }
+
+    /** Two memories whose lexical and semantic orders are opposites, then a turn that asks about 香菜. */
+    private fun rigWith(embeddings: EmbeddingService): SmartTestRig {
+        val rig = SmartTestRig()
+        rig.activate(
+            overrides = mapOf(
+                Capability.Storage to SmartFakeStorage(),
+                Capability.Embedding to embeddings,
+            ),
+        )
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+        rig.wakeAndFinal("记住我不吃香菜", turnId = "asr-1")
+        // The wake path has a 3 s cooldown (`ScenePolicy`), so a second wake inside it is skipped and never reaches
+        // the model — the first version of this test silently queried the *first* turn's request because of that.
+        rig.tick(4_000)
+        rig.wakeAndFinal("记住我喜欢那个绿色的菜", turnId = "asr-2")
+        rig.tick(4_000)
+        return rig
+    }
+
+    @Test
+    fun `the activated plugin injects the memory the embedding ranks nearest`() {
+        val rig = rigWith(ScriptedEmbeddings())
+
+        rig.wakeAndFinal("香菜", turnId = "asr-3")
+
+        val context = rig.model.requests.last().context
+        assertTrue(context.isNotEmpty(), "nothing was injected at all: $context")
+        assertEquals(
+            "我喜欢那个绿色的菜",
+            context.first().text,
+            "the lexically strongest memory won, so the production path is still the lexical retriever: $context",
+        )
+    }
+
+    @Test
+    fun `a failing embed call degrades the same wiring to the lexical order`() {
+        // The stated degradation (spec §5.1): a query that cannot be embedded must not empty the prompt — the user
+        // gets the lexical order, and it must be the order the pre-Phase-B path produced. Note the service itself
+        // stays *available*: an unavailable one trips B9 and refuses the turn before retrieval runs at all.
+        val rig = rigWith(ScriptedEmbeddings(FailureReason.ENGINE_UNAVAILABLE))
+
+        rig.wakeAndFinal("香菜", turnId = "asr-3")
+
+        val context = rig.model.requests.last().context
+        assertTrue(context.isNotEmpty(), "nothing was injected at all: $context")
+        assertEquals("我不吃香菜", context.first().text)
+    }
+}

@@ -16,6 +16,16 @@ class MemoryExtraction(
     private val log: MemoryLog,
     private val maxPerTurn: Int = MAX_PER_TURN,
     private val routineThreshold: Int = ROUTINE_THRESHOLD,
+    /**
+     * Where an entry goes. It defaults to the store itself, which is what P3.4 did and what every existing test
+     * exercises. The Phase B wiring passes [MemoryModule.remember] instead, and that is not a detail: only the
+     * module indexes an entry when it is written, so writing through the store alone leaves the semantic index
+     * **permanently cold** and every retrieval silently degrades to the lexical order — a module that looks wired
+     * and never once ranks by meaning.
+     */
+    private val write: (MemoryKind, String, MemorySource) -> MemoryEntry? = { kind, text, source ->
+        log.record(kind, text, source)
+    },
 ) {
 
     /** Successes per action category in this session, which is exactly what "a habit" is allowed to mean. */
@@ -31,19 +41,19 @@ class MemoryExtraction(
         var written = 0
         var explicitWritten = false
         val explicit = extractExplicit(utterance)
-        if (explicit != null && log.record(explicit.first, explicit.second, MemorySource.EXPLICIT) != null) {
+        if (explicit != null && write(explicit.first, explicit.second, MemorySource.EXPLICIT) != null) {
             written++
             explicitWritten = true
         }
 
         for ((kind, text) in extractCandidates(utterance)) {
             if (written >= maxPerTurn) break
-            if (log.record(kind, text, MemorySource.AUTO) != null) written++
+            if (write(kind, text, MemorySource.AUTO) != null) written++
         }
 
         for (category in countHabits(executedActions)) {
             val stored = written < maxPerTurn &&
-                log.record(MemoryKind.ROUTINE, "常$category", MemorySource.AUTO) != null
+                write(MemoryKind.ROUTINE, "常$category", MemorySource.AUTO) != null
             if (!stored) {
                 // The slot was taken, or the store refused: the habit has **not** been recorded, so its count must not be
                 // consumed. It fires exactly once, on the success that reaches the threshold - eating that event here

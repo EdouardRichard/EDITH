@@ -8,6 +8,7 @@ import edith.agent.AuditEntry
 import edith.agent.BoundedAuditLog
 import edith.agent.ConfirmationGate
 import edith.agent.GatewayTurn
+import edith.agent.MemoryRetrieval
 import edith.agent.ModelClientGateway
 import edith.agent.ProgressGuard
 import edith.agent.ToolRegistry
@@ -69,6 +70,8 @@ import edith.plugins.smart.proactive.NoulGate
 import edith.plugins.smart.proactive.ProactiveGate
 import edith.plugins.smart.proactive.ProactiveGateState
 import edith.plugins.smart.memory.MemoryLog
+import edith.plugins.smart.memory.MemoryModule
+import edith.plugins.smart.memory.MemoryModuleRetrieval
 import edith.plugins.smart.memory.SmartMemoryRetrieval
 import edith.plugins.smart.skill.SkillManager
 import edith.plugins.smart.skill.StorageAccessSkillDirectory
@@ -308,7 +311,7 @@ class SmartAssistantPlugin(
      * `deactivate` - a lookup must never reach a namespace the host has already taken back. `null` means "no session",
      * and the gateways then inject nothing at all.
      */
-    @Volatile private var memoryRetrieval: SmartMemoryRetrieval? = null
+    @Volatile private var memoryRetrieval: MemoryRetrieval? = null
 
     /**
      * P3.4: what a finished turn is allowed to write. Same lifetime and the same namespace as [memoryRetrieval]; `null`
@@ -501,8 +504,22 @@ class SmartAssistantPlugin(
         // answers nothing; either way a turn is unaffected, because the gateway degrades a failed retrieval to an empty
         // context.
         val memoryLog = MemoryLog(runCatching { context.services.storage() }.getOrNull())
-        memoryRetrieval = SmartMemoryRetrieval(memoryLog)
-        memoryExtraction = MemoryExtraction(memoryLog)
+        // edith-0.2 Phase B (B5): the session's memory runs through the module in **both** directions. Writing via
+        // the store alone leaves the module's vector index cold forever, so every retrieval would quietly fall back
+        // to the lexical order; retrieving via the lexical retriever alone leaves the module unused, which is the
+        // state B5 shipped in (a class with tests and no caller). The embedding service is a hard dependency (B9),
+        // so it is present whenever a turn runs — but this stays `runCatching` for the same reason the rest of
+        // activation does: a missing grant must degrade to the lexical order, not take activation down.
+        val memory = MemoryModule(
+            log = memoryLog,
+            embeddings = runCatching { context.services.embedding() }.getOrNull(),
+            lexicon = SmartMemoryRetrieval(memoryLog),
+        )
+        memoryRetrieval = MemoryModuleRetrieval(memory)
+        memoryExtraction = MemoryExtraction(
+            log = memoryLog,
+            write = { kind, text, source -> memory.remember(text, kind, source) },
+        )
         // B4: the SKILL library. A host that granted no directory leaves this null and the prompt is simply the
         // system instructions - "no SKILLs installed" is a normal state (spec §3.7), not a degraded one.
         skillManager = runCatching { context.services.storageAccess() }.getOrNull()
