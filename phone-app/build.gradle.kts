@@ -62,6 +62,8 @@ dependencies {
     // P3.3 Task 1: the shell-UID execution channel (spec §17.2). `provider` is what the `api` binds to at runtime.
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
+    // edith-0.2 Phase A: LiteRT for on-device Laya + EmbeddingGemma inference
+    implementation(libs.litert)
     implementation(project(":plugins-interview"))
     debugImplementation(project(":plugins-diagnostic"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")

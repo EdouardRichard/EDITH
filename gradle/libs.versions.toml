@@ -7,6 +7,7 @@ agp = "9.2.1"
 android-compose = "2.3.10"
 # P3.3: the on-device shell-UID backend (spec §17.2). `provider` carries the Shizuku provider the API binds to.
 shizuku = "13.1.5"
+litert = "2.1.0"
 
 [libraries]
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
@@ -17,6 +18,7 @@ mockwebserver = { module = "com.squareup.okhttp3:mockwebserver", version.ref = "
 kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
 shizuku-api = { module = "dev.rikka.shizuku:api", version.ref = "shizuku" }
 shizuku-provider = { module = "dev.rikka.shizuku:provider", version.ref = "shizuku" }
+litert = { module = "com.google.ai.edge.litert:litert", version.ref = "litert" }
 
 [plugins]
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
