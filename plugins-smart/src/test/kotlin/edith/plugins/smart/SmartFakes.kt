@@ -308,6 +308,11 @@ internal class SmartTestRig(
     compressor: edith.plugins.smart.context.ContextCompressor? = null,
     /** edith-0.2 Phase B (B11): the intervention gate, `null` for the pre-B11 behaviour. */
     interventionGate: edith.plugins.smart.proactive.ProactiveGate? = null,
+    /**
+     * edith-0.2 Phase B (B3): the session's token split. Defaults to the spec's own, so only a test that wants the
+     * production over-budget path reachable in a few turns injects a smaller one.
+     */
+    budget: edith.plugins.smart.context.TokenBudget = edith.plugins.smart.context.TokenBudget(),
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -336,6 +341,7 @@ internal class SmartTestRig(
             contextForTurn = contextForTurn,
             compressor = compressor,
             interventionGate = interventionGate,
+            budget = budget,
         )
     }
 

@@ -64,6 +64,7 @@ import edith.plugins.smart.context.ContextCompressor
 import edith.plugins.smart.context.ContextManager
 import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.context.ModelSummarizer
+import edith.plugins.smart.context.TokenBudget
 import edith.plugins.smart.memory.MemoryExtraction
 import edith.plugins.smart.proactive.ChoiceGate
 import edith.plugins.smart.proactive.GateForm
@@ -207,6 +208,13 @@ class SmartAssistantPlugin(
     /** The compressor, consulted **after** the turn's memory write (spec §4.9). `null` means never compress. */
     private val compressor: ContextCompressor? = null,
     /**
+     * The session's token split (spec §4.3). A seam rather than a constant because the over-budget path
+     * (`historyTokens > historyBudget`, spec §4.4) is otherwise unreachable in a test: at the spec's own 1638-token
+     * allowance it takes roughly 200 turns at the wake cooldown. The **default is the spec's split**, and a test that
+     * injects a smaller one is exercising the real production compressor against a real budget, not a fake.
+     */
+    private val budget: TokenBudget = TokenBudget(),
+    /**
      * edith-0.2 Phase B (B11): the intervention gate — "should the model step in right now?" (spec §4.7).
      *
      * It sits **after** P3's own admission and throttle, replacing the cloud model's decision rather than adding to
@@ -292,6 +300,19 @@ class SmartAssistantPlugin(
      * caller has any reason to reach for it.
      */
     internal fun auditTrail(): List<AuditEntry> = audit.entries()
+
+    /**
+     * Test-only observation of the **session's** effective history allowance (spec §4.3).
+     *
+     * It is the allowance the compressor is handed at the end of a turn: history's own share of the injected budget
+     * plus the SKILL and memory budget a session with no SKILL directory and no memories leaves unused. A test reads
+     * this to prove the injected `budget` reached the compressor the session actually uses, rather than comparing
+     * against a hard-coded copy of the split (which a plugin that ignored the injection would still satisfy).
+     */
+    internal fun historyBudgetTokensForTest(): Int {
+        val categories = budget.categories()
+        return categories.history + categories.skill + categories.memory
+    }
 
     private data class Config(
         val profileId: String,
@@ -544,7 +565,7 @@ class SmartAssistantPlugin(
             write = { kind, text, source -> memory.remember(text, kind, source) },
         )
         // B1/B3/B6: the session's transcript and compressor (see the field comments for why they are built here).
-        activeContextForTurn = contextForTurn ?: ContextManager(memory = memoryRetrieval)
+        activeContextForTurn = contextForTurn ?: ContextManager(memory = memoryRetrieval, budget = budget)
         // B3 / spec §4.4's asynchronous half. It is built per activation for the same reason the transcript is: it
         // carries a request deadline and must reach **this** session's model client, and it is `null` when the host
         // granted no model service, which the compressor's own contract turns into plain truncation.
