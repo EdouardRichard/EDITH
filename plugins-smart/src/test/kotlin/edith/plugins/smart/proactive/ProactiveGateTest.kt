@@ -82,8 +82,13 @@ class ProactiveGateTest {
 
     private class ScriptedSystemOne(private val result: SystemOneResult) : SystemOneService {
         val asked = mutableListOf<SystemOneQuestion>()
+
+        /** The state string the gate actually sent — recorded because `""` is a valid-looking String. */
+        val states = mutableListOf<String>()
+
         override fun ask(state: String, question: SystemOneQuestion): SystemOneResult {
             asked += question
+            states += state
             return result
         }
 
@@ -93,6 +98,24 @@ class ProactiveGateTest {
     }
 
     private fun state() = ProactiveGateState.of(transcript = "这个页面卡住了", foreground = "微信")
+
+    @Test
+    fun `the gate sends the rendered state rather than an empty one`() {
+        // The bug this pins: an earlier revision took the state and asked with `""`. The publisher's host serializes a
+        // String state literally, so `""` encodes to zero tokens - Laya was answering from its prior alone and none
+        // of the four input dimensions could influence the decision. No test could fail on it, because the fake
+        // recorded only the question; `""` looks like a perfectly good String.
+        val noul = ScriptedSystemOne(ok(SystemOneAnswer.Noul(0.9, 0.5)))
+        NoulGate(noul, threshold = 0.6).shouldIntervene(state())
+
+        val sent = noul.states.single()
+        assertTrue(sent.contains("transcript=这个页面卡住了"), sent)
+        assertTrue(sent.contains("app.foreground=微信"), sent)
+
+        val choice = ScriptedSystemOne(ok(SystemOneAnswer.Choice("A", mapOf("A" to 0.9), 0.9)))
+        ChoiceGate(choice).shouldIntervene(state())
+        assertTrue(choice.states.single().contains("这个页面卡住了"), choice.states.single())
+    }
 
     @Test
     fun `a noul probability at or above the threshold intervenes`() {

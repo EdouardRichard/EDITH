@@ -1098,14 +1098,7 @@ class SmartAssistantPlugin(
             "P3_PROACTIVE admit score=${verdict.score} " +
                 "features=${verdict.fired.joinToString(",") { it.name }}",
         )
-        val gate = activeGate() ?: return trigger
-        val outcome = gate.shouldIntervene(gateState(trigger))
-        // The verdict, its confidence and its cost - never the state it was drawn from.
-        P3Log.line(
-            "P3_PROACTIVE gate form=${gate.form} intervene=${outcome.intervene} " +
-                "confidence=${outcome.confidence} latencyMs=${outcome.latencyMs} reason=${outcome.reason ?: "-"}",
-        )
-        return if (outcome.intervene) trigger else null
+        return trigger
     }
 
     /**
@@ -1184,6 +1177,27 @@ class SmartAssistantPlugin(
     /** The blocking half of one proactive turn; runs on the task scope, never under [gate]. */
     private fun deliverProactive(current: PluginContext, configured: Config, filter: SmartProactive,
         hint: ProactiveHint, trigger: ProactiveTrigger, message: String, started: Long) {
+        // The intervention gate runs **here**, on the task scope, and that placement is load-bearing: it is a
+        // local-model forward pass (~231 ms GPU / ~742 ms CPU per A5), and the plugin's own rule forbids one inside
+        // `handle` - it would hold the host's single drain thread *and* the plugin lock, putting `Stop`, confirmations
+        // and the next wake turn behind a model call. By this point the trigger has passed P3's admission and
+        // throttle (C11), so this is the last decision before the cloud request.
+        activeGate()?.let { gate ->
+            val outcome = gate.shouldIntervene(gateState(trigger))
+            P3Log.line(
+                "P3_PROACTIVE gate form=${gate.form} intervene=${outcome.intervene} " +
+                    "confidence=${outcome.confidence} latencyMs=${outcome.latencyMs} " +
+                    "reason=${outcome.reason ?: "-"}",
+            )
+            if (!outcome.intervene) {
+                // A refusal restarts the cooldown, exactly as the first stage's refusals do: otherwise every
+                // `ContextChanged` would spend another forward pass asking the same question.
+                filter.noteRefused(clock.nowNanos())
+                P3Log.line("P3_PROACTIVE silence reason=GATE_DECLINED ms=${elapsedMillis(started)}")
+                discard(hint)
+                return
+            }
+        }
         val gateway = ModelClientGateway(
             client = runCatching { current.services.model() }.getOrElse { failure ->
                 P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")

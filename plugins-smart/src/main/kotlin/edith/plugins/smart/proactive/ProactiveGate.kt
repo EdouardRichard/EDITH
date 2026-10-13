@@ -66,7 +66,11 @@ class NoulGate(
     override val form = GateForm.NOUL
 
     override fun shouldIntervene(state: ProactiveGateState): GateOutcome =
-        decide(service, SystemOneQuestion(SystemOneQuestionType.NOUL, INTERVENTION_PROPOSITION)) { answer, latency ->
+        decide(
+            service,
+            state,
+            SystemOneQuestion(SystemOneQuestionType.NOUL, INTERVENTION_PROPOSITION),
+        ) { answer, latency ->
             when (answer) {
                 is SystemOneAnswer.Noul ->
                     GateOutcome(answer.probability >= threshold, answer.probability, latency)
@@ -83,6 +87,7 @@ class ChoiceGate(private val service: SystemOneService) : ProactiveGate {
     override fun shouldIntervene(state: ProactiveGateState): GateOutcome =
         decide(
             service,
+            state,
             SystemOneQuestion(SystemOneQuestionType.CHOICE, INTERVENTION_PROPOSITION, INTERVENTION_CRITERIA),
         ) { answer, latency ->
             when (answer) {
@@ -107,14 +112,18 @@ private fun wrongType(latency: Double) = GateOutcome(false, 0.0, latency, "WRONG
 /**
  * The shared shape of both forms: ask once, translate, and turn every failure into silence.
  *
- * The engine is given the **rendered state**, which is the one place the field ordering matters.
+ * **[state] is rendered and sent as the model's state.** Both gates take it and both must pass it on — an earlier
+ * revision took the parameter and asked with `""`, which the publisher's host serializes to zero tokens, so Laya was
+ * answering from its prior alone and none of the four input dimensions could influence the decision. The test that
+ * catches it asserts the string the service actually received.
  */
 private fun decide(
     service: SystemOneService,
+    state: ProactiveGateState,
     question: SystemOneQuestion,
     translate: (SystemOneAnswer, Double) -> GateOutcome,
 ): GateOutcome = try {
-    when (val result = service.ask("", question)) {
+    when (val result = service.ask(state.render(), question)) {
         is SystemOneResult.Success -> translate(result.answer, result.latencyMs)
         is SystemOneResult.Failure -> GateOutcome(false, 0.0, 0.0, result.reason.name)
     }
