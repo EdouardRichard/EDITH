@@ -36,6 +36,16 @@ data class AgentRequest(
      * transport's timeout to spend.
      */
     val requestTimeoutNanos: Long = 0L,
+    /**
+     * The transcript this turn continues, oldest first (spec §4.2: the plugin owns a session's conversation, not a
+     * turn's). Empty — the default — reproduces the previous behaviour exactly: the utterance opens the history on
+     * its own, which is what every caller before the session work relied on.
+     *
+     * The loop does **not** trim it. Bounding the transcript is the host `ContextBudgeter`'s job against the live
+     * profile, and a loop that silently dropped the caller's history would make a session's length depend on how
+     * many turns it happened to take.
+     */
+    val history: List<ModelHistoryItem> = emptyList(),
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -59,6 +69,14 @@ data class AgentRun(
     val finalText: String?,
     val steps: List<AgentStep>,
     val humanWaitNanos: Long = 0L,
+    /**
+     * The transcript this run leaves behind, with any still-pending user turn closed.
+     *
+     * Handed over so the caller that supplied [AgentRequest.history] can store what the turn actually said instead
+     * of reconstructing it — the retry nudges and the tool-round echoes are the loop's, and a caller rebuilding them
+     * from [`finalText`] would get a different conversation than the one the model saw.
+     */
+    val transcript: List<ModelHistoryItem> = emptyList(),
 )
 
 private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
@@ -187,8 +205,9 @@ class AgentLoop(
         guard.reset()
         humanWaitNanos = 0L
         val tools = registry.descriptors().map { ToolSpec(it.name, it.description, it.parametersJson) }
-        // The user's turn opens the history: the loop has no other channel to hand the model what was asked.
-        val history = mutableListOf<ModelHistoryItem>(ModelHistoryItem.Text(MessageRole.USER, request.utterance))
+        // The user's turn opens the history: the loop has no other channel to hand the model what was asked. When the
+        // caller supplies a session transcript, this turn's utterance is appended to it rather than replacing it.
+        val history = (request.history + ModelHistoryItem.Text(MessageRole.USER, request.utterance)).toMutableList()
         val steps = mutableListOf<AgentStep>()
         var unproductiveTurns = 0
         // The turn's budget counts **machine** time only. A confirmation spends the *user's* time, so the deadline is
@@ -377,7 +396,7 @@ class AgentLoop(
             history += ModelHistoryItem.Text(MessageRole.ASSISTANT, closingText.ifBlank { CLOSED_TURN_TEXT })
         }
         lastTranscript = history.toList()
-        return AgentRun(outcome, safeCode, finalText, steps.toList(), humanWaitNanos)
+        return AgentRun(outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript)
     }
 
     /**
