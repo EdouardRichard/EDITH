@@ -22,7 +22,7 @@ import kotlin.system.measureNanoTime
  *   converted Laya multilingual graph and the real EmbeddingGemma graph, using synthetic tensors of
  *   the shapes the graphs declare. Also the process' memory growth from holding both models.
  * - **Not measured**: tokenizer cost and prompt-template assembly. The Kotlin tokenizer port is not
- *   implemented yet (see [LayaLiteRTEngine.choice]'s TODO), so the numbers here are the *graph* cost,
+ *   implemented yet, so the numbers here are the *graph* cost,
  *   which is the dominant term; the tokenizer adds single-digit milliseconds on top.
  *
  * The models are read from the app's own external files directory, which needs no storage permission.

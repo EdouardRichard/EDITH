@@ -7,7 +7,7 @@ agp = "9.2.1"
 android-compose = "2.3.10"
 # P3.3: the on-device shell-UID backend (spec §17.2). `provider` carries the Shizuku provider the API binds to.
 shizuku = "13.1.5"
-litert = "2.1.0"
+litert = "2.2.0"
 
 [libraries]
 kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
