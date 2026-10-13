@@ -40,7 +40,7 @@ interface EmbeddingInferenceEngine {
     /** Initialize the engine with the given model path. Returns true on success. */
     fun initialize(modelPath: String): Boolean
 
-    /** Encode text into a dense vector of the configured dimension. */
+    /** Encode text into a dense vector at the model's own (native) width. */
     fun embed(text: String): FloatArray
 
     /** Release resources. */

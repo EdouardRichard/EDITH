@@ -39,7 +39,17 @@ class EmbeddingGemmaLiteRTEngine(
     private val injectedVocabulary: SentencePieceBpe? = null,
 ) : EmbeddingInferenceEngine {
 
+    /**
+     * Written by the loader thread in [initialize] and read by whatever thread calls [embed] afterwards.
+     *
+     * `@Volatile` because `EmbeddingServiceImpl` publishes `isAvailable` through an `AtomicReference` **after**
+     * `initialize` returns, so without volatile a reader could legally observe `isAvailable == true` with a stale
+     * null here and get one spurious `ENGINE_UNAVAILABLE` out of a service whose whole job is to be dependable.
+     */
+    @Volatile
     private var interpreter: Interpreter? = null
+
+    @Volatile
     private var vocabulary: SentencePieceBpe? = injectedVocabulary
 
     override fun initialize(modelPath: String): Boolean {
@@ -58,6 +68,9 @@ class EmbeddingGemmaLiteRTEngine(
             }
 
             val loaded = Interpreter(graph, Interpreter.Options().apply { numThreads = THREADS })
+            // A second `initialize` (not something production does, but the interface allows it) must not leak the
+            // graph it replaces: a 179 MB `Interpreter` is not reclaimed by the garbage collector.
+            interpreter?.close()
             interpreter = loaded
             vocabulary = loadedVocabulary
             true

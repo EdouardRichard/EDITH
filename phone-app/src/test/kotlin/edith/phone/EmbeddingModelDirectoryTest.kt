@@ -2,6 +2,7 @@ package edith.phone
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.rules.TemporaryFolder
@@ -38,13 +39,17 @@ class EmbeddingModelDirectoryTest {
         // `getExternalFilesDir(null)` is null when external storage is not mounted. The composition root runs at
         // process start whether or not the phone's storage is ready, so this must produce a path and not a crash —
         // and the path must be one that cannot exist, so the hard dependency refuses the turn instead of reading
-        // some other directory that happens to be there.
+        // some other directory that happens to be there. The exact path is asserted, not just `exists()`: an
+        // implementation that fell back to `internalFilesDir` itself would also "not exist" in this fixture.
         val internal = temporary.newFolder("internal")
 
         val located = EmbeddingModelDirectory.locate(null, internal)
 
+        assertEquals(
+            File(File(internal, "no-external-files-dir"), EmbeddingModelDirectory.RELATIVE_PATH),
+            located,
+        )
         assertFalse("must not resolve to a directory that exists", located.exists())
-        assertEquals("embeddinggemma", located.name)
     }
 
     @Test
@@ -56,7 +61,10 @@ class EmbeddingModelDirectoryTest {
         // could not assemble at all — a device would have crashed on start rather than degrading to a refusal.
         val located = EmbeddingModelDirectory.locate(null, null)
 
+        assertTrue(
+            "the unreachable prefix must still be in the path: ${located.path}",
+            located.path.replace('\\', '/').endsWith("no-external-files-dir/models/embeddinggemma"),
+        )
         assertFalse("must not resolve to a directory that exists", located.exists())
-        assertEquals("embeddinggemma", located.name)
     }
 }

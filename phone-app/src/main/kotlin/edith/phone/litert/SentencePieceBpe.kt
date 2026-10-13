@@ -16,7 +16,9 @@ import java.io.File
  * runs `bpe_model.cc`. The evidence is `docs/project/evidence/2026-10-13-embeddinggemma-tokenizer-is-bpe.md`. That is
  * the whole reason this class is called `...Bpe` and not `...Unigram`: the earlier name described an algorithm the
  * publisher does not use, and the mismatch is not cosmetic — a Viterbi over these scores reproduces only 19 of 68
- * strings, while this encoder reproduces 68 of 69.
+ * strings. This encoder reproduces the publisher's own output on **7305 of 7305** cases of the generated corpus
+ * (`.local/t6b2-corpus.py`, checked by `EmbeddingTokenizerTest`), which is the number to trust; the earlier "68 of 69"
+ * headline came from a reference encoder that skipped the `USER_DEFINED` pre-match and split non-BMP characters.
  *
  * The consequence is visible in the score table: **`score` is not a log-probability, it is the merge rank.** For
  * 236249 of the 262144 pieces `score == 494 - id` holds exactly (`494 → -0.0`, `500 → -6.0`, `9259 → -8765`,
@@ -25,11 +27,23 @@ import java.io.File
  *
  * ## The algorithm, as `bpe_model.cc` defines it
  *
- * 1. one symbol per character (this model has no `UNUSED` pieces, so no longer pre-match is possible)
- * 2. queue every adjacent pair whose concatenation is a real piece; a pair's priority is that piece's score, and a
- *    tie goes to the **smaller left index**
- * 3. pop the best pair, merge it, and queue the two pairs that become adjacent
- * 4. emit the survivors in order
+ * 1. **pre-match**: walk the text left to right taking the **longest** match against the pieces of type
+ *    `USER_DEFINED` (type 4) at each position; a match becomes one frozen symbol that the merge stage never
+ *    touches. This model has **6410** such pieces — `<mask>`, `[multimodal]`, `[toxicity=0]`, `<ctrl1>`…, the
+ *    `<start_of_*>`/`<end_of_*>` markers, and the run-length symbols `▁▁`…`▁`×93 and `\n`…`\n`×31. `CONTROL`,
+ *    `UNKNOWN` and `BYTE` pieces are **not** pre-matched, which the publisher's own encoder confirms: `<pad>`
+ *    splits into `<`,`pad`,`>` while `<mask>` does not.
+ * 2. everything else becomes one symbol per character; a character with no piece at all becomes one byte piece
+ *    per UTF-8 byte (see below)
+ * 3. queue every adjacent pair of non-frozen symbols whose concatenation is a real piece; a pair's priority is
+ *    that piece's score, and a tie goes to the **smaller left index**
+ * 4. pop the best pair, merge it, and queue the two pairs that become adjacent
+ * 5. emit the survivors in order
+ *
+ * The earlier port skipped stage 1 because it read "no `UNUSED` pieces" as "no pre-match at all". `UNUSED` is
+ * type 5 and really is absent here; `USER_DEFINED` is type 4 and there are 6410 of them, and the merge agenda
+ * cannot assemble `<mask>` out of `<` + `mask` + `>`. The stage was found by review, not by the reference
+ * encoder — `.local/t6b-bpe.py` skipped it too, so its 68/69 headline never covered any of those strings.
  *
  * ## The normalization was measured, not assumed
  *
@@ -46,13 +60,20 @@ import java.io.File
  * `byte_fallback = 1` and the byte pieces exist as the six-character surface `<0xNN>` (ids 238..493, score 0.0), so
  * a byte is its own piece name rather than a raw byte — which is why the earlier `raw.size == 1` test never fired.
  * The fallback is **per UTF-8 byte and only for a character with no piece at all**: `\u00a0` becomes `<0xC2>`,
- * `<0xA0>`, while `\U0001F600` is a real piece and is never exploded.
+ * `<0xA0>`, while `\U0001F600` is a real piece and is never exploded. A **one-byte** character can reach this path
+ * too — every printable ASCII character has a piece, but the control characters do not, so `\u0000` must become
+ * `<0x00>` (id 238) and not `<unk>`. An earlier `bytes.size <= 1` guard exempted exactly those and resolved them
+ * through the vocabulary lookup to `<unk>`.
  */
 class SentencePieceBpe private constructor(
     private val pieces: Array<String>,
     private val scores: FloatArray,
     /** `byteOf[id]` is the byte a byte-fallback piece stands for, or `-1`. */
     private val byteOf: IntArray,
+    /** `USER_DEFINED` (type 4) surfaces to their ids; matched before merging, longest first. */
+    private val userDefined: Map<String, Int>,
+    /** The longest `USER_DEFINED` surface in UTF-16 units, bounding the pre-match scan. */
+    private val maxUserDefinedLength: Int,
 ) {
 
     /**
@@ -86,22 +107,43 @@ class SentencePieceBpe private constructor(
         val normalized = text.replace(' ', '\u2581')
         if (normalized.isEmpty()) return IntArray(0)
 
-        val symbol = ArrayList<String>(normalized.length)
-        // A character with no piece at all becomes its UTF-8 bytes, one byte piece each.
-        for (ch in normalized) {
-            val c = ch.toString()
+        // Stage 1 (pre-match) and the character atoms, in one left-to-right pass.
+        val atoms = ArrayList<String>(normalized.length)
+        val frozenFlags = ArrayList<Boolean>(normalized.length)
+        val frozenIds = ArrayList<Int>(normalized.length)
+        var at = 0
+        while (at < normalized.length) {
+            val match = matchUserDefined(normalized, at)
+            if (match != null) {
+                atoms.add(normalized.substring(at, at + match.length))
+                frozenFlags.add(true)
+                frozenIds.add(match.id)
+                at += match.length
+                continue
+            }
+            val c = String(Character.toChars(normalized.codePointAt(at)))
             if (index.containsKey(c)) {
-                symbol.add(c)
+                atoms.add(c)
+                frozenFlags.add(false)
+                frozenIds.add(-1)
             } else {
-                val bytes = c.toByteArray(Charsets.UTF_8)
-                if (bytes.size <= 1) {
-                    symbol.add(c)
-                } else {
-                    for (b in bytes) symbol.add(bytePieceName(b.toInt() and 0xFF))
+                // A character with no piece at all becomes its UTF-8 bytes, one byte piece each — including a
+                // one-byte character: the control characters reach this and the printable ones have pieces.
+                for (b in c.toByteArray(Charsets.UTF_8)) {
+                    atoms.add(bytePieceName(b.toInt() and 0xFF))
+                    frozenFlags.add(false)
+                    frozenIds.add(-1)
                 }
             }
+            // One **code point**, not one `Char`: a non-BMP character is two `Char`s and a lone surrogate has no
+            // UTF-8 encoding, so iterating `Char`s turned every emoji into two `?` bytes. The publisher groups them
+            // by code point (`😀` is one piece; `U+10000` is not, and falls back to `F0 90 80 80`).
+            at += Character.charCount(normalized.codePointAt(at))
         }
 
+        val symbol = atoms.toTypedArray()
+        val frozen = frozenFlags.toBooleanArray()
+        val frozenId = frozenIds.toIntArray()
         val n = symbol.size
         if (n == 0) return IntArray(0)
 
@@ -110,13 +152,14 @@ class SentencePieceBpe private constructor(
         val prev = IntArray(n) { it - 1 }
 
         // Max-heap keyed by (score, -left) so the comparator is a plain Comparable pair: higher score wins, and on a
-        // tie the SMALLER left index wins, which is bpe_model.cc's `h1.left > h2.left` rule.
+        // tie the SMALLER left index wins, which is bpe_model.cc's `h1.left > h2.left` rule. A frozen symbol is
+        // never a merge target or partner, which is what "the pre-match is final" means in practice.
         val agenda = java.util.PriorityQueue<Candidate>(compareByDescending<Candidate> { it.score }.thenBy { it.left })
 
         fun push(left: Int) {
-            if (left < 0) return
+            if (left < 0 || frozen[left]) return
             val right = next[left]
-            if (right < 0) return
+            if (right < 0 || frozen[right]) return
             val merged = symbol[left] + symbol[right]
             val id = index[merged] ?: return
             if (id in RESERVED) return
@@ -142,13 +185,34 @@ class SentencePieceBpe private constructor(
         }
 
         val out = ArrayList<Int>(n)
-        var at = 0
-        while (at >= 0 && at < n) {
-            if (symbol[at].isNotEmpty()) out.add(index[symbol[at]] ?: UNK)
-            at = next[at]
+        var cursor = 0
+        while (cursor >= 0 && cursor < n) {
+            if (symbol[cursor].isNotEmpty()) {
+                out.add(if (frozenId[cursor] >= 0) frozenId[cursor] else index[symbol[cursor]] ?: UNK)
+            }
+            cursor = next[cursor]
         }
         return out.toIntArray()
     }
+
+    /**
+     * The longest `USER_DEFINED` surface starting at [from], or `null` when none matches there.
+     *
+     * Longest-first is what the publisher does — `<ctrl10>` is one piece, not `<ctrl1>` followed by `0` — and the
+     * scan advances past a match, so matches never overlap.
+     */
+    private fun matchUserDefined(text: String, from: Int): Match? {
+        if (userDefined.isEmpty()) return null
+        var length = minOf(maxUserDefinedLength, text.length - from)
+        while (length > 0) {
+            val id = userDefined[text.substring(from, from + length)]
+            if (id != null) return Match(length, id)
+            length--
+        }
+        return null
+    }
+
+    private data class Match(val length: Int, val id: Int)
 
     /**
      * The ids the graph is actually fed: `<bos>`, the text, `<eos>`, padded to [sequenceLength].
@@ -184,6 +248,12 @@ class SentencePieceBpe private constructor(
 
         /** SentencePiece's `SentencePiece.Type`: NORMAL=1, UNKNOWN=2, CONTROL=3, USER_DEFINED=4, UNUSED=5, BYTE=6. */
         private const val TYPE_BYTE = 6
+
+        /**
+         * The type the pre-match reads. `UNUSED` (5) is what the first port looked for and this model has none of
+         * them; `USER_DEFINED` (4) is what `bpe_model.cc` actually matches, and there are 6410 here.
+         */
+        private const val TYPE_USER_DEFINED = 4
 
         /**
          * Pieces that are never a merge *result*: the special tokens. `bpe_model.cc` keeps these out of the merge
@@ -245,19 +315,32 @@ class SentencePieceBpe private constructor(
 
             require(raw.isNotEmpty()) { "not a SentencePiece model: no pieces" }
 
+            val pieces = Array(raw.size) { String(raw[it], Charsets.UTF_8) }
+
             // Byte pieces are the six-character surface `<0xNN>` with type BYTE; the value is in the name, not the
             // raw field, which is why a `raw.size == 1` test never matched one.
             val byteOf = IntArray(raw.size) { -1 }
-            raw.forEachIndexed { id, surface ->
-                if (pieceTypes[id] == TYPE_BYTE) {
-                    byteOf[id] = parseBytePieceName(surface) ?: -1
+            // USER_DEFINED (type 4) pieces are the pre-match table. CONTROL (3), UNKNOWN (2) and BYTE (6) are not:
+            // the publisher's own encoder splits `<pad>` while keeping `<mask>` whole, and this model's `<mask>`
+            // (id 4) is USER_DEFINED even though it sits in the same low id band as the control tokens.
+            val userDefined = HashMap<String, Int>(pieceTypes.size * 2)
+            var maxUserDefinedLength = 0
+            pieces.forEachIndexed { id, surface ->
+                when (pieceTypes[id]) {
+                    TYPE_BYTE -> byteOf[id] = parseBytePieceName(raw[id]) ?: -1
+                    TYPE_USER_DEFINED -> {
+                        if (!userDefined.containsKey(surface)) userDefined[surface] = id
+                        if (surface.length > maxUserDefinedLength) maxUserDefinedLength = surface.length
+                    }
                 }
             }
 
             return SentencePieceBpe(
-                pieces = Array(raw.size) { String(raw[it], Charsets.UTF_8) },
+                pieces = pieces,
                 scores = FloatArray(pieceScores.size) { pieceScores[it] },
                 byteOf = byteOf,
+                userDefined = userDefined,
+                maxUserDefinedLength = maxUserDefinedLength,
             )
         }
 

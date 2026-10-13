@@ -76,6 +76,18 @@ class EmbeddingEngineTest {
     // ---------------------------------------------------------------- the frame the graph is fed
 
     @Test
+    fun `an injected vocabulary makes the frame available without the graph`() {
+        // The seam is the *tokenizer*, not the model: it exists so a JVM test can pin the frame this engine feeds
+        // the graph without a 179 MB file — and `embed()` still refuses, because no graph was ever loaded. Stated
+        // as a test because a test seam that quietly makes the engine look functional is exactly the trap the
+        // hard dependency is built to avoid.
+        val engine = EmbeddingGemmaLiteRTEngine(vocabulary())
+
+        assertEquals(256, engine.frame("Hello World").size)
+        assertThrows(IllegalStateException::class.java) { engine.embed("Hello World") }
+    }
+
+    @Test
     fun `the frame fed to the graph is the tokenizer's frame at the graph's window`() {
         // Phase A measured the export: EMBED input[0] is `[1,256]` INT32 and output[0] is `[1,768]` FLOAT32
         // (`LiteRTPerformanceTest`). The engine must therefore hand the tokenizer the *graph's* window rather
