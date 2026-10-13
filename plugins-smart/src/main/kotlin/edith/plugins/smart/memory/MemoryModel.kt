@@ -22,7 +22,38 @@ data class MemoryEntry(
     val lastUsedAtMillis: Long,
     val useCount: Int,
     val source: MemorySource,
-)
+    /**
+     * The 256-dim embedding of [text] (spec §5.2), or `null` when it has not been computed yet.
+     *
+     * **In memory only — never persisted.** A thousand of these is a multi-megabyte rewrite on every single write,
+     * and the vector is recomputable from the text at any time. [MemoryLog] therefore leaves this field out of the
+     * document, and an entry read back from storage carries `null` until the retriever fills it in.
+     */
+    val embedding: FloatArray? = null,
+) {
+    // A `FloatArray` compares by identity in a generated `equals`, which would make two content-identical entries
+    // unequal whenever their vectors are different objects. The vector is a cache, not part of the entry's identity.
+    override fun equals(other: Any?): Boolean =
+        this === other || (
+            other is MemoryEntry &&
+                id == other.id && kind == other.kind && text == other.text &&
+                createdAtMillis == other.createdAtMillis && lastUsedAtMillis == other.lastUsedAtMillis &&
+                useCount == other.useCount && source == other.source
+            )
+
+    override fun hashCode(): Int {
+        var result = id.hashCode()
+        result = 31 * result + kind.hashCode()
+        result = 31 * result + text.hashCode()
+        result = 31 * result + createdAtMillis.hashCode()
+        result = 31 * result + lastUsedAtMillis.hashCode()
+        result = 31 * result + useCount
+        result = 31 * result + source.hashCode()
+        return result
+    }
+
+    override fun toString() = "MemoryEntry(id=$id, kind=$kind, redacted)"
+}
 
 /** The longest text the store accepts: spec §3.1 says 120, and the extractor refuses longer clauses instead of cutting
  * one in half (a truncated sentence would be a fact the user never stated). */
@@ -137,21 +168,45 @@ fun rank(entries: List<MemoryEntry>, query: String, nowMillis: Long, limit: Int,
     return out
 }
 
+/** Spec §5.6 step 3: an entry created within this window is not evicted unless every entry is inside it. */
+const val PROTECT_MILLIS = 7L * 24 * 60 * 60 * 1000
+
 /**
- * Keeps at most [cap] entries, dropping the least recently used first, and reports how many went.
+ * Keeps at most [cap] entries, dropping the least **used** first, and reports how many went (spec §5.6).
  *
- * `useCount` deliberately does not buy survival: a memory that has not been needed for a long time is the one to lose,
- * and counting uses would let an old favourite outlive the cap forever. Kept entries keep their input order so the
- * stored document does not reshuffle on every write.
+ * The order is `useCount` ascending, then `lastUsedAtMillis` ascending, then input order — so the memory that has
+ * earned its place survives, and two entries that tie on use fall back to which one was needed more recently.
+ *
+ * The seven-day protection is a **preference, not an exemption**: a just-learned fact is kept ahead of a stale one,
+ * but when *every* entry is inside the window something still has to go, or a store that has filled with recent
+ * entries could never accept another.
+ *
+ * Kept entries keep their input order, so the stored document does not reshuffle on every write.
  */
-fun evict(entries: List<MemoryEntry>, cap: Int): Pair<List<MemoryEntry>, Int> {
+fun evictByUsage(
+    entries: List<MemoryEntry>,
+    cap: Int,
+    nowMillis: Long,
+    protectMillis: Long = PROTECT_MILLIS,
+): Pair<List<MemoryEntry>, Int> {
     if (entries.size <= cap) return entries to 0
-    val doomed = entries
-        .withIndex()
-        .sortedWith(compareBy<IndexedValue<MemoryEntry>> { it.value.lastUsedAtMillis }.thenBy { it.index })
-        .take(entries.size - cap)
-        .map { it.index }
-        .toSet()
+    val excess = entries.size - cap
+    val byUsage = entries.withIndex().sortedWith(
+        compareBy<IndexedValue<MemoryEntry>> { it.value.useCount }
+            .thenBy { it.value.lastUsedAtMillis }
+            .thenBy { it.index },
+    )
+    val isProtected = { indexed: IndexedValue<MemoryEntry> ->
+        nowMillis - indexed.value.createdAtMillis < protectMillis
+    }
+    val droppable = byUsage.filterNot(isProtected)
+    val chosen = if (droppable.size >= excess) {
+        droppable.take(excess)
+    } else {
+        // Every remaining candidate is protected, so the protection yields: the least used protected entries go.
+        droppable + byUsage.filter(isProtected).take(excess - droppable.size)
+    }
+    val doomed = chosen.map { it.index }.toSet()
     return entries.filterIndexed { index, _ -> index !in doomed } to doomed.size
 }
 

@@ -112,14 +112,16 @@ class MemoryModelTest {
         assertEquals("used", ranked.first().id, "用过很多次的那条应排前")
     }
 
-    @Test fun `eviction drops the least recently used and reports the count`() {
+    @Test fun `eviction drops the least recently used when use counts tie and reports the count`() {
+        // Spec §5.6 orders by useCount first, then by lastUsedAtMillis - so this pins the tie-break. `nowMillis` is
+        // far past every creation time, which is what keeps the seven-day protection out of the way.
         val entries = listOf(
             entry("1", "x1", lastUsedAt = 10L),
             entry("2", "x2", lastUsedAt = 20L),
             entry("3", "x3", lastUsedAt = 30L),
         )
 
-        val (kept, dropped) = evict(entries, cap = 2)
+        val (kept, dropped) = evictByUsage(entries, cap = 2, nowMillis = Long.MAX_VALUE / 2)
 
         assertEquals(1, dropped)
         assertEquals(listOf("2", "3"), kept.map { it.id })
@@ -128,7 +130,7 @@ class MemoryModelTest {
     @Test fun `eviction of a list within the cap changes nothing`() {
         val entries = listOf(entry("1", "x1"), entry("2", "x2"))
 
-        val (kept, dropped) = evict(entries, cap = 2)
+        val (kept, dropped) = evictByUsage(entries, cap = 2, nowMillis = Long.MAX_VALUE / 2)
 
         assertEquals(0, dropped)
         assertEquals(listOf("1", "2"), kept.map { it.id })

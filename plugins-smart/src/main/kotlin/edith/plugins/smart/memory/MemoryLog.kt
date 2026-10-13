@@ -86,7 +86,7 @@ class MemoryLog(
         } else {
             MemoryEntry(UUID.randomUUID().toString(), kind, clean, stamp, stamp, 1, source).also { current += it }
         }
-        val (kept, dropped) = evict(current, cap)
+        val (kept, dropped) = evictByUsage(current, cap, stamp)
         // The eviction line goes out only after the document it describes was actually saved: an eviction announced
         // before a write that then fails would report something that never happened.
         if (!persist(kept)) return null
@@ -184,9 +184,17 @@ class MemoryLog(
          * arrangement `AuditTrail.KEY` uses), so a second literal in the App cannot quietly point at nothing.
          */
         const val KEY = "memory.log"
-        /** Spec §3.1: at most this many entries; beyond it the least recently used go. */
-        const val CAP = 200
 
+        /** Spec §5.3: at most this many entries; beyond it the least used go (§5.6). */
+        const val CAP = 1000
+
+        /**
+         * Unchanged from the previous build, deliberately.
+         *
+         * The entry model gained an `embedding`, but the *document* did not: the vector is never persisted (see
+         * [MemoryEntry.embedding]). Bumping the version would make [decode] reject every document the previous build
+         * wrote — silently discarding every memory the user had — in exchange for nothing.
+         */
         private const val VERSION = 1
 
         /** Spec §3.2's de-duplication threshold. */
