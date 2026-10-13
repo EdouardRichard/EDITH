@@ -73,6 +73,19 @@ class ConversationContext(
     @Synchronized
     fun size(): Int = messages.size
 
+    /**
+     * Removes the [count] oldest messages and answers how many actually went.
+     *
+     * The one mutation that is not an append, and it belongs here rather than to the compressor: the transcript is
+     * this class's to change, and a caller reaching in with its own list would be a second owner of it.
+     */
+    @Synchronized
+    fun dropOldest(count: Int): Int {
+        val removed = count.coerceIn(0, messages.size)
+        repeat(removed) { messages.removeAt(0) }
+        return removed
+    }
+
     /** Whether this route owes a compression (spec §4.10). */
     @Synchronized
     fun overCap(): Boolean = messages.size > maxMessages

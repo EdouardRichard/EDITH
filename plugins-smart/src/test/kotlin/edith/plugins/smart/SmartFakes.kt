@@ -284,6 +284,12 @@ internal fun smartToolCall(
 internal class SmartTestRig(
     val sessionId: SessionId = SessionId("smart-session"),
     val generation: Generation = Generation(2),
+    /**
+     * edith-0.2 Phase B: injected into the plugin so a test can drive the session transcript and the compressor.
+     * Both default to `null`, which is the pre-Phase-B plugin shape and what most of these tests are about.
+     */
+    contextForTurn: edith.plugins.smart.context.ContextManager? = null,
+    compressor: edith.plugins.smart.context.ContextCompressor? = null,
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -309,10 +315,13 @@ internal class SmartTestRig(
             profileLookup = { profile },
             cancelOutputTurn = { s, g, t -> cancels += Triple(s, g, t) },
             onDisplayedAck = { displayedAcks += 1 },
+            contextForTurn = contextForTurn,
+            compressor = compressor,
         )
     }
 
-    fun envelope(generation: Generation = this.generation, sessionId: SessionId = this.sessionId) =        EventEnvelope(sessionId, generation, "e-${clock.nowNanos()}", clock.nowNanos(), clock.nowNanos())
+    fun envelope(generation: Generation = this.generation, sessionId: SessionId = this.sessionId) =
+        EventEnvelope(sessionId, generation, "e-${clock.nowNanos()}", clock.nowNanos(), clock.nowNanos())
 
     fun wakeEvent(generation: Generation = this.generation, word: String = "伊迪丝") =
         WakeDetected(envelope(generation), word, 0.9)

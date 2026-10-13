@@ -58,6 +58,9 @@ import edith.plugin.storage
 import edith.plugin.systemOne
 import edith.plugin.textOutput
 import edith.plugin.wakeWord
+import edith.plugins.smart.context.ContextCompressor
+import edith.plugins.smart.context.ContextManager
+import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.memory.MemoryExtraction
 import edith.plugins.smart.memory.MemoryLog
 import edith.plugins.smart.memory.SmartMemoryRetrieval
@@ -170,6 +173,13 @@ class SmartAssistantPlugin(
      * was admitted without the plugin growing a production-only accessor.
      */
     private val onDisplayedAck: () -> Unit = {},
+    /**
+     * edith-0.2 Phase B: the session's transcript. `null` is the pre-Phase-B shape — the plugin keeps no conversation
+     * — and is what a test that is about the passive loop wants.
+     */
+    private val contextForTurn: ContextManager? = null,
+    /** The compressor, consulted **after** the turn's memory write (spec §4.9). `null` means never compress. */
+    private val compressor: ContextCompressor? = null,
 ) : PluginLifecycle, ConfiguredPlugin {
 
     init {
@@ -877,6 +887,10 @@ class SmartAssistantPlugin(
         // owns its hint window here - an acknowledgement emitted afterwards would be dropped as expired, which is
         // exactly the "silent remember" the explicit path exists to avoid.
         rememberFromTurn(text, run)
+        // B6 / spec §4.9: the transcript and the compression come **after** the memory write, in that order, so a
+        // message that compression is about to discard is already in the store. Doing it the other way round would
+        // lose exactly the content compression exists to preserve.
+        recordTurnAndCompress(text, run)
         submitOutcome(owned, run)
     }
 
@@ -894,8 +908,21 @@ class SmartAssistantPlugin(
         if (report.explicit) emit(MemoryExtraction.ACKNOWLEDGEMENT)
     }
 
-    /** Builds the single-use loop for one turn: registry, tightened policy, guard, audit and gateway. */
-    private fun buildLoop(context: PluginContext, configured: Config, owned: SmartTurn): AgentLoop {
+    /**
+     * Edits the session transcript for the turn that just ended, then compresses it if it has outgrown its budget.
+     *
+     * Must be called **after** [rememberFromTurn] (spec §4.9 steps ③→⑤). Both halves are skipped when the wiring did
+     * not supply a [ContextManager], which is the pre-Phase-B shape.
+     */
+    private fun recordTurnAndCompress(userText: String, run: AgentRun) {
+        val contexts = contextForTurn ?: return
+        val context = contexts.context(ContextRoute.WAKE)
+        context.appendUser(userText)
+        run.finalText?.takeIf { it.isNotBlank() }?.let { contexts.appendAssistantMessage(ContextRoute.WAKE, it) }
+        compressor?.compressIfNeeded(context, contexts.historyBudgetTokens())
+    }
+
+    /** Builds the single-use loop for one turn: registry, tightened policy, guard, audit and gateway. */    private fun buildLoop(context: PluginContext, configured: Config, owned: SmartTurn): AgentLoop {
         val registry = ToolRegistry(listOf(context.services.actions()))
         val policy = WhitelistActionPolicy(configured.maxLevel, configured.whitelist)
         val gateway = ModelClientGateway(

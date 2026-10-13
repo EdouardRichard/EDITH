@@ -97,3 +97,15 @@ fun estimateTokens(text: String): Int {
     if (text.isEmpty()) return 0
     return ceil(text.toByteArray(Charsets.UTF_8).size / 3.0).toInt()
 }
+
+/**
+ * The text a history item contributes to an estimate.
+ *
+ * A tool call contributes its arguments and a tool output its payload; the identities are bookkeeping the model does
+ * not read, so counting them would inflate an estimate without bounding anything real.
+ */
+internal fun edith.plugin.ModelHistoryItem.estimatedText(): String = when (this) {
+    is edith.plugin.ModelHistoryItem.Text -> text
+    is edith.plugin.ModelHistoryItem.ToolCall -> argsJson
+    is edith.plugin.ModelHistoryItem.ToolOutput -> output
+}

@@ -108,6 +108,9 @@ class ContextManager(
     fun tokenCount(route: ContextRoute): Int =
         context(route).history().sumOf { estimateTokens(it.estimatedText()) }
 
+    /** The allowance a compression measures a route's history against (spec §4.3/§4.4). */
+    fun historyBudgetTokens(): Int = budget.historyBudgetTokens()
+
     private fun assembleInstructions(route: ContextRoute, skills: List<Skill>): String {
         val base = baseInstructions(route)
         val section = skillSection(skills)
@@ -122,18 +125,6 @@ class ContextManager(
                 append(skill.body)
             }
         }
-
-    /**
-     * The text a history item contributes to the estimate.
-     *
-     * A tool call contributes its arguments and a tool output its payload; the identities are bookkeeping the model
-     * does not read, so counting them would inflate the estimate without bounding anything real.
-     */
-    private fun ModelHistoryItem.estimatedText(): String = when (this) {
-        is ModelHistoryItem.Text -> text
-        is ModelHistoryItem.ToolCall -> argsJson
-        is ModelHistoryItem.ToolOutput -> output
-    }
 
     private companion object {
         /** Spec §5.7: the top-5 related memories are injected. */
