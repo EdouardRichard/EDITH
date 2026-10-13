@@ -1,6 +1,7 @@
 package edith.host.embedding
 
 import edith.plugin.EmbedResult
+import edith.plugin.EmbeddingInferenceEngine
 import edith.plugin.EmbeddingService
 import edith.plugin.FailureReason
 import edith.plugin.ModelInfo
@@ -13,9 +14,12 @@ import java.util.concurrent.atomic.AtomicReference
  * Output dimension fixed at 256 via Matryoshka truncation.
  *
  * @param modelPath Path to the EmbeddingGemma model file on disk
+ * @param engine Inference engine implementation (defaults to StubEmbeddingEngine for JVM tests;
+ *        production injects LiteRT-backed engine from phone-app)
  */
 class EmbeddingServiceImpl(
     private val modelPath: String,
+    private val engine: EmbeddingInferenceEngine = StubEmbeddingEngine(OUTPUT_DIMENSIONS),
 ) : EmbeddingService {
 
     companion object {
@@ -24,7 +28,6 @@ class EmbeddingServiceImpl(
 
     private val _isAvailable = AtomicReference(false)
     private val _modelInfo = AtomicReference<ModelInfo?>(null)
-    private val engine: EmbeddingEngine = StubEmbeddingEngine(OUTPUT_DIMENSIONS)
     private val lock = Any()
 
     override val isAvailable: Boolean get() = _isAvailable.get()

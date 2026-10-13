@@ -1,6 +1,7 @@
 package edith.host.systemone
 
 import edith.plugin.ChoiceResult
+import edith.plugin.LayaInferenceEngine
 import edith.plugin.ModelInfo
 import edith.plugin.NoulResult
 import edith.plugin.ScoreResult
@@ -18,14 +19,16 @@ import java.util.concurrent.atomic.AtomicReference
  * - Thread-safe: inference calls are serialized internally
  *
  * @param modelPath Path to the Laya model file on disk
+ * @param engine Inference engine implementation (defaults to StubLayaEngine for JVM tests;
+ *        production injects LiteRT-backed engine from phone-app)
  */
 class SystemOneServiceImpl(
     private val modelPath: String,
+    private val engine: LayaInferenceEngine = StubLayaEngine(),
 ) : SystemOneService {
 
     private val _status = AtomicReference(SystemOneStatus.LOADING)
     private val _modelInfo = AtomicReference<ModelInfo?>(null)
-    private val engine: LayaInferenceEngine = StubLayaEngine()
     private val lock = Any()
 
     override val isAvailable: Boolean get() = _status.get() == SystemOneStatus.READY
@@ -33,7 +36,6 @@ class SystemOneServiceImpl(
     override val modelInfo: ModelInfo? get() = _modelInfo.get()
 
     init {
-        // Async model loading — never blocks the caller
         Thread({ loadModel() }, "SystemOne-Loader").apply {
             isDaemon = true
             start()
@@ -57,7 +59,7 @@ class SystemOneServiceImpl(
             try {
                 engine.choice("warmup", listOf("a", "b"))
             } catch (_: Exception) {
-                // Warm-up failure is non-fatal; first real call will bear the cost
+                // Warm-up failure is non-fatal
             }
 
             _modelInfo.set(
