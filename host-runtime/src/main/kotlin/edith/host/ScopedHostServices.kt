@@ -38,6 +38,9 @@ class ScopedHostServices(
                 Capability.Context -> scopedContext(provider as? ContextSignals ?: wrong(capability))
                 Capability.WakeWord -> scopedWakeWord(provider as? WakeWordRegistry ?: wrong(capability))
                 Capability.Confirmation -> scopedConfirmation(provider as? ConfirmationChannel ?: wrong(capability))
+                // edith-0.2 Phase A: local model services — no scoped wrapper needed (stateless inference)
+                Capability.SystemOne -> provider as? edith.plugin.SystemOneService ?: wrong(capability)
+                Capability.Embedding -> provider as? edith.plugin.EmbeddingService ?: wrong(capability)
             }
         }
         val child = ResourceScope(scope.pluginId, scope.sessionId, scope.generation)
