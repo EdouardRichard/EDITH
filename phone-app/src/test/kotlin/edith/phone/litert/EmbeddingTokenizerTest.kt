@@ -15,6 +15,11 @@ import java.io.File
  * `sentencepiece.SentencePieceProcessor` (python-sentencepiece 0.2.2) over `sentencepiece.model`, and is pasted in as
  * a literal. A hand-written expectation would only prove the author and the implementation agree.
  *
+ * **The model is BPE, not unigram.** `TrainerSpec.model_type == 2`, so sentencepiece runs `bpe_model.cc` and never
+ * `unigram_model.cc`; the evidence is `docs/project/evidence/2026-10-13-embeddinggemma-tokenizer-is-bpe.md`. The
+ * consequence for this file is that every expectation is a *merge* outcome: `EDIT` survives as one piece because its
+ * rank wins, not because any sum of scores is largest. A Viterbi over these scores reproduces only 19 of 68 strings.
+ *
  * The model file is gitignored, so these tests skip — loudly, naming the path — when it is absent. That is the honest
  * structure: the alternative is committing 4.7 MB of vendor data to keep a test that proves nothing extra.
  */
@@ -25,12 +30,12 @@ class EmbeddingTokenizerTest {
         File(".local/models/embeddinggemma/sentencepiece.model"),
     ).firstOrNull { it.isFile } ?: File("../.local/models/embeddinggemma/sentencepiece.model")
 
-    private fun tokenizer(): SentencePieceUnigram {
+    private fun tokenizer(): SentencePieceBpe {
         assumeTrue(
             "sentencepiece.model not found at ${modelFile.absolutePath} — the vendor artifact is gitignored",
             modelFile.isFile,
         )
-        return SentencePieceUnigram.load(modelFile)
+        return SentencePieceBpe.load(modelFile)
     }
 
     // ---------------------------------------------------------------- the proto parses
@@ -59,13 +64,11 @@ class EmbeddingTokenizerTest {
         assertEquals(493, sp.bytePiece(0xFF))
     }
 
-    // ---------------------------------------------------------------- tokenization matches the oracle
-
     @Test
     fun `the parse keeps the publisher's own scores`() {
-        // Scores are the whole Viterbi objective, so a silent error here changes every segmentation while leaving
-        // the vocabulary looking perfect. These four are the ones that decide the cases below: `▁▁` scores 0.0 --
-        // better than any ordinary piece -- which is exactly why the publisher emits it as one piece.
+        // These are merge ranks expressed as scores, which is why they look like -(id - 494) rather than like
+        // log-probabilities. `▁▁` scores 0.0 — the best score in the model — which is exactly why it survives as one
+        // piece instead of being split into two `▁`.
         val sp = tokenizer()
 
         assertEquals(-8765.0f, sp.score(9259), 0.01f)      // 'Hello'
@@ -73,6 +76,8 @@ class EmbeddingTokenizerTest {
         assertEquals(-155.0f, sp.score(649), 0.01f)        // '▁W'
         assertEquals(-236280.0f, sp.score(236743), 0.01f)  // '▁'
     }
+
+    // ---------------------------------------------------------------- tokenization matches the oracle
 
     @Test
     fun `tokenization reproduces the publisher's own pieces`() {
@@ -95,6 +100,34 @@ class EmbeddingTokenizerTest {
     }
 
     @Test
+    fun `a merge that loses on rank is not taken even when its pieces score better`() {
+        // The sharpest difference between BPE and the unigram Viterbi this file used to drive. `EDIT` is one piece
+        // at -41362, while `ED` (-1919) + `IT` (-1274) sum to -3193 — a max-sum Viterbi therefore splits it, and the
+        // publisher does not. The piece count is asserted too, so the failure stays legible.
+        val sp = tokenizer()
+
+        assertArrayEquals(intArrayOf(41856), sp.encode("EDIT"))
+        assertEquals("EDIT must survive as one piece", 1, sp.encode("EDIT").size)
+
+        // The same shape twice more, from the same corpus: the oracle takes the longer merge.
+        assertArrayEquals(intArrayOf(2413, 13655), sp.encode("EDITH"))
+        assertArrayEquals(intArrayOf(123125, 236859), sp.encode("café"))
+    }
+
+    @Test
+    fun `merges are applied until no adjacent pair is a piece`() {
+        val sp = tokenizer()
+
+        assertArrayEquals(intArrayOf(67997), sp.encode("embedding"))
+        assertArrayEquals(intArrayOf(198329, 20257, 3516, 139245), sp.encode("SENTENCEPIECE"))
+        assertArrayEquals(intArrayOf(602, 8145, 179086), sp.encode("unbelievable"))
+        assertArrayEquals(intArrayOf(4243, 3986, 1111), sp.encode("retrieval"))
+        assertArrayEquals(intArrayOf(212275, 547), sp.encode("Rokid"))
+        assertArrayEquals(intArrayOf(8145, 703), sp.encode("belie"))
+        assertArrayEquals(intArrayOf(108414, 3927), sp.encode("semantic search"))
+    }
+
+    @Test
     fun `normalization escapes spaces and does nothing else`() {
         // Three facts from the oracle, all of which a "reasonable" NFKC normalizer would get wrong:
         // no dummy prefix (`Hello` keeps its id, it is not `▁Hello`), whitespace is NOT collapsed, and full-width
@@ -108,13 +141,18 @@ class EmbeddingTokenizerTest {
             sp.encode("a  b").toList(),
             sp.encode("a b").toList(),
         )
+        // and the oracle's actual values for that pair, so the inequality above cannot pass by both being wrong
+        assertArrayEquals(intArrayOf(236746, 138, 236763), sp.encode("a  b"))
+        assertArrayEquals(intArrayOf(236746, 518), sp.encode("a b"))
     }
 
     @Test
     fun `a character outside the vocabulary falls back to its utf-8 bytes`() {
         val sp = tokenizer()
 
-        // U+00A0 is not a piece; NBSP is two UTF-8 bytes and both become byte pieces.
+        // U+00A0 is not a piece; NBSP is two UTF-8 bytes and both become byte pieces. The fallback is per byte and
+        // applies only to a character with no piece at all — a character that does have one is never exploded.
+        assertArrayEquals(intArrayOf(432, 398), sp.encode("\u00a0"))
         assertArrayEquals(intArrayOf(432, 398, 236746), sp.encode("\u00a0a"))
     }
 
@@ -150,7 +188,7 @@ class EmbeddingTokenizerTest {
     @Test
     fun `a long text is truncated to the sequence length and keeps its frame`() {
         val sp = tokenizer()
-        val long = "语义检索 " .repeat(200)
+        val long = "语义检索 ".repeat(200)
 
         val ids = sp.encodeForModel(long, sequenceLength = 256)
 
