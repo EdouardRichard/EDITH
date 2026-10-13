@@ -1,24 +1,33 @@
-package edith.host.storage
+package edith.plugins.smart.memory
 
 import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.sqrt
 
 /**
- * In-memory vector search bridge with cosine similarity.
+ * In-memory cosine-similarity index over the memory vectors.
  *
- * This is a pure-Kotlin implementation suitable for ≤1000 entries × 256 dimensions.
- * Designed to be replaceable with sqlite-vector native extension when available,
- * without changing the public API.
+ * Moved here from `host-runtime` (`VectorSearchBridge`), where it had **no production consumer** — its only reference
+ * was its own test — while its only future consumer is this package. Leaving it in the host would have made the
+ * plugin depend on the host's implementation to get sixty lines of arithmetic.
  *
- * Thread-safe via ConcurrentHashMap + synchronized search.
+ * A pure-Kotlin linear scan, sized for the store's own cap (1000 entries × 256 dimensions, spec §5.3). It is
+ * deliberately not a vector database: the spec's `sqlite-vector` was replaced by `VectorSearchBridge` in Phase A, and
+ * this class is the same replacement under a name that says what it is.
+ *
+ * **Concurrency, stated honestly.** The store is a `ConcurrentHashMap`, so an insert during a search cannot corrupt
+ * anything — but a search is not a snapshot: an entry inserted while the scan is running may or may not appear in
+ * that search's results. For a top-5 memory lookup that is the right trade (the alternative is a lock on the read
+ * path to bound a race whose worst case is one memory appearing one turn later).
  */
-class VectorSearchBridge(private val dimensions: Int) {
+class VectorIndex(private val dimensions: Int) {
+
     private val store = ConcurrentHashMap<String, FloatArray>()
 
     fun insert(id: String, vector: FloatArray) {
         require(vector.size == dimensions) {
             "Vector dimension mismatch: expected $dimensions, got ${vector.size}"
         }
+        // A defensive copy: the caller keeps its vector and may reuse the buffer.
         store[id] = vector.copyOf()
     }
 
@@ -27,11 +36,10 @@ class VectorSearchBridge(private val dimensions: Int) {
     }
 
     /**
-     * Search for the closest vectors by cosine similarity.
+     * The ids whose vectors are closest to [query], most similar first.
      *
-     * @param query Query vector (must match configured dimensions)
-     * @param limit Maximum number of results
-     * @return List of IDs ordered by descending similarity
+     * Answers an empty list for an empty store or a zero-norm query: a zero query has no direction, so every
+     * similarity against it is arbitrary rather than meaningful.
      */
     fun search(query: FloatArray, limit: Int): List<String> {
         require(query.size == dimensions) {
