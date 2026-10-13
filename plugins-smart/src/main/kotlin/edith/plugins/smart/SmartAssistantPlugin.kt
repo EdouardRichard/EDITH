@@ -816,8 +816,10 @@ class SmartAssistantPlugin(
         // number is lost, and the honest "没能给出结果" sentence would be dropped as expired - the phone acted and the
         // glasses stayed blank.
         var loop: AgentLoop? = null
+        // One ledger per turn, handed to the `notify_user` tool the loop carries (spec §6.3's guard is per-turn).
+        val ledger = NotifyLedger()
         val run = try {
-            val built = buildLoop(current, configured, owned)
+            val built = buildLoop(current, configured, owned, ledger)
             loop = built
             synchronized(gate) {
                 if (turn !== owned || owned.closed) return
@@ -891,7 +893,7 @@ class SmartAssistantPlugin(
         // message that compression is about to discard is already in the store. Doing it the other way round would
         // lose exactly the content compression exists to preserve.
         recordTurnAndCompress(text, run)
-        submitOutcome(owned, run)
+        submitOutcome(owned, run, ledger)
     }
 
     /**
@@ -922,8 +924,15 @@ class SmartAssistantPlugin(
         compressor?.compressIfNeeded(context, contexts.historyBudgetTokens())
     }
 
-    /** Builds the single-use loop for one turn: registry, tightened policy, guard, audit and gateway. */    private fun buildLoop(context: PluginContext, configured: Config, owned: SmartTurn): AgentLoop {
-        val registry = ToolRegistry(listOf(context.services.actions()))
+    /** Builds the single-use loop for one turn: registry, tightened policy, guard, audit and gateway. */    private fun buildLoop(context: PluginContext, configured: Config, owned: SmartTurn, ledger: NotifyLedger): AgentLoop {
+        val registry = ToolRegistry(
+            listOf(
+                context.services.actions(),
+                // B7: `notify_user` is the model's only channel to the wearer (spec §6.1). It rides the action
+                // registry rather than a new tool port, and `NotifyUserTool`'s KDoc records what that choice costs.
+                NotifyUserTool { channel, text -> onNotify(owned, ledger, channel, text) },
+            ),
+        )
         val policy = WhitelistActionPolicy(configured.maxLevel, configured.whitelist)
         val gateway = ModelClientGateway(
             client = context.services.model(),
@@ -1270,19 +1279,70 @@ class SmartAssistantPlugin(
      * `COMPLETED` renders the model's own text; every other outcome renders a fixed honest sentence. There is no path
      * here that submits nothing: a turn that reached a terminal state always says something.
      */
-    private fun submitOutcome(owned: SmartTurn, run: AgentRun) {
+    private fun submitOutcome(owned: SmartTurn, run: AgentRun, ledger: NotifyLedger) {
         val assembler = synchronized(gate) {
             if (turn !== owned || owned.closed) return
             owned.assembler
         } ?: return
         val finalText = run.finalText
+        // Spec §6.1: the model reaches the wearer only through `notify_user`, so a reply must not be displayed a
+        // second time on top of the notifications it already sent. §6.2: an explicit `silent` must not be
+        // contradicted by the fallback either.
+        if (ledger.calls > 0) {
+            P3Log.line("P3_NOTIFY reply=suppressed n=${ledger.calls}")
+            return
+        }
+        if (ledger.suppressed) {
+            P3Log.line("P3_NOTIFY reply=suppressed reason=SILENT")
+            return
+        }
         if (run.outcome == AgentOutcome.COMPLETED && !finalText.isNullOrBlank()) {
+            // §6.2's fallback: the model forgot to notify, so the system says it - on `screen`, because speaking a
+            // sentence the model never chose to say out loud would be the system's decision rather than the model's.
+            P3Log.line("P3_NOTIFY fallback=screen")
             assembler.append(finalText)
             assembler.finish(ModelEnd.COMPLETED)
         } else {
             assembler.append(FAILURE_HINTS[run.outcome] ?: FAILURE_HINTS.getValue(AgentOutcome.FAILED))
             assembler.finish(ModelEnd.FAILED)
         }
+    }
+
+    /**
+     * One notification from the model, with §6.3's mid-step guard applied.
+     *
+     * The guard's rule is "this turn has already notified" — a second notification inside one turn means the task is
+     * still running, so its voice is suppressed while its screen text is not. The **first** notification of a turn is
+     * never downgraded, which is what leaves the "task starting" and "task done" notices free to speak.
+     */
+    private fun onNotify(owned: SmartTurn, ledger: NotifyLedger, channel: NotifyChannel, text: String) {
+        ledger.calls++
+        val midStep = ledger.calls > 1
+        val effective = if (midStep && channel != NotifyChannel.SCREEN && channel != NotifyChannel.SILENT) {
+            NotifyChannel.SCREEN
+        } else {
+            channel
+        }
+        val downgraded = effective != channel
+        P3Log.line(
+            "P3_NOTIFY channel=${channel.wireName} effective=${effective.wireName} " +
+                "n=${ledger.calls} downgraded=$downgraded",
+        )
+        when (val decision = decideChannel(effective)) {
+            is NotifyDecision.Suppress -> ledger.suppressed = true
+            is NotifyDecision.Show -> emit(text, decision.optionalSpeech)
+        }
+    }
+
+    /**
+     * One turn's notification bookkeeping.
+     *
+     * A local of [runTurn], handed to the tool the loop carries, and never shared: §6.3's guard is about *this* turn,
+     * and a field on the plugin would make a previous turn's notification downgrade this one's.
+     */
+    private class NotifyLedger {
+        var calls = 0
+        var suppressed = false
     }
 
     /** A terminal state reached before the loop could run at all (a blank utterance, or an expired listening window). */
@@ -1305,7 +1365,7 @@ class SmartAssistantPlugin(
      * If that ACK arrives mid-submit it is only *remembered* ([SmartTurn.pendingAck]) and admitted after
      * [OutputSubmission.Accepted] comes back.
      */
-    private fun emit(text: String) {
+    private fun emit(text: String, optionalSpeech: SpeechRequest? = null) {
         var owned: SmartTurn? = null
         val hint = synchronized(gate) {
             val current = turn ?: return
@@ -1329,7 +1389,7 @@ class SmartAssistantPlugin(
                 sourceTurnId = current.turnId,
                 priority = 0,
                 text = text,
-                optionalSpeech = null,
+                optionalSpeech = optionalSpeech,
                 expiresAtNanos = expiry,
             )
         }

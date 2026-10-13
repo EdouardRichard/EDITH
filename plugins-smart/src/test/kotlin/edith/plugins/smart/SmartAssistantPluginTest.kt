@@ -417,9 +417,11 @@ class SmartAssistantPluginTest {
         rig.wakeAndFinal("记一条笔记")
 
         val tools = rig.model.requests.single().tools
-        assertEquals(1, tools.size)
-        assertEquals("compose_note", tools.single().name)
-        assertEquals("Action compose_note", tools.single().description)
+        // B7 added `notify_user` to every turn's tool table (spec §6.1: it is the model's only channel to the
+        // wearer), so the action set is asserted by membership rather than by being the whole list.
+        assertEquals(2, tools.size)
+        assertEquals(setOf("compose_note", "notify_user"), tools.map { it.name }.toSet())
+        assertEquals("Action compose_note", tools.single { it.name == "compose_note" }.description)
     }
 
     @Test fun `a model-chosen L1 tool runs and feeds its result back into the same run`() {

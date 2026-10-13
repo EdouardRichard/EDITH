@@ -112,13 +112,16 @@ class MemoryModuleTest {
     fun `when the embedding service fails retrieval falls back to the lexical order`() {
         val log = store()
         val module = module(FakeEmbeddings(failWith = FailureReason.MODEL_NOT_LOADED), log)
-        module.remember("我不吃香菜", MemoryKind.PREFERENCE, MemorySource.EXPLICIT)
+        // Deliberately no negation marker in either the query or the entries: the lexical score penalises an entry
+        // whose negation differs from the query's, which would make the two scores tie at zero and leave the order
+        // to the tie-break. This test is about the fallback happening at all, so the fixture keeps the lexical signal
+        // unambiguous.
+        module.remember("我喜欢喝茶", MemoryKind.PREFERENCE, MemorySource.EXPLICIT)
         module.remember("明天下午三点开会", MemoryKind.FACT, MemorySource.AUTO)
 
-        // The lexical retriever scores shared tokens, so the sentence sharing "香菜" comes first.
-        val ranked = module.retrieve("香菜")
+        val ranked = module.retrieve("喝茶")
 
-        assertEquals("我不吃香菜", ranked.first().text)
+        assertEquals("我喜欢喝茶", ranked.first().text)
     }
 
     @Test
