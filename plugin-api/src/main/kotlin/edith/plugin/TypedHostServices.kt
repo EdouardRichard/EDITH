@@ -35,3 +35,11 @@ fun HostServices.wakeWord(): WakeWordRegistry = require(Capability.WakeWord) as 
 fun HostServices.confirmation(): ConfirmationChannel = require(Capability.Confirmation) as ConfirmationChannel
 fun HostServices.systemOne(): SystemOneService = require(Capability.SystemOne) as SystemOneService
 fun HostServices.embedding(): EmbeddingService = require(Capability.Embedding) as EmbeddingService
+
+/**
+ * The user's own SKILL directory, on shared storage (spec §3.5).
+ *
+ * Separate from [storage], which is the app-private key/value namespace: `Capability.StorageAccess` is the grant to
+ * read a directory the user manages, and a plugin granted only one of the two gets only that one.
+ */
+fun HostServices.storageAccess(): StorageAccess = require(Capability.StorageAccess) as StorageAccess

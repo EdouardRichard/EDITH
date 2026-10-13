@@ -41,6 +41,11 @@ class ScopedHostServices(
                 // edith-0.2 Phase A: local model services — no scoped wrapper needed (stateless inference)
                 Capability.SystemOne -> provider as? edith.plugin.SystemOneService ?: wrong(capability)
                 Capability.Embedding -> provider as? edith.plugin.EmbeddingService ?: wrong(capability)
+                // edith-0.2 Phase B: the user's SKILL directory. Passed through unwrapped for the same reason as the
+                // two local model services — a stateless request/response port with no subscription to fence and no
+                // cancellation surface, so a scoped wrapper would add a layer that conveys nothing. The grant itself
+                // is still checked: `require` refuses a capability this scope was not given.
+                Capability.StorageAccess -> provider as? edith.plugin.StorageAccess ?: wrong(capability)
             }
         }
         val child = ResourceScope(scope.pluginId, scope.sessionId, scope.generation)

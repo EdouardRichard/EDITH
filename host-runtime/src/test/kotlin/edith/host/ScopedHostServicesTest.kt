@@ -274,4 +274,29 @@ class ScopedHostServicesTest {
             mapOf(Capability.Embedding to mockService), FakeTaskScope())
         assertSame(mockService, services.require(Capability.Embedding))
     }
+
+    // edith-0.2 Phase B: the SKILL directory grant
+    @Test fun `require StorageAccess returns the provider`() {
+        val mockAccess = object : StorageAccess {
+            override fun listFiles(dirPath: String, suffix: String) = emptyList<String>()
+            override fun readFile(path: String): String? = null
+            override fun deleteFile(path: String): Boolean = false
+        }
+        val services = ScopedHostServices(scope(), setOf(Capability.StorageAccess),
+            mapOf(Capability.StorageAccess to mockAccess), FakeTaskScope())
+        assertSame(mockAccess, services.require(Capability.StorageAccess))
+    }
+
+    @Test fun `a host that grants Storage but not StorageAccess does not hand over the directory`() {
+        // The two grants are separate: an app-private key/value namespace is not a licence to read the user's files.
+        val services = ScopedHostServices(scope(), setOf(Capability.Storage),
+            mapOf(Capability.Storage to object : StorageHandle {
+                override fun read(key: String): ByteArray? = null
+                override fun write(key: String, value: ByteArray) = Unit
+                override fun delete(key: String) = Unit
+                override fun clear() = Unit
+            }), FakeTaskScope())
+
+        assertFailsWith<ContractError.CapabilityMissing> { services.require(Capability.StorageAccess) }
+    }
 }

@@ -259,6 +259,8 @@ class HostCompositionRoot internal constructor(
         // edith-0.2 Phase A: local model services
         Capability.SystemOne -> "SYSTEM_ONE_MODEL_MISSING"
         Capability.Embedding -> "EMBEDDING_MODEL_MISSING"
+        // edith-0.2 Phase B: the user's SKILL directory on shared storage
+        Capability.StorageAccess -> "STORAGE_ACCESS_PROVIDER_MISSING"
     }
     private val mutableState =
         MutableStateFlow(
