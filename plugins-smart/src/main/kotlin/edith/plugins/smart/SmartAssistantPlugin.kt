@@ -62,6 +62,8 @@ import edith.plugins.smart.context.ContextCompressor
 import edith.plugins.smart.context.ContextManager
 import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.memory.MemoryExtraction
+import edith.plugins.smart.proactive.ProactiveGate
+import edith.plugins.smart.proactive.ProactiveGateState
 import edith.plugins.smart.memory.MemoryLog
 import edith.plugins.smart.memory.SmartMemoryRetrieval
 import java.util.UUID
@@ -98,6 +100,10 @@ private const val DEFAULT_PROACTIVE_COOLDOWN_NANOS = 60_000_000_000L
 
 /** The `ContextChanged` key the foreground app arrives under; the key set is fixed (spec §16.6). */
 private const val FOREGROUND_KEY = "app.foreground"
+
+/** The other two ambient signals the intervention gate reads, under the same fixed key set (spec §16.6). */
+private const val NOTIFICATION_KEY = "notification.category"
+private const val CALENDAR_KEY = "calendar.todayTitles"
 
 /**
  * The context key the host publishes its 「主动辅助」 state under.
@@ -180,6 +186,13 @@ class SmartAssistantPlugin(
     private val contextForTurn: ContextManager? = null,
     /** The compressor, consulted **after** the turn's memory write (spec §4.9). `null` means never compress. */
     private val compressor: ContextCompressor? = null,
+    /**
+     * edith-0.2 Phase B (B11): the intervention gate — "should the model step in right now?" (spec §4.7).
+     *
+     * It sits **after** P3's own admission and throttle, replacing the cloud model's decision rather than adding to
+     * it, so `null` means the pre-B11 behaviour: every admitted trigger goes straight to the model.
+     */
+    private val interventionGate: ProactiveGate? = null,
 ) : PluginLifecycle, ConfiguredPlugin {
 
     init {
@@ -533,8 +546,19 @@ class SmartAssistantPlugin(
                 }
             }
 
-            is ContextChanged -> synchronized(gate) {
-                if (matches(event.envelope)) lastContextValues = event.values
+            is ContextChanged -> {
+                // Spec §4.7's invariant, made real: a `ContextChanged` is the only event that can move the fields
+                // the gate reads besides the utterance, so without this call site the state would change with no
+                // evaluation - the miss the coverage table exists to prevent.
+                val fromContext = synchronized(gate) {
+                    if (!matches(event.envelope)) {
+                        null
+                    } else {
+                        lastContextValues = event.values
+                        if (interventionGate == null) null else proactiveTriggerFromContext()
+                    }
+                }
+                if (fromContext != null) runProactive(fromContext)
             }
 
             is TranscriptEvent -> {
@@ -1009,6 +1033,29 @@ class SmartAssistantPlugin(
         if (!revision.final) return null
         val text = revision.text.trim()
         if (!isUsableUtterance(text)) return null
+        return admitAndGate(text)
+    }
+
+    /**
+     * Must hold [gate]; the `ContextChanged` entry point (spec §4.7).
+     *
+     * It re-judges the **last** utterance against the new ambient state. The state's leading field is the transcript,
+     * so with no utterance behind it there is nothing to judge and this answers nothing rather than asking the gate
+     * the same empty question once per context change.
+     */
+    private fun proactiveTriggerFromContext(): ProactiveTrigger? {
+        val text = lastFinalTranscript ?: return null
+        if (!isUsableUtterance(text)) return null
+        return admitAndGate(text)
+    }
+
+    /**
+     * The shared tail of both proactive entry points: P3's admission and throttle first, then the intervention gate.
+     *
+     * Must hold [gate]. The order is the spec's (C11): arming, sensitivity, cooldown and dedup are the *first* stage,
+     * and only a candidate that passed them is worth spending a local-model judgement on.
+     */
+    private fun admitAndGate(text: String): ProactiveTrigger? {
         val values = currentContextValues()
         val trigger = ProactiveTrigger(text, lastAcousticLabel, values[FOREGROUND_KEY], clock.nowNanos())
         // "Busy" means a turn is genuinely in flight - waiting for its transcript, running its loop, or a proactive
@@ -1040,7 +1087,25 @@ class SmartAssistantPlugin(
             "P3_PROACTIVE admit score=${verdict.score} " +
                 "features=${verdict.fired.joinToString(",") { it.name }}",
         )
-        return trigger
+        val gate = interventionGate ?: return trigger
+        val outcome = gate.shouldIntervene(gateState(trigger))
+        // The verdict, its confidence and its cost - never the state it was drawn from.
+        P3Log.line(
+            "P3_PROACTIVE gate form=${gate.form} intervene=${outcome.intervene} " +
+                "confidence=${outcome.confidence} latencyMs=${outcome.latencyMs} reason=${outcome.reason ?: "-"}",
+        )
+        return if (outcome.intervene) trigger else null
+    }
+
+    /** The gate's input, assembled from the same signals the request carries (spec §4.7). */
+    private fun gateState(trigger: ProactiveTrigger): ProactiveGateState {
+        val values = currentContextValues()
+        return ProactiveGateState.of(
+            transcript = trigger.transcript,
+            foreground = values[FOREGROUND_KEY],
+            notification = values[NOTIFICATION_KEY],
+            calendar = values[CALENDAR_KEY],
+        )
     }
 
     /**

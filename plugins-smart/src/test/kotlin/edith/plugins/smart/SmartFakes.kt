@@ -290,6 +290,8 @@ internal class SmartTestRig(
      */
     contextForTurn: edith.plugins.smart.context.ContextManager? = null,
     compressor: edith.plugins.smart.context.ContextCompressor? = null,
+    /** edith-0.2 Phase B (B11): the intervention gate, `null` for the pre-B11 behaviour. */
+    interventionGate: edith.plugins.smart.proactive.ProactiveGate? = null,
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -317,6 +319,7 @@ internal class SmartTestRig(
             onDisplayedAck = { displayedAcks += 1 },
             contextForTurn = contextForTurn,
             compressor = compressor,
+            interventionGate = interventionGate,
         )
     }
 
