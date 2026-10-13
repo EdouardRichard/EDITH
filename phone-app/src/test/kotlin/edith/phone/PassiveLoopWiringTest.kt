@@ -582,6 +582,21 @@ class PassiveLoopWiringTest {
     }
 
     @Test
+    fun aDetectionIsEvidencedEvenWhenTheHostHasNoIdentity() {
+        // No session is started here, so `host.currentIdentity()` is null — which is exactly the case that used to be
+        // invisible: `emitWakeDetected` returned before its log line, so "the detector fired and the event could not be
+        // delivered" and "the detector never fired" looked identical in logcat. Its own KDoc says the line exists so a
+        // firing is evidenced even when the host drops the event, so the line must come first.
+        withRig { rig ->
+            val lines = withP3Sink { captured ->
+                rig.emitWake("伊迪丝")
+                captured.toList()
+            }
+            assertEquals(listOf("P3_WAKE word=伊迪丝 confidence=1.0"), lines)
+        }
+    }
+
+    @Test
     fun theArmAndDisarmLinesReportTheEpochAndCarryNoFramePayload() {
         val input = RecordingInputPort()
         val root = compositionRoot(input)

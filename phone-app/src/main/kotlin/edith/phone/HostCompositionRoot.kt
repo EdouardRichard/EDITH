@@ -1686,12 +1686,15 @@ class HostCompositionRoot internal constructor(
          * so the removed `currentClockNanos()` accessor is not needed (item 4).
          */
         internal fun emitWakeDetected(host: HostRuntime, clock: MonotonicClock, word: String, confidence: Double) {
+            val bounded = confidence.coerceIn(0.0, 1.0)
+            // **Before the identity check.** This line is the only evidence in the whole system that a wake detector
+            // fired, and logging it after the guard made "fired, but the host had no identity to deliver it under"
+            // indistinguishable from "never fired" — the ambiguity a 2026-10-14 device investigation lost hours to.
+            // The KDoc below has always claimed the line exists for that reason; this is the line catching up with it.
+            // It carries the word and the bounded confidence and nothing else.
+            P3Log.line("P3_WAKE word=$word confidence=$bounded")
             val identity = host.currentIdentity() ?: return
             val now = clock.nowNanos()
-            val bounded = confidence.coerceIn(0.0, 1.0)
-            // On emission, before delivery: the line is evidence that the detector fired even if the host later drops
-            // the event for a stale identity. It carries the word and the bounded confidence and nothing else.
-            P3Log.line("P3_WAKE word=$word confidence=$bounded")
             host.onEvent(WakeDetected(
                 EventEnvelope(identity.first, identity.second, "wake-${UUID.randomUUID()}", now, now),
                 word,
