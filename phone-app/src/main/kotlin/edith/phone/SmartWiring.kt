@@ -7,6 +7,7 @@ import edith.plugin.ModelProfile
 import edith.plugin.MonotonicClock
 import edith.plugin.PluginConfiguration
 import edith.plugins.smart.SmartAssistantPlugin
+import edith.plugins.smart.proactive.GateForm
 import edith.storage.ProfileRepository
 
 /**
@@ -53,5 +54,9 @@ internal class SmartWiring(
         profileLookup = profiles::get,
         cancelOutputTurn = cancelOutputTurn,
         cooldownNanos = settings.cooldownNanos,
+        // edith-0.2 Phase B (B11): the intervention gate is live. It is built from the host's own decision model at
+        // call time rather than injected here, because that model arrives through a capability the plugin only holds
+        // once it is activated - and the host is free to take it back.
+        gateForm = GateForm.NOUL,
     )
 }

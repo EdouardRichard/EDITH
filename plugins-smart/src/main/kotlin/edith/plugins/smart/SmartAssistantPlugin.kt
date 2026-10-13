@@ -62,6 +62,9 @@ import edith.plugins.smart.context.ContextCompressor
 import edith.plugins.smart.context.ContextManager
 import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.memory.MemoryExtraction
+import edith.plugins.smart.proactive.ChoiceGate
+import edith.plugins.smart.proactive.GateForm
+import edith.plugins.smart.proactive.NoulGate
 import edith.plugins.smart.proactive.ProactiveGate
 import edith.plugins.smart.proactive.ProactiveGateState
 import edith.plugins.smart.memory.MemoryLog
@@ -193,6 +196,14 @@ class SmartAssistantPlugin(
      * it, so `null` means the pre-B11 behaviour: every admitted trigger goes straight to the model.
      */
     private val interventionGate: ProactiveGate? = null,
+    /**
+     * Which form the **production** gate uses (spec §4.7 leaves `noul` vs `choice` to measurement).
+     *
+     * `null` — the default — means no gate at all, which is the pre-B11 behaviour and what the tests that are about
+     * the loop want. When set, the gate is built from the **host's** `SystemOneService` at call time rather than
+     * injected, because the model arrives through a capability the plugin only holds once it is activated.
+     */
+    private val gateForm: GateForm? = null,
 ) : PluginLifecycle, ConfiguredPlugin {
 
     init {
@@ -555,7 +566,7 @@ class SmartAssistantPlugin(
                         null
                     } else {
                         lastContextValues = event.values
-                        if (interventionGate == null) null else proactiveTriggerFromContext()
+                        if (activeGate() == null) null else proactiveTriggerFromContext()
                     }
                 }
                 if (fromContext != null) runProactive(fromContext)
@@ -1087,7 +1098,7 @@ class SmartAssistantPlugin(
             "P3_PROACTIVE admit score=${verdict.score} " +
                 "features=${verdict.fired.joinToString(",") { it.name }}",
         )
-        val gate = interventionGate ?: return trigger
+        val gate = activeGate() ?: return trigger
         val outcome = gate.shouldIntervene(gateState(trigger))
         // The verdict, its confidence and its cost - never the state it was drawn from.
         P3Log.line(
@@ -1097,8 +1108,24 @@ class SmartAssistantPlugin(
         return if (outcome.intervene) trigger else null
     }
 
-    /** The gate's input, assembled from the same signals the request carries (spec §4.7). */
-    private fun gateState(trigger: ProactiveTrigger): ProactiveGateState {
+    /**
+     * The gate this turn will use, or `null` when this plugin has none.
+     *
+     * An injected gate wins — that is the test seam — and otherwise a configured [gateForm] builds one from the
+     * host's decision model. Built per call rather than cached: the capability is the host's to withdraw, and a
+     * cached gate would keep answering from a service the session no longer holds.
+     */
+    private fun activeGate(): ProactiveGate? {
+        interventionGate?.let { return it }
+        val form = gateForm ?: return null
+        val service = runCatching { currentContext()?.services?.systemOne() }.getOrNull() ?: return null
+        return when (form) {
+            GateForm.NOUL -> NoulGate(service)
+            GateForm.CHOICE -> ChoiceGate(service)
+        }
+    }
+
+    /** The gate's input, assembled from the same signals the request carries (spec §4.7). */    private fun gateState(trigger: ProactiveTrigger): ProactiveGateState {
         val values = currentContextValues()
         return ProactiveGateState.of(
             transcript = trigger.transcript,
