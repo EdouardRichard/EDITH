@@ -49,7 +49,7 @@ class KeywordAssetBundleTest {
         assertEquals("kws/joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx", bundle.joiner)
         assertEquals("kws/tokens.txt", bundle.tokens)
         assertEquals("kws/keywords.txt", bundle.keywordsFile)
-        assertEquals(listOf("y ī d í s ī @伊迪丝", "IY1 D IH0 TH @EDITH"), bundle.keywords)
+        assertEquals(listOf("y ī d í s ī @伊迪丝", "IY1 D AH0 TH @EDITH"), bundle.keywords)
     }
 
     @Test fun `keywords asset is exactly the pinned tokenisation, lf terminated, no bom and no cr`() {
@@ -60,13 +60,13 @@ class KeywordAssetBundleTest {
                 keywordsBytes[1] == 0xBB.toByte() &&
                 keywordsBytes[2] == 0xBF.toByte())
         assertFalse("keywords.txt must not contain CR", keywordsBytes.any { it == '\r'.code.toByte() })
-        assertEquals("y ī d í s ī @伊迪丝\nIY1 D IH0 TH @EDITH\n", String(keywordsBytes, Charsets.UTF_8))
+        assertEquals("y ī d í s ī @伊迪丝\nIY1 D AH0 TH @EDITH\n", String(keywordsBytes, Charsets.UTF_8))
         assertEquals(2, keywordsBytes.count { it == '\n'.code.toByte() })
     }
 
     @Test fun `createStream argument joins the keyword lines with a slash`() {
         val bundle = load(packagedAssets())!!
-        assertEquals("y ī d í s ī @伊迪丝/IY1 D IH0 TH @EDITH", bundle.keywordsArgument)
+        assertEquals("y ī d í s ī @伊迪丝/IY1 D AH0 TH @EDITH", bundle.keywordsArgument)
     }
 
     @Test fun `parsed lines drop a trailing blank line and the carriage return of a crlf file`() {
