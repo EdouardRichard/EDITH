@@ -26,6 +26,10 @@ import edith.contracts.*
 import edith.host.HostEnvironment
 import edith.host.HostRuntime
 import edith.host.storage.StorageAccessServiceImpl
+import edith.host.systemone.SystemOneServiceImpl
+import edith.host.embedding.EmbeddingServiceImpl
+import edith.phone.laya.LayaInferenceEngineImpl
+import edith.phone.laya.LayaOfficialHost
 import edith.model.*
 import edith.output.TraceRecorder
 import edith.plugin.*
@@ -1313,6 +1317,19 @@ class HostCompositionRoot internal constructor(
             // so it is stateless and cheap; the plugin points it at `/sdcard/EDITH/skills/` itself, which keeps the
             // on-device path in the module that owns the SKILL format (`StorageAccessSkillDirectory`).
             val storageAccess = StorageAccessServiceImpl()
+            // edith-0.2 Phase B: the Laya graph the publisher's host resolves from `filesDir`. Pointing the service
+            // at the main graph file is what makes "the weights are provisioned" a fact this process can check before
+            // handing the engine over; the host re-validates the whole set at construction.
+            val systemOne = SystemOneServiceImpl(
+                modelPath = File(context.filesDir, LAYA_MAIN_GRAPH).absolutePath,
+                engine = LayaInferenceEngineImpl(context),
+            )
+            // The embedding model is a directory of artifacts rather than one file, so the service is pointed at the
+            // directory the engine loads from. `EmbeddingGemmaLiteRTEngine.embed` is still a placeholder - see the
+            // Phase B closure record - so `isAvailable` means "loaded", not "produces semantic vectors".
+            val embedding = EmbeddingServiceImpl(
+                modelPath = File(context.filesDir, EMBEDDING_DIRECTORY).absolutePath,
+            )
             val contextSignals = CxrContextSignals(clock, listOf(
                 CxrContextSignals.armingSource(proactiveArming),
                 foregroundApp::values,
@@ -1502,6 +1519,13 @@ class HostCompositionRoot internal constructor(
                     // answerable set stay equal. A device that denies the read (no card, revoked permission) yields
                     // null/empty from the implementation, which is "no SKILLs installed", not a failure (spec §3.7).
                     put(Capability.StorageAccess, storageAccess)
+                    // edith-0.2 Phase B (B9/B11): the two local models become answerable, which is what lets the
+                    // plugin serve at all - declaring them as hard dependencies meant a host that could not provide
+                    // them correctly refused to activate it. Both are constructed here and load on their own threads;
+                    // a missing artifact leaves the service UNAVAILABLE and the plugin refuses service, which is the
+                    // honest answer rather than a stub answering in the model's place.
+                    put(Capability.SystemOne, systemOne)
+                    put(Capability.Embedding, embedding)
                 },
                 storageFor = namespaceFactory,
                 taskScope = ExecutorTaskScope(pluginTasks))
@@ -1744,8 +1768,17 @@ private const val ENGINE_MANIFEST_ASSET = "engine-manifest.json"
  * bundle imported through the debug path is validated against the manifest it was pushed with - what limits the
  * trust is the debug-only gate above, not the manifest's origin.
  */
-internal object DebugImportDirectory {
-    const val STORE_DIRECTORY = "engine-models"
+/**
+ * edith-0.2 Phase B: where the two local models live.
+ *
+ * Both are resolved from the app's **internal** `filesDir`, which is the publisher's own constraint — `LayaEngine`
+ * reads its assets from there and checks for them at construction, so making the location a setting would mean
+ * patching the vendored host.
+ */
+private const val LAYA_MAIN_GRAPH = "laya_ml_s256_embeds_wfp16.tflite"
+private const val EMBEDDING_DIRECTORY = "engine-models"
+
+internal object DebugImportDirectory {    const val STORE_DIRECTORY = "engine-models"
     const val IMPORT_DIRECTORY = "engine-models-import"
 
     fun store(context: Context) =

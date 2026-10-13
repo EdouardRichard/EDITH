@@ -95,6 +95,24 @@ class LayaOfficialHost(
         return result.answer
     }
 
+    /**
+     * One question in the contract's own shape (edith-0.2 Phase B, B11).
+     *
+     * The mapping is [officialQuestion] and the decode is [LayaAnswerDecoder], both pure — this method is the thin
+     * half that needs the model. A map the question did not ask for is an error rather than a guess: the caller's
+     * safe default is silence, and inventing an answer here would be inventing a decision.
+     */
+    fun ask(
+        state: Any?,
+        question: edith.plugin.SystemOneQuestion,
+        backend: LayaEngine.Backend = LayaEngine.Backend.CPU,
+        questionId: String = "ask",
+    ): edith.plugin.SystemOneAnswer {
+        val result = engine.answer(state, officialQuestion(question), backend, questionId, WINDOW)
+        return LayaAnswerDecoder.decode(question, result.answer)
+            ?: error("the publisher's answer does not match the question: ${result.answer.keys}")
+    }
+
     private fun question(statement: String) =
         linkedMapOf<String, Any?>("type" to "noul", "instructions" to statement, "criteria" to null)
 

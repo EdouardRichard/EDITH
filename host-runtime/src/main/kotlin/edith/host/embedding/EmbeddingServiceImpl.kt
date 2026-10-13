@@ -44,8 +44,10 @@ class EmbeddingServiceImpl(
     private fun loadModel() {
         try {
             val file = java.io.File(modelPath)
-            if (!file.exists() || !file.isFile) {
-                System.err.println("[Embedding] Model file not found: $modelPath")
+            // A model may be one file or a directory of artifacts (EmbeddingGemma ships a graph plus its
+            // SentencePiece model), so the check is "the path the engine will load from exists", not "it is a file".
+            if (!file.exists()) {
+                System.err.println("[Embedding] Model path not found: $modelPath")
                 return
             }
 
