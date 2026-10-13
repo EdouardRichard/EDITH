@@ -246,4 +246,31 @@ class ScopedHostServicesTest {
         assertFailsWith<IllegalArgumentException> { services.confirmation().present("  ", "s", 1_000L) }
         assertFailsWith<IllegalArgumentException> { services.confirmation().present("r1", "s", 0L) }
     }
+
+    // edith-0.2 Phase A: SystemOne and Embedding capability registration
+    @Test fun `require SystemOne returns SystemOneService`() {
+        val mockService = object : SystemOneService {
+            override fun choice(state: String, options: List<String>) = ChoiceResult(0, FloatArray(options.size))
+            override fun score(state: String, items: List<String>, scaleDescription: String) = ScoreResult(FloatArray(items.size))
+            override fun noul(state: String, statement: String) = NoulResult(0.5f)
+            override val isAvailable = true
+            override val status = SystemOneStatus.READY
+            override val modelInfo: ModelInfo? = null
+        }
+        val services = ScopedHostServices(scope(), setOf(Capability.SystemOne),
+            mapOf(Capability.SystemOne to mockService), FakeTaskScope())
+        assertSame(mockService, services.require(Capability.SystemOne))
+    }
+
+    @Test fun `require Embedding returns EmbeddingService`() {
+        val mockService = object : EmbeddingService {
+            override fun embed(text: String) = EmbedResult.Success(floatArrayOf(0.1f))
+            override val isAvailable = true
+            override val modelInfo: ModelInfo? = null
+            override val dimensions = 256
+        }
+        val services = ScopedHostServices(scope(), setOf(Capability.Embedding),
+            mapOf(Capability.Embedding to mockService), FakeTaskScope())
+        assertSame(mockService, services.require(Capability.Embedding))
+    }
 }
