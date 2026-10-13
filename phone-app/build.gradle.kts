@@ -68,6 +68,12 @@ dependencies {
     // androidx.startup initializer crashes the process under this app's minified debug build because
     // Room's generated WorkDatabase_Impl is stripped. Neither is used, so both are excluded rather than
     // kept alive with a keep rule.
+    //
+    // 2.1.0 rather than the newer 2.3.0: 2.3.0 split its API into `litert-api`, which is compiled with
+    // Kotlin 2.4.0 metadata and cannot be read by this project's Kotlin 2.2.20. No GPU artifact is needed
+    // on this line either - `litert:2.1.0` already ships `com.google.ai.edge.litert.CompiledModel` (with
+    // `GpuOptions`, `CpuOptions` and `QualcommOptions`) and the `libLiteRtOpenClAccelerator.so` the GPU
+    // path runs on. `litert-gpu` only exists from 2.3.0 and would drag the incompatible API back in.
     implementation(libs.litert) {
         exclude(group = "com.google.android.play", module = "asset-delivery")
         exclude(group = "androidx.work", module = "work-runtime")

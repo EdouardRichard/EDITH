@@ -196,6 +196,138 @@ class LiteRTPerformanceTest {
         embed.close()
     }
 
+    /**
+     * The `CompiledModel` path, which is what the model card's own latency figures were taken with, and
+     * which is the only path that reaches the GPU (`libLiteRtOpenClAccelerator.so` ships inside
+     * `litert:2.1.0`, so no separate GPU artifact is needed).
+     *
+     * Two things this test refuses to do, because the first version of it did both:
+     *
+     * 1. **Time the first call.** The first `run()` on a graph includes its preparation, so a
+     *    first-call reading mixes compile cost into latency - the same Laya graph read 590 ms and
+     *    2377 ms on two consecutive runs, which is not a latency at all. Every accelerator now gets a
+     *    warm-up run before N timed runs, and the median of those is what is logged.
+     * 2. **Report a GPU speedup it cannot corroborate.** The first GPU run reported 1 ms for a 1.2 GB
+     *    ModernBERT-large forward pass and a 295x speedup. No phone GPU does that, and the GPU's
+     *    `token_logits` disagreed with the CPU's by up to 3.3 with a different argmax. Either the
+     *    `CompiledModel` input mapping differs from the `Interpreter`'s or the run is not synchronized
+     *    before read-back; until one of those is settled the number is not a measurement. The test logs
+     *    `COMPILED_GPU_UNVERIFIED` and asserts on the values, so it cannot pass as a win by accident.
+     */
+    @Test
+    fun compiledModelCpuVersusGpu() {
+        org.junit.Assume.assumeTrue(layaMain.isFile && embeddingModel.isFile)
+
+        val env = com.google.ai.edge.litert.Environment.create()
+        val threads = 4
+
+        class Result(val medianMs: Double, val outputs: List<FloatArray>)
+
+        fun run(
+            accelerator: com.google.ai.edge.litert.Accelerator,
+            tag: String,
+            path: String,
+            inputs: List<FloatArray>,
+            intIndices: Set<Int>,
+            outCount: Int,
+        ): Result? {
+            return try {
+                val options = com.google.ai.edge.litert.CompiledModel.Options(accelerator)
+                if (accelerator == com.google.ai.edge.litert.Accelerator.CPU) {
+                    options.cpuOptions = com.google.ai.edge.litert.CompiledModel.CpuOptions(
+                        numThreads = threads)
+                } else {
+                    options.gpuOptions = com.google.ai.edge.litert.CompiledModel.GpuOptions(
+                        precision = com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision.FP32)
+                }
+                val model = com.google.ai.edge.litert.CompiledModel.create(path, options, env)
+                val inBufs = model.createInputBuffers()
+                val outBufs = model.createOutputBuffers()
+                org.junit.Assert.assertEquals("unexpected input count", inputs.size, inBufs.size)
+                org.junit.Assert.assertEquals("unexpected output count", outCount, outBufs.size)
+
+                fun fill() {
+                    for ((i, buf) in inBufs.withIndex()) {
+                        if (i in intIndices) buf.writeInt(inputs[i].map { it.toInt() }.toIntArray())
+                        else buf.writeFloat(inputs[i])
+                    }
+                }
+
+                fill()
+                model.run(inBufs, outBufs) // warm-up: this is where preparation cost lands
+
+                val samples = 5
+                val times = DoubleArray(samples) {
+                    fill()
+                    val start = System.nanoTime()
+                    model.run(inBufs, outBufs)
+                    (System.nanoTime() - start) / 1_000_000.0
+                }
+                val outputs = outBufs.map { it.readFloat().toList().toFloatArray() }
+                model.close()
+                val median = times.sorted()[samples / 2]
+                Log.i(TAG, "COMPILED_${tag}_MS median=$median samples=${times.toList()}")
+                Result(median, outputs)
+            } catch (e: Throwable) {
+                Log.e(TAG, "COMPILED_${tag}_FAILED: ${e::class.java.simpleName}: ${e.message}")
+                null
+            }
+        }
+
+        val embedIds = FloatArray(256) { (1000 + it % 100).toFloat() }
+        val ids = FloatArray(256) { (1000 + it % 100).toFloat() }
+        val mask = FloatArray(256) { 1f }
+        val qtype = floatArrayOf(1f, 0f, 0f)
+
+        val embedCpu = run(com.google.ai.edge.litert.Accelerator.CPU, "CPU_EMBED",
+            embeddingModel.absolutePath, listOf(embedIds), setOf(0), 1)
+        val layaCpu = run(com.google.ai.edge.litert.Accelerator.CPU, "CPU_LAYA",
+            layaMain.absolutePath, listOf(ids, mask, qtype), setOf(0), 2)
+        val embedGpu = run(com.google.ai.edge.litert.Accelerator.GPU, "GPU_EMBED",
+            embeddingModel.absolutePath, listOf(embedIds), setOf(0), 1)
+        val layaGpu = run(com.google.ai.edge.litert.Accelerator.GPU, "GPU_LAYA",
+            layaMain.absolutePath, listOf(ids, mask, qtype), setOf(0), 2)
+
+        org.junit.Assert.assertNotNull(
+            "Neither graph ran on the CompiledModel CPU path; the comparison has no baseline.", embedCpu)
+
+        // CPU CompiledModel vs the Interpreter CPU reading from the other test in this class. They should
+        // be the same order of magnitude; a wild disagreement means one of the two is mis-configured.
+        Log.i(TAG, "CPU_PATH_INTERPRETER_LAYA_MS=1815 CPU_PATH_COMPILED_LAYA_MS=${layaCpu?.medianMs}")
+
+        // The GPU claim is only worth anything if it reproduces the CPU's numbers.
+        fun corroborate(name: String, cpu: Result?, gpu: Result?): Boolean {
+            if (gpu == null || cpu == null) return false
+            val c = cpu.outputs[0]
+            val g = gpu.outputs[0]
+            val maxAbs = c.indices.maxOf { kotlin.math.abs(c[it] - g[it]) }
+            val scale = c.maxOf { kotlin.math.abs(it) }
+            val agrees = c.indices.all { kotlin.math.abs(c[it] - g[it]) <= 0.05f + 0.02f * kotlin.math.abs(c[it]) }
+            Log.i(TAG, "COMPILED_${name}_CPU_VS_GPU maxAbsDiff=$maxAbs cpuScale=$scale agrees=$agrees " +
+                "cpuArgmax=${c.indices.maxByOrNull { c[it] }} gpuArgmax=${g.indices.maxByOrNull { g[it] }}")
+            if (agrees) {
+                Log.i(TAG, "COMPILED_${name}_GPU_VERIFIED cpuMs=${cpu.medianMs} gpuMs=${gpu.medianMs} " +
+                    "speedup=${"%.2f".format(cpu.medianMs / gpu.medianMs)}")
+            } else {
+                Log.e(TAG, "COMPILED_${name}_GPU_UNVERIFIED: the GPU's output does not match the CPU's " +
+                    "(maxAbsDiff=$maxAbs). Its ${gpu.medianMs} ms is NOT a measurement of inference and no " +
+                    "speedup may be reported from it.")
+            }
+            return agrees
+        }
+
+        val embedOk = corroborate("EMBED", embedCpu, embedGpu)
+        val layaOk = corroborate("LAYA", layaCpu, layaGpu)
+
+        org.junit.Assert.assertTrue(
+            "GPU output did not match CPU output for either graph, so no GPU latency from this run is " +
+                "trustworthy (see COMPILED_*_GPU_UNVERIFIED above). GPU reachability itself was " +
+                "demonstrated - both graphs compiled and ran - but the numbers need the input-mapping or " +
+                "synchronization question settled first.",
+            embedOk || layaOk,
+        )
+    }
+
     private companion object {
         const val TAG = "LiteRTPerf"
     }
