@@ -34,6 +34,19 @@ class LayaHostSmokeTest {
     private val context get() = InstrumentationRegistry.getInstrumentation().targetContext
     private val filesDir get() = context.filesDir
 
+    /**
+     * A realistic Chinese state - and deliberately without any time field.
+     *
+     * D60/C10 forbids time features in Laya's state, because it makes the gate a pure function of the
+     * state (so an unchanged state cannot produce a new answer, which is why the gate is event-driven with
+     * no heartbeat). An earlier revision of this fixture carried dwell_seconds and contradicted the
+     * decision; it is exactly the kind of drift a fine-tuning session would copy as the reference state
+     * shape, so the reason is pinned here rather than left to the reader.
+     */
+    private val realisticState =
+        """{"foreground":"com.tencent.mm","notification_category":"msg",""" +
+            """"recent_transcript":"这个优惠券怎么用啊"}"""
+
     private fun provisioned(): Boolean =
         LayaOfficialHost.REQUIRED_FILES.all { File(filesDir, it).isFile }
 
@@ -55,9 +68,7 @@ class LayaHostSmokeTest {
 
             // One noul question - the shape D60 gives Laya. Chinese state, because that is the deployment
             // language and the multilingual checkpoint is the reason this package was chosen.
-            val state =
-                """{"foreground":"com.tencent.mm","notification_category":"msg","""
-                    .plus(""""recent_transcript":"这个优惠券怎么用啊","dwell_seconds":47}""")
+            val state = realisticState
             val probability = host.noul(state, "用户此刻需要帮助")
             Log.i(TAG, "NOUL_PROBABILITY=$probability")
             org.junit.Assert.assertTrue(
@@ -107,9 +118,7 @@ class LayaHostSmokeTest {
         val missing = LayaOfficialHost.REQUIRED_FILES.filterNot { File(filesDir, it).isFile }
         Assume.assumeTrue("publisher files not provisioned: missing ${missing.joinToString()}", missing.isEmpty())
 
-        val state =
-            """{"foreground":"com.tencent.mm","notification_category":"msg","""
-                .plus(""""recent_transcript":"这个优惠券怎么用啊","dwell_seconds":47}""")
+        val state = realisticState
         val statement = "用户此刻需要帮助"
 
         val host = LayaOfficialHost(context, LayaEngine.Storage.WFP16)
@@ -172,9 +181,7 @@ class LayaHostSmokeTest {
         val missing = LayaOfficialHost.REQUIRED_FILES.filterNot { File(filesDir, it).isFile }
         Assume.assumeTrue("publisher files not provisioned: missing ${missing.joinToString()}", missing.isEmpty())
 
-        val state =
-            """{"foreground":"com.tencent.mm","notification_category":"msg","""
-                .plus(""""recent_transcript":"这个优惠券怎么用啊","dwell_seconds":47}""")
+        val state = realisticState
         val question = linkedMapOf<String, Any?>("type" to "noul", "instructions" to "用户此刻需要帮助",
             "criteria" to null)
 
