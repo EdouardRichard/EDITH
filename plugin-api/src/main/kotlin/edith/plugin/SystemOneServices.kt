@@ -66,8 +66,10 @@ data class SystemOneCriterion(val label: String, val description: String? = null
  * positions back to criteria positions, so reordering the list silently relabels every answer.
  *
  * @param type which of the three forms this is.
- * @param instructions the question text — for the D60 proactive gate this is the proposition being judged
- *   ("用户此刻需要帮助"), which is why it is a first-class field rather than an inferred convention.
+ * @param instructions the question text — for the D60 proactive gate this is the proposition being judged, whose
+ *   literal is pinned by the fine-tune spec (`docs/superpowers/specs/2026-10-13-laya-gate-finetune-design.md` §3.3)
+ *   and not chosen here. A fine-tune trains on one exact string, so the trained string and the deployed string have
+ *   to be the same one; this field being first-class is what keeps that possible.
  * @param criteria the candidates or scale levels. Required for [SystemOneQuestionType.CHOICE] and
  *   [SystemOneQuestionType.SCORE]; for [SystemOneQuestionType.NOUL] it is normally empty and the host renders its
  *   own default true/false option text.

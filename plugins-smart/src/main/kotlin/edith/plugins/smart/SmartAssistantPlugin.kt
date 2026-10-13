@@ -186,6 +186,10 @@ class SmartAssistantPlugin(
             // P3.3 (spec §17.4): without this the host never hands over a channel to ask the user, and every action the
             // policy flags is refused as unavailable - which is the correct behaviour for a host that cannot ask.
             Capability.Confirmation,
+            // edith-0.2 Phase B (B4): the user's SKILL directory. This is the shared-storage grant, deliberately not
+            // `Capability.Storage` - that one is the app-private key/value namespace. Without it the plugin has no
+            // file system at all and the SKILL library is empty forever (spec §3.5).
+            Capability.StorageAccess,
         ),
         ConfigSchema(CONFIG_SCHEMA_VERSION),
     )

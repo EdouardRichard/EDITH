@@ -57,6 +57,7 @@ import edith.plugin.PluginDescriptor
 import edith.plugin.PluginLifecycle
 import edith.plugin.SecretHandle
 import edith.plugin.SpeakerWindow
+import edith.plugin.StorageAccess
 import edith.plugin.StorageHandle
 import edith.plugins.diagnostic.DiagnosticHintPlugin
 import edith.plugins.smart.SmartAssistantPlugin
@@ -159,6 +160,20 @@ class PassiveLoopWiringTest {
         override fun snapshot() = ContextSnapshot(0L, emptyMap())
         override fun listen(listener: (ContextSnapshot) -> Unit): CancellationHandle =
             object : CancellationHandle { override fun cancel() = Unit }
+    }
+
+    /**
+     * edith-0.2 Phase B (B4): the smart plugin declares `Capability.StorageAccess`, so a composition-shaped rig must
+     * advertise and answer it exactly as the App's composition does - otherwise the host refuses activation with
+     * `CAPABILITY_MISSING`, which is the correct behaviour for a declared capability nobody can serve.
+     *
+     * It answers "no SKILLs installed", the normal state on a device where the user has written none (spec §3.7),
+     * so no test in this file needs a real file system.
+     */
+    private class NoStorageAccess : StorageAccess {
+        override fun listFiles(dirPath: String, suffix: String): List<String> = emptyList()
+        override fun readFile(path: String): String? = null
+        override fun deleteFile(path: String): Boolean = false
     }
 
     private class StubStorage : StorageHandle {
@@ -329,6 +344,7 @@ class PassiveLoopWiringTest {
                     // P3.2: the smart plugin declares `Context` (its proactive path runs on perception events), so a
                     // rig that activates it must answer that capability the way the composition does.
                     Capability.Context to EmptyContextSignals(),
+                    Capability.StorageAccess to NoStorageAccess(),
                 ),
                 storageFor = { StubStorage() })
             host = HostRuntime(1, environment)
@@ -694,6 +710,7 @@ class PassiveLoopWiringTest {
                 Capability.Confirmation to NoConfirmations(),
                 Capability.WakeWord to wiring.wakeWords,
                 Capability.Context to EmptyContextSignals(),
+                Capability.StorageAccess to NoStorageAccess(),
             ),
             storageFor = { StubStorage() })
         val root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
@@ -757,7 +774,8 @@ class PassiveLoopWiringTest {
             val advertised = rig.environment.availableCapabilities
 
             assertEquals(setOf(Capability.Model, Capability.Storage, Capability.TextOutput, Capability.Asr,
-                Capability.Actions, Capability.WakeWord, Capability.Context, Capability.Confirmation), advertised)
+                Capability.Actions, Capability.WakeWord, Capability.Context, Capability.Confirmation,
+                Capability.StorageAccess), advertised)
             val services = rig.environment.services(ResourceScope("smart-assistant", session, Generation(1)), advertised)
             advertised.forEach { capability ->
                 assertNull("$capability is advertised, so it must be answerable",
@@ -873,6 +891,7 @@ class PassiveLoopWiringTest {
                 Capability.Confirmation to NoConfirmations(),
                 Capability.WakeWord to wiring.wakeWords,
                 Capability.Context to EmptyContextSignals(),
+                Capability.StorageAccess to NoStorageAccess(),
             ),
             storageFor = { StubStorage() })
         val root = HostCompositionRoot(HostRuntime(1, environment), repository, InertModel(),

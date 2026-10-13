@@ -25,6 +25,7 @@ import edith.audio.android.ValidatedModelBundle
 import edith.contracts.*
 import edith.host.HostEnvironment
 import edith.host.HostRuntime
+import edith.host.storage.StorageAccessServiceImpl
 import edith.model.*
 import edith.output.TraceRecorder
 import edith.plugin.*
@@ -1308,6 +1309,10 @@ class HostCompositionRoot internal constructor(
                 latest = NotificationCategoryService::latest,
             )
             val calendar = CalendarSource.android(context)
+            // edith-0.2 Phase B (B4): the SKILL directory grant. The implementation reads through `java.io.File`,
+            // so it is stateless and cheap; the plugin points it at `/sdcard/EDITH/skills/` itself, which keeps the
+            // on-device path in the module that owns the SKILL format (`StorageAccessSkillDirectory`).
+            val storageAccess = StorageAccessServiceImpl()
             val contextSignals = CxrContextSignals(clock, listOf(
                 CxrContextSignals.armingSource(proactiveArming),
                 foregroundApp::values,
@@ -1491,6 +1496,12 @@ class HostCompositionRoot internal constructor(
                     // provider is the composition's own signals object, so the values a plugin reads and the events
                     // the host delivers describe one source, not two.
                     put(Capability.Context, contextSignals)
+                    // edith-0.2 Phase B (B4): the user's SKILL directory. `StorageAccessServiceImpl` is pure
+                    // `java.io.File` work with no Android dependency and no permission to request at assembly time,
+                    // so this capability is answerable whenever the composition exists - the advertised set and the
+                    // answerable set stay equal. A device that denies the read (no card, revoked permission) yields
+                    // null/empty from the implementation, which is "no SKILLs installed", not a failure (spec §3.7).
+                    put(Capability.StorageAccess, storageAccess)
                 },
                 storageFor = namespaceFactory,
                 taskScope = ExecutorTaskScope(pluginTasks))

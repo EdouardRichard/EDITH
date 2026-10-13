@@ -206,6 +206,14 @@ class PublicProviderConsumerTest {
             Capability.Confirmation to object : ConfirmationChannel {
                 override fun present(requestId: String, summary: String, timeoutMillis: Long) = FakeCancellation()
             },
+            // edith-0.2 Phase B (B4): the smart plugin now declares the SKILL directory grant, and this rig's rule is
+            // that "declared" and "answerable" are the same statement - the App's composition provides this one too.
+            // Nothing in this test reads a SKILL; the provider exists so activation is judged on the App's terms.
+            Capability.StorageAccess to object : StorageAccess {
+                override fun listFiles(dirPath: String, suffix: String): List<String> = emptyList()
+                override fun readFile(path: String): String? = null
+                override fun deleteFile(path: String): Boolean = false
+            },
         )
         val host = HostRuntime(1, object : ScheduledHostEnvironment {
             override val clock = this@Providers.clock
