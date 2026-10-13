@@ -252,22 +252,39 @@ class LiteRTPerformanceTest {
                         else buf.writeFloat(inputs[i])
                     }
                 }
+                fun readAll(): List<FloatArray> = outBufs.map { it.readFloat().toList().toFloatArray() }
+                // Inputs are written on every run, which is both what the production path does and what
+                // keeps this honest: an earlier revision of this block hoisted the write out of the settle
+                // loop and ended up measuring the graphs on freshly-allocated zero buffers, then reporting
+                // those reads as the outputs.
+                fun runOnce() {
+                    fill()
+                    model.run(inBufs, outBufs)
+                }
 
-                fill()
-                model.run(inBufs, outBufs) // warm-up: this is where preparation cost lands
+                // Quiesce before trusting anything: see runUntilSettled's doc comment.
+                val settled = runUntilSettled(::runOnce, ::readAll)
+                if (settled == null) {
+                    Log.e(TAG, "COMPILED_${tag}_NEVER_SETTLED within 16 rounds; refusing to report a " +
+                        "latency or an output for it")
+                    model.close()
+                    return null
+                }
+                val (rounds, outputs) = settled
+                Log.i(TAG, "COMPILED_${tag}_SETTLED_AFTER_ROUNDS=$rounds")
 
+                // Time only post-quiescence runs.
+                repeat(rounds) { runOnce() }
                 val samples = 5
                 val times = DoubleArray(samples) {
-                    fill()
                     val start = System.nanoTime()
-                    model.run(inBufs, outBufs)
+                    runOnce()
                     (System.nanoTime() - start) / 1_000_000.0
                 }
-                val outputs = outBufs.map { it.readFloat().toList().toFloatArray() }
                 model.close()
                 val median = times.sorted()[samples / 2]
                 Log.i(TAG, "COMPILED_${tag}_MS median=$median samples=${times.toList()}")
-                Result(median, outputs)
+                return Result(median, outputs)
             } catch (e: Throwable) {
                 Log.e(TAG, "COMPILED_${tag}_FAILED: ${e::class.java.simpleName}: ${e.message}")
                 null
@@ -496,6 +513,269 @@ class LiteRTPerformanceTest {
             Log.i(TAG, "THREAD_SCALING threads=$threads COMPILED_EMBED_MS=$embed COMPILED_LAYA_MS=$laya " +
                 "INTERPRETER_LAYA_MS=$layaInterp")
         }
+    }
+
+    /**
+     * Why does the GPU's Laya output not match the CPU's? The K40 compiles and runs both graphs on the
+     * Adreno 650, so "unmeasurable" is not an acceptable resting place - the question is answerable here.
+     *
+     * Two candidate causes, separated decisively by one experiment:
+     *
+     * 1. **`Precision.FP32` is ignored and the delegate runs fp16 anyway.** The model card documents this
+     *    graph's fp16 hazards in detail (attention masks at -1e4, LayerNorm inputs whose squares reach
+     *    1e8), and its 2026-09-29 revision exists specifically to stop those overflowing fp16. Avoiding
+     *    *overflow* is not the same as fp16 *precision*: with activations in the 1e3 range and a 2^-11
+     *    mantissa, absolute error in the units digit accumulates across 24 layers, which is the size of
+     *    the mismatch actually seen (3.31).
+     * 2. **The input buffers are in a different order than `Interpreter` reports.** `createInputBuffers()`
+     *    follows the signature's order, which nothing documents for this graph.
+     *
+     * The discriminator: run the GPU twice, once declaring FP32 and once FP16, and compare both against
+     * the CPU. Identical FP32 and FP16 results mean the setting is being ignored. Different results with
+     * FP32 tracking the CPU mean the setting works and something else was wrong (the earlier GPU reading
+     * was taken while submissions were still asynchronous, which the sample lists show).
+     */
+    @Test
+    fun whyDoesTheGpuDisagree() {
+        org.junit.Assume.assumeTrue(layaMain.isFile)
+
+        val ids = FloatArray(256) { (1000 + it % 100).toFloat() }
+        val mask = FloatArray(256) { 1f }
+        val qtype = floatArrayOf(1f, 0f, 0f)
+        val inputs = listOf(ids, mask, qtype)
+        val env = com.google.ai.edge.litert.Environment.create()
+
+        fun runGpu(precision: com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision): List<FloatArray> {
+            val options = com.google.ai.edge.litert.CompiledModel.Options(
+                com.google.ai.edge.litert.Accelerator.GPU)
+            options.gpuOptions = com.google.ai.edge.litert.CompiledModel.GpuOptions(precision = precision)
+            val model = com.google.ai.edge.litert.CompiledModel.create(layaMain.absolutePath, options, env)
+            return try {
+                val ins = model.createInputBuffers()
+                val outs = model.createOutputBuffers()
+                Log.i(TAG, "GPU_INPUT_COUNT=${ins.size} OUTPUT_COUNT=${outs.size}")
+                // Buffer footprint discriminates the slots: [1,256] int32 and [1,256] float32 are both
+                // 1024 B, while qtype_onehot [1,3] float32 is 12 B. Writing a wrong-width array throws, so
+                // this probe both locates qtype and proves which slots accept which width.
+                for ((i, buf) in ins.withIndex()) {
+                    val intOk = try { buf.writeInt(IntArray(256)); true } catch (e: Throwable) { false }
+                    val smallOk = try { buf.writeInt(IntArray(3)); true } catch (e: Throwable) { false }
+                    val float256Ok = try { buf.writeFloat(FloatArray(256)); true } catch (e: Throwable) { false }
+                    val float3Ok = try { buf.writeFloat(FloatArray(3)); true } catch (e: Throwable) { false }
+                    Log.i(TAG, "GPU_INPUT[$i] accepts int256=$intOk int3=$smallOk float256=$float256Ok float3=$float3Ok")
+                }
+                for ((i, buf) in ins.withIndex()) {
+                    if (i == 0) buf.writeInt(inputs[0].map { it.toInt() }.toIntArray()) else buf.writeFloat(inputs[i])
+                }
+                // Three runs: the first submissions return before the GPU has finished (see the GPU sample
+                // lists elsewhere in this class), so the last one is the one whose buffers are complete.
+                repeat(3) { model.run(ins, outs) }
+                outs.map { it.readFloat().toList().toFloatArray() }
+            } finally {
+                model.close()
+            }
+        }
+
+        fun cpuReference(): List<FloatArray> {
+            val options = com.google.ai.edge.litert.CompiledModel.Options(
+                com.google.ai.edge.litert.Accelerator.CPU)
+            options.cpuOptions = com.google.ai.edge.litert.CompiledModel.CpuOptions(numThreads = 4)
+            val model = com.google.ai.edge.litert.CompiledModel.create(layaMain.absolutePath, options, env)
+            return try {
+                val ins = model.createInputBuffers()
+                val outs = model.createOutputBuffers()
+                for ((i, buf) in ins.withIndex()) {
+                    if (i == 0) buf.writeInt(inputs[0].map { it.toInt() }.toIntArray()) else buf.writeFloat(inputs[i])
+                }
+                model.run(ins, outs)
+                outs.map { it.readFloat().toList().toFloatArray() }
+            } finally {
+                model.close()
+            }
+        }
+
+        val cpu = cpuReference()
+        val gpuFp32 = try { runGpu(com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision.FP32) }
+            catch (e: Throwable) { Log.e(TAG, "GPU_FP32_FAILED: ${e.message}"); null }
+        val gpuFp16 = try { runGpu(com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision.FP16) }
+            catch (e: Throwable) { Log.e(TAG, "GPU_FP16_FAILED: ${e.message}"); null }
+
+        fun diff(a: List<FloatArray>, b: List<FloatArray>, name: String) {
+            for (i in a.indices) {
+                if (i >= b.size) continue
+                val maxAbs = a[i].indices.maxOf { kotlin.math.abs(a[i][it] - b[i][it]) }
+                Log.i(TAG, "GPU_DIAG_$name out$i maxAbsDiff=$maxAbs " +
+                    "scale=${a[i].maxOf { kotlin.math.abs(it) }} " +
+                    "argmaxA=${a[i].indices.maxByOrNull { a[i][it] }} argmaxB=${b[i].indices.maxByOrNull { b[i][it] }}")
+            }
+        }
+
+        if (gpuFp32 != null) diff(cpu, gpuFp32, "CPU_vs_GPU_FP32")
+        if (gpuFp16 != null) diff(cpu, gpuFp16, "CPU_vs_GPU_FP16")
+        if (gpuFp32 != null && gpuFp16 != null) {
+            diff(gpuFp32, gpuFp16, "GPU_FP32_vs_GPU_FP16")
+            val same = gpuFp32.indices.all { i ->
+                gpuFp32[i].indices.all { gpuFp32[i][it] == gpuFp16[i][it] }
+            }
+            Log.i(TAG, "GPU_PRECISION_SETTING_HONOURED=${!same} " +
+                "(FP32 and FP16 outputs bit-identical means the requested precision is ignored)")
+        }
+    }
+
+    /**
+     * Resolves the GPU mismatch by removing the guesswork instead of testing permutations.
+     *
+     * The previous experiment settled two things and left one open:
+     * - **The precision setting is honoured.** Forcing `Precision.FP16` on the fp32-weight graph produces
+     *   **NaN** - exactly the overflow the model card documents for this graph - and differs from the FP32
+     *   output. So FP32 is not being silently downgraded, and precision is not the cause.
+     * - **`qtype_onehot` is buffer [2]**, confirmed by its 12-byte footprint rejecting 256-element writes.
+     * - **Buffers [0] and [1] accept any width, so their order is genuinely ambiguous.**
+     *   `createInputBuffers()` follows the signature's order, which nothing documents. If `input_ids` and
+     *   `attention_mask` are swapped relative to the `Interpreter`'s order, an int32 array written into a
+     *   float32 buffer becomes denormal garbage and a float mask written into an int32 buffer becomes
+     *   token ids around 1.06e9 - either of which would produce a mismatch of exactly the observed size.
+     *
+     * Rather than permute, this uses the name-keyed API: `createInputBuffer(signature, tensorName)` and the
+     * `Map<String, TensorBuffer>` overload of `run`. Names come from the model card's graph contract, and
+     * the test asserts the buffers were created rather than silently swallowing a wrong name.
+     */
+    @Test
+    fun gpuByTensorName() {
+        org.junit.Assume.assumeTrue(layaMain.isFile)
+
+        val sig = "serving_default"
+        val ids = IntArray(256) { 1000 + it % 100 }
+        val mask = FloatArray(256) { 1f }
+        val qtype = floatArrayOf(1f, 0f, 0f)
+        val env = com.google.ai.edge.litert.Environment.create()
+
+        // Report the names and element types the model actually declares, so a wrong guess fails loudly.
+        runCatching {
+            val interp = Interpreter(mapModel(layaMain), Interpreter.Options().setNumThreads(4))
+            try {
+                for (i in 0 until interp.inputTensorCount) {
+                    Log.i(TAG, "NAMED_INPUT[$i] name='${interp.getInputTensor(i).name()}' " +
+                        "dtype=${interp.getInputTensor(i).dataType()}")
+                }
+                for (i in 0 until interp.outputTensorCount) {
+                    Log.i(TAG, "NAMED_OUTPUT[$i] name='${interp.getOutputTensor(i).name()}'")
+                }
+            } finally { interp.close() }
+        }
+
+        fun run(named: Boolean, accelerator: com.google.ai.edge.litert.Accelerator,
+            precision: com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision?):
+            List<FloatArray>? {
+            return try {
+                val options = com.google.ai.edge.litert.CompiledModel.Options(accelerator)
+                if (accelerator == com.google.ai.edge.litert.Accelerator.CPU) {
+                    options.cpuOptions = com.google.ai.edge.litert.CompiledModel.CpuOptions(numThreads = 4)
+                } else if (precision != null) {
+                    options.gpuOptions = com.google.ai.edge.litert.CompiledModel.GpuOptions(precision = precision)
+                }
+                val model = com.google.ai.edge.litert.CompiledModel.create(layaMain.absolutePath, options, env)
+                try {
+                    if (named) {
+                        val ins = linkedMapOf(
+                            "input_ids" to model.createInputBuffer(sig, "input_ids"),
+                            "attention_mask" to model.createInputBuffer(sig, "attention_mask"),
+                            "qtype_onehot" to model.createInputBuffer(sig, "qtype_onehot"),
+                        )
+                        val outs = linkedMapOf(
+                            "token_logits" to model.createOutputBuffer(sig, "token_logits"),
+                            "pooled_cls" to model.createOutputBuffer(sig, "pooled_cls"),
+                        )
+                        ins.getValue("input_ids").writeInt(ids)
+                        ins.getValue("attention_mask").writeFloat(mask)
+                        ins.getValue("qtype_onehot").writeFloat(qtype)
+                        // Repeat: the first GPU submissions return before the work is done.
+                        repeat(3) { model.run(ins, outs, sig) }
+                        listOf(outs.getValue("token_logits").readFloat(),
+                            outs.getValue("pooled_cls").readFloat())
+                    } else {
+                        val ins = model.createInputBuffers()
+                        val outs = model.createOutputBuffers()
+                        ins[0].writeInt(ids)
+                        ins[1].writeFloat(mask)
+                        ins[2].writeFloat(qtype)
+                        repeat(3) { model.run(ins, outs) }
+                        listOf(outs[0].readFloat(), outs[1].readFloat())
+                    }
+                } finally { model.close() }
+            } catch (e: Throwable) {
+                Log.e(TAG, "NAMED_RUN_FAILED named=$named accel=$accelerator: " +
+                    "${e::class.java.simpleName}: ${e.message}")
+                null
+            }
+        }
+
+        fun compare(tag: String, a: List<FloatArray>?, b: List<FloatArray>?) {
+            if (a == null || b == null) { Log.e(TAG, "NAMED_$tag unavailable"); return }
+            for (i in a.indices) {
+                val maxAbs = a[i].indices.maxOf { kotlin.math.abs(a[i][it] - b[i][it]) }
+                Log.i(TAG, "NAMED_${tag} out$i maxAbsDiff=$maxAbs " +
+                    "scale=${a[i].maxOf { kotlin.math.abs(it) }} " +
+                    "argmaxA=${a[i].indices.maxByOrNull { a[i][it] }} " +
+                    "argmaxB=${b[i].indices.maxByOrNull { b[i][it] }}")
+            }
+        }
+
+        val cpuNamed = run(named = true, com.google.ai.edge.litert.Accelerator.CPU, null)
+        val cpuPositional = run(named = false, com.google.ai.edge.litert.Accelerator.CPU, null)
+        compare("CPU_NAMED_vs_CPU_POSITIONAL", cpuNamed, cpuPositional)
+
+        val gpuNamed = run(named = true, com.google.ai.edge.litert.Accelerator.GPU,
+            com.google.ai.edge.litert.CompiledModel.GpuOptions.Precision.FP32)
+        compare("CPU_NAMED_vs_GPU_NAMED", cpuNamed, gpuNamed)
+    }
+
+    /**
+     * Runs [runOnce] until two consecutive reads of the outputs agree to within [tolerance], and reports
+     * how many rounds that took.
+     *
+     * This exists because the GPU delegate's `run()` returning does **not** mean the work is done. The
+     * per-sample lists elsewhere in this class show it plainly: the first submissions of every GPU graph
+     * come back in about a millisecond and later ones take ~226 ms, i.e. the call blocks on *submission*
+     * back-pressure, not on completion. Reading outputs right after `run()` therefore returns whatever is
+     * in the buffer — which is why one run of this test found the embedding graph's GPU output matching
+     * the CPU's and a later run of the same code did not.
+     *
+     * **The first version of this check demanded bit-identical reads and never settled — including on the
+     * CPU**, which is the wrong criterion rather than a finding: XNNPACK's multi-threaded reductions
+     * combine partial sums in a work-stealing order that varies between runs, so an fp32 result is
+     * reproducible only to a tolerance. Agreement within [tolerance] is the property that can actually
+     * hold, and a genuinely unwritten buffer (all zeros) still fails it.
+     */
+    private fun runUntilSettled(
+        runOnce: () -> Unit,
+        readAll: () -> List<FloatArray>,
+        tolerance: Float = 1e-4f,
+        maxRounds: Int = 16,
+    ): Pair<Int, List<FloatArray>>? {
+        var previous: List<FloatArray>? = null
+        for (round in 1..maxRounds) {
+            runOnce()
+            val now = readAll()
+            if (previous != null && agreesWithin(previous, now, tolerance)) return round to now
+            previous = now
+        }
+        return null
+    }
+
+    /** True when every element of [b] is within [tolerance] of the corresponding element of [a]. */
+    private fun agreesWithin(a: List<FloatArray>, b: List<FloatArray>, tolerance: Float): Boolean {
+        if (a.size != b.size) return false
+        for (i in a.indices) {
+            if (a[i].size != b[i].size) return false
+            for (j in a[i].indices) {
+                val x = a[i][j]
+                val y = b[i][j]
+                if (x.isNaN() || y.isNaN()) return false
+                if (kotlin.math.abs(x - y) > tolerance) return false
+            }
+        }
+        return true
     }
 
     private companion object {
