@@ -89,6 +89,113 @@ class LayaHostSmokeTest {
         }
     }
 
+    /**
+     * CPU against GPU on whichever device is attached, with the answers cross-checked.
+     *
+     * The cross-check is the point, not ceremony. On the K40 with LiteRT 2.1.0 the GPU silently disagreed
+     * with the CPU by 3.31 on a logit scale of 4.57 while running 4x faster, and that went unnoticed until
+     * a value comparison was added. On 2.2.0 the same comparison agrees to 7.6e-6. A latency figure without
+     * an output comparison is not a measurement of anything, so every timing below is paired with the
+     * question "did it compute the same answer".
+     *
+     * One engine instance serves both backends: `LayaEngine` caches compiled graphs per
+     * `(window, backend, storage)`, and one `Environment` per process is the publisher's design (and the
+     * measured hardware limit on the K40, where a handful of instantiations makes `create` fail).
+     */
+    @Test
+    fun cpuAndGpuAgreeAndHowFast() {
+        val missing = LayaOfficialHost.REQUIRED_FILES.filterNot { File(filesDir, it).isFile }
+        Assume.assumeTrue("publisher files not provisioned: missing ${missing.joinToString()}", missing.isEmpty())
+
+        val state =
+            """{"foreground":"com.tencent.mm","notification_category":"msg","""
+                .plus(""""recent_transcript":"这个优惠券怎么用啊","dwell_seconds":47}""")
+        val statement = "用户此刻需要帮助"
+
+        val host = LayaOfficialHost(context, LayaEngine.Storage.WFP16)
+        try {
+            val results = linkedMapOf<LayaEngine.Backend, List<Double>>()
+            val answers = linkedMapOf<LayaEngine.Backend, Double>()
+
+            for (backend in listOf(LayaEngine.Backend.CPU, LayaEngine.Backend.GPU)) {
+                val compiled = System.nanoTime()
+                host.initialize(backend)
+                val compileMs = (System.nanoTime() - compiled) / 1_000_000.0
+
+                // One untimed call warms the path, then five timed ones.
+                answers[backend] = host.noul(state, statement, backend)
+                val times = (1..5).map {
+                    val started = System.nanoTime()
+                    val p = host.noul(state, statement, backend)
+                    answers[backend] = p
+                    (System.nanoTime() - started) / 1_000_000.0
+                }.sorted()
+                results[backend] = times
+                Log.i(TAG, "${backend.name}_COMPILE_MS=$compileMs ${backend.name}_MEDIAN_MS=${times[2]} " +
+                    "${backend.name}_SAMPLES=$times")
+            }
+
+            val cpu = answers.getValue(LayaEngine.Backend.CPU)
+            val gpu = answers.getValue(LayaEngine.Backend.GPU)
+            Log.i(TAG, "AGREEMENT cpu=$cpu gpu=$gpu absDiff=${kotlin.math.abs(cpu - gpu)}")
+
+            org.junit.Assert.assertTrue("CPU probability not finite: $cpu", cpu.isFinite())
+            org.junit.Assert.assertTrue("GPU probability not finite: $gpu", gpu.isFinite())
+            org.junit.Assert.assertEquals(
+                "GPU and CPU disagree on the noul probability; the GPU number is not usable until they " +
+                    "agree (this is how the LiteRT 2.1.0 miscompute was caught)",
+                cpu, gpu, 0.01,
+            )
+
+            val cpuMedian = results.getValue(LayaEngine.Backend.CPU)[2]
+            val gpuMedian = results.getValue(LayaEngine.Backend.GPU)[2]
+            Log.i(TAG, "RATIO cpuOverGpu=${"%.2f".format(cpuMedian / gpuMedian)}")
+        } finally {
+            host.close()
+        }
+    }
+
+    /**
+     * Where the per-question time actually goes.
+     *
+     * This exists because the end-to-end figure is not comparable with anything published. The publisher
+     * quotes **graph** time (51.9 ms GPU, 163 ms CPU on an S26); the K40 measurements in this session were
+     * also graph-only (`CompiledModel.run`). A `LayaEngine.answer` call additionally tokenizes, builds the
+     * prompt, gathers 256 rows out of the 375 MiB table and decodes, so quoting its total against those
+     * figures would overstate the cost of the part being compared - the same category error as comparing
+     * GPU and CPU latencies measured in different thermal states.
+     *
+     * The split comes from the host's own timers, not from instrumentation around it.
+     */
+    @Test
+    fun whereTheTimeGoes() {
+        val missing = LayaOfficialHost.REQUIRED_FILES.filterNot { File(filesDir, it).isFile }
+        Assume.assumeTrue("publisher files not provisioned: missing ${missing.joinToString()}", missing.isEmpty())
+
+        val state =
+            """{"foreground":"com.tencent.mm","notification_category":"msg","""
+                .plus(""""recent_transcript":"这个优惠券怎么用啊","dwell_seconds":47}""")
+        val question = linkedMapOf<String, Any?>("type" to "noul", "instructions" to "用户此刻需要帮助",
+            "criteria" to null)
+
+        LayaOfficialHost(context, LayaEngine.Storage.WFP16).use { host ->
+            for (backend in listOf(LayaEngine.Backend.CPU, LayaEngine.Backend.GPU)) {
+                host.initialize(backend)
+                host.engine.answer(state, question, backend, "warm", LayaOfficialHost.WINDOW) // warm
+
+                val rows = (1..5).map { host.engine.answer(state, question, backend, "t$it", LayaOfficialHost.WINDOW) }
+                val median = rows.sortedBy { it.totalMs }[2]
+                val graphMs = median.raw.mainTiming.totalMs
+                val actMs = median.raw.actTiming?.totalMs
+                Log.i(TAG, "SPLIT_${backend.name} total=${median.totalMs} " +
+                    "graphMain=${graphMs} graphAct=$actMs " +
+                    "graphTotal=${graphMs + (actMs ?: 0.0)} " +
+                    "prepare=${median.prepareMs} embedLookup=${median.raw.embeddingLookupMs} " +
+                    "decode=${median.decodeMs} finite=${median.raw.finite}")
+            }
+        }
+    }
+
     private companion object {
         const val TAG = "LayaSmoke"
     }
