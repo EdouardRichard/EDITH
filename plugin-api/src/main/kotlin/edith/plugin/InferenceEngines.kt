@@ -3,23 +3,25 @@ package edith.plugin
 /**
  * Abstraction over a Laya decision model inference backend.
  *
- * Implementations wrap a specific runtime (LiteRT, ONNX Runtime, etc.) and implement
- * the Laya graph contract: state tensor in → choice/score/noul output tensors.
+ * Implementations wrap a specific runtime (LiteRT, ONNX Runtime, …). The interface is deliberately as narrow as
+ * Laya itself: initialize once, put questions, close. It carries **no model path**, because the publisher's host
+ * resolves its assets from `context.filesDir` and validates them at construction — a path parameter here would be
+ * ignored by the only real implementation, and a parameter the implementation ignores is a lie about the contract.
  *
- * See spec §2.2 and https://huggingface.co/litert-community/laya-LiteRT for graph contract details.
+ * @see SystemOneQuestion
+ * @see SystemOneAnswer
  */
 interface LayaInferenceEngine {
-    /** Initialize the engine with the given model path. Returns true on success. */
-    fun initialize(modelPath: String): Boolean
+    /** Loads/compiles the model. Returns true on success. Blocks; call off the main thread. */
+    fun initialize(): Boolean
 
-    /** Choice: select from options. Returns probability distribution across all options. */
-    fun choice(state: String, options: List<String>): FloatArray
-
-    /** Score: rate items on a scale. Returns one score per item. */
-    fun score(state: String, items: List<String>, scaleDescription: String): FloatArray
-
-    /** Noul: judge whether statement holds. Returns confidence in [0, 1]. */
-    fun noul(state: String, statement: String): Float
+    /**
+     * Puts one question to the model.
+     *
+     * Implementations may throw; [SystemOneService] owns translating a throw into a [SystemOneResult.Failure] so
+     * that callers only ever see the contract's own failure vocabulary.
+     */
+    fun ask(state: String, question: SystemOneQuestion): SystemOneAnswer
 
     /** Release resources. */
     fun close()

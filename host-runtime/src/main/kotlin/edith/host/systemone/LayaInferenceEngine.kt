@@ -1,38 +1,57 @@
 package edith.host.systemone
 
 import edith.plugin.LayaInferenceEngine
+import edith.plugin.SystemOneAnswer
+import edith.plugin.SystemOneQuestion
+import edith.plugin.SystemOneQuestionType
 
 /**
- * Stub engine for JVM unit tests. Returns deterministic outputs that satisfy
- * the interface contract without real inference.
+ * Stub engine for JVM unit tests. Answers every question with an even split over its own criteria, so the service's
+ * plumbing — serialization, availability, failure translation, latency — can be exercised without provisioning the
+ * 679 MB publisher set.
  *
- * Production uses LiteRT-backed implementations injected from phone-app.
+ * It performs no inference at all. It is reachable in production only as [SystemOneServiceImpl]'s default
+ * constructor argument, and a production composition must inject the publisher's host instead.
  */
 internal class StubLayaEngine : LayaInferenceEngine {
     private var initialized = false
 
-    override fun initialize(modelPath: String): Boolean {
+    override fun initialize(): Boolean {
         initialized = true
         return true
     }
 
-    override fun choice(state: String, options: List<String>): FloatArray {
+    override fun ask(state: String, question: SystemOneQuestion): SystemOneAnswer {
         check(initialized) { "Engine not initialized" }
-        val uniform = 1.0f / options.size
-        return FloatArray(options.size) { uniform }
-    }
+        return when (question.type) {
+            SystemOneQuestionType.CHOICE -> {
+                val labels = question.criteria.map { it.label }
+                SystemOneAnswer.Choice(
+                    choice = labels.first(),
+                    probabilities = evenSplit(labels),
+                    confidence = 1.0 / labels.size,
+                )
+            }
 
-    override fun score(state: String, items: List<String>, scaleDescription: String): FloatArray {
-        check(initialized) { "Engine not initialized" }
-        return FloatArray(items.size) { 0.5f }
-    }
+            SystemOneQuestionType.SCORE -> {
+                val levels = question.criteria.indices.map { it.toString() }
+                SystemOneAnswer.Score(
+                    level = (levels.size - 1) / 2.0,
+                    probabilities = evenSplit(levels),
+                    confidence = 1.0 / levels.size,
+                )
+            }
 
-    override fun noul(state: String, statement: String): Float {
-        check(initialized) { "Engine not initialized" }
-        return 0.5f
+            SystemOneQuestionType.NOUL -> SystemOneAnswer.Noul(probability = 0.5, confidence = 0.5)
+        }
     }
 
     override fun close() {
         initialized = false
+    }
+
+    private fun evenSplit(labels: List<String>): Map<String, Double> {
+        val each = 1.0 / labels.size
+        return labels.associateWithTo(LinkedHashMap()) { each }
     }
 }

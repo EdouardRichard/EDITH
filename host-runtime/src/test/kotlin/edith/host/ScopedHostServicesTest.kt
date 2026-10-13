@@ -250,9 +250,10 @@ class ScopedHostServicesTest {
     // edith-0.2 Phase A: SystemOne and Embedding capability registration
     @Test fun `require SystemOne returns SystemOneService`() {
         val mockService = object : SystemOneService {
-            override fun choice(state: String, options: List<String>) = ChoiceResult(0, FloatArray(options.size))
-            override fun score(state: String, items: List<String>, scaleDescription: String) = ScoreResult(FloatArray(items.size))
-            override fun noul(state: String, statement: String) = NoulResult(0.5f)
+            // A test double, so it answers every question the same way: the service is unavailable. What this test
+            // pins is the capability plumbing, not the decision model.
+            override fun ask(state: String, question: SystemOneQuestion) =
+                SystemOneResult.Failure(FailureReason.MODEL_NOT_LOADED, "test double")
             override val isAvailable = true
             override val status = SystemOneStatus.READY
             override val modelInfo: ModelInfo? = null

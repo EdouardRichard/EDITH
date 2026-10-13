@@ -1,10 +1,12 @@
 package edith.host.systemone
 
-import edith.plugin.ChoiceResult
+import edith.plugin.FailureReason
 import edith.plugin.LayaInferenceEngine
 import edith.plugin.ModelInfo
-import edith.plugin.NoulResult
-import edith.plugin.ScoreResult
+import edith.plugin.SystemOneCriterion
+import edith.plugin.SystemOneQuestion
+import edith.plugin.SystemOneQuestionType
+import edith.plugin.SystemOneResult
 import edith.plugin.SystemOneService
 import edith.plugin.SystemOneStatus
 import java.util.concurrent.atomic.AtomicReference
@@ -18,9 +20,16 @@ import java.util.concurrent.atomic.AtomicReference
  * - No pause/resume — model stays resident once loaded
  * - Thread-safe: inference calls are serialized internally
  *
- * @param modelPath Path to the Laya model file on disk
- * @param engine Inference engine implementation (defaults to StubLayaEngine for JVM tests;
- *        production injects LiteRT-backed engine from phone-app)
+ * The service's job is everything **around** the model: provisioning, the status machine, serialization, the
+ * warm-up, and translating a backend throw into the contract's own [FailureReason] vocabulary. It no longer
+ * assembles positional arguments — the question is data, and [LayaInferenceEngine] takes it whole.
+ *
+ * @param modelPath The service's own provisioning assertion. The publisher's host resolves its assets from
+ *   `context.filesDir` and re-validates them in its constructor, so this path is what the *host* process checks
+ *   before handing the engine over; making the location configurable is a Phase B todo carried by the service, not
+ *   by an engine parameter.
+ * @param engine Inference engine implementation (defaults to [StubLayaEngine] for JVM tests; production injects an
+ *   engine backed by the publisher's host from phone-app)
  */
 class SystemOneServiceImpl(
     private val modelPath: String,
@@ -50,17 +59,12 @@ class SystemOneServiceImpl(
                 return
             }
 
-            if (!engine.initialize(modelPath)) {
+            if (!engine.initialize()) {
                 _status.set(SystemOneStatus.UNAVAILABLE)
                 return
             }
 
-            // Warm-up: run a dummy choice to eliminate cold-start latency
-            try {
-                engine.choice("warmup", listOf("a", "b"))
-            } catch (_: Exception) {
-                // Warm-up failure is non-fatal
-            }
+            warmUp()
 
             _modelInfo.set(
                 ModelInfo(
@@ -68,7 +72,7 @@ class SystemOneServiceImpl(
                     version = "unknown",
                     quantization = "unknown",
                     parameterCount = "unknown",
-                    contextWindow = 512,
+                    contextWindow = WINDOW,
                 )
             )
             _status.set(SystemOneStatus.READY)
@@ -78,32 +82,57 @@ class SystemOneServiceImpl(
         }
     }
 
-    override fun choice(state: String, options: List<String>): ChoiceResult {
-        synchronized(lock) {
-            if (!isAvailable) {
-                return ChoiceResult(selectedIndex = 0, probabilities = FloatArray(options.size.coerceAtLeast(1)))
-            }
-            val probs = engine.choice(state, options)
-            val selected = probs.indices.maxByOrNull { probs[it] } ?: 0
-            return ChoiceResult(selectedIndex = selected, probabilities = probs)
+    /**
+     * One dummy choice before the service reports READY, to pay the graph's first-call cost here rather than on the
+     * proactive gate's deadline.
+     *
+     * A failed warm-up is **not** fatal: the graph may compile lazily, and refusing to become READY because a dummy
+     * question failed would turn a cold first call into no service at all.
+     */
+    private fun warmUp() {
+        try {
+            engine.ask(WARMUP_STATE, WARMUP_QUESTION)
+        } catch (_: Exception) {
+            // Non-fatal by design; see above.
         }
     }
 
-    override fun score(state: String, items: List<String>, scaleDescription: String): ScoreResult {
+    override fun ask(state: String, question: SystemOneQuestion): SystemOneResult {
         synchronized(lock) {
             if (!isAvailable) {
-                return ScoreResult(scores = FloatArray(items.size))
+                return SystemOneResult.Failure(
+                    reason = FailureReason.MODEL_NOT_LOADED,
+                    message = "System-One model is not loaded",
+                )
             }
-            return ScoreResult(scores = engine.score(state, items, scaleDescription))
+            val started = System.nanoTime()
+            return try {
+                SystemOneResult.Success(engine.ask(state, question), elapsedMillis(started))
+            } catch (failure: Exception) {
+                // Class name only. `message` is a contract field a caller may log, and the publisher's own decoder
+                // builds its error text out of the question's criterion labels — which are the caller's vocabulary,
+                // not ours to leak.
+                SystemOneResult.Failure(
+                    reason = FailureReason.ENGINE_UNAVAILABLE,
+                    message = failure::class.simpleName ?: failure.javaClass.name,
+                )
+            }
         }
     }
 
-    override fun noul(state: String, statement: String): NoulResult {
-        synchronized(lock) {
-            if (!isAvailable) {
-                return NoulResult(confidence = 0f)
-            }
-            return NoulResult(confidence = engine.noul(state, statement))
-        }
+    private fun elapsedMillis(startedNanos: Long): Double = (System.nanoTime() - startedNanos) / 1_000_000.0
+
+    private companion object {
+        /** The window the publisher validated on device (256); the 512 variant costs 2.5-3x the latency. */
+        const val WINDOW = 512
+
+        const val WARMUP_STATE = "warmup"
+
+        /** A choice form: the graph answers it without needing a real state, and it is the cheapest to decode. */
+        val WARMUP_QUESTION = SystemOneQuestion(
+            type = SystemOneQuestionType.CHOICE,
+            instructions = "warmup",
+            criteria = listOf(SystemOneCriterion("a"), SystemOneCriterion("b")),
+        )
     }
 }
