@@ -5,6 +5,7 @@ import edith.contracts.AcousticLabel
 import edith.contracts.ContextChanged
 import edith.contracts.OutputStateEvent
 import edith.contracts.OutputStatus
+import edith.contracts.SpeechRequest
 import edith.contracts.TranscriptEvent
 import edith.contracts.UserAction
 import edith.plugin.InputPart
@@ -106,7 +107,11 @@ class SmartProactiveTurnTest {
         assertEquals(1, rig.model.requests.size, "one trigger, one request")
         assertEquals(1, rig.output.hints.size, "exactly one hint must be submitted")
         assertEquals("现在正适合提醒他一句", rig.output.hints.single().text)
-        assertNull(rig.output.hints.single().optionalSpeech, "the proactive hint is visual only")
+        // P5 (spec §S6) / commit 48b881d: a proactive hint **asks for speech** so the TTS path is exercised. Whether it
+        // is actually spoken is the host's speech-capability gate (spec §S2), not this plugin's decision - and a host
+        // without a player still displays the hint normally. The P3.2-era assertion that this was "visual only" was
+        // written before that change and was left behind by it.
+        assertEquals(SpeechRequest(), rig.output.hints.single().optionalSpeech)
     }
 
     @Test
