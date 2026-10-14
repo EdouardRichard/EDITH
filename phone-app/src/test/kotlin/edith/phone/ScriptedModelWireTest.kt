@@ -161,4 +161,74 @@ class ScriptedModelWireTest {
             scriptedToolCallArgs(packageName = null, permission = null, granted = null, value = null),
         )
     }
+
+    @Test fun `a notification call is scriptable, so B8's channels can be driven on the device`() {
+        // B8 (§6.2/§6.3) is about what the phone does with a notification the model did or did not send, and the
+        // configured model does not send one at all. The same instrument that made Stage C drivable makes B8
+        // drivable: only the model's choice is canned, and `notify_user` itself, the per-turn ledger, the downgrade
+        // and the fallback all stay real.
+        assertEquals(
+            """{"text":"进度 1","channel":"both"}""",
+            scriptedToolCallArgs(
+                packageName = null, permission = null, granted = null, value = null,
+                notifyText = "进度 1", channel = "both",
+            ),
+        )
+    }
+
+    @Test fun `an arming with no tool calls serves only the closing text, so a silent model is scriptable`() {
+        // §6.2's fallback exists for a model that answers without notifying. Arming with zero calls is how that turn
+        // is produced on a device: the first answer is text, with no `function_call` anywhere in it.
+        val subject = wire()
+        assertTrue(subject.arm("", "{}", "已经帮你办好了。", calls = 0))
+
+        val first = requireNotNull(subject.nextAnswer()).body
+        assertTrue(first.contains("response.output_text.delta"))
+        assertFalse("a text-only script must never carry a tool call", first.contains("function_call"))
+        assertTrue("the script must not fall through either", requireNotNull(subject.nextAnswer()).body.contains("output_text.delta"))
+    }
+
+    @Test fun `two tool calls in one turn each get their own call id, and both are served`() {
+        // §6.3's guard is about a *second* notification inside one turn, so the instrument has to be able to send
+        // two. The call ids must differ: the host de-duplicates on (session, generation, eventId) and the eventId is
+        // the call id, so a reused one makes the second notification look like a replay and be dropped.
+        val subject = wire()
+        assertTrue(
+            subject.arm(
+                action = "notify_user",
+                argsJson = """{"text":"进度","channel":"both"}""",
+                text = "好了。",
+                calls = 2,
+            ),
+        )
+
+        val first = requireNotNull(subject.nextAnswer()).body
+        val second = requireNotNull(subject.nextAnswer()).body
+        val third = requireNotNull(subject.nextAnswer()).body
+        assertTrue(first.contains(""""name":"notify_user""""))
+        assertTrue(second.contains(""""name":"notify_user""""))
+        assertTrue(third.contains("response.output_text.delta"))
+        val firstId = Regex("\"call_id\":\"([^\"]+)\"").find(first)?.groupValues?.get(1)
+        val secondId = Regex("\"call_id\":\"([^\"]+)\"").find(second)?.groupValues?.get(1)
+        assertNotNull(firstId)
+        assertNotNull(secondId)
+        assertNotEquals("the second notification must not look like a replay of the first", firstId, secondId)
+    }
+
+    @Test fun `a failing script ends the turn with a provider failure and no text`() {
+        // §6.2's oldest invariant: even a failed turn says something. Producing that turn on a device needs the wire
+        // to deliver a real failure terminal rather than a `completed` with text.
+        val subject = wire()
+        assertTrue(subject.arm("", "{}", "不应出现", calls = 0, fail = true))
+
+        val only = requireNotNull(subject.nextAnswer()).body
+        assertTrue(only.contains("response.failed"))
+        assertFalse("a failed stream carries no text delta", only.contains("response.output_text.delta"))
+    }
+
+    @Test fun `an action is required only when the script actually serves a tool call`() {
+        assertFalse("a blank action cannot serve a tool call", wire().arm("  ", "{}", "文本", calls = 1))
+        assertTrue("but a text-only script needs no action at all", wire().arm("  ", "{}", "文本", calls = 0))
+        assertFalse("a negative call count is a mistake, not a script", wire().arm("uninstall", "{}", "文本", calls = -1))
+    }
 }

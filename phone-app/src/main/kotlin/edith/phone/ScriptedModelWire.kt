@@ -40,36 +40,50 @@ internal class ScriptedModelWire(private val log: (String) -> Unit = { P3Log.lin
     /** One canned answer, already serialised as the wire would deliver it. */
     internal class Answer(val body: String)
 
-    private class Script(val action: String, val argsJson: String, val text: String, val callId: String)
+    private class Script(val action: String, val argsJson: String, val text: String, val calls: Int)
 
     private val lock = Any()
     private var script: Script? = null
-    private var servedToolCall = false
+    private var servedCalls = 0
+    private var failAfterCalls = false
 
     /**
-     * A fresh call id per arming, and this is load-bearing rather than cosmetic: the host de-duplicates events on
-     * `(session, generation, eventId)`, and a confirmation answer's `eventId` **is** the tool call's id. Reusing one id
-     * across scripted runs made the first answer in a session work and every later one look like a duplicate, so the
-     * answer was dropped and the question timed out as a denial - an instrument artefact that reads exactly like a
-     * product defect.
+     * A fresh call id per served call, and this is load-bearing rather than cosmetic: the host de-duplicates events
+     * on `(session, generation, eventId)`, and a confirmation answer's `eventId` **is** the tool call's id. Reusing
+     * one id across scripted runs made the first answer in a session work and every later one look like a duplicate,
+     * so the answer was dropped and the question timed out as a denial. A **second notification inside one turn**
+     * (spec §6.3's guard) needs the same treatment: two calls in one arming must not share an id, or the second one
+     * is dropped as a replay.
      */
     private var serial = 0
 
-    /** Arms the wire: the **next** request is answered with [action], every request after it with [text]. */
-    fun arm(action: String, argsJson: String, text: String): Boolean {
+    /**
+     * Arms the wire.
+     *
+     * `calls` is how many tool calls the script serves before it falls through to [text] - `0` is a **model that only
+     * answers**, which is how spec §6.2's fallback turn is produced on a device, and `2` is a **turn that notifies
+     * twice**, which is what §6.3's mid-step downgrade is about.
+     *
+     * `fail` answers with a provider failure instead of the closing text, which is how §6.2's "even a failed turn says
+     * something" is driven for real. A blank [action] is therefore only a mistake when the script would actually serve
+     * a tool call.
+     */
+    fun arm(action: String, argsJson: String, text: String, calls: Int = 1, fail: Boolean = false): Boolean {
         val name = action.trim()
-        if (name.isEmpty()) return false
+        if (calls < 0) return false
+        if (calls > 0 && name.isEmpty()) return false
         synchronized(lock) {
             serial += 1
             script = Script(
                 action = name,
                 argsJson = argsJson.trim().ifEmpty { "{}" },
                 text = text.ifBlank { DEFAULT_TEXT },
-                callId = "call_scripted_$serial",
+                calls = calls,
             )
-            servedToolCall = false
+            servedCalls = 0
+            failAfterCalls = fail
         }
-        log("P3_SCRIPT state=armed action=$name")
+        log("P3_SCRIPT state=armed action=${name.ifEmpty { "none" }} calls=$calls fail=$fail")
         return true
     }
 
@@ -77,7 +91,8 @@ internal class ScriptedModelWire(private val log: (String) -> Unit = { P3Log.lin
     fun disarm() {
         synchronized(lock) {
             script = null
-            servedToolCall = false
+            servedCalls = 0
+            failAfterCalls = false
         }
         log("P3_SCRIPT state=disarmed")
     }
@@ -96,20 +111,29 @@ internal class ScriptedModelWire(private val log: (String) -> Unit = { P3Log.lin
     /**
      * The next canned answer, or `null` when the wire is not armed (and the real transport must run).
      *
-     * The first answer after arming is the tool call; every later one is the closing text, so the loop's continuation
-     * request is answered too. It stays armed until [disarm] or a new [arm] - see the class note on falling through.
+     * The first [Script.calls] answers after arming are tool calls; every later one is the closing text - or a failure
+     * terminal when the script asked for one. It stays armed until [disarm] or a new [arm] - see the class note on
+     * falling through.
      */
     internal fun nextAnswer(): Answer? {
         val current: Script
         val asToolCall: Boolean
+        val callIndex: Int
         synchronized(lock) {
             current = script ?: return null
-            asToolCall = !servedToolCall
-            servedToolCall = true
+            val allCallsServed = servedCalls >= current.calls
+            if (allCallsServed && failAfterCalls) {
+                log("P3_SCRIPT served=failure")
+                return Answer(failureStream())
+            }
+            asToolCall = !allCallsServed
+            if (asToolCall) servedCalls++
+            callIndex = servedCalls
         }
         return if (asToolCall) {
-            log("P3_SCRIPT served=tool_call action=${current.action} call=${current.callId}")
-            Answer(toolCallStream(current.action, current.argsJson, current.callId))
+            val callId = "call_scripted_${serial}_$callIndex"
+            log("P3_SCRIPT served=tool_call action=${current.action} call=$callId")
+            Answer(toolCallStream(current.action, current.argsJson, callId))
         } else {
             log("P3_SCRIPT served=text")
             Answer(textStream(current.text))
@@ -152,6 +176,20 @@ internal class ScriptedModelWire(private val log: (String) -> Unit = { P3Log.lin
         )
     }
 
+    /**
+     * A provider failure, in the shape `model-runtime`'s own `responses/text-failed.sse` carries.
+     *
+     * §6.2's oldest invariant is that a turn which reached a terminal state always says something, so the instrument
+     * that drives B8's scenarios has to be able to produce a **failed** turn rather than only successful ones. The
+     * frame carries no text and no body from any provider: the code is ours and the message is not a thing we have.
+     */
+    private fun failureStream(): String = stream(
+        listOf(
+            frame("response.created", """{"type":"response.created","sequence_number":1,"response":{"id":"$RESPONSE_ID_FAILED","status":"in_progress"}}"""),
+            frame("response.failed", """{"type":"response.failed","sequence_number":5,"response":{"id":"$RESPONSE_ID_FAILED","status":"failed","usage":null}}"""),
+        ),
+    )
+
     /** Enough JSON string escaping for the only inputs this instrument takes: a name, `{}`-shaped arguments and a line. */
     private fun escape(raw: String): String = buildString(raw.length + 8) {
         raw.forEach { character ->
@@ -174,6 +212,7 @@ internal class ScriptedModelWire(private val log: (String) -> Unit = { P3Log.lin
         const val RESPONSE_ID = "resp_scripted"
         const val MESSAGE_ID = "msg_scripted"
         const val RESPONSE_ID_TEXT = "resp_scripted_text"
+        const val RESPONSE_ID_FAILED = "resp_scripted_failed"
         const val DEFAULT_TEXT = "已处理。"
         val EVENT_STREAM = "text/event-stream; charset=utf-8".toMediaType()
     }
@@ -186,15 +225,22 @@ internal class ScriptedModelWire(private val log: (String) -> Unit = { P3Log.lin
  * executor legitimately answers `ARGUMENTS_INVALID` and the instrument looks broken rather than the call. Building the
  * object here removes the shell from the escaping question entirely. Only the members this phase's actions declare are
  * accepted; a member an action does not take is simply absent from the object.
+ *
+ * `notifyText` / `channel` cover `notify_user` (spec §6.1): B8 is about the phone's handling of a notification the
+ * model did or did not send, and the configured model never sends one.
  */
 internal fun scriptedToolCallArgs(
     packageName: String?,
     permission: String?,
     granted: Boolean?,
     value: Int?,
+    notifyText: String? = null,
+    channel: String? = null,
 ): String = buildJsonObject {
     packageName?.let { put("package", it) }
     permission?.let { put("permission", it) }
     granted?.let { put("granted", it) }
     value?.let { put("value", it) }
+    notifyText?.let { put("text", it) }
+    channel?.let { put("channel", it) }
 }.toString()

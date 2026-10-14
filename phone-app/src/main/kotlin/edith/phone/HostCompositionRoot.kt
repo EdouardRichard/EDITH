@@ -403,10 +403,20 @@ class HostCompositionRoot internal constructor(
      * `steps=0`). Scripting the transport removes only the model's willingness from the question - consent, the
      * capability gate, the budget, the policy, the gate and the executor all still run. Returns `false` in a release
      * build, where it can never arm anything.
+     *
+     * B8 (§6.2/§6.3) uses the same instrument for the same reason: the configured model never calls `notify_user`, so
+     * [calls]/[fail] let a device turn carry zero, one or two notifications, or end in a provider failure, while the
+     * per-turn ledger, the mid-step downgrade and the fallback all stay real.
      */
-    fun armScriptedModelAnswer(action: String, argsJson: String, text: String): Boolean {
+    fun armScriptedModelAnswer(
+        action: String,
+        argsJson: String,
+        text: String,
+        calls: Int = 1,
+        fail: Boolean = false,
+    ): Boolean {
         if (!BuildConfig.DEBUG) return false
-        return scriptedModelWire?.arm(action, argsJson, text) ?: false
+        return scriptedModelWire?.arm(action, argsJson, text, calls, fail) ?: false
     }
 
     /** Debug-only counterpart of [armScriptedModelAnswer]: hands the transport back to the real network. */

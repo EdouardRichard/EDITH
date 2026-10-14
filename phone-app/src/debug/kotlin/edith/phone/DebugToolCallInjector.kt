@@ -28,6 +28,18 @@ import android.content.Intent
  * It lives in the **debug source set only** (see `src/debug/AndroidManifest.xml`) and is exported because the only
  * caller is `am broadcast` as the shell UID; a release APK contains no receiver. The log line carries the action name
  * and never the members - a package, a permission or a number are exactly what must not be logged.
+ *
+ * **B8 (§6.2/§6.3) reuses it.** The configured model never calls `notify_user`, so the fallback and the mid-step
+ * downgrade cannot be driven by asking it nicely. `say` + `channel` script one notification; `times` scripts a turn
+ * that notifies twice; `times 0` scripts a model that only answers (the fallback's own case) and `fail true` scripts a
+ * provider failure (the "even a failed turn says something" invariant). What stays real is everything the scenarios are
+ * about: `notify_user` itself, the per-turn ledger, the downgrade, the fallback and the output path.
+ *
+ * ```
+ * adb shell am broadcast -a edith.DEBUG_TOOLCALL -n edith.phone/.DebugToolCallInjector \
+ *     --es action notify_user --es say 进度 --es channel both --ei times 2 --es text 好了。
+ * adb shell am broadcast -a edith.DEBUG_TOOLCALL -n edith.phone/.DebugToolCallInjector --ez fail true --ei times 0
+ * ```
  */
 class DebugToolCallInjector : BroadcastReceiver() {
 
@@ -40,15 +52,18 @@ class DebugToolCallInjector : BroadcastReceiver() {
             root.disarmScriptedModelAnswer()
             return
         }
-        val action = intent.getStringExtra(EXTRA_ACTION)
-        if (action.isNullOrBlank()) return report("refused reason=MISSING_ACTION")
+        val action = intent.getStringExtra(EXTRA_ACTION) ?: ""
+        val times = if (intent.hasExtra(EXTRA_TIMES)) intent.getIntExtra(EXTRA_TIMES, 1) else 1
+        val fail = intent.getBooleanExtra(EXTRA_FAIL, false)
         val args = scriptedToolCallArgs(
             packageName = intent.getStringExtra(EXTRA_PACKAGE),
             permission = intent.getStringExtra(EXTRA_PERMISSION),
             granted = if (intent.hasExtra(EXTRA_GRANTED)) intent.getBooleanExtra(EXTRA_GRANTED, false) else null,
             value = if (intent.hasExtra(EXTRA_VALUE)) intent.getIntExtra(EXTRA_VALUE, 0) else null,
+            notifyText = intent.getStringExtra(EXTRA_SAY),
+            channel = intent.getStringExtra(EXTRA_CHANNEL),
         )
-        if (!root.armScriptedModelAnswer(action, args, intent.getStringExtra(EXTRA_TEXT) ?: "")) {
+        if (!root.armScriptedModelAnswer(action, args, intent.getStringExtra(EXTRA_TEXT) ?: "", times, fail)) {
             return report("refused reason=NOT_DEBUG")
         }
         // How many members the instrument actually received, never which ones: "members=0" is the difference between
@@ -59,8 +74,10 @@ class DebugToolCallInjector : BroadcastReceiver() {
             intent.getStringExtra(EXTRA_PERMISSION),
             if (intent.hasExtra(EXTRA_GRANTED)) "granted" else null,
             if (intent.hasExtra(EXTRA_VALUE)) "value" else null,
+            intent.getStringExtra(EXTRA_SAY),
+            intent.getStringExtra(EXTRA_CHANNEL),
         ).size
-        report("armed action=$action members=$members")
+        report("armed action=${action.ifBlank { "none" }} members=$members times=$times fail=$fail")
     }
 
     private fun report(state: String) = P3Log.line("P3_SCRIPT state=$state")
@@ -74,5 +91,13 @@ class DebugToolCallInjector : BroadcastReceiver() {
         const val EXTRA_VALUE = "value"
         const val EXTRA_TEXT = "text"
         const val EXTRA_OFF = "off"
+        /** The notification body `notify_user` carries (`--es say`), never the closing answer text. */
+        const val EXTRA_SAY = "say"
+        /** The `notify_user` channel (`--es channel screen|voice|both|silent`). */
+        const val EXTRA_CHANNEL = "channel"
+        /** How many tool calls the script serves before its closing answer (`--ei times`, default 1). */
+        const val EXTRA_TIMES = "times"
+        /** Serve a provider failure instead of the closing answer (`--ez fail true`). */
+        const val EXTRA_FAIL = "fail"
     }
 }
