@@ -9,9 +9,21 @@ class ReadableHintAssembler(
     private val scheduler: DeadlineScheduler,
     private val emit: (String) -> Unit,
     private val mergeMillis: Long = 150,
-    private val maxCodePoints: Int = 120,
+    private val maxCodePoints: Int = MAX_CODEPOINTS,
 ) {
     init { require(mergeMillis in 100..200); require(maxCodePoints > 0) }
+
+    companion object {
+        /**
+         * How long an assembled hint may become (codepoints).
+         *
+         * The owner's 2026-10-14 ruling: 超长通知不能截断，要推送眼镜端滚动显示. A hint taller than the glasses' window is
+         * slid through it (`HintAutoScroll`), so this bound exists to keep a **document** off the panel, not to make a
+         * notification shorter. It is kept equal to `edith.output.HintWireCodec.MAX_TEXT_CODEPOINTS` and
+         * `edith.host.HintPolicy`'s bound, and a test asserts all three agree.
+         */
+        const val MAX_CODEPOINTS = 400
+    }
     private val buffer = StringBuilder()
     private var terminal: ModelEnd? = null
     private var cancelled = false
@@ -81,10 +93,13 @@ class ReadableHintAssembler(
             if (point.isEmpty()) continue
             val content = point.replace(Regex("^(?:[-•*]|\\d+[.)、])\\s*"), "").trimEnd('。', '！', '？', '.', '!', '?').trim()
             if (content.codePointCount(0, content.length) < 2) break
-            if (count == 3) break
             if (!validUnicode(point)) { safeCode = "HINT_INVALID_UNICODE"; break }
             val separator = if (result.isNotEmpty() && newLine) "\n" else ""
             val candidate = result + separator + point
+            // The **bound** is the stopping rule, not a sentence count. An earlier version stopped at three sentences
+            // as well, which is what truncated a long notification to its first three sentences with nothing said -
+            // the defect the owner reported on 2026-10-14. A hint the bound allows is displayed whole and scrolled by
+            // the glasses; a hint past it is cut here and reported through `safeCode`.
             if (candidate.codePointCount(0, candidate.length) > maxCodePoints) {
                 safeCode = "HINT_TOO_LONG"; break
             }

@@ -1704,7 +1704,17 @@ class SmartAssistantPlugin(
             // seconds cleared the text mid-sentence. The budget adds the slide's own duration; a hint that fits keeps
             // exactly `HINT_LIFETIME_MILLIS`.
             val lifetime = HintReadingBudget.readMillis(text.length, HINT_LIFETIME_MILLIS)
-            val expiry = minOf(SmartTurn.saturatingAdd(now, lifetime * 1_000_000L), current.hintValidUntil)
+            val wanted = SmartTurn.saturatingAdd(now, lifetime * 1_000_000L)
+            // The turn's own window bounds `sourceTurnId`'s validity, and it used to be the *only* bound: a hint the
+            // reading budget had already sized for two or three screens was clipped to whatever was left of the turn,
+            // so the panel cleared part-way through the slide - the same "突然内容清空了" P3.2-CLIP fixed once, moved
+            // from the base lifetime into this window. Extending the window by exactly the deficit keeps the promise
+            // "the panel holds the hint until the slide is done" true for long notifications too (owner ruling
+            // 2026-10-14: 超长通知不能截断，要推送眼镜端滚动显示). Every check that reads this window afterwards
+            // (a late hint, an ACK) now reads the later instant, which is the honest one: the turn really is still
+            // being read.
+            if (wanted > current.hintValidUntil) current.hintValidUntil = wanted
+            val expiry = wanted
             if (expiry <= now) return
             current.submitting = true
             current.pendingAck = false

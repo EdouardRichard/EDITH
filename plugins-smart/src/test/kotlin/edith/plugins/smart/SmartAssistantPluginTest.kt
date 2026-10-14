@@ -18,6 +18,7 @@ import edith.plugin.OutputModality
 import edith.plugin.PluginConfiguration
 import edith.plugin.PluginLifecycle
 import edith.plugin.RiskLevel
+import edith.output.HintReadingBudget
 import kotlin.test.*
 
 /**
@@ -114,6 +115,42 @@ class SmartAssistantPluginTest {
         assertEquals(rig.generation, hint.generation)
         assertEquals(0, hint.priority)
         assertNull(hint.optionalSpeech)
+    }
+
+    @Test fun `a long notification is submitted whole so the glasses can scroll it`() {
+        // Owner ruling 2026-10-14: 超长通知不能截断，要推送眼镜端滚动显示. Three separate bounds used to shorten this, and
+        // the quietest was `ReadableHintAssembler`'s three-sentence rule, which cut a long notification to its first
+        // three sentences with nothing said about the rest. A hint the bound allows must reach the wearer whole.
+        val rig = SmartTestRig()
+        rig.activate()
+        // Each sentence carries its ordinal, so "which sentences arrived" is readable straight off the hint. Six of
+        // them also put the text past one six-line window, which is the case the ruling is about.
+        val spoken = listOf(
+            "第一句提醒你今天的安排。", "第二句也要把话说完。", "第三句同样重要不能省。",
+            "第四句不能丢在路上。", "第五句是这条的结尾。", "第六句在这里收尾。",
+        )
+        val long = spoken.joinToString("")
+        // The old rule cut at three sentences, so its output could never exceed these three; the whole text is what
+        // the bound now allows through.
+        assertTrue(long.length > spoken.take(3).sumOf { it.length }, "the fixture must exceed the old three-sentence cut")
+        rig.model.onRequest = { request, listener -> streamText(request, listener, long) }
+        rig.wakeAndFinal("记录一下")
+
+        val shown = rig.hintTexts.single()
+        spoken.forEach { sentence ->
+            assertTrue(shown.contains(sentence.removeSuffix("。")), "the hint lost $sentence: $shown")
+        }
+
+        // And the panel must hold it for as long as the slide takes: a hint the reading budget sized for several
+        // screens cannot expire on the turn's five-second grace, or the wearer loses the end of exactly the long
+        // notifications this ruling is about.
+        val hint = rig.output.hints.single()
+        val needed = HintReadingBudget.readMillis(hint.text.length, baseMillis = 5_000L)
+        val grantedMillis = (hint.expiresAtNanos - rig.clock.nowNanos()) / 1_000_000L
+        assertTrue(
+            grantedMillis >= needed - 1_000L,
+            "the panel clears after ${grantedMillis}ms but the slide needs ${needed}ms",
+        )
     }
 
     @Test fun `a completed answer is distinguished from an honest failure`() {

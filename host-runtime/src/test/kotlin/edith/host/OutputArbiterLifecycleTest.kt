@@ -96,9 +96,18 @@ class OutputArbiterLifecycleTest {
         // is decided by the speech capability (player present AND user switch on); without a player the hint still
         // displays normally (see OutputArbiterSpeechTest for the spoken/not-spoken split).
         assertEquals(OutputStatus.Accepted, arbiter.submit(hint("speech").copy(optionalSpeech = SpeechRequest())))
-        assertEquals(OutputStatus.Rejected, arbiter.submit(hint("long").copy(text = "x".repeat(121))))
+        // The bound moved from 120 to 400 codepoints by the owner's 2026-10-14 ruling (a long notification must be
+        // scrolled, not refused), so the rejection case is pinned **relative to the bound** rather than to a literal:
+        // a literal here is what made this test look like a product rule instead of a copy of a constant.
+        assertEquals(
+            OutputStatus.Rejected,
+            arbiter.submit(hint("long").copy(text = "x".repeat(HintPolicy.DEFAULT_MAX_CODE_POINTS + 1))),
+        )
         // Clear the displayed speech hint so the unicode hint can take the slot (shared arbiter across asserts).
         arbiter.clear(SessionId("s"), Generation(1))
-        assertEquals(OutputStatus.Accepted, arbiter.submit(hint("unicode").copy(text = "\uD83D\uDE00".repeat(120))))
+        assertEquals(
+            OutputStatus.Accepted,
+            arbiter.submit(hint("unicode").copy(text = "\uD83D\uDE00".repeat(HintPolicy.DEFAULT_MAX_CODE_POINTS))),
+        )
     }
 }

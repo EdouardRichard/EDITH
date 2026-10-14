@@ -79,11 +79,12 @@ class HintWireCodecTest {
     }
 
     @Test fun surrogatePairsCountAsOneCodepointNotTwoCodeUnits() {
-        // A run of emoji is one UTF-16 surrogate pair per character, so 120 of them are 240 code units.
+        // A run of emoji is one UTF-16 surrogate pair per character, so `MAX_TEXT_CODEPOINTS` of them are twice that
+        // many code units.
         val text = "🙂".repeat(HintWireCodec.MAX_TEXT_CODEPOINTS)
         assertEquals(HintWireCodec.MAX_TEXT_CODEPOINTS * 2, text.length,
             "the fixture must really be surrogate pairs or this test proves nothing")
-        // Codepoint counting accepts exactly 120; the mutation check below proves the bound is enforced.
+        // Codepoint counting accepts exactly the bound; the mutation check below proves the bound is enforced.
         val command = HintCommand.Show("s", 1, 1, "h", 1, "sync", 1_000, 1_500, text)
         assertEquals(command, HintWireCodec.decode(HintWireCodec.encode(command)))
     }

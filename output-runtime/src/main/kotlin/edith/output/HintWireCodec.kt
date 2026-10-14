@@ -29,8 +29,19 @@ sealed interface HintCommand {
 
 object HintWireCodec {
     const val WIRE_VERSION = 1
-    /** Control text is bounded so a hint can never be used to push a document onto the glasses. */
-    const val MAX_TEXT_CODEPOINTS = 120
+
+    /**
+     * Control text is bounded so a hint can never be used to push a document onto the glasses.
+     *
+     * **Raised from 120 to 400 by the owner's 2026-10-14 ruling**: 超长通知不能截断，要推送眼镜端滚动显示. The old
+     * bound was doing double duty as a *display* bound, and the glasses' six-line window is not a display bound at all
+     * — a taller hint is slid through the window by `HintAutoScroll`, which is why a 120-codepoint answer was already
+     * being scrolled before this change. 400 codepoints is about 35 lines (5 screens) at the measured 12 characters
+     * per line: a paragraph, not a document. The phone's own acceptance bound (`edith.host.HintPolicy`) is kept equal
+     * to this one, and `HintWireCodecTest` asserts the two agree so neither side can drift into refusing a hint the
+     * other would have allowed.
+     */
+    const val MAX_TEXT_CODEPOINTS = 400
     /** Hard bound on an inbound message, checked before parsing. */
     const val MAX_MESSAGE_CHARS = 65_536
 
