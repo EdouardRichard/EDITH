@@ -62,4 +62,15 @@ object HintPresentation {
     fun renderReport(lines: Int, chars: Int): String =
         "hint rendered lines=$lines maxLines=${HintAutoScroll.VISIBLE_LINES} chars=$chars " +
             "clipped=${lines > HintAutoScroll.VISIBLE_LINES} scrollMillis=${HintAutoScroll.scrollMillis(lines)}"
+
+    /**
+     * What the bridge actually **received**, as one greppable line.
+     *
+     * `chars` is the received length of the payload string, not the sent one. Added by the 2026-10-14 ceiling
+     * measurement: above a measured transport ceiling the payload arrives **cut short**, and `undecodable` alone
+     * cannot tell "truncated in transit" from "the codec refused a well-formed message". The received length is the
+     * fact that separates them - and it is a count, never the text (the same rule as every other `P3_`/bridge line).
+     */
+    fun inboundReport(json: String, decoded: String?): String =
+        "inbound ${decoded ?: "undecodable"} chars=${json.length}"
 }

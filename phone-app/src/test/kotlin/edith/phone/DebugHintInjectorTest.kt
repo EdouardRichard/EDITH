@@ -34,8 +34,19 @@ class DebugHintInjectorTest {
 
     @Test
     fun neitherPayloadEverExceedsTheWireBound() {
-        assertEquals(120, DebugHintInjector.payload(null, chars = 500).length)
-        assertEquals(120, DebugHintInjector.payload("字".repeat(200), chars = 0).length)
+        assertEquals(DebugHintInjector.MAX_CHARS, DebugHintInjector.payload(null, chars = 500).length)
+        assertEquals(DebugHintInjector.MAX_CHARS, DebugHintInjector.payload("字".repeat(2000), chars = 0).length)
+    }
+
+    /**
+     * The instrument's bound must be the **wire's** bound, or the probe measures its own cap and reads it as the
+     * chain's. That is not hypothetical: `2026-10-09-p3-2-hint-capacity.md:36` records "探针测不到 120 以上，因为
+     * >120 会被我们自己的线缆拒绝" - the "线缆" there was this constant, so every value above 120 was refused by
+     * the instrument before the real policy or the glasses ever saw it.
+     */
+    @Test
+    fun theInjectorsBoundIsTheWiresBoundSoTheProbeCanReachTheRealLimit() {
+        assertEquals(edith.output.HintWireCodec.MAX_TEXT_CODEPOINTS, DebugHintInjector.MAX_CHARS)
     }
 
     @Test

@@ -76,4 +76,13 @@ class HintPresentationTest {
         assertEquals("hint rendered lines=7 maxLines=6 chars=81 clipped=true scrollMillis=1400",
             HintPresentation.renderReport(lines = 7, chars = 81))
     }
+
+    @Test
+    fun anInboundCommandReportsItsReceivedLengthSoATruncatedOneIsDistinguishable() {
+        // 2026-10-14 ceiling measurement: above a measured transport ceiling the payload arrives cut short and the
+        // codec answers `undecodable`, which on its own cannot tell "truncated in transit" from "the codec refused a
+        // well-formed message". The received length is the missing fact, and it is a count - never the text.
+        assertEquals("inbound Show chars=120", HintPresentation.inboundReport("x".repeat(120), "Show"))
+        assertEquals("inbound undecodable chars=400", HintPresentation.inboundReport("x".repeat(400), null))
+    }
 }

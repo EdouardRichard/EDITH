@@ -55,9 +55,15 @@ class DebugHintInjector : BroadcastReceiver() {
         /**
          * The wire refuses more than this anyway (`HintWireCodec.MAX_TEXT_CODEPOINTS`), so asking for more would only
          * measure a refusal. Kept as our own bound rather than reaching into `output-runtime` for a constant whose
-         * meaning is the wire's.
+         * meaning is the wire's, but **it must equal that bound** and `DebugHintInjectorTest` asserts it does.
+         *
+         * It was **120** until 2026-10-14, and that was the whole of the "探针测不到 120 以上" note in
+         * `2026-10-09-p3-2-hint-capacity.md:36`: the probe refused the length itself, so 120 was never the chain's
+         * limit and every value above it went unmeasured. The owner's I3 ruling (do not truncate; let the glasses
+         * scroll) raised the product bound to 400, and this instrument has to follow it or the next measurement
+         * repeats the same mistake.
          */
-        const val MAX_CHARS = 120
+        const val MAX_CHARS = 400
 
         /**
          * What to inject: a supplied text when there is one, otherwise one long point of `chars` filler codepoints.
