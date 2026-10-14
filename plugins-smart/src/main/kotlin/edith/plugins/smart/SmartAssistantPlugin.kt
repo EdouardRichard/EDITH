@@ -1075,7 +1075,7 @@ class SmartAssistantPlugin(
         // B6 / spec §4.9: the transcript and the compression come **after** the memory write, in that order, so a
         // message that compression is about to discard is already in the store. Doing it the other way round would
         // lose exactly the content compression exists to preserve.
-        recordTurnAndCompress(ContextRoute.WAKE, text, run, ledger.lastText)
+        recordTurnAndCompress(ContextRoute.WAKE, text, run, ledger.notifications)
         submitOutcome(owned, run, ledger)
         releaseParkedProactive()
     }
@@ -1105,7 +1105,12 @@ class SmartAssistantPlugin(
      * route records the utterance it answered, the proactive route the observation it reacted to. Passing `WAKE` here
      * from the proactive path was the other way "two independent conversations" was half-true.
      */
-    private fun recordTurnAndCompress(route: ContextRoute, userText: String, run: AgentRun, spokenNotification: String? = null) {
+    private fun recordTurnAndCompress(
+        route: ContextRoute,
+        userText: String,
+        run: AgentRun,
+        notifications: List<String> = emptyList(),
+    ) {
         val contexts = activeContextForTurn ?: return
         val context = contexts.context(route)
         context.appendUser(userText)
@@ -1116,10 +1121,17 @@ class SmartAssistantPlugin(
         // **every** later turn fail with `ConfigurationRejected` until the app was restarted, and the same shape
         // explains the 08 session's unexplained `PLUGIN_RUN_THREW` pair (a turn cancelled by an early injection left
         // no reply behind either).
-        val reply = run.finalText?.takeIf { it.isNotBlank() }
-            ?: spokenNotification?.takeIf { it.isNotBlank() }
-            ?: FAILURE_HINTS[run.outcome]
-            ?: FAILURE_HINTS.getValue(AgentOutcome.FAILED)
+        //
+        // §6.1: the wearer reaches the model only through `notify_user`, so the notification bodies are the assistant
+        // turn's content - and `submitOutcome` suppresses the closing text exactly because it was never displayed.
+        // Recording only `finalText` dropped every notification from the conversation (review M1's "没有任何地方把
+        // 通知内容记进上下文"), so both halves are recorded here, in the order they happened.
+        val closingText = run.finalText?.takeIf { it.isNotBlank() }
+        val reply = when {
+            notifications.isNotEmpty() -> (notifications + listOfNotNull(closingText)).joinToString("\n")
+            closingText != null -> closingText
+            else -> FAILURE_HINTS[run.outcome] ?: FAILURE_HINTS.getValue(AgentOutcome.FAILED)
+        }
         contexts.appendAssistantMessage(route, reply)
         activeCompressor?.compressIfNeeded(context, contexts.historyBudgetTokens())
     }
@@ -1673,9 +1685,10 @@ class SmartAssistantPlugin(
      */
     private fun onNotify(owned: SmartTurn, ledger: NotifyLedger, channel: NotifyChannel, text: String) {
         ledger.calls++
-        // What the wearer was actually told, for the transcript: when the model's own reply text is empty, the
-        // notification *is* the assistant's turn, and §6.1 requires all notification content to reach the context.
-        ledger.lastText = text
+        // Every notification body this turn sent, in order: §6.1 requires all of it to reach the context, and the
+        // transcript is where the model's own turn lives. A `silent` body is recorded too - §6.2 keeps it off the
+        // display, it does not make the model's own message unreal.
+        ledger.notifications += text
         val midStep = ledger.calls > 1
         val effective = if (midStep && channel != NotifyChannel.SCREEN && channel != NotifyChannel.SILENT) {
             NotifyChannel.SCREEN
@@ -1703,8 +1716,8 @@ class SmartAssistantPlugin(
         var calls = 0
         var suppressed = false
 
-        /** The last notification body the model sent, so the transcript can record what the wearer was told. */
-        var lastText: String? = null
+        /** Every notification body this turn sent, in order, so §6.1's "all notification content" reaches the context. */
+        val notifications = mutableListOf<String>()
     }
 
     /** A terminal state reached before the loop could run at all (a blank utterance, or an expired listening window). */

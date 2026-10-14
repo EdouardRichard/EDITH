@@ -3,6 +3,7 @@ package edith.phone.laya
 import android.content.ContextWrapper
 import com.laya.LayaEngine
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNull
 import org.junit.Test
 
 /**
@@ -24,14 +25,22 @@ class LayaInferenceEngineImplTest {
 
     @Test
     fun `the production engine asks for the GPU, which is what the delivery target needs`() {
-        assertEquals(LayaEngine.Backend.GPU, engine().effectiveBackend)
+        assertEquals(LayaEngine.Backend.GPU, LayaInferenceEngineImpl.DEFAULT_BACKEND)
     }
 
     @Test
-    fun `an explicitly requested CPU stays CPU rather than being a GPU in disguise`() {
+    fun `no backend is in use before a graph has compiled`() {
+        // `effectiveBackend` must not read the *requested* backend: before `initialize()` (and after a total failure)
+        // no graph exists, and a field that says GPU while nothing was compiled is the kind of value a later reader
+        // believes. `ask` is unreachable in that state anyway (`host ?: error`).
+        assertNull(engine().effectiveBackend)
+    }
+
+    @Test
+    fun `an explicitly requested CPU is honoured rather than being a GPU in disguise`() {
         // CPU remains the configurable degradation (a device without a working GPU runtime), so asking for it must be
         // honoured exactly - a silent promotion back to GPU would compile a graph this caller did not ask for.
-        assertEquals(LayaEngine.Backend.CPU, engine(LayaEngine.Backend.CPU).effectiveBackend)
+        assertEquals(LayaEngine.Backend.CPU, engine(LayaEngine.Backend.CPU).requestedBackend)
     }
 
     @Test

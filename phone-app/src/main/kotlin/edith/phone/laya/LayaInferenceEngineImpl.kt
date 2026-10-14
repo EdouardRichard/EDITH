@@ -35,17 +35,18 @@ import edith.plugin.SystemOneQuestion
  */
 class LayaInferenceEngineImpl(
     private val context: Context,
-    private val requestedBackend: LayaEngine.Backend = DEFAULT_BACKEND,
+    internal val requestedBackend: LayaEngine.Backend = DEFAULT_BACKEND,
 ) : LayaInferenceEngine {
 
     /**
-     * The backend the compiled graph actually uses, or [requestedBackend] before [initialize] has run.
+     * The backend the compiled graph actually uses, or `null` until [initialize] has compiled one.
      *
-     * Read by `ask` and by the JVM test that pins the delivery target's default; never silently equal to GPU after a
-     * failed GPU compile.
+     * Deliberately **not** initialised to the requested backend: before a compile succeeds (and after a total failure)
+     * no graph exists, and a field reading `GPU` while nothing was built is exactly the kind of value a later reader
+     * believes (review finding 3). Read by `ask` and by the JVM test that pins the delivery target's default.
      */
     @Volatile
-    var effectiveBackend: LayaEngine.Backend = requestedBackend
+    var effectiveBackend: LayaEngine.Backend? = null
         private set
 
     @Volatile
@@ -89,7 +90,8 @@ class LayaInferenceEngineImpl(
 
     override fun ask(state: String, question: SystemOneQuestion): SystemOneAnswer {
         val current = host ?: error("Laya is not initialized")
-        return current.ask(state, question, effectiveBackend)
+        // Non-null whenever `host` is: the two are assigned together under the same successful compile.
+        return current.ask(state, question, checkNotNull(effectiveBackend))
     }
 
     override fun close() {

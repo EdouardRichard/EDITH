@@ -6,6 +6,7 @@ import edith.plugin.ModelEnd
 import edith.plugin.ModelHistoryItem
 import edith.plugin.ModelStreamEvent
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
@@ -48,6 +49,43 @@ class FailedTurnTranscriptTest {
             last is ModelHistoryItem.Text && last.role == MessageRole.ASSISTANT,
             "the transcript ends on an unanswered user message ($last); the model path refuses that shape, so every " +
                 "later turn in the session would fail until the app was restarted",
+        )
+        assertEquals(
+            "智能助手这次没能给出结果。",
+            (last as ModelHistoryItem.Text).text,
+            "the transcript must carry the sentence the wearer was actually shown for this terminal state",
+        )
+    }
+
+    @Test
+    fun `a turn that notified and also closed records what the model told the wearer`() {
+        // §6.1: the wearer reaches the model only through `notify_user`, so the notification bodies are the assistant
+        // turn's content - and `submitOutcome` suppresses the closing text precisely because it was never displayed.
+        // Recording only `finalText` dropped every notification from the conversation (review I-1/M1's gap): the
+        // wearer could ask "what did you just remind me?" and the model had no record of having said it.
+        val rig = SmartTestRig()
+        rig.activate(overrides = mapOf(Capability.Storage to SmartFakeStorage()))
+        var turn = 0
+        rig.model.onRequest = { request, listener ->
+            turn++
+            if (turn == 1) {
+                listener(smartToolCall("c1", "notify_user", """{"text":"progress-body","channel":"screen"}"""))
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(request, listener, "closing-note")
+            }
+        }
+
+        rig.wakeAndFinal("帮我看看", turnId = "asr-1")
+        rig.tick(4_000)
+        rig.wakeAndFinal("第二个问题", turnId = "asr-2")
+
+        val history = rig.model.requests.last().history
+            .filterIsInstance<ModelHistoryItem.Text>()
+            .map { it.text }
+        assertTrue(
+            history.any { it.contains("progress-body") },
+            "the notification body never reached the conversation: $history",
         )
     }
 }
