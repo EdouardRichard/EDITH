@@ -109,3 +109,9 @@ internal fun edith.plugin.ModelHistoryItem.estimatedText(): String = when (this)
     is edith.plugin.ModelHistoryItem.ToolCall -> argsJson
     is edith.plugin.ModelHistoryItem.ToolOutput -> output
 }
+
+/**
+ * The same contribution, as a **size**. `P3_CONTEXT` reports how much of a prompt a turn carried, and a size is what a
+ * device log may hold: the text itself is the user's words and never appears in one.
+ */
+internal fun edith.plugin.ModelHistoryItem.estimatedLength(): Int = estimatedText().length

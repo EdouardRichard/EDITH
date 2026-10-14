@@ -65,6 +65,7 @@ import edith.plugins.smart.context.ContextManager
 import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.context.ModelSummarizer
 import edith.plugins.smart.context.TokenBudget
+import edith.plugins.smart.context.estimatedLength
 import edith.plugins.smart.memory.MemoryExtraction
 import edith.plugins.smart.proactive.ChoiceGate
 import edith.plugins.smart.proactive.GateForm
@@ -978,6 +979,17 @@ class SmartAssistantPlugin(
         val prompt = activeContextForTurn?.let { contexts ->
             runCatching { contexts.buildPrompt(ContextRoute.WAKE, text, skillsForTurn()) }.getOrNull()
         }
+        // B1/B7/B6 evidence, counts only: without this line "the session carried the previous turn into this request"
+        // and "the session carried nothing" are the same empty log, which is exactly what blocked these rows on the
+        // device. Sizes are what a log may carry (P3.1's privacy rule); no prompt text is ever printed.
+        prompt?.let {
+            P3Log.line(
+                "P3_CONTEXT route=${it.route} instructions=${it.instructions.length} " +
+                    "history=${it.history.size} historyChars=${it.history.sumOf { item -> item.estimatedLength() }} " +
+                    "memory=${it.context.size} tokens=${it.estimatedTokens} budget=${it.historyBudgetTokens} " +
+                    "over=${it.overHistoryBudget}",
+            )
+        }
         val run = try {
             val built = buildLoop(current, configured, owned, ledger)
             loop = built
@@ -1013,7 +1025,12 @@ class SmartAssistantPlugin(
             // The cause is reported by **class name only**: `PLUGIN_RUN_THREW` cannot say which layer refused (a
             // missing capability, a rejected configuration, a tool schema), and the message is exactly where a URL,
             // a profile id or user content would leak into the log. The class is the part that is safe and useful.
-            P3Log.line("P3_RUN error=${failure::class.simpleName ?: failure.javaClass.name}")
+            // The cause is reported by a **shape-validated code**, never by the raw message: the class alone cannot
+            // distinguish a profile revision mismatch from an invalid endpoint from an over-budget context (all four
+            // are `ConfigurationRejected`), and the message is exactly where a URL, a profile id or a path would leak.
+            // `safeFailureCode` keeps a bounded reason-shaped prefix and refuses anything that looks like a payload.
+            P3Log.line("P3_RUN error=${failure::class.simpleName ?: failure.javaClass.name} " +
+                "code=${failure.safeFailureCode("UNSPECIFIED")}")
             // A run that threw never handed its report over, so the measurement is taken from the loop itself - the wait
             // it had already excluded from its budget is exactly what keeps this turn's hint window open.
             AgentRun(

@@ -186,7 +186,11 @@ class SmartObservabilityTest {
             lines.single { it.startsWith("P3_TURN end") },
         )
         val cause = lines.single { it.startsWith("P3_RUN ") }
-        assertEquals("P3_RUN error=IllegalStateException", cause)
+        // The class name alone cannot say *which* refusal it was (four different `ConfigurationRejected`s exist), so the
+        // line also carries a shape-validated code. The invariant this test protects is unchanged and is the next
+        // assertion: the exception's **message** never reaches the log. An unclassifiable message yields UNSPECIFIED
+        // rather than the message itself, which is what makes that hold for text this codebase did not write.
+        assertTrue(cause.startsWith("P3_RUN error=IllegalStateException code="), cause)
         assertFalse(cause.contains("MARKER-PROVIDER-DETAIL"), "the exception's message must never be logged: $cause")
     }
 
