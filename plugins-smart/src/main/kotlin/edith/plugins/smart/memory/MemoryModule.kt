@@ -3,6 +3,21 @@ package edith.plugins.smart.memory
 import edith.plugin.ContextPart
 import edith.plugin.EmbeddingService
 
+/** Which ranking produced an injection. The device log names it, so a degraded order cannot read as a semantic one. */
+enum class MemoryRanking { SEMANTIC, LEXICAL }
+
+/**
+ * One retrieval's answer plus what produced it: the entries, the parts handed to the prompt, which ranking ran, the
+ * best semantic similarity (or `null` when the lexical order answered), and how many entries the vector index holds.
+ */
+data class MemoryInjection(
+    val entries: List<MemoryEntry>,
+    val parts: List<ContextPart>,
+    val via: MemoryRanking,
+    val topSimilarity: Double?,
+    val indexed: Int,
+)
+
 /**
  * The memory facade: one object for writing a memory, finding one, and handing the result to a prompt (spec §5.1).
  *
@@ -38,35 +53,61 @@ class MemoryModule(
      * Up to [limit] memories related to [query], most relevant first, marking them used so §5.6's eviction can see
      * that they earned their place.
      */
-    fun retrieve(query: String, limit: Int = INJECT_LIMIT): List<MemoryEntry> {
-        val asked = query.trim()
-        if (asked.isEmpty()) return emptyList()
-        val snapshot = log.snapshot()
-        if (!snapshot.readOk) return emptyList()
-        val entries = snapshot.entries
-        if (entries.isEmpty()) return emptyList()
+    fun retrieve(query: String, limit: Int = INJECT_LIMIT): List<MemoryEntry> =
+        injectionProbe(query, limit).entries
 
-        val semantic = retriever.rerank(asked, entries)
-        val ranked = if (semantic == null) {
+    /**
+     * One retrieval with the facts a **device** probe needs: which ranking ran, and how close the best semantic match
+     * was.
+     *
+     * Why this exists (B5, 2026-10-14): the JVM proves the semantic order with a fake embedding, but on the device the
+     * injected part carries no score, so "ranked by meaning" and "ranked by characters" produce an identical
+     * `P3_MEMORY inject=` line. [topSimilarity] is `null` whenever the lexical order answered — no embedding service,
+     * a query that could not be embedded, or nothing indexed yet — which is exactly the degradation spec §5.1 names.
+     */
+    fun injectionProbe(query: String, limit: Int = INJECT_LIMIT): MemoryInjection {
+        val asked = query.trim()
+        if (asked.isEmpty()) return MemoryInjection(emptyList(), emptyList(), MemoryRanking.LEXICAL, null, retriever.indexedCount)
+        val snapshot = log.snapshot()
+        if (!snapshot.readOk) return MemoryInjection(emptyList(), emptyList(), MemoryRanking.LEXICAL, null, retriever.indexedCount)
+        val entries = snapshot.entries
+        if (entries.isEmpty()) return MemoryInjection(emptyList(), emptyList(), MemoryRanking.LEXICAL, null, retriever.indexedCount)
+
+        val scored = retriever.rankScored(asked, entries)
+        // An empty `scored` is NOT a semantic ranking: it means the ranking was available and placed **none** of these
+        // entries (a cold index - the store was restored from storage and only what this process wrote is indexed).
+        // The device produced exactly that on 2026-10-14 (`n=5 … via=semantic bucket=none`), which would have claimed a
+        // meaning-based order for a purely lexical one; the label now follows what actually placed the entries.
+        val semanticHits = scored?.takeIf { it.isNotEmpty() }
+        val ranked = if (semanticHits == null) {
             lexical(entries, asked, limit)
         } else {
             // Entries the index has never seen keep the lexical order and follow the semantically ranked ones.
-            val rankedIds = semantic.mapTo(mutableSetOf()) { it.id }
-            (semantic + lexical(entries.filterNot { it.id in rankedIds }, asked, limit)).take(limit)
+            val rankedIds = semanticHits.mapTo(mutableSetOf()) { it.first.id }
+            (semanticHits.map { it.first } + lexical(entries.filterNot { it.id in rankedIds }, asked, limit)).take(limit)
         }
         if (ranked.isNotEmpty()) log.markUsed(ranked.map { it.id })
-        return ranked
-    }
-
-    /** The form `buildPrompt` injects: ids, texts and an importance derived from how well each one matched (§5.7). */
-    fun injectionFor(query: String, limit: Int = INJECT_LIMIT): List<ContextPart> =
-        retrieve(query, limit).map { entry ->
+        val parts = ranked.map { entry ->
             ContextPart(
                 id = ID_PREFIX + entry.id,
                 text = entry.text,
                 importance = lexicalScore(query, entry.text).coerceIn(0, MAX_IMPORTANCE),
             )
         }
+        return MemoryInjection(
+            entries = ranked,
+            parts = parts,
+            via = if (semanticHits == null) MemoryRanking.LEXICAL else MemoryRanking.SEMANTIC,
+            // The best semantic match, which is the first of a similarity-descending list. `null` when nothing was
+            // placed by similarity, because then there is no similarity to report rather than a zero to misread.
+            topSimilarity = semanticHits?.firstOrNull()?.second?.toDouble(),
+            indexed = retriever.indexedCount,
+        )
+    }
+
+    /** The form `buildPrompt` injects: ids, texts and an importance derived from how well each one matched (§5.7). */
+    fun injectionFor(query: String, limit: Int = INJECT_LIMIT): List<ContextPart> =
+        injectionProbe(query, limit).parts
 
     fun snapshot(): MemorySnapshot = log.snapshot()
 

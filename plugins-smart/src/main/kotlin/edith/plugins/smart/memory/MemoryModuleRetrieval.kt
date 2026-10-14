@@ -13,10 +13,11 @@ import edith.plugins.smart.P3Log
  * nothing: the gateway would keep asking a port that the lexical retriever implements, which is exactly the state
  * B5 was in — a module with tests and no caller.
  *
- * It logs the same `P3_MEMORY inject=` line the lexical retriever used to, because that line is the device log's only
- * evidence that memory was injected at all. It carries **counts, a character total and ids — never content**
- * (spec §5.3). The lexical retriever also printed a `topScore`; a score is not part of this port's answer, so that
- * field is gone rather than recomputed from a ranking the caller cannot see.
+ * The line carries **counts, a character total, which ranking ran, an interval and ids — never content** (spec §5.3).
+ * The two ranking fields are what B5 was missing on the device: the part handed to the prompt has no score, so without
+ * them "ranked by meaning" and "ranked by characters" produce the same line. The similarity is reported as a **bucket**
+ * (`similarityBucket`), which is the owner's rule for this probe ("只记分数区间") and keeps a memory's own score out of
+ * the log while still showing that meaning decided the order.
  */
 class MemoryModuleRetrieval(
     private val memory: MemoryModule,
@@ -24,15 +25,32 @@ class MemoryModuleRetrieval(
 ) : MemoryRetrieval {
 
     override fun retrieve(query: String, limit: Int): List<ContextPart> {
-        val parts = memory.injectionFor(query, limit)
+        val injection = memory.injectionProbe(query, limit)
         // A blank query, an empty store or a namespace that refused answers nothing and logs nothing: saying
         // `inject=n=0` would look like a measurement of something that never happened.
-        if (parts.isNotEmpty()) {
+        if (injection.parts.isNotEmpty()) {
             logger(
-                "P3_MEMORY inject=n=${parts.size} chars=${parts.sumOf { it.text.length }} " +
-                    "ids=${parts.joinToString(",") { it.id }}",
+                "P3_MEMORY inject=n=${injection.parts.size} chars=${injection.parts.sumOf { it.text.length }} " +
+                    "via=${injection.via.name.lowercase()} bucket=${similarityBucket(injection.topSimilarity)} " +
+                    "indexed=${injection.indexed} ids=${injection.parts.joinToString(",") { it.id }}",
             )
         }
-        return parts
+        return injection.parts
     }
+}
+
+/**
+ * Which half-open interval a cosine similarity falls in, as a label — or `none` when the ranking was lexical.
+ *
+ * Buckets rather than the number, on purpose: the observable this probe needs is "the nearest memory was a paraphrase
+ * (0.8–0.9) and the unrelated one was not (0.3–0.4)", which is the difference the K40's own embedding measurements
+ * showed (0.8586 against 0.3701). The raw similarity of a memory about the wearer is not something the device log
+ * needs to carry.
+ */
+internal fun similarityBucket(similarity: Double?): String {
+    if (similarity == null) return "none"
+    if (similarity < 0.0) return "<0.0"
+    if (similarity >= 1.0) return "0.9-1.0"
+    val lower = (similarity * 10).toInt().coerceIn(0, 9)
+    return "${lower / 10.0}-${(lower + 1) / 10.0}"
 }

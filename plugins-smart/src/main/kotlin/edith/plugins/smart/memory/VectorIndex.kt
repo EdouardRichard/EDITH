@@ -41,7 +41,16 @@ class VectorIndex(private val dimensions: Int) {
      * Answers an empty list for an empty store or a zero-norm query: a zero query has no direction, so every
      * similarity against it is arbitrary rather than meaningful.
      */
-    fun search(query: FloatArray, limit: Int): List<String> {
+    fun search(query: FloatArray, limit: Int): List<String> = searchScored(query, limit).map { it.first }
+
+    /**
+     * The same order with the cosine similarity that produced it.
+     *
+     * The number is not part of the retrieval contract, so [search] stays the ordinary answer and this exists for the
+     * one caller that turns a similarity into an **interval** for the device log (B5's ranking probe): a bucket is
+     * enough to show that meaning decided the order, and it keeps a memory's own score out of the log.
+     */
+    fun searchScored(query: FloatArray, limit: Int): List<Pair<String, Float>> {
         require(query.size == dimensions) {
             "Query dimension mismatch: expected $dimensions, got ${query.size}"
         }
@@ -54,7 +63,6 @@ class VectorIndex(private val dimensions: Int) {
             .map { (id, vec) -> id to cosineSimilarity(query, vec, queryNorm) }
             .sortedByDescending { it.second }
             .take(limit)
-            .map { it.first }
     }
 
     val size: Int get() = store.size

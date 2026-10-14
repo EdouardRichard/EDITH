@@ -49,12 +49,20 @@ class SemanticRetriever(
      * `null` and an empty list are different answers: `null` means "use your own order", an empty list means "the
      * semantic ranking is available and it found none of these" — which is what a cold index returns.
      */
-    fun rerank(query: String, entries: List<MemoryEntry>): List<MemoryEntry>? {
+    fun rerank(query: String, entries: List<MemoryEntry>): List<MemoryEntry>? =
+        rankScored(query, entries)?.map { it.first }
+
+    /**
+     * The same answer with each entry's cosine similarity to [query], for the caller that reports an **interval**
+     * instead of a score (B5's device ranking probe). `null` keeps [rerank]'s meaning exactly: no semantic ranking is
+     * possible, so the caller must use its own order.
+     */
+    fun rankScored(query: String, entries: List<MemoryEntry>): List<Pair<MemoryEntry, Float>>? {
         val service = embeddings ?: return null
         val vector = (service.embed(query) as? EmbedResult.Success)?.vector ?: return null
         if (indexedIds.isEmpty()) return emptyList()
         val byId = entries.associateBy { it.id }
-        return index.search(vector, entries.size).mapNotNull { byId[it] }
+        return index.searchScored(vector, entries.size).mapNotNull { (id, score) -> byId[id]?.let { it to score } }
     }
 
     companion object {

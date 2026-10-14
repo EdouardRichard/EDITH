@@ -5,11 +5,13 @@ import edith.plugin.EmbedResult
 import edith.plugin.EmbeddingService
 import edith.plugin.FailureReason
 import edith.plugin.ModelInfo
+import edith.plugins.smart.P3Log
 import edith.plugins.smart.SmartFakeStorage
 import edith.plugins.smart.SmartTestRig
 import edith.plugins.smart.streamText
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /** The index is 256-dim in production, so the fixture is too — a narrower vector is rejected by `VectorIndex`. */
@@ -104,5 +106,80 @@ class MemoryRetrievalWiringTest {
         val context = rig.model.requests.last().context
         assertTrue(context.isNotEmpty(), "nothing was injected at all: $context")
         assertEquals("我不吃香菜", context.first().text)
+    }
+
+    @Test
+    fun `the injection line says which ranking ran and how close the best match was, as an interval`() {
+        // B5's last unmeasured piece: the JVM proves the order, but on a device the injected part carries no score, so
+        // "ranked by meaning" and "ranked by characters" look identical in the log. This line is the difference, and
+        // it stays within the owner's rule for such probes - an interval, never the score, never the memory.
+        val rig = rigWith(ScriptedEmbeddings())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.wakeAndFinal("香菜", turnId = "asr-3")
+        } finally {
+            P3Log.sink = previous
+        }
+
+        val line = lines.filter { it.startsWith("P3_MEMORY inject=") }.lastOrNull()
+        assertTrue(line != null, "no injection line at all: $lines")
+        assertTrue(requireNotNull(line).contains("via=semantic"), line)
+        assertTrue(requireNotNull(line).contains("bucket="), line)
+        assertFalse(requireNotNull(line).contains("香菜"), "the probe must not carry memory content: $line")
+    }
+
+    @Test
+    fun `the same line names the lexical ranking when the embed call failed`() {
+        val rig = rigWith(ScriptedEmbeddings(FailureReason.ENGINE_UNAVAILABLE))
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.wakeAndFinal("香菜", turnId = "asr-3")
+        } finally {
+            P3Log.sink = previous
+        }
+
+        val line = lines.filter { it.startsWith("P3_MEMORY inject=") }.lastOrNull()
+        assertTrue(line != null, "no injection line at all: $lines")
+        assertTrue(requireNotNull(line).contains("via=lexical"), line)
+        assertTrue(requireNotNull(line).contains("bucket=none"), line)
+    }
+
+    @Test
+    fun `a store restored from storage is reported as a lexical ranking, not a semantic one with no score`() {
+        // The device reading that produced this test: `P3_MEMORY inject=n=5 … via=semantic bucket=none`. Five entries
+        // were restored from storage and the vector index was cold (`SemanticRetriever` indexes only what this process
+        // wrote), so the order was entirely lexical - and the first version of the probe called that "semantic". A
+        // probe whose whole purpose is to answer "did meaning decide the order?" must not answer yes when nothing was
+        // placed by similarity.
+        val storage = SmartFakeStorage()
+        val rig = SmartTestRig()
+        rig.activate(
+            overrides = mapOf(Capability.Storage to storage, Capability.Embedding to ScriptedEmbeddings()),
+        )
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+        rig.wakeAndFinal("记住我喜欢那个绿色的菜", turnId = "asr-1")
+        rig.tick(4_000)
+
+        // A re-activation is the process-shaped boundary: the store is restored, the vector index is not.
+        rig.activate(
+            overrides = mapOf(Capability.Storage to storage, Capability.Embedding to ScriptedEmbeddings()),
+        )
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.wakeAndFinal("香菜", turnId = "asr-2")
+        } finally {
+            P3Log.sink = previous
+        }
+
+        val line = lines.filter { it.startsWith("P3_MEMORY inject=") }.lastOrNull()
+        assertTrue(line != null, "no injection line at all: $lines")
+        assertTrue(requireNotNull(line).contains("via=lexical"), "a cold index claimed a semantic order: $line")
+        assertTrue(requireNotNull(line).contains("indexed=0"), line)
     }
 }
