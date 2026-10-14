@@ -113,9 +113,14 @@ class SkillManagerTest {
         // Constructing the manager does no I/O; the directory is read when it is asked for skills.
         manager.enabled()
 
-        assertEquals(1, reported.size)
-        assertTrue("SECRET-BODY-MARKER" !in reported.single(), reported.single())
-        assertTrue("SECOND-MARKER" !in reported.single(), reported.single())
+        // The property is "no SKILL body reaches the log", not "exactly one line is written": the load also reports
+        // how many files it read and how many are injected, which is the only device-side evidence that this path ran.
+        assertTrue("SECRET-BODY-MARKER" !in reported.joinToString("\n"), reported.toString())
+        assertTrue("SECOND-MARKER" !in reported.joinToString("\n"), reported.toString())
+        assertTrue(
+            reported.any { it.contains("duplicate") },
+            "the duplicate itself must still be reported: $reported",
+        )
     }
 
     @Test

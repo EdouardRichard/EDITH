@@ -50,7 +50,8 @@ class SkillManager(
 
     private fun load(): List<Skill> {
         val byName = LinkedHashMap<String, Skill>()
-        directory.list().sorted().forEach { path ->
+        val paths = directory.list().sorted()
+        paths.forEach { path ->
             val text = directory.read(path) ?: return@forEach
             when (val parsed = SkillParser.parse(path, text)) {
                 is SkillParse.Ok -> {
@@ -64,6 +65,11 @@ class SkillManager(
                 is SkillParse.Invalid -> log("P3_SKILL skip reason=${parsed.reason}")
             }
         }
-        return byName.values.sortedBy { it.name }
+        val skills = byName.values.sortedBy { it.name }
+        // The counts are the only device-side evidence that this path ran at all. Without them "the directory was read
+        // and N SKILLs are being injected" and "there is no directory" are both the empty log, which is exactly the
+        // ambiguity B4's device half was stuck on. A SKILL's text is never logged - only how many were read and used.
+        log("P3_SKILL load files=${paths.size} skills=${skills.size} enabled=${skills.count { it.enabled }}")
+        return skills
     }
 }
