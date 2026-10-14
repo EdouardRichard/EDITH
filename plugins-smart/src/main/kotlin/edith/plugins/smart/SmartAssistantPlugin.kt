@@ -1075,7 +1075,7 @@ class SmartAssistantPlugin(
         // B6 / spec §4.9: the transcript and the compression come **after** the memory write, in that order, so a
         // message that compression is about to discard is already in the store. Doing it the other way round would
         // lose exactly the content compression exists to preserve.
-        recordTurnAndCompress(ContextRoute.WAKE, text, run)
+        recordTurnAndCompress(ContextRoute.WAKE, text, run, ledger.lastText)
         submitOutcome(owned, run, ledger)
         releaseParkedProactive()
     }
@@ -1105,11 +1105,22 @@ class SmartAssistantPlugin(
      * route records the utterance it answered, the proactive route the observation it reacted to. Passing `WAKE` here
      * from the proactive path was the other way "two independent conversations" was half-true.
      */
-    private fun recordTurnAndCompress(route: ContextRoute, userText: String, run: AgentRun) {
+    private fun recordTurnAndCompress(route: ContextRoute, userText: String, run: AgentRun, spokenNotification: String? = null) {
         val contexts = activeContextForTurn ?: return
         val context = contexts.context(route)
         context.appendUser(userText)
-        run.finalText?.takeIf { it.isNotBlank() }?.let { contexts.appendAssistantMessage(route, it) }
+        // §4.2/§6.2: a turn that reached a terminal state **always says something** ([submitOutcome]), so the
+        // transcript records the same words the wearer got rather than only the user half. Recording the user half
+        // alone left the route's transcript ending on an unanswered user message, and the model path refuses that
+        // shape on purpose (`ContextBudgeter` rejects a trailing one-item group): on 2026-10-14 one failed turn made
+        // **every** later turn fail with `ConfigurationRejected` until the app was restarted, and the same shape
+        // explains the 08 session's unexplained `PLUGIN_RUN_THREW` pair (a turn cancelled by an early injection left
+        // no reply behind either).
+        val reply = run.finalText?.takeIf { it.isNotBlank() }
+            ?: spokenNotification?.takeIf { it.isNotBlank() }
+            ?: FAILURE_HINTS[run.outcome]
+            ?: FAILURE_HINTS.getValue(AgentOutcome.FAILED)
+        contexts.appendAssistantMessage(route, reply)
         activeCompressor?.compressIfNeeded(context, contexts.historyBudgetTokens())
     }
 
@@ -1662,6 +1673,9 @@ class SmartAssistantPlugin(
      */
     private fun onNotify(owned: SmartTurn, ledger: NotifyLedger, channel: NotifyChannel, text: String) {
         ledger.calls++
+        // What the wearer was actually told, for the transcript: when the model's own reply text is empty, the
+        // notification *is* the assistant's turn, and §6.1 requires all notification content to reach the context.
+        ledger.lastText = text
         val midStep = ledger.calls > 1
         val effective = if (midStep && channel != NotifyChannel.SCREEN && channel != NotifyChannel.SILENT) {
             NotifyChannel.SCREEN
@@ -1688,6 +1702,9 @@ class SmartAssistantPlugin(
     private class NotifyLedger {
         var calls = 0
         var suppressed = false
+
+        /** The last notification body the model sent, so the transcript can record what the wearer was told. */
+        var lastText: String? = null
     }
 
     /** A terminal state reached before the loop could run at all (a blank utterance, or an expired listening window). */
