@@ -34,6 +34,7 @@ import edith.contracts.SessionState
 import edith.plugin.Capability
 import edith.phone.model.ProfileViewModel
 import edith.phone.model.ProfileListScreen
+import edith.phone.ui.PhoneScreen
 import kotlinx.coroutines.delay
 
 class MainActivity : ComponentActivity() {
@@ -231,240 +232,6 @@ private val CONFIRM_BUTTON_WIDTH = 140.dp
 private fun secondsLeft(expiresAtMillis: Long): Long =
     ((expiresAtMillis - System.currentTimeMillis()) / 1000).coerceAtLeast(0L)
 
-@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
-@Composable private fun PhoneScreen(state: SessionUiState, root: HostCompositionRoot, viewModel: SessionViewModel,
-    profileViewModel: ProfileViewModel?,
-    start: (String) -> Unit, command: (String) -> Unit, notificationsGranted: Boolean,
-    loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit, remainingSeconds: Long) {
-    var page by remember { mutableStateOf(0) }
-    val plugins = pluginPickerOptions(
-        debug = BuildConfig.DEBUG,
-        diagnosticHintSenderPresent = root.diagnosticHintSender != null,
-    )
-    Scaffold(topBar = { Text("EDITH", style = MaterialTheme.typography.titleLarge, modifier = Modifier.padding(20.dp)) }) { padding ->
-        Column(Modifier.padding(padding).fillMaxSize()) {
-            TabRow(selectedTabIndex = page) {
-                listOf("会话", "模型档案", "诊断").forEachIndexed { index, label ->
-                    Tab(selected = page == index, onClick = { page = index }, text = { Text(label) }, enabled = index != 2 || BuildConfig.DEBUG)
-                }
-            }
-            Column(Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                when (page) {
-                    0 -> {
-                        Text(sessionLabel(state.session), style = MaterialTheme.typography.headlineSmall)
-                        var expanded by remember { mutableStateOf(false) }
-                        val selected = state.selectedPluginId ?: plugins.first().first
-                        ExposedDropdownMenuBox(expanded = expanded, onExpandedChange = { expanded = !expanded }) {
-                            OutlinedTextField(value = plugins.firstOrNull { it.first == selected }?.second ?: selected,
-                                onValueChange = {}, readOnly = true, label = { Text("插件") },
-                                trailingIcon = { ExposedDropdownMenuDefaults.TrailingIcon(expanded) }, modifier = Modifier.menuAnchor(MenuAnchorType.PrimaryNotEditable).fillMaxWidth())
-                            ExposedDropdownMenu(expanded = expanded, onDismissRequest = { expanded = false }) {
-                                plugins.forEach { (id, label) -> DropdownMenuItem(text = { Text(label) }, onClick = { viewModel.selectPlugin(id); expanded = false }) }
-                            }
-                        }
-                        // D7: 智能助手's business functions are delivered (P3.1), so the blanket "尚未交付" was false
-                        // for it. Only the interview assistant is still a shell - it needs Speaker, which the
-                        // environment deliberately does not advertise - so the line stays for that one.
-                        if (selected == "interview-assistant") Text("面试助手功能尚未交付（P4）", color = MaterialTheme.colorScheme.onSurfaceVariant)
-                        var helpResult by remember { mutableStateOf<String?>(null) }
-                        FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                            val inactive = state.session == SessionState.Idle || state.session == SessionState.Paused
-                            Button(onClick = { if (state.session == SessionState.Paused) command(SessionService.RESUME) else start(selected) }, enabled = inactive) {
-                                Icon(Icons.Default.PlayArrow, contentDescription = null); Spacer(Modifier.width(4.dp)); Text(if (state.session == SessionState.Paused) "继续" else "开始")
-                            }
-                            OutlinedButton(onClick = { command(SessionService.PAUSE) }, enabled = !inactive) {
-                                Icon(Icons.Default.Pause, contentDescription = null); Spacer(Modifier.width(4.dp)); Text("暂停")
-                            }
-                            OutlinedButton(onClick = {
-                                // P3.3 急停: a question that is still up is withdrawn and the turn in flight is
-                                // cancelled, then the session is stopped the way the service owns it.
-                                root.emergencyStop()
-                                command(SessionService.STOP)
-                            }, enabled = state.session != SessionState.Idle) {
-                                Icon(Icons.Default.Stop, contentDescription = null); Spacer(Modifier.width(4.dp)); Text("停止")
-                            }
-                            // Task 15c D2: the spec's non-wake entry point. The plugin runs its most recent final
-                            // transcript of this session; a request with no live session is dropped by the host, and
-                            // the label says so instead of pretending it was delivered.
-                            OutlinedButton(onClick = {
-                                helpResult = if (root.requestHelp()) "已请求帮助：将回应本会话最近一次最终转写"
-                                else "当前没有可响应的会话（需已开始并处于就绪/监听中）"
-                            }) { Icon(Icons.Default.HelpOutline, contentDescription = null); Spacer(Modifier.width(4.dp)); Text("手动求助") }
-                        }
-                        helpResult?.let { Text(it) }
-                        HorizontalDivider()
-                        // `D53`① (2026-10-11): there is **no** upload switch any more. The owner's ruling was "zero
-                        // knobs" - **"会话在运行"即允许** the transcript and its turn context to reach the configured
-                        // model service, and the only consenting action is the 开始 button above. What did **not**
-                        // change (and is asserted elsewhere): logs and evidence carry counts and ids only, memory
-                        // writes make no network request, and nothing goes anywhere but the configured service.
-                        // P3.2 / `D53`②: the arming switch, now a **persisted global setting** - on by default, taking
-                        // effect at install time and holding across sessions, reconnects, App restarts and phone
-                        // restarts. It is therefore **not** disabled outside a session: it is a setting, not a
-                        // per-session grant, and nothing re-arms it once the user turns it off. It is still not an
-                        // upload grant - with it on the App only starts *perceiving* (acoustic labels and context
-                        // changes), and per `D53`① "the session is running" is what allows the request itself.
-                        val proactiveArmed by root.proactiveArming.enabled.collectAsStateWithLifecycle()
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Switch(checked = proactiveArmed,
-                                onCheckedChange = { root.proactiveArming.set(it) })
-                            Spacer(Modifier.width(8.dp))
-                            Text("主动辅助（未唤醒时给一句短提示）")
-                        }
-                        Text("一次配置、长期生效：跨会话、重连、重启 App 或手机都保持；关掉后不会被任何路径自动打开。",
-                            style = MaterialTheme.typography.bodySmall)
-                        // P5 (spec §S5): the 「语音朗读」 switch. Off by default, persisted globally. When off,
-                        // SpeechOutput is not advertised and any in-progress playback is stopped.
-                        val speechOn by root.speechEnabled.collectAsStateWithLifecycle()
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Switch(checked = speechOn,
-                                onCheckedChange = { root.setSpeechEnabled(it) })
-                            Spacer(Modifier.width(8.dp))
-                            Text("语音朗读（提示会朗读出来）")
-                        }
-                        Text("关闭后不会自动打开；引擎缺失时提示照常显示、只是不出声。",
-                            style = MaterialTheme.typography.bodySmall)
-                        // P3.2 Stage B: the perception sources that need a system grant. Each entry opens the system
-                        // screen for its own special access and says, truthfully, what the assistant cannot see
-                        // without it - a refused source contributes **no** context key, never a placeholder.
-                        //
-                        // The grant is a plain property, not observable state, and the user changes it *outside* this
-                        // App - so returning from Settings recomposes nothing and the copy would keep the answer it
-                        // was built with. `grantEpoch` is bumped on every resume to re-read all three.
-                        val lifecycleOwner = LocalLifecycleOwner.current
-                        var grantEpoch by remember { mutableStateOf(0) }
-                        DisposableEffect(lifecycleOwner) {
-                            val observer = LifecycleEventObserver { _, event ->
-                                if (event == Lifecycle.Event.ON_RESUME) grantEpoch++
-                            }
-                            lifecycleOwner.lifecycle.addObserver(observer)
-                            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
-                        }
-                        root.foregroundAppSource?.let { foreground ->
-                            val activityContext = LocalContext.current
-                            val granted = remember(grantEpoch) { foreground.isGranted }
-                            OutlinedButton(onClick = {
-                                runCatching {
-                                    activityContext.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
-                                }
-                            }) { Text("前台 App 感知授权（使用情况访问）") }
-                            if (!granted) {
-                                Text("未授予使用情况访问，主动辅助看不到前台 App。", color = MaterialTheme.colorScheme.error)
-                            }
-                        }
-                        root.notificationCategorySource?.let { notifications ->
-                            val activityContext = LocalContext.current
-                            val connected = remember(grantEpoch) { notifications.isConnected }
-                            OutlinedButton(onClick = {
-                                runCatching {
-                                    activityContext.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
-                                }
-                            }) { Text("通知分类感知授权（通知使用权）") }
-                            if (!connected) {
-                                Text("未连接通知监听，主动辅助看不到通知分类（只读分类，不读通知内容）。",
-                                    color = MaterialTheme.colorScheme.error)
-                            }
-                        }
-                        root.calendarSource?.let { calendar ->
-                            val granted = remember(grantEpoch) { calendar.isGranted }
-                            val requestCalendar = rememberLauncherForActivityResult(
-                                ActivityResultContracts.RequestPermission()) { grantEpoch++ }
-                            OutlinedButton(onClick = { requestCalendar.launch(Manifest.permission.READ_CALENDAR) }) {
-                                Text("日程标题感知授权（日历权限）")
-                            }
-                            if (!granted) {
-                                Text("未授予日历权限，主动辅助看不到今天的日程标题。", color = MaterialTheme.colorScheme.error)
-                            }
-                        }
-                        // SYSTEM_ALERT_WINDOW: needed for the confirmation dialog to pop up over other apps or a locked
-                        // screen. Without it the question only appears when the user is already looking at this page.
-                        val activityContextForOverlay = LocalContext.current
-                        val overlayGranted = remember(grantEpoch) {
-                            android.provider.Settings.canDrawOverlays(activityContextForOverlay)
-                        }
-                        OutlinedButton(onClick = {
-                            runCatching {
-                                activityContextForOverlay.startActivity(
-                                    Intent(Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                        android.net.Uri.parse("package:${activityContextForOverlay.packageName}")))
-                            }
-                        }) { Text("悬浮窗授权（确认弹窗需要）") }
-                        if (!overlayGranted) {
-                            Text("未授予悬浮窗权限，确认弹窗无法在其他 App 上方弹出。",
-                                color = MaterialTheme.colorScheme.error)
-                        }
-                        // P3.3 confirmation is now shown exclusively as the modal AlertDialog above (user directive
-                        // 2026-10-12). The inline card was removed so there is one surface, not two.
-                        state.errorCode?.let { Text(errorLabel(it), color = MaterialTheme.colorScheme.error) }
-                        // Debug-only acceptance affordance: with the shipped plugins still shells, this is the only
-                        // way a wearer can check what the glasses actually show. Hidden whenever no probe is
-                        // registered, so a release build never shows it.
-                        root.diagnosticHintSender?.let { sender ->
-                            var sent by remember { mutableStateOf<String?>(null) }
-                            OutlinedButton(onClick = {
-                                sent = if (selected == "p2-hint" && sender()) "已提交一条测试提示，请看眼镜"
-                                else "未能提交：请先选择「提示探针（调试）」并开始，且眼镜显示已就绪"
-                            }) { Text("发送测试提示（眼镜）") }
-                            sent?.let { Text(it) }
-                        }
-                        if (!notificationsGranted) Text("通知未获授权", color = MaterialTheme.colorScheme.error)
-                        HorizontalDivider()
-                        // Facts only, and since `D53`③ **no connect entry at all**: 开始/停止/暂停 own the link, so the
-                        // page has nothing to offer here - it only states the link's own facts. Readiness is the
-                        // **transport's** signal (`linkReady` → state), never `Capability.Audio`: `CxrHostEnvironment`
-                        // deliberately never advertises it, so that branch was dead on a phone.
-                        Text(cxrStatusLabel(state.cxrTransportMissing, state.cxrLinkReady))
-                        state.cxrAuthorization?.let { Text(cxrAuthorizationLabel(it)) }
-                        // P3.3 (spec §17.2 rule 1): the execution channels, named one by one. Without this the panel read
-                        // 指令执行 as available while every L2-L4 tool had silently gone from the model's table - the
-                        // capability is up, its privileged half is not, and only a per-channel row can say which.
-                        state.executionChannels.forEach { channel ->
-                            ListItem(
-                                headlineContent = { Text(executionChannelLabel(channel.id)) },
-                                supportingContent = {
-                                    Text(
-                                        when {
-                                            channel.available -> "可用"
-                                            channel.note != null -> channel.note
-                                            channel.reason != null ->
-                                                "尚不可用（${capabilityReasonLabel(channel.reason)}）"
-                                            else -> "尚不可用"
-                                        },
-                                    )
-                                },
-                                leadingContent = {
-                                    Icon(if (channel.available) Icons.Default.Check else Icons.Default.Info, null)
-                                },
-                            )
-                        }
-                        state.capabilityReasons.forEach { (capability, reason) ->
-                            ListItem(headlineContent = { Text(capabilityLabel(capability)) }, supportingContent = { Text("尚不可用（${capabilityReasonLabel(reason)}）") }, leadingContent = { Icon(Icons.Default.Info, null) })
-                        }
-                        HorizontalDivider()
-                        SmartSettingsSection(loadSettings, saveSettings)
-                        root.auditLog?.let { AuditSection(it) }
-                        root.memoryLogView?.let { MemorySection(it) }
-                    }
-                    1 -> {
-                        if (profileViewModel == null) Text("档案服务不可用")
-                        else {
-                            val profileState by profileViewModel.state.collectAsStateWithLifecycle()
-                            ProfileListScreen(profileViewModel, profileState, plugins)
-                        }
-                    }
-                    2 -> {
-                        Text("诊断", style = MaterialTheme.typography.titleLarge)
-                        Text("会话：${sessionLabel(state.session)}")
-                        val marks = root.trace.snapshot()
-                        Text("事件数：${marks.size}")
-                        marks.takeLast(20).forEach { Text("${it.mark.name} · ${it.safeCode ?: ""}", style = MaterialTheme.typography.bodySmall) }
-                    }
-                }
-            }
-        }
-    }
-}
-
 /**
  * The minimal settings entry point (Task 14b): the three things the user can set, plus the inline errors.
  *
@@ -475,7 +242,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
  * is the ceiling the phase ships with while `L3`/`L4` are an explicit user choice.
  */
 @OptIn(ExperimentalMaterial3Api::class)
-@Composable private fun SmartSettingsSection(loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit) {
+@Composable internal fun SmartSettingsSection(loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit) {
     var draft by remember { mutableStateOf(SmartSettingsForm.fromSettings(loadSettings())) }
     var errors by remember { mutableStateOf(emptyList<String>()) }
     var saved by remember { mutableStateOf(false) }
@@ -550,7 +317,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
  * check that claim: the document has no field for a notification body, a screen line, a transcript or a phone number.
  */
 @Composable
-private fun AuditSection(view: AuditLogView) {
+internal fun AuditSection(view: AuditLogView) {
     var revision by remember { mutableStateOf(0) }
     val lines = remember(revision) { view.lines() }
     Text("审计记录", style = MaterialTheme.typography.titleLarge)
@@ -580,7 +347,7 @@ private fun AuditSection(view: AuditLogView) {
  * after this section recomposes (a session stop/start does that, and so does any delete).
  */
 @Composable
-private fun MemorySection(view: MemoryLogView) {
+internal fun MemorySection(view: MemoryLogView) {
     var revision by remember { mutableStateOf(0) }
     val lines = remember(revision) { view.lines() }
     Text("长期记忆", style = MaterialTheme.typography.titleLarge)
@@ -606,7 +373,7 @@ private fun MemorySection(view: MemoryLogView) {
     HorizontalDivider()
 }
 
-private fun sessionLabel(state: SessionState) = when (state) {
+internal fun sessionLabel(state: SessionState) = when (state) {
     SessionState.Idle -> "未开始"
     SessionState.Ready -> "已就绪"
     SessionState.Listening -> "监听中"
@@ -618,7 +385,7 @@ private fun sessionLabel(state: SessionState) = when (state) {
     SessionState.Reconnecting -> "重新连接中"
     SessionState.Error -> "会话异常"
 }
-private fun capabilityLabel(capability: Capability) = when (capability) {
+internal fun capabilityLabel(capability: Capability) = when (capability) {
     Capability.Audio -> "眼镜音频"
     Capability.Asr -> "语音转写"
     Capability.Speaker -> "说话人"
@@ -635,7 +402,7 @@ private fun capabilityLabel(capability: Capability) = when (capability) {
     Capability.StorageAccess -> "技能目录"
     Capability.ConversationDisplay -> "会话展示"
 }
-private fun errorLabel(code: String) = when (code) {
+internal fun errorLabel(code: String) = when (code) {
     "BLUETOOTH_PERMISSION_DENIED" -> "蓝牙权限未获授权"
     "CAPABILITY_MISSING" -> "会话所需服务尚不可用"
     "FOREGROUND_START_DENIED", "FOREGROUND_UI_REQUIRED" -> "会话未能启动"

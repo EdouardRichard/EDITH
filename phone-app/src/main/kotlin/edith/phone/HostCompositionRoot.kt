@@ -106,7 +106,14 @@ class HostCompositionRoot internal constructor(
      * instance exists, and the provider and the tab must hold the **same** object. Bounded in `ConversationLog`, so a
      * long session cannot grow either view without limit.
      */
-    internal val conversationLog: ConversationLog = ConversationLog(),    /**
+    internal val conversationLog: ConversationLog = ConversationLog(),
+    /**
+     * Phase C (spec §6.7 技能页签): the SKILL directory as the page sees it.
+     *
+     * A seam rather than a direct call, so the page can be tested without a composition and so the composition decides
+     * what "the directory" means (it is the same `Capability.StorageAccess` provider a turn reads through).
+     */
+    internal var skillDirectory: SkillDirectoryView? = null,    /**
      * The smart plugin and the settings-built configuration it must be given before activation (Task 14a item 1).
      *
      * Null keeps a composition that has no smart plugin registered (several T17/T18 harnesses build one), so the
@@ -1640,6 +1647,15 @@ class HostCompositionRoot internal constructor(
             // **and** the reason from one probe (leftover-sweep review, Important 1); the row itself is appended by
             // `executionChannels`, which keeps the four `P3_EXEC` ids and their order.
             root.rootStatusProbe = { rootProbe.status() }
+            // Phase C: the skills page reads the same provider a turn does, and asks about the shared-storage grant
+            // separately - `listFiles` answers "empty" for both "no SKILLs" and "no permission", which is the
+            // distinction B4's device work needed and could not get.
+            root.skillDirectory = StorageAccessSkillView(
+                storage = storageAccess,
+                sharedStorageGranted = {
+                    android.os.Build.VERSION.SDK_INT < 30 || android.os.Environment.isExternalStorageManager()
+                },
+            )
             root.executionChannelBringUp = {
                 shizukuShell.bind()
                 shizukuShell.requestPermissionIfNeeded()
