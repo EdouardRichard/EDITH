@@ -88,9 +88,13 @@ class GlassesActivity : Activity() {
     /** Rejects an out-of-order `SAID`; the custom-command channel promises nothing about ordering. */
     private val saidGate = SaidSequenceGate()
 
+    /** Whether the assistant is working, per route (Phase C 加载动画); bounded so a leaked level cannot spin forever. */
+    private val busyState = BusyState()
+
     private lateinit var headerView: TextView
     private lateinit var entriesView: LinearLayout
     private lateinit var hintScroll: ScrollView
+    private lateinit var loadingView: LoadingIndicatorView
     private lateinit var statusView: TextView
 
     /** The row the live hint occupies, so the layout report and the probe read the hint rather than the list. */
@@ -128,13 +132,16 @@ class GlassesActivity : Activity() {
     /** Keeps the display awake only while something is being shown; the wake lock itself lives in [holdAwakeFor]. */
     override fun onResume() {
         super.onResume()
-        if (liveEntryId != null) holdAwakeFor(true)
+        applyPanelAndAnimation()
     }
 
     override fun onPause() {
         super.onPause()
         // Leaving the foreground ends the visible hint's claim on the panel; the controller clears the text too.
         holdAwakeFor(false)
+        // The ring stops with the screen: it is not a progress bar whose state matters while nobody can see it, and a
+        // running animator keeps the panel's frame loop busy.
+        loadingView.stop()
         // ...and with it the slide, so a conversation that is no longer on screen cannot keep moving.
         scrollAnimator?.cancel()
         scrollAnimator = null
@@ -150,6 +157,8 @@ class GlassesActivity : Activity() {
         log.clear()
         order.reset()
         saidGate.reset()
+        busyState.reset()
+        loadingView.stop()
         RokidBridgeEndpoint.instance.setListener(null)
         executor.shutdownNow()
         super.onDestroy()
@@ -176,8 +185,26 @@ class GlassesActivity : Activity() {
                 // not something that needs to be looked at) and never acknowledged (it has no deadline to confirm).
                 is HintCommand.Said -> onSaid(command)
 
-                // BUSY belongs to the loading animation; it arrives with that task. Until then it is consciously
-                // ignored here rather than half-handled, and the controller's own ignore list records the decision.
+                // Phase C: whether the assistant is working. Same session gate as a SHOW, because a stale level would
+                // light the ring for a session that has ended.
+                is HintCommand.Busy -> onBusy(command)
+
+                // A new session starts clean. This is the one place the previous session's words could survive into
+                // the next one, and it is a real hazard: the glasses process outlives the phone's App, so a wearer who
+                // restarts the phone app would otherwise read the last session's conversation under the new session's
+                // name. The controller handles the identity; the conversation state is this screen's.
+                is HintCommand.Hello -> {
+                    log.clear()
+                    order.reset()
+                    saidGate.reset()
+                    busyState.reset()
+                    liveEntryId = null
+                    liveRow = null
+                    controller.accept(command)
+                    applyPanelAndAnimation()
+                    rebuild()
+                }
+
                 else -> controller.accept(command)
             }
         }
@@ -259,6 +286,36 @@ class GlassesActivity : Activity() {
     }
 
     /**
+     * Records the level the phone stated and puts the ring and the panel in line with it.
+     *
+     * Must run on the UI thread. The level is bounded in [BusyState], so a "finished" that never arrives stops by
+     * itself rather than holding the ring and the wake lock for the life of the process.
+     */
+    private fun onBusy(command: HintCommand.Busy) {
+        if (!controller.isCurrent(command.sessionId, command.generation)) {
+            android.util.Log.i("EdithGlasses", "busy refused: session or generation mismatch")
+            return
+        }
+        busyState.set(command.route, command.busy, clock.nowNanos())
+        android.util.Log.i("EdithGlasses",
+            "busy route=${command.route.name} stated=${command.busy} any=${busyState.any(clock.nowNanos())}")
+        applyPanelAndAnimation()
+        rebuild()
+    }
+
+    /**
+     * The single place that decides whether the panel is held and whether the ring turns.
+     *
+     * Two claimants share the panel — a live hint and a working turn — and they must be resolved in one place: two
+     * separate `holdAwakeFor` callers would release each other's claim, and the panel would go dark mid-answer.
+     */
+    private fun applyPanelAndAnimation() {
+        val busy = busyState.any(clock.nowNanos())
+        if (busy) loadingView.start() else loadingView.stop()
+        holdAwakeFor(busy || liveEntryId != null)
+    }
+
+    /**
      * Redraws the conversation in front of the wearer, then reveals the newest entry.
      *
      * The list is rebuilt rather than patched: it is bounded at tens of entries, and a rebuild is what makes "the view
@@ -267,7 +324,7 @@ class GlassesActivity : Activity() {
     private fun rebuild() {
         val route = order.selected()
         val rows = ConversationView.rows(log.entries(route), liveEntryId)
-        headerView.text = ConversationView.headerText(route, busy = false)
+        headerView.text = ConversationView.headerText(route, busy = busyState.any(clock.nowNanos()))
         statusView.text = ConversationView.statusText(log.size())
         entriesView.removeAllViews()
         liveRow = null
@@ -460,9 +517,22 @@ class GlassesActivity : Activity() {
             gravity = Gravity.CENTER
             text = ConversationView.statusText(0)
         }
+        // The ring sits over the conversation window rather than beside it: the window is the whole middle of a
+        // 480x640 panel, and the wearer's eye is already there while a turn runs.
+        loadingView = LoadingIndicatorView(this).apply {
+            visibility = View.VISIBLE
+            layoutParams = FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
+        }
+        val window = FrameLayout(this).apply {
+            setBackgroundColor(Color.TRANSPARENT)
+            addView(hintScroll, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+            addView(loadingView)
+        }
         column.addView(headerView, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        column.addView(hintScroll, LinearLayout.LayoutParams(
+        column.addView(window, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, windowPx * HintAutoScroll.VISIBLE_LINES))
         column.addView(statusView, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
