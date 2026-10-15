@@ -27,14 +27,34 @@ class ProactiveGateTest {
     fun `every state field names the event that triggers its re-evaluation`() {
         // The check the spec asks for, made executable: ask each field "who triggers you", and fail if the answer is
         // missing. A field with no event is a miss the assistant would never notice.
-        assertEquals(ProactiveGateState.KEYS.toSet(), TRIGGER_EVENTS.keys)
+        //
+        // The table is keyed by the **host's** signal names, because that is what a delivered event carries. The
+        // model's own field names are a separate list (`KEYS`) — see the note on `CONTEXT_KEYS` for why they are not
+        // the same strings, and why conflating them was a real defect.
+        assertEquals(ProactiveGateState.CONTEXT_KEYS.toSet(), TRIGGER_EVENTS.keys)
     }
 
     @Test
     fun `no state field is left without a trigger event`() {
-        ProactiveGateState.KEYS.forEach { key ->
+        ProactiveGateState.CONTEXT_KEYS.forEach { key ->
             assertTrue(TRIGGER_EVENTS.getValue(key).isNotEmpty(), "$key has no trigger event")
         }
+    }
+
+    @Test
+    fun `the two key lists stay in step and the render names the contract keys in order`() {
+        // `CONTEXT_KEYS` is what the host's events are keyed by; `KEYS` is what the model was trained to read. They
+        // are different strings for the same four dimensions, so the one thing that must hold is that they stay
+        // parallel — a dimension added to one and forgotten in the other is a field the model silently stops seeing.
+        assertEquals(ProactiveGateState.CONTEXT_KEYS.size, ProactiveGateState.KEYS.size)
+        assertEquals(TRIGGER_EVENTS.keys.toList(), ProactiveGateState.CONTEXT_KEYS)
+
+        val rendered = ProactiveGateState.of("说了一句", "微信", "chat", "开会").render()
+        assertEquals(
+            ProactiveGateState.KEYS,
+            Regex("\"([A-Za-z_]+)\":").findAll(rendered).map { it.groupValues[1] }.toList(),
+            "the rendered state must name the contract keys, in order: $rendered",
+        )
     }
 
     @Test
@@ -65,7 +85,7 @@ class ProactiveGateTest {
     fun `the decision critical field comes first because truncation cuts from the tail`() {
         // The publisher's template places the instructions and candidates before the state and cuts an over-long state
         // at its end, so whichever field is last is the one that gets dropped.
-        assertEquals("transcript", ProactiveGateState.KEYS.first())
+        assertEquals("recent_transcript", ProactiveGateState.KEYS.first())
 
         val render = ProactiveGateState.of("最后说的话", "微信", "chat", "开会").render()
         assertTrue(render.indexOf("最后说的话") < render.indexOf("微信"), render)
@@ -75,7 +95,57 @@ class ProactiveGateTest {
     fun `a missing signal is simply absent rather than rendered as a placeholder`() {
         val render = ProactiveGateState.of(transcript = "只说了这一句").render()
 
-        assertEquals("transcript=只说了这一句", render)
+        assertEquals("""{"recent_transcript": "只说了这一句"}""", render)
+    }
+
+    // ---------------------------------------------------------------- the trained contract (Phase C fix)
+
+    /**
+     * The state the model was fine-tuned on is a **JSON object** with these four keys, in this order.
+     *
+     * Three independent sources pin it, and the third is what made this a defect rather than a preference:
+     * `E:\layaft\tasks\edith-gate.yaml`'s `state:` block ("Rendered with json.dumps in this key order, which is the
+     * order the deployed host sends"); the fine-tune spec §2.1, which writes the state as exactly this object; and
+     * `LayaPromptBuilder.serializeState`, which passes a `String` state through **verbatim** — so whatever this
+     * method returns is literally what the model is asked.
+     */
+    @Test
+    fun `the state is the json object the model was trained on`() {
+        val rendered = ProactiveGateState.of(
+            transcript = "这个页面卡住了",
+            foreground = "微信",
+            notification = "chat",
+            calendar = "开会",
+        ).render()
+
+        assertEquals(
+            """{"recent_transcript": "这个页面卡住了", "notification_category": "chat", """ +
+                """"calendar_event": "开会", "foreground": "微信"}""",
+            rendered,
+        )
+    }
+
+    @Test
+    fun `a field over its bound is cut at the end rather than costing the whole state`() {
+        val rendered = ProactiveGateState.of(transcript = "字".repeat(300), foreground = "微信").render()
+
+        assertTrue(rendered.startsWith("""{"recent_transcript": """" + "字".repeat(200)),
+            "the leading field must be cut to its own bound: ${rendered.take(40)}…")
+        assertTrue(rendered.endsWith(""" "foreground": "微信"}"""),
+            "the fields after a cut one must survive: $rendered")
+        assertTrue(rendered.startsWith("{") && rendered.endsWith("}"),
+            "a bounded state is still a parseable JSON object, never half of one")
+    }
+
+    @Test
+    fun `quotes and control characters in an observation cannot break the object`() {
+        // The transcript is speech, so it may legitimately contain a quote; a state that stops being JSON is a state
+        // the model has never seen, which is the whole failure this fix exists for.
+        val rendered = ProactiveGateState.of(transcript = "他说\"好\"\n然后\t走了").render()
+
+        // A raw string so the backslashes below are the JSON escapes themselves, not Kotlin escapes.
+        assertEquals("""{"recent_transcript": "他说\"好\"\n然后\t走了"}""", rendered)
+        assertTrue(rendered.count { it == '{' } == 1 && rendered.count { it == '}' } == 1, rendered)
     }
 
     // ---------------------------------------------------------------- the gates
@@ -109,8 +179,8 @@ class ProactiveGateTest {
         NoulGate(noul, threshold = 0.6).shouldIntervene(state())
 
         val sent = noul.states.single()
-        assertTrue(sent.contains("transcript=这个页面卡住了"), sent)
-        assertTrue(sent.contains("app.foreground=微信"), sent)
+        assertTrue(sent.contains("\"recent_transcript\": \"这个页面卡住了\""), sent)
+        assertTrue(sent.contains("\"foreground\": \"微信\""), sent)
 
         val choice = ScriptedSystemOne(ok(SystemOneAnswer.Choice("A", mapOf("A" to 0.9), 0.9)))
         ChoiceGate(choice).shouldIntervene(state())
