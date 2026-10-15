@@ -52,6 +52,7 @@ import edith.phone.actions.ShizukuTargetState
 import edith.phone.actions.ShizukuUserServiceShell
 import edith.phone.a11y.AccessibilityExecutionBackend
 import edith.phone.a11y.AccessibilityUi
+import edith.phone.a11y.AppliedSemanticsPostProcessor
 import edith.phone.a11y.EdithAccessibilityService
 import edith.phone.a11y.ScreenFilter
 import edith.phone.a11y.ScreenFingerprint
@@ -1467,13 +1468,15 @@ class HostCompositionRoot internal constructor(
                 override fun structuralFingerprint() = live()?.structuralFingerprint()
                     ?: ScreenFingerprint(hash = "", nodeCount = 0, clickableCount = 0, truncated = false)
             }
-            val executionRouter = ExecutionRouter(
-                listOf(
-                    IntentExecutionBackend(actions),
-                    ShizukuExecutionBackend(shizukuShell, ShizukuTargetState(shizukuShell)) { shizukuShell.ready() },
-                    AccessibilityExecutionBackend(
-                        ui = accessibilityUi,
-                        connected = { EdithAccessibilityService.connected() },
+            val executionRouter = AppliedSemanticsPostProcessor(
+                ExecutionRouter(
+                    listOf(
+                        IntentExecutionBackend(actions),
+                        ShizukuExecutionBackend(shizukuShell, ShizukuTargetState(shizukuShell)) { shizukuShell.ready() },
+                        AccessibilityExecutionBackend(
+                            ui = accessibilityUi,
+                            connected = { EdithAccessibilityService.connected() },
+                        ),
                     ),
                 ),
             )

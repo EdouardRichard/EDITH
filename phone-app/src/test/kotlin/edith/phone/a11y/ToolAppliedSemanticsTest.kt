@@ -19,12 +19,8 @@ import org.junit.Test
  * `[applied=true]` or `[applied=false]` prefix in the detail, so the model never has to infer applied status from
  * outcome codes alone.
  *
- * Four cases are pinned:
- * 1. Backend returns Done but fingerprint unchanged → reclassified as Refused(NO_SCREEN_CHANGE) with applied=false
- * 2. Fingerprint changed → applied=true
- * 3. Channel unavailable → stays ACTION_CHANNEL_UNAVAILABLE, NOT mixed into applied=false
- * 4. Shizuku-style state check without screen change → reports its own outcome correctly; the post-processor
- *    only applies screen-fingerprint checking to accessibility actions
+ * T1.5 updated: tool names changed from tap_text/type_text to tap/input_text (index-based).
+ * Behavioral assertions preserved: fingerprint-based success, channel unavailable refusal, etc.
  */
 class ToolAppliedSemanticsTest {
 
@@ -32,15 +28,23 @@ class ToolAppliedSemanticsTest {
 
     /**
      * A fake [AccessibilityUi] whose fingerprint can be controlled per-call.
-     * The [fingerprintSequence] is consumed in order; once exhausted, the last value repeats.
+     * Supports both legacy and new index-based methods.
      */
     private class FakeUi(
         private val clickable: Boolean = true,
         private val fingerprintSequence: List<String> = listOf("screen-a", "screen-b"),
+        private val nodes: List<RawSnapshotNode> = listOf(
+            RawSnapshotNode(
+                text = "WLAN", contentDescription = null, className = null,
+                clickable = true, editable = false, scrollable = false, checked = false,
+                left = 0, top = 0, right = 100, bottom = 50, hintText = null,
+            ),
+        ),
     ) : AccessibilityUi {
         val clicks = mutableListOf<String>()
         val typed = mutableListOf<String>()
         private var fingerprintCalls = 0
+        private var currentSnapshot: ScreenSnapshot? = null
 
         override fun clickText(text: String): Boolean {
             clicks += text
@@ -58,13 +62,45 @@ class ToolAppliedSemanticsTest {
             return fingerprintSequence[index]
         }
 
-        override fun snapshot(filter: ScreenFilter): ScreenSnapshot =
-            throw UnsupportedOperationException("not needed for applied semantics tests")
+        override fun snapshot(filter: ScreenFilter): ScreenSnapshot {
+            val source = object : SnapshotNodeSource {
+                override fun walkNodes(filter: ScreenFilter): List<RawSnapshotNode> = nodes
+                override fun maxNodeLimit(): Int = MAX_NODES
+            }
+            val snap = SnapshotBuilder.build(source, filter)
+            currentSnapshot = snap
+            return snap
+        }
 
-        override fun clickByIndex(snapshotId: String, index: Int): Boolean = false
-        override fun longPressByIndex(snapshotId: String, index: Int): Boolean = false
-        override fun scroll(direction: ScrollDirection): Boolean = false
-        override fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean = false
+        override fun clickByIndex(snapshotId: String, index: Int): Boolean {
+            val snap = currentSnapshot ?: return false
+            if (SnapshotValidator.validate(snapshotId, snap) != null) return false
+            if (SnapshotValidator.validateIndex(snap, index) != null) return false
+            currentSnapshot = null
+            return clickable
+        }
+
+        override fun longPressByIndex(snapshotId: String, index: Int): Boolean {
+            val snap = currentSnapshot ?: return false
+            if (SnapshotValidator.validate(snapshotId, snap) != null) return false
+            if (SnapshotValidator.validateIndex(snap, index) != null) return false
+            currentSnapshot = null
+            return clickable
+        }
+
+        override fun scroll(direction: ScrollDirection): Boolean {
+            currentSnapshot = null
+            return clickable
+        }
+
+        override fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean {
+            val snap = currentSnapshot ?: return false
+            if (SnapshotValidator.validate(snapshotId, snap) != null) return false
+            if (SnapshotValidator.validateIndex(snap, index) != null) return false
+            currentSnapshot = null
+            return clickable
+        }
+
         override fun structuralFingerprint(): ScreenFingerprint =
             ScreenFingerprint(hash = "", nodeCount = 0, clickableCount = 0, truncated = false)
     }
@@ -114,15 +150,14 @@ class ToolAppliedSemanticsTest {
 
     @Test
     fun `backend Done result gets applied=true enrichment`() {
-        // The accessibility backend already does fingerprint verification internally.
-        // When it returns Done, the screen DID change. The post-processor trusts this
-        // and adds the explicit applied=true prefix.
         val ui = FakeUi(fingerprintSequence = listOf("screen-a", "screen-b"))
         val backend = accessibilityBackend(ui)
         val r = router(backend)
         val processor = postProcessor(r)
 
-        val result = processor.execute("tap_text", """{"text":"WLAN"}""")
+        // Use tap (index-based) instead of old tap_text
+        processor.execute("read_screen", "{}") // establish snapshot
+        val result = processor.execute("tap", """{"index":0}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertTrue(
@@ -133,8 +168,6 @@ class ToolAppliedSemanticsTest {
 
     @Test
     fun `non-accessibility backend Done gets applied=true without fingerprint check`() {
-        // A backend that returns Done for a non-accessibility action (e.g., Shizuku-style)
-        // should get applied=true without any screen fingerprint verification.
         val alwaysDoneBackend = object : ExecutionBackend {
             override val id = "fake-state-backend"
             override fun available() = true
@@ -176,7 +209,8 @@ class ToolAppliedSemanticsTest {
         val r = router(backend)
         val processor = postProcessor(r)
 
-        val result = processor.execute("tap_text", """{"text":"WLAN"}""")
+        processor.execute("read_screen", "{}") // establish snapshot
+        val result = processor.execute("tap", """{"index":0}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertTrue(
@@ -186,13 +220,22 @@ class ToolAppliedSemanticsTest {
     }
 
     @Test
-    fun `type text with screen change reports applied=true`() {
-        val ui = FakeUi(fingerprintSequence = listOf("before", "after"))
+    fun `input_text with screen change reports applied=true`() {
+        val editableNode = RawSnapshotNode(
+            text = "", contentDescription = null, className = null,
+            clickable = false, editable = true, scrollable = false, checked = false,
+            left = 0, top = 0, right = 100, bottom = 50, hintText = null,
+        )
+        val ui = FakeUi(
+            fingerprintSequence = listOf("before", "after"),
+            nodes = listOf(editableNode),
+        )
         val backend = accessibilityBackend(ui)
         val r = router(backend)
         val processor = postProcessor(r)
 
-        val result = processor.execute("type_text", """{"text":"hello"}""")
+        processor.execute("read_screen", "{}") // establish snapshot
+        val result = processor.execute("input_text", """{"index":0,"text":"hello"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertTrue(
@@ -210,7 +253,7 @@ class ToolAppliedSemanticsTest {
         val r = router(backend)
         val processor = postProcessor(r)
 
-        val result = processor.execute("tap_text", """{"text":"WLAN"}""")
+        val result = processor.execute("tap", """{"index":0}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertTrue(
@@ -246,14 +289,11 @@ class ToolAppliedSemanticsTest {
 
     @Test
     fun `shizuku Done via state check reports applied=true without screen fingerprint`() {
-        // Shizuku actions use state checks (pm clear succeeded, package is gone, etc.)
-        // not screen fingerprints. When they report Done, that IS the applied truth.
         val shizukuLike = FixedResultBackend(
             id = "shizuku",
             result = ActionResult(ActionOutcome.Done, "cleared com.example"),
         )
         val r = router(shizukuLike)
-        // No accessibility UI available — post-processor should pass through
         val processor = postProcessor(r)
 
         val result = processor.execute("clear_data", """{"package":"com.example"}""")
@@ -292,7 +332,8 @@ class ToolAppliedSemanticsTest {
         val r = router(backend)
         val processor = postProcessor(r)
 
-        val result = processor.execute("tap_text", """{"text":"WLAN"}""")
+        processor.execute("read_screen", "{}") // establish snapshot
+        val result = processor.execute("tap", """{"index":0}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertTrue(
@@ -328,7 +369,8 @@ class ToolAppliedSemanticsTest {
         val r = router(backend)
         val processor = postProcessor(r)
 
-        val result = processor.execute("tap_text", """{"text":""}""")
+        // tap with missing index
+        val result = processor.execute("tap", """{}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertTrue(
@@ -350,8 +392,11 @@ class ToolAppliedSemanticsTest {
 
         val descriptors = processor.descriptors()
 
-        assertEquals(2, descriptors.size)
-        assertEquals(setOf("tap_text", "type_text"), descriptors.map { d -> d.name }.toSet())
+        assertEquals(5, descriptors.size)
+        assertEquals(
+            setOf("read_screen", "tap", "long_press", "scroll", "input_text"),
+            descriptors.map { d -> d.name }.toSet(),
+        )
     }
 
     @Test
@@ -375,14 +420,13 @@ class ToolAppliedSemanticsTest {
 
     @Test
     fun `accessibility backend Done is trusted as applied=true`() {
-        // The post-processor trusts the backend's verdict. The accessibility backend
-        // already verified via fingerprint that the screen changed before returning Done.
         val ui = FakeUi(fingerprintSequence = listOf("a", "b"))
         val backend = accessibilityBackend(ui)
         val r = router(backend)
         val processor = postProcessor(r)
 
-        val result = processor.execute("tap_text", """{"text":"WLAN"}""")
+        processor.execute("read_screen", "{}") // establish snapshot
+        val result = processor.execute("tap", """{"index":0}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertTrue(
@@ -429,15 +473,13 @@ class ToolAppliedSemanticsTest {
 
     @Test
     fun `accessibility backend already returning NO_SCREEN_CHANGE gets applied=false prefix`() {
-        // The accessibility backend already returns Refused(NO_SCREEN_CHANGE) when fingerprint
-        // doesn't change. The post-processor must add the applied=false prefix without
-        // double-refusing or losing the original code.
         val ui = FakeUi(fingerprintSequence = listOf("same", "same"))
         val backend = accessibilityBackend(ui)
         val r = router(backend)
         val processor = postProcessor(r)
 
-        val result = processor.execute("tap_text", """{"text":"WLAN"}""")
+        processor.execute("read_screen", "{}") // establish snapshot
+        val result = processor.execute("tap", """{"index":0}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertTrue(
@@ -452,7 +494,6 @@ class ToolAppliedSemanticsTest {
 
     @Test
     fun `multiple backends coexist with correct applied semantics`() {
-        // Accessibility backend with screen change + Shizuku backend with state check
         val ui = FakeUi(fingerprintSequence = listOf("before", "after"))
         val a11yBackend = accessibilityBackend(ui)
         val shizukuBackend = FixedResultBackend(
@@ -463,8 +504,9 @@ class ToolAppliedSemanticsTest {
         val r = router(a11yBackend, shizukuBackend)
         val processor = postProcessor(r)
 
-        // Accessibility action
-        val tapResult = processor.execute("tap_text", """{"text":"Settings"}""")
+        // Accessibility action (tap by index)
+        processor.execute("read_screen", "{}") // establish snapshot
+        val tapResult = processor.execute("tap", """{"index":0}""")
         assertEquals(ActionOutcome.Done, tapResult.outcome)
         assertTrue("a11y applied=true: ${tapResult.detail}", tapResult.detail.contains("[applied=true]"))
 
