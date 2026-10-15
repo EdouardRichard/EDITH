@@ -6,6 +6,7 @@ import edith.plugin.CancellationHandle
 import edith.plugin.MonotonicClock
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -274,6 +275,22 @@ class GlassHintControllerTest {
     }
 
     // ---------------------------------------------------------------- Phase C: what the render callback carries
+
+    /**
+     * The controller owns the session identity, so a caller with its own traffic to gate (Phase C's `SAID` — an
+     * utterance the wearer made) must be able to ask it rather than keep a second copy that could disagree. A second
+     * copy is how a late utterance from the previous session ends up in this session's conversation.
+     */
+    @Test fun aCallerCanAskWhetherAnIdentityIsTheSessionThisControllerAdopted() {
+        val controller = controller()
+        assertFalse(controller.isCurrent("s", 1), "nothing has been adopted yet")
+        controller.accept(HintCommand.Hello("s", 4))
+        assertTrue(controller.isCurrent("s", 4))
+        assertFalse(controller.isCurrent("s", 3), "an older generation of the same session is not current")
+        assertFalse(controller.isCurrent("other", 4), "another session's traffic is never current")
+        controller.disconnect()
+        assertFalse(controller.isCurrent("s", 4), "a lost link adopts nothing")
+    }
 
     /**
      * The glasses show one conversation per route (spec §6.6), so the render callback must carry the route of the

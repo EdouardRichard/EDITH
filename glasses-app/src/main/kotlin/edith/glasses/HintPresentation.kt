@@ -1,5 +1,6 @@
 package edith.glasses
 
+import edith.contracts.AssistantRoute
 import edith.output.HintWireCodec
 
 /**
@@ -73,4 +74,14 @@ object HintPresentation {
      */
     fun inboundReport(json: String, decoded: String?): String =
         "inbound ${decoded ?: "undecodable"} chars=${json.length}"
+
+    /**
+     * What the conversation view did with one route, as one greppable line (Phase C).
+     *
+     * The same rule as every other `P3_`/bridge line: counts and a route name, never the text. It exists because
+     * "the wearer saw nothing" and "the wearer saw a conversation that stopped growing" look identical in a log that
+     * only reports hints — and the second one is what a broken `SAID` path produces.
+     */
+    fun conversationReport(route: AssistantRoute, entries: Int, chars: Int): String =
+        "conversation route=${route.name} entries=$entries chars=$chars"
 }

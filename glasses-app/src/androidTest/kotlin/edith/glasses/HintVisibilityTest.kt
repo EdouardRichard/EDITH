@@ -3,6 +3,7 @@ package edith.glasses
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
+import edith.contracts.AssistantRoute
 import edith.output.HintCommand
 import edith.output.HintWireCodec
 import org.junit.Assert.assertEquals
@@ -88,6 +89,10 @@ class HintVisibilityTest {
      * P3.2 Stage 0: the fixed region wraps, and a plain `TextView` with `maxLines` clips the overflow **silently**.
      * This pins that the overflow is at least **observable** (the reading the capacity probe depends on), not that any
      * particular length is legible - wearer readability stays a separate evidence class.
+     *
+     * Phase C repair: this assertion used to read `HintPresentation.MAX_POINTS`, a constant that was removed in
+     * P3.2-CLIP and left this file unable to compile. What it has to prove is the same thing it always did - the text
+     * is taller than the window, so an overflow is observable - and the window is `HintAutoScroll.VISIBLE_LINES`.
      */
     @Test
     fun aHintLongerThanTheLayoutShowsIsObservableAsClipped() {
@@ -97,8 +102,8 @@ class HintVisibilityTest {
                 activity.acceptCommand(HintWireCodec.encode(
                     HintCommand.Sync("sync-1", offsetLowerNanos = 0, offsetUpperNanos = 1_000_000,
                         validUntilGlassNanos = System.nanoTime() + 30_000_000_000L)))
-                // Three points, each long enough to wrap several times: the shaping limit is 3 points, the layout
-                // limit is 6 lines, so this must overflow.
+                // Three points, each long enough to wrap several times: the layout limit is 6 lines, so this must
+                // overflow whatever the shaping rule is.
                 val long = "第一点需要足够长才能折成好几行用来撑满这块小小的显示区域。".repeat(2) +
                     "第二点同样需要足够长才能折成好几行用来撑满这块小小的显示区域。".repeat(2) +
                     "第三点也一样需要足够长才能折成好几行用来撑满这块小小的显示区域".repeat(2)
@@ -112,7 +117,79 @@ class HintVisibilityTest {
             scenario.onActivity { activity ->
                 val lines = activity.renderedLineCount()
                 assertTrue("a hint that overflows the layout must be observable as clipped, saw $lines lines",
-                    lines > HintPresentation.MAX_POINTS * 2)
+                    lines > HintAutoScroll.VISIBLE_LINES)
+            }
+        }
+    }
+
+    /**
+     * Phase C (spec §6.6): an utterance the phone reports lands in **its own** conversation, and bringing it there is
+     * what makes it visible at all - a message filed under a route nobody is looking at is a message nobody sees.
+     */
+    @Test
+    fun anUtteranceLandsOnItsOwnRouteAndBringsThatRouteToTheFront() {
+        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Said("s-1", 1, sequence = 1, route = AssistantRoute.PROACTIVE,
+                        entryId = "said-1", text = "我待会儿要开会")))
+            }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            scenario.onActivity { activity ->
+                assertEquals("the utterance must be in the proactive conversation",
+                    "我待会儿要开会", activity.conversationText(AssistantRoute.PROACTIVE))
+                assertEquals("and the wake conversation must not have it",
+                    "", activity.conversationText(AssistantRoute.WAKE))
+                assertEquals("the view must follow the newest thing that arrived",
+                    AssistantRoute.PROACTIVE, activity.selectedRoute())
+            }
+        }
+    }
+
+    /**
+     * The Phase C change to what a `CLEAR` means: the live hint is retired, the conversation is **not** erased. A
+     * context view the phone can wipe is not a context view.
+     */
+    @Test
+    fun aClearRetiresTheLiveHintButKeepsTheConversation() {
+        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Sync("sync-1", offsetLowerNanos = 0, offsetUpperNanos = 1_000_000,
+                        validUntilGlassNanos = System.nanoTime() + 30_000_000_000L)))
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Show(
+                    sessionId = "s-1", generation = 1, sequence = 1, hintId = "h-1", revision = 1, syncId = "sync-1",
+                    phoneSentNanos = System.nanoTime(), remainingTtlMillis = 5_000, text = "答案在这里")))
+
+                assertEquals("答案在这里", activity.hintText())
+
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Clear("s-1", 1, sequence = 2)))
+            }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            scenario.onActivity { activity ->
+                assertEquals("a clear must retire the live hint", "", activity.hintText())
+                assertEquals("but the conversation the wearer reads back from must survive it",
+                    "答案在这里", activity.conversationText(AssistantRoute.WAKE))
+            }
+        }
+    }
+
+    /** An utterance the gates refuse must not enter the conversation: nobody read it, so it is not part of it. */
+    @Test
+    fun anUtteranceForAnotherSessionNeverEntersTheConversation() {
+        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Said("s-other", 1, sequence = 1, route = AssistantRoute.WAKE,
+                        entryId = "said-x", text = "上一个会话说的话")))
+            }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            scenario.onActivity { activity ->
+                assertEquals("another session's words must never appear here",
+                    "", activity.conversationText(AssistantRoute.WAKE))
             }
         }
     }

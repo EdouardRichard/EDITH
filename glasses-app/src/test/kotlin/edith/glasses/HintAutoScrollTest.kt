@@ -60,4 +60,26 @@ class HintAutoScrollTest {
         assertThrows(IllegalArgumentException::class.java) { HintAutoScroll.scrollMillis(lines = -1) }
         assertThrows(IllegalArgumentException::class.java) { HintAutoScroll.scrollMillis(lines = 5, visibleLines = 0) }
     }
+
+    // ---------------------------------------------------------------- Phase C: where the slide ends (spec §6.6)
+
+    @Test
+    fun theEndOffsetPutsTheLastLineAtTheBottomOfTheWindow() {
+        // A conversation that fits does not move at all.
+        assertEquals(0, HintAutoScroll.endOffsetPx(totalLines = 4, lineHeightPx = 30))
+        // Otherwise it moves exactly as far as the lines that do not fit - the same quantity `scrollMillis` paces.
+        assertEquals((10 - HintAutoScroll.VISIBLE_LINES) * 30, HintAutoScroll.endOffsetPx(totalLines = 10, lineHeightPx = 30))
+    }
+
+    @Test
+    fun aWindowWithNoMeasuredLineHeightNeverProducesAnOffset() {
+        // Before the first layout pass `lineHeight` is 0; scrolling by a guessed height would land anywhere.
+        assertEquals(0, HintAutoScroll.endOffsetPx(totalLines = 10, lineHeightPx = 0))
+        assertEquals(0, HintAutoScroll.endOffsetPx(totalLines = 0, lineHeightPx = 30))
+    }
+
+    @Test
+    fun aNegativeLineCountIsRefused() {
+        assertThrows(IllegalArgumentException::class.java) { HintAutoScroll.endOffsetPx(totalLines = -1, lineHeightPx = 30) }
+    }
 }

@@ -56,4 +56,21 @@ object HintAutoScroll {
 
     /** True when the hint is taller than the window and therefore has to move. */
     fun needsScroll(lines: Int, visibleLines: Int = VISIBLE_LINES): Boolean = scrollMillis(lines, visibleLines) > 0L
+
+    /**
+     * How far the slide has to travel to bring the last line to the bottom of the window (Phase C, spec §6.6).
+     *
+     * The same quantity [scrollMillis] paces: the lines that do not fit, times the height of one. Phase C's
+     * conversation view scrolls to its **newest entry** rather than to the end of a single hint, so the caller needs
+     * the destination as a number instead of `lines * lineHeight`, and the two must not be computed in two places.
+     *
+     * A zero or negative [lineHeightPx] means the view has not been laid out yet; the honest answer then is not to
+     * move, because any offset would be a guess.
+     */
+    fun endOffsetPx(totalLines: Int, lineHeightPx: Int, visibleLines: Int = VISIBLE_LINES): Int {
+        require(totalLines >= 0) { "line count must not be negative, was $totalLines" }
+        require(visibleLines > 0) { "the visible window must be at least one line, was $visibleLines" }
+        if (lineHeightPx <= 0) return 0
+        return (totalLines - visibleLines).coerceAtLeast(0) * lineHeightPx
+    }
 }

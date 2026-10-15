@@ -85,4 +85,14 @@ class HintPresentationTest {
         assertEquals("inbound Show chars=120", HintPresentation.inboundReport("x".repeat(120), "Show"))
         assertEquals("inbound undecodable chars=400", HintPresentation.inboundReport("x".repeat(400), null))
     }
+
+    @Test
+    fun aConversationReportsItsSizePerRouteAndNeverItsText() {
+        // Phase C: without this line, "the wearer saw nothing" and "the conversation stopped growing" are the same
+        // reading. Counts and a route name only - the same rule as every other instrument here.
+        assertEquals("conversation route=WAKE entries=3 chars=57",
+            HintPresentation.conversationReport(edith.contracts.AssistantRoute.WAKE, entries = 3, chars = 57))
+        assertEquals("conversation route=PROACTIVE entries=0 chars=0",
+            HintPresentation.conversationReport(edith.contracts.AssistantRoute.PROACTIVE, entries = 0, chars = 0))
+    }
 }

@@ -80,6 +80,16 @@ class GlassHintController(
         }
     }
 
+    /**
+     * True when [sessionId] and [generation] name the session this controller has adopted.
+     *
+     * Phase C added traffic that is not a hint — `SAID`, the wearer's own utterance — and that traffic has to pass the
+     * same session gate a `SHOW` passes, or the previous session's words appear in this one's conversation. The
+     * identity belongs to this class, so the question is asked here rather than tracked a second time by the view.
+     */
+    fun isCurrent(sessionId: String, generation: Long): Boolean =
+        this.sessionId == sessionId && this.generation == generation
+
     /** Losing the link must never leave text on the glasses. */
     fun disconnect() {
         sessionId = null
