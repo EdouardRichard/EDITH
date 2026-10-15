@@ -3,6 +3,21 @@ plugins {
     id("org.jetbrains.kotlin.plugin.compose") version "2.4.0"
 }
 
+/**
+ * Whether the MediaTek NeuroPilot NPU runtime ships in this build.
+ *
+ * **Opt-in, and the reason is a crash rather than taste.** D64 made the GPU the runtime backend and left the NPU
+ * diagnostic-only. Shipping its runtime unconditionally also breaks every non-MediaTek device: LiteRT loads the
+ * bundled `libLiteRtCompilerPlugin_MediaTek.so` on a Qualcomm SoC and the process dies inside
+ * `LiteRtCreateCompiledModel` for **every** graph — GPU and CPU alike — so neither Laya nor the embedding engine can
+ * start. Measured on the K40 (Snapdragon 870) on 2026-10-15; the same combination is recorded as D64 finding 3.
+ * Enable it for NPU work on the MediaTek delivery target:
+ * `gradlew -PwithMediaTekNpu=true :phone-app:assembleDebug`.
+ *
+ * Declared at file scope because both the `android` block (the adapter source set) and the `dependencies` block (the
+ * two LiteRT `.so` files) need it.
+ */
+val withMediaTekNpu = providers.gradleProperty("withMediaTekNpu").orNull?.toBoolean() ?: false
 
 android {
     namespace = "edith.phone"
@@ -50,12 +65,17 @@ android {
     //
     // Bundling one matters because it is the version-matched pair the plugin was built against, and because a
     // library in the app's own native directory is what `dlopen` finds first.
-    sourceSets.getByName("main").jniLibs.srcDir(rootProject.file(".local/npu-runtime"))
+    //
+    // Gated by [withMediaTekNpu] (file scope) for the crash reason documented there.
+    if (withMediaTekNpu) {
+        sourceSets.getByName("main").jniLibs.srcDir(rootProject.file(".local/npu-runtime"))
+    }
     // edith-0.2 NPU measurement: LiteRT resolves the NPU dispatch/compiler plugins by **path** (it is handed
     // `Environment.Option.DispatchLibraryDir`), so the vendor `.so` files have to exist as real files on disk.
     // With the AGP default (`extractNativeLibs=false`) they live only inside the APK and the directory LiteRT is
     // given does not exist. This is the same requirement the publisher documents for the Qualcomm runtime
-    // ("packaging { jniLibs { useLegacyPackaging = true } } // Needed for ... NPU runtime libraries").
+    // ("packaging { jniLibs { useLegacyPackaging = true } } // Needed for ... NPU runtime libraries"), and it is
+    // kept unconditional because the **GPU** dispatch library is resolved the same way.
     packaging { jniLibs { useLegacyPackaging = true } }
 }
 kotlin {
@@ -87,7 +107,10 @@ dependencies {
     // The MediaTek NeuroPilot NPU runtime: dispatch library + JIT compiler plugin. `litert-api` 2.3.0 already
     // declares the `<uses-native-library>` entries the linker needs before the plugin may dlopen the device's
     // `libneuron*` vendor libraries; this artifact supplies the two `.so` files themselves.
-    implementation(libs.litert.npu.mediatek)
+    //
+    // **Opt-in**, for the crash reason documented at `withMediaTekNpu` above: on a non-MediaTek device these two
+    // `.so` files are loaded anyway and kill the process inside `LiteRtCreateCompiledModel`.
+    if (withMediaTekNpu) implementation(libs.litert.npu.mediatek)
     implementation(project(":plugins-interview"))
     debugImplementation(project(":plugins-diagnostic"))
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.10.2")
