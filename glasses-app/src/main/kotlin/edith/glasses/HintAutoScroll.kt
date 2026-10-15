@@ -44,6 +44,16 @@ object HintAutoScroll {
     const val LINE_READ_MILLIS = HintReadingBudget.LINE_READ_MILLIS
 
     /**
+     * How long a **new** entry takes to come into view (device report, 2026-10-15).
+     *
+     * Short on purpose, and not zero. The paced slide is for reading *within* a long hint; a message that has just
+     * been spoken has to be readable when the wearer looks up, and on the device the paced slide took 16.8 s to travel
+     * a scrollback that began with a 204-character hint. Zero would be the page-jump the owner rejected
+     * (「看到自动翻页了，但这不是友好的效果」), so this is a visible slide that is over before the answer's own speech is.
+     */
+    const val IMMEDIATE_MILLIS = 280L
+
+    /**
      * How long the slide takes: one reading pace per line that does not fit, zero when everything is already visible.
      *
      * @param lines the laid-out line count (from `TextView.lineCount`, so only knowable after a layout pass)

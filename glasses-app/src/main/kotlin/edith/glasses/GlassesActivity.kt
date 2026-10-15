@@ -85,6 +85,12 @@ class GlassesActivity : Activity() {
     /** Which route is in front of the wearer, and whether the slide is paused (`KEYCODE_ENTER`). */
     private val order = ConversationOrder()
 
+    /**
+     * Whether an entry arrived since the last rebuild, so the reveal knows to show it **now** rather than at reading
+     * pace (device report, 2026-10-15: the answer was on screen only after the hint had expired).
+     */
+    private var newEntryPending = false
+
     /** Rejects an out-of-order `SAID`; the custom-command channel promises nothing about ordering. */
     private val saidGate = SaidSequenceGate()
 
@@ -272,6 +278,9 @@ class GlassesActivity : Activity() {
             // The display follows what arrived. Without this the wearer reading one conversation would never see a
             // hint filed under the other, which is precisely the failure the route tags exist to prevent.
             order.show(displayed.route)
+            // A new entry has to be brought into view whatever the wearer was doing with the scroll: the pause exists
+            // so a slide never fights someone reading, not so that the next answer stays hidden (device report).
+            newEntryPending = true
         }
         holdAwakeFor(liveEntryId != null)
         // The panel has two claimants, so it is resolved in one place: calling `holdAwakeFor` directly here released
@@ -296,6 +305,8 @@ class GlassesActivity : Activity() {
         val stored = log.append(ConversationEntry(command.entryId, command.route, ConversationRole.USER, command.text))
         android.util.Log.i("EdithGlasses",
             "said stored=$stored route=${command.route.name} chars=${command.text.length}")
+        // Same rule as a hint: the wearer's own words are new content and must be visible as they arrive.
+        if (stored) newEntryPending = true
         rebuild()
     }
 
@@ -363,7 +374,8 @@ class GlassesActivity : Activity() {
         rows.forEach { row -> entriesView.addView(entryRow(row)) }
         android.util.Log.i("EdithGlasses",
             HintPresentation.conversationReport(route, rows.size, rows.sumOf { it.entry.text.length }))
-        scheduleReveal()
+        scheduleReveal(promptly = newEntryPending)
+        newEntryPending = false
         // The layout's own limit is reported only **after** it has laid the text out - reading it here would read the
         // previous layout (or none). Counts and size only, never the text.
         liveRow?.post {
@@ -397,29 +409,44 @@ class GlassesActivity : Activity() {
      * A wearer who tapped the pad (`KEYCODE_ENTER`) has paused this: the plan then holds still, and only a tap
      * resumes it, so a slide can never fight the person reading.
      */
-    private fun scheduleReveal() {
+    private fun scheduleReveal(promptly: Boolean = false) {
         scrollAnimator?.cancel()
         scrollAnimator = null
-        if (order.isPaused()) return
         entriesView.post {
             val lineHeight = (liveRow ?: entriesView.getChildAt(0) as? TextView)?.lineHeight ?: 0
             if (lineHeight <= 0) return@post
             val totalLines = (0 until entriesView.childCount)
                 .mapNotNull { entriesView.getChildAt(it) as? TextView }
                 .sumOf { it.lineCount }
-            val duration = HintAutoScroll.scrollMillis(totalLines)
-            if (duration <= 0L) {
-                hintScroll.scrollTo(0, 0)
-                return@post
-            }
             val endPx = HintAutoScroll.endOffsetPx(totalLines, lineHeight)
-            scrollAnimator = ValueAnimator.ofInt(hintScroll.scrollY, endPx).apply {
-                this.duration = duration
-                startDelay = HintAutoScroll.READ_DELAY_MILLIS
-                interpolator = LinearInterpolator()
-                addUpdateListener { animation -> hintScroll.scrollTo(0, animation.animatedValue as Int) }
-                start()
+            // Device report (2026-10-15): the wearer heard a new answer while the screen still showed the previous
+            // 204-character hint. The entry was in the log; the scroll never brought it into view, because a pause
+            // (a side-touch tap a minute earlier) suppressed the reveal entirely, and the unpaused path travels the
+            // whole scrollback at reading pace - 16.8 s on that turn. `HintReveal` puts the decision in one place.
+            when (HintReveal.forChange(promptly, order.isPaused(), atNewest = hintScroll.scrollY >= endPx)) {
+                Reveal.HOLD -> return@post
+                Reveal.IMMEDIATE ->
+                    slideTo(endPx, HintAutoScroll.IMMEDIATE_MILLIS, startDelay = 0L)
+                Reveal.PACED -> {
+                    val duration = HintAutoScroll.scrollMillis(totalLines)
+                    if (duration <= 0L) {
+                        hintScroll.scrollTo(0, 0)
+                        return@post
+                    }
+                    slideTo(endPx, duration, startDelay = HintAutoScroll.READ_DELAY_MILLIS)
+                }
             }
+        }
+    }
+
+    /** One continuous slide from wherever the view is to [endPx]; the caller owns the pacing decision. */
+    private fun slideTo(endPx: Int, duration: Long, startDelay: Long) {
+        scrollAnimator = ValueAnimator.ofInt(hintScroll.scrollY, endPx).apply {
+            this.duration = duration
+            this.startDelay = startDelay
+            interpolator = LinearInterpolator()
+            addUpdateListener { animation -> hintScroll.scrollTo(0, animation.animatedValue as Int) }
+            start()
         }
     }
 

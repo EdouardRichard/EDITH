@@ -187,7 +187,14 @@ internal class SmartFakeOutput : OutputSink {
 }
 
 /**
- * The host services the plugin is activated with: a capability map plus a task scope.
+ * The host services the plugin is activated with: a capability map, a grant set and a task scope.
+ *
+ * **The grant set is the point.** The real host hands the plugin a scope that refuses any capability the plugin did not
+ * declare, and this fake used to answer from its provider map alone - so every port was reachable here and a
+ * capability the plugin *consumed but never declared* was invisible to the entire suite. That is not hypothetical: the
+ * plugin published nothing to the phone's conversation view on the device (no `SAID`, no `BUSY`, an empty 助手 page)
+ * while every test was green, because `ConversationDisplay` was missing from the descriptor and the optional-port
+ * access degraded silently. Refusing here is what makes the rig behave like the host it stands in for.
  *
  * The default scope runs the block **inline**, which is what keeps the plugin's own tests deterministic (the same
  * reason the P3.2 proactive tests rely on). [OffThreadTasks] models production instead: there the plugin's task pool is
@@ -197,8 +204,15 @@ internal class SmartFakeOutput : OutputSink {
 internal class SmartFakeHost(
     private val providers: Map<Capability, Any>,
     override val tasks: TaskScope = InlineTasks,
+    /** What the descriptor declared; anything else is refused the way the host's scope refuses it. */
+    private val granted: Set<Capability> = Capability.entries.toSet(),
 ) : HostServices {
-    override fun require(capability: Capability): Any = providers[capability] ?: error("missing fake provider: $capability")
+    override fun require(capability: Capability): Any {
+        if (capability !in granted) {
+            error("CapabilityMissing: $capability was not declared by the plugin's descriptor")
+        }
+        return providers[capability] ?: error("missing fake provider: $capability")
+    }
 }
 
 /** The default fake scope: the block runs on the calling thread before `launch` returns. */
@@ -360,7 +374,7 @@ internal class SmartTestRig(
         sessionId: SessionId = this.sessionId,
     ) = TranscriptRevision(envelope(generation, sessionId), turnId, revision, text, final, 1, clock.nowNanos())
 
-    fun host(overrides: Map<Capability, Any> = emptyMap(), tasks: TaskScope? = null): HostServices = SmartFakeHost(
+    fun host(overrides: Map<Capability, Any> = emptyMap(), tasks: TaskScope? = null, granted: Set<Capability> = Capability.entries.toSet()): HostServices = SmartFakeHost(
         buildMap {
             put(Capability.Model, model)
             put(Capability.TextOutput, output)
@@ -374,6 +388,7 @@ internal class SmartTestRig(
             putAll(overrides)
         },
         tasks ?: InlineTasks,
+        granted,
     )
 
     fun activate(
@@ -407,7 +422,15 @@ internal class SmartTestRig(
         plugin.validate(configuration)
         plugin.configure(configuration)
         plugin.activate(
-            edith.plugin.PluginContext(sessionId, generation, Capability.entries.toSet(), host(overrides, tasks)),
+            // Granted set == **what the descriptor declares**, which is what the real host does. This rig used to grant
+            // `Capability.entries` (every capability), so any port the plugin reached for was reachable here and a
+            // capability the plugin consumed but never declared was invisible to the whole suite. That is not
+            // hypothetical: the plugin reported nothing to the phone's conversation view on the device - no `SAID`, no
+            // `BUSY`, an empty 助手 page - while 439 tests were green, because `ConversationDisplay` was missing from
+            // the descriptor and the optional-port access degraded silently.
+            edith.plugin.PluginContext(
+                sessionId, generation, plugin.descriptor.capabilities.toSet(),
+                host(overrides, tasks, plugin.descriptor.capabilities.toSet()),),
         )
         return plugin
     }

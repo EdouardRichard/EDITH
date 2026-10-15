@@ -59,7 +59,12 @@ class SmartAssistantPluginTest {
         assertEquals(
             setOf(Capability.WakeWord, Capability.Asr, Capability.Model, Capability.Actions, Capability.TextOutput,
                 Capability.Context, Capability.Storage, Capability.Confirmation, Capability.StorageAccess,
-                Capability.SystemOne, Capability.Embedding),
+                Capability.SystemOne, Capability.Embedding,
+                // edith-0.2 Phase C: the conversation port. Added after a device report - the phone's 助手 page was
+                // empty and no `SAID`/`BUSY` ever reached the glasses, because the plugin consumed the port without
+                // declaring it and the optional access degraded to "no port" in silence. This list is the gate that
+                // now makes that omission fail here instead of on the wearer's face.
+                Capability.ConversationDisplay),
             plugin.descriptor.capabilities,
         )
         // P3.2 Task 8: `Context` is no longer absent. It is what the proactive path runs on - the host delivers

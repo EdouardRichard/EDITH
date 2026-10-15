@@ -270,6 +270,15 @@ class SmartAssistantPlugin(
             // intervention gate, "Laya unavailable" also stops the wake-word path.
             Capability.SystemOne,
             Capability.Embedding,
+            // edith-0.2 Phase C (§6.7 助手页签): the port that carries "who said what" and "who is working" to the
+            // host, which sends it to the glasses and fills the phone's conversation record with the same entries.
+            //
+            // **Declaring it is what makes it reachable.** The host grants a plugin exactly what its descriptor lists;
+            // the port is optional, so a missing declaration is not a refusal - the accessor throws, the plugin's
+            // `runCatching` turns that into "no port", and every report is silently dropped. That is precisely what
+            // happened on the device: the spoken answer was fine while the phone's 助手 page stayed empty and not one
+            // `SAID` or `BUSY` reached the glasses.
+            Capability.ConversationDisplay,
         ),
         ConfigSchema(CONFIG_SCHEMA_VERSION),
     )

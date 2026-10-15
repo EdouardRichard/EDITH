@@ -230,6 +230,17 @@ class PublicProviderConsumerTest {
                 override val modelInfo: ModelInfo? = null
                 override val dimensions = 256
             },
+            // edith-0.2 Phase C: the smart assistant's conversation port. It is **declared** by the plugin (that is
+            // what makes it reachable - see the 2026-10-15 device report), and a declared capability the host cannot
+            // provide refuses activation, so this composition-shaped rig has to answer it exactly as the phone app
+            // does. A no-op is enough here: this test is about activation and provider compatibility, not about what
+            // the port carries.
+            Capability.ConversationDisplay to object : ConversationDisplay {
+                override fun userMessage(route: AssistantRoute, text: String) = Unit
+                override fun assistantMessage(route: AssistantRoute, text: String) = Unit
+                override fun working(route: AssistantRoute) = Unit
+                override fun idle(route: AssistantRoute) = Unit
+            },
         )
         val host = HostRuntime(1, object : ScheduledHostEnvironment {
             override val clock = this@Providers.clock

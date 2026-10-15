@@ -10,6 +10,8 @@ import edith.audio.VadDecision
 import edith.audio.VadEngine
 import edith.audio.WakeWordDetector
 import edith.contracts.Assistance
+import edith.contracts.AssistantRoute
+import edith.plugin.ConversationDisplay
 import edith.contracts.AudioFormat
 import edith.contracts.EventEnvelope
 import edith.contracts.Generation
@@ -178,7 +180,15 @@ class PassiveLoopWiringTest {
      * It answers "no SKILLs installed", the normal state on a device where the user has written none (spec §3.7),
      * so no test in this file needs a real file system.
      */
-    private class NoStorageAccess : StorageAccess {
+    /** Phase C: the conversation port the smart plugin declares; this rig only needs activation to succeed. */
+private class NoConversationDisplay : ConversationDisplay {
+    override fun userMessage(route: AssistantRoute, text: String) = Unit
+    override fun assistantMessage(route: AssistantRoute, text: String) = Unit
+    override fun working(route: AssistantRoute) = Unit
+    override fun idle(route: AssistantRoute) = Unit
+}
+
+private class NoStorageAccess : StorageAccess {
         override fun listFiles(dirPath: String, suffix: String): List<String> = emptyList()
         override fun readFile(path: String): String? = null
         override fun deleteFile(path: String): Boolean = false
@@ -375,6 +385,7 @@ class PassiveLoopWiringTest {
                     Capability.StorageAccess to NoStorageAccess(),
                     Capability.SystemOne to ReadySystemOne(),
                     Capability.Embedding to ReadyEmbedding(),
+                    Capability.ConversationDisplay to NoConversationDisplay(),
                 ),
                 storageFor = { StubStorage() })
             host = HostRuntime(1, environment)
@@ -758,6 +769,7 @@ class PassiveLoopWiringTest {
                 Capability.StorageAccess to NoStorageAccess(),
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
+                Capability.ConversationDisplay to NoConversationDisplay(),
             ),
             storageFor = { StubStorage() })
         val root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
@@ -822,7 +834,10 @@ class PassiveLoopWiringTest {
 
             assertEquals(setOf(Capability.Model, Capability.Storage, Capability.TextOutput, Capability.Asr,
                 Capability.Actions, Capability.WakeWord, Capability.Context, Capability.Confirmation,
-                Capability.StorageAccess, Capability.SystemOne, Capability.Embedding), advertised)
+                Capability.StorageAccess, Capability.SystemOne, Capability.Embedding,
+                // edith-0.2 Phase C: the smart plugin declares the conversation port, so the composition advertises
+                // it and this rig answers it - the two halves of the contract this test exists to keep equal.
+                Capability.ConversationDisplay), advertised)
             val services = rig.environment.services(ResourceScope("smart-assistant", session, Generation(1)), advertised)
             advertised.forEach { capability ->
                 assertNull("$capability is advertised, so it must be answerable",
@@ -941,6 +956,7 @@ class PassiveLoopWiringTest {
                 Capability.StorageAccess to NoStorageAccess(),
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
+                Capability.ConversationDisplay to NoConversationDisplay(),
             ),
             storageFor = { StubStorage() })
         val root = HostCompositionRoot(HostRuntime(1, environment), repository, InertModel(),
