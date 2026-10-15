@@ -53,6 +53,9 @@ import edith.phone.actions.ShizukuUserServiceShell
 import edith.phone.a11y.AccessibilityExecutionBackend
 import edith.phone.a11y.AccessibilityUi
 import edith.phone.a11y.EdithAccessibilityService
+import edith.phone.a11y.ScreenFilter
+import edith.phone.a11y.ScreenFingerprint
+import edith.phone.a11y.ScrollDirection
 import edith.phone.actions.ContextIntentLauncher
 import edith.phone.actions.IntentActionExecutor
 import edith.phone.actions.PackageManagerAppCatalog
@@ -1454,6 +1457,15 @@ class HostCompositionRoot internal constructor(
                 override fun clickText(text: String) = live()?.clickText(text) ?: false
                 override fun setText(text: String) = live()?.setText(text) ?: false
                 override fun screenFingerprint() = live()?.screenFingerprint() ?: ""
+                // T1.3 extended methods — delegate to the live service
+                override fun snapshot(filter: ScreenFilter) = live()?.snapshot(filter)
+                    ?: throw IllegalStateException("accessibility service not connected")
+                override fun clickByIndex(snapshotId: String, index: Int) = live()?.clickByIndex(snapshotId, index) ?: false
+                override fun longPressByIndex(snapshotId: String, index: Int) = live()?.longPressByIndex(snapshotId, index) ?: false
+                override fun scroll(direction: ScrollDirection) = live()?.scroll(direction) ?: false
+                override fun setTextByIndex(snapshotId: String, index: Int, text: String) = live()?.setTextByIndex(snapshotId, index, text) ?: false
+                override fun structuralFingerprint() = live()?.structuralFingerprint()
+                    ?: ScreenFingerprint(hash = "", nodeCount = 0, clickableCount = 0, truncated = false)
             }
             val executionRouter = ExecutionRouter(
                 listOf(

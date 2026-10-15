@@ -55,12 +55,19 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ),
 )
 
+/** Scroll direction for semantic scroll actions. */
+enum class ScrollDirection { FORWARD, BACKWARD }
+
 /**
  * What an accessibility service can do here, as a port.
  *
  * The port exists because P0's T3b probe learned two things that must stay testable without a device: the node that
  * carries a text is usually **not** the clickable one (its ancestor is), and "the action returned true" is not success.
  * The Android implementation walks the real node tree; the JVM tests answer from a fake.
+ *
+ * Extended in T1.3 with snapshot-based semantic actions: the agent loop reads a snapshot, reasons about indices,
+ * then issues actions by index rather than by text matching. This fixes the substring-matching defect in [clickText]
+ * and removes the dependency on [findFocus] for text entry.
  */
 interface AccessibilityUi {
     /** Clicks the nearest clickable ancestor of the first node carrying [text]. `false` when there is none. */
@@ -71,6 +78,24 @@ interface AccessibilityUi {
 
     /** A digest of what is currently on screen, used only to compare before and after - never logged, never stored. */
     fun screenFingerprint(): String
+
+    /** Returns a snapshot of the current screen using the given filter. */
+    fun snapshot(filter: ScreenFilter): ScreenSnapshot
+
+    /** Clicks the node at [index] in the snapshot identified by [snapshotId]. Returns false if not clickable or stale. */
+    fun clickByIndex(snapshotId: String, index: Int): Boolean
+
+    /** Long-presses the node at [index]. Returns false if not long-clickable or stale. */
+    fun longPressByIndex(snapshotId: String, index: Int): Boolean
+
+    /** Scrolls in the given direction. Returns false when at boundary. */
+    fun scroll(direction: ScrollDirection): Boolean
+
+    /** Sets text on the editable node at [index]. Returns false if not editable or stale. */
+    fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean
+
+    /** Structural fingerprint with node counts and truncation flag. */
+    fun structuralFingerprint(): ScreenFingerprint
 }
 
 /**

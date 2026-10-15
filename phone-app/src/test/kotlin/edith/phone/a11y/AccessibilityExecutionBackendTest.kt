@@ -39,6 +39,15 @@ class AccessibilityExecutionBackendTest {
             fingerprints++
             return if (fingerprints == 1) fingerprintBefore else fingerprintAfter
         }
+        // T1.3 extended methods — not exercised by legacy backend tests; stubs keep compilation green.
+        override fun snapshot(filter: ScreenFilter): ScreenSnapshot =
+            throw UnsupportedOperationException("legacy fake")
+        override fun clickByIndex(snapshotId: String, index: Int): Boolean = false
+        override fun longPressByIndex(snapshotId: String, index: Int): Boolean = false
+        override fun scroll(direction: ScrollDirection): Boolean = false
+        override fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean = false
+        override fun structuralFingerprint(): ScreenFingerprint =
+            ScreenFingerprint(hash = "", nodeCount = 0, clickableCount = 0, truncated = false)
     }
 
     private fun backend(ui: AccessibilityUi, connected: Boolean = true) =
