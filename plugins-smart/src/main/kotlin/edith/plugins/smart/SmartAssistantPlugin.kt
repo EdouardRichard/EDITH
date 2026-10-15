@@ -1372,7 +1372,9 @@ class SmartAssistantPlugin(
         val form = gateForm ?: return null
         val service = runCatching { currentContext()?.services?.systemOne() }.getOrNull() ?: return null
         return when (form) {
-            GateForm.NOUL -> NoulGate(service)
+            // The operating point is named here rather than left to the constructor default, so the value the
+            // production gate runs at is visible at the one place the gate is built.
+            GateForm.NOUL -> NoulGate(service, threshold = edith.plugins.smart.proactive.NoulThreshold.VALUE)
             GateForm.CHOICE -> ChoiceGate(service)
         }
     }

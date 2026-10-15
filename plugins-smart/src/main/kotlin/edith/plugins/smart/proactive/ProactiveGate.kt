@@ -60,7 +60,7 @@ val INTERVENTION_CRITERIA = listOf(
 /** The `noul` form: one Bernoulli question, and a threshold the caller calibrates. */
 class NoulGate(
     private val service: SystemOneService,
-    private val threshold: Double = 0.5,
+    private val threshold: Double = NoulThreshold.VALUE,
 ) : ProactiveGate {
 
     override val form = GateForm.NOUL
@@ -108,6 +108,30 @@ class ChoiceGate(private val service: SystemOneService) : ProactiveGate {
 
 /** An answer whose shape does not match the question: the model was asked one thing and answered another. */
 private fun wrongType(latency: Double) = GateOutcome(false, 0.0, latency, "WRONG_ANSWER_TYPE")
+
+/**
+ * The `noul` gate's operating point (Phase C), chosen on a selection set rather than left at the default.
+ *
+ * The gate shipped with `0.5` for two phases, and every document said so out loud: the fine-tune spec requires an
+ * operating point picked where the model's labels are not the thing being reported on, and no such set existed.
+ * The owner's 2026-10-15 ruling was to produce one and to pick **precision first**, because a proactive assistant
+ * that interrupts wrongly costs the wearer attention, while a missed intervention costs one offer of help.
+ *
+ * The number comes from `phase_c_select_threshold.py` over the delivered artifact set
+ * (`laya-ml-embeds-bnd-seed20261014`) on the synthetic validation split `layaft` held out: among thresholds whose
+ * precision reached 0.90 there, this is the one with the greatest recall. Full readings, including the
+ * **selection-to-report gap that this value does not escape**, are in
+ * `docs/project/evidence/2026-10-15-phase-c-noul-threshold.md`; the short version is that on the 210-row report set
+ * this point reads precision 0.686 where the old default read 0.956, so it is a calibrated starting point on a
+ * synthetic distribution, **not** a validated one.
+ */
+object NoulThreshold {
+    /** How the point was chosen, recorded with it: a number without its rule cannot be re-examined. */
+    const val CHOICE_RULE = "precision >= 0.90, then max recall (synthetic validation split)"
+
+    /** The operating point itself, from the delivered graph's own probabilities. */
+    const val VALUE = 0.069
+}
 
 /**
  * The shared shape of both forms: ask once, translate, and turn every failure into silence.
