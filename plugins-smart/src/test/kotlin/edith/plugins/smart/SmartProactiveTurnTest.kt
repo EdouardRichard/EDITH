@@ -1,6 +1,7 @@
 package edith.plugins.smart
 
 import edith.contracts.AcousticEvent
+import edith.contracts.AssistantRoute
 import edith.contracts.AcousticLabel
 import edith.contracts.ContextChanged
 import edith.contracts.OutputStateEvent
@@ -107,6 +108,13 @@ class SmartProactiveTurnTest {
         assertEquals(1, rig.model.requests.size, "one trigger, one request")
         assertEquals(1, rig.output.hints.size, "exactly one hint must be submitted")
         assertEquals("现在正适合提醒他一句", rig.output.hints.single().text)
+        // Owner report, 2026-10-15: the two conversations were not isolated on the device. `Assistance.route` was added
+        // in Phase C with `AssistantRoute.WAKE` as its default and neither construction site passed it - so a proactive
+        // answer reached the glasses claiming to belong to the wake conversation, and the device log read
+        // `conversation route=WAKE entries=2` for two proactive answers. The route on the submitted hint is what the
+        // wire carries and what the glasses file the entry under, so it is asserted here, where the proactive fixture
+        // already produces exactly one hint.
+        assertEquals(AssistantRoute.PROACTIVE, rig.output.hints.single().route)
         // P5 (spec §S6) / commit 48b881d: a proactive hint **asks for speech** so the TTS path is exercised. Whether it
         // is actually spoken is the host's speech-capability gate (spec §S2), not this plugin's decision - and a host
         // without a player still displays the hint normally. The P3.2-era assertion that this was "visual only" was

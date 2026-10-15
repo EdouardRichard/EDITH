@@ -738,12 +738,18 @@ class SmartAssistantPlugin(
     /** One utterance the wearer made, for the route that consumed it. */
     private fun publishUserMessage(route: ContextRoute, text: String) {
         if (text.isBlank()) return
+        // Which conversation this landed in, as a count and a route name and nothing else. Owner report (2026-10-15)
+        // asked the obvious question of a two-conversation screen - "which one did this go into?" - and there was no
+        // line in the log that could answer it, on either end. The text never appears here (the same rule as
+        // `P3_HINT show ... chars=`).
+        P3Log.line("P3_CONV said route=${route.toContractRoute().name} chars=${text.length}")
         conversation()?.userMessage(route.toContractRoute(), text)
     }
 
     /** One message the assistant is telling the wearer, for the route that produced it. */
     private fun publishAssistantMessage(route: ContextRoute, text: String) {
         if (text.isBlank()) return
+        P3Log.line("P3_CONV answer route=${route.toContractRoute().name} chars=${text.length}")
         conversation()?.assistantMessage(route.toContractRoute(), text)
     }
 
@@ -1709,6 +1715,10 @@ class SmartAssistantPlugin(
                 sessionId = current.sessionId,
                 generation = current.generation,
                 sourceTurnId = hint.turnId,
+                // Phase C follow-up (owner report, 2026-10-15): the route decides which conversation this hint is
+                // filed under - on the glasses the wire route is the route the entry lands in. It defaults to WAKE,
+                // so leaving it out filed every proactive answer under the wake conversation.
+                route = AssistantRoute.PROACTIVE,
                 priority = 0,
                 text = text,
                 // P5 (spec §S6): proactive hints carry speech so the TTS path is exercised. The host's capability
@@ -1909,6 +1919,8 @@ class SmartAssistantPlugin(
                 sessionId = context.sessionId,
                 generation = context.generation,
                 sourceTurnId = current.turnId,
+                                // Stated rather than defaulted, so the default is never what decides this.
+                route = AssistantRoute.WAKE,
                 priority = 0,
                 text = text,
                 optionalSpeech = optionalSpeech,

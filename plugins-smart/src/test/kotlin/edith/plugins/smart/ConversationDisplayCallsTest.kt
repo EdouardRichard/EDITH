@@ -286,6 +286,26 @@ class ConversationDisplayCallsTest {
         assertTrue(completed.get(), "the host's port was called while the plugin's lock was held")
     }
 
+    /**
+     * The route a hint is submitted under is **the route it will be filed under on the glasses**.
+     *
+     * Owner report, 2026-10-15: the two conversations were not isolated. A proactive answer appeared in the 唤醒
+     * conversation, because `Assistance.route` was added in Phase C with `AssistantRoute.WAKE` as its default and
+     * **neither construction site passed it** - so every hint, proactive included, claimed to belong to the wake
+     * route. The glasses file a `SHOW` under the route the wire carries, which is why the device log read
+     * `conversation route=WAKE entries=2` for two proactive answers while the wearer's own words were filed under
+     * `route=PROACTIVE`.
+     */
+    @Test
+    fun aWakeAnswerIsSubmittedUnderTheWakeRoute() {
+        val display = RecordingDisplay()
+        val rig = rig(display)
+        answerWithANotification(rig)
+        rig.wakeAndFinal("现在几点了")
+
+        assertEquals(AssistantRoute.WAKE, rig.output.hints.last().route)
+    }
+
     @Test
     fun aHostWithoutThePortStillRunsTheTurn() {        // The port is optional: a host with no display never provides it, and a missing conversation view must not stop
         // a turn from producing a hint.
