@@ -1326,6 +1326,10 @@ class HostCompositionRoot internal constructor(
             // local gate here is what made `root.playbackGate.begin()` suppress nothing.
             val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
             val hostHolder = arrayOfNulls<HostRuntime>(1)
+            // Phase C: the speech player is built further down (it depends on the user's 「语音朗读」 setting), while the
+            // wake sink that needs it is built here, so the sink reads it through a holder. `null` is the switch being
+            // off, which is why the acknowledgement is a silent no-op rather than a second check at the call site.
+            val speechHolder = arrayOfNulls<edith.plugin.SpeechPlayer>(1)
             // P3.2 Task 6: the context provider. Stage A exposes the zero-permission time keys; Stage B appends its
             // three permissioned sources to the same list. The listener is the production arming gate, so a disarmed
             // session produces no `ContextChanged` at all - the plugin's only context signal is the acoustic event.
@@ -1396,7 +1400,14 @@ class HostCompositionRoot internal constructor(
                 // emission** and from the host itself, so the only wakes that exist are the ones the host will accept
                 // - and a wake that arrives after the session ended is dropped by `onEvent` instead of opening a turn
                 // under a generation that no longer exists.
-                wakeEmit = { word, confidence -> hostHolder[0]?.let { host -> emitWakeDetected(host, clock, word, confidence) } },
+                wakeEmit = { word, confidence -> hostHolder[0]?.let { host ->
+                    // Phase C (spec §6.4): the wearer hears "在的" before any model work starts - the fixed phrase's
+                    // whole purpose is to cover that latency. It is speech only: no hint, no conversation entry.
+                    host.currentIdentity()?.let { (session, generation) ->
+                        speakWakeAcknowledgement(speechHolder[0], session, generation, clock)
+                    }
+                    emitWakeDetected(host, clock, word, confidence)
+                } },
                 // Task 4 (P3.2): the same per-emission identity resolution for the acoustic gate, so a label that
                 // arrives after the session ended is dropped by `onEvent` instead of opening anything under a
                 // generation that no longer exists. Task 5: the host only produces the event while 「主动辅助」 is on.
@@ -1522,6 +1533,9 @@ class HostCompositionRoot internal constructor(
             val speechPlayer: edith.plugin.SpeechPlayer? = if (speechEnabledNow) {
                 AndroidSpeechPlayer.create(context, playbackGate)
             } else null
+            // Phase C: the wake sink, built above, finds the player here. The same instance the arbiter uses, so the
+            // wearer's switch governs both and there is one engine rather than two.
+            speechHolder[0] = speechPlayer
             // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
             // assistant tab reads it. It has to be created here because the provider map is built before the root.
             val conversationLog = ConversationLog()
