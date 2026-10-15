@@ -144,4 +144,43 @@ class SkillParserTest {
         val skill = ok(conforming)
         assertEquals("reply-wechat-message", skill.name)
     }
+
+    // --- T2.5: applies_when / not_applies_when front matter fields (spec §3.8.3) ---
+
+    @Test
+    fun `applies_when block list parses correctly`() {
+        val skill = ok(
+            "---\nname: a\nversion: 1.0.0\ndescription: d\napplies_when:\n  - app_installed:com.miui.player\n  - channel_available:shizuku\n---\nbody\n",
+        )
+
+        assertEquals(listOf("app_installed:com.miui.player", "channel_available:shizuku"), skill.appliesWhen)
+    }
+
+    @Test
+    fun `not_applies_when block list parses correctly`() {
+        val skill = ok(
+            "---\nname: a\nversion: 1.0.0\ndescription: d\nnot_applies_when:\n  - app_installed:com.example.bloat\n---\nbody\n",
+        )
+
+        assertEquals(listOf("app_installed:com.example.bloat"), skill.notAppliesWhen)
+    }
+
+    @Test
+    fun `missing applies_when and not_applies_when default to empty lists`() {
+        // Backward compatibility: SKILLs written before §3.8.3 must still parse.
+        val skill = ok("---\nname: a\nversion: 1.0.0\ndescription: d\n---\nbody\n")
+
+        assertEquals(emptyList(), skill.appliesWhen)
+        assertEquals(emptyList(), skill.notAppliesWhen)
+    }
+
+    @Test
+    fun `applies_when and not_applies_when inline bracket syntax works`() {
+        val skill = ok(
+            "---\nname: a\nversion: 1.0.0\ndescription: d\napplies_when: [app_installed:com.foo, channel_available:bar]\nnot_applies_when: [app_installed:com.baz]\n---\nbody\n",
+        )
+
+        assertEquals(listOf("app_installed:com.foo", "channel_available:bar"), skill.appliesWhen)
+        assertEquals(listOf("app_installed:com.baz"), skill.notAppliesWhen)
+    }
 }

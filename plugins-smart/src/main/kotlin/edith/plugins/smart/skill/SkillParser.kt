@@ -56,6 +56,8 @@ object SkillParser {
                 description = description,
                 triggers = fields["triggers"].asList(),
                 tags = fields["tags"].asList(),
+                appliesWhen = fields["applies_when"].asList(),
+                notAppliesWhen = fields["not_applies_when"].asList(),
                 priority = priority,
                 enabled = enabled,
                 body = body,

@@ -14,6 +14,8 @@ data class Skill(
     val description: String,
     val triggers: List<String> = emptyList(),
     val tags: List<String> = emptyList(),
+    val appliesWhen: List<String> = emptyList(),
+    val notAppliesWhen: List<String> = emptyList(),
     val priority: SkillPriority = SkillPriority.NORMAL,
     val enabled: Boolean = true,
     val body: String,
