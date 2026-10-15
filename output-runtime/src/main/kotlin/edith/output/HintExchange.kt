@@ -62,6 +62,9 @@ class HintExchange(
             phoneSentNanos = clock.nowNanos(),
             remainingTtlMillis = remainingTtl,
             text = assistance.text,
+            // Phase C (spec §6.6): the glasses file a hint into the conversation it belongs to, and this is the only
+            // place that knows it - the arbiter hands over the plugin's `Assistance` unchanged.
+            route = assistance.route,
         )
         val handle = Handle(
             hintId = assistance.hintId,

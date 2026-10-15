@@ -38,6 +38,7 @@ class HintExchangeTest {
         generation: Long = 1,
         text: String = "先讲项目背景",
         expiresAtNanos: Long = 0L,
+        route: edith.contracts.AssistantRoute = edith.contracts.AssistantRoute.WAKE,
     ) = Assistance(
         hintId = hintId,
         sessionId = SessionId(session),
@@ -47,7 +48,26 @@ class HintExchangeTest {
         text = text,
         optionalSpeech = null,
         expiresAtNanos = expiresAtNanos,
+        route = route,
     )
+
+    /**
+     * Phase C (spec §6.6): the glasses keep one conversation per route, so the `SHOW` has to say which conversation it
+     * belongs to. The route travels on the `Assistance` because that is what the plugin built and what the arbiter
+     * passed on; a second source of truth here would be a second opinion about which conversation the wearer reads.
+     */
+    @Test
+    fun aShowCarriesTheRouteOfItsAssistance() {
+        val proactive = Fixture()
+        proactive.exchange.show(hint(route = edith.contracts.AssistantRoute.PROACTIVE), revision = 1) { }
+        assertEquals(edith.contracts.AssistantRoute.PROACTIVE,
+            (proactive.sent.single() as HintCommand.Show).route)
+
+        val wake = Fixture()
+        wake.exchange.show(hint(), revision = 1) { }
+        assertEquals(edith.contracts.AssistantRoute.WAKE, (wake.sent.single() as HintCommand.Show).route,
+            "a hint built without a route is a wake hint - which is what every pre-Phase-C hint was")
+    }
 
     @Test
     fun showingAHintSendsOneShowCarryingThatHintAndReportsItsFirstStatus() {

@@ -43,3 +43,13 @@ fun HostServices.embedding(): EmbeddingService = require(Capability.Embedding) a
  * read a directory the user manages, and a plugin granted only one of the two gets only that one.
  */
 fun HostServices.storageAccess(): StorageAccess = require(Capability.StorageAccess) as StorageAccess
+
+/**
+ * The conversation as the wearer sees it (Phase C, spec §6.6).
+ *
+ * **Optional by design**: a host with no display never provides it, so a caller asks for it the way the plugin asks for
+ * a confirmation channel - `runCatching { services.conversationDisplay() }.getOrNull()` - and carries on without it. A
+ * missing conversation view must never stop a turn.
+ */
+fun HostServices.conversationDisplay(): ConversationDisplay =
+    require(Capability.ConversationDisplay) as ConversationDisplay

@@ -95,11 +95,14 @@ class StorageAccessContractTest {
     @Test
     fun `the capability only appends to the enum`() {
         // The guard is append-only: inserting or reordering would renumber every existing entry for a plugin that
-        // compared ordinals.
+        // compared ordinals. edith-0.2 Phase C appended `ConversationDisplay`. (This is the second such guard, the
+        // other being `PluginApiValidationTest.capability enum keeps the declared order`; both list the full order,
+        // so both have to be updated by whoever appends.)
         assertEquals(
             listOf(
                 "Audio", "Asr", "Speaker", "Model", "Storage", "TextOutput", "SpeechOutput",
                 "Actions", "Context", "WakeWord", "Confirmation", "SystemOne", "Embedding", "StorageAccess",
+                "ConversationDisplay",
             ),
             Capability.entries.map { it.name },
         )

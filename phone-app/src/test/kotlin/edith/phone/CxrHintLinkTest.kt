@@ -21,6 +21,7 @@ import edith.plugins.diagnostic.DiagnosticHintPlugin
 import edith.rokid.CxrAuthorizationOutcome
 import edith.storage.MemoryProfileRepository
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -127,8 +128,7 @@ class CxrHintLinkTest {
 
     @Test
     fun theDisplayIsNotAdvertisedBeforeTheClockExchangeCompletes() {
-        Rig().use { rig ->
-            rig.root.connectCxr(activity = Any())
+        Rig().use { rig ->            rig.root.connectCxr(activity = Any())
 
             assertTrue("the connection must be connected", rig.connection.connected == 1)
             assertNull("no mapping means nothing can be displayed yet", rig.link.liveOutput())
@@ -295,5 +295,111 @@ class CxrHintLinkTest {
         override fun delete(key: String) { values.remove(key) }
         override fun clear() { values.clear() }
         override fun toString(): String = "namespace-$namespace"
+    }
+
+    // ---------------------------------------------------------------- Phase C: what was said, and who is working
+
+    /**
+     * A bare link with a recording sender.
+     *
+     * The `Rig` above needs the composition to create its connection lazily, which is what its own tests are about;
+     * the conversation is added *to the link* and needs no composition at all, so these cases drive the link directly.
+     */
+    private fun linkInto(sent: MutableList<String>, accept: Boolean = true): CxrHintLink =
+        CxrHintLink(FakeClock(), FakeScheduler(), sendJson = { json -> if (accept) sent += json; accept })
+
+    private fun List<String>.said(): List<HintCommand.Said> =
+        mapNotNull { HintWireCodec.decode(it) as? HintCommand.Said }
+
+    private fun List<String>.busy(): List<HintCommand.Busy> =
+        mapNotNull { HintWireCodec.decode(it) as? HintCommand.Busy }
+
+    @Test
+    fun anUtteranceIsSentWithAnIncreasingSequenceOnceASessionExists() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 1)
+        sent.clear()
+
+        assertTrue(link.userSaid(edith.contracts.AssistantRoute.WAKE, "第一句"))
+        assertTrue(link.userSaid(edith.contracts.AssistantRoute.WAKE, "第二句"))
+
+        assertEquals(listOf(1L, 2L), sent.said().map { it.sequence })
+        assertEquals("第一句", sent.said().first().text)
+        assertEquals("s-1", sent.said().first().sessionId)
+    }
+
+    @Test
+    fun saidAndBusyAreDroppedBeforeASessionExists() {
+        // Nothing on the glasses has been introduced to a session, so a wearer's words must not go on the wire.
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+
+        assertFalse(link.userSaid(edith.contracts.AssistantRoute.WAKE, "没人听的时候"))
+        assertFalse(link.busy(edith.contracts.AssistantRoute.WAKE, true))
+        assertTrue(sent.isEmpty())
+    }
+
+    @Test
+    fun aStoppedSessionStopsAcceptingConversationTraffic() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 1)
+        link.sessionEnded()
+        sent.clear()
+
+        assertFalse(link.userSaid(edith.contracts.AssistantRoute.WAKE, "会话结束之后"))
+        assertFalse(link.busy(edith.contracts.AssistantRoute.WAKE, true))
+        assertTrue(sent.isEmpty())
+    }
+
+    @Test
+    fun theClockExchangeGoingLiveDoesNotStopTheConversation() {
+        // `openingSession` is cleared the moment a mapping goes live; conversation traffic wired to that flag would go
+        // deaf at exactly the point the display started working.
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 1)
+        val ping = sent.mapNotNull { HintWireCodec.decode(it) as? HintCommand.Ping }.last()
+        link.onInbound(HintWireCodec.encode(
+            HintCommand.Pong(ping.syncId, ping.p0, ping.p0 + 1_000_000, ping.p0 + 1_000_000)))
+        sent.clear()
+
+        assertTrue(link.userSaid(edith.contracts.AssistantRoute.WAKE, "交换之后"))
+    }
+
+    @Test
+    fun busyIsALevelAndBothDirectionsTravel() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 1)
+        sent.clear()
+
+        assertTrue(link.busy(edith.contracts.AssistantRoute.PROACTIVE, true))
+        assertTrue(link.busy(edith.contracts.AssistantRoute.PROACTIVE, false))
+
+        assertEquals(listOf(true, false), sent.busy().map { it.busy })
+        assertEquals(edith.contracts.AssistantRoute.PROACTIVE, sent.busy().first().route)
+    }
+
+    @Test
+    fun aRefusedSendIsReportedRatherThanAssumedToHaveArrived() {
+        // The caller has to be able to tell "the wearer's words are on the glasses" from "they are only in our log".
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent, accept = false)
+        link.sessionEstablished("s-1", 1)
+
+        assertFalse(link.userSaid(edith.contracts.AssistantRoute.WAKE, "链接断了"))
+    }
+
+    @Test
+    fun aBlankUtteranceIsNeverSent() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 1)
+        sent.clear()
+
+        assertFalse(link.userSaid(edith.contracts.AssistantRoute.WAKE, "   "))
+        assertTrue(sent.isEmpty())
     }
 }

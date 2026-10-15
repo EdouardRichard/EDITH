@@ -32,6 +32,7 @@ import edith.phone.laya.LayaInferenceEngineImpl
 import edith.phone.laya.LayaOfficialHost
 import edith.phone.litert.EmbeddingGemmaLiteRTEngine
 import edith.model.*
+import edith.output.ConversationLog
 import edith.output.TraceRecorder
 import edith.plugin.*
 import edith.plugins.smart.SmartAssistantPlugin
@@ -97,6 +98,15 @@ class HostCompositionRoot internal constructor(
     /** T18 display path for a live CXR connection; null keeps the assembly without one (tests, unwired builds). */
     private val hintLink: CxrHintLink? = null,
     /**
+     * Phase C (spec §6.7 助手页签): the conversation both screens read.
+     *
+     * One object, filled by [ConversationWireDisplay] as the plugin reports what was said, and read by the assistant
+     * tab and by the glasses - so the two cannot disagree about content, order or route. It is a constructor parameter
+     * rather than a field because the `Capability.ConversationDisplay` provider is built in `create` before this
+     * instance exists, and the provider and the tab must hold the **same** object. Bounded in `ConversationLog`, so a
+     * long session cannot grow either view without limit.
+     */
+    internal val conversationLog: ConversationLog = ConversationLog(),    /**
      * The smart plugin and the settings-built configuration it must be given before activation (Task 14a item 1).
      *
      * Null keeps a composition that has no smart plugin registered (several T17/T18 harnesses build one), so the
@@ -267,6 +277,9 @@ class HostCompositionRoot internal constructor(
         Capability.Embedding -> "EMBEDDING_MODEL_MISSING"
         // edith-0.2 Phase B: the user's SKILL directory on shared storage
         Capability.StorageAccess -> "STORAGE_ACCESS_PROVIDER_MISSING"
+        // edith-0.2 Phase C: the conversation view needs somewhere to be shown, so it is refused for the same reason
+        // the text output is.
+        Capability.ConversationDisplay -> "DISPLAY_MISSING"
     }
     private val mutableState =
         MutableStateFlow(
@@ -1509,6 +1522,9 @@ class HostCompositionRoot internal constructor(
             val speechPlayer: edith.plugin.SpeechPlayer? = if (speechEnabledNow) {
                 AndroidSpeechPlayer.create(context, playbackGate)
             } else null
+            // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
+            // assistant tab reads it. It has to be created here because the provider map is built before the root.
+            val conversationLog = ConversationLog()
             val environment = CxrHostEnvironment(clock = clock, input = audio?.input ?: UnwiredInputPort,
                 liveOutput = hintLink::liveOutput, scheduler = scheduler, speech = speechPlayer,
                 providers = buildMap {
@@ -1537,7 +1553,15 @@ class HostCompositionRoot internal constructor(
                     // answerable set stay equal. A device that denies the read (no card, revoked permission) yields
                     // null/empty from the implementation, which is "no SKILLs installed", not a failure (spec §3.7).
                     put(Capability.StorageAccess, storageAccess)
-                    // edith-0.2 Phase B (B9/B11): the two local models become answerable, which is what lets the
+                    // edith-0.2 Phase C: the conversation view. Always answerable - the phone's own record exists with
+                    // or without a live display, and a refused send only costs the display of an utterance (see
+                    // `ConversationWireDisplay`). With no link the two senders are no-ops that report false, which is
+                    // exactly what "there is nowhere to show this" means.
+                    put(Capability.ConversationDisplay, ConversationWireDisplay(
+                        log = conversationLog,
+                        sendSaid = { route, text -> hintLink?.userSaid(route, text) ?: false },
+                        sendBusy = { route, busy -> hintLink?.busy(route, busy) ?: false },
+                    ))                    // edith-0.2 Phase B (B9/B11): the two local models become answerable, which is what lets the
                     // plugin serve at all - declaring them as hard dependencies meant a host that could not provide
                     // them correctly refused to activate it. Both are constructed here and load on their own threads;
                     // a missing artifact leaves the service UNAVAILABLE and the plugin refuses service, which is the
@@ -1577,6 +1601,7 @@ class HostCompositionRoot internal constructor(
                 },
                 authorizeResult = { resultCode, data -> connection[0]?.onAuthorizationResult(resultCode, data) },
                 hintLink = hintLink,
+                conversationLog = conversationLog,
                 smartWiring = smartWiring,
                 smartSettingsStore = smartSettingsStore,
                 proactiveArming = proactiveArming,

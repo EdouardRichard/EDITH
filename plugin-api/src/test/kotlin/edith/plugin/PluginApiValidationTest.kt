@@ -25,11 +25,13 @@ class PluginApiValidationTest {
     @Test fun `capability enum keeps the declared order`() {
         // The guard is that a new capability may only be **appended**: reordering or inserting would renumber every
         // existing entry for a plugin that compared ordinals. P3.3 (spec §17.6) appended `Confirmation`, edith-0.2
-        // Phase A appended `SystemOne` and `Embedding`, and edith-0.2 Phase B appended `StorageAccess`.
+        // Phase A appended `SystemOne` and `Embedding`, edith-0.2 Phase B appended `StorageAccess`, and edith-0.2
+        // Phase C appended `ConversationDisplay`.
         assertEquals(
             listOf(
                 "Audio", "Asr", "Speaker", "Model", "Storage", "TextOutput", "SpeechOutput",
                 "Actions", "Context", "WakeWord", "Confirmation", "SystemOne", "Embedding", "StorageAccess",
+                "ConversationDisplay",
             ),
             Capability.entries.map { it.name },
         )

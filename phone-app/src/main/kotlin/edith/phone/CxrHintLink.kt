@@ -5,10 +5,13 @@ import edith.output.HintCommand
 import edith.output.HintExchange
 import edith.output.HintWireCodec
 import edith.output.RokidHintDevice
+import edith.contracts.AssistantRoute
 import edith.plugin.CancellationHandle
 import edith.plugin.DeadlineScheduler
 import edith.plugin.HintDevice
 import edith.plugin.MonotonicClock
+import java.util.UUID
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * The App-side hint link: the object that owns the display path for a live CXR connection.
@@ -118,6 +121,72 @@ class CxrHintLink(
     private var displayWasLive = false
 
     /**
+     * The session the glasses have been introduced to, whether or not a clock mapping is live yet (Phase C).
+     *
+     * Deliberately **not** [openingSession]: that one is cleared the moment a mapping goes live, and it is cleared for
+     * the opposite reason - it means "an unanswered handshake may still be repeated". Conversation traffic must keep
+     * flowing exactly when the display is working, so it needs the session's own lifetime: set by
+     * [sessionEstablished], cleared by [sessionEnded] and [linkLost].
+     */
+    private var establishedSession: String? = null
+
+    /**
+     * The number the next `SAID` carries (Phase C).
+     *
+     * The custom-command channel promises nothing about ordering, and an utterance that arrives late must not be
+     * appended behind a later one. One counter per session, drawn from exactly where the `SHOW` sequence comes from
+     * for hints: a number only has to be comparable with the ones on the same route.
+     */
+    private val conversationSequence = AtomicLong(0)
+
+    /**
+     * Reports one thing the wearer said, for the conversation named by [route].
+     *
+     * Returns false when there is no session to say it to, or when the send was refused - the caller decides whether
+     * that is worth recording, and the phone's own log keeps the words either way, so a broken link loses the display
+     * of an utterance rather than the utterance.
+     */
+    fun userSaid(route: AssistantRoute, text: String): Boolean {
+        if (establishedSession == null) {
+            diagnostics("conversation: no session yet - an utterance is not sent")
+            return false
+        }
+        if (text.isBlank()) return false
+        val command = HintCommand.Said(
+            sessionId = establishedSession!!,
+            generation = establishedGeneration,
+            sequence = conversationSequence.incrementAndGet(),
+            route = route,
+            entryId = "said-${UUID.randomUUID()}",
+            text = text,
+        )
+        return runCatching { outbound(HintWireCodec.encode(command)) }.getOrDefault(false)
+    }
+
+    /**
+     * States whether the assistant is working on [route] (Phase C 加载动画).
+     *
+     * A level, not an event: `HintCommand.Busy` carries no sequence because two statements of the same level are the
+     * same statement. Returns false when there is no session, or when the send was refused.
+     */
+    fun busy(route: AssistantRoute, busy: Boolean): Boolean {
+        val session = establishedSession ?: run {
+            diagnostics("conversation: no session yet - a busy level is not sent")
+            return false
+        }
+        val command = HintCommand.Busy(session, establishedGeneration, route, busy)
+        return runCatching { outbound(HintWireCodec.encode(command)) }.getOrDefault(false)
+    }
+
+    /**
+     * The generation the current session was introduced with (Phase C).
+     *
+     * The glasses gate every message on session **and** generation, so conversation traffic has to carry the same pair
+     * the handshake carried; a second counter here would be a second identity.
+     */
+    private var establishedGeneration = 0L
+
+    /**
      * D15: the session whose opening handshake is still unconfirmed, and how many times it has been repeated.
      *
      * Non-null only between [sessionEstablished] and the first live mapping (or [sessionEnded]/[linkLost]); it is the
@@ -138,6 +207,10 @@ class CxrHintLink(
     fun sessionEstablished(sessionId: String, generation: Long) {
         openingSession = sessionId
         openingGeneration = generation
+        // Phase C: the conversation's own idea of "there is a session to talk to", which outlives the handshake.
+        establishedSession = sessionId
+        establishedGeneration = generation
+        conversationSequence.set(0)
         openingRetries = 0
         cancelOpeningRetry()
         clockSync.sessionEstablished(sessionId, generation)
@@ -153,6 +226,9 @@ class CxrHintLink(
      */
     fun sessionEnded() {
         openingSession = null
+        // Phase C: a stopped session must not keep accepting conversation traffic - the glasses will refuse it, and
+        // sending it would put the wearer's words on a wire for a session that is over.
+        establishedSession = null
         cancelOpeningRetry()
     }
 

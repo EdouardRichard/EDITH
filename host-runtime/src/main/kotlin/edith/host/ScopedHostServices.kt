@@ -46,6 +46,11 @@ class ScopedHostServices(
                 // cancellation surface, so a scoped wrapper would add a layer that conveys nothing. The grant itself
                 // is still checked: `require` refuses a capability this scope was not given.
                 Capability.StorageAccess -> provider as? edith.plugin.StorageAccess ?: wrong(capability)
+                // edith-0.2 Phase C: the conversation view. Unwrapped for the same reason as the two above — four
+                // statements with no subscription and nothing to cancel. The scope's own grant check still applies, so
+                // a plugin that was not granted this capability cannot reach it.
+                Capability.ConversationDisplay ->
+                    provider as? edith.plugin.ConversationDisplay ?: wrong(capability)
             }
         }
         val child = ResourceScope(scope.pluginId, scope.sessionId, scope.generation)
