@@ -12,6 +12,9 @@ import edith.agent.MemoryRetrieval
 import edith.agent.ModelClientGateway
 import edith.agent.ProgressGuard
 import edith.agent.ToolRegistry
+import edith.contracts.AssistantRoute
+import edith.plugin.ConversationDisplay
+import edith.plugin.conversationDisplay
 import edith.agent.WhitelistActionPolicy
 import edith.agent.WhitelistEntry
 import edith.contracts.AcousticEvent
@@ -442,6 +445,31 @@ class SmartAssistantPlugin(
     private var proactiveInFlight = false
 
     /**
+     * True between a wake turn opening and that turn saying something (Phase C, spec §6.6 加载动画).
+     *
+     * Deliberately **not** "a `SmartTurn` object exists": a finished turn stays installed until the next one replaces
+     * it, so a level derived from the object would keep the glasses' ring turning after the answer had already been
+     * shown. The level the wearer sees is "a wake turn is being worked on and has not answered yet", which starts in
+     * `openTurn` and ends the moment `emit` submits - or when the turn is stopped or the session ends.
+     *
+     * Read and written under [gate].
+     */
+    private var wakeBusy = false
+
+    /**
+     * The busy level last reported to the host, per route (Phase C, spec §6.6 加载动画).
+     *
+     * The two methods on the port are a **level**, so this remembers what the host was last told and publishes only
+     * the difference. Writing an `idle` by hand at each terminal branch is how one branch gets missed, and a missed
+     * `idle` leaves the glasses' ring turning and the panel held awake on a device whose wearer cannot switch it off
+     * from the app; deriving the level from [wakeBusy] and [proactiveInFlight] means a new terminal path has to clear
+     * a flag rather than remember a call.
+     *
+     * Read and written under [gate].
+     */
+    private val reportedBusy = mutableMapOf(AssistantRoute.WAKE to false, AssistantRoute.PROACTIVE to false)
+
+    /**
      * The one proactive trigger a wake turn made wait (spec §4.6: "WAKE 激活时 PROACTIVE 暂停执行（不丢弃，等待恢复）").
      *
      * Held under [gate] and cleared by [resetPerception], so it cannot outlive the session that produced it.
@@ -603,6 +631,12 @@ class SmartAssistantPlugin(
 
     override fun deactivate(reason: DeactivationReason) {
         val stranded = synchronized(gate) {
+            // Phase C: tell the host nothing is being worked on **before** the context goes, because the conversation
+            // port is resolved through it - publishing after `context = null` would resolve to nothing and leave the
+            // glasses' ring turning until its own bound expired.
+            wakeBusy = false
+            proactiveInFlight = false
+            publishBusy()
             context = null
             active = false
             // The remembered transcript is session state, not plugin state: leaving it behind is exactly the bug
@@ -642,6 +676,57 @@ class SmartAssistantPlugin(
 
     private fun configuredWakeWords(): List<String> =
         synchronized(gate) { config?.wakeWords } ?: splitList(DEFAULT_WAKE_WORDS)
+
+    // ---------------------------------------------------------------- conversation (Phase C)
+
+    /**
+     * The conversation port, resolved per call.
+     *
+     * Optional by design: a host with no display never provides it, and every call here is best-effort - a missing
+     * conversation view must not stop a turn, exactly as a missing speech player must not stop a hint from being shown.
+     * Resolved rather than cached for the same reason `activeGate()` is: the capability is the host's to withdraw.
+     */
+    private fun conversation(): ConversationDisplay? =
+        runCatching { currentContext()?.services?.conversationDisplay() }.getOrNull()
+
+    /**
+     * Publishes the busy level for both routes, sending only what changed. Must hold [gate].
+     *
+     * The level is derived from [wakeBusy] and [proactiveInFlight], and every place that changes either of those calls
+     * this, so the pairing of `working` with `idle` is a property of one function rather than a rule each branch has to
+     * remember. The port is optional: with no conversation view there is nothing to publish and nothing breaks.
+     */
+    private fun publishBusy() {
+        val wanted = mapOf(
+            AssistantRoute.WAKE to wakeBusy,
+            AssistantRoute.PROACTIVE to proactiveInFlight,
+        )
+        val port = conversation() ?: return
+        wanted.forEach { (route, busy) ->
+            if (reportedBusy[route] == busy) return@forEach
+            reportedBusy[route] = busy
+            if (busy) port.working(route) else port.idle(route)
+        }
+    }
+
+    /** One utterance the wearer made, for the route that consumed it. */
+    private fun publishUserMessage(route: ContextRoute, text: String) {
+        if (text.isBlank()) return
+        conversation()?.userMessage(route.toContractRoute(), text)
+    }
+
+    /** One message the assistant is telling the wearer, for the route that produced it. */
+    private fun publishAssistantMessage(route: ContextRoute, text: String) {
+        if (text.isBlank()) return
+        conversation()?.assistantMessage(route.toContractRoute(), text)
+    }
+
+    /** The contract's name for a route; the plugin's own enum stays internal to this module. */
+    private fun ContextRoute.toContractRoute(): AssistantRoute = when (this) {
+        ContextRoute.WAKE -> AssistantRoute.WAKE
+        ContextRoute.PROACTIVE -> AssistantRoute.PROACTIVE
+    }
+
 
     // ---------------------------------------------------------------- events
 
@@ -707,8 +792,13 @@ class SmartAssistantPlugin(
                         consumed to (if (consumed == null) proactiveTrigger(event.revision) else null)
                     }
                 }
-                if (started != null) launchTurn(started.first, started.second)
-                else if (proactive != null) runProactive(proactive)
+                if (started != null) {
+                    // Phase C: the utterance this turn consumed is the wearer's own side of the conversation. Published
+                    // here rather than inside the lock: the port is the host's, and a host that answered synchronously
+                    // must not be able to re-enter this plugin while `gate` is held.
+                    publishUserMessage(ContextRoute.WAKE, started.second)
+                    launchTurn(started.first, started.second)
+                } else if (proactive != null) runProactive(proactive)
             }
 
             // P3.3 (spec §17.4): the host's answer to a question this plugin asked. It settles the gate; the loop,
@@ -777,6 +867,9 @@ class SmartAssistantPlugin(
         // Armed only after the turn is installed, so a scheduled expiry can never find a turn that is not yet the
         // current one. `Help` runs immediately and has nothing to wait for.
         if (!runsImmediately) armListening(created)
+        // Phase C: a wake turn is now being worked on, and the wearer's ring should say so until it answers.
+        wakeBusy = true
+        publishBusy()
         return created
     }
 
@@ -1343,6 +1436,9 @@ class SmartAssistantPlugin(
             proactiveHint?.cancelled = true
             proactiveHint = hint
             proactiveInFlight = true
+            // Phase C: the proactive route is now working, and the wearer's ring should say so from the trigger rather
+            // than from the first thing that happens to arrive.
+            publishBusy()
         }
         P3Log.line("P3_PROACTIVE request ctx=$contextEntries chars=${trigger.transcript.length}")
         // Off the host's dispatcher: the request blocks on the transport, and running it inside `handle` would hold
@@ -1353,7 +1449,12 @@ class SmartAssistantPlugin(
             try {
                 deliverProactive(current, configured, filter, hint, trigger, message, started)
             } finally {
-                synchronized(gate) { proactiveInFlight = false }
+                // Phase C: this is the one place every proactive ending passes through - a hint, a decline, a failure,
+                // a cancellation - which is why the level is cleared here rather than on each branch.
+                synchronized(gate) {
+                    proactiveInFlight = false
+                    publishBusy()
+                }
             }
         }
     }
@@ -1483,6 +1584,10 @@ class SmartAssistantPlugin(
      */
     private fun recordProactiveTurn(triggerTranscript: String, hintText: String) {
         if (triggerTranscript.isBlank()) return
+        // Phase C: the trigger is what this route records as its user side (see this method's note above), so it is also
+        // what the wearer's conversation shows as their own words on the proactive route.
+        publishUserMessage(ContextRoute.PROACTIVE, triggerTranscript)
+        publishAssistantMessage(ContextRoute.PROACTIVE, hintText)
         recordTurnAndCompress(
             ContextRoute.PROACTIVE,
             triggerTranscript,
@@ -1788,6 +1893,13 @@ class SmartAssistantPlugin(
         } else {
             null
         }
+        // Phase C: the conversation record gets the sentence first - it is what the wearer is being told - and the
+        // "working" level then ends, so the ring stops exactly when the answer appears rather than a moment before it.
+        publishAssistantMessage(ContextRoute.WAKE, hint.text)
+        synchronized(gate) {
+            wakeBusy = false
+            publishBusy()
+        }
         synchronized(gate) {
             current.submitting = false
             if (result == OutputSubmission.Accepted && turn === current && !current.closed) {
@@ -1835,6 +1947,10 @@ class SmartAssistantPlugin(
                 // gateway's `stop` predicate reads, and what stops a late reply from being shown.
                 proactiveHint?.cancelled = true
                 proactiveHint = null
+                // Phase C: an emergency stop ends whatever was being worked on, so the ring must stop with it - this
+                // is one of the two paths that can end a turn without an answer ever being produced.
+                wakeBusy = false
+                publishBusy()
                 detach()
             }
         }
@@ -1880,6 +1996,18 @@ class SmartAssistantPlugin(
         val generation = owned.generation ?: return
         runCatching { cancelOutputTurn(sessionId, generation, owned.turnId) }
         runCatching { currentContext()?.services?.actions()?.cancel() }
+    }
+
+    /**
+     * Marks [owned] closed without tearing it down, for a caller that will publish the level itself.
+     *
+     * `teardown` returns early for a turn with no session identity, which would silently skip a `publishBusy` written
+     * after its `return`; `stopAll` and `deactivate` therefore close the turn here and publish once, explicitly.
+     */
+    private fun closeTurn(owned: SmartTurn?) {
+        if (owned == null) return
+        owned.closed = true
+        teardown(owned)
     }
 
     private fun currentContext(): PluginContext? = synchronized(gate) { context }
