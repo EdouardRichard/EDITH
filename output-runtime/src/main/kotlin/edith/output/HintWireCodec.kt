@@ -1,5 +1,6 @@
 package edith.output
 
+import edith.contracts.AssistantRoute
 import edith.contracts.OutputStatus
 
 /**
@@ -19,12 +20,42 @@ sealed interface HintCommand {
     data class Pong(val syncId: String, val p0: Long, val g1: Long, val g2: Long) : HintCommand
     data class Sync(val syncId: String, val offsetLowerNanos: Long, val offsetUpperNanos: Long,
         val validUntilGlassNanos: Long) : HintCommand
+
+    /**
+     * Puts [text] on the glasses for the conversation named by [route], and asks to be told what happened to it.
+     *
+     * [route] is **last** so that the eight callers that predate it keep compiling positionally; on the wire it is
+     * written right after `generation`, because the encoder fixes the field order and a reader should meet the
+     * routing decision before the payload. An absent `route` reads as [AssistantRoute.WAKE] — that is what a peer
+     * built before Phase C was sending — while a route this build does not know is refused outright.
+     */
     data class Show(val sessionId: String, val generation: Long, val sequence: Long, val hintId: String,
         val revision: Long, val syncId: String, val phoneSentNanos: Long, val remainingTtlMillis: Long,
-        val text: String) : HintCommand
+        val text: String, val route: AssistantRoute = AssistantRoute.WAKE) : HintCommand
+
     data class Clear(val sessionId: String, val generation: Long, val sequence: Long) : HintCommand
     data class Ack(val sessionId: String, val generation: Long, val sequence: Long, val hintId: String,
         val revision: Long, val status: OutputStatus) : HintCommand
+
+    /**
+     * One thing the wearer said, for the conversation named by [route] (Phase C, spec §6.6 左AI右用户).
+     *
+     * A record, not a display request: there is no deadline, no sync id and no acknowledgement, because an utterance
+     * does not expire and nothing needs confirming about it. [entryId] is the identity the receiving side dedupes on
+     * — the same utterance delivered twice must not appear twice in the conversation.
+     */
+    data class Said(val sessionId: String, val generation: Long, val sequence: Long, val route: AssistantRoute,
+        val entryId: String, val text: String) : HintCommand
+
+    /**
+     * Whether the assistant is working on the conversation named by [route] (Phase C, spec §6.6 加载动画).
+     *
+     * A **level, not an event**: there is no sequence, because two `BUSY` messages for the same route are the same
+     * statement and the later one simply wins. The glasses bound it locally as well — a level that is never cleared
+     * must not be able to spin the animation and hold the panel awake forever.
+     */
+    data class Busy(val sessionId: String, val generation: Long, val route: AssistantRoute,
+        val busy: Boolean) : HintCommand
 }
 
 object HintWireCodec {
@@ -84,6 +115,7 @@ object HintWireCodec {
                 fields["command"] = "SHOW"
                 fields["sessionId"] = command.sessionId
                 fields["generation"] = command.generation
+                fields["route"] = command.route.name
                 fields["sequence"] = command.sequence
                 fields["hintId"] = command.hintId
                 fields["revision"] = command.revision
@@ -106,6 +138,23 @@ object HintWireCodec {
                 fields["hintId"] = command.hintId
                 fields["revision"] = command.revision
                 fields["status"] = command.status.name
+            }
+            is HintCommand.Said -> {
+                fields["command"] = "SAID"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["sequence"] = command.sequence
+                fields["route"] = command.route.name
+                fields["entryId"] = command.entryId
+                fields["text"] = command.text
+            }
+            is HintCommand.Busy -> {
+                fields["command"] = "BUSY"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["route"] = command.route.name
+                // The flat reader carries strings and integers only, so a boolean travels as 1/0.
+                fields["busy"] = if (command.busy) 1 else 0
             }
         }
         val json = buildString {
@@ -160,7 +209,8 @@ object HintWireCodec {
                     syncId = fields.text("syncId") ?: return null,
                     phoneSentNanos = fields.long("phoneSentNanos") ?: return null,
                     remainingTtlMillis = fields.long("remainingTtlMillis") ?: return null,
-                    text = text)
+                    text = text,
+                    route = fields.route() ?: return null)
             }
             "CLEAR" -> HintCommand.Clear(
                 sessionId = fields.text("sessionId") ?: return null,
@@ -178,6 +228,26 @@ object HintWireCodec {
                     revision = fields.long("revision") ?: return null,
                     status = status)
             }
+            "SAID" -> {
+                val text = fields.text("text") ?: return null
+                if (text.codePointCount() > MAX_TEXT_CODEPOINTS) return null
+                HintCommand.Said(
+                    sessionId = fields.text("sessionId") ?: return null,
+                    generation = fields.long("generation") ?: return null,
+                    sequence = fields.long("sequence") ?: return null,
+                    route = fields.text("route")?.let { AssistantRoute.fromWire(it) } ?: return null,
+                    entryId = fields.text("entryId") ?: return null,
+                    text = text)
+            }
+            "BUSY" -> HintCommand.Busy(
+                sessionId = fields.text("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                route = fields.text("route")?.let { AssistantRoute.fromWire(it) } ?: return null,
+                busy = when (fields.text("busy")) {
+                    "1" -> true
+                    "0" -> false
+                    else -> return null
+                })
             else -> null
         }
     }
@@ -204,7 +274,27 @@ object HintWireCodec {
                 require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
                 require(command.hintId.isNotBlank()) { "HINT_ID_REQUIRED" }
             }
+            is HintCommand.Said -> {
+                require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+                require(command.entryId.isNotBlank()) { "ENTRY_ID_REQUIRED" }
+                require(command.text.isNotBlank()) { "TEXT_REQUIRED" }
+                require(command.text.codePointCount() <= MAX_TEXT_CODEPOINTS) { "TEXT_TOO_LONG" }
+            }
+            is HintCommand.Busy -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
         }
+    }
+
+    /**
+     * The route a message names, with the pre-Phase-C shape still readable.
+     *
+     * Two different absences must not be confused: **no `route` field at all** is a peer built before the field
+     * existed, and every such message was a wake hint, so it reads as [AssistantRoute.WAKE]; a `route` field whose
+     * value this build does not know is a message we cannot file correctly, and the only honest answer is to refuse
+     * it. Callers spell that as `fields.route() ?: return null`.
+     */
+    private fun Map<String, String>.route(): AssistantRoute? {
+        val named = get("route") ?: return AssistantRoute.WAKE
+        return AssistantRoute.fromWire(named)
     }
 
     private fun String.codePointCount(): Int = codePointCount(0, length)

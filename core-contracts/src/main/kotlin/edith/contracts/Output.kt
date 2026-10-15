@@ -11,6 +11,15 @@ data class Assistance(
     val text: String,
     val optionalSpeech: SpeechRequest?,
     val expiresAtNanos: Long,
+    /**
+     * Which conversation this hint belongs to (Phase C, spec §6.6).
+     *
+     * The glasses now show one conversation per route, so a hint that did not say where it came from could only be
+     * filed by guessing. The default is [AssistantRoute.WAKE] because that is what every hint built before this
+     * field existed was: the assistant answering something the wearer said. It is the last parameter on purpose —
+     * existing callers pass the first eight positionally.
+     */
+    val route: AssistantRoute = AssistantRoute.WAKE,
 ) {
     init {
         require(hintId.isNotBlank())

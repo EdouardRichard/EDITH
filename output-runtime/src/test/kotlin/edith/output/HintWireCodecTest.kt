@@ -3,6 +3,7 @@ package edith.output
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -29,6 +30,10 @@ class HintWireCodecTest {
             HintCommand.Clear(sessionId = "s-1", generation = 1, sequence = 5),
             HintCommand.Ack(sessionId = "s-1", generation = 1, sequence = 4, hintId = "h-9", revision = 2,
                 status = edith.contracts.OutputStatus.Displayed),
+            HintCommand.Said(sessionId = "s-1", generation = 1, sequence = 6,
+                route = edith.contracts.AssistantRoute.PROACTIVE, entryId = "e-1", text = "我待会儿要开会"),
+            HintCommand.Busy(sessionId = "s-1", generation = 1,
+                route = edith.contracts.AssistantRoute.WAKE, busy = true),
         )
         for (command in commands) {
             val json = HintWireCodec.encode(command)
@@ -124,5 +129,54 @@ class HintWireCodecTest {
 
     @Test fun aBlankSessionIdIsRefused() {
         assertFailsWith<IllegalArgumentException> { HintWireCodec.encode(HintCommand.Hello(" ", 1)) }
+    }
+
+    // ---------------------------------------------------------------- Phase C: route, SAID, BUSY
+
+    @Test fun theShowCarriesItsRouteAndTheOldShapeStillReadsAsWake() {
+        val command = HintCommand.Show("s", 1, 1, "h", 1, "sync", 1_000, 1_500, "t",
+            route = edith.contracts.AssistantRoute.PROACTIVE)
+        val json = HintWireCodec.encode(command)
+        assertTrue(json.contains("\"route\":\"PROACTIVE\""), "the route must travel with the hint: $json")
+        assertEquals(command, HintWireCodec.decode(json))
+
+        // A peer built before the route existed sends no such field. That message is a wake hint — reading it as
+        // anything else would move a pre-Phase-C hint into a conversation the wearer may not be looking at.
+        val withoutRoute = json.replace(",\"route\":\"PROACTIVE\"", "")
+        assertEquals(edith.contracts.AssistantRoute.WAKE,
+            (HintWireCodec.decode(withoutRoute) as HintCommand.Show).route)
+    }
+
+    @Test fun aShowWithARouteThisBuildDoesNotKnowIsRefused() {
+        val json = HintWireCodec.encode(HintCommand.Show("s", 1, 1, "h", 1, "sync", 1_000, 1_500, "t"))
+            .replace("\"route\":\"WAKE\"", "\"route\":\"ELSEWHERE\"")
+        assertNull(HintWireCodec.decode(json), "an unknown route must be refused, not defaulted")
+    }
+
+    @Test fun aSaidRoundTripsAndCarriesNoClockFields() {
+        val command = HintCommand.Said("s", 2, 7, edith.contracts.AssistantRoute.PROACTIVE, "e-1", "帮我看下日程")
+        val json = HintWireCodec.encode(command)
+        assertEquals(command, HintWireCodec.decode(json))
+        assertTrue(json.contains("\"route\":\"PROACTIVE\""), json)
+        // An utterance has no deadline: it is a record of what was said, and the glasses must not expire it.
+        assertFalse(json.contains("syncId"), "SAID must not carry clock fields: $json")
+        assertFalse(json.contains("remainingTtlMillis"), "SAID must not carry a lifetime: $json")
+    }
+
+    @Test fun aBusyRoundTripsWithAnIntegerFlag() {
+        // The flat reader carries strings and integers only, so the flag is 1/0 and never `true`/`false`.
+        val json = HintWireCodec.encode(HintCommand.Busy("s", 2, edith.contracts.AssistantRoute.WAKE, busy = true))
+        assertTrue(json.contains("\"busy\":1"), "the busy flag must be an integer: $json")
+        assertEquals(true, (HintWireCodec.decode(json) as HintCommand.Busy).busy)
+        val off = HintWireCodec.encode(HintCommand.Busy("s", 2, edith.contracts.AssistantRoute.WAKE, busy = false))
+        assertEquals(false, (HintWireCodec.decode(off) as HintCommand.Busy).busy)
+    }
+
+    @Test fun theNewCommandsAreBoundedLikeTheOldOnes() {
+        val overBound = HintCommand.Said("s", 2, 1, edith.contracts.AssistantRoute.WAKE, "e-1",
+            "字".repeat(HintWireCodec.MAX_TEXT_CODEPOINTS + 1))
+        assertFailsWith<IllegalArgumentException> { HintWireCodec.encode(overBound) }
+        assertFailsWith<IllegalArgumentException> { HintWireCodec.encode(HintCommand.Busy(" ", 2, edith.contracts.AssistantRoute.WAKE, true)) }
+        assertFailsWith<IllegalArgumentException> { HintWireCodec.encode(HintCommand.Said("s", 2, 1, edith.contracts.AssistantRoute.WAKE, " ", "文本")) }
     }
 }
