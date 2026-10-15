@@ -231,7 +231,8 @@ class IntentActionExecutor(
     private fun openApp(argsJson: String): ActionResult {
         val args = objectArguments(argsJson) ?: return refused(ARGUMENTS_INVALID)
         val name = args.string(NAME) ?: return refused(ARGUMENTS_INVALID)
-        val target = resolver.resolve(name) ?: return refused(APP_NOT_VISIBLE)
+        val resolution = resolver.resolve(name)
+        val target = (resolution as? LaunchResolution.Found)?.target ?: return refused(APP_NOT_VISIBLE)
         val launched = launcher.launch(Intent.ACTION_MAIN, PACKAGE_URI_SCHEME + target.packageName, emptyMap())
         return if (launched) done("opened ${target.label}") else refused(LAUNCH_REFUSED)
     }

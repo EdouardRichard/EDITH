@@ -20,30 +20,48 @@ interface AppCatalog {
 }
 
 /**
- * Resolves a spoken app name to the one app it names, or to `null` when that cannot be decided.
+ * The three possible outcomes of resolving a spoken app name.
+ *
+ * Spec §3.8.2 C: ambiguity must return candidates, never silently pick one.
+ */
+sealed class LaunchResolution {
+    data class Found(val target: AppLaunchResolver.LaunchTarget) : LaunchResolution()
+    data class Ambiguous(val candidates: List<AppLaunchResolver.LaunchTarget>) : LaunchResolution()
+    object NotFound : LaunchResolution()
+}
+
+/**
+ * Resolves a spoken app name to a [LaunchResolution] describing the outcome.
  *
  * The measured rule this implements ("tools must expose ambiguity instead of heuristically picking"): a launch is
  * irreversible and invisible, so a guess would open the wrong app with no way for the user or the audit trail to tell.
  * Precedence:
- * 1. a blank query resolves to nothing (there is no name to match);
- * 2. exactly one entry whose label equals the query, case-insensitively and trimmed, wins over any substring match;
- * 3. otherwise exactly one entry whose label contains the query wins;
- * 4. anything else - no match, or two equally good matches - is `null`.
+ * 1. a blank query resolves to [LaunchResolution.NotFound] (there is no name to match);
+ * 2. exactly one entry whose label equals the query, case-insensitively and trimmed, wins over any substring match →
+ *    [LaunchResolution.Found];
+ * 3. more than one exact match → [LaunchResolution.Ambiguous] with all exact candidates;
+ * 4. exactly one entry whose label contains the query → [LaunchResolution.Found];
+ * 5. more than one partial match → [LaunchResolution.Ambiguous] with all partial candidates;
+ * 6. anything else → [LaunchResolution.NotFound].
  */
 class AppLaunchResolver(private val catalog: AppCatalog) {
     data class LaunchTarget(val packageName: String, val label: String)
 
-    fun resolve(spokenName: String): LaunchTarget? {
+    fun resolve(spokenName: String): LaunchResolution {
         val query = spokenName.trim()
-        if (query.isEmpty()) return null
+        if (query.isEmpty()) return LaunchResolution.NotFound
         val openable = catalog.visibleApps()
             .filter { !it.launchIntentAction.isNullOrBlank() && it.label.isNotBlank() }
         val exact = openable.filter { it.label.trim().equals(query, ignoreCase = true) }
-        if (exact.size == 1) return exact.single().toTarget()
+        if (exact.size == 1) return LaunchResolution.Found(exact.single().toTarget())
         // Two apps sharing a label is ambiguity, not a tie to break arbitrarily.
-        if (exact.size > 1) return null
+        if (exact.size > 1) return LaunchResolution.Ambiguous(exact.map { it.toTarget() })
         val partial = openable.filter { it.label.contains(query, ignoreCase = true) }
-        return if (partial.size == 1) partial.single().toTarget() else null
+        return when {
+            partial.size == 1 -> LaunchResolution.Found(partial.single().toTarget())
+            partial.size > 1 -> LaunchResolution.Ambiguous(partial.map { it.toTarget() })
+            else -> LaunchResolution.NotFound
+        }
     }
 
     private fun AppEntry.toTarget() = LaunchTarget(packageName, label.trim())
