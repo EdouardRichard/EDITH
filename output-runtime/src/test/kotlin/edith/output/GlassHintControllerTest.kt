@@ -26,10 +26,13 @@ import kotlin.test.assertTrue
 class GlassHintControllerTest {
     private val clock = FakeClock()
     private val scheduler = FakeScheduler()
-    private val rendered = mutableListOf<String?>()
+    private val rendered = mutableListOf<DisplayedHint?>()
     private val acks = mutableListOf<HintCommand.Ack>()
 
     private fun controller() = GlassHintController(clock, scheduler, { rendered += it }, { acks += it })
+
+    /** What the wearer would see, so an assertion about the text does not have to restate the route and the id. */
+    private fun renderedTexts(): List<String?> = rendered.map { it?.text }
 
     private fun expireMapping(controller: GlassHintController) {
         controller.accept(HintCommand.Hello("s", 1))
@@ -44,7 +47,7 @@ class GlassHintControllerTest {
             validUntilGlassNanos = 10_000_000_000L))
         controller.accept(HintCommand.Show("s", 1, sequence = 1, hintId = "h", revision = 1, syncId = "sync",
             phoneSentNanos = 0, remainingTtlMillis = 1_000, text = "先讲结论"))
-        assertEquals(listOf<String?>("先讲结论"), rendered)
+        assertEquals(listOf<String?>("先讲结论"), renderedTexts())
         assertEquals(1, acks.size)
         assertEquals(OutputStatus.Displayed, acks.single().status)
     }
@@ -70,7 +73,7 @@ class GlassHintControllerTest {
         controller.accept(HintCommand.Sync("sync", 0, 1_000_000, 10_000_000_000L))
         controller.accept(HintCommand.Show("s", 1, 1, "h", revision = 3, "sync", 0, 1_000, "v3"))
         controller.accept(HintCommand.Show("s", 1, 2, "h", revision = 2, "sync", 0, 1_000, "v2"))
-        assertEquals(listOf<String?>("v3"), rendered, "a lower revision of the same hint must not overwrite")
+        assertEquals(listOf<String?>("v3"), renderedTexts(), "a lower revision of the same hint must not overwrite")
     }
 
     @Test fun aShowAfterCloseIsRefused() {
@@ -81,7 +84,7 @@ class GlassHintControllerTest {
         controller.accept(HintCommand.Clear("s", 1, sequence = 2))
         controller.accept(HintCommand.Show("s", 1, sequence = 2, hintId = "h2", revision = 1, syncId = "sync",
             phoneSentNanos = 0, remainingTtlMillis = 1_000, text = "late"))
-        assertEquals(listOf<String?>("first", null), rendered, "a SHOW at or below the clear fence is refused")
+        assertEquals(listOf<String?>("first", null), renderedTexts(), "a SHOW at or below the clear fence is refused")
     }
 
     @Test fun aNewTurnAfterClearMayStillRender() {
@@ -93,7 +96,7 @@ class GlassHintControllerTest {
         controller.accept(HintCommand.Clear("s", 1, 2))
         controller.accept(HintCommand.Show("s", 1, sequence = 3, hintId = "h3", revision = 1, syncId = "sync",
             phoneSentNanos = 0, remainingTtlMillis = 1_000, text = "second turn"))
-        assertEquals(listOf<String?>("first", null, "second turn"), rendered)
+        assertEquals(listOf<String?>("first", null, "second turn"), renderedTexts())
     }
 
     @Test fun aShowWithNoClockMappingIsRefused() {
@@ -113,7 +116,7 @@ class GlassHintControllerTest {
         assertEquals(1, rendered.size)
         // The scheduled expiry must have fired locally, clearing the text.
         scheduler.fireAll()
-        assertEquals(listOf<String?>("short", null), rendered)
+        assertEquals(listOf<String?>("short", null), renderedTexts())
     }
 
     @Test fun theLocalExpiryFiresWithoutAnyFurtherMessageFromThePhone() {
@@ -123,7 +126,7 @@ class GlassHintControllerTest {
         controller.accept(HintCommand.Show("s", 1, 1, "h", 1, "sync", 0, 5_000, "text"))
         assertTrue(scheduler.pendingCount > 0, "a local deadline must be scheduled")
         scheduler.fireAll()
-        assertEquals(listOf<String?>("text", null), rendered)
+        assertEquals(listOf<String?>("text", null), renderedTexts())
     }
 
     @Test fun disconnectClearsLocally() {
@@ -132,7 +135,7 @@ class GlassHintControllerTest {
         controller.accept(HintCommand.Sync("sync", 0, 1_000_000, 10_000_000_000L))
         controller.accept(HintCommand.Show("s", 1, 1, "h", 1, "sync", 0, 5_000, "text"))
         controller.disconnect()
-        assertEquals(listOf<String?>("text", null), rendered, "a lost link must not leave text on screen")
+        assertEquals(listOf<String?>("text", null), renderedTexts(), "a lost link must not leave text on screen")
     }
 
     @Test fun anAckIsOnlySentForACommitAndNeverClaimsHumanVisibility() {
@@ -194,7 +197,7 @@ class GlassHintControllerTest {
         val phoneUptime = 144_913_586_573_571L
         val offset = glassUptime - phoneUptime
         val deviceClock = FakeClock(glassUptime)
-        val rendered = mutableListOf<String?>()
+        val rendered = mutableListOf<DisplayedHint?>()
         val acks = mutableListOf<HintCommand.Ack>()
         val controller = GlassHintController(deviceClock, scheduler, { rendered += it }, { acks += it })
 
@@ -204,7 +207,10 @@ class GlassHintControllerTest {
         controller.accept(HintCommand.Show("s", 1, sequence = 1, hintId = "h", revision = 1, syncId = "sync",
             phoneSentNanos = phoneUptime, remainingTtlMillis = 10_000, text = "先讲结论"))
 
-        assertEquals(listOf<String?>("先讲结论"), rendered, "a freshly accepted mapping must not read as expired")
+        // This test drives its own controller on a device-aged clock, so it reads its own list rather than the
+        // field-backed helper above.
+        assertEquals(listOf<String?>("先讲结论"), rendered.map { it?.text },
+            "a freshly accepted mapping must not read as expired")
         assertEquals(1, acks.size, "and it must be acknowledged once rendered")
     }
 
@@ -233,7 +239,7 @@ class GlassHintControllerTest {
         controller.accept(HintCommand.Show("new-session", 1, sequence = 1, hintId = "h2", revision = 1,
             syncId = "sync2", phoneSentNanos = 0, remainingTtlMillis = 5_000, text = "new"))
 
-        assertEquals(listOf<String?>("old", null, "new"), rendered,
+        assertEquals(listOf<String?>("old", null, "new"), renderedTexts(),
             "a HELLO for a different session must be adopted even when its generation is lower")
         assertEquals(2, acks.size, "and the new session's hint must be acknowledged")
     }
@@ -245,7 +251,7 @@ class GlassHintControllerTest {
         controller.accept(HintCommand.Hello("s", generation = 4))
         controller.accept(HintCommand.Sync("sync", 0, 1_000_000, 10_000_000_000L))
         controller.accept(HintCommand.Show("s", 5, 1, "h", 1, "sync", 0, 5_000, "text"))
-        assertEquals(listOf<String?>("text"), rendered, "the newer generation of the same session must survive")
+        assertEquals(listOf<String?>("text"), renderedTexts(), "the newer generation of the same session must survive")
     }
 
     /**
@@ -265,6 +271,50 @@ class GlassHintControllerTest {
             "Hello accepted: session=s-2 generation=1 (replaced session=s-1 generation=3)",
             "Hello refused: generation 0 < 1 for session s-2",
         ), lines)
+    }
+
+    // ---------------------------------------------------------------- Phase C: what the render callback carries
+
+    /**
+     * The glasses show one conversation per route (spec §6.6), so the render callback must carry the route of the
+     * hint it accepted — and it must carry it *from here*, because this class is where the eight acceptance gates
+     * live. A view that decided for itself whether a SHOW was real would be a second implementation of those rules,
+     * and the two would drift.
+     */
+    @Test fun theRenderCallbackCarriesTheAcceptedShowAndItsRoute() {
+        val controller = controller()
+        expireMapping(controller)
+        controller.accept(HintCommand.Sync("sync", 0, 1_000_000, 10_000_000_000L))
+        controller.accept(HintCommand.Show("s", 1, sequence = 1, hintId = "h-1", revision = 1, syncId = "sync",
+            phoneSentNanos = 0, remainingTtlMillis = 1_000, text = "左边的答案",
+            route = edith.contracts.AssistantRoute.PROACTIVE))
+        assertEquals(
+            listOf<DisplayedHint?>(DisplayedHint("左边的答案", edith.contracts.AssistantRoute.PROACTIVE, "h-1")),
+            rendered)
+    }
+
+    /** A hint the gates refused must not enter the wearer's conversation: nobody saw it, so nobody said it. */
+    @Test fun aRefusedShowNeverReachesTheRenderCallback() {
+        val controller = controller()
+        controller.accept(HintCommand.Hello("s", 1))
+        controller.accept(HintCommand.Show("s", 1, 1, "h", 1, "never-synced", 0, 1_000, "no mapping"))
+        assertTrue(rendered.isEmpty(), "a refused hint must not enter the conversation")
+    }
+
+    /**
+     * Retiring a hint is `null`, and the name matters: `null` means "nothing is live on the panel now", **not**
+     * "forget what was shown". The conversation the wearer reads back from is the view's, and this callback must not
+     * be readable as an instruction to erase it.
+     */
+    @Test fun retiringAHintIsReportedAsNothingLiveRatherThanAsAnInstructionToErase() {
+        val controller = controller()
+        expireMapping(controller)
+        controller.accept(HintCommand.Sync("sync", 0, 1_000_000, 10_000_000_000L))
+        controller.accept(HintCommand.Show("s", 1, 1, "h", 1, "sync", 0, 5_000, "文本"))
+        controller.accept(HintCommand.Clear("s", 1, 2))
+        assertEquals(listOf<String?>("文本", null), renderedTexts())
+        assertEquals(2, rendered.size, "the accepted hint and its retirement, and nothing else")
+        assertEquals("h", rendered.first()?.hintId, "the retirement must not restate the hint as a new one")
     }
 
     private class FakeClock(var nanos: Long = 0) : MonotonicClock {

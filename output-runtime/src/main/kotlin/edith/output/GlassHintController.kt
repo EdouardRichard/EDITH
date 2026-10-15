@@ -35,7 +35,14 @@ import edith.plugin.MonotonicClock
 class GlassHintController(
     private val clock: MonotonicClock,
     private val scheduler: DeadlineScheduler,
-    private val render: (String?) -> Unit,
+    /**
+     * Where an accepted hint goes, and how it is retired.
+     *
+     * `null` means **nothing is live on the panel any more** — an expiry, a `CLEAR`, a `HELLO` for a new session or a
+     * lost link. It does **not** mean "erase what was shown": since Phase C the view keeps a conversation per route
+     * and the wearer reads back from it, so this callback must never be readable as an instruction to forget.
+     */
+    private val render: (DisplayedHint?) -> Unit,
     private val ack: (HintCommand.Ack) -> Unit,
     /**
      * Where the refusals go.
@@ -162,7 +169,7 @@ class GlassHintController(
         lastSequence = command.sequence
         shownRevisions[command.hintId] = command.revision
         cancelExpiry()
-        render(command.text)
+        render(DisplayedHint(command.text, command.route, command.hintId))
         visible = true
         diagnostics("Show displayed: sequence=${command.sequence} hintId=${command.hintId} " +
             "ttl=${command.remainingTtlMillis}ms")

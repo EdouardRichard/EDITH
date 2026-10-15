@@ -248,7 +248,7 @@ class HintClockSyncTest {
         val glassesClock = FakeClock()
         val latency = 5_000_000L
         val offset = 1_000_000_000L
-        val rendered = mutableListOf<String?>()
+        val rendered = mutableListOf<DisplayedHint?>()
         val statuses = mutableListOf<OutputStatus>()
         val wire = mutableListOf<HintCommand>()
 
@@ -293,7 +293,7 @@ class HintClockSyncTest {
         ), revision = 1L) { statuses += it }
 
         assertEquals(listOf(OutputStatus.Queued, OutputStatus.Displayed), statuses)
-        assertEquals(listOf<String?>("先讲结论"), rendered)
+        assertEquals(listOf<String?>("先讲结论"), rendered.map { it?.text })
     }
 
     /**
@@ -311,7 +311,7 @@ class HintClockSyncTest {
         val glassesClock = FakeClock()
         val latency = 5_000_000L
         val offset = 1_000_000_000L
-        val rendered = mutableListOf<String?>()
+        val rendered = mutableListOf<DisplayedHint?>()
         lateinit var currentPhone: RokidHintDevice
         lateinit var link: HintClockSync
 
@@ -356,7 +356,7 @@ class HintClockSyncTest {
 
         assertEquals(listOf(OutputStatus.Queued, OutputStatus.Displayed), secondStatuses,
             "the restarted generation must not make the glasses refuse the new session's hint")
-        assertEquals(listOf<String?>("旧会话", null, "新会话"), rendered)
+        assertEquals(listOf<String?>("旧会话", null, "新会话"), rendered.map { it?.text })
     }
 
     private class FakeClock(var nanos: Long = 0L) : MonotonicClock {

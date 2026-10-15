@@ -14,6 +14,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import edith.output.DisplayedHint
 import edith.output.GlassHintController
 import edith.output.HintCommand
 import edith.output.HintWireCodec
@@ -158,7 +159,16 @@ class GlassesActivity : Activity() {
         const val HINT_HOLD_MILLIS = 15_000L
     }
 
-    private fun render(text: String?) {
+    /**
+     * Shows one accepted hint; `null` retires whatever is live.
+     *
+     * Phase C (Task 2) changed what the controller hands over — the accepted hint's text **and** its route, because
+     * only the controller knows whether the eight gates let the hint through. This build still renders a single hint
+     * block; the conversation view that consumes `displayed.route` arrives with Task 5, and until then the route is
+     * deliberately unused rather than guessed at.
+     */
+    private fun render(displayed: DisplayedHint?) {
+        val text = displayed?.text
         val display = HintPresentation.displayText(text)
         if (HintPresentation.truncated(text)) {
             // Recorded rather than silently dropped: the phone bounded the hint, so this means it sent more than the
