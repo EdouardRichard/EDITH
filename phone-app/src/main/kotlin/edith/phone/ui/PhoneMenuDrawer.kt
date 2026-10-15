@@ -76,9 +76,12 @@ internal fun PhoneMenuDrawer(
         Text("会话管理", style = MaterialTheme.typography.titleLarge)
         Text(sessionLabel(state.session), style = MaterialTheme.typography.bodyMedium)
         var helpResult by remember { mutableStateOf<String?>(null) }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             val inactive = state.session == SessionState.Idle || state.session == SessionState.Paused
+            // Equal thirds, because the drawer is narrow: content-sized buttons squeezed the last one until its label
+            // was clipped to "停" (measured on the K40). A fixed share of the row is what makes all three readable.
             Button(
+                modifier = Modifier.weight(1f),
                 onClick = {
                     if (state.session == SessionState.Paused) command(SessionService.RESUME)
                     else selected?.let(start)
@@ -87,21 +90,27 @@ internal fun PhoneMenuDrawer(
             ) {
                 Icon(Icons.Default.PlayArrow, contentDescription = null)
                 Spacer(Modifier.width(4.dp))
-                // The drawer is narrow, and a two-character label wrapped onto two lines on the K40 ("停" over "止"),
-                // which reads as a broken button. One line each, and the row scrolls rather than squeezing.
                 Text(if (state.session == SessionState.Paused) "继续" else "开始", maxLines = 1, softWrap = false)
             }
-            OutlinedButton(onClick = { command(SessionService.PAUSE) }, enabled = !inactive) {
+            OutlinedButton(
+                modifier = Modifier.weight(1f),
+                onClick = { command(SessionService.PAUSE) },
+                enabled = !inactive,
+            ) {
                 Icon(Icons.Default.Pause, contentDescription = null)
                 Spacer(Modifier.width(4.dp))
                 Text("暂停", maxLines = 1, softWrap = false)
             }
-            OutlinedButton(onClick = {
-                // P3.3 急停: a question that is still up is withdrawn and the turn in flight is cancelled, then the
-                // session is stopped the way the service owns it.
-                root.emergencyStop()
-                command(SessionService.STOP)
-            }, enabled = state.session != SessionState.Idle) {
+            OutlinedButton(
+                modifier = Modifier.weight(1f),
+                onClick = {
+                    // P3.3 急停: a question that is still up is withdrawn and the turn in flight is cancelled, then the
+                    // session is stopped the way the service owns it.
+                    root.emergencyStop()
+                    command(SessionService.STOP)
+                },
+                enabled = state.session != SessionState.Idle,
+            ) {
                 Icon(Icons.Default.Stop, contentDescription = null)
                 Spacer(Modifier.width(4.dp))
                 Text("停止", maxLines = 1, softWrap = false)
