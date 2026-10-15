@@ -17,9 +17,14 @@ import kotlin.test.assertTrue
  * produce one, and to pick **precision first**: among thresholds whose precision on the selection set reaches 0.90,
  * take the one with the greatest recall.
  *
- * This test does not re-derive the number - that lives in the evidence file - it pins the two things a later edit
- * could silently break: that the constant is *some* real operating point rather than the old default, and that the
- * production gate is actually built with it.
+ * This test does not re-derive the number - that lives in the evidence file - it pins the things a later edit could
+ * silently break: that the constant is *some* real operating point rather than the old default, that a probability
+ * between the two follows the chosen one, and that the rule it came from is recorded beside it.
+ *
+ * **What it does not pin** (independent review, 2026-10-15): that the *production* gate is built with the constant.
+ * The call site names it explicitly (`SmartAssistantPlugin.activeGate`), but no test drives an activation far enough
+ * to observe the threshold it constructed, which the plan had asked for. Recorded as a gap rather than implied by this
+ * KDoc.
  */
 class NoulThresholdTest {
 

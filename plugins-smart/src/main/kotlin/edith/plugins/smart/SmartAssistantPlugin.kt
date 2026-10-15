@@ -1998,6 +1998,11 @@ class SmartAssistantPlugin(
                 bypassWakeGates = true,
             )?.let { it to text }
         } ?: return
+        // Phase C: Help opens a real turn and must raise the same level a wake does, or the ring never starts on a
+        // path that is an acceptance row - and the idle emit reports at the end would be an unpaired report. Outside
+        // the lock, as publishBusy requires.
+        publishBusy()
+        publishUserMessage(ContextRoute.WAKE, started.second)
         launchTurn(started.first, started.second)
     }
 
@@ -2021,19 +2026,7 @@ class SmartAssistantPlugin(
         runCatching { currentContext()?.services?.actions()?.cancel() }
     }
 
-    /**
-     * Marks [owned] closed without tearing it down, for a caller that will publish the level itself.
-     *
-     * `teardown` returns early for a turn with no session identity, which would silently skip a `publishBusy` written
-     * after its `return`; `stopAll` and `deactivate` therefore close the turn here and publish once, explicitly.
-     */
-    private fun closeTurn(owned: SmartTurn?) {
-        if (owned == null) return
-        owned.closed = true
-        teardown(owned)
-    }
-
-    private fun currentContext(): PluginContext? = synchronized(gate) { context }
+        private fun currentContext(): PluginContext? = synchronized(gate) { context }
 
     /**
      * Whether a hard dependency is missing, as a stable reason code, or `null` when both models are ready.

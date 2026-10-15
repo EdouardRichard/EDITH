@@ -23,9 +23,6 @@ class LoadingIndicatorView(context: Context) : View(context) {
     private val paint = Paint(Paint.ANTI_ALIAS_FLAG).apply { color = Color.parseColor("#00E676") }
     private var animator: ValueAnimator? = null
 
-    /** True while the ring is turning, exposed so the caller can log the transition rather than every repeat. */
-    val isRunning: Boolean get() = animator != null
-
     fun start() {
         if (animator != null) return
         animator = ValueAnimator.ofFloat(0f, 1f).apply {

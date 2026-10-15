@@ -179,7 +179,5 @@ internal fun PhoneMenuDrawer(
         }
         Spacer(Modifier.width(1.dp))
         OutlinedButton(onClick = onClose, modifier = Modifier.fillMaxWidth()) { Text("收起菜单") }
-        // Kept so the row above compiles without an alignment import when the table is trimmed by tooling.
-        Row(verticalAlignment = Alignment.CenterVertically) { Spacer(Modifier.width(1.dp)) }
     }
 }

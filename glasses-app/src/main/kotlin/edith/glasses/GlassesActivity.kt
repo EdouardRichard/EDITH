@@ -108,6 +108,9 @@ class GlassesActivity : Activity() {
 
     private val powerManager by lazy { getSystemService(PowerManager::class.java) }
 
+    /** Whether a deadline is already armed for the current busy spell; see [applyPanelAndAnimation]. */
+    private var busyDeadlineArmed = false
+
     /** Held only while something is on screen that needs to be seen; see [holdAwakeFor]. */
     private var hintWakeLock: PowerManager.WakeLock? = null
 
@@ -171,7 +174,13 @@ class GlassesActivity : Activity() {
      * same method rather than a test-only path.
      */
     fun acceptCommand(json: String): Boolean {
-        val command = HintWireCodec.decode(json) ?: return false
+        val command = HintWireCodec.decode(json) ?: run {
+            // Recorded because this is the mixed-build safety net: an old glasses APK silently drops every command it
+            // does not know, and without a line here "the wearer saw nothing" has no cause on this side either. The
+            // length is a count, never the payload (the same rule as `HintPresentation.inboundReport`).
+            android.util.Log.i("EdithGlasses", "inbound undecodable chars=${json.length}")
+            return false
+        }
         runOnUiThread {
             when (command) {
                 // A PING is the one command the controller deliberately ignores: it is the phone's clock exchange, and
@@ -189,17 +198,19 @@ class GlassesActivity : Activity() {
                 // light the ring for a session that has ended.
                 is HintCommand.Busy -> onBusy(command)
 
-                // A new session starts clean. This is the one place the previous session's words could survive into
-                // the next one, and it is a real hazard: the glasses process outlives the phone's App, so a wearer who
-                // restarts the phone app would otherwise read the last session's conversation under the new session's
-                // name. The controller handles the identity; the conversation state is this screen's.
+                // A **new** session starts clean. Only a new one: the phone repeats its opening HELLO while it waits
+                // for the clock exchange (up to five times), and clearing on every HELLO wiped a conversation whose
+                // utterances had already arrived - the wearer's own words disappearing from the glasses while the
+                // phone still showed them.
                 is HintCommand.Hello -> {
-                    log.clear()
-                    order.reset()
-                    saidGate.reset()
-                    busyState.reset()
-                    liveEntryId = null
-                    liveRow = null
+                    if (!controller.isCurrent(command.sessionId, command.generation)) {
+                        log.clear()
+                        order.reset()
+                        saidGate.reset()
+                        busyState.reset()
+                        liveEntryId = null
+                        liveRow = null
+                    }
                     controller.accept(command)
                     applyPanelAndAnimation()
                     rebuild()
@@ -263,6 +274,9 @@ class GlassesActivity : Activity() {
             order.show(displayed.route)
         }
         holdAwakeFor(liveEntryId != null)
+        // The panel has two claimants, so it is resolved in one place: calling `holdAwakeFor` directly here released
+        // the wake lock a still-running proactive turn was holding (a hint expiring mid-turn is the ordinary case).
+        applyPanelAndAnimation()
         rebuild()
     }
 
@@ -308,11 +322,27 @@ class GlassesActivity : Activity() {
      *
      * Two claimants share the panel — a live hint and a working turn — and they must be resolved in one place: two
      * separate `holdAwakeFor` callers would release each other's claim, and the panel would go dark mid-answer.
+     *
+     * **The bound is armed, not merely computed.** `BusyState` answers "is it still busy" from the clock, but nothing
+     * asks it again once the phone stops talking — and the case the bound exists for is exactly that one (the phone
+     * died mid-turn, or the link dropped). Without a scheduled re-check the ring would turn and
+     * `FLAG_KEEP_SCREEN_ON` would stay set for the life of this process, on a device whose wearer cannot switch the
+     * display off from the app. So raising a level arms a deadline, and the deadline re-runs this method.
      */
     private fun applyPanelAndAnimation() {
-        val busy = busyState.any(clock.nowNanos())
+        val now = clock.nowNanos()
+        val busy = busyState.any(now)
         if (busy) loadingView.start() else loadingView.stop()
         holdAwakeFor(busy || liveEntryId != null)
+        if (!busy) return
+        // One armed deadline per busy spell: a repeat of the same level must not keep pushing it back.
+        if (busyDeadlineArmed) return
+        busyDeadlineArmed = true
+        scheduler.at(now + BusyState.MAX_MILLIS * 1_000_000L) {
+            busyDeadlineArmed = false
+            applyPanelAndAnimation()
+            rebuild()
+        }
     }
 
     /**
@@ -324,7 +354,9 @@ class GlassesActivity : Activity() {
     private fun rebuild() {
         val route = order.selected()
         val rows = ConversationView.rows(log.entries(route), liveEntryId)
-        headerView.text = ConversationView.headerText(route, busy = busyState.any(clock.nowNanos()))
+        headerView.text = ConversationView.headerText(route, busy = busyState.route(clock.nowNanos()) != null)
+        // The header names **which** conversation is being worked on, so it asks the route rather than `any`: with a
+        // wake turn and a proactive turn alive at once, `any` would print 处理中 next to the wrong one.
         statusView.text = ConversationView.statusText(log.size())
         entriesView.removeAllViews()
         liveRow = null
@@ -538,7 +570,10 @@ class GlassesActivity : Activity() {
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         root.addView(column, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-        installSideTouch(root)
+        // Registered on the **content view**, as the official sample does (`android.R.id.content`), rather than on the
+        // FrameLayout built above: a key one of that layout's children consumed would never reach a listener attached
+        // below it, and the sample's placement is the one that is known to work on this ROM.
+        installSideTouch(findViewById(android.R.id.content) ?: root)
         return root
     }
 }

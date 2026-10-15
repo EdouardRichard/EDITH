@@ -185,14 +185,27 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
 /**
  * The assistant's page (spec §6.7 助手: 对话上下文记录；顶部切换 WAKE/PROACTIVE).
  *
- * The switch is **read-only**: it changes which conversation is in front of the wearer and nothing else. It is the
- * same `ConversationLog` the glasses render, so the two screens cannot disagree about what was said.
+ * The switch is **read-only**: it changes which conversation is in front of the wearer and nothing else. It reads the
+ * same `ConversationLog` the glasses render — same shape, same order, same eviction — so the two screens cannot drift
+ * apart the way two implementations would. They are not the same *instance*: the phone records what the plugin said,
+ * the glasses what the display accepted, so a refused hint shows here and never there.
+ *
+ * The list re-reads itself while the tab is on screen, because a record that only updates when the wearer presses a
+ * button is a record that looks frozen exactly when a turn is running.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
 internal fun AssistantTab(log: edith.output.ConversationLog) {
     var route by remember { mutableStateOf(AssistantRoute.WAKE) }
     var revision by remember { mutableStateOf(0) }
+    // The log is written from the host's drain thread and the plugin's task pool, so this is a poll rather than a
+    // subscription: a cheap re-read every two seconds while the tab is composed, and nothing while it is not.
+    LaunchedEffect(route) {
+        while (true) {
+            revision++
+            kotlinx.coroutines.delay(2_000)
+        }
+    }
 
     Text("对话上下文记录", style = MaterialTheme.typography.titleLarge)
     SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {

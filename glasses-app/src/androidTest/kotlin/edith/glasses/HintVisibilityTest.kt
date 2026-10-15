@@ -123,11 +123,16 @@ class HintVisibilityTest {
     }
 
     /**
-     * Phase C (spec §6.6): an utterance the phone reports lands in **its own** conversation, and bringing it there is
-     * what makes it visible at all - a message filed under a route nobody is looking at is a message nobody sees.
+     * Phase C (spec §6.6): an utterance the phone reports lands in **its own** conversation.
+     *
+     * An utterance does **not** bring its route to the front: what the wearer is looking at follows what the assistant
+     * is *telling* them (`SHOW`), not what they said. An earlier version of this test asserted the opposite - a
+     * `selectedRoute() == PROACTIVE` after a `SAID` - which contradicted `GlassesActivity.onSaid` and could never
+     * have passed. Nothing caught it, because `connectedDebugAndroidTest` is forbidden in this project (it would wipe
+     * the phone's 1.03 GiB provision), so an instrumentation assertion is a contract, not a gate.
      */
     @Test
-    fun anUtteranceLandsOnItsOwnRouteAndBringsThatRouteToTheFront() {
+    fun anUtteranceLandsOnItsOwnRouteWithoutMovingTheView() {
         ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
@@ -141,8 +146,30 @@ class HintVisibilityTest {
                     "我待会儿要开会", activity.conversationText(AssistantRoute.PROACTIVE))
                 assertEquals("and the wake conversation must not have it",
                     "", activity.conversationText(AssistantRoute.WAKE))
-                assertEquals("the view must follow the newest thing that arrived",
-                    AssistantRoute.PROACTIVE, activity.selectedRoute())
+                assertEquals("an utterance is not something to look at, so the view stays where it was",
+                    AssistantRoute.WAKE, activity.selectedRoute())
+            }
+        }
+    }
+
+    /** A `SHOW` **does** bring its route to the front: that is what makes a proactive hint visible at all. */
+    @Test
+    fun aShowBringsItsOwnRouteToTheFront() {
+        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Sync("sync-1", offsetLowerNanos = 0, offsetUpperNanos = 1_000_000,
+                        validUntilGlassNanos = System.nanoTime() + 30_000_000_000L)))
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Show(
+                    sessionId = "s-1", generation = 1, sequence = 1, hintId = "h-p", revision = 1, syncId = "sync-1",
+                    phoneSentNanos = System.nanoTime(), remainingTtlMillis = 5_000, text = "主动提醒一句",
+                    route = AssistantRoute.PROACTIVE)))
+            }
+            InstrumentationRegistry.getInstrumentation().waitForIdleSync()
+            scenario.onActivity { activity ->
+                assertEquals(AssistantRoute.PROACTIVE, activity.selectedRoute())
+                assertEquals("主动提醒一句", activity.conversationText(AssistantRoute.PROACTIVE))
             }
         }
     }

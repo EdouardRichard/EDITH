@@ -22,8 +22,12 @@ data class ConversationEntry(
  * The conversation the wearer reads back from (Phase C, spec §6.6 / §6.7).
  *
  * One implementation serves both screens — the glasses render it and the phone's assistant tab renders it — so they
- * cannot disagree about what was said, in which order, or under which route. It is deliberately transport-free and
- * Android-free, which is what makes the ordering and eviction rules plain JVM behaviour.
+ * agree on **shape, order and eviction** and cannot drift apart as two code bases would. They are not, however, the
+ * same *instance* on the two devices: the phone appends an assistant message when the plugin submits it, while the
+ * glasses append only a `SHOW` that passed every gate, and each side mints its own entry ids. A hint the display layer
+ * refuses therefore appears on the phone and never on the glasses, which is the honest reading of "the two screens
+ * show the same conversation". It is deliberately Android-free and transport-free, which is what makes the ordering
+ * and eviction rules plain JVM behaviour.
  *
  * **Bounded, per route.** A session that runs for an hour appends two entries a turn; the glasses rebuild their view
  * from this list every time it changes and have no input path to scroll a long one, so the list has to stay small
@@ -32,6 +36,11 @@ data class ConversationEntry(
  *
  * **The two routes are independent** (spec §1.3 C3). Bounds are counted per route so that a busy proactive spell
  * cannot evict the conversation the wearer opened by speaking.
+ *
+ * **Every method is synchronised, because its callers are not on one thread.** The glasses write from the bridge's
+ * callback thread and read from the UI thread; on the phone the host's drain thread and the plugin's task pool write
+ * while Compose reads. An unsynchronised `LinkedHashMap` iterated during an insert is a `ConcurrentModificationException`
+ * waiting for a slow frame, and no single-threaded test can see it.
  */
 class ConversationLog(
     private val maxEntries: Int = MAX_ENTRIES,
@@ -46,41 +55,60 @@ class ConversationLog(
     private val byRoute: MutableMap<AssistantRoute, LinkedHashMap<String, ConversationEntry>> =
         AssistantRoute.entries.associateWithTo(linkedMapOf()) { LinkedHashMap<String, ConversationEntry>() }
 
+    /** The entry each route wrote last, which eviction must never take: it is the newest thing said. */
+    private val lastWritten: MutableMap<AssistantRoute, String?> =
+        AssistantRoute.entries.associateWithTo(linkedMapOf()) { null }
+
     /**
      * Adds [entry], or updates the text of one already present under the same id.
      *
      * Returns false only for an entry the log refuses outright — a blank id or blank text. A revised entry is a
      * success: the caller's statement was recorded either way.
      */
+    @Synchronized
     fun append(entry: ConversationEntry): Boolean {
         if (entry.entryId.isBlank() || entry.text.isBlank()) return false
         val route = byRoute.getValue(entry.route)
         // `put` on a LinkedHashMap keeps the original position when the key already exists, which is what makes a
         // revised hint stay where the wearer last saw it instead of jumping to the bottom.
         route[entry.entryId] = entry
-        evict(route)
+        lastWritten[entry.route] = entry.entryId
+        evict(entry.route, route)
         return true
     }
 
     /** A read-only snapshot of one route's conversation, oldest first. */
+    @Synchronized
     fun entries(route: AssistantRoute): List<ConversationEntry> =
         byRoute.getValue(route).values.toList()
 
     /** Every route's entries, for a caller that only needs the count or a full reset. */
+    @Synchronized
     fun size(): Int = byRoute.values.sumOf { it.size }
 
     /** Forgets both conversations — a new session must not open on the last one's words. */
+    @Synchronized
     fun clear() {
         byRoute.values.forEach { it.clear() }
+        lastWritten.keys.forEach { lastWritten[it] = null }
     }
 
-    /** Evicts from the oldest end until both bounds hold, never touching the newest entry. */
-    private fun evict(route: LinkedHashMap<String, ConversationEntry>) {
-        while (route.size > maxEntries) {
-            route.remove(route.keys.first())
+    /**
+     * Evicts from the oldest end until both bounds hold.
+     *
+     * The last entry written for this route is never evicted, even when it is the oldest: a **replaced** entry keeps
+     * its old position, so a revision of a very old message would otherwise be deleted by the very append that wrote
+     * it - and the caller was told it succeeded.
+     */
+    private fun evict(route: AssistantRoute, entries: LinkedHashMap<String, ConversationEntry>) {
+        val keep = lastWritten[route]
+        while (entries.size > maxEntries) {
+            val oldest = entries.keys.firstOrNull { it != keep } ?: break
+            entries.remove(oldest)
         }
-        while (route.size > 1 && route.values.sumOf { it.text.length } > maxChars) {
-            route.remove(route.keys.first())
+        while (entries.size > 1 && entries.values.sumOf { it.text.length } > maxChars) {
+            val oldest = entries.keys.firstOrNull { it != keep } ?: break
+            entries.remove(oldest)
         }
     }
 

@@ -161,10 +161,34 @@ class ConversationDisplayCallsTest {
     }
 
     @Test
-    fun aStoppedTurnLeavesTheLevelsPaired() = assertLevelsArePaired("stopped") { rig ->
-        answerWithANotification(rig)
-        rig.wakeAndFinal("问一句")
+    fun aStoppedTurnLeavesTheLevelsPaired() {
+        // A turn whose level is **live** when `Stop` arrives: the wake has opened it and it is still waiting for its
+        // utterance, which is the state the emergency brake is for. The earlier version drove the turn to completion
+        // first, by which time the level was already down, so it passed without exercising the path at all.
+        val display = RecordingDisplay()
+        val rig = rig(display)
+        rig.plugin.handle(rig.wakeEvent())
+        assertTrue(display.count("working:WAKE") >= 1, display.calls.toString())
+
         rig.plugin.handle(edith.contracts.UserAction(rig.envelope(), edith.contracts.UserAction.Action.Stop))
+
+        assertEquals(display.count("working:WAKE"), display.count("idle:WAKE"), display.calls.toString())
+    }
+
+    @Test
+    fun manualHelpRaisesAndClearsTheLevelLikeAWake() {
+        // `Help` is an acceptance row of its own (P3's manual entry point) and it opens a real turn, so it must pair
+        // like one. It was the path the busy publisher missed when the level moved out of the turn object.
+        val display = RecordingDisplay()
+        val rig = rig(display)
+        answerWithANotification(rig)
+        rig.plugin.handle(edith.contracts.TranscriptEvent(rig.transcript("记住我喜欢喝乌龙茶")))
+        rig.tick()
+
+        rig.plugin.handle(edith.contracts.UserAction(rig.envelope(), edith.contracts.UserAction.Action.Help))
+
+        assertTrue(display.count("working:WAKE") >= 1, "manual help must raise the level: ${display.calls}")
+        assertEquals(display.count("working:WAKE"), display.count("idle:WAKE"), display.calls.toString())
     }
 
     @Test

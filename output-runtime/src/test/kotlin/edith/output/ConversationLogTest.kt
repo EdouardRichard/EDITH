@@ -114,10 +114,43 @@ class ConversationLogTest {
         // The glasses rebuild their view from this list; a caller that could mutate it would be a second writer.
         val log = ConversationLog()
         log.append(entry("a"))
-        val read = log.entries(AssistantRoute.WAKE)
-        assertFalse(runCatching { (read as MutableList<ConversationEntry>).clear() }.isSuccess,
-            "the snapshot must not be the live list")
-        assertEquals(1, log.entries(AssistantRoute.WAKE).size)
+        log.append(entry("b"))
+        val read = log.entries(AssistantRoute.WAKE) as MutableList<ConversationEntry>
+        read.clear()
+        assertEquals(listOf("a", "b"), log.entries(AssistantRoute.WAKE).map { it.entryId },
+            "clearing the snapshot must not touch the log")
+    }
+
+    @Test
+    fun `a revision of the oldest entry is not deleted by the append that wrote it`() {
+        // A replaced entry keeps its position, so without this the very append that updated an old message could evict
+        // it - and the caller was told the append succeeded.
+        val log = ConversationLog(maxEntries = 2, maxChars = 1_000)
+        log.append(entry("old", text = "第一版"))
+        log.append(entry("new", text = "另一条"))
+        assertTrue(log.append(entry("old", text = "修订版")))
+        assertEquals(listOf("修订版", "另一条"), log.entries(AssistantRoute.WAKE).map { it.text })
+    }
+
+    @Test
+    fun `several threads writing and reading at once never corrupt the log`() {
+        // The glasses write from the bridge's callback thread and read from the UI thread; the phone writes from the
+        // host's drain thread while Compose reads. An unsynchronised LinkedHashMap iterated during an insert is a
+        // ConcurrentModificationException waiting for a slow frame.
+        val log = ConversationLog(maxEntries = 8, maxChars = 400)
+        val threads = (0 until 4).map { writer ->
+            Thread {
+                repeat(200) { index ->
+                    log.append(entry("w$writer-$index", text = "第 $writer-$index 条"))
+                    log.entries(AssistantRoute.WAKE).size
+                    log.size()
+                }
+            }
+        }
+        threads.forEach { it.start() }
+        threads.forEach { it.join(10_000) }
+        assertTrue(threads.none { it.isAlive }, "no writer may still be blocked")
+        assertTrue(log.entries(AssistantRoute.WAKE).size <= 8, "the bound must survive concurrent writers")
     }
 
     @Test
