@@ -9,6 +9,8 @@ import edith.plugin.ModelClient
 import edith.plugin.ModelHistoryItem
 import edith.plugin.ModelProfile
 import edith.plugin.MonotonicClock
+import edith.plugins.smart.P3Log
+import edith.plugins.smart.safeFailureCode
 
 /**
  * The production [Summarizer] (spec §4.4 step 3): one request to the plugin's own configured profile, one sentence
@@ -21,9 +23,13 @@ import edith.plugin.MonotonicClock
  * **It blocks**, which is why the compressor hands it to the plugin's task scope. It is not itself asynchronous: a
  * function that could choose its own thread would put the choice in two places.
  *
- * **Nothing here logs.** [ContextCompressor] already logs `P3_CONTEXT summary=ok chars=…` / `summary=none` from the
- * counts, and a second sink would be a second place for a summary body to leak from. The same rule the gateway
- * follows applies here: the request is never printed and `ModelRequest.toString()` is redacted by contract.
+ * **The summary body is never logged; the summary's *outcome* is.** [ContextCompressor] logs
+ * `P3_CONTEXT summary=ok chars=…` / `summary=none`, and that line is why this class used to log nothing at all. But
+ * `summary=none` has four different causes — a profile the host cannot resolve, an answer that arrived empty, a
+ * request the model path refuses **by throwing**, and a deadline — and on 2026-10-15 the device produced `none`
+ * without saying which, so B3's asynchronous half could not be accepted or refuted at all. [P3Log] therefore carries
+ * one line per attempt with the outcome, the elapsed time, the character count and the **sanitized** failure code:
+ * counts and codes, never the sentence (the same rule `P3_RUN` follows).
  *
  * **Assembly is the gateway's, not a second one.** `ModelClientGateway` already turns a transcript into a stateless
  * `ModelRequest`, owns the deadline and accumulates the stream; re-implementing that here would be a second answer
@@ -47,6 +53,7 @@ class ModelSummarizer(
     override fun summarize(transcript: String): String? {
         val text = transcript.trim()
         if (text.isEmpty()) return null
+        val startedNanos = clock.nowNanos()
         return runCatching {
             // The gateway's own `PROFILE_MISSING` refusal lands here as a non-`COMPLETED` terminal, so an
             // unconfigured profile degrades to truncation instead of throwing into the turn.
@@ -68,9 +75,34 @@ class ModelSummarizer(
                     deadlineNanos = deadlineNanos(),
                 ),
             )
-            reply.text.takeIf { reply.terminal == edith.plugin.ModelEnd.COMPLETED }?.trim()?.takeIf { it.isNotEmpty() }
-        }.getOrNull()
+            val summary = reply.text
+                .takeIf { reply.terminal == edith.plugin.ModelEnd.COMPLETED }
+                ?.trim()
+                ?.takeIf { it.isNotEmpty() }
+            // The outcome, never the answer: `terminal` names which of the four causes this was, and `safeCode` is
+            // the provider's own machine-readable reason when the provider sent one.
+            if (summary == null) {
+                P3Log.line(
+                    "P3_SUMMARY ok=false ms=${elapsedMillis(startedNanos)} chars=${reply.text.length} " +
+                        "terminal=${reply.terminal ?: "-"} code=${reply.safeCode ?: "-"}",
+                )
+            } else {
+                P3Log.line("P3_SUMMARY ok=true ms=${elapsedMillis(startedNanos)} chars=${summary.length}")
+            }
+            summary
+        }.getOrElse { failure ->
+            // A request the model path refused by throwing (an over-budget explicit context, a profile revision
+            // mismatch, an invalid endpoint, an unavailable credential) arrives here; the class name alone cannot say
+            // which one it was, so the same shape-validated code `P3_RUN` uses is logged instead of the message.
+            P3Log.line(
+                "P3_SUMMARY ok=false ms=${elapsedMillis(startedNanos)} chars=0 " +
+                    "error=${failure.safeFailureCode("UNSPECIFIED")}",
+            )
+            null
+        }
     }
+
+    private fun elapsedMillis(startedNanos: Long): Long = (clock.nowNanos() - startedNanos) / 1_000_000L
 
     private companion object {
         /** Identifies a summary request in an envelope the host also carries turns on; not a transcript. */

@@ -61,13 +61,15 @@ class ModelSummarizerTest {
     private lateinit var tasks: ThreadingTasks
     private lateinit var clock: SmartFakeClock
 
-    private fun newSummarizer(): ModelSummarizer {
+    private fun newSummarizer(
+        profile: edith.plugin.ModelProfile? = smartProfile(id = "profile-x", revision = 9),
+    ): ModelSummarizer {
         clock = SmartFakeClock()
         model = SmartFakeModel()
         tasks = ThreadingTasks()
         return ModelSummarizer(
             client = model,
-            profileLookup = { smartProfile(id = "profile-x", revision = 9) },
+            profileLookup = { profile },
             profileId = "profile-x",
             clock = clock,
             scheduler = SmartFakeScheduler(clock),
@@ -249,6 +251,73 @@ class ModelSummarizerTest {
             "the summary never reached the transcript: $wake",
         )
         assertTrue(lines.none { it.contains(marker) }, "the summary's text must never reach the log: $lines")
+    }
+
+    @Test
+    fun `the outcome of a summary is observable as counts and codes, while its body never is`() {
+        // B3's device gap was not "the summary is untested" but "the summary's failure had four possible causes and
+        // no line to tell them apart": a profile that is not configured, an answer that came back empty, a request
+        // the model path refuses by shape, and a deadline. The JVM fixture fakes the transport, so the third cause is
+        // invisible here - which is exactly why the line has to name the cause rather than just say "none".
+        val marker = "摘要正文标记-9911"
+
+        val succeeded = newSummarizer()
+        model.onRequest = answers(marker)
+        val successLines = mutableListOf<String>()
+        var previous = P3Log.sink
+        P3Log.sink = { successLines += it }
+        try {
+            assertEquals(marker, succeeded.summarize("要摘要的对话"))
+        } finally {
+            P3Log.sink = previous
+        }
+        val success = successLines.single { it.startsWith("P3_SUMMARY ") }
+        assertTrue(success.contains("ok=true"), success)
+        assertTrue(success.contains("chars=${marker.length}"), success)
+        assertTrue(successLines.none { it.contains(marker) }, "the summary body must never reach the log: $successLines")
+
+        // An answer that arrived empty: the transport *worked*, so the cause is the model's answer, not the wiring.
+        val blank = newSummarizer()
+        model.onRequest = answers("   ")
+        val blankLines = mutableListOf<String>()
+        previous = P3Log.sink
+        P3Log.sink = { blankLines += it }
+        try {
+            assertNull(blank.summarize("要摘要的对话"))
+        } finally {
+            P3Log.sink = previous
+        }
+        val blankLine = blankLines.single { it.startsWith("P3_SUMMARY ") }
+        assertTrue(blankLine.contains("ok=false"), blankLine)
+        assertTrue(blankLine.contains("terminal=COMPLETED"), "an empty answer is a completed-but-empty stream: $blankLine")
+
+        // A profile the plugin is configured with but the host cannot resolve: refused before any request is built.
+        val unconfigured = newSummarizer(profile = null)
+        val unconfiguredLines = mutableListOf<String>()
+        previous = P3Log.sink
+        P3Log.sink = { unconfiguredLines += it }
+        try {
+            assertNull(unconfigured.summarize("要摘要的对话"))
+        } finally {
+            P3Log.sink = previous
+        }
+        val unconfiguredLine = unconfiguredLines.single { it.startsWith("P3_SUMMARY ") }
+        assertTrue(unconfiguredLine.contains("code=PROFILE_MISSING"), unconfiguredLine)
+
+        // A request the model path refuses *by throwing* (an over-budget explicit context, a revision mismatch, an
+        // invalid endpoint): the sanitized code is the only thing that may be logged about it.
+        val refused = newSummarizer()
+        model.onRequest = { _, _ -> throw IllegalStateException("Explicit context exceeds safe budget") }
+        val refusedLines = mutableListOf<String>()
+        previous = P3Log.sink
+        P3Log.sink = { refusedLines += it }
+        try {
+            assertNull(refused.summarize("要摘要的对话"))
+        } finally {
+            P3Log.sink = previous
+        }
+        val refusedLine = refusedLines.single { it.startsWith("P3_SUMMARY ") }
+        assertTrue(refusedLine.contains("error=Explicit context exceeds safe budget"), refusedLine)
     }
 
     private companion object {
