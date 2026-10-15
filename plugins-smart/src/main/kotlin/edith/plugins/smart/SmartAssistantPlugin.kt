@@ -630,13 +630,15 @@ class SmartAssistantPlugin(
     }
 
     override fun deactivate(reason: DeactivationReason) {
-        val stranded = synchronized(gate) {
-            // Phase C: tell the host nothing is being worked on **before** the context goes, because the conversation
-            // port is resolved through it - publishing after `context = null` would resolve to nothing and leave the
-            // glasses' ring turning until its own bound expired.
+        // Phase C: the level is cleared and reported **before** the context goes, because the conversation port is
+        // resolved through it - reporting after `context = null` would resolve to nothing and leave the glasses' ring
+        // turning until its own bound expired. Reported outside the lock, as `publishBusy` requires.
+        synchronized(gate) {
             wakeBusy = false
             proactiveInFlight = false
-            publishBusy()
+        }
+        publishBusy()
+        val stranded = synchronized(gate) {
             context = null
             active = false
             // The remembered transcript is session state, not plugin state: leaving it behind is exactly the bug
@@ -690,21 +692,36 @@ class SmartAssistantPlugin(
         runCatching { currentContext()?.services?.conversationDisplay() }.getOrNull()
 
     /**
-     * Publishes the busy level for both routes, sending only what changed. Must hold [gate].
+     * The differences to report, recorded as reported. Must hold [gate]; returns only what changed.
      *
-     * The level is derived from [wakeBusy] and [proactiveInFlight], and every place that changes either of those calls
-     * this, so the pairing of `working` with `idle` is a property of one function rather than a rule each branch has to
-     * remember. The port is optional: with no conversation view there is nothing to publish and nothing breaks.
+     * Split out from [publishBusy] so the decision is made under the lock and the **call to the host happens outside
+     * it**: the port reaches the CXR wire, and this class already documents why a host call must not be made while
+     * `gate` is held (a host that answers synchronously would re-enter [handle] and deadlock).
      */
-    private fun publishBusy() {
+    private fun busyChanges(): List<Pair<AssistantRoute, Boolean>> {
         val wanted = mapOf(
             AssistantRoute.WAKE to wakeBusy,
             AssistantRoute.PROACTIVE to proactiveInFlight,
         )
+        return wanted.mapNotNull { (route, busy) ->
+            if (reportedBusy[route] == busy) null else {
+                reportedBusy[route] = busy
+                route to busy
+            }
+        }
+    }
+
+    /**
+     * Reports the current busy level to the host's conversation view, sending only what changed.
+     *
+     * **Must be called without [gate] held.** The port is the host's, and the plugin's task pool is multi-threaded, so
+     * deferring the report to it would not preserve the order of a `working` and the `idle` that ends it.
+     */
+    private fun publishBusy() {
+        val changes = synchronized(gate) { busyChanges() }
+        if (changes.isEmpty()) return
         val port = conversation() ?: return
-        wanted.forEach { (route, busy) ->
-            if (reportedBusy[route] == busy) return@forEach
-            reportedBusy[route] = busy
+        changes.forEach { (route, busy) ->
             if (busy) port.working(route) else port.idle(route)
         }
     }
@@ -732,14 +749,19 @@ class SmartAssistantPlugin(
 
     override fun handle(event: HostEvent) {
         when (event) {
-            is WakeDetected -> synchronized(gate) {
-                if (matches(event.envelope)) {
-                    openTurn(clock.nowNanos(), event.envelope, refusedWakeWord = event.word)?.let { opened ->
-                        // The plugin's half of P3_WAKE: the phone-side builder logs the word/confidence on emission,
-                        // and this names the turn the wake opened. A refused wake opens nothing and logs no turn line.
-                        P3Log.line("P3_WAKE turn=${opened.turnId}")
+            is WakeDetected -> {
+                synchronized(gate) {
+                    if (matches(event.envelope)) {
+                        openTurn(clock.nowNanos(), event.envelope, refusedWakeWord = event.word)?.let { opened ->
+                            // The plugin's half of P3_WAKE: the phone-side builder logs the word/confidence on
+                            // emission, and this names the turn the wake opened. A refused wake opens nothing and logs
+                            // no turn line.
+                            P3Log.line("P3_WAKE turn=${opened.turnId}")
+                        }
                     }
                 }
+                // Phase C: outside the lock, because the report reaches the host's conversation port.
+                publishBusy()
             }
 
             // P3.2: the host's perception signals. They are remembered rather than acted on here - the utterance is
@@ -867,9 +889,9 @@ class SmartAssistantPlugin(
         // Armed only after the turn is installed, so a scheduled expiry can never find a turn that is not yet the
         // current one. `Help` runs immediately and has nothing to wait for.
         if (!runsImmediately) armListening(created)
-        // Phase C: a wake turn is now being worked on, and the wearer's ring should say so until it answers.
+        // Phase C: a wake turn is now being worked on, and the wearer's ring should say so until it answers. The flag
+        // is set here (under `gate`) and reported by the caller, because `publishBusy` must not run under the lock.
         wakeBusy = true
-        publishBusy()
         return created
     }
 
@@ -1438,10 +1460,10 @@ class SmartAssistantPlugin(
             proactiveHint?.cancelled = true
             proactiveHint = hint
             proactiveInFlight = true
-            // Phase C: the proactive route is now working, and the wearer's ring should say so from the trigger rather
-            // than from the first thing that happens to arrive.
-            publishBusy()
         }
+        // Phase C: the proactive route is now working, and the wearer's ring should say so from the trigger rather than
+        // from the first thing that happens to arrive. Outside the lock, as `publishBusy` requires.
+        publishBusy()
         P3Log.line("P3_PROACTIVE request ctx=$contextEntries chars=${trigger.transcript.length}")
         // Off the host's dispatcher: the request blocks on the transport, and running it inside `handle` would hold
         // the host's single drain thread for up to the deadline - delaying `Stop` (and its UI thread) and the next
@@ -1452,11 +1474,10 @@ class SmartAssistantPlugin(
                 deliverProactive(current, configured, filter, hint, trigger, message, started)
             } finally {
                 // Phase C: this is the one place every proactive ending passes through - a hint, a decline, a failure,
-                // a cancellation - which is why the level is cleared here rather than on each branch.
-                synchronized(gate) {
-                    proactiveInFlight = false
-                    publishBusy()
-                }
+                // a cancellation - which is why the level is cleared here rather than on each branch. The report happens
+                // outside the lock, as `publishBusy` requires.
+                synchronized(gate) { proactiveInFlight = false }
+                publishBusy()
             }
         }
     }
@@ -1898,10 +1919,9 @@ class SmartAssistantPlugin(
         // Phase C: the conversation record gets the sentence first - it is what the wearer is being told - and the
         // "working" level then ends, so the ring stops exactly when the answer appears rather than a moment before it.
         publishAssistantMessage(ContextRoute.WAKE, hint.text)
-        synchronized(gate) {
-            wakeBusy = false
-            publishBusy()
-        }
+        synchronized(gate) { wakeBusy = false }
+        // Outside the lock, as `publishBusy` requires: the host's port is what ends the ring.
+        publishBusy()
         synchronized(gate) {
             current.submitting = false
             if (result == OutputSubmission.Accepted && turn === current && !current.closed) {
@@ -1952,11 +1972,12 @@ class SmartAssistantPlugin(
                 // Phase C: an emergency stop ends whatever was being worked on, so the ring must stop with it - this
                 // is one of the two paths that can end a turn without an answer ever being produced.
                 wakeBusy = false
-                publishBusy()
                 detach()
             }
         }
         teardown(stopped)
+        // Outside the lock, as `publishBusy` requires.
+        publishBusy()
     }
 
     /**

@@ -217,9 +217,53 @@ class ConversationDisplayCallsTest {
         assertEquals(display.count("working:PROACTIVE"), display.count("idle:PROACTIVE"), display.calls.toString())
     }
 
+    /**
+     * The port must be called **without** the plugin's lock held.
+     *
+     * The port is the host's, it reaches the CXR wire, and the host delivers its own events from another thread. If a
+     * level were reported while `gate` was held, that other thread would block on the lock for as long as the wire
+     * took - and the plugin's own `emit` already documents this hazard for the output submit ("the submit itself
+     * happens outside it, so a synchronous `OutputStateEvent` … can re-enter `handle` without deadlocking").
+     *
+     * The probe makes the hazard observable: the first port call asks a **second thread** to take the same lock and
+     * joins it. With the lock held that join cannot complete, so the assertion fails instead of the report silently
+     * becoming a stall on a device.
+     */
     @Test
-    fun aHostWithoutThePortStillRunsTheTurn() {
-        // The port is optional: a host with no display never provides it, and a missing conversation view must not stop
+    fun thePortIsNeverCalledWhileThePluginsLockIsHeld() {
+        val rig = SmartTestRig()
+        val plugin = rig.plugin
+        val probed = java.util.concurrent.atomic.AtomicBoolean(false)
+        val completed = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        fun probe() {
+            if (!probed.compareAndSet(false, true)) return
+            val worker = Thread({
+                // A plain host event, so the other thread only has to take the lock - what it does with it is
+                // irrelevant to the question being asked.
+                plugin.handle(edith.contracts.AcousticEvent(rig.envelope(), edith.contracts.AcousticLabel.Speech))
+            }, "port-probe").apply { isDaemon = true }
+            worker.start()
+            worker.join(2_000)
+            completed.set(!worker.isAlive)
+        }
+
+        val display = object : ConversationDisplay {
+            override fun userMessage(route: AssistantRoute, text: String) = probe()
+            override fun assistantMessage(route: AssistantRoute, text: String) = probe()
+            override fun working(route: AssistantRoute) = probe()
+            override fun idle(route: AssistantRoute) = probe()
+        }
+
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        answerWithANotification(rig)
+        rig.wakeAndFinal("问一句")
+
+        assertTrue(completed.get(), "the host's port was called while the plugin's lock was held")
+    }
+
+    @Test
+    fun aHostWithoutThePortStillRunsTheTurn() {        // The port is optional: a host with no display never provides it, and a missing conversation view must not stop
         // a turn from producing a hint.
         val rig = SmartTestRig()
         rig.activate()
