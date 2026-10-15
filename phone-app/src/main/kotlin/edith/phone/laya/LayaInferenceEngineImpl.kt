@@ -23,9 +23,10 @@ import edith.plugin.SystemOneQuestion
  *
  * **The backend is the GPU, because the delivery target needs it.** The plan's Global Constraints and the A5 evidence
  * both say so, with numbers: 742 ms CPU against 231 ms GPU for this graph, which is the difference between fitting
- * D60's event-driven cadence and not. The GPU path additionally costs ~3.4 s of compile at startup, is FP32-only
- * (`LayaEngine.createGraph` sets `Precision.FP32`; FP16 measured as NaN) and is pinned to LiteRT 2.2.0 (2.1.0
- * computed the GPU graph wrong; 2.3.0 carries metadata this project cannot read).
+ * D60's event-driven cadence and not. The GPU path additionally costs ~3.4 s of compile at startup and is FP32-only
+ * (`LayaEngine.createGraph` sets `Precision.FP32`; FP16 measured as NaN). LiteRT is pinned to **2.3.0** as of
+ * 2026-10-14: 2.1.0 computed the GPU graph wrong, and 2.3.0 is what publishes the MediaTek NeuroPilot NPU runtime
+ * the delivery target (MT6989) needs — taken with Kotlin 2.4.0, because 2.3.0's `litert-api` carries mv=[2,4,0].
  *
  * **CPU remains the one allowed degradation, and taking it is recorded.** A GPU compile that cannot run on the
  * device must not cost the wearer the whole assistant when a working CPU path exists, so [initialize] retries once on

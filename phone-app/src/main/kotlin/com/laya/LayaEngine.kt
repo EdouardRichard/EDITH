@@ -13,8 +13,15 @@ import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 
 /**
- * Single-row multilingual Laya execution. GPU explicitly requests FP32; the NPU (Qualcomm HTP)
- * compiles the same fp16-safe graph on the device (JIT, cached after the first launch).
+ * Single-row multilingual Laya execution. GPU explicitly requests FP32; the NPU compiles the same fp16-safe
+ * graph on the device (JIT, cached after the first launch).
+ *
+ * **NPU is vendor-specific.** LiteRT reaches an NPU through a vendor dispatch library plus a compiler plugin.
+ * This project carries the Qualcomm pair (AI Engine Direct / HTP) and the MediaTek pair (NeuroPilot); the
+ * delivery target — a Redmi K70 Ultra, SoC MT6989 — is MediaTek, and the MediaTek plugin pair is published only
+ * from LiteRT 2.3.0 (2.2.0's release assets ship a Qualcomm and a Google Tensor dispatcher and nothing for
+ * MediaTek), which is why this project runs on 2.3.0. Which vendor is usable is decided by [npuVendor] from the
+ * libraries actually packaged, never from the SoC name.
  */
 class LayaEngine(context: Context, val storage: Storage = Storage.WFP16) : Closeable {
   /** Storage changes graph weights only; GPU arithmetic remains explicitly FP32 in both cases. */
@@ -49,6 +56,23 @@ class LayaEngine(context: Context, val storage: Storage = Storage.WFP16) : Close
           else -> error("Unknown accelerator: $value; expected gpu, npu or cpu")
         }
     }
+  }
+
+  /**
+   * A vendor NPU runtime this APK can drive, identified by the libraries it needs together.
+   *
+   * Both entries list the **dispatch library and the JIT compiler plugin**, which is what LiteRT loads when a
+   * graph is compiled for the NPU. Qualcomm needs its QNN host library as well. The MediaTek adapter
+   * (`libneuron_adapter_mgvi.so`, `libneuronusdk_adapter*.so`) is deliberately not probed: the linker resolves it
+   * through the runtime artifact's `<uses-native-library>` declarations, so it is not visible as a file in this
+   * app's own library directory and a path check here would refuse a device that actually works. A missing
+   * adapter fails inside the plugin, with its own message, which is the honest place for it.
+   */
+  enum class NpuVendor(val libraries: List<String>) {
+    QUALCOMM(
+      listOf("libLiteRtDispatch_Qualcomm.so", "libLiteRtCompilerPlugin_Qualcomm.so", "libQnnHtp.so"),
+    ),
+    MEDIATEK(listOf("libLiteRtDispatch_MediaTek.so", "libLiteRtCompilerPlugin_MediaTek.so")),
   }
 
   /** Includes output readback because GPU run() can enqueue work asynchronously. */
@@ -159,8 +183,9 @@ class LayaEngine(context: Context, val storage: Storage = Storage.WFP16) : Close
     LayaProcessRuntime.call {
       checkOpen()
       requireWindow(window)
-      check(backend != Backend.NPU || npuLibrariesInstalled(appContext)) {
-        "This APK has no Qualcomm NPU libraries; see the NPU section of the README."
+      check(backend != Backend.NPU || npuVendor(appContext) != null) {
+        "This APK carries no NPU runtime for this device's vendor (Qualcomm HTP or MediaTek NeuroPilot); " +
+          "see the NPU section of the README."
       }
       mainGraph(window, backend)
       actGraph(backend)
@@ -311,17 +336,22 @@ class LayaEngine(context: Context, val storage: Storage = Storage.WFP16) : Close
   ): Graph {
     // The action head is tiny and its logits reach 2e3-5e3, so an NPU run keeps it on the CPU.
     val accelerator = if (backend == Backend.NPU && !main) Accelerator.CPU else backend.accelerator
+    val vendor = if (backend == Backend.NPU && main) npuVendor(appContext) else null
     val options =
       CompiledModel.Options(accelerator).apply {
         when {
           backend == Backend.GPU ->
             gpuOptions =
               CompiledModel.GpuOptions(precision = CompiledModel.GpuOptions.Precision.FP32)
-          backend == Backend.NPU && main ->
+          vendor == NpuVendor.QUALCOMM ->
             qualcommOptions =
               CompiledModel.QualcommOptions(
                 htpPerformanceMode = CompiledModel.QualcommOptions.HtpPerformanceMode.BURST
               )
+          // MediaTek: LiteRT's `CompiledModel.Options` exposes no NeuroPilot knobs (only CPU, GPU and Qualcomm
+          // settings exist in 2.3.0) - the compiler plugin takes its own defaults - so no vendor options are
+          // set. Falling through to cpuOptions would be wrong here: this branch is an NPU compile.
+          backend == Backend.NPU && main -> Unit
           else -> cpuOptions = CompiledModel.CpuOptions(numThreads = 4)
         }
       }
@@ -372,7 +402,7 @@ class LayaEngine(context: Context, val storage: Storage = Storage.WFP16) : Close
 
   companion object {
     /** Runtime pin shared with the version catalog and gate metadata. */
-    const val LITERT_VERSION = "2.2.0"
+    const val LITERT_VERSION = "2.3.0"
     private const val SIGNATURE = "serving_default"
     /** Shared files required by either graph storage choice. */
     val REQUIRED_FILES =
@@ -391,14 +421,16 @@ class LayaEngine(context: Context, val storage: Storage = Storage.WFP16) : Close
 
     private fun milliseconds(nanos: Long) = nanos / 1_000_000.0
 
-    /** The dispatch library and the JIT compiler plugin must both be packaged for the NPU. */
-    fun npuLibrariesInstalled(context: Context): Boolean {
+    /**
+     * Which vendor's NPU runtime this APK actually carries, or `null` when it carries none.
+     *
+     * Read from the packaged libraries rather than from `Build.SOC_MODEL`, because what decides whether a
+     * compile can succeed is which plugin will be loaded, not which SoC is present.
+     */
+    fun npuVendor(context: Context): NpuVendor? {
       val libDir = File(context.applicationInfo.nativeLibraryDir)
-      return NPU_LIBRARIES.all { File(libDir, it).isFile }
+      return NpuVendor.entries.firstOrNull { vendor -> vendor.libraries.all { File(libDir, it).isFile } }
     }
-
-    private val NPU_LIBRARIES =
-      listOf("libLiteRtDispatch_Qualcomm.so", "libLiteRtCompilerPlugin_Qualcomm.so", "libQnnHtp.so")
 
     private fun timing(start: Long, written: Long, enqueued: Long, read: Long) =
       GraphTiming(

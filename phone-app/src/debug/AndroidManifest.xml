@@ -57,5 +57,26 @@
                 <action android:name="edith.DEBUG_CREATE_PROFILE" />
             </intent-filter>
         </receiver>
+        <!--
+          Laya backend probe. Same export rule and the same reason as the instruments above: the only caller is
+          an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in
+          a release build. It exists because MIUI on the K40 refuses the androidTest APK, so the CPU-vs-GPU
+          comparison has to be driven through the app itself. Logs counts and one probability - no user content.
+        -->
+        <receiver
+            android:name=".DebugLayaProbe"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_LAYA" />
+            </intent-filter>
+        </receiver>
+        <!--
+          `DebugModelProbe` (the generic all-models-on-an-accelerator probe) is NOT registered here yet: it needs the
+          process's single shared LiteRT `Environment`, which lives in the vendored `com.laya` file as a
+          file-private object, so the probe cannot compile without making vendored code non-private. Its entry, its
+          source and the decision about how to expose that environment belong to the Laya line; leaving a receiver
+          with no class behind it would only ship a debug build whose broadcast dies at run time.
+        -->
     </application>
 </manifest>

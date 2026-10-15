@@ -32,9 +32,11 @@ import java.io.Closeable
  *   build), parses the calibration, and memory-maps the 375 MiB token table. It must not run on a UI thread.
  * - **`initialize(backend)` compiles the graph**, and a GPU compile is ~1.3 s for this graph, the first NPU
  *   compile about 40 s (cached afterwards).
- * - **The NPU needs Qualcomm runtime libraries in the APK**; without them `initialize(NPU)` throws with a
- *   message pointing at the README. On the K70 Ultra this path is not merely unvalidated, it is the wrong
- *   vendor — that device's NPU is a MediaTek APU.
+ * - **The NPU needs its vendor's runtime libraries in the APK.** Qualcomm needs the QNN set; the delivery
+ *   target — a Redmi K70 Ultra on MT6989 — is MediaTek, whose NeuroPilot dispatch and compiler plugin come
+ *   from LiteRT 2.3.0 (`com.google.ai.edge.litert:litert-npu-runtime-mediatek`). Without a matching pair
+ *   `initialize(NPU)` throws with a message pointing at the README, because the fallback that can answer is the
+ *   GPU and pretending otherwise would be worse than refusing.
  */
 class LayaOfficialHost(
     context: Context,

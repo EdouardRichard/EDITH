@@ -198,8 +198,8 @@ class LiteRTPerformanceTest {
 
     /**
      * The `CompiledModel` path, which is what the model card's own latency figures were taken with, and
-     * which is the only path that reaches the GPU (`libLiteRtOpenClAccelerator.so` ships inside
-     * `litert:2.1.0`, so no separate GPU artifact is needed).
+     * which is the only path that reaches the GPU (`libLiteRtOpenClAccelerator.so`; on 2.1.0 it shipped inside
+     * `litert` itself, and from 2.3.0 it comes from the separate `litert-gpu` artifact).
      *
      * Two things this test refuses to do, because the first version of it did both:
      *
