@@ -32,6 +32,8 @@ interface SkillDirectory {
 class SkillManager(
     private val directory: SkillDirectory,
     private val log: (String) -> Unit = { P3Log.line(it) },
+    /** T2.7: optional condition evaluator for SKILL filtering by appliesWhen/notAppliesWhen (spec §3.8.3). */
+    private val conditionEvaluator: SkillConditionEvaluator? = null,
 ) {
 
     /** The SKILLs to inject, sorted by name so one request is reproducible (spec §3.6 step 3). */
@@ -56,6 +58,12 @@ class SkillManager(
             when (val parsed = SkillParser.parse(path, text)) {
                 is SkillParse.Ok -> {
                     val skill = parsed.skill
+                    // T2.7: filter by machine-checkable conditions before the duplicate-name check, so a skipped
+                    // SKILL does not block a later one with the same name (spec §3.8.3).
+                    if (conditionEvaluator != null && !conditionEvaluator.shouldInclude(skill)) {
+                        log("P3_SKILL skipped=${skill.name} reason=CONDITION_NOT_MET")
+                        return@forEach
+                    }
                     if (byName.putIfAbsent(skill.name, skill) != null) {
                         // Name and count only: a SKILL body is the user's own text and never reaches a log line.
                         log("P3_SKILL duplicate name=${skill.name}")

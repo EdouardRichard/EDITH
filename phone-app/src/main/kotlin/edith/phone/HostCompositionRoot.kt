@@ -45,10 +45,12 @@ import edith.phone.actions.AppLaunchResolver
 import edith.phone.actions.CallPermission
 import edith.phone.actions.ExecutionRouter
 import edith.phone.actions.IntentExecutionBackend
+import edith.phone.actions.LaunchAppExecutor
 import edith.phone.actions.RootProbe
 import edith.phone.actions.RootStatus
 import edith.phone.actions.ShizukuExecutionBackend
 import edith.phone.actions.ShizukuTargetState
+import edith.phone.actions.SystemActionExecutor
 import edith.phone.actions.ShizukuUserServiceShell
 import edith.phone.a11y.AccessibilityExecutionBackend
 import edith.phone.a11y.AccessibilityUi
@@ -1468,6 +1470,11 @@ class HostCompositionRoot internal constructor(
                 override fun structuralFingerprint() = live()?.structuralFingerprint()
                     ?: ScreenFingerprint(hash = "", nodeCount = 0, clickableCount = 0, truncated = false)
             }
+            // T2.7: the app catalog and launch resolver are shared between the intent backend (which already has
+            // `actions`) and the new Shizuku-backed launch executor. Built here rather than inside either backend so
+            // both read one package list per turn.
+            val appCatalog = PackageManagerAppCatalog(context)
+            val appLaunchResolver = AppLaunchResolver(appCatalog)
             val executionRouter = AppliedSemanticsPostProcessor(
                 ExecutionRouter(
                     listOf(
@@ -1477,6 +1484,10 @@ class HostCompositionRoot internal constructor(
                             ui = accessibilityUi,
                             connected = { EdithAccessibilityService.connected() },
                         ),
+                        // T2.7: Shizuku-backed app launch and system action executors. They share the same channel
+                        // probe as ShizukuExecutionBackend — one binder, three tool sets.
+                        LaunchAppExecutor(appLaunchResolver, appCatalog, shizukuShell) { shizukuShell.ready() },
+                        SystemActionExecutor(shizukuShell) { shizukuShell.ready() },
                     ),
                 ),
             )
