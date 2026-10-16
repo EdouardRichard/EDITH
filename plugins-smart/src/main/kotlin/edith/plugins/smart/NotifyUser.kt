@@ -105,7 +105,7 @@ class NotifyUserTool(private val onNotify: (NotifyChannel, String) -> Unit) : Ac
         val DESCRIPTOR = ActionDescriptor(
             name = "notify_user",
             title = "向用户发送通知",
-            parametersJson = """{"type":"object","properties":{"text":{"type":"string","description":"要通知用户的内容"},"channel":{"type":"string","enum":["screen","voice","both","silent"],"description":"screen=仅眼镜显示，voice=仅语音播报，both=同时显示和播报，silent=不通知用户但阻止系统自动补发通知"}},"required":["text","channel"],"additionalProperties":false}""",
+            parametersJson = """{"type":"object","properties":{"text":{"type":"string","description":"要通知用户的内容"},"channel":{"type":"string","enum":["screen","voice","both","silent"],"description":"screen=仅眼镜显示，voice=仅语音播报，both=同时显示和播报，silent=不通知用户但阻止系统自动补发通知"},"final":{"type":"boolean","description":"true=模型声明任务结束（spec §3.7 决策5b）"}},"required":["text","channel"],"additionalProperties":false}""",
             risk = RiskLevel.L0,
             requiresConfirmation = false,
             idempotent = true,

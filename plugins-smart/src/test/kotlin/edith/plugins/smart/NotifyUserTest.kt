@@ -124,4 +124,14 @@ class NotifyUserTest {
             NotifyChannel.entries.map { it.wireName },
         )
     }
+
+    @Test
+    fun `DESCRIPTOR includes final parameter for task completion signal`() {
+        val schema = tool.descriptors().single().parametersJson
+        assertTrue(schema.contains("\"final\""), "schema must contain final field: $schema")
+        assertTrue(schema.contains("\"boolean\""), "final must be boolean type: $schema")
+        // final is optional (not in required), so existing callers are unaffected
+        assertTrue(!schema.contains("\"required\":[\"text\",\"channel\",\"final\"]"),
+            "final must not be required: $schema")
+    }
 }
