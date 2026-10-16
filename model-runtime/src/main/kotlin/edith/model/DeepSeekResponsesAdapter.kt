@@ -102,7 +102,6 @@ class DeepSeekResponsesAdapter {
             }
             put("input", buildJsonArray {
                 budgeted.request.history.forEach { add(historyItem(it)) }
-                budgeted.request.context.forEach { add(message("user", it.text)) }
                 budgeted.request.input.forEach { add(message("user", (it as InputPart.Text).text)) }
             })
         }

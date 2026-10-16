@@ -192,10 +192,6 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
                         else -> { /* tool calls not yet supported for this protocol */ }
                     }
                 }
-                // Context
-                budgeted.request.context.forEach { add(buildJsonObject {
-                    put("role", "user"); put("content", it.text)
-                }) }
                 // Current turn: text + optional audio
                 val contentParts = buildJsonArray {
                     textParts.forEach { add(buildJsonObject {

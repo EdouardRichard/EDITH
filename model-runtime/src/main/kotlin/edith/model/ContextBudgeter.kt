@@ -14,7 +14,6 @@ class ContextBudgeter {
             throw ContractError.CapabilityMissing("Media estimator and encoder unavailable")
         }
         val history = request.history.toList()
-        val context = request.context.toList()
         // Text alternates USER/ASSISTANT from a leading USER, with one deliberate exception: an ASSISTANT text may
         // directly follow a tool item, because a real assistant turn spans several tool rounds and is only then closed
         // (this is how the endpoint's stateless `input` array looks). Every consecutive run of tool items must still be
@@ -62,7 +61,6 @@ class ContextBudgeter {
             var total = Math.addExact(32L, message(request.instructions))
             input.forEach { total = Math.addExact(total, message((it as InputPart.Text).text)) }
             history.forEach { total = Math.addExact(total, itemCost(it)) }
-            context.forEach { total = Math.addExact(total, message(it.text)) }
             val limit = minOf(profile.inputBudgetTokens.toLong(),
                 profile.usableWindowTokens.toLong() - profile.maxOutputTokens.toLong() - profile.safetyTokens.toLong())
             val removed = mutableListOf<String>()
@@ -72,13 +70,6 @@ class ContextBudgeter {
                 removed += "history:$removedGroups"
                 removedGroups++
             }
-            val removedContext = mutableSetOf<Int>()
-            for (index in context.indices.sortedWith(compareBy<Int> { context[it].importance }.thenBy { it })) {
-                if (total <= limit) break
-                total = Math.subtractExact(total, message(context[index].text))
-                removed += context[index].id
-                removedContext += index
-            }
             if (total > limit) rejected()
             val removedCount = groups.take(removedGroups).sumOf { it.size }
             val keptHistory = history.drop(removedCount)
@@ -86,8 +77,7 @@ class ContextBudgeter {
             // one user turn had to go would leave neither `input` nor `history`, and `copy` would throw a raw
             // `IllegalArgumentException` from the contract type; the request that fits nothing is rejected here.
             if (input.isEmpty() && keptHistory.isEmpty()) rejected()
-            return BudgetedRequest(request.copy(input = input, history = keptHistory,
-                context = context.filterIndexed { index, _ -> index !in removedContext }), total.toInt(), removed.toList(), true)
+            return BudgetedRequest(request.copy(input = input, history = keptHistory), total.toInt(), removed.toList(), true)
         } catch (_: ArithmeticException) {
             rejected()
         }

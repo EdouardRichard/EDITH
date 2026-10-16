@@ -1,7 +1,8 @@
 package edith.plugins.smart.memory
 
 import edith.agent.MemoryRetrieval
-import edith.plugin.ContextPart
+import edith.agent.Segment
+import edith.agent.SegmentOrigin
 import edith.plugins.smart.P3Log
 import kotlin.math.roundToInt
 
@@ -29,7 +30,7 @@ class SmartMemoryRetrieval(
     private val logger: (String) -> Unit = { P3Log.line(it) },
 ) : MemoryRetrieval {
 
-    override fun retrieve(query: String, limit: Int): List<ContextPart> {
+    override fun retrieve(query: String, limit: Int): List<Segment> {
         val asked = query.trim()
         if (asked.isEmpty()) return emptyList()
         val snapshot = log.snapshot()
@@ -51,13 +52,13 @@ class SmartMemoryRetrieval(
                 "topScore=${(scores.max() * 100).roundToInt() / 100.0} " +
                 "ids=${top.joinToString(",") { it.id }}",
         )
-        return top.mapIndexed { index, entry ->
-            ContextPart(ID_PREFIX + entry.id, entry.text, scores[index].coerceIn(0.0, 10.0).roundToInt())
+        return top.map { entry ->
+            Segment(SegmentOrigin.MEMORY_EVIDENCE, false, entry.text)
         }
     }
 
     /** What a turn asks for: the same call, with the phase's own limit. Named so the call site reads as a decision. */
-    fun injectionFor(utterance: String): List<ContextPart> = retrieve(utterance, INJECT_LIMIT)
+    fun injectionFor(utterance: String): List<Segment> = retrieve(utterance, INJECT_LIMIT)
 
     companion object {
         /** Spec §3.3: at most this many parts per request. */

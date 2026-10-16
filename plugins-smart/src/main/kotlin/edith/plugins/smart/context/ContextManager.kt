@@ -1,7 +1,7 @@
 package edith.plugins.smart.context
 
 import edith.agent.MemoryRetrieval
-import edith.plugin.ContextPart
+import edith.agent.Segment
 import edith.plugin.MessageRole
 import edith.plugin.ModelHistoryItem
 import edith.plugins.smart.SmartPrompts
@@ -17,7 +17,7 @@ data class PromptAssembly(
     val route: ContextRoute,
     val instructions: String,
     val history: List<ModelHistoryItem>,
-    val context: List<ContextPart>,
+    val memorySegments: List<Segment>,
     val estimatedTokens: Int,
     /** The history allowance this assembly was measured against (spec §4.3). */
     val historyBudgetTokens: Int,
@@ -92,7 +92,7 @@ class ContextManager(
             route = route,
             instructions = instructions,
             history = history,
-            context = memoryParts,
+            memorySegments = memoryParts,
             estimatedTokens = estimated,
             historyBudgetTokens = historyBudget,
             overHistoryBudget = historyTokens > historyBudget,

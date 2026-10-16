@@ -1,7 +1,7 @@
 package edith.plugins.smart.memory
 
 import edith.agent.MemoryRetrieval
-import edith.plugin.ContextPart
+import edith.agent.Segment
 import edith.plugins.smart.P3Log
 
 /**
@@ -24,7 +24,7 @@ class MemoryModuleRetrieval(
     private val logger: (String) -> Unit = { P3Log.line(it) },
 ) : MemoryRetrieval {
 
-    override fun retrieve(query: String, limit: Int): List<ContextPart> {
+    override fun retrieve(query: String, limit: Int): List<Segment> {
         val injection = memory.injectionProbe(query, limit)
         // A blank query, an empty store or a namespace that refused answers nothing and logs nothing: saying
         // `inject=n=0` would look like a measurement of something that never happened.
@@ -32,7 +32,7 @@ class MemoryModuleRetrieval(
             logger(
                 "P3_MEMORY inject=n=${injection.parts.size} chars=${injection.parts.sumOf { it.text.length }} " +
                     "via=${injection.via.name.lowercase()} bucket=${similarityBucket(injection.topSimilarity)} " +
-                    "indexed=${injection.indexed} ids=${injection.parts.joinToString(",") { it.id }}",
+                    "indexed=${injection.indexed} ids=${injection.entries.joinToString(",") { it.id }}",
             )
         }
         return injection.parts

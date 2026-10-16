@@ -1,6 +1,7 @@
 package edith.plugins.smart.memory
 
-import edith.plugin.ContextPart
+import edith.agent.Segment
+import edith.agent.SegmentOrigin
 import edith.plugin.EmbeddingService
 
 /** Which ranking produced an injection. The device log names it, so a degraded order cannot read as a semantic one. */
@@ -12,7 +13,7 @@ enum class MemoryRanking { SEMANTIC, LEXICAL }
  */
 data class MemoryInjection(
     val entries: List<MemoryEntry>,
-    val parts: List<ContextPart>,
+    val parts: List<Segment>,
     val via: MemoryRanking,
     val topSimilarity: Double?,
     val indexed: Int,
@@ -88,11 +89,7 @@ class MemoryModule(
         }
         if (ranked.isNotEmpty()) log.markUsed(ranked.map { it.id })
         val parts = ranked.map { entry ->
-            ContextPart(
-                id = ID_PREFIX + entry.id,
-                text = entry.text,
-                importance = lexicalScore(query, entry.text).coerceIn(0, MAX_IMPORTANCE),
-            )
+            Segment(SegmentOrigin.MEMORY_EVIDENCE, false, entry.text)
         }
         return MemoryInjection(
             entries = ranked,
@@ -105,8 +102,8 @@ class MemoryModule(
         )
     }
 
-    /** The form `buildPrompt` injects: ids, texts and an importance derived from how well each one matched (§5.7). */
-    fun injectionFor(query: String, limit: Int = INJECT_LIMIT): List<ContextPart> =
+    /** The form `buildPrompt` injects: memory evidence segments for the request frame (§5.7). */
+    fun injectionFor(query: String, limit: Int = INJECT_LIMIT): List<Segment> =
         injectionProbe(query, limit).parts
 
     fun snapshot(): MemorySnapshot = log.snapshot()

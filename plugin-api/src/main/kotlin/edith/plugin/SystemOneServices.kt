@@ -54,7 +54,7 @@ data class SystemOneCriterion(val label: String, val description: String? = null
     init {
         require(label.isNotBlank()) { "criterion label must not be blank" }
     }
-    // Redacted like `ContextPart`: a label is supplied by the caller and a general caller's labels are its own
+    // Redacted: a label is supplied by the caller and a general caller's labels are its own
     // vocabulary, which the "counts and ids only, never content" rule keeps out of anything that prints.
     override fun toString() = "SystemOneCriterion(redacted)"
 }
