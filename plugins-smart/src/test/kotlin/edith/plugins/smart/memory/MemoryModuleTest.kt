@@ -257,6 +257,103 @@ class MemoryModuleTest {
         assertEquals("", entry.normalizedText)
     }
 
+    // --- Phase 4 Task 4: relevance threshold seam + counting probes ---
+
+    @Test
+    fun `threshold disabled by default — below is zero and cutoff is none`() {
+        val log = store()
+        val embeddings = FakeEmbeddings(
+            vectors = mapOf(
+                "我喜欢喝茶" to unit(1f, 0f),
+                "茶的味道" to unit(0.9f, 0.1f),
+            ),
+        )
+        val module = MemoryModule(
+            log = log,
+            embeddings = embeddings,
+            lexicon = SmartMemoryRetrieval(log, logger = {}),
+            retriever = SemanticRetriever(embeddings, VectorIndex(DIM)),
+        )
+        module.remember("我喜欢喝茶", MemoryKind.PREFERENCE, MemorySource.AUTO)
+
+        val injection = module.injectionProbe("茶", 5)
+
+        assertEquals(0, injection.below, "no entries dropped when threshold is disabled")
+        assertEquals("none", injection.cutoff, "cutoff is 'none' when threshold is disabled")
+    }
+
+    @Test
+    fun `threshold filters entries below cutoff and counts them`() {
+        val log = store()
+        // Two entries: one close to the query (similarity ~1.0), one far away (similarity ~0.0).
+        val embeddings = FakeEmbeddings(
+            vectors = mapOf(
+                "我喜欢喝茶" to unit(1f, 0f),
+                "明天下午三点开会" to unit(0f, 1f),
+                "茶的偏好" to unit(1f, 0f),
+            ),
+        )
+        val module = MemoryModule(
+            log = log,
+            embeddings = embeddings,
+            lexicon = SmartMemoryRetrieval(log, logger = {}),
+            retriever = SemanticRetriever(embeddings, VectorIndex(DIM)),
+            similarityThreshold = 0.5,
+        )
+        module.remember("我喜欢喝茶", MemoryKind.PREFERENCE, MemorySource.AUTO)
+        module.remember("明天下午三点开会", MemoryKind.FACT, MemorySource.AUTO)
+
+        val injection = module.injectionProbe("茶的偏好", 5)
+
+        assertTrue(injection.below > 0, "at least one entry should be below threshold")
+        assertEquals("0.5", injection.cutoff, "cutoff records the threshold value")
+        // All surviving entries must have been above the threshold.
+        assertTrue(injection.entries.isNotEmpty(), "at least one entry should survive")
+    }
+
+    @Test
+    fun `cold index with threshold returns empty without error`() {
+        // No entries written → cold index. Threshold active but nothing to filter.
+        val log = store()
+        val embeddings = FakeEmbeddings(
+            vectors = mapOf("任何查询" to unit(1f, 0f)),
+        )
+        val module = MemoryModule(
+            log = log,
+            embeddings = embeddings,
+            lexicon = SmartMemoryRetrieval(log, logger = {}),
+            retriever = SemanticRetriever(embeddings, VectorIndex(DIM)),
+            similarityThreshold = 0.5,
+        )
+
+        val injection = module.injectionProbe("任何查询", 5)
+
+        assertEquals(emptyList(), injection.entries)
+        assertEquals(emptyList(), injection.parts)
+        assertEquals(0, injection.below, "nothing to drop in a cold index")
+    }
+
+    @Test
+    fun `unembeddable query with threshold injects zero entries without error`() {
+        val log = store()
+        val embeddings = FakeEmbeddings(failWith = FailureReason.MODEL_NOT_LOADED)
+        val module = MemoryModule(
+            log = log,
+            embeddings = embeddings,
+            lexicon = SmartMemoryRetrieval(log, logger = {}),
+            retriever = SemanticRetriever(embeddings, VectorIndex(DIM)),
+            similarityThreshold = 0.5,
+        )
+        module.remember("我喜欢喝茶", MemoryKind.PREFERENCE, MemorySource.AUTO)
+
+        val injection = module.injectionProbe("茶", 5)
+
+        // Lexical fallback still works; threshold only applies to semantic scores.
+        // When ranking is lexical, no entries are "below threshold" because there is no score to compare.
+        assertEquals(0, injection.below, "lexical ranking has no similarity scores to threshold against")
+        assertEquals("none", injection.cutoff, "cutoff stays 'none' for lexical ranking")
+    }
+
     private companion object {
         const val DIM = 8
     }

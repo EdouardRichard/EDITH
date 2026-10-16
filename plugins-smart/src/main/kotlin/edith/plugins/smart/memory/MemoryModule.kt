@@ -17,6 +17,10 @@ data class MemoryInjection(
     val via: MemoryRanking,
     val topSimilarity: Double?,
     val indexed: Int,
+    /** Phase 4 AC-4: count of entries dropped by the relevance threshold. Zero when threshold is disabled. */
+    val below: Int = 0,
+    /** Phase 4 AC-4: the threshold value as a string, or `"none"` when threshold is disabled. */
+    val cutoff: String = "none",
 )
 
 /**
@@ -41,6 +45,11 @@ class MemoryModule(
     private val lexicon: SmartMemoryRetrieval,
     private val retriever: SemanticRetriever = SemanticRetriever(embeddings),
     private val now: () -> Long = System::currentTimeMillis,
+    /**
+     * Phase 4 AC-4 (§3.9 6f): entries with semantic similarity below this value are dropped whole.
+     * `null` (the default) disables filtering entirely — behavior is identical to pre-Phase-4 code.
+     */
+    private val similarityThreshold: Double? = null,
 ) {
 
     /** Writes one raw message and indexes it (spec §5.5: the original text, never a summary). */
@@ -87,18 +96,43 @@ class MemoryModule(
             val rankedIds = semanticHits.mapTo(mutableSetOf()) { it.first.id }
             (semanticHits.map { it.first } + lexical(entries.filterNot { it.id in rankedIds }, asked, limit)).take(limit)
         }
-        if (ranked.isNotEmpty()) log.markUsed(ranked.map { it.id })
-        val parts = ranked.map { entry ->
+
+        // Phase 4 AC-4 (§3.9 6f): drop entries below the relevance threshold. Only applies when the ranking
+        // produced semantic scores; a lexical ranking has no similarity to compare against, so the threshold
+        // stays inert and the counting probes report zero/none.
+        val threshold = similarityThreshold
+        val filteredRanked: List<MemoryEntry>
+        val belowCount: Int
+        val cutoffLabel: String
+        if (threshold != null && semanticHits != null) {
+            val scoredMap = semanticHits.associate { it.first.id to it.second.toDouble() }
+            val above = ranked.filter { entry ->
+                val s = scoredMap[entry.id]
+                s != null && s >= threshold
+            }
+            filteredRanked = above
+            belowCount = ranked.size - above.size
+            cutoffLabel = threshold.toString()
+        } else {
+            filteredRanked = ranked
+            belowCount = 0
+            cutoffLabel = "none"
+        }
+
+        if (filteredRanked.isNotEmpty()) log.markUsed(filteredRanked.map { it.id })
+        val parts = filteredRanked.map { entry ->
             Segment(SegmentOrigin.MEMORY_EVIDENCE, false, entry.text)
         }
         return MemoryInjection(
-            entries = ranked,
+            entries = filteredRanked,
             parts = parts,
             via = if (semanticHits == null) MemoryRanking.LEXICAL else MemoryRanking.SEMANTIC,
             // The best semantic match, which is the first of a similarity-descending list. `null` when nothing was
             // placed by similarity, because then there is no similarity to report rather than a zero to misread.
             topSimilarity = semanticHits?.firstOrNull()?.second?.toDouble(),
             indexed = retriever.indexedCount,
+            below = belowCount,
+            cutoff = cutoffLabel,
         )
     }
 

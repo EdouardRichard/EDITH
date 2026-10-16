@@ -29,10 +29,14 @@ class MemoryModuleRetrieval(
         // A blank query, an empty store or a namespace that refused answers nothing and logs nothing: saying
         // `inject=n=0` would look like a measurement of something that never happened.
         if (injection.parts.isNotEmpty()) {
+            val thresholdFields = if (injection.below > 0 || injection.cutoff != "none") {
+                " below=${injection.below} cutoff=${injection.cutoff}"
+            } else ""
             logger(
                 "P3_MEMORY inject=n=${injection.parts.size} chars=${injection.parts.sumOf { it.text.length }} " +
                     "via=${injection.via.name.lowercase()} bucket=${similarityBucket(injection.topSimilarity)} " +
-                    "indexed=${injection.indexed} ids=${injection.entries.joinToString(",") { it.id }}",
+                    "indexed=${injection.indexed} ids=${injection.entries.joinToString(",") { it.id }}" +
+                    thresholdFields,
             )
         }
         return injection.parts
