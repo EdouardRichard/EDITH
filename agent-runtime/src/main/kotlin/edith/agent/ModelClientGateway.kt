@@ -237,6 +237,15 @@ class ModelClientGateway(
      * a user turn, or a history that ends on a lone user message (the last one is the shape cut ① leaves when the
      * only surviving turn is an unanswered user half).
      *
+     * ## A `RETRY` is folded into the request `input`, never a history turn
+     *
+     * A retry instruction is the loop talking to the model, not the wearer speaking. As a history turn it would open
+     * a **new** group ending on a bare user text, which `ContextBudgeter` rejects by design (`groups.last().size == 1`)
+     * — the loop's designed retry would be refused before it was ever sent. It therefore rides **ahead of the request
+     * `input`**, in flow order, exactly as a summary and the memory ride ahead of the history's first user turn: the
+     * surviving transcript's last group stays closed, and the loop's nudge is the first thing the model reads in the
+     * message it is answering. The frame's one `USER_INPUT` is still the request `input` — it is not replaced.
+     *
      * Folding several context segments into one message removes one 32-byte per-message overhead per folded segment and
      * adds 2 bytes per join, so it is cheaper whenever more than one segment is folded. With a **single** context
      * segment it is 2 bytes **more** expensive than the trimmer's measurement of that one segment (no overhead is
@@ -248,12 +257,18 @@ class ModelClientGateway(
         val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
         if (inputIndex < 0) return null
         val inputText = flow[inputIndex].text
+        // Loop-internal continuations are not conversation turns; see the KDoc above.
+        val retryText = flow.take(inputIndex)
+            .filter { it.origin == SegmentOrigin.RETRY }
+            .joinToString("\n\n") { it.text }
+        val requestInput = if (retryText.isEmpty()) inputText else "$retryText\n\n$inputText"
         val leading = mutableListOf<String>()
         val history = mutableListOf<ModelHistoryItem>()
         for (segment in flow.take(inputIndex)) {
             when (segment.origin) {
                 SegmentOrigin.SUMMARY -> leading += boundedSummary(segment.text)
                 SegmentOrigin.MEMORY_EVIDENCE, SegmentOrigin.PERCEPTION -> leading += segment.text
+                SegmentOrigin.RETRY -> Unit
                 SegmentOrigin.TOOL_ROUND -> {
                     // A tool round is not conversation-flow text: the endpoint is stateless, so the model's own call
                     // must be echoed back as a call item beside its result or the exchange does not round-trip (and two
@@ -272,7 +287,7 @@ class ModelClientGateway(
         val transcript = when {
             leading.isEmpty() ->
                 if (history.isEmpty() || opensWithUser(history)) {
-                    Transcript(listOf(InputPart.Text(inputText)), history)
+                    Transcript(listOf(InputPart.Text(requestInput)), history)
                 } else {
                     null
                 }
@@ -282,9 +297,9 @@ class ModelClientGateway(
                 when {
                     head is ModelHistoryItem.Text && head.role == MessageRole.USER -> {
                         history[0] = ModelHistoryItem.Text(MessageRole.USER, "$context\n\n${head.text}")
-                        Transcript(listOf(InputPart.Text(inputText)), history)
+                        Transcript(listOf(InputPart.Text(requestInput)), history)
                     }
-                    history.isEmpty() -> Transcript(listOf(InputPart.Text("$context\n\n$inputText")), history)
+                    history.isEmpty() -> Transcript(listOf(InputPart.Text("$context\n\n$requestInput")), history)
                     else -> null
                 }
             }

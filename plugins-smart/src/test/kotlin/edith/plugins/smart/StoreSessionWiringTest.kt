@@ -1,6 +1,7 @@
 package edith.plugins.smart
 
 import edith.agent.ConversationStore
+import edith.agent.SummaryBoundary
 import edith.contracts.AcousticEvent
 import edith.contracts.AcousticLabel
 import edith.contracts.TranscriptEvent
@@ -18,6 +19,7 @@ import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.memory.MemoryLog
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 /**
@@ -259,6 +261,99 @@ class StoreSessionWiringTest {
             lines.any { it.startsWith("P3_CONTEXT route=WAKE store=2 historyChars=6") },
             "P3_CONTEXT must report the store's own counts: $lines",
         )
+    }
+
+    // ------------------------------------------------------------ a compressed head, and a retry
+
+    /**
+     * The defect: the flat transcript a frame builder receives from `AgentLoop` carries no attribution, so a store
+     * `SUMMARY` — the store's head after any compression — used to be relabelled a plain assistant `TRANSCRIPT`. The
+     * gateway then could not lift it into the leading context, the history opened on an assistant item, and **every**
+     * turn after the first compression ended `FAILED`/`NO_USER_TURN` without reaching the model.
+     *
+     * The assertion is on the assembled request, not on "no exception": the summary body must be in the history, the
+     * history must open on the user turn (the shape `ContextBudgeter` requires), and the turn must complete.
+     */
+    @Test
+    fun `a turn after a compression reaches the model with the head summary`() {
+        val stores = stores()
+        val rig = rig(stores)
+        // Seeded after activation: activation is the session boundary and empties the route's store. `appendSummary`
+        // lands at the head, which is the only position the store's invariant allows a summary to occupy.
+        stores.getValue(ContextRoute.WAKE).apply {
+            appendSummary("用户之前问过天气")
+            appendUser("旧问题")
+            appendAssistant("旧回答")
+        }
+
+        val lines = withLines { captured -> rig.wakeAndFinal("现在几点了"); captured.toList() }
+
+        assertTrue(
+            lines.contains("P3_TURN end turn=asr-1 outcome=COMPLETED code=- steps=0"),
+            "a post-compression turn must complete: $lines",
+        )
+        assertTrue(lines.none { it.contains("NO_USER_TURN") }, "the head summary must not defeat the turn: $lines")
+        val sent = rig.model.requests.single()
+        val head = assertIs<ModelHistoryItem.Text>(
+            sent.history.firstOrNull(),
+            "the history must open on a user turn: ${sent.history}",
+        )
+        assertEquals(MessageRole.USER, head.role, "the history must open on the user turn: ${sent.history}")
+        assertTrue(head.text.contains("用户之前问过天气"), "the head summary must reach the request: ${head.text}")
+        assertTrue(
+            head.text.contains(SummaryBoundary.OPEN),
+            "the store's bounded summary carries its boundary into the request: ${head.text}",
+        )
+        assertTrue(head.text.contains("旧问题"), "the summary must fold into the surviving user turn: ${head.text}")
+    }
+
+    /**
+     * The defect: the loop's retry continuation is a bare `Text(USER)` — a loop-internal instruction, not the wearer
+     * speaking. Rendered as a trailing `TRANSCRIPT` `USER` it opened an unclosed one-item user group, which the
+     * gateway refused: the designed retry was never sent, so an empty turn stayed empty on the production path.
+     *
+     * Two retries are driven (still inside the loop's `maxEmptyTurns`), because that is also where the recovery is
+     * load-bearing: only the **pending** retry is a `RETRY`; the earlier one must stay an ordinary user turn, or the
+     * assistant placeholders collapse into two consecutive assistant texts — a shape `ContextBudgeter` also rejects.
+     *
+     * The assertion is on each retry request's content, not on "more requests happened": it must carry the retry
+     * instruction, still carry this turn's utterance, and be a shape the send-time budgeter accepts.
+     */
+    @Test
+    fun `an empty turn's retry continuation is sent and accepted`() {
+        val stores = stores()
+        val rig = rig(stores)
+        var turn = 0
+        rig.model.onRequest = { request, listener ->
+            turn += 1
+            // An INCOMPLETE turn with no call is the unproductive turn the loop retries; the third answers.
+            if (turn <= 2) {
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.INCOMPLETE, null, null))
+            } else {
+                streamText(request, listener, "好。")
+            }
+        }
+
+        val lines = withLines { captured -> rig.wakeAndFinal("现在几点了"); captured.toList() }
+
+        assertEquals(3, rig.model.requests.size, "every empty turn must be retried: $lines")
+        assertTrue(lines.none { it.contains("NO_USER_TURN") }, "no retry may be refused: $lines")
+        assertTrue(
+            lines.contains("P3_TURN end turn=asr-1 outcome=COMPLETED code=- steps=0"),
+            "the retried turn must complete: $lines",
+        )
+        for (retry in rig.model.requests.drop(1)) {
+            assertTrue(
+                acceptableWireHistory(retry.history),
+                "the retried request must stay a shape the send-time budgeter accepts: ${retry.history}",
+            )
+            val retryInput = retry.input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue(
+                retryInput.contains("no tool call and no text"),
+                "the loop's retry instruction must actually be sent: $retryInput",
+            )
+            assertTrue(retryInput.contains("现在几点了"), "the wearer's utterance must still be sent: $retryInput")
+        }
     }
 
     // ------------------------------------------------------------ B6's order on the store path

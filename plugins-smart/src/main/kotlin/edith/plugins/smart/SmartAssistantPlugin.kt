@@ -1186,7 +1186,7 @@ class SmartAssistantPlugin(
         // A **builder**, not a one-shot frame: a tool round makes this run ask the model a second time, and that
         // request must be rendered by the same renderer from the transcript it continues. Only the store path gets one;
         // the legacy path keeps its frame-less behaviour byte for byte.
-        val frameFor = store?.let { frameBuilderFor(ContextRoute.WAKE, text, prompt, toolSpecsOf(registry)) }
+        val frameFor = store?.let { frameBuilderFor(it, ContextRoute.WAKE, text, prompt, toolSpecsOf(registry)) }
         val run = try {
             val built = buildLoop(configured, registry, gateway)
             loop = built
@@ -1441,22 +1441,63 @@ class SmartAssistantPlugin(
      * The transcript's items are mapped back to segments with their roles preserved — tool rounds stay `TOOL_ROUND`, so
      * `TurnTrimmer`'s whole-turn boundary is still visible. No text is folded together here: that stays
      * `frameToTranscript`'s single job.
+     *
+     * ## The two items the flat transcript cannot attribute
+     *
+     * A `List<ModelHistoryItem>` carries no [SegmentOrigin], and two items need one that its text cannot supply:
+     * the store's **head summary** and the loop's **retry instruction**. Both are recovered from the store's own
+     * metadata and from position — never from what the text says, so no user content can be reclassified by its
+     * wording. The store answers the summary ([ConversationStore.headIsSummary], a summary is only ever at index 0),
+     * and the retry is the bare user text the loop appended **past** the store's pinned history (see [retryIndexIn]).
      */
     private fun frameBuilderFor(
+        store: ConversationStore,
         route: ContextRoute,
         userInput: String,
         prompt: PromptAssembly?,
         tools: List<ToolSpec>,
-    ): (List<ModelHistoryItem>) -> RequestFrame = { transcript ->
-        RequestFrame(
-            systemSegments = systemSlot(route, prompt),
-            conversationFlow = buildList {
-                addAll(transcript.map { it.toSegment() })
-                addAll(prompt?.memorySegments.orEmpty())
-                add(Segment(SegmentOrigin.USER_INPUT, trusted = true, text = userInput))
-            },
-            tools = tools,
-        )
+    ): (List<ModelHistoryItem>) -> RequestFrame {
+        // Where the store's items end: the utterance sits exactly here, and only the loop appends past it.
+        val pinnedCount = store.history().size
+        return { transcript ->
+            val retryIndex = retryIndexIn(transcript, pinnedCount)
+            RequestFrame(
+                systemSegments = systemSlot(route, prompt),
+                conversationFlow = buildList {
+                    transcript.forEachIndexed { index, item ->
+                        add(
+                            when {
+                                // A summary may occupy only the store's head, so index 0 is the only place this can be it.
+                                index == 0 && store.headIsSummary() ->
+                                    item.toSegment().copy(origin = SegmentOrigin.SUMMARY, trusted = false)
+                                index == retryIndex -> item.toSegment().copy(origin = SegmentOrigin.RETRY)
+                                else -> item.toSegment()
+                            },
+                        )
+                    }
+                    addAll(prompt?.memorySegments.orEmpty())
+                    add(Segment(SegmentOrigin.USER_INPUT, trusted = true, text = userInput))
+                },
+                tools = tools,
+            )
+        }
+    }
+
+    /**
+     * The index of the loop's retry instruction in [transcript], or `-1` when this request is not a retry continuation.
+     *
+     * Positional and store-relative, never textual. The loop appends at most one bare user text after this turn's
+     * utterance: its retry instruction. Everything at or before [pinnedCount] came from the store, and the utterance
+     * sits exactly at that index, so a user text that is **past** it *and* is the transcript's last item is the loop's
+     * own continuation — a loop-internal instruction, not the wearer speaking. An **earlier** retry is not selected:
+     * the model has already seen it, so it stays an ordinary user turn in the transcript, which is also what keeps the
+     * wire shape alternating.
+     */
+    private fun retryIndexIn(transcript: List<ModelHistoryItem>, pinnedCount: Int): Int {
+        val last = transcript.lastIndex
+        if (last <= pinnedCount) return -1
+        val item = transcript[last]
+        return if (item is ModelHistoryItem.Text && item.role == MessageRole.USER) last else -1
     }
 
     /** The system slot both frame paths share: instructions (with the SKILL section) plus the fixed memory policy. */

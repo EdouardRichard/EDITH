@@ -154,6 +154,18 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     @Synchronized
     fun lastRole(): SegmentRole? = items.lastOrNull()?.role
 
+    /**
+     * Whether the head item is this store's summary — answered from the stored [SegmentOrigin], never from the text.
+     *
+     * A summary may occupy only index 0 (see the class KDoc), so "is the head a summary" is the whole question a
+     * caller rebuilding a request from [history] has to ask: [history] returns the wire shape, which cannot carry
+     * attribution, and the head summary is the one item whose `SUMMARY` origin a flat list loses. A caller that
+     * answers it from the rendered [SummaryBoundary] instead would be classifying by text, which the boundary's own
+     * KDoc forbids.
+     */
+    @Synchronized
+    fun headIsSummary(): Boolean = items.firstOrNull()?.origin == SegmentOrigin.SUMMARY
+
     /** Whether the conversation currently ends on a user message with no assistant reply yet. */
     @Synchronized
     fun hasPendingUserTurn(): Boolean = lastRole() == SegmentRole.USER
