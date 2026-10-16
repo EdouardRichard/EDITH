@@ -23,14 +23,17 @@ import edith.plugin.ModelHistoryItem
  *
  * ## The summary invariant (the tests pin this)
  *
- * A `SUMMARY` item may appear **only at index 0**, and there is at most one. [appendSummary] lands a summary there,
- * so the "summary + turns" shape the compressor produces is a valid state and the summary survives until a *newer*
- * summary replaces it (the newer one takes index 0 and displaces the older to index 1). A summary that sits *after* a
- * turn is only reachable transiently, and only by appending turns after a summary landed: earlier turns then precede
- * it, so it has been superseded by the newer summary that covers them. It takes no part in whole-turn eviction, and
- * the next eviction removes it — [dropOldestTurns] or [removeOldestTurns], or any append other than the one that
- * landed it ([enforceEnvelope]) — which is why a non-head summary is never a lasting state. This is also why a
- * summary takes no part in whole-turn eviction: it is not a turn.
+ * A `SUMMARY` item may appear **only at index 0**, and there is at most one. Every public mutator maintains that
+ * atomically: [appendSummary] lands its summary at the head and removes every other `SUMMARY` **in the same call**, so
+ * the store can never be observed holding two summaries — the shape `[newer, older, turn, …]` does not exist, not even
+ * between two calls, and a frame built from [history] therefore can never relabel a stranded older summary as an
+ * assistant turn. A summary *after* a turn is consequently unreachable through this API; the sweep of non-head
+ * summaries in [enforceEnvelope] and [removeOldestTurns] remains as the fallback for any future path that introduces
+ * one. This is also why a summary takes no part in whole-turn eviction: it is not a turn.
+ *
+ * The landing append must not drop **its own** summary, and it must drop the previously superseded one. Both hold in
+ * the same call because the rule is positional: [dropSupersededSummaries] removes only a `SUMMARY` **past index 0**,
+ * and a freshly landed summary is at index 0.
  *
  * @param maxItems the maximum number of stored messages the envelope keeps. Defaults to [MAX_ITEMS],
  *   which equals `ConversationContext.MAX_MESSAGES`, so the default behaviour is unchanged.
@@ -88,12 +91,15 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
 
     /**
      * Inserts a compression-produced summary at the **head** (index 0) as a SUMMARY item trusted=false, with
-     * [SegmentRole.ASSISTANT]. The head is the only place the summary invariant allows (see the class KDoc): a
-     * summary *after* a turn is superseded and is removed at the next eviction, so appending one at the tail would
-     * let the very next append sweep the summary it had just landed — and "the summary is what lets the next turn
-     * start compacted" is the whole point of this cut. A head insert makes the lazy clause below harmless instead of
-     * fatal: a later summary lands at the head too, displacing the previous one to index 1, where the next eviction
-     * sweeps it.
+     * [SegmentRole.ASSISTANT], and removes every summary it supersedes **in the same call** (see the class KDoc). The
+     * head is the only position the invariant allows, so a summary inserted at the tail would be swept by the very
+     * next append while a head insert makes the "the summary is what lets the next turn start compacted" property
+     * hold. Supersession is atomic: a second compression can no longer be observed as `[newer, older, …]`, so a caller
+     * reading the store right after it sees exactly one summary, at the head.
+     *
+     * The removal cannot reach the summary just landed — that one is at index 0 and [dropSupersededSummaries] removes
+     * only items past index 0 — so the two requirements hold without a flag: the append that **creates** a summary
+     * never drops **its own** summary, while it does drop the previously superseded one.
      *
      * The boundary is rendered **here**, at the boundary of the store: the stored text is the bounded rendering, so
      * [history] and [snapshot] hand out the same bytes and the byte accounting of a request measures exactly what is
@@ -101,11 +107,7 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
      */
     @Synchronized
     fun appendSummary(text: String) =
-        insertAtHead(
-            ModelHistoryItem.Text(MessageRole.ASSISTANT, boundedBody(text)),
-            SegmentOrigin.SUMMARY,
-            SegmentRole.ASSISTANT,
-        )
+        insertSummaryAtHead(ModelHistoryItem.Text(MessageRole.ASSISTANT, boundedBody(text)))
 
     /**
      * Clears all existing items and replaces them with a single SUMMARY item (trusted=false).
@@ -157,11 +159,12 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     /**
      * Whether the head item is this store's summary — answered from the stored [SegmentOrigin], never from the text.
      *
-     * A summary may occupy only index 0 (see the class KDoc), so "is the head a summary" is the whole question a
-     * caller rebuilding a request from [history] has to ask: [history] returns the wire shape, which cannot carry
-     * attribution, and the head summary is the one item whose `SUMMARY` origin a flat list loses. A caller that
-     * answers it from the rendered [SummaryBoundary] instead would be classifying by text, which the boundary's own
-     * KDoc forbids.
+     * The store guarantees, after **every** public mutation, that a summary occupies only index 0 and that there is at
+     * most one (see the class KDoc: [appendSummary] replaces the previous summary in the same call rather than
+     * displacing it). "Is the head a summary" is therefore exactly the question a caller rebuilding a request from
+     * [history] has to ask: [history] returns the wire shape, which cannot carry attribution, and the head summary is
+     * the one item whose `SUMMARY` origin a flat list loses. A caller that answers it from the rendered
+     * [SummaryBoundary] instead would be classifying by text, which the boundary's own KDoc forbids.
      */
     @Synchronized
     fun headIsSummary(): Boolean = items.firstOrNull()?.origin == SegmentOrigin.SUMMARY
@@ -212,25 +215,30 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     }
 
     /**
-     * Inserts [item] at the head and enforces the envelope **without sweeping**, then evicts.
+     * Lands a summary at the head, removes every summary it supersedes, then enforces the envelope.
      *
-     * The lazy clause lives here, and only here: the insert that lands a summary must not drop it. On a head insert
-     * it cannot drop its own summary anyway — index 0 is the one position a summary is allowed to occupy — so the
-     * skipped sweep is harmless: it can only defer the removal of a *displaced* summary (index 1 after this insert)
-     * to the next append or eviction. Every other append goes through [add], which sweeps and evicts together
-     * ([enforceEnvelope]), so the summary invariant holds after every append.
+     * Replacement happens **inside this one call**: the item goes in, [dropSupersededSummaries] removes any other
+     * `SUMMARY` (the one this summary supersedes), and only then does [evictTurns] run. Appending without the removal
+     * would leave the store holding `[newer, older, …]` for a whole turn — long enough for the next turn's frame to
+     * render the older one as an assistant turn — so this is what makes the invariant hold after every append rather
+     * than lazily.
+     *
+     * The sweep runs **before** the eviction for the same reason [enforceEnvelope] does: a summary a later call would
+     * remove must not count toward the envelope and cost a turn its place. And it can never remove the item just
+     * inserted, which is at index 0, while the sweep only removes items past index 0.
      */
-    private fun insertAtHead(item: ModelHistoryItem, origin: SegmentOrigin, role: SegmentRole?) {
-        items.add(0, SessionItem(item, origin, role))
+    private fun insertSummaryAtHead(item: ModelHistoryItem) {
+        items.add(0, SessionItem(item, SegmentOrigin.SUMMARY, SegmentRole.ASSISTANT))
+        dropSupersededSummaries()
         evictTurns(maxItems)
     }
 
     /**
      * Appends [item] and enforces the envelope.
      *
-     * Every append except the one that lands a summary sweeps and evicts together ([enforceEnvelope]), so the
-     * summary invariant holds after every append. The exception is [appendSummary], which inserts at the head
-     * through [insertAtHead] and therefore sweeps nothing.
+     * Every append enforces the summary invariant together with the envelope. [add] does it through
+     * [enforceEnvelope]; [appendSummary] does it through [insertSummaryAtHead], which removes the summaries it
+     * supersedes in the same call and then evicts. Either way no append can leave two summaries behind.
      */
     private fun add(
         item: ModelHistoryItem,
@@ -246,10 +254,11 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
      * newer summary that covers the turns before it), then drop whole turns from the head. Returns the true
      * number of messages dropped — the superseded summaries plus the turn items.
      *
-     * **This and [removeOldestTurns] are the only places a superseded summary is removed.** The invariant is lazy:
-     * a non-head summary is *superseded* and is removed at an eviction — by [dropOldestTurns], by
-     * [removeOldestTurns], or by any other append — never by the append that landed it ([appendSummary] inserts at
-     * the head through [insertAtHead] and does not sweep; see its KDoc and [add]).
+     * **This, [removeOldestTurns] and [insertSummaryAtHead] are the only places a superseded summary is removed.** In
+     * the reachable state [appendSummary] has already removed it atomically (through [insertSummaryAtHead]); this sweep
+     * is the fallback that keeps the invariant true if a future path ever introduces a non-head summary. It is also why
+     * the invariant needs no flag: the sweep never touches index 0, so the summary that *is* current is never a
+     * candidate here.
      *
      * A summary is never evicted as a turn — it is not a turn. When the only remaining turn is the last user
      * turn, the envelope is allowed to overrun rather than empty the conversation, the same trade-off
@@ -263,6 +272,10 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     /**
      * Drops every SUMMARY that is not at index 0 and returns how many were removed. See the summary invariant
      * in the class KDoc.
+     *
+     * Called from [enforceEnvelope] and [removeOldestTurns] as the fallback sweep, and from [insertSummaryAtHead] as
+     * the atomic supersession itself. The lower bound is index 1, so a summary that was just landed at index 0 — the
+     * current one — is never a candidate.
      */
     private fun dropSupersededSummaries(): Int {
         var dropped = 0

@@ -1,6 +1,7 @@
 package edith.plugins.smart
 
 import edith.agent.ConversationStore
+import edith.agent.SegmentOrigin
 import edith.agent.SummaryBoundary
 import edith.contracts.AcousticEvent
 import edith.contracts.AcousticLabel
@@ -305,6 +306,59 @@ class StoreSessionWiringTest {
             "the store's bounded summary carries its boundary into the request: ${head.text}",
         )
         assertTrue(head.text.contains("旧问题"), "the summary must fold into the surviving user turn: ${head.text}")
+    }
+
+    /**
+     * The defect this test exists for: `appendSummary` used to merely insert at the head, so a **second** compression
+     * left the superseded summary stranded at index 1 (`[S_new, S_old, turns…]`) — a shape `ConversationStoreTest`
+     * pinned as legal and that is not swept until the next append, i.e. until the **end** of the next turn. The frame
+     * builder can attribute only index 0, so `S_old` came back as an assistant `TRANSCRIPT`; the leading fold then had
+     * no `USER` to ride and returned `null` ⇒ the turn after a second compression ended `FAILED`/`NO_USER_TURN`.
+     *
+     * Supersession is atomic now, so that shape cannot be observed at all — but only a turn driven from a
+     * twice-compressed store proves the turn is accepted, so the store is compressed twice here (through
+     * `appendSummary`, the operation a compression lands) with a turn in between.
+     *
+     * The assertion is on the request content and the completion, not on "no exception".
+     */
+    @Test
+    fun `a turn after a second compression reaches the model`() {
+        val stores = stores()
+        val rig = rig(stores)
+        // Seeded after activation: activation is the session boundary and empties the route's store.
+        stores.getValue(ContextRoute.WAKE).apply {
+            appendSummary("第一次压缩的摘要")
+            appendUser("第一次压缩之后的问题")
+            appendAssistant("第一次压缩之后的回答")
+            // A second compression lands: it supersedes the first summary in the same call.
+            appendSummary("第二次压缩的摘要")
+        }
+
+        val lines = withLines { captured -> rig.wakeAndFinal("现在几点了"); captured.toList() }
+
+        assertTrue(
+            lines.contains("P3_TURN end turn=asr-1 outcome=COMPLETED code=- steps=0"),
+            "a turn after a second compression must complete: $lines",
+        )
+        assertTrue(lines.none { it.contains("NO_USER_TURN") }, "a stranded summary must not defeat the turn: $lines")
+        // The transient two-summary state is unobservable: exactly one summary, at the head, before the request was built.
+        assertEquals(
+            1,
+            stores.getValue(ContextRoute.WAKE).snapshot().count { it.origin == SegmentOrigin.SUMMARY },
+            "the second compression must leave exactly one summary: ${stores.getValue(ContextRoute.WAKE).snapshot()}",
+        )
+        val sent = rig.model.requests.single()
+        val head = assertIs<ModelHistoryItem.Text>(
+            sent.history.firstOrNull(),
+            "the history must open on a user turn: ${sent.history}",
+        )
+        assertEquals(MessageRole.USER, head.role, "the history must open on the user turn: ${sent.history}")
+        assertTrue(head.text.contains("第二次压缩的摘要"), "the newer summary must reach the request: ${head.text}")
+        assertTrue(head.text.contains("第一次压缩之后的问题"), "the surviving older turn must fold in: ${head.text}")
+        assertTrue(
+            sent.history.none { it is ModelHistoryItem.Text && it.text.contains("第一次压缩的摘要") },
+            "the superseded summary must not be sent as an assistant turn: ${sent.history}",
+        )
     }
 
     /**

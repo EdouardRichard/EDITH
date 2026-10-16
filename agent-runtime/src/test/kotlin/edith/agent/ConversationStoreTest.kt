@@ -181,11 +181,11 @@ class ConversationStoreTest {
         assertTrue(store.snapshot().any { it.origin == SegmentOrigin.SUMMARY })
     }
 
-    @Test fun `a summary that is no longer at the head is superseded and dropped`() {
-        // 不变式：SUMMARY 只能在首位，且任何时刻最多一条。`appendSummary` 把摘要插到首位，所以**正常的
-        // append 序列不再能产生非首位摘要**：后来落地的摘要在首位，先落地的那条被挤到 index 1 —— 这（外加
-        // 一个紧随的回合，触发 `add` 的 sweep）是唯一合法的构造，也是本用例钉住的形状。移除它是 `add` 的
-        // sweep 的职责：删掉 `enforceEnvelope` 里的 `dropSupersededSummaries()`，压在 index 1 的旧摘要会留下。
+    @Test fun `a second summary replaces the first in the same call, leaving exactly one at the head`() {
+        // 不变式：SUMMARY 只能在首位，且任何时刻最多一条。本用例钉住**取代是原子的**：`appendSummary` 在**同一次
+        // 调用**里把被取代的旧摘要删掉，所以 `[新, 旧, …]` 这个中间态对任何观察者都不存在（第二次压缩后紧接着的
+        // 那一回合因此也不会拿到一条被错标成 assistant 回合的旧摘要）。变异：把 `insertSummaryAtHead` 里的
+        // `dropSupersededSummaries()` 变成 no-op，本例与 `StoreSessionWiringTest` 的「第二次压缩后那一回合」都会红。
         val store = ConversationStore()
         store.appendSummary("旧摘要")
 
@@ -194,8 +194,9 @@ class ConversationStoreTest {
 
         store.appendSummary("更新的摘要")
 
-        assertEquals(2, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY },
-            "旧摘要没有被删，只是被挤到 index 1（`appendSummary` 跳过自己的 sweep）")
+        // 被取代的旧摘要在**同一次 appendSummary** 里就没了 —— 不是"被挤到 index 1 等下一次 sweep"。
+        assertEquals(1, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY },
+            "两次压缩之间不能观察到两条摘要：${store.snapshot()}")
         assertEquals(SummaryBoundary.render("更新的摘要"), store.snapshot()[0].text,
             "首位是更新的那条")
 
@@ -213,6 +214,11 @@ class ConversationStoreTest {
         val store = ConversationStore()
         store.appendUser("u1"); store.appendAssistant("a1")
         store.appendSummary("摘要")
+
+        // 取代是同一次调用完成的（见上一个用例），所以"落地的那条摘要在自己的 append 里不被删掉"必须显式钉住：
+        // 任何"先删光所有摘要、再插入新的"或把 index 0 也算进 sweep 的写法都会在这里红。
+        assertEquals(1, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY },
+            "落地的摘要不能被**它自己那次** append 扫掉：${store.snapshot()}")
 
         val landed = store.snapshot()
         assertEquals(SegmentOrigin.SUMMARY, landed[0].origin, "落地的摘要必须在首位：$landed")
@@ -246,17 +252,17 @@ class ConversationStoreTest {
 
     // ---- Phase 5 review fixes ----
 
-    @Test fun `a superseded summary is removed by the sweep, never promoted to the head`() {
-        // 旧形状 `u1,a1,appendSummary(旧),u2,a2,appendSummary(新)` 在首位插入下不再产生非首位摘要 —— 实测
-        // （见 task-5 报告）：摘要落地后 append 回合，摘要仍在 index 0。所以"非首位摘要"只能由**更新的摘要
-        // 抢占首位**造出来，也只有那一次 append 会把它扫掉。这里由它后面的那个 append 触发。
+    @Test fun `two summaries cannot coexist, and the newer one is the only stored summary`() {
+        // **State re-derived after atomic supersession.** 旧前提（"两次 `appendSummary` 会留下一条 index 1 的摘要等
+        // sweep 删"）在原子取代下不复存在：第二次调用就删掉了第一次那条。所以这里钉住的判断是"较新的摘要是唯一的
+        // 幸存者，且它从落地起就在首位"—— 而不是"旧摘要曾经在 index 1 待过"。断言本身与原子化之前逐字相同。
         val store = ConversationStore()
         store.appendSummary("旧摘要")
         store.appendSummary("更新的摘要")
         store.appendUser("u2")
 
         val summaries = store.snapshot().filter { it.origin == SegmentOrigin.SUMMARY }
-        assertEquals(1, summaries.size, "被取代的摘要必须被 sweep 掉，不能留在表里：${store.snapshot()}")
+        assertEquals(1, summaries.size, "被取代的摘要必须被删除，不能留在表里：${store.snapshot()}")
         assertEquals(SummaryBoundary.render("更新的摘要"), summaries[0].text)
         assertEquals(listOf(SummaryBoundary.render("更新的摘要"), "u2"), texts(store))
     }
@@ -348,28 +354,33 @@ class ConversationStoreTest {
         assertEquals(listOf(SummaryBoundary.render("摘要"), "u2", "a2"), texts(store))
     }
 
-    @Test fun `removeOldestTurns also sweeps a superseded summary`() {
-        // **State re-derived after the head-insert fix.** The old premise ("a trailing summary is the shape
-        // `appendSummary` leaves behind") no longer exists: `appendSummary` inserts at index 0, and appending turns
-        // after it leaves it at index 0 too (probed). The reachable non-head shape is a summary **displaced by a
-        // newer one**, and there `removeOldestTurns`'s sweep is what removes it — with no user turn in the store the
-        // sweep is the sole remover, so the returned count of 1 is entirely the swept summary.
+    @Test fun `removeOldestTurns finds a single atomic summary and counts no turn`() {
+        // **State re-derived after atomic supersession.** 旧用例的前提（"两次 `appendSummary` 会留下一条 index 1 的
+        // 摘要，由 `removeOldestTurns` 的 sweep 移除并计入返回值"）随原子取代消失：第二次调用已删掉旧摘要。表里
+        // 只有摘要、没有回合，所以 count-based 移除什么都不该拿走、返回 0 —— 这保住了原来的判断"摘要不是回合，
+        // 两个方向都不计入"。为将来可能出现非首位摘要的路径保留的 sweep 仍在 `removeOldestTurns` 里（经公开 API
+        // 如今不可达）。
         val store = ConversationStore()
         store.appendSummary("旧摘要")
         store.appendSummary("更新的摘要")
 
         val removed = store.removeOldestTurns(1)
 
-        assertEquals(1, removed, "被取代的那条摘要由 sweep 移除，且计入返回条数")
+        assertEquals(0, removed, "只有一条摘要、没有回合：count-based 移除不该拿走任何东西")
         val survivors = store.snapshot().filter { it.origin == SegmentOrigin.SUMMARY }
         assertEquals(1, survivors.size, "留下的只能是更新的那条：${store.snapshot()}")
         assertEquals(SummaryBoundary.render("更新的摘要"), survivors[0].text)
         assertEquals(listOf(SummaryBoundary.render("更新的摘要")), texts(store))
     }
 
-    @Test fun `removeOldestTurns keeps the head summary and still counts a swept one`() {
+    @Test fun `removeOldestTurns keeps the head summary and counts only the turn items`() {
         // Contract-mandated shape: a head summary plus its turns, evicted by count. Its counterpart — the same call
-        // with a *displaced* summary present instead — is `removeOldestTurns also sweeps a superseded summary`.
+        // with only a summary present instead — is `removeOldestTurns finds a single atomic summary and counts no turn`.
+        // **Label re-derived after atomic supersession**: the count is the turn items alone, because there is no longer
+        // a displaced summary to sweep into it (the old name "still counts a swept one" asserted a mechanism that can
+        // no longer happen). The assertions are byte-identical, so the judgement — a head summary survives and is never
+        // counted as a turn — is preserved. Same body as `removeOldestTurns keeps a head summary and its turns` above;
+        // kept rather than merged, since existing cases may be reconciled but not deleted.
         val store = ConversationStore()
         store.appendSummary("摘要")
         store.appendUser("u1"); store.appendAssistant("a1")
