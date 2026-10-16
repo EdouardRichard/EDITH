@@ -205,6 +205,11 @@ class AgentLoop(
         guard.reset()
         humanWaitNanos = 0L
         val tools = registry.descriptors().map { ToolSpec(it.name, it.description, it.parametersJson) }
+        // Phase 3: TurnRunner owns request assembly. For now, the system slot carries only INSTRUCTIONS;
+        // memory evidence, perception, and conversation store will be wired in later phases.
+        val turnRunner = TurnRunner(
+            listOf(Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = request.instructions)),
+        )
         // The user's turn opens the history: the loop has no other channel to hand the model what was asked. When the
         // caller supplies a session transcript, this turn's utterance is appended to it rather than replacing it.
         val history = (request.history + ModelHistoryItem.Text(MessageRole.USER, request.utterance)).toMutableList()
@@ -219,11 +224,13 @@ class AgentLoop(
             if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "")
             if (clock.nowNanos() >= turnDeadlineNanos) return finish(AgentOutcome.DEADLINE, null, null, steps, history, "")
 
+            // Assemble the RequestFrame through TurnRunner; the gateway still receives a plain instructions string.
+            val frame = turnRunner.assemble(userInput = request.utterance, tools = tools)
             val reply = gateway.turn(
                 GatewayTurn(
                     request.turnId,
                     request.profileId,
-                    request.instructions,
+                    frame.systemText,
                     history.toList(),
                     tools,
                     // D49: the turn's budget and one request's cap are different numbers. A caller that supplies no cap
