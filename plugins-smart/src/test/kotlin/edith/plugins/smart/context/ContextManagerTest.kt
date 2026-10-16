@@ -1,7 +1,8 @@
 package edith.plugins.smart.context
 
 import edith.agent.MemoryRetrieval
-import edith.plugin.ContextPart
+import edith.agent.Segment
+import edith.agent.SegmentOrigin
 import edith.plugin.MessageRole
 import edith.plugin.ModelHistoryItem
 import edith.plugins.smart.skill.Skill
@@ -19,10 +20,10 @@ import kotlin.test.assertTrue
  */
 class ContextManagerTest {
 
-    private class RecordingMemory(private val parts: List<ContextPart> = emptyList()) : MemoryRetrieval {
+    private class RecordingMemory(private val parts: List<Segment> = emptyList()) : MemoryRetrieval {
         val queries = mutableListOf<String>()
         val limits = mutableListOf<Int>()
-        override fun retrieve(query: String, limit: Int): List<ContextPart> {
+        override fun retrieve(query: String, limit: Int): List<Segment> {
             queries += query
             limits += limit
             return parts
@@ -129,22 +130,22 @@ class ContextManagerTest {
     }
 
     @Test
-    fun `memory is retrieved with the user input and lands in the context`() {
-        val part = ContextPart("memory:1", "用户在淘宝买过手机壳", 3)
+    fun `memory is retrieved with the user input and lands in memorySegments`() {
+        val part = Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "用户在淘宝买过手机壳")
         val memory = RecordingMemory(listOf(part))
         val manager = ContextManager(memory = memory)
 
         val prompt = manager.buildPrompt(ContextRoute.WAKE, "上次买的什么壳")
 
         assertEquals(listOf("上次买的什么壳"), memory.queries)
-        assertEquals(listOf(part), prompt.context)
+        assertEquals(listOf(part), prompt.memorySegments)
     }
 
     @Test
     fun `a manager with no memory injects nothing and does not throw`() {
         val prompt = ContextManager().buildPrompt(ContextRoute.WAKE, "x")
 
-        assertEquals(emptyList(), prompt.context)
+        assertEquals(emptyList(), prompt.memorySegments)
     }
 
     @Test
@@ -167,7 +168,7 @@ class ContextManagerTest {
 
     @Test
     fun `estimated tokens cover the instructions the history and the context`() {
-        val manager = ContextManager(memory = RecordingMemory(listOf(ContextPart("m", "记忆", 1))))
+        val manager = ContextManager(memory = RecordingMemory(listOf(Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "记忆"))))
         manager.context(ContextRoute.WAKE).appendUser("一")
 
         val prompt = manager.buildPrompt(ContextRoute.WAKE, "二", skills = listOf(skill("a")))

@@ -22,7 +22,7 @@ class OpenAiChatCompletionsAdapterTest {
 
     private fun budgeted(input: List<InputPart> = listOf(InputPart.Text("hello"))) = BudgetedRequest(
         ModelRequest(EventEnvelope(SessionId("s"), Generation(1), "e", 0, 1),
-            "q", "t", "p1", 1, "instructions", input, emptyList(), emptyList(), OutputModality.TEXT, 100),
+            "q", "t", "p1", 1, "instructions", input, emptyList(), OutputModality.TEXT, 100),
         estimatedInputTokens = 10, removedIds = emptyList(), estimated = false)
 
     @Test fun `text only request has no input_audio part`() {

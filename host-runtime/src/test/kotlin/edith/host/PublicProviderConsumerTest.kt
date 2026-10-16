@@ -255,6 +255,6 @@ class PublicProviderConsumerTest {
         })
         fun envelope(g: Generation) = EventEnvelope(SessionId("s"), g, "e-${eventSequence++}", clock.nowNanos, clock.nowNanos)
         fun request(g: Generation) = ModelRequest(envelope(g), "r", "t", "dummy", 3, "dummy instructions",
-            listOf(InputPart.Text("dummy")), emptyList(), emptyList(), OutputModality.TEXT, 11_000_000_000)
+            listOf(InputPart.Text("dummy")), emptyList(), OutputModality.TEXT, 11_000_000_000)
     }
 }

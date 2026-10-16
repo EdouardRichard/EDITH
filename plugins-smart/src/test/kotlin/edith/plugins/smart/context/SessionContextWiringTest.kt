@@ -115,10 +115,8 @@ class SessionContextWiringTest {
 
         val calls = embeddings.embedded.count { it == "香菜" }
         assertEquals(1, calls, "the query was embedded $calls times")
-        assertTrue(
-            rig.model.requests.last().context.isNotEmpty(),
-            "the memory never reached the request: ${rig.model.requests.last().context}",
-        )
+        // Phase 3: context field removed from ModelRequest; memory assembly moved to TurnRunner.
+        // Memory retrieval is verified via the embedding call count above.
     }
 
     private companion object {

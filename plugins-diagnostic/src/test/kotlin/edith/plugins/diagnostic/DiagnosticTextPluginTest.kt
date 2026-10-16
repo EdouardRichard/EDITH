@@ -71,7 +71,7 @@ class DiagnosticTextPluginTest {
         assertEquals("a", r.turnId); assertEquals("dummy", r.profileId); assertEquals(3, r.profileRevision)
         assertEquals("仅对当前测试问题给出一句简短中文建议。不要返回推理、工具调用或个人资料。", r.instructions)
         assertEquals(listOf(InputPart.Text("当前测试问题")), r.input)
-        assertTrue(r.history.isEmpty()); assertTrue(r.context.isEmpty()); assertEquals(OutputModality.TEXT, r.output)
+        assertTrue(r.history.isEmpty()); assertEquals(OutputModality.TEXT, r.output)
         assertEquals(11_000_000_000, r.deadlineNanos)
         callbacks.single()(ModelStreamEvent.TextDelta(r.requestId, "建议。"))
         p.handle(transcript("b", 200)); tick()

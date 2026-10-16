@@ -1,6 +1,5 @@
 package edith.agent
 
-import edith.plugin.ContextPart
 import edith.plugin.MessageRole
 import edith.plugin.ModelHistoryItem
 import kotlin.test.Test
@@ -231,8 +230,11 @@ class ContextPlannerTest {
         )
     }
 
-    @Test fun `the retrieval boundary can be implemented and hands back context parts`() {
-        val parts = listOf(ContextPart("m1", "喜欢喝茶", 2), ContextPart("m2", "上午工作", 1))
+    @Test fun `the retrieval boundary can be implemented and hands back segments`() {
+        val parts = listOf(
+            Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "喜欢喝茶"),
+            Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "上午工作"),
+        )
         val retrieval: MemoryRetrieval = FakeMemoryRetrieval(parts)
 
         assertEquals(parts, retrieval.retrieve("preferences", 5))

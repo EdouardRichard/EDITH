@@ -33,12 +33,11 @@ class ContextBudgeterTest {
         assertEquals(history.takeLast(2), result.request.history)
     }
 
-    @Test fun `history is removed before context then lowest importance with original ties`() {
-        val context = listOf(ContextPart("high", "h".repeat(40), 10), ContextPart("low-a", "a".repeat(40), 1), ContextPart("low-b", "b".repeat(40), 1))
-        val request = required().copy(context = context, history = listOf(ModelHistoryItem.Text(MessageRole.USER, "old"), ModelHistoryItem.Text(MessageRole.ASSISTANT, "old")))
-        val result = budgeter.prepare(smallProfile(270), request)
-        assertEquals(listOf("history:0", "low-a", "low-b"), result.removedIds)
-        assertEquals(listOf(context[0]), result.request.context)
+    @Test fun `history is removed to fit within budget while preserving required input`() {
+        val request = required().copy(history = listOf(ModelHistoryItem.Text(MessageRole.USER, "u".repeat(100)), ModelHistoryItem.Text(MessageRole.ASSISTANT, "a".repeat(100))))
+        val result = budgeter.prepare(smallProfile(220), request)
+        assertEquals(listOf("history:0"), result.removedIds)
+        assertEquals(emptyList(), result.request.history)
         assertEquals(request.input, result.request.input)
     }
 
@@ -101,12 +100,10 @@ class ContextBudgeterTest {
     @Test fun `prepared request owns list snapshots`() {
         val input = mutableListOf<InputPart>(InputPart.Text("synthetic"))
         val history = mutableListOf<ModelHistoryItem>(ModelHistoryItem.Text(MessageRole.USER, "old"), ModelHistoryItem.Text(MessageRole.ASSISTANT, "reply"))
-        val context = mutableListOf(ContextPart("c", "data", 1))
-        val result = budgeter.prepare(profileFixture(), requestFixture(input).copy(history = history, context = context))
-        input.clear(); history.clear(); context.clear()
+        val result = budgeter.prepare(profileFixture(), requestFixture(input).copy(history = history))
+        input.clear(); history.clear()
         assertEquals(listOf(InputPart.Text("synthetic")), result.request.input)
         assertEquals(2, result.request.history.size)
-        assertEquals(listOf("c"), result.request.context.map { it.id })
     }
 
     @Test fun `tool exchange after an assistant text item is accepted`() {

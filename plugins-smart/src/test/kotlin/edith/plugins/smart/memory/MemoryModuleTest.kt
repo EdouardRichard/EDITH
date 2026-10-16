@@ -193,9 +193,9 @@ class MemoryModuleTest {
         val parts = module.injectionFor("香菜")
 
         val part = parts.single()
-        assertTrue(part.id.startsWith("memory:"), part.id)
+        assertEquals(edith.agent.SegmentOrigin.MEMORY_EVIDENCE, part.origin)
         assertEquals("我不吃香菜", part.text)
-        assertTrue(part.importance >= 0)
+        assertTrue(!part.trusted, "memory evidence must be untrusted")
     }
 
     @Test

@@ -113,7 +113,7 @@ class ProfileGateTest {
         val request = requestFixture(listOf(InputPart.Audio("local:dummy")))
         CapabilityGate().check(profile, request, support, consent, false)
         denied(profile, request, support, consent.copy(text = false))
-        for (textRequest in listOf(request.copy(context = listOf(ContextPart("c", "synthetic", 1))),
+        for (textRequest in listOf(
             request.copy(history = listOf(ModelHistoryItem.Text(MessageRole.USER, "synthetic"), ModelHistoryItem.Text(MessageRole.ASSISTANT, "reply"))))) {
             denied(profile, textRequest, support)
             val declaredText = profile.copy(inputs = setOf(InputModality.TEXT, InputModality.AUDIO))

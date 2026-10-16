@@ -46,10 +46,8 @@ class MemoryModuleRetrievalTest {
         val parts = MemoryModuleRetrieval(module, logger = {}).retrieve("香菜", 5)
 
         assertEquals(listOf("我不吃香菜"), parts.map { it.text })
-        assertTrue(
-            parts.all { it.id.startsWith("memory:") },
-            "every part must be namespaced: ${parts.map { it.id }}",
-        )
+        // Phase 3: Segment has no id field; namespace verification moved to MemoryModule internals
+        assertTrue(parts.all { it.origin == edith.agent.SegmentOrigin.MEMORY_EVIDENCE })
     }
 
     @Test

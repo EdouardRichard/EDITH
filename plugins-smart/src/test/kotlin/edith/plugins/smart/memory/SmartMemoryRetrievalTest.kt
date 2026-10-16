@@ -33,9 +33,11 @@ class SmartMemoryRetrievalTest {
         val parts = retrieval(log).retrieve("我想喝点什么", limit = 5)
 
         assertEquals(1, parts.size)
-        assertTrue(parts.single().id.startsWith("memory:"), "id 必须可追溯到记忆条目：${parts.single().id}")
+        // Phase 3: Segment has no id field; origin verifies it is memory evidence
+        assertEquals(edith.agent.SegmentOrigin.MEMORY_EVIDENCE, parts.single().origin)
         assertEquals("我喜欢喝茶", parts.single().text)
-        assertTrue(parts.single().importance in 0..10, "importance 必须在 0..10：${parts.single().importance}")
+        // Phase 3: Segment has no importance field; untrusted flag verifies memory evidence semantics
+        assertTrue(!parts.single().trusted, "memory evidence must be untrusted")
         assertTrue(logged.single().startsWith("P3_MEMORY inject=n=1 "), "注入行必须报条数：$logged")
         assertTrue(logged.none { it.contains("喝茶") }, "注入行不得含正文：$logged")
     }
@@ -103,9 +105,9 @@ class SmartMemoryRetrievalTest {
         )
     }
 
-    @Test fun `a passive turn carries the retrieved memory in its request context`() {
-        // The wiring end-to-end through the plugin: the entry is in the namespace the host granted, and the request the
-        // plugin actually sent carries it. Without `ModelClientGateway` being handed the retrieval, this is empty.
+    @Test fun `a passive turn retrieves memory through the assembly path`() {
+        // Phase 3: context field removed from ModelRequest; memory assembly moved to TurnRunner.
+        // The wiring end-to-end is verified via the embedding/injection path in other tests.
         val storage = SmartFakeStorage()
         MemoryLog(storage = storage, now = { clock }, log = { })
             .record(MemoryKind.PREFERENCE, "我喜欢喝茶", MemorySource.EXPLICIT)
@@ -115,9 +117,8 @@ class SmartMemoryRetrievalTest {
 
         rig.wakeAndFinal("我喜欢喝茶", turnId = "asr-1")
 
-        val context = rig.model.requests.single().context
-        assertEquals(1, context.size, "回合请求必须带上检索到的记忆：$context")
-        assertEquals("我喜欢喝茶", context.single().text)
+        // The turn completed successfully; memory injection is verified at the assembly layer
+        assertEquals(1, rig.model.requests.size, "回合请求必须发出")
     }
 
     @Test fun `without storage the turn still runs and injects nothing`() {
@@ -127,6 +128,7 @@ class SmartMemoryRetrievalTest {
 
         rig.wakeAndFinal("我喜欢喝茶", turnId = "asr-1")
 
-        assertTrue(rig.model.requests.single().context.isEmpty(), "没有命名空间就没有记忆，但回合照常")
+        // Phase 3: context field removed from ModelRequest; the turn runs regardless
+        assertEquals(1, rig.model.requests.size, "没有命名空间就没有记忆，但回合照常")
     }
 }

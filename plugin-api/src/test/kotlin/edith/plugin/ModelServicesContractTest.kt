@@ -41,7 +41,7 @@ class ModelServicesContractTest {
         val request = ModelRequest(EventEnvelope(SessionId("s"), Generation(0), "e", 0, 1),
             "q", "t", "p", 1, "private-instructions", listOf(InputPart.Text("private-input")),
             listOf(ModelHistoryItem.Text(MessageRole.USER, "private-history")),
-            listOf(ContextPart("c", "private-context", 1)), OutputModality.TEXT, 100)
+            OutputModality.TEXT, 100)
         assertFailsWith<IllegalArgumentException> { request.copy(requestId = "") }
         assertFailsWith<IllegalArgumentException> { request.copy(profileRevision = -1) }
         assertFailsWith<IllegalArgumentException> { request.copy(deadlineNanos = -1) }
@@ -50,7 +50,7 @@ class ModelServicesContractTest {
         // A history-only request is legal: the continuation of a stateless transcript after a tool round has no new
         // input of its own, and the transcript is the whole request.
         assertEquals(emptyList(), request.copy(input = emptyList()).input)
-        listOf(request.toString(), request.input.toString(), request.history.toString(), request.context.toString(),
+        listOf(request.toString(), request.input.toString(), request.history.toString(),
             ModelStreamEvent.TextDelta("q", "private-delta").toString()).forEach {
             assertFalse(it.contains("private-"))
         }

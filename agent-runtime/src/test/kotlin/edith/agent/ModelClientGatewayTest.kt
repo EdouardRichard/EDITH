@@ -48,19 +48,9 @@ class ModelClientGatewayTest {
     private fun gateway(
         client: edith.plugin.ModelClient,
         stop: () -> Boolean = { false },
-        memoryRetrieval: MemoryRetrieval? = null,
         audioParts: (() -> List<InputPart>)? = null,
     ) =
-        ModelClientGateway(client, { lookup(it) }, clock, scheduler, envelopeFor, stop, memoryRetrieval, audioParts)
-
-    /** A retrieval that records the query it was asked, so "what was memory asked about" is an assertion. */
-    private class RecordingRetrieval(private val parts: List<edith.plugin.ContextPart>) : MemoryRetrieval {
-        val queries = mutableListOf<String>()
-        override fun retrieve(query: String, limit: Int): List<edith.plugin.ContextPart> {
-            queries += query
-            return parts.take(limit)
-        }
-    }
+        ModelClientGateway(client, { lookup(it) }, clock, scheduler, envelopeFor, stop, audioParts)
 
     private fun turn(
         turnId: String = "turn-7",
@@ -155,57 +145,10 @@ class ModelClientGatewayTest {
         assertTrue(client.requests.isEmpty())
     }
 
-    // ------------------------------------------------------------ 2b. long-term memory (P3.4 §3.3)
-
-    @Test fun `retrieved memory becomes the request context and is asked about the in-flight user turn`() {
-        val client = scripted(ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null))
-        val retrieval = RecordingRetrieval(listOf(edith.plugin.ContextPart("memory:1", "喜欢喝茶", 7)))
-
-        gateway(client, memoryRetrieval = retrieval).turn(turn())
-
-        assertEquals(listOf(edith.plugin.ContextPart("memory:1", "喜欢喝茶", 7)), client.requests.single().context)
-        assertEquals(listOf("把音量调小一点"), retrieval.queries)
-    }
-
-    @Test fun `a continuation turn asks memory about the user turn already in its history`() {
-        // After a tool round the request has no `input`; the utterance memory must be matched against is the one the
-        // transcript still opens with, not an empty string (which would retrieve nothing at all).
-        val history = listOf(
-            ModelHistoryItem.Text(MessageRole.USER, "我的爱好是喝茶"),
-            ModelHistoryItem.Text(MessageRole.ASSISTANT, "calling"),
-            ModelHistoryItem.ToolCall("c1", "a", "{}"),
-            ModelHistoryItem.ToolOutput("c1", "done"),
-        )
-        val client = scripted(ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null))
-        val retrieval = RecordingRetrieval(emptyList())
-
-        gateway(client, memoryRetrieval = retrieval).turn(turn(history = history))
-
-        assertEquals(listOf("我的爱好是喝茶"), retrieval.queries)
-    }
-
-    @Test fun `without a retrieval the request context stays empty`() {
-        val client = scripted(ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null))
-
-        gateway(client).turn(turn())
-
-        assertTrue(client.requests.single().context.isEmpty())
-    }
-
-    @Test fun `a failing retrieval degrades to an empty context instead of failing the turn`() {
-        // Memory is an optimisation: nothing about it may take a turn down. The implementation owns its own honest
-        // logging of a storage failure; the gateway's job is only that the turn still happens.
-        val client = scripted(ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null))
-        val exploding = object : MemoryRetrieval {
-            override fun retrieve(query: String, limit: Int): List<edith.plugin.ContextPart> =
-                throw IllegalStateException("storage gone")
-        }
-
-        val reply = gateway(client, memoryRetrieval = exploding).turn(turn())
-
-        assertEquals(ModelEnd.COMPLETED, reply.terminal)
-        assertTrue(client.requests.single().context.isEmpty())
-    }
+    // ------------------------------------------------------------ 2b. long-term memory (Phase 3: moved to TurnRunner)
+    // Memory retrieval was removed from ModelClientGateway in Phase 3 (request assembly convergence).
+    // The gateway no longer retrieves memory itself; that responsibility moved to agent-runtime's TurnRunner.
+    // Tests for memory retrieval behavior now live in TurnRunner tests.
 
     // ------------------------------------------------------------ 3. one-to-one request mapping
 
@@ -224,7 +167,7 @@ class ModelClientGatewayTest {
         assertEquals(OutputModality.TEXT, request.output)
         assertEquals(4_242, request.deadlineNanos)
         assertEquals(tools, request.tools)
-        assertTrue(request.context.isEmpty(), "the loop folds context into instructions; the request carries none")
+        // Phase 3: context field removed from ModelRequest; memory assembly moved to TurnRunner
         assertEquals(listOf(Triple("turn-7", 0L, 0L)), envelopeCalls, "the request envelope is a point at the turn start")
         assertEquals(EventEnvelope(SessionId("session"), Generation(1), "turn-7", 0, 0), request.envelope)
     }

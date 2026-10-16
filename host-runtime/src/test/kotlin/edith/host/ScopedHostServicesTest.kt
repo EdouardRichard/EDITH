@@ -178,7 +178,7 @@ class ScopedHostServicesTest {
             Capability.Asr to asr, Capability.Speaker to speaker, Capability.TextOutput to output), FakeTaskScope())
         var delivered = 0
         val request = ModelRequest(envelope, "q", "t", "p", 1, "test", listOf(InputPart.Text("test")),
-            emptyList(), emptyList(), OutputModality.TEXT, 100)
+            emptyList(), OutputModality.TEXT, 100)
         services.model().request(request) { delivered++ }
         services.audio().listen { delivered++ }
         services.asr().listen { delivered++ }
