@@ -49,11 +49,133 @@ data class ShellResult(
      * to its error stream did answer, and its text is the command's diagnostics, not a channel failure.
      */
     val failure: ShellFailure? = null,
+    /**
+     * Whether **a rebind answered this call**: the call first could not reach the remote, the channel asked Shizuku to
+     * bind the same user service again, and the retry crossed (R-9 follow-up, item #2).
+     *
+     * A fact about the *path*, not about the reply's contents, so it stays separate from [failure] and [truncated]: a
+     * `relinked` reply is an ordinary reply that happens to have been carried by a connection this code brought back
+     * itself, and a rebind that did not restore the channel leaves this `false` so nothing downstream can read "it
+     * recovered" out of an unchanged failure. Appended last, so every existing positional construction keeps compiling.
+     */
+    val relinked: Boolean = false,
 )
 
 /** The privileged command channel: Shizuku's shell UID (or whatever runs commands as that UID in a test). */
 interface PrivilegedShell {
     fun run(command: String): ShellResult
+}
+
+/** Why the channel is (or is not) asking Shizuku to bind its user service again (R-9 follow-up, item #2). */
+enum class RelinkDecision {
+    /** The remote is there and this call did not just prove otherwise; nothing is rebound. */
+    READY,
+
+    /** The connection could not carry the call, Shizuku is alive and permission is granted: bind the same service again. */
+    REBIND,
+
+    /** The connection is down and Shizuku itself is unavailable or the grant is gone: there is nothing to bring back. */
+    NOT_USABLE,
+
+    /** A rebind was already tried inside the current window; wait rather than ask again. */
+    RATE_LIMITED,
+}
+
+/**
+ * The bounded "bring the channel back" decision (R-9 follow-up, item #2).
+ *
+ * **Why this exists.** A reply too large for the Binder transaction buffer kills the connection
+ * (`android.os.DeadObjectException`, measured on the K40). Recovery used to depend entirely on Shizuku's framework
+ * redelivering `onServiceConnected`: `bind()` was called exactly once at composition time, and `onServiceDisconnected`
+ * only cleared the remote. On the device the framework *did* redeliver (the immediately next call succeeded on the same
+ * remote pid), but nothing in this code excluded the case where it does not - and in that case the channel would stay
+ * dead for the rest of the process with no attempt to re-arm it. This class is that attempt, made deliberately small.
+ *
+ * **The refusals are the point, not the retry.** A rebind is attempted only when the call really could not reach the
+ * remote, Shizuku is still alive, permission is still granted, and no attempt was made inside [windowMillis]. So it
+ * cannot spin: a burst of commands inside one window costs exactly one bind, a dead Shizuku costs none, and a channel
+ * that is already usable costs none. Callers report an attempt with [decide], which is also the only way to record one.
+ *
+ * **It never creates a second connection.** Shizuku allows one `UserService` binding per app, so the only recovery this
+ * code has is asking Shizuku to bind *the same* args and *the same* `ServiceConnection` again - which is what
+ * `ShizukuUserServiceShell.bind` does, and which it is already documented as safe to call repeatedly.
+ *
+ * **Thread safety.** The three executors and the state parsers all call into one shell and a turn thread can interleave
+ * with the UI's probe, so the timestamp is an `AtomicLong` and [attempts] an `AtomicInteger`; every field read by a test
+ * is `@Volatile`. There is no lock and no scheduling: two racing callers can each be answered `REBIND` and each bind,
+ * which is a duplicate bind request - harmless and idempotent - never a second connection.
+ *
+ * **The clock is injected** so the window is testable on the JVM without sleeping. The default reads the monotonic
+ * clock, and only differences are ever compared.
+ */
+class RelinkGate(
+    /** How long the gate waits after a bind attempt before it is willing to ask again. */
+    val windowMillis: Long = DEFAULT_WINDOW_MILLIS,
+    private val elapsedMillis: () -> Long = { System.nanoTime() / 1_000_000L },
+) {
+
+    private val lastAttemptAt = java.util.concurrent.atomic.AtomicLong(Long.MIN_VALUE)
+    private val attemptCount = java.util.concurrent.atomic.AtomicInteger(0)
+
+    /** How many binds this gate has asked for; a test reads it to tell "bounded" from "on every call". */
+    val attempts: Int get() = attemptCount.get()
+
+    /** The last answer [decide] gave, or `null` before the first call. The "which path answered" a caller can read. */
+    @Volatile
+    var lastDecision: RelinkDecision? = null
+        private set
+
+    /** Whether this gate has ever asked for a bind: `true` after the first `REBIND`, never reset. */
+    val remoteMissing: Boolean get() = attemptCount.get() > 0
+
+    /**
+     * Decides the path for one call, and **records an attempt when the answer is [RelinkDecision.REBIND]**.
+     *
+     * The recording lives here rather than in a separate `attempt()` on purpose: a caller that could record an attempt
+     * without a matching `REBIND` could spend the window on a refusal, and a `RATE_LIMITED` caller that recorded anyway
+     * would make "bounded" a comment instead of a property. With one entry point, boundedness is not something a caller
+     * has to remember.
+     *
+     * `remoteReady` is the shell's own "a remote reference is present"; `shizukuUsable` its own "Shizuku is alive and
+     * granted". `connectionKnownDead` is the third fact only the caller has: a carrier failure proves the connection did
+     * not deliver **this** call, and a binder that dies does not necessarily clear the remote reference until the
+     * framework's `onServiceDisconnected` arrives. Without it, a call that just died would be told `READY` and the
+     * recovery would never run - the whole point of item #2.
+     */
+    fun decide(
+        remoteReady: Boolean,
+        shizukuUsable: Boolean,
+        connectionKnownDead: Boolean = false,
+    ): RelinkDecision {
+        val decision = when {
+            connectionKnownDead || !remoteReady -> when {
+                !shizukuUsable -> RelinkDecision.NOT_USABLE
+                !windowElapsed() -> RelinkDecision.RATE_LIMITED
+                else -> RelinkDecision.REBIND
+            }
+            else -> RelinkDecision.READY
+        }
+        if (decision == RelinkDecision.REBIND) {
+            attemptCount.incrementAndGet()
+            lastAttemptAt.set(elapsedMillis())
+        }
+        lastDecision = decision
+        return decision
+    }
+
+    private fun windowElapsed(): Boolean {
+        val last = lastAttemptAt.get()
+        return last == Long.MIN_VALUE || elapsedMillis() - last >= windowMillis
+    }
+
+    private companion object {
+        /**
+         * The K40's measured recovery latency is well under a second (the framework redelivered between two calls ~1 s
+         * apart), but the window is deliberately far longer than that: its job is to bound a *failed* attempt, and a
+         * recovery that the framework performs anyway must not turn every command in a turn into another bind request.
+         */
+        const val DEFAULT_WINDOW_MILLIS = 3_000L
+    }
 }
 
 /** The marker the privileged shell uses when it cannot parse its own reply (see `ShellReply`). */
@@ -119,40 +241,56 @@ internal fun carrierCodeFor(thrown: Throwable): String {
  * was never at risk, because every failure code reports `exitCode = -1` and empty `stdout`, so no success test can pass;
  * what was wrong was the reason, and the reason is what the model acts on.
  *
- * This is exactly [ShellResult.failure] `== null`, and deliberately **not** [isAStateReply]: a command that answered with
- * a non-empty `stderr` *did* answer, and its diagnostics are the command's business rather than a channel failure. The
- * empty-`stderr` half of [isAStateReply] is a **stronger** requirement that only the stdout parsers
- * (`installed`/`disabled`/`permissionGranted`, which read an absence as "the target is not there") need, so folding the
- * two together here would either reopen that hole or start calling a completed command a dead channel.
+ * This is exactly [ShellResult.failure] `== null`, and deliberately **not** [isReadableState]: a command that answered
+ * with a non-empty `stderr` *did* answer, and its diagnostics are the command's business rather than a channel failure.
+ * A stdout parser needs more than "the call came back" - [isReadableState] adds "the command completed" and "the payload
+ * was not clipped" - so folding the two together here would either open that hole or start calling a completed command a
+ * dead channel.
  */
 internal fun ShellResult.isCallComplete(): Boolean = failure == null
 
 /**
- * False when the shell itself reported a failure: a state read that **failed**, not an answer about the target.
+ * The channel reported no failure: the bytes crossed and the payload parsed. **Not** yet a state read.
  *
- * A reply is a state reply only when the channel reported **no** failure, i.e. [ShellResult.failure] is `null` **and**
- * `stderr` is empty.
+ * This is [ShellResult.failure] `== null`, and nothing else. It used to also require an empty `stderr`, and that extra
+ * half was open item #4: a successful command (`exit 0`) that wrote a warning to its error stream was judged unreadable,
+ * so `installed`/`disabled`/`permissionGranted` answered `false` and the backend reported "the action did not take
+ * effect" for an action whose state it had in fact just read - failing closed, but with the wrong reason.
  *
- * Why the empty-`stderr` half is a whitelist rather than a list of known-bad codes: `isAStateReply()` used to be
- * `stderr != SHELL_REPLY_INVALID && stderr != SHELL_REPLY_TOO_LARGE`, which made `SHELL_NOT_BOUND` - and any code added
- * later, or written by a newer shell - read as a successful state reply with an empty `stdout`. `installed()` then
- * answered `false` for a target nobody ever asked about, and the backend reported "the action did not take" for an
- * action that was never attempted. A blacklist cannot exclude a code it has never seen, so the rule is stated the other
- * way round.
- *
- * The strict half costs little measured. What the K40 probe's `stderrBytes=0` records actually cover is its **control
- * command**, `settings get system screen_brightness` (3 stdout bytes, 0 stderr bytes), plus the `yes a | head -c N` arms
- * (evidence §2.3/§2.4/§8.3); `settings get` is one of the three shapes below. The empty-`stderr` property for the three
- * state commands this build issues - `pm list packages`, `dumpsys package <pkg>` and `settings get` - is pinned on the
- * JVM (`ShellStateReadabilityTest`, `ShellReplyCapTest`), **not yet device-measured**: the probe never ran those three,
- * and it never ran a command whose `stderr` was non-empty and whose stdout still parsed.
- * A read whose `stderr` is non-empty therefore describes a read the channel or the command disturbed, and treating it as
- * unreadable means the backend refuses instead of judging the action from a reply it cannot fully account for.
- *
- * `isCallComplete() && stderr.isEmpty()`, spelled through the shared predicate so the "the call came back" half has one
- * definition; the semantics are unchanged and the extra `stderr` half stays where it is.
+ * It is deliberately **not** the predicate a state parser may use either. What a stdout parser needs is
+ * [isReadableState], which adds the two facts that make a reply an *answer about the target*: the command completed
+ * (`exitCode == 0`) and the payload was not cut short. Keeping this function is what lets [ShellCallCompletionTest] and
+ * the executors state "this call came back" without repeating the state-read rule; it must never be used to judge a
+ * target.
  */
-internal fun ShellResult.isAStateReply(): Boolean = isCallComplete() && stderr.isEmpty()
+internal fun ShellResult.isAStateReply(): Boolean = isCallComplete()
+
+/**
+ * Whether a **state read** may be judged from this reply (R-9 follow-up, item #4).
+ *
+ * A reply is a readable state read when all three hold:
+ * - **the channel reported no failure** ([isCallComplete]) - so `SHELL_NOT_BOUND`, the carrier code, a parse failure, and
+ *   any code a newer shell invents are all refused. This is the half that a blacklist could not express, and it is kept
+ *   exactly as it was;
+ * - **the command completed**: `exitCode == 0`. The device's own completion signal, and the part that replaced the
+ *   empty-`stderr` half. Measured (K40 `2696813b`, this build, `DebugShellCapProbe`): over 3 turns and five targets,
+ *   **52 `exit 0` reads of the three state commands produced non-empty `stderr` 0 times** (`stdoutBytes` 30 … 328 983,
+ *   `code=none`, `truncated=false` throughout), so on the one device this App targets the old whitelist was never
+ *   *needed* - and every non-empty-`stderr` row observed (`exit -1`, `stderrBytes` 21, `code=SHELL_REPLY_TOO_LARGE`) was
+ *   a carrier failure whose 21-byte `stderr` is the marker string itself, which the failure-kind half already refuses.
+ *   A non-zero exit with an *empty* `stderr` was observed too (a hand-typed invalid argument to `dumpsys`), and the old
+ *   predicate read it as a confident answer - the dangerous direction this half closes;
+ * - **the payload was not cut short** (`!truncated`). A clipped `stdout` is a prefix, and the clipped tail is exactly
+ *   where a `package:` line goes - so an unread prefix would answer `false` for a package that is present, and the
+ *   backend would judge that as "the action did not take". A *decoded* reply that hit the cap is a successful parse, so
+ *   only this flag distinguishes it from a whole one.
+ *
+ * **Every parser goes through this.** `installed`, `disabled`, `permissionGranted` and `setting` all read through
+ * `ShizukuTargetState.read`, which answers nothing unless this is true, and [TargetState.readable] reports the same
+ * answer for the same read - so the refusal the backend reports and the answer a parser gives cannot disagree.
+ */
+internal fun ShellResult.isReadableState(): Boolean =
+    isCallComplete() && exitCode == 0 && !truncated
 
 /**
  * What the device actually looks like after a command, which is the only thing that may be read as success.

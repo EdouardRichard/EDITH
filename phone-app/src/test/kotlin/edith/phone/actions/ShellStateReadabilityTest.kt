@@ -15,6 +15,10 @@ import org.junit.Test
  *
  * Each case is built by hand here, which is the point: the rule must hold for a code the fake invented, so the
  * implementation cannot be a test for the codes someone remembered to list.
+ *
+ * The predicate these cases drive is `isReadableState()` (open item #4), which asks the completion half *and* the exit
+ * code *and* the truncation flag. `isAStateReply()` is only the completion half and deliberately says nothing about a
+ * target, so it is never the predicate a state probe may judge from.
  */
 class ShellStateReadabilityTest {
 
@@ -25,7 +29,7 @@ class ShellStateReadabilityTest {
     @Test
     fun `SHELL_NOT_BOUND is not a state reply, so a dead channel is not read as an answer`() {
         val notBound = ShellResult("pm list packages com.example", -1, "", "SHELL_NOT_BOUND")
-        assertFalse("a channel that is not bound did not answer anything", notBound.isAStateReply())
+        assertFalse("a channel that is not bound did not answer anything", notBound.isReadableState())
     }
 
     @Test
@@ -52,7 +56,7 @@ class ShellStateReadabilityTest {
         // build happens to know": otherwise a future code - or a code from a newer shell - is silently read as a state
         // reply with empty stdout, which is the same defect in a new costume.
         val unknown = ShellResult("pm list packages com.example", -1, "", "SHELL_FROM_A_NEWER_BUILD")
-        assertFalse(unknown.isAStateReply())
+        assertFalse(unknown.isReadableState())
 
         val state = ShizukuTargetState(FixedShell(unknown))
         assertFalse(state.installed("com.example"))
@@ -63,6 +67,6 @@ class ShellStateReadabilityTest {
     fun `a genuinely empty stderr is still a state reply`() {
         // The inversion's other side: a command whose stderr is empty did answer, even when it answered nothing at all.
         val empty = ShellResult("pm list packages com.example", 0, "", "")
-        assertTrue(empty.isAStateReply())
+        assertTrue(empty.isReadableState())
     }
 }

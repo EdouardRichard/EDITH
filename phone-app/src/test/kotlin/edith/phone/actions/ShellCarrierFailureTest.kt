@@ -6,7 +6,6 @@ import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
-
 /**
  * R-9's distinction at the boundary that actually broke on the device: **"the channel could not carry the reply"**
  * versus **"this build could not parse it"**.
@@ -72,23 +71,25 @@ class ShellCarrierFailureTest {
     }
 
     @Test
-    fun `a successful reply that wrote to stderr is refused as a state read`() {
-        // R-9 close-out review: the whole point of the whitelist is the *dangerous* direction - a reply that arrived,
-        // parsed, exited 0 and would therefore look like an answer, but whose `stderr` the command also wrote to.
-        // `installed` would read the empty stdout as "the package is not there" and the backend would report "the
-        // action did not take" for an action that may well have taken. The reply carries no `failure` kind (the bytes
-        // crossed the channel and were understood), so only the empty-`stderr` half can refuse it, and the probe must
-        // report the read as unreadable rather than answer.
-        val noisy = ShellResult("pm list packages com.example", 0, "", "Warning: activity not started")
+    fun `a successful reply that wrote to stderr is still read, because exit 0 is the completion signal`() {
+        // R-9 follow-up, open item #4. This test used to pin the opposite, and the device round is what settled it:
+        // across 3 turns and five targets, 52 `exit 0` reads of the three state commands produced non-empty `stderr`
+        // 0 times, so the empty-`stderr` half of the old whitelist was never *needed* on this device - while the only
+        // non-empty-`stderr` rows seen (`exit -1`, `stderrBytes` 21) were carrier failures the failure kind already
+        // refuses. Keying on `stderr` therefore bought nothing and cost the wrong reason: a benign warning made
+        // `installed` answer `false` and the backend report "the action did not take" for an action whose state it had
+        // just read. The predicate is now the failure kind **plus the exit code** (and `truncated`), which keeps the
+        // dangerous direction safe: see `ShellStateReadPredicateTest` for the non-zero-exit and clipped-payload refusals.
+        val noisy = ShellResult("pm list packages com.example", 0, "package:com.example\n", "Warning: deprecated flag")
         assertNull("the reply crossed the channel and was understood, so it carries no failure kind", noisy.failure)
-        assertFalse("a non-empty stderr is not a state reply, even on exit 0", noisy.isAStateReply())
+        assertTrue("an exit 0 command's diagnostics do not unmake its answer", noisy.isReadableState())
 
         val state = ShizukuTargetState(
             object : PrivilegedShell {
                 override fun run(command: String): ShellResult = noisy.copy(command = command)
             },
         )
-        assertFalse("an unreadable reply must not be judged as 'the package is gone'", state.installed("com.example"))
-        assertFalse("the read must be reported unreadable so the backend refuses instead of judging", state.readable())
+        assertTrue("the parser reads the state the command actually reported", state.installed("com.example"))
+        assertTrue("and the read is readable, so nothing is reported as 'did not take effect'", state.readable())
     }
 }

@@ -33,11 +33,13 @@ import edith.phone.actions.ShellResult
  * **What it logs, and what it must never log.** One line per phase: the channel's own readiness, then `start`, then
  * `end` carrying the fixed [EXTRA_LABEL] identity, the exit code, `stdout`/`stderr` **byte counts**, the `truncated`
  * flag, the channel's own failure code (`code=`), the production branch that produced it (`arm=`), the raising
- * exception's **class name** when the failure is a carrier one (`throwable=`), and the elapsed milliseconds. The command
- * itself and the reply's text are **never** printed: a reply may carry logcat lines, i.e. anything at all, and this is
- * the same rule the other debug instruments follow. The label is sanitised to `[A-Za-z0-9_-]` and bounded, so it cannot
- * become a channel for text either, and the throwable field is a class name - never a message, which could quote a
- * command.
+ * exception's **class name** when the failure is a carrier one (`throwable=`), the branch of `run` that answered this
+ * call (`answer=` - `direct`/`rebound`/`failed`/`rate_limited`/`not_usable`, R-9 follow-up item #2), whether a rebind
+ * is what answered it (`relinked=`), and the elapsed milliseconds. The command itself and the reply's text are
+ * **never** printed: a reply may carry logcat lines, i.e. anything at all, and
+ * this is the same rule the other debug instruments follow. The label is sanitised to `[A-Za-z0-9_-]` and bounded, so
+ * it cannot become a channel for text either, and the throwable field is a class name - never a message, which could
+ * quote a command. `answer=` and `relinked=` are bounded enum-derived words and a boolean, so they cannot carry text.
  *
  * **"Did it return at all"** is read off the two lines: `start` is written *before* the binder call and `end` only after
  * it returned, so a `start` with no `end` is a call that never came back - the deadlock this instrument exists to look
@@ -103,7 +105,7 @@ class DebugShellCapProbe : BroadcastReceiver() {
                 "stdoutBytes=${utf8Bytes(reply.stdout)} stderrBytes=${utf8Bytes(reply.stderr)} " +
                 "truncated=${reply.truncated} code=$code arm=$arm " +
                 "throwable=${if (reply.failure == ShellFailure.CARRIER) shell.lastCarrierThrowable ?: NONE else NONE} " +
-                "elapsedMs=$elapsedMs",
+                "answer=${shell.lastAnswerPath} relinked=${reply.relinked} elapsedMs=$elapsedMs",
         )
     }
 
