@@ -27,7 +27,7 @@ import edith.plugin.ModelHistoryItem
  * summary; the next append is a new user turn, so in "summary + turns" the summary covers every turn
  * before it and must be kept. A summary that sits *after* a turn means earlier turns still precede it,
  * so it has been superseded by a newer summary: it takes no part in whole-turn eviction, and eviction
- * removes it — by [dropOldestTurns], or by any append other than the one that created it
+ * removes it — by [dropOldestTurns] or [removeOldestTurns], or by any append other than the one that created it
  * ([enforceEnvelope]). This is also why a summary takes no part in whole-turn eviction: it is not a turn.
  *
  * @param maxItems the maximum number of stored messages the envelope keeps. Defaults to [MAX_ITEMS],
@@ -93,9 +93,9 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
      *
      * **The append that creates a summary never drops it.** Appending a summary that ends up *after* a turn
      * makes it a superseded summary, but this method only appends and skips the sweep: the removal is a
-     * consequence of the summary invariant and happens at the next eviction — [dropOldestTurns], or any later
-     * append (see [enforceEnvelope]). A non-head summary is therefore transiently visible through [snapshot]
-     * and [history] until that next eviction, and never after the append that created it.
+     * consequence of the summary invariant and happens at the next eviction — [dropOldestTurns] or
+     * [removeOldestTurns], or any later append (see [enforceEnvelope]). A non-head summary is therefore transiently
+     * visible through [snapshot] and [history] until that next eviction, and never after the append that created it.
      */
     @Synchronized
     fun appendSummary(text: String) =
@@ -161,12 +161,42 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
      * Drops the oldest whole turns until `size <= maxItems`, and returns the number of messages dropped —
      * the superseded summaries removed by the sweep plus the turn items evicted.
      *
+     * The parameter is a **target size**, not a count: `dropOldestTurns(1)` on a five-message store leaves one
+     * message, not one turn fewer. Use [removeOldestTurns] when the caller knows how many **turns** to give up.
+     *
      * A whole turn is one user message plus the assistant/tool round it produced; a tool round is never
      * orphaned from the turn that caused it. The **last** user turn is never dropped — and because a turn
      * is dropped whole, a drop that would remove the last user turn never begins.
      */
     @Synchronized
     fun dropOldestTurns(maxItems: Int): Int = enforceEnvelope(maxItems)
+
+    /**
+     * Removes exactly [count] oldest whole turns and returns the number of messages that left — the superseded
+     * summaries removed by the sweep plus the turn items. Unlike [dropOldestTurns], whose parameter is a **target
+     * size**, [count] is a **number of turns**: one turn dropped from `[u1, a1, u2, a2, u3]` leaves
+     * `[u2, a2, u3]`, three messages, not one.
+     *
+     * The turn boundary is the same one [dropOldestTurns] uses (both go through [dropLeadingTurn]), so a tool round
+     * is never orphaned from its turn. The **last** user turn is never removed: a [count] larger than the number of
+     * droppable turns removes what it can and reports the true figure rather than failing.
+     *
+     * A non-positive [count] changes nothing and returns 0.
+     */
+    @Synchronized
+    fun removeOldestTurns(count: Int): Int {
+        if (count <= 0) return 0
+        val superseded = dropSupersededSummaries()
+        var dropped = 0
+        var remaining = count
+        while (remaining > 0) {
+            val gone = dropLeadingTurn()
+            if (gone == 0) break
+            dropped += gone
+            remaining--
+        }
+        return superseded + dropped
+    }
 
     /**
      * Appends [item] and enforces the envelope.
@@ -191,9 +221,10 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
      * newer summary that covers the turns before it), then drop whole turns from the head. Returns the true
      * number of messages dropped — the superseded summaries plus the turn items.
      *
-     * **This is the only place a superseded summary is removed.** The invariant is lazy: a non-head summary is
-     * *superseded* and is removed here — by [dropOldestTurns] or by any other append — never by the append
-     * that created it ([appendSummary] passes `sweepSuperseded = false`; see its KDoc and [add]).
+     * **This and [removeOldestTurns] are the only places a superseded summary is removed.** The invariant is lazy:
+     * a non-head summary is *superseded* and is removed at an eviction — by [dropOldestTurns], by
+     * [removeOldestTurns], or by any other append — never by the append that created it ([appendSummary] passes
+     * `sweepSuperseded = false`; see its KDoc and [add]).
      *
      * A summary is never evicted as a turn — it is not a turn. When the only remaining turn is the last user
      * turn, the envelope is allowed to overrun rather than empty the conversation, the same trade-off
@@ -225,12 +256,24 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     private fun evictTurns(target: Int): Int {
         var dropped = 0
         while (items.size > target) {
-            val start = turnStart(0) ?: break
-            val next = turnStart(start + 1) ?: break
-            dropped += next - start
-            repeat(next - start) { items.removeAt(start) }
+            val gone = dropLeadingTurn()
+            if (gone == 0) break
+            dropped += gone
         }
         return dropped
+    }
+
+    /**
+     * Removes the oldest whole turn — its user message plus every message up to the next one — and returns how many
+     * messages it gave up. Returns 0 and removes nothing when there is no turn left to give: either no user message
+     * remains, or only the **last** user turn does. This is the one turn-boundary routine [evictTurns] (for
+     * [dropOldestTurns]) and [removeOldestTurns] share, so the two can never disagree about where a turn ends.
+     */
+    private fun dropLeadingTurn(): Int {
+        val start = turnStart(0) ?: return 0
+        val next = turnStart(start + 1) ?: return 0
+        repeat(next - start) { items.removeAt(start) }
+        return next - start
     }
 
     /** The index of the first user message at or after [index], or `null` when there is none. */

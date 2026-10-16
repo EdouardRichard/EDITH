@@ -236,4 +236,103 @@ class ConversationStoreTest {
             "append 触发的淘汰必须同时 sweep，不能把被取代的摘要留成首位")
         assertEquals(3, store.size())
     }
+
+    // ---- Phase 5 Task 5 review fixes: count-based removal ----
+
+    /** The text shape of a store, for the assertions below. */
+    private fun texts(store: ConversationStore): List<String> =
+        store.history().filterIsInstance<ModelHistoryItem.Text>().map { it.text }
+
+    /** Two finished turns plus a pending third: the shape a compressor meets at a turn's end. */
+    private fun threeTurnStore(): ConversationStore = ConversationStore().also {
+        it.appendUser("u1"); it.appendAssistant("a1")
+        it.appendUser("u2"); it.appendAssistant("a2")
+        it.appendUser("u3")
+    }
+
+    @Test fun `removeOldestTurns drops exactly the requested count of whole turns`() {
+        val store = threeTurnStore()
+
+        val removed = store.removeOldestTurns(1)
+
+        assertEquals(2, removed, "one whole turn is two items")
+        assertEquals(listOf("u2", "a2", "u3"), texts(store))
+    }
+
+    @Test fun `removeOldestTurns is a count, not a target size`() {
+        // The distinction this method exists for: `dropOldestTurns(1)` means "until size <= 1" and leaves one
+        // message; `removeOldestTurns(1)` means "exactly one turn" and leaves three. Passing a count to the former
+        // over-compacts, and over-compaction is what silently loses messages that were never written to memory.
+        val bySize = threeTurnStore()
+        val byCount = threeTurnStore()
+
+        assertEquals(4, bySize.dropOldestTurns(1))
+        assertEquals(listOf("u3"), texts(bySize))
+
+        assertEquals(2, byCount.removeOldestTurns(1))
+        assertEquals(listOf("u2", "a2", "u3"), texts(byCount))
+    }
+
+    @Test fun `removeOldestTurns never drops the last user turn`() {
+        val store = threeTurnStore()
+
+        val removed = store.removeOldestTurns(99)
+
+        assertEquals(4, removed, "only the two turns before the pending one may go")
+        assertEquals(listOf("u3"), texts(store))
+    }
+
+    @Test fun `removeOldestTurns of zero changes nothing`() {
+        val store = threeTurnStore()
+
+        assertEquals(0, store.removeOldestTurns(0))
+        assertEquals(5, store.size())
+        assertEquals(listOf("u1", "a1", "u2", "a2", "u3"), texts(store))
+    }
+
+    @Test fun `removeOldestTurns takes a tool round with its turn`() {
+        val store = ConversationStore()
+        store.appendUser("u1"); store.appendAssistant("a1")
+        store.appendToolCall("c1", "t", "{}"); store.appendToolOutput("c1", "x")
+        store.appendUser("u2"); store.appendAssistant("a2")
+
+        val removed = store.removeOldestTurns(1)
+
+        assertEquals(4, removed)
+        assertEquals(0, store.history().count { it is ModelHistoryItem.ToolCall })
+        assertEquals(0, store.history().count { it is ModelHistoryItem.ToolOutput })
+        assertEquals(MessageRole.USER, (store.history().first() as ModelHistoryItem.Text).role)
+        assertEquals(listOf("u2", "a2"), texts(store))
+    }
+
+    @Test fun `removeOldestTurns keeps a head summary and its turns`() {
+        val store = ConversationStore()
+        store.appendSummary("摘要")
+        store.appendUser("u1"); store.appendAssistant("a1")
+        store.appendUser("u2"); store.appendAssistant("a2")
+
+        val removed = store.removeOldestTurns(1)
+
+        assertEquals(2, removed)
+        assertTrue(store.snapshot().any { it.origin == SegmentOrigin.SUMMARY })
+        // `texts()` would see the summary too: it is a Text item. Only the transcript turns moved.
+        val transcript = store.snapshot().filter { it.origin == SegmentOrigin.TRANSCRIPT }.map { it.text }
+        assertEquals(listOf("u2", "a2"), transcript)
+    }
+
+    @Test fun `removeOldestTurns also sweeps a superseded summary`() {
+        // A trailing summary is the shape `appendSummary` leaves behind (it never sweeps its own summary), and a
+        // non-head summary must not survive an eviction (the class's summary invariant). The sweep counts toward
+        // the returned removal just as it does for `dropOldestTurns`.
+        val store = ConversationStore()
+        store.appendUser("u1"); store.appendAssistant("a1")
+        store.appendUser("u2"); store.appendAssistant("a2")
+        store.appendSummary("旧摘要")
+
+        val removed = store.removeOldestTurns(1)
+
+        assertEquals(3, removed, "the swept summary plus the evicted turn")
+        assertEquals(0, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY })
+        assertEquals(listOf("u2", "a2"), texts(store))
+    }
 }
