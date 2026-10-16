@@ -1,5 +1,6 @@
 package edith.model
 
+import edith.agent.ConversationStore
 import edith.agent.GatewayTurn
 import edith.agent.ModelClientGateway
 import edith.agent.RequestFrame
@@ -9,6 +10,10 @@ import edith.agent.SegmentRole
 import edith.agent.SummaryBoundary
 import edith.agent.TrimCounts
 import edith.agent.TurnTrimmer
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import edith.contracts.ContractError
 import edith.contracts.EventEnvelope
 import edith.contracts.Generation
@@ -30,6 +35,7 @@ import edith.plugin.SecretHandle
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 import kotlin.test.fail
 
@@ -94,6 +100,20 @@ class GatewayWindowAcceptanceTest {
     )
 
     private fun tightProfile() = profile.copy(inputBudgetTokens = 200, maxOutputTokens = 128, safetyTokens = 128)
+
+    /**
+     * The trim window the gateway uses at send time, recomputed here because `ModelClientGateway.windowBytes` is
+     * `internal` to `agent-runtime`: the send-time limit minus the deliberate 32-byte margin. The comparison in the
+     * production-shape test is a "nothing was cut" check, so sharing the send-time `prepare` limit itself would be
+     * circular; the formula above it is `ContextBudgeter`'s own.
+     */
+    private fun limitWindowBytes(chosen: ModelProfile): Int = maxOf(
+        0,
+        minOf(
+            chosen.inputBudgetTokens,
+            chosen.usableWindowTokens - chosen.maxOutputTokens - chosen.safetyTokens,
+        ) - 32,
+    )
 
     private fun turn(frame: RequestFrame?, chosen: ModelProfile = profile) =
         GatewayTurn("turn-7", chosen.id, "You are Edith.", emptyList(), emptyList(), 1_000_000_000L, frame = frame)
@@ -311,4 +331,145 @@ class GatewayWindowAcceptanceTest {
             )
         }
     }
+
+    /**
+     * The **production shape** (head summary + memory + a tool round, store-backed) through the real send-time
+     * [ContextBudgeter] — the gap Task 8 flagged and Task 9 only half closed.
+     *
+     * `GatewayWindowAcceptanceTest`'s other cases build their `RequestFrame` by hand, and the only store-backed
+     * production shape was checked by `plugins-smart`'s `StoreSessionWiringTest.acceptableWireHistory` — a **local
+     * re-implementation** of the budgeter's rules, because `plugins-smart` cannot see `model-runtime` (Gradle cycle).
+     * A re-implementation can agree with itself while disagreeing with the real class. This test removes the middle
+     * man: the frame below is built exactly as `SmartAssistantPlugin.buildFrame`/`frameBuilderFor` build it (a
+     * `ConversationStore` snapshot, then memory, then this turn's `USER_INPUT` last), it goes through the real
+     * [ModelClientGateway] — the only `frame → ModelRequest` renderer — and the outgoing request goes to the real
+     * `ContextBudgeter().prepare(profile, request)`.
+     *
+     * The store is driven through its own public API, so the head summary carries the boundary `appendSummary`
+     * rendered at insert time and the tool round is stored as `ToolCall`/`ToolOutput` (not as a plain text round).
+     *
+     * The window for the "nothing was trimmed" check below is written out here rather than calling the gateway's
+     * `windowBytes`: that function is `internal` to `agent-runtime`, and this module is on the other side of the
+     * boundary. It is the same formula with the same deliberate 32-byte margin, floored at 0 so a small profile cannot
+     * produce a negative limit.
+     */
+    @Test fun `the production shaped store backed frame is accepted by the send time budgeter`() {
+        val summaryBody = "上一段对话已被压缩为摘要。"
+        // The frame's flow exactly as `frameBuilderFor` produces it from the store's items: index 0 is the summary the
+        // store's own metadata marks as one (never inferred from text - the head text is just a bounded assistant
+        // text), every other item is mapped by the plugin's `toSegment` rule (`SmartAssistantPlugin.kt:2336`), and
+        // memory then this turn's `USER_INPUT` follow, in that order.
+        val store = ConversationStore()
+        store.appendSummary(summaryBody)
+        store.appendUser("旧问题")
+        store.appendAssistant("旧回答")
+        store.appendToolCall("c1", "notify_user", """{"text":"稍等","channel":"screen"}""")
+        store.appendToolOutput("c1", "notified:1")
+        // Two views, because a flat `List<ModelHistoryItem>` cannot attribute a summary and cannot carry structured
+        // tool items: `snapshot()` hands over the summary's own origin (and only that item is needed from it),
+        // `history()` over the wire-shape items the plugin's `toSegment` encodes. `frameBuilderFor` answers exactly
+        // these two questions with exactly these two calls (`store.headIsSummary()` / the transcript argument).
+        val headSnapshot = store.snapshot().first()
+        assertEquals(SegmentOrigin.SUMMARY, headSnapshot.origin, "the store head must be the summary this shape is about")
+        assertFalse(headSnapshot.trusted, "a summary is never trusted")
+        val frameItems = buildList {
+            add(headSnapshot)
+            store.history().drop(1).forEach { add(it.toSegment()) }
+        }
+        val memory = Segment(SegmentOrigin.MEMORY_EVIDENCE, trusted = false, text = "<reference_context>\n用户喜欢咖啡\n</reference_context>")
+        val flow = buildList {
+            addAll(frameItems)
+            add(memory)
+            add(Segment(SegmentOrigin.USER_INPUT, true, "现在呢"))
+        }
+        val frame = RequestFrame(
+            systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")),
+            conversationFlow = flow,
+            tools = emptyList(),
+        )
+        // The head really is the compressed summary, and cut ① has nothing to drop at this profile's window - so the
+        // shape below is the untrimmed production frame, not a trimmer artefact.
+        assertTrue(store.headIsSummary(), "the store head must be the summary this shape is about")
+        val window = limitWindowBytes(profile)
+        assertEquals(frame, TurnTrimmer().trim(frame, window).kept)
+
+        gateway().turn(turn(frame))
+
+        val sent = client.requests.single()
+        // The discriminating assertion: the real budgeter accepts the shape the production path actually sends.
+        try {
+            budgeter.prepare(profile, sent)
+        } catch (rejected: ContractError.ConfigurationRejected) {
+            fail("the production shaped store backed frame must be sendable: ${rejected.message}")
+        }
+        // …and it is the production shape, not merely accepted: summary + memory are folded into the one leading user
+        // message, ahead of the oldest surviving turn; the current utterance is the request input; the tool round came
+        // back structured (a plain-text round would hand the endpoint an assistant message where it expects the call
+        // it produced).
+        val head = sent.history.first() as ModelHistoryItem.Text
+        assertEquals(MessageRole.USER, head.role)
+        assertTrue(head.text.contains(SummaryBoundary.render(summaryBody)), head.text)
+        assertTrue(head.text.contains("<reference_context>"), head.text)
+        assertTrue(head.text.endsWith("旧问题"), head.text)
+        assertEquals(
+            listOf(
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "旧回答"),
+                ModelHistoryItem.ToolCall(
+                    callId = "c1",
+                    name = "notify_user",
+                    argsJson = """{"text":"稍等","channel":"screen"}""",
+                    itemId = "c1",
+                ),
+                ModelHistoryItem.ToolOutput("c1", "notified:1"),
+            ),
+            sent.history.drop(1),
+        )
+        assertEquals(listOf("现在呢"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+        // The tool round survives `frameToTranscript` as **one** leading user group: the property whole-group eviction
+        // depends on, and the reason the memory cannot be a standalone user message.
+        assertEquals(1, sent.history.count { it is ModelHistoryItem.Text && it.role == MessageRole.USER })
+    }
+}
+
+/**
+ * The plugin's `toSegment` rule, mirrored here because `plugins-smart` is downstream of `model-runtime` and its own
+ * private copy is not visible from this module (`SmartAssistantPlugin.kt:2336`). Kept byte-identical in intent: roles
+ * ride along for text, and a tool item becomes a `TOOL_ROUND` segment whose text is the frame vocabulary's JSON entry,
+ * so the gateway restores the round as **structured** items rather than as assistant texts.
+ */
+private fun ModelHistoryItem.toSegment(): Segment = when (this) {
+    is ModelHistoryItem.Text -> Segment(
+        origin = SegmentOrigin.TRANSCRIPT,
+        trusted = true,
+        text = text,
+        role = if (role == MessageRole.USER) SegmentRole.USER else SegmentRole.ASSISTANT,
+    )
+    is ModelHistoryItem.ToolCall -> Segment(
+        origin = SegmentOrigin.TOOL_ROUND,
+        trusted = true,
+        text = buildJsonArray {
+            add(
+                buildJsonObject {
+                    put("type", "call")
+                    put("callId", callId)
+                    put("itemId", itemId)
+                    put("name", name)
+                    put("argsJson", argsJson)
+                },
+            )
+        }.toString(),
+    )
+    is ModelHistoryItem.ToolOutput -> Segment(
+        origin = SegmentOrigin.TOOL_ROUND,
+        trusted = true,
+        text = buildJsonArray {
+            add(
+                buildJsonObject {
+                    put("type", "output")
+                    put("callId", callId)
+                    put("output", output)
+                },
+            )
+        }.toString(),
+    )
 }

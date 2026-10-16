@@ -236,6 +236,13 @@ class AgentLoop(
         val tools = registry.descriptors().map { ToolSpec(it.name, it.description, it.parametersJson) }
         // Phase 3: TurnRunner owns request assembly. For now, the system slot carries only INSTRUCTIONS;
         // memory evidence, perception, and conversation store will be wired in later phases.
+        //
+        // Phase 5 note: this runner is **not** the live renderer on a caller-owned store path. It is constructed and
+        // `assemble` is called every iteration (below), but when the caller supplies a `frame`/`frameFor` the only
+        // thing that survives from the result is `assembled.systemText`, used **only as the instruction fallback** in
+        // the `GatewayTurn` below (`request.frame?.systemText ?: assembled.systemText`). Do not read it as proof that
+        // this loop still assembles the session: the frame builder does that, and everything else here is dead on that
+        // path. This is left in place deliberately (no restructuring in Phase 5).
         val turnRunner = TurnRunner(
             listOf(Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = request.instructions)),
         )

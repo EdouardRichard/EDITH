@@ -137,6 +137,59 @@ class ShellReplyCapTest {
         assertEquals(ShellReply.MAX_REPLY_BYTES, err.toByteArray().size)
     }
 
+    @Test
+    fun `a tiny cap cuts both streams at the same per-stream budget and still drains each to EOF`() {
+        // Every other test in this class (and `ShellStreamsTest`) leaves `maxBytes` at the 8 MiB default, so the
+        // parameter was never exercised with any other value: a hard-coded cap inside `readReply` would have stayed
+        // green. This is the seam made real - a cap small enough to reason about by hand.
+        val cap = 100
+        val stdout = ByteArray(250) { 'o'.code.toByte() }
+        val stderr = ByteArray(400) { 'e'.code.toByte() }
+        // One count per stream of reads requested **past** that stream's budget. Within the budget the caller clamps
+        // the request to `maxBytes - total` (never more than the cap); past it the request is the whole 8 KiB discard
+        // buffer, so a request above the cap is exactly the post-budget read. Atomic because the two streams drain on
+        // two threads. A shared (rather than per-stream) budget would leave one of the two at zero.
+        val pastBudget = arrayOf(AtomicInteger(0), AtomicInteger(0))
+
+        val (out, err, truncated) = drainStreams(
+            countingStream(stdout) { if (it > cap) pastBudget[0].incrementAndGet() },
+            countingStream(stderr) { if (it > cap) pastBudget[1].incrementAndGet() },
+            maxBytes = cap,
+        )
+
+        assertTrue("either stream over the cap must set the flag", truncated)
+        assertEquals("stdout is cut to the cap, not to something else", cap, out.toByteArray().size)
+        assertEquals("stderr spends its own budget, not what stdout left", cap, err.toByteArray().size)
+        assertTrue("stdout must be read past its budget to reach EOF", pastBudget[0].get() > 0)
+        assertTrue("stderr must be read past its budget to reach EOF", pastBudget[1].get() > 0)
+        assertTrue(out.all { it == 'o' })
+        assertTrue(err.all { it == 'e' })
+    }
+
+    /**
+     * A stream that hands its payload over in the requested sizes and then reaches EOF. The callback sees each read
+     * attempt's **requested** length after the first, which is what makes "this read is past the budget" observable.
+     */
+    private fun countingStream(payload: ByteArray, onRead: (Int) -> Unit): InputStream {
+        var offset = 0
+        return object : InputStream() {
+            private var first = true
+            override fun read(): Int = -1
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (first) {
+                    first = false
+                } else {
+                    onRead(len)
+                }
+                if (offset >= payload.size) return -1
+                val n = minOf(len, payload.size - offset)
+                for (i in 0 until n) b[off + i] = payload[offset + i]
+                offset += n
+                return n
+            }
+        }
+    }
+
     /**
      * Stands in for the interleaved child: [maxBytes] of stdout, then **one byte past the cap**, then EOF.
      *
@@ -186,14 +239,35 @@ class ShellReplyCapTest {
     }
 
     @Test
-    fun `a truncated state read is not answered as a readable state`() {
+    fun `a state read whose stdout was truncated is not readable, so no probe answer is trusted`() {
+        // R-9's flag is only honest if a *state-deciding* read consumes it. `installed`/`disabled`/`permissionGranted`
+        // are stdout **parsers**: a `pm list packages` reply clipped at the cap still decodes and still carries
+        // `truncated = true`, and `stdout` is then a prefix rather than the whole answer. The clipped tail is where the
+        // package line lives, so the probe answers `false` for a package that **is** present - the exact
+        // "a completed action that never happened" class `readable()` exists to block. The reply here is a *successful*
+        // parse (no error marker on either stream): only the truncation flag makes it unreadable.
         val shell = object : PrivilegedShell {
             override fun run(command: String): ShellResult =
-                ShellResult(command, -1, "", SHELL_REPLY_TOO_LARGE)
+                ShellResult(command, 0, "package:com.example.other\npackage:com.examp", "", truncated = true)
         }
         val state = ShizukuTargetState(shell)
+
+        assertFalse("the clipped stdout answers a negative for a package it never got to list", state.installed("com.example"))
+        assertFalse("a truncated stdout is a prefix, so the state read cannot be read at all", state.readable())
+    }
+
+    @Test
+    fun `an untruncated state read stays readable, so the flag alone decides`() {
+        // The other half of the pair: the same shape with nothing clipped must still be readable, so the assertion above
+        // is about `truncated` and not about stdout parsing in general.
+        val shell = object : PrivilegedShell {
+            override fun run(command: String): ShellResult =
+                ShellResult(command, 0, "package:com.example.other\n", "")
+        }
+        val state = ShizukuTargetState(shell)
+
         assertFalse(state.installed("com.example"))
-        assertFalse("a too-large reply must never be read as a state", state.readable())
+        assertTrue("a reply that was not clipped is still an answer about the target", state.readable())
     }
 
     private companion object {

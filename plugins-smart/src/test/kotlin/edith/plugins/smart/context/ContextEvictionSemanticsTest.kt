@@ -15,8 +15,13 @@ import kotlin.test.assertTrue
 /**
  * The `ConversationContext` path's eviction criteria, frozen (§4.9/Task 5 hard constraint).
  *
- * `compressIfNeeded` is **live production code** (`SmartAssistantPlugin` calls it over a `ConversationContext`) and
- * its behaviour must not drift while the store path is added beside it. The failure this class pins is concrete: a
+ * `compressIfNeeded` is production code on the **no-store path only** (`SmartAssistantPlugin` calls it over a
+ * `ConversationContext` when no `conversationStores` was injected), and its behaviour must not drift while the store
+ * path lives beside it. That path is **not** the shipped composition: the phone host's `SmartWiring` always
+ * constructs the plugin with `conversationStores` (one `ConversationStore` per route), so the running app never
+ * reaches `compressIfNeeded`. This class is kept for a different reason - it pins the **frozen
+ * semantics** R3 protects, so the shared eviction routine cannot rot behind a path that is still reachable from a
+ * caller that wires no store (and from every test that does the same). The failure this class pins is concrete: a
  * shared body that charged a turn only its opening message but then passed a **count** to a removal that means
  * "drop until `size <= n`" left a dangling assistant head — `[u1, a1, u2]` came back as `[a1, u2]` with `truncated`
  * 1 and only `u1` in memory — and stopped long before the budget was met.

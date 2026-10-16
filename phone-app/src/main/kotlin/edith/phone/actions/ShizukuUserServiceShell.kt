@@ -128,10 +128,15 @@ class ShizukuUserServiceShell(
 class ShizukuTargetState(private val shell: PrivilegedShell) : TargetState {
 
     /**
-     * Whether the probe that just ran produced a reply this build could parse.
+     * Whether the probe that just ran produced a reply this build could parse **and was not cut short**.
      *
      * Starts `false`: before anything has been read, nothing may be claimed. Every probe goes through [read], so the
      * answer always describes the read the backend is about to judge.
+     *
+     * Truncation makes a read unreadable (R-9): [installed], [disabled] and [permissionGranted] are stdout **parsers**,
+     * and a clipped `stdout` is a prefix, not the whole answer - so the clipped tail can turn a present package into a
+     * `false` that the backend then judges as "the action did not take". A too-large reply is already reported as its
+     * own code, but the *decoded-and-truncated* case is a successful parse, and only this flag distinguishes it.
      */
     @Volatile
     private var lastReplyReadable = false
@@ -151,5 +156,5 @@ class ShizukuTargetState(private val shell: PrivilegedShell) : TargetState {
         read("settings get system $name").stdout.trim().takeIf { it.isNotEmpty() && it != "null" }
 
     private fun read(command: String): ShellResult =
-        shell.run(command).also { lastReplyReadable = it.isAStateReply() }
+        shell.run(command).also { lastReplyReadable = it.isAStateReply() && !it.truncated }
 }

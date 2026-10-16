@@ -1155,11 +1155,12 @@ class SmartAssistantPlugin(
         // and "the session carried nothing" are the same empty log, which is exactly what blocked these rows on the
         // device. Sizes are what a log may carry (P3.1's privacy rule); no prompt text is ever printed.
         //
-        // Phase 5: with a store injected the session is the store, and `activeContextForTurn` is never written to on
-        // this path, so the manager's counts are not the session's. `history=1` there is the assembly's own utterance,
-        // not "the store carried one turn" - the line would report a carried turn on an empty session and vice versa.
-        // A store in use therefore reports the store's own counts, and only when there is no store is the manager's
-        // line the honest one. Still counts only: never text.
+        // Phase 5: with a store injected, `buildPrompt` still runs (its memory and instructions are what the turn
+        // uses), but the manager it reads is not this route's session - the store is. The manager's transcript holds
+        // only what the assembly put there, and `history=1` is the truthful value for it: the utterance itself. What
+        // the line must **not** do is let a reader take that 1 as "the session carried one turn" (the store may hold
+        // many, or none) - so with a store in use the counts come from the store instead, and only when there is no
+        // store is the manager's line the whole session. Still counts only: never text.
         val store = activeStores?.get(ContextRoute.WAKE)
         if (store != null) {
             val history = store.history()
