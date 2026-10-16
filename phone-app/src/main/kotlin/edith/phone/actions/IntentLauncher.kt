@@ -83,10 +83,18 @@ class PackageManagerAppCatalog(private val context: Context) : AppCatalog {
         if (manager == null) emptyList() else manager.getInstalledApplications(0).mapNotNull { info ->
             // One unreadable package must not hide the rest of the catalog.
             try {
+                val launchIntent = manager.getLaunchIntentForPackage(info.packageName)
+                // K40 device finding (2026-10-16): getLaunchIntentForPackage returns a non-null
+                // intent for launchable apps, but on MIUI the intent's action can be null even
+                // when the app has a valid launcher activity (confirmed via cmd package
+                // resolve-activity). Using the intent's existence as the launchability signal
+                // rather than its action field keeps these apps in the catalog. The action is
+                // still carried when present for backward compatibility with IntentActionExecutor.
+                if (launchIntent == null) return@mapNotNull null
                 AppEntry(
                     packageName = info.packageName,
                     label = info.loadLabel(manager).toString(),
-                    launchIntentAction = manager.getLaunchIntentForPackage(info.packageName)?.action,
+                    launchIntentAction = launchIntent.action ?: LAUNCH_MARKER,
                 )
             } catch (unreadable: Exception) {
                 android.util.Log.i("EdithActions",
@@ -99,4 +107,10 @@ class PackageManagerAppCatalog(private val context: Context) : AppCatalog {
             "APP_CATALOG_UNAVAILABLE: ${unavailable.javaClass.simpleName}: ${unavailable.message}")
         emptyList()
     }
+
+    /**
+     * Sentinel value for "has a launch intent but its action is null". Non-blank so the resolver's
+     * `isNullOrBlank` filter keeps the entry; distinct from any real action string.
+     */
+    private companion object { const val LAUNCH_MARKER = "__has_launch_intent__" }
 }
