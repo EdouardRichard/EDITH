@@ -45,8 +45,12 @@ class MemoryModuleRetrievalTest {
 
         val parts = MemoryModuleRetrieval(module, logger = {}).retrieve("香菜", 5)
 
-        assertEquals(listOf("我不吃香菜"), parts.map { it.text })
-        // Phase 3: Segment has no id field; namespace verification moved to MemoryModule internals
+        // Phase 4 Task 5: all entries are wrapped in a single <reference_context> block.
+        assertEquals(1, parts.size, "one segment wrapping all entries")
+        val text = parts[0].text
+        assertTrue(text.startsWith("<reference_context>"))
+        assertTrue(text.endsWith("</reference_context>"))
+        assertTrue(text.contains("我不吃香菜"), "original text present (no normalizer configured)")
         assertTrue(parts.all { it.origin == edith.agent.SegmentOrigin.MEMORY_EVIDENCE })
     }
 
@@ -58,7 +62,9 @@ class MemoryModuleRetrievalTest {
         MemoryModuleRetrieval(module, logger = { lines += it }).retrieve("香菜", 5)
 
         val line = lines.single()
-        assertTrue(line.startsWith("P3_MEMORY inject=n=2"), "expected an injection count: $line")
+        // Phase 4 Task 5: parts is now one segment wrapping all entries in a <reference_context> block.
+        // n= reflects segment count (1), chars= includes header/tag overhead — both correct per task brief.
+        assertTrue(line.startsWith("P3_MEMORY inject=n=1"), "one segment wrapping all entries: $line")
         assertTrue(line.contains("chars="), "expected a character total: $line")
         assertTrue(line.contains("ids="), "expected the entry ids: $line")
         assertFalse(line.contains("香菜"), "the log must not carry remembered content: $line")
