@@ -233,7 +233,10 @@ class ShellReplyCapTest {
         assertFalse("a too-large reply is a failed state read, not an answer", tooLarge.isAStateReply())
         assertNotEquals("a too-large reply is not reported as a parse failure", SHELL_REPLY_INVALID, tooLarge.stderr)
 
-        // A reply that decoded but was truncated is still readable: the flag describes the payload, not the channel.
+        // The `truncated` flag describes the payload, so a reply that was truncated still decodes and still carries the
+        // flag - that is all this asserts. It is **not** a claim that a truncated **state read** may be trusted: the
+        // test below asserts the opposite, and `ShizukuUserServiceShell.read` joins the two facts as
+        // `isAStateReply() && !truncated`.
         val truncated = ShellReply.decode(ShellReply.encode(0, "out", "err", truncated = true))!!
         assertTrue(truncated.isAStateReply())
     }
