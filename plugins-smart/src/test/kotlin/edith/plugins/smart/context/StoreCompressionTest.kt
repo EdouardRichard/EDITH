@@ -1,0 +1,269 @@
+package edith.plugins.smart.context
+
+import edith.agent.ConversationStore
+import edith.agent.SegmentOrigin
+import edith.agent.SummaryBoundary
+import edith.plugin.CancellationHandle
+import edith.plugin.MessageRole
+import edith.plugin.ModelHistoryItem
+import edith.plugin.StorageHandle
+import edith.plugin.TaskScope
+import edith.plugins.smart.memory.MemoryLog
+import edith.plugins.smart.memory.MemoryModule
+import edith.plugins.smart.memory.SemanticRetriever
+import edith.plugins.smart.memory.SmartMemoryRetrieval
+import edith.plugins.smart.memory.VectorIndex
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
+
+/**
+ * Cut ③ over the production session owner (`ConversationStore`), spec §4.4 / D-4.
+ *
+ * B3's criteria are unchanged and only the apparatus moves (design §7): the synchronous half still drops the
+ * oldest content until the transcript fits and still stops at the anchored region, the write-to-memory ordering
+ * is unchanged, and the asynchronous half is still a pure improvement. The one **stronger** semantic the store
+ * adds is whole-turn eviction: a half turn can no longer be left behind.
+ *
+ * The fixtures are a local copy of `CompressionTest`'s on purpose. Reusing them would mean widening those
+ * `private` members, which would modify a test this task must not touch.
+ */
+class StoreCompressionTest {
+
+    private class FakeStorage : StorageHandle {
+        val values = mutableMapOf<String, ByteArray>()
+        override fun read(key: String): ByteArray? = values[key]
+        override fun write(key: String, value: ByteArray) {
+            values[key] = value
+        }
+        override fun delete(key: String) {
+            values.remove(key)
+        }
+        override fun clear() = values.clear()
+    }
+
+    /** Runs nothing: the summary is captured so a test can prove the call was deferred, not performed. */
+    private class CapturingTasks : TaskScope {
+        val launched = mutableListOf<() -> Unit>()
+        override fun launch(block: () -> Unit): CancellationHandle {
+            launched += block
+            return object : CancellationHandle { override fun cancel() = Unit }
+        }
+        override fun cancelAll() {
+            launched.clear()
+        }
+        fun runAll() {
+            launched.toList().forEach { it() }
+        }
+    }
+
+    private fun memory(): MemoryModule {
+        val log = MemoryLog(FakeStorage(), now = { 1L }, log = {})
+        return MemoryModule(
+            log = log,
+            embeddings = null,
+            lexicon = SmartMemoryRetrieval(log, logger = {}),
+            retriever = SemanticRetriever(null, VectorIndex(4)),
+        )
+    }
+
+    private fun compressor(
+        memory: MemoryModule? = null,
+        summarize: ((String) -> String?)? = null,
+        tasks: TaskScope? = null,
+    ) = ContextCompressor(memory = memory, summarizer = summarize, scope = tasks)
+
+    /** Two finished turns plus a pending user turn: the store's shape at a turn's end. */
+    private fun threeTurnStore(): ConversationStore = ConversationStore().also {
+        it.appendUser("u1")
+        it.appendAssistant("a1")
+        it.appendUser("u2")
+        it.appendAssistant("a2")
+        it.appendUser("u3")
+    }
+
+    private fun ConversationStore.texts(): List<String> =
+        history().map { (it as ModelHistoryItem.Text).text }
+
+    @Test
+    fun `a store inside its share is untouched and starts no summary`() {
+        val store = ConversationStore()
+        store.appendUser("一")
+        store.appendAssistant("二")
+        val asked = mutableListOf<String>()
+
+        val report = compressor(summarize = { asked += it; "不该调用" }).compressStore(store, shareTokens = 10_000)
+
+        assertEquals(2, store.size())
+        assertEquals(0, report.truncated)
+        assertEquals(0, report.droppedTurns)
+        assertEquals(false, report.summaryStarted)
+        assertEquals(emptyList(), asked)
+    }
+
+    @Test
+    fun `an over-share store drops whole turns and keeps the last one`() {
+        val store = threeTurnStore()
+
+        val report = compressor().compressStore(store, shareTokens = 3)
+
+        assertTrue(report.droppedTurns > 0)
+        // §4.4's first anchor: the most recent user turn must stay.
+        assertEquals("u3", store.texts().last())
+        assertTrue("u1" !in store.texts(), store.texts().toString())
+        // Whole-turn eviction: no half turn is left behind (this is the semantic the store adds over the context).
+        assertEquals(listOf("u3"), store.texts())
+    }
+
+    @Test
+    fun `the dropped messages reach memory before they leave the store`() {
+        // B6's store version: the store hands every evicted message to memory, so the raw content survives the
+        // eviction. (In the wired turn the caller has already written this turn's memory; this half is the one the
+        // compressor itself owns - §4.4 step 2.)
+        val memory = memory()
+        val store = threeTurnStore()
+
+        compressor(memory = memory).compressStore(store, shareTokens = 3)
+
+        val stored = memory.entries().map { it.text }
+        assertTrue("u1" in stored, stored.toString())
+        assertTrue("a1" in stored, stored.toString())
+    }
+
+    @Test
+    fun `a landed summary is stored with SUMMARY origin and the boundary`() {
+        val store = threeTurnStore()
+        val tasks = CapturingTasks()
+
+        compressor(summarize = { "（此前对话已摘要）" }, tasks = tasks).compressStore(store, shareTokens = 3)
+        tasks.runAll()
+
+        assertTrue(store.snapshot().any { it.origin == SegmentOrigin.SUMMARY })
+        val last = store.history().last() as ModelHistoryItem.Text
+        assertEquals(MessageRole.ASSISTANT, last.role)
+        assertTrue(last.text.startsWith(SummaryBoundary.OPEN), last.text)
+        assertTrue(last.text.endsWith(SummaryBoundary.CLOSE), last.text)
+        assertTrue("（此前对话已摘要）" in last.text, last.text)
+    }
+
+    @Test
+    fun `the summary is written to memory beside the originals rather than instead of them`() {
+        val memory = memory()
+        val store = threeTurnStore()
+        val tasks = CapturingTasks()
+
+        compressor(memory = memory, summarize = { "（摘要）" }, tasks = tasks).compressStore(store, shareTokens = 3)
+        tasks.runAll()
+
+        val stored = memory.entries().map { it.text }
+        assertTrue("u1" in stored, stored.toString())
+        assertTrue("（摘要）" in stored, stored.toString())
+    }
+
+    @Test
+    fun `no summarizer degrades to pure truncation with no error`() {
+        val store = threeTurnStore()
+
+        val report = compressor().compressStore(store, shareTokens = 3)
+
+        assertEquals(false, report.summaryStarted)
+        assertEquals("NO_SUMMARIZER", report.summaryReason)
+        assertTrue(report.truncated > 0, "the synchronous half must still have done its job")
+        assertTrue(store.size() > 0)
+    }
+
+    @Test
+    fun `a summary that throws or answers nothing adds no placeholder`() {
+        val store = threeTurnStore()
+        val tasks = CapturingTasks()
+
+        compressor(summarize = { error("cloud down") }, tasks = tasks).compressStore(store, shareTokens = 3)
+        val afterCompression = store.size()
+        val compacted = store.history()
+        tasks.runAll()
+        assertEquals(afterCompression, store.size(), "a throwing summary must change nothing")
+        assertEquals(compacted, store.history())
+
+        val emptyTasks = CapturingTasks()
+        val store2 = threeTurnStore()
+        compressor(summarize = { null }, tasks = emptyTasks).compressStore(store2, shareTokens = 3)
+        val afterSecondCompression = store2.size()
+        emptyTasks.runAll()
+        assertEquals(afterSecondCompression, store2.size(), "an empty answer must add no placeholder")
+        assertFalse(store2.snapshot().any { it.origin == SegmentOrigin.SUMMARY })
+    }
+
+    @Test
+    fun `the summary is deferred to the task scope rather than performed inline`() {
+        val store = threeTurnStore()
+        val tasks = CapturingTasks()
+        val asked = mutableListOf<String>()
+
+        val report = compressor(summarize = { asked += it; "（摘要）" }, tasks = tasks)
+            .compressStore(store, shareTokens = 3)
+
+        assertEquals(true, report.summaryStarted)
+        assertEquals(emptyList(), asked, "the summary must not have run on the caller's thread")
+        assertEquals(1, tasks.launched.size)
+
+        tasks.runAll()
+        assertEquals(1, asked.size)
+    }
+
+    @Test
+    fun `compression never empties the store`() {
+        val store = ConversationStore()
+        store.appendUser("u1")
+        store.appendAssistant("a1")
+
+        compressor().compressStore(store, shareTokens = 0)
+
+        assertTrue(store.size() > 0, "a compressed store must still say something")
+        // The anchored region is the last user turn and everything it opened, so this turn stays whole.
+        assertEquals(listOf("u1", "a1"), store.texts())
+    }
+
+    /**
+     * The ③ gate, no-summary case (D-4): `compressionOwed` can be true with nothing to drop - an over-budget frame
+     * whose flow holds only this turn's input and memory (Task 3 found this shape). Cut ③ is allowed to start
+     * **only after cut ① actually happened**, so with `droppedTurns == 0` no summary may be started: there is no
+     * turn to summarise and a summary would be invented content.
+     *
+     * The store's own version of that shape is "the only turn is the anchored one, and it alone overruns the share".
+     * The summarizer is the observable: it must never be entered.
+     */
+    @Test
+    fun `an anchored-only store over its share starts no summary`() {
+        val store = ConversationStore()
+        store.appendUser("只有本轮一句")
+        val asked = mutableListOf<String>()
+
+        val report = compressor(summarize = { asked += it; "不该调用" }).compressStore(store, shareTokens = 1)
+
+        assertTrue(report.truncated == 0 && report.droppedTurns == 0)
+        assertTrue(estimateTokens("只有本轮一句") > 1, "the fixture must really be over its share")
+        assertEquals(emptyList(), asked, "droppedTurns == 0: no summary may be requested")
+        assertEquals(false, report.summaryStarted)
+        assertEquals(listOf("只有本轮一句"), store.texts())
+    }
+
+    /**
+     * The same gate through the seam the caller uses: `droppedTurns > 0` but the caller reports nothing owed ⇒ the
+     * transcript was already restored by cut ① ⇒ no summary. This is the `compressionOwed == false` half of
+     * `droppedTurns > 0 && compressionOwed`; the other half (`droppedTurns == 0`) is the test above and the
+     * `droppable` clamp it exercises.
+     */
+    @Test
+    fun `a turn dropped with nothing owed starts no summary`() {
+        val store = threeTurnStore()
+        val asked = mutableListOf<String>()
+
+        val report = compressor(summarize = { asked += it; "不该调用" })
+            .compressStore(store, shareTokens = 3, compressionOwed = false)
+
+        assertTrue(report.droppedTurns > 0, "the fixture must really have dropped a turn")
+        assertEquals(emptyList(), asked, "compressionOwed == false: no summary may be requested")
+        assertEquals(false, report.summaryStarted)
+    }
+}
