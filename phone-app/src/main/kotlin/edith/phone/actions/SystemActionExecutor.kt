@@ -76,6 +76,10 @@ class SystemActionExecutor(
             ?: return refused(ARGUMENTS_INVALID)
         val command = SYSTEM_COMMANDS[action] ?: return refused(UNKNOWN_ACTION)
         val result = shell.run(command)
+        // R-9 follow-up #3: a call that never came back is a **channel** failure, not a failed command. Without this the
+        // carrier/not-bound/parse replies (`exit -1`, empty stdout) read as `COMMAND_FAILED`, which tells the model the
+        // key event itself failed and invites a retry on a route that just proved it cannot carry an answer.
+        if (!result.isCallComplete()) return refused(ACTION_CHANNEL_UNAVAILABLE)
         return if (result.exitCode == 0) done("executed $action") else failed(COMMAND_FAILED)
     }
 

@@ -117,6 +117,28 @@ class SystemActionExecutorTest {
         assertEquals("COMMAND_FAILED", result.detail)
     }
 
+    // ── The call never came back → Refused, not Failed (R-9 follow-up #3) ─────
+
+    @Test
+    fun `a call that never came back is refused ACTION_CHANNEL_UNAVAILABLE`() {
+        // Before the completion guard, all three of these returned `Failed COMMAND_FAILED`: the executor read the
+        // channel's own failure - `exit -1` and an empty stdout - as the command having run and failed. The dangerous
+        // direction was already safe (no success test can pass on `exit -1`), but the *reason* was wrong: the model was
+        // told to retry a command when the truth is that this route cannot carry an answer.
+        val kinds = mapOf(
+            ShellFailure.CARRIER to ShellResult("", -1, "", SHELL_REPLY_TOO_LARGE, failure = ShellFailure.CARRIER),
+            ShellFailure.NOT_BOUND to ShellResult("", -1, "", SHELL_NOT_BOUND, failure = ShellFailure.NOT_BOUND),
+            ShellFailure.PARSE to ShellResult("", -1, "", SHELL_REPLY_INVALID, failure = ShellFailure.PARSE),
+        )
+        for ((kind, reply) in kinds) {
+            val shell = FakeShell(reply)
+            val result = backend(shell).execute("system_action", """{"action":"back"}""")
+
+            assertEquals("$kind must be refused, not failed", ActionOutcome.Refused, result.outcome)
+            assertEquals("$kind must name the channel, not the command", "ACTION_CHANNEL_UNAVAILABLE", result.detail)
+        }
+    }
+
     // ── Descriptor shape ───────────────────────────────────────────────────────
 
     @Test

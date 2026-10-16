@@ -108,6 +108,26 @@ internal fun carrierCodeFor(thrown: Throwable): String {
 }
 
 /**
+ * Whether this call actually completed: the binder returned and the payload **and its marker** parsed.
+ *
+ * The one question every executor that reads a [ShellResult] has to ask before it judges an action, asked once so the
+ * three executors on this channel cannot drift apart (R-9 follow-up, open item #3). `ShizukuExecutionBackend` consulted
+ * [ShellResult.failure] and refused with `ACTION_CHANNEL_UNAVAILABLE`; [LaunchAppExecutor] and [SystemActionExecutor]
+ * did not, so a call whose reply never crossed reported `STATE_UNCHANGED` / `COMMAND_FAILED` instead - **the wrong
+ * invitation**: those tell the model the action failed (retry it, or pick another app), when the fact is that this route
+ * could not carry an answer at all (take another route, or say the capability is unavailable). The dangerous direction
+ * was never at risk, because every failure code reports `exitCode = -1` and empty `stdout`, so no success test can pass;
+ * what was wrong was the reason, and the reason is what the model acts on.
+ *
+ * This is exactly [ShellResult.failure] `== null`, and deliberately **not** [isAStateReply]: a command that answered with
+ * a non-empty `stderr` *did* answer, and its diagnostics are the command's business rather than a channel failure. The
+ * empty-`stderr` half of [isAStateReply] is a **stronger** requirement that only the stdout parsers
+ * (`installed`/`disabled`/`permissionGranted`, which read an absence as "the target is not there") need, so folding the
+ * two together here would either reopen that hole or start calling a completed command a dead channel.
+ */
+internal fun ShellResult.isCallComplete(): Boolean = failure == null
+
+/**
  * False when the shell itself reported a failure: a state read that **failed**, not an answer about the target.
  *
  * A reply is a state reply only when the channel reported **no** failure, i.e. [ShellResult.failure] is `null` **and**
@@ -128,8 +148,11 @@ internal fun carrierCodeFor(thrown: Throwable): String {
  * and it never ran a command whose `stderr` was non-empty and whose stdout still parsed.
  * A read whose `stderr` is non-empty therefore describes a read the channel or the command disturbed, and treating it as
  * unreadable means the backend refuses instead of judging the action from a reply it cannot fully account for.
+ *
+ * `isCallComplete() && stderr.isEmpty()`, spelled through the shared predicate so the "the call came back" half has one
+ * definition; the semantics are unchanged and the extra `stderr` half stays where it is.
  */
-internal fun ShellResult.isAStateReply(): Boolean = failure == null && stderr.isEmpty()
+internal fun ShellResult.isAStateReply(): Boolean = isCallComplete() && stderr.isEmpty()
 
 /**
  * What the device actually looks like after a command, which is the only thing that may be read as success.

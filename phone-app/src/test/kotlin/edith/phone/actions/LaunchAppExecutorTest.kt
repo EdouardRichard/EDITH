@@ -107,6 +107,61 @@ class LaunchAppExecutorTest {
         assertEquals("STATE_UNCHANGED", result.detail)
     }
 
+    // ── launch_app: the call never came back → Refused, not Failed ────────────
+    //
+    // The two commands this executor runs are guarded the same way, and the tests say which command each case is about:
+    //  * a failure on `cmd package resolve-activity` **short-circuits** - the second call is not attempted, because a
+    //    channel that just failed to carry a reply must not be asked for another one (measured recovery is on a *later*
+    //    call, not the immediately next one: evidence/2026-10-17-shizuku-reply-ceiling.md §1/§9);
+    //  * a failure on `am start -W` is refused identically once that call has been made.
+
+    @Test
+    fun `launch_app refuses when the resolve call never came back, without making the launch call`() {
+        val kinds = mapOf(
+            ShellFailure.CARRIER to ShellResult("", -1, "", SHELL_REPLY_TOO_LARGE, failure = ShellFailure.CARRIER),
+            ShellFailure.NOT_BOUND to ShellResult("", -1, "", SHELL_NOT_BOUND, failure = ShellFailure.NOT_BOUND),
+            ShellFailure.PARSE to ShellResult("", -1, "", SHELL_REPLY_INVALID, failure = ShellFailure.PARSE),
+        )
+        for ((kind, reply) in kinds) {
+            val shell = FakeShell(result = reply)
+            val catalog = FakeCatalog(listOf(entry("WeChat", "com.tencent.mm")))
+
+            val result = backend(catalog = catalog, shell = shell).execute("launch_app", """{"name":"WeChat"}""")
+
+            assertEquals("$kind must be refused, not failed", ActionOutcome.Refused, result.outcome)
+            assertEquals("$kind must name the channel, not the app", "ACTION_CHANNEL_UNAVAILABLE", result.detail)
+            assertEquals("no second call may be spent on a channel that just failed", 1, shell.commands.size)
+            assertTrue(shell.commands[0].startsWith("cmd package resolve-activity"))
+        }
+    }
+
+    @Test
+    fun `launch_app refuses when the launch call never came back`() {
+        val kinds = mapOf(
+            ShellFailure.CARRIER to ShellResult("", -1, "", SHELL_REPLY_TOO_LARGE, failure = ShellFailure.CARRIER),
+            ShellFailure.NOT_BOUND to ShellResult("", -1, "", SHELL_NOT_BOUND, failure = ShellFailure.NOT_BOUND),
+            ShellFailure.PARSE to ShellResult("", -1, "", SHELL_REPLY_INVALID, failure = ShellFailure.PARSE),
+        )
+        for ((kind, reply) in kinds) {
+            val shell = FakeShell(
+                result = ShellResult("", 0, "Status: ok", ""),
+                overrides = mapOf(
+                    "cmd package resolve-activity" to
+                        ShellResult("", 0, "priority=0\ncom.tencent.mm/.ui.LauncherUI", ""),
+                    "am start" to reply,
+                ),
+            )
+            val catalog = FakeCatalog(listOf(entry("WeChat", "com.tencent.mm")))
+
+            val result = backend(catalog = catalog, shell = shell).execute("launch_app", """{"name":"WeChat"}""")
+
+            assertEquals("$kind must be refused, not failed", ActionOutcome.Refused, result.outcome)
+            assertEquals("$kind must name the channel, not the app", "ACTION_CHANNEL_UNAVAILABLE", result.detail)
+            assertEquals("resolve-activity then am start, and nothing else", 2, shell.commands.size)
+            assertTrue(shell.commands[1].startsWith("am start -W -n com.tencent.mm/.ui.LauncherUI"))
+        }
+    }
+
     // ── launch_app: Ambiguous → Done with candidate JSON ───────────────────────
 
     @Test

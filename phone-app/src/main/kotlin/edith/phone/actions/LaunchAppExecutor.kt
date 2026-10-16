@@ -104,6 +104,12 @@ class LaunchAppExecutor(
         // PackageManager that built the catalog, so it cannot disagree about what is launchable.
         val resolveCmd = "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER ${target.packageName}"
         val resolved = shell.run(resolveCmd)
+        // R-9 follow-up #3, and the **short-circuit** is deliberate: a resolve call that did not come back is reported
+        // as the channel failure it is, and the launch call is not attempted. Continuing would spend a second call on a
+        // binder that just failed to carry a reply - the measured recovery is on a *later* call, not the next one
+        // (evidence/2026-10-17-shizuku-reply-ceiling.md §1/§9) - and the fallback `am start -p` would only turn the
+        // resolve failure into a second, equally undeliverable failure whose reason names the wrong command.
+        if (!resolved.isCallComplete()) return refused(ACTION_CHANNEL_UNAVAILABLE)
         val component = resolved.stdout.lines().lastOrNull { it.contains("/") }?.trim()
         val launchCmd = if (!component.isNullOrBlank()) {
             "am start -W -n $component"
@@ -114,6 +120,7 @@ class LaunchAppExecutor(
             "am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p ${target.packageName}"
         }
         val result = shell.run(launchCmd)
+        if (!result.isCallComplete()) return refused(ACTION_CHANNEL_UNAVAILABLE)
         val launched = result.exitCode == 0 && result.stdout.contains("Status: ok")
         return if (launched) done("launched ${target.label}") else failed(STATE_UNCHANGED)
     }
