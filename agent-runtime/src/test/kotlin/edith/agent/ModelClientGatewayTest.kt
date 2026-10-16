@@ -13,6 +13,10 @@ import edith.plugin.OutputModality
 import edith.plugin.ToolSpec
 import edith.testsupport.FakeClock
 import edith.testsupport.ManualScheduler
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import java.io.ByteArrayOutputStream
 import java.io.PrintStream
 import java.util.concurrent.CountDownLatch
@@ -529,6 +533,51 @@ class ModelClientGatewayTest {
         assertTrue(input.contains(bounded), input)
         assertEquals(1, input.split(SummaryBoundary.OPEN).size - 1, "no second boundary: $input")
         assertEquals(1, input.split(SummaryBoundary.CLOSE).size - 1, "no second boundary: $input")
+    }
+
+    @Test fun `a frame's tool round reaches the wire as a tool call and its output`() {
+        // Phase 5: `AgentLoop.frameFor` rebuilds every request of a run from one renderer, so a tool-round continuation
+        // arrives as `TOOL_ROUND` segments. The wire shape for those is not text: the endpoint is stateless and the
+        // model's call must be echoed back as a call item beside its result, or the tool exchange does not round-trip
+        // (and two assistant texts in a row are a shape `ContextBudgeter` rejects).
+        val client = terminalClient()
+        val round = buildJsonArray {
+            add(buildJsonObject {
+                put("type", "call")
+                put("callId", "c1")
+                put("itemId", "item-1")
+                put("name", "notify_user")
+                put("argsJson", """{"text":"稍等","channel":"screen"}""")
+            })
+            add(buildJsonObject {
+                put("type", "output")
+                put("callId", "c1")
+                put("output", "notified:1")
+            })
+        }.toString()
+        val flow = listOf(
+            Segment(SegmentOrigin.TRANSCRIPT, true, "旧问题", SegmentRole.USER),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "旧回答", SegmentRole.ASSISTANT),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "现在几点", SegmentRole.USER),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "(tool call)", SegmentRole.ASSISTANT),
+            Segment(SegmentOrigin.TOOL_ROUND, true, round),
+            Segment(SegmentOrigin.USER_INPUT, true, "现在几点"),
+        )
+        val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
+
+        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+
+        val sent = client.requests.single()
+        assertEquals(
+            ModelHistoryItem.ToolCall("c1", "notify_user", """{"text":"稍等","channel":"screen"}""", itemId = "item-1"),
+            sent.history[4],
+            "the model's own call must come back as a call item: ${sent.history}",
+        )
+        assertEquals(
+            ModelHistoryItem.ToolOutput("c1", "notified:1"),
+            sent.history[5],
+            "the tool result must come back as its output item: ${sent.history}",
+        )
     }
 
     @Test fun `without a frame the gateway behaves exactly as before`() {

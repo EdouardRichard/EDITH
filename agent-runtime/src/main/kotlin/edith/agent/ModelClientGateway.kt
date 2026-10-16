@@ -13,6 +13,11 @@ import edith.plugin.ModelRequest
 import edith.plugin.ModelStreamEvent
 import edith.plugin.MonotonicClock
 import edith.plugin.OutputModality
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.jsonPrimitive
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
@@ -30,6 +35,9 @@ private const val TOOL_CALL_DELIVERY_INCOMPLETE = "TOOL_CALL_DELIVERY_INCOMPLETE
  * how long an observed `stop` can go unnoticed when the scheduler is not the one delivering time.
  */
 private const val WAIT_STEP_MILLIS = 10L
+
+/** Lenient by construction: a `TOOL_ROUND` body is a JSON document assembled by a caller, and a bad one falls back. */
+private val toolRoundJson = Json { isLenient = true }
 
 /**
  * The one [ModelGateway] over `plugin-api`'s streaming [ModelClient]: it turns the loop's [GatewayTurn] into a
@@ -246,6 +254,18 @@ class ModelClientGateway(
             when (segment.origin) {
                 SegmentOrigin.SUMMARY -> leading += boundedSummary(segment.text)
                 SegmentOrigin.MEMORY_EVIDENCE, SegmentOrigin.PERCEPTION -> leading += segment.text
+                SegmentOrigin.TOOL_ROUND -> {
+                    // A tool round is not conversation-flow text: the endpoint is stateless, so the model's own call
+                    // must be echoed back as a call item beside its result or the exchange does not round-trip (and two
+                    // assistant texts in a row are a shape `ContextBudgeter` rejects). A segment this cannot parse
+                    // (a plain tool-round summary, or a store's raw text) keeps the pre-existing text mapping.
+                    val items = toolRoundItems(segment.text)
+                    if (items.isEmpty()) {
+                        history += ModelHistoryItem.Text(roleOf(segment), segment.text)
+                    } else {
+                        history += items
+                    }
+                }
                 else -> history += ModelHistoryItem.Text(roleOf(segment), segment.text)
             }
         }
@@ -284,6 +304,46 @@ class ModelClientGateway(
      */
     private fun lastGroupIsClosed(history: List<ModelHistoryItem>): Boolean =
         (history.last() as? ModelHistoryItem.Text)?.role != MessageRole.USER
+
+    /**
+     * A `TOOL_ROUND` segment's wire items: the JSON array of call/output entries the frame vocabulary defines
+     * (`{"type":"call",…}` / `{"type":"output",…}`), decoded back into [ModelHistoryItem]s.
+     *
+     * Answers an empty list for anything this cannot read — a plain tool-round summary, or an unparsable body — so the
+     * caller can fall back to the segment's text. An entry missing the identity the contract type requires (`callId`,
+     * `name`) is skipped rather than defaulted: a call with an invented id could never be matched to its output.
+     */
+    private fun toolRoundItems(text: String): List<ModelHistoryItem> {
+        val array = runCatching { toolRoundJson.parseToJsonElement(text) as? JsonArray }.getOrNull() ?: return emptyList()
+        return array.mapNotNull { element ->
+            val obj = element as? JsonObject ?: return@mapNotNull null
+            when (obj["type"]?.jsonPrimitive?.contentOrNull) {
+                "call" -> {
+                    val callId = obj["callId"]?.jsonPrimitive?.contentOrNull
+                    val name = obj["name"]?.jsonPrimitive?.contentOrNull
+                    if (callId.isNullOrBlank() || name.isNullOrBlank()) {
+                        null
+                    } else {
+                        ModelHistoryItem.ToolCall(
+                            callId = callId,
+                            name = name,
+                            argsJson = obj["argsJson"]?.jsonPrimitive?.contentOrNull ?: "{}",
+                            itemId = obj["itemId"]?.jsonPrimitive?.contentOrNull ?: callId,
+                        )
+                    }
+                }
+                "output" -> {
+                    val callId = obj["callId"]?.jsonPrimitive?.contentOrNull
+                    if (callId.isNullOrBlank()) {
+                        null
+                    } else {
+                        ModelHistoryItem.ToolOutput(callId, obj["output"]?.jsonPrimitive?.contentOrNull ?: "")
+                    }
+                }
+                else -> null
+            }
+        }
+    }
 
     /** A summary body as it must go on the wire: bounded once, never twice. */
     private fun boundedSummary(text: String): String =

@@ -15,6 +15,7 @@ import edith.agent.ProgressGuard
 import edith.agent.RequestFrame
 import edith.agent.Segment
 import edith.agent.SegmentOrigin
+import edith.agent.SegmentRole
 import edith.agent.ToolRegistry
 import edith.agent.TrimCounts
 import edith.contracts.AssistantRoute
@@ -93,7 +94,11 @@ import edith.plugins.smart.skill.StorageAccessSkillDirectory
 import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.put
 
 private const val CONFIG_SCHEMA_VERSION = 1
 private const val DEFAULT_WAKE_WORDS = "伊迪丝,edith"
@@ -699,7 +704,7 @@ class SmartAssistantPlugin(
             // Phase 5: the injected stores are the same session state, so both ends of the handover empty them.
             activeStores?.values?.forEach { it.clear() }
             activeStores = null
-        skillManager = null
+            skillManager = null
             detach()
         }
         // P3.3: a session that ends withdraws any question it asked. Leaving one pending would let the *next* session's
@@ -1149,21 +1154,39 @@ class SmartAssistantPlugin(
         // B1/B7/B6 evidence, counts only: without this line "the session carried the previous turn into this request"
         // and "the session carried nothing" are the same empty log, which is exactly what blocked these rows on the
         // device. Sizes are what a log may carry (P3.1's privacy rule); no prompt text is ever printed.
-        prompt?.let {
+        //
+        // Phase 5: with a store injected the session is the store, and `activeContextForTurn` is never written to on
+        // this path, so the manager's counts are not the session's. `history=1` there is the assembly's own utterance,
+        // not "the store carried one turn" - the line would report a carried turn on an empty session and vice versa.
+        // A store in use therefore reports the store's own counts, and only when there is no store is the manager's
+        // line the honest one. Still counts only: never text.
+        val store = activeStores?.get(ContextRoute.WAKE)
+        if (store != null) {
+            val history = store.history()
             P3Log.line(
-                "P3_CONTEXT route=${it.route} instructions=${it.instructions.length} " +
-                    "history=${it.history.size} historyChars=${it.history.sumOf { item -> item.estimatedLength() }} " +
-                    "memory=${it.memorySegments.size} tokens=${it.estimatedTokens} budget=${it.historyBudgetTokens} " +
-                    "over=${it.overHistoryBudget}",
+                "P3_CONTEXT route=${ContextRoute.WAKE} store=${history.size} " +
+                    "historyChars=${history.sumOf { item -> item.estimatedLength() }} " +
+                    "memory=${prompt?.memorySegments?.size ?: 0}",
             )
+        } else {
+            prompt?.let {
+                P3Log.line(
+                    "P3_CONTEXT route=${it.route} instructions=${it.instructions.length} " +
+                        "history=${it.history.size} historyChars=${it.history.sumOf { item -> item.estimatedLength() }} " +
+                        "memory=${it.memorySegments.size} tokens=${it.estimatedTokens} budget=${it.historyBudgetTokens} " +
+                        "over=${it.overHistoryBudget}",
+                )
+            }
         }
         // Phase 5: with a store injected, this turn's shape is a `RequestFrame` — the route's snapshot, the memory the
         // assembly retrieved, and this turn's utterance last — and the gateway maps it. The registry is built here
         // (rather than inside `buildLoop`) so the frame's tool table and the loop's own are the same table.
-        val store = activeStores?.get(ContextRoute.WAKE)
         val registry = registryFor(current, owned, ledger)
         val gateway = gatewayFor(current, owned)
-        val frame = store?.let { buildFrame(it, ContextRoute.WAKE, text, prompt, toolSpecsOf(registry)) }
+        // A **builder**, not a one-shot frame: a tool round makes this run ask the model a second time, and that
+        // request must be rendered by the same renderer from the transcript it continues. Only the store path gets one;
+        // the legacy path keeps its frame-less behaviour byte for byte.
+        val frameFor = store?.let { frameBuilderFor(ContextRoute.WAKE, text, prompt, toolSpecsOf(registry)) }
         val run = try {
             val built = buildLoop(configured, registry, gateway)
             loop = built
@@ -1185,8 +1208,16 @@ class SmartAssistantPlugin(
                     ),
                     // `buildPrompt` ends its history on this turn's user message while the loop appends the utterance
                     // itself, so the last item is dropped: passing it whole would ask the model the same thing twice.
-                    history = prompt?.history?.dropLast(1).orEmpty(),
-                    frame = frame,
+                    //
+                    // Phase 5: the store path replaces the manager transcript with the route's own store, so the
+                    // session this turn continues is the store's — not `prompt.history`, which the store path never
+                    // writes (it holds only this utterance, i.e. an empty session). The store is handed over **whole**:
+                    // the loop appends this turn's utterance and drops it again before calling `frameFor`, so the
+                    // builder receives the store exactly as it stands, with the previous turn's assistant half intact.
+                    // (`dropLast(1)` here would drop that half and lose a turn from every frame; the loop's own
+                    // drop is the one that matches the "the utterance is already in the history" convention.)
+                    history = store?.history() ?: prompt?.history?.dropLast(1).orEmpty(),
+                    frameFor = frameFor,
                 ),
             )
         } catch (failure: Throwable) {
@@ -1292,12 +1323,14 @@ class SmartAssistantPlugin(
          */
         trim: TrimCounts? = null,
     ) {
+        // A turn with no manager has no transcript to write: the counts below belong to a turn that was actually
+        // recorded, so the early return comes first rather than logging a trim for a route this session never owns.
+        val contexts = activeContextForTurn ?: return
         // The two counts the frame path is allowed to log (Task 4's `lastTrim`): how many whole turns cut ① dropped
         // and whether cut ③ is still owed. Nothing else from the report is printed, and the report has no text at all.
         trim?.let {
             P3Log.line("P3_CONTEXT trim route=$route droppedTurns=${it.droppedTurns} compressionOwed=${it.compressionOwed}")
         }
-        val contexts = activeContextForTurn ?: return
         // §4.2/§6.2: a turn that reached a terminal state **always says something** ([submitOutcome]), so the
         // transcript records the same words the wearer got rather than only the user half. Recording the user half
         // alone left the route's transcript ending on an unanswered user message, and the model path refuses that
@@ -1384,26 +1417,62 @@ class SmartAssistantPlugin(
         prompt: PromptAssembly?,
         tools: List<ToolSpec>,
     ): RequestFrame {
-        val instructions = prompt?.instructions ?: instructionsFor(
-            when (route) {
-                ContextRoute.WAKE -> SmartPrompts.instructions()
-                ContextRoute.PROACTIVE -> SmartPrompts.proactiveInstructions()
-            },
-        )
         val flow = buildList {
             addAll(store.snapshot())
             addAll(prompt?.memorySegments.orEmpty())
             add(Segment(SegmentOrigin.USER_INPUT, trusted = true, text = userInput))
         }
         return RequestFrame(
-            systemSegments = listOf(
-                Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = instructions),
-                Segment(SegmentOrigin.MEMORY_POLICY, trusted = true, text = SmartPrompts.MEMORY_POLICY),
-            ),
+            systemSegments = systemSlot(route, prompt),
             conversationFlow = flow,
             tools = tools,
         )
     }
+
+    /**
+     * Phase 5: the frame for **one** model request, built from the transcript that request continues.
+     *
+     * This is the builder `AgentRequest.frameFor` calls for every request of the run, which is what keeps a tool round's
+     * second request from losing the session: the plugin composes the system slot, the memory it captured once for the
+     * turn ([prompt]'s segments), the given transcript, and this turn's utterance **last**. The transcript arrives
+     * without the **pending** utterance (a frame renders that as `USER_INPUT`; the loop appends it to the transcript
+     * only once a tool round or a retry has moved past it), so a builder that also added it would ask the model twice.
+     *
+     * The transcript's items are mapped back to segments with their roles preserved — tool rounds stay `TOOL_ROUND`, so
+     * `TurnTrimmer`'s whole-turn boundary is still visible. No text is folded together here: that stays
+     * `frameToTranscript`'s single job.
+     */
+    private fun frameBuilderFor(
+        route: ContextRoute,
+        userInput: String,
+        prompt: PromptAssembly?,
+        tools: List<ToolSpec>,
+    ): (List<ModelHistoryItem>) -> RequestFrame = { transcript ->
+        RequestFrame(
+            systemSegments = systemSlot(route, prompt),
+            conversationFlow = buildList {
+                addAll(transcript.map { it.toSegment() })
+                addAll(prompt?.memorySegments.orEmpty())
+                add(Segment(SegmentOrigin.USER_INPUT, trusted = true, text = userInput))
+            },
+            tools = tools,
+        )
+    }
+
+    /** The system slot both frame paths share: instructions (with the SKILL section) plus the fixed memory policy. */
+    private fun systemSlot(route: ContextRoute, prompt: PromptAssembly?): List<Segment> = listOf(
+        Segment(
+            SegmentOrigin.INSTRUCTIONS,
+            trusted = true,
+            text = prompt?.instructions ?: instructionsFor(
+                when (route) {
+                    ContextRoute.WAKE -> SmartPrompts.instructions()
+                    ContextRoute.PROACTIVE -> SmartPrompts.proactiveInstructions()
+                },
+            ),
+        ),
+        Segment(SegmentOrigin.MEMORY_POLICY, trusted = true, text = SmartPrompts.MEMORY_POLICY),
+    )
 
     /** Builds the single-use loop for one turn from the registry and gateway its caller already built. */
     private fun buildLoop(configured: Config, registry: ToolRegistry, gateway: ModelClientGateway): AgentLoop =
@@ -2210,4 +2279,52 @@ class SmartAssistantPlugin(
             override fun cancel() = Unit
         }
     }
+}
+
+/**
+ * Phase 5: one transcript item as a request-flow segment, so the accumulated transcript can go back through the one
+ * frame renderer (`ModelClientGateway.frameToTranscript`) rather than a second expression that maps a transcript to the
+ * wire. Roles ride along as metadata; a tool item carries no role, which is what keeps `TurnTrimmer`'s whole-turn
+ * boundary (`isTurnStart`: a `TRANSCRIPT` segment with [SegmentRole.USER]) visible after the round trip.
+ *
+ * A tool item becomes a `TOOL_ROUND` segment whose text is the frame vocabulary's JSON entry (the same shape the
+ * model-runtime adapters parse), so the renderer can restore the call and its output as **structured** items: a
+ * continuation whose tool round arrived as plain text would hand the endpoint an assistant message where it expects the
+ * function call it produced, and two assistant texts in a row are a shape `ContextBudgeter` rejects.
+ */
+private fun ModelHistoryItem.toSegment(): Segment = when (this) {
+    is ModelHistoryItem.Text -> Segment(
+        origin = SegmentOrigin.TRANSCRIPT,
+        trusted = true,
+        text = text,
+        role = if (role == MessageRole.USER) SegmentRole.USER else SegmentRole.ASSISTANT,
+    )
+    is ModelHistoryItem.ToolCall -> Segment(
+        origin = SegmentOrigin.TOOL_ROUND,
+        trusted = true,
+        text = buildJsonArray {
+            add(
+                buildJsonObject {
+                    put("type", "call")
+                    put("callId", callId)
+                    put("itemId", itemId)
+                    put("name", name)
+                    put("argsJson", argsJson)
+                },
+            )
+        }.toString(),
+    )
+    is ModelHistoryItem.ToolOutput -> Segment(
+        origin = SegmentOrigin.TOOL_ROUND,
+        trusted = true,
+        text = buildJsonArray {
+            add(
+                buildJsonObject {
+                    put("type", "output")
+                    put("callId", callId)
+                    put("output", output)
+                },
+            )
+        }.toString(),
+    )
 }

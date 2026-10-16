@@ -51,12 +51,30 @@ data class AgentRequest(
      * default — for the pre-Phase-5 history path. `null` reproduces the previous behaviour exactly, so every existing
      * caller is unaffected.
      *
-     * The frame describes the run's **opening** state — a session store's snapshot, the retrieved memory and this
-     * turn's utterance — so only the first model turn is mapped from it. Once the loop has appended a tool round or a
-     * retry, the frame no longer describes the transcript (and a [RequestFrame] cannot carry tool rounds after its
-     * `USER_INPUT`), so every later turn keeps the history path, which is the one that owns them.
+     * Prefer [frameFor] when the caller owns a session: a frame describes one moment, and a run issues **more than one**
+     * model request whenever a tool round or a retry follows the opening turn.
      */
     val frame: RequestFrame? = null,
+    /**
+     * Phase 5: builds the [RequestFrame] for **every** model request of this run from the session transcript that
+     * request continues, or `null` — the default — for the history path.
+     *
+     * A tool round makes the loop ask the model a second time (`notify_user` alone guarantees it), and the frame that
+     * opened the run no longer describes that request: it cannot carry a tool round, because a [RequestFrame]'s one
+     * `USER_INPUT` must be last. Without a builder the later requests fall back to [history], which for a
+     * store-backed session is empty — the model then loses every earlier turn **and** the retrieved memory, because
+     * the memory exists only inside a frame. This seam is what gives every model request one renderer.
+     *
+     * `transcript` is the run's accumulated history **without the pending user turn**: the session's earlier turns
+     * plus this turn's assistant text, tool calls and tool outputs, oldest first. The current utterance arrives
+     * separately and the builder renders it as the frame's one `USER_INPUT` (last), so a builder that also appended it
+     * would ask the model the same thing twice. While the utterance is still the last item it is *pending* and is
+     * excluded — a history ending on it is the lone user group the budgeter refuses — and once a tool round or a retry
+     * has appended after it, it is an interior turn of this run and stays where it belongs. When a builder is supplied
+     * it owns the shape of every request (including the opening one) and [frame] is ignored; the builder is expected to
+     * compose its system slot, the memory it captured for the turn, the given transcript, and `USER_INPUT` last.
+     */
+    val frameFor: ((transcript: List<ModelHistoryItem>) -> RequestFrame)? = null,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -224,8 +242,14 @@ class AgentLoop(
         // The user's turn opens the history: the loop has no other channel to hand the model what was asked. When the
         // caller supplies a session transcript, this turn's utterance is appended to it rather than replacing it.
         val history = (request.history + ModelHistoryItem.Text(MessageRole.USER, request.utterance)).toMutableList()
-        // Phase 5: a caller-supplied frame is the run's **opening** shape, so only the first model turn is mapped from
-        // it (see `AgentRequest.frame`); a tool round or retry makes the loop's own history the transcript.
+        // Where this turn's utterance sits in that transcript. It is the pending user turn until a tool round or a
+        // retry appends after it, and a frame renders the pending user turn as its one `USER_INPUT` rather than as a
+        // history entry (a history that ended on it would be the lone user group `ContextBudgeter` refuses) — so the
+        // transcript handed to a builder excludes it **only while nothing follows it**.
+        val utteranceIndex = request.history.size
+        // Phase 5: a caller with a frame **builder** renders every request through it (see `AgentRequest.frameFor`), and
+        // this flag is then irrelevant; without one, a plain `frame` is the opening turn's shape and later turns keep
+        // the history path that owns the tool rounds.
         var openingTurn = true
         val steps = mutableListOf<AgentStep>()
         var unproductiveTurns = 0
@@ -242,7 +266,16 @@ class AgentLoop(
             // The system slot is one string and stays identical across the run: a caller-supplied frame's whole system
             // slot when there is one, the assembler's text otherwise.
             val assembled = turnRunner.assemble(userInput = request.utterance, tools = tools)
-            val frameForTurn = if (openingTurn) request.frame else null
+            // One renderer for every request: with a builder the frame is rebuilt from the transcript this request
+            // continues (earlier turns plus this turn's tool rounds), so a continuation keeps the session and the
+            // memory the opening frame carried. The builder renders the current utterance itself as `USER_INPUT`, so
+            // the transcript leaves out the pending user turn while it is still pending and keeps it — where it
+            // belongs, at the head of this turn's tool round — once something follows it.
+            val frameForTurn = when {
+                request.frameFor != null -> request.frameFor(frameTranscript(history, utteranceIndex))
+                openingTurn -> request.frame
+                else -> null
+            }
             openingTurn = false
             val reply = gateway.turn(
                 GatewayTurn(
@@ -403,6 +436,15 @@ class AgentLoop(
             }
         }
     }
+
+    /**
+     * The transcript a frame builder continues: the run's accumulated history, minus this turn's utterance while that
+     * utterance is still the pending user turn — a history ending on it is the lone user group the budgeter refuses,
+     * and a frame renders the pending turn as its one `USER_INPUT` instead. Once a tool round or a retry appended after
+     * it, the utterance is an interior turn of this run and stays.
+     */
+    private fun frameTranscript(history: List<ModelHistoryItem>, utteranceIndex: Int): List<ModelHistoryItem> =
+        if (history.size == utteranceIndex + 1) history.take(utteranceIndex) else history.toList()
 
     /**
      * Returns a run and records the transcript it leaves behind, closing a still-pending user turn first: a transcript

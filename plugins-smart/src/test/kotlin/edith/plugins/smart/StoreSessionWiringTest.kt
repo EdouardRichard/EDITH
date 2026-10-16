@@ -6,6 +6,7 @@ import edith.contracts.AcousticLabel
 import edith.contracts.TranscriptEvent
 import edith.plugin.Capability
 import edith.plugin.InputPart
+import edith.plugin.MessageRole
 import edith.plugin.ModelEnd
 import edith.plugin.ModelHistoryItem
 import edith.plugin.ModelProfile
@@ -122,6 +123,142 @@ class StoreSessionWiringTest {
         rig.wakeAndFinal("你好")
 
         assertEquals(2, contexts.context(ContextRoute.WAKE).size())
+    }
+
+    // ------------------------------------------------------------ a tool round: every model request through one renderer
+
+    /**
+     * Whether the wire history is a shape `ContextBudgeter` accepts, re-implemented locally because `plugins-smart`
+     * does not depend on `model-runtime` (where the real check lives). It is the same rule: text alternates from a
+     * leading `USER`, a tool run is preceded by an assistant text, and the last group is not a lone user message.
+     */
+    private fun acceptableWireHistory(history: List<ModelHistoryItem>): Boolean {
+        var lastTextRole: MessageRole? = null
+        var inToolRun = false
+        var lastGroupSize = 0
+        for (item in history) {
+            when (item) {
+                is ModelHistoryItem.Text -> {
+                    when {
+                        lastTextRole == null -> if (item.role != MessageRole.USER) return false
+                        inToolRun -> Unit
+                        lastTextRole == MessageRole.USER -> if (item.role != MessageRole.ASSISTANT) return false
+                        else -> if (item.role != MessageRole.USER) return false
+                    }
+                    if (item.role == MessageRole.USER) lastGroupSize = 1 else lastGroupSize++
+                    lastTextRole = item.role
+                    inToolRun = false
+                }
+                is ModelHistoryItem.ToolCall, is ModelHistoryItem.ToolOutput -> {
+                    if (!inToolRun && lastTextRole != MessageRole.ASSISTANT) return false
+                    inToolRun = true
+                    lastGroupSize++
+                }
+            }
+        }
+        return !(history.isNotEmpty() && lastGroupSize == 1 && lastTextRole == MessageRole.USER)
+    }
+
+    /**
+     * The defect this test exists for: within **one** turn a tool round makes `AgentLoop` issue a second model
+     * request, and on the store path that request used to lose the whole session — the store owned the transcript, the
+     * frame was supplied for the opening turn only, and the legacy history base was empty. `notify_user` is L0 and
+     * non-terminal, so this is reachable on any real tool call.
+     *
+     * The assertions are on **content**, not on "a second request happened": request 2 must carry the earlier session
+     * turns, the memory block, this turn's utterance and the tool round — and still be a shape the send-time budgeter
+     * accepts. A builder ignored for the continuation fails on every one of the first three.
+     */
+    @Test
+    fun `a tool round keeps the session and the memory in the second request`() {
+        val storage = SmartFakeStorage()
+        // The memory the turn retrieves, written through the production store. The query below is a substring of the
+        // remembered sentence, so the lexical ranking finds it even though the vector index starts cold.
+        MemoryLog(storage, log = {}).record(
+            edith.plugins.smart.memory.MemoryKind.PREFERENCE,
+            "我不吃香菜",
+            edith.plugins.smart.memory.MemorySource.EXPLICIT,
+        )
+        val stores = stores()
+        val rig = rig(stores, overrides = mapOf(Capability.Storage to storage))
+        // The model notifies once, then answers: two requests in one turn.
+        var turn = 0
+        rig.model.onRequest = { request, listener ->
+            turn += 1
+            if (turn == 1) {
+                listener(
+                    smartToolCall(
+                        "c1", "notify_user", """{"text":"稍等","channel":"screen"}""",
+                        requestId = request.requestId,
+                    ),
+                )
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(request, listener, "已经看过了。")
+            }
+        }
+        // Seeded after activation: activation is the session boundary and empties the route's store.
+        stores.getValue(ContextRoute.WAKE).apply {
+            appendUser("旧问题")
+            appendAssistant("旧回答")
+        }
+
+        val lines = withLines { captured -> rig.wakeAndFinal("香菜"); captured.toList() }
+
+        assertEquals(2, rig.model.requests.size, "the tool round must make a second model request")
+        val first = rig.model.requests[0]
+        assertEquals(listOf("香菜"), first.input.filterIsInstance<InputPart.Text>().map { it.text })
+        assertTrue(
+            first.history.none { it is ModelHistoryItem.ToolOutput },
+            "the opening request is issued before any tool has run: ${first.history}",
+        )
+        val firstHead = first.history.firstOrNull()
+        assertTrue(
+            firstHead is ModelHistoryItem.Text && firstHead.role == MessageRole.USER &&
+                firstHead.text.contains("reference_context") && firstHead.text.contains("旧问题"),
+            "the opening request must carry the session and the memory too: ${first.history}",
+        )
+
+        val second = rig.model.requests[1]
+        // The frame's one `USER_INPUT` is this turn's utterance and is rendered last on the wire (that is the frame
+        // path's deliberate shape), so the continuation carries it as `input`; the transcript it continues stays in
+        // `history` and ends on the tool round.
+        assertEquals(listOf("香菜"), second.input.filterIsInstance<InputPart.Text>().map { it.text })
+        assertTrue(
+            second.history.lastOrNull() is ModelHistoryItem.ToolOutput,
+            "the tool output must stay last in the transcript: ${second.history}",
+        )
+        val head = second.history.firstOrNull()
+        assertTrue(
+            head is ModelHistoryItem.Text && head.role == MessageRole.USER && head.text.contains("reference_context"),
+            "request 2 must still carry the retrieved memory: ${second.history}",
+        )
+        val headText = (head as ModelHistoryItem.Text).text
+        assertTrue(headText.contains("旧问题"), "request 2 must still carry the earlier session turn: $headText")
+        assertTrue(headText.contains("我不吃香菜"), "request 2 must carry the memory content: $headText")
+        assertTrue(
+            second.history.filterIsInstance<ModelHistoryItem.Text>().map { it.text }.any { it == "旧回答" },
+            "request 2 must still carry the earlier assistant turn: ${second.history}",
+        )
+        assertTrue(
+            second.history.any { it is ModelHistoryItem.ToolOutput && it.output == "notified:1" },
+            "request 2 must carry this turn's tool round: ${second.history}",
+        )
+        assertTrue(
+            second.history.any { it is ModelHistoryItem.ToolCall && it.name == "notify_user" },
+            "the call must come back structured, not as text: ${second.history}",
+        )
+        assertTrue(
+            acceptableWireHistory(second.history),
+            "the continuation must stay a shape the send-time budgeter accepts: ${second.history}",
+        )
+        assertTrue(second.instructions.contains(SmartPrompts.MEMORY_POLICY), "the fixed memory policy rides along")
+        // Important 2: the count line must report the store's own session, not the manager the store path never writes
+        // (which holds only this utterance, so the line used to read `history=1` however many turns the store held).
+        assertTrue(
+            lines.any { it.startsWith("P3_CONTEXT route=WAKE store=2 historyChars=6") },
+            "P3_CONTEXT must report the store's own counts: $lines",
+        )
     }
 
     // ------------------------------------------------------------ B6's order on the store path
