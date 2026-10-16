@@ -635,6 +635,36 @@ class ModelClientGatewayTest {
         assertTrue(client.requests.isEmpty(), "an unsendable frame must be refused before any transport call")
     }
 
+    @Test fun `a frame whose surviving history is a lone user group is refused as NO_USER_TURN`() {
+        // `ContextBudgeter` rejects a history whose last group is a single user message, by design
+        // (`ContextBudgeter.kt:53` — whole-group eviction depends on it). A frame reaches that shape after cut ① when
+        // the only turn that survives is an unanswered user half: the older whole turn is evicted for the budget and
+        // the pending user turn is left alone. The gateway must refuse it here rather than hand an unsendable request
+        // to the transport — the 2026-10-14 failure mode (one bad shape ⇒ every later turn fails until a restart).
+        val client = terminalClient()
+        val pending = "没有被回答的一问"
+        val input = "现在呢"
+        val flow = listOf(
+            Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(100), SegmentRole.USER),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "答".repeat(100), SegmentRole.ASSISTANT),
+            Segment(SegmentOrigin.TRANSCRIPT, true, pending, SegmentRole.USER),
+            Segment(SegmentOrigin.USER_INPUT, true, input),
+        )
+        val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
+        // The window fits the system slot, the pending user turn and the input — and none of the older turn: cut ①
+        // takes exactly that whole group and stops, so the surviving history is the lone user half.
+        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+        val limit = FIXED_OVERHEAD + measure("sys") + measure(pending) + measure(input)
+        val gateway = gateway(client)
+
+        val reply = gateway.turn(turn(frame = frame, limitBytes = limit))
+
+        assertEquals(1, requireNotNull(gateway.lastTrim).droppedTurns, "cut ① took exactly the older whole turn")
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals("NO_USER_TURN", reply.safeCode)
+        assertTrue(client.requests.isEmpty(), "an unsendable frame must be refused before any transport call")
+    }
+
     @Test fun `the gateway exposes trim counts and never any text`() {
         // I-6: the probe-shaped seam must be counts only. `TrimReport` carries the kept `RequestFrame`, whose
         // segments hold text, so `lastTrim.toString()` used to be able to print a surviving body; the gateway now

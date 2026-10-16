@@ -1,5 +1,6 @@
 package edith.phone
 
+import edith.agent.ConversationStore
 import edith.contracts.Generation
 import edith.contracts.SessionId
 import edith.plugin.DeadlineScheduler
@@ -7,6 +8,7 @@ import edith.plugin.ModelProfile
 import edith.plugin.MonotonicClock
 import edith.plugin.PluginConfiguration
 import edith.plugins.smart.SmartAssistantPlugin
+import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.proactive.GateForm
 import edith.storage.ProfileRepository
 
@@ -48,6 +50,14 @@ internal class SmartWiring(
      */
     fun configuration(profile: ModelProfile?): PluginConfiguration = settings.pluginConfiguration(profile)
 
+    /**
+     * The two routes' session stores (Phase 5 / spec §1.3 C3): one `ConversationStore` per route, and nothing shared
+     * between them. The plugin empties them at each activation and deactivation, so they are session state that happens
+     * to outlive one activation by living in the wiring — never a session's words replayed under the next one.
+     */
+    private val conversationStores: Map<ContextRoute, ConversationStore> =
+        ContextRoute.entries.associateWith { ConversationStore() }
+
     val plugin: SmartAssistantPlugin = SmartAssistantPlugin(
         clock = clock,
         scheduler = scheduler,
@@ -58,5 +68,7 @@ internal class SmartWiring(
         // call time rather than injected here, because that model arrives through a capability the plugin only holds
         // once it is activated - and the host is free to take it back.
         gateForm = GateForm.NOUL,
+        // Phase 5: the production session owner. Non-null switches every turn onto the store + `RequestFrame` path.
+        conversationStores = conversationStores,
     )
 }

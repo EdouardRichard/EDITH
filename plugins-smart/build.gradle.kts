@@ -12,7 +12,11 @@ dependencies {
     implementation(project(":plugin-api"))
     // The passive loop (Task 13) lives in agent-runtime, and the hint assembly in output-runtime. Both are already on
     // phone-app's runtime classpath, so this adds no new external artifact and does not disturb any lockfile.
-    implementation(project(":agent-runtime"))
+    //
+    // `api` for `agent-runtime`: Phase 5 put `ConversationStore` into `SmartAssistantPlugin`'s **constructor**, so an
+    // agent-runtime type is now part of this module's public API and every consumer that builds the plugin (phone-app's
+    // `SmartWiring`) must be able to resolve it. `implementation` would hide it and fail that compilation.
+    api(project(":agent-runtime"))
     implementation(project(":output-runtime"))
     // The proactive turn (Task 8) parses the one tool call it accepts (`propose_hint`'s arguments) with the same
     // parser the loop uses. Already on this module's runtime classpath through `:agent-runtime`, so no new artifact.

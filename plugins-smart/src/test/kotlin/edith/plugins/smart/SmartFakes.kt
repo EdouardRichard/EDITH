@@ -327,6 +327,11 @@ internal class SmartTestRig(
      * production over-budget path reachable in a few turns injects a smaller one.
      */
     budget: edith.plugins.smart.context.TokenBudget = edith.plugins.smart.context.TokenBudget(),
+    /**
+     * Phase 5: the per-route session stores the production wiring injects. `null` — the default — is the legacy shape
+     * every pre-Phase-5 test uses, so those tests keep both old paths untouched.
+     */
+    conversationStores: Map<edith.plugins.smart.context.ContextRoute, edith.agent.ConversationStore>? = null,
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -356,6 +361,7 @@ internal class SmartTestRig(
             compressor = compressor,
             interventionGate = interventionGate,
             budget = budget,
+            conversationStores = conversationStores,
         )
     }
 

@@ -1,0 +1,295 @@
+package edith.plugins.smart
+
+import edith.agent.ConversationStore
+import edith.contracts.AcousticEvent
+import edith.contracts.AcousticLabel
+import edith.contracts.TranscriptEvent
+import edith.plugin.Capability
+import edith.plugin.InputPart
+import edith.plugin.ModelEnd
+import edith.plugin.ModelHistoryItem
+import edith.plugin.ModelProfile
+import edith.plugin.ModelStreamEvent
+import edith.plugins.smart.context.CompressionReport
+import edith.plugins.smart.context.ContextCompressor
+import edith.plugins.smart.context.ContextManager
+import edith.plugins.smart.context.ContextRoute
+import edith.plugins.smart.memory.MemoryLog
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertTrue
+
+/**
+ * Phase 5's production wiring: with a `ConversationStore` per route injected, the session records into the store and
+ * each model turn is assembled as a `RequestFrame`; with none injected, both legacy paths stay byte for byte.
+ *
+ * Every ordering or independence guarantee here is written so that **removing the code it names turns it red**: the
+ * routes test drives *both* routes and asserts each store holds its own half (a plugin that records nothing fails on
+ * the "used route is non-empty" half), the compressor test asserts the **call count** and what the store held **on
+ * entry** (not merely that a summary appeared), and the gate tests assert the boolean the plugin actually passed in
+ * both directions. The mutation outputs are in the Task 6 report.
+ */
+class StoreSessionWiringTest {
+
+    /** One fresh store per route, exactly as `SmartWiring` builds them. */
+    private fun stores(): Map<ContextRoute, ConversationStore> =
+        ContextRoute.entries.associateWith { ConversationStore() }
+
+    /** An activated production-shaped rig whose two route stores are `stores`. */
+    private fun rig(
+        stores: Map<ContextRoute, ConversationStore> = stores(),
+        compressor: ContextCompressor? = null,
+        overrides: Map<Capability, Any> = mapOf(Capability.Storage to SmartFakeStorage()),
+    ): SmartTestRig = SmartTestRig(conversationStores = stores, compressor = compressor).also {
+        it.activate(overrides = overrides)
+        it.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+    }
+
+    private fun <T> withLines(block: (MutableList<String>) -> T): T {
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        return try {
+            block(lines)
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    private fun textItems(store: ConversationStore): List<String> =
+        store.history().filterIsInstance<ModelHistoryItem.Text>().map { it.text }
+
+    // ------------------------------------------------------------ the store path
+
+    @Test
+    fun `the store route records the turn and hands the model a frame`() {
+        val stores = stores()
+        val rig = rig(stores)
+
+        rig.wakeAndFinal("现在几点了")
+
+        // ① the store recorded both halves of this turn
+        assertEquals(listOf("现在几点了", "好。"), textItems(stores.getValue(ContextRoute.WAKE)))
+        // ② on the wire, this turn's utterance is the request input, not a history item
+        val sent = rig.model.requests.last()
+        assertEquals(listOf("现在几点了"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+        assertTrue(sent.history.isEmpty(), "an empty store opens the request with the input alone: ${sent.history}")
+    }
+
+    @Test
+    fun `the two routes keep independent stores`() {
+        // Both routes are driven, and each store must hold **its own** half only. Asserting "the other route is 0"
+        // alone would also pass for a plugin that records nothing at all, so the used route is asserted non-empty too.
+        val stores = stores()
+        val rig = rig(stores)
+        rig.model.onRequest = { request, listener ->
+            if (request.tools.any { it.name == SmartPrompts.PROPOSE_HINT.name }) {
+                listener(smartToolCall("c1", "propose_hint", """{"text":"主动提示"}""", requestId = request.requestId))
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(request, listener, "好。")
+            }
+        }
+
+        // The wake route.
+        rig.wakeAndFinal("开灯")
+        rig.tick(4_000)
+        // The proactive route: armed by a perception signal, admitted by a question-shaped trigger.
+        rig.plugin.handle(AcousticEvent(rig.envelope(), AcousticLabel.Speech))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("帮我记一下这件事", turnId = "asr-p1")))
+
+        val wake = stores.getValue(ContextRoute.WAKE)
+        val proactive = stores.getValue(ContextRoute.PROACTIVE)
+        assertTrue(wake.size() > 0, "the wake route recorded nothing at all")
+        assertTrue(proactive.size() > 0, "the proactive route recorded nothing at all")
+        assertEquals(listOf("开灯", "好。"), textItems(wake), "the proactive turn leaked into the wake store")
+        assertEquals(
+            listOf("帮我记一下这件事", "主动提示"),
+            textItems(proactive),
+            "a wake turn leaked into the proactive store",
+        )
+    }
+
+    @Test
+    fun `with no injected stores the plugin keeps the legacy transcript`() {
+        // Regression: with no store the Phase B behaviour is unchanged — the `ContextManager` transcript is what the
+        // session records into, and no frame is assembled.
+        val contexts = ContextManager()
+        val rig = SmartTestRig(contextForTurn = contexts)
+        rig.activate(overrides = mapOf(Capability.Storage to SmartFakeStorage()))
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+        rig.wakeAndFinal("你好")
+
+        assertEquals(2, contexts.context(ContextRoute.WAKE).size())
+    }
+
+    // ------------------------------------------------------------ B6's order on the store path
+
+    /**
+     * Records what the memory store held **and** what the session store held **at the moment compression ran**.
+     *
+     * That is the whole assertion: if the memory store already carries this turn's message and the session store
+     * already carries this turn's two halves when `compressStore` is entered, then ③ (memory write), ④ (transcript
+     * record) and ⑤ (compression) ran in that order.
+     */
+    private class OrderWatchingStoreCompressor(private val memory: MemoryLog) : ContextCompressor() {
+        val memoryAtCompression = mutableListOf<List<String>>()
+        val storeAtCompression = mutableListOf<List<String>>()
+        var calls = 0
+
+        override fun compressStore(
+            store: ConversationStore,
+            shareTokens: Int,
+            compressionOwed: Boolean,
+        ): CompressionReport {
+            calls++
+            memoryAtCompression += memory.entries().map { it.text }
+            storeAtCompression += store.history().filterIsInstance<ModelHistoryItem.Text>().map { it.text }
+            return CompressionReport(truncated = 0, summaryStarted = false, summaryReason = null)
+        }
+    }
+
+    @Test
+    fun `a completed turn asks the store compressor exactly once, after the memory write`() {
+        val storage = SmartFakeStorage()
+        val watcher = OrderWatchingStoreCompressor(MemoryLog(storage, log = {}))
+        val rig = rig(compressor = watcher, overrides = mapOf(Capability.Storage to storage))
+
+        rig.wakeAndFinal("记住我不吃香菜")
+
+        assertEquals(1, watcher.calls, "a finished store turn consults the compressor exactly once")
+        assertTrue(
+            watcher.memoryAtCompression.single().any { it == "我不吃香菜" },
+            "the memory write must have happened before compression, memory held: ${watcher.memoryAtCompression}",
+        )
+        assertEquals(
+            listOf("记住我不吃香菜", "好。"),
+            watcher.storeAtCompression.single(),
+            "the turn's two halves must already be recorded when compression enters",
+        )
+    }
+
+    // ------------------------------------------------------------ the ③ gate, both directions
+
+    /** Records the caller's half of the ③ gate — what the plugin decided, not what compression then did. */
+    private class GateWatchingCompressor : ContextCompressor() {
+        val owedAtEntry = mutableListOf<Boolean>()
+
+        override fun compressStore(
+            store: ConversationStore,
+            shareTokens: Int,
+            compressionOwed: Boolean,
+        ): CompressionReport {
+            owedAtEntry += compressionOwed
+            return CompressionReport(truncated = 0, summaryStarted = false, summaryReason = null)
+        }
+    }
+
+    /**
+     * A profile whose frame window (32 bytes) fits nothing at all: the system slot alone overruns it, so the trimmer
+     * reports `compressionOwed = true` on every turn. Whether a **whole turn was dropped** is then the only variable,
+     * which is exactly the conjunction the ③ gate is.
+     */
+    private fun tinyWindowProfile(): ModelProfile = smartProfile().copy(
+        usableWindowTokens = 1_000,
+        inputBudgetTokens = 64,
+        maxOutputTokens = 100,
+        safetyTokens = 100,
+    )
+
+    @Test
+    fun `the store gate opens only when a turn was dropped and compression is still owed`() {
+        val stores = stores()
+        val gate = GateWatchingCompressor()
+        val rig = rig(stores, compressor = gate)
+        rig.profile = tinyWindowProfile()
+        // Seeded after activation: activation is the session boundary and empties the route's store.
+        stores.getValue(ContextRoute.WAKE).apply {
+            appendUser("旧问题")
+            appendAssistant("旧回答")
+        }
+
+        val lines = withLines { captured -> rig.wakeAndFinal("现在几点"); captured.toList() }
+
+        assertEquals(
+            listOf(true),
+            gate.owedAtEntry,
+            "cut ① dropped a whole turn and the frame is still over budget, so ③ is owed",
+        )
+        assertTrue(
+            lines.contains("P3_CONTEXT trim route=WAKE droppedTurns=1 compressionOwed=true"),
+            "the trim counts must be logged as two numbers: $lines",
+        )
+    }
+
+    @Test
+    fun `the store gate stays shut when no turn was dropped even though compression is owed`() {
+        // An empty store: nothing was evicted, yet the frame is over budget (the system slot + this turn's input).
+        // Passing `compressionOwed` alone here would start a summary with no turn to summarise — invented content.
+        val gate = GateWatchingCompressor()
+        val rig = rig(compressor = gate)
+        rig.profile = tinyWindowProfile()
+
+        val lines = withLines { captured -> rig.wakeAndFinal("现在几点"); captured.toList() }
+
+        assertEquals(
+            listOf(false),
+            gate.owedAtEntry,
+            "no turn was dropped, so the caller's half of the ③ gate must be false",
+        )
+        assertTrue(
+            lines.contains("P3_CONTEXT trim route=WAKE droppedTurns=0 compressionOwed=true"),
+            "the two counts must be logged even when cut ① did nothing: $lines",
+        )
+    }
+
+    // ------------------------------------------------------------ the lone one-item user group
+
+    /** `TurnTrimmer.total`'s own byte unit (`UTF-8 bytes + 32`), so the window below is exact. */
+    private fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+
+    /**
+     * A profile whose window fits the system slot, the surviving pending user turn and this turn's input — with 8
+     * bytes to spare — so cut ① evicts the older whole turn and stops there. The system slot is composed exactly as
+     * `buildFrame` composes it.
+     */
+    private fun windowSizedFor(vararg survivors: String): ModelProfile {
+        val system = SmartPrompts.instructions() + "\n" + SmartPrompts.MEMORY_POLICY
+        val total = 32 + measure(system) + survivors.sumOf { measure(it) }
+        val window = total + 8
+        val inputBudget = window + 32
+        return smartProfile().copy(
+            usableWindowTokens = inputBudget + 1_000 + 100,
+            inputBudgetTokens = inputBudget,
+            maxOutputTokens = 1_000,
+            safetyTokens = 100,
+        )
+    }
+
+    @Test
+    fun `a lone surviving user turn ends the turn as NO_USER_TURN without throwing`() {
+        // The 2026-10-14 shape: the surviving history's last (hence only) group is a single unanswered user message,
+        // which `ContextBudgeter` rejects by design (`groups.last().size == 1`). The gateway must refuse it as
+        // `FAILED`/`NO_USER_TURN` instead of handing an unsendable shape to the transport — one bad shape must not
+        // make every later turn fail until an app restart.
+        val stores = stores()
+        val rig = rig(stores)
+        val pending = "还没有被回答的那一问"
+        val input = "现在几点了"
+        rig.profile = windowSizedFor(pending, input)
+        stores.getValue(ContextRoute.WAKE).apply {
+            appendUser("旧".repeat(60))
+            appendAssistant("答".repeat(60))
+            appendUser(pending)
+        }
+
+        val lines = withLines { captured -> rig.wakeAndFinal(input); captured.toList() }
+
+        assertTrue(
+            lines.contains("P3_TURN end turn=asr-1 outcome=FAILED code=NO_USER_TURN steps=0"),
+            "the turn must end FAILED/NO_USER_TURN rather than throw or send an unsendable shape: $lines",
+        )
+        assertTrue(rig.model.requests.isEmpty(), "an unsendable frame must never reach the transport")
+    }
+}

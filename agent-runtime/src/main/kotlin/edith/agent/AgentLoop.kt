@@ -46,6 +46,17 @@ data class AgentRequest(
      * many turns it happened to take.
      */
     val history: List<ModelHistoryItem> = emptyList(),
+    /**
+     * Phase 5: the caller's already-assembled [RequestFrame] for this run's **opening** model turn, or `null` — the
+     * default — for the pre-Phase-5 history path. `null` reproduces the previous behaviour exactly, so every existing
+     * caller is unaffected.
+     *
+     * The frame describes the run's **opening** state — a session store's snapshot, the retrieved memory and this
+     * turn's utterance — so only the first model turn is mapped from it. Once the loop has appended a tool round or a
+     * retry, the frame no longer describes the transcript (and a [RequestFrame] cannot carry tool rounds after its
+     * `USER_INPUT`), so every later turn keeps the history path, which is the one that owns them.
+     */
+    val frame: RequestFrame? = null,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -213,6 +224,9 @@ class AgentLoop(
         // The user's turn opens the history: the loop has no other channel to hand the model what was asked. When the
         // caller supplies a session transcript, this turn's utterance is appended to it rather than replacing it.
         val history = (request.history + ModelHistoryItem.Text(MessageRole.USER, request.utterance)).toMutableList()
+        // Phase 5: a caller-supplied frame is the run's **opening** shape, so only the first model turn is mapped from
+        // it (see `AgentRequest.frame`); a tool round or retry makes the loop's own history the transcript.
+        var openingTurn = true
         val steps = mutableListOf<AgentStep>()
         var unproductiveTurns = 0
         // The turn's budget counts **machine** time only. A confirmation spends the *user's* time, so the deadline is
@@ -225,12 +239,16 @@ class AgentLoop(
             if (clock.nowNanos() >= turnDeadlineNanos) return finish(AgentOutcome.DEADLINE, null, null, steps, history, "")
 
             // Assemble the RequestFrame through TurnRunner; the gateway still receives a plain instructions string.
-            val frame = turnRunner.assemble(userInput = request.utterance, tools = tools)
+            // The system slot is one string and stays identical across the run: a caller-supplied frame's whole system
+            // slot when there is one, the assembler's text otherwise.
+            val assembled = turnRunner.assemble(userInput = request.utterance, tools = tools)
+            val frameForTurn = if (openingTurn) request.frame else null
+            openingTurn = false
             val reply = gateway.turn(
                 GatewayTurn(
                     request.turnId,
                     request.profileId,
-                    frame.systemText,
+                    request.frame?.systemText ?: assembled.systemText,
                     history.toList(),
                     tools,
                     // D49: the turn's budget and one request's cap are different numbers. A caller that supplies no cap
@@ -240,6 +258,7 @@ class AgentLoop(
                     } else {
                         turnDeadlineNanos
                     },
+                    frame = frameForTurn,
                 ),
             )
             // A turn that was blocked when `cancel()` arrived must not complete the run with a late answer.

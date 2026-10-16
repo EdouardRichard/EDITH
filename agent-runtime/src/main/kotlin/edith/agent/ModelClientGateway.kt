@@ -68,11 +68,12 @@ class ModelClientGateway(
     /**
      * Counts from the most recent frame-path trim — how many whole turns and which origins were dropped, and whether
      * compression is still owed. **Never any text**, by type: it is [TrimCounts], which carries no frame and no
-     * segment, so no probe's `toString()` can print a surviving body. It exists for tests and count-only probes
-     * (spec's "只记计数"). Null until the first frame-path turn, and never updated by the legacy `split(history)`
-     * path.
+     * segment, so no probe's `toString()` can print a surviving body. It exists for tests and for the two count-only
+     * consumers the production plugin has: its `P3_CONTEXT` trim line and the ③ gate it hands to `compressStore`
+     * (`plugins-smart`'s `recordTurnAndCompress`). Null until the first frame-path turn, and never updated by the
+     * legacy `split(history)` path.
      */
-    internal var lastTrim: TrimCounts? = null
+    var lastTrim: TrimCounts? = null
         private set
 
     companion object {
@@ -224,12 +225,15 @@ class ModelClientGateway(
      * would be a lone user group and unsendable.
      *
      * Returns `null` — the caller answers `NO_USER_TURN` — when the mapping could not produce a request
-     * `ContextBudgeter` would send: no `USER_INPUT` segment at all, or a non-empty history whose first text is not
-     * a user turn.
+     * `ContextBudgeter` would send: no `USER_INPUT` segment at all, a non-empty history whose first text is not
+     * a user turn, or a history that ends on a lone user message (the last one is the shape cut ① leaves when the
+     * only surviving turn is an unanswered user half).
      *
-     * Folding several context segments into one message can only make the sent request **cheaper** than the
-     * trimmer's measurement (one 32-byte per-message overhead disappears per folded segment, while each join adds
-     * 2 bytes), so the trimmer's verdict stays the conservative one and no fold can push a request over the limit.
+     * Folding several context segments into one message removes one 32-byte per-message overhead per folded segment and
+     * adds 2 bytes per join, so it is cheaper whenever more than one segment is folded. With a **single** context
+     * segment it is 2 bytes **more** expensive than the trimmer's measurement of that one segment (no overhead is
+     * removed), which the gateway's deliberate 32-byte window margin absorbs; the trimmer's verdict therefore stays
+     * the conservative one either way and no fold can push a request over the limit.
      */
     private fun frameToTranscript(frame: RequestFrame): Transcript? {
         val flow = frame.conversationFlow
@@ -245,24 +249,41 @@ class ModelClientGateway(
                 else -> history += ModelHistoryItem.Text(roleOf(segment), segment.text)
             }
         }
-        if (leading.isEmpty()) {
-            return if (history.isEmpty() || opensWithUser(history)) {
-                Transcript(listOf(InputPart.Text(inputText)), history)
-            } else {
-                null
+        val transcript = when {
+            leading.isEmpty() ->
+                if (history.isEmpty() || opensWithUser(history)) {
+                    Transcript(listOf(InputPart.Text(inputText)), history)
+                } else {
+                    null
+                }
+            else -> {
+                val context = leading.joinToString("\n\n")
+                val head = history.firstOrNull()
+                when {
+                    head is ModelHistoryItem.Text && head.role == MessageRole.USER -> {
+                        history[0] = ModelHistoryItem.Text(MessageRole.USER, "$context\n\n${head.text}")
+                        Transcript(listOf(InputPart.Text(inputText)), history)
+                    }
+                    history.isEmpty() -> Transcript(listOf(InputPart.Text("$context\n\n$inputText")), history)
+                    else -> null
+                }
             }
-        }
-        val context = leading.joinToString("\n\n")
-        val head = history.firstOrNull()
-        return when {
-            head is ModelHistoryItem.Text && head.role == MessageRole.USER -> {
-                history[0] = ModelHistoryItem.Text(MessageRole.USER, "$context\n\n${head.text}")
-                Transcript(listOf(InputPart.Text(inputText)), history)
-            }
-            history.isEmpty() -> Transcript(listOf(InputPart.Text("$context\n\n$inputText")), history)
-            else -> null
-        }
+        } ?: return null
+        // A history whose last group is a single user message is refused exactly like the shapes above: it is what cut
+        // ① leaves when the only surviving turn is an unanswered user half, and `ContextBudgeter` rejects it **by
+        // design** (`groups.last().size == 1` — whole-group eviction depends on it). Handing it to the transport would
+        // make every later turn fail with `ConfigurationRejected` until a restart (the 2026-10-14 incident).
+        if (history.isNotEmpty() && !lastGroupIsClosed(history)) return null
+        return transcript
     }
+
+    /**
+     * Whether the history's last whole-turn group holds more than its opening `USER` text — the property
+     * `ContextBudgeter` needs for whole-group eviction. A bare trailing `USER` text is a group of one and is
+     * unsendable.
+     */
+    private fun lastGroupIsClosed(history: List<ModelHistoryItem>): Boolean =
+        (history.last() as? ModelHistoryItem.Text)?.role != MessageRole.USER
 
     /** A summary body as it must go on the wire: bounded once, never twice. */
     private fun boundedSummary(text: String): String =

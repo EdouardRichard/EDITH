@@ -178,8 +178,12 @@ open class ContextCompressor(
      * share it measured.
      *
      * **It does not free space in the current request** (P5-R4; see the class KDoc). Call it at the turn's tail.
+     *
+     * `open` for the same reason [compressIfNeeded] is: a test observes **when** it ran relative to the memory write
+     * (spec §4.9's ordering) and **what the caller's half of the gate was**, which no post-hoc assertion on the store
+     * can recover.
      */
-    fun compressStore(
+    open fun compressStore(
         store: ConversationStore,
         shareTokens: Int,
         compressionOwed: Boolean,

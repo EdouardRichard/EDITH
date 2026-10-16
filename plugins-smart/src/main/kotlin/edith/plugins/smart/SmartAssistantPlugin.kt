@@ -7,11 +7,16 @@ import edith.agent.AgentRun
 import edith.agent.AuditEntry
 import edith.agent.BoundedAuditLog
 import edith.agent.ConfirmationGate
+import edith.agent.ConversationStore
 import edith.agent.GatewayTurn
 import edith.agent.MemoryRetrieval
 import edith.agent.ModelClientGateway
 import edith.agent.ProgressGuard
+import edith.agent.RequestFrame
+import edith.agent.Segment
+import edith.agent.SegmentOrigin
 import edith.agent.ToolRegistry
+import edith.agent.TrimCounts
 import edith.contracts.AssistantRoute
 import edith.plugin.ConversationDisplay
 import edith.plugin.conversationDisplay
@@ -53,6 +58,7 @@ import edith.plugin.PluginContext
 import edith.plugin.PluginDescriptor
 import edith.plugin.PluginLifecycle
 import edith.plugin.RiskLevel
+import edith.plugin.ToolSpec
 import edith.plugin.actions
 import edith.plugin.confirmation
 import edith.plugin.context
@@ -67,6 +73,7 @@ import edith.plugins.smart.context.ContextCompressor
 import edith.plugins.smart.context.ContextManager
 import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.context.ModelSummarizer
+import edith.plugins.smart.context.PromptAssembly
 import edith.plugins.smart.context.TokenBudget
 import edith.plugins.smart.context.estimatedLength
 import edith.plugins.smart.memory.MemoryExtraction
@@ -234,6 +241,19 @@ class SmartAssistantPlugin(
      * injected, because the model arrives through a capability the plugin only holds once it is activated.
      */
     private val gateForm: GateForm? = null,
+    /**
+     * Phase 5: the session's transcript owner, one [ConversationStore] per route — or `null`, the default, for the
+     * pre-Phase-5 shape, where [contextForTurn] (or the manager [activate] builds) owns the transcript and the request
+     * is assembled from `ModelHistoryItem` history. Non-null switches every turn onto the production path: the route
+     * records into its own store and each model turn is assembled as a [RequestFrame] the gateway trims and maps.
+     *
+     * `SmartWiring` builds one `ConversationStore()` per route. A route missing from a non-null map is the legacy path
+     * for that route, so a partial map degrades one route rather than failing the session.
+     *
+     * The stores are **session** state: [activate] and [deactivate] empty them, exactly as they do the
+     * manager-built transcript, so a re-activated session cannot replay the previous session's words.
+     */
+    private val conversationStores: Map<ContextRoute, ConversationStore>? = null,
 ) : PluginLifecycle, ConfiguredPlugin {
 
     init {
@@ -370,6 +390,12 @@ class SmartAssistantPlugin(
      */
     @Volatile private var activeContextForTurn: ContextManager? = null
     @Volatile private var activeCompressor: ContextCompressor? = null
+
+    /**
+     * Phase 5: the session's per-route stores, or `null` when the wiring supplied none. Session state like
+     * [activeContextForTurn]: [activate] adopts the injected map **and empties it**, [deactivate] empties and drops it.
+     */
+    @Volatile private var activeStores: Map<ContextRoute, ConversationStore>? = null
 
     /**
      * P3.4: what a finished turn is allowed to write. Same lifetime and the same namespace as [memoryRetrieval]; `null`
@@ -608,6 +634,10 @@ class SmartAssistantPlugin(
         )
         // B1/B3/B6: the session's transcript and compressor (see the field comments for why they are built here).
         activeContextForTurn = contextForTurn ?: ContextManager(memory = memoryRetrieval, budget = budget)
+        // Phase 5: the injected per-route stores are session state too. A store left over from the previous session
+        // would be replayed under the new session's envelope - the same leak `lastFinalTranscript` is cleared for - so
+        // activation empties them; `deactivate` clears them at the other end of the handover.
+        activeStores = conversationStores?.also { stores -> stores.values.forEach { it.clear() } }
         // B3 / spec §4.4's asynchronous half. It is built per activation for the same reason the transcript is: it
         // carries a request deadline and must reach **this** session's model client, and it is `null` when the host
         // granted no model service, which the compressor's own contract turns into plain truncation.
@@ -666,6 +696,9 @@ class SmartAssistantPlugin(
             // behind would be the previous session's words under the new session's envelope.
             activeContextForTurn = null
             activeCompressor = null
+            // Phase 5: the injected stores are the same session state, so both ends of the handover empty them.
+            activeStores?.values?.forEach { it.clear() }
+            activeStores = null
         skillManager = null
             detach()
         }
@@ -1124,8 +1157,15 @@ class SmartAssistantPlugin(
                     "over=${it.overHistoryBudget}",
             )
         }
+        // Phase 5: with a store injected, this turn's shape is a `RequestFrame` — the route's snapshot, the memory the
+        // assembly retrieved, and this turn's utterance last — and the gateway maps it. The registry is built here
+        // (rather than inside `buildLoop`) so the frame's tool table and the loop's own are the same table.
+        val store = activeStores?.get(ContextRoute.WAKE)
+        val registry = registryFor(current, owned, ledger)
+        val gateway = gatewayFor(current, owned)
+        val frame = store?.let { buildFrame(it, ContextRoute.WAKE, text, prompt, toolSpecsOf(registry)) }
         val run = try {
-            val built = buildLoop(current, configured, owned, ledger)
+            val built = buildLoop(configured, registry, gateway)
             loop = built
             synchronized(gate) {
                 if (turn !== owned || owned.closed) return
@@ -1146,6 +1186,7 @@ class SmartAssistantPlugin(
                     // `buildPrompt` ends its history on this turn's user message while the loop appends the utterance
                     // itself, so the last item is dropped: passing it whole would ask the model the same thing twice.
                     history = prompt?.history?.dropLast(1).orEmpty(),
+                    frame = frame,
                 ),
             )
         } catch (failure: Throwable) {
@@ -1206,7 +1247,7 @@ class SmartAssistantPlugin(
         // B6 / spec §4.9: the transcript and the compression come **after** the memory write, in that order, so a
         // message that compression is about to discard is already in the store. Doing it the other way round would
         // lose exactly the content compression exists to preserve.
-        recordTurnAndCompress(ContextRoute.WAKE, text, run, ledger.notifications)
+        recordTurnAndCompress(ContextRoute.WAKE, text, run, ledger.notifications, gateway.lastTrim)
         submitOutcome(owned, run, ledger)
         releaseParkedProactive()
     }
@@ -1232,6 +1273,10 @@ class SmartAssistantPlugin(
      * Must be called **after** the turn's memory write (spec §4.9 steps ③→⑤). Both halves are skipped when the wiring
      * did not supply a [ContextManager], which is the pre-Phase-B shape.
      *
+     * Phase 5 gives the route two possible owners, and the one that exists is used **instead of** the other: with a
+     * store injected for this route the transcript is the store and the compression is [ContextCompressor.compressStore]
+     * (whole turns, gated by D-4's ③ rule); otherwise the `ConversationContext` path runs exactly as it did before.
+     *
      * The route is a parameter because both routes own a turn to record and each has its own transcript: the wake
      * route records the utterance it answered, the proactive route the observation it reacted to. Passing `WAKE` here
      * from the proactive path was the other way "two independent conversations" was half-true.
@@ -1241,10 +1286,18 @@ class SmartAssistantPlugin(
         userText: String,
         run: AgentRun,
         notifications: List<String> = emptyList(),
+        /**
+         * Phase 5: the frame path's trim counts for this turn, or `null` on the legacy path (which never trims a
+         * frame). [TrimCounts] carries no text by type, so it is safe to hold; only its two counts are ever printed.
+         */
+        trim: TrimCounts? = null,
     ) {
+        // The two counts the frame path is allowed to log (Task 4's `lastTrim`): how many whole turns cut ① dropped
+        // and whether cut ③ is still owed. Nothing else from the report is printed, and the report has no text at all.
+        trim?.let {
+            P3Log.line("P3_CONTEXT trim route=$route droppedTurns=${it.droppedTurns} compressionOwed=${it.compressionOwed}")
+        }
         val contexts = activeContextForTurn ?: return
-        val context = contexts.context(route)
-        context.appendUser(userText)
         // §4.2/§6.2: a turn that reached a terminal state **always says something** ([submitOutcome]), so the
         // transcript records the same words the wearer got rather than only the user half. Recording the user half
         // alone left the route's transcript ending on an unanswered user message, and the model path refuses that
@@ -1263,12 +1316,31 @@ class SmartAssistantPlugin(
             closingText != null -> closingText
             else -> FAILURE_HINTS[run.outcome] ?: FAILURE_HINTS.getValue(AgentOutcome.FAILED)
         }
+        val store = activeStores?.get(route)
+        if (store != null) {
+            // Phase 5's production path: the route's own store is the transcript. Order is the spec's (memory write →
+            // transcript record → compression): this is called after `rememberFromTurn`.
+            store.appendUser(userText)
+            store.appendAssistant(reply)
+            // D-4's ③ gate: cut ③ may start **only after cut ① really happened**. `compressionOwed` alone is also true
+            // for an over-budget frame whose flow holds no turn to give (an empty store, or memory as the only thing
+            // trimmed), and a summary started there would be invented content.
+            val owed = trim != null && trim.droppedTurns > 0 && trim.compressionOwed
+            activeCompressor?.compressStore(store, contexts.historyBudgetTokens(), owed)
+            return
+        }
+        val context = contexts.context(route)
+        context.appendUser(userText)
         contexts.appendAssistantMessage(route, reply)
         activeCompressor?.compressIfNeeded(context, contexts.historyBudgetTokens())
     }
 
-    /** Builds the single-use loop for one turn: registry, tightened policy, guard, audit and gateway. */    private fun buildLoop(context: PluginContext, configured: Config, owned: SmartTurn, ledger: NotifyLedger): AgentLoop {
-        val registry = ToolRegistry(
+    /**
+     * The turn's tool registry: the host's action set plus `notify_user` (B7 — the model's only channel to the wearer,
+     * spec §6.1). Built per turn so the frame's table and the loop's registry are literally the same table.
+     */
+    private fun registryFor(context: PluginContext, owned: SmartTurn, ledger: NotifyLedger): ToolRegistry =
+        ToolRegistry(
             listOf(
                 context.services.actions(),
                 // B7: `notify_user` is the model's only channel to the wearer (spec §6.1). It rides the action
@@ -1276,28 +1348,75 @@ class SmartAssistantPlugin(
                 NotifyUserTool { channel, text -> onNotify(owned, ledger, channel, text) },
             ),
         )
-        val policy = WhitelistActionPolicy(configured.maxLevel, configured.whitelist)
-        val gateway = ModelClientGateway(
-            client = context.services.model(),
-            profileLookup = profileLookup,
-            clock = clock,
-            scheduler = scheduler,
-            envelopeFor = { requestId, startNanos, endNanos ->
-                EventEnvelope(context.sessionId, context.generation, requestId, startNanos, endNanos)
+
+    /** The registry's tools in wire shape, which is what a [RequestFrame] carries. */
+    private fun toolSpecsOf(registry: ToolRegistry): List<ToolSpec> =
+        registry.descriptors().map { ToolSpec(it.name, it.description, it.parametersJson) }
+
+    /** The gateway one turn sends through; held by `runTurn` so the frame path's trim counts can be read afterwards. */
+    private fun gatewayFor(context: PluginContext, owned: SmartTurn): ModelClientGateway = ModelClientGateway(
+        client = context.services.model(),
+        profileLookup = profileLookup,
+        clock = clock,
+        scheduler = scheduler,
+        envelopeFor = { requestId, startNanos, endNanos ->
+            EventEnvelope(context.sessionId, context.generation, requestId, startNanos, endNanos)
+        },
+        stop = { owned.closed },
+    )
+
+    /**
+     * Phase 5's request shape for one turn: the system slot (instructions + the fixed memory policy), the route's
+     * snapshot, the memory the assembly retrieved, and this turn's utterance **last**.
+     *
+     * The plugin's job stops at "segments and their attribution": the memory is *not* folded into the first user
+     * message here. That is `ModelClientGateway.frameToTranscript`'s single job, and doing it in two places would give
+     * two renderers that drift.
+     *
+     * @param store the route's session store, whose [ConversationStore.snapshot] opens the flow.
+     * @param prompt the session assembly, or `null` when it could not be built — the instructions then fall back to
+     *   the route's own prompt and the flow carries no memory, which is the shape a host without a manager produces.
+     */
+    private fun buildFrame(
+        store: ConversationStore,
+        route: ContextRoute,
+        userInput: String,
+        prompt: PromptAssembly?,
+        tools: List<ToolSpec>,
+    ): RequestFrame {
+        val instructions = prompt?.instructions ?: instructionsFor(
+            when (route) {
+                ContextRoute.WAKE -> SmartPrompts.instructions()
+                ContextRoute.PROACTIVE -> SmartPrompts.proactiveInstructions()
             },
-            stop = { owned.closed },
         )
-        return AgentLoop(
+        val flow = buildList {
+            addAll(store.snapshot())
+            addAll(prompt?.memorySegments.orEmpty())
+            add(Segment(SegmentOrigin.USER_INPUT, trusted = true, text = userInput))
+        }
+        return RequestFrame(
+            systemSegments = listOf(
+                Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = instructions),
+                Segment(SegmentOrigin.MEMORY_POLICY, trusted = true, text = SmartPrompts.MEMORY_POLICY),
+            ),
+            conversationFlow = flow,
+            tools = tools,
+        )
+    }
+
+    /** Builds the single-use loop for one turn from the registry and gateway its caller already built. */
+    private fun buildLoop(configured: Config, registry: ToolRegistry, gateway: ModelClientGateway): AgentLoop =
+        AgentLoop(
             gateway = gateway,
             registry = registry,
-            policy = policy,
+            policy = WhitelistActionPolicy(configured.maxLevel, configured.whitelist),
             guard = ProgressGuard(),
             audit = audit,
             clock = clock,
             // P3.3: the loop asks before it acts on anything the policy flagged, and never acts without an answer.
             confirmation = confirmation,
         )
-    }
 
     // ---------------------------------------------------------------- proactive turn (P3.2)
 
@@ -1542,6 +1661,13 @@ class SmartAssistantPlugin(
             runCatching { contexts.buildPrompt(ContextRoute.PROACTIVE, trigger.transcript, skillsForTurn()) }
                 .getOrNull()
         }
+        // Phase 5: with a store injected, this route's request is a `RequestFrame` too — the PROACTIVE snapshot, the
+        // memory this assembly retrieved, and the perception message last. The frame's user segment is `message`, not
+        // the trigger: the trigger is what the transcript records (see `recordProactiveTurn`), while the message is
+        // what this request asks the model about.
+        val frame = activeStores?.get(ContextRoute.PROACTIVE)?.let {
+            buildFrame(it, ContextRoute.PROACTIVE, message, prompt, listOf(SmartPrompts.PROPOSE_HINT))
+        }
         val reply = try {
             gateway.turn(GatewayTurn(
                 turnId = hint.turnId,
@@ -1555,6 +1681,7 @@ class SmartAssistantPlugin(
                     ModelHistoryItem.Text(MessageRole.USER, message)),
                 tools = listOf(SmartPrompts.PROPOSE_HINT),
                 deadlineNanos = SmartTurn.saturatingAdd(started, SmartPrompts.PROACTIVE_DEADLINE_MILLIS * 1_000_000L),
+                frame = frame,
             ))
         } catch (failure: Throwable) {
             // `D53`① (2026-10-11): this is no longer "the upload gate said no" - there is no such gate any more. It is
@@ -1592,7 +1719,7 @@ class SmartAssistantPlugin(
                         // submission's, not the compressor's: the compressor's truncation is what writes the dropped
                         // messages to memory, and the trigger belongs to the conversation whether or not the display
                         // accepted it.
-                        recordProactiveTurn(trigger.transcript, text)
+                        recordProactiveTurn(trigger.transcript, text, gateway.lastTrim)
                         submitProactiveHint(hint, text)
                     }
                 }
@@ -1612,7 +1739,7 @@ class SmartAssistantPlugin(
      * recorded: a turn that ended in silence said nothing, and a proactive turn has no memory-extraction candidate
      * (spec §5.5's habits are what the *wearer* keeps doing, which a proactive hint is not).
      */
-    private fun recordProactiveTurn(triggerTranscript: String, hintText: String) {
+    private fun recordProactiveTurn(triggerTranscript: String, hintText: String, trim: TrimCounts?) {
         if (triggerTranscript.isBlank()) return
         // Phase C: the trigger is what this route records as its user side (see this method's note above), so it is also
         // what the wearer's conversation shows as their own words on the proactive route.
@@ -1622,6 +1749,7 @@ class SmartAssistantPlugin(
             ContextRoute.PROACTIVE,
             triggerTranscript,
             AgentRun(AgentOutcome.COMPLETED, null, hintText, emptyList()),
+            trim = trim,
         )
     }
 
