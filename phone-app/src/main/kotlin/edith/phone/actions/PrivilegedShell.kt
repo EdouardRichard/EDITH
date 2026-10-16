@@ -44,7 +44,7 @@ data class ShellResult(
      * Why this reply is not usable, or `null` when it crossed the channel and was understood (R-9).
      *
      * Non-null for every failure [PrivilegedShell] itself reports - [ShellFailure.NOT_BOUND], [ShellFailure.CARRIER],
-     * [ShellFailure.PARSE] - so a caller (and [isAStateReply]) can act on the kind without parsing [stderr]. A reply
+     * [ShellFailure.PARSE] - so a caller can act on the kind without parsing [stderr]. A reply
      * that decoded normally leaves it `null` even when the command's own `stderr` is full of text: a child that writes
      * to its error stream did answer, and its text is the command's diagnostics, not a channel failure.
      */
@@ -259,11 +259,14 @@ internal fun ShellResult.isCallComplete(): Boolean = failure == null
  *
  * It is deliberately **not** the predicate a state parser may use either. What a stdout parser needs is
  * [isReadableState], which adds the two facts that make a reply an *answer about the target*: the command completed
- * (`exitCode == 0`) and the payload was not cut short. Keeping this function is what lets [ShellCallCompletionTest] and
- * the executors state "this call came back" without repeating the state-read rule; it must never be used to judge a
- * target.
+ * (`exitCode == 0`) and the payload was not cut short. Keeping [isCallComplete] separate is what lets the executors
+ * state "this call came back" without repeating the state-read rule; it must never be used to judge a target.
+ *
+ * A former `isAStateReply()` alias of this function was deleted (R-9 follow-up): its name promised a *state* answer
+ * while it only reported completion, so it read as true for a reply that had exited non-zero or been cut short - the
+ * two cases [isReadableState] exists to refuse. Nothing in production called it; its test call-sites now use
+ * [isReadableState].
  */
-internal fun ShellResult.isAStateReply(): Boolean = isCallComplete()
 
 /**
  * Whether a **state read** may be judged from this reply (R-9 follow-up, item #4).

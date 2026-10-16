@@ -17,8 +17,9 @@ import org.junit.Test
  * implementation cannot be a test for the codes someone remembered to list.
  *
  * The predicate these cases drive is `isReadableState()` (open item #4), which asks the completion half *and* the exit
- * code *and* the truncation flag. `isAStateReply()` is only the completion half and deliberately says nothing about a
- * target, so it is never the predicate a state probe may judge from.
+ * code *and* the truncation flag. The completion half alone (`isCallComplete()`) deliberately says nothing about a
+ * target, so it is never the predicate a state probe may judge from - and the `isAStateReply()` name that used to sit on
+ * top of it has been deleted, because it promised a state answer while only reporting completion.
  */
 class ShellStateReadabilityTest {
 

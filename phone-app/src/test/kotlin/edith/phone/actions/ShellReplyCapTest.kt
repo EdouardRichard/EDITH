@@ -233,21 +233,22 @@ class ShellReplyCapTest {
         assertNotEquals(SHELL_REPLY_INVALID, SHELL_REPLY_TOO_LARGE)
 
         val tooLarge = ShellResult("dumpsys power", -1, "", SHELL_REPLY_TOO_LARGE, failure = ShellFailure.CARRIER)
-        assertFalse("a too-large reply is a failed state read, not an answer", tooLarge.isAStateReply())
+        assertFalse("a too-large reply is a failed state read, not an answer", tooLarge.isReadableState())
         assertNotEquals("a too-large reply is not reported as a parse failure", SHELL_REPLY_INVALID, tooLarge.stderr)
         // The two carriers of the same fact agree: the code a human greps for, and the kind a caller reads. A result
         // marked CARRIER but still carrying SHELL_REPLY_INVALID would be the old collapse back in a new field.
         assertEquals(ShellFailure.CARRIER, tooLarge.failure)
         assertFalse(
             "a reply marked as a carrier failure is not a state reply even without the marker",
-            ShellResult("dumpsys power", -1, "", "SHELL_SOMETHING_ELSE", failure = ShellFailure.CARRIER).isAStateReply(),
+            ShellResult("dumpsys power", -1, "", "SHELL_SOMETHING_ELSE", failure = ShellFailure.CARRIER).isReadableState(),
         )
 
         // The `truncated` flag describes the payload, so a reply that was truncated still decodes and still says it was
         // truncated - that is what is asserted here. It is **not** a claim that a truncated **state read** may be
         // trusted, and `stderr` being non-empty is not a channel failure either: `decode` returns a reply with no
-        // `failure` kind because the bytes *did* arrive and *were* understood. `ShizukuUserServiceShell.read` joins the
-        // two facts as `isAStateReply() && !truncated`, and the test below pins the truncated half.
+        // `failure` kind because the bytes *did* arrive and *were* understood. `ShizukuTargetState.read` joins the
+        // facts as `isReadableState()`, which is `failure == null && exitCode == 0 && !truncated`, and the test below
+        // pins the truncated half.
         val truncated = ShellReply.decode(ShellReply.encode(0, "out", "err", truncated = true))!!
         assertTrue("a decoded reply is a reply the build understood", truncated.truncated)
         assertNull("decoding a reply is not a channel failure", truncated.failure)

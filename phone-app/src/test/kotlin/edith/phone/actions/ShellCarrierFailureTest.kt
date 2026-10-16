@@ -67,7 +67,7 @@ class ShellCarrierFailureTest {
     fun `a successful reply is not a failure and is readable`() {
         val ok = ShellResult("pm list packages com.example", 0, "package:com.example\n", "")
         assertNull(ok.failure)
-        assertTrue(ok.isAStateReply())
+        assertTrue(ok.isReadableState())
     }
 
     @Test

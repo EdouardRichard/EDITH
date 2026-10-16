@@ -24,10 +24,11 @@ import org.junit.Test
  *
  * Reconciled with open item #4: the empty-`stderr` half this file used to require of a state reply is **gone**. It was an
  * unmeasured assumption, and the device round measured it at **0 of 52** `exit 0` state reads across 3 turns and five
- * targets, while the exit code is the OS's own completion signal. `isAStateReply()` survives only as the completion half
- * ([isCallComplete]) and is **not** what a parser may judge from. The judgement the old half protected - never judge an
- * action from a read that did not fully arrive - is preserved by [isReadableState], not weakened: a non-completed or
- * clipped read is still refused.
+ * targets, while the exit code is the OS's own completion signal. The `isAStateReply()` alias that briefly stood in for
+ * the completion half has been **deleted** (its name promised a state answer while it only reported completion), so
+ * [isCallComplete] is the completion question and is **not** what a parser may judge from. The judgement the old half
+ * protected - never judge an action from a read that did not fully arrive - is preserved by [isReadableState], not
+ * weakened: a non-completed or clipped read is still refused.
  */
 class ShellCallCompletionTest {
 
