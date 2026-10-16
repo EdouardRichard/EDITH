@@ -29,17 +29,23 @@ enum class SegmentOrigin {
     RETRY,
 }
 
+/** 会话流里一条消息的说话人。归属是元数据，**永不**由文本推断。 */
+enum class SegmentRole { USER, ASSISTANT }
+
 /**
  * One named, attributed block of text in a request frame (spec §3.2).
  *
  * [origin] identifies what produced this segment and where it belongs in the frame.
  * [trusted] marks whether the content is authoritative (true) or untrusted external data (false).
  * [text] is the segment's content; always non-blank.
+ * [role] is the speaker of a conversation-flow segment, or `null` for every segment that is not
+ * conversation flow. `role` 只对会话流段有意义；系统槽与记忆段为 `null`。
  */
 data class Segment(
     val origin: SegmentOrigin,
     val trusted: Boolean,
     val text: String,
+    val role: SegmentRole? = null,
 ) {
     init {
         require(text.isNotBlank()) { "Segment text must not be blank" }
