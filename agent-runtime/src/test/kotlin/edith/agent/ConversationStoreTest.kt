@@ -115,9 +115,12 @@ class ConversationStoreTest {
         // I-2: 边界在入库时渲染 ⇒ snapshot() 就是线上那份文本（测量值 == 发送值）。
         assertEquals(SummaryBoundary.render("先前对话摘要"), summary.text)
         assertTrue(summary.text.contains(SummaryBoundary.OPEN), summary.text)
-        // 线缆形状是同一份文本：两个视图不再有一份"干净正文"。
-        val wireText = (store.history().last() as ModelHistoryItem.Text).text
+        // 线缆形状是同一份文本：两个视图不再有一份"干净正文"。摘要在**首位**（它必须在那儿才不被取代），
+        // 所以按归属找到它在线缆上的那一份，而不是取 `last()`。
+        val wireText = (store.history().single { it is ModelHistoryItem.Text && it.text == summary.text }
+            as ModelHistoryItem.Text).text
         assertEquals(summary.text, wireText)
+        assertEquals(SegmentOrigin.SUMMARY, store.snapshot().first().origin)
     }
 
     @Test fun `a body that already carries the boundary is not wrapped twice`() {
@@ -179,15 +182,50 @@ class ConversationStoreTest {
     }
 
     @Test fun `a summary that is no longer at the head is superseded and dropped`() {
-        // 不变式：SUMMARY 只能在首位。回合之后的摘要说明它前面还有更早的回合 ⇒ 已被更新的摘要取代。
+        // 不变式：SUMMARY 只能在首位，且任何时刻最多一条。`appendSummary` 把摘要插到首位，所以**正常的
+        // append 序列不再能产生非首位摘要**：后来落地的摘要在首位，先落地的那条被挤到 index 1 —— 这（外加
+        // 一个紧随的回合，触发 `add` 的 sweep）是唯一合法的构造，也是本用例钉住的形状。移除它是 `add` 的
+        // sweep 的职责：删掉 `enforceEnvelope` 里的 `dropSupersededSummaries()`，压在 index 1 的旧摘要会留下。
+        val store = ConversationStore()
+        store.appendSummary("旧摘要")
+
+        assertEquals(0, store.snapshot().indexOfFirst { it.origin == SegmentOrigin.SUMMARY },
+            "刚落地的摘要在首位")
+
+        store.appendSummary("更新的摘要")
+
+        assertEquals(2, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY },
+            "旧摘要没有被删，只是被挤到 index 1（`appendSummary` 跳过自己的 sweep）")
+        assertEquals(SummaryBoundary.render("更新的摘要"), store.snapshot()[0].text,
+            "首位是更新的那条")
+
+        store.appendUser("u2")
+
+        val summaries = store.snapshot().filter { it.origin == SegmentOrigin.SUMMARY }
+        assertEquals(1, summaries.size, "最多只允许一条 SUMMARY：${store.snapshot()}")
+        assertEquals(SummaryBoundary.render("更新的摘要"), summaries[0].text, "留下的必须是更新的那条")
+        assertEquals(SegmentOrigin.SUMMARY, store.snapshot().first().origin, "且仍在首位")
+    }
+
+    @Test fun `a landed summary survives the next append because it lands at the head`() {
+        // 这正是 ③ 这一刀的意义：摘要是为了让**下一轮**从压缩态起步。如果摘要在尾部落地，下一次 append 会
+        // 由 `enforceEnvelope` 把它当"已被取代"扫掉，store 常常一个摘要都不剩。
         val store = ConversationStore()
         store.appendUser("u1"); store.appendAssistant("a1")
-        store.appendSummary("旧摘要")
+        store.appendSummary("摘要")
+
+        val landed = store.snapshot()
+        assertEquals(SegmentOrigin.SUMMARY, landed[0].origin, "落地的摘要必须在首位：$landed")
+        // 摘要存的是**渲染过**的文本（边界在入库时渲染一次），所以这里比较渲染串而不是裸正文。
+        assertEquals(listOf(SummaryBoundary.render("摘要"), "u1", "a1"), texts(store))
+
+        // 下一轮开始：新回合 append 会触发 sweep + 淘汰，摘要必须还在。
         store.appendUser("u2"); store.appendAssistant("a2")
 
-        store.dropOldestTurns(maxItems = 3)
-
-        assertEquals(0, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY })
+        assertTrue(store.snapshot().any { it.origin == SegmentOrigin.SUMMARY },
+            "刚落地的摘要不能被下一次 append 扫掉：${store.snapshot()}")
+        assertEquals(SegmentOrigin.SUMMARY, store.snapshot().first().origin, "摘要仍在首位")
+        assertEquals(listOf(SummaryBoundary.render("摘要"), "u1", "a1", "u2", "a2"), texts(store))
     }
 
     @Test fun `the envelope is enforced on append and drops whole turns only`() {
@@ -208,33 +246,19 @@ class ConversationStoreTest {
 
     // ---- Phase 5 review fixes ----
 
-    @Test fun `a stale summary after the last turn is removed by the sweep`() {
-        // 唯一由 sweep（而非回合淘汰）移除摘要的形状 —— Finding 3 的漏洞就在这。
+    @Test fun `a superseded summary is removed by the sweep, never promoted to the head`() {
+        // 旧形状 `u1,a1,appendSummary(旧),u2,a2,appendSummary(新)` 在首位插入下不再产生非首位摘要 —— 实测
+        // （见 task-5 报告）：摘要落地后 append 回合，摘要仍在 index 0。所以"非首位摘要"只能由**更新的摘要
+        // 抢占首位**造出来，也只有那一次 append 会把它扫掉。这里由它后面的那个 append 触发。
         val store = ConversationStore()
-        store.appendUser("u1"); store.appendAssistant("a1")
         store.appendSummary("旧摘要")
-        store.appendUser("u2"); store.appendAssistant("a2")
         store.appendSummary("更新的摘要")
-
-        val dropped = store.dropOldestTurns(0)
-
-        assertEquals(0, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY },
-            "非首位摘要必须由 sweep 移除")
-        assertEquals(3, dropped, "sweep 摘掉的摘要也要计入返回的条数")
-    }
-
-    @Test fun `an append that evicts also sweeps a superseded summary instead of promoting it`() {
-        // Finding 1 的具体反例：maxItems=3 时 append 触发淘汰，不能把旧摘要顶到首位。
-        // 合法终止态只能是 3 条 [u1,a1,u2]（sweep 掉摘要）或 1 条 [u2]（丢掉整个回合）；
-        // 2 条需要按条裁剪（丢掉 u1 而留下孤立的 a1），整回合淘汰下不可达、也被禁止。
-        val store = ConversationStore(maxItems = 3)
-        store.appendUser("u1"); store.appendAssistant("a1")
-        store.appendSummary("旧摘要")
         store.appendUser("u2")
 
-        assertEquals(0, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY },
-            "append 触发的淘汰必须同时 sweep，不能把被取代的摘要留成首位")
-        assertEquals(3, store.size())
+        val summaries = store.snapshot().filter { it.origin == SegmentOrigin.SUMMARY }
+        assertEquals(1, summaries.size, "被取代的摘要必须被 sweep 掉，不能留在表里：${store.snapshot()}")
+        assertEquals(SummaryBoundary.render("更新的摘要"), summaries[0].text)
+        assertEquals(listOf(SummaryBoundary.render("更新的摘要"), "u2"), texts(store))
     }
 
     // ---- Phase 5 Task 5 review fixes: count-based removal ----
@@ -306,6 +330,8 @@ class ConversationStoreTest {
     }
 
     @Test fun `removeOldestTurns keeps a head summary and its turns`() {
+        // The shape production actually reaches: a summary at the head survives the sweep of a count-based removal,
+        // and the returned count is the turn items that left — the summary is not a turn.
         val store = ConversationStore()
         store.appendSummary("摘要")
         store.appendUser("u1"); store.appendAssistant("a1")
@@ -313,26 +339,50 @@ class ConversationStoreTest {
 
         val removed = store.removeOldestTurns(1)
 
-        assertEquals(2, removed)
-        assertTrue(store.snapshot().any { it.origin == SegmentOrigin.SUMMARY })
+        assertEquals(2, removed, "一个整回合两条消息；摘要不是回合，不受影响")
+        assertEquals(1, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY })
+        assertEquals(SegmentOrigin.SUMMARY, store.snapshot().first().origin)
         // `texts()` would see the summary too: it is a Text item. Only the transcript turns moved.
         val transcript = store.snapshot().filter { it.origin == SegmentOrigin.TRANSCRIPT }.map { it.text }
         assertEquals(listOf("u2", "a2"), transcript)
+        assertEquals(listOf(SummaryBoundary.render("摘要"), "u2", "a2"), texts(store))
     }
 
     @Test fun `removeOldestTurns also sweeps a superseded summary`() {
-        // A trailing summary is the shape `appendSummary` leaves behind (it never sweeps its own summary), and a
-        // non-head summary must not survive an eviction (the class's summary invariant). The sweep counts toward
-        // the returned removal just as it does for `dropOldestTurns`.
+        // **State re-derived after the head-insert fix.** The old premise ("a trailing summary is the shape
+        // `appendSummary` leaves behind") no longer exists: `appendSummary` inserts at index 0, and appending turns
+        // after it leaves it at index 0 too (probed). The reachable non-head shape is a summary **displaced by a
+        // newer one**, and there `removeOldestTurns`'s sweep is what removes it — with no user turn in the store the
+        // sweep is the sole remover, so the returned count of 1 is entirely the swept summary.
         val store = ConversationStore()
-        store.appendUser("u1"); store.appendAssistant("a1")
-        store.appendUser("u2"); store.appendAssistant("a2")
         store.appendSummary("旧摘要")
+        store.appendSummary("更新的摘要")
 
         val removed = store.removeOldestTurns(1)
 
-        assertEquals(3, removed, "the swept summary plus the evicted turn")
-        assertEquals(0, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY })
-        assertEquals(listOf("u2", "a2"), texts(store))
+        assertEquals(1, removed, "被取代的那条摘要由 sweep 移除，且计入返回条数")
+        val survivors = store.snapshot().filter { it.origin == SegmentOrigin.SUMMARY }
+        assertEquals(1, survivors.size, "留下的只能是更新的那条：${store.snapshot()}")
+        assertEquals(SummaryBoundary.render("更新的摘要"), survivors[0].text)
+        assertEquals(listOf(SummaryBoundary.render("更新的摘要")), texts(store))
+    }
+
+    @Test fun `removeOldestTurns keeps the head summary and still counts a swept one`() {
+        // Contract-mandated shape: a head summary plus its turns, evicted by count. Its counterpart — the same call
+        // with a *displaced* summary present instead — is `removeOldestTurns also sweeps a superseded summary`.
+        val store = ConversationStore()
+        store.appendSummary("摘要")
+        store.appendUser("u1"); store.appendAssistant("a1")
+        store.appendUser("u2"); store.appendAssistant("a2")
+
+        val removed = store.removeOldestTurns(1)
+
+        assertEquals(2, removed, "一个整回合两条消息；摘要不是回合，不受影响")
+        assertEquals(1, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY })
+        assertEquals(SegmentOrigin.SUMMARY, store.snapshot().first().origin)
+        // `texts()` would see the summary too: it is a Text item. Only the transcript turns moved.
+        val transcript = store.snapshot().filter { it.origin == SegmentOrigin.TRANSCRIPT }.map { it.text }
+        assertEquals(listOf("u2", "a2"), transcript)
+        assertEquals(listOf(SummaryBoundary.render("摘要"), "u2", "a2"), texts(store))
     }
 }

@@ -62,13 +62,22 @@ data class CompressionReport(
  * request that does not fit is cut ①/②'s problem (`TurnTrimmer`), never this one's. That is also why
  * [compressStore] is called at the **end** of a turn ([`runTurn`]'s tail) rather than before assembly.
  *
- * **The ③ gate (D-4).** Cut ③ runs **only after cut ① actually happened**, so both entry points start a summary only
- * when a turn was reached: `droppedTurns > 0`. `TurnTrimmer`'s `compressionOwed` can be `true` with its own
- * `droppedTurns == 0` — an over-budget frame whose flow holds only this turn's input and memory, or a turn whose
- * memory was the only thing trimmed — and in that shape there is no dropped turn to summarise. A summary started
- * there would be **invented content**. [compressStore] therefore takes the caller's half of the gate
- * (`compressionOwed`) as a parameter and applies the conjunction `droppedTurns > 0 && compressionOwed` itself: there
- * is one public entry point and it is the gated one, so a caller cannot reach a summary by forgetting the gate.
+ * **The ③ gate (D-4).** Cut ③ runs **only after cut ① actually happened** — only when something really left the
+ * transcript — and each entry point states that condition in its own eviction unit rather than in a shared
+ * expression. **These gates are frozen with the paths; documenting them must not change them.**
+ *
+ * [compressStore] evicts whole turns and applies the full `droppedTurns > 0 && compressionOwed` conjunction itself,
+ * taking the caller's half (`compressionOwed`) as a parameter: there is one public entry point and it is the gated
+ * one, so a caller cannot reach a summary by forgetting the gate. `TurnTrimmer`'s `compressionOwed` can be `true`
+ * with its own `droppedTurns == 0` — an over-budget frame whose flow holds only this turn's input and memory, or a
+ * turn whose memory was the only thing trimmed — and in that shape there is no dropped turn to summarise. A summary
+ * started there would be **invented content**.
+ *
+ * [compressIfNeeded] is the frozen `ConversationContext` path and its gate is **not** the store's: it drops the
+ * oldest messages one at a time, so its condition is `dropped != 0` — a **message count** — and it never consults
+ * `compressionOwed` at all (its caller has no `TurnTrimmer` report to offer). The `droppedTurns` it publishes in
+ * the report is derived *afterwards* (`turnStartIndices(messages).count { it < dropped }`) for the caller's
+ * accounting; it is deliberately **not** what that path gates on, because a half turn is a legitimate unit there.
  *
  * **Two paths, two eviction units, deliberately not one body.** [compressStore] removes the oldest **whole turns** (a
  * user message plus everything it opened, so a half turn can never be left behind), through

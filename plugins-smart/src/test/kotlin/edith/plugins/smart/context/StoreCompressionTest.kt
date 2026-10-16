@@ -182,14 +182,21 @@ class StoreCompressionTest {
         compressor(summarize = { body }, tasks = tasks).compressStore(store, shareTokens = 3, compressionOwed = true)
         tasks.runAll()
 
-        assertTrue(store.snapshot().any { it.origin == SegmentOrigin.SUMMARY })
-        val last = store.history().last() as ModelHistoryItem.Text
-        assertEquals(MessageRole.ASSISTANT, last.role)
+        // The summary lands at the **head** (index 0) — `ConversationStore.appendSummary` inserts it there so it is
+        // a non-superseded head summary and the next turn really starts compacted — so it is located by its origin,
+        // not by a position. `appendSummary` is the only producer of SUMMARY origin on this path.
+        val landed = store.snapshot().single { it.origin == SegmentOrigin.SUMMARY }
+        val wire = store.history().single { it is ModelHistoryItem.Text && it.text == landed.text }
+            as ModelHistoryItem.Text
+        assertEquals(MessageRole.ASSISTANT, wire.role)
         // Exactly one layer: `startsWith`/`endsWith`/`contains` all hold for OPEN+OPEN+body+CLOSE+CLOSE, so the
         // rendered string is pinned whole and the boundary tokens are counted.
-        assertEquals(SummaryBoundary.render(body), last.text)
-        assertEquals(1, last.text.split(SummaryBoundary.OPEN).size - 1, last.text)
-        assertEquals(1, last.text.split(SummaryBoundary.CLOSE).size - 1, last.text)
+        assertEquals(SummaryBoundary.render(body), wire.text)
+        assertEquals(1, wire.text.split(SummaryBoundary.OPEN).size - 1, wire.text)
+        assertEquals(1, wire.text.split(SummaryBoundary.CLOSE).size - 1, wire.text)
+        // It is the head, beside the anchored turn the compression kept.
+        assertEquals(SegmentOrigin.SUMMARY, store.snapshot().first().origin)
+        assertEquals("u3", store.texts().last())
     }
 
     @Test
