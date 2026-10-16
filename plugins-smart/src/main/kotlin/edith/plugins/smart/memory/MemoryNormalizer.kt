@@ -11,6 +11,9 @@ package edith.plugins.smart.memory
  * - [MemoryKind.FACT]: strips possessive prefix ("我的"), prepends "用户曾告知"
  * - [MemoryKind.ROUTINE]: prepends "用户曾有习惯："
  *
+ * Mood sanitization (AC-9): trailing question particles ("吗", "呢", "么", "嘛") and second-person interrogative
+ * prefixes ("你能", "你能不能", "你能否") are stripped so the output reads as a statement, not a question or command.
+ *
  * Tag escaping (§3.9 / AC-9): ASCII `<` and `>` are replaced with fullwidth equivalents `＜` `＞` to prevent
  * boundary-tag forgery in the rendered injection block.
  *
@@ -22,12 +25,29 @@ fun normalize(text: String, kind: MemoryKind): String {
         MemoryKind.FACT -> text.removePrefix("我的")
         MemoryKind.ROUTINE -> text
     }
+    val sanitized = stripQuestionMood(stripped)
     val framed = when (kind) {
-        MemoryKind.PREFERENCE -> "用户曾表示$stripped"
-        MemoryKind.FACT -> "用户曾告知$stripped"
-        MemoryKind.ROUTINE -> "用户曾有习惯：$stripped"
+        MemoryKind.PREFERENCE -> "用户曾表示$sanitized"
+        MemoryKind.FACT -> "用户曾告知$sanitized"
+        MemoryKind.ROUTINE -> "用户曾有习惯：$sanitized"
     }
     return escapeTags(framed)
+}
+
+/**
+ * Strips question mood markers so the normalized text reads as a statement.
+ *
+ * Handles:
+ * - Trailing question particles: 吗, 呢, 么, 嘛 (with optional trailing punctuation)
+ * - Second-person interrogative prefixes: 你能不能, 你能否, 你能
+ */
+private fun stripQuestionMood(text: String): String {
+    var result = text
+    // Strip second-person interrogative prefixes (longest match first)
+    result = result.removePrefix("你能不能").removePrefix("你能否").removePrefix("你能")
+    // Strip trailing question particles (with optional trailing ?/？)
+    result = result.replace(Regex("[吗呢么嘛][?？]?$"), "")
+    return result
 }
 
 /**
