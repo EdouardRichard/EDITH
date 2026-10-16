@@ -174,12 +174,16 @@ class ConversationStoreTest {
         assertEquals(0, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY })
     }
 
-    @Test fun `the envelope is enforced on append`() {
-        val store = ConversationStore(maxItems = 2)
+    @Test fun `the envelope is enforced on append and drops whole turns only`() {
+        val store = ConversationStore(maxItems = 4)
         store.appendUser("u1"); store.appendAssistant("a1")
-        store.appendUser("u2")
+        store.appendUser("u2"); store.appendAssistant("a2")
+        store.appendUser("u3")
 
-        assertEquals(2, store.size(), "the store must stay inside its envelope")
+        assertEquals(3, store.size(), "the envelope must be enforced")
+        // 丢掉的必须是最旧的那个**整回合**，不是半条。
+        val texts = store.history().filterIsInstance<ModelHistoryItem.Text>().map { it.text }
+        assertEquals(listOf("u2", "a2", "u3"), texts, "只有最旧的整回合可以走")
     }
 
     @Test fun `maxItems must be at least one`() {

@@ -87,6 +87,12 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
      * Appends a compression-produced summary as a SUMMARY item trusted=false, with
      * [SegmentRole.ASSISTANT]. The stored text is the **clean body**; the wire shape ([history]) carries
      * the explicit [SummaryBoundary] because it is rendered here, at the boundary of the store.
+     *
+     * **A summary is dropped when eviction runs, not when it is created.** Appending a summary that ends up
+     * *after* a turn makes it a superseded summary, but this method does not remove it: the removal is a
+     * consequence of the summary invariant and happens at eviction — [dropOldestTurns], or any append that
+     * evicts (see [enforceEnvelope]). A non-head summary is therefore transiently visible through [snapshot]
+     * and [history] until the next eviction, and never by the append that created it.
      */
     @Synchronized
     fun appendSummary(text: String) =
@@ -165,6 +171,10 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
      * Enforces the envelope: first drop every SUMMARY that is no longer at the head (it is superseded by the
      * newer summary that covers the turns before it), then drop whole turns from the head. Returns the number
      * of messages dropped.
+     *
+     * **This is the only place a superseded summary is removed.** The invariant is lazy: a non-head summary
+     * is *superseded* and is removed here — by [dropOldestTurns] or by any append that evicts — never by the
+     * append that created it ([appendSummary] only adds; see its KDoc).
      *
      * A summary is never evicted as a turn — it is not a turn. When the only remaining turn is the last user
      * turn, the envelope is allowed to overrun rather than empty the conversation, the same trade-off
