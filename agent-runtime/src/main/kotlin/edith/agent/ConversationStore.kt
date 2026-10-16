@@ -15,10 +15,11 @@ import edith.plugin.ModelHistoryItem
  * ## Storage shape
  *
  * The stored shape is [ModelHistoryItem] — the wire shape — with attribution kept beside it as
- * metadata ([SessionItem.origin] / [SessionItem.role]), never inferred from text. A summary's text
- * is stored **clean**; [SummaryBoundary] is a render-time product, so [history] carries the rendered
- * boundary while [snapshot] returns the clean body. Both paths render the same constant, so there is
- * only one wording.
+ * metadata ([SessionItem.origin] / [SessionItem.role]), never inferred from text. A summary's text is
+ * stored **with** its [SummaryBoundary]: the boundary is rendered once, at store-insert time, so
+ * [history] and [snapshot] return the **same** bounded text and no later stage can add a byte the byte
+ * accounting never saw. (A clean body would be measured clean and sent rendered: +64 B for the
+ * boundary, a latent over-budget rejection.)
  *
  * ## The summary invariant (the tests pin this)
  *
@@ -85,8 +86,10 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
 
     /**
      * Appends a compression-produced summary as a SUMMARY item trusted=false, with
-     * [SegmentRole.ASSISTANT]. The stored text is the **clean body**; the wire shape ([history]) carries
-     * the explicit [SummaryBoundary] because it is rendered here, at the boundary of the store.
+     * [SegmentRole.ASSISTANT]. The boundary is rendered **here**, at the boundary of the store: the stored
+     * text is the bounded rendering, so [history] and [snapshot] hand out the same bytes and the byte
+     * accounting of a request measures exactly what is sent. A body that already carries the boundary is
+     * passed through unchanged rather than wrapped twice.
      *
      * **The append that creates a summary never drops it.** Appending a summary that ends up *after* a turn
      * makes it a superseded summary, but this method only appends and skips the sweep: the removal is a
@@ -97,7 +100,7 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     @Synchronized
     fun appendSummary(text: String) =
         add(
-            ModelHistoryItem.Text(MessageRole.ASSISTANT, SummaryBoundary.render(text)),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, boundedBody(text)),
             SegmentOrigin.SUMMARY,
             SegmentRole.ASSISTANT,
             sweepSuperseded = false,
@@ -115,8 +118,8 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     }
 
     /**
-     * Returns the conversation in wire shape, in order. A summary keeps the boundary rendering applied
-     * by [appendSummary]; use [snapshot] for the clean body.
+     * Returns the conversation in wire shape, in order. A summary carries the boundary rendering that
+     * [appendSummary] applied at insert time; [snapshot] returns the same text, not a stripped body.
      */
     @Synchronized
     fun history(): List<ModelHistoryItem> = items.map { it.item }
@@ -124,15 +127,16 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     /**
      * Returns an immutable defensive copy of the current segment list.
      *
-     * Later mutations to this store do not affect previously returned snapshots. A summary segment holds
-     * the **clean** body (no boundary) — [history] is the bounded rendering.
+     * Later mutations to this store do not affect previously returned snapshots. A summary segment holds the
+     * **bounded** text — [SummaryBoundary] is rendered at insert time ([appendSummary]), so this view and
+     * [history] are byte-identical and a request measured from this snapshot is a request that fits.
      */
     @Synchronized
     fun snapshot(): List<Segment> = items.map {
         Segment(
             origin = it.origin,
             trusted = it.origin == SegmentOrigin.TRANSCRIPT || it.origin == SegmentOrigin.TOOL_ROUND,
-            text = cleanBodyOf(it),
+            text = textOf(it.item),
             role = it.role,
         )
     }
@@ -239,21 +243,14 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     }
 
     /**
-     * The clean body of a stored item, for [snapshot].
+     * The stored text of a summary: the body wrapped in the explicit [SummaryBoundary], rendered **once**.
      *
-     * A summary is stored on the wire with its boundary ([appendSummary] renders it there), so the boundary is
-     * stripped back off here: `snapshot()` is the clean-body view, `history()` is the bounded rendering. The
-     * boundary constant is the same one, so there is only one wording. A store that never went through
-     * [appendSummary] carries no boundary, so the strip is a no-op for it.
+     * A body that already carries the boundary is passed through unchanged, so a caller that hands over an
+     * already-bounded rendering does not get a second layer. Attribution never depends on this: a `SUMMARY` is
+     * a `SUMMARY` because of [SegmentOrigin.SUMMARY], not because its text looks bounded.
      */
-    private fun cleanBodyOf(stored: SessionItem): String {
-        val text = textOf(stored.item)
-        if (stored.origin != SegmentOrigin.SUMMARY || !SummaryBoundary.isRendered(text)) return text
-        return text
-            .removePrefix(SummaryBoundary.OPEN)
-            .removeSuffix(SummaryBoundary.CLOSE)
-            .trim('\n')
-    }
+    private fun boundedBody(text: String): String =
+        if (SummaryBoundary.isRendered(text)) text else SummaryBoundary.render(text)
 
     /**
      * The text of a stored item. `estimatedText()` is `internal` to `plugins-smart`'s `TokenBudget.kt`

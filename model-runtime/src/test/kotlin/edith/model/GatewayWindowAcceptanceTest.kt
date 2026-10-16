@@ -6,6 +6,7 @@ import edith.agent.RequestFrame
 import edith.agent.Segment
 import edith.agent.SegmentOrigin
 import edith.agent.SegmentRole
+import edith.agent.SummaryBoundary
 import edith.agent.TurnTrimmer
 import edith.contracts.ContractError
 import edith.contracts.EventEnvelope
@@ -15,6 +16,7 @@ import edith.plugin.CancellationHandle
 import edith.plugin.DeadlineScheduler
 import edith.plugin.InputModality
 import edith.plugin.InputPart
+import edith.plugin.MessageRole
 import edith.plugin.ModelClient
 import edith.plugin.ModelEnd
 import edith.plugin.ModelHistoryItem
@@ -26,21 +28,30 @@ import edith.plugin.OutputModality
 import edith.plugin.SecretHandle
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
- * Task 4's cross-module half: a frame the gateway trims must reach the send-time [ContextBudgeter] in a shape it
- * **accepts**.
+ * Task 4's cross-module half: whatever the gateway sends must be a shape the send-time [ContextBudgeter] **accepts**.
  *
  * `ContextBudgeter` lives in `model-runtime`, and `model-runtime` already depends on `agent-runtime`
  * (`model-runtime/build.gradle.kts:13`), so the reverse test dependency — the one the task brief sketched for
  * `ModelClientGatewayTest` — would be a project cycle. This test therefore drives the real [ModelClientGateway] from
  * the module that owns the budgeter and hands the outgoing [ModelRequest] straight to it.
  *
- * The window arithmetic itself (`windowBytes = min(inputBudget, usable - maxOutput - safety) - FIXED_OVERHEAD`) is
- * asserted directly next to the code in `ModelClientGatewayTest`'s
- * `the trim window subtracts the fixed overhead the send time budgeter adds`. This test pins the end-to-end property:
- * whatever the gateway trims to, the composition of the two must not reject.
+ * ## What the discriminating assertion is (I-4)
+ *
+ * The gate is the `budgeter.prepare(...)` call itself, not the shape of the wire. [TurnTrimmer.total] and
+ * [ContextBudgeter.prepare] compute **structurally identical** totals against the same `minOf(...)` limit — the same
+ * per-item `bytes + 32`, the same fixed 32, and `instructions == frame.systemText` — so parity is exact and the
+ * gateway's `- 32` in `windowBytes` is a deliberate **safety margin**, not a correction. A frame trimmed to that
+ * margin is therefore at least 32 bytes under the check it must pass; what these tests can still catch is a *shape*
+ * drift in the mapping (for example rendering each system segment as its own message, or merging the leading context
+ * in a way that inflates the cost), which is why the frame below is trimmed right up to the window.
+ *
+ * The margin itself is pinned next to the code it lives in, by `ModelClientGatewayTest`'s
+ * `the trim window is the send time limit minus a deliberate safety margin`.
  */
 class GatewayWindowAcceptanceTest {
 
@@ -75,7 +86,7 @@ class GatewayWindowAcceptanceTest {
     )
 
     private fun turn(frame: RequestFrame?) =
-        GatewayTurn("turn-7", profile.id, "You are Edith.", emptyList(), emptyList(), 1_000_000_000L, frame)
+        GatewayTurn("turn-7", profile.id, "You are Edith.", emptyList(), emptyList(), 1_000_000_000L, frame = frame)
 
     /**
      * `ModelProfile` requires `inputBudgetTokens + maxOutputTokens + safetyTokens <= usableWindowTokens`
@@ -100,46 +111,146 @@ class GatewayWindowAcceptanceTest {
         verifications = emptyList(),
     )
 
-    @Test fun `a frame trimmed to the window is accepted by the send time budgeter`() {
-        // Byte-exact, so the fixed 32 is visible on the wire rather than swallowed by the send-time check:
+    private fun request(
+        history: List<ModelHistoryItem>,
+        input: List<String>,
+    ) = ModelRequest(
+        envelope = EventEnvelope(SessionId("session"), Generation(1), "turn-7", 0, 0),
+        requestId = "turn-7",
+        turnId = "turn-7",
+        profileId = profile.id,
+        profileRevision = profile.revision,
+        instructions = "sys",
+        input = input.map { InputPart.Text(it) },
+        history = history,
+        output = OutputModality.TEXT,
+        deadlineNanos = 1_000_000_000L,
+    )
+
+    @Test fun `a frame at the trim window is accepted by the send time budgeter`() {
+        // Byte-exact, so a shape drift in the mapping shows up as a rejection rather than being swallowed:
         //
-        //   ContextBudgeter limit = minOf(93_000, 100_000 - 6_000 - 1_000) = 93_000
-        //   gateway window        = 93_000 - FIXED_OVERHEAD(32)            = 92_968
+        //   ContextBudgeter limit = minOf(93_000, 100_000 - 6_000 - 1_000) = **93_000**
+        //   gateway window        = 93_000 - FIXED_OVERHEAD(32)            = **92_968**
+        //   TurnTrimmer.total()   = 32 + (3 + 32) + (2_800 + 32) + (90_000 + 32) + (5 + 32) = **92_968**
         //
-        //   TurnTrimmer.total()   = 32 + (3 + 32) + (2_831 + 32) + (90_000 + 32) + (5 + 32) = **92_999**
-        //
-        // 92_999 is the boundary that discriminates: 31 over the correct 92_968 window, so ① evicts the 90_000-byte
-        // old turn; but 1 *under* the un-subtracted 93_000, where no cut would fire at all. Same frame, a different
-        // number of whole turns on the wire, because the trimmer's `total()` already counts the same fixed 32 that
-        // `ContextBudgeter.kt:61` adds on top.
+        // The frame sits exactly on the trim window, so cut ① does not fire and the whole transcript is sent. The
+        // send-time total is the same 92_968 (identical formula) against the 93_000 limit — 32 bytes of slack, all of
+        // it the deliberate margin. The discriminating assertion is that `prepare` accepts it.
         val frame = RequestFrame(
             systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")),
             conversationFlow = listOf(
-                Segment(SegmentOrigin.TRANSCRIPT, true, "u".repeat(2_831), SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "u".repeat(2_800), SegmentRole.USER),
                 Segment(SegmentOrigin.TRANSCRIPT, true, "a".repeat(90_000), SegmentRole.ASSISTANT),
                 Segment(SegmentOrigin.USER_INPUT, true, "hello"),
             ),
             tools = emptyList(),
         )
 
-        // The trimmer's own verdict at the same boundary, asserted here so the wire assertion cannot drift from it.
-        assertEquals(1, TurnTrimmer().trim(frame, 92_968).kept.conversationFlow.size, "92_968 evicts the old turn")
-        assertEquals(3, TurnTrimmer().trim(frame, 93_000).kept.conversationFlow.size, "93_000 would keep everything")
+        // The trimmer's own verdict at the window: nothing is cut, so the assertion below cannot drift from it.
+        assertEquals(frame, TurnTrimmer().trim(frame, 92_968).kept, "92_968 is the exact window: nothing is cut")
 
         gateway().turn(turn(frame))
 
-        val request = client.requests.single()
+        val sent = client.requests.single()
         try {
-            budgeter.prepare(profile, request)
+            budgeter.prepare(profile, sent)
         } catch (rejected: ContractError.ConfigurationRejected) {
-            fail("the gateway trimmed to a window the send-time ContextBudgeter rejects: ${rejected.message}")
+            fail("the gateway trimmed to a request the send-time ContextBudgeter rejects: ${rejected.message}")
         }
-        assertEquals(listOf("hello"), request.input.filterIsInstance<InputPart.Text>().map { it.text })
-        assertEquals(
-            emptyList(),
-            request.history,
-            "the trim window (92_968) evicts the old turn exactly as the trimmer's own verdict said; a window 32 bytes " +
-                "wider (the un-subtracted 93_000) would have kept the whole 92_999-byte frame instead",
+        // Supporting observations, not the discriminator: the untrimmed frame's transcript survives as history and
+        // the current turn is the request input.
+        assertEquals(2, sent.history.size)
+        assertEquals(listOf("hello"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+    }
+
+    @Test fun `the merged leading context is accepted where the trailing memory order is rejected`() {
+        // The owner-approved design change (2026-10-16), proven against the real budgeter: the old order — transcript
+        // then a `MEMORY_EVIDENCE` user turn then the input — ends the history on a lone user group, which
+        // `ContextBudgeter` rejects **by design** (whole-group eviction depends on it). Every later turn would fail
+        // `ConfigurationRejected` until an app restart (the 2026-10-14 incident).
+        //
+        // The frame is assembled in the production order (`TurnRunner`: store snapshot → perception → memory →
+        // `USER_INPUT`), so the memory is the last thing before the input.
+        val memory = "<reference_context>\n用户喜欢咖啡\n</reference_context>"
+        val frame = RequestFrame(
+            systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")),
+            conversationFlow = listOf(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "第一轮问", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "第一轮答", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.MEMORY_EVIDENCE, false, memory),
+                Segment(SegmentOrigin.USER_INPUT, true, "现在呢"),
+            ),
+            tools = emptyList(),
         )
+
+        gateway().turn(turn(frame))
+
+        val sent = client.requests.single()
+        // The new order is accepted (the discriminating assertion).
+        try {
+            budgeter.prepare(profile, sent)
+        } catch (rejected: ContractError.ConfigurationRejected) {
+            fail("the merged leading context must be a sendable shape: ${rejected.message}")
+        }
+        // …and it really is the merged order: memory folded into the head user message, not a second user turn.
+        val head = sent.history.first() as ModelHistoryItem.Text
+        assertEquals(MessageRole.USER, head.role)
+        assertTrue(head.text.contains(memory), head.text)
+        assertTrue(head.text.endsWith("第一轮问"), head.text)
+        assertEquals(ModelHistoryItem.Text(MessageRole.ASSISTANT, "第一轮答"), sent.history[1])
+        assertEquals(listOf("现在呢"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+
+        // Counterexample: the order the plan used to specify. Built by hand, because that is exactly what the old
+        // mapping produced — history ends on `Text(USER, memory)`, one user group with no reply.
+        val oldOrder = request(
+            history = listOf(
+                ModelHistoryItem.Text(MessageRole.USER, "第一轮问"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "第一轮答"),
+                ModelHistoryItem.Text(MessageRole.USER, memory),
+            ),
+            input = listOf("现在呢"),
+        )
+        assertFailsWith<ContractError.ConfigurationRejected> {
+            budgeter.prepare(profile, oldOrder)
+        }
+    }
+
+    @Test fun `a standalone leading user message beside the transcript's user turn is rejected`() {
+        // The mutation that pins *why* the context is merged rather than merely prepended: `[USER(context)]` followed
+        // by the transcript's own `[USER(transcript), ASSISTANT(reply), …]` is two consecutive user texts, and the
+        // budgeter rejects it. This is the shape a naive reading of "one leading user message" produces, and it is
+        // why `frameToTranscript` folds the context into the transcript's head user turn instead.
+        val literalLeadingMessage = request(
+            history = listOf(
+                ModelHistoryItem.Text(MessageRole.USER, "<reference_context>\n用户喜欢咖啡\n</reference_context>"),
+                ModelHistoryItem.Text(MessageRole.USER, "第一轮问"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "第一轮答"),
+            ),
+            input = listOf("现在呢"),
+        )
+        assertFailsWith<ContractError.ConfigurationRejected> {
+            budgeter.prepare(profile, literalLeadingMessage)
+        }
+    }
+
+    @Test fun `a summary without memory cannot stand at the head as an assistant message`() {
+        // The other half of the same constraint, recorded so the shape choice is not mistaken for an oversight: a
+        // bounded summary as the history's opening assistant message is rejected (the history must open with a user
+        // text), which is why the summary is folded into the leading user message rather than emitted on its own.
+        val summary = SummaryBoundary.render("先前对话摘要")
+        assertFailsWith<ContractError.ConfigurationRejected> {
+            budgeter.prepare(
+                profile,
+                request(
+                    history = listOf(
+                        ModelHistoryItem.Text(MessageRole.ASSISTANT, summary),
+                        ModelHistoryItem.Text(MessageRole.USER, "第一轮问"),
+                        ModelHistoryItem.Text(MessageRole.ASSISTANT, "第一轮答"),
+                    ),
+                    input = listOf("现在呢"),
+                ),
+            )
+        }
     }
 }

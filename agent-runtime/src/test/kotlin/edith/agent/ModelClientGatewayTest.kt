@@ -60,11 +60,11 @@ class ModelClientGatewayTest {
         tools: List<ToolSpec> = emptyList(),
         deadlineNanos: Long = 1_000_000_000L,
         // Phase 5 seams, both appended with defaults so every existing positional call site keeps its meaning:
-        // `frame = null` is exactly today's `split(history)` behaviour, and `Int.MAX_VALUE` is the "no override"
-        // sentinel the gateway reads as "trim to `windowBytes(profile)`".
-        frame: RequestFrame? = null,
+        // `Int.MAX_VALUE` is the "no override" sentinel the gateway reads as "trim to `windowBytes(profile)`, and
+        // `frame = null` is exactly today's `split(history)` behaviour. `frame` is the last parameter.
         limitBytes: Int = Int.MAX_VALUE,
-    ) = GatewayTurn(turnId, profileId, instructions, history, tools, deadlineNanos, frame, limitBytes)
+        frame: RequestFrame? = null,
+    ) = GatewayTurn(turnId, profileId, instructions, history, tools, deadlineNanos, limitBytes, frame)
 
     private fun scripted(vararg events: ModelStreamEvent) =
         FakeModelClient { _, listener -> events.forEach(listener) }
@@ -475,11 +475,20 @@ class ModelClientGatewayTest {
         assertEquals(0, sent.history.size, "旧回合被裁掉了")
     }
 
-    @Test fun `a summary reaches the wire with the boundary and as an assistant message`() {
-        // AC-6
+    @Test fun `a clean-body summary reaches the wire bounded exactly once inside the leading user message`() {
+        // AC-6 / I-1: the frame path must render the boundary itself. The store hands over the **bounded** text
+        // (I-2), so a frame whose summary arrives pre-rendered would pass even with the render arm deleted —
+        // `roleOf(null) == ASSISTANT` supplies the role either way. This case is therefore built by hand with a
+        // clean body, which is exactly what a caller-supplied frame can look like.
+        //
+        // Owner-approved shape (2026-10-16): the summary is not its own message; it is folded into the **one**
+        // leading user message, ahead of the oldest surviving transcript text. A standalone leading user message
+        // followed by the transcript's own first user turn would be two consecutive user texts, which
+        // `ContextBudgeter` rejects by design (see `GatewayWindowAcceptanceTest`).
         val client = terminalClient()
+        val body = "先前对话摘要"
         val flow = listOf(
-            Segment(SegmentOrigin.SUMMARY, false, SummaryBoundary.render("先前对话摘要")),
+            Segment(SegmentOrigin.SUMMARY, false, body),
             Segment(SegmentOrigin.TRANSCRIPT, true, "之前问过一句", SegmentRole.USER),
             Segment(SegmentOrigin.TRANSCRIPT, true, "之前答过一句", SegmentRole.ASSISTANT),
             Segment(SegmentOrigin.USER_INPUT, true, "现在呢"),
@@ -489,10 +498,37 @@ class ModelClientGatewayTest {
         gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
 
         val sent = client.requests.single()
-        val texts = sent.history.filterIsInstance<ModelHistoryItem.Text>()
-        val summary = texts.single { it.text.startsWith(SummaryBoundary.OPEN) }
-        assertEquals(MessageRole.ASSISTANT, summary.role, "摘要必须是 assistant 那条，不能是 user")
-        assertEquals(MessageRole.USER, texts.first { it.text == "之前问过一句" }.role, "角色必须来自元数据")
+        val head = sent.history.first() as ModelHistoryItem.Text
+        assertEquals(MessageRole.USER, head.role, "the merged leading context is one user message")
+        assertTrue(head.text.startsWith(SummaryBoundary.OPEN), head.text)
+        assertTrue(head.text.contains(SummaryBoundary.render(body)), "the clean body must be rendered with the boundary")
+        assertEquals(1, head.text.split(SummaryBoundary.OPEN).size - 1, "exactly one boundary: ${head.text}")
+        // The context rides the transcript's **oldest surviving** user turn, so that turn's text is inside the head
+        // message; every later transcript item keeps its own role and text.
+        assertTrue(head.text.endsWith("之前问过一句"), head.text)
+        assertEquals(ModelHistoryItem.Text(MessageRole.ASSISTANT, "之前答过一句"), sent.history[1])
+        assertEquals(listOf("现在呢"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+    }
+
+    @Test fun `a summary that already carries the boundary is not wrapped twice`() {
+        // I-1's second half: the `isRendered` guard. A caller-supplied frame may carry the bounded rendering (the
+        // store now does), and the gateway must pass it through rather than nesting a second boundary.
+        val client = terminalClient()
+        val bounded = SummaryBoundary.render("先前对话摘要")
+        val flow = listOf(
+            Segment(SegmentOrigin.SUMMARY, false, bounded),
+            Segment(SegmentOrigin.USER_INPUT, true, "现在呢"),
+        )
+        val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
+
+        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+
+        // The flow has no transcript user turn to carry the context, so it rides the request input itself (a
+        // history holding only the leading context is a lone user group, which the budgeter rejects).
+        val input = client.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(input.contains(bounded), input)
+        assertEquals(1, input.split(SummaryBoundary.OPEN).size - 1, "no second boundary: $input")
+        assertEquals(1, input.split(SummaryBoundary.CLOSE).size - 1, "no second boundary: $input")
     }
 
     @Test fun `without a frame the gateway behaves exactly as before`() {
@@ -502,60 +538,115 @@ class ModelClientGatewayTest {
         assertEquals(listOf("把音量调小一点"), client.requests.single().input.filterIsInstance<InputPart.Text>().map { it.text })
     }
 
-    @Test fun `memory evidence survives when only an old turn has to be cut`() {
-        // Design D-4's order only holds if a memory segment sits **outside** every turn group: cut ① identifies a turn
-        // by `TRANSCRIPT` + `role`, so a memory segment is never part of one. The limit below is computed to be exactly
-        // the bytes of the frame **without** the old turn, so it forces ① to cut that turn and leaves the memory in.
-        val memory = Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "记".repeat(2_000))
-        val oldUser = Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(3_000), SegmentRole.USER)
-        val oldAssistant = Segment(SegmentOrigin.TRANSCRIPT, true, "答".repeat(3_000), SegmentRole.ASSISTANT)
+    @Test fun `the compacted leading context survives while cut one can still cut an older turn`() {
+        // I-3: this test previously ordered the frame `[memory, oldTurn, input]`, which production never assembles
+        // (`TurnRunner`: store snapshot → perception → memory → `USER_INPUT`). In the real order the memory sits
+        // **after** the last turn group, i.e. inside the ① slice of the group that precedes it — so the guard only
+        // passed because the order was inverted. Rewritten against the real order and the merged shape.
+        //
+        // Limit arithmetic (`TurnTrimmer.total()`, `measure = utf8 bytes + 32`, plus the fixed 32): the limit below
+        // is exactly the frame **without** the older turn, so cut ① must take that one whole group and stop.
+        val memory = Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "记".repeat(200))
+        val oldUser = Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(300), SegmentRole.USER)
+        val oldAssistant = Segment(SegmentOrigin.TRANSCRIPT, true, "答".repeat(300), SegmentRole.ASSISTANT)
+        val keptUser = Segment(SegmentOrigin.TRANSCRIPT, true, "新".repeat(100), SegmentRole.USER)
+        val keptAssistant = Segment(SegmentOrigin.TRANSCRIPT, true, "复".repeat(100), SegmentRole.ASSISTANT)
         val system = Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")
         val input = Segment(SegmentOrigin.USER_INPUT, true, "现在几点")
-        val frame = RequestFrame(listOf(system), listOf(memory, oldUser, oldAssistant, input), emptyList())
+        val frame = RequestFrame(
+            listOf(system),
+            listOf(oldUser, oldAssistant, keptUser, keptAssistant, memory, input),
+            emptyList(),
+        )
         fun bytes(segment: Segment) = segment.text.toByteArray(Charsets.UTF_8).size + 32
-        // `TurnTrimmer.total()` at the limit the test passes: fixed 32 + system + memory + input — i.e. the frame
-        // without the old turn, so ① must cut it and must not eat the memory.
-        val limitWithoutTheOldTurn = FIXED_OVERHEAD + bytes(system) + bytes(memory) + bytes(input)
+        val withoutTheOlderTurn =
+            FIXED_OVERHEAD + bytes(system) + bytes(keptUser) + bytes(keptAssistant) + bytes(memory) + bytes(input)
         val client = terminalClient()
         val gateway = gateway(client)
 
-        gateway.turn(turn(frame = frame, limitBytes = limitWithoutTheOldTurn))
+        gateway.turn(turn(frame = frame, limitBytes = withoutTheOlderTurn))
 
-        val report = requireNotNull(gateway.lastTrim)
-        assertEquals(1, report.droppedTurns, "① cut exactly one whole turn")
-        assertTrue(report.droppedOrigins.isEmpty(), "② never had to touch memory")
-        assertTrue(report.kept.conversationFlow.contains(memory), "the memory segment is still in the kept frame")
-        assertEquals(
-            listOf("现在几点"),
-            client.requests.single().input.filterIsInstance<InputPart.Text>().map { it.text },
+        val counts = requireNotNull(gateway.lastTrim)
+        assertEquals(1, counts.droppedTurns, "① cut exactly the older whole turn")
+        assertTrue(counts.droppedOrigins.isEmpty(), "② never had to touch the memory")
+        val sent = client.requests.single()
+        val head = sent.history.first() as ModelHistoryItem.Text
+        assertEquals(MessageRole.USER, head.role, "the leading context is one user message")
+        assertTrue(head.text.contains(memory.text), "the compacted leading context is still on the wire")
+        assertTrue(head.text.contains(keptUser.text), "and it rides the head user turn")
+        assertFalse(
+            sent.history.any { it is ModelHistoryItem.Text && it.text.contains(oldUser.text) },
+            "the older turn is gone",
         )
-
-        // Second half: tighten the window until ① alone cannot fit the frame, so ② has to drop the memory. The memory
-        // must then be charged to ② (`droppedOrigins`) while `droppedTurns` stays 1 — the cut that owns the old turn
-        // must not also be the cut that silently loses memory, which is the accounting design D-4 depends on.
-        client.requests.clear()
-        gateway.turn(turn(frame = frame, limitBytes = 4_000))
-
-        val tightened = requireNotNull(gateway.lastTrim)
-        assertEquals(1, tightened.droppedTurns, "① still cuts only the turn it owns")
-        assertEquals(
-            listOf(SegmentOrigin.MEMORY_EVIDENCE),
-            tightened.droppedOrigins,
-            "the memory fell to cut ② and is reported as such",
-        )
-        assertFalse(tightened.kept.conversationFlow.contains(memory), "② did drop it, and said so")
+        assertEquals(listOf("现在几点"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
     }
 
-    @Test fun `the trim report records counts and never any text`() {
-        // The probe-shaped seam: `lastTrim` is for counts only (spec's 只记计数). `TrimReport` cannot carry text by
-        // construction (`kept` is a `RequestFrame`, whose `toString` prints no body), and `droppedOrigins` is origins.
+    @Test fun `a memory segment after the last turn leaves inside that turn's cut one slice`() {
+        // I-3's real behaviour, asserted instead of the wished-for "memory is always reported under ②".
+        //
+        // With the production order, ①'s slice runs from the group's first segment to the next turn start — and to
+        // `flow.size` when no later turn follows. A memory segment sits after the last group, so once ① has to evict
+        // that group the memory leaves **inside the same slice** and is charged to `droppedTurns`; `droppedOrigins`
+        // stays empty. That is what makes the declared cut ② a no-op for every flow that carries a turn group (see
+        // `TrimOrder`): only a transcript-less flow (`[memory, USER_INPUT]`) ever reaches ②.
+        val memory = Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "记".repeat(200))
+        val oldUser = Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(300), SegmentRole.USER)
+        val oldAssistant = Segment(SegmentOrigin.TRANSCRIPT, true, "答".repeat(300), SegmentRole.ASSISTANT)
+        val keptUser = Segment(SegmentOrigin.TRANSCRIPT, true, "新".repeat(100), SegmentRole.USER)
+        val keptAssistant = Segment(SegmentOrigin.TRANSCRIPT, true, "复".repeat(100), SegmentRole.ASSISTANT)
+        val system = Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")
+        val input = Segment(SegmentOrigin.USER_INPUT, true, "现在几点")
+        val frame = RequestFrame(
+            listOf(system),
+            listOf(oldUser, oldAssistant, keptUser, keptAssistant, memory, input),
+            emptyList(),
+        )
+        fun bytes(segment: Segment) = segment.text.toByteArray(Charsets.UTF_8).size + 32
+        val onlySystemAndInput = FIXED_OVERHEAD + bytes(system) + bytes(input)
         val client = terminalClient()
+        val gateway = gateway(client)
+
+        gateway.turn(turn(frame = frame, limitBytes = onlySystemAndInput))
+
+        val counts = requireNotNull(gateway.lastTrim)
+        assertEquals(2, counts.droppedTurns, "both groups go: the tighter window cannot fit the newer turn either")
+        assertTrue(counts.droppedOrigins.isEmpty(), "the memory left with ①'s slice, so ② reports nothing")
+        val sent = client.requests.single()
+        assertTrue(sent.history.isEmpty(), "nothing but the current turn fits")
+        assertEquals(listOf("现在几点"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+    }
+
+    @Test fun `a frame whose transcript opens on an assistant text is refused as NO_USER_TURN`() {
+        // The frame path used to drop `split(history)`'s refusal silently. `RequestFrame` guarantees exactly one
+        // `USER_INPUT`, but it does **not** guarantee that the transcript opens on a user turn; a history that opens
+        // with an assistant text could never pass `ContextBudgeter`, so the gateway refuses it here instead of
+        // handing an unsendable request to the transport.
+        val client = terminalClient()
+        val flow = listOf(
+            Segment(SegmentOrigin.TRANSCRIPT, true, "没有用户回合的开头", SegmentRole.ASSISTANT),
+            Segment(SegmentOrigin.USER_INPUT, true, "现在呢"),
+        )
+        val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
+
+        val reply = gateway(client).turn(turn(frame = frame))
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals("NO_USER_TURN", reply.safeCode)
+        assertTrue(client.requests.isEmpty(), "an unsendable frame must be refused before any transport call")
+    }
+
+    @Test fun `the gateway exposes trim counts and never any text`() {
+        // I-6: the probe-shaped seam must be counts only. `TrimReport` carries the kept `RequestFrame`, whose
+        // segments hold text, so `lastTrim.toString()` used to be able to print a surviving body; the gateway now
+        // exposes `TrimCounts`, which has no text to print at all.
+        val client = terminalClient()
+        val surviving = "本轮问句的正文"
         val frame = RequestFrame(
             listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")),
             listOf(
                 Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(3_000), SegmentRole.USER),
                 Segment(SegmentOrigin.TRANSCRIPT, true, "答".repeat(3_000), SegmentRole.ASSISTANT),
-                Segment(SegmentOrigin.USER_INPUT, true, "现在几点"),
+                Segment(SegmentOrigin.USER_INPUT, true, surviving),
             ),
             emptyList(),
         )
@@ -563,17 +654,19 @@ class ModelClientGatewayTest {
 
         gateway.turn(turn(frame = frame, limitBytes = 100))
 
-        val report = requireNotNull(gateway.lastTrim)
-        assertEquals(1, report.droppedTurns)
-        assertTrue(report.droppedOrigins.isEmpty())
-        assertFalse(report.toString().contains("旧"), "the report must not carry the trimmed body")
+        val counts: TrimCounts = requireNotNull(gateway.lastTrim)
+        assertEquals(1, counts.droppedTurns)
+        assertTrue(counts.droppedOrigins.isEmpty())
+        assertFalse(counts.toString().contains(surviving), "the retained body must not be printable: $counts")
+        assertFalse(counts.toString().contains("旧"), "no trimmed body either: $counts")
     }
 
-    @Test fun `the trim window is the send time limit minus the fixed overhead`() {
-        // The two fixed 32s: `TurnTrimmer.total()` already adds `FIXED_OVERHEAD`, and `ContextBudgeter` adds its own
-        // on top of the per-message accounting (`ContextBudgeter.kt:61`). The fixture profile's window is
-        // `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, so the trimmer must be handed exactly 59_968 — sharing
-        // 60_000 would let it call a frame "fits" that the send-time check rejects by 32.
+    @Test fun `the trim window is the send time limit minus a deliberate safety margin`() {
+        // I-4: `TurnTrimmer.total()` and `ContextBudgeter.prepare` compute **structurally identical** totals against
+        // the same `minOf(inputBudgetTokens, usable - maxOutput - safety)` limit, so parity is exact with one shared
+        // number; the `- FIXED_OVERHEAD` is a deliberate 32-byte **safety margin** (the trimmer is stricter than the
+        // check it must satisfy), not a correction of a 32-byte disagreement. The fixture profile's window is
+        // `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, so the trimmer is handed 59_968.
         assertEquals(59_968, ModelClientGateway.windowBytes(profile))
     }
 

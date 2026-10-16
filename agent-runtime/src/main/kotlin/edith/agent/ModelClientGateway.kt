@@ -67,10 +67,12 @@ class ModelClientGateway(
 
     /**
      * Counts from the most recent frame-path trim — how many whole turns and which origins were dropped, and whether
-     * compression is still owed. **Never any text**: it exists for tests and count-only probes (spec's "只记计数").
-     * Null until the first frame-path turn, and never updated by the legacy `split(history)` path.
+     * compression is still owed. **Never any text**, by type: it is [TrimCounts], which carries no frame and no
+     * segment, so no probe's `toString()` can print a surviving body. It exists for tests and count-only probes
+     * (spec's "只记计数"). Null until the first frame-path turn, and never updated by the legacy `split(history)`
+     * path.
      */
-    internal var lastTrim: TrimReport? = null
+    internal var lastTrim: TrimCounts? = null
         private set
 
     companion object {
@@ -78,10 +80,14 @@ class ModelClientGateway(
          * The byte budget a frame is trimmed to, in the same unit and against the same bound `ContextBudgeter`
          * enforces at send time (`minOf(inputBudgetTokens, usableWindow - maxOutput - safety)`).
          *
-         * The `- [FIXED_OVERHEAD]` is **not optional**: [TurnTrimmer.total] already adds that fixed 32, and
-         * `ContextBudgeter` adds its own 32 on top of the per-message accounting (`ContextBudgeter.kt:61`). Sharing
-         * one limit would let the trimmer call a frame "fits" that the send-time check rejects by 32 bytes, turning a
-         * turn that should have succeeded into `ConfigurationRejected` — the exact bug the acceptance test pins.
+         * The `- [FIXED_OVERHEAD]` is a **deliberate 32-byte safety margin**, not a correction.
+         * [TurnTrimmer.total] and `ContextBudgeter.prepare` (`ContextBudgeter.kt:55-65`) compute structurally
+         * identical totals against the same `minOf(...)` limit — the same per-item `bytes + 32`, the same fixed 32,
+         * and `instructions == frame.systemText` — so with one shared limit they would already agree exactly. Taking
+         * one more 32 off makes the trimmer 32 bytes **stricter** than the check it must satisfy, which is the safe
+         * direction; the cost is that a frame within 32 bytes of fitting is trimmed one message earlier than strictly
+         * necessary. Nothing here claims the subtraction is what prevents a rejection: the acceptance test's
+         * discriminating assertion is the send-time `prepare` call itself.
          */
         internal fun windowBytes(profile: ModelProfile): Int =
             minOf(
@@ -100,12 +106,13 @@ class ModelClientGateway(
             split(request.history)
                 ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN)
         } else {
-            // The window is the same expression `ContextBudgeter` bounds the send with, minus the fixed overhead the
-            // trimmer already counts (see [windowBytes]). A caller-supplied `limitBytes` (test seam) wins.
+            // The window is the same expression `ContextBudgeter` bounds the send with, minus the deliberate
+            // 32-byte margin (see [windowBytes]). A caller-supplied `limitBytes` (test seam) wins.
             val limit = if (request.limitBytes == Int.MAX_VALUE) windowBytes(profile) else request.limitBytes
             val report = TurnTrimmer().trim(frame, limit)
-            lastTrim = report
+            lastTrim = report.counts
             frameToTranscript(report.kept)
+                ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN)
         }
         val startedAt = clock.nowNanos()
         // The loop's turn id is the only id this adapter owns, and one turn finishes before the next one starts, so it
@@ -193,29 +200,77 @@ class ModelClientGateway(
     /**
      * Maps a (already trimmed) frame's conversation flow onto the request's `input`/`history` shape.
      *
-     * The in-flight user turn is the frame's one `USER_INPUT` segment and becomes `input`; a conversation-flow
-     * segment's `role` is metadata (`Segment.role`), never inferred from text, and a segment with no role
-     * (theoretically only `PERCEPTION`/`MEMORY_EVIDENCE`) is rendered as the assistant's own message rather than
-     * being promoted into the user's input. A `SUMMARY` is re-wrapped in [SummaryBoundary] here: the store keeps the
-     * clean body ([ConversationStore.snapshot]), so the boundary is a render-time product and a summary would
-     * otherwise reach the wire as an ordinary assistant utterance. Attribution is `origin == SUMMARY` — never a text
-     * prefix — and an already-rendered body is passed through unchanged rather than wrapped twice.
+     * The in-flight user turn is the frame's one `USER_INPUT` segment and becomes `input` — never history. A
+     * conversation-flow segment's `role` is metadata ([Segment.role]), never inferred from text.
+     *
+     * ## The summary and the memory form the head of the history — as one user message
+     *
+     * A `SUMMARY`, every `MEMORY_EVIDENCE` and every `PERCEPTION` segment is not a conversation turn: it is lifted
+     * out of the flow and folded into the **one leading user message**, ahead of the oldest surviving transcript
+     * text. Attribution is `origin == SUMMARY` throughout — never a text prefix — and a summary body is rendered
+     * with [SummaryBoundary] here unless it already carries the boundary (the store hands over the bounded text).
+     *
+     * This is the owner-approved shape (2026-10-16). The previous order (transcript → memory → `USER_INPUT`) made
+     * the history end on a lone `Text(USER, memory)` group immediately before the request `input`, a shape
+     * `ContextBudgeter` rejects **by design** (whole-group eviction depends on it), so every later turn would fail
+     * `ConfigurationRejected` until an app restart — the 2026-10-14 incident.
+     *
+     * The leading context cannot be a **standalone** user message: `ContextBudgeter` requires the history to open
+     * with a user text and then alternate, so a leading user message followed by the transcript's own first user
+     * turn is two consecutive user texts and is rejected. Folding the context **into** that first user turn keeps
+     * one leading user message, keeps the alternation, and leaves every transcript role untouched. When the flow
+     * carries no transcript user turn to ride (an empty store — the first turn of a session that already has
+     * memory), the context is folded into the request `input` instead, because a history holding only the context
+     * would be a lone user group and unsendable.
+     *
+     * Returns `null` — the caller answers `NO_USER_TURN` — when the mapping could not produce a request
+     * `ContextBudgeter` would send: no `USER_INPUT` segment at all, or a non-empty history whose first text is not
+     * a user turn.
+     *
+     * Folding several context segments into one message can only make the sent request **cheaper** than the
+     * trimmer's measurement (one 32-byte per-message overhead disappears per folded segment, while each join adds
+     * 2 bytes), so the trimmer's verdict stays the conservative one and no fold can push a request over the limit.
      */
-    private fun frameToTranscript(frame: RequestFrame): Transcript {
+    private fun frameToTranscript(frame: RequestFrame): Transcript? {
         val flow = frame.conversationFlow
         val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
-        val input = flow.drop(inputIndex).map { InputPart.Text(it.text) }
-        val history = flow.take(inputIndex).map { segment ->
+        if (inputIndex < 0) return null
+        val inputText = flow[inputIndex].text
+        val leading = mutableListOf<String>()
+        val history = mutableListOf<ModelHistoryItem>()
+        for (segment in flow.take(inputIndex)) {
             when (segment.origin) {
-                SegmentOrigin.SUMMARY -> {
-                    val body = if (SummaryBoundary.isRendered(segment.text)) segment.text else SummaryBoundary.render(segment.text)
-                    ModelHistoryItem.Text(MessageRole.ASSISTANT, body)
-                }
-                else -> ModelHistoryItem.Text(roleOf(segment), segment.text)
+                SegmentOrigin.SUMMARY -> leading += boundedSummary(segment.text)
+                SegmentOrigin.MEMORY_EVIDENCE, SegmentOrigin.PERCEPTION -> leading += segment.text
+                else -> history += ModelHistoryItem.Text(roleOf(segment), segment.text)
             }
         }
-        return Transcript(input, history)
+        if (leading.isEmpty()) {
+            return if (history.isEmpty() || opensWithUser(history)) {
+                Transcript(listOf(InputPart.Text(inputText)), history)
+            } else {
+                null
+            }
+        }
+        val context = leading.joinToString("\n\n")
+        val head = history.firstOrNull()
+        return when {
+            head is ModelHistoryItem.Text && head.role == MessageRole.USER -> {
+                history[0] = ModelHistoryItem.Text(MessageRole.USER, "$context\n\n${head.text}")
+                Transcript(listOf(InputPart.Text(inputText)), history)
+            }
+            history.isEmpty() -> Transcript(listOf(InputPart.Text("$context\n\n$inputText")), history)
+            else -> null
+        }
     }
+
+    /** A summary body as it must go on the wire: bounded once, never twice. */
+    private fun boundedSummary(text: String): String =
+        if (SummaryBoundary.isRendered(text)) text else SummaryBoundary.render(text)
+
+    /** Whether the history opens on a user text, the only opening `ContextBudgeter` accepts. */
+    private fun opensWithUser(history: List<ModelHistoryItem>): Boolean =
+        (history.first() as? ModelHistoryItem.Text)?.role == MessageRole.USER
 
     private fun roleOf(segment: Segment): MessageRole = when (segment.role) {
         SegmentRole.USER -> MessageRole.USER

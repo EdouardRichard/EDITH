@@ -7,6 +7,25 @@ package edith.agent
  * [COMPRESSION_AFTER] is the prefix that runs synchronously before send. The third cut
  * ([COMPRESSION]) is not performed by [TurnTrimmer] — it is only *reported* as owed
  * ([TrimReport.compressionOwed]); the asynchronous summary is Task 5's.
+ *
+ * ## Cut ② is a no-op for every flow that carries a turn group
+ *
+ * The declared order stays `[OLDEST_TURNS, MEMORY_EVIDENCE, COMPRESSION]`, but the assembled shape makes the middle
+ * cut unreachable in practice, and this is stated here rather than left as a silent lie:
+ *
+ * - The frame is assembled in the production order — store snapshot → perception → memory → `USER_INPUT`
+ *   ([TurnRunner.assemble]) — so the `MEMORY_EVIDENCE` segments sit **after** the last turn group.
+ * - Cut ① removes the slice `(group start until the next turn start)`, and `flow.size` when no later turn follows.
+ *   For the last group that slice therefore **contains the memory segments**, so they leave with ① and are charged
+ *   to [TrimReport.droppedTurns] — not to ②.
+ * - ① runs until the flow fits or no turn group is left. It never stops with a turn group still present and the
+ *   memory behind it, so ② only ever fires on a flow with **no turn group at all** (`[memory, USER_INPUT]`, e.g. the
+ *   first turn of a session).
+ *
+ * The owner-approved consequence (2026-10-16, "memory leaves with the turn boundary or not at all") is that memory
+ * is no longer shed independently of a turn. The `MEMORY_EVIDENCE` cut is still implemented and still tested
+ * (`a memory is dropped from the least relevant end first`), and it is the only cut that can act when there is no
+ * turn to give up.
  */
 object TrimOrder {
     const val OLDEST_TURNS = "OLDEST_TURNS"
@@ -33,12 +52,30 @@ data class TrimReport(
 )
 
 /**
+ * The counts of one trim and nothing else — what a probe or a log line may read.
+ *
+ * [TrimReport] cannot serve as that surface: it carries [TrimReport.kept], a [RequestFrame] whose segments hold the
+ * surviving conversation text, so `TrimReport.toString()` would print bodies that a count-only probe must never
+ * expose. This type has no text to print.
+ */
+data class TrimCounts(
+    val droppedTurns: Int,
+    val droppedOrigins: List<SegmentOrigin>,
+    val compressionOwed: Boolean,
+)
+
+/** The counts-only view of this report: safe to log, `toString()`, or hand to a probe. */
+val TrimReport.counts: TrimCounts
+    get() = TrimCounts(droppedTurns, droppedOrigins, compressionOwed)
+
+/**
  * Trims a [RequestFrame] down to a byte budget in the fixed order (H2 + H3). A pure function: it
  * never mutates its input, never touches a store, and calls nothing asynchronous.
  *
  * ① [TrimOrder.OLDEST_TURNS] (whole old turns) and ② [TrimOrder.MEMORY_EVIDENCE] (least relevant
  * first) run here, synchronously, on the assembling thread before send. ③ [TrimOrder.COMPRESSION] is
- * only reported ([TrimReport.compressionOwed]) — never performed.
+ * only reported ([TrimReport.compressionOwed]) — never performed. In the assembled shape ② is
+ * unreachable for any flow that carries a turn group; [TrimOrder]'s KDoc says exactly why.
  *
  * ## The current input is never trimmed — by construction
  *
@@ -59,12 +96,14 @@ data class TrimReport(
  * [total] strictly falls, so the loop cannot spin and an empty candidate slice is unreachable — there
  * is deliberately no empty-slice guard (one existed and was dead code).
  *
- * ## Byte accounting — the same unit as `ContextBudgeter`
+ * ## Byte accounting — the same unit and the same total as `ContextBudgeter`
  *
  * [measure] is the arithmetic `ContextBudgeter` uses for one message (UTF-8 bytes + 32, see
  * `ContextBudgeter.kt`'s `message(text)`), and [total] adds the same fixed [FIXED_OVERHEAD] that
- * `ContextBudgeter.kt` adds once (`Math.addExact(32L, message(instructions))`). Sharing the unit is
- * the point: "trimmed to fit" and the send-time check must not disagree by 32.
+ * `ContextBudgeter.kt` adds once (`Math.addExact(32L, message(instructions))`). The two totals are
+ * therefore **structurally identical** against the same `minOf(...)` limit, and a frame whose
+ * `total()` is at or under that limit is accepted by the send-time check. (The gateway still trims to
+ * `limit - 32` as a deliberate safety margin; that is stricter, never the other way round.)
  *
  * A `SUMMARY` segment is **not a turn**: it never participates in turn eviction. But it does count
  * toward [total] — it gets no exemption from the budget check.
@@ -99,6 +138,9 @@ class TurnTrimmer(private val measure: (Segment) -> Int = { utf8BytesPlusOverhea
         }
 
         // ② 最不相关记忆：按相关性整条丢，从最不相关（列表末尾）开始。SUMMARY 与 USER_INPUT 不参与。
+        // 装配形状下（记忆段在最后一组之后）这一刀通常已经没有对象：① 的最后一组 slice 一直延伸到
+        // `flow.size`，把记忆段一起带走并记在 droppedTurns 上（见 `TrimOrder` 的 KDoc）。它保留下来是为了
+        // 没有任何回合组可让的请求（`[memory, USER_INPUT]`），以及为后续阶段保留"按相关性单独让出记忆"的能力。
         var index = flow.lastIndex
         while (total() > limitBytes && index >= 0) {
             if (flow[index].origin == SegmentOrigin.MEMORY_EVIDENCE) {
@@ -130,8 +172,10 @@ class TurnTrimmer(private val measure: (Segment) -> Int = { utf8BytesPlusOverhea
 
 /**
  * The fixed `+32` `ContextBudgeter` adds once on top of the per-message costs
- * (`Math.addExact(32L, message(request.instructions))`). [TurnTrimmer.total] must include it, or a
- * frame trimmed to exactly `limit` is 32 over the send-time check.
+ * (`Math.addExact(32L, message(request.instructions))`). It is part of the **shared** formula, not a
+ * correction: `TurnTrimmer.total` and `ContextBudgeter.prepare` count the same terms, so including it
+ * here is what makes the two agree exactly. (`ModelClientGateway.windowBytes` subtracts one more 32 as
+ * a deliberate margin.)
  */
 internal const val FIXED_OVERHEAD = 32
 

@@ -59,7 +59,10 @@ class ConversationStoreTest {
         assertEquals(1, snapshot.size)
         assertEquals(SegmentOrigin.SUMMARY, snapshot[0].origin)
         assertEquals(false, snapshot[0].trusted)
-        assertEquals("compressed context", snapshot[0].text)
+        // I-2: the boundary is rendered at **store-insert** time, so `snapshot()` returns the bounded text — the same
+        // bytes `history()` sends. A clean body here would be measured clean and sent rendered (+64 B for the
+        // boundary against a 32 B margin), which is a latent `ConfigurationRejected`.
+        assertEquals(SummaryBoundary.render("compressed context"), snapshot[0].text)
     }
 
     @Test fun `appendUser and appendAssistant both produce TRANSCRIPT origin`() {
@@ -101,19 +104,32 @@ class ConversationStoreTest {
         assertEquals("noted", (history[3] as ModelHistoryItem.ToolOutput).output)
     }
 
-    @Test fun `a summary is stored with SUMMARY origin and rendered with the boundary on the wire`() {
+    @Test fun `a summary is stored bounded and both views carry the same rendered text`() {
         val store = ConversationStore()
         store.appendUser("old")
         store.appendAssistant("reply")
         store.appendSummary("先前对话摘要")
 
         // 归属来自元数据，不是文本匹配。
-        assertTrue(store.snapshot().any { it.origin == SegmentOrigin.SUMMARY })
-        // 正文本身保持干净（库里不存边界）。
-        assertTrue(store.snapshot().none { it.origin == SegmentOrigin.SUMMARY && it.text.contains(SummaryBoundary.OPEN) })
-        // 线缆形状带上边界。
+        val summary = store.snapshot().single { it.origin == SegmentOrigin.SUMMARY }
+        // I-2: 边界在入库时渲染 ⇒ snapshot() 就是线上那份文本（测量值 == 发送值）。
+        assertEquals(SummaryBoundary.render("先前对话摘要"), summary.text)
+        assertTrue(summary.text.contains(SummaryBoundary.OPEN), summary.text)
+        // 线缆形状是同一份文本：两个视图不再有一份"干净正文"。
         val wireText = (store.history().last() as ModelHistoryItem.Text).text
-        assertTrue(wireText.startsWith(SummaryBoundary.OPEN), wireText)
+        assertEquals(summary.text, wireText)
+    }
+
+    @Test fun `a body that already carries the boundary is not wrapped twice`() {
+        // I-2: `appendSummary` 的 isRendered 守卫 —— 已带边界的正文必须原样入库一次。
+        val store = ConversationStore()
+        val bounded = SummaryBoundary.render("先前对话摘要")
+        store.appendSummary(bounded)
+
+        val text = store.snapshot().single().text
+        assertEquals(bounded, text)
+        assertEquals(1, text.split(SummaryBoundary.OPEN).size - 1, "边界只能出现一次：$text")
+        assertEquals(1, text.split(SummaryBoundary.CLOSE).size - 1, "边界只能出现一次：$text")
     }
 
     @Test fun `a user message that merely starts with the boundary text is not a summary`() {
