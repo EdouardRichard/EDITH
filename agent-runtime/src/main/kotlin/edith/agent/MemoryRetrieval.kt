@@ -1,20 +1,16 @@
 package edith.agent
 
-import edith.plugin.ContextPart
-
 /**
- * The long-term-memory retrieval boundary of the agent runtime (spec §6.5): turns a query into context parts that a
- * caller may fold into the next model request.
+ * The long-term-memory retrieval boundary of the agent runtime (spec §6.5): turns a query into segments that a
+ * caller may fold into the next request frame.
  *
- * P3.1 ships the **interface and its boundary only**. Task 14 owns the storage-backed implementation over the
- * encrypted `Capability.Storage` namespace, together with the view/delete affordances; **retrieval quality is
- * explicitly out of P3.1's scope** (spec §12), so nothing in this module ranks, scores or evaluates results and no
- * implementation lives here.
+ * Phase 3 changed the return type from `List<ContextPart>` to `List<Segment>` as part of the request assembly
+ * convergence. The interface and its boundary remain; implementations produce `MEMORY_EVIDENCE` segments.
  */
 interface MemoryRetrieval {
     /**
-     * Returns up to [limit] context parts relevant to [query]. Never returns more than [limit]; ordering and quality
-     * are the implementation's concern and are not specified by P3.1.
+     * Returns up to [limit] memory evidence segments relevant to [query]. Never returns more than [limit]; ordering
+     * and quality are the implementation's concern.
      */
-    fun retrieve(query: String, limit: Int): List<ContextPart>
+    fun retrieve(query: String, limit: Int): List<Segment>
 }

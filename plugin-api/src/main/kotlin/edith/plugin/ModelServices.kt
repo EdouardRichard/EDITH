@@ -104,11 +104,6 @@ sealed interface ModelHistoryItem {
     }
 }
 
-data class ContextPart(val id: String, val text: String, val importance: Int) {
-    init { require(id.isNotBlank()); require(text.isNotBlank()); require(importance >= 0) }
-    override fun toString() = "ContextPart(redacted)"
-}
-
 data class ModelRequest(
     val envelope: EventEnvelope,
     val requestId: String,
@@ -118,7 +113,6 @@ data class ModelRequest(
     val instructions: String,
     val input: List<InputPart>,
     val history: List<ModelHistoryItem>,
-    val context: List<ContextPart>,
     val output: OutputModality,
     val deadlineNanos: Long,
     /** Empty means a text-only request: the P2 body shape is preserved byte for byte. */

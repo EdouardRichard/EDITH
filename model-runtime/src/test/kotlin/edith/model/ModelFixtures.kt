@@ -18,4 +18,4 @@ internal fun requestFixture(input: List<InputPart> = listOf(InputPart.Text("synt
     output: OutputModality = OutputModality.TEXT,
     history: List<ModelHistoryItem> = emptyList()) = ModelRequest(
     EventEnvelope(SessionId("s"), Generation(1), "e", 0, 1), "r", "t", "p", 1,
-    "synthetic instructions", input, history, emptyList(), output, 10_000_000_000)
+    "synthetic instructions", input, history, output, 10_000_000_000)

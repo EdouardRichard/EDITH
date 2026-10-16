@@ -19,7 +19,7 @@ class CapabilityGate {
                 is InputPart.Image -> InputModality.IMAGE
                 is InputPart.Audio -> InputModality.AUDIO
             }
-        }.toSet() + if (request.history.isNotEmpty() || request.context.isNotEmpty()) setOf(InputModality.TEXT) else emptySet()
+        }.toSet() + if (request.history.isNotEmpty()) setOf(InputModality.TEXT) else emptySet()
         if (!profile.inputs.containsAll(inputs) || !support.inputs.containsAll(inputs) ||
             request.output !in profile.outputs || request.output !in support.outputs) missing()
         if (!consent.text || (InputModality.IMAGE in inputs && !consent.image) ||

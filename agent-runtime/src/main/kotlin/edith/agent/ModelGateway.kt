@@ -1,6 +1,5 @@
 package edith.agent
 
-import edith.plugin.ContextPart
 import edith.plugin.ModelEnd
 import edith.plugin.ModelHistoryItem
 import edith.plugin.ToolSpec
@@ -26,9 +25,6 @@ interface ModelGateway {
  * [history] is the stateless transcript so far: the loop opens it with the request's utterance and appends one
  * `[assistant text, tool call*, tool output*]` group per tool round plus `[assistant text, user instruction]` per
  * retry. [tools] is empty when the run offers no tool; the loop still sends the turn.
- *
- * [context] is the memory the caller assembled, or `null` to let the gateway retrieve it. An empty list means "no
- * memory this turn" and is deliberately **not** treated as "retrieve for me".
  */
 data class GatewayTurn(
     val turnId: String,
@@ -37,7 +33,6 @@ data class GatewayTurn(
     val history: List<ModelHistoryItem>,
     val tools: List<ToolSpec>,
     val deadlineNanos: Long,
-    val context: List<ContextPart>? = null,
 )
 
 /**

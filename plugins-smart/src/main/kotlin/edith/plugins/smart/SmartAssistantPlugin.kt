@@ -1116,7 +1116,7 @@ class SmartAssistantPlugin(
             P3Log.line(
                 "P3_CONTEXT route=${it.route} instructions=${it.instructions.length} " +
                     "history=${it.history.size} historyChars=${it.history.sumOf { item -> item.estimatedLength() }} " +
-                    "memory=${it.context.size} tokens=${it.estimatedTokens} budget=${it.historyBudgetTokens} " +
+                    "memory=${it.memorySegments.size} tokens=${it.estimatedTokens} budget=${it.historyBudgetTokens} " +
                     "over=${it.overHistoryBudget}",
             )
         }
@@ -1142,9 +1142,6 @@ class SmartAssistantPlugin(
                     // `buildPrompt` ends its history on this turn's user message while the loop appends the utterance
                     // itself, so the last item is dropped: passing it whole would ask the model the same thing twice.
                     history = prompt?.history?.dropLast(1).orEmpty(),
-                    // A non-null context is how the caller says "the memory is already assembled": the gateway then
-                    // does not retrieve, which is what keeps the query from being embedded twice per turn.
-                    context = prompt?.context,
                 ),
             )
         } catch (failure: Throwable) {
@@ -1285,9 +1282,6 @@ class SmartAssistantPlugin(
                 EventEnvelope(context.sessionId, context.generation, requestId, startNanos, endNanos)
             },
             stop = { owned.closed },
-            // P3.4 §3.3: the turn's context parts come from long-term memory, and only from it (the gateway asks about
-            // the in-flight utterance).
-            memoryRetrieval = memoryRetrieval,
         )
         return AgentLoop(
             gateway = gateway,
@@ -1534,9 +1528,6 @@ class SmartAssistantPlugin(
                 EventEnvelope(current.sessionId, current.generation, requestId, startNanos, endNanos)
             },
             stop = { hint.cancelled },
-            // P3.4 §3.3: the proactive request carries retrieved memory too - it is a request to the same model about
-            // the same person, and it passes the same upload gate.
-            memoryRetrieval = memoryRetrieval,
         )
         // B1/B3/B6 / spec §4.2: the proactive route consumes the **session's own** assembly exactly as the wake route
         // does — its instructions (with the SKILL section) and its own transcript come from `buildPrompt` under
@@ -1558,9 +1549,6 @@ class SmartAssistantPlugin(
                 // passing it whole would put the observation to the model twice.
                 history = (prompt?.history?.dropLast(1).orEmpty() +
                     ModelHistoryItem.Text(MessageRole.USER, message)),
-                // A non-null context is how the caller says "the memory is already assembled" (B5): the gateway then
-                // does not retrieve, which is what keeps the query from being embedded twice per turn.
-                context = prompt?.context,
                 tools = listOf(SmartPrompts.PROPOSE_HINT),
                 deadlineNanos = SmartTurn.saturatingAdd(started, SmartPrompts.PROACTIVE_DEADLINE_MILLIS * 1_000_000L),
             ))

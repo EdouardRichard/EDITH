@@ -121,7 +121,7 @@ class DiagnosticTextPlugin(
         }
         close(old)
         val request = ModelRequest(EventEnvelope(c.sessionId, c.generation, o.requestId, now, now), o.requestId,
-            t.turnId, cfg.profile, cfg.revision, INSTRUCTIONS, listOf(InputPart.Text(text)), emptyList(), emptyList(),
+            t.turnId, cfg.profile, cfg.revision, INSTRUCTIONS, listOf(InputPart.Text(text)), emptyList(),
             OutputModality.TEXT, deadline)
         try {
             synchronized(gate) { if (owner !== o || o.closed) return; mark(TraceMark.REQUEST_START, o) }

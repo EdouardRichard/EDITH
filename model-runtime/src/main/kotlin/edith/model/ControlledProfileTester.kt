@@ -14,7 +14,7 @@ class ControlledProfileTester(private val client: ControlledModelClient, private
         val now = clock.nowNanos()
         val request = ModelRequest(EventEnvelope(SessionId("profile-probe:$profileId"), Generation(1), id, now, now),
             id, id, profile.id, profile.revision, "Reply briefly with plain text.", listOf(InputPart.Text("只回复测试通过")),
-            emptyList(), emptyList(), OutputModality.TEXT, Long.MAX_VALUE)
+            emptyList(), OutputModality.TEXT, Long.MAX_VALUE)
         return client.probe(request) { event ->
             if (event is ModelStreamEvent.Terminal) {
                 val state = when (event.end) {
