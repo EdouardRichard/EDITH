@@ -26,8 +26,8 @@ import edith.plugin.ModelHistoryItem
  * summary; the next append is a new user turn, so in "summary + turns" the summary covers every turn
  * before it and must be kept. A summary that sits *after* a turn means earlier turns still precede it,
  * so it has been superseded by a newer summary: it takes no part in whole-turn eviction, and eviction
- * removes it ([dropOldestTurns], and every append that evicts). This is also why a summary takes no part
- * in whole-turn eviction: it is not a turn.
+ * removes it — by [dropOldestTurns], or by any append other than the one that created it
+ * ([enforceEnvelope]). This is also why a summary takes no part in whole-turn eviction: it is not a turn.
  *
  * @param maxItems the maximum number of stored messages the envelope keeps. Defaults to [MAX_ITEMS],
  *   which equals `ConversationContext.MAX_MESSAGES`, so the default behaviour is unchanged.
@@ -88,15 +88,20 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
      * [SegmentRole.ASSISTANT]. The stored text is the **clean body**; the wire shape ([history]) carries
      * the explicit [SummaryBoundary] because it is rendered here, at the boundary of the store.
      *
-     * **A summary is dropped when eviction runs, not when it is created.** Appending a summary that ends up
-     * *after* a turn makes it a superseded summary, but this method does not remove it: the removal is a
-     * consequence of the summary invariant and happens at eviction — [dropOldestTurns], or any append that
-     * evicts (see [enforceEnvelope]). A non-head summary is therefore transiently visible through [snapshot]
-     * and [history] until the next eviction, and never by the append that created it.
+     * **The append that creates a summary never drops it.** Appending a summary that ends up *after* a turn
+     * makes it a superseded summary, but this method only appends and skips the sweep: the removal is a
+     * consequence of the summary invariant and happens at the next eviction — [dropOldestTurns], or any later
+     * append (see [enforceEnvelope]). A non-head summary is therefore transiently visible through [snapshot]
+     * and [history] until that next eviction, and never after the append that created it.
      */
     @Synchronized
     fun appendSummary(text: String) =
-        add(ModelHistoryItem.Text(MessageRole.ASSISTANT, SummaryBoundary.render(text)), SegmentOrigin.SUMMARY, SegmentRole.ASSISTANT)
+        add(
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, SummaryBoundary.render(text)),
+            SegmentOrigin.SUMMARY,
+            SegmentRole.ASSISTANT,
+            sweepSuperseded = false,
+        )
 
     /**
      * Clears all existing items and replaces them with a single SUMMARY item (trusted=false).
@@ -149,7 +154,8 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     fun hasPendingUserTurn(): Boolean = lastRole() == SegmentRole.USER
 
     /**
-     * Drops the oldest whole turns until `size <= maxItems`, and returns the number of messages dropped.
+     * Drops the oldest whole turns until `size <= maxItems`, and returns the number of messages dropped —
+     * the superseded summaries removed by the sweep plus the turn items evicted.
      *
      * A whole turn is one user message plus the assistant/tool round it produced; a tool round is never
      * orphaned from the turn that caused it. The **last** user turn is never dropped — and because a turn
@@ -158,40 +164,57 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
     @Synchronized
     fun dropOldestTurns(maxItems: Int): Int = enforceEnvelope(maxItems)
 
-    private fun add(item: ModelHistoryItem, origin: SegmentOrigin, role: SegmentRole?) {
+    /**
+     * Appends [item] and enforces the envelope.
+     *
+     * Every append except the one that creates a summary sweeps and evicts together ([enforceEnvelope]), so
+     * the summary invariant holds after every append. The exception is [appendSummary], which passes
+     * `sweepSuperseded = false`: the append that creates a summary must not immediately drop its own summary
+     * (supersession is lazy), so that append only evicts ([evictTurns]).
+     */
+    private fun add(
+        item: ModelHistoryItem,
+        origin: SegmentOrigin,
+        role: SegmentRole?,
+        sweepSuperseded: Boolean = true,
+    ) {
         items += SessionItem(item, origin, role)
-        // A summary that is no longer at the head is *superseded*, but it is not removed here: appending a
-        // summary is a maintenance action whose result the caller may read back immediately, and the removal
-        // is a consequence of the summary invariant rather than of the append. It happens at eviction
-        // ([dropOldestTurns] / the next append that evicts), which is what [dropOldestTurns]'s tests pin.
-        evictTurns(maxItems)
+        if (sweepSuperseded) enforceEnvelope(maxItems) else evictTurns(maxItems)
     }
 
     /**
      * Enforces the envelope: first drop every SUMMARY that is no longer at the head (it is superseded by the
-     * newer summary that covers the turns before it), then drop whole turns from the head. Returns the number
-     * of messages dropped.
+     * newer summary that covers the turns before it), then drop whole turns from the head. Returns the true
+     * number of messages dropped — the superseded summaries plus the turn items.
      *
-     * **This is the only place a superseded summary is removed.** The invariant is lazy: a non-head summary
-     * is *superseded* and is removed here — by [dropOldestTurns] or by any append that evicts — never by the
-     * append that created it ([appendSummary] only adds; see its KDoc).
+     * **This is the only place a superseded summary is removed.** The invariant is lazy: a non-head summary is
+     * *superseded* and is removed here — by [dropOldestTurns] or by any other append — never by the append
+     * that created it ([appendSummary] passes `sweepSuperseded = false`; see its KDoc and [add]).
      *
      * A summary is never evicted as a turn — it is not a turn. When the only remaining turn is the last user
      * turn, the envelope is allowed to overrun rather than empty the conversation, the same trade-off
      * `ContextCompressor` already makes with its `ANCHORED` reason.
      */
     private fun enforceEnvelope(target: Int): Int {
-        dropSupersededSummaries()
-        return evictTurns(target)
+        val superseded = dropSupersededSummaries()
+        return superseded + evictTurns(target)
     }
 
-    /** Drops every SUMMARY that is not at index 0. See the summary invariant in the class KDoc. */
-    private fun dropSupersededSummaries() {
+    /**
+     * Drops every SUMMARY that is not at index 0 and returns how many were removed. See the summary invariant
+     * in the class KDoc.
+     */
+    private fun dropSupersededSummaries(): Int {
+        var dropped = 0
         var index = items.size - 1
         while (index > 0) {
-            if (items[index].origin == SegmentOrigin.SUMMARY) items.removeAt(index)
+            if (items[index].origin == SegmentOrigin.SUMMARY) {
+                items.removeAt(index)
+                dropped++
+            }
             index--
         }
+        return dropped
     }
 
     /** Drops whole turns from the head while more than [target] messages remain. Returns the count dropped. */

@@ -189,4 +189,35 @@ class ConversationStoreTest {
     @Test fun `maxItems must be at least one`() {
         assertFailsWith<IllegalArgumentException> { ConversationStore(maxItems = 0) }
     }
+
+    // ---- Phase 5 review fixes ----
+
+    @Test fun `a stale summary after the last turn is removed by the sweep`() {
+        // 唯一由 sweep（而非回合淘汰）移除摘要的形状 —— Finding 3 的漏洞就在这。
+        val store = ConversationStore()
+        store.appendUser("u1"); store.appendAssistant("a1")
+        store.appendSummary("旧摘要")
+        store.appendUser("u2"); store.appendAssistant("a2")
+        store.appendSummary("更新的摘要")
+
+        val dropped = store.dropOldestTurns(0)
+
+        assertEquals(0, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY },
+            "非首位摘要必须由 sweep 移除")
+        assertEquals(3, dropped, "sweep 摘掉的摘要也要计入返回的条数")
+    }
+
+    @Test fun `an append that evicts also sweeps a superseded summary instead of promoting it`() {
+        // Finding 1 的具体反例：maxItems=3 时 append 触发淘汰，不能把旧摘要顶到首位。
+        // 合法终止态只能是 3 条 [u1,a1,u2]（sweep 掉摘要）或 1 条 [u2]（丢掉整个回合）；
+        // 2 条需要按条裁剪（丢掉 u1 而留下孤立的 a1），整回合淘汰下不可达、也被禁止。
+        val store = ConversationStore(maxItems = 3)
+        store.appendUser("u1"); store.appendAssistant("a1")
+        store.appendSummary("旧摘要")
+        store.appendUser("u2")
+
+        assertEquals(0, store.snapshot().count { it.origin == SegmentOrigin.SUMMARY },
+            "append 触发的淘汰必须同时 sweep，不能把被取代的摘要留成首位")
+        assertEquals(3, store.size())
+    }
 }
