@@ -40,6 +40,12 @@ class MemoryLog(
     private val now: () -> Long = System::currentTimeMillis,
     private val cap: Int = CAP,
     private val log: (String) -> Unit = { P3Log.line(it) },
+    /**
+     * Phase 4 §3.9 6d: optional normalizer that derives a third-person form from the original text at write time.
+     * When non-null, [record] stores both the original and normalized text (dual storage).
+     * When null, [MemoryEntry.normalizedText] stays empty — backward compatible with pre-Phase-4 behavior.
+     */
+    private val normalizer: ((String, MemoryKind) -> String)? = null,
 ) {
 
     init {
@@ -80,11 +86,13 @@ class MemoryLog(
         val stamp = now()
         val existing = current.indexOfFirst { it.kind == kind && similarity(it.text, clean) >= DEDUPE }
         val entry = if (existing >= 0) {
+            // Refresh: keep the original normalizedText from the first record.
             val refreshed = current[existing].copy(lastUsedAtMillis = stamp, useCount = current[existing].useCount + 1)
             current[existing] = refreshed
             refreshed
         } else {
-            MemoryEntry(UUID.randomUUID().toString(), kind, clean, stamp, stamp, 1, source).also { current += it }
+            val normalized = normalizer?.invoke(clean, kind) ?: ""
+            MemoryEntry(UUID.randomUUID().toString(), kind, clean, stamp, stamp, 1, source, normalizedText = normalized).also { current += it }
         }
         val (kept, dropped) = evictByUsage(current, cap, stamp)
         // The eviction line goes out only after the document it describes was actually saved: an eviction announced
@@ -143,6 +151,9 @@ class MemoryLog(
                             put("lastUsedAtMillis", entry.lastUsedAtMillis)
                             put("useCount", entry.useCount)
                             put("source", entry.source.name)
+                            // Phase 4 §3.9 6d: dual storage — persist normalized form alongside original.
+                            // Always written (even when empty) so re-encoding a decoded document is stable.
+                            put("normalizedText", entry.normalizedText)
                         },
                     )
                 }
@@ -175,6 +186,8 @@ class MemoryLog(
             lastUsedAtMillis = json["lastUsedAtMillis"]?.jsonPrimitive?.longOrNull ?: 0L,
             useCount = json["useCount"]?.jsonPrimitive?.intOrNull ?: 0,
             source = source,
+            // Phase 4 §3.9 6d: old documents lack this field — default to empty string (backward compat).
+            normalizedText = json["normalizedText"]?.jsonPrimitive?.contentOrNull ?: "",
         )
     }
 

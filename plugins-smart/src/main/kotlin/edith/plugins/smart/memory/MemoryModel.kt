@@ -23,6 +23,16 @@ data class MemoryEntry(
     val useCount: Int,
     val source: MemorySource,
     /**
+     * Phase 4 §3.9 6d: the normalized (third-person) form of [text], persisted alongside the original.
+     *
+     * Empty string signals "not yet normalized" — old documents lack this field and decode with the default.
+     * The retriever falls back to [text] when this is blank.
+     *
+     * **Persisted** in the JSON document (unlike [embedding]), because it is derived once at write time and must
+     * survive across sessions without re-normalization.
+     */
+    val normalizedText: String = "",
+    /**
      * The 256-dim embedding of [text] (spec §5.2), or `null` when it has not been computed yet.
      *
      * **In memory only — never persisted.** A thousand of these is a multi-megabyte rewrite on every single write,
@@ -38,7 +48,8 @@ data class MemoryEntry(
             other is MemoryEntry &&
                 id == other.id && kind == other.kind && text == other.text &&
                 createdAtMillis == other.createdAtMillis && lastUsedAtMillis == other.lastUsedAtMillis &&
-                useCount == other.useCount && source == other.source
+                useCount == other.useCount && source == other.source &&
+                normalizedText == other.normalizedText
             )
 
     override fun hashCode(): Int {
@@ -49,6 +60,7 @@ data class MemoryEntry(
         result = 31 * result + lastUsedAtMillis.hashCode()
         result = 31 * result + useCount
         result = 31 * result + source.hashCode()
+        result = 31 * result + normalizedText.hashCode()
         return result
     }
 

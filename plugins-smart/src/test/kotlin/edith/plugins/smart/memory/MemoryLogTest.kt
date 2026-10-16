@@ -200,4 +200,55 @@ class MemoryLogTest {
         assertEquals(5_000L, log.entries().single().lastUsedAtMillis)
         assertEquals(2, log.entries().single().useCount)
     }
+
+    // --- Phase 4 Task 2: dual storage ---
+
+    @Test fun `record persists both original and normalized text`() {
+        val storage = SmartFakeStorage()
+        val log = MemoryLog(storage = storage, now = { clock }, cap = MemoryLog.CAP, log = { logged += it }, normalizer = ::normalize)
+        val entry = log.record(MemoryKind.PREFERENCE, "我喜欢喝茶", MemorySource.AUTO)!!
+
+        assertEquals("我喜欢喝茶", entry.text)
+        assertEquals("用户曾表示喜欢喝茶", entry.normalizedText)
+
+        // Round-trip through storage
+        val restored = store(storage).entries().first { it.id == entry.id }
+        assertEquals("我喜欢喝茶", restored.text)
+        assertEquals("用户曾表示喜欢喝茶", restored.normalizedText)
+    }
+
+    @Test fun `record without normalizer leaves normalizedText empty`() {
+        val log = store()
+        val entry = log.record(MemoryKind.PREFERENCE, "我喜欢喝茶", MemorySource.AUTO)!!
+
+        assertEquals("我喜欢喝茶", entry.text)
+        assertEquals("", entry.normalizedText)
+    }
+
+    @Test fun `backward compat - old documents without normalizedText decode with empty string`() {
+        val storage = SmartFakeStorage()
+        // Write a v1 document manually without normalizedText field
+        val oldJson = """{"version":1,"entries":[{"id":"old-1","kind":"PREFERENCE","text":"我喜欢喝茶","createdAtMillis":1000,"lastUsedAtMillis":1000,"useCount":1,"source":"AUTO"}]}"""
+        storage.write(MemoryLog.KEY, oldJson.toByteArray(Charsets.UTF_8))
+
+        val entries = store(storage).entries()
+
+        assertEquals(1, entries.size)
+        assertEquals("我喜欢喝茶", entries.single().text)
+        assertEquals("", entries.single().normalizedText)
+    }
+
+    @Test fun `refreshed entry preserves normalizedText from original record`() {
+        val storage = SmartFakeStorage()
+        val log = MemoryLog(storage = storage, now = { clock }, cap = MemoryLog.CAP, log = { logged += it }, normalizer = ::normalize)
+        log.record(MemoryKind.PREFERENCE, "我喜欢喝茶", MemorySource.AUTO)
+        clock = 2_000L
+
+        // Recording the same text again should refresh, keeping normalizedText
+        val refreshed = log.record(MemoryKind.PREFERENCE, "我喜欢喝茶", MemorySource.AUTO)!!
+
+        assertEquals("我喜欢喝茶", refreshed.text)
+        assertEquals("用户曾表示喜欢喝茶", refreshed.normalizedText)
+        assertEquals(2, refreshed.useCount)
+    }
 }

@@ -246,7 +246,8 @@ class MemoryEvictionTest {
         assertEquals(setOf("version", "entries"), root.keys)
         val row = (root.getValue("entries") as kotlinx.serialization.json.JsonArray).single() as JsonObject
         assertEquals(
-            setOf("id", "kind", "text", "createdAtMillis", "lastUsedAtMillis", "useCount", "source"),
+            // Phase 4 Task 2: normalizedText added for dual storage (§3.9 6d).
+            setOf("id", "kind", "text", "createdAtMillis", "lastUsedAtMillis", "useCount", "source", "normalizedText"),
             row.keys,
         )
     }

@@ -220,6 +220,43 @@ class MemoryModuleTest {
         assertEquals(emptyList(), module.retrieve("任何问题"))
     }
 
+    // --- Phase 4 Task 2: normalizer integration ---
+
+    @Test
+    fun `remember stores normalized form via normalizer`() {
+        val storage = FakeStorage()
+        val log = MemoryLog(storage = storage, now = { 1L }, cap = 1000, log = {}, normalizer = ::normalize)
+        val embeddings = FakeEmbeddings(vectors = mapOf("我喜欢喝茶" to unit(1f, 0f)))
+        val module = MemoryModule(
+            log = log,
+            embeddings = embeddings,
+            lexicon = SmartMemoryRetrieval(log, logger = {}),
+            retriever = SemanticRetriever(embeddings, VectorIndex(DIM)),
+        )
+
+        val entry = module.remember("我喜欢喝茶", MemoryKind.PREFERENCE, MemorySource.AUTO)!!
+
+        assertEquals("我喜欢喝茶", entry.text)
+        assertEquals("用户曾表示喜欢喝茶", entry.normalizedText)
+    }
+
+    @Test
+    fun `remember without normalizer leaves normalizedText empty`() {
+        val log = store()
+        val embeddings = FakeEmbeddings(vectors = mapOf("我喜欢喝茶" to unit(1f, 0f)))
+        val module = MemoryModule(
+            log = log,
+            embeddings = embeddings,
+            lexicon = SmartMemoryRetrieval(log, logger = {}),
+            retriever = SemanticRetriever(embeddings, VectorIndex(DIM)),
+        )
+
+        val entry = module.remember("我喜欢喝茶", MemoryKind.PREFERENCE, MemorySource.AUTO)!!
+
+        assertEquals("我喜欢喝茶", entry.text)
+        assertEquals("", entry.normalizedText)
+    }
+
     private companion object {
         const val DIM = 8
     }
