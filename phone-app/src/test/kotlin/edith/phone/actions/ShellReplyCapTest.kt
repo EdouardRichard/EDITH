@@ -5,6 +5,10 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.io.InputStream
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * R-9 / D-6: one privileged reply has an explicit cap, and "too large" is a distinguishable answer.
@@ -14,12 +18,17 @@ import org.junit.Test
  * reported as a parse failure, and a reply that was merely large was indistinguishable from one that was malformed.
  * The privileged process would also accumulate an unbounded `String`, then a second copy for the JSON, then a third on
  * the app side.
+ *
+ * The drain-to-EOF claim is pinned by an **interleaved** stream pair rather than two whole `ByteArrayInputStream`s:
+ * the second stream here withholds its bytes until the first has yielded a byte *past* the cap, so a drain that broke
+ * out of the loop at the cap would starve it and hang the call, whereas the in-memory variant cannot see that at all
+ * (each `ByteArrayInputStream` is read by its own thread under its own budget and reaches EOF regardless).
  */
 class ShellReplyCapTest {
 
     @Test
     fun `a reply at exactly the cap is not truncated`() {
-        // Review Focus 4: one byte short of the cap is not truncated; the boundary is exact.
+        // Review Focus 4: exactly at the cap is not over it; the boundary is exact.
         val out = "x".repeat(ShellReply.MAX_REPLY_BYTES)
         val (stdout, _, truncated) = drainStreams(out.byteInputStream(), "".byteInputStream())
         assertEquals(ShellReply.MAX_REPLY_BYTES, stdout.toByteArray().size)
@@ -57,10 +66,107 @@ class ShellReplyCapTest {
     }
 
     @Test
+    fun `an unreadable truncated value is read as false rather than rejecting the reply`() {
+        // The flag is advisory and must never reject a reply whose payload we did understand - including when the value
+        // is present but is not a primitive at all, which is the shape that used to throw out of `decode` instead.
+        val decoded = ShellReply.decode("""{"exit":0,"stdout":"a","stderr":"","truncated":{}}""")
+        assertEquals("a non-primitive truncated must not fail the payload", "a", decoded?.stdout)
+        assertFalse("a non-primitive truncated reads as false", decoded?.truncated ?: true)
+    }
+
+    @Test
     fun `an untouched reply does not carry the truncated key`() {
         // Only write the key when it is true, so the wire form of the common case is unchanged.
         val encoded = ShellReply.encode(0, "out", "err")
         assertFalse(encoded.contains("truncated"))
+    }
+
+    @Test(timeout = 10_000)
+    fun `reaching the cap does not stop the drain, so the other stream still reaches EOF`() {
+        // The single fact the in-memory variant cannot see: `write(2)` coupling. stdout's one byte past the cap is what
+        // releases stderr, so a drain that broke out of the loop at the cap never reads it, the stderr thread stays
+        // parked on `await`, and the `join` never returns. `MAX_REPLY_BYTES` is a multiple of the 8 KiB read buffer, so
+        // the read carrying that byte is exactly the first discard read.
+        val overshootRead = CountDownLatch(1)
+        val overshootReads = AtomicInteger(0)
+        val stdout = capBoundStdout(overshootRead, overshootReads)
+        val payload = STDERR_PAYLOAD
+        val stderr = object : InputStream() {
+            private var offset = 0
+            private var gated = false
+            override fun read(): Int = -1
+            override fun read(b: ByteArray, off: Int, len: Int): Int {
+                if (!gated) {
+                    // Gated exactly once: with the drain intact stdout has already been read past the cap and this
+                    // returns immediately; with the drain cut short at the cap it waits - and the join hangs.
+                    assertTrue(
+                        "stderr must not be drained before stdout is read past the cap",
+                        overshootRead.await(5, TimeUnit.SECONDS),
+                    )
+                    gated = true
+                }
+                if (offset >= payload.length) return -1
+                val n = minOf(len, payload.length - offset)
+                for (i in 0 until n) b[off + i] = payload[offset + i].code.toByte()
+                offset += n
+                return n
+            }
+        }
+
+        val (out, err, truncated) = drainStreams(stdout, stderr)
+
+        assertTrue(
+            "stdout was never read past the cap: overshootReads=${overshootReads.get()} latch=${overshootRead.count}",
+            overshootReads.get() == 1,
+        )
+        assertTrue(truncated)
+        assertEquals(ShellReply.MAX_REPLY_BYTES, out.toByteArray().size)
+        assertEquals(payload.length, err.length)
+    }
+
+    @Test
+    fun `only stderr over the cap is truncated too`() {
+        // The flag is `either stream`, and only the stdout side used to be exercised - so `outTruncated` alone left
+        // every test green. Here stdout is small and whole; stderr alone spends the budget.
+        val (out, err, truncated) = drainStreams(
+            "out".byteInputStream(),
+            "e".repeat(ShellReply.MAX_REPLY_BYTES + 1).byteInputStream(),
+        )
+        assertTrue("a truncated stderr must set the flag on its own", truncated)
+        assertEquals("out", out)
+        assertEquals(ShellReply.MAX_REPLY_BYTES, err.toByteArray().size)
+    }
+
+    /**
+     * Stands in for the interleaved child: [maxBytes] of stdout, then **one byte past the cap**, then EOF.
+     *
+     * The extra byte is what makes the post-cap read observable - the discard read has to carry real data to run at
+     * all - and the countdown on it is what releases the peer stream.
+     */
+    private fun capBoundStdout(
+        overshootRead: CountDownLatch,
+        overshootReads: AtomicInteger,
+        maxBytes: Int = ShellReply.MAX_REPLY_BYTES,
+    ): InputStream = object : InputStream() {
+        private var remaining = maxBytes
+        private var pastCap = 1
+        override fun read(): Int = -1
+        override fun read(b: ByteArray, off: Int, len: Int): Int {
+            if (remaining > 0) {
+                val n = minOf(len, remaining)
+                java.util.Arrays.fill(b, off, off + n, 0)
+                remaining -= n
+                return n
+            }
+            if (pastCap > 0) {
+                pastCap -= 1
+                overshootReads.incrementAndGet()
+                b[off] = 0
+                overshootRead.countDown()
+                return 1
+            }
+            return -1
+        }
     }
 
     @Test
@@ -88,5 +194,10 @@ class ShellReplyCapTest {
         val state = ShizukuTargetState(shell)
         assertFalse(state.installed("com.example"))
         assertFalse("a too-large reply must never be read as a state", state.readable())
+    }
+
+    private companion object {
+        /** Non-empty, and small next to the 8 MiB cap, so a peer's payload is never mistaken for the clip. */
+        val STDERR_PAYLOAD = "e".repeat(2 * 1024 * 1024)
     }
 }

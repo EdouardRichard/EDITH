@@ -2,6 +2,7 @@ package edith.phone.actions
 
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -64,8 +65,9 @@ object ShellReply {
         val stdout = root["stdout"]?.jsonPrimitive?.contentOrNull ?: return null
         val stderr = root["stderr"]?.jsonPrimitive?.contentOrNull ?: return null
         // An unreadable `truncated` value is a false one: the flag is advisory and must never reject a reply whose
-        // payload we did understand.
-        val truncated = root["truncated"]?.jsonPrimitive?.booleanOrNull ?: false
+        // payload we did understand. The cast is `as?` rather than `.jsonPrimitive` because a non-primitive value
+        // (`{"truncated":{}}`) would otherwise **throw** out of `decode` at the caller instead of reading as false.
+        val truncated = (root["truncated"] as? JsonPrimitive)?.booleanOrNull ?: false
         return ShellResult(REMOTE_COMMAND, exit, stdout, stderr, truncated)
     }
 }
