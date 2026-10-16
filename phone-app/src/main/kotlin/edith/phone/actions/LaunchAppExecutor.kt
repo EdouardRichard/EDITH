@@ -98,9 +98,22 @@ class LaunchAppExecutor(
     }
 
     private fun launchTarget(target: AppLaunchResolver.LaunchTarget): ActionResult {
-        val command = "am start -W -a android.intent.action.MAIN" +
-            " -c android.intent.category.LAUNCHER -p ${target.packageName}"
-        val result = shell.run(command)
+        // Resolve the exact launcher activity component first. On MIUI, `am start -p <pkg>` with
+        // action+category can fail with "unable to resolve Intent" for some system apps (e.g.
+        // com.miui.player), while `-n <component>` always works. The resolve step uses the same
+        // PackageManager that built the catalog, so it cannot disagree about what is launchable.
+        val resolveCmd = "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER ${target.packageName}"
+        val resolved = shell.run(resolveCmd)
+        val component = resolved.stdout.lines().lastOrNull { it.contains("/") }?.trim()
+        val launchCmd = if (!component.isNullOrBlank()) {
+            "am start -W -n $component"
+        } else {
+            // Fallback: the original action+category+package form. This works for most apps and
+            // is the right answer when resolve-activity returns nothing (the package has no
+            // launcher activity matching the category, which the resolver already filtered out).
+            "am start -W -a android.intent.action.MAIN -c android.intent.category.LAUNCHER -p ${target.packageName}"
+        }
+        val result = shell.run(launchCmd)
         val launched = result.exitCode == 0 && result.stdout.contains("Status: ok")
         return if (launched) done("launched ${target.label}") else failed(STATE_UNCHANGED)
     }

@@ -16,11 +16,16 @@ import org.junit.Test
  */
 class LaunchAppExecutorTest {
 
-    private class FakeShell(var result: ShellResult = ShellResult("", 0, "Status: ok", "")) : PrivilegedShell {
+    private class FakeShell(
+        var result: ShellResult = ShellResult("", 0, "Status: ok", ""),
+        /** Optional per-command results; matched by prefix. Falls back to [result] when nothing matches. */
+        private val overrides: Map<String, ShellResult> = emptyMap(),
+    ) : PrivilegedShell {
         val commands = mutableListOf<String>()
         override fun run(command: String): ShellResult {
             commands += command
-            return result.copy(command = command)
+            val matched = overrides.entries.firstOrNull { command.startsWith(it.key) }?.value
+            return (matched ?: result).copy(command = command)
         }
     }
 
@@ -54,7 +59,13 @@ class LaunchAppExecutorTest {
 
     @Test
     fun `launch_app found and shell succeeds returns Done`() {
-        val shell = FakeShell(ShellResult("", 0, "Status: ok", ""))
+        val shell = FakeShell(
+            result = ShellResult("", 0, "Status: ok", ""),
+            overrides = mapOf(
+                "cmd package resolve-activity" to ShellResult("", 0,
+                    "priority=0\ncom.tencent.mm/.ui.LauncherUI", ""),
+            ),
+        )
         val catalog = FakeCatalog(listOf(entry("WeChat", "com.tencent.mm")))
         val executor = backend(catalog = catalog, shell = shell)
 
@@ -62,9 +73,10 @@ class LaunchAppExecutorTest {
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals("launched WeChat", result.detail)
-        assertEquals(1, shell.commands.size)
-        assertTrue(shell.commands[0].startsWith("am start -W"))
-        assertTrue(shell.commands[0].contains("com.tencent.mm"))
+        // Two shell calls: resolve-activity first, then am start with the resolved component.
+        assertEquals(2, shell.commands.size)
+        assertTrue(shell.commands[0].startsWith("cmd package resolve-activity"))
+        assertTrue(shell.commands[1].startsWith("am start -W -n com.tencent.mm/.ui.LauncherUI"))
     }
 
     // ── launch_app: Found + shell failure → Failed ─────────────────────────────
