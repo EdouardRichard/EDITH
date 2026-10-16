@@ -65,11 +65,48 @@ class ModelClientGateway(
     private val audioParts: (() -> List<InputPart>)? = null,
 ) : ModelGateway {
 
+    /**
+     * Counts from the most recent frame-path trim — how many whole turns and which origins were dropped, and whether
+     * compression is still owed. **Never any text**: it exists for tests and count-only probes (spec's "只记计数").
+     * Null until the first frame-path turn, and never updated by the legacy `split(history)` path.
+     */
+    internal var lastTrim: TrimReport? = null
+        private set
+
+    companion object {
+        /**
+         * The byte budget a frame is trimmed to, in the same unit and against the same bound `ContextBudgeter`
+         * enforces at send time (`minOf(inputBudgetTokens, usableWindow - maxOutput - safety)`).
+         *
+         * The `- [FIXED_OVERHEAD]` is **not optional**: [TurnTrimmer.total] already adds that fixed 32, and
+         * `ContextBudgeter` adds its own 32 on top of the per-message accounting (`ContextBudgeter.kt:61`). Sharing
+         * one limit would let the trimmer call a frame "fits" that the send-time check rejects by 32 bytes, turning a
+         * turn that should have succeeded into `ConfigurationRejected` — the exact bug the acceptance test pins.
+         */
+        internal fun windowBytes(profile: ModelProfile): Int =
+            minOf(
+                profile.inputBudgetTokens,
+                profile.usableWindowTokens - profile.maxOutputTokens - profile.safetyTokens,
+            ) - FIXED_OVERHEAD
+    }
+
     override fun turn(request: GatewayTurn): GatewayReply {
         val profile = profileLookup(request.profileId)
             ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, PROFILE_MISSING)
-        val transcript = split(request.history)
-            ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN)
+        // Phase 5: an assembled RequestFrame is trimmed to the window here and mapped to the request's shape; without
+        // one, the pre-Phase-5 `split(history)` path is kept verbatim.
+        val frame = request.frame
+        val transcript = if (frame == null) {
+            split(request.history)
+                ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN)
+        } else {
+            // The window is the same expression `ContextBudgeter` bounds the send with, minus the fixed overhead the
+            // trimmer already counts (see [windowBytes]). A caller-supplied `limitBytes` (test seam) wins.
+            val limit = if (request.limitBytes == Int.MAX_VALUE) windowBytes(profile) else request.limitBytes
+            val report = TurnTrimmer().trim(frame, limit)
+            lastTrim = report
+            frameToTranscript(report.kept)
+        }
         val startedAt = clock.nowNanos()
         // The loop's turn id is the only id this adapter owns, and one turn finishes before the next one starts, so it
         // is also the request id the stream's events echo back.
@@ -80,7 +117,7 @@ class ModelClientGateway(
             turnId = request.turnId,
             profileId = profile.id,
             profileRevision = profile.revision,
-            instructions = request.instructions,
+            instructions = if (frame == null) request.instructions else frame.systemText,
             input = transcript.input + (audioParts?.invoke() ?: emptyList()),
             history = transcript.history,
             output = OutputModality.TEXT,
@@ -152,6 +189,38 @@ class ModelClientGateway(
 
     /** The request `input` (empty for a continuation turn) and the transcript that becomes `ModelRequest.history`. */
     private class Transcript(val input: List<InputPart>, val history: List<ModelHistoryItem>)
+
+    /**
+     * Maps a (already trimmed) frame's conversation flow onto the request's `input`/`history` shape.
+     *
+     * The in-flight user turn is the frame's one `USER_INPUT` segment and becomes `input`; a conversation-flow
+     * segment's `role` is metadata (`Segment.role`), never inferred from text, and a segment with no role
+     * (theoretically only `PERCEPTION`/`MEMORY_EVIDENCE`) is rendered as the assistant's own message rather than
+     * being promoted into the user's input. A `SUMMARY` is re-wrapped in [SummaryBoundary] here: the store keeps the
+     * clean body ([ConversationStore.snapshot]), so the boundary is a render-time product and a summary would
+     * otherwise reach the wire as an ordinary assistant utterance. Attribution is `origin == SUMMARY` — never a text
+     * prefix — and an already-rendered body is passed through unchanged rather than wrapped twice.
+     */
+    private fun frameToTranscript(frame: RequestFrame): Transcript {
+        val flow = frame.conversationFlow
+        val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
+        val input = flow.drop(inputIndex).map { InputPart.Text(it.text) }
+        val history = flow.take(inputIndex).map { segment ->
+            when (segment.origin) {
+                SegmentOrigin.SUMMARY -> {
+                    val body = if (SummaryBoundary.isRendered(segment.text)) segment.text else SummaryBoundary.render(segment.text)
+                    ModelHistoryItem.Text(MessageRole.ASSISTANT, body)
+                }
+                else -> ModelHistoryItem.Text(roleOf(segment), segment.text)
+            }
+        }
+        return Transcript(input, history)
+    }
+
+    private fun roleOf(segment: Segment): MessageRole = when (segment.role) {
+        SegmentRole.USER -> MessageRole.USER
+        SegmentRole.ASSISTANT, null -> MessageRole.ASSISTANT
+    }
 
     /**
      * Splits the loop's transcript into the request's `input` and `history`.

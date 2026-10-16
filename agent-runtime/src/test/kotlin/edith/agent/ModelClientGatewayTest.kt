@@ -59,10 +59,23 @@ class ModelClientGatewayTest {
         history: List<ModelHistoryItem> = listOf(ModelHistoryItem.Text(MessageRole.USER, "把音量调小一点")),
         tools: List<ToolSpec> = emptyList(),
         deadlineNanos: Long = 1_000_000_000L,
-    ) = GatewayTurn(turnId, profileId, instructions, history, tools, deadlineNanos)
+        // Phase 5 seams, both appended with defaults so every existing positional call site keeps its meaning:
+        // `frame = null` is exactly today's `split(history)` behaviour, and `Int.MAX_VALUE` is the "no override"
+        // sentinel the gateway reads as "trim to `windowBytes(profile)`".
+        frame: RequestFrame? = null,
+        limitBytes: Int = Int.MAX_VALUE,
+    ) = GatewayTurn(turnId, profileId, instructions, history, tools, deadlineNanos, frame, limitBytes)
 
     private fun scripted(vararg events: ModelStreamEvent) =
         FakeModelClient { _, listener -> events.forEach(listener) }
+
+    /**
+     * A client that completes the turn on the calling thread. A silent [FakeModelClient] would leave the turn waiting
+     * on a deadline the fake clock never advances, so every frame-path test that only inspects the sent request still
+     * needs a terminal.
+     */
+    private fun terminalClient(requestId: String = "turn-7") =
+        scripted(ModelStreamEvent.Terminal(requestId, ModelEnd.COMPLETED, null, null))
 
     // ------------------------------------------------------------ 1. profile lookup
 
@@ -440,6 +453,150 @@ class ModelClientGatewayTest {
 
         assertTrue(interrupted, "the interrupt must reach the caller")
         assertTrue(client.handles.single().cancelled, "the stream must not outlive the interrupted turn")
+    }
+
+    // ------------------------------------------------------------ 7b. the RequestFrame path (Phase 5)
+
+    @Test fun `a frame is trimmed and turned into the request before it leaves the gateway`() {
+        // AC-5：极端预算下本轮 input 仍在。
+        val client = terminalClient()
+        val huge = (1..40).joinToString(" ") { "旧回合$it 的正文" }
+        val flow = buildList {
+            add(Segment(SegmentOrigin.TRANSCRIPT, true, huge, SegmentRole.USER))
+            add(Segment(SegmentOrigin.TRANSCRIPT, true, huge, SegmentRole.ASSISTANT))
+            add(Segment(SegmentOrigin.USER_INPUT, true, "本轮到底几点了"))
+        }
+        val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
+
+        gateway(client).turn(turn(frame = frame, limitBytes = 200))
+
+        val sent = client.requests.single()
+        assertEquals(listOf("本轮到底几点了"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+        assertEquals(0, sent.history.size, "旧回合被裁掉了")
+    }
+
+    @Test fun `a summary reaches the wire with the boundary and as an assistant message`() {
+        // AC-6
+        val client = terminalClient()
+        val flow = listOf(
+            Segment(SegmentOrigin.SUMMARY, false, SummaryBoundary.render("先前对话摘要")),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "之前问过一句", SegmentRole.USER),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "之前答过一句", SegmentRole.ASSISTANT),
+            Segment(SegmentOrigin.USER_INPUT, true, "现在呢"),
+        )
+        val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
+
+        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+
+        val sent = client.requests.single()
+        val texts = sent.history.filterIsInstance<ModelHistoryItem.Text>()
+        val summary = texts.single { it.text.startsWith(SummaryBoundary.OPEN) }
+        assertEquals(MessageRole.ASSISTANT, summary.role, "摘要必须是 assistant 那条，不能是 user")
+        assertEquals(MessageRole.USER, texts.first { it.text == "之前问过一句" }.role, "角色必须来自元数据")
+    }
+
+    @Test fun `without a frame the gateway behaves exactly as before`() {
+        // 旧通路回归：既有 15 个 GatewayTurn 调用点的形状不能被这次改动影响。
+        val client = terminalClient()
+        gateway(client).turn(turn(history = listOf(ModelHistoryItem.Text(MessageRole.USER, "把音量调小一点"))))
+        assertEquals(listOf("把音量调小一点"), client.requests.single().input.filterIsInstance<InputPart.Text>().map { it.text })
+    }
+
+    @Test fun `memory evidence survives when only an old turn has to be cut`() {
+        // Design D-4's order only holds if a memory segment sits **outside** every turn group: cut ① identifies a turn
+        // by `TRANSCRIPT` + `role`, so a memory segment is never part of one. The limit below is computed to be exactly
+        // the bytes of the frame **without** the old turn, so it forces ① to cut that turn and leaves the memory in.
+        val memory = Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "记".repeat(2_000))
+        val oldUser = Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(3_000), SegmentRole.USER)
+        val oldAssistant = Segment(SegmentOrigin.TRANSCRIPT, true, "答".repeat(3_000), SegmentRole.ASSISTANT)
+        val system = Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")
+        val input = Segment(SegmentOrigin.USER_INPUT, true, "现在几点")
+        val frame = RequestFrame(listOf(system), listOf(memory, oldUser, oldAssistant, input), emptyList())
+        fun bytes(segment: Segment) = segment.text.toByteArray(Charsets.UTF_8).size + 32
+        // `TurnTrimmer.total()` at the limit the test passes: fixed 32 + system + memory + input — i.e. the frame
+        // without the old turn, so ① must cut it and must not eat the memory.
+        val limitWithoutTheOldTurn = FIXED_OVERHEAD + bytes(system) + bytes(memory) + bytes(input)
+        val client = terminalClient()
+        val gateway = gateway(client)
+
+        gateway.turn(turn(frame = frame, limitBytes = limitWithoutTheOldTurn))
+
+        val report = requireNotNull(gateway.lastTrim)
+        assertEquals(1, report.droppedTurns, "① cut exactly one whole turn")
+        assertTrue(report.droppedOrigins.isEmpty(), "② never had to touch memory")
+        assertTrue(report.kept.conversationFlow.contains(memory), "the memory segment is still in the kept frame")
+        assertEquals(
+            listOf("现在几点"),
+            client.requests.single().input.filterIsInstance<InputPart.Text>().map { it.text },
+        )
+
+        // Second half: tighten the window until ① alone cannot fit the frame, so ② has to drop the memory. The memory
+        // must then be charged to ② (`droppedOrigins`) while `droppedTurns` stays 1 — the cut that owns the old turn
+        // must not also be the cut that silently loses memory, which is the accounting design D-4 depends on.
+        client.requests.clear()
+        gateway.turn(turn(frame = frame, limitBytes = 4_000))
+
+        val tightened = requireNotNull(gateway.lastTrim)
+        assertEquals(1, tightened.droppedTurns, "① still cuts only the turn it owns")
+        assertEquals(
+            listOf(SegmentOrigin.MEMORY_EVIDENCE),
+            tightened.droppedOrigins,
+            "the memory fell to cut ② and is reported as such",
+        )
+        assertFalse(tightened.kept.conversationFlow.contains(memory), "② did drop it, and said so")
+    }
+
+    @Test fun `the trim report records counts and never any text`() {
+        // The probe-shaped seam: `lastTrim` is for counts only (spec's 只记计数). `TrimReport` cannot carry text by
+        // construction (`kept` is a `RequestFrame`, whose `toString` prints no body), and `droppedOrigins` is origins.
+        val client = terminalClient()
+        val frame = RequestFrame(
+            listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")),
+            listOf(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(3_000), SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "答".repeat(3_000), SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.USER_INPUT, true, "现在几点"),
+            ),
+            emptyList(),
+        )
+        val gateway = gateway(client)
+
+        gateway.turn(turn(frame = frame, limitBytes = 100))
+
+        val report = requireNotNull(gateway.lastTrim)
+        assertEquals(1, report.droppedTurns)
+        assertTrue(report.droppedOrigins.isEmpty())
+        assertFalse(report.toString().contains("旧"), "the report must not carry the trimmed body")
+    }
+
+    @Test fun `the trim window is the send time limit minus the fixed overhead`() {
+        // The two fixed 32s: `TurnTrimmer.total()` already adds `FIXED_OVERHEAD`, and `ContextBudgeter` adds its own
+        // on top of the per-message accounting (`ContextBudgeter.kt:61`). The fixture profile's window is
+        // `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, so the trimmer must be handed exactly 59_968 — sharing
+        // 60_000 would let it call a frame "fits" that the send-time check rejects by 32.
+        assertEquals(59_968, ModelClientGateway.windowBytes(profile))
+    }
+
+    @Test fun `the frame path sends one instructions message for the whole system slot`() {
+        // `frameToTranscript` must take `instructions` from the frame's whole system slot, not map each system segment
+        // to its own message: the trimmer measures that slot as ONE message, so n system segments mapped as n messages
+        // would undercount by 32 bytes per extra segment and the send-time check could reject the trimmed request.
+        val client = terminalClient()
+        val system = listOf(
+            Segment(SegmentOrigin.INSTRUCTIONS, true, "base instructions"),
+            Segment(SegmentOrigin.SKILL, true, "active skill"),
+            Segment(SegmentOrigin.MEMORY_POLICY, true, "memory policy"),
+        )
+        val frame = RequestFrame(system, listOf(Segment(SegmentOrigin.USER_INPUT, true, "在吗")), emptyList())
+
+        gateway(client).turn(turn(frame = frame, limitBytes = 5_000))
+
+        val sent = client.requests.single()
+        assertEquals(
+            frame.systemText,
+            sent.instructions,
+            "the wire instructions must be one string: the system slot joined by newlines, exactly what the trimmer measured",
+        )
     }
 
     // ------------------------------------------------------------ 8. redaction
