@@ -76,6 +76,7 @@ import edith.plugins.smart.proactive.NoulGate
 import edith.plugins.smart.proactive.ProactiveGate
 import edith.plugins.smart.proactive.ProactiveGateState
 import edith.plugins.smart.memory.MemoryLog
+import edith.plugins.smart.memory.normalize
 import edith.plugins.smart.memory.MemoryModule
 import edith.plugins.smart.memory.MemoryModuleRetrieval
 import edith.plugins.smart.memory.SmartMemoryRetrieval
@@ -585,7 +586,10 @@ class SmartAssistantPlugin(
         // P3.4: the same rule again for long-term memory. Without a namespace the store is empty and every lookup
         // answers nothing; either way a turn is unaffected, because the gateway degrades a failed retrieval to an empty
         // context.
-        val memoryLog = MemoryLog(runCatching { context.services.storage() }.getOrNull())
+        val memoryLog = MemoryLog(
+            storage = runCatching { context.services.storage() }.getOrNull(),
+            normalizer = { text, kind -> normalize(text, kind) },
+        )
         // edith-0.2 Phase B (B5): the session's memory runs through the module in **both** directions. Writing via
         // the store alone leaves the module's vector index cold forever, so every retrieval would quietly fall back
         // to the lexical order; retrieving via the lexical retriever alone leaves the module unused, which is the
