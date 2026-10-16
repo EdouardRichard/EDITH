@@ -7,6 +7,7 @@ import edith.agent.Segment
 import edith.agent.SegmentOrigin
 import edith.agent.SegmentRole
 import edith.agent.SummaryBoundary
+import edith.agent.TrimCounts
 import edith.agent.TurnTrimmer
 import edith.contracts.ContractError
 import edith.contracts.EventEnvelope
@@ -74,9 +75,16 @@ class GatewayWindowAcceptanceTest {
         }
     }
 
-    private fun gateway() = ModelClientGateway(
-        client = client,
-        profileLookup = { profile },
+    /**
+     * A gateway over [recording] (the shared [client] by default) whose profile lookup answers [chosen]. A fresh
+     * instance per test keeps a tight-profile turn from leaking into another test through [ModelClientGateway.lastTrim].
+     */
+    private fun gateway(
+        recording: RecordingModelClient = client,
+        chosen: ModelProfile = profile,
+    ) = ModelClientGateway(
+        client = recording,
+        profileLookup = { chosen },
         clock = object : MonotonicClock { override fun nowNanos() = 0L },
         scheduler = object : DeadlineScheduler {
             override fun at(deadlineNanos: Long, task: () -> Unit): CancellationHandle =
@@ -85,8 +93,10 @@ class GatewayWindowAcceptanceTest {
         envelopeFor = envelopeFor,
     )
 
-    private fun turn(frame: RequestFrame?) =
-        GatewayTurn("turn-7", profile.id, "You are Edith.", emptyList(), emptyList(), 1_000_000_000L, frame = frame)
+    private fun tightProfile() = profile.copy(inputBudgetTokens = 200, maxOutputTokens = 128, safetyTokens = 128)
+
+    private fun turn(frame: RequestFrame?, chosen: ModelProfile = profile) =
+        GatewayTurn("turn-7", chosen.id, "You are Edith.", emptyList(), emptyList(), 1_000_000_000L, frame = frame)
 
     /**
      * `ModelProfile` requires `inputBudgetTokens + maxOutputTokens + safetyTokens <= usableWindowTokens`
@@ -162,6 +172,54 @@ class GatewayWindowAcceptanceTest {
         // the current turn is the request input.
         assertEquals(2, sent.history.size)
         assertEquals(listOf("hello"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+    }
+
+    /**
+     * The genuinely tight case (Task 8's flagged gap): a window so small that **only the current turn's input can
+     * survive** the trim. The other acceptance tests trim at or near a 93 000-token window and cut nothing; this one
+     * makes cut ① fire and then hands the result to the real send-time [ContextBudgeter].
+     *
+     * `tightProfile()` pins `minOf(200, 100_000 - 128 - 128)` = **200**, so the trim window is `200 - 32` = **168**:
+     *
+     * ```
+     * ContextBudgeter limit = minOf(200, 100_000 - 128 - 128)                    = **200**
+     * gateway window        = 200 - FIXED_OVERHEAD(32)                           = **168**
+     * frame total           = 32 + (40 + 32) + (1 + 32) + (2 + 32) + (14 + 32)   = **217**  > 168  ⇒ ① fires
+     * kept total            = 32 + (40 + 32) + (14 + 32)                         = **150**  ≤ 168
+     * ```
+     *
+     * The old turn is deliberately **two** segments (`USER` + `ASSISTANT`) so that the input sits inside cut ①'s slice:
+     * with a one-segment turn the slice would stop before the input and the eviction filter would never be consulted.
+     * `prepare` re-measures the kept request with the same per-message arithmetic, so the acceptance is exact.
+     */
+    @Test fun `a frame trimmed to a window that fits only the current turn input is accepted`() {
+        val frame = RequestFrame(
+            systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "i".repeat(40))),
+            conversationFlow = listOf(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "u", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "a1", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.USER_INPUT, true, "现在几点了"),
+            ),
+            tools = emptyList(),
+        )
+        // The window really is the tight one: the untrimmed frame does not fit, and one whole old turn is what gives way.
+        assertEquals(1, TurnTrimmer().trim(frame, 168).droppedTurns, "the whole old turn is dropped")
+
+        val tightClient = RecordingModelClient()
+        val tightGateway = gateway(recording = tightClient, chosen = tightProfile())
+        tightGateway.turn(turn(frame, tightProfile()))
+
+        val sent = tightClient.requests.single()
+        // The discriminating assertion: the real send-time budgeter accepts the trimmed request.
+        try {
+            budgeter.prepare(tightProfile(), sent)
+        } catch (rejected: ContractError.ConfigurationRejected) {
+            fail("a tightly trimmed frame must still be sendable: ${rejected.message}")
+        }
+        // …and what survived is the current turn's input, with the old turn gone.
+        assertEquals(emptyList(), sent.history, "the whole old turn left the transcript")
+        assertEquals(listOf("现在几点了"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+        assertEquals(TrimCounts(1, emptyList(), false), tightGateway.lastTrim)
     }
 
     @Test fun `the merged leading context is accepted where the trailing memory order is rejected`() {
