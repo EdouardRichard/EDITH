@@ -5,7 +5,6 @@ import android.content.Context
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.IBinder
-import android.os.TransactionTooLargeException
 import android.util.Log
 import rikka.shizuku.Shizuku
 
@@ -21,9 +20,10 @@ import rikka.shizuku.Shizuku
  * Three honest answers, never a guess:
  * - not bound yet ⇒ [ready] is false and the caller must not claim the channel works;
  * - the binder died ⇒ `onServiceDisconnected` clears the remote, so [ready] turns false again;
- * - a reply this build cannot parse ⇒ `SHELL_REPLY_INVALID` with exit `-1`, never an empty success;
- * - a reply the channel could not carry ⇒ `SHELL_REPLY_TOO_LARGE` with exit `-1` (R-9): a distinct code, so "too large"
- *   and "cannot be parsed" are two facts rather than one, and neither is read as a success.
+ * - a reply this build cannot parse ⇒ `SHELL_REPLY_INVALID` with exit `-1` and `failure = PARSE`, never an empty success;
+ * - a call that did not come back ⇒ `SHELL_REPLY_TOO_LARGE` with exit `-1` and `failure = CARRIER` (R-9): a distinct
+ *   code **and** a distinct kind, so "the channel could not carry it" and "this build could not parse it" are two facts
+ *   rather than one, and neither is read as a success.
  */
 class ShizukuUserServiceShell(
     context: Context,
@@ -35,6 +35,10 @@ class ShizukuUserServiceShell(
 
     @Volatile
     private var remote: IRemoteShell? = null
+
+    /** See [lastCarrierThrowable]; a class name only, overwritten on the next carrier failure. */
+    @Volatile
+    private var lastCarrierThrowableValue: String? = null
 
     private val args = Shizuku.UserServiceArgs(
         ComponentName(context.packageName, EdithShellService::class.java.name),
@@ -87,20 +91,30 @@ class ShizukuUserServiceShell(
     fun ready(): Boolean = binderAlive() && remote != null
 
     override fun run(command: String): ShellResult {
-        val service = remote ?: return ShellResult(command, -1, "", "SHELL_NOT_BOUND")
-        // `TransactionTooLargeException` is caught **first and separately** (R-9): it is a reply this build could not
-        // carry, not one it could not parse, and reporting the two as the same string told a caller whose command had
-        // actually run that the reply was garbage. Neither answer is an empty success.
+        val service = remote ?: return ShellResult(command, -1, "", SHELL_NOT_BOUND, failure = ShellFailure.NOT_BOUND)
+        // R-9: **any** throwable out of the binder call is a carrier failure, not a parse failure. Testing for
+        // `TransactionTooLargeException` alone was the defect - the device raised something else, the catch-all below
+        // swallowed it into `null`, and `decode(null)` reported a reply that could not cross the wire as garbage.
         val reply = try {
             service.run(command)
-        } catch (_: TransactionTooLargeException) {
-            return ShellResult(command, -1, "", SHELL_REPLY_TOO_LARGE)
-        } catch (_: Throwable) {
-            null
+        } catch (thrown: Throwable) {
+            lastCarrierThrowableValue = thrown.javaClass.name
+            return ShellResult(command, -1, "", carrierCodeFor(thrown), failure = ShellFailure.CARRIER)
         }
         return ShellReply.decode(reply)?.copy(command = command)
-            ?: ShellResult(command, -1, "", SHELL_REPLY_INVALID)
+            ?: ShellResult(command, -1, "", SHELL_REPLY_INVALID, failure = ShellFailure.PARSE)
     }
+
+    /**
+     * The class name of the last throwable the binder call raised, or `null` when it has not raised one.
+     *
+     * **Diagnostics only**, and a class name alone: it exists so a device probe can say *which* failure actually occurs,
+     * because the code was once named after an exception (`TransactionTooLargeException`) that turned out not to be the
+     * one the device throws. Never a message, never a reply body, never a command - the class name is bounded, carries
+     * no payload, and is read by `DebugShellCapProbe` on the device.
+     */
+    val lastCarrierThrowable: String?
+        get() = lastCarrierThrowableValue
 
     private fun binderAlive(): Boolean = runCatching {
         Shizuku.pingBinder() && Shizuku.getVersion() >= MIN_SHIZUKU_VERSION &&
@@ -128,15 +142,22 @@ class ShizukuUserServiceShell(
 class ShizukuTargetState(private val shell: PrivilegedShell) : TargetState {
 
     /**
-     * Whether the probe that just ran produced a reply this build could parse **and was not cut short**.
+     * Whether the probe that just ran produced a reply that **crossed the channel, was understood, and was not cut
+     * short**.
      *
      * Starts `false`: before anything has been read, nothing may be claimed. Every probe goes through [read], so the
      * answer always describes the read the backend is about to judge.
      *
-     * Truncation makes a read unreadable (R-9): [installed], [disabled] and [permissionGranted] are stdout **parsers**,
-     * and a clipped `stdout` is a prefix, not the whole answer - so the clipped tail can turn a present package into a
-     * `false` that the backend then judges as "the action did not take". A too-large reply is already reported as its
-     * own code, but the *decoded-and-truncated* case is a successful parse, and only this flag distinguishes it.
+     * Both halves are R-9, and both are about not inventing an answer:
+     * - **the channel reported a failure** - `SHELL_NOT_BOUND`, the carrier code, or `SHELL_REPLY_INVALID` - makes the
+     *   read unreadable. `isAStateReply()` is deliberately the inverse of the channel's failure field rather than a test
+     *   for two remembered codes, because the old two-code version let `SHELL_NOT_BOUND` through: [installed] then
+     *   answered `false` on an empty `stdout` and the backend reported "the action did not take" for an action that was
+     *   never attempted;
+     * - **truncation** makes it unreadable too: [installed], [disabled] and [permissionGranted] are stdout **parsers**,
+     *   and a clipped `stdout` is a prefix, not the whole answer - so the clipped tail can turn a present package into a
+     *   `false` the backend then judges as "the action did not take". A carrier failure is already its own code, but the
+     *   *decoded-and-truncated* case is a successful parse, and only this flag distinguishes it.
      */
     @Volatile
     private var lastReplyReadable = false

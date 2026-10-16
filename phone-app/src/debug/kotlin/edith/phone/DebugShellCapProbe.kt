@@ -3,15 +3,21 @@ package edith.phone
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import edith.phone.actions.SHELL_NOT_BOUND
 import edith.phone.actions.SHELL_REPLY_INVALID
 import edith.phone.actions.SHELL_REPLY_TOO_LARGE
+import edith.phone.actions.ShellFailure
+import edith.phone.actions.ShellResult
 
 /**
  * R-9 device instrument: run **one** command through the production privileged shell and log a reply's *shape*.
  *
- * Why it exists: a JVM test proves the reply cap's arithmetic against a fake `IRemoteShell`, and nothing proved that a
- * real >8 MiB reply through the real Shizuku `UserService` binder engages the cap and **returns within a bounded time**
- * instead of deadlocking. `logcat -d` on this device is ~38 MB, which is the command that reaches the cap for real.
+ * Why it exists: R-9's claim is about what happens when a reply **cannot cross the binder**, which is only observable
+ * on a device. It was first built to look for the 8 MiB cap and a deadlock; the measurement showed neither - the
+ * channel fails somewhere between 250 000 and 350 000 B, far below any cap - and that the failure was reported as
+ * `SHELL_REPLY_INVALID`. The failure kind and the throwable's **class name** were added here to find out *which*
+ * exception the binder actually raises, because the production code was catching `TransactionTooLargeException` and
+ * evidently never saw it.
  *
  * It reaches the **production** `ShizukuUserServiceShell` through
  * `HostCompositionRoot.privilegedShellForProbe` (debug-only, see that field's KDoc) rather than constructing one: a
@@ -21,15 +27,17 @@ import edith.phone.actions.SHELL_REPLY_TOO_LARGE
  * adb shell am broadcast -a edith.DEBUG_SHELLCAP -n edith.phone/.DebugShellCapProbe \
  *     --es label control-brightness --es command 'settings get system screen_brightness'
  * adb shell am broadcast -a edith.DEBUG_SHELLCAP -n edith.phone/.DebugShellCapProbe \
- *     --es label logcat-d --es command 'logcat -d'
+ *     --es label bytes-400k --es command 'yes a | head -c 400000'
  * ```
  *
  * **What it logs, and what it must never log.** One line per phase: the channel's own readiness, then `start`, then
  * `end` carrying the fixed [EXTRA_LABEL] identity, the exit code, `stdout`/`stderr` **byte counts**, the `truncated`
- * flag, the channel's own failure code when `stderr` is one of its markers, and the elapsed milliseconds. The command
+ * flag, the channel's own failure code (`code=`), the production branch that produced it (`arm=`), the raising
+ * exception's **class name** when the failure is a carrier one (`throwable=`), and the elapsed milliseconds. The command
  * itself and the reply's text are **never** printed: a reply may carry logcat lines, i.e. anything at all, and this is
  * the same rule the other debug instruments follow. The label is sanitised to `[A-Za-z0-9_-]` and bounded, so it cannot
- * become a channel for text either.
+ * become a channel for text either, and the throwable field is a class name - never a message, which could quote a
+ * command.
  *
  * **"Did it return at all"** is read off the two lines: `start` is written *before* the binder call and `end` only after
  * it returned, so a `start` with no `end` is a call that never came back - the deadlock this instrument exists to look
@@ -84,30 +92,40 @@ class DebugShellCapProbe : BroadcastReceiver() {
                     "throw=${outcome.exceptionOrNull()?.javaClass?.simpleName ?: "none"} elapsedMs=$elapsedMs",
             )
         }
+        // `shell.run` promises not to throw, so this line's `arm` says which of its own branches answered: `none` for a
+        // reply that crossed the channel, otherwise the failure kind the production code assigned. `code` stays the
+        // greppable marker. The throwable is the **class name only** - the R-9 investigation needed it because the code
+        // was named after an exception the device turned out not to throw, and a class name is bounded and carries no
+        // payload (never a message, a command or a reply body).
+        val (code, arm) = classify(reply)
         report(
             "P3_SHELLCAP end label=$label returned=true exit=${reply.exitCode} " +
                 "stdoutBytes=${utf8Bytes(reply.stdout)} stderrBytes=${utf8Bytes(reply.stderr)} " +
-                "truncated=${reply.truncated} code=${codeOf(reply.stderr)} elapsedMs=$elapsedMs",
+                "truncated=${reply.truncated} code=$code arm=$arm " +
+                "throwable=${if (reply.failure == ShellFailure.CARRIER) shell.lastCarrierThrowable ?: NONE else NONE} " +
+                "elapsedMs=$elapsedMs",
         )
     }
 
     private fun report(line: String) = P3Log.line(line)
 
     /**
-     * The channel's own failure code when `stderr` is one of its markers, and `none` otherwise.
+     * The channel's own failure code and which arm of `ShizukuUserServiceShell.run` produced it.
      *
-     * Without this the two distinct facts R-9 exists to keep apart (a reply too large to carry vs one this build could
-     * not parse) would look identical from the outside: both are exit `-1` with an empty `stdout`. Device `stderr` is
+     * `arm` is read off the production result's failure kind, not guessed from the strings; the code is derived from the
+     * same kind with the marker as a fallback, so a result built without a kind still names itself. Device `stderr` is
      * never printed - only this code, which is a constant, not a payload.
      */
-    private fun codeOf(stderr: String): String = when (stderr) {
-        SHELL_REPLY_TOO_LARGE -> "REPLY_TOO_LARGE"
-        SHELL_REPLY_INVALID -> "REPLY_INVALID"
-        // The third marker `ShizukuUserServiceShell.run` returns, repeated here as the same literal so the probe can
-        // name it; it is never reached through this probe's own `ready()` gate, so it can only be observed if the
-        // binding died between that gate and the call.
-        SHELL_NOT_BOUND -> "NOT_BOUND"
-        else -> "none"
+    private fun classify(reply: ShellResult): Pair<String, String> = when (reply.failure) {
+        ShellFailure.CARRIER -> SHELL_REPLY_TOO_LARGE to "carrier"
+        ShellFailure.PARSE -> SHELL_REPLY_INVALID to "parse"
+        ShellFailure.NOT_BOUND -> SHELL_NOT_BOUND to "not_bound"
+        null -> when (reply.stderr) {
+            SHELL_REPLY_TOO_LARGE -> SHELL_REPLY_TOO_LARGE to "carrier"
+            SHELL_REPLY_INVALID -> SHELL_REPLY_INVALID to "parse"
+            SHELL_NOT_BOUND -> SHELL_NOT_BOUND to "not_bound"
+            else -> NONE to NONE
+        }
     }
 
     /** The reply's size in bytes, which is what the cap counts - never a character count, which UTF-8 changes. */
@@ -139,8 +157,5 @@ class DebugShellCapProbe : BroadcastReceiver() {
         private const val THREAD_NAME = "edith-shellcap-probe"
         private const val MAX_LABEL_CHARS = 32
         private const val NONE = "none"
-
-        /** `ShizukuUserServiceShell.run`'s own marker for "the remote is not bound"; see [codeOf]. */
-        private const val SHELL_NOT_BOUND = "SHELL_NOT_BOUND"
     }
 }

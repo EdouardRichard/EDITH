@@ -19,9 +19,11 @@ import kotlinx.serialization.json.put
  * on the JVM while the binder itself is only exercisable on a device.
  *
  * [decode] answers `null` for anything that is not the documented shape. A malformed reply is never a success and never
- * an exception in the caller: it becomes `SHELL_REPLY_INVALID` at the backend. A reply that *was* understood but had to
- * be cut short at [MAX_REPLY_BYTES] decodes normally and carries `truncated = true` (R-9 / D-6) - being large is not
- * being malformed.
+ * an exception in the caller: it becomes `SHELL_REPLY_INVALID` at the backend, and that code means exactly one thing -
+ * **the carrier delivered something this build could not parse**. It never means "the reply did not arrive", which is
+ * the carrier code's job (R-9). A reply that *was* understood but whose accumulation hit [MAX_REPLY_BYTES] decodes
+ * normally and carries `truncated = true` (R-9 / D-6) - being large is not being malformed. That flag has not been
+ * observed on a device and is kept for the memory bound, not because the channel is expected to reach it.
  */
 object ShellReply {
 
@@ -31,16 +33,24 @@ object ShellReply {
     /**
      * The most of one stream's text that a single reply may accumulate: **8 MiB (8 388 608 B)**.
      *
-     * **This is a product safety valve, not a measured link limit.** The largest successful single reply ever probed on
-     * the K40 is **1 228 800 B**, and the real ceiling was **never found** - so 8 MiB is not "the Binder limit", and
-     * nothing in this code may describe it as one. Its job is to bound **memory**: without a cap the privileged process
-     * accumulates one unbounded `String`, then a second copy while [encode] builds the JSON, then a third on the app
-     * side after the reply crosses the binder, so a command like `dumpsys` or `cat /dev/zero` could take the app down
-     * with an OOM rather than with an honest error.
+     * **This is a memory bound inside the privileged process, not a limit of the channel.** Nothing here may be read as
+     * "replies up to 8 MiB can be sent": the K40 measurement (2026-10-16/17, `evidence/2026-10-16-phase-5-device-verification.md`)
+     * shows the transport failing **well below any cap we set** - by exact byte sweep, 325 000 B succeeds and 350 000 B
+     * does not, and the failure is a dead binder (`android.os.DeadObjectException`, with the remote logging
+     * `Large reply transaction of 750080 bytes … code 2`), not a truncation. `truncated = true` has never been observed
+     * on a device, and [ShizukuUserServiceShell][edith.phone.actions.ShizukuUserServiceShell] reports the carrier failure
+     * as its own code instead of pretending otherwise.
      *
-     * The value leaves room against everything measured: 6.7x the largest successful reply and ~35x the largest
-     * *normal* one (a `screencap -p` PNG, 175-179 KB, ~233 KB once base64'd). It obstructs no known real scenario,
-     * because screenshots, recordings and photos travel as **files** rather than through this string channel.
+     * **Decision (R-9 close-out): the value stays 8 MiB, and the reason is not link headroom.** Its job is to bound
+     * **memory** in the privileged process: without a cap, one command such as `dumpsys` or `cat /dev/zero` would
+     * accumulate one unbounded `String`, then a second copy while [encode] builds the JSON, then a third on the app side,
+     * and take the app down with an OOM instead of an honest error. Lowering the value towards the measured ~325 kB
+     * ceiling was considered and rejected: a bound chosen to match a transport limit that kills the connection would
+     * start truncating replies that today arrive whole, while a bound *above* the failure point is the only kind that
+     * keeps the two concerns - "the process may not grow without limit" and "the binder cannot carry this" - separate.
+     * The old justification for 8 MiB (6.7x a measured 1 228 800 B success) is **withdrawn**: that success came from a
+     * probe that returned a *count* rather than the payload, and 325 000 B is the largest reply since measured to arrive
+     * whole through this channel.
      */
     const val MAX_REPLY_BYTES: Int = 8 * 1024 * 1024
 

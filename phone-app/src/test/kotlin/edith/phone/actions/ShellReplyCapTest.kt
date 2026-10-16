@@ -3,6 +3,7 @@ package edith.phone.actions
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.InputStream
@@ -224,21 +225,32 @@ class ShellReplyCapTest {
 
     @Test
     fun `a reply too large is distinguishable from a reply that cannot be parsed`() {
-        // The real defect: `runCatching{}.getOrNull()` used to collapse every exception into SHELL_REPLY_INVALID.
-        // `ShizukuUserServiceShell.run` returns SHELL_REPLY_TOO_LARGE for TransactionTooLargeException instead, so the
-        // two are different codes... and neither is an empty success.
+        // The real defect: `runCatching{}.getOrNull()` used to collapse every throwable into SHELL_REPLY_INVALID.
+        // `ShizukuUserServiceShell.run` reports a call that did not come back as SHELL_REPLY_TOO_LARGE + CARRIER
+        // instead, so the two are different codes and different kinds... and neither is an empty success. (The device
+        // then showed the thrown class is not `TransactionTooLargeException`, which is why the classification must not
+        // test for that one class; `ShellCarrierFailureTest` pins that.)
         assertNotEquals(SHELL_REPLY_INVALID, SHELL_REPLY_TOO_LARGE)
 
-        val tooLarge = ShellResult("dumpsys power", -1, "", SHELL_REPLY_TOO_LARGE)
+        val tooLarge = ShellResult("dumpsys power", -1, "", SHELL_REPLY_TOO_LARGE, failure = ShellFailure.CARRIER)
         assertFalse("a too-large reply is a failed state read, not an answer", tooLarge.isAStateReply())
         assertNotEquals("a too-large reply is not reported as a parse failure", SHELL_REPLY_INVALID, tooLarge.stderr)
+        // The two carriers of the same fact agree: the code a human greps for, and the kind a caller reads. A result
+        // marked CARRIER but still carrying SHELL_REPLY_INVALID would be the old collapse back in a new field.
+        assertEquals(ShellFailure.CARRIER, tooLarge.failure)
+        assertFalse(
+            "a reply marked as a carrier failure is not a state reply even without the marker",
+            ShellResult("dumpsys power", -1, "", "SHELL_SOMETHING_ELSE", failure = ShellFailure.CARRIER).isAStateReply(),
+        )
 
-        // The `truncated` flag describes the payload, so a reply that was truncated still decodes and still carries the
-        // flag - that is all this asserts. It is **not** a claim that a truncated **state read** may be trusted: the
-        // test below asserts the opposite, and `ShizukuUserServiceShell.read` joins the two facts as
-        // `isAStateReply() && !truncated`.
+        // The `truncated` flag describes the payload, so a reply that was truncated still decodes and still says it was
+        // truncated - that is what is asserted here. It is **not** a claim that a truncated **state read** may be
+        // trusted, and `stderr` being non-empty is not a channel failure either: `decode` returns a reply with no
+        // `failure` kind because the bytes *did* arrive and *were* understood. `ShizukuUserServiceShell.read` joins the
+        // two facts as `isAStateReply() && !truncated`, and the test below pins the truncated half.
         val truncated = ShellReply.decode(ShellReply.encode(0, "out", "err", truncated = true))!!
-        assertTrue(truncated.isAStateReply())
+        assertTrue("a decoded reply is a reply the build understood", truncated.truncated)
+        assertNull("decoding a reply is not a channel failure", truncated.failure)
     }
 
     @Test
