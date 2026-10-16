@@ -52,6 +52,13 @@ data class TrimReport(
  * input stays `ContextBudgeter`'s existing `ConfigurationRejected` rule — out of scope here, and this
  * class never emits an oversized input into a send path that would bypass that rule.
  *
+ * ## Cut ① always terminates
+ *
+ * Each ① iteration removes at least the group's own first segment: [isTurnStart] implies a
+ * `TRANSCRIPT` origin, which [isEvictable] never rejects. `flow` therefore strictly shrinks and
+ * [total] strictly falls, so the loop cannot spin and an empty candidate slice is unreachable — there
+ * is deliberately no empty-slice guard (one existed and was dead code).
+ *
  * ## Byte accounting — the same unit as `ContextBudgeter`
  *
  * [measure] is the arithmetic `ContextBudgeter` uses for one message (UTF-8 bytes + 32, see
@@ -83,8 +90,10 @@ class TurnTrimmer(private val measure: (Segment) -> Int = { utf8BytesPlusOverhea
             val next = flow.subList(start + 1, flow.size).indexOfFirst { isTurnStart(it) }
             val stop = if (next < 0) flow.size else start + 1 + next
             // 绝不吞掉 USER_INPUT 与 SUMMARY：它们不在回合里。索引降序删，否则索引会漂。
+            // slice 非空是构造保证：`start` 自身落在 [start, stop) 内，且 isTurnStart ⇒ TRANSCRIPT
+            // ⇒ isEvictable 必为真。故不存在（也不需要）空集分支。每轮至少删掉 flow[start]，
+            // flow 单调变短、total() 单调变小 ⇒ 循环必终止，① 不会空转。
             val slice = (start until stop).filter { isEvictable(flow[it]) }
-            if (slice.isEmpty()) break
             slice.sortedDescending().forEach { flow.removeAt(it) }
             droppedTurns++
         }

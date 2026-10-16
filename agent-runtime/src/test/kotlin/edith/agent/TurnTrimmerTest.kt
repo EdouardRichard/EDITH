@@ -39,6 +39,22 @@ class TurnTrimmerTest {
         assertEquals(SegmentOrigin.USER_INPUT, r.kept.conversationFlow.last().origin)
     }
 
+    @Test fun `step one drops a second whole turn group when one cut is not enough`() {
+        // 多组淘汰：检验降序删除的索引不漂（reviewer 点名的风险点）。
+        // 口径复算：总 = 32 + 35(sys) + 6×34(u1..a3) + 35(now) = 306；裁第 1 组 = 238；裁第 2 组 = 170。
+        // limitBytes 必须落在 [170, 238) 才会连裁两组却留下最后一组 ⇒ 取 200。
+        val f = frame(
+            userTurn("u1"), assistant("a1"),
+            userTurn("u2"), assistant("a2"),
+            userTurn("u3"), assistant("a3"),
+            user("now"),
+        )
+        val r = TurnTrimmer().trim(f, limitBytes = 200)
+
+        assertEquals(2, r.droppedTurns)
+        assertEquals(listOf(userTurn("u3"), assistant("a3"), user("now")), r.kept.conversationFlow)
+    }
+
     @Test fun `step two drops memory evidence whole, after step one is exhausted`() {
         // H3 步骤 ②
         val memory = Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "m".repeat(300))
@@ -79,12 +95,25 @@ class TurnTrimmerTest {
         assertEquals(SegmentOrigin.USER_INPUT, r.kept.conversationFlow.single().origin)
     }
 
-    @Test fun `a summary is not dropped as an old turn`() {
-        // Review Focus 5
-        val f = frame(Segment(SegmentOrigin.SUMMARY, false, "摘要"), userTurn("u1"), assistant("a1"), user("now"))
-        val r = TurnTrimmer().trim(f, limitBytes = 120)
+    @Test fun `a summary is not dropped as an old turn but still counts toward the budget`() {
+        // Review Focus 5：摘要落在“本轮发言之前”的回合组*内部*，① 会把它前面的整个回合组一起裁；
+        // 但如果摘要**不计入 total()**，这一刀就不会落，摘要之外的保留集也更大。
+        // 口径复算：总 = 32 + 35(sys) + 34(u1) + 38(摘要, 6 字节) + 34(a1) + 35(now) = 208；
+        // ① 裁掉回合组 u1+a1（68）后 = 140。摘要计入时 140 > 110 ⇒ compressionOwed=true；
+        // 摘要豁免预算时初始 170、裁后 102 ≤ 110 ⇒ compressionOwed=false ⇒ 该断言就是判别点。
+        val f = frame(
+            userTurn("u1"),
+            Segment(SegmentOrigin.SUMMARY, false, "摘要"),
+            assistant("a1"),
+            user("now"),
+        )
+        val r = TurnTrimmer().trim(f, limitBytes = 110)
 
-        assertTrue(r.kept.conversationFlow.any { it.origin == SegmentOrigin.SUMMARY }, r.kept.conversationFlow.toString())
+        // 摘要本身绝不是被裁的那一条。
+        assertTrue(r.kept.conversationFlow.any { it.origin == SegmentOrigin.SUMMARY },
+            "摘要不得作为旧回合被裁：${r.kept.conversationFlow}")
+        // 而它必须计入预算 —— 否则这一刀根本不会落。
+        assertTrue(r.compressionOwed, "摘要必须计入 total()（未计入时不该还欠压缩）")
     }
 
     @Test fun `the system slot is never trimmed`() {
