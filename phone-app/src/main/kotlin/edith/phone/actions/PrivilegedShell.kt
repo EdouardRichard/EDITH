@@ -70,10 +70,12 @@ internal const val SHELL_REPLY_INVALID = "SHELL_REPLY_INVALID"
  * What the device actually does (K40, 2026-10-17) is worth stating, because it is not what the code used to assume. The
  * remote logs `Large reply transaction of 750080 bytes, interface descriptor edith.phone.actions.IRemoteShell, code 2`
  * and the caller gets **`android.os.DeadObjectException`** - the binder connection itself dies mid-transaction, rather
- * than `TransactionTooLargeException` being raised politely. The service process is restarted by the framework and the
- * next call on the same channel succeeds (measured: the very next sweep entry returned `exit=0`), so this is a
- * recoverable, per-call carrier failure. The classification therefore does not test for one exception class - see
- * [carrierCodeFor].
+ * than `TransactionTooLargeException` being raised politely. The service process is restarted by the framework, and
+ * recovery was measured **on a later round, after that restart, on the same channel**: the byte sweep that contained
+ * the failure (`bytes-350k` → `bytes-400k`/`bytes-900k`/`logcat-d` all `carrier`) did *not* recover entry by entry;
+ * the `00:19` run on the new remote pid answered `exit=0` (`bytes-250k`/`bytes-300k`, and a `35 217 B` `logcat-d`).
+ * That makes this a recoverable, per-call carrier failure - but only on a later call, not the immediately next one.
+ * The classification therefore does not test for one exception class - see [carrierCodeFor].
  */
 internal const val SHELL_REPLY_TOO_LARGE = "SHELL_REPLY_TOO_LARGE"
 
@@ -89,8 +91,21 @@ internal const val SHELL_NOT_BOUND = "SHELL_NOT_BOUND"
  * the real failure as a parse failure, and `SHELL_REPLY_TOO_LARGE` - the code that was supposed to fire - never
  * appeared. Anything thrown out of the binder call means the same thing: *this call did not deliver a reply*, which is a
  * carrier fact and cannot be a statement about the reply's syntax.
+ *
+ * The parameter is kept, and is deliberately **not inspected** (R-9 close-out review, Minor 4): it is the witness that
+ * this answer is type-agnostic, and it also keeps the mapping testable with the two classes that matter - the
+ * `android.os.DeadObjectException` the device really raises and the `TransactionTooLargeException` it never raised.
+ * Any branch on the class here would reintroduce the defect this function exists to remove; the class name is recorded
+ * for diagnostics, separately, in `ShizukuUserServiceShell.lastCarrierThrowable`.
  */
-internal fun carrierCodeFor(thrown: Throwable): String = SHELL_REPLY_TOO_LARGE
+@Suppress("UNUSED_PARAMETER")
+internal fun carrierCodeFor(thrown: Throwable): String {
+    // `thrown` is intentionally not read: the answer must not depend on the class, which is the whole point (the old
+    // code's failure was exactly a by-name test for one class). Kept as the parameter the caller already has, and so
+    // the mapping can be driven directly with the two classes that matter - `DeadObjectException` (what the device
+    // raises) and `TransactionTooLargeException` (what it never raised).
+    return SHELL_REPLY_TOO_LARGE
+}
 
 /**
  * False when the shell itself reported a failure: a state read that **failed**, not an answer about the target.
@@ -105,8 +120,12 @@ internal fun carrierCodeFor(thrown: Throwable): String = SHELL_REPLY_TOO_LARGE
  * action that was never attempted. A blacklist cannot exclude a code it has never seen, so the rule is stated the other
  * way round.
  *
- * The strict half costs nothing measured: every real state command this app issues (`pm list packages`,
- * `dumpsys package <pkg>`, `settings get`) answers with an empty `stderr`, as the K40 probe's `stderrBytes=0` records.
+ * The strict half costs little measured. What the K40 probe's `stderrBytes=0` records actually cover is its **control
+ * command**, `settings get system screen_brightness` (3 stdout bytes, 0 stderr bytes), plus the `yes a | head -c N` arms
+ * (evidence §2.3/§2.4/§8.3); `settings get` is one of the three shapes below. The empty-`stderr` property for the three
+ * state commands this build issues - `pm list packages`, `dumpsys package <pkg>` and `settings get` - is pinned on the
+ * JVM (`ShellStateReadabilityTest`, `ShellReplyCapTest`), **not yet device-measured**: the probe never ran those three,
+ * and it never ran a command whose `stderr` was non-empty and whose stdout still parsed.
  * A read whose `stderr` is non-empty therefore describes a read the channel or the command disturbed, and treating it as
  * unreadable means the backend refuses instead of judging the action from a reply it cannot fully account for.
  */

@@ -26,31 +26,33 @@ import org.junit.Test
 class ShellCarrierFailureTest {
 
     @Test
-    fun `a binder failure that is not TransactionTooLarge is still classified as a carrier failure`() {
-        // The device's real case. The concrete class is deliberately *not* `TransactionTooLargeException`: whatever the
-        // binder throws, "the call did not come back" is a carrier fact, never a statement about the reply's syntax.
-        assertEquals(SHELL_REPLY_TOO_LARGE, carrierCodeFor(RuntimeException("android.os.RemoteException")))
-        assertEquals(SHELL_REPLY_TOO_LARGE, carrierCodeFor(IllegalStateException("parcel")))
-        // Any throwable at all, including one that is not an exception subclass, is a call that did not come back.
-        assertEquals(SHELL_REPLY_TOO_LARGE, carrierCodeFor(StackOverflowError()))
-    }
-
-    @Test
-    fun `every carrier failure is distinguishable from a parse failure`() {
-        assertNotEquals(SHELL_REPLY_INVALID, SHELL_REPLY_TOO_LARGE)
-        assertNotEquals(SHELL_REPLY_INVALID, carrierCodeFor(RuntimeException()))
-    }
-
-    @Test
-    fun `a carrier failure is reported as its own kind and never as a parse failure`() {
-        // The old code produced `decode(null)` here: `SHELL_REPLY_INVALID`. Two different facts were one string, and a
-        // command that had actually run was reported as garbage.
-        val carrier = ShellResult("dumpsys power", -1, "", SHELL_REPLY_TOO_LARGE, failure = ShellFailure.CARRIER)
-        assertEquals(ShellFailure.CARRIER, carrier.failure)
-        assertNotEquals(SHELL_REPLY_INVALID, carrier.stderr)
-        // Not a success in any reading: it carries no stdout and its exit code is the channel's own -1.
-        assertEquals(0, carrier.stdout.length)
-        assertEquals(-1, carrier.exitCode)
+    fun `the two exception classes in play are both carrier failures and never parse failures`() {
+        // R-9 close-out review (Minor 3): the previous test here built a `ShellResult` with `failure = CARRIER` and
+        // then asserted the four fields its own constructor had just set - it would have stayed green if
+        // `carrierCodeFor` and `SHELL_REPLY_TOO_LARGE` were deleted from production. The mapping itself is what has to
+        // be pinned, and this test drives it with **the classes that matter**:
+        //
+        // - `DeadObjectException` is the class the K40 actually raises (evidence §8.1): the remote logs the oversized
+        //   transaction, the binder connection dies, and that is what the caller catches;
+        // - `TransactionTooLargeException` is the class the old code tested for **by name** and the device *never*
+        //   raised - not raising it is exactly why the named code never fired, and why a classification keyed on it
+        //   answered "parse failure" for a reply that could not cross;
+        // - an ordinary `RuntimeException` and an `Error` that is not an `Exception` at all: anything out of the binder
+        //   call means the same thing, *this call did not deliver a reply*.
+        //
+        // Both are Android classes whose `Throwable`-taking constructors are reachable in a JVM unit test (checked
+        // before this test was written), so the device's own classes are used rather than stand-ins.
+        val witnesses = listOf<Throwable>(
+            android.os.DeadObjectException("binder died"),
+            android.os.TransactionTooLargeException("parcel too big"),
+            RuntimeException("android.os.RemoteException"),
+            StackOverflowError(),
+        )
+        for (witness in witnesses) {
+            val name = witness.javaClass.name
+            assertEquals("$name must be classified as a carrier failure", SHELL_REPLY_TOO_LARGE, carrierCodeFor(witness))
+            assertNotEquals("$name must never be reported as a parse failure", SHELL_REPLY_INVALID, carrierCodeFor(witness))
+        }
     }
 
     @Test
@@ -67,5 +69,26 @@ class ShellCarrierFailureTest {
         val ok = ShellResult("pm list packages com.example", 0, "package:com.example\n", "")
         assertNull(ok.failure)
         assertTrue(ok.isAStateReply())
+    }
+
+    @Test
+    fun `a successful reply that wrote to stderr is refused as a state read`() {
+        // R-9 close-out review: the whole point of the whitelist is the *dangerous* direction - a reply that arrived,
+        // parsed, exited 0 and would therefore look like an answer, but whose `stderr` the command also wrote to.
+        // `installed` would read the empty stdout as "the package is not there" and the backend would report "the
+        // action did not take" for an action that may well have taken. The reply carries no `failure` kind (the bytes
+        // crossed the channel and were understood), so only the empty-`stderr` half can refuse it, and the probe must
+        // report the read as unreadable rather than answer.
+        val noisy = ShellResult("pm list packages com.example", 0, "", "Warning: activity not started")
+        assertNull("the reply crossed the channel and was understood, so it carries no failure kind", noisy.failure)
+        assertFalse("a non-empty stderr is not a state reply, even on exit 0", noisy.isAStateReply())
+
+        val state = ShizukuTargetState(
+            object : PrivilegedShell {
+                override fun run(command: String): ShellResult = noisy.copy(command = command)
+            },
+        )
+        assertFalse("an unreadable reply must not be judged as 'the package is gone'", state.installed("com.example"))
+        assertFalse("the read must be reported unreadable so the backend refuses instead of judging", state.readable())
     }
 }
