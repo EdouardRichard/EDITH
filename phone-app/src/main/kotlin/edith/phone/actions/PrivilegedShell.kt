@@ -12,6 +12,14 @@ data class ShellResult(
     val exitCode: Int,
     val stdout: String,
     val stderr: String,
+    /**
+     * Whether this reply hit the single-reply cap and was cut short (R-9 / D-6).
+     *
+     * Appended last, so every existing positional construction keeps compiling. A truncated reply is still a reply the
+     * caller understood - it is not a parse failure and not an empty success - but `stdout` is a prefix rather than the
+     * whole answer, so a caller that judges a target by parsing it must be able to tell.
+     */
+    val truncated: Boolean = false,
 )
 
 /** The privileged command channel: Shizuku's shell UID (or whatever runs commands as that UID in a test). */
@@ -22,8 +30,20 @@ interface PrivilegedShell {
 /** The marker the privileged shell uses when it cannot parse its own reply (see `ShellReply`). */
 internal const val SHELL_REPLY_INVALID = "SHELL_REPLY_INVALID"
 
+/**
+ * The marker for a reply that was too large to cross the binder (**R-9**), reported as its own code.
+ *
+ * Before this existed, `ShizukuUserServiceShell.run` wrapped the binder call in `runCatching{}.getOrNull()`, so a
+ * `TransactionTooLargeException` collapsed into [SHELL_REPLY_INVALID]: "the reply was too large" and "the reply could
+ * not be parsed" were the same string, and a command that actually ran was reported as a parse failure. They are two
+ * different facts - one says the channel refuses payloads this size, the other says this build does not understand the
+ * payload - and both are *failures*: neither is an empty success.
+ */
+internal const val SHELL_REPLY_TOO_LARGE = "SHELL_REPLY_TOO_LARGE"
+
 /** False when the shell could not parse its reply: a state read that **failed**, not an answer about the target. */
-internal fun ShellResult.isAStateReply(): Boolean = stderr != SHELL_REPLY_INVALID
+internal fun ShellResult.isAStateReply(): Boolean =
+    stderr != SHELL_REPLY_INVALID && stderr != SHELL_REPLY_TOO_LARGE
 
 /**
  * What the device actually looks like after a command, which is the only thing that may be read as success.

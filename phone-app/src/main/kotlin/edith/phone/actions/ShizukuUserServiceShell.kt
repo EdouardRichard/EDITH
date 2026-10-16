@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.ServiceConnection
 import android.content.pm.PackageManager
 import android.os.IBinder
+import android.os.TransactionTooLargeException
 import android.util.Log
 import rikka.shizuku.Shizuku
 
@@ -20,7 +21,9 @@ import rikka.shizuku.Shizuku
  * Three honest answers, never a guess:
  * - not bound yet ⇒ [ready] is false and the caller must not claim the channel works;
  * - the binder died ⇒ `onServiceDisconnected` clears the remote, so [ready] turns false again;
- * - a reply this build cannot parse ⇒ `SHELL_REPLY_INVALID` with exit `-1`, never an empty success.
+ * - a reply this build cannot parse ⇒ `SHELL_REPLY_INVALID` with exit `-1`, never an empty success;
+ * - a reply the channel could not carry ⇒ `SHELL_REPLY_TOO_LARGE` with exit `-1` (R-9): a distinct code, so "too large"
+ *   and "cannot be parsed" are two facts rather than one, and neither is read as a success.
  */
 class ShizukuUserServiceShell(
     context: Context,
@@ -85,7 +88,16 @@ class ShizukuUserServiceShell(
 
     override fun run(command: String): ShellResult {
         val service = remote ?: return ShellResult(command, -1, "", "SHELL_NOT_BOUND")
-        val reply = runCatching { service.run(command) }.getOrNull()
+        // `TransactionTooLargeException` is caught **first and separately** (R-9): it is a reply this build could not
+        // carry, not one it could not parse, and reporting the two as the same string told a caller whose command had
+        // actually run that the reply was garbage. Neither answer is an empty success.
+        val reply = try {
+            service.run(command)
+        } catch (_: TransactionTooLargeException) {
+            return ShellResult(command, -1, "", SHELL_REPLY_TOO_LARGE)
+        } catch (_: Throwable) {
+            null
+        }
         return ShellReply.decode(reply)?.copy(command = command)
             ?: ShellResult(command, -1, "", SHELL_REPLY_INVALID)
     }

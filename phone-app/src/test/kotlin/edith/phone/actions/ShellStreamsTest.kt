@@ -46,10 +46,13 @@ class ShellStreamsTest {
             }
         }
 
-        val (out, err) = drainStreams(stdout, stderr)
+        // `drainStreams` now returns a triple: the third element is the R-9 truncation flag (false here - 200 KB is
+        // far below the cap), so this test is about the concurrent drain and nothing else.
+        val (out, err, truncated) = drainStreams(stdout, stderr)
 
         assertEquals("", out)
         assertEquals(payload.length, err.length)
+        assertFalse(truncated)
     }
 
     @Test(timeout = 10_000)

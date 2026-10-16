@@ -37,9 +37,11 @@ class EdithShellService : IRemoteShell.Stub {
         val process = Runtime.getRuntime().exec(arrayOf("sh", "-c", command))
         // Both streams are drained **concurrently** (see `drainStreams`): a child whose stderr fills the pipe blocks in
         // the child, so "stdout first, then stderr" waits on a process that is waiting for us (P3.3 review, Minor 3).
-        val (stdout, stderr) = drainStreams(process.inputStream, process.errorStream)
+        // The drain also bounds what one reply may accumulate (R-9): past `ShellReply.MAX_REPLY_BYTES` it keeps reading
+        // the pipes to EOF - stopping there would deadlock the child - but stops accumulating, and the reply says so.
+        val (stdout, stderr, truncated) = drainStreams(process.inputStream, process.errorStream)
         val exit = process.waitFor()
-        return ShellReply.encode(exit, stdout, stderr)
+        return ShellReply.encode(exit, stdout, stderr, truncated)
     }
 
     private companion object {
