@@ -13,13 +13,21 @@ import org.junit.Test
  * That is the wrong invitation - the first asks the model to retry or to pick a different app, the second asks it to
  * ask again on a channel that just proved it cannot carry an answer.
  *
- * The predicate is weaker than [isAStateReply] **on purpose** and this file pins both sides:
+ * The predicate is weaker than the state-read question **on purpose**, and this file pins the nesting in both directions:
  * - `isCallComplete()` asks about the **channel**: the binder returned and the payload and its marker parsed. A
  *   non-empty `stderr` does not enter into it - the reply did cross and was understood, and the command's own
  *   diagnostics are the command's business;
- * - [isAStateReply] asks the **stronger** question a stdout parser needs: *and* nothing was written to `stderr`, because
- *   `installed`/`disabled`/`permissionGranted` read an absence as "the target is not there". Weakening that half here
- *   would reopen the hole `ShellStateReadabilityTest` closes.
+ * - [isReadableState] is the question a stdout parser must ask before it judges a target: the call came back **and** the
+ *   command completed (`exitCode == 0`) **and** the payload was not cut short (`!truncated`). It is strictly stronger
+ *   than `isCallComplete()`, so a reply that did not complete, or whose `stdout` is a prefix, can never be judged as an
+ *   answer about the target.
+ *
+ * Reconciled with open item #4: the empty-`stderr` half this file used to require of a state reply is **gone**. It was an
+ * unmeasured assumption, and the device round measured it at **0 of 52** `exit 0` state reads across 3 turns and five
+ * targets, while the exit code is the OS's own completion signal. `isAStateReply()` survives only as the completion half
+ * ([isCallComplete]) and is **not** what a parser may judge from. The judgement the old half protected - never judge an
+ * action from a read that did not fully arrive - is preserved by [isReadableState], not weakened: a non-completed or
+ * clipped read is still refused.
  */
 class ShellCallCompletionTest {
 
@@ -35,6 +43,7 @@ class ShellCallCompletionTest {
 
         for ((label, reply) in listOf("NOT_BOUND" to notBound, "CARRIER" to carrier, "PARSE" to parse)) {
             assertFalse("$label did not deliver a reply the caller may judge", reply.isCallComplete())
+            assertFalse("$label is not a readable state read either: a state probe may judge nothing from it", reply.isReadableState())
         }
     }
 
@@ -52,16 +61,26 @@ class ShellCallCompletionTest {
     }
 
     @Test
-    fun `the completion question is strictly weaker than the state-reply question`() {
-        // The two are nested, and in this direction only: a state reply is a completed call, a completed call is not
-        // necessarily a state reply (the noisy one above). Stating the nesting pins that neither predicate was folded
-        // into the other by a later edit.
-        val noisy = ShellResult("pm list packages com.example", 0, "", "Warning: activity not started")
-        assertTrue(noisy.isCallComplete())
-        assertFalse("the empty-stderr half still refuses a state read", noisy.isAStateReply())
+    fun `the completion question is strictly weaker than the readable-state question`() {
+        // The two are nested, and in this direction only: a readable state read is always a completed call, and a
+        // completed call need not be readable. Stating the nesting pins that neither predicate was folded into the
+        // other - and that the state-read refusal now comes from the OS's own completion signal and the truncation flag
+        // rather than from `stderr` emptiness. `ShellStateReadPredicateTest` owns the exhaustive direction; the two
+        // witnesses below are what makes the nesting **strict**.
+        val noisy = ShellResult("pm list packages com.example", 0, "package:com.example\n", "Warning: deprecated flag")
+        assertTrue("the reply crossed the channel", noisy.isCallComplete())
+        assertTrue("an exit 0 command's diagnostics do not unmake its answer", noisy.isReadableState())
+
+        val exitedNonZero = ShellResult("pm list packages com.example", 1, "package:com.example\n", "")
+        assertTrue("the bytes crossed, so the call completed", exitedNonZero.isCallComplete())
+        assertFalse("but a command that did not complete is not a readable state read", exitedNonZero.isReadableState())
+
+        val clipped = ShellResult("pm list packages com.example", 0, "package:com.exampl", "", truncated = true)
+        assertTrue("a decoded reply is still a completed call", clipped.isCallComplete())
+        assertFalse("a clipped stdout is a prefix, not an answer about the target", clipped.isReadableState())
 
         val carrier = ShellResult("pm list packages com.example", -1, "", SHELL_REPLY_TOO_LARGE, failure = ShellFailure.CARRIER)
         assertFalse(carrier.isCallComplete())
-        assertFalse(carrier.isAStateReply())
+        assertFalse("a reply the channel could not carry is not a readable read either", carrier.isReadableState())
     }
 }
