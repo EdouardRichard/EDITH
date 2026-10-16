@@ -337,6 +337,20 @@ class HostCompositionRoot internal constructor(
     internal var channelProbes: List<Pair<String, () -> Boolean>> = emptyList()
 
     /**
+     * R-9 device probe (debug builds only): the privileged shell this composition's execution layer runs commands
+     * through, so a debug-only instrument can drive **this** instance against a real Binder reply.
+     *
+     * A field rather than an accessor on the executors for two reasons: a second `ShizukuUserServiceShell` would open a
+     * second Shizuku user-service binding and disturb the app's real channel, and the execution router keeps its
+     * executors private. It is assigned in [create] — a companion function, so it reaches this `internal` member — and
+     * only when `BuildConfig.DEBUG` is true; `BuildConfig.DEBUG` is a compile-time constant, so the assignment is dead
+     * code in a release build and R8 removes it with the whole branch. Nothing in production reads this field, so it
+     * changes no production behaviour. `null` means "this build was not wired for the probe", never "the channel is
+     * down": the channel's own answer is [ShizukuUserServiceShell.ready].
+     */
+    internal var privilegedShellForProbe: ShizukuUserServiceShell? = null
+
+    /**
      * The Root row's informational line's **source**: the probe, asked once per read.
      *
      * The panel states the device's own answer (`Root：不可用（设备无 su）`) rather than a bare code, because a missing
@@ -1686,6 +1700,9 @@ class HostCompositionRoot internal constructor(
                 shizukuShell.bind()
                 shizukuShell.requestPermissionIfNeeded()
             }
+            // R-9 device probe: hand the debug-only instrument the **production** shell it would otherwise have to
+            // duplicate (see the field's KDoc). Debug-gated so a release build never writes it.
+            if (BuildConfig.DEBUG) root.privilegedShellForProbe = shizukuShell
             root.confirmationPresenter = confirmationPresenter
             // P3.3 (§17.4): the notification shade, so a question can be answered while this App is not in front.
             root.notificationSurface = AndroidNotificationSurface(context)

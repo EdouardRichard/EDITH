@@ -72,6 +72,21 @@
             </intent-filter>
         </receiver>
         <!--
+          R-9 reply-cap instrument. Same export rule and the same reason as the instruments above: the only caller is
+          an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
+          release build. It runs one command through the **production** Shizuku shell and logs the reply's shape only -
+          a fixed label, exit code, stdout/stderr byte counts, the `truncated` flag, the channel's own failure code and
+          the elapsed milliseconds. It logs neither the command nor the reply's text.
+        -->
+        <receiver
+            android:name=".DebugShellCapProbe"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_SHELLCAP" />
+            </intent-filter>
+        </receiver>
+        <!--
           `DebugModelProbe` (the generic all-models-on-an-accelerator probe) is NOT registered here yet: it needs the
           process's single shared LiteRT `Environment`, which lives in the vendored `com.laya` file as a
           file-private object, so the probe cannot compile without making vendored code non-private. Its entry, its
