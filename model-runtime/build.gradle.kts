@@ -10,6 +10,7 @@ dependencyLocking { lockAllConfigurations() }
 dependencies {
     implementation(project(":core-contracts"))
     implementation(project(":plugin-api"))
+    implementation(project(":agent-runtime"))
     implementation(project(":storage-runtime"))
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
