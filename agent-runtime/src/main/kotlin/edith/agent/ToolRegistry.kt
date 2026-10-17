@@ -112,4 +112,5 @@ private fun ActionDescriptor.toToolDescriptor() = ToolDescriptor(
     reversible = reversible,
     scope = scope,
     auditTargetArgument = auditTargetArgument,
+    countsTowardStepLimit = countsTowardStepLimit,
 )

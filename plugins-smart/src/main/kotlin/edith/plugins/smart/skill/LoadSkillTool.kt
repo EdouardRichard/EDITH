@@ -96,6 +96,10 @@ class LoadSkillTool(
             reversible = true,
             scope = "skill",
             auditTargetArgument = null,
+            // AC-18 / D-9: reading a SKILL body is reference reading, not a device step. Without this declaration the
+            // model could exhaust `maxSteps` by pulling the tool it was just given, and the two-layer catalog would
+            // defeat itself. This is the only `false` in the repository.
+            countsTowardStepLimit = false,
         )
     }
 }

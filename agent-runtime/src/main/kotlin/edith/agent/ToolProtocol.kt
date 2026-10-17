@@ -47,6 +47,12 @@ data class ToolDescriptor(
     val scope: String,
     /** P3.3: projected from the plugin's descriptor; see `ActionDescriptor.auditTargetArgument`. */
     val auditTargetArgument: String? = null,
+    /**
+     * Phase 6 (design D-9): projected from the plugin's descriptor; see
+     * [edith.plugin.ActionDescriptor.countsTowardStepLimit]. `true` — the default — spends one step of the loop's
+     * `maxSteps` hang guard; `false` makes every call free of the guard without leaving `AgentRun.steps`.
+     */
+    val countsTowardStepLimit: Boolean = true,
 )
 
 /** A descriptor bound to the executor that declared it. */

@@ -35,6 +35,19 @@ data class ActionDescriptor(
      * ever recorded for this action, so a phone number cannot reach the trail.
      */
     val auditTargetArgument: String? = null,
+    /**
+     * Phase 6 (design D-9): whether one call of this action spends a step of the agent loop's `maxSteps` hang guard.
+     *
+     * `maxSteps` is not a budget (spec D-P3-10): it only stops a run that would otherwise call tools forever. An action
+     * that merely **reads reference material** — no device side effect, idempotent — should not be able to end a run by
+     * being read often, so it declares `false`. The default is `true`, i.e. today's behaviour, so every existing action
+     * keeps spending its step without changing a line.
+     *
+     * The declaration lives here, not in the runtime: `agent-runtime` may not single a tool out by name (§3.8.1 —
+     * plugins declare capability, the framework implements the channel). The loop still **records** every call
+     * (including exempt ones) in `AgentRun.steps`; only its local step counter ignores exempt calls.
+     */
+    val countsTowardStepLimit: Boolean = true,
 ) {
     init {
         require(name.isNotBlank())

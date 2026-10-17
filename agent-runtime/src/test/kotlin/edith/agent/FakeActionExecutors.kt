@@ -41,6 +41,7 @@ internal fun actionDescriptor(
     reversible: Boolean = true,
     scope: String = "test",
     auditTargetArgument: String? = null,
+    countsTowardStepLimit: Boolean = true,
 ) = ActionDescriptor(
     name = name,
     title = "Title of $name",
@@ -51,6 +52,7 @@ internal fun actionDescriptor(
     reversible = reversible,
     scope = scope,
     auditTargetArgument = auditTargetArgument,
+    countsTowardStepLimit = countsTowardStepLimit,
 )
 
 /** An executor offering exactly one tool, described by [actionDescriptor] defaults. */

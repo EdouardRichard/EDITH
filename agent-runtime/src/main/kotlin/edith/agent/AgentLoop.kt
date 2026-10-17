@@ -106,6 +106,19 @@ data class AgentRun(
      * from [`finalText`] would get a different conversation than the one the model saw.
      */
     val transcript: List<ModelHistoryItem> = emptyList(),
+    /**
+     * Phase 6 (design D-9): how many tool calls this run's `maxSteps` hang guard counted — every call **except** the
+     * ones whose descriptor declared `countsTowardStepLimit = false`.
+     *
+     * [steps] stays the full record of tool calls, exempt ones included: two production consumers (`P3_RUN … steps=`
+     * and `p3-eval-trigger`'s `toolCalls` / `toolSuccessRate`) read `steps.size` as "how many tools the model called",
+     * so gating and recording are separate concerns. This is the gate's own number, and it is `0` — the behaviour
+     * before it existed — for a run with no counted calls.
+     *
+     * Test-observable only: it is deliberately **not** appended to the `P3_TURN` log line or the eval trigger's
+     * `toolCalls`, whose exact shapes are pinned and whose meaning is `steps.size`, not this number.
+     */
+    val spentSteps: Int = 0,
 )
 
 private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
@@ -259,6 +272,10 @@ class AgentLoop(
         // the history path that owns the tool rounds.
         var openingTurn = true
         val steps = mutableListOf<AgentStep>()
+        // D-9: the gate's input. It is deliberately **not** `steps.size`: `steps` records every call (exempt ones
+        // included) because two production consumers read it as the tool-call count, while the hang guard must count
+        // only calls whose descriptor declared `countsTowardStepLimit` (an unknown name declared nothing, so it counts).
+        var spentSteps = 0
         var unproductiveTurns = 0
         // The turn's budget counts **machine** time only. A confirmation spends the *user's* time, so the deadline is
         // shifted forward by however long that call waits (D49): with a 120 s decision window (D47) charging the wait to
@@ -266,8 +283,10 @@ class AgentLoop(
         var turnDeadlineNanos = request.deadlineNanos
 
         while (true) {
-            if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "")
-            if (clock.nowNanos() >= turnDeadlineNanos) return finish(AgentOutcome.DEADLINE, null, null, steps, history, "")
+            if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+            if (clock.nowNanos() >= turnDeadlineNanos) {
+                return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+            }
 
             // Assemble the RequestFrame through TurnRunner; the gateway still receives a plain instructions string.
             // The system slot is one string and stays identical across the run: a caller-supplied frame's whole system
@@ -302,7 +321,7 @@ class AgentLoop(
                 ),
             )
             // A turn that was blocked when `cancel()` arrived must not complete the run with a late answer.
-            if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "")
+            if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
 
             // Only an INCOMPLETE turn with no call is an unproductive turn: a cut-off turn that still carries calls
             // produced real steps, so they run below instead of being retried away.
@@ -317,14 +336,21 @@ class AgentLoop(
                             steps,
                             history,
                             reply.text,
+                            spentSteps,
                         )
                     }
                     appendRetry(history, reply.text)
                     continue
                 }
-                ModelEnd.FAILED -> return finish(AgentOutcome.FAILED, reply.safeCode, null, steps, history, reply.text)
-                ModelEnd.DEADLINE -> return finish(AgentOutcome.DEADLINE, reply.safeCode, null, steps, history, reply.text)
-                ModelEnd.CANCELLED -> return finish(AgentOutcome.CANCELLED, reply.safeCode, null, steps, history, reply.text)
+                ModelEnd.FAILED -> return finish(
+                    AgentOutcome.FAILED, reply.safeCode, null, steps, history, reply.text, spentSteps,
+                )
+                ModelEnd.DEADLINE -> return finish(
+                    AgentOutcome.DEADLINE, reply.safeCode, null, steps, history, reply.text, spentSteps,
+                )
+                ModelEnd.CANCELLED -> return finish(
+                    AgentOutcome.CANCELLED, reply.safeCode, null, steps, history, reply.text, spentSteps,
+                )
                 ModelEnd.COMPLETED, null -> Unit
             }
 
@@ -332,12 +358,12 @@ class AgentLoop(
                 if (reply.text.isBlank()) {
                     unproductiveTurns++
                     if (unproductiveTurns >= maxEmptyTurns) {
-                        return finish(AgentOutcome.INSUFFICIENT, EMPTY_TURN, null, steps, history, reply.text)
+                        return finish(AgentOutcome.INSUFFICIENT, EMPTY_TURN, null, steps, history, reply.text, spentSteps)
                     }
                     appendRetry(history, reply.text)
                     continue
                 }
-                return finish(AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text)
+                return finish(AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps)
             }
 
             unproductiveTurns = 0
@@ -353,8 +379,11 @@ class AgentLoop(
                 )
             }
             for (call in reply.toolCalls) {
-                if (steps.size >= maxSteps) return finish(AgentOutcome.FAILED, STEP_LIMIT, null, steps, history, "")
+                if (spentSteps >= maxSteps) return finish(AgentOutcome.FAILED, STEP_LIMIT, null, steps, history, "", spentSteps)
                 val registered = registry.resolve(call.name)
+                // D-9: one declaration decides both halves — an exempt call is recorded but spends no step, while an
+                // unknown name declared nothing and therefore still spends one.
+                if (registered == null || registered.descriptor.countsTowardStepLimit) spentSteps++
                 val result = if (registered == null) {
                     // An unknown name is a step to feed back and never reaches the policy. It is *not* an execution, so
                     // it carries its own stable audit label instead of sharing `executed` with a real tool run.
@@ -434,12 +463,14 @@ class AgentLoop(
                 history += ModelHistoryItem.ToolOutput(call.id, result.payload)
                 // The guard sees only a fingerprint that exists after this action ran — never a pre-action observation.
                 guard.observeAfterAction(result.payload)
-                if (guard.tripped) return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "")
+                if (guard.tripped) return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps)
                 if (registered?.descriptor?.scope == SCOPE_TERMINAL && result.ok) {
-                    return finish(AgentOutcome.COMPLETED, null, result.payload, steps, history, "")
+                    return finish(AgentOutcome.COMPLETED, null, result.payload, steps, history, "", spentSteps)
                 }
-                if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "")
-                if (clock.nowNanos() >= turnDeadlineNanos) return finish(AgentOutcome.DEADLINE, null, null, steps, history, "")
+                if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+                if (clock.nowNanos() >= turnDeadlineNanos) {
+                    return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                }
             }
         }
     }
@@ -465,13 +496,14 @@ class AgentLoop(
         steps: List<AgentStep>,
         history: MutableList<ModelHistoryItem>,
         closingText: String,
+        spentSteps: Int,
     ): AgentRun {
         val last = history.lastOrNull()
         if (last is ModelHistoryItem.Text && last.role == MessageRole.USER) {
             history += ModelHistoryItem.Text(MessageRole.ASSISTANT, closingText.ifBlank { CLOSED_TURN_TEXT })
         }
         lastTranscript = history.toList()
-        return AgentRun(outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript)
+        return AgentRun(outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps)
     }
 
     /**

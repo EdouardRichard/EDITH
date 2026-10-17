@@ -44,6 +44,11 @@ class LoadSkillToolTest {
         // A pull inside a multi-step task must not end the run, so the scope must not be the terminal one.
         assertNotEquals(SCOPE_TERMINAL, d.scope)
         assertEquals("skill", d.scope)
+        // AC-18 / D-9: pulling a body is reference reading, not a step, so `load_skill` must not consume `maxSteps`.
+        // This assertion deliberately reads the **real** descriptor: the agent-runtime tests drive fake executors, so
+        // they would stay green even if the production tool declared nothing, and the exemption would be dead in
+        // production with every suite passing. This is the only exemption in the repository.
+        assertFalse(d.countsTowardStepLimit, "load_skill must not consume maxSteps (AC-18)")
         // The schema is the contract the model reads; pin it whole rather than by `contains`.
         assertEquals(
             """{"type":"object","properties":{"name":{"type":"string","description":"SKILL 目录中的 name"}},"required":["name"],"additionalProperties":false}""",
