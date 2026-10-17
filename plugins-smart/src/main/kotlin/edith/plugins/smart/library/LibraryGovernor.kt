@@ -132,6 +132,10 @@ class LibraryGovernor(
      * retired out from under them.
      *
      * Also enforces the size cap, so the turn that overflows the catalog reports the overflow in its own verdict.
+     * The cap is evaluated over the entries **seen this turn** only (the intersection of [seenThisTurn] and
+     * [LibraryState.ACTIVE]): an entry this turn did not advertise cannot overflow a catalog it is not in, so it is
+     * neither capped nor named — its lifecycle state is left exactly where it was.
+     *
      * Idempotent: a second call with nothing newly seen advances nothing and reports nothing.
      */
     fun endTurn(): GovernorVerdict {
@@ -156,7 +160,7 @@ class LibraryGovernor(
             }
         }
 
-        val overflow = applyCatalogCap() + pendingCatalogDemotions
+        val overflow = applyCatalogCap(seenThisTurn) + pendingCatalogDemotions
         pendingCatalogDemotions = LinkedHashSet()
         turnOpen = false
         seenThisTurn.clear()
@@ -193,26 +197,42 @@ class LibraryGovernor(
     fun entry(id: String): LibraryEntry? = entries[id]?.copy()
 
     /**
-     * The catalog as the model should see it this step: [LibraryState.ACTIVE] ids only, sorted, at most
-     * [maxCatalogEntries] of them.
+     * The catalog as the model should see it this step: the [LibraryState.ACTIVE] ids **from [advertised]** only,
+     * sorted, at most [maxCatalogEntries] of them.
      *
-     * When more entries are ACTIVE than the catalog holds, the lexicographically smallest ids keep their places and the
-     * remainder are demoted to [LibraryState.DORMANT]. The comparison is on the id alone, so the rule is deterministic
-     * and independent of the order ids were advertised in. Those demotions are **not** swallowed here: they are queued
-     * and reported by the next [endTurn] verdict, so the turn that caused the overflow names what it demoted (design
-     * D-6 "不静默"). No name or content from an entry is ever reported, only its id.
+     * [advertised] is the catalog's universe, not a hint. An id it does not contain — a SKILL the user disabled or
+     * deleted after it was observed — is neither listed nor cap-demoted, and its lifecycle state is left untouched, so
+     * re-enabling it makes it visible again without a restart. Governing an absent entry would let a ghost hold a slot
+     * and push a genuinely advertised entry out of the catalog: the silent loss this phase exists to remove. The cap is
+     * therefore taken over `advertised ∩ ACTIVE`, and only entries that could actually reach the model are bounded.
+     *
+     * When more advertised entries are ACTIVE than the catalog holds, the lexicographically smallest ids keep their
+     * places and the remainder are demoted to [LibraryState.DORMANT]. The comparison is on the id alone, so the rule is
+     * deterministic and independent of the order ids were advertised in. Those demotions are **not** swallowed here:
+     * they are queued and reported by the next [endTurn] verdict, so the turn that caused the overflow names what it
+     * demoted (design D-6 "不静默"). No name or content from an entry is ever reported, only its id.
+     *
+     * [everListed] is pruned to [advertised] and grows only by what this call returns. An id that stops being
+     * advertised leaves the "appeared in a catalog" set with it, so a disabled or deleted entry cannot inflate
+     * [neverPulledCount] (that count is the signal "the catalog shows entries nobody pulls", and an entry the catalog
+     * no longer shows is not part of it); an id that is advertised again re-enters. This pruning touches bookkeeping
+     * only — never a lifecycle state.
      *
      * Idempotent: the demotion is applied to the entries, so a second call finds the excess already DORMANT and
-     * queues nothing further. [advertised] is accepted for the caller's convenience and for API symmetry with
-     * [observeTurn]; selecting on it would make the cap depend on this step's advertisement rather than on the
-     * catalog's contents, which is the thing being bounded.
+     * queues nothing further.
      */
     fun catalog(advertised: Collection<String>): List<String> {
+        val universe = advertised.toSet()
+        // A ghost drops out of the never-pulled signal the moment it stops being advertised. Its state is untouched.
+        everListed.retainAll(universe)
         // An overflow the cap applies here is not thrown away: it is queued for the next endTurn() verdict, because
         // the design's ordering is "catalog per request, endTurn at turn end" — without this, the request that
         // overflowed the catalog would demote entries and nothing would ever report it (D-6 "不静默").
-        pendingCatalogDemotions += applyCatalogCap()
-        val listed = activeIds().take(maxCatalogEntries)
+        pendingCatalogDemotions += applyCatalogCap(universe)
+        val listed = universe
+            .filter { entries[it]?.state == LibraryState.ACTIVE }
+            .sorted()
+            .take(maxCatalogEntries)
         everListed += listed
         return listed
     }
@@ -243,12 +263,16 @@ class LibraryGovernor(
         LibraryState.RETIRED -> LibraryState.ACTIVE
     }
 
-    private fun activeIds(): List<String> =
-        entries.values.filter { it.state == LibraryState.ACTIVE }.map { it.id }.sorted()
-
-    /** Demote ACTIVE ids beyond [maxCatalogEntries], smallest ids first; returns them sorted. */
-    private fun applyCatalogCap(): List<String> {
-        val overflow = activeIds().drop(maxCatalogEntries)
+    /**
+     * Demote the [LibraryState.ACTIVE] ids among [candidates] beyond [maxCatalogEntries], smallest ids first; returns
+     * them sorted. [candidates] is the advertised set in [catalog] and the entries seen this turn in [endTurn], so an
+     * id outside it is never capped.
+     */
+    private fun applyCatalogCap(candidates: Collection<String>): List<String> {
+        val overflow = candidates
+            .filter { entries[it]?.state == LibraryState.ACTIVE }
+            .sorted()
+            .drop(maxCatalogEntries)
         overflow.forEach { id ->
             val entry = entries[id] ?: return@forEach
             entries[id] = entry.copy(state = LibraryState.DORMANT)

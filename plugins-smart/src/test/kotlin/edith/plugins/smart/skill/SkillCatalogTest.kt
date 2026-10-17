@@ -197,4 +197,178 @@ class SkillCatalogTest {
         assertEquals(0, ungoverned.neverPulledCount())
         assertTrue(ungoverned.endTurn().isEmpty)
     }
+
+    @Test fun `the catalog text is exactly the header, a blank line and one line per entry`() {
+        // `contains` assertions would let the header, the blank line and the absence of a trailing newline drift; the
+        // whole string is pinned instead. Input order is reversed to prove the formatter's own sort.
+        val text = catalogFor(listOf(
+            Skill("beta", "1", "d-beta", body = "body-b"),
+            Skill("alpha", "1", "d-alpha", body = "body-a"),
+        ))
+        assertEquals("## SKILL 目录\n\n- alpha: d-alpha\n- beta: d-beta", text)
+    }
+
+    @Test fun `catalog never advances the turn observation`() {
+        // Observation belongs to beginTurn() alone (design D-3: the unit is the turn, not the request). Rebuilding the
+        // catalog twice in one turn must not add drift evidence, and a rebuild after the turn has closed must not open
+        // a new turn either — either would let tool round-trips inflate drift.
+        val governor = LibraryGovernor()
+        val manager = SkillManager(FakeDirectory(mapOf("a.md" to doc("a"))), governor = governor)
+
+        manager.beginTurn()
+        assertEquals(1, governor.entry("a")?.observedTurns, "beginTurn is the one observation")
+        manager.catalog()
+        manager.catalog()
+        assertEquals(1, governor.entry("a")?.observedTurns, "catalog is per request and must not observe")
+
+        manager.endTurn()
+        manager.catalog()
+        assertEquals(1, governor.entry("a")?.observedTurns, "a catalog after endTurn must not start a turn")
+    }
+
+    @Test fun `neverPulledCount reports the exact number of listed entries nobody pulled`() {
+        // The only prior manager-level assertion on this accessor expected 0, so replacing it with a constant 0 stayed
+        // green. Both a listed-but-unpulled count and its decrement after a pull are pinned here.
+        val governor = LibraryGovernor()
+        val manager = SkillManager(FakeDirectory(mapOf("a.md" to doc("a"), "b.md" to doc("b"))), governor = governor)
+
+        manager.beginTurn()
+        manager.catalog()
+        assertEquals(2, manager.neverPulledCount(), "both listed entries have never been pulled")
+
+        manager.load("a")
+        assertEquals(1, manager.neverPulledCount(), "a pull removes its entry from the never-pulled count")
+    }
+
+    @Test fun `a skill disabled after it was observed stops consuming a catalog slot`() {
+        // Turn 1: the library fits the cap with the ghost in it (eleven enabled + `aa-off` = twelve), so the ghost is
+        // observed and genuinely listed. Between turns the user disables it and enables a twelfth SKILL. The next turn
+        // must advertise all twelve enabled entries; pre-fix the ghost is still ACTIVE in the governor, the cap counts
+        // thirteen, and one genuinely enabled entry is pushed out of the catalog.
+        val cap = LibraryGovernor.MAX_CATALOG_ENTRIES
+        val kept = (1 until cap).map { "s%02d".format(it) }
+        val files = mutableMapOf<String, String>()
+        kept.forEach { files["$it.md"] = doc(it) }
+        files["aa-off.md"] = doc("aa-off")                    // sorts before every `s`, so pre-fix it takes slot one
+        val governor = LibraryGovernor()
+        val manager = SkillManager(FakeDirectory(files), governor = governor)
+
+        manager.beginTurn()
+        assertTrue("- aa-off: d-aa-off" in manager.catalog(), "the ghost is advertised while it is enabled")
+        manager.endTurn()
+
+        files["aa-off.md"] = doc("aa-off", enabled = false)   // disabled after it was observed
+        files["%s.md".format("s%02d".format(cap))] = doc("s%02d".format(cap))
+
+        manager.beginTurn()
+        val text = manager.catalog()
+        val listed = text.lines().filter { it.startsWith("- ") }
+        assertEquals(cap, listed.size, "all $cap enabled entries must be advertised")
+        assertTrue("aa-off" !in text, "the disabled ghost must never be advertised")
+    }
+
+    @Test fun `a skill disabled after it was observed is not counted as never-pulled`() {
+        // The ghost is listed on turn 1 — the only way it could inflate the count — then disabled. `neverPulled` is
+        // the "the catalog shows entries nobody pulls" signal, so an entry the catalog no longer shows must leave it.
+        val cap = LibraryGovernor.MAX_CATALOG_ENTRIES
+        val kept = (1 until cap).map { "s%02d".format(it) }
+        val files = mutableMapOf<String, String>()
+        kept.forEach { files["$it.md"] = doc(it) }
+        files["aa-off.md"] = doc("aa-off")
+        val governor = LibraryGovernor()
+        val manager = SkillManager(FakeDirectory(files), governor = governor)
+
+        manager.beginTurn()
+        manager.catalog()                                     // the ghost reaches the model, unpulled
+        manager.endTurn()
+        assertEquals(cap, manager.neverPulledCount(), "the ghost and the eleven enabled entries are all unpulled")
+
+        files["aa-off.md"] = doc("aa-off", enabled = false)
+        manager.beginTurn()
+        manager.catalog()
+
+        assertEquals(kept.size, manager.neverPulledCount(), "the disabled ghost is not a never-pulled catalog entry")
+        assertEquals(LibraryState.ACTIVE, governor.entry("aa-off")?.state, "the ghost is left alone, not demoted")
+    }
+
+    @Test fun `a skill re-enabled after being disabled is advertised again`() {
+        // The fix must leave a de-advertised entry's lifecycle alone (no demotion, no retirement, no restart), so the
+        // user turning it back on makes it visible again in the same process.
+        val cap = LibraryGovernor.MAX_CATALOG_ENTRIES
+        val kept = (1 until cap).map { "s%02d".format(it) }
+        val files = mutableMapOf<String, String>()
+        kept.forEach { files["$it.md"] = doc(it) }
+        files["aa-off.md"] = doc("aa-off")
+        val governor = LibraryGovernor()
+        val manager = SkillManager(FakeDirectory(files), governor = governor)
+
+        manager.beginTurn()
+        assertTrue("- aa-off: d-aa-off" in manager.catalog(), "the entry is advertised while enabled")
+        manager.endTurn()
+
+        files["aa-off.md"] = doc("aa-off", enabled = false)
+        manager.beginTurn()
+        assertTrue("- aa-off" !in manager.catalog(), "a disabled entry is not advertised")
+        manager.endTurn()
+        assertEquals(LibraryState.ACTIVE, governor.entry("aa-off")?.state, "the fix must not demote or retire a ghost")
+
+        files["aa-off.md"] = doc("aa-off")                    // the user turns it back on
+        manager.beginTurn()
+        assertTrue("- aa-off: d-aa-off" in manager.catalog(), "a re-enabled entry is advertised again without a restart")
+        assertEquals(2, governor.entry("aa-off")?.observedTurns, "it resumed where it left off, it did not restart")
+    }
+
+    @Test fun `the catalog names each entry it demotes`() {
+        // Design D-6: a cap demotion must not be silent. Counts alone do not say which entry vanished.
+        val lines = mutableListOf<String>()
+        val cap = LibraryGovernor.MAX_CATALOG_ENTRIES
+        val files = (1..cap + 2).associate { "s%02d.md".format(it) to doc("s%02d".format(it)) }
+        val manager = SkillManager(FakeDirectory(files), log = { lines += it }, governor = LibraryGovernor())
+
+        manager.beginTurn()
+        manager.catalog()                                     // the cap demotes the two entries beyond the bound
+
+        val demoted = listOf("s%02d".format(cap + 1), "s%02d".format(cap + 2))
+        demoted.forEach { name ->
+            assertEquals(1, lines.count { it == "P3_SKILL dormant name=$name" }, lines.toString())
+        }
+
+        // Those transitions are also drained into the turn's verdict; naming them there again would print each one
+        // twice. The manager names a transition once, so endTurn must add no second line.
+        manager.endTurn()
+        assertEquals(2, lines.count { it.startsWith("P3_SKILL dormant name=") }, lines.toString())
+    }
+
+    @Test fun `endTurn names each drifted entry it demotes or retires`() {
+        val lines = mutableListOf<String>()
+        val manager = SkillManager(FakeDirectory(mapOf("a.md" to doc("a"))), log = { lines += it }, governor = LibraryGovernor())
+
+        repeat(LibraryGovernor.MIN_OBSERVED_TURNS) { manager.beginTurn(); manager.endTurn() }
+        assertEquals(1, lines.count { it == "P3_SKILL dormant name=a" }, lines.toString())
+
+        repeat(LibraryGovernor.MIN_OBSERVED_TURNS) { manager.beginTurn(); manager.endTurn() }
+        assertEquals(1, lines.count { it == "P3_SKILL retired name=a" }, lines.toString())
+        assertEquals(1, lines.count { it == "P3_SKILL dormant name=a" }, "a transition is named once, not every turn")
+    }
+
+    @Test fun `a demotion after a same-turn pull is named again`() {
+        // Two distinct transitions on one entry in one turn: the cap demotes `s13` during the request (named once),
+        // the model pulls it back by name (design D-4's second gate), and endTurn's cap demotes it again. The second
+        // transition is new and must be named too — the ledger only suppresses the duplicate naming of the *same*
+        // transition, not a later one.
+        val lines = mutableListOf<String>()
+        val cap = LibraryGovernor.MAX_CATALOG_ENTRIES
+        val files = (1..cap + 1).associate { "s%02d.md".format(it) to doc("s%02d".format(it)) }
+        val manager = SkillManager(FakeDirectory(files), log = { lines += it }, governor = LibraryGovernor())
+
+        manager.beginTurn()
+        manager.catalog()                                     // the cap demotes `s13`
+        assertEquals(1, lines.count { it == "P3_SKILL dormant name=s13" }, lines.toString())
+
+        val loaded = manager.load("s13") as SkillLoad.Loaded
+        assertTrue(loaded.wasDormant, "the cap-demoted entry is still pullable")
+        manager.endTurn()                                     // the cap demotes it again this turn
+
+        assertEquals(2, lines.count { it == "P3_SKILL dormant name=s13" }, lines.toString())
+    }
 }

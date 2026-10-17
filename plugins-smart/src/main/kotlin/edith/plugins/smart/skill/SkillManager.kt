@@ -49,6 +49,14 @@ class SkillManager(
     /** Last reported `(listed, bounded, dormant)` triple, so a per-request rebuild logs only when the numbers move. */
     private var lastCatalogNumbers: Triple<Int, Int, Int>? = null
 
+    /**
+     * Ids whose ACTIVE → DORMANT transition has already been named in a log line. A cap demotion performed by
+     * [catalog] is also drained into the [endTurn] verdict, so naming that verdict unconditionally would print the
+     * same transition twice. A pull removes the id: it returns the entry to ACTIVE, so a later demotion is a new
+     * transition and must be named again. Keyed by id, so the set holds at most one entry per library id.
+     */
+    private val namedDemotionIds = LinkedHashSet<String>()
+
     /** The SKILLs to inject, sorted by name so one request is reproducible (spec §3.6 step 3). */
     fun enabled(): List<Skill> = all().filter { it.enabled }
 
@@ -67,29 +75,31 @@ class SkillManager(
      * The SKILL catalog for one request (Phase 6, design D-1): `name` and `description` per entry, bodies omitted.
      *
      * Recomputed on every call because the directory is re-read (spec §3.5) and the governor's selection is
-     * per-request. With a governor, the entries it lists are intersected with the enabled set — a disabled SKILL is
-     * never advertised — and the overflow the cap demoted stays reachable through [load]. With no governor every
+     * per-request. With a governor, the **enabled** names are handed to it as the advertised set — the same set
+     * [beginTurn] observed — so a disabled or deleted entry is neither listed nor capped and cannot take a slot from a
+     * genuinely enabled one; the overflow the cap demoted stays reachable through [load]. With no governor every
      * enabled entry is listed. An empty library yields the empty string, never a header with nothing under it.
      *
      * Logs one `P3_SKILL catalog listed=<n> bounded=<n> dormant=<n>` line whenever those measured numbers change
-     * (design D-10). All three are read from real state: `listed` counts what the returned text actually carries,
-     * `bounded` counts the ACTIVE→DORMANT transitions this call performed, and `dormant` counts the whole library's
-     * dormant entries afterwards. Counts only — a body never reaches a log line.
+     * (design D-10), and one `P3_SKILL dormant name=<id>` line for every entry **this call** moved ACTIVE → DORMANT
+     * (design D-6 — a demotion must not be silent). The counts are read from real state: `listed` counts what the
+     * returned text actually carries, `bounded` counts the transitions this call performed, and `dormant` counts the
+     * whole library's dormant entries afterwards. Names and counts only — a body never reaches a log line.
      */
     fun catalog(): String {
         val skills = all()
-        val names = skills.map { it.name }
+        val enabledNames = skills.filter { it.enabled }.map { it.name }
         val governor = this.governor
 
-        val bounded: Int
+        val demotedNames: List<String>
         val listedNames: List<String>
         if (governor == null) {
-            bounded = 0
-            listedNames = names
+            demotedNames = emptyList()
+            listedNames = enabledNames
         } else {
-            val before = names.associateWith { governor.entry(it)?.state }
-            listedNames = governor.catalog(names)
-            bounded = names.count {
+            val before = enabledNames.associateWith { governor.entry(it)?.state }
+            listedNames = governor.catalog(enabledNames)
+            demotedNames = enabledNames.filter {
                 before[it] == LibraryState.ACTIVE && governor.entry(it)?.state == LibraryState.DORMANT
             }
         }
@@ -97,12 +107,19 @@ class SkillManager(
         // Only enabled, still-present skills can appear in the catalog the model sees. The governor's list may name an
         // entry the directory no longer holds, or one that was enabled when beginTurn() observed it and has since been
         // disabled — a file can change mid-turn. This intersection is the defence for that race, not the rule that
-        // keeps disabled entries out of governance: beginTurn() never observes them.
+        // keeps disabled entries out of governance: beginTurn() never observes them and catalog() advertises only the
+        // enabled set.
         val enabledByName = skills.filter { it.enabled }.associateBy { it.name }
         val listedSkills = listedNames.mapNotNull { enabledByName[it] }
-        val dormant = if (governor == null) 0 else names.count { governor.entry(it)?.state == LibraryState.DORMANT }
+        val dormant = if (governor == null) 0 else skills.count { governor.entry(it.name)?.state == LibraryState.DORMANT }
 
-        reportCatalogNumbers(listed = listedSkills.size, bounded = bounded, dormant = dormant)
+        reportCatalogNumbers(listed = listedSkills.size, bounded = demotedNames.size, dormant = dormant)
+        // Design D-6: name each transition this call performed. The transitions are one-way, so a later call cannot
+        // report the same one again; the ledger stops the turn's endTurn() from naming it a second time.
+        demotedNames.forEach { name ->
+            log("P3_SKILL dormant name=$name")
+            namedDemotionIds += name
+        }
         return catalogFor(listedSkills)
     }
 
@@ -128,6 +145,9 @@ class SkillManager(
         if (!skill.enabled) return SkillLoad.NotFound(SkillLoadReason.DISABLED)
         val wasDormant = governor?.entry(name)?.state == LibraryState.DORMANT
         governor?.recordPull(name)
+        // A pull returns the entry to ACTIVE, so a demotion named earlier is superseded: a fresh demotion later is a
+        // new transition and must be named again.
+        namedDemotionIds.remove(name)
         return SkillLoad.Loaded(skill, wasDormant)
     }
 
@@ -145,11 +165,21 @@ class SkillManager(
     }
 
     /**
-     * Close a turn: advance the governor one step and report what it demoted/retired. Quiet without a governor, so a
-     * caller that has not adopted Phase 6 keeps its old behaviour.
+     * Close a turn: advance the governor one step, name what it demoted/retired, and report that verdict. Quiet without
+     * a governor, so a caller that has not adopted Phase 6 keeps its old behaviour.
+     *
+     * Design D-6: a demotion is never silent. Each id in the verdict is named on its own `P3_SKILL dormant name=<id>` /
+     * `P3_SKILL retired name=<id>` line, apart from the cap demotions [catalog] already named — one transition is
+     * logged once, not once per reporter. Names only: a body never reaches a log line.
      */
-    fun endTurn(): GovernorVerdict =
-        governor?.endTurn() ?: GovernorVerdict(emptyList(), emptyList(), emptyList())
+    fun endTurn(): GovernorVerdict {
+        val verdict = governor?.endTurn() ?: GovernorVerdict(emptyList(), emptyList(), emptyList())
+        verdict.demoted.distinct()
+            .filterNot { it in namedDemotionIds }
+            .forEach { log("P3_SKILL dormant name=$it") }
+        verdict.retired.distinct().forEach { log("P3_SKILL retired name=$it") }
+        return verdict
+    }
 
     /** Pulls during the turn that just completed (survives [endTurn]); 0 without a governor. */
     val pullsThisTurn: Int get() = governor?.pullsThisTurn ?: 0

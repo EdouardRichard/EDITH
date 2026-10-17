@@ -138,4 +138,29 @@ class LibraryGovernorTest {
         assertEquals(0, g.pullsThisTurn)
         assertEquals(1, g.pullsThisSession, "the session count stays monotonic")
     }
+
+    @Test fun `catalog caps over its advertised set and never demotes an absent entry`() {
+        // `ghost` was ACTIVE last turn and is no longer advertised (disabled or deleted after it was observed). The cap
+        // must ignore it: counting every known ACTIVE entry would demote the ghost and, at the bound, push a genuinely
+        // advertised entry out of the catalog.
+        val g = LibraryGovernor(maxCatalogEntries = 2)
+        g.observeTurn(listOf("a", "ghost"))
+        g.endTurn()
+        g.observeTurn(listOf("a", "b"))
+
+        val listed = g.catalog(listOf("a", "b"))
+        assertEquals(listOf("a", "b"), listed)
+        assertEquals(LibraryState.ACTIVE, g.entry("ghost")?.state, "an unadvertised entry is left alone, not capped")
+    }
+
+    @Test fun `endTurn caps over the entries seen this turn and reports nothing for an absent one`() {
+        val g = LibraryGovernor(maxCatalogEntries = 2)
+        g.observeTurn(listOf("a", "ghost"))
+        g.endTurn()
+        g.observeTurn(listOf("a", "b"))
+
+        val verdict = g.endTurn()
+        assertTrue(verdict.demoted.isEmpty(), "an entry that was not advertised cannot overflow the catalog")
+        assertEquals(LibraryState.ACTIVE, g.entry("ghost")?.state)
+    }
 }
