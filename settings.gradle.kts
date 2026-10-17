@@ -8,12 +8,12 @@ pluginManagement {
 
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-    // The vendored CXR AARs sit at <root>/probes/p0/vendor in a plain checkout. A git worktree created two levels
+    // The vendored CXR AARs sit at <root>/third_party/cxr/vendor in a plain checkout. A git worktree created two levels
     // below the root (…/.worktrees/<name>) reaches the same files through ../../probes, and pinning that one layout
     // made the repository resolve to a directory outside the repository (D:/probes) whenever the project was built
     // from the root checkout - the merged main tree therefore could not configure transport-rokid or glasses-app.
-    val verifiedCxrDir = listOf(rootDir.resolve("probes/p0/vendor"), rootDir.resolve("../../probes/p0/vendor"))
-        .firstOrNull { it.isDirectory } ?: rootDir.resolve("probes/p0/vendor")
+    val verifiedCxrDir = listOf(rootDir.resolve("third_party/cxr/vendor"), rootDir.resolve("../../third_party/cxr/vendor"))
+        .firstOrNull { it.isDirectory } ?: rootDir.resolve("third_party/cxr/vendor")
     repositories {
         google()
         mavenCentral()
@@ -32,7 +32,7 @@ dependencyResolutionManagement {
             forRepository {
                 ivy {
                     name = "verifiedSherpaRuntime"
-                    url = uri("audio-android/libs")
+                    url = uri("phone-app/perception/audio-android/libs")
                     patternLayout { artifact("[artifact]-[revision].[ext]") }
                     metadataSources { artifact() }
                 }
@@ -65,41 +65,41 @@ dependencyResolutionManagement {
 rootProject.name = "edith"
 
 include(
-    ":core-contracts",
-    ":plugin-api",
-    ":host-runtime",
-    ":test-support",
-    ":plugins-smart",
-    ":plugins-interview",
-    ":audio-runtime",
-    ":audio-android",
-    ":transport-rokid",
-    ":storage-runtime",
-    ":model-runtime",
+    ":common:contracts:core-contracts",
+    ":common:contracts:plugin-api",
+    ":phone-app:assistant:host-runtime",
+    ":common:testkit:test-support",
+    ":phone-app:plugins:plugin-smart-helper",
+    ":phone-app:plugins:plugin-interview",
+    ":phone-app:perception:audio-runtime",
+    ":phone-app:perception:audio-android",
+    ":phone-app:link:transport-rokid",
+    ":phone-app:persistence:storage-runtime",
+    ":phone-app:assistant:model-runtime",
     // P3.1 agent loop: platform-independent tool protocol, registry and loop (Tasks 4-8).
-    ":agent-runtime",
-    ":output-runtime",
-    ":plugins-diagnostic",
-    ":tools:p2-text-probe",
+    ":phone-app:assistant:agent-runtime",
+    ":common:presentation:output-runtime",
+    ":phone-app:plugins:plugin-diagnostic",
+    ":tools:probes:p2-text-probe",
     // P3.0 throwaway probe (T4): can a `tools` array round-trip through the Responses endpoint, and does the reply
     // carry a `function_call` item? Not a delivery tool.
-    ":tools:p3-toolcall-probe",
+    ":tools:probes:p3-toolcall-probe",
     // P3.0 agent probe: an LLM-driven loop that chooses tools and has them executed on a real device through adb.
     // This is the end-to-end verification of the Agent harness, not a hand-run matrix. Not a delivery tool.
-    ":tools:p3-agent-probe",
-    ":phone-app",
+    ":tools:probes:p3-agent-probe",
+    ":phone-app:app",
     // Glasses-side audio capture probe: runs on the glasses (YodaOS-Sprite / Android 12), not on the phone.
-    ":glasses-audio-probe",
+    ":tools:probes:glasses-audio-probe",
     // Glasses-side CustomApp: renders the phone's hints through the CXR-S bridge (T18).
-    ":glasses-app",
+    ":glasses-app:app",
     // P3.0 throwaway probe (T0/T1): can the Glasses-side open SDK and the CXR-S bridge live in one glasses app, and
     // can the offline wake-word lexicon be customised without stealing the microphone? Not a delivery module.
-    ":glasses-sdk-coexistence-probe",
+    ":tools:probes:glasses-sdk-coexistence-probe",
     // P3.0 throwaway probe (T3b): how often does a semantic (accessibility-node) cross-app click actually land,
     // compared with a coordinate tap at the same node's bounds? Not a delivery module.
-    ":phone-accessibility-probe",
+    ":tools:probes:phone-accessibility-probe",
     // P3.4 evaluation harness: scores the frozen corpus against what the real trigger path actually did (precision /
     // recall per scenario, the chat mis-trigger window). Reads logs; never touches the device itself. Not a delivery
     // module.
-    ":tools:p3-eval-trigger",
+    ":tools:eval:p3-eval-trigger",
 )
