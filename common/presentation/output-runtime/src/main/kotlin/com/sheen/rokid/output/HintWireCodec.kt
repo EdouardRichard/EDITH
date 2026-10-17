@@ -68,7 +68,7 @@ object HintWireCodec {
      * bound was doing double duty as a *display* bound, and the glasses' six-line window is not a display bound at all
      * — a taller hint is slid through the window by `HintAutoScroll`, which is why a 120-codepoint answer was already
      * being scrolled before this change. 400 codepoints is about 35 lines (5 screens) at the measured 12 characters
-     * per line: a paragraph, not a document. The phone's own acceptance bound (`edith.host.HintPolicy`) is kept equal
+     * per line: a paragraph, not a document. The phone's own acceptance bound (`com.sheen.rokid.host.HintPolicy`) is kept equal
      * to this one, and `HintWireCodecTest` asserts the two agree so neither side can drift into refusing a hint the
      * other would have allowed.
      */

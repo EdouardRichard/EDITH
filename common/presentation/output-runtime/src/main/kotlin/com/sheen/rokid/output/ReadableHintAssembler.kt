@@ -20,7 +20,7 @@ class ReadableHintAssembler(
          * The owner's 2026-10-14 ruling: 超长通知不能截断，要推送眼镜端滚动显示. A hint taller than the glasses' window is
          * slid through it (`HintAutoScroll`), so this bound exists to keep a **document** off the panel, not to make a
          * notification shorter. It is kept equal to `com.sheen.rokid.output.HintWireCodec.MAX_TEXT_CODEPOINTS` and
-         * `edith.host.HintPolicy`'s bound, and a test asserts all three agree.
+         * `com.sheen.rokid.host.HintPolicy`'s bound, and a test asserts all three agree.
          */
         const val MAX_CODEPOINTS = 400
     }
