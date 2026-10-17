@@ -1,6 +1,7 @@
 package com.sheen.rokid.glasses.app
 import com.sheen.rokid.glasses.display.BusyState
 import com.sheen.rokid.glasses.display.HintPresentation
+import com.sheen.rokid.glasses.display.HintTicker
 import com.sheen.rokid.glasses.display.ConversationView
 import com.sheen.rokid.glasses.display.SaidSequenceGate
 import com.sheen.rokid.glasses.display.ConversationOrder
@@ -11,6 +12,7 @@ import com.sheen.rokid.glasses.display.GradientMaskView
 import com.sheen.rokid.glasses.display.LoadingIndicatorView
 import com.sheen.rokid.glasses.display.MaskEdge
 import com.sheen.rokid.glasses.display.OrbState
+import com.sheen.rokid.glasses.display.PinIconView
 import com.sheen.rokid.glasses.display.VoiceOrbView
 
 import android.animation.ValueAnimator
@@ -95,7 +97,7 @@ class GlassesActivity : Activity() {
     /** What was said, per route (Phase C). Bounded; see [ConversationLog]. */
     private val log = ConversationLog()
 
-    /** Which route is in front of the wearer, and whether the slide is paused (`KEYCODE_ENTER`). */
+    /** Which route is in front of the wearer, and whether the wearer pinned the reading position (`KEYCODE_ENTER`). */
     private val order = ConversationOrder()
 
     /** Rejects an out-of-order `SAID`; the custom-command channel promises nothing about ordering. */
@@ -112,6 +114,7 @@ class GlassesActivity : Activity() {
     private lateinit var orbView: VoiceOrbView
     private lateinit var tipsView: TextView
     private lateinit var pinTextView: TextView
+    private lateinit var pinIconView: PinIconView
     private lateinit var complianceView: TextView
     private lateinit var topMask: GradientMaskView
     private lateinit var bottomMask: GradientMaskView
@@ -126,6 +129,21 @@ class GlassesActivity : Activity() {
 
     /** The entry id of the live hint, so exactly one row is emphasised. */
     private var liveEntryId: String? = null
+
+    /**
+     * 0.23 P4: one entry arrived since the last rebuild, so the rebuild must bring it into view before the ticker
+     * starts. This is the "new content first" rule - it applies while pinned as well, because a pin is a reading
+     * position, not a reason for the next answer to stay hidden.
+     */
+    private var newEntryPending = false
+
+    /** The 1 px/frame engine; null while the list is not moving. */
+    private var tickerAnimator: ValueAnimator? = null
+    private var tickerFrames = 0
+    private var tickerStartOffset = 0
+
+    /** The wearer paged by hand: the ticker stays stopped until the next entry arrives (official `isAutoScroll=false`). */
+    private var userReadPaused = false
 
     private val powerManager by lazy { getSystemService(PowerManager::class.java) }
 
@@ -167,6 +185,7 @@ class GlassesActivity : Activity() {
         // running animator keeps the panel's frame loop busy.
         orbView.stop()
         thinkingIcon?.stop()
+        stopTicker()
     }
 
     override fun onDestroy() {
@@ -180,6 +199,7 @@ class GlassesActivity : Activity() {
         busyState.reset()
         orbView.stop()
         thinkingIcon?.stop()
+        stopTicker()
         RokidBridgeEndpoint.instance.setListener(null)
         executor.shutdownNow()
         super.onDestroy()
@@ -222,6 +242,9 @@ class GlassesActivity : Activity() {
                 // phone still showed them.
                 is HintCommand.Hello -> {
                     if (!controller.isCurrent(command.sessionId, command.generation)) {
+                        stopTicker()
+                        userReadPaused = false
+                        newEntryPending = false
                         log.clear()
                         order.reset()
                         saidGate.reset()
@@ -292,6 +315,7 @@ class GlassesActivity : Activity() {
             order.show(displayed.route)
             // A new entry has to be brought into view whatever the wearer was doing with the scroll: the pin exists
             // so the continuous ticker never fights someone reading, not so that the next answer stays hidden (P4).
+            newEntryPending = true
         }
         holdAwakeFor(liveEntryId != null)
         // The panel has two claimants, so it is resolved in one place: calling `holdAwakeFor` directly here released
@@ -316,6 +340,7 @@ class GlassesActivity : Activity() {
         val stored = log.append(ConversationEntry(command.entryId, command.route, ConversationRole.USER, command.text))
         android.util.Log.i("EdithGlasses",
             "said stored=$stored route=${command.route.name} chars=${command.text.length}")
+        if (stored) newEntryPending = true
         rebuild()
     }
 
@@ -391,10 +416,14 @@ class GlassesActivity : Activity() {
         if (thinking) thinkingIcon?.start() else thinkingIcon?.stop()
         orbView.setState(GlassesPanelSpec.orbState(busyForRoute, live, route, lastRole))
         tipsView.text = GlassesPanelSpec.tipsText(busyState.any(now))
+        val pinned = order.isPinned()
+        pinTextView.visibility = if (pinned) View.GONE else View.VISIBLE
+        pinIconView.visibility = if (pinned) View.VISIBLE else View.GONE
         android.util.Log.i("EdithGlasses",
             "P3_STATE route=${route.name} busy=$busyForRoute any=${busyState.any(now)} live=$live " +
                 "orb=${GlassesPanelSpec.orbState(busyForRoute, live, route, lastRole).name} " +
-                "listening=$listening thinking=$thinking pinned=${order.isPinned()}")
+                "listening=$listening thinking=$thinking pinned=$pinned " +
+                "offset=${scrollOffsetY()} max=${maxScrollY()} ticker=${tickerAnimator != null}")
     }
 
     /**
@@ -407,6 +436,8 @@ class GlassesActivity : Activity() {
         val route = order.selected()
         val rows = ConversationView.rows(log.entries(route), liveEntryId)
         val now = clock.nowNanos()
+        // `removeAllViews` can clamp the scroll to zero, so the position to restore is read before the rebuild.
+        val previousScroll = scrollOffsetY()
         entriesView.removeAllViews()
         liveRow = null
         thinkingIcon = null
@@ -421,13 +452,91 @@ class GlassesActivity : Activity() {
         android.util.Log.i("EdithGlasses",
             HintPresentation.conversationReport(route, rows.size, rows.sumOf { it.entry.text.length }))
         applyVisualState()
-        // The layout's own limit is reported only **after** it has laid the text out - reading it here would read the
-        // previous layout (or none). Counts and size only, never the text.
-        liveRow?.post {
-            val live = liveRow ?: return@post
-            android.util.Log.i("EdithGlasses",
-                HintPresentation.renderReport(live.lineCount, live.text.length, maxScrollY()))
+        entriesView.post {
+            val max = maxScrollY()
+            if (newEntryPending) {
+                // New content first: the newest entry's top, even while pinned. The ticker, if it runs, carries the
+                // rest of that entry through the window.
+                stopTicker()
+                val top = (lastMessageRowForProbe()?.top ?: 0).coerceIn(0, max)
+                hintScroll.scrollTo(0, top)
+                android.util.Log.i("EdithGlasses", "P4_REVEAL top=$top offset=${scrollOffsetY()} max=$max")
+                userReadPaused = false
+                newEntryPending = false
+            } else {
+                hintScroll.scrollTo(0, previousScroll.coerceIn(0, max))
+            }
+            updateScrollChrome()
+            startTickerIfNeeded()
+            liveRow?.let { live ->
+                android.util.Log.i("EdithGlasses",
+                    HintPresentation.renderReport(live.lineCount, live.text.length, max))
+            }
         }
+    }
+
+    /**
+     * Starts the official ticker when there is somewhere to go and the wearer has not stopped it.
+     *
+     * The engine is a `ValueAnimator` whose duration is effectively endless; the per-frame work is [HintTicker]'s
+     * arithmetic. Starting is idempotent - every incoming command re-applies the state - and the ticker stops itself
+     * at the bottom, on the pin, on a manual page and with the screen.
+     */
+    private fun startTickerIfNeeded() {
+        if (tickerAnimator != null) return
+        if (order.isPinned() || userReadPaused) return
+        if (!HintTicker.shouldScroll(scrollOffsetY(), maxScrollY())) return
+        tickerStartOffset = scrollOffsetY()
+        tickerFrames = 0
+        tickerAnimator = ValueAnimator.ofInt(0, Int.MAX_VALUE).apply {
+            duration = Int.MAX_VALUE.toLong()
+            interpolator = LinearInterpolator()
+            addUpdateListener {
+                tickerFrames++
+                val next = HintTicker.offsetAfterFrames(tickerStartOffset, tickerFrames, maxScrollY())
+                val delta = next - scrollOffsetY()
+                if (delta > 0) hintScroll.scrollBy(0, delta)
+                if (tickerFrames % 30 == 0) {
+                    // Movement evidence: offset and bound, never the text. Every 30 frames is about half a second.
+                    android.util.Log.i("EdithGlasses",
+                        "P4_TICKER frames=$tickerFrames offset=${scrollOffsetY()} max=${maxScrollY()}")
+                }
+                if (!HintTicker.shouldScroll(scrollOffsetY(), maxScrollY())) stopTicker()
+            }
+            start()
+        }
+    }
+
+    /** Stops the ticker; idempotent. */
+    private fun stopTicker() {
+        tickerAnimator?.cancel()
+        tickerAnimator = null
+        tickerFrames = 0
+    }
+
+    /**
+     * One page key: `min(remaining, viewport * 0.85)` in the requested direction, and the ticker stops.
+     *
+     * A manual page is the wearer reading, so it also stops the continuous ticker until the next entry arrives (the
+     * official `isAutoScroll = false` rule). It is not a pin: unpinning still resumes the ticker.
+     */
+    private fun pageBy(direction: Int) {
+        stopTicker()
+        userReadPaused = true
+        val viewport = if (::hintScroll.isInitialized) hintScroll.height else 0
+        val remaining = if (direction > 0) maxScrollY() - scrollOffsetY() else scrollOffsetY()
+        val step = HintTicker.pageStepPx(remaining, viewport)
+        if (step <= 0) return
+        hintScroll.smoothScrollBy(0, direction * step)
+        android.util.Log.i("EdithGlasses",
+            "P4_PAGE direction=$direction step=$step offset=${scrollOffsetY()} max=${maxScrollY()}")
+    }
+
+    /** The bottom fade is visible only while the list has more content below. */
+    private fun updateScrollChrome() {
+        if (!::bottomMask.isInitialized) return
+        bottomMask.visibility =
+            if (HintTicker.shouldScroll(scrollOffsetY(), maxScrollY())) View.VISIBLE else View.GONE
     }
 
     /**
@@ -514,7 +623,7 @@ class GlassesActivity : Activity() {
     }
 
     /**
-     * The side-touch pad (spec §6.6 顶部支持切换 WAKE/PROACTIVE 上下文; owner's ruling 2026-10-15).
+     * The side-touch pad (0.23 P4, spec §5.2.3/§5.2.4).
      *
      * The vendor's official sample (`50-system/01-按键与侧边触控.md`) documents this channel: the temple pad sends
      * `KeyEvent`s to the foreground page - `KEYCODE_DPAD_RIGHT` for a forward swipe, `KEYCODE_DPAD_LEFT` for a
@@ -522,23 +631,35 @@ class GlassesActivity : Activity() {
      * `ViewCompat`, which exists to reach API < 28; this app's `minSdk` is 28, so the platform's own
      * `addOnUnhandledKeyEventListener` is the same mechanism without adding a dependency.
      *
-     * Only `ACTION_DOWN` is handled, and `true` is returned, because both are what stop one gesture from being acted
-     * on twice (the sample's own warning). `BACK` is deliberately not consumed: the wearer must keep a way out.
+     * 0.23 changes the meaning: the four directions page the list (official `min(remaining, viewport*0.85)`), and
+     * `ENTER` toggles the pin. There is **no route switch** left (U8). `BACK` is handled in [onKeyUp] instead of here:
+     * the Activity consumes BACK through its default key path before an unhandled-key listener can see it.
      *
-     * **The list is unhandled-key only**: if the root view or a child consumes these keys first, this listener never
-     * sees them, and the device reading is what settles whether that happens on this build.
+     * Only `ACTION_DOWN` is handled, and `true` is returned, because both are what stop one gesture from being acted
+     * on twice (the sample's own warning).
      */
     private fun installSideTouch(root: View) {
         root.addOnUnhandledKeyEventListener(View.OnUnhandledKeyEventListener { _, event ->
             if (event.action != KeyEvent.ACTION_DOWN) return@OnUnhandledKeyEventListener false
             when (event.keyCode) {
-                // U8: no left/right route switch exists any more. The two direction pairs belong to the list paging
-                // and are wired with the ticker (P4 Task 6); until then they are deliberately not consumed.
-                KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_LEFT,
-                KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_UP -> false
+                KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                    pageBy(1)
+                    true
+                }
+                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_LEFT -> {
+                    pageBy(-1)
+                    true
+                }
                 KeyEvent.KEYCODE_ENTER -> {
                     val pinned = order.togglePin()
                     android.util.Log.i("EdithGlasses", "side touch: pinned=$pinned")
+                    if (pinned) {
+                        stopTicker()
+                    } else {
+                        userReadPaused = false
+                        startTickerIfNeeded()
+                    }
+                    applyVisualState()
                     true
                 }
                 else -> false
@@ -585,6 +706,9 @@ class GlassesActivity : Activity() {
             setPadding(GlassesPanelSpec.LIST_PADDING_SIDE_PX, GlassesPanelSpec.LIST_PADDING_TOP_PX,
                 GlassesPanelSpec.LIST_PADDING_SIDE_PX, GlassesPanelSpec.LIST_PADDING_BOTTOM_PX)
             addView(entriesView)
+            // The bottom fade follows the scroll: visible while there is more below, gone at the bottom (official
+            // `id_iv_recycler_bottom_mask` is gone by default for the same reason).
+            setOnScrollChangeListener { _, _, _, _, _ -> updateScrollChrome() }
         }
         topMask = GradientMaskView(this, MaskEdge.TOP)
         bottomMask = GradientMaskView(this, MaskEdge.BOTTOM)
@@ -640,6 +764,7 @@ class GlassesActivity : Activity() {
             gravity = Gravity.END
             text = GlassesPanelSpec.PIN_TEXT
         }
+        pinIconView = PinIconView(this).apply { visibility = View.GONE }
         val tipsRow = FrameLayout(this).apply {
             addView(tipsView, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
@@ -648,6 +773,11 @@ class GlassesActivity : Activity() {
             })
             addView(pinTextView, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.END or Gravity.CENTER_VERTICAL).apply {
+                marginEnd = GlassesPanelSpec.TIPS_MARGIN_END_PX
+            })
+            addView(pinIconView, FrameLayout.LayoutParams(
+                GlassesPanelSpec.PIN_ICON_PX, GlassesPanelSpec.PIN_ICON_PX,
                 Gravity.END or Gravity.CENTER_VERTICAL).apply {
                 marginEnd = GlassesPanelSpec.TIPS_MARGIN_END_PX
             })
@@ -701,6 +831,18 @@ class GlassesActivity : Activity() {
     /** How far the conversation can still travel; zero when everything fits. */
     fun maxScrollY(): Int =
         if (::entriesView.isInitialized && ::hintScroll.isInitialized) {
-            (entriesView.height - hintScroll.height).coerceAtLeast(0)
+            // The ScrollView's padding is part of what the wearer sees but not of the scrollable viewport: subtracting
+            // only the view's height under-reported the maximum by top+bottom padding, so a new entry could be
+            // positioned exactly at the "maximum" and still sit under the bottom edge.
+            val viewport = (hintScroll.height - hintScroll.paddingTop - hintScroll.paddingBottom)
+                .coerceAtLeast(0)
+            (entriesView.height - viewport).coerceAtLeast(0)
         } else 0
+
+    fun isPinnedForProbe(): Boolean = order.isPinned()
+
+    fun tickerRunningForProbe(): Boolean = tickerAnimator != null
+
+    /** The top of the last message row, in the list's own coordinates; the new-entry reveal lands here. */
+    fun lastMessageTopForProbe(): Int = lastMessageRowForProbe()?.top ?: 0
 }

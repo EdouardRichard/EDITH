@@ -37,7 +37,8 @@ class HintVisibilityTest {
                     sessionId = "s-1", generation = 1, sequence = 1, hintId = "h-1", revision = 1, syncId = "sync-1",
                     phoneSentNanos = System.nanoTime(), remainingTtlMillis = 5_000, text = "先讲结论。再讲背景")))
 
-                assertEquals("先讲结论\n再讲背景", activity.hintText())
+                assertEquals("the answer is shown verbatim; the official panel does not split sentences into lines",
+                    "先讲结论。再讲背景", activity.hintText())
 
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Clear("s-1", 1, sequence = 2)))
 
@@ -97,23 +98,25 @@ class HintVisibilityTest {
      * is taller than the window, so an overflow is observable - and the window is `HintAutoScroll.VISIBLE_LINES`.
      */
     @Test
-    fun aHintLongerThanTheLayoutShowsIsObservableAsClipped() {
+    fun aHintLongerThanTheLayoutShowsIsObservableAsScrollable() {
         ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
                 activity.acceptCommand(HintWireCodec.encode(
                     HintCommand.Sync("sync-1", offsetLowerNanos = 0, offsetUpperNanos = 1_000_000,
                         validUntilGlassNanos = System.nanoTime() + 30_000_000_000L)))
-                // Three points, each long enough to wrap several times: the layout limit is 6 lines, so this must
-                // overflow whatever the shaping rule is.
-                val long = "第一点需要足够长才能折成好几行用来撑满这块小小的显示区域。".repeat(2) +
-                    "第二点同样需要足够长才能折成好几行用来撑满这块小小的显示区域。".repeat(2) +
-                    "第三点也一样需要足够长才能折成好几行用来撑满这块小小的显示区域".repeat(2)
+                // Near the wire's 400-code-point bound: at the official 16 px the list fits a handful of lines, so a
+                // shorter text (the old 182-character one) no longer overflows the window at all.
+                val long = buildString {
+                    repeat(12) { index ->
+                        append("第${index + 1}点：这是用于溢出证据的合成长文本，长度足以超出眼镜列表窗口。")
+                    }
+                }.take(390)
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Show(
                     sessionId = "s-1", generation = 1, sequence = 1, hintId = "h-long", revision = 1,
                     syncId = "sync-1", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 5_000, text = long)))
             }
-            // `lineCount` describes the **last** layout, so the assertion has to wait for the pass that lays this
+            // `maxScrollY` describes the **last** layout, so the assertion has to wait for the pass that lays this
             // text out - reading it inside the same `onActivity` would read the previous (empty) layout.
             InstrumentationRegistry.getInstrumentation().waitForIdleSync()
             scenario.onActivity { activity ->
