@@ -77,6 +77,7 @@ import edith.plugins.smart.context.ModelSummarizer
 import edith.plugins.smart.context.PromptAssembly
 import edith.plugins.smart.context.TokenBudget
 import edith.plugins.smart.context.estimatedLength
+import edith.plugins.smart.library.LibraryGovernor
 import edith.plugins.smart.memory.MemoryExtraction
 import edith.plugins.smart.proactive.ChoiceGate
 import edith.plugins.smart.proactive.GateForm
@@ -88,7 +89,10 @@ import edith.plugins.smart.memory.normalize
 import edith.plugins.smart.memory.MemoryModule
 import edith.plugins.smart.memory.MemoryModuleRetrieval
 import edith.plugins.smart.memory.SmartMemoryRetrieval
+import edith.plugins.smart.skill.LoadSkillTool
 import edith.plugins.smart.skill.Skill
+import edith.plugins.smart.skill.SkillLoad
+import edith.plugins.smart.skill.SkillLoadReason
 import edith.plugins.smart.skill.SkillManager
 import edith.plugins.smart.skill.StorageAccessSkillDirectory
 import java.util.UUID
@@ -417,6 +421,63 @@ class SmartAssistantPlugin(
     @Volatile private var skillManager: SkillManager? = null
 
     /**
+     * Phase 6 (design D-2/D-3): the session's SKILL lifecycle governor, built once in [activate] and dropped in
+     * [deactivate]. It is session state like the transcript: a governor left over from the previous session would count
+     * this session's turns against entries it never advertised.
+     */
+    @Volatile private var libraryGovernor: LibraryGovernor? = null
+
+    /**
+     * Test-only observation of the session's SKILL governor.
+     *
+     * The governor is production state the plugin owns, so a JVM test can only pin "a turn is one observation" by
+     * reading it; no production caller has any reason to reach for it. Same shape as [auditTrail].
+     */
+    internal fun skillGovernor(): LibraryGovernor? = libraryGovernor
+
+    /**
+     * Phase 6 (design D-2, obligation 5): the bodies pulled with `load_skill` during the **current** turn, in pull
+     * order and keyed by `name` so a second pull overwrites rather than duplicates. Cleared at the turn boundary — the
+     * body's lifetime is one turn, and letting it accumulate across turns would move the unbounded growth this phase
+     * removes into the conversation itself.
+     *
+     * Guarded by its own monitor because a proactive task and the wake turn can briefly overlap; every read takes a
+     * snapshot so a concurrent [endSkillTurn] cannot change the list mid-iteration.
+     */
+    private val loadedSkillBodies = LinkedHashMap<String, Skill>()
+
+    /**
+     * Phase 6 (design D-2/D-8, obligation 3): the model's only way to pull a SKILL body.
+     *
+     * **One instance for the plugin, never one per request.** The receipt is `loaded:<n>` from a per-instance counter,
+     * and `ProgressGuard` ends a run after three identical consecutive tool receipts; constructing this inside
+     * [systemSlot] (or the per-request frame builder) would restart the counter at `loaded:1` for every request, so
+     * three pulls within one run would look like `NO_PROGRESS` and the run would be killed by the very tool the
+     * catalog exists for. Built once, both routes' registries share the same counter.
+     */
+    private val loadSkillTool = LoadSkillTool(
+        lookup = { name ->
+            // A library that throws (or a host that granted no directory) refuses the pull; it must never throw into
+            // the loop, and an absent name is exactly what the model may correct.
+            runCatching { skillManager?.load(name) }.getOrNull()
+                ?: SkillLoad.NotFound(SkillLoadReason.NOT_IN_LIBRARY)
+        },
+        onLoaded = { skill -> rememberLoadedSkill(skill) },
+    )
+
+    private fun rememberLoadedSkill(skill: Skill) {
+        synchronized(loadedSkillBodies) { loadedSkillBodies[skill.name] = skill }
+    }
+
+    /** A snapshot, so a turn ending on another thread cannot make this iteration see a half-cleared map. */
+    private fun loadedBodiesSnapshot(): List<Skill> =
+        synchronized(loadedSkillBodies) { loadedSkillBodies.values.toList() }
+
+    private fun clearLoadedSkills() {
+        synchronized(loadedSkillBodies) { loadedSkillBodies.clear() }
+    }
+
+    /**
      * P3.3 (spec §17.4): the question-asker the loop blocks on.
      *
      * Built once per plugin, not per turn: the gate's invariant is "one live question at a time", and the host channel
@@ -670,8 +731,10 @@ class SmartAssistantPlugin(
         )
         // B4: the SKILL library. A host that granted no directory leaves this null and the prompt is simply the
         // system instructions - "no SKILLs installed" is a normal state (spec §3.7), not a degraded one.
+        val governor = LibraryGovernor()
+        libraryGovernor = governor
         skillManager = runCatching { context.services.storageAccess() }.getOrNull()
-            ?.let { SkillManager(StorageAccessSkillDirectory(it)) }
+            ?.let { SkillManager(StorageAccessSkillDirectory(it), governor = governor) }
         // P3.3: the same rule for the confirmation channel. A host that cannot ask the user leaves this null, and the
         // loop then refuses every flagged action (`CONFIRMATION_UNAVAILABLE`) instead of acting unasked.
         confirmation.attach(runCatching { context.services.confirmation() }.getOrNull())
@@ -705,6 +768,9 @@ class SmartAssistantPlugin(
             activeStores?.values?.forEach { it.clear() }
             activeStores = null
             skillManager = null
+            libraryGovernor = null
+            // The pulled bodies are session/turn state too: nothing may survive the session that obtained it.
+            clearLoadedSkills()
             detach()
         }
         // P3.3: a session that ends withdraws any question it asked. Leaving one pending would let the *next* session's
@@ -1144,12 +1210,21 @@ class SmartAssistantPlugin(
         var loop: AgentLoop? = null
         // One ledger per turn, handed to the `notify_user` tool the loop carries (spec §6.3's guard is per-turn).
         val ledger = NotifyLedger()
-        // B1/B6/spec §4.2: the session's own assembly — instructions (with the SKILL section), the transcript this
-        // turn continues, and the memory for the utterance. Read once per turn so the three come from one snapshot.
+        // B1/B6/spec §4.2: the session's own assembly — the route's instructions, the transcript this turn
+        // continues, and the memory for the utterance. Read once per turn so the three come from one snapshot.
         // `null` when the wiring supplied no manager, which is every test that is about the passive loop; the request
         // then falls back to the pre-Phase-B shape and the gateway retrieves memory itself.
+        //
+        // SKILL is deliberately not part of this assembly since Phase 6: the managed text would double-inject what
+        // `systemSlot` already carries, so the manager is de-skilled and the catalog/bodies ride the frame's SKILL
+        // segments (design D-1).
+        //
+        // Phase 6 (obligation 1): the turn's **single** governor observation opens here, before the turn's first
+        // request is assembled and never from inside the per-request builder — the observation unit is the turn
+        // (design D-3), and a call per request would inflate drift by every tool round-trip.
+        beginSkillTurn()
         val prompt = activeContextForTurn?.let { contexts ->
-            runCatching { contexts.buildPrompt(ContextRoute.WAKE, text, skillsForTurn()) }.getOrNull()
+            runCatching { contexts.buildPrompt(ContextRoute.WAKE, text) }.getOrNull()
         }
         // B1/B7/B6 evidence, counts only: without this line "the session carried the previous turn into this request"
         // and "the session carried nothing" are the same empty log, which is exactly what blocked these rows on the
@@ -1192,14 +1267,20 @@ class SmartAssistantPlugin(
             val built = buildLoop(configured, registry, gateway)
             loop = built
             synchronized(gate) {
-                if (turn !== owned || owned.closed) return
+                if (turn !== owned || owned.closed) {
+                    // Phase 6 (obligation 2): this turn is already over (stopped, replaced or the session ended), and
+                    // this return leaves the function before the normal turn-end bookkeeping. Close the SKILL turn
+                    // here too, or the governor's open turn would fold the next turn into this one.
+                    endSkillTurn()
+                    return
+                }
                 owned.loop = built
             }
             built.run(
                 AgentRequest(
                     turnId = owned.turnId,
                     utterance = text,
-                    instructions = prompt?.instructions ?: instructionsFor(SmartPrompts.instructions()),
+                    instructions = prompt?.instructions ?: SmartPrompts.instructions(),
                     profileId = configured.profileId,
                     deadlineNanos = owned.deadlineNanos,
                     // D49: the profile's timeout caps **one model request**; the turn's own budget is the number above,
@@ -1260,6 +1341,11 @@ class SmartAssistantPlugin(
         }
         P3Log.line("P3_TURN end turn=${owned.turnId} outcome=${run.outcome} code=${run.safeCode ?: "-"} " +
             "steps=${run.steps.size}")
+        // Phase 6 (obligations 2 and 5): close the turn that `beginSkillTurn()` opened. This runs before the outcome
+        // is submitted **and** on the detached path below, so every ending pairs with its opening: an unclosed turn
+        // would let the following turn fold into this one as a single observation, and a body pulled here would still
+        // be in the next turn's first request.
+        endSkillTurn()
         if (!stillOurs) return
         // Review I-1: the loop shifts its *own* budget by the time a person spent deciding (D49), but this turn's hint
         // window is derived from **its** deadline (`hintValidUntil` = deadline + grace). Without moving that too, a
@@ -1371,7 +1457,11 @@ class SmartAssistantPlugin(
 
     /**
      * The turn's tool registry: the host's action set plus `notify_user` (B7 — the model's only channel to the wearer,
-     * spec §6.1). Built per turn so the frame's table and the loop's registry are literally the same table.
+     * spec §6.1) and `load_skill` (Phase 6 — the catalog's only way to a body, design D-1/D-2). Built per turn so the
+     * frame's table and the loop's registry are literally the same table.
+     *
+     * `load_skill` is the plugin's **one** tool instance (see [loadSkillTool]); this method must never construct a new
+     * one, or the counter receipt restarts and `ProgressGuard` mistakes a working pull for `NO_PROGRESS`.
      */
     private fun registryFor(context: PluginContext, owned: SmartTurn, ledger: NotifyLedger): ToolRegistry =
         ToolRegistry(
@@ -1380,6 +1470,7 @@ class SmartAssistantPlugin(
                 // B7: `notify_user` is the model's only channel to the wearer (spec §6.1). It rides the action
                 // registry rather than a new tool port, and `NotifyUserTool`'s KDoc records what that choice costs.
                 NotifyUserTool { channel, text -> onNotify(owned, ledger, channel, text) },
+                loadSkillTool,
             ),
         )
 
@@ -1501,20 +1592,41 @@ class SmartAssistantPlugin(
         return if (item is ModelHistoryItem.Text && item.role == MessageRole.USER) last else -1
     }
 
-    /** The system slot both frame paths share: instructions (with the SKILL section) plus the fixed memory policy. */
-    private fun systemSlot(route: ContextRoute, prompt: PromptAssembly?): List<Segment> = listOf(
-        Segment(
-            SegmentOrigin.INSTRUCTIONS,
-            trusted = true,
-            text = prompt?.instructions ?: instructionsFor(
-                when (route) {
+    /**
+     * The system slot both frame paths share: the route's instructions, the SKILL layer, and the fixed memory policy.
+     *
+     * Phase 6 (design D-1/D-2, obligations 4 and 5): the SKILL layer is **one catalog segment** (only when the catalog
+     * is non-blank — never a heading with nothing under it) followed by **one segment per body pulled this turn**, in
+     * pull order. `systemSlot` is called per request, which is what makes a pull visible on the next request of the
+     * same turn; the governor's observation unit stays the turn because [beginSkillTurn]/[endSkillTurn] own that
+     * boundary. A library that throws contributes no segment rather than failing the request (spec §3.7).
+     */
+    private fun systemSlot(route: ContextRoute, prompt: PromptAssembly?): List<Segment> = buildList {
+        add(
+            Segment(
+                SegmentOrigin.INSTRUCTIONS,
+                trusted = true,
+                text = prompt?.instructions ?: when (route) {
                     ContextRoute.WAKE -> SmartPrompts.instructions()
                     ContextRoute.PROACTIVE -> SmartPrompts.proactiveInstructions()
                 },
             ),
-        ),
-        Segment(SegmentOrigin.MEMORY_POLICY, trusted = true, text = SmartPrompts.MEMORY_POLICY),
-    )
+        )
+        val catalog = runCatching { skillManager?.catalog() }.getOrNull().orEmpty()
+        if (catalog.isNotBlank()) {
+            add(Segment(SegmentOrigin.SKILL, trusted = true, text = catalog))
+        }
+        loadedBodiesSnapshot().forEach { skill ->
+            add(Segment(SegmentOrigin.SKILL, trusted = true, text = bodySegmentText(skill)))
+        }
+        add(Segment(SegmentOrigin.MEMORY_POLICY, trusted = true, text = SmartPrompts.MEMORY_POLICY))
+    }
+
+    /**
+     * One pulled body as its own `SKILL` segment. The heading names the entry so the model can tell which body this is
+     * when it pulled more than one this turn; the body follows verbatim (D-2: the body travels whole, never summarised).
+     */
+    private fun bodySegmentText(skill: Skill): String = "## SKILL 正文: ${skill.name}\n${skill.body}"
 
     /** Builds the single-use loop for one turn from the registry and gateway its caller already built. */
     private fun buildLoop(configured: Config, registry: ToolRegistry, gateway: ModelClientGateway): AgentLoop =
@@ -1645,22 +1757,33 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * The system prompt plus the SKILL library (B4 / D60: every enabled SKILL, whole, in name order, no cap).
+     * Phase 6 (obligation 1): open the current turn's SKILL observation, once, at the turn's assembly point.
      *
-     * The library is re-read here, per turn, which is what makes spec §3.5's "no file watching; an edit takes effect
-     * on the next turn" true. A directory that cannot be read contributes nothing rather than failing the turn:
-     * "no SKILLs installed" and "the grant was refused" both leave the assistant answering from its system prompt.
+     * Guarded because a library that refuses to list must not fail the turn (spec §3.7): the governor then simply
+     * learns nothing and the request goes out without a catalog segment.
      */
-    private fun instructionsFor(base: String): String {
-        val section = runCatching { skillManager?.injection() }.getOrNull().orEmpty()
-        return if (section.isEmpty()) base else "$base\n\n$section"
+    private fun beginSkillTurn() {
+        runCatching { skillManager?.beginTurn() }
     }
 
     /**
-     * The enabled SKILLs for a turn's assembly, or none when the host granted no directory (D60: every enabled SKILL,
-     * no selection, no cap — the filtering is `enabled()`'s and the formatting is the assembly's).
+     * Phase 6 (obligations 2 and 5): close the turn [beginSkillTurn] opened — on every ending of the turn and before
+     * its outcome is submitted.
+     *
+     * The order is the design's (D-2, design §5): clear the pulled bodies (their lifetime is this turn), advance the
+     * governor once, then report the count-only `P3_SKILL pulls` line (D-10). Clearing here is what makes a body
+     * pulled in one turn absent from the next turn's first request; advancing here is what keeps a proactive turn and
+     * the following wake turn two separate observations instead of one.
      */
-    private fun skillsForTurn(): List<Skill> = runCatching { skillManager?.enabled() }.getOrNull().orEmpty()
+    private fun endSkillTurn() {
+        clearLoadedSkills()
+        val manager = skillManager
+        runCatching { manager?.endTurn() }
+        P3Log.line(
+            "P3_SKILL pulls turn=${manager?.pullsThisTurn ?: 0} session=${manager?.pullsThisSession ?: 0} " +
+                "neverPulled=${runCatching { manager?.neverPulledCount() }.getOrNull() ?: 0}",
+        )
+    }
 
     /** The gate's input, assembled from the same signals the request carries (spec §4.7). */    private fun gateState(trigger: ProactiveTrigger): ProactiveGateState {
         val values = currentContextValues()
@@ -1719,6 +1842,11 @@ class SmartAssistantPlugin(
                 // Phase C: this is the one place every proactive ending passes through - a hint, a decline, a failure,
                 // a cancellation - which is why the level is cleared here rather than on each branch. The report happens
                 // outside the lock, as `publishBusy` requires.
+                //
+                // Phase 6 (obligations 2 and 5): the same is true of the proactive turn's SKILL bookkeeping. Closing it
+                // here is what keeps the proactive turn and the next wake turn **two** observations instead of one
+                // folded turn, and it is where the pulled bodies are cleared before anything else runs.
+                endSkillTurn()
                 synchronized(gate) { proactiveInFlight = false }
                 publishBusy()
             }
@@ -1728,6 +1856,10 @@ class SmartAssistantPlugin(
     /** The blocking half of one proactive turn; runs on the task scope, never under [gate]. */
     private fun deliverProactive(current: PluginContext, configured: Config, filter: SmartProactive,
         hint: ProactiveHint, trigger: ProactiveTrigger, message: String, started: Long) {
+        // Phase 6 (obligation 1): one `beginTurn()` per proactive turn, before its first (and only) request is
+        // assembled and never from inside `systemSlot`. Its matching `endTurn()` sits in `runProactive`'s `finally`,
+        // which every proactive ending passes through — a decline, a failure, a cancellation or a hint.
+        beginSkillTurn()
         // The intervention gate runs **here**, on the task scope, and that placement is load-bearing: it is a
         // local-model forward pass (~231 ms GPU / ~742 ms CPU per A5), and the plugin's own rule forbids one inside
         // `handle` - it would hold the host's single drain thread *and* the plugin lock, putting `Stop`, confirmations
@@ -1764,13 +1896,13 @@ class SmartAssistantPlugin(
             stop = { hint.cancelled },
         )
         // B1/B3/B6 / spec §4.2: the proactive route consumes the **session's own** assembly exactly as the wake route
-        // does — its instructions (with the SKILL section) and its own transcript come from `buildPrompt` under
-        // `ContextRoute.PROACTIVE`. Before this, the route hand-built `SmartPrompts.proactiveInstructions()` plus one
-        // history item, so the manager's PROACTIVE context was constructed and never read: "two independent
-        // conversations" held for the wake route only. `null` is the pre-Phase-B shape a test without a manager gets.
+        // does — its transcript comes from `buildPrompt` under `ContextRoute.PROACTIVE` (the SKILL layer arrives
+        // through the shared `systemSlot`, not through this assembly). Before this, the route hand-built
+        // `SmartPrompts.proactiveInstructions()` plus one history item, so the manager's PROACTIVE context was
+        // constructed and never read: "two independent conversations" held for the wake route only. `null` is the
+        // pre-Phase-B shape a test without a manager gets.
         val prompt = activeContextForTurn?.let { contexts ->
-            runCatching { contexts.buildPrompt(ContextRoute.PROACTIVE, trigger.transcript, skillsForTurn()) }
-                .getOrNull()
+            runCatching { contexts.buildPrompt(ContextRoute.PROACTIVE, trigger.transcript) }.getOrNull()
         }
         // Phase 5: with a store injected, this route's request is a `RequestFrame` too — the PROACTIVE snapshot, the
         // memory this assembly retrieved, and the perception message last. The frame's user segment is `message`, not
@@ -1783,7 +1915,7 @@ class SmartAssistantPlugin(
             gateway.turn(GatewayTurn(
                 turnId = hint.turnId,
                 profileId = configured.profileId,
-                instructions = prompt?.instructions ?: instructionsFor(SmartPrompts.proactiveInstructions()),
+                instructions = prompt?.instructions ?: SmartPrompts.proactiveInstructions(),
                 // The gateway lifts a trailing USER turn into `input`, which is what puts the utterance and the
                 // perception last on the wire - the same shape the passive path uses. The assembly's history ends on
                 // this turn's trigger, so that last item is dropped and the full message below becomes the input:

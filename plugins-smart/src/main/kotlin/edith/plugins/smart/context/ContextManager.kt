@@ -5,7 +5,6 @@ import edith.agent.Segment
 import edith.plugin.MessageRole
 import edith.plugin.ModelHistoryItem
 import edith.plugins.smart.SmartPrompts
-import edith.plugins.smart.skill.Skill
 
 /**
  * What [ContextManager.buildPrompt] hands the loop: the request's pieces, already assembled and measured.
@@ -30,6 +29,12 @@ data class PromptAssembly(
  *
  * Two [ConversationContext]s, never merged: C3 makes the wake path and the proactive path independent histories
  * that share only the SKILL library, the memory store and the local model services.
+ *
+ * **It no longer assembles SKILL text.** Phase 6 (design D-1/D-2) moved the SKILL layer to the request frame's
+ * `SegmentOrigin.SKILL` segments — a bounded catalog plus the bodies pulled this turn — owned by the plugin's
+ * `systemSlot`. Keeping the old whole-library section here as well would put every SKILL into the model twice
+ * (`systemSlot` already takes `prompt.instructions`), which is why the `skills` parameter and this manager's
+ * `assembleInstructions`/`skillSection` were deleted rather than left unused.
  *
  * **It holds no `SystemOneService`**, although spec §4.2's constructor sketch does. Under D60 Laya participates in
  * neither compression, SKILL selection nor memory writing — spec §4.7 says so in its first paragraph — so injecting
@@ -61,26 +66,25 @@ class ContextManager(
     fun context(route: ContextRoute): ConversationContext = contexts.getValue(route)
 
     /**
-     * Assembles one request.
-     *
-     * The SKILL section is built by concatenating **every** supplied skill, in name order, with no scoring and no
-     * cap (C9/D60). The caller has already filtered to `enabled` ones — `SkillManager.enabled()` — so nothing here
-     * re-decides membership.
+     * Assembles one request: the route's base instructions, the transcript this turn continues, and the memory for
+     * the utterance. Nothing here decides what SKILLs the model sees — that is the frame's `SKILL` segments.
      */
     fun buildPrompt(
         route: ContextRoute,
         userInput: String,
-        skills: List<Skill> = emptyList(),
     ): PromptAssembly {
         val context = context(route)
-        val instructions = assembleInstructions(route, skills)
+        val instructions = baseInstructions(route)
         val history = context.history() + ModelHistoryItem.Text(MessageRole.USER, userInput)
         val memoryParts = runCatching { memory?.retrieve(userInput, MEMORY_LIMIT) }.getOrNull().orEmpty()
 
         val historyTokens = history.sumOf { estimateTokens(it.estimatedText()) }
+        // Phase 6: this assembly carries no SKILL text, so the SKILL category is unused and its allowance flows to
+        // history exactly as an unused category always has (spec §4.3). The catalog's own small cost rides the frame
+        // and is not part of this estimate; it is bounded by the governor's cap, not by the token split.
         val historyBudget = historyBudgetWithLeftovers(
             categories = budget.categories(),
-            skillsUsed = estimateTokens(skillSection(skills)),
+            skillsUsed = 0,
             memoryUsed = memoryParts.sumOf { estimateTokens(it.text) },
         )
         val estimated = estimateTokens(instructions) +
@@ -110,21 +114,6 @@ class ContextManager(
 
     /** The allowance a compression measures a route's history against (spec §4.3/§4.4). */
     fun historyBudgetTokens(): Int = budget.historyBudgetTokens()
-
-    private fun assembleInstructions(route: ContextRoute, skills: List<Skill>): String {
-        val base = baseInstructions(route)
-        val section = skillSection(skills)
-        return if (section.isEmpty()) base else "$base\n\n$section"
-    }
-
-    private fun skillSection(skills: List<Skill>): String =
-        skills.sortedBy { it.name }.joinToString("\n\n") { skill ->
-            buildString {
-                append("## SKILL: ").append(skill.name).append('\n')
-                append(skill.description).append('\n')
-                append(skill.body)
-            }
-        }
 
     private companion object {
         /** Spec §5.7: the top-5 related memories are injected. */

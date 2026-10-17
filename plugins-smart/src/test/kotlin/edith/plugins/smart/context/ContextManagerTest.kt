@@ -5,14 +5,18 @@ import edith.agent.Segment
 import edith.agent.SegmentOrigin
 import edith.plugin.MessageRole
 import edith.plugin.ModelHistoryItem
-import edith.plugins.smart.skill.Skill
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
 
 /**
- * Spec §4.2/§4.3: the two routes are independent, the prompt is assembled from the budgeted pieces, and every
- * `enabled` SKILL body is injected whole (C9/D60).
+ * Spec §4.2/§4.3: the two routes are independent and the prompt is assembled from the budgeted pieces.
+ *
+ * Phase 6 (design D-1/D-2) **de-skilled this manager**: it no longer assembles SKILL text, because the system slot's
+ * `SKILL` segments are the plugin's only SKILL path and the old whole-body section would double-inject. The two
+ * assertions that lived here ("every enabled body is injected whole" and "skills are injected in name order") were the
+ * D60 form this phase removes; their intent — a SKILL really reaches the model — is preserved by
+ * `SkillTwoLayerWiringTest`'s pull tests, on the layer that now carries it.
  *
  * One deliberate deviation from spec §4.2's constructor: it takes no `SystemOneService`. Under D60 Laya does not
  * participate in compression, SKILL selection or memory writing (spec §4.7 says so in its first paragraph), and
@@ -29,10 +33,6 @@ class ContextManagerTest {
             return parts
         }
     }
-
-    private fun skill(name: String, body: String = "body of $name") = Skill(
-        name = name, version = "1.0.0", description = "d for $name", body = body,
-    )
 
     @Test
     fun `the two routes count tokens independently`() {
@@ -89,37 +89,6 @@ class ContextManagerTest {
     }
 
     @Test
-    fun `every enabled skill body is injected whole with no cap`() {
-        // C9 / D60: no scoring, no ranking, no token budget ceiling. The huge body is the point - the manager must
-        // not be the thing that decides a SKILL is too big.
-        val huge = "x".repeat(50_000)
-        val manager = ContextManager()
-
-        val prompt = manager.buildPrompt(
-            ContextRoute.WAKE,
-            "帮我回微信",
-            skills = listOf(skill("zulu", huge), skill("alpha", "short body")),
-        )
-
-        assertTrue(prompt.instructions.contains(huge), "a huge body must survive injection whole")
-        assertTrue(prompt.instructions.contains("short body"))
-    }
-
-    @Test
-    fun `skills are injected in name order so a request is reproducible`() {
-        val manager = ContextManager()
-
-        val prompt = manager.buildPrompt(
-            ContextRoute.WAKE, "x",
-            skills = listOf(skill("zulu"), skill("alpha"), skill("mike")),
-        )
-
-        val positions = listOf("alpha", "mike", "zulu").map { prompt.instructions.indexOf("SKILL: $it") }
-        assertTrue(positions.all { it >= 0 }, "every skill must be announced: ${prompt.instructions.take(200)}")
-        assertEquals(positions.sorted(), positions, "skills must appear in name order")
-    }
-
-    @Test
     fun `the two routes get different base instructions`() {
         val manager = ContextManager()
 
@@ -171,7 +140,7 @@ class ContextManagerTest {
         val manager = ContextManager(memory = RecordingMemory(listOf(Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "记忆"))))
         manager.context(ContextRoute.WAKE).appendUser("一")
 
-        val prompt = manager.buildPrompt(ContextRoute.WAKE, "二", skills = listOf(skill("a")))
+        val prompt = manager.buildPrompt(ContextRoute.WAKE, "二")
 
         assertTrue(
             prompt.estimatedTokens >=

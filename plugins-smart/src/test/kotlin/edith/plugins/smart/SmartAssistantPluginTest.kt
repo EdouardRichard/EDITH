@@ -460,9 +460,12 @@ class SmartAssistantPluginTest {
 
         val tools = rig.model.requests.single().tools
         // B7 added `notify_user` to every turn's tool table (spec §6.1: it is the model's only channel to the
-        // wearer), so the action set is asserted by membership rather than by being the whole list.
-        assertEquals(2, tools.size)
-        assertEquals(setOf("compose_note", "notify_user"), tools.map { it.name }.toSet())
+        // wearer), and Phase 6 added `load_skill` (D-1/D-2: the catalog's only way to a body), so the action set is
+        // asserted by membership rather than by being the whole list. A count of 2 was true only before `load_skill`.
+        assertEquals(
+            setOf("compose_note", "notify_user", "load_skill"),
+            tools.map { it.name }.toSet(),
+        )
         assertEquals("Action compose_note", tools.single { it.name == "compose_note" }.description)
     }
 

@@ -28,6 +28,7 @@ import edith.plugin.OutputSink
 import edith.plugin.OutputSubmission
 import edith.plugin.RiskLevel
 import edith.plugin.SecretHandle
+import edith.plugin.StorageAccess
 import edith.plugin.StorageHandle
 import edith.plugin.SystemOneAnswer
 import edith.plugin.SystemOneQuestion
@@ -267,6 +268,35 @@ internal fun smartProfile(
     outputs = setOf(OutputModality.TEXT),
     verifications = emptyList(),
 )
+
+/**
+ * A host `StorageAccess` grant backed by an in-memory SKILL library (Phase 6): one `.md` file per map entry.
+ *
+ * `listThrows` is the "the directory itself refuses / throws" case: a throwing listing must leave the turn running
+ * with no catalog segment, because a broken library is not a broken turn (spec §3.7 and design D-1).
+ */
+internal class SmartFakeSkills(
+    private val files: Map<String, String?> = emptyMap(),
+    private val listThrows: Boolean = false,
+) : StorageAccess {
+    override fun listFiles(dirPath: String, suffix: String): List<String> =
+        if (listThrows) throw IllegalStateException("the directory refused") else files.keys.toList()
+
+    override fun readFile(path: String): String? = files[path]
+    override fun deleteFile(path: String): Boolean = false
+}
+
+/** One SKILL `.md` file with valid front matter, as the user would write it. */
+internal fun smartSkillDoc(
+    name: String,
+    body: String,
+    description: String = "d-$name",
+    enabled: Boolean = true,
+) = "---\nname: $name\nversion: 1.0.0\ndescription: $description\nenabled: $enabled\n---\n$body\n"
+
+/** One fresh `ConversationStore` per route, exactly as `SmartWiring` builds them. */
+internal fun smartStores(): Map<edith.plugins.smart.context.ContextRoute, edith.agent.ConversationStore> =
+    edith.plugins.smart.context.ContextRoute.entries.associateWith { edith.agent.ConversationStore() }
 
 /** `ActionDescriptor` fixture whose defaults describe a harmless L0 action in the `app` scope. */
 internal fun smartAction(
