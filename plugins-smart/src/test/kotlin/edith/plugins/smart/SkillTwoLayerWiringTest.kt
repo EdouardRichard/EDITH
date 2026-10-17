@@ -1,6 +1,8 @@
 package edith.plugins.smart
 
 import edith.agent.ConversationStore
+import edith.agent.Segment
+import edith.agent.SegmentOrigin
 import edith.contracts.AcousticEvent
 import edith.contracts.AcousticLabel
 import edith.contracts.TranscriptEvent
@@ -8,11 +10,18 @@ import edith.plugin.Capability
 import edith.plugin.ModelEnd
 import edith.plugin.ModelHistoryItem
 import edith.plugin.ModelStreamEvent
+import edith.plugin.StorageAccess
 import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.skill.LoadSkillTool
+import java.util.concurrent.ConcurrentLinkedQueue
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 
 /**
@@ -346,4 +355,228 @@ class SkillTwoLayerWiringTest {
             "the turn-end count line must be exactly the design's shape: $lines",
         )
     }
+
+    // ------------------------------------------------------------ turn ownership under replacement (fix round)
+
+    /**
+     * Review finding (Important): the SKILL turn state is plugin-global, but turns are concurrent — a stopped/replaced
+     * wake turn keeps unwinding and still reaches `endSkillTurn`. With one shared map and no owner there is nothing to
+     * tell turn 1's late end from turn 2's own end, so it clears the live turn's pulled bodies (and closes its
+     * observation). Ownership by generation is what makes the late end a no-op.
+     *
+     * The seam calls the production boundary directly because this interleaving cannot be produced through the event
+     * flow deterministically: the replacement must begin *before* the stopped turn's end, which the host's own turn
+     * replacement only races into. The "next request" is a real one: the proactive route builds its frame through the
+     * same `systemSlot`, and a proactive turn joins the live turn instead of owning a new one.
+     */
+    @Test
+    fun `a stale end from a stopped turn does not clear the next turn's pulled bodies`() {
+        val firstMarker = "正文标记-8101"
+        val secondMarker = "正文标记-8102"
+        val rig = rig(
+            SmartFakeSkills(
+                mapOf(
+                    "/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", firstMarker),
+                    "/sdcard/EDITH/skills/b.md" to smartSkillDoc("beta", secondMarker),
+                ),
+            ),
+        )
+
+        // Turn 1 owns the lifecycle and pulls alpha; turn 2 then takes ownership and pulls beta. Turn 1 is the one
+        // that was stopped/replaced: its end must not carry turn 1's generation into turn 2's turn state.
+        val first = rig.plugin.beginSkillTurnForTest(owner = true)
+        rig.plugin.loadSkillToolForTest().execute(LoadSkillTool.NAME, """{"name":"alpha"}""")
+        val second = rig.plugin.beginSkillTurnForTest(owner = true)
+        rig.plugin.loadSkillToolForTest().execute(LoadSkillTool.NAME, """{"name":"beta"}""")
+        rig.plugin.endSkillTurnForTest(first)
+
+        // The next request goes through the real frame path; its slot must still carry turn 2's body.
+        rig.model.onRequest = { request, listener ->
+            listener(
+                smartToolCall(
+                    "p1", SmartPrompts.PROPOSE_HINT.name, """{"text":"主动提示"}""",
+                    requestId = request.requestId,
+                ),
+            )
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        rig.plugin.handle(AcousticEvent(rig.envelope(), AcousticLabel.Speech))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("这个页面怎么一直转圈", turnId = "asr-p1")))
+
+        val sent = rig.model.requests.single().instructions
+        assertTrue(
+            secondMarker in sent,
+            "turn 1's late end must not clear the body turn 2 pulled: $sent",
+        )
+        assertFalse(firstMarker in sent, "turn 2 began with no pulled bodies: $sent")
+        rig.plugin.endSkillTurnForTest(second)
+    }
+
+    /**
+     * A proactive turn has no `load_skill` tool, so it never contributes a body and must never wipe the one a live
+     * wake turn has pulled. When it overlaps a wake turn it therefore only joins the wake turn's observation; its own
+     * end is a no-op. (When it is alone it owns its own turn — see `a proactive turn followed by a wake turn records
+     * two observations` — because nothing else would ever close its observation.)
+     */
+    @Test
+    fun `a proactive turn never clears a wake turn's pulled bodies`() {
+        val marker = "正文标记-8103"
+        val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", marker))))
+
+        val wake = rig.plugin.beginSkillTurnForTest(owner = true)
+        rig.plugin.loadSkillToolForTest().execute(LoadSkillTool.NAME, """{"name":"alpha"}""")
+
+        val proactive = rig.plugin.beginSkillTurnForTest(owner = false)
+        assertEquals(0L, proactive, "a proactive turn beside a live wake turn must join it, not take ownership")
+        rig.plugin.endSkillTurnForTest(proactive)
+
+        val slot = rig.plugin.systemSlotForTest(ContextRoute.WAKE)
+        assertTrue(
+            slot.any { it.origin == SegmentOrigin.SKILL && marker in it.text },
+            "the wake turn's pulled body must survive the proactive turn's end: $slot",
+        )
+        rig.plugin.endSkillTurnForTest(wake)
+    }
+
+    /**
+     * Design D-1/D-2 fixes **where** the body travels: it belongs to the system slot's `SKILL` origin, never to
+     * `INSTRUCTIONS`. The flattened `instructions` string cannot tell the two apart, so the old assertions would pass
+     * even if the body were moved back into the instruction segment. This asserts on the segments themselves.
+     */
+    @Test
+    fun `a pulled body travels in a SKILL segment and never in INSTRUCTIONS`() {
+        val marker = "正文标记-8104"
+        val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", marker))))
+        val slots = mutableListOf<List<Segment>>()
+        var calls = 0
+        rig.model.onRequest = { request, listener ->
+            calls += 1
+            if (calls == 1) {
+                listener(smartToolCall("c1", LoadSkillTool.NAME, """{"name":"alpha"}""", requestId = request.requestId))
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                // The production producer for the slot this very request carries (the gateway flattens it into
+                // `instructions`, so the segments are only observable through the plugin).
+                slots += rig.plugin.systemSlotForTest(ContextRoute.WAKE)
+                streamText(request, listener, "好。")
+            }
+        }
+
+        rig.wakeAndFinal("帮我回微信")
+
+        val slot = slots.single()
+        assertTrue(
+            slot.filter { it.origin == SegmentOrigin.SKILL }.any { marker in it.text },
+            "the pulled body must travel in a SKILL segment: $slot",
+        )
+        assertFalse(
+            slot.filter { it.origin == SegmentOrigin.INSTRUCTIONS }.any { marker in it.text },
+            "the body must not be folded into INSTRUCTIONS; its origin is the whole point: $slot",
+        )
+    }
+
+    /**
+     * Review finding (Important), concurrency half: `LibraryGovernor` documents "not thread-safe" and the SKILL state
+     * was one map and one turn flag read and written from the plugin's **two-thread** production pool. This drives two
+     * turns through the real boundary and pins the interleaving with latches: a blocking directory holds turn A inside
+     * its catalog build while turn B begins and ends.
+     *
+     * The latch handshake is deliberate — a bare race would only catch the corruption sometimes. Pre-fix, B's end is
+     * free to run while A is mid-request, clearing the body A is about to read; the catalog build and the body snapshot
+     * are also two separate lock acquisitions. Post-fix the one SKILL lock serialises B behind A, so A's request keeps
+     * its body and no shared structure is mutated by two threads.
+     */
+    @Test
+    fun `concurrent begin catalog and end do not throw or corrupt the turn state`() {
+        val storage = BlockingSkillStorage(
+            mapOf(
+                "/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", "正文-a"),
+                "/sdcard/EDITH/skills/b.md" to smartSkillDoc("beta", "正文-b"),
+            ),
+        )
+        val rig = SmartTestRig(conversationStores = smartStores()).also {
+            it.activate(overrides = mapOf(Capability.StorageAccess to storage))
+        }
+        val failures = ConcurrentLinkedQueue<Throwable>()
+        val firstSlot = AtomicReference<List<Segment>>(emptyList())
+        val secondDone = CountDownLatch(1)
+
+        val first = Thread {
+            try {
+                val generation = rig.plugin.beginSkillTurnForTest(owner = true)
+                rig.plugin.loadSkillToolForTest().execute(LoadSkillTool.NAME, """{"name":"alpha"}""")
+                // The next directory listing is the catalog build of this turn's request, and it blocks there.
+                storage.blockNextList.set(true)
+                firstSlot.set(rig.plugin.systemSlotForTest(ContextRoute.WAKE))
+                rig.plugin.endSkillTurnForTest(generation)
+            } catch (failure: Throwable) {
+                failures += failure
+            }
+        }
+        first.start()
+        assertTrue(storage.entered.await(2, TimeUnit.SECONDS), "the first turn must reach its catalog build")
+
+        val second = Thread {
+            try {
+                val generation = rig.plugin.beginSkillTurnForTest(owner = true)
+                rig.plugin.endSkillTurnForTest(generation)
+            } catch (failure: Throwable) {
+                failures += failure
+            }
+            secondDone.countDown()
+        }
+        second.start()
+        // Not an assertion on timing: pre-fix the second turn finishes here and clears the first turn's body; post-fix
+        // it waits on the SKILL lock, and the wait only bounds the test.
+        secondDone.await(500, TimeUnit.MILLISECONDS)
+        storage.release()
+        first.join(5_000)
+        second.join(5_000)
+
+        assertFalse(first.isAlive || second.isAlive, "both turns must finish; a torn structure or a deadlock is a failure")
+        assertTrue(failures.isEmpty(), "concurrent SKILL turn work threw: ${failures.take(3)}")
+        assertTrue(
+            firstSlot.get().any { it.origin == SegmentOrigin.SKILL && "正文-a" in it.text },
+            "the overlapping turn's end must not clear the body this request is still building: ${firstSlot.get()}",
+        )
+
+        // The shared state must be intact: both entries still governed, the catalog still non-empty, and a fresh turn
+        // still opens and closes without wedging mid-turn.
+        val governor = assertNotNull(rig.plugin.skillGovernor(), "activation must build the session's library governor")
+        assertTrue(
+            governor.entry("alpha") != null && governor.entry("beta") != null,
+            "both advertised entries must still be governed",
+        )
+        val fresh = rig.plugin.beginSkillTurnForTest(owner = true)
+        val freshSlot = rig.plugin.systemSlotForTest(ContextRoute.WAKE)
+        rig.plugin.endSkillTurnForTest(fresh)
+        assertTrue(
+            freshSlot.any { it.origin == SegmentOrigin.SKILL && "- alpha: d-alpha" in it.text },
+            "the catalog must still be intact after the overlap: $freshSlot",
+        )
+    }
+}
+
+/**
+ * A `StorageAccess` that can hold one `listFiles` call on a latch, so a test can pin the exact interleaving of two
+ * turns instead of racing them. The block is armed explicitly and fires once.
+ */
+private class BlockingSkillStorage(files: Map<String, String?>) : StorageAccess {
+    private val delegate = SmartFakeSkills(files)
+    val blockNextList = AtomicBoolean(false)
+    val entered = CountDownLatch(1)
+    private val release = CountDownLatch(1)
+
+    fun release() = release.countDown()
+
+    override fun listFiles(dirPath: String, suffix: String): List<String> {
+        if (blockNextList.compareAndSet(true, false)) {
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+        }
+        return delegate.listFiles(dirPath, suffix)
+    }
+
+    override fun readFile(path: String): String? = delegate.readFile(path)
+    override fun deleteFile(path: String): Boolean = delegate.deleteFile(path)
 }

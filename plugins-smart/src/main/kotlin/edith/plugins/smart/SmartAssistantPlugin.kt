@@ -436,13 +436,40 @@ class SmartAssistantPlugin(
     internal fun skillGovernor(): LibraryGovernor? = libraryGovernor
 
     /**
+     * The one monitor guarding every read and mutation of the SKILL turn state: the generation/owner below, the pulled
+     * bodies, and **every** call into the session's [SkillManager] — whose [LibraryGovernor] documents that it is "not
+     * thread-safe". Turns are concurrent (the host runs plugin work on a two-thread pool and both routes submit to it),
+     * so all of it must be serialised, not just the map.
+     *
+     * Deliberately **not** [gate]. The plugin's gate guards events, turn ownership and configuration; `Stop`, a
+     * confirmation and the next wake all queue behind it, so governor work and the catalog's logging must never run
+     * there. Same discipline as `publishBusy`: the report happens outside the lock that produced the numbers.
+     *
+     * Never reset: a generation is process-wide monotonic, so a stopped turn's generation can never be handed to a
+     * later turn and be mistaken for the live owner. Only the *owner* is cleared when a session ends.
+     */
+    private val skillLock = Any()
+
+    /** The last generation handed out. Only an owner turn takes one; guarded by [skillLock]. */
+    private var skillTurnGeneration: Long = 0L
+
+    /**
+     * The generation of the turn that owns the SKILL lifecycle, or `0` when no turn owns it. Guarded by [skillLock].
+     *
+     * A turn's end is honoured only when it carries this generation. A stopped/replaced turn keeps unwinding and still
+     * reaches [endSkillTurn]; without the owner check its generation would be indistinguishable from the live turn's,
+     * so it would clear the live turn's pulled bodies and close its observation (review finding).
+     */
+    private var skillTurnOwner: Long = 0L
+
+    /**
      * Phase 6 (design D-2, obligation 5): the bodies pulled with `load_skill` during the **current** turn, in pull
      * order and keyed by `name` so a second pull overwrites rather than duplicates. Cleared at the turn boundary — the
      * body's lifetime is one turn, and letting it accumulate across turns would move the unbounded growth this phase
      * removes into the conversation itself.
      *
-     * Guarded by its own monitor because a proactive task and the wake turn can briefly overlap; every read takes a
-     * snapshot so a concurrent [endSkillTurn] cannot change the list mid-iteration.
+     * Guarded by [skillLock]; [systemSlot] reads the catalog and this map in one critical section so a request cannot
+     * pair a newer catalog with an older pulled set.
      */
     private val loadedSkillBodies = LinkedHashMap<String, Skill>()
 
@@ -458,23 +485,31 @@ class SmartAssistantPlugin(
     private val loadSkillTool = LoadSkillTool(
         lookup = { name ->
             // A library that throws (or a host that granted no directory) refuses the pull; it must never throw into
-            // the loop, and an absent name is exactly what the model may correct.
-            runCatching { skillManager?.load(name) }.getOrNull()
-                ?: SkillLoad.NotFound(SkillLoadReason.NOT_IN_LIBRARY)
+            // the loop, and an absent name is exactly what the model may correct. Under [skillLock], because the pull
+            // mutates the governor: the turn that is ending on another thread must not interleave with it.
+            synchronized(skillLock) {
+                runCatching { skillManager?.load(name) }.getOrNull()
+                    ?: SkillLoad.NotFound(SkillLoadReason.NOT_IN_LIBRARY)
+            }
         },
         onLoaded = { skill -> rememberLoadedSkill(skill) },
     )
 
     private fun rememberLoadedSkill(skill: Skill) {
-        synchronized(loadedSkillBodies) { loadedSkillBodies[skill.name] = skill }
+        synchronized(skillLock) { loadedSkillBodies[skill.name] = skill }
     }
 
-    /** A snapshot, so a turn ending on another thread cannot make this iteration see a half-cleared map. */
-    private fun loadedBodiesSnapshot(): List<Skill> =
-        synchronized(loadedSkillBodies) { loadedSkillBodies.values.toList() }
-
-    private fun clearLoadedSkills() {
-        synchronized(loadedSkillBodies) { loadedSkillBodies.clear() }
+    /**
+     * Ends the session's SKILL lifecycle state: no bodies, no owner.
+     *
+     * The generation counter is **not** reset — a turn from the session that just ended may still be unwinding, and a
+     * reused generation would let its late end pass the owner check against the new session's owner.
+     */
+    private fun resetSkillTurnState() {
+        synchronized(skillLock) {
+            loadedSkillBodies.clear()
+            skillTurnOwner = 0L
+        }
     }
 
     /**
@@ -769,8 +804,9 @@ class SmartAssistantPlugin(
             activeStores = null
             skillManager = null
             libraryGovernor = null
-            // The pulled bodies are session/turn state too: nothing may survive the session that obtained it.
-            clearLoadedSkills()
+            // The pulled bodies are session/turn state too: nothing may survive the session that obtained it. The
+            // turn owner goes with them, without reusing the generation (a stale turn may still be unwinding).
+            resetSkillTurnState()
             detach()
         }
         // P3.3: a session that ends withdraws any question it asked. Leaving one pending would let the *next* session's
@@ -1222,7 +1258,7 @@ class SmartAssistantPlugin(
         // Phase 6 (obligation 1): the turn's **single** governor observation opens here, before the turn's first
         // request is assembled and never from inside the per-request builder — the observation unit is the turn
         // (design D-3), and a call per request would inflate drift by every tool round-trip.
-        beginSkillTurn()
+        val skillTurn = beginSkillTurn(owner = true)
         val prompt = activeContextForTurn?.let { contexts ->
             runCatching { contexts.buildPrompt(ContextRoute.WAKE, text) }.getOrNull()
         }
@@ -1271,7 +1307,7 @@ class SmartAssistantPlugin(
                     // Phase 6 (obligation 2): this turn is already over (stopped, replaced or the session ended), and
                     // this return leaves the function before the normal turn-end bookkeeping. Close the SKILL turn
                     // here too, or the governor's open turn would fold the next turn into this one.
-                    endSkillTurn()
+                    endSkillTurn(skillTurn)
                     return
                 }
                 owned.loop = built
@@ -1345,7 +1381,7 @@ class SmartAssistantPlugin(
         // is submitted **and** on the detached path below, so every ending pairs with its opening: an unclosed turn
         // would let the following turn fold into this one as a single observation, and a body pulled here would still
         // be in the next turn's first request.
-        endSkillTurn()
+        endSkillTurn(skillTurn)
         if (!stillOurs) return
         // Review I-1: the loop shifts its *own* budget by the time a person spent deciding (D49), but this turn's hint
         // window is derived from **its** deadline (`hintValidUntil` = deadline + grace). Without moving that too, a
@@ -1612,11 +1648,17 @@ class SmartAssistantPlugin(
                 },
             ),
         )
-        val catalog = runCatching { skillManager?.catalog() }.getOrNull().orEmpty()
+        // The catalog and the pulled bodies are read in **one** critical section: the catalog mutates the session's
+        // governor (not thread-safe) and both halves must describe the same turn, so an ending turn on the other pool
+        // thread cannot clear the bodies between the two reads.
+        val (catalog, bodies) = synchronized(skillLock) {
+            val text = runCatching { skillManager?.catalog() }.getOrNull().orEmpty()
+            text to loadedSkillBodies.values.toList()
+        }
         if (catalog.isNotBlank()) {
             add(Segment(SegmentOrigin.SKILL, trusted = true, text = catalog))
         }
-        loadedBodiesSnapshot().forEach { skill ->
+        bodies.forEach { skill ->
             add(Segment(SegmentOrigin.SKILL, trusted = true, text = bodySegmentText(skill)))
         }
         add(Segment(SegmentOrigin.MEMORY_POLICY, trusted = true, text = SmartPrompts.MEMORY_POLICY))
@@ -1757,33 +1799,98 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * Phase 6 (obligation 1): open the current turn's SKILL observation, once, at the turn's assembly point.
+     * Phase 6 (obligation 1): open the current turn's SKILL observation, once, at the turn's assembly point, and return
+     * the **generation** that owns it (`0` for a turn that only joins another one).
      *
-     * Guarded because a library that refuses to list must not fail the turn (spec §3.7): the governor then simply
-     * learns nothing and the request goes out without a catalog segment.
+     * Two modes (review fix, turn ownership by generation):
+     * - **owner** — the wake route. Takes the next generation, becomes the current owner, and clears the pulled bodies:
+     *   a new turn starts with none. A proactive turn that arrives with no live owner also owns its own turn, because
+     *   nothing else would ever close its observation.
+     * - **joiner** — the proactive route beside a live wake turn. Calls `governor.beginTurn()` only. It has no
+     *   `load_skill` tool, so it never contributes a body, and it must never wipe the bodies of the turn that is still
+     *   running.
+     *
+     * Everything runs under [skillLock], because the governor is not thread-safe and a stopped turn may be unwinding on
+     * the other pool thread at the same moment. Guarded because a library that refuses to list must not fail the turn
+     * (spec §3.7): the governor then simply learns nothing and the request goes out without a catalog segment.
      */
-    private fun beginSkillTurn() {
+    private fun beginSkillTurn(owner: Boolean): Long = synchronized(skillLock) {
+        // A **joiner** (the proactive route, which has no `load_skill` tool and therefore never pulls a body) arrived
+        // while another turn owns the lifecycle. It still observes — the observation unit is the turn — but it must
+        // not clear the live turn's pulled bodies and must not take ownership: its own end must not be able to close
+        // or clear the turn that is still running.
+        //
+        // A proactive turn that begins with **no** owner is not a joiner: nothing else would ever close its
+        // observation, and leaving the governor's turn open would fold it into the next wake turn (D-3's
+        // one-observation-per-turn). So it owns its own generation and gives it back at its own end.
+        if (!owner && skillTurnOwner != 0L) {
+            runCatching { skillManager?.beginTurn() }
+            return 0L
+        }
+        val generation = ++skillTurnGeneration
+        skillTurnOwner = generation
+        // An owner begin starts a turn with no pulled bodies. The previous owner (if any) is being replaced; its late
+        // end is made harmless by the generation check, not by this clear.
+        loadedSkillBodies.clear()
         runCatching { skillManager?.beginTurn() }
+        generation
     }
 
     /**
      * Phase 6 (obligations 2 and 5): close the turn [beginSkillTurn] opened — on every ending of the turn and before
      * its outcome is submitted.
      *
-     * The order is the design's (D-2, design §5): clear the pulled bodies (their lifetime is this turn), advance the
-     * governor once, then report the count-only `P3_SKILL pulls` line (D-10). Clearing here is what makes a body
-     * pulled in one turn absent from the next turn's first request; advancing here is what keeps a proactive turn and
-     * the following wake turn two separate observations instead of one.
+     * Only the **current owner** may close: generation `0` (a joiner) or any other generation (a turn that has already
+     * been replaced, only now unwinding) is a no-op. That check is the whole fix — a stopped turn's late end must not
+     * clear the live turn's bodies or advance its governor turn.
+     *
+     * For the owner the order is the design's (D-2, design §5): clear the pulled bodies (their lifetime is this turn),
+     * advance the governor once, then report the count-only `P3_SKILL pulls` line (D-10). All of it happens under
+     * [skillLock]; the report is emitted after the lock is released.
      */
-    private fun endSkillTurn() {
-        clearLoadedSkills()
-        val manager = skillManager
-        runCatching { manager?.endTurn() }
-        P3Log.line(
-            "P3_SKILL pulls turn=${manager?.pullsThisTurn ?: 0} session=${manager?.pullsThisSession ?: 0} " +
-                "neverPulled=${runCatching { manager?.neverPulledCount() }.getOrNull() ?: 0}",
-        )
+    private fun endSkillTurn(generation: Long) {
+        val report = synchronized(skillLock) {
+            if (generation == 0L || generation != skillTurnOwner) return
+            loadedSkillBodies.clear()
+            val manager = skillManager
+            runCatching { manager?.endTurn() }
+            // The counts are read under the same lock: the governor is documented not thread-safe, and its between-turns
+            // state is exactly what `pullsThisTurn`/`neverPulledCount` read.
+            val counts = Triple(
+                manager?.pullsThisTurn ?: 0,
+                manager?.pullsThisSession ?: 0,
+                runCatching { manager?.neverPulledCount() }.getOrNull() ?: 0,
+            )
+            skillTurnOwner = 0L
+            counts
+        }
+        // Counts only, no names and no bodies — and outside the lock, like every other report in this file.
+        P3Log.line("P3_SKILL pulls turn=${report.first} session=${report.second} neverPulled=${report.third}")
     }
+
+    // ---------------------------------------------------------------- SKILL turn test seams
+
+    /**
+     * Test-only: open the SKILL turn boundary directly and return the generation the turn owns.
+     *
+     * The defect this models cannot be produced through the event flow deterministically: a stopped turn's **late**
+     * end has to land after a newer turn already owns the lifecycle, and a proactive turn has to join a wake turn
+     * that is still in flight. These hooks call the production methods themselves (never a copy), so the test pins
+     * the real boundary rather than a re-implementation of it. No production caller exists.
+     */
+    internal fun beginSkillTurnForTest(owner: Boolean): Long = beginSkillTurn(owner)
+
+    /** Test-only: close the boundary opened by [beginSkillTurnForTest] with that turn's generation. */
+    internal fun endSkillTurnForTest(generation: Long) = endSkillTurn(generation)
+
+    /**
+     * Test-only: the plugin's one `load_skill` executor, so a test can drive a pull through the same `onLoaded` write
+     * the model's tool call makes instead of manufacturing a body into the turn's map.
+     */
+    internal fun loadSkillToolForTest(): LoadSkillTool = loadSkillTool
+
+    /** Test-only: the system slot the next request for [route] would carry, built by the production [systemSlot]. */
+    internal fun systemSlotForTest(route: ContextRoute): List<Segment> = systemSlot(route, null)
 
     /** The gate's input, assembled from the same signals the request carries (spec §4.7). */    private fun gateState(trigger: ProactiveTrigger): ProactiveGateState {
         val values = currentContextValues()
@@ -1836,6 +1943,13 @@ class SmartAssistantPlugin(
         // wake turn. The task re-checks ownership under `gate` before writing anything back. A test host runs the task
         // inline, which is what keeps the plugin's own tests deterministic.
         current.services.tasks.launch {
+            // Phase 6 (obligation 1): the proactive turn's SKILL boundary opens here, before `deliverProactive`'s
+            // blocking work, and closes in the `finally` that every proactive ending passes through - a hint, a
+            // decline, a failure, a cancellation or a throw. The proactive route has no `load_skill` tool, so its
+            // `begin` is a **joiner** whenever a wake turn already owns the lifecycle: it must not clear that turn's
+            // pulled bodies. When it is alone it owns its own turn, which is what gives it its own observation
+            // instead of folding it into the next wake turn (design D-3).
+            val skillGeneration = beginSkillTurn(owner = false)
             try {
                 deliverProactive(current, configured, filter, hint, trigger, message, started)
             } finally {
@@ -1845,8 +1959,8 @@ class SmartAssistantPlugin(
                 //
                 // Phase 6 (obligations 2 and 5): the same is true of the proactive turn's SKILL bookkeeping. Closing it
                 // here is what keeps the proactive turn and the next wake turn **two** observations instead of one
-                // folded turn, and it is where the pulled bodies are cleared before anything else runs.
-                endSkillTurn()
+                // folded turn, and a stale close from a turn that has already been replaced is a no-op.
+                endSkillTurn(skillGeneration)
                 synchronized(gate) { proactiveInFlight = false }
                 publishBusy()
             }
@@ -1856,10 +1970,10 @@ class SmartAssistantPlugin(
     /** The blocking half of one proactive turn; runs on the task scope, never under [gate]. */
     private fun deliverProactive(current: PluginContext, configured: Config, filter: SmartProactive,
         hint: ProactiveHint, trigger: ProactiveTrigger, message: String, started: Long) {
-        // Phase 6 (obligation 1): one `beginTurn()` per proactive turn, before its first (and only) request is
-        // assembled and never from inside `systemSlot`. Its matching `endTurn()` sits in `runProactive`'s `finally`,
-        // which every proactive ending passes through — a decline, a failure, a cancellation or a hint.
-        beginSkillTurn()
+        // Phase 6 (obligation 1): the proactive turn's `beginTurn()` opened at the task launch in `runProactive`,
+        // before this blocking half; its matching `endTurn()` is that launch's `finally`. Neither is here so the
+        // whole turn - including this function throwing - is inside the pair.
+        //
         // The intervention gate runs **here**, on the task scope, and that placement is load-bearing: it is a
         // local-model forward pass (~231 ms GPU / ~742 ms CPU per A5), and the plugin's own rule forbids one inside
         // `handle` - it would hold the host's single drain thread *and* the plugin lock, putting `Stop`, confirmations
