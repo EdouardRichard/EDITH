@@ -21,12 +21,20 @@ data class GovernorVerdict(
 /**
  * The generic three-state lifecycle model for a library of advertised entries.
  *
- * The model answers one question: *which entries keep earning their place in the catalog?* An entry that is advertised
+ * The model answers one question: *which entries keep earning their place in the catalog?* An entry that is listed
  * on every turn but never pulled accumulates drift evidence; enough of it and the entry is demoted out of the catalog
  * ([LibraryState.DORMANT]), and twice that and it is retired outright ([LibraryState.RETIRED]). One pull — the wearer
  * actually using the entry — erases the evidence and returns it to [LibraryState.ACTIVE] from any state, and from then
  * on this process stops counting drift against it at all. The freeze is derived, not stored: `pulls > 0` is the whole
  * condition, and it is checked at both guard sites ([observeTurn] does not count, [endTurn] does not advance).
+ *
+ * ## Drift is evidence of "offered and not used"
+ *
+ * Drift is counted only while an entry is being offered, because a name the model never saw cannot be pulled. An
+ * advertised entry that the size cap keeps out of the catalog is never listed, so the model cannot pull it by name and
+ * it never accumulates evidence — otherwise the governor would retire an entry nobody was ever shown a name for. A
+ * DORMANT entry that left ACTIVE by drift *did* reach the model while it was listed, and its name can still be pulled,
+ * so it keeps counting on a turn that builds a catalog; a cap-demoted entry never gets that far.
  *
  * ## Why a pull silences drift for the rest of the process
  *
@@ -54,7 +62,7 @@ class LibraryGovernor(
 ) {
 
     /**
-     * One drift step per observed turn: how many turns an entry may be advertised without a pull before it is demoted,
+     * One drift step per observed turn: how many turns an entry may be listed without a pull before it is demoted,
      * and again before it is retired. The second threshold is measured from creation, not from the demotion, so an
      * entry runs continuously from one threshold to the next while its evidence supports it.
      */
@@ -62,6 +70,24 @@ class LibraryGovernor(
 
     private val entries = LinkedHashMap<String, LibraryEntry>()
     private val seenThisTurn = LinkedHashSet<String>()
+
+    /**
+     * Ids [catalog] actually returned during the current turn — the entries the model was offered this turn. Cleared at
+     * the turn boundary. Drift is evidence of "offered and not used", and an entry that was advertised but kept out of
+     * the catalog by the size cap was never offered, so it cannot be pulled by name and must not accumulate evidence.
+     */
+    private val listedThisTurn = LinkedHashSet<String>()
+
+    /** Whether a catalog was built at all this turn. A turn with no catalog request lists nothing and advances nothing. */
+    private var catalogRequestedThisTurn = false
+
+    /**
+     * Ids that left [LibraryState.ACTIVE] for [LibraryState.DORMANT] because drift reached its threshold while they
+     * were listed. This is the only kind of DORMANT entry that may keep accumulating drift: its name reached the model
+     * and remains pullable by name. A cap demotion never enters this set (and a pull removes the id).
+     */
+    private val dormantFromDrift = LinkedHashSet<String>()
+
     private val everListed = LinkedHashSet<String>()
     private var pendingCatalogDemotions = LinkedHashSet<String>()
     private var turnOpen = false
@@ -85,10 +111,10 @@ class LibraryGovernor(
      * Record the ids advertised to the model this turn.
      *
      * A never-before-seen id is created here, in [LibraryState.ACTIVE] with one observed turn already counted: being
-     * advertised *is* the first observation, and that first observation is real drift evidence against an entry nobody
-     * has asked for. The observation unit is the **turn**, not the call: an id counts once however many times and
-     * however many calls this turn advertises it, so a turn that rebuilds the catalog repeatedly cannot inflate the
-     * evidence. The batch is closed by [endTurn] and the next [observeTurn] starts the next turn.
+     * advertised *is* the first observation. The observation unit is the **turn**, not the call: an id counts once
+     * however many times and however many calls this turn advertises it, so a turn that rebuilds the catalog repeatedly
+     * cannot inflate the evidence. The batch is closed by [endTurn] and the next [observeTurn] starts the next turn.
+     * An id counts here whether or not the catalog ends up listing it; [endTurn] decides what may become drift.
      *
      * An entry with `pulls > 0` is not counted at all — its drift evidence is not "reset and then allowed to regrow",
      * it is absent (see the class comment). That is the freeze, and `pulls > 0` is the whole of it.
@@ -103,6 +129,8 @@ class LibraryGovernor(
             // therefore "pulls during the last completed turn" until the next turn opens.
             pullsThisTurnCount = 0
             seenThisTurn.clear()
+            listedThisTurn.clear()
+            catalogRequestedThisTurn = false
             turnOpen = true
         }
         advertised.toSet().forEach { id ->
@@ -124,12 +152,17 @@ class LibraryGovernor(
     }
 
     /**
-     * Close the current turn and advance the entries that were seen in it.
+     * Close the current turn and advance the entries that were **offered** in it.
      *
-     * An entry advances only if it was advertised at least once this turn **and** has never been pulled in this process
-     * (`pulls == 0`). An entry that this turn never advertised is left where it is — it is not in the catalog, so it
-     * cannot drift — and an entry the wearer has pulled is left ACTIVE, which is what keeps a used entry from being
-     * retired out from under them.
+     * An ACTIVE entry advances only if it was advertised this turn, was actually listed by [catalog] this turn, and has
+     * never been pulled in this process (`pulls == 0`). An entry that this turn advertised but never listed — the size cap
+     * pushed it out — is left where it is: the model never saw its name, cannot pull it by name, and so the turn is not
+     * evidence that the entry is going unused (see the class comment). An entry the wearer has pulled stays ACTIVE,
+     * which is what keeps a used entry from being retired out from under them.
+     *
+     * A DORMANT entry that drift demoted while it was listed keeps advancing on a turn that builds a catalog, because
+     * its name did reach the model and can still be pulled. A turn with no catalog request at all lists nothing, so it
+     * advances nothing — not even a drift-demoted entry (a deliberate consequence of ruling 11). The suite pins that.
      *
      * Also enforces the size cap, so the turn that overflows the catalog reports the overflow in its own verdict.
      * The cap is evaluated over the entries **seen this turn** only (the intersection of [seenThisTurn] and
@@ -146,10 +179,14 @@ class LibraryGovernor(
         seenThisTurn.sorted().forEach { id ->
             val entry = entries[id] ?: return@forEach
             if (entry.pulls > 0) return@forEach
+            if (!mayDrift(id, entry)) return@forEach
             when (advance(entry)) {
                 LibraryState.DORMANT -> {
                     demoted += id
                     entries[id] = entry.copy(state = LibraryState.DORMANT)
+                    // It left ACTIVE while the model was being offered it, so this is the one DORMANT kind that may
+                    // keep accruing drift. The cap path below never adds here.
+                    dormantFromDrift += id
                 }
                 LibraryState.RETIRED -> {
                     retired += id
@@ -164,12 +201,28 @@ class LibraryGovernor(
         pendingCatalogDemotions = LinkedHashSet()
         turnOpen = false
         seenThisTurn.clear()
+        listedThisTurn.clear()
+        catalogRequestedThisTurn = false
 
         return GovernorVerdict(
             demoted = demoted + overflow,
             retired = retired,
             promoted = emptyList(),
         )
+    }
+
+    /**
+     * Whether drift may advance [entry] this turn.
+     *
+     * [LibraryState.ACTIVE] requires the entry to have been listed this turn: a turn that never built a catalog, or
+     * one whose cap kept the entry out, is not evidence of disuse. [LibraryState.DORMANT] requires the entry to have
+     * been demoted by drift (so its name reached the model) **and** the turn to have built a catalog; a cap-demoted
+     * entry was never offered, so it never qualifies. A [LibraryState.RETIRED] entry has nowhere left to advance.
+     */
+    private fun mayDrift(id: String, entry: LibraryEntry): Boolean = when (entry.state) {
+        LibraryState.ACTIVE -> id in listedThisTurn
+        LibraryState.DORMANT -> catalogRequestedThisTurn && id in dormantFromDrift
+        LibraryState.RETIRED -> false
     }
 
     /**
@@ -189,6 +242,9 @@ class LibraryGovernor(
             observedTurns = 0,
             pulls = entry.pulls + 1,
         )
+        // Back in ACTIVE: it is no longer a drift-demoted entry. A later demotion must be earned again, and a later
+        // cap demotion must not inherit the drift mark.
+        dormantFromDrift.remove(id)
         pullsThisTurnCount += 1
         pullsThisSessionCount += 1
     }
@@ -218,6 +274,10 @@ class LibraryGovernor(
      * no longer shows is not part of it); an id that is advertised again re-enters. This pruning touches bookkeeping
      * only — never a lifecycle state.
      *
+     * The returned ids are also recorded as the turn's **offered** set, which is what [endTurn] advances. Only an id
+     * that this call actually returns counts: an advertised entry the cap pushed out is not offered, so the model never
+     * sees its name and the turn cannot be drift evidence against it.
+     *
      * Idempotent: the demotion is applied to the entries, so a second call finds the excess already DORMANT and
      * queues nothing further.
      */
@@ -234,6 +294,8 @@ class LibraryGovernor(
             .sorted()
             .take(maxCatalogEntries)
         everListed += listed
+        listedThisTurn += listed
+        catalogRequestedThisTurn = true
         return listed
     }
 
@@ -276,6 +338,10 @@ class LibraryGovernor(
         overflow.forEach { id ->
             val entry = entries[id] ?: return@forEach
             entries[id] = entry.copy(state = LibraryState.DORMANT)
+            // A cap demotion is not a drift demotion: the entry is out of the catalog by size, so it must not inherit
+            // the right to keep counting drift. (It cannot be in the set today — only a pull returns an entry to
+            // ACTIVE and the pull removes it — but the invariant is cheaper to state than to reason about here.)
+            dormantFromDrift.remove(id)
         }
         return overflow
     }

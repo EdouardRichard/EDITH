@@ -72,7 +72,8 @@ class SkillCatalogTest {
         val governor = LibraryGovernor()
         val manager = SkillManager(FakeDirectory(mapOf("a.md" to doc("a"))), governor = governor)
         val k = LibraryGovernor.MIN_OBSERVED_TURNS
-        repeat(k) { manager.beginTurn(); manager.endTurn() }
+        // Drift is evidence of "listed and not pulled", so the entry must actually be listed on each of these turns.
+        repeat(k) { manager.beginTurn(); manager.catalog(); manager.endTurn() }
         assertEquals(LibraryState.DORMANT, governor.entry("a")?.state)
         val loaded = manager.load("a") as SkillLoad.Loaded
         assertTrue(loaded.wasDormant)
@@ -343,10 +344,11 @@ class SkillCatalogTest {
         val lines = mutableListOf<String>()
         val manager = SkillManager(FakeDirectory(mapOf("a.md" to doc("a"))), log = { lines += it }, governor = LibraryGovernor())
 
-        repeat(LibraryGovernor.MIN_OBSERVED_TURNS) { manager.beginTurn(); manager.endTurn() }
+        // The entry must be listed on each turn: drift only grows while the catalog actually offers the entry.
+        repeat(LibraryGovernor.MIN_OBSERVED_TURNS) { manager.beginTurn(); manager.catalog(); manager.endTurn() }
         assertEquals(1, lines.count { it == "P3_SKILL dormant name=a" }, lines.toString())
 
-        repeat(LibraryGovernor.MIN_OBSERVED_TURNS) { manager.beginTurn(); manager.endTurn() }
+        repeat(LibraryGovernor.MIN_OBSERVED_TURNS) { manager.beginTurn(); manager.catalog(); manager.endTurn() }
         assertEquals(1, lines.count { it == "P3_SKILL retired name=a" }, lines.toString())
         assertEquals(1, lines.count { it == "P3_SKILL dormant name=a" }, "a transition is named once, not every turn")
     }

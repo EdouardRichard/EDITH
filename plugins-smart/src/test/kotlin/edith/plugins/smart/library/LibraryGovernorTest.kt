@@ -18,32 +18,114 @@ class LibraryGovernorTest {
         g.observeTurn(listOf("a"))
         g.observeTurn(listOf("a"))                                   // same turn, rebuilt catalog
         assertEquals(1, g.entry("a")?.observedTurns)
+        g.catalog(listOf("a"))                                       // the entry was actually offered
         assertTrue(g.endTurn().isEmpty, "one observation must be below the minimum")
     }
 
     @Test fun `fewer observations than the minimum change nothing`() {
         val g = LibraryGovernor()
-        repeat(LibraryGovernor.MIN_OBSERVED_TURNS - 1) { g.observeTurn(listOf("a")); assertTrue(g.endTurn().isEmpty) }
+        repeat(LibraryGovernor.MIN_OBSERVED_TURNS - 1) {
+            g.observeTurn(listOf("a"))
+            g.catalog(listOf("a"))
+            assertTrue(g.endTurn().isEmpty)
+        }
         assertEquals(LibraryState.ACTIVE, g.entry("a")?.state)
     }
 
-    @Test fun `an entry with no pulls is demoted after the minimum then retired after twice the minimum`() {
+    @Test fun `a listed entry still drifts normally`() {
+        // The positive side of the rule. It is driven through catalog() because drift is now evidence of "listed and
+        // not pulled" only: a turn that lists nothing no longer advances anything.
         val g = LibraryGovernor()
         val k = LibraryGovernor.MIN_OBSERVED_TURNS
-        repeat(k) { g.observeTurn(listOf("a")); g.endTurn() }
+        repeat(k) {
+            g.observeTurn(listOf("a"))
+            assertEquals(listOf("a"), g.catalog(listOf("a")))
+            g.endTurn()
+        }
         assertEquals(LibraryState.DORMANT, g.entry("a")?.state)      // forward side
-        repeat(k) { g.observeTurn(listOf("a")); g.endTurn() }
+        repeat(k) {
+            g.observeTurn(listOf("a"))
+            g.catalog(listOf("a"))                                   // it was offered before it went dormant
+            g.endTurn()
+        }
         assertEquals(LibraryState.RETIRED, g.entry("a")?.state)
+    }
+
+    @Test fun `a cap-demoted entry is not retired while it is not listed`() {
+        // The defect ruling 11 removes: the cap pushes the overflow out of the catalog to DORMANT, but the entries
+        // stay enabled and advertised. They are never listed, so the model never sees their names and can never pull
+        // them by name; drift evidence against them would be manufactured from a period in which nobody was offered
+        // them at all. They must stay DORMANT — and pullable — well past the retirement horizon.
+        val g = LibraryGovernor()
+        val cap = LibraryGovernor.MAX_CATALOG_ENTRIES
+        val ids = (1..cap + 2).map { "s%02d".format(it) }
+        val demoted = ids.sorted().drop(cap)
+        val horizon = 2 * LibraryGovernor.MIN_OBSERVED_TURNS
+
+        repeat(horizon * 2) {
+            g.observeTurn(ids)
+            val listed = g.catalog(ids)
+            assertTrue(demoted.none { it in listed }, "the cap-demoted entries must stay unlisted")
+            assertTrue(g.endTurn().retired.none { it in demoted }, "an entry the model was never shown must not retire")
+        }
+
+        demoted.forEach { id ->
+            assertEquals(LibraryState.DORMANT, g.entry(id)?.state, "$id must never leave DORMANT while unlisted")
+        }
+        // Still reachable by name: D-6 demotes, it never retires, and a pull restores it (design D-4's second gate).
+        val rescued = demoted.first()
+        g.recordPull(rescued)
+        assertEquals(LibraryState.ACTIVE, g.entry(rescued)?.state)
+    }
+
+    @Test fun `a pulled entry still never advances`() {
+        // The D-4 protection is untouched by ruling 11: a pull freezes drift for the rest of the process, so even
+        // though the entry is listed on every turn below it never moves.
+        val g = LibraryGovernor()
+        val k = LibraryGovernor.MIN_OBSERVED_TURNS
+        g.observeTurn(listOf("a"))
+        assertEquals(listOf("a"), g.catalog(listOf("a")))
+        g.endTurn()
+        g.recordPull("a")                                            // the wearer used it, early
+
+        repeat(k * 3 + 1) {
+            g.observeTurn(listOf("a"))
+            assertTrue("a" in g.catalog(listOf("a")), "a used entry must stay in the catalog")
+            assertTrue(g.endTurn().isEmpty, "pulls > 0 must leave the drift counter frozen")
+        }
+        assertEquals(LibraryState.ACTIVE, g.entry("a")?.state)
+        assertEquals(1, g.entry("a")?.pulls)
+    }
+
+    @Test fun `a turn with no catalog request advances nothing`() {
+        // The deliberate consequence of counting drift only for listed entries: a turn that never asks for the
+        // catalog lists nothing, so nothing advances — not even an entry that was already dormant. Production makes at
+        // least one request per turn, so this under-counts only turns that did no work at all.
+        val g = LibraryGovernor()
+        val k = LibraryGovernor.MIN_OBSERVED_TURNS
+        repeat(k) { g.observeTurn(listOf("a")); g.catalog(listOf("a")); g.endTurn() }
+        assertEquals(LibraryState.DORMANT, g.entry("a")?.state)
+
+        repeat(2 * k) {
+            g.observeTurn(listOf("a"))                               // advertised, but no catalog request this turn
+            assertTrue(g.endTurn().isEmpty, "no catalog request this turn means no drift evidence")
+        }
+        assertEquals(LibraryState.DORMANT, g.entry("a")?.state)
     }
 
     @Test fun `COUNTER-EXAMPLE a pulled entry is never demoted however many quiet turns follow`() {
         val g = LibraryGovernor()
         val k = LibraryGovernor.MIN_OBSERVED_TURNS
         g.observeTurn(listOf("a"))
+        g.catalog(listOf("a"))
         g.endTurn()
         g.recordPull("a")                                            // the wearer used it, early
         val quiet = k * 3 + 1
-        repeat(quiet) { g.observeTurn(listOf("a")); assertTrue(g.endTurn().isEmpty, "must not demote a used entry") }
+        repeat(quiet) {
+            g.observeTurn(listOf("a"))
+            g.catalog(listOf("a"))
+            assertTrue(g.endTurn().isEmpty, "must not demote a used entry")
+        }
         assertEquals(LibraryState.ACTIVE, g.entry("a")?.state)
         assertTrue("a" in g.catalog(listOf("a")), "a used entry must stay in the catalog")
     }
@@ -51,10 +133,14 @@ class LibraryGovernorTest {
     @Test fun `COUNTER-EXAMPLE a pull rescues an entry that had already drifted to DORMANT`() {
         val g = LibraryGovernor()
         val k = LibraryGovernor.MIN_OBSERVED_TURNS
-        repeat(k) { g.observeTurn(listOf("a")); g.endTurn() }
+        repeat(k) { g.observeTurn(listOf("a")); g.catalog(listOf("a")); g.endTurn() }
         assertEquals(LibraryState.DORMANT, g.entry("a")?.state)
         g.recordPull("a")                                            // used again -> back in play
-        repeat(k * 3 + 1) { g.observeTurn(listOf("a")); assertTrue(g.endTurn().isEmpty) }
+        repeat(k * 3 + 1) {
+            g.observeTurn(listOf("a"))
+            g.catalog(listOf("a"))
+            assertTrue(g.endTurn().isEmpty)
+        }
         assertEquals(LibraryState.ACTIVE, g.entry("a")?.state)
     }
 
@@ -62,9 +148,14 @@ class LibraryGovernorTest {
         // A governor whose demotion threshold is 1, so any drift advance shows up in the very next verdict.
         val g = LibraryGovernor(minObservedTurns = 1)
         g.observeTurn(listOf("a"))
+        g.catalog(listOf("a"))
         g.endTurn()
         g.recordPull("a")
-        repeat(2) { g.observeTurn(listOf("a")); assertTrue(g.endTurn().isEmpty, "pulls > 0 must freeze the drift") }
+        repeat(2) {
+            g.observeTurn(listOf("a"))
+            g.catalog(listOf("a"))
+            assertTrue(g.endTurn().isEmpty, "pulls > 0 must freeze the drift")
+        }
         assertEquals(LibraryState.ACTIVE, g.entry("a")?.state)
         // The entry is exactly the four public fields; there is no fifth field that could disagree with pulls > 0.
         assertEquals(LibraryEntry("a", LibraryState.ACTIVE, 0, 1), g.entry("a"))
@@ -72,7 +163,11 @@ class LibraryGovernorTest {
 
     @Test fun `a pull on a RETIRED entry brings it back to ACTIVE`() {
         val g = LibraryGovernor()
-        repeat(LibraryGovernor.MIN_OBSERVED_TURNS * 2) { g.observeTurn(listOf("a")); g.endTurn() }
+        repeat(LibraryGovernor.MIN_OBSERVED_TURNS * 2) {
+            g.observeTurn(listOf("a"))
+            g.catalog(listOf("a"))
+            g.endTurn()
+        }
         assertEquals(LibraryState.RETIRED, g.entry("a")?.state)
         g.recordPull("a")
         assertEquals(LibraryState.ACTIVE, g.entry("a")?.state)
