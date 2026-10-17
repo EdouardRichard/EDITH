@@ -923,7 +923,8 @@ function Set-Form {
 #   1. launch A11yClickActivity (it takes the foreground and starts polling),
 #   2. sleep 1.5 s,
 #   3. start edith.phone/.MainActivity WHILE the probe is still polling,
-#   4. wait for P3_A1CLICK_VERDICT and require clicked=true.
+#   4. wait for P3_A1CLICK_VERDICT and require clicked=true (or, when the verdict write is lost,
+#      accept the probe's same-label A1CLICK_MATCH clicked=true; see Get-ProbeClickAcceptance).
 # Evidence: docs/project/evidence/2026-10-16-phase-5-device-verification.md:49-57 (menu and 开始 both
 # start the probe, wait 1.5 s, then re-front MainActivity) and
 # docs/project/evidence/2026-10-16-deepseek-apikey-repair.md:121-123 (the probe reads the active
@@ -938,9 +939,64 @@ function Get-ProbeClickSequence {
     )
 }
 
-# Runs the Phase 5 sequence above. The verdict is the probe's own line; a click that never matched,
-# timed out, or was refused is a fatal session-setup failure (design section 3.1), not a slot to
-# retry twenty times.
+# Decides a click from the probe's log slice. The verdict is authoritative when present: its
+# outcome must still be `clicked`. When the verdict write is lost (Task 8 review round 3: the click
+# was dispatched and the app armed, but P3_A1CLICK_VERDICT never appeared), the probe's own match
+# line is the remaining dispatch evidence: only the SAME label with clicked=true counts, and the
+# caller records a deviation marker. A match line for another label is never accepted.
+function Get-ProbeClickAcceptance {
+    param([string[]]$Lines, [string]$Label)
+
+    $verdict = Get-MatchingLines -Lines $Lines -Pattern 'P3_A1CLICK_VERDICT' | Select-Object -Last 1
+    if ($null -ne $verdict) {
+        $outcome = 'unknown'
+        if ($verdict -match 'outcome=(\S+)') { $outcome = $Matches[1] }
+        if ($outcome -ne 'clicked') {
+            return [pscustomobject]@{
+                Accepted = $false; Source = 'verdict'; Outcome = $outcome
+                Failure = ('CLICK_FAILED label={0} outcome={1}' -f $Label, $outcome)
+            }
+        }
+        return [pscustomobject]@{
+            Accepted = $true; Source = 'verdict'; Outcome = 'clicked'; Failure = ''
+        }
+    }
+
+    # The probe logs `A1CLICK_MATCH tick=11 label='开始' clicked=true package=edith.phone`. Parse the
+    # quoted label forms first so the comparison stays exact; never infer the label from some other
+    # field (`labels=` on the verdict is the requested set, not the matched one).
+    $matchLine = $null
+    foreach ($line in @(Get-MatchingLines -Lines $Lines -Pattern 'A1CLICK_MATCH')) {
+        $lineLabel = $null
+        if ($line -match "label='([^']*)'") { $lineLabel = $Matches[1] }
+        elseif ($line -match 'label="([^"]*)"') { $lineLabel = $Matches[1] }
+        elseif ($line -match 'label=(\S+)') { $lineLabel = $Matches[1] }
+        if ($null -eq $lineLabel) { continue }
+        if (-not [string]::Equals($lineLabel, $Label, [System.StringComparison]::Ordinal)) { continue }
+        $matchLine = $line
+    }
+    if ($null -eq $matchLine) {
+        return [pscustomobject]@{
+            Accepted = $false; Source = ''; Outcome = ''
+            Failure = ('CLICK_TIMEOUT label={0}' -f $Label)
+        }
+    }
+    $clicked = ''
+    if ($matchLine -match 'clicked=(\S+)') { $clicked = $Matches[1] }
+    if ($clicked -ne 'true') {
+        return [pscustomobject]@{
+            Accepted = $false; Source = 'match'; Outcome = ('clicked=' + $clicked)
+            Failure = ('CLICK_FAILED label={0} clicked={1}' -f $Label, $clicked)
+        }
+    }
+    return [pscustomobject]@{
+        Accepted = $true; Source = 'match'; Outcome = 'clicked'; Failure = ''
+    }
+}
+
+# Runs the Phase 5 sequence above. The verdict (or, when the verdict write is lost, the probe's own
+# same-label match line) is the click evidence; a click that never matched, timed out, or was
+# refused is a fatal session-setup failure (design section 3.1), not a slot to retry twenty times.
 function Invoke-ProbeClick {
     param(
         [string]$Label,
@@ -967,7 +1023,7 @@ function Invoke-ProbeClick {
             }
             'wait-verdict' {
                 $timeout = [int][math]::Ceiling($step.WaitMillis / 1000.0) + 10
-                $pattern = 'P3_A1CLICK_VERDICT|A1CLICK_SERVICE_NOT_ENABLED|A1CLICK_NOT_CONFIRMED'
+                $pattern = 'P3_A1CLICK_VERDICT|A1CLICK_MATCH|A1CLICK_SERVICE_NOT_ENABLED|A1CLICK_NOT_CONFIRMED'
                 $wait = Wait-LogPattern -Since $since -RequiredPatterns @($pattern) `
                     -TimeoutSeconds $timeout -Label ('CLICK_' + $step.Label)
                 if (Test-AnyLineMatch -Lines $wait.Lines -Pattern 'A1CLICK_SERVICE_NOT_ENABLED') {
@@ -976,14 +1032,12 @@ function Invoke-ProbeClick {
                 if (Test-AnyLineMatch -Lines $wait.Lines -Pattern 'A1CLICK_NOT_CONFIRMED') {
                     Stop-CampaignFatal 'A11Y_CLICK_NOT_CONFIRMED'
                 }
-                $verdict = Get-MatchingLines -Lines $wait.Lines -Pattern 'P3_A1CLICK_VERDICT' | Select-Object -Last 1
-                if ($null -eq $verdict) {
-                    Stop-CampaignFatal ('CLICK_TIMEOUT label={0}' -f $step.Label)
+                $acceptance = Get-ProbeClickAcceptance -Lines $wait.Lines -Label $step.Label
+                if (-not $acceptance.Accepted) {
+                    Stop-CampaignFatal $acceptance.Failure
                 }
-                $outcome = 'unknown'
-                if ($verdict -match 'outcome=(\S+)') { $outcome = $Matches[1] }
-                if ($outcome -ne 'clicked') {
-                    Stop-CampaignFatal ('CLICK_FAILED label={0} outcome={1}' -f $step.Label, $outcome)
+                if ($acceptance.Source -eq 'match') {
+                    Write-CampaignLog ('CLICK_VERDICT_MISSING_ACCEPTED_MATCH label={0}' -f $step.Label)
                 }
                 break
             }
@@ -1861,6 +1915,102 @@ function Invoke-SelfTest {
     }
     finally {
         $script:Fatal = $null
+    }
+
+    # Case 17: the probe's verdict with outcome=clicked still accepts the click.
+    try {
+        $verdictLine = '10-17 15:28:05.000  1000  1100 I System.out: EdithA11y P3_A1CLICK_VERDICT ' +
+            'outcome=clicked labels=开始 matched=开始 clicked=true polls=3 waitMillis=25000 window=edith.phone visible=7'
+        $acceptance = Get-ProbeClickAcceptance -Lines @($verdictLine) -Label $StartLabel
+        $problems = @()
+        if (-not $acceptance.Accepted) { $problems += 'accepted expected=true actual=false' }
+        if ($acceptance.Source -ne 'verdict') { $problems += ('source actual={0}' -f $acceptance.Source) }
+        if ($acceptance.Outcome -ne 'clicked') { $problems += ('outcome actual={0}' -f $acceptance.Outcome) }
+        if (-not [string]::IsNullOrEmpty($acceptance.Failure)) { $problems += ('failure actual={0}' -f $acceptance.Failure) }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 17 -Detail 'VERDICT_CLICKED accepted source=verdict'
+        }
+        else {
+            Add-SelfTestFail -Number 17 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 17 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
+    # Case 18: the verdict write was lost; the probe's own same-label match with clicked=true is the
+    # remaining dispatch evidence (Task 8 review round 3; this is the exact device line shape).
+    try {
+        $matchLine = "10-17 15:28:05.261  1000  1100 I System.out: EdithA11y A1CLICK_MATCH tick=11 label='开始' clicked=true package=edith.phone"
+        $acceptance = Get-ProbeClickAcceptance -Lines @($matchLine) -Label $StartLabel
+        $problems = @()
+        if (-not $acceptance.Accepted) { $problems += 'accepted expected=true actual=false' }
+        if ($acceptance.Source -ne 'match') { $problems += ('source actual={0}' -f $acceptance.Source) }
+        if ($acceptance.Outcome -ne 'clicked') { $problems += ('outcome actual={0}' -f $acceptance.Outcome) }
+        if (-not [string]::IsNullOrEmpty($acceptance.Failure)) { $problems += ('failure actual={0}' -f $acceptance.Failure) }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 18 -Detail 'MATCH_ONLY accepted source=match clicked=true'
+        }
+        else {
+            Add-SelfTestFail -Number 18 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 18 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
+    # Case 19: a same-label match that says clicked=false is a failed click, never a dispatch.
+    try {
+        $matchLine = "10-17 15:28:05.261  1000  1100 I System.out: EdithA11y A1CLICK_MATCH tick=11 label='开始' clicked=false package=edith.phone"
+        $acceptance = Get-ProbeClickAcceptance -Lines @($matchLine) -Label $StartLabel
+        $problems = @()
+        if ($acceptance.Accepted) { $problems += 'accepted expected=false actual=true' }
+        if ($acceptance.Failure -notmatch '^CLICK_FAILED ') { $problems += ('failure actual={0}' -f $acceptance.Failure) }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 19 -Detail 'MATCH_CLICKED_FALSE rejected=CLICK_FAILED'
+        }
+        else {
+            Add-SelfTestFail -Number 19 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 19 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
+    # Case 20: a match line for a different label is never accepted; with no verdict and no
+    # same-label match, the click stays a timeout.
+    try {
+        $matchLine = "10-17 15:28:05.261  1000  1100 I System.out: EdithA11y A1CLICK_MATCH tick=11 label='菜单' clicked=true package=edith.phone"
+        $acceptance = Get-ProbeClickAcceptance -Lines @($matchLine) -Label $StartLabel
+        $problems = @()
+        if ($acceptance.Accepted) { $problems += 'accepted expected=false actual=true' }
+        if ($acceptance.Failure -notmatch '^CLICK_TIMEOUT ') { $problems += ('failure actual={0}' -f $acceptance.Failure) }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 20 -Detail 'MATCH_OTHER_LABEL rejected=CLICK_TIMEOUT'
+        }
+        else {
+            Add-SelfTestFail -Number 20 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 20 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
+    # Case 21: neither a verdict nor a same-label match appears -> keep CLICK_TIMEOUT.
+    try {
+        $acceptance = Get-ProbeClickAcceptance -Lines @() -Label $StartLabel
+        $problems = @()
+        if ($acceptance.Accepted) { $problems += 'accepted expected=false actual=true' }
+        if ($acceptance.Failure -notmatch '^CLICK_TIMEOUT ') { $problems += ('failure actual={0}' -f $acceptance.Failure) }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 21 -Detail 'NO_LINES rejected=CLICK_TIMEOUT'
+        }
+        else {
+            Add-SelfTestFail -Number 21 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 21 -Detail ('error={0}' -f $_.Exception.Message)
     }
 
     if ($script:SelfTestFailures.Count -gt 0) {
