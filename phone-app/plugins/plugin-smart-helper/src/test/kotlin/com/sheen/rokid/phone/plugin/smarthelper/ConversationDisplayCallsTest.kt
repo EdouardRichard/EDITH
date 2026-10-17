@@ -324,7 +324,7 @@ class ConversationDisplayCallsTest {
     }
 
     @Test
-    fun aStopDuringADisplayedProactiveTurnCancelsItsOutput() {
+    fun aStopDuringAnAcceptedProactiveHintCancelsItsOutput() {
         // 0.23 P5 (D145): the official "double-click interrupt" stops the speech and takes the hint off the screen.
         // The wake turn already went through `cancelOutputTurn`; a proactive hint that is already displayed must too.
         val display = RecordingDisplay()
@@ -371,6 +371,35 @@ class ConversationDisplayCallsTest {
         assertTrue(display.calls.contains("working:PROACTIVE"), display.calls.toString())
         assertTrue(display.calls.contains("idle:PROACTIVE"), display.calls.toString())
         assertTrue(rig.output.hints.isEmpty(), "a cancelled proactive hint must never be submitted")
+    }
+
+    @Test
+    fun aStopDuringSubmitCancelsAHintTheHostAlreadyAccepted() {
+        // The STOP can land between the plugin's "not cancelled" check and the host's `submit` returning Accepted.
+        // The hint must then be cancelled explicitly; marking it unreadable is not enough because the host may already
+        // have put it on screen.
+        val display = RecordingDisplay()
+        val rig = rig(display)
+        rig.model.onRequest = { request, listener ->
+            if (request.tools.any { it.name == "propose_hint" }) {
+                listener(smartToolCall("c1", "propose_hint", """{"text":"迟到的主动提醒"}""",
+                    requestId = request.requestId))
+            }
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        rig.output.onSubmit = {
+            rig.plugin.handle(com.sheen.rokid.contracts.UserAction(rig.envelope(),
+                com.sheen.rokid.contracts.UserAction.Action.Stop))
+        }
+
+        rig.plugin.handle(com.sheen.rokid.contracts.AcousticEvent(rig.envelope(),
+            com.sheen.rokid.contracts.AcousticLabel.Speech))
+        rig.plugin.handle(com.sheen.rokid.contracts.TranscriptEvent(rig.transcript("现在几点了")))
+        rig.tick()
+
+        val hintTurn = rig.output.hints.single().sourceTurnId
+        assertTrue(rig.cancels.contains(Triple(rig.sessionId, rig.generation, hintTurn)),
+            "the accepted-then-stopped hint must be cancelled: ${rig.cancels}")
     }
 
     private class DecliningGate : com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate {

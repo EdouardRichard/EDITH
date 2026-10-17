@@ -10,10 +10,8 @@ import com.sheen.rokid.output.HintWireCodec
  * [HintWireCodec.MAX_TEXT_CODEPOINTS] codepoints, so the only job left here is **layout**: split the text on sentence
  * boundaries, one point per line, and show all of them.
  *
- * **Changed for `P3.2-CLIP` (2026-10-09).** This layer used to hand the view at most [MAX_POINTS] points, so a
- * four-sentence answer lost its tail *before* layout ever saw it; an 89-character wake answer was silently cut to its
- * first three sentences on top of the view's own six-line window. The wire bound is the only limit that has a reason
- * to exist, so it is now the only one: a longer hint is not dropped here, it is walked through by [HintTicker].
+ * **0.23 P4:** production now shows the raw answer text and lets [HintTicker] walk it; the sentence-splitting helpers
+ * below are retained only for the pure unit tests that pin the old contract. Do not wire them back into the Activity.
  */
 object HintPresentation {
     /**

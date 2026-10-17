@@ -7,6 +7,7 @@ import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.glasses.display.OrbState
+import com.sheen.rokid.glasses.display.TailTextView
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import org.junit.Assert.assertEquals
@@ -150,7 +151,7 @@ class GlassesPanelStateTest {
     }
 
     @Test
-    fun theWearersLineLeftAlignsAndCapsAtFourLinesWhileTheAnswerDoesNot() {
+    fun theWearersLineShowsTheNewestFourLinesAndAlignsLeft() {
         ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-p3", 1)))
@@ -162,8 +163,12 @@ class GlassesPanelStateTest {
             scenario.onActivity { activity ->
                 val userRow = requireNotNull(activity.lastMessageRowForProbe()) {
                     "the wearer's line must have been rendered"
-                }
-                assertEquals("the wearer's line is capped at four lines", 4, userRow.maxLines)
+                } as TailTextView
+                assertEquals("the wearer's line is capped at four lines", 4,
+                    userRow.maxVisibleLinesForProbe())
+                assertTrue("six lines must be tail-clipped", userRow.isTailClippedForProbe())
+                assertEquals("the newest line must survive the cap", "第六行",
+                    userRow.visibleLineTextForProbe().last())
                 val absolute = android.view.Gravity.getAbsoluteGravity(
                     userRow.gravity, userRow.layoutDirection)
                 assertEquals("and aligns left like every other line",

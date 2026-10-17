@@ -135,6 +135,20 @@ import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
+/**
+ * Whether a STOP's validated identity still names the session the host is running.
+ *
+ * 0.23 P5 review: the link validates a STOP against the identity it knows, then calls the composition. A **new
+ * session** (stop/start) has a new id and must not accept the old STOP; a **pause/resume** keeps the id but bumps
+ * `HostRuntime.generation` without re-introducing the session to the glasses, so comparing the generation here would
+ * reject every legitimate STOP after a resume. The link has already checked the generation against the glasses'
+ * session; the composition only needs the session id to rule out a different session.
+ */
+internal fun stopSessionMatches(
+    current: Pair<com.sheen.rokid.contracts.SessionId, com.sheen.rokid.contracts.Generation>?,
+    sessionId: String,
+): Boolean = current != null && current.first.value == sessionId
+
 class HostCompositionRoot internal constructor(
     val host: HostRuntime,
     val profiles: ProfileRepository,
@@ -952,16 +966,21 @@ class HostCompositionRoot internal constructor(
     /**
      * 0.23 P5 (spec §5.3.2, U11): the wearer's double-click on the glasses, raised as `UserAction.Stop`.
      *
-     * Same shape and identity rule as [requestHelp]: the identity is read from the host at call time, so a STOP that
-     * arrives after a pause, a stop or a session switch is dropped by the host rather than cancelling another
-     * session's work. A composition with nothing active answers false instead of throwing.
+     * The caller passes the session/generation the STOP was validated against (not just "a stop happened"), and the
+     * pair is compared with the host's identity **again** here. A stop/start between the link's validation and this
+     * method would otherwise let an old STOP cancel the new session's work; a mismatch is answered `stale` and the
+     * event is not delivered.
      *
-     * @return true when the host accepted the event for the active plugin; false when there is no live session.
+     * @return true when the host accepted the event for the active plugin; false for a stale or absent identity.
      */
-    @Synchronized fun requestStop(): Boolean {
+    @Synchronized fun requestStop(sessionId: String, generation: Long): Boolean {
         if (closed) return false
         val identity = runCatching { host.currentIdentity() }.getOrNull() ?: run {
             P3Log.line("P3_CXR stop result=no_session")
+            return false
+        }
+        if (!stopSessionMatches(identity, sessionId)) {
+            P3Log.line("P3_CXR stop result=stale")
             return false
         }
         val now = clock.nowNanos()
@@ -1279,11 +1298,19 @@ class HostCompositionRoot internal constructor(
         // there is no reset here and no `deactivate()` to call. (`D53`① removed the upload consent that used to be
         // reset in the same breath; both are pinned by tests.)
         // D15: a stopped session must not keep repeating its opening handshake to the glasses.
-        hintLink?.sessionEnded()
+        //
+        // 0.23 P5 review: `host.stop()` **before** `sessionEnded()`. Deactivation publishes an `idle` for the route it
+        // was working on; clearing the link's session first made that statement unsendable and left the glasses
+        // spinning until their local 60 s bound. `sessionEnded()` then states both levels idle while it still has an
+        // identity to address, so even an already-idle plugin leaves the glasses at rest.
         // Before `host.stop()`: the epoch named by `runningAudioEpoch` is the one the loop is polling under, and
         // after teardown the input port may no longer be able to answer for it.
         disarmAudioEpoch()
-        host.stop()
+        try {
+            host.stop()
+        } finally {
+            hintLink?.sessionEnded()
+        }
         activatedPlugin = null
         awaitingDisplayForActivation = false
         retriedMappingSyncId = null
@@ -1533,17 +1560,13 @@ class HostCompositionRoot internal constructor(
                 wakeEmit = { word, confidence -> hostHolder[0]?.let { host ->
                     // 0.23 P5 (D135): a short chime, governed by the same 「语音朗读」 switch, then the wake event.
                     // No Assistance, no conversation entry and no TTS phrase: the wearer hears that they were heard,
-                    // and nothing claims to be an answer.
+                    // and nothing claims to be an answer. A wake with no live identity is not a session the wearer
+                    // can be hearing - do not chime for it.
                     val root = rootHolder[0]
-                    if (root != null) {
-                        val enabled = root.speechEnabled.value
-                        val accepted = wakeChime.play(clock.nowNanos(), enabled, wakeChimeSink)
-                        val state = when {
-                            !enabled -> "disabled"
-                            !accepted -> "debounced"
-                            else -> "played"
-                        }
-                        P3Log.line("P5_CHIME state=$state")
+                    if (root != null && host.currentIdentity() != null) {
+                        val outcome = wakeChime.playOutcome(
+                            clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
+                        P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
                     }
                     emitWakeDetected(host, clock, word, confidence)
                 } },
@@ -1845,7 +1868,9 @@ class HostCompositionRoot internal constructor(
             rootHolder[0] = root
             // 0.23 P5 (U11): the glasses' STOP reaches the production composition through the link, and the identity
             // is read from the host at call time by `requestStop` (not captured here).
-            hintLink.onStopRequest = { rootHolder[0]?.requestStop() ?: false }
+            hintLink.onStopRequest = { sessionId, generation ->
+                rootHolder[0]?.requestStop(sessionId, generation) ?: false
+            }
             scene.composition = root
             // Task 14a item 1: the real plugin, not `SmartAssistantPlugin()` with defaults. Its configuration is
             // applied by `activateSelected` before every activation, from the same settings this root was built with.

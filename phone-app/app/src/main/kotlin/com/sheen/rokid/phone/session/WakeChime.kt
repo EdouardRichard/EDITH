@@ -38,9 +38,18 @@ class WakeChime(private val debounceMillis: Long = DEBOUNCE_MILLIS) {
      * Asks [sink] to play exactly when [onWake] accepts. A sink that throws costs the wearer the sound, never the
      * wake: this runs on the path that emits `WakeDetected`, and an exception must not take that down.
      */
-    internal fun play(nowNanos: Long, enabled: Boolean, sink: WakeChimeSink): Boolean {        if (!onWake(nowNanos, enabled)) return false
+    internal fun play(nowNanos: Long, enabled: Boolean, sink: WakeChimeSink): Boolean {
+        if (!onWake(nowNanos, enabled)) return false
         runCatching { sink.play() }
         return true
+    }
+
+    /** As [play], but keeps the sink's own result so `P5_CHIME` cannot say `played` after a failed tone. */
+    internal fun playOutcome(nowNanos: Long, enabled: Boolean, sink: WakeChimeSink): WakeChimeOutcome {
+        if (!enabled) return WakeChimeOutcome.DISABLED
+        if (!onWake(nowNanos, true)) return WakeChimeOutcome.DEBOUNCED
+        val played = runCatching { sink.play() }.getOrDefault(false)
+        return if (played) WakeChimeOutcome.PLAYED else WakeChimeOutcome.FAILED
     }
 
     /** Forgets the debounce window; used when a composition is rebuilt rather than on a normal wake. */
@@ -56,8 +65,12 @@ class WakeChime(private val debounceMillis: Long = DEBOUNCE_MILLIS) {
 
 /** The one thing the chime needs from Android, so the decision above stays JVM-testable. */
 internal fun interface WakeChimeSink {
-    fun play()
+    /** True when the platform accepted the tone; false when it could not even start one. */
+    fun play(): Boolean
 }
+
+/** The result of one wake's chime attempt, for the one `P5_CHIME` line the composition writes. */
+internal enum class WakeChimeOutcome { DISABLED, DEBOUNCED, PLAYED, FAILED }
 
 /**
  * The platform equivalent of the official short `aiWakeSound`: a 120 ms `TONE_PROP_BEEP` on the music stream.
@@ -71,15 +84,11 @@ internal class ToneWakeChimeSink(context: Context) : WakeChimeSink, AutoCloseabl
     private val tone: ToneGenerator? =
         runCatching { ToneGenerator(AudioManager.STREAM_MUSIC, TONE_VOLUME) }.getOrNull()
 
-    override fun play() {
-        val generator = tone ?: run {
-            android.util.Log.i(TAG, "P5_CHIME state=failed device=no_tone_generator")
-            return
-        }
-        val started = runCatching {
+    override fun play(): Boolean {
+        val generator = tone ?: return false
+        return runCatching {
             generator.startTone(ToneGenerator.TONE_PROP_BEEP, TONE_MILLIS)
         }.getOrDefault(false)
-        if (!started) android.util.Log.i(TAG, "P5_CHIME state=failed device=start_tone_refused")
     }
 
     override fun close() {

@@ -126,6 +126,14 @@ class GlassesInteractionTest {
             mark("paged")
             settle(2_000)
 
+            // Unpinning is the other half of the pin contract: the ticker resumes from the current position.
+            key(KeyEvent.KEYCODE_ENTER)
+            settle(500)
+            scenario.onActivity { activity ->
+                assertFalse("a second ENTER unpins", activity.isPinnedForProbe())
+                assertTrue("unpinning must resume the ticker", activity.tickerRunningForProbe())
+            }
+
             // A new session is a new window: both conversations empty, wake route, unpinned, nothing to scroll.
             scenario.onActivity { activity -> accept(activity, HintCommand.Hello("s-p4b", 2)) }
             settle(900)
@@ -157,6 +165,7 @@ class GlassesInteractionTest {
     fun aBackWhileBusyStopsWithoutExitingAndIdleBackExits() {
         ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
             scenario.onActivity { activity ->
+                activity.setStopSenderForProbe { true }
                 accept(activity, HintCommand.Hello("s-p5-back", 1))
                 accept(activity, HintCommand.Busy("s-p5-back", 1, AssistantRoute.WAKE, busy = true))
             }
@@ -166,6 +175,7 @@ class GlassesInteractionTest {
             settle(700)
             scenario.onActivity { activity ->
                 assertEquals("a busy BACK is a STOP, not an exit", "stop", activity.lastBackActionForProbe())
+                assertEquals(true, activity.lastBackStopSentForProbe())
                 assertFalse("and the window stays open", activity.isFinishing)
             }
 
@@ -177,6 +187,61 @@ class GlassesInteractionTest {
             settle(1_000)
             assertEquals("an idle BACK must exit the glasses window",
                 Lifecycle.State.DESTROYED, scenario.state)
+        }
+    }
+
+    @Test
+    fun aManualPageStopsTheRunningTickerAndTheNextEntryRestartsIt() {
+        val longText = buildString {
+            repeat(12) { index -> append("第${index + 1}点：这是用于翻页证据的合成长文本，长度足以超出眼镜列表窗口。") }
+        }.take(390)
+        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                accept(activity, HintCommand.Hello("s-p4-page", 1))
+                accept(activity, HintCommand.Sync("sync-page", 0, 1_000_000,
+                    System.nanoTime() + 60_000_000_000L))
+                accept(activity, HintCommand.Show("s-p4-page", 1, sequence = 1, hintId = "h-page-1", revision = 1,
+                    syncId = "sync-page", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 60_000,
+                    text = longText))
+            }
+            settle(700)
+            scenario.onActivity { activity ->
+                assertTrue("the ticker must be running on a long hint", activity.tickerRunningForProbe())
+            }
+
+            key(KeyEvent.KEYCODE_DPAD_DOWN)
+            settle(400)
+            scenario.onActivity { activity ->
+                assertFalse("a manual page must stop the ticker", activity.tickerRunningForProbe())
+            }
+
+            scenario.onActivity { activity ->
+                accept(activity, HintCommand.Show("s-p4-page", 1, sequence = 2, hintId = "h-page-2", revision = 1,
+                    syncId = "sync-page", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 60_000,
+                    text = longText))
+            }
+            settle(700)
+            scenario.onActivity { activity ->
+                assertTrue("the next entry must resume the ticker", activity.tickerRunningForProbe())
+            }
+        }
+    }
+
+    @Test
+    fun aBackWhileBusyWithADeadLinkExitsInsteadOfTrappingTheWearer() {
+        // A STOP that could not be sent is not an interrupt: the phone cannot clear the level, so keeping the window
+        // open would trap the wearer until the local 60 s bound.
+        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                activity.setStopSenderForProbe { false }
+                accept(activity, HintCommand.Hello("s-p5-dead", 1))
+                accept(activity, HintCommand.Busy("s-p5-dead", 1, AssistantRoute.WAKE, busy = true))
+            }
+            settle(700)
+
+            key(KeyEvent.KEYCODE_BACK)
+            settle(1_000)
+            assertEquals("the dead-link BACK must exit the window", Lifecycle.State.DESTROYED, scenario.state)
         }
     }
 }

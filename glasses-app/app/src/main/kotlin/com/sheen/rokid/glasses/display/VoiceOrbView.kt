@@ -34,11 +34,12 @@ class VoiceOrbView(context: Context) : View(context) {
 
     /** Changes the state and restarts the animator only when the new state actually breathes. */
     fun setState(state: OrbState) {
-        if (this.state == state) return
+        val changed = this.state != state
         this.state = state
-        val shouldBreathe = state == OrbState.LISTENING || state == OrbState.ANSWERING
-        if (shouldBreathe) start() else stop()
-        invalidate()
+        // Starting is idempotent, and it must run even when the state is unchanged: `onPause` stops the animator
+        // without changing the state, so a resumed LISTENING/ANSWERING orb would otherwise stay frozen.
+        if (state == OrbState.LISTENING || state == OrbState.ANSWERING) start() else stop()
+        if (changed) invalidate()
     }
 
     fun state(): OrbState = state

@@ -2020,7 +2020,12 @@ class SmartAssistantPlugin(
                 // here is what keeps the proactive turn and the next wake turn **two** observations instead of one
                 // folded turn, and a stale close from a turn that has already been replaced is a no-op.
                 endSkillTurn(skillGeneration)
-                synchronized(gate) { proactiveInFlight = false }
+                synchronized(gate) {
+                    // Only the turn that still owns the proactive slot may clear the level. A STOP (or a newer trigger)
+                    // can have replaced this turn while it was blocked; the old `finally` must not clear the new
+                    // turn's BUSY level, which would send the glasses back to idle while work is still in flight.
+                    if (proactiveHint === hint || proactiveHint == null) proactiveInFlight = false
+                }
                 publishBusy()
             }
         }
@@ -2270,6 +2275,7 @@ class SmartAssistantPlugin(
         } else {
             null
         }
+        var cancelLateOutput = false
         synchronized(gate) {
             hint.submitting = false
             if (result == OutputSubmission.Accepted && proactiveHint === hint && !hint.cancelled) {
@@ -2280,12 +2286,21 @@ class SmartAssistantPlugin(
                     P3Log.line("P3_HINT ack hint=${hint.hintId} status=${OutputStatus.Displayed}")
                     onDisplayedAck()
                 }
-            } else if (result != OutputSubmission.Accepted) {
+            } else if (result == OutputSubmission.Accepted) {
+                // A STOP (or a newer trigger) replaced the hint while `submit` was running outside the lock. The host
+                // may already have shown it, so it must be cancelled explicitly - not merely marked unreadable.
+                hint.cancelled = true
+                if (proactiveHint === hint) proactiveHint = null
+                cancelLateOutput = true
+            } else {
                 // Refused by the host's display gate: one line, no retry, no second request.
                 P3Log.line("P3_PROACTIVE hint rejected chars=${assistance.text.length}")
                 hint.cancelled = true
                 if (proactiveHint === hint) proactiveHint = null
             }
+        }
+        if (cancelLateOutput) {
+            runCatching { cancelOutputTurn(current.sessionId, current.generation, hint.turnId) }
         }
     }
 

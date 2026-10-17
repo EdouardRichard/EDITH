@@ -96,7 +96,7 @@ class GlassesPanelSpecTest {
     }
 
     @Test
-    fun everyRowIsLeftAlignedWithTheOfficialSizes() {
+    fun everyRowUsesTheOfficialSizesAndColors() {
         assertEquals(14f, GlassesPanelSpec.textSizePx(ConversationRole.USER))
         assertEquals(16f, GlassesPanelSpec.textSizePx(ConversationRole.ASSISTANT))
         assertEquals(0xB340FF5E.toInt(), GlassesPanelSpec.textColor(ConversationRole.USER))

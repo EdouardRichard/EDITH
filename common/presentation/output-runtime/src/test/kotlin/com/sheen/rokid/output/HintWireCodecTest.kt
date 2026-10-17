@@ -10,9 +10,9 @@ import kotlin.test.assertTrue
 /**
  * T18 versioned hint wire (wire version 1).
  *
- * Commands are `HELLO/PING/PONG/SYNC/SHOW/CLEAR/ACK`. The phone and glasses clock domains are distinguished
- * explicitly in the field names (`phoneSentNanos` is a phone instant, `validUntilGlassNanos` is a glasses
- * instant) so a raw phone nanosecond can never be read as a glasses clock.
+ * Commands are `HELLO/PING/PONG/SYNC/SHOW/CLEAR/ACK/SAID/BUSY`, plus 0.23 P5's glasses-to-phone `STOP`. The phone and
+ * glasses clock domains are distinguished explicitly in the field names (`phoneSentNanos` is a phone instant,
+ * `validUntilGlassNanos` is a glasses instant) so a raw phone nanosecond can never be read as a glasses clock.
  *
  * The codec is deliberately strict on input: it is the boundary that a hostile or buggy peer reaches, and the
  * SDK promises nothing about message order, size or duplication.
@@ -148,6 +148,13 @@ class HintWireCodecTest {
 
     @Test fun aStopWithABlankSessionIsRefusedOnEncode() {
         assertFailsWith<IllegalArgumentException> { HintWireCodec.encode(HintCommand.Stop("  ", 7)) }
+    }
+
+    @Test fun anUnknownCommandStaysNull() {
+        // The mixed-build safety net: an old peer must not throw on a command it does not know, and a new peer must
+        // not guess at one it was never taught.
+        assertNull(HintWireCodec.decode("""{"wireVersion":1,"command":"END","sessionId":"s","generation":1}"""))
+        assertNull(HintWireCodec.decode("""{"wireVersion":1,"command":"STOPP","sessionId":"s","generation":1}"""))
     }
 
     @Test fun theShowCarriesItsRouteAndTheOldShapeStillReadsAsWake() {

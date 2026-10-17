@@ -95,7 +95,7 @@ class HintVisibilityTest {
      *
      * Phase C repair: this assertion used to read `HintPresentation.MAX_POINTS`, a constant that was removed in
      * P3.2-CLIP and left this file unable to compile. What it has to prove is the same thing it always did - the text
-     * is taller than the window, so an overflow is observable - and the window is `HintAutoScroll.VISIBLE_LINES`.
+     * is taller than the window, so an overflow is observable - and the window is the ScrollView's visible height.
      */
     @Test
     fun aHintLongerThanTheLayoutShowsIsObservableAsScrollable() {

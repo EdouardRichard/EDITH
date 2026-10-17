@@ -20,15 +20,6 @@ class ConversationViewTest {
         ConversationEntry(id, AssistantRoute.WAKE, role, text)
 
     @Test
-    fun everyLineSitsOnTheLeftLikeTheOfficialPanel() {
-        val rows = ConversationView.rows(
-            listOf(entry("a", ConversationRole.USER), entry("b", ConversationRole.ASSISTANT)), liveEntryId = null)
-
-        assertTrue("the wearer's own words are left-aligned as well in 0.23: $rows",
-            rows.all { !it.alignedToEnd })
-    }
-
-    @Test
     fun onlyTheLiveHintIsEmphasised() {
         val rows = ConversationView.rows(
             listOf(entry("a", ConversationRole.ASSISTANT), entry("b", ConversationRole.ASSISTANT)),

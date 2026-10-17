@@ -44,7 +44,7 @@ class WakeChimeTest {
     fun playAsksTheSinkOnlyWhenTheWakeIsAccepted() {
         val chime = WakeChime()
         var plays = 0
-        val sink = WakeChimeSink { plays++ }
+        val sink = WakeChimeSink { plays++; true }
 
         assertFalse("disabled means no sound and no sink call", chime.play(1_000_000_000L, false, sink))
         assertEquals(0, plays)
@@ -60,6 +60,20 @@ class WakeChimeTest {
 
         assertTrue("the wake still counts as handled", chime.play(1_000_000_000L, true, sink))
         assertFalse("and the debounce still applies", chime.play(1_200_000_000L, true, sink))
+    }
+
+    @Test
+    fun theOutcomeSeparatesDisabledDebouncedPlayedAndFailed() {
+        val chime = WakeChime()
+        val sink = WakeChimeSink { true }
+        assertEquals(WakeChimeOutcome.DISABLED, chime.playOutcome(1_000_000_000L, false, sink))
+        assertEquals(WakeChimeOutcome.PLAYED, chime.playOutcome(1_100_000_000L, true, sink))
+        assertEquals(WakeChimeOutcome.DEBOUNCED, chime.playOutcome(1_200_000_000L, true, sink))
+
+        assertEquals(WakeChimeOutcome.FAILED,
+            WakeChime().playOutcome(1_000_000_000L, true, WakeChimeSink { false }))
+        assertEquals(WakeChimeOutcome.FAILED,
+            WakeChime().playOutcome(1_000_000_000L, true, WakeChimeSink { error("engine died") }))
     }
 
     @Test

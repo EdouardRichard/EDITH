@@ -13,6 +13,7 @@ import com.sheen.rokid.glasses.display.LoadingIndicatorView
 import com.sheen.rokid.glasses.display.MaskEdge
 import com.sheen.rokid.glasses.display.OrbState
 import com.sheen.rokid.glasses.display.PinIconView
+import com.sheen.rokid.glasses.display.TailTextView
 import com.sheen.rokid.glasses.display.VoiceOrbView
 
 import android.animation.ValueAnimator
@@ -21,7 +22,6 @@ import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.os.PowerManager
-import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
@@ -58,11 +58,10 @@ import java.util.concurrent.TimeUnit
  * acknowledgement honest: `GlassHintController` reports `Displayed` only after the render callback has committed, and
  * a view update that had merely been *posted* would have acknowledged something the wearer could not see yet.
  *
- * **Phase C (spec §6.6) changed what this screen is.** It used to show one hint at a time and erase it when the hint
- * expired. It now shows a **conversation**: AI replies on the left, the wearer's own messages on the right, one list
- * per route, with the live hint emphasised rather than being the only thing on screen. Retiring a hint therefore no
- * longer erases anything - `render(null)` means "nothing is live now", and the entries stay readable, which is the
- * whole point of a context view.
+ * **0.23 P3/P4 changed what this screen is.** It shows one **conversation** at a time, every line left-aligned
+ * (including the wearer's own), with the official bottom panel and a 1 px/frame ticker; the route is chosen by `SHOW`,
+ * and `ENTER` pins the reading position. The live hint is not emphasised - it is simply the newest row; retiring it
+ * does not erase anything (`render(null)` means "nothing is live now").
  *
  * [ConversationLog] is the single authority for what was said, in which order, under which route; the phone's
  * assistant tab renders the same object, so the two screens cannot disagree. The log is bounded, so a long session
@@ -116,7 +115,6 @@ class GlassesActivity : Activity() {
     private lateinit var pinTextView: TextView
     private lateinit var pinIconView: PinIconView
     private lateinit var complianceView: TextView
-    private lateinit var topMask: GradientMaskView
     private lateinit var bottomMask: GradientMaskView
 
     /** The thinking row currently in the list, so its ring can be stopped with the panel; null when not thinking. */
@@ -146,8 +144,17 @@ class GlassesActivity : Activity() {
     private var lastBackAction: String? = null
     private var lastBackStopSent: Boolean? = null
 
+    /** Test-only override for the CXR send; production leaves it null and uses [RokidBridgeEndpoint]. */
+    private var stopSenderForProbe: ((String) -> Boolean)? = null
+
     /** The wearer paged by hand: the ticker stays stopped until the next entry arrives (official `isAutoScroll=false`). */
     private var userReadPaused = false
+
+    /** False between `onPause` and `onResume`; prevents a pending post from restarting animators on a hidden screen. */
+    private var resumed = false
+
+    /** Monotonic rebuild token: only the newest layout pass may restore/reveal a scroll position. */
+    private var rebuildSerial = 0
 
     private val powerManager by lazy { getSystemService(PowerManager::class.java) }
 
@@ -178,11 +185,16 @@ class GlassesActivity : Activity() {
     /** Keeps the display awake only while something is being shown; the wake lock itself lives in [holdAwakeFor]. */
     override fun onResume() {
         super.onResume()
+        resumed = true
         applyPanelAndAnimation()
+        // `applyPanelAndAnimation` restores the state row; the scroll needs its own start because `applyVisualState`
+        // deliberately does not touch the ticker.
+        startTickerIfNeeded()
     }
 
     override fun onPause() {
         super.onPause()
+        resumed = false
         // Leaving the foreground ends the visible hint's claim on the panel; the controller clears the text too.
         holdAwakeFor(false)
         // The ring stops with the screen: it is not a progress bar whose state matters while nobody can see it, and a
@@ -205,15 +217,33 @@ class GlassesActivity : Activity() {
      */
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK) {
+            // A cancelled gesture (the window lost focus mid-press) is not a wearer decision. Consume it without
+            // finishing so a lost focus cannot close the panel.
+            if (event.isCanceled) return true
             val identity = controller.currentIdentity()
             val busy = busyState.any(clock.nowNanos())
             if (busy && identity != null) {
-                val sent = RokidBridgeEndpoint.instance.send(
-                    HintWireCodec.encode(HintCommand.Stop(identity.first, identity.second)))
-                lastBackAction = "stop"
-                lastBackStopSent = sent
+                // A malformed identity/encoder failure must fall through to the exit branch rather than throw on the
+                // UI thread. `encode` is total for a decoded HELLO, but this is the one path a wearer uses to get out.
+                val sent = runCatching {
+                    val json = HintWireCodec.encode(HintCommand.Stop(identity.first, identity.second))
+                    stopSenderForProbe?.invoke(json) ?: RokidBridgeEndpoint.instance.send(json)
+                }.getOrDefault(false)
+                if (sent) {
+                    lastBackAction = "stop"
+                    lastBackStopSent = true
+                    android.util.Log.i("EdithGlasses",
+                        "P5_GLASS_BACK action=stop sent=true session=${identity.first} " +
+                            "generation=${identity.second}")
+                    return true
+                }
+                // The link is dead, so the STOP cannot reach the phone. Keeping the window open would trap the wearer
+                // until the local 60 s busy bound expires; a STOP that was not sent is not an interrupt.
+                lastBackAction = "exit"
+                lastBackStopSent = false
                 android.util.Log.i("EdithGlasses",
-                    "P5_GLASS_BACK action=stop sent=$sent session=${identity.first} generation=${identity.second}")
+                    "P5_GLASS_BACK action=exit reason=stop_unsent busy=true identity=true")
+                finish()
                 return true
             }
             lastBackAction = "exit"
@@ -311,15 +341,6 @@ class GlassesActivity : Activity() {
     /** Which conversation is in front of the wearer, for the same reason. */
     fun selectedRoute(): AssistantRoute = order.selected()
 
-    /**
-     * The line count the live hint actually laid out into.
-     *
-     * Exposed for the same reason as [hintText]: the window shows a fixed number of lines, so nothing said about the
-     * overflow would leave "the hint was taller than the screen" unobservable. Valid after a layout pass. Since
-     * `P3.2-CLIP` an overflow is scrolled rather than clipped, and this count is what the scroll plan is built from.
-     */
-    fun renderedLineCount(): Int = liveRow?.lineCount ?: 0
-
     private companion object {
         /**
          * Upper bound on one hint's claim on the panel: longer than any hint the phone bounds (its `SHOW` carries the
@@ -378,8 +399,12 @@ class GlassesActivity : Activity() {
         val stored = log.append(ConversationEntry(command.entryId, command.route, ConversationRole.USER, command.text))
         android.util.Log.i("EdithGlasses",
             "said stored=$stored route=${command.route.name} chars=${command.text.length}")
-        if (stored) newEntryPending = true
-        rebuild()
+        // A SAID for the route that is not on screen is recorded but must not move the current view: only a SHOW
+        // changes the route (U8), and its rebuild will bring the updated conversation in then.
+        if (command.route == order.selected()) {
+            if (stored) newEntryPending = true
+            rebuild()
+        }
     }
 
     /**
@@ -413,6 +438,12 @@ class GlassesActivity : Activity() {
      * display off from the app. So raising a level arms a deadline, and the deadline re-runs this method.
      */
     private fun applyPanelAndAnimation() {
+        // A command can arrive while paused; it must not re-acquire the wake lock or start animators behind a blank
+        // display. `onResume` applies the state again once the screen is back.
+        if (!resumed) {
+            holdAwakeFor(false)
+            return
+        }
         val now = clock.nowNanos()
         val busy = busyState.any(now)
         // 0.23 P3: the whole-window loading ring is gone. The orb is the working indicator, and its state (idle /
@@ -440,6 +471,9 @@ class GlassesActivity : Activity() {
      */
     private fun applyVisualState() {
         if (!::orbView.isInitialized) return
+        // A command can arrive while the screen is paused (the bridge outlives the Activity); it must not restart the
+        // orb or the ticker behind a blank display. `onResume` applies the state once the screen is back.
+        if (!resumed) return
         val now = clock.nowNanos()
         val route = order.selected()
         val live = liveEntryId != null
@@ -490,7 +524,11 @@ class GlassesActivity : Activity() {
         android.util.Log.i("EdithGlasses",
             HintPresentation.conversationReport(route, rows.size, rows.sumOf { it.entry.text.length }))
         applyVisualState()
+        val serial = ++rebuildSerial
         entriesView.post {
+            // Only the newest rebuild may move the scroll. Several commands can arrive before the layout pass; a
+            // stale post restoring its own `previousScroll` would otherwise undo the newest entry's reveal.
+            if (serial != rebuildSerial || isFinishing || isDestroyed) return@post
             val max = maxScrollY()
             if (newEntryPending) {
                 // New content first: the newest entry's top, even while pinned. The ticker, if it runs, carries the
@@ -521,6 +559,7 @@ class GlassesActivity : Activity() {
      * at the bottom, on the pin, on a manual page and with the screen.
      */
     private fun startTickerIfNeeded() {
+        if (!resumed) return
         if (tickerAnimator != null) return
         if (order.isPinned() || userReadPaused) return
         if (!HintTicker.shouldScroll(scrollOffsetY(), maxScrollY())) return
@@ -539,7 +578,11 @@ class GlassesActivity : Activity() {
                     android.util.Log.i("EdithGlasses",
                         "P4_TICKER frames=$tickerFrames offset=${scrollOffsetY()} max=${maxScrollY()}")
                 }
-                if (!HintTicker.shouldScroll(scrollOffsetY(), maxScrollY())) stopTicker()
+                if (!HintTicker.shouldScroll(scrollOffsetY(), maxScrollY())) {
+                    android.util.Log.i("EdithGlasses",
+                        "P4_TICKER_STOP offset=${scrollOffsetY()} max=${maxScrollY()}")
+                    stopTicker()
+                }
             }
             start()
         }
@@ -561,9 +604,10 @@ class GlassesActivity : Activity() {
     private fun pageBy(direction: Int) {
         stopTicker()
         userReadPaused = true
-        val viewport = if (::hintScroll.isInitialized) hintScroll.height else 0
+        val viewport = (if (::hintScroll.isInitialized) hintScroll.height else 0) -
+            (if (::hintScroll.isInitialized) hintScroll.paddingTop + hintScroll.paddingBottom else 0)
         val remaining = if (direction > 0) maxScrollY() - scrollOffsetY() else scrollOffsetY()
-        val step = HintTicker.pageStepPx(remaining, viewport)
+        val step = HintTicker.pageStepPx(remaining, viewport.coerceAtLeast(0))
         if (step <= 0) return
         hintScroll.smoothScrollBy(0, direction * step)
         android.util.Log.i("EdithGlasses",
@@ -584,21 +628,31 @@ class GlassesActivity : Activity() {
      * **from the start** (the official `StaticLayoutView` keeps the newest words), while the assistant's line is 16 px
      * at full green and never truncated at the view layer - the list scrolls instead.
      */
-    private fun entryRow(row: ConversationView.Row): TextView = TextView(this).apply {
+    private fun entryRow(row: ConversationView.Row): TextView {
         val role = row.entry.role
-        text = row.entry.text
-        setTextColor(GlassesPanelSpec.textColor(role))
-        setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.textSizePx(role))
-        maxLines = GlassesPanelSpec.maxLines(role)
-        gravity = Gravity.START
-        if (role == com.sheen.rokid.output.ConversationRole.USER) {
-            ellipsize = TextUtils.TruncateAt.START
+        val view: TextView = if (role == com.sheen.rokid.output.ConversationRole.USER) {
+            // U6: keep the **newest** four lines. AOSP start-ellipsis is single-line only, so a plain
+            // `maxLines=4 + ellipsize=START` TextView would keep the oldest four instead.
+            TailTextView(this, maxVisibleLines = GlassesPanelSpec.maxLines(com.sheen.rokid.output.ConversationRole.USER))
+        } else {
+            TextView(this)
         }
-        layoutParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        val vertical = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 4f, resources.displayMetrics).toInt()
-        setPadding(0, vertical, 0, vertical)
-        if (row.live) liveRow = this
+        view.apply {
+            text = row.entry.text
+            setTextColor(GlassesPanelSpec.textColor(role))
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.textSizePx(role))
+            if (role != com.sheen.rokid.output.ConversationRole.USER) {
+                maxLines = GlassesPanelSpec.maxLines(role)
+            }
+            gravity = Gravity.START
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+            val vertical = TypedValue.applyDimension(
+                TypedValue.COMPLEX_UNIT_DIP, 4f, resources.displayMetrics).toInt()
+            setPadding(0, vertical, 0, vertical)
+            if (row.live) liveRow = this
+        }
+        return view
     }
 
     /**
@@ -625,7 +679,8 @@ class GlassesActivity : Activity() {
         thinkingIcon = icon
         thinkingRowView = this
         thinkingTextView = label
-        icon.start()
+        // The animator is started by `applyVisualState` only while the screen is resumed; starting it here would let a
+        // BUSY/SAID that arrives while paused keep a ring running behind a blank display.
     }
 
     /**
@@ -748,7 +803,7 @@ class GlassesActivity : Activity() {
             // `id_iv_recycler_bottom_mask` is gone by default for the same reason).
             setOnScrollChangeListener { _, _, _, _, _ -> updateScrollChrome() }
         }
-        topMask = GradientMaskView(this, MaskEdge.TOP)
+        val topMask = GradientMaskView(this, MaskEdge.TOP)
         bottomMask = GradientMaskView(this, MaskEdge.BOTTOM)
         complianceView = TextView(this).apply {
             setTextColor(GlassesPanelSpec.ALERT_RED)
@@ -885,6 +940,11 @@ class GlassesActivity : Activity() {
     fun lastBackActionForProbe(): String? = lastBackAction
 
     fun lastBackStopSentForProbe(): Boolean? = lastBackStopSent
+
+    /** Test-only: replaces the CXR send used by BACK, so both the sent and unsent branches can be driven on-device. */
+    fun setStopSenderForProbe(sender: ((String) -> Boolean)?) {
+        stopSenderForProbe = sender
+    }
 
     /** The top of the last message row, in the list's own coordinates; the new-entry reveal lands here. */
     fun lastMessageTopForProbe(): Int = lastMessageRowForProbe()?.top ?: 0

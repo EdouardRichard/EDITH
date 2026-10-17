@@ -407,15 +407,15 @@ class CxrHintLinkTest {
     // ---------------------------------------------------------------- 0.23 P5: the wearer's STOP
 
     @Test
-    fun aMatchingStopIsRoutedToTheHostCallback() {
+    fun aMatchingStopIsRoutedToTheHostCallbackWithItsOwnIdentity() {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
-        var stopped = 0
-        link.onStopRequest = { stopped++ }
+        val received = mutableListOf<Pair<String, Long>>()
+        link.onStopRequest = { session, generation -> received += session to generation }
         link.sessionEstablished("s-1", 3)
 
         assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.Stop("s-1", 3))))
-        assertEquals(1, stopped)
+        assertEquals(listOf("s-1" to 3L), received)
     }
 
     @Test
@@ -423,7 +423,7 @@ class CxrHintLinkTest {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
         var stopped = 0
-        link.onStopRequest = { stopped++ }
+        link.onStopRequest = { _, _ -> stopped++ }
         link.sessionEstablished("s-1", 3)
 
         assertFalse("another generation is another session's work",
@@ -437,7 +437,7 @@ class CxrHintLinkTest {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
         var stopped = 0
-        link.onStopRequest = { stopped++ }
+        link.onStopRequest = { _, _ -> stopped++ }
         link.sessionEstablished("s-1", 3)
         val json = HintWireCodec.encode(HintCommand.Stop("s-1", 3))
 
@@ -447,13 +447,54 @@ class CxrHintLinkTest {
     }
 
     @Test
+    fun aThrowingStopCallbackDoesNotEscapeTheSdkThread() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.onStopRequest = { _, _ -> error("the host died") }
+        link.sessionEstablished("s-1", 3)
+
+        assertTrue("the link still handled the STOP", link.onInbound(HintWireCodec.encode(HintCommand.Stop("s-1", 3))))
+    }
+
+    @Test
     fun aStopBeforeAnySessionIsRefused() {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
         var stopped = 0
-        link.onStopRequest = { stopped++ }
+        link.onStopRequest = { _, _ -> stopped++ }
 
         assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.Stop("s-1", 3))))
         assertEquals(0, stopped)
+    }
+
+    @Test
+    fun endingASessionClearsBothBusyLevelsBeforeTheSessionGoesAway() {
+        // 0.23 P5 review: the phone's own 停止 used to clear the session before the plugin could publish idle, so the
+        // glasses spun for up to 60 s. The link now states both levels false while it still has an identity to send.
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 4)
+        sent.clear()
+
+        link.sessionEnded()
+
+        val busies = sent.busy()
+        assertEquals("one idle per route: $busies", 2, busies.size)
+        assertEquals(setOf(com.sheen.rokid.contracts.AssistantRoute.WAKE,
+            com.sheen.rokid.contracts.AssistantRoute.PROACTIVE), busies.map { it.route }.toSet())
+        assertTrue("both levels must be false: $busies", busies.none { it.busy })
+    }
+
+    @Test
+    fun theCompositionStopCheckMatchesTheSessionAcrossPauseResume() {
+        // The link validates the STOP against the identity it knows; the composition must rule out a **different
+        // session** (a stop/start) but accept the same session after pause/resume, which bumps the host generation
+        // without re-introducing the session to the glasses.
+        assertFalse(com.sheen.rokid.phone.app.stopSessionMatches(null, "s-1"))
+        assertFalse(com.sheen.rokid.phone.app.stopSessionMatches(
+            com.sheen.rokid.contracts.SessionId("other") to com.sheen.rokid.contracts.Generation(3), "s-1"))
+        assertTrue("pause/resume keeps the session id; generation is the link's concern",
+            com.sheen.rokid.phone.app.stopSessionMatches(
+                com.sheen.rokid.contracts.SessionId("s-1") to com.sheen.rokid.contracts.Generation(4), "s-1"))
     }
 }

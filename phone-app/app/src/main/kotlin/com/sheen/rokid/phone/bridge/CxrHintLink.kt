@@ -112,10 +112,11 @@ class CxrHintLink(
     /**
      * 0.23 P5 (spec §5.3.2): the wearer's double-click reached us as a `STOP` for the established session.
      *
-     * Set by the composition to `HostCompositionRoot.requestStop()`. Only a matching session/generation invokes it;
-     * everything else is diagnosed and dropped, so an old glasses build or a stale command cannot cancel this one.
+     * The validated session and generation are passed through, not dropped: the composition re-checks the same pair
+     * against the host's identity at the moment it delivers the event, so a stop/start racing this callback cannot
+     * turn an old STOP into a cancellation of the new session.
      */
-    var onStopRequest: (() -> Unit)? = null
+    var onStopRequest: ((sessionId: String, generation: Long) -> Unit)? = null
 
     /**
      * The identifier of the mapping that is live **right now**, or null while nothing can be displayed.
@@ -233,6 +234,12 @@ class CxrHintLink(
      * introducing itself to the glasses.
      */
     fun sessionEnded() {
+        // 0.23 P5 review: state both routes idle **before** the identity is cleared. The phone's own 停止 otherwise
+        // left the glasses spinning until the local 60 s bound, and a STOP could no longer be sent for a dead session.
+        val session = establishedSession
+        if (session != null) {
+            AssistantRoute.entries.forEach { route -> runCatching { busy(route, false) } }
+        }
         openingSession = null
         // Phase C: a stopped session must not keep accepting conversation traffic - the glasses will refuse it, and
         // sending it would put the wearer's words on a wire for a session that is over.
@@ -294,9 +301,14 @@ class CxrHintLink(
                 return false
             }
             // No ACK: STOP is an event. The callback is the emergency brake (UserAction.Stop -> plugin.stopAll), and
-            // the plugin's own BUSY=false is what the glasses see as the effect.
+            // the plugin's own BUSY=false is what the glasses see as the effect. The callback reaches the host on this
+            // SDK thread, so a throw must be contained here rather than escape into the vendor's callback.
             diagnostics("stop accepted: session=${command.sessionId} generation=${command.generation}")
-            onStopRequest?.invoke()
+            val callback = onStopRequest
+            if (callback != null) {
+                runCatching { callback(command.sessionId, command.generation) }
+                    .onFailure { diagnostics("stop callback failed: ${it.javaClass.simpleName}") }
+            }
             return true
         }
         return rokidDevice.onCommand(json)
