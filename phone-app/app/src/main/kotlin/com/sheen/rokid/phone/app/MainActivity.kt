@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.app
 import com.sheen.rokid.phone.ui.profile.ProfileListScreen
 import com.sheen.rokid.phone.ui.profile.ProfileViewModel
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.AuditLogView
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.MemoryLine
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.MemoryLogView
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SmartSettingsForm
@@ -18,6 +19,7 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -30,6 +32,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
@@ -40,6 +43,7 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.phone.ui.PhoneDetailPage
 import com.sheen.rokid.phone.ui.PhoneScreen
 import kotlinx.coroutines.delay
 
@@ -355,6 +359,7 @@ internal fun AuditSection(view: AuditLogView) {
 @Composable
 internal fun MemorySection(view: MemoryLogView) {
     var revision by remember { mutableStateOf(0) }
+    var selected by remember { mutableStateOf<MemoryLine?>(null) }
     val lines = remember(revision) { view.lines() }
     Text("长期记忆", style = MaterialTheme.typography.titleLarge)
     Text(
@@ -364,8 +369,18 @@ internal fun MemorySection(view: MemoryLogView) {
     )
     if (lines.isEmpty()) Text("暂无记忆")
     lines.forEach { line ->
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(view.render(line), style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
+        // U-4: the list is a thumbnail (time, kind, 40 code points); the row opens the whole sentence on its own page.
+        Row(
+            Modifier.fillMaxWidth().clickable(onClickLabel = "查看记忆") { selected = line },
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text(
+                view.renderPreview(line),
+                style = MaterialTheme.typography.bodySmall,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f),
+            )
             TextButton(onClick = {
                 view.delete(line.id)
                 revision++
@@ -376,6 +391,12 @@ internal fun MemorySection(view: MemoryLogView) {
         view.clear()
         revision++
     }) { Text("清空长期记忆") }
+    selected?.let { line ->
+        PhoneDetailPage(title = "记忆详情", onBack = { selected = null }) {
+            Text("${line.stamp} | ${line.kind}", style = MaterialTheme.typography.bodySmall)
+            Text(line.text)
+        }
+    }
     HorizontalDivider()
 }
 

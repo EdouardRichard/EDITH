@@ -8,6 +8,7 @@ import android.content.Intent
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -44,6 +45,7 @@ import com.sheen.rokid.phone.app.MemorySection
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.SessionViewModel
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillContent
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillListing
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.app.capabilityLabel
@@ -436,6 +438,7 @@ private fun RoleAvatar(role: ConversationRole) {
 @Composable
 internal fun SkillsTab(root: HostCompositionRoot) {
     var revision by remember { mutableStateOf(0) }
+    var selected by remember { mutableStateOf<String?>(null) }
     val listing = remember(revision) { root.skillDirectory?.list() ?: SkillListing.Unreadable }
 
     Text("技能（SKILL）", style = MaterialTheme.typography.titleLarge)
@@ -449,7 +452,11 @@ internal fun SkillsTab(root: HostCompositionRoot) {
             Text("暂无技能")
         } else {
             listing.names.forEach { name ->
-                Row(verticalAlignment = Alignment.CenterVertically) {
+                // U-3: the whole row opens the full text; the delete verb keeps its own click target at the end.
+                Row(
+                    Modifier.fillMaxWidth().clickable(onClickLabel = "查看技能") { selected = name },
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
                     Text(name, modifier = Modifier.weight(1f))
                     TextButton(onClick = {
                         root.skillDirectory?.delete(name)
@@ -460,6 +467,17 @@ internal fun SkillsTab(root: HostCompositionRoot) {
         }
     }
     OutlinedButton(onClick = { revision++ }) { Text("刷新") }
+
+    selected?.let { name ->
+        PhoneDetailPage(title = name, onBack = { selected = null }) {
+            // Read again when the row is opened: the listing and the file can disagree if the grant or the file changed.
+            when (val content = remember(name) { root.skillDirectory?.read(name) }) {
+                is SkillContent.Text -> Text(content.body)
+                SkillContent.Empty -> Text("（空技能文件）")
+                else -> Text("未授权或文件不可读", color = MaterialTheme.colorScheme.error)
+            }
+        }
+    }
 }
 
 /**
