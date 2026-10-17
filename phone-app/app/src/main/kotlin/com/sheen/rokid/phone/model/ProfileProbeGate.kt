@@ -1,4 +1,6 @@
 package com.sheen.rokid.phone.model
+import com.sheen.rokid.phone.ui.profile.ProbeConsent
+import com.sheen.rokid.phone.ui.profile.domain
 import com.sheen.rokid.phone.storage.unavailable
 
 import com.sheen.rokid.contracts.ContractError

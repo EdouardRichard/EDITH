@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone
+import com.sheen.rokid.phone.model.EngineBundleProvisioning
 import com.sheen.rokid.phone.app.activateBundle
 import com.sheen.rokid.phone.app.CandidateEngines
 import com.sheen.rokid.phone.app.AudioChainEngines

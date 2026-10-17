@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.storage
+import kotlinx.serialization.json.JsonObject
 import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.storage.ProfileRepository

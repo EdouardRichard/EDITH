@@ -92,7 +92,7 @@
         <!-- P3.2 Stage B (Task 12): notification access is the user's grant, made in Settings. The service only ever
              reads a notification's category/channel id (see NotificationCategoryService); the permission it binds
              with is declared by the platform, not by us. -->
-        <service android:name=".NotificationCategoryService" android:exported="false"
+        <service android:name=".context.NotificationCategoryService" android:exported="false"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />

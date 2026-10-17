@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.actions.intent
+import kotlinx.serialization.json.JsonObject
 import com.sheen.rokid.phone.R
 import com.sheen.rokid.phone.actions.shizuku.isCallComplete
 import com.sheen.rokid.phone.actions.shizuku.PrivilegedShell
@@ -9,7 +10,6 @@ import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.RiskLevel
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.contentOrNull
 

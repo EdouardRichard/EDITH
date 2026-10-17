@@ -1,4 +1,6 @@
 package com.sheen.rokid.phone.ui
+import com.sheen.rokid.phone.ui.profile.ProfileListScreen
+import com.sheen.rokid.phone.ui.profile.ProfileViewModel
 import com.sheen.rokid.phone.app.SmartSettingsSection
 
 import android.Manifest
@@ -31,17 +33,15 @@ import com.sheen.rokid.phone.app.MemorySection
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.SessionViewModel
-import com.sheen.rokid.phone.SkillListing
-import com.sheen.rokid.phone.SmartSettings
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillListing
+import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.app.capabilityLabel
-import com.sheen.rokid.phone.capabilityReasonLabel
+import com.sheen.rokid.phone.ui.capabilityReasonLabel
 import com.sheen.rokid.phone.bridge.cxrAuthorizationLabel
 import com.sheen.rokid.phone.bridge.cxrStatusLabel
 import com.sheen.rokid.phone.app.errorLabel
 import com.sheen.rokid.phone.actions.executionChannelLabel
-import com.sheen.rokid.phone.model.ProfileListScreen
-import com.sheen.rokid.phone.model.ProfileViewModel
-import com.sheen.rokid.phone.pluginPickerOptions
+import com.sheen.rokid.phone.ui.pluginPickerOptions
 import com.sheen.rokid.phone.app.sessionLabel
 import com.sheen.rokid.plugin.Capability
 import kotlinx.coroutines.launch

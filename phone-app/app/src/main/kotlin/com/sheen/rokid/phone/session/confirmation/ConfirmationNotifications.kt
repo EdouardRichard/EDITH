@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.session.confirmation
-import com.sheen.rokid.phone.P3Log
+import com.sheen.rokid.phone.platform.P3Log
 
 /**
  * The phone's notification shade, as the confirmation path needs it (spec §17.4).

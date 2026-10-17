@@ -7,7 +7,7 @@ import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.host.ActivationResult
 import com.sheen.rokid.host.HostRuntime
-import com.sheen.rokid.phone.model.ProactiveArming
+import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ConfigSchema

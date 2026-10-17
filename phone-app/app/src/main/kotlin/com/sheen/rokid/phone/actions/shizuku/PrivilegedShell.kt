@@ -3,7 +3,7 @@ import com.sheen.rokid.phone.R
 import com.sheen.rokid.phone.actions.intent.LaunchAppExecutor
 import com.sheen.rokid.phone.actions.intent.SystemActionExecutor
 import com.sheen.rokid.phone.storage.unavailable
-import com.sheen.rokid.phone.DebugShellCapProbe
+import com.sheen.rokid.phone.debug.DebugShellCapProbe
 /**
  * What went wrong when a reply could not be used (R-9).
  *

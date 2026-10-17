@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone
+import com.sheen.rokid.phone.debug.DebugHintInjector
 
 import org.junit.Assert.assertEquals
 import org.junit.Test

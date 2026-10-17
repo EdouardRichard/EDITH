@@ -1,8 +1,10 @@
 package com.sheen.rokid.phone.app
-import com.sheen.rokid.phone.AuditLogView
-import com.sheen.rokid.phone.MemoryLogView
-import com.sheen.rokid.phone.SmartSettings
-import com.sheen.rokid.phone.SmartSettingsForm
+import com.sheen.rokid.phone.ui.profile.ProfileListScreen
+import com.sheen.rokid.phone.ui.profile.ProfileViewModel
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.AuditLogView
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.MemoryLogView
+import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SmartSettingsForm
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionViewModel
 
@@ -38,8 +40,6 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.plugin.Capability
-import com.sheen.rokid.phone.model.ProfileViewModel
-import com.sheen.rokid.phone.model.ProfileListScreen
 import com.sheen.rokid.phone.ui.PhoneScreen
 import kotlinx.coroutines.delay
 

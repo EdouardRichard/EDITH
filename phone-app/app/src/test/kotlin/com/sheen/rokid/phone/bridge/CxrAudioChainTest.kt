@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.bridge
-import com.sheen.rokid.phone.EngineBundleProvisioning
+import com.sheen.rokid.phone.model.EngineBundleProvisioning
 import com.sheen.rokid.phone.session.PlaybackGate
 import com.sheen.rokid.phone.app.CxrAudioChain
 import com.sheen.rokid.phone.app.activateBundle

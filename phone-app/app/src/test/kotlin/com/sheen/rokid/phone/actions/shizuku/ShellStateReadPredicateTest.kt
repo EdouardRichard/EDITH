@@ -1,6 +1,6 @@
 package com.sheen.rokid.phone.actions.shizuku
 import com.sheen.rokid.phone.R
-import com.sheen.rokid.phone.DebugShellCapProbe
+import com.sheen.rokid.phone.debug.DebugShellCapProbe
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

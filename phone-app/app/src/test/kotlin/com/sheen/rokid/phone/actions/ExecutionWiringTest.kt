@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.actions
-import com.sheen.rokid.phone.capabilityReasonLabel
+import com.sheen.rokid.phone.ui.capabilityReasonLabel
 import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.unavailable
 

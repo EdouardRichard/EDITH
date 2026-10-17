@@ -1,4 +1,7 @@
 package com.sheen.rokid.phone
+import com.sheen.rokid.phone.debug.DebugBurstTarget
+import com.sheen.rokid.phone.debug.DebugWavPcm
+import com.sheen.rokid.phone.debug.DebugBurst
 
 import com.sheen.rokid.audio.PcmOffer
 import com.sheen.rokid.contracts.GapReason

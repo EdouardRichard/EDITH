@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone
+import com.sheen.rokid.phone.debug.DebugMemoryForm
 
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryMeasurementForm
 import org.junit.Assert.assertEquals

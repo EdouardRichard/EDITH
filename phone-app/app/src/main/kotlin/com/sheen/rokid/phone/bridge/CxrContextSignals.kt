@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.bridge
-import com.sheen.rokid.phone.model.ProactiveArming
+import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
 
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.ContextSignals
@@ -83,11 +83,11 @@ internal class CxrContextSignals(
          * The host's own 「主动辅助」 state, as one context source.
          *
          * The composition appends this to the Stage A sources, so the arming switch is readable at request time by the
-         * plugin that has to honour it (see [com.sheen.rokid.phone.model.ProactiveArming.CONTEXT_KEY]). It is a source rather
+         * plugin that has to honour it (see [com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming.CONTEXT_KEY]). It is a source rather
          * than a fourth constructor parameter so the plugin-facing key set stays one flat projection.
          */
-        fun armingSource(arming: com.sheen.rokid.phone.model.ProactiveArming): () -> Map<String, String> =
-            { mapOf(com.sheen.rokid.phone.model.ProactiveArming.CONTEXT_KEY to arming.enabled.value.toString()) }
+        fun armingSource(arming: com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming): () -> Map<String, String> =
+            { mapOf(com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming.CONTEXT_KEY to arming.enabled.value.toString()) }
     }
 }
 

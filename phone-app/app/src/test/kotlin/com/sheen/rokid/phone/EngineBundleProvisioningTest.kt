@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone
+import com.sheen.rokid.phone.model.EngineBundleProvisioning
 
 import com.sheen.rokid.audio.android.EngineManifestLoader
 import com.sheen.rokid.audio.android.EngineModelStore

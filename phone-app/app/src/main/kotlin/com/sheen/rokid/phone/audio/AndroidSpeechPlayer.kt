@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.audio
-import com.sheen.rokid.phone.P3Log
+import com.sheen.rokid.phone.platform.P3Log
 import com.sheen.rokid.phone.session.PlaybackGate
 
 import android.content.Context

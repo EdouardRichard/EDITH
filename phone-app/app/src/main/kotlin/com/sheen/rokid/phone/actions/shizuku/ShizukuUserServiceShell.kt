@@ -1,6 +1,6 @@
 package com.sheen.rokid.phone.actions.shizuku
 import com.sheen.rokid.phone.R
-import com.sheen.rokid.phone.DebugShellCapProbe
+import com.sheen.rokid.phone.debug.DebugShellCapProbe
 import android.content.ComponentName
 import android.content.Context
 import android.content.ServiceConnection

@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.context
-import com.sheen.rokid.phone.NotificationCategoryService
+import com.sheen.rokid.phone.context.NotificationCategoryService
 
 /**
  * The notification **category** as one context signal, published under [KEY] (P3.2 Stage B, Task 12).

@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone
+import com.sheen.rokid.phone.debug.F4MemoryBackup
 
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals

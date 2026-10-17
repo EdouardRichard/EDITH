@@ -13,7 +13,7 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
         <receiver
-            android:name=".DebugAudioInjector"
+            android:name=".debug.DebugAudioInjector"
             android:enabled="true"
             android:exported="true">
             <intent-filter>
@@ -26,7 +26,7 @@
           release build. It carries synthetic text only and logs counts only.
         -->
         <receiver
-            android:name=".DebugHintInjector"
+            android:name=".debug.DebugHintInjector"
             android:enabled="true"
             android:exported="true">
             <intent-filter>
@@ -41,7 +41,7 @@
           nothing but the transport, and it logs the action name only - never the arguments.
         -->
         <receiver
-            android:name=".DebugToolCallInjector"
+            android:name=".debug.DebugToolCallInjector"
             android:enabled="true"
             android:exported="true">
             <intent-filter>
@@ -50,7 +50,7 @@
         </receiver>
         <!-- P5 Task 12: creates a model profile from .local/p5-omni.properties for AUDIO_REQUEST verification. -->
         <receiver
-            android:name=".DebugProfileCreator"
+            android:name=".debug.DebugProfileCreator"
             android:enabled="true"
             android:exported="true">
             <intent-filter>
@@ -64,7 +64,7 @@
           comparison has to be driven through the app itself. Logs counts and one probability - no user content.
         -->
         <receiver
-            android:name=".DebugLayaProbe"
+            android:name=".debug.DebugLayaProbe"
             android:enabled="true"
             android:exported="true">
             <intent-filter>
@@ -79,7 +79,7 @@
           the elapsed milliseconds. It logs neither the command nor the reply's text.
         -->
         <receiver
-            android:name=".DebugShellCapProbe"
+            android:name=".debug.DebugShellCapProbe"
             android:enabled="true"
             android:exported="true">
             <intent-filter>
@@ -94,7 +94,7 @@
           whether a plugin accepted it, never memory text.
         -->
         <receiver
-            android:name=".DebugMemoryForm"
+            android:name=".debug.DebugMemoryForm"
             android:enabled="true"
             android:exported="true">
             <intent-filter>
@@ -109,7 +109,7 @@
           never memory text.
         -->
         <receiver
-            android:name=".DebugF4Memory"
+            android:name=".debug.DebugF4Memory"
             android:enabled="true"
             android:exported="true">
             <intent-filter>
@@ -123,7 +123,7 @@
           SHA-256 only - the text itself never reaches logcat.
         -->
         <receiver
-            android:name=".DebugF4Answer"
+            android:name=".debug.DebugF4Answer"
             android:enabled="true"
             android:exported="true">
             <intent-filter>

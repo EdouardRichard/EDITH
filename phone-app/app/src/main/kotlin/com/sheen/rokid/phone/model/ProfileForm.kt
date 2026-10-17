@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.model
+import com.sheen.rokid.phone.ui.profile.domain
 
 import com.sheen.rokid.phone.storage.opaqueSecret
 import com.sheen.rokid.plugin.*
