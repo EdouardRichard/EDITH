@@ -949,6 +949,30 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
+     * 0.23 P5 (spec §5.3.2, U11): the wearer's double-click on the glasses, raised as `UserAction.Stop`.
+     *
+     * Same shape and identity rule as [requestHelp]: the identity is read from the host at call time, so a STOP that
+     * arrives after a pause, a stop or a session switch is dropped by the host rather than cancelling another
+     * session's work. A composition with nothing active answers false instead of throwing.
+     *
+     * @return true when the host accepted the event for the active plugin; false when there is no live session.
+     */
+    @Synchronized fun requestStop(): Boolean {
+        if (closed) return false
+        val identity = runCatching { host.currentIdentity() }.getOrNull() ?: run {
+            P3Log.line("P3_CXR stop result=no_session")
+            return false
+        }
+        val now = clock.nowNanos()
+        val accepted = host.onEvent(UserAction(
+            EventEnvelope(identity.first, identity.second, "stop-${UUID.randomUUID()}", now, now),
+            UserAction.Action.Stop,
+        ))
+        P3Log.line("P3_CXR stop result=${if (accepted) "accepted" else "refused"}")
+        return accepted
+    }
+
+    /**
      * Forwards one receiver offer outcome to the chain (Task 14a item 5).
      *
      * `PcmIngress.offer`'s result used to be discarded inside the transport, so `INGRESS_OVERFLOW` and
@@ -1809,6 +1833,9 @@ class HostCompositionRoot internal constructor(
             }
             root.scriptedModelWire = scriptedWire
             rootHolder[0] = root
+            // 0.23 P5 (U11): the glasses' STOP reaches the production composition through the link, and the identity
+            // is read from the host at call time by `requestStop` (not captured here).
+            hintLink.onStopRequest = { rootHolder[0]?.requestStop() ?: false }
             scene.composition = root
             // Task 14a item 1: the real plugin, not `SmartAssistantPlugin()` with defaults. Its configuration is
             // applied by `activateSelected` before every activation, from the same settings this root was built with.

@@ -2519,13 +2519,18 @@ class SmartAssistantPlugin(
      * raised in another session (or for an older generation of this one) must not be able to cancel this plugin's turn.
      */
     private fun stopAll(envelope: EventEnvelope) {
+        var cancelledProactive: ProactiveHint? = null
         val stopped = synchronized(gate) {
             if (!matches(envelope)) null
             else {
                 // P3.2: a proactive request is in flight outside this lock; marking its hint cancelled is what the
                 // gateway's `stop` predicate reads, and what stops a late reply from being shown.
+                cancelledProactive = proactiveHint
                 proactiveHint?.cancelled = true
                 proactiveHint = null
+                // 0.23 P5 (U11): the level must be down before `publishBusy` runs, or the glasses keep thinking after
+                // the wearer asked to interrupt.
+                proactiveInFlight = false
                 // Phase C: an emergency stop ends whatever was being worked on, so the ring must stop with it - this
                 // is one of the two paths that can end a turn without an answer ever being produced.
                 wakeBusy = false
@@ -2533,6 +2538,12 @@ class SmartAssistantPlugin(
             }
         }
         teardown(stopped)
+        // 0.23 P5 (D145): an already-displayed proactive hint is output too. The official `stopTalk` stops the speech
+        // and leaves the panel idle without closing it; `cancelOutputTurn` is the host path that both stops speech and
+        // clears the hint (OutputArbiter.cancelTurn). Done outside the lock, as every host call here must be.
+        cancelledProactive?.let { hint ->
+            runCatching { cancelOutputTurn(envelope.sessionId, envelope.generation, hint.turnId) }
+        }
         // Outside the lock, as `publishBusy` requires.
         publishBusy()
     }
