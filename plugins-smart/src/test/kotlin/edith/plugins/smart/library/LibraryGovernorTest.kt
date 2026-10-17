@@ -10,16 +10,71 @@ class LibraryGovernorTest {
         val g = LibraryGovernor()
         g.observeTurn(listOf("a"))
         assertEquals(LibraryState.ACTIVE, g.entry("a")?.state)
-        assertEquals(1, g.entry("a")?.observedTurns)
+        // A directory sighting only creates the entry: its first observation is the first turn it is actually
+        // listed, not the turn it first appears in the directory (ruling 14).
+        assertEquals(0, g.entry("a")?.observedTurns, "creation is not an observation")
     }
 
-    @Test fun `two observeTurn calls in one turn count one observation`() {
+    @Test fun `two observeTurn calls in one turn create one entry and count one observation`() {
         val g = LibraryGovernor()
         g.observeTurn(listOf("a"))
-        g.observeTurn(listOf("a"))                                   // same turn, rebuilt catalog
-        assertEquals(1, g.entry("a")?.observedTurns)
+        g.observeTurn(listOf("a"))                                   // same turn, still no catalog
+        assertEquals(0, g.entry("a")?.observedTurns, "sightings create the entry; they do not observe it")
         g.catalog(listOf("a"))                                       // the entry was actually offered
+        g.catalog(listOf("a"))                                       // same turn, rebuilt catalog
+        assertEquals(1, g.entry("a")?.observedTurns, "the turn is the observation unit, not the call")
         assertTrue(g.endTurn().isEmpty, "one observation must be below the minimum")
+    }
+
+    @Test fun `a turn that builds no catalog adds no drift evidence`() {
+        // Ruling 14's defect: a turn that ends before its first request (deadline, cancellation) still flows to
+        // endTurn(). It advertises the library but never builds a catalog, so the model was shown nothing and cannot
+        // have pulled anything. Pre-fix observeTurn() incremented every advertised id, so 2 * K such turns manufactured
+        // enough drift to demote and then retire an entry that was never offered at all.
+        val g = LibraryGovernor()
+        val k = LibraryGovernor.MIN_OBSERVED_TURNS
+        val ids = listOf("a", "b")
+        repeat(2 * k + 1) {
+            g.observeTurn(ids)
+            assertTrue(g.endTurn().isEmpty, "a turn with no catalog request cannot produce a verdict")
+        }
+        ids.forEach { id ->
+            assertEquals(0, g.entry(id)?.observedTurns, "$id was never listed, so it has no observations")
+            assertEquals(LibraryState.ACTIVE, g.entry(id)?.state, "$id must stay ACTIVE while it is never listed")
+        }
+    }
+
+    @Test fun `a newly observed entry is not demoted until it has been listed minObservedTurns times`() {
+        // New-entry semantics (ruling 14): an entry is created ACTIVE with observedTurns = 0, and its first
+        // observation is the first turn it is actually listed. K listed turns are needed to demote, not K turns of
+        // merely appearing in the directory.
+        val g = LibraryGovernor()
+        val k = LibraryGovernor.MIN_OBSERVED_TURNS
+        g.observeTurn(listOf("a"))
+        assertEquals(0, g.entry("a")?.observedTurns, "appearing in the directory is not an observation")
+        assertEquals(LibraryState.ACTIVE, g.entry("a")?.state)
+
+        repeat(k - 1) {
+            g.observeTurn(listOf("a"))
+            assertEquals(listOf("a"), g.catalog(listOf("a")))
+            assertTrue(g.endTurn().isEmpty, "fewer than $k listed turns must not demote")
+        }
+        assertEquals(LibraryState.ACTIVE, g.entry("a")?.state, "K-1 listed turns is below the threshold")
+        assertEquals(k - 1, g.entry("a")?.observedTurns)
+
+        g.observeTurn(listOf("a"))
+        assertEquals(listOf("a"), g.catalog(listOf("a")))
+        assertEquals(listOf("a"), g.endTurn().demoted, "the K-th listed turn is the one that demotes")
+        assertEquals(LibraryState.DORMANT, g.entry("a")?.state)
+    }
+
+    @Test fun `two catalog calls in one turn count as one observation`() {
+        val g = LibraryGovernor()
+        g.observeTurn(listOf("a"))
+        assertEquals(0, g.entry("a")?.observedTurns, "creation is not an observation")
+        assertEquals(listOf("a"), g.catalog(listOf("a")))
+        assertEquals(listOf("a"), g.catalog(listOf("a")))
+        assertEquals(1, g.entry("a")?.observedTurns, "two requests in one turn are one observation")
     }
 
     @Test fun `fewer observations than the minimum change nothing`() {

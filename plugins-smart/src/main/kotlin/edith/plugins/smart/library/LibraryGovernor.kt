@@ -26,7 +26,18 @@ data class GovernorVerdict(
  * ([LibraryState.DORMANT]), and twice that and it is retired outright ([LibraryState.RETIRED]). One pull — the wearer
  * actually using the entry — erases the evidence and returns it to [LibraryState.ACTIVE] from any state, and from then
  * on this process stops counting drift against it at all. The freeze is derived, not stored: `pulls > 0` is the whole
- * condition, and it is checked at both guard sites ([observeTurn] does not count, [endTurn] does not advance).
+ * condition, and it is checked at both guard sites ([catalog] does not count, [endTurn] does not advance).
+ *
+ * ## Observations are recorded where listing is decided
+ *
+ * [observeTurn] only **creates** entries and records the turn's advertised set. The observation counter moves in
+ * [catalog], once per turn for each id that call actually offered. An entry is therefore created [LibraryState.ACTIVE]
+ * with `observedTurns = 0`, and its **first observation is the first turn it is actually listed** — not the turn it
+ * first appears in the directory. A turn that ends before its first request (a run that hits its deadline or is
+ * cancelled before the first frame still reaches the turn-end bookkeeping) builds no catalog, lists nothing, and so
+ * produces no drift evidence at all. Counting the sighting instead would let `K` such turns demote an entry on its
+ * first listed turn, manufacturing evidence from a period in which the entry was never offered — the failure the
+ * "offered and not used" rule exists to prevent.
  *
  * ## Drift is evidence of "offered and not used"
  *
@@ -78,6 +89,13 @@ class LibraryGovernor(
      */
     private val listedThisTurn = LinkedHashSet<String>()
 
+    /**
+     * Ids already observed during the current turn. [catalog] may be called once per request, with several requests in
+     * one turn; the observation unit is the turn, so the first call that offers an id counts it and later calls in the
+     * same turn are no-ops. Cleared with the rest of the turn state.
+     */
+    private val observedThisTurn = LinkedHashSet<String>()
+
     /** Whether a catalog was built at all this turn. A turn with no catalog request lists nothing and advances nothing. */
     private var catalogRequestedThisTurn = false
 
@@ -110,13 +128,15 @@ class LibraryGovernor(
     /**
      * Record the ids advertised to the model this turn.
      *
-     * A never-before-seen id is created here, in [LibraryState.ACTIVE] with one observed turn already counted: being
-     * advertised *is* the first observation. The observation unit is the **turn**, not the call: an id counts once
-     * however many times and however many calls this turn advertises it, so a turn that rebuilds the catalog repeatedly
-     * cannot inflate the evidence. The batch is closed by [endTurn] and the next [observeTurn] starts the next turn.
-     * An id counts here whether or not the catalog ends up listing it; [endTurn] decides what may become drift.
+     * A never-before-seen id is created here, in [LibraryState.ACTIVE] with **zero** observations: appearing in the
+     * directory is not evidence that the entry was offered. Its first observation is the first turn [catalog] actually
+     * lists it (see the class comment). Existing entries keep their counter untouched — this call never increments
+     * anything, so a turn that ends before its first request leaves every counter exactly where it was.
      *
-     * An entry with `pulls > 0` is not counted at all — its drift evidence is not "reset and then allowed to regrow",
+     * The observation unit is the **turn**, not the call: an id is recorded once however many times and however many
+     * calls this turn advertise it. The batch is closed by [endTurn] and the next [observeTurn] starts the next turn.
+     *
+     * An entry with `pulls > 0` is never counted at all — its drift evidence is not "reset and then allowed to regrow",
      * it is absent (see the class comment). That is the freeze, and `pulls > 0` is the whole of it.
      *
      * Returns the verdict for the creation step, which is always empty today: entries are only ever created ACTIVE,
@@ -130,19 +150,19 @@ class LibraryGovernor(
             pullsThisTurnCount = 0
             seenThisTurn.clear()
             listedThisTurn.clear()
+            observedThisTurn.clear()
             catalogRequestedThisTurn = false
             turnOpen = true
         }
         advertised.toSet().forEach { id ->
-            // The observation unit is the turn: only the FIRST sighting of an id this turn may count, so an id that a
-            // later call this turn advertises again is already in the set and falls through untouched.
+            // The observation unit is the turn: only the FIRST sighting of an id this turn is considered, so an id that
+            // a later call this turn advertises again is already in the set and falls through untouched.
             if (!seenThisTurn.add(id)) return@forEach
-            val existing = entries[id]
-            entries[id] = when {
-                existing == null ->
-                    LibraryEntry(id = id, state = LibraryState.ACTIVE, observedTurns = 1, pulls = 0)
-                existing.pulls > 0 -> existing
-                else -> existing.copy(observedTurns = existing.observedTurns + 1)
+            if (entries[id] == null) {
+                // New-entry semantics: a directory sighting creates the entry but is not an observation. An entry that
+                // is advertised but never listed (the size cap, or a turn that ends before its first request) carries
+                // no drift evidence — the model never saw its name, so it cannot have used it.
+                entries[id] = LibraryEntry(id = id, state = LibraryState.ACTIVE, observedTurns = 0, pulls = 0)
             }
         }
         // The size cap is deliberately not applied here: it belongs to catalog(), which is the one place that knows
@@ -202,6 +222,7 @@ class LibraryGovernor(
         turnOpen = false
         seenThisTurn.clear()
         listedThisTurn.clear()
+        observedThisTurn.clear()
         catalogRequestedThisTurn = false
 
         return GovernorVerdict(
@@ -278,8 +299,16 @@ class LibraryGovernor(
      * that this call actually returns counts: an advertised entry the cap pushed out is not offered, so the model never
      * sees its name and the turn cannot be drift evidence against it.
      *
+     * **This is also the one place that records an observation** (ruling 14). It increments `observedTurns` by one for
+     * each id the call actually offered, at most once per turn: an id listed by two requests in the same turn counts
+     * once. "Offered" is the returned ids plus a drift-demoted [LibraryState.DORMANT] entry — the one kind that may
+     * continue to [LibraryState.RETIRED], because its name did reach the model while it was listed and can still be
+     * pulled (ruling 13's companion clause). A cap-demoted entry is in neither group, and a pulled entry (`pulls > 0`)
+     * is frozen; neither counter moves here. A turn with no catalog request records nothing at all, so a run that ends
+     * before its first request cannot manufacture drift.
+     *
      * Idempotent: the demotion is applied to the entries, so a second call finds the excess already DORMANT and
-     * queues nothing further.
+     * queues nothing further; and the observation is per turn, so a second call this turn adds no evidence.
      */
     fun catalog(advertised: Collection<String>): List<String> {
         val universe = advertised.toSet()
@@ -296,7 +325,32 @@ class LibraryGovernor(
         everListed += listed
         listedThisTurn += listed
         catalogRequestedThisTurn = true
+        recordObservations(listed, universe)
         return listed
+    }
+
+    /**
+     * Record one observation this turn for each id this catalog call actually offered.
+     *
+     * [observedThisTurn] makes the turn the unit: a second [catalog] call this turn offers the same ids and records
+     * nothing further. The returned ids are the entries the model was shown; a drift-demoted DORMANT entry that is
+     * still advertised is counted too — its name reached the model on the turn it was listed and remains pullable, and
+     * without this D-3's DORMANT → RETIRED half would be unreachable. A cap-demoted or unadvertised entry is in
+     * neither group, which is exactly the entry the model was never offered. A pulled entry is frozen: `pulls > 0`
+     * means the inference from silence no longer applies to it.
+     *
+     * A call made outside an open turn (after [endTurn]) records nothing: it cannot reopen a turn, just as it cannot
+     * make a turn's evidence count twice.
+     */
+    private fun recordObservations(listed: List<String>, universe: Set<String>) {
+        if (!turnOpen) return
+        val offered = listed + dormantFromDrift.filter { it in universe }
+        offered.forEach { id ->
+            if (!observedThisTurn.add(id)) return@forEach
+            val entry = entries[id] ?: return@forEach
+            if (entry.pulls > 0) return@forEach
+            entries[id] = entry.copy(observedTurns = entry.observedTurns + 1)
+        }
     }
 
     /**
@@ -314,8 +368,8 @@ class LibraryGovernor(
      * The state an entry moves to once its drift reaches the next threshold, or [LibraryState.ACTIVE] when it has not.
      *
      * Progression is one step at a time, so an entry cannot skip [LibraryState.DORMANT] on its way to
-     * [LibraryState.RETIRED] no matter how many turns pass without an [endTurn]: the counter runs continuously from
-     * creation, and the DORMANT threshold is checked first.
+     * [LibraryState.RETIRED] no matter how many turns pass without an [endTurn]: the counter runs continuously from the
+     * entry's first listing, and the DORMANT threshold is checked first.
      */
     private fun advance(entry: LibraryEntry): LibraryState = when (entry.state) {
         LibraryState.ACTIVE ->

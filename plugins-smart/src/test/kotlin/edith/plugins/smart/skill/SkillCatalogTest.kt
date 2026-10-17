@@ -209,18 +209,21 @@ class SkillCatalogTest {
         assertEquals("## SKILL 目录\n\n- alpha: d-alpha\n- beta: d-beta", text)
     }
 
-    @Test fun `catalog never advances the turn observation`() {
-        // Observation belongs to beginTurn() alone (design D-3: the unit is the turn, not the request). Rebuilding the
-        // catalog twice in one turn must not add drift evidence, and a rebuild after the turn has closed must not open
-        // a new turn either — either would let tool round-trips inflate drift.
+    @Test fun `the catalog is the one observation per turn, not the request`() {
+        // Observation belongs to the catalog, not beginTurn() (ruling 14: catalog() decides what was actually
+        // listed, so it is the only place that can decide what counts as an observation). The unit is still the
+        // turn, not the request: rebuilding the catalog twice in one turn must not add drift evidence, and a
+        // rebuild after the turn has closed must not open a new turn either — either would let tool round-trips
+        // inflate drift.
         val governor = LibraryGovernor()
         val manager = SkillManager(FakeDirectory(mapOf("a.md" to doc("a"))), governor = governor)
 
         manager.beginTurn()
-        assertEquals(1, governor.entry("a")?.observedTurns, "beginTurn is the one observation")
+        assertEquals(0, governor.entry("a")?.observedTurns, "beginTurn creates the entry but observes nothing")
         manager.catalog()
+        assertEquals(1, governor.entry("a")?.observedTurns, "the first request that lists it observes it")
         manager.catalog()
-        assertEquals(1, governor.entry("a")?.observedTurns, "catalog is per request and must not observe")
+        assertEquals(1, governor.entry("a")?.observedTurns, "catalog is per request and must not over-observe")
 
         manager.endTurn()
         manager.catalog()
