@@ -20,9 +20,14 @@ class SkillDirectoryViewTest {
         private val suffixAnswer: List<String>? = null,
     ) : StorageAccess {
         val deleted = mutableListOf<String>()
+        val reads = mutableListOf<String>()
+        var content: String? = null
         override fun listFiles(dirPath: String, suffix: String): List<String> =
             (suffixAnswer ?: files).toList()
-        override fun readFile(path: String): String? = null
+        override fun readFile(path: String): String? {
+            reads += path
+            return content
+        }
         override fun deleteFile(path: String): Boolean {
             deleted += path
             return true
@@ -87,5 +92,49 @@ class SkillDirectoryViewTest {
 
         assertFalse(view.delete("a.md"))
         assertTrue(storage.deleted.isEmpty())
+    }
+
+    @Test
+    fun aValidNameIsReadAsItsFullText() {
+        val storage = FakeStorage().apply { content = "# 设备任务纪律\n先读设备，再写代码。" }
+        val view = StorageAccessSkillView(storage, sharedStorageGranted = { true })
+
+        assertEquals(SkillContent.Text("a.md", "# 设备任务纪律\n先读设备，再写代码。"), view.read("a.md"))
+        assertEquals(listOf("/sdcard/EDITH/skills/a.md"), storage.reads)
+    }
+
+    @Test
+    fun anUnsafeNameNeverReachesTheFilesystem() {
+        val storage = FakeStorage()
+        val view = StorageAccessSkillView(storage, sharedStorageGranted = { true })
+
+        listOf("../secrets.md", "sub/a.md", "sub\\a.md", ".", "..", "a.txt", "", "   ").forEach {
+            assertEquals("refused: $it", SkillContent.Unreadable, view.read(it))
+        }
+        assertTrue("readFile must not be called for any unsafe name", storage.reads.isEmpty())
+    }
+
+    @Test
+    fun unreadableEmptyAndRefusedAreDistinguished() {
+        val missing = FakeStorage().apply { content = null }
+        assertEquals(SkillContent.Unreadable, StorageAccessSkillView(missing, { true }).read("a.md"))
+
+        val empty = FakeStorage().apply { content = "  \n" }
+        assertEquals(SkillContent.Empty, StorageAccessSkillView(empty, { true }).read("a.md"))
+
+        val refused = FakeStorage().apply { content = "x" }
+        assertEquals(SkillContent.Unreadable, StorageAccessSkillView(refused, { false }).read("a.md"))
+        assertTrue("a refused grant must not read", refused.reads.isEmpty())
+
+        assertEquals(SkillContent.Unreadable, StorageAccessSkillView(null, { true }).read("a.md"))
+    }
+
+    @Test
+    fun aLongBodyIsReturnedWhole() {
+        val body = "技能全文😀\n".repeat(500) + "END-OF-SKILL"
+        val storage = FakeStorage().apply { content = body }
+        val view = StorageAccessSkillView(storage, sharedStorageGranted = { true })
+
+        assertEquals(SkillContent.Text("long.md", body), view.read("long.md"))
     }
 }

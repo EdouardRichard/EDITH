@@ -13,19 +13,40 @@ internal sealed interface SkillListing {
     data class Listed(val names: List<String>) : SkillListing
 }
 
+/**
+ * What the detail page gets back for one SKILL name (U-3).
+ *
+ * The three cases are the ones a reader acts on differently: a refused read and an empty file both look like "nothing
+ * here", but only one of them is the user's own doing. [Text] carries the **whole** UTF-8 body - the page shows what a
+ * turn would load, so truncating here would show a sentence the file does not contain.
+ */
+internal sealed interface SkillContent {
+    /** Refused, missing, or unreadable: no grant, no storage service, a missing file, or an unsafe name. */
+    data object Unreadable : SkillContent
+
+    /** The file was read and holds nothing but whitespace. */
+    data object Empty : SkillContent
+
+    /** The complete body. [name] is the name the page asked for, not a resolved path. */
+    data class Text(val name: String, val body: String) : SkillContent
+}
+
 /** The SKILL files in a listing, in a stable order. Only `.md` counts — the parser reads Markdown. */
 internal fun skillNames(entries: List<String>): List<String> =
     entries.map { it.substringAfterLast('/') }.filter { it.endsWith(".md") }.sorted()
 
 /**
- * Whether a name may be deleted.
+ * Whether a name may be turned into a path under [SKILLS_DIR].
  *
- * The page's names come from the directory listing, but the value still reaches `deleteFile` as a **path**, so a name
- * carrying a separator or a parent reference is refused here rather than resolved. This is the one place in the UI
- * where a user-visible string becomes a file path.
+ * The page's names come from the directory listing, but the value still reaches `deleteFile`/`readFile` as a **path**,
+ * so a name carrying a separator or a parent reference is refused here rather than resolved. This is the one place in
+ * the UI where a user-visible string becomes a file path, and both verbs use it so they cannot drift apart.
  */
-internal fun deletable(name: String): Boolean =
+internal fun safeSkillName(name: String): Boolean =
     name.isNotBlank() && name.endsWith(".md") && '/' !in name && '\\' !in name && name != "." && name != ".."
+
+/** Whether a name may be deleted. Kept as the delete verb's own name; the path rule itself is [safeSkillName]. */
+internal fun deletable(name: String): Boolean = safeSkillName(name)
 
 /**
  * The skills page's data, over the same `Capability.StorageAccess` the plugin uses.
@@ -46,6 +67,15 @@ internal class StorageAccessSkillView(
         return SkillListing.Listed(skillNames(access.listFiles(SKILLS_DIR, ".md")))
     }
 
+    override fun read(name: String): SkillContent {
+        // The name is checked before anything else, so a refused name can never reach `readFile` (U-3).
+        if (!safeSkillName(name)) return SkillContent.Unreadable
+        val access = storage ?: return SkillContent.Unreadable
+        if (!sharedStorageGranted()) return SkillContent.Unreadable
+        val body = access.readFile("$SKILLS_DIR/$name") ?: return SkillContent.Unreadable
+        return if (body.isBlank()) SkillContent.Empty else SkillContent.Text(name, body)
+    }
+
     override fun delete(name: String): Boolean {
         if (!deletable(name)) return false
         val access = storage ?: return false
@@ -57,5 +87,6 @@ internal class StorageAccessSkillView(
 /** What the skills page needs from the composition; a seam so the page is testable without one. */
 internal interface SkillDirectoryView {
     fun list(): SkillListing
+    fun read(name: String): SkillContent
     fun delete(name: String): Boolean
 }
