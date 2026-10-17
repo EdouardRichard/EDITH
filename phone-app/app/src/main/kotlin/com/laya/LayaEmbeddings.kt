@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.laya
-
 import java.io.Closeable
 import java.io.File
 import java.io.FileInputStream

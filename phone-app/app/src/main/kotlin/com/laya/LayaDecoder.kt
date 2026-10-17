@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // NumPy float32 host decoder port; source attribution is retained in NOTICE.
 package com.laya
-
 import java.math.BigDecimal
 import java.math.RoundingMode
 import kotlin.math.exp

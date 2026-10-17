@@ -8,7 +8,7 @@ import kotlin.test.*
 /**
  * §17.5 promises the audit is 可查**可删**. Two ways that promise was broken, both found by review, both about the fact
  * that the durable document has *two* hands on it: the plugin's [AuditTrail] writes it, and the App's settings page
- * ([edith.phone.AuditLogView]) reads and deletes it. In production they are one process over one encrypted namespace.
+ * ([com.sheen.rokid.phone.AuditLogView]) reads and deletes it. In production they are one process over one encrypted namespace.
  *
  * 1. **a deleted line came back.** The page deleted the document, but the plugin's ring still held every line, so the
  *    next recorded action re-encoded the whole ring and resurrected what the user had deleted - silently, in the same

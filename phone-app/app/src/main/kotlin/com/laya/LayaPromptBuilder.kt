@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // Port of laya 0.3.4 common.py and LayaHost._to_internal (Convai Innovations).
 package com.laya
-
 /** Normalized upstream question schema; criteria order determines marker order. */
 data class LayaQuestion(val type: String, val instructions: String, val criteria: Any?) {
   /** Graph channel: choice=0, score=1, noul=2. */

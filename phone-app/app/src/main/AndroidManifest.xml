@@ -53,7 +53,7 @@
         <package android:name="com.rokid.sprite.global.aiapp" />
         <package android:name="com.rokid.uxr" />
     </queries>
-    <application android:name=".EdithApplication" android:allowBackup="false" android:label="@string/app_name"
+    <application android:name=".app.EdithApplication" android:allowBackup="false" android:label="@string/app_name"
         android:dataExtractionRules="@xml/data_extraction_rules" android:fullBackupContent="false"
         android:theme="@android:style/Theme.Material.Light.NoActionBar" android:usesCleartextTraffic="false">
         <!-- P3.3 Task 1: the Shizuku provider is how this app acquires the shell-UID binder. The declaration is the
@@ -67,17 +67,17 @@
             android:enabled="true"
             android:exported="true"
             android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
-        <activity android:name=".MainActivity" android:exported="true">
+        <activity android:name=".app.MainActivity" android:exported="true">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <service android:name=".SessionService" android:exported="false" android:foregroundServiceType="connectedDevice" />
+        <service android:name=".session.SessionService" android:exported="false" android:foregroundServiceType="connectedDevice" />
         <!-- P3.3 (§17.4): the notification's three buttons (允许/拒绝/急停). `exported="false"` is load-bearing, not a
              formality: an exported receiver would let any App on the phone answer a confirmation on the user's behalf.
              The PendingIntents that reach it are explicit and immutable. -->
-        <receiver android:name=".ConfirmationActionReceiver" android:exported="false" />
+        <receiver android:name=".session.confirmation.ConfirmationActionReceiver" android:exported="false" />
         <!-- P3.3 Task 10: the accessibility channel. The user enables it in system settings; the service cannot and must
              not enable itself, and the host stops advertising the channel the moment the system unbinds it. -->
         <service android:name=".a11y.EdithAccessibilityService" android:exported="false"

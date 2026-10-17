@@ -1,7 +1,7 @@
 # Keep the shared contracts and constructor injection stable for separate instrumentation APKs.
--keep class !edith.model.DevelopmentProfileLoader**,!edith.model.DevelopmentConfiguration**,edith.** { *; }
--checkdiscard class edith.model.DevelopmentProfileLoader**
--checkdiscard class edith.model.DevelopmentConfiguration**
+-keep class !com.sheen.rokid.model.DevelopmentProfileLoader**,!com.sheen.rokid.model.DevelopmentConfiguration**,com.sheen.rokid.** { *; }
+-checkdiscard class com.sheen.rokid.model.DevelopmentProfileLoader**
+-checkdiscard class com.sheen.rokid.model.DevelopmentConfiguration**
 
 # The CXR native bridges (libcxr-sock-proto-jni.so from cxr-service-bridge, which ships no proguard.txt)
 # look their Java peers up by name through JNI. The vendor client-l proguard.txt keeps only a handful of

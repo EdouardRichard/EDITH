@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
 package com.laya
-
 import android.content.Context
 import com.google.ai.edge.litert.Accelerator
 import com.google.ai.edge.litert.CompiledModel

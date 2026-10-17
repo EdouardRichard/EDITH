@@ -20,15 +20,15 @@ plugins {
 val withMediaTekNpu = providers.gradleProperty("withMediaTekNpu").orNull?.toBoolean() ?: false
 
 android {
-    namespace = "edith.phone"
+    namespace = "com.sheen.rokid.phone"
     compileSdk = 35
     defaultConfig {
-        applicationId = "edith.phone"
+        applicationId = "com.sheen.rokid.phone"
         minSdk = 28
         targetSdk = 34
         versionCode = 1
         versionName = "0.1.0"
-        testInstrumentationRunner = "edith.phone.PhoneTestRunner"
+        testInstrumentationRunner = "com.sheen.rokid.phone.PhoneTestRunner"
     }
     signingConfigs {
         getByName("debug") {

@@ -153,7 +153,7 @@ private const val CALENDAR_KEY = "calendar.todayTitles"
 /**
  * The context key the host publishes its 「主动辅助」 state under.
  *
- * Mirrors `edith.phone.model.ProactiveArming.CONTEXT_KEY`: the plugin cannot import the App's class (module
+ * Mirrors `com.sheen.rokid.phone.model.ProactiveArming.CONTEXT_KEY`: the plugin cannot import the App's class (module
  * direction), so the string is duplicated with a pinning test on each side. The switch has to be readable *now*
  * because local transcription continues while it is off - see [SmartAssistantPlugin.armedNow].
  */

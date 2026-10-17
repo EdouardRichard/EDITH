@@ -14,5 +14,5 @@
 # These live in the debug rules rather than proguard-rules.pro on purpose: they should disappear when
 # Phase B gives the host a production caller, and keeping them debug-only makes that removal automatic
 # rather than something to remember.
--keep class edith.phone.laya.** { *; }
+-keep class com.sheen.rokid.phone.laya.** { *; }
 -keep class com.laya.** { *; }
