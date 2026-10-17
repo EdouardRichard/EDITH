@@ -75,7 +75,7 @@ class ProfileStorageContractTest {
             ManualScheduler(clock), { RequestConsent(true, true, true, true) })
         try {
             val request = ModelRequest(EventEnvelope(SessionId("synthetic"), Generation(1), "synthetic-event", 0, 0), "synthetic-request", "synthetic-turn", saved.id, saved.revision,
-                "synthetic instructions", listOf(InputPart.Text("synthetic text")), emptyList(), emptyList(), OutputModality.TEXT, Long.MAX_VALUE)
+                "synthetic instructions", listOf(InputPart.Text("synthetic text")), emptyList(), OutputModality.TEXT, Long.MAX_VALUE)
             assertThrows(ContractError.CapabilityMissing::class.java) { client.request(request) {} }
             assertThrows(ContractError.CapabilityMissing::class.java) { ControlledProfileTester(client, repo, clock).testText(saved.id) {} }
             assertEquals(0, resolutions); assertEquals(0, sends)
