@@ -36,9 +36,9 @@ dependencies {
     // The hint protocol, the clock mapping and the render/expiry rules live in `output-runtime` so the phone and the
     // glasses share exactly one implementation of the wire format and of the ordering rules. A second copy here would
     // eventually disagree with the phone about the same bytes, which is the failure this structure exists to prevent.
-    implementation(project(":output-runtime"))
-    implementation(project(":core-contracts"))
-    implementation(project(":plugin-api"))
+    implementation(project(":common:presentation:output-runtime"))
+    implementation(project(":common:contracts:core-contracts"))
+    implementation(project(":common:contracts:plugin-api"))
     // CXR-S: the glasses-side bridge. The same public bytes the phone side and the vendor's own glasses sample use.
     implementation("edith.vendor.cxr:cxr-service-bridge:1.0-20260715.121510-107@aar")
     testImplementation("junit:junit:4.13.2")
@@ -50,7 +50,7 @@ dependencies {
     androidTestImplementation("androidx.lifecycle:lifecycle-runtime:2.8.6")
     androidTestImplementation("androidx.annotation:annotation:1.8.1")
     androidTestImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.10.2")
-    androidTestImplementation(project(":test-support"))
+    androidTestImplementation(project(":common:testkit:test-support"))
 }
 
 /**
@@ -64,13 +64,13 @@ val verifiedBridge = "cxr-service-bridge-1.0-20260715.121510-107.aar" to
     "0A76387E106A51578F82169AEB2DA904372A9569B26AF1E6C87CEBE7A76B94FC"
 run {
     val (name, expected) = verifiedBridge
-    // Same two-layout resolution as transport-rokid: a plain checkout keeps the AARs at <root>/probes/p0/vendor, a
+    // Same two-layout resolution as transport-rokid: a plain checkout keeps the AARs at <root>/third_party/cxr/vendor, a
     // worktree two levels below the root reaches them via ../../probes. See that module for why this must not be pinned.
     val artifact = listOf(
-        rootProject.file("probes/p0/vendor/$name"),
-        rootProject.file("../../probes/p0/vendor/$name"),
-    ).firstOrNull { it.isFile } ?: rootProject.file("probes/p0/vendor/$name")
-    check(artifact.isFile) { "Missing indexed public CXR artifact: $name (looked in probes/p0/vendor and ../../probes/p0/vendor of $rootDir)" }
+        rootProject.file("third_party/cxr/vendor/$name"),
+        rootProject.file("../../third_party/cxr/vendor/$name"),
+    ).firstOrNull { it.isFile } ?: rootProject.file("third_party/cxr/vendor/$name")
+    check(artifact.isFile) { "Missing indexed public CXR artifact: $name (looked in third_party/cxr/vendor and ../../third_party/cxr/vendor of $rootDir)" }
     val digest = MessageDigest.getInstance("SHA-256")
     artifact.inputStream().use { input ->
         val buffer = ByteArray(8192)

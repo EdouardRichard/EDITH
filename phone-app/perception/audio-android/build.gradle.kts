@@ -28,13 +28,13 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation("edith.vendor.sherpa:sherpa-onnx:1.13.8@aar")
     implementation(project(":phone-app:perception:audio-runtime"))
-    implementation(project(":core-contracts"))
-    implementation(project(":plugin-api"))
+    implementation(project(":common:contracts:core-contracts"))
+    implementation(project(":common:contracts:plugin-api"))
     testImplementation("junit:junit:4.13.2")
     // The measurement runner consumes the versioned EngineMetrics record and the bounded RAM fixture;
     // both live in test-support so they are never part of a production artifact.
-    testImplementation(project(":test-support"))
-    androidTestImplementation(project(":test-support"))
+    testImplementation(project(":common:testkit:test-support"))
+    androidTestImplementation(project(":common:testkit:test-support"))
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation(libs.kotlinx.coroutines.core)
@@ -74,9 +74,9 @@ abstract class TrustedManifestAssets : DefaultTask() {
     }
 }
 val trustedManifestAssets = tasks.register<TrustedManifestAssets>("generateTrustedManifestAssets") {
-    manifestFile.set(rootProject.layout.projectDirectory.file("tools/p2/engine-manifest.json"))
-    licenseDirectory.set(rootProject.layout.projectDirectory.dir("tools/p2/licenses"))
-    noticeFile.set(rootProject.layout.projectDirectory.file("tools/p2/NOTICE.md"))
+    manifestFile.set(rootProject.layout.projectDirectory.file("tools/scripts/p2/engine-manifest.json"))
+    licenseDirectory.set(rootProject.layout.projectDirectory.dir("tools/scripts/p2/licenses"))
+    noticeFile.set(rootProject.layout.projectDirectory.file("tools/scripts/p2/NOTICE.md"))
     outputDirectory.set(layout.buildDirectory.dir("generated/trustedManifestAssets"))
 }
 androidComponents.onVariants { variant ->

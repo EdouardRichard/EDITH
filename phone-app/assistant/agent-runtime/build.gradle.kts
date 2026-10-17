@@ -6,10 +6,10 @@ kotlin {
 }
 
 dependencies {
-    implementation(project(":core-contracts"))
-    implementation(project(":plugin-api"))
+    implementation(project(":common:contracts:core-contracts"))
+    implementation(project(":common:contracts:plugin-api"))
     implementation(libs.kotlinx.serialization.json)
-    testImplementation(project(":test-support"))
+    testImplementation(project(":common:testkit:test-support"))
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.test.junit5)
 }

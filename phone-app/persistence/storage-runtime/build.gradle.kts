@@ -6,7 +6,7 @@ kotlin {
 }
 
 dependencies {
-    implementation(project(":plugin-api"))
+    implementation(project(":common:contracts:plugin-api"))
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.test.junit5)
 }

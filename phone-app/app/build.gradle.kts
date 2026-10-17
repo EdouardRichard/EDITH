@@ -83,8 +83,8 @@ kotlin {
 }
 
 dependencies {
-    implementation(project(":core-contracts"))
-    implementation(project(":plugin-api"))
+    implementation(project(":common:contracts:core-contracts"))
+    implementation(project(":common:contracts:plugin-api"))
     implementation(project(":phone-app:assistant:host-runtime"))
     implementation(project(":phone-app:persistence:storage-runtime"))
     implementation(project(":phone-app:assistant:model-runtime"))
@@ -93,7 +93,7 @@ dependencies {
     implementation(project(":phone-app:link:transport-rokid"))
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)
-    implementation(project(":output-runtime"))
+    implementation(project(":common:presentation:output-runtime"))
     implementation(project(":phone-app:plugins:plugin-smart-helper"))
     // P3.3 Task 1: the shell-UID execution channel (spec §17.2). `provider` is what the `api` binds to at runtime.
     implementation(libs.shizuku.api)
@@ -123,11 +123,11 @@ dependencies {
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.ui:ui")
     testImplementation("junit:junit:4.13.2")
-    testImplementation(project(":test-support"))
+    testImplementation(project(":common:testkit:test-support"))
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test:rules:1.6.1")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
-    androidTestImplementation(project(":test-support"))
+    androidTestImplementation(project(":common:testkit:test-support"))
 }
 // LiteRT pulls in Play Asset Delivery (its NPU-accelerator download path) and, through it,
 // `androidx.work:work-runtime`. This app's models ship on the device rather than through Play, and on the

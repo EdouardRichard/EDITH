@@ -8,8 +8,8 @@ kotlin {
 dependencyLocking { lockAllConfigurations() }
 
 dependencies {
-    implementation(project(":core-contracts"))
-    implementation(project(":plugin-api"))
+    implementation(project(":common:contracts:core-contracts"))
+    implementation(project(":common:contracts:plugin-api"))
     implementation(project(":phone-app:assistant:agent-runtime"))
     implementation(project(":phone-app:persistence:storage-runtime"))
     implementation(libs.okhttp)

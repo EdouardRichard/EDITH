@@ -8,14 +8,14 @@ kotlin {
 }
 
 dependencies {
-    implementation(project(":core-contracts"))
-    implementation(project(":plugin-api"))
+    implementation(project(":common:contracts:core-contracts"))
+    implementation(project(":common:contracts:plugin-api"))
     implementation(libs.kotlinx.coroutines.core)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.test.junit5)
-    testImplementation(project(":test-support"))
+    testImplementation(project(":common:testkit:test-support"))
     testImplementation(project(":phone-app:plugins:plugin-smart-helper"))
     testImplementation(project(":phone-app:plugins:plugin-interview"))
     testImplementation(project(":phone-app:plugins:plugin-diagnostic"))
-    testImplementation(project(":output-runtime"))
+    testImplementation(project(":common:presentation:output-runtime"))
 }

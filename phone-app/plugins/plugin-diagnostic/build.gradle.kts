@@ -4,10 +4,10 @@ kotlin {
     compilerOptions.jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
 }
 dependencies {
-    implementation(project(":core-contracts"))
-    implementation(project(":plugin-api"))
-    implementation(project(":output-runtime"))
-    testImplementation(project(":test-support"))
+    implementation(project(":common:contracts:core-contracts"))
+    implementation(project(":common:contracts:plugin-api"))
+    implementation(project(":common:presentation:output-runtime"))
+    testImplementation(project(":common:testkit:test-support"))
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.test.junit5)
 }

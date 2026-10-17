@@ -8,8 +8,8 @@ kotlin {
 }
 
 dependencies {
-    implementation(project(":core-contracts"))
-    implementation(project(":plugin-api"))
+    implementation(project(":common:contracts:core-contracts"))
+    implementation(project(":common:contracts:plugin-api"))
     // The passive loop (Task 13) lives in agent-runtime, and the hint assembly in output-runtime. Both are already on
     // phone-app's runtime classpath, so this adds no new external artifact and does not disturb any lockfile.
     //
@@ -17,7 +17,7 @@ dependencies {
     // agent-runtime type is now part of this module's public API and every consumer that builds the plugin (phone-app's
     // `SmartWiring`) must be able to resolve it. `implementation` would hide it and fail that compilation.
     api(project(":phone-app:assistant:agent-runtime"))
-    implementation(project(":output-runtime"))
+    implementation(project(":common:presentation:output-runtime"))
     // The proactive turn (Task 8) parses the one tool call it accepts (`propose_hint`'s arguments) with the same
     // parser the loop uses. Already on this module's runtime classpath through `:agent-runtime`, so no new artifact.
     implementation(libs.kotlinx.serialization.json)
