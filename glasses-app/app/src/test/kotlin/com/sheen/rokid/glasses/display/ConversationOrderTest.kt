@@ -7,63 +7,57 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Phase C (spec §6.6): which conversation the glasses show, and how the wearer changes it — decided off-device.
+ * 0.23 P4 (spec §5.2.1, U8): the glasses show **one** conversation and offer no route switch.
  *
- * The official sample (`50-system/01-按键与侧边触控.md`) documents the temple's side-touch pad as `KeyEvent`s to the
- * foreground page: a swipe is `KEYCODE_DPAD_RIGHT`/`KEYCODE_DPAD_LEFT` and a tap is `KEYCODE_ENTER`. What those keys
- * *mean* lives here so it can be tested without a device; the Activity keeps the key plumbing.
+ * The official panel has no route label and no left/right route gesture; EDITH keeps its two logs, but the view is
+ * whatever the last `SHOW` named. The panel's only view-level state left is the pin (the wearer's reading control),
+ * and this class is the whole of both decisions so they can be tested without a device.
  */
 class ConversationOrderTest {
 
     @Test
-    fun aNewOrderLooksAtTheWakeConversationAndIsNotPaused() {
+    fun aNewOrderShowsWakeAndIsUnpinned() {
         val order = ConversationOrder()
         assertEquals(AssistantRoute.WAKE, order.selected())
-        assertFalse(order.isPaused())
+        assertFalse(order.isPinned())
     }
 
     @Test
-    fun aSwipeSwitchesToTheOtherRouteAndWrapsBack() {
+    fun showBringsItsRouteToTheFrontAndKeepsThePin() {
+        // The pin is a view state, not a route state: switching to the proactive answer must not silently unpin the
+        // wearer's reading position.
         val order = ConversationOrder()
-        assertEquals(AssistantRoute.PROACTIVE, order.swipe())
-        assertEquals("two routes, so the same gesture must bring you back",
-            AssistantRoute.WAKE, order.swipe())
+        order.togglePin()
+        assertEquals(AssistantRoute.PROACTIVE, order.show(AssistantRoute.PROACTIVE))
+        assertEquals(AssistantRoute.PROACTIVE, order.selected())
+        assertTrue("pin is a view state, not a route state", order.isPinned())
     }
 
     @Test
-    fun aTapStopsASlideAndASecondTapResumesIt() {
+    fun aTapPinsAndASecondTapUnpins() {
         val order = ConversationOrder()
-        assertTrue("the first tap stops the slide", order.togglePaused())
-        assertFalse("the second tap starts it again", order.togglePaused())
+        assertTrue(order.togglePin())
+        assertFalse(order.togglePin())
     }
 
     @Test
-    fun anArrivingHintBringsItsOwnRouteToTheFront() {
-        // Without this the wearer would never see a proactive hint while reading the wake conversation: it would be
-        // filed into a list nobody is looking at.
+    fun aNewSessionResetsRouteAndPin() {
         val order = ConversationOrder()
-        order.swipe() // now showing PROACTIVE
-        assertEquals(AssistantRoute.WAKE, order.show(AssistantRoute.WAKE))
-        assertEquals(AssistantRoute.WAKE, order.selected())
-    }
-
-    @Test
-    fun anArrivingHintResumesASlideTheWearerHadPaused() {
-        // A stale pause would hold brand new content off the bottom of the window with nothing on screen saying why.
-        val order = ConversationOrder()
-        order.togglePaused()
         order.show(AssistantRoute.PROACTIVE)
-        assertFalse(order.isPaused())
-    }
-
-    @Test
-    fun aNewSessionOpensOnTheWakeConversationAgain() {
-        val order = ConversationOrder()
-        order.swipe()
-        order.togglePaused()
+        order.togglePin()
         order.reset()
         assertEquals(AssistantRoute.WAKE, order.selected())
-        assertFalse(order.isPaused())
+        assertFalse(order.isPinned())
+    }
+
+    @Test
+    fun thereIsNoRouteSwitchLeft() {
+        // U8: the wearer has no entry point. The only way the route changes is a SHOW, which is `show`.
+        val order = ConversationOrder()
+        order.show(AssistantRoute.PROACTIVE)
+        assertEquals(AssistantRoute.PROACTIVE, order.selected())
+        order.show(AssistantRoute.PROACTIVE)
+        assertEquals(AssistantRoute.PROACTIVE, order.selected())
     }
 }
 

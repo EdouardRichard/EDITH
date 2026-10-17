@@ -54,12 +54,4 @@ class ConversationViewTest {
 
         assertEquals(listOf("第 a 条", "第 b 条", "第 c 条"), rows.map { it.entry.text })
     }
-
-    @Test
-    fun theHeaderNamesTheRouteAndSaysWhenTheAssistantIsWorking() {
-        // P3 keeps this temporary header; P4 deletes it with the route switch (U8).
-        assertEquals("WAKE 上下文", ConversationView.headerText(AssistantRoute.WAKE, busy = false))
-        assertEquals("PROACTIVE 上下文", ConversationView.headerText(AssistantRoute.PROACTIVE, busy = false))
-        assertEquals("WAKE 上下文 · 处理中", ConversationView.headerText(AssistantRoute.WAKE, busy = true))
-    }
 }

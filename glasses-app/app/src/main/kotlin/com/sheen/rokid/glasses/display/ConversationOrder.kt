@@ -3,61 +3,49 @@ package com.sheen.rokid.glasses.display
 import com.sheen.rokid.contracts.AssistantRoute
 
 /**
- * Phase C (spec §6.6): which conversation the glasses are showing, and how the wearer changes it.
+ * 0.23 P4 (spec §5.2.1, U8): which conversation the glasses are showing, and the wearer's pin.
  *
- * The glasses have no touch screen; the vendor's official sample documents the **temple's side-touch pad** as
- * `KeyEvent`s delivered to the foreground page (`50-system/01-按键与侧边触控.md`): a forward swipe is
- * `KEYCODE_DPAD_RIGHT`, a backward swipe is `KEYCODE_DPAD_LEFT`, a single tap is `KEYCODE_ENTER`. This class holds
- * only the decision — which route a swipe lands on, and whether a tap should stop or resume the slide — so the
- * decision is provable off-device while the Activity keeps the key plumbing.
+ * The official panel has **no route label and no route gesture**: the assistant's answer is whatever arrived last.
+ * EDITH keeps two conversations internally (wake and proactive), but the glasses no longer offer a switch - the view
+ * follows `SHOW`, `SAID` does not move it, and the other log is only retained in memory for the current window.
  *
- * Two rules are deliberately asymmetric:
- *
- * - A swipe **wraps**, so both routes are reachable with one gesture from either side.
- * - [show] — used when a hint arrives for a route that is not the one on screen — is **not** a swipe: it is the
- *   display following the newest thing that needs the wearer's attention, which is what the panel has always done.
- *   Without it a proactive hint would be filed into a conversation nobody is looking at, and the wearer would never
- *   see it at all.
+ * The pin is the only view-level state left. It maps the official "single tap = hold" gesture to EDITH's reading
+ * control (D133): pinning stops the ticker, unpinning lets it continue. It is deliberately **not** a route state, so a
+ * new answer can still be brought into view while the pin is held.
  */
 class ConversationOrder {
 
     private var selected: AssistantRoute = AssistantRoute.WAKE
-    private var paused = false
+    private var pinned: Boolean = false
 
     /** The route currently in front of the wearer. */
     fun selected(): AssistantRoute = selected
 
-    /** True while the wearer has stopped the slide, so arriving content holds still. */
-    fun isPaused(): Boolean = paused
-
-    /** Switches to the other route. Returns the route now selected. */
-    fun swipe(): AssistantRoute {
-        selected = if (selected == AssistantRoute.WAKE) AssistantRoute.PROACTIVE else AssistantRoute.WAKE
-        return selected
-    }
-
-    /** A tap stops a slide that is running and resumes one that is not. Returns the new paused state. */
-    fun togglePaused(): Boolean {
-        paused = !paused
-        return paused
-    }
+    /** True while the wearer has pinned the reading position. */
+    fun isPinned(): Boolean = pinned
 
     /**
      * Brings [route] to the front because something arrived for it.
      *
-     * Resuming here is deliberate: content that has just arrived is content the wearer has not read, and leaving a
-     * stale pause in place would hold it off screen with nothing on the display to say why.
+     * This is the **only** way the selected route changes: a `SHOW` (the assistant telling the wearer something), not a
+     * `SAID` (the wearer's own words, which do not need looking at). The pin is left alone - it is a reading position,
+     * not a property of the conversation.
      */
     fun show(route: AssistantRoute): AssistantRoute {
         selected = route
-        paused = false
         return selected
     }
 
-    /** A new session opens on the wake conversation, unpaused. */
+    /** A tap flips the pin and returns its new state. */
+    fun togglePin(): Boolean {
+        pinned = !pinned
+        return pinned
+    }
+
+    /** A new session opens on the wake conversation, unpinned. */
     fun reset() {
         selected = AssistantRoute.WAKE
-        paused = false
+        pinned = false
     }
 }
 

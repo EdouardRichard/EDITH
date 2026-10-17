@@ -113,7 +113,6 @@ class GlassesActivity : Activity() {
     /** Whether the assistant is working, per route (Phase C 加载动画); bounded so a leaked level cannot spin forever. */
     private val busyState = BusyState()
 
-    private lateinit var headerView: TextView
     private lateinit var entriesView: LinearLayout
     private lateinit var hintScroll: ScrollView
 
@@ -415,7 +414,7 @@ class GlassesActivity : Activity() {
         android.util.Log.i("EdithGlasses",
             "P3_STATE route=${route.name} busy=$busyForRoute any=${busyState.any(now)} live=$live " +
                 "orb=${GlassesPanelSpec.orbState(busyForRoute, live, route, lastRole).name} " +
-                "listening=$listening thinking=$thinking pinned=${order.isPaused()}")
+                "listening=$listening thinking=$thinking pinned=${order.isPinned()}")
     }
 
     /**
@@ -428,7 +427,6 @@ class GlassesActivity : Activity() {
         val route = order.selected()
         val rows = ConversationView.rows(log.entries(route), liveEntryId)
         val now = clock.nowNanos()
-        headerView.text = ConversationView.headerText(route, busy = busyState.isBusy(route, now))
         entriesView.removeAllViews()
         liveRow = null
         thinkingIcon = null
@@ -529,7 +527,7 @@ class GlassesActivity : Activity() {
             // 204-character hint. The entry was in the log; the scroll never brought it into view, because a pause
             // (a side-touch tap a minute earlier) suppressed the reveal entirely, and the unpaused path travels the
             // whole scrollback at reading pace - 16.8 s on that turn. `HintReveal` puts the decision in one place.
-            when (HintReveal.forChange(promptly, order.isPaused(), atNewest = hintScroll.scrollY >= endPx)) {
+            when (HintReveal.forChange(promptly, order.isPinned(), atNewest = hintScroll.scrollY >= endPx)) {
                 Reveal.HOLD -> return@post
                 Reveal.IMMEDIATE ->
                     slideTo(endPx, HintAutoScroll.IMMEDIATE_MILLIS, startDelay = 0L)
@@ -607,16 +605,13 @@ class GlassesActivity : Activity() {
         root.addOnUnhandledKeyEventListener(View.OnUnhandledKeyEventListener { _, event ->
             if (event.action != KeyEvent.ACTION_DOWN) return@OnUnhandledKeyEventListener false
             when (event.keyCode) {
-                KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_LEFT -> {
-                    val route = order.swipe()
-                    android.util.Log.i("EdithGlasses", "side touch: route now ${route.name}")
-                    rebuild()
-                    true
-                }
+                // U8: no left/right route switch exists any more. The two direction pairs belong to the list paging
+                // and are wired with the ticker (P4 Task 6); until then they are deliberately not consumed.
+                KeyEvent.KEYCODE_DPAD_RIGHT, KeyEvent.KEYCODE_DPAD_LEFT,
+                KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_UP -> false
                 KeyEvent.KEYCODE_ENTER -> {
-                    val paused = order.togglePaused()
-                    android.util.Log.i("EdithGlasses", "side touch: paused=$paused")
-                    if (!paused) scheduleReveal()
+                    val pinned = order.togglePin()
+                    android.util.Log.i("EdithGlasses", "side touch: pinned=$pinned")
                     true
                 }
                 else -> false
@@ -644,16 +639,7 @@ class GlassesActivity : Activity() {
         }
         val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
 
-        // P3 temporary route header. P4 deletes it, because the official panel has no route label at all (U8).
-        headerView = TextView(this).apply {
-            setTextColor(GlassesPanelSpec.GREEN_40)
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.HEADER_TEXT_SIZE_PX)
-            gravity = Gravity.START
-            setPadding(GlassesPanelSpec.LIST_PADDING_SIDE_PX, GlassesPanelSpec.LIST_PADDING_TOP_PX,
-                GlassesPanelSpec.LIST_PADDING_SIDE_PX, 4)
-            text = GlassesPanelSpec.headerText(AssistantRoute.WAKE)
-        }
-
+        // P4: no route header. The official panel has no label, and the view follows SHOW alone (U8).
         entriesView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             // Phase C C1: nothing may paint the panel except the text. A child view would otherwise sit on the
@@ -740,8 +726,6 @@ class GlassesActivity : Activity() {
             })
         }
 
-        column.addView(headerView, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
         column.addView(listContainer, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
         column.addView(stateRow, LinearLayout.LayoutParams(

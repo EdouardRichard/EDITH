@@ -145,9 +145,6 @@ object GlassesPanelSpec {
     /** The bottom-right compliance label; official copy, never translated by a template. */
     fun complianceText(): String = COMPLIANCE_TEXT
 
-    /** The line above the conversation (P3 shows it temporarily; P4 removes the route label entirely). */
-    fun headerText(route: AssistantRoute): String = "${route.name} 上下文"
-
     fun textSizePx(role: ConversationRole): Float = when (role) {
         ConversationRole.USER -> USER_TEXT_SIZE_PX
         ConversationRole.ASSISTANT -> ASSISTANT_TEXT_SIZE_PX

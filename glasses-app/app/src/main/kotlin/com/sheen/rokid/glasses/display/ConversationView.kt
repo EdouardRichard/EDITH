@@ -41,8 +41,4 @@ object ConversationView {
                 live = liveEntryId != null && entry.entryId == liveEntryId,
             )
         }
-
-    /** The line above the conversation, naming which of the two conversations is in front of the wearer (P3 only). */
-    fun headerText(route: AssistantRoute, busy: Boolean): String =
-        "${route.name} 上下文" + if (busy) " · 处理中" else ""
 }
