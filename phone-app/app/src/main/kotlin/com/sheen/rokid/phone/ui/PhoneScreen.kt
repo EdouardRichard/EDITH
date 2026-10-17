@@ -593,7 +593,7 @@ private fun SmartToggles(root: HostCompositionRoot) {
         Text("语音朗读（提示会朗读出来）")
     }
     Text(
-        "关闭后不会自动打开；引擎缺失时提示照常显示、只是不出声。唤醒后的「在的」也受这个开关控制。",
+        "关闭后不会自动打开；引擎缺失时提示照常显示、只是不出声。唤醒后的短提示音也受这个开关控制。",
         style = MaterialTheme.typography.bodySmall,
     )
 }

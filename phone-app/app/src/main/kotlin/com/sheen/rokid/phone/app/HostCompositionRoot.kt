@@ -55,7 +55,8 @@ import com.sheen.rokid.phone.audio.AudioSegmentCapture
 import com.sheen.rokid.phone.session.confirmation.ConfirmationNotifier
 import com.sheen.rokid.phone.session.confirmation.ConfirmationPresenter
 import com.sheen.rokid.phone.bridge.ConversationWireDisplay
-import com.sheen.rokid.phone.session.speakWakeAcknowledgement
+import com.sheen.rokid.phone.session.ToneWakeChimeSink
+import com.sheen.rokid.phone.session.WakeChime
 import com.sheen.rokid.phone.session.confirmation.AndroidNotificationSurface
 
 import android.content.Context
@@ -1454,10 +1455,11 @@ class HostCompositionRoot internal constructor(
             // local gate here is what made `root.playbackGate.begin()` suppress nothing.
             val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
             val hostHolder = arrayOfNulls<HostRuntime>(1)
-            // Phase C: the speech player is built further down (it depends on the user's 「语音朗读」 setting), while the
-            // wake sink that needs it is built here, so the sink reads it through a holder. `null` is the switch being
-            // off, which is why the acknowledgement is a silent no-op rather than a second check at the call site.
-            val speechHolder = arrayOfNulls<com.sheen.rokid.plugin.SpeechPlayer>(1)
+            // Phase C: the speech player is built further down (it depends on the user's 「语音朗读」 setting). 0.23 P5
+            // (D135) replaced the fixed TTS phrase with a short chime, so the wake path no longer needs a holder here:
+            // the chime sink is independent of the TTS engine and works even when the engine is missing.
+            val wakeChime = WakeChime()
+            val wakeChimeSink = ToneWakeChimeSink(context)
             // P3.2 Task 6: the context provider. Stage A exposes the zero-permission time keys; Stage B appends its
             // three permissioned sources to the same list. The listener is the production arming gate, so a disarmed
             // session produces no `ContextChanged` at all - the plugin's only context signal is the acoustic event.
@@ -1529,10 +1531,19 @@ class HostCompositionRoot internal constructor(
                 // - and a wake that arrives after the session ended is dropped by `onEvent` instead of opening a turn
                 // under a generation that no longer exists.
                 wakeEmit = { word, confidence -> hostHolder[0]?.let { host ->
-                    // Phase C (spec §6.4): the wearer hears "在的" before any model work starts - the fixed phrase's
-                    // whole purpose is to cover that latency. It is speech only: no hint, no conversation entry.
-                    host.currentIdentity()?.let { (session, generation) ->
-                        speakWakeAcknowledgement(speechHolder[0], session, generation, clock)
+                    // 0.23 P5 (D135): a short chime, governed by the same 「语音朗读」 switch, then the wake event.
+                    // No Assistance, no conversation entry and no TTS phrase: the wearer hears that they were heard,
+                    // and nothing claims to be an answer.
+                    val root = rootHolder[0]
+                    if (root != null) {
+                        val enabled = root.speechEnabled.value
+                        val accepted = wakeChime.play(clock.nowNanos(), enabled, wakeChimeSink)
+                        val state = when {
+                            !enabled -> "disabled"
+                            !accepted -> "debounced"
+                            else -> "played"
+                        }
+                        P3Log.line("P5_CHIME state=$state")
                     }
                     emitWakeDetected(host, clock, word, confidence)
                 } },
@@ -1681,9 +1692,6 @@ class HostCompositionRoot internal constructor(
             val speechPlayer: com.sheen.rokid.plugin.SpeechPlayer? = if (speechEnabledNow) {
                 AndroidSpeechPlayer.create(context, playbackGate)
             } else null
-            // Phase C: the wake sink, built above, finds the player here. The same instance the arbiter uses, so the
-            // wearer's switch governs both and there is one engine rather than two.
-            speechHolder[0] = speechPlayer
             // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
             // assistant tab reads it. It has to be created here because the provider map is built before the root.
             val conversationLog = ConversationLog()
@@ -1748,6 +1756,8 @@ class HostCompositionRoot internal constructor(
                 })
                 // Closes the pipeline (and with it the native engines) with the composition that owns them.
                 audio?.let { add(it) }
+                // 0.23 P5: the chime's ToneGenerator is a native resource; release it with the composition.
+                add(wakeChimeSink)
             }, profileTester = tester, profileConsent = probeGate::grant,
                 namespaceFactory = namespaceFactory, speakerProfiles = AndroidSpeakerProfileStore(blobs),
                 // One CXR connection per composition, built on first use: the transport stays the only
