@@ -24,8 +24,16 @@ class ToolCallDecodingTest {
     private fun fixtureBytes() = checkNotNull(javaClass.getResource("/responses/tool-call-completed.sse")).readText()
         .toByteArray(Charsets.UTF_8)
 
-    /** Rebuilds the fixture without one SSE frame, so a truncated stream can be replayed from the honest bytes. */
+    /**
+     * Rebuilds the fixture without one SSE frame, so a truncated stream can be replayed from the honest bytes.
+     *
+     * The line endings are normalised first. A Windows checkout of the `.sse` fixture carries CRLF, and splitting on
+     * `"\n\n"` then finds no separator at all: the whole document contains the removed event's name, so the filter
+     * deleted every frame and the test measured `EOF_INCOMPLETE` instead of the incomplete tool delivery it is about.
+     * The criterion is unchanged - only the fixture's transport line endings are made irrelevant.
+     */
     private fun fixtureWithout(event: String) = fixtureBytes().toString(Charsets.UTF_8)
+        .replace("\r\n", "\n")
         .split("\n\n")
         .filterNot { it.contains("event: $event") }
         .joinToString("\n\n")

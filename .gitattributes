@@ -1,0 +1,10 @@
+# Build inputs whose line endings the build itself inspects. A Windows checkout with
+# `core.autocrlf=true` otherwise turns them into CRLF and the build/test refuses them:
+#  - the KWS asset task says "keywords.txt must use LF line endings";
+#  - the SSE fixture is split on blank lines by a decoder test.
+phone-app/perception/audio-android/kws/keywords.txt text eol=lf
+phone-app/assistant/model-runtime/src/test/resources/responses/*.sse text eol=lf
+
+# Gradle wrapper: the shell script must stay LF, the Windows launcher must stay CRLF.
+gradlew text eol=lf
+gradlew.bat text eol=crlf
