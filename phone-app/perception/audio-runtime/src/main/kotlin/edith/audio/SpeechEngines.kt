@@ -1,8 +1,8 @@
 package edith.audio
 
-import edith.contracts.SpeakerAssessment
-import edith.plugin.CancellationHandle
-import edith.plugin.SpeakerWindow
+import com.sheen.rokid.contracts.SpeakerAssessment
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.SpeakerWindow
 
 data class VadDecision(val speech: Boolean, val endpoint: Boolean)
 data class AsrHypothesis(val text: String, val final: Boolean)

@@ -1,10 +1,10 @@
 package edith.agent
 
-import edith.plugin.MessageRole
-import edith.plugin.ModelEnd
-import edith.plugin.ModelHistoryItem
-import edith.plugin.MonotonicClock
-import edith.plugin.ToolSpec
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.ToolSpec
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive

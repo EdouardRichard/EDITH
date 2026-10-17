@@ -2,7 +2,7 @@ package edith.model
 
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
-import edith.contracts.ContractError
+import com.sheen.rokid.contracts.ContractError
 import java.net.URI
 
 object ModelEndpoint {

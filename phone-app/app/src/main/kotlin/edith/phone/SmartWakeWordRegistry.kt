@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.plugin.WakeWordRegistry
+import com.sheen.rokid.plugin.WakeWordRegistry
 
 /**
  * The phone-side `Capability.WakeWord` provider (Task 14a item 2).

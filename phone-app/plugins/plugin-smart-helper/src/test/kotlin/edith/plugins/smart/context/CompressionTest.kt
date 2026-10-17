@@ -1,9 +1,9 @@
 package edith.plugins.smart.context
 
-import edith.plugin.MessageRole
-import edith.plugin.ModelHistoryItem
-import edith.plugin.TaskScope
-import edith.plugin.CancellationHandle
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.TaskScope
+import com.sheen.rokid.plugin.CancellationHandle
 import edith.plugins.smart.memory.MemoryKind
 import edith.plugins.smart.memory.MemoryLog
 import edith.plugins.smart.memory.MemoryModule
@@ -11,7 +11,7 @@ import edith.plugins.smart.memory.MemorySource
 import edith.plugins.smart.memory.SemanticRetriever
 import edith.plugins.smart.memory.SmartMemoryRetrieval
 import edith.plugins.smart.memory.VectorIndex
-import edith.plugin.StorageHandle
+import com.sheen.rokid.plugin.StorageHandle
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull

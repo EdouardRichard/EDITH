@@ -1,6 +1,6 @@
 package edith.storage
 
-import edith.plugin.SecretHandle
+import com.sheen.rokid.plugin.SecretHandle
 import java.util.UUID
 
 interface SecretResolver {

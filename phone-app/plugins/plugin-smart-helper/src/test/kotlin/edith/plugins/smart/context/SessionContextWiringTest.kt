@@ -1,10 +1,10 @@
 package edith.plugins.smart.context
 
-import edith.plugin.Capability
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingService
-import edith.plugin.ModelHistoryItem
-import edith.plugin.ModelInfo
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelInfo
 import edith.plugins.smart.SmartFakeStorage
 import edith.plugins.smart.SmartTestRig
 import edith.plugins.smart.streamText

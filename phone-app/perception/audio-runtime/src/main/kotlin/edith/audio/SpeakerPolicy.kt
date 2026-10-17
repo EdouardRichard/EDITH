@@ -1,6 +1,6 @@
 package edith.audio
 
-import edith.contracts.SpeakerLabel
+import com.sheen.rokid.contracts.SpeakerLabel
 
 class SpeakerPolicy(val minVoicedMillis: Long, val selfThreshold: Double?, val otherThreshold: Double?) {
     init {

@@ -1,10 +1,10 @@
 package edith.host.embedding
 
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingInferenceEngine
-import edith.plugin.EmbeddingService
-import edith.plugin.FailureReason
-import edith.plugin.ModelInfo
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingInferenceEngine
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.FailureReason
+import com.sheen.rokid.plugin.ModelInfo
 import java.util.concurrent.atomic.AtomicReference
 
 /**

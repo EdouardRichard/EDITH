@@ -1,6 +1,6 @@
 package edith.storage
 
-import edith.plugin.SpeakerProfileRef
+import com.sheen.rokid.plugin.SpeakerProfileRef
 import java.util.UUID
 
 interface SpeakerProfileStore {

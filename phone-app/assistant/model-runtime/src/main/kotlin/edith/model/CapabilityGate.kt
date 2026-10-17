@@ -1,7 +1,7 @@
 package edith.model
 
-import edith.plugin.*
-import edith.contracts.ContractError
+import com.sheen.rokid.plugin.*
+import com.sheen.rokid.contracts.ContractError
 
 data class ProtocolSupport(val id: String, val inputs: Set<InputModality>, val outputs: Set<OutputModality>)
 data class RequestConsent(val text: Boolean, val image: Boolean, val audio: Boolean, val syntheticProbe: Boolean)

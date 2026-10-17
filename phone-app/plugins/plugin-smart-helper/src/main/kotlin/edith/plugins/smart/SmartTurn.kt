@@ -1,12 +1,12 @@
 package edith.plugins.smart
 
 import edith.agent.AgentLoop
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.plugin.CancellationHandle
-import edith.plugin.DeadlineScheduler
-import edith.plugin.MonotonicClock
-import edith.output.ReadableHintAssembler
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.output.ReadableHintAssembler
 
 /**
  * Where one smart turn is in its life.

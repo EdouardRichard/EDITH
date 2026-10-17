@@ -1,18 +1,18 @@
 package edith.phone
 
-import edith.contracts.Assistance
-import edith.contracts.Generation
-import edith.contracts.SessionId
+import com.sheen.rokid.contracts.Assistance
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
 import edith.host.ResourceScope
-import edith.plugin.CancellationHandle
-import edith.plugin.Capability
-import edith.plugin.ContextSignals
-import edith.plugin.ContextSnapshot
-import edith.plugin.DeadlineScheduler
-import edith.plugin.HintDevice
-import edith.plugin.HostServices
-import edith.plugin.InputPort
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ContextSignals
+import com.sheen.rokid.plugin.ContextSnapshot
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.HintDevice
+import com.sheen.rokid.plugin.HostServices
+import com.sheen.rokid.plugin.InputPort
+import com.sheen.rokid.plugin.MonotonicClock
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -35,13 +35,13 @@ class CxrHostEnvironmentTest {
 
     private class FakeInput : InputPort {
         var started = 0
-        override fun start(epoch: edith.contracts.InputEpoch) { started++ }
-        override fun stop(epoch: edith.contracts.InputEpoch) = Unit
+        override fun start(epoch: com.sheen.rokid.contracts.InputEpoch) { started++ }
+        override fun stop(epoch: com.sheen.rokid.contracts.InputEpoch) = Unit
     }
 
     private class FakeHintDevice : HintDevice {
         var shown = 0
-        override fun show(assistance: Assistance, revision: Long, listener: (edith.contracts.OutputStatus) -> Unit): CancellationHandle {
+        override fun show(assistance: Assistance, revision: Long, listener: (com.sheen.rokid.contracts.OutputStatus) -> Unit): CancellationHandle {
             shown++
             return object : CancellationHandle { override fun cancel() = Unit }
         }

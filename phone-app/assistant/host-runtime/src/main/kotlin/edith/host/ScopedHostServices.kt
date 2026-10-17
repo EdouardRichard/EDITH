@@ -1,7 +1,7 @@
 package edith.host
 
-import edith.contracts.*
-import edith.plugin.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.*
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ScopedHostServices(
@@ -21,10 +21,10 @@ class ScopedHostServices(
                 // The scoped wrapper preserves both interfaces so audioSegments() can cast successfully.
                 Capability.Audio -> {
                     val sub = provider as? AudioSubscription ?: wrong(capability)
-                    val seg = provider as? edith.plugin.AudioSegmentSource
-                    if (seg != null) object : AudioSubscription, edith.plugin.AudioSegmentSource {
+                    val seg = provider as? com.sheen.rokid.plugin.AudioSegmentSource
+                    if (seg != null) object : AudioSubscription, com.sheen.rokid.plugin.AudioSegmentSource {
                         private val scoped = scopedAudio(sub)
-                        override fun listen(listener: (edith.contracts.AudioSegment) -> Unit) = scoped.listen(listener)
+                        override fun listen(listener: (com.sheen.rokid.contracts.AudioSegment) -> Unit) = scoped.listen(listener)
                         override fun fetch(turnId: String) = scope.active { seg.fetch(turnId) }
                     } else scopedAudio(sub)
                 }
@@ -39,18 +39,18 @@ class ScopedHostServices(
                 Capability.WakeWord -> scopedWakeWord(provider as? WakeWordRegistry ?: wrong(capability))
                 Capability.Confirmation -> scopedConfirmation(provider as? ConfirmationChannel ?: wrong(capability))
                 // edith-0.2 Phase A: local model services — no scoped wrapper needed (stateless inference)
-                Capability.SystemOne -> provider as? edith.plugin.SystemOneService ?: wrong(capability)
-                Capability.Embedding -> provider as? edith.plugin.EmbeddingService ?: wrong(capability)
+                Capability.SystemOne -> provider as? com.sheen.rokid.plugin.SystemOneService ?: wrong(capability)
+                Capability.Embedding -> provider as? com.sheen.rokid.plugin.EmbeddingService ?: wrong(capability)
                 // edith-0.2 Phase B: the user's SKILL directory. Passed through unwrapped for the same reason as the
                 // two local model services — a stateless request/response port with no subscription to fence and no
                 // cancellation surface, so a scoped wrapper would add a layer that conveys nothing. The grant itself
                 // is still checked: `require` refuses a capability this scope was not given.
-                Capability.StorageAccess -> provider as? edith.plugin.StorageAccess ?: wrong(capability)
+                Capability.StorageAccess -> provider as? com.sheen.rokid.plugin.StorageAccess ?: wrong(capability)
                 // edith-0.2 Phase C: the conversation view. Unwrapped for the same reason as the two above — four
                 // statements with no subscription and nothing to cancel. The scope's own grant check still applies, so
                 // a plugin that was not granted this capability cannot reach it.
                 Capability.ConversationDisplay ->
-                    provider as? edith.plugin.ConversationDisplay ?: wrong(capability)
+                    provider as? com.sheen.rokid.plugin.ConversationDisplay ?: wrong(capability)
             }
         }
         val child = ResourceScope(scope.pluginId, scope.sessionId, scope.generation)

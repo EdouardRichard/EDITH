@@ -1,8 +1,8 @@
 package edith.phone
 
-import edith.contracts.AssistantRoute
-import edith.output.ConversationLog
-import edith.output.ConversationRole
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.output.ConversationLog
+import com.sheen.rokid.output.ConversationRole
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

@@ -2,12 +2,12 @@ package edith.phone
 
 import edith.phone.model.TestBlobs
 import edith.phone.storage.writeJson
-import edith.plugin.CancellationHandle
-import edith.plugin.CapabilityVerification
-import edith.plugin.InputModality
-import edith.plugin.ModelProfile
-import edith.plugin.OutputModality
-import edith.plugin.SecretHandle
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.CapabilityVerification
+import com.sheen.rokid.plugin.InputModality
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.SecretHandle
 import edith.storage.ProfileRepository
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
@@ -245,8 +245,8 @@ class SmartSettingsStoreTest {
         // be opened), and an exception here would take the whole composition - and with it the passive loop - down.
         // The shape must stay usable so the caller can still build an accepted configuration.
         val refusing = object : ProfileRepository {
-            override fun list(): List<ModelProfile> = throw edith.contracts.ContractError.ConfigurationRejected("no storage")
-            override fun get(id: String): ModelProfile? = throw edith.contracts.ContractError.ConfigurationRejected("no storage")
+            override fun list(): List<ModelProfile> = throw com.sheen.rokid.contracts.ContractError.ConfigurationRejected("no storage")
+            override fun get(id: String): ModelProfile? = throw com.sheen.rokid.contracts.ContractError.ConfigurationRejected("no storage")
             override fun save(profile: ModelProfile) = profile
             override fun delete(id: String) = Unit
             override fun verify(id: String, result: CapabilityVerification) = Unit

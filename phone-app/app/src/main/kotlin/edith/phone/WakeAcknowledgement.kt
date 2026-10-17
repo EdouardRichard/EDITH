@@ -1,11 +1,11 @@
 package edith.phone
 
-import edith.contracts.Assistance
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.contracts.SpeechRequest
-import edith.plugin.MonotonicClock
-import edith.plugin.SpeechPlayer
+import com.sheen.rokid.contracts.Assistance
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.contracts.SpeechRequest
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.SpeechPlayer
 
 /**
  * Phase C (spec §6.4): the assistant's answer to being woken, said immediately.

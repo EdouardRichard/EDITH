@@ -1,6 +1,6 @@
 package edith.model
 
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import edith.storage.*
 import okhttp3.OkHttpClient
 import okhttp3.*
@@ -12,7 +12,7 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
-import edith.contracts.ContractError
+import com.sheen.rokid.contracts.ContractError
 import kotlinx.serialization.json.*
 
 class ControlledModelClient(

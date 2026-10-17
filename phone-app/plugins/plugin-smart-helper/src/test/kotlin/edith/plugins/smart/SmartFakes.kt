@@ -1,42 +1,42 @@
 package edith.plugins.smart
 
-import edith.contracts.Assistance
-import edith.contracts.EventEnvelope
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.contracts.TranscriptRevision
-import edith.contracts.WakeDetected
-import edith.plugin.ActionDescriptor
-import edith.plugin.ActionExecutor
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
-import edith.plugin.CancellationHandle
-import edith.plugin.Capability
-import edith.plugin.DeadlineScheduler
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingService
-import edith.plugin.HostServices
-import edith.plugin.InputModality
-import edith.plugin.ModelClient
-import edith.plugin.ModelInfo
-import edith.plugin.ModelProfile
-import edith.plugin.ModelRequest
-import edith.plugin.ModelStreamEvent
-import edith.plugin.MonotonicClock
-import edith.plugin.OutputModality
-import edith.plugin.OutputSink
-import edith.plugin.OutputSubmission
-import edith.plugin.RiskLevel
-import edith.plugin.SecretHandle
-import edith.plugin.StorageAccess
-import edith.plugin.StorageHandle
-import edith.plugin.SystemOneAnswer
-import edith.plugin.SystemOneQuestion
-import edith.plugin.SystemOneResult
-import edith.plugin.SystemOneService
-import edith.plugin.SystemOneStatus
-import edith.plugin.TaskScope
-import edith.plugin.WakeWordRegistry
+import com.sheen.rokid.contracts.Assistance
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.contracts.TranscriptRevision
+import com.sheen.rokid.contracts.WakeDetected
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.HostServices
+import com.sheen.rokid.plugin.InputModality
+import com.sheen.rokid.plugin.ModelClient
+import com.sheen.rokid.plugin.ModelInfo
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.OutputSink
+import com.sheen.rokid.plugin.OutputSubmission
+import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.SecretHandle
+import com.sheen.rokid.plugin.StorageAccess
+import com.sheen.rokid.plugin.StorageHandle
+import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.SystemOneResult
+import com.sheen.rokid.plugin.SystemOneService
+import com.sheen.rokid.plugin.SystemOneStatus
+import com.sheen.rokid.plugin.TaskScope
+import com.sheen.rokid.plugin.WakeWordRegistry
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 
@@ -319,7 +319,7 @@ internal fun smartAction(
 /** One text-delta-then-terminal stream, the shape a successful answer arrives in. */
 internal fun streamText(request: ModelRequest, listener: (ModelStreamEvent) -> Unit, text: String) {
     listener(ModelStreamEvent.TextDelta(request.requestId, text))
-    listener(ModelStreamEvent.Terminal(request.requestId, edith.plugin.ModelEnd.COMPLETED, null, null))
+    listener(ModelStreamEvent.Terminal(request.requestId, com.sheen.rokid.plugin.ModelEnd.COMPLETED, null, null))
 }
 
 /** One tool-call-then-terminal stream; the call is complete before the terminal, as the transport promises. */
@@ -454,7 +454,7 @@ internal class SmartTestRig(
             proactiveCooldownMillis?.let { put("proactiveCooldownMillis", it) }
             proactiveSensitivity?.let { put("proactiveSensitivity", it) }
         }
-        val configuration = edith.plugin.PluginConfiguration(1, values)
+        val configuration = com.sheen.rokid.plugin.PluginConfiguration(1, values)
         plugin.validate(configuration)
         plugin.configure(configuration)
         plugin.activate(
@@ -464,7 +464,7 @@ internal class SmartTestRig(
             // hypothetical: the plugin reported nothing to the phone's conversation view on the device - no `SAID`, no
             // `BUSY`, an empty 助手 page - while 439 tests were green, because `ConversationDisplay` was missing from
             // the descriptor and the optional-port access degraded silently.
-            edith.plugin.PluginContext(
+            com.sheen.rokid.plugin.PluginContext(
                 sessionId, generation, plugin.descriptor.capabilities.toSet(),
                 host(overrides, tasks, plugin.descriptor.capabilities.toSet()),),
         )
@@ -480,7 +480,7 @@ internal class SmartTestRig(
     /** Wakes, then hands over one final transcript, and releases the scheduler. */
     fun wakeAndFinal(text: String = "需要记什么", turnId: String = "asr-1") {
         plugin.handle(wakeEvent())
-        plugin.handle(edith.contracts.TranscriptEvent(transcript(text, turnId = turnId)))
+        plugin.handle(com.sheen.rokid.contracts.TranscriptEvent(transcript(text, turnId = turnId)))
         tick()
     }
 

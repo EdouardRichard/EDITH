@@ -9,48 +9,48 @@ import edith.audio.SpeechPipeline
 import edith.audio.StreamingAsrEngine
 import edith.audio.VadDecision
 import edith.audio.VadEngine
-import edith.contracts.Assistance
-import edith.contracts.AudioFormat
-import edith.contracts.ContractError
-import edith.contracts.Generation
-import edith.contracts.HostEvent
-import edith.contracts.InputEpoch
-import edith.contracts.OutputStatus
-import edith.contracts.PcmEncoding
-import edith.contracts.SessionId
-import edith.contracts.SpeakerAssessment
-import edith.contracts.TranscriptEvent
-import edith.contracts.TranscriptRevision
-import edith.contracts.VerifiedPcm
+import com.sheen.rokid.contracts.Assistance
+import com.sheen.rokid.contracts.AudioFormat
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.HostEvent
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.OutputStatus
+import com.sheen.rokid.contracts.PcmEncoding
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.contracts.SpeakerAssessment
+import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.contracts.TranscriptRevision
+import com.sheen.rokid.contracts.VerifiedPcm
 import edith.host.HostRuntime
 import edith.host.ResourceScope
-import edith.output.HintCommand
-import edith.output.HintWireCodec
-import edith.plugin.ActionDescriptor
-import edith.plugin.ActionExecutor
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
-import edith.plugin.AsrSession
-import edith.plugin.CancellationHandle
-import edith.plugin.Capability
-import edith.plugin.ConfigSchema
-import edith.plugin.DeactivationReason
-import edith.plugin.DeadlineScheduler
-import edith.plugin.HintDevice
-import edith.plugin.InputPort
-import edith.plugin.ModelClient
-import edith.plugin.ModelRequest
-import edith.plugin.ModelStreamEvent
-import edith.plugin.MonotonicClock
-import edith.plugin.PluginContext
-import edith.plugin.PluginDescriptor
-import edith.plugin.PluginLifecycle
-import edith.plugin.SpeakerWindow
-import edith.plugin.StorageHandle
+import com.sheen.rokid.output.HintCommand
+import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.AsrSession
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ConfigSchema
+import com.sheen.rokid.plugin.DeactivationReason
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.HintDevice
+import com.sheen.rokid.plugin.InputPort
+import com.sheen.rokid.plugin.ModelClient
+import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.PluginContext
+import com.sheen.rokid.plugin.PluginDescriptor
+import com.sheen.rokid.plugin.PluginLifecycle
+import com.sheen.rokid.plugin.SpeakerWindow
+import com.sheen.rokid.plugin.StorageHandle
 import edith.rokid.CxrAuthorizationOutcome
 import edith.storage.MemoryProfileRepository
-import edith.testsupport.FakeClock as TestClock
-import edith.testsupport.ManualScheduler
+import com.sheen.rokid.testsupport.FakeClock as TestClock
+import com.sheen.rokid.testsupport.ManualScheduler
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -120,7 +120,7 @@ class CxrHostServicesTest {
      * A stand-in for the wake-word provider. Task 14a made `Capability.WakeWord` real (the composition now supplies
      * its own configured registry), so the advertised set includes it and it must therefore be answerable here too.
      */
-    private class StubWakeWords : edith.plugin.WakeWordRegistry {
+    private class StubWakeWords : com.sheen.rokid.plugin.WakeWordRegistry {
         private val words = mutableListOf<String>()
         override fun declare(words: List<String>): Boolean { this.words.clear(); this.words += words; return true }
         override fun current(): List<String> = words.toList()
@@ -148,7 +148,7 @@ class CxrHostServicesTest {
     private fun scope(pluginId: String) = ResourceScope(pluginId, SessionId("s-1"), Generation(1))
 
     private fun environment(displayLive: Boolean, storage: Boolean = true, input: InputPort = RecordingInput(),
-        asr: AsrSession? = null, actions: ActionExecutor? = null, wakeWords: edith.plugin.WakeWordRegistry? = StubWakeWords()) =
+        asr: AsrSession? = null, actions: ActionExecutor? = null, wakeWords: com.sheen.rokid.plugin.WakeWordRegistry? = StubWakeWords()) =
         CxrHostEnvironment(
             clock = FakeClock(),
             input = input,

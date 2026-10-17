@@ -1,10 +1,10 @@
 package edith.phone.a11y
 
 import edith.phone.actions.ExecutionRouter
-import edith.plugin.ActionDescriptor
-import edith.plugin.ActionExecutor
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
 
 /**
  * T1.4 — Applied semantics post-processor (AC-10).

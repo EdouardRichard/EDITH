@@ -1,6 +1,6 @@
 package edith.audio
 
-import edith.contracts.SampleRange
+import com.sheen.rokid.contracts.SampleRange
 
 /**
  * Test doubles for the wake layer. Kept out of the `*Test.kt` files so that the detector tests and the

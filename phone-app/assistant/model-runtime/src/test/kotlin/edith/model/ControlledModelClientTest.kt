@@ -1,7 +1,7 @@
 package edith.model
 
-import edith.contracts.ContractError
-import edith.plugin.*
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.plugin.*
 import edith.storage.*
 import okhttp3.*
 import okhttp3.mockwebserver.*
@@ -289,7 +289,7 @@ class ControlledModelClientTest {
         rig.start(); rig.awaitRequest()
         val secondDone = CountDownLatch(1)
         rig.client.request(rig.request().copy(requestId = "r2", turnId = "t2",
-            envelope = rig.request().envelope.copy(generation = edith.contracts.Generation(2)))) {
+            envelope = rig.request().envelope.copy(generation = com.sheen.rokid.contracts.Generation(2)))) {
             if (it is ModelStreamEvent.Terminal) secondDone.countDown()
         }
         rig.awaitTerminal(); assertTrue(secondDone.await(5, TimeUnit.SECONDS))

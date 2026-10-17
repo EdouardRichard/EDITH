@@ -1,15 +1,15 @@
 package edith.phone
 
-import edith.contracts.*
+import com.sheen.rokid.contracts.*
 import edith.host.HostRuntime
 import edith.host.ResourceScope
 import edith.host.ScheduledHostEnvironment
-import edith.plugin.*
-import edith.testsupport.FakeClock
-import edith.testsupport.FakeTaskScope
-import edith.testsupport.ManualScheduler
-import edith.testsupport.RecordingHintDevice
-import edith.testsupport.RecordingInputPort
+import com.sheen.rokid.plugin.*
+import com.sheen.rokid.testsupport.FakeClock
+import com.sheen.rokid.testsupport.FakeTaskScope
+import com.sheen.rokid.testsupport.ManualScheduler
+import com.sheen.rokid.testsupport.RecordingHintDevice
+import com.sheen.rokid.testsupport.RecordingInputPort
 import org.junit.Assert.*
 import org.junit.Test
 

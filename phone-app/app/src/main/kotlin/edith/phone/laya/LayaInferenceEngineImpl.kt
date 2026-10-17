@@ -4,9 +4,9 @@ package edith.phone.laya
 import android.content.Context
 import com.laya.LayaEngine
 import edith.phone.P3Log
-import edith.plugin.LayaInferenceEngine
-import edith.plugin.SystemOneAnswer
-import edith.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.LayaInferenceEngine
+import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneQuestion
 
 /**
  * The production Laya engine: the publisher's host behind the contract's port.

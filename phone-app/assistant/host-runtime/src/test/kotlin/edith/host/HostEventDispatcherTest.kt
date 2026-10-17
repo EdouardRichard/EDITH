@@ -1,7 +1,7 @@
 package edith.host
 
-import edith.contracts.*
-import edith.plugin.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.*
 import kotlin.test.*
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -28,7 +28,7 @@ class HostEventDispatcherTest {
         val env = object : ScheduledHostEnvironment by rig.environment {
             override val availableCapabilities = setOf(Capability.Storage)
             override fun services(scope: ResourceScope, granted: Set<Capability>): HostServices =
-                ScopedHostServices(scope, granted, mapOf(Capability.Storage to storage), edith.testsupport.FakeTaskScope())
+                ScopedHostServices(scope, granted, mapOf(Capability.Storage to storage), com.sheen.rokid.testsupport.FakeTaskScope())
         }
         val host = HostRuntime(1, env)
         val plugin = object : PluginLifecycle {
@@ -118,7 +118,7 @@ class HostEventDispatcherTest {
         }
         val env = object : ScheduledHostEnvironment by rig.environment {
             override fun services(scope: ResourceScope, granted: Set<Capability>): HostServices =
-                ScopedHostServices(scope, granted, mapOf(Capability.Audio to provider), edith.testsupport.FakeTaskScope())
+                ScopedHostServices(scope, granted, mapOf(Capability.Audio to provider), com.sheen.rokid.testsupport.FakeTaskScope())
         }
         val host = HostRuntime(1, env)
         val plugin = object : PluginLifecycle {

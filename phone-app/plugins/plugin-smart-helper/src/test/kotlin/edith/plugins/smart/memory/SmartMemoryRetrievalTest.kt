@@ -112,7 +112,7 @@ class SmartMemoryRetrievalTest {
         MemoryLog(storage = storage, now = { clock }, log = { })
             .record(MemoryKind.PREFERENCE, "我喜欢喝茶", MemorySource.EXPLICIT)
         val rig = SmartTestRig()
-        rig.activate(overrides = mapOf(edith.plugin.Capability.Storage to storage))
+        rig.activate(overrides = mapOf(com.sheen.rokid.plugin.Capability.Storage to storage))
         rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
 
         rig.wakeAndFinal("我喜欢喝茶", turnId = "asr-1")

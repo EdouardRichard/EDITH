@@ -1,6 +1,6 @@
 package edith.rokid
 
-import edith.contracts.PcmEncoding
+import com.sheen.rokid.contracts.PcmEncoding
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull

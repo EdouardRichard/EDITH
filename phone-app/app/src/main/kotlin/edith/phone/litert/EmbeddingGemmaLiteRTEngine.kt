@@ -1,6 +1,6 @@
 package edith.phone.litert
 
-import edith.plugin.EmbeddingInferenceEngine
+import com.sheen.rokid.plugin.EmbeddingInferenceEngine
 import org.tensorflow.lite.Interpreter
 import java.io.File
 

@@ -1,6 +1,6 @@
 package edith.audio
 
-import edith.contracts.*
+import com.sheen.rokid.contracts.*
 import kotlin.test.*
 
 class AcousticLabelerTest {

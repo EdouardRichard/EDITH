@@ -1,14 +1,14 @@
 package edith.host.systemone
 
-import edith.plugin.FailureReason
-import edith.plugin.LayaInferenceEngine
-import edith.plugin.ModelInfo
-import edith.plugin.SystemOneCriterion
-import edith.plugin.SystemOneQuestion
-import edith.plugin.SystemOneQuestionType
-import edith.plugin.SystemOneResult
-import edith.plugin.SystemOneService
-import edith.plugin.SystemOneStatus
+import com.sheen.rokid.plugin.FailureReason
+import com.sheen.rokid.plugin.LayaInferenceEngine
+import com.sheen.rokid.plugin.ModelInfo
+import com.sheen.rokid.plugin.SystemOneCriterion
+import com.sheen.rokid.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.SystemOneQuestionType
+import com.sheen.rokid.plugin.SystemOneResult
+import com.sheen.rokid.plugin.SystemOneService
+import com.sheen.rokid.plugin.SystemOneStatus
 import java.util.concurrent.atomic.AtomicReference
 
 /**

@@ -6,7 +6,7 @@ import edith.audio.android.EngineModelStore
 import edith.audio.android.SherpaEngineCandidate
 import edith.audio.android.SherpaEngineFactory
 import edith.audio.android.ValidatedModelBundle
-import edith.contracts.VerifiedPcm
+import com.sheen.rokid.contracts.VerifiedPcm
 import java.io.InputStream
 
 enum class AudioCandidateAvailability { MISSING, READY_FOR_MEASUREMENT, INVALID }

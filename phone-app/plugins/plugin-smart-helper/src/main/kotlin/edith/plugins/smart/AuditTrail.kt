@@ -4,7 +4,7 @@ import edith.agent.AuditEntry
 import edith.agent.AuditSink
 import edith.agent.BoundedAuditLog
 import edith.agent.ConfirmationSource
-import edith.plugin.StorageHandle
+import com.sheen.rokid.plugin.StorageHandle
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray

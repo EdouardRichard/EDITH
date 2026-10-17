@@ -1,12 +1,12 @@
 package edith.phone.model
 
-import edith.contracts.*
+import com.sheen.rokid.contracts.*
 import edith.model.*
 import edith.phone.storage.*
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import edith.storage.SecretResolver
-import edith.testsupport.FakeClock
-import edith.testsupport.ManualScheduler
+import com.sheen.rokid.testsupport.FakeClock
+import com.sheen.rokid.testsupport.ManualScheduler
 import okhttp3.OkHttpClient
 import org.junit.Assert.*
 import org.junit.Test

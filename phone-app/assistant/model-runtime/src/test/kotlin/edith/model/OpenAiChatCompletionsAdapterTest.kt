@@ -1,10 +1,10 @@
 package edith.model
 
-import edith.contracts.ContractError
-import edith.contracts.EventEnvelope
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.plugin.*
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.*
 import kotlinx.serialization.json.*
 import kotlin.test.Test
 import kotlin.test.assertContentEquals

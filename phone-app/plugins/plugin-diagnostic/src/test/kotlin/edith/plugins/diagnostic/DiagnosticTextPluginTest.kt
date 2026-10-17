@@ -1,9 +1,9 @@
 package edith.plugins.diagnostic
 
-import edith.contracts.*
-import edith.plugin.*
-import edith.testsupport.*
-import edith.output.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.*
+import com.sheen.rokid.testsupport.*
+import com.sheen.rokid.output.*
 import kotlin.test.*
 
 class DiagnosticTextPluginTest {
@@ -172,7 +172,7 @@ class DiagnosticTextPluginTest {
         assertEquals(1, marks(t).count { it == "DISPLAY_ACK" })
     }
     @Test fun `default host policy denies even explicit synthetic intent`() {
-        val p = DiagnosticTextPlugin(clock, scheduler, edith.output.TraceRecorder(), { lookup })
+        val p = DiagnosticTextPlugin(clock, scheduler, com.sheen.rokid.output.TraceRecorder(), { lookup })
         p.configure(config(mode = "synthetic")); p.activate(context); p.handle(transcript()); help(p)
         assertTrue(requests.isEmpty())
     }

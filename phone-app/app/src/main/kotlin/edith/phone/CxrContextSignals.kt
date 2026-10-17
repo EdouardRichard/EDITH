@@ -1,9 +1,9 @@
 package edith.phone
 
-import edith.plugin.CancellationHandle
-import edith.plugin.ContextSignals
-import edith.plugin.ContextSnapshot
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.ContextSignals
+import com.sheen.rokid.plugin.ContextSnapshot
+import com.sheen.rokid.plugin.MonotonicClock
 import java.time.LocalTime
 
 /**

@@ -1,7 +1,7 @@
 package edith.host.embedding
 
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingInferenceEngine
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingInferenceEngine
 import kotlin.math.sqrt
 import kotlin.test.Test
 import kotlin.test.assertEquals

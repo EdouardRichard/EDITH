@@ -1,8 +1,8 @@
 package edith.audio
 
-import edith.contracts.*
-import edith.plugin.CancellationHandle
-import edith.plugin.SpeakerWindow
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.SpeakerWindow
 import java.io.ByteArrayOutputStream
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue

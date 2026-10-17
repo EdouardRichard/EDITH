@@ -1,7 +1,7 @@
 package edith.plugins.interview
 
-import edith.contracts.HostEvent
-import edith.plugin.*
+import com.sheen.rokid.contracts.HostEvent
+import com.sheen.rokid.plugin.*
 
 class InterviewAssistantPlugin : PluginLifecycle {
     override val descriptor = PluginDescriptor("interview-assistant", "1.0.0", 1, "Interview Assistant", listOf(Capability.Speaker, Capability.Storage, Capability.Model, Capability.TextOutput), ConfigSchema(1))

@@ -21,8 +21,8 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import edith.contracts.AssistantRoute
-import edith.contracts.SessionState
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.SessionState
 import edith.phone.AuditSection
 import edith.phone.BuildConfig
 import edith.phone.HostCompositionRoot
@@ -43,7 +43,7 @@ import edith.phone.model.ProfileListScreen
 import edith.phone.model.ProfileViewModel
 import edith.phone.pluginPickerOptions
 import edith.phone.sessionLabel
-import edith.plugin.Capability
+import com.sheen.rokid.plugin.Capability
 import kotlinx.coroutines.launch
 
 /**
@@ -195,7 +195,7 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun AssistantTab(log: edith.output.ConversationLog) {
+internal fun AssistantTab(log: com.sheen.rokid.output.ConversationLog) {
     var route by remember { mutableStateOf(AssistantRoute.WAKE) }
     var revision by remember { mutableStateOf(0) }
     // The log is written from the host's drain thread and the plugin's task pool, so this is a poll rather than a
@@ -229,11 +229,11 @@ internal fun AssistantTab(log: edith.output.ConversationLog) {
             ListItem(
                 headlineContent = { Text(entry.text) },
                 supportingContent = {
-                    Text(if (entry.role == edith.output.ConversationRole.USER) "你" else "助手")
+                    Text(if (entry.role == com.sheen.rokid.output.ConversationRole.USER) "你" else "助手")
                 },
                 leadingContent = {
                     Icon(
-                        if (entry.role == edith.output.ConversationRole.USER) Icons.Default.Person else Icons.Default.Info,
+                        if (entry.role == com.sheen.rokid.output.ConversationRole.USER) Icons.Default.Person else Icons.Default.Info,
                         contentDescription = null,
                     )
                 },

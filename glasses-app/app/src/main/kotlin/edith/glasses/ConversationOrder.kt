@@ -1,6 +1,6 @@
 package edith.glasses
 
-import edith.contracts.AssistantRoute
+import com.sheen.rokid.contracts.AssistantRoute
 
 /**
  * Phase C (spec §6.6): which conversation the glasses are showing, and how the wearer changes it.

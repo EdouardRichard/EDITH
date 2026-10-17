@@ -1,7 +1,7 @@
 package edith.audio
 
-import edith.contracts.*
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.MonotonicClock
 import java.lang.management.ManagementFactory
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch

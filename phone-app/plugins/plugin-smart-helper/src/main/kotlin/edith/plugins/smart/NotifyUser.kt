@@ -1,11 +1,11 @@
 package edith.plugins.smart
 
-import edith.contracts.SpeechRequest
-import edith.plugin.ActionDescriptor
-import edith.plugin.ActionExecutor
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
-import edith.plugin.RiskLevel
+import com.sheen.rokid.contracts.SpeechRequest
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.RiskLevel
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive

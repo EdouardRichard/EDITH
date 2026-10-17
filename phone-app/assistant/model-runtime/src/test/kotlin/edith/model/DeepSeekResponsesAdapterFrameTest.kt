@@ -3,7 +3,7 @@ package edith.model
 import edith.agent.RequestFrame
 import edith.agent.Segment
 import edith.agent.SegmentOrigin
-import edith.plugin.ToolSpec
+import com.sheen.rokid.plugin.ToolSpec
 import kotlinx.serialization.json.*
 import kotlin.test.Test
 import kotlin.test.assertContentEquals

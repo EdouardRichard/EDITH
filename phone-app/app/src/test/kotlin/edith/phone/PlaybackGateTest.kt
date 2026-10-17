@@ -1,11 +1,11 @@
 package edith.phone
 
 import edith.audio.WakeWordDetector
-import edith.contracts.Generation
-import edith.contracts.InputEpoch
-import edith.contracts.SampleRange
-import edith.contracts.SessionId
-import edith.testsupport.FakeClock
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.SampleRange
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.testsupport.FakeClock
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import org.junit.Assert.assertEquals

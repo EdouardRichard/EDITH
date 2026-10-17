@@ -46,7 +46,7 @@ class DebugHintInjectorTest {
      */
     @Test
     fun theInjectorsBoundIsTheWiresBoundSoTheProbeCanReachTheRealLimit() {
-        assertEquals(edith.output.HintWireCodec.MAX_TEXT_CODEPOINTS, DebugHintInjector.MAX_CHARS)
+        assertEquals(com.sheen.rokid.output.HintWireCodec.MAX_TEXT_CODEPOINTS, DebugHintInjector.MAX_CHARS)
     }
 
     @Test

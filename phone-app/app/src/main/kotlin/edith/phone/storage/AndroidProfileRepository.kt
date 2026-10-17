@@ -1,7 +1,7 @@
 package edith.phone.storage
 
-import edith.contracts.ContractError
-import edith.plugin.*
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.plugin.*
 import edith.storage.ProfileRepository
 import kotlinx.serialization.json.*
 import java.util.UUID

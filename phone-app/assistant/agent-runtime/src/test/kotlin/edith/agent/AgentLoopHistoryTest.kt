@@ -1,9 +1,9 @@
 package edith.agent
 
-import edith.plugin.MessageRole
-import edith.plugin.ModelEnd
-import edith.plugin.ModelHistoryItem
-import edith.testsupport.FakeClock
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.testsupport.FakeClock
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue

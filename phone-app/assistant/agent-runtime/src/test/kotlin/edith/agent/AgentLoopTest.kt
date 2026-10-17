@@ -1,14 +1,14 @@
 package edith.agent
 
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
-import edith.plugin.MessageRole
-import edith.plugin.ModelEnd
-import edith.plugin.ModelHistoryItem
-import edith.plugin.MonotonicClock
-import edith.plugin.RiskLevel
-import edith.plugin.ToolSpec
-import edith.testsupport.FakeClock
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolSpec
+import com.sheen.rokid.testsupport.FakeClock
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.concurrent.thread

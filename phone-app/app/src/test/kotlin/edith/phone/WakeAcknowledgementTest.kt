@@ -1,11 +1,11 @@
 package edith.phone
 
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.plugin.CancellationHandle
-import edith.plugin.SpeechPlayback
-import edith.plugin.SpeechPlayer
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.SpeechPlayback
+import com.sheen.rokid.plugin.SpeechPlayer
+import com.sheen.rokid.plugin.MonotonicClock
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -27,9 +27,9 @@ class WakeAcknowledgementTest {
 
     private class RecordingPlayer : SpeechPlayer {
         val spoken = mutableListOf<String>()
-        val routes = mutableListOf<edith.contracts.AssistantRoute>()
+        val routes = mutableListOf<com.sheen.rokid.contracts.AssistantRoute>()
         override fun play(
-            assistance: edith.contracts.Assistance,
+            assistance: com.sheen.rokid.contracts.Assistance,
             onState: (SpeechPlayback) -> Unit,
         ): CancellationHandle {
             spoken += assistance.text
@@ -91,7 +91,7 @@ class WakeAcknowledgementTest {
         // opposite of what an acknowledgement is for.
         val exploding = object : SpeechPlayer {
             override fun play(
-                assistance: edith.contracts.Assistance,
+                assistance: com.sheen.rokid.contracts.Assistance,
                 onState: (SpeechPlayback) -> Unit,
             ): CancellationHandle = throw IllegalStateException("the engine died")
         }

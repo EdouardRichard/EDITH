@@ -1,12 +1,12 @@
 package edith.plugins.smart
 
-import edith.contracts.AcousticEvent
-import edith.contracts.AcousticLabel
-import edith.contracts.TranscriptEvent
-import edith.plugin.Capability
-import edith.plugin.ModelEnd
-import edith.plugin.ModelHistoryItem
-import edith.plugin.ModelStreamEvent
+import com.sheen.rokid.contracts.AcousticEvent
+import com.sheen.rokid.contracts.AcousticLabel
+import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelStreamEvent
 import edith.plugins.smart.skill.LoadSkillTool
 import kotlin.test.Test
 import kotlin.test.assertEquals

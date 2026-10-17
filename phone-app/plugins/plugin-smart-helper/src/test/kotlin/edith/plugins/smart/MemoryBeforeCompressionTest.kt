@@ -1,6 +1,6 @@
 package edith.plugins.smart
 
-import edith.plugin.Capability
+import com.sheen.rokid.plugin.Capability
 import edith.plugins.smart.context.CompressionReport
 import edith.plugins.smart.context.ContextCompressor
 import edith.plugins.smart.context.ContextManager

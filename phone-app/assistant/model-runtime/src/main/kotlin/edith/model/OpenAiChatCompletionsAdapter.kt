@@ -2,8 +2,8 @@ package edith.model
 
 import edith.agent.RequestFrame
 import edith.agent.SegmentOrigin
-import edith.contracts.ContractError
-import edith.plugin.*
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.plugin.*
 import kotlinx.serialization.json.*
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer

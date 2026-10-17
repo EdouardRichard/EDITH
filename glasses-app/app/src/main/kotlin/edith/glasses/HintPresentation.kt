@@ -1,7 +1,7 @@
 package edith.glasses
 
-import edith.contracts.AssistantRoute
-import edith.output.HintWireCodec
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.output.HintWireCodec
 
 /**
  * What the wearer actually sees, decided without Android so it can be tested off-device.

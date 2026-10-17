@@ -1,8 +1,8 @@
 package edith.plugins.smart.context
 
-import edith.plugin.MessageRole
-import edith.plugin.ModelHistoryItem
-import edith.plugin.StorageHandle
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.StorageHandle
 import edith.plugins.smart.memory.MemoryLog
 import edith.plugins.smart.memory.MemoryModule
 import edith.plugins.smart.memory.SemanticRetriever

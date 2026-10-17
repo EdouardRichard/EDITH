@@ -1,7 +1,7 @@
 package edith.host.embedding
 
-import edith.plugin.EmbedResult
-import edith.plugin.FailureReason
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.FailureReason
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse

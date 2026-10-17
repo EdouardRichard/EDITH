@@ -1,9 +1,9 @@
 package edith.phone.laya
 
-import edith.plugin.SystemOneAnswer
-import edith.plugin.SystemOneCriterion
-import edith.plugin.SystemOneQuestion
-import edith.plugin.SystemOneQuestionType
+import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneCriterion
+import com.sheen.rokid.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.SystemOneQuestionType
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue

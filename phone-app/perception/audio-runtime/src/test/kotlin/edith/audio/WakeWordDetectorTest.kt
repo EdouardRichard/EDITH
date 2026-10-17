@@ -1,10 +1,10 @@
 package edith.audio
 
-import edith.contracts.Generation
-import edith.contracts.InputEpoch
-import edith.contracts.SampleRange
-import edith.contracts.SessionId
-import edith.testsupport.FakeClock
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.SampleRange
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.testsupport.FakeClock
 import kotlin.test.*
 
 class WakeWordDetectorTest {

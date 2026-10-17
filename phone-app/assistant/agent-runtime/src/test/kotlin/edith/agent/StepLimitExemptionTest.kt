@@ -1,10 +1,10 @@
 package edith.agent
 
-import edith.plugin.ActionDescriptor
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
-import edith.plugin.RiskLevel
-import edith.testsupport.FakeClock
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.testsupport.FakeClock
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull

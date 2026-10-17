@@ -1,20 +1,20 @@
 package edith.phone
 
-import edith.contracts.ContractError
+import com.sheen.rokid.contracts.ContractError
 import edith.host.ResourceScope
 import edith.host.ScheduledHostEnvironment
 import edith.host.ScopedHostServices
-import edith.plugin.CancellationHandle
-import edith.plugin.Capability
-import edith.plugin.DeadlineScheduler
-import edith.plugin.HintDevice
-import edith.plugin.HostServices
-import edith.plugin.InputPort
-import edith.plugin.MonotonicClock
-import edith.plugin.OutputSink
-import edith.plugin.OutputSubmission
-import edith.plugin.StorageHandle
-import edith.plugin.TaskScope
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.HintDevice
+import com.sheen.rokid.plugin.HostServices
+import com.sheen.rokid.plugin.InputPort
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.OutputSink
+import com.sheen.rokid.plugin.OutputSubmission
+import com.sheen.rokid.plugin.StorageHandle
+import com.sheen.rokid.plugin.TaskScope
 import java.util.concurrent.Executor
 import java.util.concurrent.Future
 import java.util.concurrent.RejectedExecutionException
@@ -60,9 +60,9 @@ class CxrHostEnvironment(
     /** Plugin background work; [UnavailableTaskScope] refuses rather than silently running work inline. */
     private val taskScope: TaskScope = UnavailableTaskScope,
     /** P5 (spec §S1): the speech player, or null when TTS is unavailable or the user switch is off. */
-    override val speech: edith.plugin.SpeechPlayer? = null,
+    override val speech: com.sheen.rokid.plugin.SpeechPlayer? = null,
     /** P5 (C2 fix): audio segment source for the direct-audio path, or null when not wired. */
-    override val audioSegmentSource: edith.plugin.AudioSegmentSource? = null,
+    override val audioSegmentSource: com.sheen.rokid.plugin.AudioSegmentSource? = null,
 ) : ScheduledHostEnvironment {
 
     init {
@@ -74,7 +74,7 @@ class CxrHostEnvironment(
      * provider for every granted capability during construction.
      */
     private val hostOwnedOutput = object : OutputSink {
-        override fun submit(assistance: edith.contracts.Assistance): OutputSubmission = OutputSubmission.Rejected
+        override fun submit(assistance: com.sheen.rokid.contracts.Assistance): OutputSubmission = OutputSubmission.Rejected
     }
 
     /**
@@ -104,12 +104,12 @@ class CxrHostEnvironment(
      *   teardown into an error path.
      */
     private val forwarding = object : HintDevice {
-        override fun show(assistance: edith.contracts.Assistance, revision: Long,
-            listener: (edith.contracts.OutputStatus) -> Unit): CancellationHandle =
+        override fun show(assistance: com.sheen.rokid.contracts.Assistance, revision: Long,
+            listener: (com.sheen.rokid.contracts.OutputStatus) -> Unit): CancellationHandle =
             (liveOutput() ?: throw ContractError.CapabilityMissing("display unavailable"))
                 .show(assistance, revision, listener)
 
-        override fun clear(sessionId: edith.contracts.SessionId, generation: edith.contracts.Generation) {
+        override fun clear(sessionId: com.sheen.rokid.contracts.SessionId, generation: com.sheen.rokid.contracts.Generation) {
             liveOutput()?.clear(sessionId, generation)
         }
     }
@@ -151,10 +151,10 @@ class CxrHostEnvironment(
  * `MissingHostEnvironment` did.
  */
 internal object UnwiredInputPort : InputPort {
-    override fun start(epoch: edith.contracts.InputEpoch) =
+    override fun start(epoch: com.sheen.rokid.contracts.InputEpoch) =
         throw ContractError.CapabilityMissing("audio unavailable")
 
-    override fun stop(epoch: edith.contracts.InputEpoch) = Unit
+    override fun stop(epoch: com.sheen.rokid.contracts.InputEpoch) = Unit
 }
 
 /** Refuses plugin background work rather than pretending it ran; the default until a real scope is provided. */

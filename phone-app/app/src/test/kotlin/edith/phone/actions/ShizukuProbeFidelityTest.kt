@@ -1,6 +1,6 @@
 package edith.phone.actions
 
-import edith.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionOutcome
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

@@ -1,9 +1,9 @@
 package edith.plugins.smart
 
-import edith.contracts.TranscriptEvent
-import edith.plugin.ModelEnd
-import edith.plugin.ModelStreamEvent
-import edith.plugin.RiskLevel
+import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.RiskLevel
 import kotlin.test.*
 
 /**
@@ -16,7 +16,7 @@ import kotlin.test.*
  */
 class SmartWhitelistTest {
 
-    private fun rigWith(descriptor: edith.plugin.ActionDescriptor, maxLevel: String, whitelist: String?): SmartTestRig {
+    private fun rigWith(descriptor: com.sheen.rokid.plugin.ActionDescriptor, maxLevel: String, whitelist: String?): SmartTestRig {
         val rig = SmartTestRig()
         rig.actions.descriptors += descriptor
         rig.activate(maxLevel = maxLevel, whitelist = whitelist)

@@ -1,9 +1,9 @@
 package edith.plugins.smart.proactive
 
-import edith.plugin.SystemOneAnswer
-import edith.plugin.SystemOneResult
-import edith.plugin.SystemOneService
-import edith.plugin.SystemOneStatus
+import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneResult
+import com.sheen.rokid.plugin.SystemOneService
+import com.sheen.rokid.plugin.SystemOneStatus
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
@@ -29,10 +29,10 @@ import kotlin.test.assertTrue
 class NoulThresholdTest {
 
     private class ScriptedSystemOne(private val result: SystemOneResult) : SystemOneService {
-        override fun ask(state: String, question: edith.plugin.SystemOneQuestion): SystemOneResult = result
+        override fun ask(state: String, question: com.sheen.rokid.plugin.SystemOneQuestion): SystemOneResult = result
         override val isAvailable = true
         override val status = SystemOneStatus.READY
-        override val modelInfo: edith.plugin.ModelInfo? = null
+        override val modelInfo: com.sheen.rokid.plugin.ModelInfo? = null
     }
 
     private fun state() = ProactiveGateState.of(transcript = "这个页面卡住了", foreground = "微信")

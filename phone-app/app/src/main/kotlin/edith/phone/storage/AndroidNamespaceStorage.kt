@@ -1,6 +1,6 @@
 package edith.phone.storage
 
-import edith.plugin.StorageHandle
+import com.sheen.rokid.plugin.StorageHandle
 import kotlinx.serialization.json.*
 import java.util.Base64
 

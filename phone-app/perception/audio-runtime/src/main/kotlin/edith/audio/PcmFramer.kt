@@ -1,6 +1,6 @@
 package edith.audio
 
-import edith.contracts.*
+import com.sheen.rokid.contracts.*
 
 data class PcmFrame(val epoch: InputEpoch, val samples: FloatArray, val sampleRateHz: Int,
     val range: SampleRange, val startNanos: Long, val endNanos: Long)

@@ -1,13 +1,13 @@
 package edith.plugins.smart
 
-import edith.plugin.CancellationHandle
-import edith.plugin.Capability
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingService
-import edith.plugin.ModelInfo
-import edith.plugin.ModelRequest
-import edith.plugin.ModelStreamEvent
-import edith.plugin.TaskScope
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.ModelInfo
+import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.TaskScope
 import edith.plugins.smart.context.TokenBudget
 import edith.plugins.smart.memory.MemoryLog
 import kotlin.test.Test

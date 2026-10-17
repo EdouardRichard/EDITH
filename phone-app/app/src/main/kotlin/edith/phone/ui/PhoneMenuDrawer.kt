@@ -34,7 +34,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import edith.contracts.SessionState
+import com.sheen.rokid.contracts.SessionState
 import edith.phone.BuildConfig
 import edith.phone.HostCompositionRoot
 import edith.phone.SessionService

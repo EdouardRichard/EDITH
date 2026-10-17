@@ -1,14 +1,14 @@
 package edith.plugins.smart.context
 
-import edith.contracts.AcousticEvent
-import edith.contracts.AcousticLabel
-import edith.contracts.TranscriptEvent
-import edith.plugin.Capability
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingService
-import edith.plugin.MessageRole
-import edith.plugin.ModelHistoryItem
-import edith.plugin.ModelInfo
+import com.sheen.rokid.contracts.AcousticEvent
+import com.sheen.rokid.contracts.AcousticLabel
+import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelInfo
 import edith.plugins.smart.SmartFakeStorage
 import edith.plugins.smart.SmartTestRig
 import edith.plugins.smart.smartToolCall
@@ -73,7 +73,7 @@ class ProactiveContextWiringTest {
         fun propose(text: String) {
             rig.model.onRequest = { request, listener ->
                 listener(smartToolCall("c1", "propose_hint", """{"text":"$text"}""", requestId = request.requestId))
-                listener(edith.plugin.ModelStreamEvent.Terminal(request.requestId, edith.plugin.ModelEnd.COMPLETED, null, null))
+                listener(com.sheen.rokid.plugin.ModelStreamEvent.Terminal(request.requestId, com.sheen.rokid.plugin.ModelEnd.COMPLETED, null, null))
             }
         }
 
@@ -82,11 +82,11 @@ class ProactiveContextWiringTest {
             rig.wakeAndFinal(text, turnId = turnId)
         }
 
-        fun requestTexts(request: edith.plugin.ModelRequest): List<String> =
+        fun requestTexts(request: com.sheen.rokid.plugin.ModelRequest): List<String> =
             request.history.filterIsInstance<ModelHistoryItem.Text>().map { it.text }
 
-        fun inputText(request: edith.plugin.ModelRequest): String =
-            request.input.filterIsInstance<edith.plugin.InputPart.Text>().joinToString(" ") { it.text }
+        fun inputText(request: com.sheen.rokid.plugin.ModelRequest): String =
+            request.input.filterIsInstance<com.sheen.rokid.plugin.InputPart.Text>().joinToString(" ") { it.text }
     }
 
     @Test

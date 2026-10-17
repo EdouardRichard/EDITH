@@ -1,6 +1,6 @@
 package edith.storage
 
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import java.util.concurrent.atomic.AtomicBoolean
 
 interface ProfileRepository {

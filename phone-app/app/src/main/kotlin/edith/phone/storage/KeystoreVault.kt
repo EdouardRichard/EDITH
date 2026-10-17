@@ -4,8 +4,8 @@ import android.content.Context
 import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.AtomicFile
-import edith.contracts.ContractError
-import edith.plugin.SecretHandle
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.plugin.SecretHandle
 import edith.storage.SecretResolver
 import kotlinx.serialization.json.*
 import java.nio.ByteBuffer

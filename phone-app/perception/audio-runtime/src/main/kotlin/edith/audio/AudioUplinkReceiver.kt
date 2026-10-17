@@ -1,10 +1,10 @@
 package edith.audio
 
-import edith.contracts.AudioFormat
-import edith.contracts.InputEpoch
-import edith.contracts.PcmEncoding
-import edith.contracts.VerifiedPcm
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.contracts.AudioFormat
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.PcmEncoding
+import com.sheen.rokid.contracts.VerifiedPcm
+import com.sheen.rokid.plugin.MonotonicClock
 
 /** What the receiver did with a datagram. Every outcome is explicit so a caller can count what was lost. */
 enum class UplinkFeed {

@@ -1,7 +1,7 @@
 package edith.audio
 
-import edith.contracts.*
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.MonotonicClock
 import java.util.UUID
 
 enum class PcmOffer { ACCEPTED, OVERFLOW, UNKNOWN_FORMAT, STALE_EPOCH }

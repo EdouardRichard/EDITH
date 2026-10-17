@@ -1,6 +1,6 @@
 package edith.host.systemone
 
-import edith.plugin.SystemOneStatus
+import com.sheen.rokid.plugin.SystemOneStatus
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse

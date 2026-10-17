@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.contracts.VerifiedPcm
+import com.sheen.rokid.contracts.VerifiedPcm
 
 /**
  * A captured audio segment bound to a single turn, held entirely in RAM.

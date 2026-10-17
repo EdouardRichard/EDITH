@@ -1,8 +1,8 @@
 package edith.glasses
 
-import edith.output.HintCommand
-import edith.output.HintWireCodec
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.output.HintCommand
+import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.plugin.MonotonicClock
 
 /**
  * Answers the phone's `PING` with the glasses' two stamps - the half of the T18 clock handshake that only the

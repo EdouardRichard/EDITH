@@ -2,9 +2,9 @@ package edith.phone
 
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import edith.contracts.Generation
-import edith.contracts.InputEpoch
-import edith.contracts.SessionId
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.SessionId
 import edith.rokid.ControlledToneCapture
 import edith.rokid.ControlledToneFormat
 import edith.rokid.MonoPcmFormat

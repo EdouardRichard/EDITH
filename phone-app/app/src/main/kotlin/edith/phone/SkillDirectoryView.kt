@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.plugin.StorageAccess
+import com.sheen.rokid.plugin.StorageAccess
 
 /** The user's SKILL directory (spec §3.5). The same path a turn reads, so the page shows what a turn would load. */
 internal const val SKILLS_DIR = "/sdcard/EDITH/skills"

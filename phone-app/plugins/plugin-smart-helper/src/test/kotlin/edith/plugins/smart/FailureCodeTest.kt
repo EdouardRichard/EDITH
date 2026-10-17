@@ -1,6 +1,6 @@
 package edith.plugins.smart
 
-import edith.contracts.ContractError
+import com.sheen.rokid.contracts.ContractError
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse

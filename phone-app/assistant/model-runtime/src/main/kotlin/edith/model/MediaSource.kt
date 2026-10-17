@@ -17,7 +17,7 @@ data class ResolvedAudio(val bytes: ByteArray, val format: String, val durationM
 }
 
 /**
- * Host-owned port that resolves an opaque audio reference (from [edith.plugin.AudioSegmentHandle.ref]) into actual
+ * Host-owned port that resolves an opaque audio reference (from [com.sheen.rokid.plugin.AudioSegmentHandle.ref]) into actual
  * bytes at encode time. Unknown or expired refs return null so the adapter can refuse the request rather than send
  * an empty audio payload.
  */

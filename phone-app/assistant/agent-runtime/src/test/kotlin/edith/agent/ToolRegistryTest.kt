@@ -1,8 +1,8 @@
 package edith.agent
 
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
-import edith.plugin.RiskLevel
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.RiskLevel
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlin.test.Test

@@ -2,7 +2,7 @@ package edith.phone
 
 import edith.audio.android.EngineManifestLoader
 import edith.audio.android.EngineModelStore
-import edith.contracts.ContractError
+import com.sheen.rokid.contracts.ContractError
 import java.io.File
 import java.io.InputStream
 import java.nio.file.Files

@@ -1,6 +1,6 @@
 package edith.agent
 
-import edith.plugin.RiskLevel
+import com.sheen.rokid.plugin.RiskLevel
 
 /**
  * One免确认 grant: [action] may run without asking, but **only** against [scope].

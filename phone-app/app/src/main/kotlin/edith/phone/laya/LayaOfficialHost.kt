@@ -106,10 +106,10 @@ class LayaOfficialHost(
      */
     fun ask(
         state: Any?,
-        question: edith.plugin.SystemOneQuestion,
+        question: com.sheen.rokid.plugin.SystemOneQuestion,
         backend: LayaEngine.Backend = LayaEngine.Backend.CPU,
         questionId: String = "ask",
-    ): edith.plugin.SystemOneAnswer {
+    ): com.sheen.rokid.plugin.SystemOneAnswer {
         val result = engine.answer(state, officialQuestion(question), backend, questionId, WINDOW)
         return LayaAnswerDecoder.decode(question, result.answer)
             ?: error("the publisher's answer does not match the question: ${result.answer.keys}")

@@ -1,17 +1,17 @@
 package edith.phone
 
-import edith.contracts.EventEnvelope
-import edith.contracts.Generation
-import edith.contracts.SessionId
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
 import edith.host.HostRuntime
-import edith.plugin.CancellationHandle
-import edith.plugin.ModelClient
-import edith.plugin.ModelRequest
-import edith.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.ModelClient
+import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelStreamEvent
 import edith.storage.MemoryProfileRepository
-import edith.testsupport.FakeClock
-import edith.testsupport.ManualScheduler
-import edith.testsupport.RecordingInputPort
+import com.sheen.rokid.testsupport.FakeClock
+import com.sheen.rokid.testsupport.ManualScheduler
+import com.sheen.rokid.testsupport.RecordingInputPort
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

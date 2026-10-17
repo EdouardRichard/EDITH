@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 package edith.phone.laya
 
-import edith.plugin.SystemOneQuestion
-import edith.plugin.SystemOneQuestionType
+import com.sheen.rokid.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.SystemOneQuestionType
 
 /**
  * Maps a contract [SystemOneQuestion] onto the publisher's question schema.

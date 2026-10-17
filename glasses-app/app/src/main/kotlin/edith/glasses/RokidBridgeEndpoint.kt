@@ -39,7 +39,7 @@ class RokidBridgeEndpoint private constructor() {
                 // The phone writes the reply channel key first and the payload second (its sample's layout), so the
                 // payload is the **second** string - reading the first would hand the codec a channel key.
                 val json = runCatching { payloadString(args) }.getOrNull() ?: return
-                val decoded = edith.output.HintWireCodec.decode(json)?.let { it::class.simpleName }
+                val decoded = com.sheen.rokid.output.HintWireCodec.decode(json)?.let { it::class.simpleName }
                 Log.i(TAG, HintPresentation.inboundReport(json, decoded))
                 listener?.invoke(json)
             }

@@ -1,22 +1,22 @@
 package edith.phone
 
-import edith.contracts.InputEpoch
-import edith.contracts.SessionState
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.SessionState
 import edith.host.HostRuntime
-import edith.output.HintCommand
-import edith.output.HintWireCodec
-import edith.plugin.CancellationHandle
-import edith.plugin.Capability
-import edith.plugin.ConfigSchema
-import edith.plugin.DeactivationReason
-import edith.plugin.DeadlineScheduler
-import edith.plugin.ModelClient
-import edith.plugin.ModelRequest
-import edith.plugin.ModelStreamEvent
-import edith.plugin.MonotonicClock
-import edith.plugin.PluginContext
-import edith.plugin.PluginDescriptor
-import edith.plugin.PluginLifecycle
+import com.sheen.rokid.output.HintCommand
+import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ConfigSchema
+import com.sheen.rokid.plugin.DeactivationReason
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.ModelClient
+import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.PluginContext
+import com.sheen.rokid.plugin.PluginDescriptor
+import com.sheen.rokid.plugin.PluginLifecycle
 import edith.plugins.diagnostic.DiagnosticHintPlugin
 import edith.rokid.CxrAuthorizationOutcome
 import edith.storage.MemoryProfileRepository
@@ -189,7 +189,7 @@ class CxrHintLinkTest {
             // An ack for a hint this device never showed must be ignored rather than adopted.
             assertTrue("an unknown ack must not be reported as handled",
                 !rig.link.onInbound(HintWireCodec.encode(HintCommand.Ack("s", 1, 7, "nobody", 1,
-                    edith.contracts.OutputStatus.Displayed))))
+                    com.sheen.rokid.contracts.OutputStatus.Displayed))))
         }
     }
 
@@ -199,7 +199,7 @@ class CxrHintLinkTest {
         // require audio, and `Capability.Audio` is not advertised, so the port must still refuse.
         Rig().use { rig ->
             val thrown = runCatching { rig.environment.input.start(InputEpoch(
-                edith.contracts.SessionId("s"), edith.contracts.Generation(1), 1)) }.exceptionOrNull()
+                com.sheen.rokid.contracts.SessionId("s"), com.sheen.rokid.contracts.Generation(1), 1)) }.exceptionOrNull()
 
             assertNotNull("the host audio path must stay refusing", thrown)
         }
@@ -284,11 +284,11 @@ class CxrHintLinkTest {
         override val descriptor = PluginDescriptor("needs-audio", "1.0.0", 1, "Audio Probe",
             listOf(Capability.Audio, Capability.TextOutput), ConfigSchema(1))
         override fun activate(context: PluginContext) = Unit
-        override fun handle(event: edith.contracts.HostEvent) = Unit
+        override fun handle(event: com.sheen.rokid.contracts.HostEvent) = Unit
         override fun deactivate(reason: DeactivationReason) = Unit
     }
 
-    private class NamespaceStub(private val namespace: String) : edith.plugin.StorageHandle {
+    private class NamespaceStub(private val namespace: String) : com.sheen.rokid.plugin.StorageHandle {
         private val values = mutableMapOf<String, ByteArray>()
         override fun read(key: String): ByteArray? = values[key]?.copyOf()
         override fun write(key: String, value: ByteArray) { values[key] = value.copyOf() }
@@ -321,8 +321,8 @@ class CxrHintLinkTest {
         link.sessionEstablished("s-1", 1)
         sent.clear()
 
-        assertTrue(link.userSaid(edith.contracts.AssistantRoute.WAKE, "第一句"))
-        assertTrue(link.userSaid(edith.contracts.AssistantRoute.WAKE, "第二句"))
+        assertTrue(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "第一句"))
+        assertTrue(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "第二句"))
 
         assertEquals(listOf(1L, 2L), sent.said().map { it.sequence })
         assertEquals("第一句", sent.said().first().text)
@@ -335,8 +335,8 @@ class CxrHintLinkTest {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
 
-        assertFalse(link.userSaid(edith.contracts.AssistantRoute.WAKE, "没人听的时候"))
-        assertFalse(link.busy(edith.contracts.AssistantRoute.WAKE, true))
+        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "没人听的时候"))
+        assertFalse(link.busy(com.sheen.rokid.contracts.AssistantRoute.WAKE, true))
         assertTrue(sent.isEmpty())
     }
 
@@ -348,8 +348,8 @@ class CxrHintLinkTest {
         link.sessionEnded()
         sent.clear()
 
-        assertFalse(link.userSaid(edith.contracts.AssistantRoute.WAKE, "会话结束之后"))
-        assertFalse(link.busy(edith.contracts.AssistantRoute.WAKE, true))
+        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "会话结束之后"))
+        assertFalse(link.busy(com.sheen.rokid.contracts.AssistantRoute.WAKE, true))
         assertTrue(sent.isEmpty())
     }
 
@@ -365,7 +365,7 @@ class CxrHintLinkTest {
             HintCommand.Pong(ping.syncId, ping.p0, ping.p0 + 1_000_000, ping.p0 + 1_000_000)))
         sent.clear()
 
-        assertTrue(link.userSaid(edith.contracts.AssistantRoute.WAKE, "交换之后"))
+        assertTrue(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "交换之后"))
     }
 
     @Test
@@ -375,11 +375,11 @@ class CxrHintLinkTest {
         link.sessionEstablished("s-1", 1)
         sent.clear()
 
-        assertTrue(link.busy(edith.contracts.AssistantRoute.PROACTIVE, true))
-        assertTrue(link.busy(edith.contracts.AssistantRoute.PROACTIVE, false))
+        assertTrue(link.busy(com.sheen.rokid.contracts.AssistantRoute.PROACTIVE, true))
+        assertTrue(link.busy(com.sheen.rokid.contracts.AssistantRoute.PROACTIVE, false))
 
         assertEquals(listOf(true, false), sent.busy().map { it.busy })
-        assertEquals(edith.contracts.AssistantRoute.PROACTIVE, sent.busy().first().route)
+        assertEquals(com.sheen.rokid.contracts.AssistantRoute.PROACTIVE, sent.busy().first().route)
     }
 
     @Test
@@ -389,7 +389,7 @@ class CxrHintLinkTest {
         val link = linkInto(sent, accept = false)
         link.sessionEstablished("s-1", 1)
 
-        assertFalse(link.userSaid(edith.contracts.AssistantRoute.WAKE, "链接断了"))
+        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "链接断了"))
     }
 
     @Test
@@ -399,7 +399,7 @@ class CxrHintLinkTest {
         link.sessionEstablished("s-1", 1)
         sent.clear()
 
-        assertFalse(link.userSaid(edith.contracts.AssistantRoute.WAKE, "   "))
+        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "   "))
         assertTrue(sent.isEmpty())
     }
 }

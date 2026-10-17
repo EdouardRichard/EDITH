@@ -56,8 +56,8 @@ class DevelopmentProfileLoaderTest {
             assertNull(config.safeCode, "expected no error, got ${config.safeCode}")
             val profile = assertNotNull(config.profile)
             assertEquals("OPENAI_CHAT_COMPLETIONS", profile.protocolId)
-            assertTrue(edith.plugin.InputModality.AUDIO in profile.inputs, "AUDIO must be in inputs for OpenAI protocol")
-            assertTrue(edith.plugin.InputModality.TEXT in profile.inputs)
+            assertTrue(com.sheen.rokid.plugin.InputModality.AUDIO in profile.inputs, "AUDIO must be in inputs for OpenAI protocol")
+            assertTrue(com.sheen.rokid.plugin.InputModality.TEXT in profile.inputs)
         }
     }
 

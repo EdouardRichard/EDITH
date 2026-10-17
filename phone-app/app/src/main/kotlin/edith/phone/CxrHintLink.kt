@@ -1,15 +1,15 @@
 package edith.phone
 
-import edith.output.HintClockSync
-import edith.output.HintCommand
-import edith.output.HintExchange
-import edith.output.HintWireCodec
-import edith.output.RokidHintDevice
-import edith.contracts.AssistantRoute
-import edith.plugin.CancellationHandle
-import edith.plugin.DeadlineScheduler
-import edith.plugin.HintDevice
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.output.HintClockSync
+import com.sheen.rokid.output.HintCommand
+import com.sheen.rokid.output.HintExchange
+import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.output.RokidHintDevice
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.HintDevice
+import com.sheen.rokid.plugin.MonotonicClock
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 

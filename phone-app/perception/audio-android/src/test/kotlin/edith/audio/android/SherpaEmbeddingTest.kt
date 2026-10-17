@@ -1,7 +1,7 @@
 package edith.audio.android
 
-import edith.contracts.*
-import edith.plugin.SpeakerWindow
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.SpeakerWindow
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.CountDownLatch

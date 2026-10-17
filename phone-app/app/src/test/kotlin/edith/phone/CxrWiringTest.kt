@@ -1,7 +1,7 @@
 package edith.phone
 
 import edith.host.HostRuntime
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import edith.rokid.CxrAuthorizationOutcome
 import edith.storage.MemoryProfileRepository
 import org.junit.Assert.*

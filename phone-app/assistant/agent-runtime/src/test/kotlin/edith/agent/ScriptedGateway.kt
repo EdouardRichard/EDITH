@@ -1,6 +1,6 @@
 package edith.agent
 
-import edith.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelEnd
 
 /**
  * Test-only [ModelGateway]: hands back the scripted replies in order and records every [GatewayTurn] verbatim, so a

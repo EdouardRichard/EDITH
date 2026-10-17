@@ -1,8 +1,8 @@
 package edith.host
 
-import edith.contracts.Assistance
-import edith.contracts.Generation
-import edith.contracts.SessionId
+import com.sheen.rokid.contracts.Assistance
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -59,9 +59,9 @@ class HintPolicyTest {
         // a notification and then fail to encode it - the hint would vanish between the policy and the transport,
         // which is the same class of defect as the refusal the owner reported.
         assertEquals(
-            edith.output.HintWireCodec.MAX_TEXT_CODEPOINTS,
+            com.sheen.rokid.output.HintWireCodec.MAX_TEXT_CODEPOINTS,
             HintPolicy.DEFAULT_MAX_CODE_POINTS,
-            "edith.host.HintPolicy and edith.output.HintWireCodec must agree on the hint bound",
+            "edith.host.HintPolicy and com.sheen.rokid.output.HintWireCodec must agree on the hint bound",
         )
     }
 }

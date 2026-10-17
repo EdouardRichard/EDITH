@@ -1,6 +1,6 @@
 package edith.storage
 
-import edith.plugin.StorageHandle
+import com.sheen.rokid.plugin.StorageHandle
 
 class MemoryNamespaceBacking {
     internal val entries = mutableMapOf<String, MutableMap<String, ByteArray>>()

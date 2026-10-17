@@ -1,6 +1,6 @@
 package edith.plugins.smart
 
-import edith.plugin.ToolSpec
+import com.sheen.rokid.plugin.ToolSpec
 
 /**
  * The instruction text the smart assistant folds into every model request.

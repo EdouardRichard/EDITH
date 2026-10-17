@@ -30,8 +30,8 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import edith.contracts.SessionState
-import edith.plugin.Capability
+import com.sheen.rokid.contracts.SessionState
+import com.sheen.rokid.plugin.Capability
 import edith.phone.model.ProfileViewModel
 import edith.phone.model.ProfileListScreen
 import edith.phone.ui.PhoneScreen

@@ -1,12 +1,12 @@
 package edith.phone
 
 import edith.agent.ConversationStore
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.plugin.DeadlineScheduler
-import edith.plugin.ModelProfile
-import edith.plugin.MonotonicClock
-import edith.plugin.PluginConfiguration
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.PluginConfiguration
 import edith.plugins.smart.SmartAssistantPlugin
 import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.proactive.GateForm

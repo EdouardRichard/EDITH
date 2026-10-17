@@ -2,7 +2,7 @@ package edith.model
 
 import edith.agent.RequestFrame
 import edith.agent.SegmentOrigin
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import kotlinx.serialization.json.*
 import java.util.Locale
 

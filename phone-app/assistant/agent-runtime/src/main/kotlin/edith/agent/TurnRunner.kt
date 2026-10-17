@@ -1,6 +1,6 @@
 package edith.agent
 
-import edith.plugin.ToolSpec
+import com.sheen.rokid.plugin.ToolSpec
 
 /**
  * Assembles a [RequestFrame] for one model turn (spec §3.2 / Phase 3).

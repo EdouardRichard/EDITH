@@ -1,9 +1,9 @@
 package edith.plugins.smart.context
 
 import edith.agent.ConversationStore
-import edith.plugin.MessageRole
-import edith.plugin.ModelHistoryItem
-import edith.plugin.TaskScope
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.TaskScope
 import edith.plugins.smart.P3Log
 import edith.plugins.smart.memory.MemoryKind
 import edith.plugins.smart.memory.MemoryModule

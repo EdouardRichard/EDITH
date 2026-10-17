@@ -1,6 +1,6 @@
 package edith.audio
 
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.plugin.MonotonicClock
 
 /**
  * Platform-independent wake-word engine port.

@@ -6,7 +6,7 @@ import android.content.Intent
 import android.util.Log
 import com.rokid.cxr.Caps
 import com.rokid.cxr.session.*
-import edith.plugin.CancellationHandle
+import com.sheen.rokid.plugin.CancellationHandle
 import java.util.concurrent.Executor
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean

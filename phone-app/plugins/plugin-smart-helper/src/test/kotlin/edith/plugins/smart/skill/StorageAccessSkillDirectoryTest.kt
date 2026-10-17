@@ -1,6 +1,6 @@
 package edith.plugins.smart.skill
 
-import edith.plugin.StorageAccess
+import com.sheen.rokid.plugin.StorageAccess
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull

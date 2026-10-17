@@ -4,10 +4,10 @@ import edith.agent.ConfirmationGate
 import edith.agent.ConfirmationOutcome
 import edith.agent.ConfirmationPort
 import edith.agent.ConfirmationSource
-import edith.contracts.ConfirmationResult
-import edith.contracts.TranscriptRevision
-import edith.plugin.CancellationHandle
-import edith.plugin.ConfirmationChannel
+import com.sheen.rokid.contracts.ConfirmationResult
+import com.sheen.rokid.contracts.TranscriptRevision
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.ConfirmationChannel
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference

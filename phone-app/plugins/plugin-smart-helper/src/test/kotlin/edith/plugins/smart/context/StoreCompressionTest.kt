@@ -3,11 +3,11 @@ package edith.plugins.smart.context
 import edith.agent.ConversationStore
 import edith.agent.SegmentOrigin
 import edith.agent.SummaryBoundary
-import edith.plugin.CancellationHandle
-import edith.plugin.MessageRole
-import edith.plugin.ModelHistoryItem
-import edith.plugin.StorageHandle
-import edith.plugin.TaskScope
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.StorageHandle
+import com.sheen.rokid.plugin.TaskScope
 import edith.plugins.smart.memory.MemoryLog
 import edith.plugins.smart.memory.MemoryModule
 import edith.plugins.smart.memory.SemanticRetriever

@@ -20,7 +20,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import edith.model.ProfileTester
 import edith.phone.ForegroundTestActivity
 import edith.phone.storage.*
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith

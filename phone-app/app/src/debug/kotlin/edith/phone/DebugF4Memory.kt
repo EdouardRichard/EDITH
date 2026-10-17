@@ -3,7 +3,7 @@ package edith.phone
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import edith.plugin.StorageHandle
+import com.sheen.rokid.plugin.StorageHandle
 import edith.plugins.smart.memory.MemoryKind
 import edith.plugins.smart.memory.MemoryLog
 import edith.plugins.smart.memory.MemorySource

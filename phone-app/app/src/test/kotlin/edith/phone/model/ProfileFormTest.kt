@@ -2,7 +2,7 @@ package edith.phone.model
 
 import edith.model.ProfileTester
 import edith.phone.storage.*
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import org.junit.Assert.*
 import org.junit.Test
 

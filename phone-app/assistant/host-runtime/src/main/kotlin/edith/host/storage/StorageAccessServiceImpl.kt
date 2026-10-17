@@ -1,6 +1,6 @@
 package edith.host.storage
 
-import edith.plugin.StorageAccess
+import com.sheen.rokid.plugin.StorageAccess
 import java.io.File
 
 /**

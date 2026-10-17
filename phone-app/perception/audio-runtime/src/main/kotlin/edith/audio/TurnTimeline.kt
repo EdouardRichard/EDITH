@@ -1,7 +1,7 @@
 package edith.audio
 
-import edith.contracts.*
-import edith.plugin.SpeakerWindow
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.SpeakerWindow
 
 internal class TurnRevision(private val turnId: String, private val startNanos: Long) {
     private var revision = -1L

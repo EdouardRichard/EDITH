@@ -4,10 +4,10 @@ import android.app.Activity
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import edith.audio.PcmIngress
 import edith.audio.PcmOffer
-import edith.contracts.*
+import com.sheen.rokid.contracts.*
 import edith.host.*
-import edith.plugin.*
-import edith.testsupport.*
+import com.sheen.rokid.plugin.*
+import com.sheen.rokid.testsupport.*
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith

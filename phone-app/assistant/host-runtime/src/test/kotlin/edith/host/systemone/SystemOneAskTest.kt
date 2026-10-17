@@ -1,13 +1,13 @@
 package edith.host.systemone
 
-import edith.plugin.FailureReason
-import edith.plugin.LayaInferenceEngine
-import edith.plugin.SystemOneAnswer
-import edith.plugin.SystemOneCriterion
-import edith.plugin.SystemOneQuestion
-import edith.plugin.SystemOneQuestionType
-import edith.plugin.SystemOneResult
-import edith.plugin.SystemOneStatus
+import com.sheen.rokid.plugin.FailureReason
+import com.sheen.rokid.plugin.LayaInferenceEngine
+import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneCriterion
+import com.sheen.rokid.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.SystemOneQuestionType
+import com.sheen.rokid.plugin.SystemOneResult
+import com.sheen.rokid.plugin.SystemOneStatus
 import java.io.File
 import kotlin.test.Test
 import kotlin.test.assertEquals

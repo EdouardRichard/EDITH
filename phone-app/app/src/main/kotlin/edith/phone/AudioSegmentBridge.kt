@@ -2,8 +2,8 @@ package edith.phone
 
 import edith.model.MediaSource
 import edith.model.ResolvedAudio
-import edith.plugin.AudioSegmentHandle
-import edith.plugin.AudioSegmentSource
+import com.sheen.rokid.plugin.AudioSegmentHandle
+import com.sheen.rokid.plugin.AudioSegmentSource
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
 

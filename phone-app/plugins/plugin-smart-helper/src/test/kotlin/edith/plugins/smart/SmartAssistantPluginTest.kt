@@ -1,24 +1,24 @@
 package edith.plugins.smart
 
-import edith.contracts.AcousticEvent
-import edith.contracts.AcousticLabel
-import edith.contracts.Generation
-import edith.contracts.OutputStateEvent
-import edith.contracts.OutputStatus
-import edith.contracts.SessionId
-import edith.contracts.TranscriptEvent
-import edith.contracts.UserAction
-import edith.plugin.Capability
-import edith.plugin.ConfigSchema
-import edith.plugin.DeactivationReason
-import edith.plugin.InputPart
-import edith.plugin.ModelEnd
-import edith.plugin.ModelStreamEvent
-import edith.plugin.OutputModality
-import edith.plugin.PluginConfiguration
-import edith.plugin.PluginLifecycle
-import edith.plugin.RiskLevel
-import edith.output.HintReadingBudget
+import com.sheen.rokid.contracts.AcousticEvent
+import com.sheen.rokid.contracts.AcousticLabel
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.OutputStateEvent
+import com.sheen.rokid.contracts.OutputStatus
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.contracts.UserAction
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ConfigSchema
+import com.sheen.rokid.plugin.DeactivationReason
+import com.sheen.rokid.plugin.InputPart
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.PluginConfiguration
+import com.sheen.rokid.plugin.PluginLifecycle
+import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.output.HintReadingBudget
 import kotlin.test.*
 
 /**
@@ -211,11 +211,11 @@ class SmartAssistantPluginTest {
         rig.activate()
         rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
         rig.plugin.handle(rig.wakeEvent())
-        rig.plugin.handle(TranscriptEvent(rig.transcript("外会话", generation = edith.contracts.Generation(9))))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("外会话", generation = com.sheen.rokid.contracts.Generation(9))))
         rig.plugin.handle(
             TranscriptEvent(
-                edith.contracts.TranscriptRevision(
-                    edith.contracts.EventEnvelope(edith.contracts.SessionId("other"), rig.generation, "e", 0, 0),
+                com.sheen.rokid.contracts.TranscriptRevision(
+                    com.sheen.rokid.contracts.EventEnvelope(com.sheen.rokid.contracts.SessionId("other"), rig.generation, "e", 0, 0),
                     "t-1", 1, "别的会话", true, 0, 0,
                 ),
             ),
@@ -472,7 +472,7 @@ class SmartAssistantPluginTest {
     @Test fun `a model-chosen L1 tool runs and feeds its result back into the same run`() {
         val rig = SmartTestRig()
         rig.actions.descriptors += smartAction("compose_note", risk = RiskLevel.L1, scope = "note")
-        rig.actions.outcome = { _, _ -> edith.plugin.ActionResult(edith.plugin.ActionOutcome.Done, "已记下") }
+        rig.actions.outcome = { _, _ -> com.sheen.rokid.plugin.ActionResult(com.sheen.rokid.plugin.ActionOutcome.Done, "已记下") }
         rig.activate(maxLevel = "L1", whitelist = "compose_note|note")
         var turn = 0
         rig.model.onRequest = { request, listener ->
@@ -492,7 +492,7 @@ class SmartAssistantPluginTest {
         assertEquals(listOf("已经记好了。"), rig.hintTexts)
         val second = rig.model.requests[1]
         assertTrue(
-            second.history.any { it is edith.plugin.ModelHistoryItem.ToolOutput && it.output == "已记下" },
+            second.history.any { it is com.sheen.rokid.plugin.ModelHistoryItem.ToolOutput && it.output == "已记下" },
             "the tool output must be echoed back into the transcript, was ${second.history}",
         )
     }
@@ -508,7 +508,7 @@ class SmartAssistantPluginTest {
             rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, status))
         }
         assertEquals(0, rig.displayedAcks)
-        rig.plugin.handle(OutputStateEvent(rig.envelope(edith.contracts.Generation(9)), hintId, OutputStatus.Displayed))
+        rig.plugin.handle(OutputStateEvent(rig.envelope(com.sheen.rokid.contracts.Generation(9)), hintId, OutputStatus.Displayed))
         rig.plugin.handle(OutputStateEvent(rig.envelope(), "somebody-elses-hint", OutputStatus.Displayed))
         assertEquals(0, rig.displayedAcks, "only a Displayed for this hint in this generation counts")
         rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
@@ -546,7 +546,7 @@ class SmartAssistantPluginTest {
         val rejected = SmartTestRig()
         rejected.activate()
         rejected.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
-        rejected.output.submission = edith.plugin.OutputSubmission.Rejected
+        rejected.output.submission = com.sheen.rokid.plugin.OutputSubmission.Rejected
         rejected.output.onSubmit = { hint ->
             rejected.output.onSubmit = null
             rejected.plugin.handle(OutputStateEvent(rejected.envelope(), hint.hintId, OutputStatus.Displayed))

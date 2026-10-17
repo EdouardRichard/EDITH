@@ -4,7 +4,7 @@ import android.app.Activity
 import android.content.Intent
 import edith.audio.PcmIngress
 import edith.host.HostRuntime
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.plugin.MonotonicClock
 import edith.rokid.CxrAuthorizationOutcome
 import edith.rokid.CxrInboundPayload
 import edith.rokid.RokidConnectionConfig

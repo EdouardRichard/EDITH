@@ -1,7 +1,7 @@
 package edith.plugins.smart.memory
 
 import edith.agent.Segment
-import edith.plugin.EmbeddingService
+import com.sheen.rokid.plugin.EmbeddingService
 import edith.plugins.smart.library.LibraryGovernor
 
 /** Which ranking produced an injection. The device log names it, so a degraded order cannot read as a semantic one. */

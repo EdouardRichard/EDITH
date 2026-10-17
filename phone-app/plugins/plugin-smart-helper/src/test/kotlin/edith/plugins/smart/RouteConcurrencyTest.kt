@@ -1,8 +1,8 @@
 package edith.plugins.smart
 
-import edith.contracts.AcousticEvent
-import edith.contracts.AcousticLabel
-import edith.contracts.TranscriptEvent
+import com.sheen.rokid.contracts.AcousticEvent
+import com.sheen.rokid.contracts.AcousticLabel
+import com.sheen.rokid.contracts.TranscriptEvent
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
@@ -114,7 +114,7 @@ class RouteConcurrencyTest {
         try {
             arm(rig)
             rig.plugin.handle(TranscriptEvent(rig.transcript("今天星期几", turnId = "asr-2")))
-            rig.plugin.deactivate(edith.plugin.DeactivationReason.Stopped)
+            rig.plugin.deactivate(com.sheen.rokid.plugin.DeactivationReason.Stopped)
         } finally {
             turn.finish()
         }

@@ -1,7 +1,7 @@
 package edith.phone.model
 
 import edith.phone.storage.opaqueSecret
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import java.math.BigDecimal
 
 internal enum class ProfileField { NAME, SERVICE, BASE_URL, MODEL, PROTOCOL, API_KEY, MAX_INPUT, MAX_OUTPUT, TIMEOUT, INPUTS, OUTPUTS }

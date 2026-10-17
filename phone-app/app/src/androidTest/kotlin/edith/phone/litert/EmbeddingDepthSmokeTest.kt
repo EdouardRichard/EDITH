@@ -4,7 +4,7 @@ import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import edith.host.embedding.EmbeddingServiceImpl
-import edith.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbedResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

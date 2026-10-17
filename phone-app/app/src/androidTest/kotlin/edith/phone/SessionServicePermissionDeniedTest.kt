@@ -9,7 +9,7 @@ import android.os.Build
 import androidx.core.content.ContextCompat
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import edith.contracts.SessionState
+import com.sheen.rokid.contracts.SessionState
 import org.junit.*
 import org.junit.Assert.*
 import org.junit.runner.RunWith

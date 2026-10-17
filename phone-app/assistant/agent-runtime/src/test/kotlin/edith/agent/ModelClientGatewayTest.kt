@@ -1,18 +1,18 @@
 package edith.agent
 
-import edith.contracts.EventEnvelope
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.plugin.InputPart
-import edith.plugin.MessageRole
-import edith.plugin.ModelEnd
-import edith.plugin.ModelHistoryItem
-import edith.plugin.ModelProfile
-import edith.plugin.ModelStreamEvent
-import edith.plugin.OutputModality
-import edith.plugin.ToolSpec
-import edith.testsupport.FakeClock
-import edith.testsupport.ManualScheduler
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.InputPart
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.ToolSpec
+import com.sheen.rokid.testsupport.FakeClock
+import com.sheen.rokid.testsupport.ManualScheduler
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -30,7 +30,7 @@ import kotlin.test.assertTrue
 
 /**
  * [`ModelClientGateway`] is the adapter between the agent loop's one-shot [GatewayTurn] and `plugin-api`'s streaming
- * [edith.plugin.ModelClient]: it assembles the stateless request (the in-flight user turn becomes the request `input`,
+ * [com.sheen.rokid.plugin.ModelClient]: it assembles the stateless request (the in-flight user turn becomes the request `input`,
  * never history), accumulates the stream into a [GatewayReply], and — because the loop runs on one thread and the
  * transport delivers on another — owns the turn's deadline and the caller's `stop` while it waits.
  *
@@ -50,7 +50,7 @@ class ModelClientGatewayTest {
     }
 
     private fun gateway(
-        client: edith.plugin.ModelClient,
+        client: com.sheen.rokid.plugin.ModelClient,
         stop: () -> Boolean = { false },
         audioParts: (() -> List<InputPart>)? = null,
     ) =

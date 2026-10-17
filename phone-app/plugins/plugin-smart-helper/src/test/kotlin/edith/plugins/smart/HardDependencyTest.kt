@@ -1,15 +1,15 @@
 package edith.plugins.smart
 
-import edith.plugin.Capability
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingService
-import edith.plugin.FailureReason
-import edith.plugin.ModelInfo
-import edith.plugin.SystemOneAnswer
-import edith.plugin.SystemOneQuestion
-import edith.plugin.SystemOneResult
-import edith.plugin.SystemOneService
-import edith.plugin.SystemOneStatus
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.FailureReason
+import com.sheen.rokid.plugin.ModelInfo
+import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.SystemOneResult
+import com.sheen.rokid.plugin.SystemOneService
+import com.sheen.rokid.plugin.SystemOneStatus
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue

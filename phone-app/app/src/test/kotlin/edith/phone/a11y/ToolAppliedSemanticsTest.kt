@@ -2,10 +2,10 @@ package edith.phone.a11y
 
 import edith.phone.actions.ExecutionBackend
 import edith.phone.actions.ExecutionRouter
-import edith.plugin.ActionDescriptor
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
-import edith.plugin.RiskLevel
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.RiskLevel
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

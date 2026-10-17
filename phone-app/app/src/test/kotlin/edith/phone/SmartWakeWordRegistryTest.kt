@@ -1,12 +1,12 @@
 package edith.phone
 
-import edith.plugin.Capability
-import edith.plugin.WakeWordRegistry
-import edith.plugin.wakeWord
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.WakeWordRegistry
+import com.sheen.rokid.plugin.wakeWord
 import edith.host.ResourceScope
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.testsupport.FakeTaskScope
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.testsupport.FakeTaskScope
 import edith.host.ScopedHostServices
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

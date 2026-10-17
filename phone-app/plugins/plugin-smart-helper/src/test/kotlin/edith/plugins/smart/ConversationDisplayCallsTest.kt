@@ -1,11 +1,11 @@
 package edith.plugins.smart
 
-import edith.contracts.AssistantRoute
-import edith.plugin.Capability
-import edith.plugin.ConversationDisplay
-import edith.plugin.DeactivationReason
-import edith.plugin.ModelEnd
-import edith.plugin.ModelStreamEvent
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ConversationDisplay
+import com.sheen.rokid.plugin.DeactivationReason
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelStreamEvent
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -119,8 +119,8 @@ class ConversationDisplayCallsTest {
         rig.model.onRequest = { _, _ -> error("a declined proactive turn must not reach the model") }
 
         // Arm the proactive path (the acoustic label is what does it) and hand it a candidate.
-        rig.plugin.handle(edith.contracts.AcousticEvent(rig.envelope(), edith.contracts.AcousticLabel.Speech))
-        rig.plugin.handle(edith.contracts.TranscriptEvent(rig.transcript("这个页面怎么一直转圈")))
+        rig.plugin.handle(com.sheen.rokid.contracts.AcousticEvent(rig.envelope(), com.sheen.rokid.contracts.AcousticLabel.Speech))
+        rig.plugin.handle(com.sheen.rokid.contracts.TranscriptEvent(rig.transcript("这个页面怎么一直转圈")))
 
         assertEquals(display.count("working:PROACTIVE"), display.count("idle:PROACTIVE"),
             "a gate that refuses must not leave the ring turning: ${display.calls}")
@@ -148,7 +148,7 @@ class ConversationDisplayCallsTest {
     @Test
     fun aRefusedHintLeavesTheLevelsPaired() = assertLevelsArePaired("refused") { rig ->
         answerWithANotification(rig)
-        rig.output.submission = edith.plugin.OutputSubmission.Rejected
+        rig.output.submission = com.sheen.rokid.plugin.OutputSubmission.Rejected
         rig.wakeAndFinal("问一句")
     }
 
@@ -170,7 +170,7 @@ class ConversationDisplayCallsTest {
         rig.plugin.handle(rig.wakeEvent())
         assertTrue(display.count("working:WAKE") >= 1, display.calls.toString())
 
-        rig.plugin.handle(edith.contracts.UserAction(rig.envelope(), edith.contracts.UserAction.Action.Stop))
+        rig.plugin.handle(com.sheen.rokid.contracts.UserAction(rig.envelope(), com.sheen.rokid.contracts.UserAction.Action.Stop))
 
         assertEquals(display.count("working:WAKE"), display.count("idle:WAKE"), display.calls.toString())
     }
@@ -182,10 +182,10 @@ class ConversationDisplayCallsTest {
         val display = RecordingDisplay()
         val rig = rig(display)
         answerWithANotification(rig)
-        rig.plugin.handle(edith.contracts.TranscriptEvent(rig.transcript("记住我喜欢喝乌龙茶")))
+        rig.plugin.handle(com.sheen.rokid.contracts.TranscriptEvent(rig.transcript("记住我喜欢喝乌龙茶")))
         rig.tick()
 
-        rig.plugin.handle(edith.contracts.UserAction(rig.envelope(), edith.contracts.UserAction.Action.Help))
+        rig.plugin.handle(com.sheen.rokid.contracts.UserAction(rig.envelope(), com.sheen.rokid.contracts.UserAction.Action.Help))
 
         assertTrue(display.count("working:WAKE") >= 1, "manual help must raise the level: ${display.calls}")
         assertEquals(display.count("working:WAKE"), display.count("idle:WAKE"), display.calls.toString())
@@ -265,7 +265,7 @@ class ConversationDisplayCallsTest {
             val worker = Thread({
                 // A plain host event, so the other thread only has to take the lock - what it does with it is
                 // irrelevant to the question being asked.
-                plugin.handle(edith.contracts.AcousticEvent(rig.envelope(), edith.contracts.AcousticLabel.Speech))
+                plugin.handle(com.sheen.rokid.contracts.AcousticEvent(rig.envelope(), com.sheen.rokid.contracts.AcousticLabel.Speech))
             }, "port-probe").apply { isDaemon = true }
             worker.start()
             worker.join(2_000)

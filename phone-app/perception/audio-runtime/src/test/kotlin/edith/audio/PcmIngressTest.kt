@@ -1,7 +1,7 @@
 package edith.audio
 
-import edith.contracts.*
-import edith.testsupport.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.testsupport.*
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit

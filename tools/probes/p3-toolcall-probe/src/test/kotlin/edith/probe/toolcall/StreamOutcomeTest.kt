@@ -1,7 +1,7 @@
 package edith.probe.toolcall
 
-import edith.plugin.ModelEnd
-import edith.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelStreamEvent
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse

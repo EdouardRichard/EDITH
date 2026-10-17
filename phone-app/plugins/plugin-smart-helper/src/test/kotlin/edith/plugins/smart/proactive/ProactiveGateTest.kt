@@ -1,12 +1,12 @@
 package edith.plugins.smart.proactive
 
-import edith.plugin.FailureReason
-import edith.plugin.SystemOneAnswer
-import edith.plugin.SystemOneQuestion
-import edith.plugin.SystemOneQuestionType
-import edith.plugin.SystemOneResult
-import edith.plugin.SystemOneService
-import edith.plugin.SystemOneStatus
+import com.sheen.rokid.plugin.FailureReason
+import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.SystemOneQuestionType
+import com.sheen.rokid.plugin.SystemOneResult
+import com.sheen.rokid.plugin.SystemOneService
+import com.sheen.rokid.plugin.SystemOneStatus
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -164,7 +164,7 @@ class ProactiveGateTest {
 
         override val isAvailable = true
         override val status = SystemOneStatus.READY
-        override val modelInfo: edith.plugin.ModelInfo? = null
+        override val modelInfo: com.sheen.rokid.plugin.ModelInfo? = null
     }
 
     private fun state() = ProactiveGateState.of(transcript = "这个页面卡住了", foreground = "微信")
@@ -278,7 +278,7 @@ class ProactiveGateTest {
             override fun ask(state: String, question: SystemOneQuestion): SystemOneResult = error("boom")
             override val isAvailable = true
             override val status = SystemOneStatus.READY
-            override val modelInfo: edith.plugin.ModelInfo? = null
+            override val modelInfo: com.sheen.rokid.plugin.ModelInfo? = null
         }
 
         assertFalse(NoulGate(throwing, threshold = 0.6).shouldIntervene(state()).intervene)

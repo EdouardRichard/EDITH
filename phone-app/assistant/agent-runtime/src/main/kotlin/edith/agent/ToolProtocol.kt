@@ -1,7 +1,7 @@
 package edith.agent
 
-import edith.plugin.ActionExecutor
-import edith.plugin.RiskLevel
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.RiskLevel
 
 /**
  * One tool invocation requested by the model for a single agent step.
@@ -34,7 +34,7 @@ data class ToolResult(val id: String, val ok: Boolean, val payload: String) {
 
 /**
  * Platform-independent description of one tool offered to the model, projected from `plugin-api`'s
- * [edith.plugin.ActionDescriptor] (its `title` becomes [description]).
+ * [com.sheen.rokid.plugin.ActionDescriptor] (its `title` becomes [description]).
  */
 data class ToolDescriptor(
     val name: String,
@@ -49,7 +49,7 @@ data class ToolDescriptor(
     val auditTargetArgument: String? = null,
     /**
      * Phase 6 (design D-9): projected from the plugin's descriptor; see
-     * [edith.plugin.ActionDescriptor.countsTowardStepLimit]. `true` — the default — spends one step of the loop's
+     * [com.sheen.rokid.plugin.ActionDescriptor.countsTowardStepLimit]. `true` — the default — spends one step of the loop's
      * `maxSteps` hang guard. `false` means the call does **not** increment that counter; it does **not** bypass an
      * already-exhausted guard (the next call is still stopped at `maxSteps`), and the call still appears in
      * `AgentRun.steps`.

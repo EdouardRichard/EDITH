@@ -1,9 +1,9 @@
 package edith.audio
 
-import edith.contracts.Generation
-import edith.contracts.InputEpoch
-import edith.contracts.SessionId
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.MonotonicClock
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull

@@ -1,13 +1,13 @@
 package edith.plugins.smart
 
-import edith.contracts.OutputStateEvent
-import edith.contracts.OutputStatus
-import edith.contracts.TranscriptEvent
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
-import edith.plugin.ModelEnd
-import edith.plugin.ModelStreamEvent
-import edith.plugin.RiskLevel
+import com.sheen.rokid.contracts.OutputStateEvent
+import com.sheen.rokid.contracts.OutputStatus
+import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.RiskLevel
 import kotlin.test.*
 
 /**

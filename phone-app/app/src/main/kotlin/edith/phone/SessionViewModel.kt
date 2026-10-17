@@ -1,8 +1,8 @@
 package edith.phone
 
 import androidx.lifecycle.ViewModel
-import edith.contracts.SessionState
-import edith.plugin.Capability
+import com.sheen.rokid.contracts.SessionState
+import com.sheen.rokid.plugin.Capability
 import edith.rokid.CxrAuthorizationOutcome
 import kotlinx.coroutines.flow.StateFlow
 

@@ -1,6 +1,6 @@
 package edith.agent
 
-import edith.plugin.ToolSpec
+import com.sheen.rokid.plugin.ToolSpec
 
 /**
  * The single request shape that replaces the old three-owner assembly (spec §3.2).

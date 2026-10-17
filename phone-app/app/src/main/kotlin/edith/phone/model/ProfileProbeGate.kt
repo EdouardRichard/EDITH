@@ -1,9 +1,9 @@
 package edith.phone.model
 
-import edith.contracts.ContractError
+import com.sheen.rokid.contracts.ContractError
 import edith.model.ProfileTester
 import edith.model.RequestConsent
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import edith.storage.ProfileRepository
 import java.util.concurrent.atomic.AtomicReference
 

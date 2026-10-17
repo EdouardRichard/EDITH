@@ -3,10 +3,10 @@ package edith.plugins.smart
 import edith.agent.ConfirmationGate
 import edith.agent.ConfirmationOutcome
 import edith.agent.ConfirmationSource
-import edith.contracts.ConfirmationResult
-import edith.contracts.TranscriptRevision
-import edith.plugin.CancellationHandle
-import edith.plugin.ConfirmationChannel
+import com.sheen.rokid.contracts.ConfirmationResult
+import com.sheen.rokid.contracts.TranscriptRevision
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.ConfirmationChannel
 import kotlin.concurrent.thread
 import kotlin.test.*
 import java.util.concurrent.TimeUnit

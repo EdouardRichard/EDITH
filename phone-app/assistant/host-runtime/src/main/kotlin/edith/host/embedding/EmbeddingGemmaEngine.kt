@@ -1,6 +1,6 @@
 package edith.host.embedding
 
-import edith.plugin.EmbeddingInferenceEngine
+import com.sheen.rokid.plugin.EmbeddingInferenceEngine
 
 /**
  * Stub engine for JVM unit tests. Returns deterministic unit-norm vectors.

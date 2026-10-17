@@ -1,6 +1,6 @@
 package edith.glasses
 
-import edith.contracts.AssistantRoute
+import com.sheen.rokid.contracts.AssistantRoute
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

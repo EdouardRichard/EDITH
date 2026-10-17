@@ -11,7 +11,7 @@ import android.os.IBinder
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
 import androidx.core.content.ContextCompat
-import edith.contracts.SessionState
+import com.sheen.rokid.contracts.SessionState
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collect
 

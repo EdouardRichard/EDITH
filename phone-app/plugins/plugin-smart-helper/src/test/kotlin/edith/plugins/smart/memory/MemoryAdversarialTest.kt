@@ -1,10 +1,10 @@
 package edith.plugins.smart.memory
 
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingService
-import edith.plugin.FailureReason
-import edith.plugin.ModelInfo
-import edith.plugin.StorageHandle
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.FailureReason
+import com.sheen.rokid.plugin.ModelInfo
+import com.sheen.rokid.plugin.StorageHandle
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse

@@ -1,8 +1,8 @@
 package edith.rokid
 
-import edith.contracts.AudioFormat
-import edith.contracts.PcmEncoding
-import edith.contracts.VerifiedPcm
+import com.sheen.rokid.contracts.AudioFormat
+import com.sheen.rokid.contracts.PcmEncoding
+import com.sheen.rokid.contracts.VerifiedPcm
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.*

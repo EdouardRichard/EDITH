@@ -1,7 +1,7 @@
 package edith.host
 
-import edith.contracts.*
-import edith.plugin.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.*
 import java.util.concurrent.ExecutionException
 import java.util.concurrent.Executors
 

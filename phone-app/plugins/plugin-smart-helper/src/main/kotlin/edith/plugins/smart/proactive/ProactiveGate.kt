@@ -1,11 +1,11 @@
 package edith.plugins.smart.proactive
 
-import edith.plugin.SystemOneAnswer
-import edith.plugin.SystemOneCriterion
-import edith.plugin.SystemOneQuestion
-import edith.plugin.SystemOneQuestionType
-import edith.plugin.SystemOneResult
-import edith.plugin.SystemOneService
+import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneCriterion
+import com.sheen.rokid.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.SystemOneQuestionType
+import com.sheen.rokid.plugin.SystemOneResult
+import com.sheen.rokid.plugin.SystemOneService
 
 /** Which of Laya's two forms this gate asks. The spec leaves the choice to measurement (see the fine-tune design). */
 enum class GateForm { NOUL, CHOICE }

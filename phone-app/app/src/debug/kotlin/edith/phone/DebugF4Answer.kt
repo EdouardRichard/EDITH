@@ -3,9 +3,9 @@ package edith.phone
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import edith.contracts.AssistantRoute
-import edith.output.ConversationEntry
-import edith.output.ConversationRole
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.output.ConversationEntry
+import com.sheen.rokid.output.ConversationRole
 import java.io.File
 import java.security.MessageDigest
 
@@ -13,7 +13,7 @@ import java.security.MessageDigest
  * Debug-only F4 assistant-output capture (Phase 7 design §3.4).
  *
  * The F4 judgement reads the assistant's **final output** and, for §2.4's validity check, the ASR final transcript.
- * The phone already holds both on the WAKE route's [edith.output.ConversationLog]; this receiver copies the last USER
+ * The phone already holds both on the WAKE route's [com.sheen.rokid.output.ConversationLog]; this receiver copies the last USER
  * and last ASSISTANT entries into two files:
  *
  * ```

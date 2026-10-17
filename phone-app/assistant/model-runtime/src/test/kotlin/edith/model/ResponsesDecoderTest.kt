@@ -1,6 +1,6 @@
 package edith.model
 
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import kotlinx.serialization.json.*
 import kotlin.test.*
 

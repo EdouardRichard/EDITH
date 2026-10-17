@@ -1,10 +1,10 @@
 package edith.phone
 
 import android.speech.tts.UtteranceProgressListener
-import edith.contracts.Assistance
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.plugin.SpeechPlayback
+import com.sheen.rokid.contracts.Assistance
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.SpeechPlayback
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test

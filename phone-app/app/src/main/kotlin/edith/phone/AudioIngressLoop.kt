@@ -6,11 +6,11 @@ import edith.audio.PcmIngress
 import edith.audio.PcmOffer
 import edith.audio.SpeechPipeline
 import edith.audio.WakeWordDetector
-import edith.contracts.InputEpoch
-import edith.plugin.CancellationHandle
-import edith.plugin.DeadlineScheduler
-import edith.plugin.InputPort
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.InputPort
+import com.sheen.rokid.plugin.MonotonicClock
 
 /** One `P3_FRAME` summary per this many delivered frames, whichever interval is reached first (P3.1 acceptance). */
 private const val FRAME_SUMMARY_FRAMES = 250L

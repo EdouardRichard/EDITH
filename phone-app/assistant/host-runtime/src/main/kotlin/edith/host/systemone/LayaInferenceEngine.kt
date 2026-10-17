@@ -1,9 +1,9 @@
 package edith.host.systemone
 
-import edith.plugin.LayaInferenceEngine
-import edith.plugin.SystemOneAnswer
-import edith.plugin.SystemOneQuestion
-import edith.plugin.SystemOneQuestionType
+import com.sheen.rokid.plugin.LayaInferenceEngine
+import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.SystemOneQuestionType
 
 /**
  * Stub engine for JVM unit tests. Answers every question with an even split over its own criteria, so the service's

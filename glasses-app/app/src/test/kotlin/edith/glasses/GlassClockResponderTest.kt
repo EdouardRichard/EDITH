@@ -1,8 +1,8 @@
 package edith.glasses
 
-import edith.output.HintCommand
-import edith.output.HintWireCodec
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.output.HintCommand
+import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.plugin.MonotonicClock
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

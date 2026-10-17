@@ -7,7 +7,7 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 
 @OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable fun ProfileListScreen(viewModel: ProfileViewModel, state: ProfileUiState, plugins: List<Pair<String, String>>) {

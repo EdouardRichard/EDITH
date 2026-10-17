@@ -1,11 +1,11 @@
 package edith.glasses
 
-import edith.contracts.AssistantRoute
+import com.sheen.rokid.contracts.AssistantRoute
 
 /**
  * Phase C (spec §6.6 加载动画): whether the assistant is working, per route, decided without Android.
  *
- * [edith.output.HintCommand.Busy] is a **level, not an event** — the phone states it when a turn starts and states the
+ * [com.sheen.rokid.output.HintCommand.Busy] is a **level, not an event** — the phone states it when a turn starts and states the
  * opposite when the turn ends, and the later statement wins. That makes one failure mode obvious: a single missing
  * "finished" (a model timeout, a `Stop`, a process that died) would leave the ring turning and the panel held awake on
  * a device the wearer cannot switch off from the app. So the level **expires by itself** at [maxMillis], which is the

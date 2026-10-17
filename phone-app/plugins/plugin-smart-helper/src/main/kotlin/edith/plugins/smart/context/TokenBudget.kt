@@ -104,14 +104,14 @@ fun estimateTokens(text: String): Int {
  * A tool call contributes its arguments and a tool output its payload; the identities are bookkeeping the model does
  * not read, so counting them would inflate an estimate without bounding anything real.
  */
-internal fun edith.plugin.ModelHistoryItem.estimatedText(): String = when (this) {
-    is edith.plugin.ModelHistoryItem.Text -> text
-    is edith.plugin.ModelHistoryItem.ToolCall -> argsJson
-    is edith.plugin.ModelHistoryItem.ToolOutput -> output
+internal fun com.sheen.rokid.plugin.ModelHistoryItem.estimatedText(): String = when (this) {
+    is com.sheen.rokid.plugin.ModelHistoryItem.Text -> text
+    is com.sheen.rokid.plugin.ModelHistoryItem.ToolCall -> argsJson
+    is com.sheen.rokid.plugin.ModelHistoryItem.ToolOutput -> output
 }
 
 /**
  * The same contribution, as a **size**. `P3_CONTEXT` reports how much of a prompt a turn carried, and a size is what a
  * device log may hold: the text itself is the user's words and never appears in one.
  */
-internal fun edith.plugin.ModelHistoryItem.estimatedLength(): Int = estimatedText().length
+internal fun com.sheen.rokid.plugin.ModelHistoryItem.estimatedLength(): Int = estimatedText().length

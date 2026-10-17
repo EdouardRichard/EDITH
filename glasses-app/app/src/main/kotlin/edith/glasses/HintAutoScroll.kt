@@ -1,6 +1,6 @@
 package edith.glasses
 
-import edith.output.HintReadingBudget
+import com.sheen.rokid.output.HintReadingBudget
 
 /**
  * How a hint that is taller than the glasses' window is walked through, decided without Android so it can be tested

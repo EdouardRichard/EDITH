@@ -22,7 +22,7 @@ import edith.audio.android.SherpaEngineFactory
 import edith.audio.android.SherpaKeywordSpotterFactory
 import edith.audio.android.SherpaVadFactory
 import edith.audio.android.ValidatedModelBundle
-import edith.contracts.*
+import com.sheen.rokid.contracts.*
 import edith.host.HostEnvironment
 import edith.host.HostRuntime
 import edith.host.storage.StorageAccessServiceImpl
@@ -32,9 +32,9 @@ import edith.phone.laya.LayaInferenceEngineImpl
 import edith.phone.laya.LayaOfficialHost
 import edith.phone.litert.EmbeddingGemmaLiteRTEngine
 import edith.model.*
-import edith.output.ConversationLog
-import edith.output.TraceRecorder
-import edith.plugin.*
+import com.sheen.rokid.output.ConversationLog
+import com.sheen.rokid.output.TraceRecorder
+import com.sheen.rokid.plugin.*
 import edith.plugins.smart.SmartAssistantPlugin
 import edith.plugins.interview.InterviewAssistantPlugin
 import edith.rokid.CxrAuthorizationOutcome
@@ -1058,7 +1058,7 @@ class HostCompositionRoot internal constructor(
     }
 
     /** The live CXR transport, for callers that must drive an audio epoch (T17/T18 device bring-up). */
-    fun cxrInputPort(): edith.plugin.InputPort? = activeConnection?.inputPortOrNull()
+    fun cxrInputPort(): com.sheen.rokid.plugin.InputPort? = activeConnection?.inputPortOrNull()
 
     /** True only once the live CXR transport reports a session; there is no ready transport without one. */
     fun cxrReady(): Boolean = activeConnection?.ready == true
@@ -1378,7 +1378,7 @@ class HostCompositionRoot internal constructor(
             // Phase C: the speech player is built further down (it depends on the user's 「语音朗读」 setting), while the
             // wake sink that needs it is built here, so the sink reads it through a holder. `null` is the switch being
             // off, which is why the acknowledgement is a silent no-op rather than a second check at the call site.
-            val speechHolder = arrayOfNulls<edith.plugin.SpeechPlayer>(1)
+            val speechHolder = arrayOfNulls<com.sheen.rokid.plugin.SpeechPlayer>(1)
             // P3.2 Task 6: the context provider. Stage A exposes the zero-permission time keys; Stage B appends its
             // three permissioned sources to the same list. The listener is the production arming gate, so a disarmed
             // session produces no `ContextChanged` at all - the plugin's only context signal is the acoustic event.
@@ -1599,7 +1599,7 @@ class HostCompositionRoot internal constructor(
             // P5 (spec §S1/S5): construct the speech player only when the user switch is on AND the engine is ready.
             // The player is passed to the environment so OutputArbiter can use it; null means no speech capability.
             val speechEnabledNow = runCatching { smartSettingsStore.load().speechEnabled }.getOrNull() ?: false
-            val speechPlayer: edith.plugin.SpeechPlayer? = if (speechEnabledNow) {
+            val speechPlayer: com.sheen.rokid.plugin.SpeechPlayer? = if (speechEnabledNow) {
                 AndroidSpeechPlayer.create(context, playbackGate)
             } else null
             // Phase C: the wake sink, built above, finds the player here. The same instance the arbiter uses, so the
@@ -2214,7 +2214,7 @@ internal class CxrAudioChain private constructor(
                 emit = { event ->
                     holder[0]?.onEvent(event); emit(event)
                     // Seal the audio segment when a final transcript arrives.
-                    if (event is edith.contracts.TranscriptEvent && event.revision.final) {
+                    if (event is com.sheen.rokid.contracts.TranscriptEvent && event.revision.final) {
                         bridgeRef.get()?.sealForTurn(event.revision.turnId)
                     }
                 }, cancelTurn = cancelTurn,

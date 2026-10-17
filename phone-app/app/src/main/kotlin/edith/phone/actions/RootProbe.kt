@@ -1,9 +1,9 @@
 package edith.phone.actions
 
-import edith.plugin.ActionDescriptor
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
-import edith.plugin.RiskLevel
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.RiskLevel
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 

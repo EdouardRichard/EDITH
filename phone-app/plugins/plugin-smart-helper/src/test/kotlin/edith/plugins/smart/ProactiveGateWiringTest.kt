@@ -1,9 +1,9 @@
 package edith.plugins.smart
 
-import edith.contracts.AcousticEvent
-import edith.contracts.AcousticLabel
-import edith.contracts.ContextChanged
-import edith.contracts.TranscriptEvent
+import com.sheen.rokid.contracts.AcousticEvent
+import com.sheen.rokid.contracts.AcousticLabel
+import com.sheen.rokid.contracts.ContextChanged
+import com.sheen.rokid.contracts.TranscriptEvent
 import edith.plugins.smart.proactive.GateForm
 import edith.plugins.smart.proactive.GateOutcome
 import edith.plugins.smart.proactive.ProactiveGate
@@ -36,8 +36,8 @@ class ProactiveGateWiringTest {
         rig.model.onRequest = { request, listener ->
             listener(smartToolCall("c1", "propose_hint", """{"text":"要不要我帮你？"}"""))
             listener(
-                edith.plugin.ModelStreamEvent.Terminal(
-                    request.requestId, edith.plugin.ModelEnd.COMPLETED, null, null,
+                com.sheen.rokid.plugin.ModelStreamEvent.Terminal(
+                    request.requestId, com.sheen.rokid.plugin.ModelEnd.COMPLETED, null, null,
                 ),
             )
         }

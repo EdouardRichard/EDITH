@@ -2,13 +2,13 @@ package edith.plugins.smart.context
 
 import edith.agent.ModelClientGateway
 import edith.agent.GatewayTurn
-import edith.contracts.EventEnvelope
-import edith.plugin.DeadlineScheduler
-import edith.plugin.MessageRole
-import edith.plugin.ModelClient
-import edith.plugin.ModelHistoryItem
-import edith.plugin.ModelProfile
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelClient
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.MonotonicClock
 import edith.plugins.smart.P3Log
 import edith.plugins.smart.safeFailureCode
 
@@ -76,7 +76,7 @@ class ModelSummarizer(
                 ),
             )
             val summary = reply.text
-                .takeIf { reply.terminal == edith.plugin.ModelEnd.COMPLETED }
+                .takeIf { reply.terminal == com.sheen.rokid.plugin.ModelEnd.COMPLETED }
                 ?.trim()
                 ?.takeIf { it.isNotEmpty() }
             // The outcome, never the answer: `terminal` names which of the four causes this was, and `safeCode` is

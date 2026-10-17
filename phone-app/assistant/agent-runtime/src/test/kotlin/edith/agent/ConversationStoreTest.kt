@@ -1,7 +1,7 @@
 package edith.agent
 
-import edith.plugin.MessageRole
-import edith.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelHistoryItem
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith

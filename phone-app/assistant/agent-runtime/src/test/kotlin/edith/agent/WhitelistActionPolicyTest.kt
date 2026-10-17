@@ -1,6 +1,6 @@
 package edith.agent
 
-import edith.plugin.RiskLevel
+import com.sheen.rokid.plugin.RiskLevel
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotSame

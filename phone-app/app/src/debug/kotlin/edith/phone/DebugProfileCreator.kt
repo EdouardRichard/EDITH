@@ -4,7 +4,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import edith.phone.model.ProfileForm
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import java.io.File
 import java.util.Properties
 

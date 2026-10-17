@@ -1,8 +1,8 @@
 package edith.plugins.smart
 
-import edith.contracts.SpeechRequest
-import edith.plugin.Capability
-import edith.plugin.ModelEnd
+import com.sheen.rokid.contracts.SpeechRequest
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ModelEnd
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
@@ -25,7 +25,7 @@ class NotifyFallbackTest {
             turn++
             if (turn <= times) {
                 listener(smartToolCall("c$turn", "notify_user", """{"text":"进度 $turn","channel":"$channel"}"""))
-                listener(edith.plugin.ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+                listener(com.sheen.rokid.plugin.ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
             } else {
                 streamText(request, listener, "好了。")
             }
@@ -127,7 +127,7 @@ class NotifyFallbackTest {
         val rig = SmartTestRig()
         rig.activate()
         rig.model.onRequest = { request, listener ->
-            listener(edith.plugin.ModelStreamEvent.Terminal(request.requestId, ModelEnd.FAILED, null, "provider_error"))
+            listener(com.sheen.rokid.plugin.ModelStreamEvent.Terminal(request.requestId, ModelEnd.FAILED, null, "provider_error"))
         }
 
         rig.wakeAndFinal("帮我看看")

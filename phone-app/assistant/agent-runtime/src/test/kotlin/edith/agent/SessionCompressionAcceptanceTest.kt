@@ -1,16 +1,16 @@
 package edith.agent
 
-import edith.contracts.EventEnvelope
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.plugin.InputPart
-import edith.plugin.MessageRole
-import edith.plugin.ModelEnd
-import edith.plugin.ModelHistoryItem
-import edith.plugin.ModelProfile
-import edith.plugin.ModelStreamEvent
-import edith.testsupport.FakeClock
-import edith.testsupport.ManualScheduler
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.InputPart
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.testsupport.FakeClock
+import com.sheen.rokid.testsupport.ManualScheduler
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse

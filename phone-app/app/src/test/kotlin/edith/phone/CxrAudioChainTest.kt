@@ -17,23 +17,23 @@ import edith.audio.android.EngineManifest
 import edith.audio.android.EngineModelStore
 import edith.audio.android.ModelArtifact
 import edith.audio.android.ValidatedModelBundle
-import edith.contracts.AudioFormat
-import edith.contracts.ContractError
-import edith.contracts.GapReason
-import edith.contracts.Generation
-import edith.contracts.InputEpoch
-import edith.contracts.PcmEncoding
-import edith.contracts.SessionId
-import edith.contracts.SpeakerAssessment
-import edith.contracts.VerifiedPcm
+import com.sheen.rokid.contracts.AudioFormat
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.contracts.GapReason
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.PcmEncoding
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.contracts.SpeakerAssessment
+import com.sheen.rokid.contracts.VerifiedPcm
 import edith.host.HostRuntime
-import edith.plugin.CancellationHandle
-import edith.plugin.Capability
-import edith.plugin.DeadlineScheduler
-import edith.plugin.SpeakerWindow
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.SpeakerWindow
 import edith.storage.MemoryProfileRepository
-import edith.testsupport.FakeClock
-import edith.testsupport.ManualScheduler
+import com.sheen.rokid.testsupport.FakeClock
+import com.sheen.rokid.testsupport.ManualScheduler
 import java.io.ByteArrayInputStream
 import java.io.File
 import java.security.MessageDigest
@@ -147,9 +147,9 @@ class CxrAudioChainTest {
         }
     }
 
-    private class StubModelClient : edith.plugin.ModelClient {
-        override fun request(request: edith.plugin.ModelRequest,
-            listener: (edith.plugin.ModelStreamEvent) -> Unit): CancellationHandle =
+    private class StubModelClient : com.sheen.rokid.plugin.ModelClient {
+        override fun request(request: com.sheen.rokid.plugin.ModelRequest,
+            listener: (com.sheen.rokid.plugin.ModelStreamEvent) -> Unit): CancellationHandle =
             object : CancellationHandle { override fun cancel() = Unit }
     }
 

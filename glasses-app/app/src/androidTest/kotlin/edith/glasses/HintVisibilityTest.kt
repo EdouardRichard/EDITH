@@ -3,9 +3,9 @@ package edith.glasses
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import edith.contracts.AssistantRoute
-import edith.output.HintCommand
-import edith.output.HintWireCodec
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.output.HintCommand
+import com.sheen.rokid.output.HintWireCodec
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test

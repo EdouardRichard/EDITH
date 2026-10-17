@@ -2,8 +2,8 @@ package edith.rokid
 
 import android.app.Activity
 import edith.audio.PcmIngress
-import edith.contracts.*
-import edith.plugin.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.*
 import java.util.concurrent.Executor
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors

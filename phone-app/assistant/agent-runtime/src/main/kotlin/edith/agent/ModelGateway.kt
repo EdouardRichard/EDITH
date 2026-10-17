@@ -1,8 +1,8 @@
 package edith.agent
 
-import edith.plugin.ModelEnd
-import edith.plugin.ModelHistoryItem
-import edith.plugin.ToolSpec
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ToolSpec
 
 /**
  * The one model port of the agent loop: a [turn] is one stateless model round trip.

@@ -3,7 +3,7 @@ package edith.probe.toolcall
 import edith.model.ResponsesDecoder
 import edith.model.SseDecoder
 import edith.model.SseFrame
-import edith.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.ModelStreamEvent
 import kotlinx.serialization.json.Json
 
 /**

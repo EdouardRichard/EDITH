@@ -5,8 +5,8 @@ import android.content.ContextWrapper
 import android.content.pm.ApplicationInfo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import edith.contracts.ContractError
-import edith.plugin.*
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.plugin.*
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.runner.RunWith

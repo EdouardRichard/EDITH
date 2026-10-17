@@ -1,6 +1,6 @@
 package edith.plugins.smart.skill
 
-import edith.plugin.StorageAccess
+import com.sheen.rokid.plugin.StorageAccess
 
 /**
  * The one place that knows where the SKILL library lives on the device, and the bridge from the host's

@@ -5,8 +5,8 @@ import com.k2fsa.sherpa.onnx.OnlineStream
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractor
 import com.k2fsa.sherpa.onnx.SpeakerEmbeddingExtractorConfig
 import com.k2fsa.sherpa.onnx.Vad
-import edith.contracts.AudioFormat
-import edith.contracts.VerifiedPcm
+import com.sheen.rokid.contracts.AudioFormat
+import com.sheen.rokid.contracts.VerifiedPcm
 
 /** Candidate lifecycle only; creation does not select a production engine. */
 class SherpaEngineCandidate internal constructor(

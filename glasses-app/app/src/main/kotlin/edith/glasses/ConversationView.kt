@@ -1,8 +1,8 @@
 package edith.glasses
 
-import edith.contracts.AssistantRoute
-import edith.output.ConversationEntry
-import edith.output.ConversationRole
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.output.ConversationEntry
+import com.sheen.rokid.output.ConversationRole
 
 /**
  * How the conversation is laid out, decided without Android so it can be tested off-device (spec §6.6).
@@ -12,7 +12,7 @@ import edith.output.ConversationRole
  * and they live here so a rendering regression fails a unit test instead of needing someone to put the glasses on.
  *
  * Nothing here reads the clock, the log or the wire: it is a pure function of the entries it is handed, which is what
- * keeps the phone's assistant tab (same [edith.output.ConversationLog], same order) and this view in agreement.
+ * keeps the phone's assistant tab (same [com.sheen.rokid.output.ConversationLog], same order) and this view in agreement.
  */
 object ConversationView {
 

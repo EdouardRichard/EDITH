@@ -1,9 +1,9 @@
 package edith.model
 
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import edith.storage.ProfileRepository
 import java.time.Clock
-import edith.contracts.*
+import com.sheen.rokid.contracts.*
 import java.util.UUID
 
 class ControlledProfileTester(private val client: ControlledModelClient, private val repository: ProfileRepository,

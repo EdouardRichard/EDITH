@@ -1,6 +1,6 @@
 package edith.storage
 
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit

@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.plugin.StorageAccess
+import com.sheen.rokid.plugin.StorageAccess
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

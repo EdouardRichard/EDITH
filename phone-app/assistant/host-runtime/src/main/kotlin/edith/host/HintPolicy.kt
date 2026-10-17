@@ -1,6 +1,6 @@
 package edith.host
 
-import edith.contracts.Assistance
+import com.sheen.rokid.contracts.Assistance
 
 /**
  * The phone's hint bound (P3.2-CLIP and the owner's 2026-10-14 ruling).

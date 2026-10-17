@@ -3,7 +3,7 @@ package edith.rokid
 import android.app.Activity
 import com.rokid.cxr.session.AuthResult
 import edith.audio.PcmIngress
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.plugin.MonotonicClock
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

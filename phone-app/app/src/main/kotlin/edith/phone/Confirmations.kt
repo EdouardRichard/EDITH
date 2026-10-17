@@ -1,11 +1,11 @@
 package edith.phone
 
-import edith.contracts.ConfirmationResult
-import edith.contracts.EventEnvelope
-import edith.plugin.CancellationHandle
-import edith.plugin.ConfirmationChannel
-import edith.plugin.DeadlineScheduler
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.contracts.ConfirmationResult
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.ConfirmationChannel
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.MonotonicClock
 
 /**
  * How the action summary reaches the wearer.

@@ -1,8 +1,8 @@
 package edith.model
 
-import edith.plugin.ModelEnd
-import edith.plugin.ModelStreamEvent
-import edith.plugin.ModelUsage
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.ModelUsage
 import kotlinx.serialization.json.*
 
 /**

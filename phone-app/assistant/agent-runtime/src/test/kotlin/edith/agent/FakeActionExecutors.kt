@@ -1,10 +1,10 @@
 package edith.agent
 
-import edith.plugin.ActionDescriptor
-import edith.plugin.ActionExecutor
-import edith.plugin.ActionOutcome
-import edith.plugin.ActionResult
-import edith.plugin.RiskLevel
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.RiskLevel
 
 /**
  * Test-only action executor: records every `execute` call verbatim so a test can prove which tool name and which

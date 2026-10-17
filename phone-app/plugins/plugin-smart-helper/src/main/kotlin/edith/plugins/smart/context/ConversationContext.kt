@@ -1,7 +1,7 @@
 package edith.plugins.smart.context
 
-import edith.plugin.MessageRole
-import edith.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelHistoryItem
 
 /**
  * One route's transcript.

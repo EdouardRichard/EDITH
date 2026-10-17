@@ -1,13 +1,13 @@
 package edith.plugins.smart
 
-import edith.contracts.ConfirmationResult
-import edith.contracts.TranscriptEvent
-import edith.plugin.CancellationHandle
-import edith.plugin.Capability
-import edith.plugin.ConfirmationChannel
-import edith.plugin.ModelEnd
-import edith.plugin.ModelStreamEvent
-import edith.plugin.RiskLevel
+import com.sheen.rokid.contracts.ConfirmationResult
+import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ConfirmationChannel
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.RiskLevel
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit

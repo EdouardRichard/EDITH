@@ -1,8 +1,8 @@
 package edith.host
 
-import edith.contracts.*
-import edith.plugin.*
-import edith.testsupport.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.*
+import com.sheen.rokid.testsupport.*
 import kotlin.test.*
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch

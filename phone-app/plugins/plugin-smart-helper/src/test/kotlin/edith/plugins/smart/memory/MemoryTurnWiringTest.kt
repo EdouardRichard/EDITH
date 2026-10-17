@@ -1,6 +1,6 @@
 package edith.plugins.smart.memory
 
-import edith.plugin.Capability
+import com.sheen.rokid.plugin.Capability
 import edith.plugins.smart.SmartFakeStorage
 import edith.plugins.smart.SmartTestRig
 import edith.plugins.smart.streamText

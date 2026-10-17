@@ -1,7 +1,7 @@
 package edith.model
 
-import edith.contracts.*
-import edith.plugin.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.*
 
 internal fun profileFixture(
     inputs: Set<InputModality> = setOf(InputModality.TEXT),

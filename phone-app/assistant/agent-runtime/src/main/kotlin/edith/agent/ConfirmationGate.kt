@@ -1,8 +1,8 @@
 package edith.agent
 
-import edith.plugin.CancellationHandle
-import edith.plugin.DeadlineScheduler
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.MonotonicClock
 
 /**
  * The confirmation state machine (spec §7.3/§7.4): one pending question per [request] id, settled exactly once.

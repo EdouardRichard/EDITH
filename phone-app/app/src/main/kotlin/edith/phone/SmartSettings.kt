@@ -3,9 +3,9 @@ package edith.phone
 import edith.phone.storage.EncryptedBlobStore
 import edith.phone.storage.readJson
 import edith.phone.storage.writeJson
-import edith.plugin.ModelProfile
-import edith.plugin.PluginConfiguration
-import edith.plugin.RiskLevel
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.PluginConfiguration
+import com.sheen.rokid.plugin.RiskLevel
 import edith.storage.ProfileRepository
 import kotlinx.serialization.json.*
 

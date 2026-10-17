@@ -1,14 +1,14 @@
 package edith.agent
 
-import edith.plugin.CancellationHandle
-import edith.plugin.InputModality
-import edith.plugin.ModelClient
-import edith.plugin.ModelProfile
-import edith.plugin.ModelRequest
-import edith.plugin.ModelStreamEvent
-import edith.plugin.OutputModality
-import edith.plugin.SecretHandle
-import edith.testsupport.FakeCancellation
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.InputModality
+import com.sheen.rokid.plugin.ModelClient
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.SecretHandle
+import com.sheen.rokid.testsupport.FakeCancellation
 import java.util.concurrent.CopyOnWriteArrayList
 
 /**

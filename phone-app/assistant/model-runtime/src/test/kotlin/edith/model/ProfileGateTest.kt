@@ -1,7 +1,7 @@
 package edith.model
 
-import edith.contracts.ContractError
-import edith.plugin.*
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.plugin.*
 import kotlin.test.*
 
 class ProfileGateTest {

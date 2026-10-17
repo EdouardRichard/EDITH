@@ -1,8 +1,8 @@
 package edith.plugins.smart
 
 import edith.agent.SCOPE_TERMINAL
-import edith.plugin.ActionOutcome
-import edith.plugin.RiskLevel
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.RiskLevel
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNull

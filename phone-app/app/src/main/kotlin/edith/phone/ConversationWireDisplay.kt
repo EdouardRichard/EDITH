@@ -1,10 +1,10 @@
 package edith.phone
 
-import edith.contracts.AssistantRoute
-import edith.output.ConversationEntry
-import edith.output.ConversationLog
-import edith.output.ConversationRole
-import edith.plugin.ConversationDisplay
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.output.ConversationEntry
+import com.sheen.rokid.output.ConversationLog
+import com.sheen.rokid.output.ConversationRole
+import com.sheen.rokid.plugin.ConversationDisplay
 import java.util.UUID
 
 /**

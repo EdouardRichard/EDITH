@@ -1,6 +1,6 @@
 package edith.plugins.smart.memory
 
-import edith.plugin.StorageHandle
+import com.sheen.rokid.plugin.StorageHandle
 import edith.plugins.smart.P3Log
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject

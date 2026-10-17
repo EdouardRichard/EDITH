@@ -1,7 +1,7 @@
 package edith.plugins.smart.memory
 
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingService
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
 import java.util.concurrent.ConcurrentHashMap
 
 /**

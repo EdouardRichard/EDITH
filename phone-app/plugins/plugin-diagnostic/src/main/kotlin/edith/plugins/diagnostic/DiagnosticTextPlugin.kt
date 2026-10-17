@@ -1,8 +1,8 @@
 package edith.plugins.diagnostic
 
-import edith.contracts.*
-import edith.output.*
-import edith.plugin.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.output.*
+import com.sheen.rokid.plugin.*
 import java.util.UUID
 
 class DiagnosticTextPlugin(

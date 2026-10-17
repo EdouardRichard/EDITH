@@ -1,8 +1,8 @@
 package edith.agent
 
-import edith.plugin.ActionDescriptor
-import edith.plugin.ActionExecutor
-import edith.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ActionOutcome
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -41,7 +41,7 @@ internal fun validateToolSchema(toolName: String, parametersJson: String) {
  * The set of tools the agent may offer this run, built once from the executors' descriptors.
  *
  * Construction validates every schema and merges duplicate tool names: the surviving descriptor is the declaration
- * with the highest [edith.plugin.RiskLevel] (ties keep the first registration) together with *its* executor, so a
+ * with the highest [com.sheen.rokid.plugin.RiskLevel] (ties keep the first registration) together with *its* executor, so a
  * descriptor never gets paired with an executor that did not declare it. Each merged name reports exactly one
  * `DUPLICATE_TOOL_MERGED:<name>` to [note].
  *

@@ -1,7 +1,7 @@
 package edith.probe
 
 import edith.model.*
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import edith.storage.*
 import okhttp3.OkHttpClient
 import java.nio.file.Path

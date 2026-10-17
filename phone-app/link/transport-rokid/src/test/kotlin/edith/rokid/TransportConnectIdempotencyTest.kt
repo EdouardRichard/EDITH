@@ -24,7 +24,7 @@ class TransportConnectIdempotencyTest {
         override fun start(audio: RokidBackend.Audio) = true
         override fun stop(audio: RokidBackend.Audio) = Unit
         override fun send(route: RokidCommandRoute, json: String, correlation: RokidReplyCorrelation?,
-            listener: (String?) -> Unit) = object : edith.plugin.CancellationHandle {
+            listener: (String?) -> Unit) = object : com.sheen.rokid.plugin.CancellationHandle {
             override fun cancel() = Unit
         }
         override fun close() { closed++ }
@@ -35,7 +35,7 @@ class TransportConnectIdempotencyTest {
     }
 
     private fun transport(backend: Backend): RokidSessionTransport {
-        val clock = object : edith.plugin.MonotonicClock { override fun nowNanos() = 0L }
+        val clock = object : com.sheen.rokid.plugin.MonotonicClock { override fun nowNanos() = 0L }
         return RokidSessionTransport(
             ingress = edith.audio.PcmIngress(clock),
             onSceneReady = {},

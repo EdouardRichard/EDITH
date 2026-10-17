@@ -1,6 +1,6 @@
 package edith.audio
 
-import edith.contracts.AcousticLabel
+import com.sheen.rokid.contracts.AcousticLabel
 import kotlin.math.sqrt
 
 /**

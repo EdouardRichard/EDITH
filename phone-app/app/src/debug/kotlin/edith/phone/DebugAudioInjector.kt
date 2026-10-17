@@ -5,11 +5,11 @@ import android.content.Context
 import android.content.Intent
 import edith.audio.PcmIngress
 import edith.audio.PcmOffer
-import edith.contracts.AudioFormat
-import edith.contracts.GapReason
-import edith.contracts.InputEpoch
-import edith.contracts.PcmEncoding
-import edith.contracts.VerifiedPcm
+import com.sheen.rokid.contracts.AudioFormat
+import com.sheen.rokid.contracts.GapReason
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.PcmEncoding
+import com.sheen.rokid.contracts.VerifiedPcm
 import edith.rokid.RokidSessionTransport
 import java.io.File
 

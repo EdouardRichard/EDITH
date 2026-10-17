@@ -1,19 +1,19 @@
 package edith.plugins.smart
 
-import edith.contracts.AcousticEvent
-import edith.contracts.AssistantRoute
-import edith.contracts.AcousticLabel
-import edith.contracts.ContextChanged
-import edith.contracts.OutputStateEvent
-import edith.contracts.OutputStatus
-import edith.contracts.SpeechRequest
-import edith.contracts.TranscriptEvent
-import edith.contracts.UserAction
-import edith.plugin.InputPart
-import edith.plugin.ModelEnd
-import edith.plugin.ModelRequest
-import edith.plugin.ModelStreamEvent
-import edith.plugin.OutputSubmission
+import com.sheen.rokid.contracts.AcousticEvent
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.AcousticLabel
+import com.sheen.rokid.contracts.ContextChanged
+import com.sheen.rokid.contracts.OutputStateEvent
+import com.sheen.rokid.contracts.OutputStatus
+import com.sheen.rokid.contracts.SpeechRequest
+import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.contracts.UserAction
+import com.sheen.rokid.plugin.InputPart
+import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.OutputSubmission
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.*
@@ -30,17 +30,17 @@ import kotlin.test.*
 class SmartProactiveTurnTest {
 
     /** A provider that always answers the same snapshot, so "the request sampled it" is observable. */
-    private class FixedContextSignals(private val values: Map<String, String>) : edith.plugin.ContextSignals {
-        override fun snapshot() = edith.plugin.ContextSnapshot(1L, values)
-        override fun listen(listener: (edith.plugin.ContextSnapshot) -> Unit) =
-            object : edith.plugin.CancellationHandle { override fun cancel() = Unit }
+    private class FixedContextSignals(private val values: Map<String, String>) : com.sheen.rokid.plugin.ContextSignals {
+        override fun snapshot() = com.sheen.rokid.plugin.ContextSnapshot(1L, values)
+        override fun listen(listener: (com.sheen.rokid.plugin.ContextSnapshot) -> Unit) =
+            object : com.sheen.rokid.plugin.CancellationHandle { override fun cancel() = Unit }
     }
 
     /** A provider the test can change, so "the host disarmed mid-session" is expressible. */
-    private class MutableContextSignals(var values: Map<String, String>) : edith.plugin.ContextSignals {
-        override fun snapshot() = edith.plugin.ContextSnapshot(1L, values)
-        override fun listen(listener: (edith.plugin.ContextSnapshot) -> Unit) =
-            object : edith.plugin.CancellationHandle { override fun cancel() = Unit }
+    private class MutableContextSignals(var values: Map<String, String>) : com.sheen.rokid.plugin.ContextSignals {
+        override fun snapshot() = com.sheen.rokid.plugin.ContextSnapshot(1L, values)
+        override fun listen(listener: (com.sheen.rokid.plugin.ContextSnapshot) -> Unit) =
+            object : com.sheen.rokid.plugin.CancellationHandle { override fun cancel() = Unit }
     }
 
     /**
@@ -360,7 +360,7 @@ class SmartProactiveTurnTest {
         // path has to start the cooldown itself - the earlier revision dropped that call and claimed it was covered.
         val rig = SmartTestRig()
         rig.activate(proactiveCooldownMillis = "60000")
-        rig.model.onRequest = { _, _ -> throw edith.contracts.ContractError.CapabilityMissing("refused") }
+        rig.model.onRequest = { _, _ -> throw com.sheen.rokid.contracts.ContractError.CapabilityMissing("refused") }
 
         withLines { lines ->
             arm(rig)
@@ -438,7 +438,7 @@ class SmartProactiveTurnTest {
     @Test
     fun `the request samples the context provider so its keys reach the model`() {
         val rig = SmartTestRig()
-        rig.activate(overrides = mapOf(edith.plugin.Capability.Context to
+        rig.activate(overrides = mapOf(com.sheen.rokid.plugin.Capability.Context to
             FixedContextSignals(mapOf("time.local" to "20:05", "time.period" to "evening"))))
         rig.model.onRequest = proposing()
 
@@ -460,7 +460,7 @@ class SmartProactiveTurnTest {
     fun `turning the arming switch off mid session stops the next proactive request`() {
         val signals = MutableContextSignals(mapOf("proactive.armed" to "true"))
         val rig = SmartTestRig()
-        rig.activate(overrides = mapOf(edith.plugin.Capability.Context to signals))
+        rig.activate(overrides = mapOf(com.sheen.rokid.plugin.Capability.Context to signals))
         rig.model.onRequest = proposing()
 
         arm(rig)
@@ -565,7 +565,7 @@ class SmartProactiveTurnTest {
     fun `a context key the provider stopped reporting is not carried from an earlier change`() {
         val signals = MutableContextSignals(mapOf("proactive.armed" to "true", "app.foreground" to "com.stale"))
         val rig = SmartTestRig()
-        rig.activate(overrides = mapOf(edith.plugin.Capability.Context to signals))
+        rig.activate(overrides = mapOf(com.sheen.rokid.plugin.Capability.Context to signals))
         rig.model.onRequest = proposing()
         // The host delivered a change that included the foreground app...
         rig.plugin.handle(ContextChanged(rig.envelope(), 7L,

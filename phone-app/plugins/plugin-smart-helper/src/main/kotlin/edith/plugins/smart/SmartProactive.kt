@@ -1,6 +1,6 @@
 package edith.plugins.smart
 
-import edith.contracts.AcousticLabel
+import com.sheen.rokid.contracts.AcousticLabel
 
 /**
  * How sensitive the proactive path is.

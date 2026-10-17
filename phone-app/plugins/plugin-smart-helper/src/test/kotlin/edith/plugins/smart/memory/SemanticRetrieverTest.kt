@@ -1,8 +1,8 @@
 package edith.plugins.smart.memory
 
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingService
-import edith.plugin.ModelInfo
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.ModelInfo
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull

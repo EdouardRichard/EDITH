@@ -1,7 +1,7 @@
 package edith.phone
 
-import edith.plugin.DeadlineScheduler
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.MonotonicClock
 import edith.plugins.diagnostic.DiagnosticHintPlugin
 import edith.plugins.diagnostic.DiagnosticTextPlugin
 

@@ -1,6 +1,6 @@
 package edith.agent
 
-import edith.plugin.ToolSpec
+import com.sheen.rokid.plugin.ToolSpec
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith

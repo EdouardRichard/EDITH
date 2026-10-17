@@ -33,10 +33,10 @@ class HintPresentationTest {
     @Test
     fun onlyTextBeyondTheWireBoundIsReportedAsTruncated() {
         // The one loss this layer still guards against is a hint the phone should never have sent.
-        val oversized = "字".repeat(edith.output.HintWireCodec.MAX_TEXT_CODEPOINTS + 1)
+        val oversized = "字".repeat(com.sheen.rokid.output.HintWireCodec.MAX_TEXT_CODEPOINTS + 1)
 
         assertTrue(HintPresentation.truncated(oversized))
-        assertEquals(edith.output.HintWireCodec.MAX_TEXT_CODEPOINTS,
+        assertEquals(com.sheen.rokid.output.HintWireCodec.MAX_TEXT_CODEPOINTS,
             HintPresentation.displayText(oversized).length)
     }
 
@@ -91,8 +91,8 @@ class HintPresentationTest {
         // Phase C: without this line, "the wearer saw nothing" and "the conversation stopped growing" are the same
         // reading. Counts and a route name only - the same rule as every other instrument here.
         assertEquals("conversation route=WAKE entries=3 chars=57",
-            HintPresentation.conversationReport(edith.contracts.AssistantRoute.WAKE, entries = 3, chars = 57))
+            HintPresentation.conversationReport(com.sheen.rokid.contracts.AssistantRoute.WAKE, entries = 3, chars = 57))
         assertEquals("conversation route=PROACTIVE entries=0 chars=0",
-            HintPresentation.conversationReport(edith.contracts.AssistantRoute.PROACTIVE, entries = 0, chars = 0))
+            HintPresentation.conversationReport(com.sheen.rokid.contracts.AssistantRoute.PROACTIVE, entries = 0, chars = 0))
     }
 }

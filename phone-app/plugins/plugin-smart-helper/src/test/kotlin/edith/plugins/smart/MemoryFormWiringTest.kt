@@ -1,10 +1,10 @@
 package edith.plugins.smart
 
 import edith.agent.ConversationStore
-import edith.plugin.Capability
-import edith.plugin.InputPart
-import edith.plugin.ModelHistoryItem
-import edith.plugin.ModelRequest
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.InputPart
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelRequest
 import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.memory.MemoryKind
 import edith.plugins.smart.memory.MemoryLog

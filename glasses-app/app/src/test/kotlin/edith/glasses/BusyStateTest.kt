@@ -1,6 +1,6 @@
 package edith.glasses
 
-import edith.contracts.AssistantRoute
+import com.sheen.rokid.contracts.AssistantRoute
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -11,7 +11,7 @@ import org.junit.Test
  * Phase C (spec §6.6 加载动画): whether the assistant is working, per route, and the bound that keeps a lost "finished"
  * from spinning the animation forever.
  *
- * [edith.output.HintCommand.Busy] is a **level**, not an event: the phone sends it when a turn starts and when it
+ * [com.sheen.rokid.output.HintCommand.Busy] is a **level**, not an event: the phone sends it when a turn starts and when it
  * ends, and the later statement simply wins. That makes the failure mode obvious — one missing `idle` (a model
  * timeout, a `Stop`, a killed process) would leave the ring turning and the panel awake — so the level expires by
  * itself, and the test below is what proves it.

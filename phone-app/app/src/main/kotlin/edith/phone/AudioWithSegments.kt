@@ -1,9 +1,9 @@
 package edith.phone
 
-import edith.plugin.AudioSegmentHandle
-import edith.plugin.AudioSegmentSource
-import edith.plugin.AudioSubscription
-import edith.contracts.AudioSegment
+import com.sheen.rokid.plugin.AudioSegmentHandle
+import com.sheen.rokid.plugin.AudioSegmentSource
+import com.sheen.rokid.plugin.AudioSubscription
+import com.sheen.rokid.contracts.AudioSegment
 
 /**
  * Composite provider that satisfies both [AudioSubscription] (the existing audio capability) and

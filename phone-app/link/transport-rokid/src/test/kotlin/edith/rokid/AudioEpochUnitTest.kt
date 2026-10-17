@@ -2,8 +2,8 @@ package edith.rokid
 
 import android.app.Activity
 import edith.audio.*
-import edith.contracts.*
-import edith.plugin.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.*
 import org.junit.Assert.*
 import org.junit.Test
 import java.util.concurrent.Executor

@@ -1,9 +1,9 @@
 package edith.phone
 
-import edith.output.HintCommand
-import edith.output.HintWireCodec
-import edith.testsupport.FakeClock
-import edith.testsupport.ManualScheduler
+import com.sheen.rokid.output.HintCommand
+import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.testsupport.FakeClock
+import com.sheen.rokid.testsupport.ManualScheduler
 import org.junit.Assert.*
 import org.junit.Test
 

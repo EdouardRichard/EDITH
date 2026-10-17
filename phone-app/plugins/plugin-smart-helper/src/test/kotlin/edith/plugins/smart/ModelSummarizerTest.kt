@@ -1,14 +1,14 @@
 package edith.plugins.smart
 
-import edith.plugin.CancellationHandle
-import edith.plugin.Capability
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingService
-import edith.plugin.MessageRole
-import edith.plugin.ModelHistoryItem
-import edith.plugin.ModelInfo
-import edith.plugin.ModelStreamEvent
-import edith.plugin.TaskScope
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelInfo
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.TaskScope
 import edith.plugins.smart.context.ContextCompressor
 import edith.plugins.smart.context.ContextManager
 import edith.plugins.smart.context.ContextRoute
@@ -62,7 +62,7 @@ class ModelSummarizerTest {
     private lateinit var clock: SmartFakeClock
 
     private fun newSummarizer(
-        profile: edith.plugin.ModelProfile? = smartProfile(id = "profile-x", revision = 9),
+        profile: com.sheen.rokid.plugin.ModelProfile? = smartProfile(id = "profile-x", revision = 9),
     ): ModelSummarizer {
         clock = SmartFakeClock()
         model = SmartFakeModel()
@@ -74,8 +74,8 @@ class ModelSummarizerTest {
             clock = clock,
             scheduler = SmartFakeScheduler(clock),
             envelopeFor = { requestId, startNanos, endNanos ->
-                edith.contracts.EventEnvelope(
-                    edith.contracts.SessionId("s"), edith.contracts.Generation(1),
+                com.sheen.rokid.contracts.EventEnvelope(
+                    com.sheen.rokid.contracts.SessionId("s"), com.sheen.rokid.contracts.Generation(1),
                     requestId, startNanos, endNanos,
                 )
             },
@@ -84,7 +84,7 @@ class ModelSummarizerTest {
     }
 
     /** Answers the request with one assistant sentence, as a transport delivers it. */
-    private fun answers(text: String): (edith.plugin.ModelRequest, (ModelStreamEvent) -> Unit) -> Unit =
+    private fun answers(text: String): (com.sheen.rokid.plugin.ModelRequest, (ModelStreamEvent) -> Unit) -> Unit =
         { request, listener -> streamText(request, listener, text) }
 
     /** The transcript a compression is about to discard: long enough that a small budget forces a truncation. */
@@ -111,7 +111,7 @@ class ModelSummarizerTest {
         // transcript is asserted where it actually travels rather than where a hand-built history would have put it.
         assertEquals(
             listOf("用户问了几点。助手回答了时间。"),
-            request.input.filterIsInstance<edith.plugin.InputPart.Text>().map { it.text },
+            request.input.filterIsInstance<com.sheen.rokid.plugin.InputPart.Text>().map { it.text },
             "the transcript to summarise has to be what the request carries",
         )
         assertTrue(request.tools.isEmpty(), "a summary must never be able to execute anything: ${request.tools}")

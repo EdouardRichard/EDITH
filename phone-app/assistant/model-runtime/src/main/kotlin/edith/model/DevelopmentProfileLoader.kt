@@ -1,6 +1,6 @@
 package edith.model
 
-import edith.plugin.*
+import com.sheen.rokid.plugin.*
 import edith.storage.MemorySecretResolver
 import java.nio.file.Path
 import java.nio.file.Files

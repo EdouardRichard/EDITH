@@ -3,12 +3,12 @@ package edith.phone
 import android.content.Context
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
-import edith.contracts.Assistance
-import edith.output.TtsAvailability
-import edith.output.availability
-import edith.plugin.CancellationHandle
-import edith.plugin.SpeechPlayback
-import edith.plugin.SpeechPlayer
+import com.sheen.rokid.contracts.Assistance
+import com.sheen.rokid.output.TtsAvailability
+import com.sheen.rokid.output.availability
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.SpeechPlayback
+import com.sheen.rokid.plugin.SpeechPlayer
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 

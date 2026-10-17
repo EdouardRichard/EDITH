@@ -1,7 +1,7 @@
 package edith.agent
 
-import edith.plugin.MessageRole
-import edith.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelHistoryItem
 
 /**
  * The history a plan hands back, plus the bookkeeping that keeps truncation visible.

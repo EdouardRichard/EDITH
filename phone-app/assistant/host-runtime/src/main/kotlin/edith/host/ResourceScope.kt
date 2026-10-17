@@ -1,9 +1,9 @@
 package edith.host
 
-import edith.contracts.ContractError
-import edith.contracts.Generation
-import edith.contracts.SessionId
-import edith.plugin.CancellationHandle
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.CancellationHandle
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ResourceScope(val pluginId: String, val sessionId: SessionId, val generation: Generation) {

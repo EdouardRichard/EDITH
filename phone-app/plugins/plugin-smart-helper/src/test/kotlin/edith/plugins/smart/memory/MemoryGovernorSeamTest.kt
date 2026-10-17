@@ -2,7 +2,7 @@ package edith.plugins.smart.memory
 
 import edith.agent.Segment
 import edith.agent.SegmentOrigin
-import edith.plugin.StorageHandle
+import com.sheen.rokid.plugin.StorageHandle
 import edith.plugins.smart.library.LibraryGovernor
 import edith.plugins.smart.library.LibraryState
 import kotlin.test.Test

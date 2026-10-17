@@ -1,7 +1,7 @@
 package edith.model
 
-import edith.plugin.CancellationHandle
-import edith.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.ModelStreamEvent
 
 /** Host-only synthetic text testing; concrete transport and verification are implemented in T12. */
 interface ProfileTester {

@@ -1,6 +1,6 @@
 package edith.storage
 
-import edith.plugin.SpeakerProfileRef
+import com.sheen.rokid.plugin.SpeakerProfileRef
 import kotlin.test.*
 
 class SpeakerDeletionTest {

@@ -1,11 +1,11 @@
 package edith.phone
 
 import edith.audio.SpeechPipeline
-import edith.contracts.HostEvent
-import edith.contracts.TranscriptEvent
-import edith.contracts.TranscriptRevision
-import edith.plugin.AsrSession
-import edith.plugin.CancellationHandle
+import com.sheen.rokid.contracts.HostEvent
+import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.contracts.TranscriptRevision
+import com.sheen.rokid.plugin.AsrSession
+import com.sheen.rokid.plugin.CancellationHandle
 
 /**
  * The `Capability.Asr` provider: the speech pipeline's transcripts as the plugin-facing [AsrSession].

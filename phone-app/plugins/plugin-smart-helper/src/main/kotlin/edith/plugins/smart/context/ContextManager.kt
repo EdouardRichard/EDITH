@@ -2,8 +2,8 @@ package edith.plugins.smart.context
 
 import edith.agent.MemoryRetrieval
 import edith.agent.Segment
-import edith.plugin.MessageRole
-import edith.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.MessageRole
+import com.sheen.rokid.plugin.ModelHistoryItem
 import edith.plugins.smart.SmartPrompts
 
 /**

@@ -1,10 +1,10 @@
 package edith.plugins.smart.memory
 
-import edith.plugin.Capability
-import edith.plugin.EmbedResult
-import edith.plugin.EmbeddingService
-import edith.plugin.FailureReason
-import edith.plugin.ModelInfo
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.FailureReason
+import com.sheen.rokid.plugin.ModelInfo
 import edith.plugins.smart.P3Log
 import edith.plugins.smart.SmartFakeStorage
 import edith.plugins.smart.SmartTestRig

@@ -2,7 +2,7 @@ package edith.plugins.smart
 
 import edith.agent.BoundedAuditLog
 import edith.agent.ConfirmationSource
-import edith.plugin.StorageHandle
+import com.sheen.rokid.plugin.StorageHandle
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse

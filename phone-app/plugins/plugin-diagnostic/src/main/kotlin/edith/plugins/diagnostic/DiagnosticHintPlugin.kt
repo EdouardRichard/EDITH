@@ -1,17 +1,17 @@
 package edith.plugins.diagnostic
 
-import edith.contracts.Assistance
-import edith.contracts.HostEvent
-import edith.output.HintReadingBudget
-import edith.plugin.Capability
-import edith.plugin.ConfigSchema
-import edith.plugin.DeactivationReason
-import edith.plugin.MonotonicClock
-import edith.plugin.OutputSink
-import edith.plugin.OutputSubmission
-import edith.plugin.PluginContext
-import edith.plugin.PluginDescriptor
-import edith.plugin.PluginLifecycle
+import com.sheen.rokid.contracts.Assistance
+import com.sheen.rokid.contracts.HostEvent
+import com.sheen.rokid.output.HintReadingBudget
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ConfigSchema
+import com.sheen.rokid.plugin.DeactivationReason
+import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.OutputSink
+import com.sheen.rokid.plugin.OutputSubmission
+import com.sheen.rokid.plugin.PluginContext
+import com.sheen.rokid.plugin.PluginDescriptor
+import com.sheen.rokid.plugin.PluginLifecycle
 
 /**
  * Debug-only hint source for the T18 display acceptance.

@@ -1,7 +1,7 @@
 package edith.audio
 
-import edith.contracts.*
-import edith.plugin.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.*
 import edith.storage.SpeakerProfileStore
 import java.util.concurrent.Executor
 import java.util.UUID

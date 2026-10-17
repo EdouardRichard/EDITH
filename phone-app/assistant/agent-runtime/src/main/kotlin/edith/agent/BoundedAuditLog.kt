@@ -1,6 +1,6 @@
 package edith.agent
 
-import edith.plugin.MonotonicClock
+import com.sheen.rokid.plugin.MonotonicClock
 
 /** At most this many characters of a summary are ever stored; the rest is dropped, not summarised. */
 private const val MAX_SUMMARY_CHARS = 200

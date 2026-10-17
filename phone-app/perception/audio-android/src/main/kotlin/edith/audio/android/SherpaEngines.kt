@@ -1,8 +1,8 @@
 package edith.audio.android
 
 import edith.audio.*
-import edith.contracts.*
-import edith.plugin.SpeakerWindow
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.SpeakerWindow
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 

@@ -3,7 +3,7 @@ package edith.audio.android
 import edith.audio.AsrHypothesis
 import edith.audio.PcmFrame
 import edith.audio.VadDecision
-import edith.contracts.*
+import com.sheen.rokid.contracts.*
 import org.junit.Assert.*
 import org.junit.Test
 

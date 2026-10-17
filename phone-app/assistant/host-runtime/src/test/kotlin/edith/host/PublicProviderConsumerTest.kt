@@ -1,12 +1,12 @@
 package edith.host
 
-import edith.contracts.*
-import edith.plugin.*
-import edith.output.*
+import com.sheen.rokid.contracts.*
+import com.sheen.rokid.plugin.*
+import com.sheen.rokid.output.*
 import edith.plugins.diagnostic.DiagnosticTextPlugin
 import edith.plugins.smart.SmartAssistantPlugin
 import edith.plugins.interview.InterviewAssistantPlugin
-import edith.testsupport.*
+import com.sheen.rokid.testsupport.*
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.*

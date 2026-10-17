@@ -1,7 +1,7 @@
 package edith.host
 
-import edith.contracts.ContractError
-import edith.plugin.*
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.plugin.*
 
 internal object ConfigurationPolicy {
     fun validate(plugin: PluginLifecycle, configuration: PluginConfiguration) {
