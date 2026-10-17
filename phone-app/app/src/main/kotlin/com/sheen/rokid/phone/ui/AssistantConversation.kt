@@ -65,18 +65,34 @@ fun shouldAutoScroll(atBottom: Boolean, previousCount: Int, newCount: Int): Bool
 fun shouldFollowNewEntry(atBottom: Boolean, previousLastId: String?, currentLastId: String?): Boolean =
     atBottom && currentLastId != null && currentLastId != previousLastId
 
+/** One visible `LazyColumn` item: its key and the screen offset of its bottom edge (`offset + size`). */
+data class VisibleItem(val key: Any?, val endOffset: Int)
+
 /**
  * Whether the reader was at the bottom before a new entry arrived.
  *
- * The **visible item keys** are the authority, never an index/count comparison. `ConversationLog` is bounded at 40
- * entries, so once the cap is reached an append evicts the oldest entry and leaves the count unchanged; and the new
- * item may or may not be laid out by the time the follow effect runs. The previous last entry still being on screen is
- * the frame-order-independent fact that means "the reader was at the end". A null [previousLastId] means the list was
- * empty, so the first entry is followed; a non-null previous id with no visible keys means the list has not been laid
- * out yet, which is not the same thing as a reader who scrolled away.
+ * The **end of the previous last entry being visible** is the fact that matters, never an index/count comparison:
+ *  - `ConversationLog` is bounded at 40 entries, so an append at the cap evicts the oldest entry and leaves the count
+ *    unchanged; a count comparison cannot see the new entry.
+ *  - A long last bubble whose tail is still below the viewport is being read, not finished; its key being visible is
+ *    not enough.
+ *  - A fully visible last entry means the end of the list, even when empty space sits below it.
+ *
+ * A null [previousLastId] means the list was empty, so the first entry is followed. A non-null previous id with no
+ * visible items means the list has not been laid out yet, which is not the same thing as a reader who scrolled away.
  */
-fun wasAtBottom(visibleKeys: List<Any?>, previousLastId: String?): Boolean =
-    previousLastId == null || visibleKeys.any { it == previousLastId }
+fun wasAtBottom(
+    previousLastId: String?,
+    visibleItems: List<VisibleItem>,
+    viewportEndOffset: Int,
+    bottomPaddingPx: Int,
+): Boolean {
+    if (previousLastId == null) return true
+    val previousLast = visibleItems.firstOrNull { it.key == previousLastId } ?: return false
+    // <=, not >=: the item's *end* must already be on screen. A partially visible last item has its end below the
+    // viewport and is still being read.
+    return previousLast.endOffset <= viewportEndOffset - bottomPaddingPx + 1
+}
 
 /** The index a freshly opened route starts at: the newest entry, or `null` when there is nothing to show. */
 fun initialScrollTarget(entryCount: Int): Int? = if (entryCount > 0) entryCount - 1 else null

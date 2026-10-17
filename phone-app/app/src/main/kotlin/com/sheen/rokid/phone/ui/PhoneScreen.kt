@@ -24,6 +24,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
@@ -250,7 +251,10 @@ internal fun AssistantTab(log: ConversationLog, modifier: Modifier = Modifier) {
     var route by remember { mutableStateOf(AssistantRoute.WAKE) }
     var revision by remember { mutableStateOf(0) }
     val entries = remember(revision, route) { log.entries(route) }
-    val listState = rememberLazyListState()
+    // Start the first layout at the newest entry, so the frame before the route-opening effect cannot show the oldest
+    // one. The route-opening effect still owns route switches (the state is shared, not recreated).
+    val listState = rememberLazyListState(initialFirstVisibleItemIndex = initialScrollTarget(entries.size) ?: 0)
+    val bottomPaddingPx = with(LocalDensity.current) { 12.dp.roundToPx() }
     // The values the follow decision compares against. They reset with the route, because the list state belongs to one
     // conversation at a time: carrying the old position into the other route would judge the wrong reader position.
     var previousCount by remember(route) { mutableStateOf(entries.size) }
@@ -273,24 +277,26 @@ internal fun AssistantTab(log: ConversationLog, modifier: Modifier = Modifier) {
         previousLastId = entries.lastOrNull()?.entryId
     }
 
-    // Follow a newly appended entry only when the reader was already at the bottom. The bottom test compares the last
-    // visible index with the *previous* count, not with the new total: after an append the new item is not laid out yet
-    // on some frames, and "last visible < new total - 1" would then wrongly read as "the reader scrolled up".
+    // Follow a newly appended entry only when the reader was already at the bottom. The previous last entry's *end*
+    // being visible is the frame-order-independent fact that means "the reader is at the end": an index/count comparison
+    // cannot see a capped append (count stays 40), and a long last bubble that is only partly visible is still being
+    // read rather than finished.
     LaunchedEffect(entries.size, entries.lastOrNull()?.entryId) {
-        // Visible *keys*, not an index/count comparison: at the 40-entry cap an append evicts the oldest entry and the
-        // count stays 40, and the new item may or may not have been laid out yet. The previous last entry still being
-        // on screen is the frame-order-independent fact that means the reader was at the bottom.
-        val visibleKeys = listState.layoutInfo.visibleItemsInfo.map { it.key }
-        val atBottomBefore = wasAtBottom(visibleKeys, previousLastId)
+        val layout = listState.layoutInfo
+        val visibleItems = layout.visibleItemsInfo.map { VisibleItem(it.key, it.offset + it.size) }
+        val atBottomBefore = wasAtBottom(previousLastId, visibleItems, layout.viewportEndOffset, bottomPaddingPx)
         // Either a count increase or a changed last id is a new entry; the second covers the bounded log's cap.
         val shouldFollow = shouldAutoScroll(atBottomBefore, previousCount, entries.size) ||
             shouldFollowNewEntry(atBottomBefore, previousLastId, entries.lastOrNull()?.entryId)
-        if (entries.isNotEmpty() && shouldFollow) {
-            if (previousCount == 0) listState.scrollToItem(entries.lastIndex)
-            else listState.animateScrollToItem(entries.lastIndex)
-        }
+        val oldCount = previousCount
+        // Bookkeeping is updated BEFORE the suspend scroll: if the animation is cancelled by the user starting to
+        // scroll, the next decision must still compare against the list that is now on screen, not the one before it.
         previousCount = entries.size
         previousLastId = entries.lastOrNull()?.entryId
+        if (entries.isNotEmpty() && shouldFollow) {
+            if (oldCount == 0) listState.scrollToItem(entries.lastIndex)
+            else listState.animateScrollToItem(entries.lastIndex)
+        }
     }
 
     Column(

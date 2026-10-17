@@ -55,14 +55,17 @@ class AssistantConversationTest {
         assertTrue(shouldFollowNewEntry(atBottom = true, previousLastId = null, currentLastId = "h-1"))
     }
 
-    @Test fun `the reader is at the bottom when the previous last entry is still visible`() {
+    @Test fun `the reader is at the bottom only when the previous last entry's end is visible`() {
         // Empty log: the first entry must be followed.
-        assertTrue(wasAtBottom(emptyList(), previousLastId = null))
-        assertTrue(wasAtBottom(listOf("h-40"), previousLastId = "h-40"))
-        assertFalse(wasAtBottom(listOf("h-38"), previousLastId = "h-40"))
-        // A list that is not laid out yet is not a reader who is reading older messages; only the route-opening
-        // effect scrolls then, and the follow gate is not the authority for the first frame.
-        assertFalse(wasAtBottom(emptyList(), previousLastId = "h-40"))
+        assertTrue(wasAtBottom(previousLastId = null, visibleItems = emptyList(), viewportEndOffset = 800, bottomPaddingPx = 12))
+        // The previous last entry is fully visible (its end is inside the viewport): the reader is at the end.
+        assertTrue(wasAtBottom("h-40", listOf(VisibleItem("h-40", endOffset = 788)), 800, 12))
+        // A long last bubble whose tail is still below the viewport: the reader is inside it, not at the bottom.
+        assertFalse(wasAtBottom("h-40", listOf(VisibleItem("h-40", endOffset = 900)), 800, 12))
+        // The previous last entry is no longer visible: the reader scrolled up.
+        assertFalse(wasAtBottom("h-40", listOf(VisibleItem("h-38", endOffset = 788)), 800, 12))
+        // A non-null previous id with no visible items is a not-laid-out list, not an at-bottom reader.
+        assertFalse(wasAtBottom("h-40", emptyList(), 800, 12))
     }
 
     @Test fun `a fresh view starts at the newest entry`() {
