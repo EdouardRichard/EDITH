@@ -87,6 +87,21 @@
             </intent-filter>
         </receiver>
         <!--
+          Phase 7 F4 memory-form switch. Same export rule and the same reason as the instruments above: the only caller
+          is an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
+          release build. It selects the measurement form the plugin reads at activation - `A` legacy raw, `B`
+          production - so the A/B experiment can share one APK and one memory document. It logs the form name and
+          whether a plugin accepted it, never memory text.
+        -->
+        <receiver
+            android:name=".DebugMemoryForm"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_MEMORY_FORM" />
+            </intent-filter>
+        </receiver>
+        <!--
           `DebugModelProbe` (the generic all-models-on-an-accelerator probe) is NOT registered here yet: it needs the
           process's single shared LiteRT `Environment`, which lives in the vendored `com.laya` file as a
           file-private object, so the probe cannot compile without making vendored code non-private. Its entry, its

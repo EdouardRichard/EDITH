@@ -328,6 +328,16 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
+     * Phase 7 F4 (§3.2): the smart plugin this composition registered, for the **debug-only** measurement receivers.
+     *
+     * The receiver must reach the same plugin instance the host activates, or setting the form would change a
+     * different object's state; [smartWiring] is the composition's own holder and this accessor exposes it read-only.
+     * Null for the harnesses that build a composition with no smart plugin. `internal`, and no production code reads
+     * it: only `src/debug` receivers call it, which is what keeps the measurement switch out of a release build.
+     */
+    internal val smartPluginForProbe: SmartAssistantPlugin? get() = smartWiring?.plugin
+
+    /**
      * P3.3 (spec §17.2): one probe per execution channel, logged once per session as `P3_EXEC channel=… available=…`.
      *
      * The pair is id to a **live** question, not a cached answer: the accessibility service is switched off in system

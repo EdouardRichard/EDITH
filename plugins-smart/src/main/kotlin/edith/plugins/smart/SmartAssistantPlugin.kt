@@ -78,7 +78,10 @@ import edith.plugins.smart.context.PromptAssembly
 import edith.plugins.smart.context.TokenBudget
 import edith.plugins.smart.context.estimatedLength
 import edith.plugins.smart.library.LibraryGovernor
+import edith.plugins.smart.memory.LegacyRawMemoryEvidenceRenderer
 import edith.plugins.smart.memory.MemoryExtraction
+import edith.plugins.smart.memory.MemoryMeasurementForm
+import edith.plugins.smart.memory.ProductionMemoryEvidenceRenderer
 import edith.plugins.smart.proactive.ChoiceGate
 import edith.plugins.smart.proactive.GateForm
 import edith.plugins.smart.proactive.NoulGate
@@ -387,6 +390,33 @@ class SmartAssistantPlugin(
      * and the gateways then inject nothing at all.
      */
     @Volatile private var memoryRetrieval: MemoryRetrieval? = null
+
+    /**
+     * Phase 7 F4 (§3.1/§3.2): which memory form [activate] renders, **measurement only**.
+     *
+     * The default is [MemoryMeasurementForm.PRODUCTION], which keeps the production output byte-identical. A
+     * debug-only receiver may set [MemoryMeasurementForm.LEGACY_RAW] before a session activates, and [activate] reads
+     * the value once when it constructs the session's `MemoryModule`. **No production caller sets this**, and a release
+     * build has no component that could; the property exists so the F4 experiment is a runtime measurement switch
+     * rather than a second APK.
+     *
+     * `@Volatile` because the debug receiver runs on the main thread while `activate` runs on the host's plugin
+     * thread: the write must be visible to the activation that follows it.
+     */
+    @Volatile private var memoryMeasurementForm = MemoryMeasurementForm.PRODUCTION
+
+    /**
+     * Selects the memory form the next [activate] will render. **Measurement only; production never calls it.**
+     *
+     * The value is read at activation time, not per turn, so a caller must set it **before** the session activates
+     * (design §3.1); changing it mid-session deliberately does nothing to that session's renderer.
+     */
+    fun setMemoryMeasurementForm(form: MemoryMeasurementForm) {
+        memoryMeasurementForm = form
+    }
+
+    /** Test-only observation of the measurement form; no production caller has any reason to reach for it. */
+    internal fun memoryMeasurementFormForTest(): MemoryMeasurementForm = memoryMeasurementForm
 
     /**
      * edith-0.2 Phase B (B1/B3/B6): the **session's** prompt assembly and compressor.
@@ -727,6 +757,14 @@ class SmartAssistantPlugin(
             log = memoryLog,
             embeddings = runCatching { context.services.embedding() }.getOrNull(),
             lexicon = SmartMemoryRetrieval(memoryLog),
+            // Phase 7 F4 (§3.1): the measurement switch is read here, once per activation. Production (the default)
+            // passes the same renderer `MemoryModule` already defaults to, so its output is unchanged; only an
+            // explicit debug-only LEGACY_RAW selection takes the experiment's raw path.
+            renderer = if (memoryMeasurementForm == MemoryMeasurementForm.LEGACY_RAW) {
+                LegacyRawMemoryEvidenceRenderer
+            } else {
+                ProductionMemoryEvidenceRenderer
+            },
         )
         memoryRetrieval = MemoryModuleRetrieval(memory)
         memoryExtraction = MemoryExtraction(
