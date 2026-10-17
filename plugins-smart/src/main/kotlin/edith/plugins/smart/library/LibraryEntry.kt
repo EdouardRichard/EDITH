@@ -12,17 +12,18 @@ package edith.plugins.smart.library
 enum class LibraryState { ACTIVE, DORMANT, RETIRED }
 
 /**
- * One governed library entry: an id, its lifecycle [state], how many drift observations it has accumulated since it
- * was last pulled (or created), and how many times it has been pulled in total.
+ * One governed library entry: an id, its lifecycle [state], how many drift observations it has accumulated, and how
+ * many times it has been pulled in total.
  *
  * [observedTurns] is progress along the drift, not the entry's age. It counts up while the entry is advertised and
  * untouched, is wiped to zero by a pull, and drives the thresholds in [LibraryGovernor]: `minObservedTurns` demotes,
- * twice that retires. Once a pull has happened the counter stops moving entirely for this process, so it can never
- * carry the entry back over a threshold it has already been rescued from.
+ * twice that retires. Once [pulls] is greater than zero the counter stops moving entirely for this process, so it can
+ * never carry the entry back over a threshold it has already been rescued from.
  *
- * [pulledSinceReset] is that freeze, made explicit: true means "the wearer has used this entry here, so drift is no
- * longer counted against it". It is derived state, carried on the entry so a consumer reading a transition can tell
- * "still being advertised, never used" from "used, therefore never demoted".
+ * The freeze is **derived, not stored**: `pulls > 0` *is* "the wearer has used this entry here, so drift is no longer
+ * counted against it" ([LibraryGovernor] guards both the counting and the advancing on that expression). Carrying a
+ * separate flag for it would admit the inconsistent combination `pulls > 0 && !flag`, a state in which the protection
+ * silently vanishes — so there is no such field.
  *
  * This type is deliberately anonymous about what the id *means*. It carries ids, states and counts only, so the SKILL
  * catalog and the memory store can both be governed by the same machinery without either one leaking into it.
@@ -32,5 +33,4 @@ data class LibraryEntry(
     val state: LibraryState,
     val observedTurns: Int,
     val pulls: Int,
-    val pulledSinceReset: Boolean = false,
 )

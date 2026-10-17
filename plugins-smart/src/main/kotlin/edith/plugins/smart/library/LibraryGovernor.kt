@@ -25,7 +25,8 @@ data class GovernorVerdict(
  * on every turn but never pulled accumulates drift evidence; enough of it and the entry is demoted out of the catalog
  * ([LibraryState.DORMANT]), and twice that and it is retired outright ([LibraryState.RETIRED]). One pull — the wearer
  * actually using the entry — erases the evidence and returns it to [LibraryState.ACTIVE] from any state, and from then
- * on this process stops counting drift against it at all.
+ * on this process stops counting drift against it at all. The freeze is derived, not stored: `pulls > 0` is the whole
+ * condition, and it is checked at both guard sites ([observeTurn] does not count, [endTurn] does not advance).
  *
  * ## Why a pull silences drift for the rest of the process
  *
@@ -61,12 +62,20 @@ class LibraryGovernor(
 
     private val entries = LinkedHashMap<String, LibraryEntry>()
     private val seenThisTurn = LinkedHashSet<String>()
+    private val everListed = LinkedHashSet<String>()
+    private var pendingCatalogDemotions = LinkedHashSet<String>()
     private var turnOpen = false
 
     private var pullsThisTurnCount = 0
     private var pullsThisSessionCount = 0
 
-    /** How many pulls have happened since the last [endTurn]. */
+    /**
+     * How many pulls happened during the turn that just completed.
+     *
+     * The count survives [endTurn] — that is exactly when the design reads it (`P3_SKILL pulls turn=… session=…`) —
+     * and is reset when the next turn opens in [observeTurn]. Before any turn has been observed, and during a turn
+     * that has seen no pull, it reads 0.
+     */
     val pullsThisTurn: Int get() = pullsThisTurnCount
 
     /** How many pulls have happened since this governor was created. */
@@ -81,24 +90,30 @@ class LibraryGovernor(
      * however many calls this turn advertises it, so a turn that rebuilds the catalog repeatedly cannot inflate the
      * evidence. The batch is closed by [endTurn] and the next [observeTurn] starts the next turn.
      *
-     * An entry that has been pulled since its last reset is not counted at all — its drift evidence is not "reset and
-     * then allowed to regrow", it is absent (see the class comment).
+     * An entry with `pulls > 0` is not counted at all — its drift evidence is not "reset and then allowed to regrow",
+     * it is absent (see the class comment). That is the freeze, and `pulls > 0` is the whole of it.
      *
      * Returns the verdict for the creation step, which is always empty today: entries are only ever created ACTIVE,
      * and only [endTurn] and [catalog] move them.
      */
     fun observeTurn(advertised: Collection<String>): GovernorVerdict {
         if (!turnOpen) {
+            // The turn boundary is here, not in endTurn(): the design reads pullsThisTurn at turn end, right after
+            // endTurn(), so resetting there would erase the number at the one moment it is needed. The counter is
+            // therefore "pulls during the last completed turn" until the next turn opens.
+            pullsThisTurnCount = 0
             seenThisTurn.clear()
             turnOpen = true
         }
         advertised.toSet().forEach { id ->
-            seenThisTurn += id
+            // The observation unit is the turn: only the FIRST sighting of an id this turn may count, so an id that a
+            // later call this turn advertises again is already in the set and falls through untouched.
+            if (!seenThisTurn.add(id)) return@forEach
             val existing = entries[id]
             entries[id] = when {
                 existing == null ->
                     LibraryEntry(id = id, state = LibraryState.ACTIVE, observedTurns = 1, pulls = 0)
-                existing.pulledSinceReset -> existing
+                existing.pulls > 0 -> existing
                 else -> existing.copy(observedTurns = existing.observedTurns + 1)
             }
         }
@@ -111,10 +126,10 @@ class LibraryGovernor(
     /**
      * Close the current turn and advance the entries that were seen in it.
      *
-     * An entry advances only if it was advertised at least once this turn **and** has been pulled zero times since its
-     * last reset (creation counts as a reset). An entry that this turn never advertised is left where it is — it is
-     * not in the catalog, so it cannot drift — and an entry the wearer has pulled is left ACTIVE, which is what keeps
-     * a used entry from being retired out from under them.
+     * An entry advances only if it was advertised at least once this turn **and** has never been pulled in this process
+     * (`pulls == 0`). An entry that this turn never advertised is left where it is — it is not in the catalog, so it
+     * cannot drift — and an entry the wearer has pulled is left ACTIVE, which is what keeps a used entry from being
+     * retired out from under them.
      *
      * Also enforces the size cap, so the turn that overflows the catalog reports the overflow in its own verdict.
      * Idempotent: a second call with nothing newly seen advances nothing and reports nothing.
@@ -126,7 +141,7 @@ class LibraryGovernor(
         // Keys are visited in sorted order so the verdict is stable regardless of the order ids were advertised in.
         seenThisTurn.sorted().forEach { id ->
             val entry = entries[id] ?: return@forEach
-            if (entry.pulledSinceReset) return@forEach
+            if (entry.pulls > 0) return@forEach
             when (advance(entry)) {
                 LibraryState.DORMANT -> {
                     demoted += id
@@ -141,10 +156,10 @@ class LibraryGovernor(
             }
         }
 
-        val overflow = applyCatalogCap()
+        val overflow = applyCatalogCap() + pendingCatalogDemotions
+        pendingCatalogDemotions = LinkedHashSet()
         turnOpen = false
         seenThisTurn.clear()
-        pullsThisTurnCount = 0
 
         return GovernorVerdict(
             demoted = demoted + overflow,
@@ -157,8 +172,8 @@ class LibraryGovernor(
      * Record that the wearer actually pulled [id].
      *
      * A pull increments the lifetime count, wipes the drift evidence, forces the entry back to [LibraryState.ACTIVE]
-     * from **any** state — including [LibraryState.RETIRED] — and marks it pulled for the rest of this process, which
-     * freezes the drift counter (see the class comment for why that guarantee is unbounded).
+     * from **any** state — including [LibraryState.RETIRED] — and makes `pulls > 0`, which freezes the drift counter
+     * for the rest of this process (see the class comment for why that guarantee is unbounded).
      *
      * Pulling an id this governor has never seen is a no-op: an unseen id has nothing to reset, and inventing an entry
      * here would let a stale caller repopulate the catalog.
@@ -169,7 +184,6 @@ class LibraryGovernor(
             state = LibraryState.ACTIVE,
             observedTurns = 0,
             pulls = entry.pulls + 1,
-            pulledSinceReset = true,
         )
         pullsThisTurnCount += 1
         pullsThisSessionCount += 1
@@ -184,20 +198,35 @@ class LibraryGovernor(
      *
      * When more entries are ACTIVE than the catalog holds, the lexicographically smallest ids keep their places and the
      * remainder are demoted to [LibraryState.DORMANT]. The comparison is on the id alone, so the rule is deterministic
-     * and independent of the order ids were advertised in.
+     * and independent of the order ids were advertised in. Those demotions are **not** swallowed here: they are queued
+     * and reported by the next [endTurn] verdict, so the turn that caused the overflow names what it demoted (design
+     * D-6 "不静默"). No name or content from an entry is ever reported, only its id.
      *
      * Idempotent: the demotion is applied to the entries, so a second call finds the excess already DORMANT and
-     * reports nothing. [advertised] is accepted for the caller's convenience and for API symmetry with
+     * queues nothing further. [advertised] is accepted for the caller's convenience and for API symmetry with
      * [observeTurn]; selecting on it would make the cap depend on this step's advertisement rather than on the
      * catalog's contents, which is the thing being bounded.
      */
     fun catalog(advertised: Collection<String>): List<String> {
-        applyCatalogCap()
-        return activeIds().take(maxCatalogEntries)
+        // An overflow the cap applies here is not thrown away: it is queued for the next endTurn() verdict, because
+        // the design's ordering is "catalog per request, endTurn at turn end" — without this, the request that
+        // overflowed the catalog would demote entries and nothing would ever report it (D-6 "不静默").
+        pendingCatalogDemotions += applyCatalogCap()
+        val listed = activeIds().take(maxCatalogEntries)
+        everListed += listed
+        return listed
     }
 
-    /** How many known entries have never been pulled, whatever state they are in. */
-    fun neverPulledCount(): Int = entries.values.count { it.pulls == 0 }
+    /**
+     * How many entries have appeared in a catalog and have never been pulled (design D-10).
+     *
+     * "Listed" means the id was actually handed out by [catalog]: it survived that call's cap and was part of the
+     * sorted, bounded result. An entry that the cap demoted before it was ever listed is therefore *not* counted —
+     * it never reached the model, so it cannot be part of the "the catalog advertises entries nobody uses" signal that
+     * this count exists to detect. Counting every known-but-unpulled entry instead would make the count grow with the
+     * overflow, i.e. with the very entries the model was never shown.
+     */
+    fun neverPulledCount(): Int = everListed.count { entries[it]?.pulls == 0 }
 
     /**
      * The state an entry moves to once its drift reaches the next threshold, or [LibraryState.ACTIVE] when it has not.
