@@ -1,11 +1,11 @@
-package edith.rokid
+package com.sheen.rokid.transport
 
 import android.app.Activity
 import androidx.test.ext.junit.runners.AndroidJUnit4
-import edith.audio.PcmIngress
-import edith.audio.PcmOffer
+import com.sheen.rokid.audio.PcmIngress
+import com.sheen.rokid.audio.PcmOffer
 import com.sheen.rokid.contracts.*
-import edith.host.*
+import com.sheen.rokid.host.*
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.testsupport.*
 import org.junit.Assert.*

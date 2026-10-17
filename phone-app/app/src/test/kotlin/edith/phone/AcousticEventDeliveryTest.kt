@@ -1,13 +1,13 @@
 package edith.phone
 
-import edith.audio.AsrHypothesis
-import edith.audio.PcmFramer
-import edith.audio.PcmFrame
-import edith.audio.PcmIngress
-import edith.audio.SpeakerEngine
-import edith.audio.StreamingAsrEngine
-import edith.audio.VadDecision
-import edith.audio.VadEngine
+import com.sheen.rokid.audio.AsrHypothesis
+import com.sheen.rokid.audio.PcmFramer
+import com.sheen.rokid.audio.PcmFrame
+import com.sheen.rokid.audio.PcmIngress
+import com.sheen.rokid.audio.SpeakerEngine
+import com.sheen.rokid.audio.StreamingAsrEngine
+import com.sheen.rokid.audio.VadDecision
+import com.sheen.rokid.audio.VadEngine
 import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
 import com.sheen.rokid.contracts.AudioFormat
@@ -17,8 +17,8 @@ import com.sheen.rokid.contracts.PcmEncoding
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.contracts.SpeakerAssessment
 import com.sheen.rokid.contracts.VerifiedPcm
-import edith.host.ActivationResult
-import edith.host.HostRuntime
+import com.sheen.rokid.host.ActivationResult
+import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ConfigSchema

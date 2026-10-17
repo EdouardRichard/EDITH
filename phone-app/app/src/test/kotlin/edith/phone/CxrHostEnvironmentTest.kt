@@ -3,7 +3,7 @@ package edith.phone
 import com.sheen.rokid.contracts.Assistance
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
-import edith.host.ResourceScope
+import com.sheen.rokid.host.ResourceScope
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ContextSignals

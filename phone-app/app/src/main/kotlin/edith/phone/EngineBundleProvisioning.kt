@@ -1,7 +1,7 @@
 package edith.phone
 
-import edith.audio.android.EngineManifestLoader
-import edith.audio.android.EngineModelStore
+import com.sheen.rokid.audio.android.EngineManifestLoader
+import com.sheen.rokid.audio.android.EngineModelStore
 import com.sheen.rokid.contracts.ContractError
 import java.io.File
 import java.io.InputStream

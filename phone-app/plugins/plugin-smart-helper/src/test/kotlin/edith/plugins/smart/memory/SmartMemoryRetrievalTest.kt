@@ -34,7 +34,7 @@ class SmartMemoryRetrievalTest {
 
         assertEquals(1, parts.size)
         // Phase 3: Segment has no id field; origin verifies it is memory evidence
-        assertEquals(edith.agent.SegmentOrigin.MEMORY_EVIDENCE, parts.single().origin)
+        assertEquals(com.sheen.rokid.agent.SegmentOrigin.MEMORY_EVIDENCE, parts.single().origin)
         assertEquals("我喜欢喝茶", parts.single().text)
         // Phase 3: Segment has no importance field; untrusted flag verifies memory evidence semantics
         assertTrue(!parts.single().trusted, "memory evidence must be untrusted")

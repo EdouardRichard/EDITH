@@ -5,9 +5,9 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.contracts.SessionId
-import edith.rokid.ControlledToneCapture
-import edith.rokid.ControlledToneFormat
-import edith.rokid.MonoPcmFormat
+import com.sheen.rokid.transport.ControlledToneCapture
+import com.sheen.rokid.transport.ControlledToneFormat
+import com.sheen.rokid.transport.MonoPcmFormat
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -93,7 +93,7 @@ class PcmFormatBringupTest {
     }
 
     private fun report(chunkSizes: AtomicLongArray, chunks: Int, bytes: Int, measuredMillis: Long,
-        verdict: edith.rokid.VoiceBurstVerdict) {
+        verdict: com.sheen.rokid.transport.VoiceBurstVerdict) {
         val sizes = (0 until minOf(chunks, CHUNK_SAMPLE)).joinToString(",") { chunkSizes.get(it).toString() }
         println("T17_FORMAT_REPORT chunks=$chunks firstChunkSizes=[$sizes] bytes=$bytes " +
             "measuredMillis=$measuredMillis measuredBytesPerSecond=${if (measuredMillis > 0) bytes * 1000.0 / measuredMillis else 0.0} " +

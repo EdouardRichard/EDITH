@@ -1,6 +1,6 @@
 package edith.plugins.smart
 
-import edith.agent.AgentLoop
+import com.sheen.rokid.agent.AgentLoop
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.plugin.CancellationHandle

@@ -1,7 +1,7 @@
 package edith.phone.storage
 
 import com.sheen.rokid.plugin.SpeakerProfileRef
-import edith.storage.SpeakerProfileStore
+import com.sheen.rokid.storage.SpeakerProfileStore
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.UUID

@@ -51,7 +51,7 @@ class MemoryModuleRetrievalTest {
         assertTrue(text.startsWith("<reference_context>"))
         assertTrue(text.endsWith("</reference_context>"))
         assertTrue(text.contains("我不吃香菜"), "original text present (no normalizer configured)")
-        assertTrue(parts.all { it.origin == edith.agent.SegmentOrigin.MEMORY_EVIDENCE })
+        assertTrue(parts.all { it.origin == com.sheen.rokid.agent.SegmentOrigin.MEMORY_EVIDENCE })
     }
 
     @Test

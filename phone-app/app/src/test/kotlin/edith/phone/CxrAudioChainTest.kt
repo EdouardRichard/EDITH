@@ -1,22 +1,22 @@
 package edith.phone
 
-import edith.audio.AsrHypothesis
-import edith.audio.KeywordHit
-import edith.audio.KeywordSpotterPort
-import edith.audio.KeywordStreamPort
-import edith.audio.PcmFramer
-import edith.audio.PcmFrame
-import edith.audio.PcmIngress
-import edith.audio.PcmOffer
-import edith.audio.SpeakerEngine
-import edith.audio.StreamingAsrEngine
-import edith.audio.VadDecision
-import edith.audio.VadEngine
-import edith.audio.WakeWordDetector
-import edith.audio.android.EngineManifest
-import edith.audio.android.EngineModelStore
-import edith.audio.android.ModelArtifact
-import edith.audio.android.ValidatedModelBundle
+import com.sheen.rokid.audio.AsrHypothesis
+import com.sheen.rokid.audio.KeywordHit
+import com.sheen.rokid.audio.KeywordSpotterPort
+import com.sheen.rokid.audio.KeywordStreamPort
+import com.sheen.rokid.audio.PcmFramer
+import com.sheen.rokid.audio.PcmFrame
+import com.sheen.rokid.audio.PcmIngress
+import com.sheen.rokid.audio.PcmOffer
+import com.sheen.rokid.audio.SpeakerEngine
+import com.sheen.rokid.audio.StreamingAsrEngine
+import com.sheen.rokid.audio.VadDecision
+import com.sheen.rokid.audio.VadEngine
+import com.sheen.rokid.audio.WakeWordDetector
+import com.sheen.rokid.audio.android.EngineManifest
+import com.sheen.rokid.audio.android.EngineModelStore
+import com.sheen.rokid.audio.android.ModelArtifact
+import com.sheen.rokid.audio.android.ValidatedModelBundle
 import com.sheen.rokid.contracts.AudioFormat
 import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.contracts.GapReason
@@ -26,12 +26,12 @@ import com.sheen.rokid.contracts.PcmEncoding
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.contracts.SpeakerAssessment
 import com.sheen.rokid.contracts.VerifiedPcm
-import edith.host.HostRuntime
+import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.SpeakerWindow
-import edith.storage.MemoryProfileRepository
+import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
 import java.io.ByteArrayInputStream
@@ -125,7 +125,7 @@ class CxrAudioChainTest {
         override fun wakeDetector(bundle: ValidatedModelBundle, vad: VadEngine,
             emit: (word: String, confidence: Double) -> Unit,
             suppressWhile: () -> Boolean): WakeWordDetector? =
-            WakeWordDetector(vad, edith.audio.KeywordSpotterWakeWordEngine(StubKeywordSpotter(), "伊迪丝"),
+            WakeWordDetector(vad, com.sheen.rokid.audio.KeywordSpotterWakeWordEngine(StubKeywordSpotter(), "伊迪丝"),
                 emit = emit, clock = timeSource, suppressWhile = suppressWhile)
     }
 
@@ -371,7 +371,7 @@ class CxrAudioChainTest {
             override fun wakeDetector(bundle: ValidatedModelBundle, vad: VadEngine,
                 emit: (word: String, confidence: Double) -> Unit,
                 suppressWhile: () -> Boolean): WakeWordDetector =
-                WakeWordDetector(vad, edith.audio.KeywordSpotterWakeWordEngine(HittingKeywordSpotter("伊迪丝"), "伊迪丝"),
+                WakeWordDetector(vad, com.sheen.rokid.audio.KeywordSpotterWakeWordEngine(HittingKeywordSpotter("伊迪丝"), "伊迪丝"),
                     emit = emit, clock = clock, suppressWhile = suppressWhile)
         }
         val ingress = PcmIngress(clock)

@@ -1,15 +1,15 @@
 package edith.plugins.smart.memory
 
-import edith.agent.GatewayTurn
-import edith.agent.ModelClientGateway
-import edith.agent.RequestFrame
-import edith.agent.Segment
-import edith.agent.SegmentOrigin
+import com.sheen.rokid.agent.GatewayTurn
+import com.sheen.rokid.agent.ModelClientGateway
+import com.sheen.rokid.agent.RequestFrame
+import com.sheen.rokid.agent.Segment
+import com.sheen.rokid.agent.SegmentOrigin
 import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
-import edith.model.ContextBudgeter
+import com.sheen.rokid.model.ContextBudgeter
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.InputModality

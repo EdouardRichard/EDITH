@@ -4,8 +4,8 @@ import com.sheen.rokid.contracts.ContextChanged
 import com.sheen.rokid.contracts.HostEvent
 import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.contracts.SessionId
-import edith.host.ActivationResult
-import edith.host.HostRuntime
+import com.sheen.rokid.host.ActivationResult
+import com.sheen.rokid.host.HostRuntime
 import edith.phone.model.ProactiveArming
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability

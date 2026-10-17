@@ -5,7 +5,7 @@ plugins {
 }
 
 android {
-    namespace = "edith.audio.android"
+    namespace = "com.sheen.rokid.audio.android"
     compileSdk = 35
 
     defaultConfig {

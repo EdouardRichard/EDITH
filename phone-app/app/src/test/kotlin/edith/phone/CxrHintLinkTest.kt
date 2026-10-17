@@ -2,7 +2,7 @@ package edith.phone
 
 import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.contracts.SessionState
-import edith.host.HostRuntime
+import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.plugin.CancellationHandle
@@ -18,8 +18,8 @@ import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
 import com.sheen.rokid.plugin.PluginLifecycle
 import edith.plugins.diagnostic.DiagnosticHintPlugin
-import edith.rokid.CxrAuthorizationOutcome
-import edith.storage.MemoryProfileRepository
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
+import com.sheen.rokid.storage.MemoryProfileRepository
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull

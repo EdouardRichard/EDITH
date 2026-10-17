@@ -1,8 +1,8 @@
 package edith.probe.toolcall
 
-import edith.model.ResponsesDecoder
-import edith.model.SseDecoder
-import edith.model.SseFrame
+import com.sheen.rokid.model.ResponsesDecoder
+import com.sheen.rokid.model.SseDecoder
+import com.sheen.rokid.model.SseFrame
 import com.sheen.rokid.plugin.ModelStreamEvent
 import kotlinx.serialization.json.Json
 

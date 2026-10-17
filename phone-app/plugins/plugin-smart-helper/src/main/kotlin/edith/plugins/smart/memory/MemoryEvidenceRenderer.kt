@@ -1,7 +1,7 @@
 package edith.plugins.smart.memory
 
-import edith.agent.Segment
-import edith.agent.SegmentOrigin
+import com.sheen.rokid.agent.Segment
+import com.sheen.rokid.agent.SegmentOrigin
 
 /**
  * Phase 7 F4 (§3.1): the memory evidence rendering seam, **measurement only**.

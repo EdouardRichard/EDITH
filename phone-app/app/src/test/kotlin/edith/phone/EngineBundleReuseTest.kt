@@ -1,15 +1,15 @@
 package edith.phone
 
-import edith.audio.AsrHypothesis
-import edith.audio.PcmFrame
-import edith.audio.SpeakerEngine
-import edith.audio.StreamingAsrEngine
-import edith.audio.VadDecision
-import edith.audio.VadEngine
-import edith.audio.android.EngineManifest
-import edith.audio.android.EngineModelStore
-import edith.audio.android.ModelArtifact
-import edith.audio.android.ValidatedModelBundle
+import com.sheen.rokid.audio.AsrHypothesis
+import com.sheen.rokid.audio.PcmFrame
+import com.sheen.rokid.audio.SpeakerEngine
+import com.sheen.rokid.audio.StreamingAsrEngine
+import com.sheen.rokid.audio.VadDecision
+import com.sheen.rokid.audio.VadEngine
+import com.sheen.rokid.audio.android.EngineManifest
+import com.sheen.rokid.audio.android.EngineModelStore
+import com.sheen.rokid.audio.android.ModelArtifact
+import com.sheen.rokid.audio.android.ValidatedModelBundle
 import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.contracts.SpeakerAssessment
 import com.sheen.rokid.contracts.VerifiedPcm

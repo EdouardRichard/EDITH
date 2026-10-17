@@ -1,11 +1,11 @@
 package edith.phone
 
 import android.content.Context
-import edith.audio.android.EngineManifestLoader
-import edith.audio.android.EngineModelStore
-import edith.audio.android.SherpaEngineCandidate
-import edith.audio.android.SherpaEngineFactory
-import edith.audio.android.ValidatedModelBundle
+import com.sheen.rokid.audio.android.EngineManifestLoader
+import com.sheen.rokid.audio.android.EngineModelStore
+import com.sheen.rokid.audio.android.SherpaEngineCandidate
+import com.sheen.rokid.audio.android.SherpaEngineFactory
+import com.sheen.rokid.audio.android.ValidatedModelBundle
 import com.sheen.rokid.contracts.VerifiedPcm
 import java.io.InputStream
 

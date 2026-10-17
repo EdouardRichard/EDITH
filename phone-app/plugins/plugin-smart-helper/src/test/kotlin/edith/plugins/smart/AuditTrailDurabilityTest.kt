@@ -1,7 +1,7 @@
 package edith.plugins.smart
 
-import edith.agent.BoundedAuditLog
-import edith.agent.ConfirmationSource
+import com.sheen.rokid.agent.BoundedAuditLog
+import com.sheen.rokid.agent.ConfirmationSource
 import com.sheen.rokid.plugin.StorageHandle
 import kotlin.test.*
 

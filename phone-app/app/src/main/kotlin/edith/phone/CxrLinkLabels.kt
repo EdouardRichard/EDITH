@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.rokid.CxrAuthorizationOutcome
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
 
 /**
  * What the glasses-connection area of 会话 may say, and what the SDK's authorization result is allowed to say.

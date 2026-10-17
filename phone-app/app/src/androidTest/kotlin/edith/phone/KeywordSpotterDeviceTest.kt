@@ -3,10 +3,10 @@ package edith.phone
 import android.os.ParcelFileDescriptor
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import edith.audio.KeywordHit
-import edith.audio.KeywordSpotterPort
-import edith.audio.android.KeywordAssetBundle
-import edith.audio.android.SherpaKeywordSpotterFactory
+import com.sheen.rokid.audio.KeywordHit
+import com.sheen.rokid.audio.KeywordSpotterPort
+import com.sheen.rokid.audio.android.KeywordAssetBundle
+import com.sheen.rokid.audio.android.SherpaKeywordSpotterFactory
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue

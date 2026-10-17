@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.rokid.CxrAuthorizationOutcome
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Test

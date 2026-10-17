@@ -1,9 +1,9 @@
 package edith.phone
 
 import com.sheen.rokid.contracts.ContractError
-import edith.host.ResourceScope
-import edith.host.ScheduledHostEnvironment
-import edith.host.ScopedHostServices
+import com.sheen.rokid.host.ResourceScope
+import com.sheen.rokid.host.ScheduledHostEnvironment
+import com.sheen.rokid.host.ScopedHostServices
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.DeadlineScheduler

@@ -1,8 +1,8 @@
 package edith.probe
 
-import edith.model.*
+import com.sheen.rokid.model.*
 import com.sheen.rokid.plugin.*
-import edith.storage.*
+import com.sheen.rokid.storage.*
 import okhttp3.OkHttpClient
 import java.nio.file.Path
 import java.util.concurrent.CountDownLatch

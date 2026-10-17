@@ -1,12 +1,12 @@
 package edith.phone
 
-import edith.audio.AsrHypothesis
-import edith.audio.PcmFrame
-import edith.audio.SpeakerEngine
-import edith.audio.SpeechPipeline
-import edith.audio.StreamingAsrEngine
-import edith.audio.VadDecision
-import edith.audio.VadEngine
+import com.sheen.rokid.audio.AsrHypothesis
+import com.sheen.rokid.audio.PcmFrame
+import com.sheen.rokid.audio.SpeakerEngine
+import com.sheen.rokid.audio.SpeechPipeline
+import com.sheen.rokid.audio.StreamingAsrEngine
+import com.sheen.rokid.audio.VadDecision
+import com.sheen.rokid.audio.VadEngine
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.InputEpoch

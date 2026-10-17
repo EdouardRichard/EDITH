@@ -1,6 +1,6 @@
 package edith.phone.model
 
-import edith.model.ProfileTester
+import com.sheen.rokid.model.ProfileTester
 import edith.phone.storage.*
 import com.sheen.rokid.plugin.*
 import org.junit.Assert.*

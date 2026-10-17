@@ -1,9 +1,9 @@
 package edith.phone
 
 import com.sheen.rokid.contracts.*
-import edith.host.HostRuntime
-import edith.host.ResourceScope
-import edith.host.ScheduledHostEnvironment
+import com.sheen.rokid.host.HostRuntime
+import com.sheen.rokid.host.ResourceScope
+import com.sheen.rokid.host.ScheduledHostEnvironment
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.FakeTaskScope

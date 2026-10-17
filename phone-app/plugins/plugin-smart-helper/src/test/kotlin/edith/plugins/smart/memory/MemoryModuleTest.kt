@@ -194,7 +194,7 @@ class MemoryModuleTest {
         val parts = module.injectionFor("香菜")
 
         val part = parts.single()
-        assertEquals(edith.agent.SegmentOrigin.MEMORY_EVIDENCE, part.origin)
+        assertEquals(com.sheen.rokid.agent.SegmentOrigin.MEMORY_EVIDENCE, part.origin)
         // Phase 4 Task 5: entries are now wrapped in <reference_context> boundary tags.
         // Without a normalizer, the original text is used as fallback inside the block.
         assertTrue(part.text.startsWith("<reference_context>"))

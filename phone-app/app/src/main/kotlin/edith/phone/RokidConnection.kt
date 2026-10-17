@@ -2,13 +2,13 @@ package edith.phone
 
 import android.app.Activity
 import android.content.Intent
-import edith.audio.PcmIngress
-import edith.host.HostRuntime
+import com.sheen.rokid.audio.PcmIngress
+import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.plugin.MonotonicClock
-import edith.rokid.CxrAuthorizationOutcome
-import edith.rokid.CxrInboundPayload
-import edith.rokid.RokidConnectionConfig
-import edith.rokid.RokidSessionTransport
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
+import com.sheen.rokid.transport.CxrInboundPayload
+import com.sheen.rokid.transport.RokidConnectionConfig
+import com.sheen.rokid.transport.RokidSessionTransport
 
 /** Explicit connection seam; engine/display capability selection remains with App assembly. */
 class RokidConnection(activity: Activity, config: RokidConnectionConfig, host: HostRuntime,
@@ -20,7 +20,7 @@ class RokidConnection(activity: Activity, config: RokidConnectionConfig, host: H
      * receiver's `ACCEPTED`/`OVERFLOW`/`UNKNOWN_FORMAT`/`STALE_EPOCH` result died inside `transport-rokid`, so
      * `INGRESS_OVERFLOW` and `UNKNOWN_FORMAT` could never be reported as faults.
      */
-    onOffer: (edith.audio.PcmOffer) -> Unit = {},
+    onOffer: (com.sheen.rokid.audio.PcmOffer) -> Unit = {},
 ) : CxrConnection {
     val ingress = PcmIngress(clock)
     val input = RokidSessionTransport.create(activity.applicationContext, config, ingress,
@@ -32,7 +32,7 @@ class RokidConnection(activity: Activity, config: RokidConnectionConfig, host: H
      * It is owned here so it is created with the connection's own ingress and torn down with the connection: a
      * receiver outliving its session would keep accepting frames for an epoch that no longer exists.
      */
-    val uplinkReceiver = edith.audio.AudioUplinkReceiver(ingress, clock)
+    val uplinkReceiver = com.sheen.rokid.audio.AudioUplinkReceiver(ingress, clock)
 
     private var inbound: ((String) -> Unit)? = null
 

@@ -1,8 +1,8 @@
 package edith.plugins.smart
 
-import edith.agent.ConversationStore
-import edith.agent.SegmentOrigin
-import edith.agent.SummaryBoundary
+import com.sheen.rokid.agent.ConversationStore
+import com.sheen.rokid.agent.SegmentOrigin
+import com.sheen.rokid.agent.SummaryBoundary
 import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
 import com.sheen.rokid.contracts.TranscriptEvent

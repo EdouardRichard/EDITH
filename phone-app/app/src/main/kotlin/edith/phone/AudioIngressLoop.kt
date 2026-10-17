@@ -1,11 +1,11 @@
 package edith.phone
 
-import edith.audio.PcmFramer
-import edith.audio.PcmFrame
-import edith.audio.PcmIngress
-import edith.audio.PcmOffer
-import edith.audio.SpeechPipeline
-import edith.audio.WakeWordDetector
+import com.sheen.rokid.audio.PcmFramer
+import com.sheen.rokid.audio.PcmFrame
+import com.sheen.rokid.audio.PcmIngress
+import com.sheen.rokid.audio.PcmOffer
+import com.sheen.rokid.audio.SpeechPipeline
+import com.sheen.rokid.audio.WakeWordDetector
 import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler

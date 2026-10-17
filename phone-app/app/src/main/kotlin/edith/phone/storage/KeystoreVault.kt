@@ -6,7 +6,7 @@ import android.security.keystore.KeyProperties
 import android.util.AtomicFile
 import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.plugin.SecretHandle
-import edith.storage.SecretResolver
+import com.sheen.rokid.storage.SecretResolver
 import kotlinx.serialization.json.*
 import java.nio.ByteBuffer
 import java.nio.CharBuffer

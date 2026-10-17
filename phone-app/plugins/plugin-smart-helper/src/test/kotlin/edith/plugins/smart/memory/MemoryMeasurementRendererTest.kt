@@ -1,7 +1,7 @@
 package edith.plugins.smart.memory
 
-import edith.agent.Segment
-import edith.agent.SegmentOrigin
+import com.sheen.rokid.agent.Segment
+import com.sheen.rokid.agent.SegmentOrigin
 import kotlin.test.Test
 import kotlin.test.assertEquals
 

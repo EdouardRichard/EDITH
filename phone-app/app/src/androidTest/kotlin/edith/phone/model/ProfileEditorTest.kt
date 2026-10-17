@@ -17,7 +17,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import edith.model.ProfileTester
+import com.sheen.rokid.model.ProfileTester
 import edith.phone.ForegroundTestActivity
 import edith.phone.storage.*
 import com.sheen.rokid.plugin.*

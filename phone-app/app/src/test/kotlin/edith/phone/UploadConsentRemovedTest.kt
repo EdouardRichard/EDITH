@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.model.RequestConsent
+import com.sheen.rokid.model.RequestConsent
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test

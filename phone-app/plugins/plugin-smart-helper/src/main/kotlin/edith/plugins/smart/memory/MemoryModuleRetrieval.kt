@@ -1,14 +1,14 @@
 package edith.plugins.smart.memory
 
-import edith.agent.MemoryRetrieval
-import edith.agent.Segment
+import com.sheen.rokid.agent.MemoryRetrieval
+import com.sheen.rokid.agent.Segment
 import edith.plugins.smart.P3Log
 
 /**
  * edith-0.2 Phase B (B5): makes the memory facade satisfy the agent runtime's retrieval port.
  *
  * The two interfaces do not line up on purpose — [MemoryModule] is the plugin's own storage-and-ranking facade, and
- * `edith.agent.MemoryRetrieval` is the boundary `ModelClientGateway` asks. This class is the single place where a
+ * `com.sheen.rokid.agent.MemoryRetrieval` is the boundary `ModelClientGateway` asks. This class is the single place where a
  * **production turn's** memory parts acquire their semantic ordering. Without it, building the module would change
  * nothing: the gateway would keep asking a port that the lexical retriever implements, which is exactly the state
  * B5 was in — a module with tests and no caller.

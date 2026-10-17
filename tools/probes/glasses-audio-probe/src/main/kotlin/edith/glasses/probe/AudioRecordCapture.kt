@@ -4,8 +4,8 @@ import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import android.util.Log
-import edith.audio.CaptureConfig
-import edith.audio.UplinkCapture
+import com.sheen.rokid.audio.CaptureConfig
+import com.sheen.rokid.audio.UplinkCapture
 
 /**
  * The glasses microphone, as [UplinkCapture] expects it.

@@ -1,7 +1,7 @@
 package edith.phone
 
-import edith.model.MediaSource
-import edith.model.ResolvedAudio
+import com.sheen.rokid.model.MediaSource
+import com.sheen.rokid.model.ResolvedAudio
 import com.sheen.rokid.plugin.AudioSegmentHandle
 import com.sheen.rokid.plugin.AudioSegmentSource
 import java.util.UUID

@@ -1,8 +1,8 @@
 package edith.plugins.smart.memory
 
-import edith.agent.MemoryRetrieval
-import edith.agent.Segment
-import edith.agent.SegmentOrigin
+import com.sheen.rokid.agent.MemoryRetrieval
+import com.sheen.rokid.agent.Segment
+import com.sheen.rokid.agent.SegmentOrigin
 import edith.plugins.smart.P3Log
 import kotlin.math.roundToInt
 

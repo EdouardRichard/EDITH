@@ -1,7 +1,7 @@
 package edith.plugins.smart.context
 
-import edith.agent.ModelClientGateway
-import edith.agent.GatewayTurn
+import com.sheen.rokid.agent.ModelClientGateway
+import com.sheen.rokid.agent.GatewayTurn
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MessageRole

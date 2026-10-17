@@ -1,9 +1,9 @@
 package edith.plugins.smart
 
-import edith.agent.AuditEntry
-import edith.agent.AuditSink
-import edith.agent.BoundedAuditLog
-import edith.agent.ConfirmationSource
+import com.sheen.rokid.agent.AuditEntry
+import com.sheen.rokid.agent.AuditSink
+import com.sheen.rokid.agent.BoundedAuditLog
+import com.sheen.rokid.agent.ConfirmationSource
 import com.sheen.rokid.plugin.StorageHandle
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject

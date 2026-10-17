@@ -6,7 +6,7 @@ import edith.phone.storage.writeJson
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.PluginConfiguration
 import com.sheen.rokid.plugin.RiskLevel
-import edith.storage.ProfileRepository
+import com.sheen.rokid.storage.ProfileRepository
 import kotlinx.serialization.json.*
 
 /**

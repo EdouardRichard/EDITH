@@ -1,13 +1,13 @@
 package edith.phone
 
 import android.app.Activity
-import edith.host.HostRuntime
+import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.ModelClient
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
-import edith.rokid.CxrAuthorizationOutcome
-import edith.storage.MemoryProfileRepository
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
+import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
 import com.sheen.rokid.testsupport.RecordingInputPort

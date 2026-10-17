@@ -11,9 +11,9 @@ import androidx.test.platform.app.InstrumentationRegistry
 import androidx.test.rule.GrantPermissionRule
 import androidx.test.runner.AndroidJUnitRunner
 import com.sheen.rokid.contracts.*
-import edith.host.*
+import com.sheen.rokid.host.*
 import com.sheen.rokid.plugin.*
-import edith.storage.MemoryProfileRepository
+import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.testsupport.*
 import org.junit.*
 import org.junit.Assert.*

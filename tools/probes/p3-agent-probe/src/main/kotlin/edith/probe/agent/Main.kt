@@ -1,8 +1,8 @@
 package edith.probe.agent
 
-import edith.model.DevelopmentProfileLoader
-import edith.model.ModelEndpoint
-import edith.storage.MemorySecretResolver
+import com.sheen.rokid.model.DevelopmentProfileLoader
+import com.sheen.rokid.model.ModelEndpoint
+import com.sheen.rokid.storage.MemorySecretResolver
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject

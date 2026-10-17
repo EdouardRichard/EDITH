@@ -8,7 +8,7 @@ import com.sheen.rokid.plugin.WakeWordRegistry
  * Two different things are deliberately kept apart and must not be merged:
  * - **this** registry is the plugin-facing *declaration* port - a plugin says which words it wants the host to listen
  *   for, and the host answers whether it accepted them;
- * - `edith.audio.WakeWordEngine` is the detection port the audio layer runs.
+ * - `com.sheen.rokid.audio.WakeWordEngine` is the detection port the audio layer runs.
  *
  * A declaration replaces the current set rather than adding to it, because "current" is the word set the configured
  * smart plugin asked for; merging lists across activations would keep a word from a previous configuration alive with

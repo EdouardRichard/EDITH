@@ -3,7 +3,7 @@ package edith.phone
 import androidx.lifecycle.ViewModel
 import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.plugin.Capability
-import edith.rokid.CxrAuthorizationOutcome
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
 import kotlinx.coroutines.flow.StateFlow
 
 /** P3.3 (spec §17.4): the question the session page is showing, if one is up. */

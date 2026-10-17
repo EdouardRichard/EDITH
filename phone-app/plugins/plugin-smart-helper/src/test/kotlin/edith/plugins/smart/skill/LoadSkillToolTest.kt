@@ -1,6 +1,6 @@
 package edith.plugins.smart.skill
 
-import edith.agent.SCOPE_TERMINAL
+import com.sheen.rokid.agent.SCOPE_TERMINAL
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.RiskLevel
 import kotlin.test.Test

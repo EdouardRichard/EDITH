@@ -1,6 +1,6 @@
 package edith.plugins.smart
 
-import edith.agent.ConversationStore
+import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelHistoryItem

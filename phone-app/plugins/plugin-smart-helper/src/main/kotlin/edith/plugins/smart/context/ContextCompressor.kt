@@ -1,6 +1,6 @@
 package edith.plugins.smart.context
 
-import edith.agent.ConversationStore
+import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.TaskScope
@@ -83,7 +83,7 @@ data class CompressionReport(
  * user message plus everything it opened, so a half turn can never be left behind), through
  * [ConversationStore.removeOldestTurns] — a **count** of turns. [compressIfNeeded] keeps `ConversationContext`'s
  * historical message-at-a-time behaviour **byte for byte**, including its summary staying a plain assistant message
- * with **no** [edith.agent.SummaryBoundary]. Sharing one eviction loop between them is exactly what changed the
+ * with **no** [com.sheen.rokid.agent.SummaryBoundary]. Sharing one eviction loop between them is exactly what changed the
  * frozen path's semantics once already (a turn charged one message, then removed by count), so the two loops are
  * written separately and only the write-to-memory ordering, [estimatedText] and the summary landing are shared. The
  * duplication is deliberate and time-boxed: `ConversationContext` is a test-only path after Phase 5's wiring lands,

@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.agent.ConversationStore
+import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.plugin.DeadlineScheduler
@@ -10,7 +10,7 @@ import com.sheen.rokid.plugin.PluginConfiguration
 import edith.plugins.smart.SmartAssistantPlugin
 import edith.plugins.smart.context.ContextRoute
 import edith.plugins.smart.proactive.GateForm
-import edith.storage.ProfileRepository
+import com.sheen.rokid.storage.ProfileRepository
 
 /**
  * The smart plugin as the composition builds it (Task 14a item 1).

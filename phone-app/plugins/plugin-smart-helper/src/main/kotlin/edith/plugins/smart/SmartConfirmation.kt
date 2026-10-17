@@ -1,9 +1,9 @@
 package edith.plugins.smart
 
-import edith.agent.ConfirmationGate
-import edith.agent.ConfirmationOutcome
-import edith.agent.ConfirmationPort
-import edith.agent.ConfirmationSource
+import com.sheen.rokid.agent.ConfirmationGate
+import com.sheen.rokid.agent.ConfirmationOutcome
+import com.sheen.rokid.agent.ConfirmationPort
+import com.sheen.rokid.agent.ConfirmationSource
 import com.sheen.rokid.contracts.ConfirmationResult
 import com.sheen.rokid.contracts.TranscriptRevision
 import com.sheen.rokid.plugin.CancellationHandle

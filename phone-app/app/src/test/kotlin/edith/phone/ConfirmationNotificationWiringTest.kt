@@ -3,12 +3,12 @@ package edith.phone
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
-import edith.host.HostRuntime
+import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.ModelClient
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
-import edith.storage.MemoryProfileRepository
+import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
 import com.sheen.rokid.testsupport.RecordingInputPort

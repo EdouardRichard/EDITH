@@ -1,9 +1,9 @@
 package edith.phone
 
 import com.sheen.rokid.contracts.*
-import edith.host.*
+import com.sheen.rokid.host.*
 import com.sheen.rokid.plugin.*
-import edith.storage.MemoryProfileRepository
+import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.testsupport.*
 import org.junit.Assert.*
 import org.junit.Test

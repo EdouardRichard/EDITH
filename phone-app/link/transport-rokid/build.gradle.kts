@@ -3,7 +3,7 @@ import java.security.MessageDigest
 plugins { id("com.android.library") }
 
 android {
-    namespace = "edith.rokid"
+    namespace = "com.sheen.rokid.transport"
     compileSdk = 35
     defaultConfig {
         minSdk = 28

@@ -2,7 +2,7 @@ package edith.phone.storage
 
 import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.plugin.*
-import edith.storage.ProfileRepository
+import com.sheen.rokid.storage.ProfileRepository
 import kotlinx.serialization.json.*
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicBoolean

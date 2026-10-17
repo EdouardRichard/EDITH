@@ -1,8 +1,8 @@
 package edith.phone
 
 import android.app.Activity
-import edith.rokid.CxrAuthorizationOutcome
-import edith.rokid.RokidConnectionConfig
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
+import com.sheen.rokid.transport.RokidConnectionConfig
 
 /**
  * The CXR glasses application a session starts.

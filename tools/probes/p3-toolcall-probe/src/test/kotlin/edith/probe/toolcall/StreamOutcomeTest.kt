@@ -13,7 +13,7 @@ import java.net.SocketTimeoutException
  * The streaming verdict, pinned before any network call.
  *
  * The delivery path is always streaming, so this is the shape the loop under Tasks 13/14 will actually see. The
- * fixtures are replayed through the **real** [edith.model.SseDecoder] / [edith.model.ResponsesDecoder] pair in small
+ * fixtures are replayed through the **real** [com.sheen.rokid.model.SseDecoder] / [com.sheen.rokid.model.ResponsesDecoder] pair in small
  * chunks — the same loop the live `--stream` mode runs — rather than through a second parser that could agree with a
  * mistaken reading of the wire.
  *

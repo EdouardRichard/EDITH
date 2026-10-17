@@ -3,11 +3,11 @@ package edith.phone
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.WakeWordRegistry
 import com.sheen.rokid.plugin.wakeWord
-import edith.host.ResourceScope
+import com.sheen.rokid.host.ResourceScope
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.testsupport.FakeTaskScope
-import edith.host.ScopedHostServices
+import com.sheen.rokid.host.ScopedHostServices
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue

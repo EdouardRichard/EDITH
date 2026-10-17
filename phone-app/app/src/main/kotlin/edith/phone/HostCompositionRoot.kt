@@ -2,44 +2,44 @@ package edith.phone
 
 import android.content.Context
 import android.content.Intent
-import edith.audio.AcousticLabeler
-import edith.audio.LocalSpeakerService
-import edith.audio.KeywordSpotterWakeWordEngine
-import edith.audio.PcmFramer
-import edith.audio.PcmIngress
-import edith.audio.PcmOffer
-import edith.audio.SpeakerEngine
-import edith.audio.SpeakerPolicy
-import edith.audio.SpeechPipeline
-import edith.audio.StreamingAsrEngine
-import edith.audio.VadEngine
-import edith.audio.WakeWordDetector
-import edith.audio.android.EngineManifest
-import edith.audio.android.EngineManifestLoader
-import edith.audio.android.EngineModelStore
-import edith.audio.android.KeywordAssetBundle
-import edith.audio.android.SherpaEngineFactory
-import edith.audio.android.SherpaKeywordSpotterFactory
-import edith.audio.android.SherpaVadFactory
-import edith.audio.android.ValidatedModelBundle
+import com.sheen.rokid.audio.AcousticLabeler
+import com.sheen.rokid.audio.LocalSpeakerService
+import com.sheen.rokid.audio.KeywordSpotterWakeWordEngine
+import com.sheen.rokid.audio.PcmFramer
+import com.sheen.rokid.audio.PcmIngress
+import com.sheen.rokid.audio.PcmOffer
+import com.sheen.rokid.audio.SpeakerEngine
+import com.sheen.rokid.audio.SpeakerPolicy
+import com.sheen.rokid.audio.SpeechPipeline
+import com.sheen.rokid.audio.StreamingAsrEngine
+import com.sheen.rokid.audio.VadEngine
+import com.sheen.rokid.audio.WakeWordDetector
+import com.sheen.rokid.audio.android.EngineManifest
+import com.sheen.rokid.audio.android.EngineManifestLoader
+import com.sheen.rokid.audio.android.EngineModelStore
+import com.sheen.rokid.audio.android.KeywordAssetBundle
+import com.sheen.rokid.audio.android.SherpaEngineFactory
+import com.sheen.rokid.audio.android.SherpaKeywordSpotterFactory
+import com.sheen.rokid.audio.android.SherpaVadFactory
+import com.sheen.rokid.audio.android.ValidatedModelBundle
 import com.sheen.rokid.contracts.*
-import edith.host.HostEnvironment
-import edith.host.HostRuntime
-import edith.host.storage.StorageAccessServiceImpl
-import edith.host.systemone.SystemOneServiceImpl
-import edith.host.embedding.EmbeddingServiceImpl
+import com.sheen.rokid.host.HostEnvironment
+import com.sheen.rokid.host.HostRuntime
+import com.sheen.rokid.host.storage.StorageAccessServiceImpl
+import com.sheen.rokid.host.systemone.SystemOneServiceImpl
+import com.sheen.rokid.host.embedding.EmbeddingServiceImpl
 import edith.phone.laya.LayaInferenceEngineImpl
 import edith.phone.laya.LayaOfficialHost
 import edith.phone.litert.EmbeddingGemmaLiteRTEngine
-import edith.model.*
+import com.sheen.rokid.model.*
 import com.sheen.rokid.output.ConversationLog
 import com.sheen.rokid.output.TraceRecorder
 import com.sheen.rokid.plugin.*
 import edith.plugins.smart.SmartAssistantPlugin
 import edith.plugins.interview.InterviewAssistantPlugin
-import edith.rokid.CxrAuthorizationOutcome
-import edith.rokid.PcmFormatEvidence
-import edith.storage.*
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
+import com.sheen.rokid.transport.PcmFormatEvidence
+import com.sheen.rokid.storage.*
 import edith.phone.storage.*
 import edith.phone.actions.AppLaunchResolver
 import edith.phone.actions.CallPermission
@@ -1117,7 +1117,7 @@ class HostCompositionRoot internal constructor(
             }
         }
         val result = if (activatedPlugin == null) host.activate(selected) else host.switchTo(selected)
-        if (result == edith.host.ActivationResult.Activated) {
+        if (result == com.sheen.rokid.host.ActivationResult.Activated) {
             activatedPlugin = selected
             awaitingDisplayForActivation = false
             // Clearing the earlier refusal is part of succeeding: a retry that worked must not leave the App showing
@@ -1146,9 +1146,9 @@ class HostCompositionRoot internal constructor(
             android.util.Log.i("EdithHost", "activation refused result=$result selected=$selected " +
                 "available=${environment?.availableCapabilities} state=${host.currentState} " +
                 "cause=${host.lastActivationCause}")
-            error(if (result == edith.host.ActivationResult.UnknownPlugin) "UNKNOWN_PLUGIN" else "CAPABILITY_MISSING")
+            error(if (result == com.sheen.rokid.host.ActivationResult.UnknownPlugin) "UNKNOWN_PLUGIN" else "CAPABILITY_MISSING")
             // A capability refusal is worth one retry when the display becomes real; an unknown plugin is not.
-            awaitingDisplayForActivation = result == edith.host.ActivationResult.Failed
+            awaitingDisplayForActivation = result == com.sheen.rokid.host.ActivationResult.Failed
         }
     }
 

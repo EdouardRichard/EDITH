@@ -1,14 +1,14 @@
 package edith.phone
 
-import edith.audio.AsrHypothesis
-import edith.audio.PcmFramer
-import edith.audio.PcmFrame
-import edith.audio.PcmOffer
-import edith.audio.SpeakerEngine
-import edith.audio.StreamingAsrEngine
-import edith.audio.VadDecision
-import edith.audio.VadEngine
-import edith.audio.WakeWordDetector
+import com.sheen.rokid.audio.AsrHypothesis
+import com.sheen.rokid.audio.PcmFramer
+import com.sheen.rokid.audio.PcmFrame
+import com.sheen.rokid.audio.PcmOffer
+import com.sheen.rokid.audio.SpeakerEngine
+import com.sheen.rokid.audio.StreamingAsrEngine
+import com.sheen.rokid.audio.VadDecision
+import com.sheen.rokid.audio.VadEngine
+import com.sheen.rokid.audio.WakeWordDetector
 import com.sheen.rokid.contracts.Assistance
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.plugin.ConversationDisplay
@@ -26,8 +26,8 @@ import com.sheen.rokid.contracts.SpeakerAssessment
 import com.sheen.rokid.contracts.UserAction
 import com.sheen.rokid.contracts.VerifiedPcm
 import com.sheen.rokid.contracts.WakeDetected
-import edith.host.HostRuntime
-import edith.host.ResourceScope
+import com.sheen.rokid.host.HostRuntime
+import com.sheen.rokid.host.ResourceScope
 import edith.phone.model.TestBlobs
 import edith.phone.storage.AndroidProfileRepository
 import edith.phone.storage.KeystoreVault
@@ -71,9 +71,9 @@ import com.sheen.rokid.plugin.EmbeddingService
 import com.sheen.rokid.plugin.ModelInfo
 import edith.plugins.diagnostic.DiagnosticHintPlugin
 import edith.plugins.smart.SmartAssistantPlugin
-import edith.rokid.CxrAuthorizationOutcome
-import edith.storage.MemoryProfileRepository
-import edith.storage.ProfileRepository
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
+import com.sheen.rokid.storage.MemoryProfileRepository
+import com.sheen.rokid.storage.ProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
 import com.sheen.rokid.testsupport.RecordingInputPort
@@ -223,7 +223,7 @@ private class NoStorageAccess : StorageAccess {
     }
 
     /** A wake engine that reports one configured word from one frame, so the real detector can be driven. */
-    private class OneWordEngine(private val word: String) : edith.audio.WakeWordEngine {
+    private class OneWordEngine(private val word: String) : com.sheen.rokid.audio.WakeWordEngine {
         override fun accept(frame: PcmFrame): List<String> = listOf(word)
         override fun reset() = Unit
         override fun close() = Unit
@@ -400,7 +400,7 @@ private class NoStorageAccess : StorageAccess {
                     FloatArray(320), 16000, SampleRange("c-1", 0, 320), 0L, 20_000_000L))
         }
 
-        fun activateSmart(): edith.host.ActivationResult {
+        fun activateSmart(): com.sheen.rokid.host.ActivationResult {
             host.configure("smart-assistant", configuration)
             host.startSession(session)
             host.markSceneReady()
@@ -422,7 +422,7 @@ private class NoStorageAccess : StorageAccess {
     @Test
     fun aDetectorEmissionBecomesAWakeDetectedTheHostAcceptsAndDeliversToTheActivePlugin() {
         withRig { rig ->
-            assertEquals(edith.host.ActivationResult.Activated, rig.activateSmart())
+            assertEquals(com.sheen.rokid.host.ActivationResult.Activated, rig.activateSmart())
             val current = requireNotNull(rig.host.currentIdentity())
             assertEquals(session, current.first)
 
@@ -442,7 +442,7 @@ private class NoStorageAccess : StorageAccess {
     @Test
     fun aDetectorEmissionCarryingAStaleIdentityIsDroppedAndNeverReleasedByTheHost() {
         withRig { rig ->
-            assertEquals(edith.host.ActivationResult.Activated, rig.activateSmart())
+            assertEquals(com.sheen.rokid.host.ActivationResult.Activated, rig.activateSmart())
             val current = requireNotNull(rig.host.currentIdentity())
             val stale = current.first to Generation(current.second.value - 1)
             assertNotEquals(current, stale)
@@ -461,7 +461,7 @@ private class NoStorageAccess : StorageAccess {
     @Test
     fun theWakePathDeliversOnlyTheConfiguredWordList() {
         withRig { rig ->
-            assertEquals(edith.host.ActivationResult.Activated, rig.activateSmart())
+            assertEquals(com.sheen.rokid.host.ActivationResult.Activated, rig.activateSmart())
             // The plugin declares its configured words on activation; the provider must hold exactly those, in order.
             assertEquals(listOf("伊迪丝", "edith"), rig.wakes.current())
             assertTrue("the plugin's gate is the WakeWord capability this provider answers",
@@ -580,7 +580,7 @@ private class NoStorageAccess : StorageAccess {
     @Test
     fun theWakeEmissionLineCarriesTheWordAndConfidenceAndNothingElse() {
         withRig { rig ->
-            assertEquals(edith.host.ActivationResult.Activated, rig.activateSmart())
+            assertEquals(com.sheen.rokid.host.ActivationResult.Activated, rig.activateSmart())
             // The emission builder is the production one (Task 14a-fix item 6), so this drives the same call the KWS
             // detector's sink reaches; only the wake is captured, not the activation that preceded it.
             val lines = withP3Sink { captured ->
@@ -801,7 +801,7 @@ private class NoStorageAccess : StorageAccess {
         val faults = CopyOnWriteArrayList<String>()
         val offers = CopyOnWriteArrayList<PcmOffer>()
         val clock = FakeClock(0)
-        val ingress = edith.audio.PcmIngress(clock)
+        val ingress = com.sheen.rokid.audio.PcmIngress(clock)
         val verified = VerifiedPcm(AudioFormat.Pcm(16000, 1, 16), PcmEncoding.SIGNED_LE, "synthetic-test")
         val chain = CxrAudioChain.assemble(ingress = { ingress },
             framer = PcmFramer(verified, 20),
@@ -1110,7 +1110,7 @@ private class NoStorageAccess : StorageAccess {
     @Test
     fun noWakeMeansNoModelRequestIsMade() {
         withRig { rig ->
-            assertEquals(edith.host.ActivationResult.Activated, rig.activateSmart())
+            assertEquals(com.sheen.rokid.host.ActivationResult.Activated, rig.activateSmart())
             rig.settle()
 
             assertTrue("nothing was said, so nothing may be handled", rig.smart.handled.isEmpty())

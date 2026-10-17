@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.audio.WakeWordDetector
+import com.sheen.rokid.audio.WakeWordDetector
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.contracts.SampleRange
@@ -26,21 +26,21 @@ import org.junit.Test
 class PlaybackGateTest {
 
     private val epoch = InputEpoch(SessionId("gate-session"), Generation(1), 1)
-    private fun frame(index: Int) = edith.audio.PcmFrame(
+    private fun frame(index: Int) = com.sheen.rokid.audio.PcmFrame(
         epoch, FloatArray(320) { it.toFloat() / 320f }, 16000, SampleRange("gate", index * 320L, (index + 1) * 320L),
         index * 20_000_000L, (index + 1) * 20_000_000L)
 
-    private class AlwaysSpeechVad : edith.audio.VadEngine {
+    private class AlwaysSpeechVad : com.sheen.rokid.audio.VadEngine {
         var frames = 0
-        override fun accept(frame: edith.audio.PcmFrame) = edith.audio.VadDecision(true, false).also { frames++ }
+        override fun accept(frame: com.sheen.rokid.audio.PcmFrame) = com.sheen.rokid.audio.VadDecision(true, false).also { frames++ }
         override fun reset() = Unit
         override fun close() = Unit
     }
 
     /** Reports one configured word from every frame, so "was the engine reached" is observable. */
-    private class EveryFrameWord(private val word: String) : edith.audio.WakeWordEngine {
+    private class EveryFrameWord(private val word: String) : com.sheen.rokid.audio.WakeWordEngine {
         var frames = 0
-        override fun accept(frame: edith.audio.PcmFrame): List<String> = listOf(word).also { frames++ }
+        override fun accept(frame: com.sheen.rokid.audio.PcmFrame): List<String> = listOf(word).also { frames++ }
         override fun reset() = Unit
         override fun close() = Unit
     }

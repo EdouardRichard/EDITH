@@ -1,6 +1,6 @@
 package edith.plugins.smart.memory
 
-import edith.agent.Segment
+import com.sheen.rokid.agent.Segment
 import com.sheen.rokid.plugin.EmbeddingService
 import edith.plugins.smart.library.LibraryGovernor
 

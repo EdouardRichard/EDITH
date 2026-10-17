@@ -1,8 +1,8 @@
 package edith.plugins.smart.context
 
-import edith.agent.ConversationStore
-import edith.agent.SegmentOrigin
-import edith.agent.SummaryBoundary
+import com.sheen.rokid.agent.ConversationStore
+import com.sheen.rokid.agent.SegmentOrigin
+import com.sheen.rokid.agent.SummaryBoundary
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelHistoryItem

@@ -295,8 +295,8 @@ internal fun smartSkillDoc(
 ) = "---\nname: $name\nversion: 1.0.0\ndescription: $description\nenabled: $enabled\n---\n$body\n"
 
 /** One fresh `ConversationStore` per route, exactly as `SmartWiring` builds them. */
-internal fun smartStores(): Map<edith.plugins.smart.context.ContextRoute, edith.agent.ConversationStore> =
-    edith.plugins.smart.context.ContextRoute.entries.associateWith { edith.agent.ConversationStore() }
+internal fun smartStores(): Map<edith.plugins.smart.context.ContextRoute, com.sheen.rokid.agent.ConversationStore> =
+    edith.plugins.smart.context.ContextRoute.entries.associateWith { com.sheen.rokid.agent.ConversationStore() }
 
 /** `ActionDescriptor` fixture whose defaults describe a harmless L0 action in the `app` scope. */
 internal fun smartAction(
@@ -361,7 +361,7 @@ internal class SmartTestRig(
      * Phase 5: the per-route session stores the production wiring injects. `null` — the default — is the legacy shape
      * every pre-Phase-5 test uses, so those tests keep both old paths untouched.
      */
-    conversationStores: Map<edith.plugins.smart.context.ContextRoute, edith.agent.ConversationStore>? = null,
+    conversationStores: Map<edith.plugins.smart.context.ContextRoute, com.sheen.rokid.agent.ConversationStore>? = null,
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -490,7 +490,7 @@ internal class SmartTestRig(
     val consentFlag: Boolean get() = plugin.requestConsentConfigured
 
     /** The plugin's audit trail, through its `internal` observation accessor. */
-    val auditEntries: List<edith.agent.AuditEntry> get() = plugin.auditTrail()
+    val auditEntries: List<com.sheen.rokid.agent.AuditEntry> get() = plugin.auditTrail()
 }
 
 /** The namespace a host grants: a plain in-memory map, so a test can read exactly what was persisted. */

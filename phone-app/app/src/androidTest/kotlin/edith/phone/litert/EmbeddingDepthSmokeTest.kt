@@ -3,7 +3,7 @@ package edith.phone.litert
 import android.util.Log
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
-import edith.host.embedding.EmbeddingServiceImpl
+import com.sheen.rokid.host.embedding.EmbeddingServiceImpl
 import com.sheen.rokid.plugin.EmbedResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

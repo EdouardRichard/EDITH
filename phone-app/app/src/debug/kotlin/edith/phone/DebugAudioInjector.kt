@@ -3,14 +3,14 @@ package edith.phone
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import edith.audio.PcmIngress
-import edith.audio.PcmOffer
+import com.sheen.rokid.audio.PcmIngress
+import com.sheen.rokid.audio.PcmOffer
 import com.sheen.rokid.contracts.AudioFormat
 import com.sheen.rokid.contracts.GapReason
 import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.contracts.PcmEncoding
 import com.sheen.rokid.contracts.VerifiedPcm
-import edith.rokid.RokidSessionTransport
+import com.sheen.rokid.transport.RokidSessionTransport
 import java.io.File
 
 /**

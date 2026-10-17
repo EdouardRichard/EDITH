@@ -1,10 +1,10 @@
 package edith.phone.model
 
 import com.sheen.rokid.contracts.*
-import edith.model.*
+import com.sheen.rokid.model.*
 import edith.phone.storage.*
 import com.sheen.rokid.plugin.*
-import edith.storage.SecretResolver
+import com.sheen.rokid.storage.SecretResolver
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
 import okhttp3.OkHttpClient

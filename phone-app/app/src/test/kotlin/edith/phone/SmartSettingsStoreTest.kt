@@ -8,7 +8,7 @@ import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.SecretHandle
-import edith.storage.ProfileRepository
+import com.sheen.rokid.storage.ProfileRepository
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject

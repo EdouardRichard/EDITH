@@ -1,7 +1,7 @@
 package edith.phone.model
 
 import androidx.lifecycle.ViewModel
-import edith.model.ProfileTester
+import com.sheen.rokid.model.ProfileTester
 import edith.phone.storage.AndroidProfileRepository
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.contracts.ContractError

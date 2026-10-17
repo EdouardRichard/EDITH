@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.audio.PcmOffer
+import com.sheen.rokid.audio.PcmOffer
 import com.sheen.rokid.contracts.GapReason
 import java.io.ByteArrayOutputStream
 import org.junit.Assert.assertEquals

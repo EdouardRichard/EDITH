@@ -1,14 +1,14 @@
 package edith.phone
 
-import edith.audio.AsrHypothesis
-import edith.audio.PcmFramer
-import edith.audio.PcmFrame
-import edith.audio.PcmIngress
-import edith.audio.SpeakerEngine
-import edith.audio.SpeechPipeline
-import edith.audio.StreamingAsrEngine
-import edith.audio.VadDecision
-import edith.audio.VadEngine
+import com.sheen.rokid.audio.AsrHypothesis
+import com.sheen.rokid.audio.PcmFramer
+import com.sheen.rokid.audio.PcmFrame
+import com.sheen.rokid.audio.PcmIngress
+import com.sheen.rokid.audio.SpeakerEngine
+import com.sheen.rokid.audio.SpeechPipeline
+import com.sheen.rokid.audio.StreamingAsrEngine
+import com.sheen.rokid.audio.VadDecision
+import com.sheen.rokid.audio.VadEngine
 import com.sheen.rokid.contracts.Assistance
 import com.sheen.rokid.contracts.AudioFormat
 import com.sheen.rokid.contracts.ContractError
@@ -22,8 +22,8 @@ import com.sheen.rokid.contracts.SpeakerAssessment
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.contracts.TranscriptRevision
 import com.sheen.rokid.contracts.VerifiedPcm
-import edith.host.HostRuntime
-import edith.host.ResourceScope
+import com.sheen.rokid.host.HostRuntime
+import com.sheen.rokid.host.ResourceScope
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.plugin.ActionDescriptor
@@ -47,8 +47,8 @@ import com.sheen.rokid.plugin.PluginDescriptor
 import com.sheen.rokid.plugin.PluginLifecycle
 import com.sheen.rokid.plugin.SpeakerWindow
 import com.sheen.rokid.plugin.StorageHandle
-import edith.rokid.CxrAuthorizationOutcome
-import edith.storage.MemoryProfileRepository
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
+import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.testsupport.FakeClock as TestClock
 import com.sheen.rokid.testsupport.ManualScheduler
 import org.junit.Assert.assertEquals

@@ -1,8 +1,8 @@
 package edith.probe.toolcall
 
-import edith.model.DevelopmentProfileLoader
-import edith.model.ModelEndpoint
-import edith.storage.MemorySecretResolver
+import com.sheen.rokid.model.DevelopmentProfileLoader
+import com.sheen.rokid.model.ModelEndpoint
+import com.sheen.rokid.storage.MemorySecretResolver
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -131,7 +131,7 @@ private fun attempt(
 
 /**
  * One streaming request, read and decoded the way the delivery path reads it: 8 KiB body reads into the real
- * [edith.model.SseDecoder]/[edith.model.ResponsesDecoder] pair (via [decodeStream]), the whole verdict reduced to a
+ * [com.sheen.rokid.model.SseDecoder]/[com.sheen.rokid.model.ResponsesDecoder] pair (via [decodeStream]), the whole verdict reduced to a
  * [StreamOutcome]. Nothing from the wire but those fields ever leaves this function.
  */
 private fun attemptStream(

@@ -1,10 +1,10 @@
 package edith.phone.model
 
 import com.sheen.rokid.contracts.ContractError
-import edith.model.ProfileTester
-import edith.model.RequestConsent
+import com.sheen.rokid.model.ProfileTester
+import com.sheen.rokid.model.RequestConsent
 import com.sheen.rokid.plugin.*
-import edith.storage.ProfileRepository
+import com.sheen.rokid.storage.ProfileRepository
 import java.util.concurrent.atomic.AtomicReference
 
 internal class ProfileProbeGate(private val repository: ProfileRepository) {

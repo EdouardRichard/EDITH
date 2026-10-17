@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.audio.SpeechPipeline
+import com.sheen.rokid.audio.SpeechPipeline
 import com.sheen.rokid.contracts.HostEvent
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.contracts.TranscriptRevision
