@@ -23,5 +23,11 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.test.junit5)
+    // Phase 7 F4 JVM gate: `MemoryMeasurementRequestShapeTest` hands the request the real `ModelClientGateway` builds
+    // to model-runtime's `ContextBudgeter` (the send-time acceptance check), so the A/B forms are proven sendable
+    // before any device run. Test-only: `:model-runtime` depends on `core-contracts`, `plugin-api`, `agent-runtime` and
+    // `storage-runtime` only — there is no cycle — and this edge adds nothing to phone-app's runtime classpath and
+    // touches no lockfile (plugins-smart has none; model-runtime's own dependencies are unchanged).
+    testImplementation(project(":model-runtime"))
 }
 
