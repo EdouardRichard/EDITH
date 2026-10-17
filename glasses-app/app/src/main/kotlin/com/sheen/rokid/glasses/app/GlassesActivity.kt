@@ -142,6 +142,10 @@ class GlassesActivity : Activity() {
     private var tickerFrames = 0
     private var tickerStartOffset = 0
 
+    /** What the last BACK meant, so the device test can assert the branch rather than infer it from a log. */
+    private var lastBackAction: String? = null
+    private var lastBackStopSent: Boolean? = null
+
     /** The wearer paged by hand: the ticker stays stopped until the next entry arrives (official `isAutoScroll=false`). */
     private var userReadPaused = false
 
@@ -186,6 +190,40 @@ class GlassesActivity : Activity() {
         orbView.stop()
         thinkingIcon?.stop()
         stopTicker()
+    }
+
+    /**
+     * 0.23 P5 (U11, spec §5.3.1): the double-click's `KEYCODE_BACK`.
+     *
+     * **Busy, with an established session identity**: send `STOP` to the phone and keep the window open - the phone
+     * cancels the turn/proactive request and broadcasts `BUSY=false`, which puts the thinking row and orb back to
+     * idle. **Idle, or busy with no identity to name**: exit, exactly as the wearer expects from a back key.
+     *
+     * Handled here rather than in `installSideTouch`: an Activity consumes BACK through its default key path before an
+     * unhandled-key listener can see it (the official app handles it in a `Dialog.onKeyUp` instead). Returning true
+     * stops the framework from also calling `onBackPressed()`.
+     */
+    override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
+        if (keyCode == KeyEvent.KEYCODE_BACK) {
+            val identity = controller.currentIdentity()
+            val busy = busyState.any(clock.nowNanos())
+            if (busy && identity != null) {
+                val sent = RokidBridgeEndpoint.instance.send(
+                    HintWireCodec.encode(HintCommand.Stop(identity.first, identity.second)))
+                lastBackAction = "stop"
+                lastBackStopSent = sent
+                android.util.Log.i("EdithGlasses",
+                    "P5_GLASS_BACK action=stop sent=$sent session=${identity.first} generation=${identity.second}")
+                return true
+            }
+            lastBackAction = "exit"
+            lastBackStopSent = null
+            android.util.Log.i("EdithGlasses",
+                "P5_GLASS_BACK action=exit busy=$busy identity=${identity != null}")
+            finish()
+            return true
+        }
+        return super.onKeyUp(keyCode, event)
     }
 
     override fun onDestroy() {
@@ -842,6 +880,11 @@ class GlassesActivity : Activity() {
     fun isPinnedForProbe(): Boolean = order.isPinned()
 
     fun tickerRunningForProbe(): Boolean = tickerAnimator != null
+
+    /** The last BACK branch: `"stop"` while busy, `"exit"` when idle. Device-test seam only. */
+    fun lastBackActionForProbe(): String? = lastBackAction
+
+    fun lastBackStopSentForProbe(): Boolean? = lastBackStopSent
 
     /** The top of the last message row, in the list's own coordinates; the new-entry reveal lands here. */
     fun lastMessageTopForProbe(): Int = lastMessageRowForProbe()?.top ?: 0

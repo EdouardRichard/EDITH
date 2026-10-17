@@ -2,6 +2,7 @@ package com.sheen.rokid.glasses
 
 import android.content.Context
 import android.view.KeyEvent
+import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
@@ -146,5 +147,36 @@ class GlassesInteractionTest {
 
     private companion object {
         const val MARKER = "visual-state"
+    }
+
+    /**
+     * 0.23 P5 (U11, spec §5.3.1): the same BACK key means "interrupt" while the assistant works and "exit" when it
+     * does not. The busy half must not close the window; the idle half must.
+     */
+    @Test
+    fun aBackWhileBusyStopsWithoutExitingAndIdleBackExits() {
+        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                accept(activity, HintCommand.Hello("s-p5-back", 1))
+                accept(activity, HintCommand.Busy("s-p5-back", 1, AssistantRoute.WAKE, busy = true))
+            }
+            settle(700)
+
+            key(KeyEvent.KEYCODE_BACK)
+            settle(700)
+            scenario.onActivity { activity ->
+                assertEquals("a busy BACK is a STOP, not an exit", "stop", activity.lastBackActionForProbe())
+                assertFalse("and the window stays open", activity.isFinishing)
+            }
+
+            scenario.onActivity { activity ->
+                accept(activity, HintCommand.Busy("s-p5-back", 1, AssistantRoute.WAKE, busy = false))
+            }
+            settle(500)
+            key(KeyEvent.KEYCODE_BACK)
+            settle(1_000)
+            assertEquals("an idle BACK must exit the glasses window",
+                Lifecycle.State.DESTROYED, scenario.state)
+        }
     }
 }
