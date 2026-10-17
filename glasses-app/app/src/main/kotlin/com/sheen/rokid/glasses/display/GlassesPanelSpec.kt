@@ -64,7 +64,6 @@ object GlassesPanelSpec {
     const val THINKING_TEXT_SIZE_PX = 16f
     const val TIPS_TEXT_SIZE_PX = 14f
     const val COMPLIANCE_TEXT_SIZE_PX = 12f
-    const val HEADER_TEXT_SIZE_PX = 14f
 
     /** The wearer's line is capped at four lines and loses its **beginning** (`TruncateAt.START`). */
     const val USER_MAX_LINES = 4

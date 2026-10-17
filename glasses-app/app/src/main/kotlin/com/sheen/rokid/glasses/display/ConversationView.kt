@@ -1,16 +1,14 @@
 package com.sheen.rokid.glasses.display
-import com.sheen.rokid.glasses.app.GlassesActivity
 
-import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.output.ConversationEntry
-import com.sheen.rokid.output.ConversationRole
 
 /**
- * How the conversation is laid out, decided without Android so it can be tested off-device (spec §6.6).
+ * How the conversation is laid out, decided without Android so it can be tested off-device.
  *
- * The rule the spec fixes is "AI replies on the left, the wearer's messages on the right". `GlassesActivity` builds
- * the `TextView`s; **which** rows exist, which side each sits on, and which one is the live hint are the decisions,
- * and they live here so a rendering regression fails a unit test instead of needing someone to put the glasses on.
+ * The rule 0.23 fixes (U9) is that **every line is left-aligned**, including the wearer's own words; the official
+ * panel separates the two roles by colour and size instead of by side. `GlassesActivity` builds the `TextView`s;
+ * **which** rows exist, which side each one sits on, and which one is the live hint are decisions, and they live here
+ * so a rendering regression fails a unit test instead of needing someone to put the glasses on.
  *
  * Nothing here reads the clock, the log or the wire: it is a pure function of the entries it is handed, which is what
  * keeps the phone's assistant tab (same [com.sheen.rokid.output.ConversationLog], same order) and this view in agreement.
