@@ -3,6 +3,7 @@ package edith.plugins.smart.memory
 import edith.agent.Segment
 import edith.agent.SegmentOrigin
 import edith.plugin.EmbeddingService
+import edith.plugins.smart.library.LibraryGovernor
 
 /** Which ranking produced an injection. The device log names it, so a degraded order cannot read as a semantic one. */
 enum class MemoryRanking { SEMANTIC, LEXICAL }
@@ -50,6 +51,16 @@ class MemoryModule(
      * `null` (the default) disables filtering entirely — behavior is identical to pre-Phase-4 code.
      */
     private val similarityThreshold: Double? = null,
+    /**
+     * Design D-11: the memory side's lifecycle seam, **default off**.
+     *
+     * When a governor is present, every entry that reaches the prompt is recorded as a pull. The default (`null`) is
+     * the production path: memory retirement needs real recall-outcome data — opening it here would turn an
+     * uncalibrated number into an operating point, so production must not wire one. With `null`, retrieval and
+     * rendering are byte-identical to the pre-seam module; the seam only counts, and no ranking, threshold or limit
+     * reads the governor's state.
+     */
+    private val governor: LibraryGovernor? = null,
 ) {
 
     /** Writes one raw message and indexes it (spec §5.5: the original text, never a summary). */
@@ -120,6 +131,10 @@ class MemoryModule(
         }
 
         if (filteredRanked.isNotEmpty()) log.markUsed(filteredRanked.map { it.id })
+        // Design D-11: the counting position. An entry that is handed to the prompt has been "pulled" in the
+        // governor's vocabulary. The governor is null in production (the default), so this line is unreachable there;
+        // it records counts only and must never feed back into ranking, thresholding or the limit above.
+        governor?.let { g -> filteredRanked.forEach { g.recordPull(it.id) } }
         val renderedText = buildReferenceContext(filteredRanked)
         val parts = if (renderedText != null) {
             listOf(Segment(SegmentOrigin.MEMORY_EVIDENCE, false, renderedText))
