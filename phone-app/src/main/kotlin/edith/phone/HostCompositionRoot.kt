@@ -328,6 +328,18 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
+     * Phase 7 F4 (§3.3): the exact storage handle behind the smart plugin's memory document, for the **debug-only**
+     * memory backup/seed/restore receiver.
+     *
+     * `MemoryLog.KEY` names a key in the plugin's own `smart-assistant` namespace; this accessor reaches that same
+     * namespace, so a backup saves the document the plugin actually writes and a restore writes back into it. It is
+     * `internal` and has **no production caller**: only `src/debug` receivers invoke it, and a release build contains
+     * neither them nor any other call site. `null` means this build has no storage wired, which the receiver reports as
+     * `refused reason=NO_STORE` rather than treating as an empty document.
+     */
+    internal fun memoryStoreForProbe(): StorageHandle? = namespaceFactory?.invoke("smart-assistant")
+
+    /**
      * Phase 7 F4 (§3.2): the smart plugin this composition registered, for the **debug-only** measurement receivers.
      *
      * The receiver must reach the same plugin instance the host activates, or setting the form would change a

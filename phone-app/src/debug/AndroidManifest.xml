@@ -102,6 +102,35 @@
             </intent-filter>
         </receiver>
         <!--
+          Phase 7 F4 memory backup → seed → restore. Same export rule and the same reason as the instruments above: the
+          only caller is an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never
+          exist in a release build. It reads the production `smart-assistant` memory document, saves its exact bytes,
+          writes the one pre-registered FACT, and can put the original bytes back. It logs counts, ids and SHA-256 only,
+          never memory text.
+        -->
+        <receiver
+            android:name=".DebugF4Memory"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_MEMORY_SEED" />
+            </intent-filter>
+        </receiver>
+        <!--
+          Phase 7 F4 assistant-output capture. Same export rule and the same reason as the instruments above: the only
+          caller is an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist
+          in a release build. It copies the WAKE route's last USER/ASSISTANT text to files and logs character counts and
+          SHA-256 only - the text itself never reaches logcat.
+        -->
+        <receiver
+            android:name=".DebugF4Answer"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_F4_ANSWER" />
+            </intent-filter>
+        </receiver>
+        <!--
           `DebugModelProbe` (the generic all-models-on-an-accelerator probe) is NOT registered here yet: it needs the
           process's single shared LiteRT `Environment`, which lives in the vendored `com.laya` file as a
           file-private object, so the probe cannot compile without making vendored code non-private. Its entry, its
