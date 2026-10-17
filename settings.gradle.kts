@@ -32,7 +32,7 @@ dependencyResolutionManagement {
             forRepository {
                 ivy {
                     name = "verifiedSherpaRuntime"
-                    url = uri("audio-android/libs")
+                    url = uri("phone-app/perception/audio-android/libs")
                     patternLayout { artifact("[artifact]-[revision].[ext]") }
                     metadataSources { artifact() }
                 }
@@ -67,19 +67,19 @@ rootProject.name = "edith"
 include(
     ":core-contracts",
     ":plugin-api",
-    ":host-runtime",
+    ":phone-app:assistant:host-runtime",
     ":test-support",
-    ":plugins-smart",
-    ":plugins-interview",
-    ":audio-runtime",
-    ":audio-android",
-    ":transport-rokid",
-    ":storage-runtime",
-    ":model-runtime",
+    ":phone-app:plugins:plugin-smart-helper",
+    ":phone-app:plugins:plugin-interview",
+    ":phone-app:perception:audio-runtime",
+    ":phone-app:perception:audio-android",
+    ":phone-app:link:transport-rokid",
+    ":phone-app:persistence:storage-runtime",
+    ":phone-app:assistant:model-runtime",
     // P3.1 agent loop: platform-independent tool protocol, registry and loop (Tasks 4-8).
-    ":agent-runtime",
+    ":phone-app:assistant:agent-runtime",
     ":output-runtime",
-    ":plugins-diagnostic",
+    ":phone-app:plugins:plugin-diagnostic",
     ":tools:p2-text-probe",
     // P3.0 throwaway probe (T4): can a `tools` array round-trip through the Responses endpoint, and does the reply
     // carry a `function_call` item? Not a delivery tool.

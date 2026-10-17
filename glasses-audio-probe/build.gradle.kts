@@ -34,7 +34,7 @@ kotlin {
 dependencies {
     // The uplink frame codec lives in audio-runtime so the glasses sender and the phone receiver share exactly one
     // implementation; two copies would eventually disagree on the wire format.
-    implementation(project(":audio-runtime"))
+    implementation(project(":phone-app:perception:audio-runtime"))
     // CXR-S: the glasses-side bridge carrying the uplink. Pinned and hash-verified in the root build.
     implementation("edith.vendor.cxr:cxr-service-bridge:1.0-20260715.121510-107@aar")
     testImplementation("junit:junit:4.13.2")

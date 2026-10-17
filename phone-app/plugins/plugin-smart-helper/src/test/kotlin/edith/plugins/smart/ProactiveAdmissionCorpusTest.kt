@@ -26,12 +26,21 @@ import kotlin.test.assertTrue
  *
  * ## Path
  *
- * Gradle runs tests with the **module** directory as the working directory, so this is `../docs/...`. A missing file is
- * an `error`, never a silent skip: a gate that quietly passes when the corpus moves is not a gate.
+ * Gradle runs tests with the **module** directory as the working directory, and this module now sits several levels
+ * below the repository root, so the corpus is located by walking up until the tracked `settings.gradle.kts` is found.
+ * A missing file is an `error`, never a silent skip: a gate that quietly passes when the corpus moves is not a gate.
  */
 class ProactiveAdmissionCorpusTest {
 
-    private val corpus = File("../docs/project/evidence/2026-10-11-p3-4-eval-corpus.md")
+    private fun repositoryRoot(): File =
+        generateSequence(File("").absoluteFile) { it.parentFile }
+            .firstOrNull { File(it, "settings.gradle.kts").isFile }
+            ?: error("repository root not found from ${File("").absolutePath}")
+
+    private val corpus = File(
+        repositoryRoot(),
+        "docs/project/evidence/2026-10-11-p3-4-eval-corpus.md",
+    )
 
     private fun rows(): List<CorpusRow> {
         check(corpus.isFile) { "frozen corpus not found at ${corpus.absolutePath} - the gate cannot be silently skipped" }

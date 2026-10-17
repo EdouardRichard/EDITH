@@ -12,8 +12,8 @@ application { mainClass.set("edith.probe.agent.MainKt") }
 dependencyLocking { lockAllConfigurations() }
 
 dependencies {
-    implementation(project(":model-runtime"))
-    implementation(project(":storage-runtime"))
+    implementation(project(":phone-app:assistant:model-runtime"))
+    implementation(project(":phone-app:persistence:storage-runtime"))
     implementation(project(":plugin-api"))
     implementation(libs.okhttp)
     implementation(libs.kotlinx.serialization.json)

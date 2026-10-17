@@ -24,13 +24,13 @@ dependencies {
     implementation("com.google.code.gson:gson:2.10.1")
     api(project(":core-contracts"))
     api(project(":plugin-api"))
-    api(project(":audio-runtime"))
+    api(project(":phone-app:perception:audio-runtime"))
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.lifecycle:lifecycle-runtime:2.8.6")
     androidTestImplementation("androidx.annotation:annotation:1.8.1")
-    androidTestImplementation(project(":host-runtime"))
+    androidTestImplementation(project(":phone-app:assistant:host-runtime"))
     androidTestImplementation(project(":test-support"))
 }
 

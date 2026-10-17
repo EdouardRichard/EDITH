@@ -30,10 +30,13 @@ class EmbeddingEngineTest {
     @get:Rule
     val temporary = TemporaryFolder()
 
-    private val modelFile: File = sequenceOf(
-        File("../.local/models/embeddinggemma/sentencepiece.model"),
-        File(".local/models/embeddinggemma/sentencepiece.model"),
-    ).firstOrNull { it.isFile } ?: File("../.local/models/embeddinggemma/sentencepiece.model")
+    private fun repositoryRoot(): File =
+        generateSequence(File("").absoluteFile) { it.parentFile }
+            .firstOrNull { File(it, "settings.gradle.kts").isFile }
+            ?: error("repository root not found from ${File("").absolutePath}")
+
+    private val modelFile: File =
+        File(repositoryRoot(), ".local/models/embeddinggemma/sentencepiece.model")
 
     private fun vocabulary(): SentencePieceBpe {
         assumeTrue(

@@ -27,7 +27,7 @@ kotlin {
 dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation("edith.vendor.sherpa:sherpa-onnx:1.13.8@aar")
-    implementation(project(":audio-runtime"))
+    implementation(project(":phone-app:perception:audio-runtime"))
     implementation(project(":core-contracts"))
     implementation(project(":plugin-api"))
     testImplementation("junit:junit:4.13.2")

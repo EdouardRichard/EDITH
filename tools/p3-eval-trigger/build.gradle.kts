@@ -16,7 +16,7 @@ dependencies {
     // so the number the report prints and the rule the plugin applies are the same code. Re-implementing the rule
     // here is the failure mode this dependency exists to prevent. `plugins-smart` is a plain JVM module and pulls no
     // Android artifact, so the CLI stays device-free.
-    implementation(project(":plugins-smart"))
+    implementation(project(":phone-app:plugins:plugin-smart-helper"))
     testImplementation(libs.kotlin.test)
     testImplementation(libs.kotlin.test.junit5)
 }
