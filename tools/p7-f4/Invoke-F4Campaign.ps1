@@ -31,8 +31,11 @@
 #   asrHasMusic / asrHasYueban   true/false from that text (does it contain 音乐 / 月半)
 #   answerChars decoded .NET string length of answers/f4-assistant-<slot>.txt
 #   answerSha256 SHA-256 of the RAW bytes of that file
-#   mediaTitle  "title - artist" when the artist is readable, e.g. 稻香 - 周杰伦
-#   mediaState  PLAYING (state=3), PAUSED (state=2), OTHER otherwise, empty with no session
+#   mediaTitle  "title - artist" when the artist is readable, e.g. 稻香 - 周杰伦 (media session or
+#               design section 3.5's uiautomator fallback)
+#   mediaState  PLAYING (state=3, or the fallback sees the track plus a pause/暂停 control),
+#               PAUSED (state=2), OTHER otherwise, UNKNOWN when the fallback cannot establish a
+#               state, empty with no session
 #   foreground  bare foreground package, e.g. com.miui.player (not a component string)
 #   memoryChars the P3_MEMORY chars= value
 #   route       the P3_F4ANSWER route= value (external/internal/NONE)
@@ -81,6 +84,19 @@ $StartLabel = '开始'
 $AsrKeywordMusic = '音乐'
 $AsrKeywordYueban = '月半'
 
+# The two pre-registered tracks (design section 2.6). The uiautomator fallback reads only these
+# markers from the player screen instead of guessing which visible line is a title; a guessed
+# title would be a false M2 reading. 月半小夜曲 is the current request, 稻香 the memory track.
+$CurrentTrackKeyword = '月半小夜曲'
+$CurrentArtistKeyword = '李克勤'
+$MemoryTrackKeyword = '稻香'
+$MemoryArtistKeyword = '周杰伦'
+$PauseControlKeyword = '暂停'
+
+# Phase 5's unattended click sequence gives the probe 1.5 s to take the foreground, then re-fronts
+# the app while the probe is still polling (docs/project/evidence/2026-10-16-phase-5-device-verification.md:49-57).
+$ProbeRefrontDelayMillis = 1500
+
 # The one pre-registered memory (design section 2.1). The production renderer derives
 # `用户曾告知播放周杰伦的稻香` from it; the legacy-raw renderer replays it verbatim.
 $MemoryRaw = '播放周杰伦的稻香'
@@ -99,7 +115,10 @@ $ProductionMemoryBlock = @(
 $ProductionMemoryBlockSha256 = '763dfa8c07f0fb37027cbc5128d2ad6943e5b284e3239a1322a74ed975674ee4'
 
 $ExpectedMemoryCharsA = $MemoryRaw.Length                       # 8, printed by -Preflight
-$ExpectedMemoryCharsB = $ProductionMemoryBlock.Length           # computed, printed by -Preflight
+# The literal design section 2.1 block is 110 UTF-16 chars. This is deliberately a fixed number,
+# not `$ProductionMemoryBlock.Length`: comparing the block to itself proved nothing. The SHA-256
+# guard above protects the literal; this fixed number is what -Preflight asserts the device logged.
+$ExpectedMemoryCharsB = 110
 
 $CsvColumns = @(
     'slot', 'form', 'valid', 'asrChars', 'asrSha256', 'asrHasMusic', 'asrHasYueban',
@@ -135,6 +154,11 @@ function Assert-KeywordEncoding {
         '开始'               = @(0x5F00, 0x59CB)
         '音乐'               = @(0x97F3, 0x4E50)
         '月半'               = @(0x6708, 0x534A)
+        '月半小夜曲'         = @(0x6708, 0x534A, 0x5C0F, 0x591C, 0x66F2)
+        '李克勤'             = @(0x674E, 0x514B, 0x52E4)
+        '稻香'               = @(0x7A3B, 0x9999)
+        '周杰伦'             = @(0x5468, 0x6770, 0x4F26)
+        '暂停'               = @(0x6682, 0x505C)
         '播放周杰伦的稻香'   = @(0x64AD, 0x653E, 0x5468, 0x6770, 0x4F26, 0x7684, 0x7A3B, 0x9999)
     }
     foreach ($keyword in $expected.Keys) {
@@ -160,7 +184,8 @@ function Assert-KeywordEncoding {
                 $blockSha, $ProductionMemoryBlockSha256)
     }
     if ($ProductionMemoryBlock.Length -ne $ExpectedMemoryCharsB) {
-        throw 'MEMORY_BLOCK_LENGTH_UNSTABLE'
+        throw ("MEMORY_BLOCK_LENGTH_UNSTABLE length={0} expected={1}" -f `
+                $ProductionMemoryBlock.Length, $ExpectedMemoryCharsB)
     }
 }
 
@@ -366,6 +391,7 @@ function New-TurnSignals {
         MediaTitle         = ''
         MediaState         = ''
         MediaSessionFound  = $false
+        MediaSource        = ''
         PlayerForeground   = $false
     }
 }
@@ -547,6 +573,98 @@ function ConvertFrom-ForegroundDump {
     return ''
 }
 
+# Design section 3.5's fallback: when `dumpsys media_session` cannot supply a title/state, read the
+# visible text of the player screen from a `uiautomator dump`. This is a read at the accessibility /
+# uiautomator layer, NOT an operation simulation: nothing is clicked or typed here.
+#
+# The campaign has exactly two pre-registered tracks, so the parser looks for those markers instead
+# of guessing which visible line is a title. `PLAYING` is claimed only when the track is visible, a
+# pause/暂停 control is visible, and the dump's package (or the activity dump's foreground) is the
+# player; otherwise the state is OTHER, and UNKNOWN when no track can be identified.
+function ConvertFrom-UiautomatorDump {
+    param([string]$Dump, [string]$Foreground = '')
+    $result = [pscustomobject]@{
+        Foreground     = (Get-TrimmedText $Foreground)
+        MediaTitle     = ''
+        MediaState     = 'UNKNOWN'
+        Title          = ''
+        Artist         = ''
+        HasTrack       = $false
+        HasPauseControl = $false
+        Established    = $false
+    }
+    if ([string]::IsNullOrWhiteSpace($Dump)) { return $result }
+
+    $textValues = New-Object System.Collections.ArrayList
+    foreach ($match in [regex]::Matches($Dump, '(?:text|content-desc)="([^"]*)"')) {
+        $value = [System.Net.WebUtility]::HtmlDecode($match.Groups[1].Value).Trim()
+        if (-not [string]::IsNullOrEmpty($value)) { [void]$textValues.Add($value) }
+    }
+
+    if ([string]::IsNullOrEmpty($result.Foreground)) {
+        $packageMatch = [regex]::Match($Dump, 'package="([^"]*)"')
+        if ($packageMatch.Success) {
+            $result.Foreground = [System.Net.WebUtility]::HtmlDecode($packageMatch.Groups[1].Value).Trim()
+        }
+    }
+
+    $hasPause = $false
+    foreach ($value in $textValues) {
+        if ($value.IndexOf($PauseControlKeyword, [System.StringComparison]::Ordinal) -ge 0 -or
+            $value.IndexOf('pause', [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $hasPause = $true
+            break
+        }
+    }
+    $result.HasPauseControl = $hasPause
+
+    $title = ''
+    $artist = ''
+    foreach ($value in $textValues) {
+        if ($value.IndexOf($CurrentTrackKeyword, [System.StringComparison]::Ordinal) -ge 0) {
+            $title = $value
+            $artist = $CurrentArtistKeyword
+            break
+        }
+    }
+    if ([string]::IsNullOrEmpty($title)) {
+        foreach ($value in $textValues) {
+            if ($value.IndexOf($MemoryTrackKeyword, [System.StringComparison]::Ordinal) -ge 0) {
+                $title = $value
+                $artist = $MemoryArtistKeyword
+                break
+            }
+        }
+    }
+
+    if (-not [string]::IsNullOrEmpty($title)) {
+        $result.HasTrack = $true
+        $result.Title = $title
+        $artistVisible = $false
+        foreach ($value in $textValues) {
+            if ($value.IndexOf($artist, [System.StringComparison]::Ordinal) -ge 0) {
+                $artistVisible = $true
+                break
+            }
+        }
+        if ($artistVisible -and $title.IndexOf($artist, [System.StringComparison]::Ordinal) -lt 0) {
+            $result.Artist = $artist
+            $result.MediaTitle = '{0} - {1}' -f $title, $artist
+        }
+        else {
+            $result.MediaTitle = $title
+        }
+        if ($hasPause -and (Test-PlayerForeground -Foreground $result.Foreground)) {
+            $result.MediaState = 'PLAYING'
+        }
+        else {
+            $result.MediaState = 'OTHER'
+        }
+        $result.Established = $true
+    }
+    return $result
+}
+
 # `P3_F4ANSWER userChars=.. assistantChars=.. userSha=.. assistantSha=.. route=..`
 function ConvertFrom-F4AnswerLine {
     param([string]$Line)
@@ -609,16 +727,50 @@ function Get-MediaSignals {
     param(
         [string]$MediaSessionDump,
         [string]$ActivityDump,
-        [string]$WindowDump
+        [string]$WindowDump,
+        [string]$UiautomatorDump = ''
     )
     $media = ConvertFrom-MediaSessionDump -Dump $MediaSessionDump
     $foreground = ConvertFrom-ForegroundDump -ActivityDump $ActivityDump -WindowDump $WindowDump
+    $title = $media.MediaTitle
+    $state = $media.MediaState
+    $source = ''
+
+    # A media session is definitive only when it names the track AND gives a playing/paused state.
+    # state=OTHER or metadata:null is exactly the design section 3.5 case that needs the fallback.
+    $definitive = ($media.SessionFound -and -not [string]::IsNullOrEmpty($title) -and
+        ($state -eq 'PLAYING' -or $state -eq 'PAUSED'))
+    $needsUiautomator = -not $definitive
+    if ($definitive) { $source = 'media_session' }
+
+    if ($needsUiautomator -and -not [string]::IsNullOrWhiteSpace($UiautomatorDump)) {
+        $source = 'uiautomator'
+        $ui = ConvertFrom-UiautomatorDump -Dump $UiautomatorDump -Foreground $foreground
+        if ($ui.Established) {
+            if ([string]::IsNullOrEmpty($title)) { $title = $ui.MediaTitle }
+            if ([string]::IsNullOrEmpty($state) -or $state -eq 'OTHER' -or $state -eq 'UNKNOWN') {
+                $state = $ui.MediaState
+            }
+            if ([string]::IsNullOrEmpty($foreground)) { $foreground = $ui.Foreground }
+        }
+        elseif ([string]::IsNullOrEmpty($state)) {
+            # The fallback was the only source and could not identify a track: say UNKNOWN rather
+            # than leaving an empty cell that looks like "no dump was attempted".
+            $state = 'UNKNOWN'
+        }
+    }
+
+    $established = (-not [string]::IsNullOrEmpty($title) -and -not [string]::IsNullOrEmpty($state) -and
+        $state -ne 'UNKNOWN')
     return [pscustomobject]@{
-        MediaTitle        = $media.MediaTitle
-        MediaState        = $media.MediaState
+        MediaTitle        = $title
+        MediaState        = $state
         MediaSessionFound = $media.SessionFound
         Foreground        = $foreground
         PlayerForeground  = (Test-PlayerForeground -Foreground $foreground)
+        MediaEstablished  = $established
+        MediaSource       = $source
+        NeedsUiautomator  = $needsUiautomator
     }
 }
 
@@ -627,13 +779,16 @@ function Get-TurnSignals {
         [string[]]$Lines,
         [string]$MediaSessionDump,
         [string]$ActivityDump,
-        [string]$WindowDump
+        [string]$WindowDump,
+        [string]$UiautomatorDump = ''
     )
     $signals = ConvertFrom-TurnLogLines -Lines $Lines
-    $media = Get-MediaSignals -MediaSessionDump $MediaSessionDump -ActivityDump $ActivityDump -WindowDump $WindowDump
+    $media = Get-MediaSignals -MediaSessionDump $MediaSessionDump -ActivityDump $ActivityDump `
+        -WindowDump $WindowDump -UiautomatorDump $UiautomatorDump
     $signals.MediaTitle = $media.MediaTitle
     $signals.MediaState = $media.MediaState
     $signals.MediaSessionFound = $media.MediaSessionFound
+    $signals.MediaSource = $media.MediaSource
     $signals.Foreground = $media.Foreground
     $signals.PlayerForeground = $media.PlayerForeground
     return $signals
@@ -672,6 +827,21 @@ function Test-Valid {
     return [pscustomobject]@{ Valid = ($reasons.Count -eq 0); Reasons = @($reasons) }
 }
 
+# Design section 3.5 / the review's preflight requirement: the action channel is proven only when at
+# least one slot reports PLAYING for the pre-registered current track (media session or fallback).
+function Test-PreflightActionChannel {
+    param([object[]]$Rows)
+    foreach ($row in @($Rows)) {
+        if ($null -eq $row) { continue }
+        $title = Get-TrimmedText $row.mediaTitle
+        if ((Get-TrimmedText $row.mediaState) -eq 'PLAYING' -and -not [string]::IsNullOrEmpty($title) -and
+            $title.IndexOf($CurrentTrackKeyword, [System.StringComparison]::Ordinal) -ge 0) {
+            return $true
+        }
+    }
+    return $false
+}
+
 # --- Device session ---------------------------------------------------------------
 
 function Set-Form {
@@ -688,7 +858,9 @@ function Set-Form {
     $wait = Wait-LogPattern -Since $since -RequiredPatterns @('P3_F4FORM form=') `
         -TimeoutSeconds $TimeoutSeconds -Label ('FORM_' + $Form)
     if (-not $wait.Found) {
-        throw ('FORM_TIMEOUT form={0}' -f $Form)
+        # A form switch that never answers is a systemic setup failure, not a retryable slot: the
+        # run cannot know which renderer it measured, so it must stop before burning slots.
+        Stop-CampaignFatal ('FORM_TIMEOUT form={0}' -f $Form)
     }
     $line = Get-MatchingLines -Lines $wait.Lines -Pattern 'P3_F4FORM form=' | Select-Object -Last 1
     if (($line -notmatch ('P3_F4FORM form={0} ' -f $formName)) -or ($line -notmatch 'applied=true')) {
@@ -699,32 +871,75 @@ function Set-Form {
     Write-CampaignLog ("FORM form={0} applied=true" -f $Form)
 }
 
+# The corrected Phase 5 click order, as a pure plan so -SelfTest can pin it without adb:
+#   1. launch A11yClickActivity (it takes the foreground and starts polling),
+#   2. sleep 1.5 s,
+#   3. start edith.phone/.MainActivity WHILE the probe is still polling,
+#   4. wait for P3_A1CLICK_VERDICT and require clicked=true.
+# Evidence: docs/project/evidence/2026-10-16-phase-5-device-verification.md:49-57 (menu and 开始 both
+# start the probe, wait 1.5 s, then re-front MainActivity) and
+# docs/project/evidence/2026-10-16-deepseek-apikey-repair.md:121-123 (the probe reads the active
+# window; started last it sees only its own package and every click ends in no_match).
+function Get-ProbeClickSequence {
+    param([string]$Label, [int]$WaitMillis)
+    return @(
+        [pscustomobject]@{ Step = 'launch-probe'; Label = $Label; WaitMillis = $WaitMillis }
+        [pscustomobject]@{ Step = 'sleep'; Milliseconds = $ProbeRefrontDelayMillis }
+        [pscustomobject]@{ Step = 'refront-app' }
+        [pscustomobject]@{ Step = 'wait-verdict'; Label = $Label; WaitMillis = $WaitMillis }
+    )
+}
+
+# Runs the Phase 5 sequence above. The verdict is the probe's own line; a click that never matched,
+# timed out, or was refused is a fatal session-setup failure (design section 3.1), not a slot to
+# retry twenty times.
 function Invoke-ProbeClick {
     param(
         [string]$Label,
         [int]$WaitMillis
     )
     $since = Get-DeviceTimestamp
-    $command = "am start --activity-clear-top -n {0} --es labels '{1}' --ez confirm true --el waitMillis {2}" -f `
-        $ProbeClickComponent, $Label, $WaitMillis
-    Invoke-Adb -Arguments @('shell', $command) | Out-Null
-    $timeout = [int][math]::Ceiling($WaitMillis / 1000.0) + 10
-    $pattern = 'P3_A1CLICK_VERDICT|A1CLICK_SERVICE_NOT_ENABLED|A1CLICK_NOT_CONFIRMED'
-    $wait = Wait-LogPattern -Since $since -RequiredPatterns @($pattern) -TimeoutSeconds $timeout -Label ('CLICK_' + $Label)
-    if (Test-AnyLineMatch -Lines $wait.Lines -Pattern 'A1CLICK_SERVICE_NOT_ENABLED') {
-        Stop-CampaignFatal 'A11Y_SERVICE_NOT_ENABLED the probe service is not connected'
-    }
-    if (Test-AnyLineMatch -Lines $wait.Lines -Pattern 'A1CLICK_NOT_CONFIRMED') {
-        Stop-CampaignFatal 'A11Y_CLICK_NOT_CONFIRMED'
-    }
-    $verdict = Get-MatchingLines -Lines $wait.Lines -Pattern 'P3_A1CLICK_VERDICT' | Select-Object -Last 1
-    if ($null -eq $verdict) {
-        throw ('CLICK_TIMEOUT label={0}' -f $Label)
-    }
-    $outcome = 'unknown'
-    if ($verdict -match 'outcome=(\S+)') { $outcome = $Matches[1] }
-    if ($outcome -ne 'clicked') {
-        throw ('CLICK_FAILED label={0} outcome={1}' -f $Label, $outcome)
+    foreach ($step in (Get-ProbeClickSequence -Label $Label -WaitMillis $WaitMillis)) {
+        switch ($step.Step) {
+            'launch-probe' {
+                $command = "am start --activity-clear-top -n {0} --es labels '{1}' --ez confirm true --el waitMillis {2}" -f `
+                    $ProbeClickComponent, $step.Label, $step.WaitMillis
+                Invoke-Adb -Arguments @('shell', $command) | Out-Null
+                break
+            }
+            'sleep' {
+                Start-Sleep -Milliseconds $step.Milliseconds
+                break
+            }
+            'refront-app' {
+                # Phase 5 lines 49-57: re-front the app while the probe is still polling. Doing this
+                # only after the verdict would let the probe see its own window and fail no_match.
+                Invoke-Adb -Arguments @('shell', 'am start -n edith.phone/.MainActivity') | Out-Null
+                break
+            }
+            'wait-verdict' {
+                $timeout = [int][math]::Ceiling($step.WaitMillis / 1000.0) + 10
+                $pattern = 'P3_A1CLICK_VERDICT|A1CLICK_SERVICE_NOT_ENABLED|A1CLICK_NOT_CONFIRMED'
+                $wait = Wait-LogPattern -Since $since -RequiredPatterns @($pattern) `
+                    -TimeoutSeconds $timeout -Label ('CLICK_' + $step.Label)
+                if (Test-AnyLineMatch -Lines $wait.Lines -Pattern 'A1CLICK_SERVICE_NOT_ENABLED') {
+                    Stop-CampaignFatal 'A11Y_SERVICE_NOT_ENABLED the probe service is not connected'
+                }
+                if (Test-AnyLineMatch -Lines $wait.Lines -Pattern 'A1CLICK_NOT_CONFIRMED') {
+                    Stop-CampaignFatal 'A11Y_CLICK_NOT_CONFIRMED'
+                }
+                $verdict = Get-MatchingLines -Lines $wait.Lines -Pattern 'P3_A1CLICK_VERDICT' | Select-Object -Last 1
+                if ($null -eq $verdict) {
+                    Stop-CampaignFatal ('CLICK_TIMEOUT label={0}' -f $step.Label)
+                }
+                $outcome = 'unknown'
+                if ($verdict -match 'outcome=(\S+)') { $outcome = $Matches[1] }
+                if ($outcome -ne 'clicked') {
+                    Stop-CampaignFatal ('CLICK_FAILED label={0} outcome={1}' -f $step.Label, $outcome)
+                }
+                break
+            }
+        }
     }
     Write-CampaignLog ("CLICK label={0} outcome=clicked" -f $Label)
 }
@@ -741,20 +956,18 @@ function Start-Session {
 
     Set-Form -Form $Form
 
+    # Phase 5: probe -> 1.5 s -> re-front (inside the helper) -> verdict clicked=true -> 6 s settle.
     Invoke-ProbeClick -Label $MenuLabel -WaitMillis 20000
-    Invoke-Adb -Arguments @('shell', 'am start -n edith.phone/.MainActivity') | Out-Null
     Start-Sleep -Seconds 6
 
     # The arm can be logged during the post-click settle, so the slice starts BEFORE the click.
     $since = Get-DeviceTimestamp
     Invoke-ProbeClick -Label $StartLabel -WaitMillis 25000
-    # Bring MainActivity back over the translucent probe before reading the armed state.
-    Invoke-Adb -Arguments @('shell', 'am start -n edith.phone/.MainActivity') | Out-Null
     Start-Sleep -Seconds 8
     $armed = Wait-LogPattern -Since $since -RequiredPatterns @('P3_AUDIO state=armed') `
         -TimeoutSeconds $SessionArmTimeoutSeconds -Label 'ARM'
     if (-not $armed.Found) {
-        throw 'SESSION_NOT_ARMED P3_AUDIO state=armed never appeared'
+        Stop-CampaignFatal 'SESSION_NOT_ARMED P3_AUDIO state=armed never appeared'
     }
     Write-CampaignLog 'SESSION armed=true'
 }
@@ -927,11 +1140,41 @@ function Capture-Answer {
     }
 }
 
+# Design section 3.5 fallback reader: dump the active window's XML, pull it, and return the text.
+# A failed dump (screen off, idle state) returns ''; the caller then reports the honest
+# MEDIA_TITLE_NONE/MEDIA_STATE in preflight instead of pretending a state was measured.
+function Read-UiautomatorDump {
+    $remote = '/sdcard/window_dump.xml'
+    $local = Join-Path ([System.IO.Path]::GetTempPath()) ('edith-uiautomator-{0}.xml' -f [guid]::NewGuid().ToString('N'))
+    try {
+        Invoke-Adb -Arguments @('shell', ('uiautomator dump {0}' -f $remote)) -AllowFailure | Out-Null
+        Invoke-Adb -Arguments @('pull', $remote, $local) -AllowFailure | Out-Null
+        if (-not (Test-Path -LiteralPath $local -PathType Leaf)) { return '' }
+        return [System.IO.File]::ReadAllText($local)
+    }
+    finally {
+        if (Test-Path -LiteralPath $local) { Remove-Item -LiteralPath $local -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 function Read-SystemDumps {
     $media = (Invoke-Adb -Arguments @('shell', 'dumpsys media_session')) -join "`n"
     $activity = (Invoke-Adb -Arguments @('shell', 'dumpsys activity activities')) -join "`n"
     $window = (Invoke-Adb -Arguments @('shell', 'dumpsys window')) -join "`n"
-    return [pscustomobject]@{ MediaSession = $media; Activity = $activity; Window = $window }
+    $probe = Get-MediaSignals -MediaSessionDump $media -ActivityDump $activity -WindowDump $window
+    $uiautomator = ''
+    $attempted = $false
+    if ($probe.NeedsUiautomator) {
+        $attempted = $true
+        $uiautomator = Read-UiautomatorDump
+    }
+    return [pscustomobject]@{
+        MediaSession = $media
+        Activity = $activity
+        Window = $window
+        Uiautomator = $uiautomator
+        UiautomatorAttempted = $attempted
+    }
 }
 
 # --- Memory backup / seed / restore -----------------------------------------------
@@ -1044,7 +1287,10 @@ function Invoke-Cleanup {
 
     try {
         Invoke-Adb -Arguments @('shell', 'am force-stop com.miui.player') | Out-Null
-        $playerPid = (Invoke-Adb -Arguments @('shell', 'pidof com.miui.player')) | Select-Object -First 1
+        # `pidof` exits 1 when no process matches. After a successful force-stop that exit code is
+        # the success case, not an adb failure: allow it and treat empty output as "stopped".
+        $playerPid = (Invoke-Adb -Arguments @('shell', 'pidof com.miui.player') -AllowFailure) |
+            Select-Object -First 1
         $playerPid = Get-TrimmedText $playerPid
         if ([string]::IsNullOrEmpty($playerPid)) {
             $result.PlayerStopped = $true
@@ -1056,6 +1302,7 @@ function Invoke-Cleanup {
     catch {
         [void]$errors.Add(('CLEANUP_STOP_PLAYER_FAILED {0}' -f $_.Exception.Message))
     }
+    $script:Fatal = $null
 
     try {
         Invoke-Adb -Arguments @('shell', 'am force-stop edith.phone') | Out-Null
@@ -1152,6 +1399,35 @@ function New-SelfTestActivityDump {
         'ACTIVITY MANAGER ACTIVITIES (dumpsys activity activities)',
         ('  ResumedActivity: ActivityRecord{{abc123 u0 {0}/{1}}} t1}}' -f $Package, $Component),
         '  mCurrentFocus=null'
+    ) -join "`n"
+}
+
+# A host-only fixture for design section 3.5's `uiautomator dump` fallback. The player screen
+# exposes the track and artist as text and the pause control as a content-desc; no adb is involved.
+function New-SelfTestUiautomatorDump {
+    param(
+        [string]$Track = '月半小夜曲',
+        [string]$Artist = '李克勤',
+        [bool]$PauseControl = $true,
+        [string]$Package = 'com.miui.player'
+    )
+    $nodes = New-Object System.Collections.ArrayList
+    if (-not [string]::IsNullOrEmpty($Track)) {
+        [void]$nodes.Add(('    <node index="1" text="{0}" content-desc="" package="{1}" />' -f $Track, $Package))
+    }
+    if (-not [string]::IsNullOrEmpty($Artist)) {
+        [void]$nodes.Add(('    <node index="2" text="{0}" content-desc="" package="{1}" />' -f $Artist, $Package))
+    }
+    if ($PauseControl) {
+        [void]$nodes.Add(('    <node index="3" text="" content-desc="暂停" package="{0}" />' -f $Package))
+    }
+    return @(
+        '<?xml version="1.0" encoding="UTF-8"?>'
+        '<hierarchy rotation="0">'
+        ('  <node index="0" text="" resource-id="" class="android.widget.FrameLayout" package="{0}">' -f $Package)
+        ($nodes -join "`n")
+        '  </node>'
+        '</hierarchy>'
     ) -join "`n"
 }
 
@@ -1350,6 +1626,125 @@ function Invoke-SelfTest {
         Add-SelfTestFail -Number 9 -Detail ('error={0}' -f $_.Exception.Message)
     }
 
+    # Case 10: design section 3.5 fallback: the player screen shows the track and a 暂停 control.
+    try {
+        $ui = ConvertFrom-UiautomatorDump -Dump (New-SelfTestUiautomatorDump)
+        $problems = @()
+        if ($ui.MediaState -ne 'PLAYING') { $problems += ('state expected=PLAYING actual={0}' -f $ui.MediaState) }
+        if ($ui.MediaTitle -ne '月半小夜曲 - 李克勤') { $problems += ('title actual={0}' -f $ui.MediaTitle) }
+        if ($ui.Foreground -ne 'com.miui.player') { $problems += ('foreground actual={0}' -f $ui.Foreground) }
+        if (-not $ui.Established) { $problems += 'Established expected=true actual=false' }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 10 -Detail ('UI_FALLBACK state=PLAYING title={0} foreground={1}' -f $ui.MediaTitle, $ui.Foreground)
+        }
+        else {
+            Add-SelfTestFail -Number 10 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 10 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
+    # Case 11: the track is visible but no pause control -> the screen does not prove playback.
+    try {
+        $ui = ConvertFrom-UiautomatorDump -Dump (New-SelfTestUiautomatorDump -PauseControl $false)
+        if ($ui.MediaState -eq 'OTHER' -and $ui.Established) {
+            Add-SelfTestPass -Number 11 -Detail 'UI_NO_PAUSE state=OTHER'
+        }
+        else {
+            Add-SelfTestFail -Number 11 -Detail ('state={0} established={1} expected OTHER/true' -f $ui.MediaState, $ui.Established)
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 11 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
+    # Case 12: no pre-registered track on screen -> UNKNOWN and nothing established.
+    try {
+        $ui = ConvertFrom-UiautomatorDump -Dump (New-SelfTestUiautomatorDump -Track '' -Artist '')
+        $problems = @()
+        if ($ui.MediaState -ne 'UNKNOWN') { $problems += ('state expected=UNKNOWN actual={0}' -f $ui.MediaState) }
+        if ($ui.Established) { $problems += 'Established expected=false actual=true' }
+        if (-not [string]::IsNullOrEmpty($ui.MediaTitle)) { $problems += ('title expected empty actual={0}' -f $ui.MediaTitle) }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 12 -Detail 'UI_NO_TRACK state=UNKNOWN established=False'
+        }
+        else {
+            Add-SelfTestFail -Number 12 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 12 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
+    # Case 13: media_session has metadata:null/state=0, but the UI fallback proves the player screen.
+    try {
+        $idle = (New-SelfTestMediaDump -State '0') -replace 'metadata: size=3, description=月半小夜曲, 李克勤, null, null', 'metadata: null'
+        $media = Get-MediaSignals -MediaSessionDump $idle -ActivityDump $activityPlayer -WindowDump '' `
+            -UiautomatorDump (New-SelfTestUiautomatorDump)
+        $problems = @()
+        if ($media.MediaState -ne 'PLAYING') { $problems += ('state expected=PLAYING actual={0}' -f $media.MediaState) }
+        if ($media.MediaTitle.IndexOf('月半小夜曲', [System.StringComparison]::Ordinal) -lt 0) {
+            $problems += ('title actual={0}' -f $media.MediaTitle)
+        }
+        if ($media.MediaSource -ne 'uiautomator') { $problems += ('source expected=uiautomator actual={0}' -f $media.MediaSource) }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 13 -Detail ('MEDIA_FALLBACK source=uiautomator state=PLAYING title={0}' -f $media.MediaTitle)
+        }
+        else {
+            Add-SelfTestFail -Number 13 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 13 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
+    # Case 14: the probe click plan must re-front the app AFTER launching the probe and BEFORE the
+    # verdict wait. A plan that waits for the verdict first sees only the probe window (no_match).
+    try {
+        $sequence = Get-ProbeClickSequence -Label $StartLabel -WaitMillis 25000
+        $steps = @($sequence | ForEach-Object { $_.Step })
+        $expected = @('launch-probe', 'sleep', 'refront-app', 'wait-verdict')
+        $problems = @()
+        if (($steps -join ',') -ne ($expected -join ',')) { $problems += ('steps actual={0}' -f ($steps -join ',')) }
+        if ($sequence[1].Milliseconds -ne 1500) { $problems += ('sleep actual={0}' -f $sequence[1].Milliseconds) }
+        if ($sequence[0].Label -ne $StartLabel) { $problems += ('label actual={0}' -f $sequence[0].Label) }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 14 -Detail ('PROBE_SEQUENCE steps={0} delay={1}' -f ($steps -join ','), $sequence[1].Milliseconds)
+        }
+        else {
+            Add-SelfTestFail -Number 14 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 14 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
+    # Case 15: preflight's action channel requires at least one PLAYING row whose title is the
+    # pre-registered current track; a PLAYING row for another track is not proof.
+    try {
+        $notProof = @(
+            [pscustomobject]@{ mediaState = 'OTHER'; mediaTitle = '月半小夜曲 - 李克勤' },
+            [pscustomobject]@{ mediaState = 'PLAYING'; mediaTitle = '稻香 - 周杰伦' }
+        )
+        $proof = @(
+            [pscustomobject]@{ mediaState = 'OTHER'; mediaTitle = '稻香 - 周杰伦' },
+            [pscustomobject]@{ mediaState = 'PLAYING'; mediaTitle = '月半小夜曲 - 李克勤' }
+        )
+        $problems = @()
+        if (Test-PreflightActionChannel -Rows $notProof) { $problems += 'notProof expected=false actual=true' }
+        if (-not (Test-PreflightActionChannel -Rows $proof)) { $problems += 'proof expected=true actual=false' }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 15 -Detail 'PREFLIGHT_ACTION proof=true notProof=false'
+        }
+        else {
+            Add-SelfTestFail -Number 15 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 15 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
     if ($script:SelfTestFailures.Count -gt 0) {
         Write-Host ('SELFTEST FAIL failures={0}' -f $script:SelfTestFailures.Count)
         return $false
@@ -1383,15 +1778,26 @@ function Show-DryRunPlan {
     Write-Host ('  adb -s {0} shell [ -f {1} ] && echo PRESENT || echo MISSING' -f $DeviceSerial, $questionShown)
     Write-Host ('  adb -s {0} shell am broadcast -a edith.DEBUG_MEMORY_SEED -n {1} --es mode backup' -f $DeviceSerial, $MemoryReceiver)
     Write-Host ('  adb -s {0} shell am broadcast -a edith.DEBUG_MEMORY_SEED -n {1} --es mode seed' -f $DeviceSerial, $MemoryReceiver)
-    Write-Host ('  # for each slot/attempt:')
+    Write-Host '  # for each slot/attempt:'
+    Write-Host ('  adb -s {0} shell dumpsys power  # DEVICE_ASLEEP guard before the slot' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell am force-stop edith.phone' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell am start -n edith.phone/.MainActivity' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell am broadcast -a edith.DEBUG_MEMORY_FORM -n {1} --es form <A|B>' -f $DeviceSerial, $FormReceiver)
+    Write-Host '  # 「菜单」: launch probe -> sleep 1.5 s -> re-front MainActivity while the probe polls -> require P3_A1CLICK_VERDICT clicked=true'
     Write-Host ('  adb -s {0} shell am start --activity-clear-top -n {1} --es labels ''{2}'' --ez confirm true --el waitMillis 20000' -f $DeviceSerial, $ProbeClickComponent, $MenuLabel)
+    Write-Host '  # sleep 1.5 s (the probe is still polling)'
     Write-Host ('  adb -s {0} shell am start -n edith.phone/.MainActivity' -f $DeviceSerial)
+    Write-Host ('  adb -s {0} logcat -d -T <device timestamp> -s EdithP3:* EdithP3T3b:* System.out:*  # require P3_A1CLICK_VERDICT clicked=true' -f $DeviceSerial)
+    Write-Host '  # sleep 6 s'
+    Write-Host '  # 「开始」: same probe -> sleep 1.5 s -> re-front -> verdict clicked=true ordering'
+    Write-Host ('  adb -s {0} shell date +%m-%d_%H:%M:%S.000  # slice for P3_AUDIO armed starts before the click' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell am start --activity-clear-top -n {1} --es labels ''{2}'' --ez confirm true --el waitMillis 25000' -f $DeviceSerial, $ProbeClickComponent, $StartLabel)
+    Write-Host '  # sleep 1.5 s (the probe is still polling)'
     Write-Host ('  adb -s {0} shell am start -n edith.phone/.MainActivity' -f $DeviceSerial)
-    Write-Host ('  adb -s {0} shell date +%m-%d_%H:%M:%S.000' -f $DeviceSerial)
+    Write-Host ('  adb -s {0} logcat -d -T <device timestamp> -s EdithP3:* EdithP3T3b:* System.out:*  # require P3_A1CLICK_VERDICT clicked=true' -f $DeviceSerial)
+    Write-Host '  # sleep 8 s, then wait up to 30 s for P3_AUDIO state=armed'
+    Write-Host ('  adb -s {0} logcat -d -T <pre-click device timestamp> -s EdithP3:* System.out:*  # P3_AUDIO state=armed' -f $DeviceSerial)
+    Write-Host ('  adb -s {0} shell date +%m-%d_%H:%M:%S.000  # turn slice starts here' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell am broadcast -a edith.DEBUG_INJECT -n {1} --es path {2}' -f $DeviceSerial, $InjectReceiver, $WakeWav)
     Write-Host ('  adb -s {0} logcat -d -T <device timestamp> -s EdithP3:* EdithP3T3b:* System.out:*' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell am broadcast -a edith.DEBUG_INJECT -n {1} --es path {2}' -f $DeviceSerial, $InjectReceiver, $questionShown)
@@ -1404,12 +1810,18 @@ function Show-DryRunPlan {
     Write-Host ('  adb -s {0} shell dumpsys media_session' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell dumpsys activity activities' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell dumpsys window' -f $DeviceSerial)
-    Write-Host ('  # after the loop:')
+    Write-Host '  # fallback only when media_session lacks the player title/state:'
+    Write-Host ('  adb -s {0} shell uiautomator dump /sdcard/window_dump.xml' -f $DeviceSerial)
+    Write-Host ('  adb -s {0} pull /sdcard/window_dump.xml <temp>' -f $DeviceSerial)
+    Write-Host '  # parse visible text; campaign.log records DEVIATION_MEDIA_VIA_UIAUTOMATOR'
+    Write-Host '  # after the loop:'
     Write-Host ('  adb -s {0} shell am broadcast -a edith.DEBUG_MEMORY_SEED -n {1} --es mode restore' -f $DeviceSerial, $MemoryReceiver)
     Write-Host ('  adb -s {0} shell am broadcast -a edith.DEBUG_MEMORY_FORM -n {1} --es form B' -f $DeviceSerial, $FormReceiver)
     Write-Host ('  adb -s {0} shell am force-stop com.miui.player' -f $DeviceSerial)
+    Write-Host ('  adb -s {0} shell pidof com.miui.player  # exit 1 allowed; empty output means stopped' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell am force-stop edith.phone' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell am start -n edith.phone/.MainActivity' -f $DeviceSerial)
+    Write-Host ('  adb -s {0} shell pidof edith.phone  # must be non-empty (cold start proof)' -f $DeviceSerial)
 }
 
 # --- Campaign main ----------------------------------------------------------------
@@ -1489,12 +1901,10 @@ function Invoke-Campaign {
             $form = if ($index % 2 -eq 1) { 'A' } else { 'B' }
             $slotName = '{0}{1}' -f $form, [int][math]::Ceiling($index / 2.0)
             $valid = $false
-            $producingAttempt = 0
             $row = $null
             $lastReasons = @()
 
             for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-                $producingAttempt = $attempt
                 $reasons = New-Object System.Collections.ArrayList
                 Write-CampaignLog ('SLOT_BEGIN slot={0} form={1} attempt={2}' -f $slotName, $form, $attempt)
                 try {
@@ -1514,7 +1924,15 @@ function Invoke-Campaign {
                     Start-Sleep -Seconds $MediaSettleSeconds
                     $dumps = Read-SystemDumps
                     $signals = Get-TurnSignals -Lines $turn.Lines -MediaSessionDump $dumps.MediaSession `
-                        -ActivityDump $dumps.Activity -WindowDump $dumps.Window
+                        -ActivityDump $dumps.Activity -WindowDump $dumps.Window `
+                        -UiautomatorDump $dumps.Uiautomator
+                    if ($dumps.UiautomatorAttempted) {
+                        # Design section 3.5: the fallback is a deviation from the media-session
+                        # reading and must be visible in campaign.log (there is no extra CSV column).
+                        Write-CampaignLog ('DEVIATION_MEDIA_VIA_UIAUTOMATOR used={0} state={1} titleFound={2}' -f `
+                                ($signals.MediaSource -eq 'uiautomator'), $signals.MediaState,
+                                (-not [string]::IsNullOrWhiteSpace($signals.MediaTitle)))
+                    }
 
                     $userText = ''
                     $userChars = 0
@@ -1571,6 +1989,12 @@ function Invoke-Campaign {
                 catch {
                     if ($null -ne $script:Fatal) { throw }
                     $lastReasons = @($_.Exception.Message)
+                    # A failed attempt that never reached the row builder must not leave a previous
+                    # attempt's media/foreground/memory/route attached to this attempt's slot row.
+                    $row = New-Row -Slot $slotName -Form $form -Valid $false -AsrChars 0 -AsrSha '' `
+                        -AsrHasMusic $false -AsrHasYueban $false -AnswerChars 0 -AnswerSha '' `
+                        -MediaTitle '' -MediaState '' -Foreground '' -MemoryChars '' -Route '' `
+                        -TurnId '' -Attempt $attempt
                     Write-CampaignLog ('SLOT_ERROR slot={0} form={1} attempt={2} error={3}' -f `
                             $slotName, $form, $attempt, $_.Exception.Message)
                 }
@@ -1582,18 +2006,6 @@ function Invoke-Campaign {
                         -AsrHasMusic $false -AsrHasYueban $false -AnswerChars 0 -AnswerSha '' `
                         -MediaTitle '' -MediaState '' -Foreground '' -MemoryChars '' -Route '' `
                         -TurnId '' -Attempt $Attempts
-                }
-                else {
-                    $row.slot = $slotName
-                    $row.form = $form
-                    $row.valid = '0'
-                    $row.asrChars = '0'
-                    $row.asrSha256 = ''
-                    $row.asrHasMusic = 'false'
-                    $row.asrHasYueban = 'false'
-                    $row.answerChars = '0'
-                    $row.answerSha256 = ''
-                    $row.attempt = [string]$Attempts
                 }
                 Write-CampaignLog ('SLOT_NOT_MEASURED slot={0} form={1} attempts={2} reasons={3}' -f `
                         $slotName, $form, $Attempts, ($lastReasons -join ','))
@@ -1677,11 +2089,12 @@ function Invoke-Campaign {
             elseif ([int]$row.answerChars -ne $convChars) {
                 [void]$reasons.Add(('ANSWER_CHARS {0} conv={1} csv={2}' -f $row.slot, $convChars, $row.answerChars))
             }
-            # "Readable" means the system dumps yielded a package and a session state, not that
-            # group A happened to play a song: A is the experimental variable. At least one slot
-            # must expose a track title, which is how the preflight proves the metadata parse works
-            # (normally B1, whose whole point is to play the current request).
-            if ([string]::IsNullOrWhiteSpace($row.mediaState)) {
+            # "Readable" means the system dumps (or the design section 3.5 fallback) yielded a
+            # package and a state, not that group A happened to play a song: A is the experimental
+            # variable. UNKNOWN is not readable: it is the fallback saying it could not establish
+            # a title/state, so preflight must fail rather than silently degrade.
+            $stateText = Get-TrimmedText $row.mediaState
+            if ([string]::IsNullOrWhiteSpace($stateText) -or $stateText -eq 'UNKNOWN') {
                 [void]$reasons.Add(('MEDIA_STATE {0}' -f $row.slot))
             }
             if ([string]::IsNullOrWhiteSpace($row.foreground)) {
@@ -1690,6 +2103,11 @@ function Invoke-Campaign {
             if (-not [string]::IsNullOrWhiteSpace($row.mediaTitle)) { $rowsWithTitle++ }
         }
         if ($rowsWithTitle -eq 0) { [void]$reasons.Add('MEDIA_TITLE_NONE') }
+        # The action channel, not merely "some state was readable": at least one preflight slot must
+        # show PLAYING for the pre-registered current track (media session or fallback).
+        if (-not (Test-PreflightActionChannel -Rows @($rows))) {
+            [void]$reasons.Add('MEDIA_NOT_PLAYING')
+        }
         if ($reasons.Count -gt 0) {
             Write-Host ('PREFLIGHT FAIL reasons={0}' -f ($reasons -join '; '))
             $exitCode = 1
