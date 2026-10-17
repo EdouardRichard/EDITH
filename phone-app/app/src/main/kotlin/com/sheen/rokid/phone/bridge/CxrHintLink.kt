@@ -110,6 +110,14 @@ class CxrHintLink(
     var onMappingLive: (() -> Unit)? = null
 
     /**
+     * 0.23 P5 (spec §5.3.2): the wearer's double-click reached us as a `STOP` for the established session.
+     *
+     * Set by the composition to `HostCompositionRoot.requestStop()`. Only a matching session/generation invokes it;
+     * everything else is diagnosed and dropped, so an old glasses build or a stale command cannot cancel this one.
+     */
+    var onStopRequest: (() -> Unit)? = null
+
+    /**
      * The identifier of the mapping that is live **right now**, or null while nothing can be displayed.
      *
      * A fresh `syncId` is minted per exchange, so this is the identity of one mapping. A caller that must act once
@@ -278,6 +286,19 @@ class CxrHintLink(
             if (handled) notifyDisplayLiveness()
             return handled
         }
+        if (command is HintCommand.Stop) {
+            val session = establishedSession
+            if (session == null || command.sessionId != session || command.generation != establishedGeneration) {
+                diagnostics("stop refused: session=${command.sessionId} generation=${command.generation} " +
+                    "established=${session ?: "none"}/$establishedGeneration")
+                return false
+            }
+            // No ACK: STOP is an event. The callback is the emergency brake (UserAction.Stop -> plugin.stopAll), and
+            // the plugin's own BUSY=false is what the glasses see as the effect.
+            diagnostics("stop accepted: session=${command.sessionId} generation=${command.generation}")
+            onStopRequest?.invoke()
+            return true
+        }
         return rokidDevice.onCommand(json)
     }
 
@@ -310,6 +331,7 @@ class CxrHintLink(
             "ttl=${command.remainingTtlMillis}ms hintId=${command.hintId}"
         is HintCommand.Clear -> "Clear sequence=${command.sequence}"
         is HintCommand.Ack -> "Ack sequence=${command.sequence}"
+        is HintCommand.Stop -> "Stop session=${command.sessionId} generation=${command.generation}"
         else -> command::class.simpleName ?: "unknown"
     }
 

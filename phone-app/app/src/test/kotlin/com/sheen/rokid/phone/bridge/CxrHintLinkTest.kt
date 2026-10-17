@@ -403,4 +403,57 @@ class CxrHintLinkTest {
         assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "   "))
         assertTrue(sent.isEmpty())
     }
+
+    // ---------------------------------------------------------------- 0.23 P5: the wearer's STOP
+
+    @Test
+    fun aMatchingStopIsRoutedToTheHostCallback() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        var stopped = 0
+        link.onStopRequest = { stopped++ }
+        link.sessionEstablished("s-1", 3)
+
+        assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.Stop("s-1", 3))))
+        assertEquals(1, stopped)
+    }
+
+    @Test
+    fun aStopForAnotherGenerationIsRefused() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        var stopped = 0
+        link.onStopRequest = { stopped++ }
+        link.sessionEstablished("s-1", 3)
+
+        assertFalse("another generation is another session's work",
+            link.onInbound(HintWireCodec.encode(HintCommand.Stop("s-1", 2))))
+        assertEquals(0, stopped)
+    }
+
+    @Test
+    fun aRepeatedStopIsIdempotentAndStillRouted() {
+        // STOP is an event, not a level: the wearer may double-click twice and both must be answered without harm.
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        var stopped = 0
+        link.onStopRequest = { stopped++ }
+        link.sessionEstablished("s-1", 3)
+        val json = HintWireCodec.encode(HintCommand.Stop("s-1", 3))
+
+        assertTrue(link.onInbound(json))
+        assertTrue(link.onInbound(json))
+        assertEquals(2, stopped)
+    }
+
+    @Test
+    fun aStopBeforeAnySessionIsRefused() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        var stopped = 0
+        link.onStopRequest = { stopped++ }
+
+        assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.Stop("s-1", 3))))
+        assertEquals(0, stopped)
+    }
 }
