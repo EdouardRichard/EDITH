@@ -27,6 +27,20 @@ fun sideFor(role: ConversationRole): BubbleSide = when (role) {
     ConversationRole.USER -> BubbleSide.END
 }
 
+/**
+ * The visible role description carried by the bubble's avatar (owner follow-up 2026-10-17).
+ *
+ * The avatars are what lets a reader name the two sides at a glance; the content description carries the same words to
+ * accessibility services, so "left is the assistant, right is the wearer" is not only a colour/position cue.
+ */
+fun roleDescription(role: ConversationRole): String = when (role) {
+    ConversationRole.ASSISTANT -> "助手"
+    ConversationRole.USER -> "你"
+}
+
+/** What a screen reader says for one bubble: who spoke, then the words. */
+fun spokenMessage(role: ConversationRole, text: String): String = "${roleDescription(role)}说：$text"
+
 /** The full name of the route shown in the chat box header; the segmented buttons keep the shorter 唤醒 / 主动 labels. */
 fun routeLabel(route: AssistantRoute): String = when (route) {
     AssistantRoute.WAKE -> "唤醒对话"
@@ -50,6 +64,19 @@ fun shouldAutoScroll(atBottom: Boolean, previousCount: Int, newCount: Int): Bool
  */
 fun shouldFollowNewEntry(atBottom: Boolean, previousLastId: String?, currentLastId: String?): Boolean =
     atBottom && currentLastId != null && currentLastId != previousLastId
+
+/**
+ * Whether the reader was at the bottom before a new entry arrived.
+ *
+ * The **visible item keys** are the authority, never an index/count comparison. `ConversationLog` is bounded at 40
+ * entries, so once the cap is reached an append evicts the oldest entry and leaves the count unchanged; and the new
+ * item may or may not be laid out by the time the follow effect runs. The previous last entry still being on screen is
+ * the frame-order-independent fact that means "the reader was at the end". A null [previousLastId] means the list was
+ * empty, so the first entry is followed; a non-null previous id with no visible keys means the list has not been laid
+ * out yet, which is not the same thing as a reader who scrolled away.
+ */
+fun wasAtBottom(visibleKeys: List<Any?>, previousLastId: String?): Boolean =
+    previousLastId == null || visibleKeys.any { it == previousLastId }
 
 /** The index a freshly opened route starts at: the newest entry, or `null` when there is nothing to show. */
 fun initialScrollTarget(entryCount: Int): Int? = if (entryCount > 0) entryCount - 1 else null

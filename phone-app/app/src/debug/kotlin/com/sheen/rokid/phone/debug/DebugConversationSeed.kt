@@ -20,7 +20,12 @@ import com.sheen.rokid.phone.platform.P3Log
  * ```
  * adb -s 2696813b shell am broadcast -a edith.DEBUG_CONVERSATION \
  *   -n com.sheen.rokid.phone/.debug.DebugConversationSeed --ei count 30 --ez clear true
+ * adb -s 2696813b shell am broadcast -a edith.DEBUG_CONVERSATION \
+ *   -n com.sheen.rokid.phone/.debug.DebugConversationSeed --ei count 3 --es route PROACTIVE
  * ```
+ *
+ * `clear` is **global** (`ConversationLog` has no per-route clear), so a seeded PROACTIVE run after a WAKE run must
+ * omit `--ez clear true`; the ids include the route name, so the two routes cannot replace each other.
  *
  * It exists **only in the debug source set** (see `src/debug/AndroidManifest.xml`) and is `exported` so `am broadcast`
  * from the host can reach it; a release build contains no receiver and no seed path. It logs counts only — never the
@@ -32,28 +37,36 @@ class DebugConversationSeed : BroadcastReceiver() {
         if (intent.action != ACTION) return
         val app = context.applicationContext as? EdithApplication ?: return
         val count = intent.getIntExtra(EXTRA_COUNT, DEFAULT_COUNT).coerceIn(0, MAX_COUNT)
+        val route = AssistantRoute.fromWire(intent.getStringExtra(EXTRA_ROUTE)) ?: AssistantRoute.WAKE
         val log = app.composition.conversationLog
+        // Deliberately global: ConversationLog exposes clear() only. A caller seeding the second route must omit clear.
         if (intent.getBooleanExtra(EXTRA_CLEAR, false)) log.clear()
         for (index in 1..count) {
             val role = if (index % 2 == 1) ConversationRole.USER else ConversationRole.ASSISTANT
             log.append(
                 ConversationEntry(
-                    entryId = "$ID_PREFIX$index-${role.name}",
-                    route = AssistantRoute.WAKE,
+                    entryId = "$ID_PREFIX${route.name}-$index-${role.name}",
+                    route = route,
                     role = role,
-                    text = textFor(index, role),
+                    text = textFor(route, index, role),
                 ),
             )
         }
-        // Counts only: the text itself is the evidence subject and must not reach logcat.
-        P3Log.line("P3_CONV_SEED count=$count total=${log.size()}")
+        // Counts and route only: the text itself is the evidence subject and must not reach logcat.
+        P3Log.line("P3_CONV_SEED route=${route.name} count=$count total=${log.size()}")
     }
 
-    private fun textFor(index: Int, role: ConversationRole): String = when (role) {
-        ConversationRole.USER ->
-            "第 $index 轮用户消息：这是用于布局证据的合成记录，句子长度足以让对话列表超过一屏并触发滚动。"
-        ConversationRole.ASSISTANT ->
-            "第 $index 轮助手回复：这是用于布局证据的合成记录，句子长度足以让对话列表超过一屏并触发滚动。"
+    private fun textFor(route: AssistantRoute, index: Int, role: ConversationRole): String {
+        val conversation = when (route) {
+            AssistantRoute.WAKE -> "唤醒"
+            AssistantRoute.PROACTIVE -> "主动辅助"
+        }
+        return when (role) {
+            ConversationRole.USER ->
+                "$conversation 第 $index 轮用户消息：这是用于布局证据的合成记录，句子长度足以让对话列表超过一屏并触发滚动。"
+            ConversationRole.ASSISTANT ->
+                "$conversation 第 $index 轮助手回复：这是用于布局证据的合成记录，句子长度足以让对话列表超过一屏并触发滚动。"
+        }
     }
 
     companion object {
@@ -62,6 +75,9 @@ class DebugConversationSeed : BroadcastReceiver() {
 
         const val EXTRA_COUNT = "count"
         const val EXTRA_CLEAR = "clear"
+
+        /** `WAKE` (default) or `PROACTIVE`; the ids include the route name. `clear` is global regardless of route. */
+        const val EXTRA_ROUTE = "route"
 
         const val DEFAULT_COUNT = 30
 

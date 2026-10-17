@@ -13,6 +13,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -23,6 +24,8 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -227,8 +230,10 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
  * icon) are **outside** every scroll container, so a long record cannot carry them off screen. Only the message
  * `LazyColumn` scrolls.
  *
- * U2 puts the assistant's bubbles on the left and the wearer's on the right; the owner 2026-10-18 chose to show neither
- * a role label nor a timestamp, so alignment and colour are the whole distinction.
+ * U2 puts the assistant's bubbles on the left and the wearer's on the right; the owner 2026-10-17 follow-up chose a
+ * visible role avatar (a feminine face for the assistant, a person for the wearer) and no timestamp, so the two sides
+ * are named as well as positioned. The avatar is decorative to a screen reader: the bubble row carries the spoken
+ * "助手说：…" text.
  *
  * The switch is **read-only**: it changes which conversation is in front of the wearer and nothing else. It reads the
  * same `ConversationLog` the glasses render — same shape, same order, same eviction — so the two screens cannot drift
@@ -237,7 +242,7 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
  *
  * The list re-reads itself while the tab is on screen, because a record that only updates when the wearer presses a
  * button is a record that looks frozen exactly when a turn is running. It follows new entries only when the reader is
- * already at the bottom; the owner 2026-10-18 chose to start each route at its newest entry.
+ * already at the bottom; the owner 2026-10-17 chose to start each route at its newest entry.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -260,7 +265,7 @@ internal fun AssistantTab(log: ConversationLog, modifier: Modifier = Modifier) {
         }
     }
 
-    // Opening a route, or switching to the other one, starts at the newest entry (owner 2026-10-18). scrollToItem, not
+    // Opening a route, or switching to the other one, starts at the newest entry (owner 2026-10-17). scrollToItem, not
     // animateScrollToItem: a first frame that animates through the whole record would show the oldest line first.
     LaunchedEffect(route) {
         initialScrollTarget(entries.size)?.let { listState.scrollToItem(it) }
@@ -272,11 +277,12 @@ internal fun AssistantTab(log: ConversationLog, modifier: Modifier = Modifier) {
     // visible index with the *previous* count, not with the new total: after an append the new item is not laid out yet
     // on some frames, and "last visible < new total - 1" would then wrongly read as "the reader scrolled up".
     LaunchedEffect(entries.size, entries.lastOrNull()?.entryId) {
-        val info = listState.layoutInfo
-        val lastVisible = info.visibleItemsInfo.lastOrNull()?.index
-        val atBottomBefore = lastVisible == null || lastVisible >= previousCount - 1
-        // Either a count increase or a changed last id is a new entry; the second covers the bounded log's cap, where
-        // an append evicts the oldest entry and leaves the count at 40.
+        // Visible *keys*, not an index/count comparison: at the 40-entry cap an append evicts the oldest entry and the
+        // count stays 40, and the new item may or may not have been laid out yet. The previous last entry still being
+        // on screen is the frame-order-independent fact that means the reader was at the bottom.
+        val visibleKeys = listState.layoutInfo.visibleItemsInfo.map { it.key }
+        val atBottomBefore = wasAtBottom(visibleKeys, previousLastId)
+        // Either a count increase or a changed last id is a new entry; the second covers the bounded log's cap.
         val shouldFollow = shouldAutoScroll(atBottomBefore, previousCount, entries.size) ||
             shouldFollowNewEntry(atBottomBefore, previousLastId, entries.lastOrNull()?.entryId)
         if (entries.isNotEmpty() && shouldFollow) {
@@ -343,14 +349,27 @@ internal fun AssistantTab(log: ConversationLog, modifier: Modifier = Modifier) {
     }
 }
 
-/** One message: the assistant's on the left, the wearer's on the right (U2), content-sized up to 80% of the row. */
+/**
+ * One message: the assistant's on the left, the wearer's on the right (U2), content-sized up to 80% of the row.
+ *
+ * A small avatar sits on the *outside* of each bubble — robot for the assistant, person for the wearer — so the two
+ * sides are identifiable without relying on position and colour alone (owner follow-up 2026-10-17). It is a rendered
+ * control, not a text label: the role name travels in the avatar's content description.
+ */
 @Composable
 private fun MessageBubble(entry: ConversationEntry) {
     val side = sideFor(entry.role)
     Row(
-        Modifier.fillMaxWidth(),
+        Modifier.fillMaxWidth().semantics(mergeDescendants = true) {
+            contentDescription = spokenMessage(entry.role, entry.text)
+        },
         horizontalArrangement = if (side == BubbleSide.END) Arrangement.End else Arrangement.Start,
+        verticalAlignment = Alignment.Top,
     ) {
+        if (side == BubbleSide.START) {
+            RoleAvatar(entry.role)
+            Spacer(Modifier.width(8.dp))
+        }
         BoxWithConstraints {
             Surface(
                 modifier = Modifier.widthIn(max = maxWidth * BUBBLE_MAX_WIDTH_FRACTION),
@@ -363,6 +382,40 @@ private fun MessageBubble(entry: ConversationEntry) {
             ) {
                 Text(entry.text, modifier = Modifier.padding(12.dp))
             }
+        }
+        if (side == BubbleSide.END) {
+            Spacer(Modifier.width(8.dp))
+            RoleAvatar(entry.role)
+        }
+    }
+}
+
+/** The role avatar: a feminine face for the assistant, a person for the wearer; the bubble carries the spoken role. */
+@Composable
+private fun RoleAvatar(role: ConversationRole) {
+    Surface(
+        modifier = Modifier.size(32.dp),
+        shape = CircleShape,
+        color = if (role == ConversationRole.USER) {
+            MaterialTheme.colorScheme.primaryContainer
+        } else {
+            MaterialTheme.colorScheme.surfaceVariant
+        },
+    ) {
+        Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Icon(
+                // Face4 is the feminine face with a bun; the owner asked for a softer, female-looking assistant
+                // avatar instead of the robot glyph (2026-10-17 follow-up).
+                imageVector = if (role == ConversationRole.USER) Icons.Default.Person else Icons.Default.Face4,
+                // Decorative: the bubble row's merged semantics already say "助手说：…" / "你说：…".
+                contentDescription = null,
+                modifier = Modifier.size(20.dp),
+                tint = if (role == ConversationRole.USER) {
+                    MaterialTheme.colorScheme.onPrimaryContainer
+                } else {
+                    MaterialTheme.colorScheme.onSurfaceVariant
+                },
+            )
         }
     }
 }
