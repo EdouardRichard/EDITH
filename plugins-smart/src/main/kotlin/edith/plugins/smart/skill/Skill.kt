@@ -38,6 +38,22 @@ internal fun injectionFor(skills: List<Skill>): String =
         }
     }
 
+/**
+ * The catalog form of a SKILL list (Phase 6, design D-1): one `- <name>: <description>` line per entry, sorted by
+ * `name`, under a `## SKILL 目录` header — and **never a body**. The model reads the catalog to decide what to pull;
+ * the body only follows an explicit [SkillManager.load].
+ *
+ * Empty input yields the empty string, not a header with nothing under it: "no SKILL is available" must make the
+ * caller omit the segment entirely, not put an empty section in the system frame.
+ */
+internal fun catalogFor(skills: List<Skill>): String {
+    if (skills.isEmpty()) return ""
+    return skills.sortedBy { it.name }.joinToString(
+        separator = "\n",
+        prefix = "## SKILL 目录\n\n",
+    ) { skill -> "- ${skill.name}: ${skill.description}" }
+}
+
 /** The outcome of parsing one file. */
 sealed class SkillParse {
     data class Ok(val skill: Skill) : SkillParse()
@@ -72,4 +88,31 @@ enum class SkillRejection {
      * readable half.
      */
     INVALID_ENCODING,
+}
+
+/**
+ * The result of pulling one SKILL body by name (Phase 6, design D-1/D-4).
+ *
+ * A refusal names *why* it refused so the two cases stay distinguishable at the tool boundary: a disabled SKILL is
+ * still installed (the user turned it off), while an absent name is a call the model can self-correct.
+ */
+sealed class SkillLoad {
+    /**
+     * The body, plus whether the governor held the entry DORMANT **before** the pull. Drift-demoted and
+     * cap-demoted entries both arrive here; the flag lets the caller tell "it was in the catalog" from "it was only
+     * reachable by name" (design D-4's second gate).
+     */
+    data class Loaded(val skill: Skill, val wasDormant: Boolean) : SkillLoad()
+
+    /** Nothing was returned. [reason] says whether the name exists but is disabled, or does not exist at all. */
+    data class NotFound(val reason: SkillLoadReason) : SkillLoad()
+}
+
+/** Why a [SkillLoad] found no body. */
+enum class SkillLoadReason {
+    /** No entry with that name in the whole library. */
+    NOT_IN_LIBRARY,
+
+    /** The entry exists but the user disabled it, so its body must not be handed to the model. */
+    DISABLED,
 }
