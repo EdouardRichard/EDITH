@@ -108,4 +108,52 @@ class MemoryLogViewTest {
     @Test fun `an absent document renders as empty`() {
         assertTrue(view().lines().isEmpty())
     }
+
+    @Test fun `a short memory is shown unchanged`() {
+        assertEquals("我喜欢喝茶", view().preview("我喜欢喝茶"))
+    }
+
+    @Test fun `exactly forty code points are not truncated`() {
+        val text = "字".repeat(MemoryLogView.PREVIEW_CODE_POINTS)
+
+        assertEquals(text, view().preview(text))
+    }
+
+    @Test fun `a longer memory keeps forty code points and adds an ellipsis`() {
+        val preview = view().preview("字".repeat(41))
+
+        assertEquals("字".repeat(40) + "…", preview)
+        assertEquals(41, preview.codePointCount(0, preview.length))
+    }
+
+    @Test fun `a surrogate pair at the exact limit is not split`() {
+        val text = "😀".repeat(39) + "汉"
+
+        assertEquals(text, view().preview(text))
+    }
+
+    @Test fun `an emoji is never cut in half`() {
+        assertEquals("😀".repeat(40) + "…", view().preview("😀".repeat(40) + "汉"))
+    }
+
+    @Test fun `blank memory previews empty`() {
+        assertEquals("", view().preview("   "))
+        assertEquals("", view().preview(""))
+    }
+
+    @Test fun `the list line is the time the kind and the preview`() {
+        store().record(MemoryKind.PREFERENCE, "我喜欢喝茶", MemorySource.EXPLICIT)
+        val line = view().lines().single()
+
+        assertEquals("${line.stamp} | 偏好 | 我喜欢喝茶", view().renderPreview(line))
+    }
+
+    @Test fun `the list line never carries the whole long sentence and storage is unchanged`() {
+        val long = "字".repeat(60)
+        store().record(MemoryKind.FACT, long, MemorySource.EXPLICIT)
+        val line = view().lines().single()
+
+        assertEquals("the full text stays in the document", long, line.text)
+        assertEquals("${line.stamp} | 事实 | ${"字".repeat(40)}…", view().renderPreview(line))
+    }
 }

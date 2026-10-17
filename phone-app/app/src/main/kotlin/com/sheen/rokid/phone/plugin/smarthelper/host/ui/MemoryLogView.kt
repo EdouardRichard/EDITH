@@ -35,6 +35,23 @@ class MemoryLogView(private val storage: StorageHandle) {
     /** Exactly what the page shows for one entry. Kept separate so a test can pin the fields it may contain. */
     fun render(line: MemoryLine): String = "${line.stamp} | ${line.kind} | ${line.text}"
 
+    /**
+     * The list row's thumbnail: the first [maxCodePoints] code points, plus `…` when there is more.
+     *
+     * The cap is **code points**, not UTF-16 units: a surrogate pair is one character and must never be cut in half by
+     * the thumbnail. The document is untouched - [MemoryLine.text] still holds the whole sentence - so the detail page
+     * can show every character the file has.
+     */
+    fun preview(text: String, maxCodePoints: Int = PREVIEW_CODE_POINTS): String {
+        if (text.isBlank()) return ""
+        val count = text.codePointCount(0, text.length)
+        if (count <= maxCodePoints) return text
+        return text.substring(0, text.offsetByCodePoints(0, maxCodePoints)) + "…"
+    }
+
+    /** The single line the list shows: time, kind and the [preview] - never the whole long sentence. */
+    fun renderPreview(line: MemoryLine): String = "${line.stamp} | ${line.kind} | ${preview(line.text)}"
+
     /** The user's "forget this" - the entry goes out of the document, not merely off this page. */
     fun delete(id: String) = log.delete(id)
 
@@ -59,6 +76,9 @@ class MemoryLogView(private val storage: StorageHandle) {
 
         /** How many lines the page shows unless it is asked for another number. */
         const val DEFAULT_LIMIT = 50
+
+        /** How many code points the list thumbnail keeps before the `…` (U-4, approved spec §4.2.2). */
+        const val PREVIEW_CODE_POINTS = 40
 
         private val STAMP: DateTimeFormatter = DateTimeFormatter.ofPattern("MM-dd HH:mm")
     }
