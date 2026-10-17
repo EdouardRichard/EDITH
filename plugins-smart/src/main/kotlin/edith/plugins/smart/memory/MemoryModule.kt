@@ -63,8 +63,9 @@ class MemoryModule(
     /**
      * Phase 7 F4 (§3.1): the **measurement-only** rendering seam, defaulting to [ProductionMemoryEvidenceRenderer].
      *
-     * Production never passes this parameter, so its output is byte-identical to the pre-seam module. The seam exists
-     * so the F4 experiment can select [LegacyRawMemoryEvidenceRenderer]; no ranking, threshold or limit reads it.
+     * Production passes only [ProductionMemoryEvidenceRenderer] - the very object this default names - so its output
+     * stays byte-identical to the pre-seam module. The seam exists so the F4 measurement path can select
+     * [LegacyRawMemoryEvidenceRenderer]; no production path does, and no ranking, threshold or limit reads it.
      */
     private val renderer: MemoryEvidenceRenderer = ProductionMemoryEvidenceRenderer,
 ) {

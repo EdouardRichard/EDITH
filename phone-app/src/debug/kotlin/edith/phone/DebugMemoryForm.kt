@@ -23,8 +23,9 @@ import edith.plugins.smart.memory.MemoryMeasurementForm
  * logged as `form=REFUSED`, rather than silently defaulting a typo into the wrong experimental slot.
  *
  * It exists **only in the debug source set** (see `src/debug/AndroidManifest.xml`) and is `exported` so `am broadcast`
- * can reach it; a release build contains no receiver and no way to select the legacy renderer. The log line carries the
- * form name and whether a plugin took it - never memory text or any other content.
+ * can reach it; a release build contains no receiver. The `setMemoryMeasurementForm` setter it calls remains in
+ * `src/main` as a measurement seam, but it has no release caller, so release has no path that selects the legacy
+ * renderer. The log line carries the form name and whether a plugin took it - never memory text or any other content.
  */
 class DebugMemoryForm : BroadcastReceiver() {
 

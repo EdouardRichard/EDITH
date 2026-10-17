@@ -31,7 +31,8 @@ import java.security.MessageDigest
  *
  * Only counts, ids and SHA-256 values reach the log - never the memory text. The receiver exists **only in the debug
  * source set** (see `src/debug/AndroidManifest.xml`) and is `exported` so `am broadcast` can reach it; a release build
- * contains neither the receiver nor [HostCompositionRoot.memoryStoreForProbe].
+ * contains no receiver. [HostCompositionRoot.memoryStoreForProbe] remains in `src/main` as an `internal` accessor, but
+ * it has no release caller - only this debug receiver uses it.
  */
 class DebugF4Memory : BroadcastReceiver() {
 

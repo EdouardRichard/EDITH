@@ -25,10 +25,13 @@ not changed. Variant selection happens in the preflight, not here, and not durin
 
 ## Generate
 
-Run from the repository root (the default `-OutDir` is relative to the current directory):
+Run from the repository root (the default `-OutDir` is relative to the current directory). The p7-f4
+scripts target **Windows PowerShell 5.1**, the host used for the Phase 7 run, and must be invoked with
+`powershell.exe -NoProfile -ExecutionPolicy Bypass -File` (not bare `pwsh`; PowerShell 7 was not the
+measured host, though the same `-File` arguments work there):
 
 ```powershell
-pwsh -File tools/p7-f4/New-QuestionWav.ps1
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/p7-f4/New-QuestionWav.ps1
 ```
 
 Output (gitignored):
@@ -49,7 +52,7 @@ printed.
 To choose another directory:
 
 ```powershell
-pwsh -File tools/p7-f4/New-QuestionWav.ps1 -OutDir .local/p7-f4/wav-2
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File tools/p7-f4/New-QuestionWav.ps1 -OutDir .local/p7-f4/wav-2
 ```
 
 ## Push to the phone

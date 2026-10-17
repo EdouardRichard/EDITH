@@ -71,6 +71,9 @@ $ErrorActionPreference = 'Stop'
 $DeviceSerial = '2696813b'
 $PlayerPackage = 'com.miui.player'
 $ExternalFilesDir = '/sdcard/Android/data/edith.phone/files'
+# The memory backup wrapper's file name under getExternalFilesDir(null) (DebugF4Memory.BACKUP_FILE).
+# It is the only way back to the owner's document, so cleanup deletes it ONLY after a verified restore.
+$BackupFileName = 'f4-memory-backup.bin'
 $AppPackage = 'edith.phone'
 $MemoryReceiver = 'edith.phone/.DebugF4Memory'
 $FormReceiver = 'edith.phone/.DebugMemoryForm'
@@ -1333,6 +1336,55 @@ function Restore-Memory {
     return [pscustomobject]@{ Bytes = $info.Bytes; Sha = $info.Sha; Entries = $info.Entries; Line = $line }
 }
 
+# The device-side files a finished campaign leaves behind: the memory backup wrapper and the LAST
+# turn's captured answer files, in both locations the capture may have written (the external files
+# dir and the app-internal `files/` dir used by route=internal). Deleting the wrapper before the
+# restore is verified would destroy the only way back to the owner's document, so the list is EMPTY
+# unless RestoreOk is true - a failed restore keeps every file. Pure so -SelfTest can pin the list
+# without adb.
+function Get-DeviceCleanupFilePlan {
+    param([bool]$RestoreVerified)
+    if (-not $RestoreVerified) { return @() }
+    return @(
+        [pscustomobject]@{ Scope = 'external'; Name = $BackupFileName }
+        [pscustomobject]@{ Scope = 'external'; Name = 'f4-user.txt' }
+        [pscustomobject]@{ Scope = 'external'; Name = 'f4-assistant.txt' }
+        [pscustomobject]@{ Scope = 'internal'; Name = 'f4-user.txt' }
+        [pscustomobject]@{ Scope = 'internal'; Name = 'f4-assistant.txt' }
+    )
+}
+
+# Removes the plan above. `-AllowFailure`: this is best-effort housekeeping AFTER a verified restore;
+# a failing `rm` must be visible in the log but must not turn a completed campaign into an error.
+function Clear-DeviceCampaignFiles {
+    param([bool]$RestoreVerified)
+    $plan = @(Get-DeviceCleanupFilePlan -RestoreVerified $RestoreVerified)
+    if ($plan.Count -eq 0) {
+        Write-CampaignLog 'CLEANUP_DEVICE_FILES removed=false reason=RESTORE_NOT_VERIFIED'
+        return [pscustomobject]@{ Removed = $false; Files = @() }
+    }
+    $externalPaths = @($plan | Where-Object { $_.Scope -eq 'external' } |
+            ForEach-Object { '{0}/{1}' -f $ExternalFilesDir, $_.Name })
+    $internalPaths = @($plan | Where-Object { $_.Scope -eq 'internal' } |
+            ForEach-Object { 'files/{0}' -f $_.Name })
+    $described = @($plan | ForEach-Object { '{0}/{1}' -f $_.Scope, $_.Name })
+    try {
+        if ($externalPaths.Count -gt 0) {
+            Invoke-Adb -Arguments @('shell', ('rm -f ' + ($externalPaths -join ' '))) -AllowFailure | Out-Null
+        }
+        if ($internalPaths.Count -gt 0) {
+            Invoke-Adb -Arguments @('shell', ('run-as edith.phone rm -f ' + ($internalPaths -join ' '))) `
+                -AllowFailure | Out-Null
+        }
+        Write-CampaignLog ('CLEANUP_DEVICE_FILES removed=true files={0}' -f ($described -join '|'))
+        return [pscustomobject]@{ Removed = $true; Files = $described }
+    }
+    catch {
+        Write-CampaignLog ('CLEANUP_DEVICE_FILES removed=false reason={0}' -f $_.Exception.Message)
+        return [pscustomobject]@{ Removed = $false; Files = @() }
+    }
+}
+
 # Design section 3.7: restore, set the production form, stop the player, cold start, verify the
 # restore line. Every step is attempted even when an earlier one failed; the result is reported.
 function Invoke-Cleanup {
@@ -1345,6 +1397,7 @@ function Invoke-Cleanup {
         PlayerStopped = $false
         ColdStart    = $false
         ColdStartPid = ''
+        DeviceFilesRemoved = $false
         Errors       = @()
     }
     $errors = New-Object System.Collections.ArrayList
@@ -1421,11 +1474,24 @@ function Invoke-Cleanup {
     catch {
         [void]$errors.Add(('CLEANUP_COLD_START_FAILED {0}' -f $_.Exception.Message))
     }
+    $script:Fatal = $null
+
+    # Design section 3.7 / final review: housekeeping runs LAST and only after the restore above was
+    # verified. A failed restore (or a run that never got as far as a backup) keeps the wrapper and
+    # the last answer files on the device, because the wrapper is the only way back. Host `.local`
+    # copies are never touched here.
+    try {
+        $deviceFiles = Clear-DeviceCampaignFiles -RestoreVerified $result.RestoreOk
+        $result.DeviceFilesRemoved = $deviceFiles.Removed
+    }
+    catch {
+        [void]$errors.Add(('CLEANUP_DEVICE_FILES_FAILED {0}' -f $_.Exception.Message))
+    }
 
     $result.Errors = @($errors)
-    Write-CampaignLog ("CLEANUP restoreOk={0} restoreSha={1} formSet={2} playerStopped={3} coldStart={4} pid={5} errors={6}" -f `
+    Write-CampaignLog ("CLEANUP restoreOk={0} restoreSha={1} formSet={2} playerStopped={3} coldStart={4} pid={5} deviceFilesRemoved={6} errors={7}" -f `
             $result.RestoreOk, $result.RestoreSha, $result.FormSet, $result.PlayerStopped, $result.ColdStart, `
-            $result.ColdStartPid, ($result.Errors -join '|'))
+            $result.ColdStartPid, $result.DeviceFilesRemoved, ($result.Errors -join '|'))
     return $result
 }
 
@@ -2013,6 +2079,34 @@ function Invoke-SelfTest {
         Add-SelfTestFail -Number 21 -Detail ('error={0}' -f $_.Exception.Message)
     }
 
+    # Case 22: the device cleanup file list. Nothing is deleted unless the restore was verified, and
+    # the verified list is exactly the wrapper plus the last external/internal answer copies - no
+    # broader `rm`, and the backup is never in the unverified list.
+    try {
+        $unverified = @(Get-DeviceCleanupFilePlan -RestoreVerified $false)
+        $verified = @(Get-DeviceCleanupFilePlan -RestoreVerified $true)
+        $actual = @($verified | ForEach-Object { '{0}/{1}' -f $_.Scope, $_.Name }) -join ','
+        $expected = @(
+            'external/' + $BackupFileName
+            'external/f4-user.txt'
+            'external/f4-assistant.txt'
+            'internal/f4-user.txt'
+            'internal/f4-assistant.txt'
+        ) -join ','
+        $problems = @()
+        if ($unverified.Count -ne 0) { $problems += ('unverified count actual={0}' -f $unverified.Count) }
+        if ($actual -ne $expected) { $problems += ('verified actual={0}' -f $actual) }
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 22 -Detail ('CLEANUP_FILES unverified=0 verified={0}' -f $verified.Count)
+        }
+        else {
+            Add-SelfTestFail -Number 22 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 22 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
     if ($script:SelfTestFailures.Count -gt 0) {
         Write-Host ('SELFTEST FAIL failures={0}' -f $script:SelfTestFailures.Count)
         return $false
@@ -2084,6 +2178,8 @@ function Show-DryRunPlan {
     Write-Host '  # parse visible text; campaign.log records DEVIATION_MEDIA_VIA_UIAUTOMATOR'
     Write-Host '  # after the loop:'
     Write-Host ('  adb -s {0} shell am broadcast -a edith.DEBUG_MEMORY_SEED -n {1} --es mode restore' -f $DeviceSerial, $MemoryReceiver)
+    Write-Host ('  adb -s {0} shell rm -f {1}/{2} {1}/f4-user.txt {1}/f4-assistant.txt  # ONLY after the restore line verified the backup SHA' -f $DeviceSerial, $ExternalFilesDir, $BackupFileName)
+    Write-Host ('  adb -s {0} shell run-as edith.phone rm -f files/f4-user.txt files/f4-assistant.txt  # ONLY after the verified restore; kept on failure' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell am broadcast -a edith.DEBUG_MEMORY_FORM -n {1} --es form B' -f $DeviceSerial, $FormReceiver)
     Write-Host ('  adb -s {0} shell am force-stop com.miui.player' -f $DeviceSerial)
     Write-Host ('  adb -s {0} shell pidof com.miui.player  # exit 1 allowed; empty output means stopped' -f $DeviceSerial)
@@ -2303,6 +2399,7 @@ function Invoke-Campaign {
         $cleanup = [pscustomobject]@{
             RestoreOk = $false; RestoreSha = ''; RestoreLine = ''; FormSet = $false
             PlayerStopped = $false; ColdStart = $false; ColdStartPid = ''
+            DeviceFilesRemoved = $false
             Errors = @('CLEANUP_DID_NOT_RUN')
         }
     }

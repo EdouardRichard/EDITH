@@ -6,9 +6,9 @@ import edith.agent.SegmentOrigin
 /**
  * Phase 7 F4 (§3.1): the memory evidence rendering seam, **measurement only**.
  *
- * Production never passes a renderer to [MemoryModule]; the default is [ProductionMemoryEvidenceRenderer], whose
- * output is byte-identical to the pre-seam block. The seam exists so the F4 experiment can render the original
- * utterance instead of the normalized form without touching the production path.
+ * Production passes only [ProductionMemoryEvidenceRenderer] - the same object that is [MemoryModule]'s default - so
+ * its output is byte-identical to the pre-seam block. The measurement path can select
+ * [LegacyRawMemoryEvidenceRenderer]; no production path does, and the default remains production.
  */
 fun interface MemoryEvidenceRenderer {
     fun render(entries: List<MemoryEntry>): List<Segment>
