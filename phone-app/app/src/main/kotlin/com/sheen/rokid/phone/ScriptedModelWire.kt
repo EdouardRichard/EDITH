@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone
-import com.sheen.rokid.phone.actions.TargetState
+import com.sheen.rokid.phone.actions.shizuku.TargetState
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
 import okhttp3.Interceptor

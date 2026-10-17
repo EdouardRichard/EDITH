@@ -80,7 +80,7 @@
         <receiver android:name=".session.confirmation.ConfirmationActionReceiver" android:exported="false" />
         <!-- P3.3 Task 10: the accessibility channel. The user enables it in system settings; the service cannot and must
              not enable itself, and the host stops advertising the channel the moment the system unbinds it. -->
-        <service android:name=".a11y.EdithAccessibilityService" android:exported="false"
+        <service android:name=".actions.a11y.EdithAccessibilityService" android:exported="false"
             android:label="@string/a11y_service_label"
             android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
             <intent-filter>

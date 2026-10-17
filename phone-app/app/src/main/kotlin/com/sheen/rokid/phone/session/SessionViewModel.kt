@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.session
-import com.sheen.rokid.phone.ExecutionChannelStatus
+import com.sheen.rokid.phone.actions.ExecutionChannelStatus
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
 import androidx.lifecycle.ViewModel

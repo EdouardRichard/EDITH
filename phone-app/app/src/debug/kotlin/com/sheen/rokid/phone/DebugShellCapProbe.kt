@@ -1,16 +1,19 @@
 package com.sheen.rokid.phone
-import com.sheen.rokid.phone.actions.ShizukuUserServiceShell
+import com.sheen.rokid.phone.actions.shizuku.SHELL_REPLY_TOO_LARGE
+import com.sheen.rokid.phone.actions.shizuku.SHELL_REPLY_INVALID
+import com.sheen.rokid.phone.actions.shizuku.SHELL_NOT_BOUND
+import com.sheen.rokid.phone.actions.shizuku.ShizukuUserServiceShell
 import com.sheen.rokid.phone.app.EdithApplication
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import com.sheen.rokid.phone.actions.SHELL_NOT_BOUND
-import com.sheen.rokid.phone.actions.SHELL_REPLY_INVALID
-import com.sheen.rokid.phone.actions.SHELL_REPLY_TOO_LARGE
-import com.sheen.rokid.phone.actions.ShellFailure
-import com.sheen.rokid.phone.actions.ShellResult
+import com.sheen.rokid.phone.actions.shizuku.SHELL_NOT_BOUND
+import com.sheen.rokid.phone.actions.shizuku.SHELL_REPLY_INVALID
+import com.sheen.rokid.phone.actions.shizuku.SHELL_REPLY_TOO_LARGE
+import com.sheen.rokid.phone.actions.shizuku.ShellFailure
+import com.sheen.rokid.phone.actions.shizuku.ShellResult
 
 /**
  * R-9 device instrument: run **one** command through the production privileged shell and log a reply's *shape*.

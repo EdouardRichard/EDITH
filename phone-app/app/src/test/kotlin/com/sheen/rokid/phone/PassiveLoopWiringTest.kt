@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone
+import com.sheen.rokid.plugin.ConfirmationChannel
 import com.sheen.rokid.phone.storage.unavailable
 import com.sheen.rokid.phone.app.MainActivity
 import com.sheen.rokid.phone.app.CxrAudioChain
@@ -45,7 +46,6 @@ import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.AsrSession
 import com.sheen.rokid.plugin.CancellationHandle
-import com.sheen.rokid.plugin.ConfirmationChannel
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.CapabilityVerification
 import com.sheen.rokid.plugin.ConfigSchema

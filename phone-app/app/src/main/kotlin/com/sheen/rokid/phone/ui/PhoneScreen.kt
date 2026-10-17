@@ -38,7 +38,7 @@ import com.sheen.rokid.phone.capabilityReasonLabel
 import com.sheen.rokid.phone.bridge.cxrAuthorizationLabel
 import com.sheen.rokid.phone.bridge.cxrStatusLabel
 import com.sheen.rokid.phone.app.errorLabel
-import com.sheen.rokid.phone.executionChannelLabel
+import com.sheen.rokid.phone.actions.executionChannelLabel
 import com.sheen.rokid.phone.model.ProfileListScreen
 import com.sheen.rokid.phone.model.ProfileViewModel
 import com.sheen.rokid.phone.pluginPickerOptions

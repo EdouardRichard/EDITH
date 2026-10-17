@@ -1,4 +1,8 @@
 package com.sheen.rokid.phone
+import com.sheen.rokid.phone.actions.A11Y_CHANNEL
+import com.sheen.rokid.phone.actions.ROOT_CHANNEL
+import com.sheen.rokid.phone.actions.INTENT_CHANNEL
+import com.sheen.rokid.phone.actions.SHIZUKU_CHANNEL
 import com.sheen.rokid.phone.storage.unavailable
 import com.sheen.rokid.phone.bridge.CxrHintLink
 import com.sheen.rokid.phone.bridge.DisplayRetryTest
@@ -6,7 +10,7 @@ import com.sheen.rokid.phone.bridge.CxrHostEnvironment
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
 import com.sheen.rokid.host.HostRuntime
-import com.sheen.rokid.phone.actions.RootStatus
+import com.sheen.rokid.phone.actions.shizuku.RootStatus
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ModelClient
