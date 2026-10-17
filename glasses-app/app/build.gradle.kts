@@ -3,11 +3,11 @@ import java.security.MessageDigest
 plugins { id("com.android.application") }
 
 android {
-    namespace = "edith.glasses"
+    namespace = "com.sheen.rokid.glasses"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "edith.glasses"
+        applicationId = "com.sheen.rokid.glasses"
         // The glasses run Android 12 (YodaOS-Sprite); the CXR-S bridge requires minSdk >= 28.
         minSdk = 28
         targetSdk = 33

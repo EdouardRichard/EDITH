@@ -1,4 +1,4 @@
-package edith.glasses
+package com.sheen.rokid.glasses
 
 import com.sheen.rokid.contracts.AssistantRoute
 import org.junit.Assert.assertEquals

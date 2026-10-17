@@ -21,8 +21,8 @@ class CxrGlassesTargetTest {
 
     @Test fun theDefaultIsOurOwnGlassesRenderingApp() {
         val config = CxrGlassesTarget.configFrom(reader())
-        assertEquals("edith.glasses", config.glassesPackageName)
-        assertEquals("edith.glasses.GlassesActivity", config.glassesActivityName)
+        assertEquals("com.sheen.rokid.glasses", config.glassesPackageName)
+        assertEquals("com.sheen.rokid.glasses.GlassesActivity", config.glassesActivityName)
         assertEquals("the APK is installed by the operator, not pushed by the SDK", null, config.glassesApkPath)
         assertEquals("1.26.011-20260929-150201", config.firmware)
     }
@@ -58,7 +58,7 @@ class CxrGlassesTargetTest {
                 CxrGlassesTarget.TARGET_APK_PROPERTY to "",
             ),
         )
-        assertEquals("edith.glasses", config.glassesPackageName)
+        assertEquals("com.sheen.rokid.glasses", config.glassesPackageName)
         assertEquals(null, config.glassesApkPath)
     }
 
@@ -86,6 +86,6 @@ class CxrGlassesTargetTest {
     @Test fun theLiveReaderFallsBackToTheDefaultWhenNothingIsSet() {
         // No properties are set in the test JVM, so the production entry point must yield the default pairing.
         val config = CxrGlassesTarget.config()
-        assertEquals("edith.glasses", config.glassesPackageName)
+        assertEquals("com.sheen.rokid.glasses", config.glassesPackageName)
     }
 }

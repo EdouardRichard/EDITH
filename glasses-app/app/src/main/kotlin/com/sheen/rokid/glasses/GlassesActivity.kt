@@ -1,4 +1,4 @@
-package edith.glasses
+package com.sheen.rokid.glasses
 
 import android.animation.ValueAnimator
 import android.app.Activity

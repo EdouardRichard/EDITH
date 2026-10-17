@@ -16,8 +16,8 @@ import com.sheen.rokid.transport.RokidConnectionConfig
  * the earlier audio measurements were taken against is preserved in the evidence records, not by freezing this value.
  */
 object CxrGlassesTarget {
-    const val GLASSES_PACKAGE_NAME = "edith.glasses"
-    const val GLASSES_ACTIVITY_NAME = "edith.glasses.GlassesActivity"
+    const val GLASSES_PACKAGE_NAME = "com.sheen.rokid.glasses"
+    const val GLASSES_ACTIVITY_NAME = "com.sheen.rokid.glasses.GlassesActivity"
     const val GLASSES_FIRMWARE = "1.26.011-20260929-150201"
 
     /** System-property keys an operator sets to point the session at a different glasses application. */

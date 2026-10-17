@@ -101,7 +101,7 @@ internal class CxrBackendRig {
             else -> null
         }
     }
-    val backend = CxrBackend(RokidConnectionConfig("edith.glasses", "edith.glasses.Main", null, "test"),
+    val backend = CxrBackend(RokidConnectionConfig("com.sheen.rokid.glasses", "com.sheen.rokid.glasses.Main", null, "test"),
         worker, { manager }, { _, action -> ui.add(action) }, { _, command, json -> sends.add(command); sentJson.add(command to json); sendSuccess },
         { installer }, { commandInstaller })
 

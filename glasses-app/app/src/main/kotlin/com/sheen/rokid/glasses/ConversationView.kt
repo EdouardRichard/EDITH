@@ -1,4 +1,4 @@
-package edith.glasses
+package com.sheen.rokid.glasses
 
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.output.ConversationEntry

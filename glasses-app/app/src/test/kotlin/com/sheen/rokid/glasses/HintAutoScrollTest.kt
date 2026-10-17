@@ -1,4 +1,4 @@
-package edith.glasses
+package com.sheen.rokid.glasses
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse

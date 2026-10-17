@@ -1,4 +1,4 @@
-package edith.glasses
+package com.sheen.rokid.glasses
 
 import android.util.Log
 import com.rokid.cxr.CXRServiceBridge
