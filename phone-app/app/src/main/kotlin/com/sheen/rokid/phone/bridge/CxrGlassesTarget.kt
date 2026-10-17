@@ -16,7 +16,7 @@ import com.sheen.rokid.transport.RokidConnectionConfig
  */
 object CxrGlassesTarget {
     const val GLASSES_PACKAGE_NAME = "com.sheen.rokid.glasses"
-    const val GLASSES_ACTIVITY_NAME = "com.sheen.rokid.glasses.GlassesActivity"
+    const val GLASSES_ACTIVITY_NAME = "com.sheen.rokid.glasses.app.GlassesActivity"
     const val GLASSES_FIRMWARE = "1.26.011-20260929-150201"
 
     /** System-property keys an operator sets to point the session at a different glasses application. */

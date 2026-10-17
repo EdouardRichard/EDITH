@@ -1,4 +1,4 @@
-package com.sheen.rokid.glasses
+package com.sheen.rokid.glasses.bridge
 
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec

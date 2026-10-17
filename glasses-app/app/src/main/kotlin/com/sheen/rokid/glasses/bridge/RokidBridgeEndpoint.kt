@@ -1,4 +1,5 @@
-package com.sheen.rokid.glasses
+package com.sheen.rokid.glasses.bridge
+import com.sheen.rokid.glasses.display.HintPresentation
 
 import android.util.Log
 import com.rokid.cxr.CXRServiceBridge

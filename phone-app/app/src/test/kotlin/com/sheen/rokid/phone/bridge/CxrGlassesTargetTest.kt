@@ -22,7 +22,7 @@ class CxrGlassesTargetTest {
     @Test fun theDefaultIsOurOwnGlassesRenderingApp() {
         val config = CxrGlassesTarget.configFrom(reader())
         assertEquals("com.sheen.rokid.glasses", config.glassesPackageName)
-        assertEquals("com.sheen.rokid.glasses.GlassesActivity", config.glassesActivityName)
+        assertEquals("com.sheen.rokid.glasses.app.GlassesActivity", config.glassesActivityName)
         assertEquals("the APK is installed by the operator, not pushed by the SDK", null, config.glassesApkPath)
         assertEquals("1.26.011-20260929-150201", config.firmware)
     }

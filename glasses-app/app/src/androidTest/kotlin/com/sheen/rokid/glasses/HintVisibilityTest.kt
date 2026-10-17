@@ -1,4 +1,7 @@
 package com.sheen.rokid.glasses
+import com.sheen.rokid.glasses.display.HintAutoScroll
+import com.sheen.rokid.glasses.app.GlassesActivity
+import com.sheen.rokid.glasses.display.HintPresentation
 
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4

@@ -19,10 +19,10 @@ import org.junit.Test
 class CxrWiringTest {
     @Test fun appCarriesTheExactCxrPairingFromTheRecordedPreflight() {
         assertEquals("com.sheen.rokid.glasses", CxrGlassesTarget.GLASSES_PACKAGE_NAME)
-        assertEquals("com.sheen.rokid.glasses.GlassesActivity", CxrGlassesTarget.GLASSES_ACTIVITY_NAME)
+        assertEquals("com.sheen.rokid.glasses.app.GlassesActivity", CxrGlassesTarget.GLASSES_ACTIVITY_NAME)
         val config = CxrGlassesTarget.config()
         assertEquals("com.sheen.rokid.glasses", config.glassesPackageName)
-        assertEquals("com.sheen.rokid.glasses.GlassesActivity", config.glassesActivityName)
+        assertEquals("com.sheen.rokid.glasses.app.GlassesActivity", config.glassesActivityName)
         assertNull("the glasses app is installed on the glasses, not pushed by the SDK", config.glassesApkPath)
         assertEquals(CxrGlassesTarget.GLASSES_FIRMWARE, config.firmware)
         assertEquals("1.26.011-20260929-150201", config.firmware)

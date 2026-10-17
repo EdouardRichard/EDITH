@@ -1,4 +1,5 @@
-package com.sheen.rokid.glasses
+package com.sheen.rokid.glasses.display
+import com.sheen.rokid.glasses.app.GlassesActivity
 
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.output.ConversationEntry

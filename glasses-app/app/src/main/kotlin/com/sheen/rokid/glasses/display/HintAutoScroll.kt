@@ -1,4 +1,4 @@
-package com.sheen.rokid.glasses
+package com.sheen.rokid.glasses.display
 
 import com.sheen.rokid.output.HintReadingBudget
 

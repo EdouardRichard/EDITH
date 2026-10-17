@@ -1,4 +1,4 @@
-package com.sheen.rokid.glasses
+package com.sheen.rokid.glasses.display
 
 import android.content.Context
 import android.graphics.Canvas

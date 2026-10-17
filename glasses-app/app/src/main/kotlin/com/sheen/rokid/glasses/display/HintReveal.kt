@@ -1,4 +1,4 @@
-package com.sheen.rokid.glasses
+package com.sheen.rokid.glasses.display
 
 /**
  * What the view should do about the scroll when the conversation or the hint changes (device report, 2026-10-15).

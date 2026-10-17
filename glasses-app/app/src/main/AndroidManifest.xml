@@ -18,7 +18,7 @@
         android:label="EDITH"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <activity
-            android:name=".GlassesActivity"
+            android:name=".app.GlassesActivity"
             android:exported="true"
             android:label="EDITH">
             <intent-filter>
