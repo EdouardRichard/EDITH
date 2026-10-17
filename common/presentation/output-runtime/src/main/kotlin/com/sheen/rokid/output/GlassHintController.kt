@@ -76,9 +76,17 @@ class GlassHintController(
             // indicator live in the view (see `edith.glasses`). Keeping them out is what lets every ordering and
             // expiry rule above stay testable as plain JVM behaviour with no notion of a conversation.
             is HintCommand.Ping, is HintCommand.Pong, is HintCommand.Ack,
-            is HintCommand.Said, is HintCommand.Busy -> Unit
+            is HintCommand.Said, is HintCommand.Busy, is HintCommand.Stop -> Unit
         }
     }
+
+    /**
+     * The session and generation this controller would accept a command for, or null before a `HELLO`.
+     *
+     * 0.23 P5: the wearer's BACK has to put the identity in a `STOP`, and the identity must be the one the SHOW gate
+     * uses - a second copy tracked by the Activity could disagree with it. `disconnect()` clears it.
+     */
+    fun currentIdentity(): Pair<String, Long>? = sessionId?.let { it to generation }
 
     /**
      * True when [sessionId] and [generation] name the session this controller has adopted.

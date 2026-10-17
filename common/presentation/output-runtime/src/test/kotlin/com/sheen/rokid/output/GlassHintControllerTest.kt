@@ -41,6 +41,30 @@ class GlassHintControllerTest {
             validUntilGlassNanos = 10_000_000_000L))
     }
 
+    @Test
+    fun theControllerExposesTheIdentityItAcceptsCommandsFor() {
+        // 0.23 P5: the glasses' BACK needs the session/generation to put in a STOP. It must be the identity the
+        // controller accepted, not a second copy that could disagree with the SHOW gate.
+        val controller = controller()
+        assertNull(controller.currentIdentity())
+        controller.accept(HintCommand.Hello("s-1", 4))
+        assertEquals("s-1" to 4L, controller.currentIdentity())
+        controller.accept(HintCommand.Hello("s-2", 1))
+        assertEquals("s-2" to 1L, controller.currentIdentity())
+        controller.disconnect()
+        assertNull(controller.currentIdentity())
+    }
+
+    @Test
+    fun aStopFromThePhoneIsNotACommandTheGlassesActOn() {
+        // STOP travels glasses -> phone. If a mixed build ever sends it back, it must be inert rather than crash the
+        // controller's exhaustive `when`.
+        val controller = controller()
+        controller.accept(HintCommand.Hello("s-1", 1))
+        controller.accept(HintCommand.Stop("s-1", 1))
+        assertEquals("s-1" to 1L, controller.currentIdentity())
+    }
+
     @Test fun helloEstablishesTheSessionAndAcceptsAShow() {
         val controller = controller()
         controller.accept(HintCommand.Hello("s", 1))

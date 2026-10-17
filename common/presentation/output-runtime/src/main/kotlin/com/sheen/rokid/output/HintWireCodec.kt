@@ -56,6 +56,15 @@ sealed interface HintCommand {
      */
     data class Busy(val sessionId: String, val generation: Long, val route: AssistantRoute,
         val busy: Boolean) : HintCommand
+
+    /**
+     * 0.23 P5 (spec §5.3.3, D134): the wearer's double-click on the glasses, travelling **glasses -> phone**.
+     *
+     * Additive on `wireVersion = 1`: an event, not a display request, so there is no sequence and no ACK, and a repeat
+     * is idempotent. An old decoder answers null for an unknown command (safe failure); the phone validates the pair
+     * against the session it established before it cancels anything.
+     */
+    data class Stop(val sessionId: String, val generation: Long) : HintCommand
 }
 
 object HintWireCodec {
@@ -156,6 +165,11 @@ object HintWireCodec {
                 // The flat reader carries strings and integers only, so a boolean travels as 1/0.
                 fields["busy"] = if (command.busy) 1 else 0
             }
+            is HintCommand.Stop -> {
+                fields["command"] = "STOP"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+            }
         }
         val json = buildString {
             append('{')
@@ -248,6 +262,9 @@ object HintWireCodec {
                     "0" -> false
                     else -> return null
                 })
+            "STOP" -> HintCommand.Stop(
+                sessionId = fields.text("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null)
             else -> null
         }
     }
@@ -281,6 +298,7 @@ object HintWireCodec {
                 require(command.text.codePointCount() <= MAX_TEXT_CODEPOINTS) { "TEXT_TOO_LONG" }
             }
             is HintCommand.Busy -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+            is HintCommand.Stop -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
         }
     }
 

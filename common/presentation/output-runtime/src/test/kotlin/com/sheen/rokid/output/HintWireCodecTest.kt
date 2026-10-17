@@ -34,6 +34,7 @@ class HintWireCodecTest {
                 route = com.sheen.rokid.contracts.AssistantRoute.PROACTIVE, entryId = "e-1", text = "我待会儿要开会"),
             HintCommand.Busy(sessionId = "s-1", generation = 1,
                 route = com.sheen.rokid.contracts.AssistantRoute.WAKE, busy = true),
+            HintCommand.Stop(sessionId = "s-1", generation = 7),
         )
         for (command in commands) {
             val json = HintWireCodec.encode(command)
@@ -132,6 +133,22 @@ class HintWireCodecTest {
     }
 
     // ---------------------------------------------------------------- Phase C: route, SAID, BUSY
+
+    @Test fun stopRoundTripsOnWireVersionOne() {
+        // 0.23 P5 (U11, D134): the STOP command is additive; wireVersion stays 1 and there is no sequence/ACK.
+        val json = HintWireCodec.encode(HintCommand.Stop("s-1", 7))
+        assertEquals("""{"wireVersion":1,"command":"STOP","sessionId":"s-1","generation":7}""", json)
+        assertEquals(HintCommand.Stop("s-1", 7), HintWireCodec.decode(json))
+    }
+
+    @Test fun aStopMissingItsGenerationIsRefused() {
+        assertNull(HintWireCodec.decode("""{"wireVersion":1,"command":"STOP","sessionId":"s-1"}"""))
+        assertNull(HintWireCodec.decode("""{"wireVersion":1,"command":"STOP","generation":7}"""))
+    }
+
+    @Test fun aStopWithABlankSessionIsRefusedOnEncode() {
+        assertFailsWith<IllegalArgumentException> { HintWireCodec.encode(HintCommand.Stop("  ", 7)) }
+    }
 
     @Test fun theShowCarriesItsRouteAndTheOldShapeStillReadsAsWake() {
         val command = HintCommand.Show("s", 1, 1, "h", 1, "sync", 1_000, 1_500, "t",
