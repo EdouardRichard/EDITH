@@ -91,6 +91,54 @@ class SkillCatalogTest {
         assertEquals(files.size - LibraryGovernor.MAX_CATALOG_ENTRIES, verdict.demoted.size)
         val listed = manager.catalog().lines().filter { it.startsWith("- ") }.size
         assertEquals(LibraryGovernor.MAX_CATALOG_ENTRIES, listed)
+
+        // The mirror of the disabled-entry case below: an enabled entry beyond the cap is demoted *and* still
+        // pullable by name, so bounding never becomes a silent retirement (design D-4's second gate).
+        val overflowName = "s%02d".format(files.size)
+        assertEquals(LibraryState.DORMANT, governor.entry(overflowName)?.state)
+        val pulled = manager.load(overflowName) as SkillLoad.Loaded
+        assertTrue(pulled.wasDormant, "a cap-demoted entry must report wasDormant")
+        assertEquals(LibraryState.ACTIVE, governor.entry(overflowName)?.state)
+    }
+
+    @Test fun `a disabled entry consumes no catalog slot and is never demoted`() {
+        // Ordering is chosen so that BOTH failure modes are observable before the fix:
+        //  - `zz-off` sorts after every enabled id, so pre-fix it is the ACTIVE id the cap demotes;
+        //  - `aa-off` sorts before every enabled id, so pre-fix it occupies a catalog slot and displaces the last
+        //    enabled entry (`s12`), which then disappears from the 12-line catalog.
+        // Enabled entries are `s01`..`s12`, so sorted ACTIVE ids are `aa-off, s01..s12, zz-off`.
+        val cap = LibraryGovernor.MAX_CATALOG_ENTRIES
+        val enabledNames = (1..cap).map { "s%02d".format(it) }
+        val files = buildMap {
+            enabledNames.forEach { put("$it.md", doc(it)) }
+            put("aa-off.md", doc("aa-off", enabled = false))
+            put("zz-off.md", doc("zz-off", enabled = false))
+        }
+        val governor = LibraryGovernor()
+        val manager = SkillManager(FakeDirectory(files), governor = governor)
+
+        // Pull every enabled entry on the first turn: drift must not be what empties the catalog while the turns
+        // below are driven. The disabled entries are never pulled — pre-fix they are the drift/cap targets.
+        manager.beginTurn()
+        enabledNames.forEach { manager.load(it) }
+        manager.endTurn()
+
+        // Drive past the retirement horizon (2 * K) with no further pulls.
+        repeat(2 * LibraryGovernor.MIN_OBSERVED_TURNS) {
+            manager.beginTurn()
+            manager.endTurn()
+        }
+
+        assertEquals(null, governor.entry("aa-off"), "a disabled entry must not be governed at all")
+        assertEquals(null, governor.entry("zz-off"), "a disabled entry must not be governed at all")
+
+        val text = manager.catalog()
+        val listed = text.lines().filter { it.startsWith("- ") }
+        assertEquals(cap, listed.size, "all $cap enabled entries must fit the catalog")
+        enabledNames.forEach { name ->
+            assertTrue("- $name: d-$name" in text, "enabled entry $name must be advertised")
+        }
+        assertTrue("aa-off" !in text && "zz-off" !in text, "no disabled entry may be advertised")
     }
 
     @Test fun `an absent directory yields an empty catalog, not a header with nothing under it`() {

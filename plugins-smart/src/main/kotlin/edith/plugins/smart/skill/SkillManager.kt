@@ -94,9 +94,10 @@ class SkillManager(
             }
         }
 
-        // Only enabled, still-present skills can appear in the catalog the model sees. The governor's list may also
-        // name an entry the directory no longer holds (a file deleted mid-process), and disabled entries are observed
-        // by beginTurn() because it advertises the whole library.
+        // Only enabled, still-present skills can appear in the catalog the model sees. The governor's list may name an
+        // entry the directory no longer holds, or one that was enabled when beginTurn() observed it and has since been
+        // disabled — a file can change mid-turn. This intersection is the defence for that race, not the rule that
+        // keeps disabled entries out of governance: beginTurn() never observes them.
         val enabledByName = skills.filter { it.enabled }.associateBy { it.name }
         val listedSkills = listedNames.mapNotNull { enabledByName[it] }
         val dormant = if (governor == null) 0 else names.count { governor.entry(it)?.state == LibraryState.DORMANT }
@@ -131,11 +132,16 @@ class SkillManager(
     }
 
     /**
-     * Open a turn: advertise the whole library to the governor **once** (design §5). Never called from [catalog] —
+     * Open a turn: advertise every **enabled** entry to the governor **once** (design §5). Never called from [catalog] —
      * that is per-request, and counting it as an observation would inflate drift per tool round-trip (D-3).
+     *
+     * Disabled entries are deliberately not observed: they are never advertised in the catalog and [load] refuses them
+     * with [SkillLoadReason.DISABLED], so they can never answer drift with a pull. Governing them would demote and
+     * then retire a SKILL merely because the user turned it off — the premature retirement design D-4 exists to
+     * prevent.
      */
     fun beginTurn() {
-        governor?.observeTurn(all().map { it.name })
+        governor?.observeTurn(enabled().map { it.name })
     }
 
     /**
