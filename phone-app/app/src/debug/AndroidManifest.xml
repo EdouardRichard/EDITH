@@ -160,6 +160,20 @@
             </intent-filter>
         </receiver>
         <!--
+          0.23 P5 wake-chime evidence: drives the production 「语音朗读」 switch from a host shell so the wake path can
+          be measured with the switch off (`P5_CHIME state=disabled`) and on (`state=played`). Same export rule and the
+          same reason as the instruments above: the only caller is an `adb shell am broadcast`, so it must be exported
+          and must therefore never exist in a release build. It logs only the requested/committed boolean.
+        -->
+        <receiver
+            android:name=".debug.DebugSpeechToggle"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_SPEECH" />
+            </intent-filter>
+        </receiver>
+        <!--
           `DebugModelProbe` (the generic all-models-on-an-accelerator probe) is NOT registered here yet: it needs the
           process's single shared LiteRT `Environment`, which lives in the vendored `com.laya` file as a
           file-private object, so the probe cannot compile without making vendored code non-private. Its entry, its
