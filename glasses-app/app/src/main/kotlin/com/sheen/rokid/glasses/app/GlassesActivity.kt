@@ -1,8 +1,5 @@
 package com.sheen.rokid.glasses.app
-import com.sheen.rokid.glasses.display.Reveal
 import com.sheen.rokid.glasses.display.BusyState
-import com.sheen.rokid.glasses.display.HintReveal
-import com.sheen.rokid.glasses.display.HintAutoScroll
 import com.sheen.rokid.glasses.display.HintPresentation
 import com.sheen.rokid.glasses.display.ConversationView
 import com.sheen.rokid.glasses.display.SaidSequenceGate
@@ -101,12 +98,6 @@ class GlassesActivity : Activity() {
     /** Which route is in front of the wearer, and whether the slide is paused (`KEYCODE_ENTER`). */
     private val order = ConversationOrder()
 
-    /**
-     * Whether an entry arrived since the last rebuild, so the reveal knows to show it **now** rather than at reading
-     * pace (device report, 2026-10-15: the answer was on screen only after the hint had expired).
-     */
-    private var newEntryPending = false
-
     /** Rejects an out-of-order `SAID`; the custom-command channel promises nothing about ordering. */
     private val saidGate = SaidSequenceGate()
 
@@ -135,9 +126,6 @@ class GlassesActivity : Activity() {
 
     /** The entry id of the live hint, so exactly one row is emphasised. */
     private var liveEntryId: String? = null
-
-    /** Drives [scheduleReveal]: one slide per conversation change, cancelled when the content changes again. */
-    private var scrollAnimator: ValueAnimator? = null
 
     private val powerManager by lazy { getSystemService(PowerManager::class.java) }
 
@@ -179,15 +167,10 @@ class GlassesActivity : Activity() {
         // running animator keeps the panel's frame loop busy.
         orbView.stop()
         thinkingIcon?.stop()
-        // ...and with it the slide, so a conversation that is no longer on screen cannot keep moving.
-        scrollAnimator?.cancel()
-        scrollAnimator = null
     }
 
     override fun onDestroy() {
         // Leaving the screen must never leave text on the glasses, and the endpoint must not keep a dead Activity.
-        scrollAnimator?.cancel()
-        scrollAnimator = null
         runCatching { controller.disconnect() }
         holdAwakeFor(false)
         // The conversation is session state: a destroyed Activity must not hand its words to the next one.
@@ -307,9 +290,8 @@ class GlassesActivity : Activity() {
             // The display follows what arrived. Without this the wearer reading one conversation would never see a
             // hint filed under the other, which is precisely the failure the route tags exist to prevent.
             order.show(displayed.route)
-            // A new entry has to be brought into view whatever the wearer was doing with the scroll: the pause exists
-            // so a slide never fights someone reading, not so that the next answer stays hidden (device report).
-            newEntryPending = true
+            // A new entry has to be brought into view whatever the wearer was doing with the scroll: the pin exists
+            // so the continuous ticker never fights someone reading, not so that the next answer stays hidden (P4).
         }
         holdAwakeFor(liveEntryId != null)
         // The panel has two claimants, so it is resolved in one place: calling `holdAwakeFor` directly here released
@@ -334,8 +316,6 @@ class GlassesActivity : Activity() {
         val stored = log.append(ConversationEntry(command.entryId, command.route, ConversationRole.USER, command.text))
         android.util.Log.i("EdithGlasses",
             "said stored=$stored route=${command.route.name} chars=${command.text.length}")
-        // Same rule as a hint: the wearer's own words are new content and must be visible as they arrive.
-        if (stored) newEntryPending = true
         rebuild()
     }
 
@@ -418,7 +398,7 @@ class GlassesActivity : Activity() {
     }
 
     /**
-     * Redraws the conversation in front of the wearer, then reveals the newest entry.
+     * Redraws the conversation in front of the wearer.
      *
      * The list is rebuilt rather than patched: it is bounded at tens of entries, and a rebuild is what makes "the view
      * shows the log" true by construction instead of by careful incremental updates.
@@ -440,14 +420,13 @@ class GlassesActivity : Activity() {
         }
         android.util.Log.i("EdithGlasses",
             HintPresentation.conversationReport(route, rows.size, rows.sumOf { it.entry.text.length }))
-        scheduleReveal(promptly = newEntryPending)
-        newEntryPending = false
         applyVisualState()
         // The layout's own limit is reported only **after** it has laid the text out - reading it here would read the
         // previous layout (or none). Counts and size only, never the text.
         liveRow?.post {
             val live = liveRow ?: return@post
-            android.util.Log.i("EdithGlasses", HintPresentation.renderReport(live.lineCount, live.text.length))
+            android.util.Log.i("EdithGlasses",
+                HintPresentation.renderReport(live.lineCount, live.text.length, maxScrollY()))
         }
     }
 
@@ -500,58 +479,6 @@ class GlassesActivity : Activity() {
         thinkingRowView = this
         thinkingTextView = label
         icon.start()
-    }
-
-    /**
-     * Slides the conversation down to its newest entry (P3.2 `P3.2-CLIP` pacing, Phase C destination).
-     *
-     * The pacing is the owner's requirement, not a detail: the first version jumped a whole page at a time and the
-     * verdict was "看到自动翻页了，但这不是友好的效果…滚动要延迟一两秒…让用户读完前面的字再滚动". So the plan is a
-     * **duration**: hold still long enough to read the first window, then move at one line per reading pace. The
-     * destination comes from [HintAutoScroll.endOffsetPx], the same quantity that pacing is computed from.
-     *
-     * A wearer who tapped the pad (`KEYCODE_ENTER`) has paused this: the plan then holds still, and only a tap
-     * resumes it, so a slide can never fight the person reading.
-     */
-    private fun scheduleReveal(promptly: Boolean = false) {
-        scrollAnimator?.cancel()
-        scrollAnimator = null
-        entriesView.post {
-            val lineHeight = (liveRow ?: entriesView.getChildAt(0) as? TextView)?.lineHeight ?: 0
-            if (lineHeight <= 0) return@post
-            val totalLines = (0 until entriesView.childCount)
-                .mapNotNull { entriesView.getChildAt(it) as? TextView }
-                .sumOf { it.lineCount }
-            val endPx = HintAutoScroll.endOffsetPx(totalLines, lineHeight)
-            // Device report (2026-10-15): the wearer heard a new answer while the screen still showed the previous
-            // 204-character hint. The entry was in the log; the scroll never brought it into view, because a pause
-            // (a side-touch tap a minute earlier) suppressed the reveal entirely, and the unpaused path travels the
-            // whole scrollback at reading pace - 16.8 s on that turn. `HintReveal` puts the decision in one place.
-            when (HintReveal.forChange(promptly, order.isPinned(), atNewest = hintScroll.scrollY >= endPx)) {
-                Reveal.HOLD -> return@post
-                Reveal.IMMEDIATE ->
-                    slideTo(endPx, HintAutoScroll.IMMEDIATE_MILLIS, startDelay = 0L)
-                Reveal.PACED -> {
-                    val duration = HintAutoScroll.scrollMillis(totalLines)
-                    if (duration <= 0L) {
-                        hintScroll.scrollTo(0, 0)
-                        return@post
-                    }
-                    slideTo(endPx, duration, startDelay = HintAutoScroll.READ_DELAY_MILLIS)
-                }
-            }
-        }
-    }
-
-    /** One continuous slide from wherever the view is to [endPx]; the caller owns the pacing decision. */
-    private fun slideTo(endPx: Int, duration: Long, startDelay: Long) {
-        scrollAnimator = ValueAnimator.ofInt(hintScroll.scrollY, endPx).apply {
-            this.duration = duration
-            this.startDelay = startDelay
-            interpolator = LinearInterpolator()
-            addUpdateListener { animation -> hintScroll.scrollTo(0, animation.animatedValue as Int) }
-            start()
-        }
     }
 
     /**
@@ -767,4 +694,13 @@ class GlassesActivity : Activity() {
     /** The last message row (the thinking row is a `LinearLayout`, so it is skipped). */
     fun lastMessageRowForProbe(): TextView? =
         (0 until entriesView.childCount).mapNotNull { entriesView.getChildAt(it) as? TextView }.lastOrNull()
+
+    /** The committed scroll offset; the scroll-by-one ticker is asserted against this on the device. */
+    fun scrollOffsetY(): Int = if (::hintScroll.isInitialized) hintScroll.scrollY else 0
+
+    /** How far the conversation can still travel; zero when everything fits. */
+    fun maxScrollY(): Int =
+        if (::entriesView.isInitialized && ::hintScroll.isInitialized) {
+            (entriesView.height - hintScroll.height).coerceAtLeast(0)
+        } else 0
 }

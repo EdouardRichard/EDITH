@@ -50,19 +50,14 @@ object HintPresentation {
     /**
      * What the layout actually did with the hint, as one greppable line.
      *
-     * `maxLines` is the **window** the fixed layout shows at once ([HintAutoScroll.VISIBLE_LINES]); `clipped` keeps its
-     * P3.2 Stage 0 meaning - the laid-out text is taller than that window - and `scrollMillis` says how long the slide
-     * that reveals the rest takes (`0` when everything fits). The field the Stage 0 probe reads (`clipped`) is
-     * unchanged; `pages` from the first P3.2-CLIP build was replaced by `scrollMillis` when page jumps became a smooth
-     * slide.
-     *
-     * The line count is only knowable after a layout pass, so the caller reports it from a `post {}` - and this
-     * formatter is separate from the reading so it stays testable off-device. Carries counts and sizes, never the
-     * text: the same rule as every other `P3_` line.
+     * 0.23 P4 replaced the paced slide with the official 1 px/frame ticker, so the old `maxLines` / `clipped` /
+     * `scrollMillis` fields are gone: the fact that matters now is that the ticker is the engine and how far it can
+     * travel (`maxOffset`). The line count is only knowable after a layout pass, so the caller reports it from a
+     * `post {}` - and this formatter is separate from the reading so it stays testable off-device. Counts and sizes,
+     * never the text: the same rule as every other `P3_` line.
      */
-    fun renderReport(lines: Int, chars: Int): String =
-        "hint rendered lines=$lines maxLines=${HintAutoScroll.VISIBLE_LINES} chars=$chars " +
-            "clipped=${lines > HintAutoScroll.VISIBLE_LINES} scrollMillis=${HintAutoScroll.scrollMillis(lines)}"
+    fun renderReport(lines: Int, chars: Int, maxOffsetPx: Int): String =
+        "hint rendered lines=$lines chars=$chars ticker=true maxOffset=$maxOffsetPx"
 
     /**
      * What the bridge actually **received**, as one greppable line.

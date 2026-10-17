@@ -1,5 +1,4 @@
 package com.sheen.rokid.glasses
-import com.sheen.rokid.glasses.display.HintAutoScroll
 import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.glasses.display.HintPresentation
 
@@ -118,9 +117,9 @@ class HintVisibilityTest {
             // text out - reading it inside the same `onActivity` would read the previous (empty) layout.
             InstrumentationRegistry.getInstrumentation().waitForIdleSync()
             scenario.onActivity { activity ->
-                val lines = activity.renderedLineCount()
-                assertTrue("a hint that overflows the layout must be observable as clipped, saw $lines lines",
-                    lines > HintAutoScroll.VISIBLE_LINES)
+                val maxScroll = activity.maxScrollY()
+                assertTrue("a hint that overflows the layout must be observable as scrollable, saw max=$maxScroll",
+                    maxScroll > 0)
             }
         }
     }
