@@ -57,14 +57,9 @@ class ConversationViewTest {
 
     @Test
     fun theHeaderNamesTheRouteAndSaysWhenTheAssistantIsWorking() {
+        // P3 keeps this temporary header; P4 deletes it with the route switch (U8).
         assertEquals("WAKE 上下文", ConversationView.headerText(AssistantRoute.WAKE, busy = false))
         assertEquals("PROACTIVE 上下文", ConversationView.headerText(AssistantRoute.PROACTIVE, busy = false))
         assertEquals("WAKE 上下文 · 处理中", ConversationView.headerText(AssistantRoute.WAKE, busy = true))
-    }
-
-    @Test
-    fun thePromptLineSaysSomethingDifferentWhenThereIsNothingToShow() {
-        assertEquals("等待提示", ConversationView.statusText(0))
-        assertFalse(ConversationView.statusText(3) == ConversationView.statusText(0))
     }
 }

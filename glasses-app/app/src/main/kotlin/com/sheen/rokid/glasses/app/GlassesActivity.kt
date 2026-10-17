@@ -9,15 +9,20 @@ import com.sheen.rokid.glasses.display.SaidSequenceGate
 import com.sheen.rokid.glasses.display.ConversationOrder
 import com.sheen.rokid.glasses.bridge.GlassClockResponder
 import com.sheen.rokid.glasses.bridge.RokidBridgeEndpoint
+import com.sheen.rokid.glasses.display.GlassesPanelSpec
+import com.sheen.rokid.glasses.display.GradientMaskView
 import com.sheen.rokid.glasses.display.LoadingIndicatorView
+import com.sheen.rokid.glasses.display.MaskEdge
+import com.sheen.rokid.glasses.display.OrbState
+import com.sheen.rokid.glasses.display.VoiceOrbView
 
 import android.animation.ValueAnimator
 import android.app.Activity
 import android.graphics.Color
-import android.graphics.Typeface
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
 import android.os.PowerManager
+import android.text.TextUtils
 import android.util.TypedValue
 import android.view.Gravity
 import android.view.KeyEvent
@@ -111,8 +116,20 @@ class GlassesActivity : Activity() {
     private lateinit var headerView: TextView
     private lateinit var entriesView: LinearLayout
     private lateinit var hintScroll: ScrollView
-    private lateinit var loadingView: LoadingIndicatorView
-    private lateinit var statusView: TextView
+
+    /** The official bottom cluster: the listening line, the voice orb and the two operating tips. */
+    private lateinit var listeningView: TextView
+    private lateinit var orbView: VoiceOrbView
+    private lateinit var tipsView: TextView
+    private lateinit var pinTextView: TextView
+    private lateinit var complianceView: TextView
+    private lateinit var topMask: GradientMaskView
+    private lateinit var bottomMask: GradientMaskView
+
+    /** The thinking row currently in the list, so its ring can be stopped with the panel; null when not thinking. */
+    private var thinkingIcon: LoadingIndicatorView? = null
+    private var thinkingRowView: LinearLayout? = null
+    private var thinkingTextView: TextView? = null
 
     /** The row the live hint occupies, so the layout report and the probe read the hint rather than the list. */
     private var liveRow: TextView? = null
@@ -161,7 +178,8 @@ class GlassesActivity : Activity() {
         holdAwakeFor(false)
         // The ring stops with the screen: it is not a progress bar whose state matters while nobody can see it, and a
         // running animator keeps the panel's frame loop busy.
-        loadingView.stop()
+        orbView.stop()
+        thinkingIcon?.stop()
         // ...and with it the slide, so a conversation that is no longer on screen cannot keep moving.
         scrollAnimator?.cancel()
         scrollAnimator = null
@@ -178,7 +196,8 @@ class GlassesActivity : Activity() {
         order.reset()
         saidGate.reset()
         busyState.reset()
-        loadingView.stop()
+        orbView.stop()
+        thinkingIcon?.stop()
         RokidBridgeEndpoint.instance.setListener(null)
         executor.shutdownNow()
         super.onDestroy()
@@ -354,7 +373,9 @@ class GlassesActivity : Activity() {
     private fun applyPanelAndAnimation() {
         val now = clock.nowNanos()
         val busy = busyState.any(now)
-        if (busy) loadingView.start() else loadingView.stop()
+        // 0.23 P3: the whole-window loading ring is gone. The orb is the working indicator, and its state (idle /
+        // listening / thinking / answering) is applied by `applyVisualState` from the same busy level.
+        applyVisualState()
         holdAwakeFor(busy || liveEntryId != null)
         if (!busy) return
         // One armed deadline per busy spell: a repeat of the same level must not keep pushing it back.
@@ -368,6 +389,36 @@ class GlassesActivity : Activity() {
     }
 
     /**
+     * The official panel's state row, computed in one place so the listening line, the thinking row, the orb and the
+     * tips cannot disagree with each other.
+     *
+     * The busy boolean is **per displayed route** (`isBusy(selected)`): a proactive turn must not make the wake
+     * conversation look busy, and the other way round (0.23 P3/P4 route isolation). The tips and BACK use `any`,
+     * because either route working is something the wearer can interrupt.
+     */
+    private fun applyVisualState() {
+        if (!::orbView.isInitialized) return
+        val now = clock.nowNanos()
+        val route = order.selected()
+        val live = liveEntryId != null
+        val busyForRoute = busyState.isBusy(route, now)
+        val entries = log.entries(route)
+        val lastRole = entries.lastOrNull()?.role
+        val listening = GlassesPanelSpec.listeningVisible(busyForRoute, live, route, lastRole)
+        val thinking = GlassesPanelSpec.thinkingVisible(busyForRoute, live, route, lastRole)
+
+        listeningView.visibility = if (listening) View.VISIBLE else View.GONE
+        thinkingRowView?.visibility = if (thinking) View.VISIBLE else View.GONE
+        if (thinking) thinkingIcon?.start() else thinkingIcon?.stop()
+        orbView.setState(GlassesPanelSpec.orbState(busyForRoute, live, route, lastRole))
+        tipsView.text = GlassesPanelSpec.tipsText(busyState.any(now))
+        android.util.Log.i("EdithGlasses",
+            "P3_STATE route=${route.name} busy=$busyForRoute any=${busyState.any(now)} live=$live " +
+                "orb=${GlassesPanelSpec.orbState(busyForRoute, live, route, lastRole).name} " +
+                "listening=$listening thinking=$thinking pinned=${order.isPaused()}")
+    }
+
+    /**
      * Redraws the conversation in front of the wearer, then reveals the newest entry.
      *
      * The list is rebuilt rather than patched: it is bounded at tens of entries, and a rebuild is what makes "the view
@@ -376,17 +427,24 @@ class GlassesActivity : Activity() {
     private fun rebuild() {
         val route = order.selected()
         val rows = ConversationView.rows(log.entries(route), liveEntryId)
-        headerView.text = ConversationView.headerText(route, busy = busyState.route(clock.nowNanos()) != null)
-        // The header names **which** conversation is being worked on, so it asks the route rather than `any`: with a
-        // wake turn and a proactive turn alive at once, `any` would print 处理中 next to the wrong one.
-        statusView.text = ConversationView.statusText(log.size())
+        val now = clock.nowNanos()
+        headerView.text = ConversationView.headerText(route, busy = busyState.isBusy(route, now))
         entriesView.removeAllViews()
         liveRow = null
+        thinkingIcon = null
+        thinkingRowView = null
+        thinkingTextView = null
         rows.forEach { row -> entriesView.addView(entryRow(row)) }
+        val busyForRoute = busyState.isBusy(route, now)
+        val lastRole = log.entries(route).lastOrNull()?.role
+        if (GlassesPanelSpec.thinkingVisible(busyForRoute, liveEntryId != null, route, lastRole)) {
+            entriesView.addView(thinkingRow())
+        }
         android.util.Log.i("EdithGlasses",
             HintPresentation.conversationReport(route, rows.size, rows.sumOf { it.entry.text.length }))
         scheduleReveal(promptly = newEntryPending)
         newEntryPending = false
+        applyVisualState()
         // The layout's own limit is reported only **after** it has laid the text out - reading it here would read the
         // previous layout (or none). Counts and size only, never the text.
         liveRow?.post {
@@ -395,18 +453,55 @@ class GlassesActivity : Activity() {
         }
     }
 
-    /** One row of the conversation: the wearer's words on the right, the assistant's on the left. */
+    /**
+     * One row of the conversation, in the official style.
+     *
+     * 0.23 U9: every row is left-aligned; the wearer's line is 14 px at 70% green, capped at four lines and truncated
+     * **from the start** (the official `StaticLayoutView` keeps the newest words), while the assistant's line is 16 px
+     * at full green and never truncated at the view layer - the list scrolls instead.
+     */
     private fun entryRow(row: ConversationView.Row): TextView = TextView(this).apply {
+        val role = row.entry.role
         text = row.entry.text
-        setTextColor(Color.parseColor(if (row.alignedToEnd) "#B2FF59" else "#00E676"))
-        setTextSize(TypedValue.COMPLEX_UNIT_SP, if (row.live) 22f else 20f)
-        typeface = if (row.live) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
-        gravity = if (row.alignedToEnd) Gravity.END else Gravity.START
+        setTextColor(GlassesPanelSpec.textColor(role))
+        setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.textSizePx(role))
+        maxLines = GlassesPanelSpec.maxLines(role)
+        gravity = Gravity.START
+        if (role == com.sheen.rokid.output.ConversationRole.USER) {
+            ellipsize = TextUtils.TruncateAt.START
+        }
         layoutParams = LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
         val vertical = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 4f, resources.displayMetrics).toInt()
         setPadding(0, vertical, 0, vertical)
         if (row.live) liveRow = this
+    }
+
+    /**
+     * The `正在思考` row: the official 22x22 icon plus 16 px full-green copy, as the last line of the conversation.
+     *
+     * It is a row **inside** the list (not a separate overlay), because the list scrolls and the thinking line must
+     * move with it. The icon is the existing ring with a smaller dot radius, not a second implementation.
+     */
+    private fun thinkingRow(): LinearLayout = LinearLayout(this).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        val icon = LoadingIndicatorView(this@GlassesActivity, dotRadiusPx = 2f,
+            colorInt = GlassesPanelSpec.GREEN_NORMAL)
+        addView(icon, LinearLayout.LayoutParams(
+            GlassesPanelSpec.THINKING_ICON_PX, GlassesPanelSpec.THINKING_ICON_PX))
+        val label = TextView(this@GlassesActivity).apply {
+            text = GlassesPanelSpec.THINKING_TEXT
+            setTextColor(GlassesPanelSpec.GREEN_NORMAL)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.THINKING_TEXT_SIZE_PX)
+            gravity = Gravity.START
+        }
+        addView(label, LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = 5 })
+        thinkingIcon = icon
+        thinkingRowView = this
+        thinkingTextView = label
+        icon.start()
     }
 
     /**
@@ -530,28 +625,35 @@ class GlassesActivity : Activity() {
     }
 
     /**
-     * The fixed layout: a padded safe area, a route header, the conversation window and one small status line.
+     * The official panel (0.23 P3, spec §5.1): a bottom-anchored 380 px black panel on the 480x640 canvas.
+     *
+     * Relative geometry follows `dialog_page_ai.xml`: the conversation window sits between two 30 px fades, the fixed
+     * listening line and the 55x45 orb share the bottom state row, the two operating tips sit 70 px above the panel's
+     * bottom edge, and the red compliance label is pinned to the bottom-right of the window. The P3 build keeps a
+     * temporary route header so the phase can show what it changed; P4 removes it with the route switch.
      *
      * Built in code on purpose - a `TextView` needs no resources, and a resource file would add a build surface that
      * nothing here needs.
      */
     private fun buildLayout(): FrameLayout {
         val root = FrameLayout(this).apply { setBackgroundColor(Color.TRANSPARENT) }
-        val padding = TypedValue.applyDimension(TypedValue.COMPLEX_UNIT_DIP, 24f, resources.displayMetrics).toInt()
-        // The official FAQ's other display note: "受光学结构影响，屏幕顶部约 40px 区域可能出现倒影。建议将关键文字、
-        // 图标和按钮整体下移 40px." The conversation is the one thing that must be read, so it is pushed below that zone.
-        val reflectionZone = 40
-        val column = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER
-            setPadding(padding, padding + reflectionZone, padding, padding)
+
+        val panel = FrameLayout(this).apply {
+            setBackgroundColor(GlassesPanelSpec.BLACK)
+            setPadding(0, 0, 0, GlassesPanelSpec.PANEL_BOTTOM_PADDING_PX)
         }
+        val column = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+        // P3 temporary route header. P4 deletes it, because the official panel has no route label at all (U8).
         headerView = TextView(this).apply {
-            setTextColor(Color.parseColor("#9E9E9E"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            gravity = Gravity.CENTER
-            text = ConversationView.headerText(AssistantRoute.WAKE, busy = false)
+            setTextColor(GlassesPanelSpec.GREEN_40)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.HEADER_TEXT_SIZE_PX)
+            gravity = Gravity.START
+            setPadding(GlassesPanelSpec.LIST_PADDING_SIDE_PX, GlassesPanelSpec.LIST_PADDING_TOP_PX,
+                GlassesPanelSpec.LIST_PADDING_SIDE_PX, 4)
+            text = GlassesPanelSpec.headerText(AssistantRoute.WAKE)
         }
+
         entriesView = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             // Phase C C1: nothing may paint the panel except the text. A child view would otherwise sit on the
@@ -560,58 +662,125 @@ class GlassesActivity : Activity() {
             layoutParams = FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT)
         }
-        // The window the wearer sees: exactly [HintAutoScroll.VISIBLE_LINES] lines tall, so the auto-scroll plan and
-        // the drawing agree on what "one page" is.
-        val windowPx = (20f * resources.displayMetrics.scaledDensity).toInt()
         hintScroll = ScrollView(this).apply {
-            // P3.2 Stage 0 had the bar off ("no input path"); Phase C turns it back on because the spec asks for a
-            // scrollbar that shows while the content moves and hides when it stops. Android's own bar does exactly
-            // that: `View.scrollTo` calls `awakenScrollBars()`, so a programmatic slide fades it in and lets it fade
-            // out again. No timer of our own.
             isVerticalScrollBarEnabled = true
             isScrollbarFadingEnabled = true
             isFillViewport = false
             setBackgroundColor(Color.TRANSPARENT)
-            // The other half of C1, measured on the device on 2026-10-15: `ScrollView` sets itself **focusable**, and
-            // since API 26 a focused view is drawn with the framework's *default focus highlight* over its bounds.
-            // With nothing else focusable in this window the ScrollView always held focus, so a uniform ~6% white
-            // rectangle sat over exactly the conversation window (#101010 on black, #FF1010 on red) whatever colour
-            // was set anywhere - the screenshot is what found it. A read-only display must not be focusable at all.
             isFocusable = false
             defaultFocusHighlightEnabled = false
+            setPadding(GlassesPanelSpec.LIST_PADDING_SIDE_PX, GlassesPanelSpec.LIST_PADDING_TOP_PX,
+                GlassesPanelSpec.LIST_PADDING_SIDE_PX, GlassesPanelSpec.LIST_PADDING_BOTTOM_PX)
             addView(entriesView)
         }
-        statusView = TextView(this).apply {
-            setTextColor(Color.parseColor("#9E9E9E"))
-            setTextSize(TypedValue.COMPLEX_UNIT_SP, 12f)
-            gravity = Gravity.CENTER
-            text = ConversationView.statusText(0)
+        topMask = GradientMaskView(this, MaskEdge.TOP)
+        bottomMask = GradientMaskView(this, MaskEdge.BOTTOM)
+        complianceView = TextView(this).apply {
+            setTextColor(GlassesPanelSpec.ALERT_RED)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.COMPLIANCE_TEXT_SIZE_PX)
+            gravity = Gravity.END
+            text = GlassesPanelSpec.complianceText()
         }
-        // The ring sits over the conversation window rather than beside it: the window is the whole middle of a
-        // 480x640 panel, and the wearer's eye is already there while a turn runs.
-        loadingView = LoadingIndicatorView(this).apply {
-            visibility = View.VISIBLE
-            layoutParams = FrameLayout.LayoutParams(
-                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT)
-        }
-        val window = FrameLayout(this).apply {
-            setBackgroundColor(Color.TRANSPARENT)
+        val listContainer = FrameLayout(this).apply {
             addView(hintScroll, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
-            addView(loadingView)
+            addView(topMask, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, GlassesPanelSpec.MASK_HEIGHT_PX, Gravity.TOP))
+            addView(bottomMask, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, GlassesPanelSpec.MASK_HEIGHT_PX, Gravity.BOTTOM))
+            addView(complianceView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END).apply {
+                marginEnd = GlassesPanelSpec.COMPLIANCE_MARGIN_END_PX
+                bottomMargin = GlassesPanelSpec.COMPLIANCE_MARGIN_BOTTOM_PX
+            })
         }
+
+        listeningView = TextView(this).apply {
+            setTextColor(GlassesPanelSpec.GREEN_NORMAL)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.LISTENING_TEXT_SIZE_PX)
+            gravity = Gravity.CENTER
+            text = GlassesPanelSpec.LISTENING_TEXT
+            visibility = View.GONE
+        }
+        orbView = VoiceOrbView(this)
+        val stateRow = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            addView(listeningView, LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = GlassesPanelSpec.LISTENING_MARGIN_TOP_PX
+            })
+            addView(orbView, LinearLayout.LayoutParams(
+                GlassesPanelSpec.VOICE_ORB_WIDTH_PX, GlassesPanelSpec.VOICE_ORB_HEIGHT_PX))
+        }
+
+        tipsView = TextView(this).apply {
+            setTextColor(GlassesPanelSpec.GREEN_40)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.TIPS_TEXT_SIZE_PX)
+            gravity = Gravity.START
+            text = GlassesPanelSpec.tipsText(busy = false)
+        }
+        pinTextView = TextView(this).apply {
+            setTextColor(GlassesPanelSpec.GREEN_40)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.TIPS_TEXT_SIZE_PX)
+            gravity = Gravity.END
+            text = GlassesPanelSpec.PIN_TEXT
+        }
+        val tipsRow = FrameLayout(this).apply {
+            addView(tipsView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.START or Gravity.CENTER_VERTICAL).apply {
+                marginStart = GlassesPanelSpec.TIPS_MARGIN_START_PX
+            })
+            addView(pinTextView, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT,
+                Gravity.END or Gravity.CENTER_VERTICAL).apply {
+                marginEnd = GlassesPanelSpec.TIPS_MARGIN_END_PX
+            })
+        }
+
         column.addView(headerView, LinearLayout.LayoutParams(
             LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        column.addView(window, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, windowPx * HintAutoScroll.VISIBLE_LINES))
-        column.addView(statusView, LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
-        root.addView(column, FrameLayout.LayoutParams(
+        column.addView(listContainer, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, 0, 1f))
+        column.addView(stateRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = GlassesPanelSpec.STATE_MARGIN_BOTTOM_PX
+        })
+        column.addView(tipsRow, LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            bottomMargin = GlassesPanelSpec.TIPS_BOTTOM_MARGIN_PX
+        })
+        panel.addView(column, FrameLayout.LayoutParams(
             FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.MATCH_PARENT))
+        root.addView(panel, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, GlassesPanelSpec.PANEL_HEIGHT_PX, Gravity.BOTTOM))
         // Registered on the **content view**, as the official sample does (`android.R.id.content`), rather than on the
         // FrameLayout built above: a key one of that layout's children consumed would never reach a listener attached
         // below it, and the sample's placement is the one that is known to work on this ROM.
         installSideTouch(findViewById(android.R.id.content) ?: root)
         return root
     }
+
+    // ---------------------------------------------------------------- instrumentation seams (production entry points)
+
+    /** Which orb state is committed; the same value [applyVisualState] computed. */
+    fun orbStateForProbe(): OrbState = orbView.state()
+
+    fun listeningVisibleForProbe(): Boolean = listeningView.visibility == View.VISIBLE
+
+    fun thinkingVisibleForProbe(): Boolean = thinkingRowView?.visibility == View.VISIBLE
+
+    fun listeningTextForProbe(): String = listeningView.text.toString()
+
+    fun thinkingTextForProbe(): String = thinkingTextView?.text?.toString().orEmpty()
+
+    fun tipsTextForProbe(): String = tipsView.text.toString()
+
+    fun complianceTextForProbe(): String = complianceView.text.toString()
+
+    /** The last message row (the thinking row is a `LinearLayout`, so it is skipped). */
+    fun lastMessageRowForProbe(): TextView? =
+        (0 until entriesView.childCount).mapNotNull { entriesView.getChildAt(it) as? TextView }.lastOrNull()
 }

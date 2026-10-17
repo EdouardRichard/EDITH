@@ -42,15 +42,7 @@ object ConversationView {
             )
         }
 
-    /** The line above the conversation, naming which of the two conversations is in front of the wearer. */
+    /** The line above the conversation, naming which of the two conversations is in front of the wearer (P3 only). */
     fun headerText(route: AssistantRoute, busy: Boolean): String =
         "${route.name} 上下文" + if (busy) " · 处理中" else ""
-
-    /**
-     * The small line under the conversation.
-     *
-     * It says something different once there is a conversation, so "nothing has arrived yet" and "the last thing
-     * arrived a while ago" do not read the same on a device with no other status indicator.
-     */
-    fun statusText(entries: Int): String = if (entries == 0) "等待提示" else "EDITH"
 }

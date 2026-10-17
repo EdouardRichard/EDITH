@@ -78,8 +78,8 @@ class VoiceOrbView(context: Context) : View(context) {
         val scale = OrbGeometry.headScale(state)
         val centerX = width / 2f
         val headCenterY = height * 0.46f
-        val headRadiusX = width * 0.235f * scale
-        val headRadiusY = height * 0.33f * scale
+        val headRadiusX = width * 0.30f * scale
+        val headRadiusY = height * 0.36f * scale
 
         // The soft shadow under the head: the official close-ups all show one, and it is what makes the orb look like
         // a bubble above the black panel rather than a sticker on it.
