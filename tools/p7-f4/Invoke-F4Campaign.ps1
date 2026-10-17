@@ -79,6 +79,14 @@ $InjectReceiver = 'edith.phone/.DebugAudioInjector'
 $ProbeClickComponent = 'edith.phone.a11yprobe/.A11yClickActivity'
 $LogTags = @('EdithP3:*', 'EdithP3T3b:*', 'System.out:*')
 
+# Android prints these two warnings on `am start` stderr when the activity is already front-most.
+# They are benign (exit 0) and must not be surfaced as campaign output. They are matched exactly,
+# so a similar-but-different warning line is retained and still fails a caller that requires it.
+$BenignAdbNoise = @(
+    'Warning: Activity not started, its current task has been brought to the front'
+    'Warning: Activity not started, intent has been delivered to currently running top-most instance.'
+)
+
 $MenuLabel = '菜单'
 $StartLabel = '开始'
 $AsrKeywordMusic = '音乐'
@@ -236,17 +244,57 @@ function Stop-CampaignFatal {
 
 # --- adb and logcat ---------------------------------------------------------------
 
+# Drops ONLY the two exact benign `am start` stderr warnings. This is a pure helper so -SelfTest can
+# prove the exactness without adb: a near miss, a different warning, or any other stderr line is
+# returned unchanged.
+function Remove-BenignAdbNoise {
+    param([string[]]$Lines)
+    $result = New-Object System.Collections.ArrayList
+    foreach ($line in @($Lines)) {
+        $text = [string]$line
+        if ($BenignAdbNoise -ccontains $text) { continue }
+        [void]$result.Add($text)
+    }
+    return @($result)
+}
+
+# The exit-code branch is separate from the native call so -SelfTest can pin it without a device:
+# a non-zero exit fails with ADB_FAILED unless the caller explicitly allows the failure.
+function Assert-AdbExitCode {
+    param(
+        [int]$ExitCode,
+        [string[]]$Arguments,
+        [switch]$AllowFailure
+    )
+    if ($ExitCode -ne 0 -and -not $AllowFailure) {
+        Stop-CampaignFatal ("ADB_FAILED exit={0} args={1}" -f $ExitCode, ($Arguments -join ' '))
+    }
+}
+
 function Invoke-Adb {
     param(
         [string[]]$Arguments,
         [switch]$AllowFailure
     )
-    $output = @(& adb -s $DeviceSerial @Arguments 2>&1 | ForEach-Object { [string]$_ })
-    $exitCode = $LASTEXITCODE
-    if ($exitCode -ne 0 -and -not $AllowFailure) {
-        Stop-CampaignFatal ("ADB_FAILED exit={0} args={1}" -f $exitCode, ($Arguments -join ' '))
+    # Windows PowerShell 5.1 turns a native command's redirected stderr (`2>&1`) into a terminating
+    # NativeCommandError while $ErrorActionPreference is Stop. `adb shell am start` writes a benign
+    # warning to stderr with exit 0, so run the native call under Continue and let the exit-code
+    # check below decide failure. The previous preference is restored in `finally`, so the rest of
+    # the campaign stays fail-fast.
+    $previousErrorActionPreference = $ErrorActionPreference
+    $exitCode = -1
+    $ErrorActionPreference = 'Continue'
+    try {
+        $output = @(& adb -s $DeviceSerial @Arguments 2>&1 | ForEach-Object { [string]$_ })
+        $exitCode = $LASTEXITCODE
     }
-    return $output
+    finally {
+        $ErrorActionPreference = $previousErrorActionPreference
+    }
+    Assert-AdbExitCode -ExitCode $exitCode -Arguments $Arguments -AllowFailure:$AllowFailure
+    # The filter applies to every adb call, including the cleanup `am start` and -AllowFailure
+    # probes; only those two exact benign warning lines are removed.
+    return (Remove-BenignAdbNoise -Lines $output)
 }
 
 function Send-DeviceBroadcast {
@@ -1743,6 +1791,76 @@ function Invoke-SelfTest {
     }
     catch {
         Add-SelfTestFail -Number 15 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+
+    # Case 16: native stderr tolerance. Windows PowerShell 5.1 turns a native command's redirected
+    # stderr into a terminating error under the script's Stop preference; `adb shell am start`
+    # warns on stderr with exit 0. Invoke-Adb runs the native call under Continue and filters ONLY
+    # the two exact benign warning lines; every other stderr line is kept, and a non-zero exit
+    # still fails unless the caller allows it. No adb is involved here.
+    try {
+        $frontWarning = 'Warning: Activity not started, its current task has been brought to the front'
+        $intentWarning = 'Warning: Activity not started, intent has been delivered to currently running top-most instance.'
+        $otherStderr = 'error: device offline'
+        $problems = @()
+
+        $filtered = @(Remove-BenignAdbNoise -Lines @($frontWarning, $otherStderr, $intentWarning))
+        if (($filtered.Count -ne 1) -or ($filtered[0] -ne $otherStderr)) {
+            $problems += ('filter actual={0}' -f ($filtered -join '|'))
+        }
+
+        # Only the exact lines are noise: a near miss with an extra character, a different case or
+        # a different sentence must be retained.
+        $nearMiss = @(
+            ($frontWarning + ' ')
+            ('WARNING: Activity not started, its current task has been brought to the front')
+            $otherStderr
+        )
+        $nearMissKept = @(Remove-BenignAdbNoise -Lines $nearMiss)
+        if ($nearMissKept.Count -ne $nearMiss.Count) {
+            $problems += ('nearMiss kept={0}/{1}' -f $nearMissKept.Count, $nearMiss.Count)
+        }
+
+        # Exit 0 with benign warnings is not a failure.
+        try {
+            Assert-AdbExitCode -ExitCode 0 -Arguments @('shell', 'am start -n edith.phone/.MainActivity')
+        }
+        catch {
+            $problems += ('exit0 threw={0}' -f $_.Exception.Message)
+        }
+
+        # A non-zero exit still fails with ADB_FAILED and sets the campaign's fatal reason.
+        $failed = $false
+        $script:Fatal = $null
+        try {
+            Assert-AdbExitCode -ExitCode 1 -Arguments @('shell', 'am start -n edith.phone/.MainActivity')
+        }
+        catch {
+            $failed = (($_.Exception.Message -match 'ADB_FAILED') -and
+                ($script:Fatal -match '^ADB_FAILED '))
+        }
+        if (-not $failed) { $problems += ('exit1 fatal={0}' -f $script:Fatal) }
+
+        # ...unless the caller explicitly allows it (pidof / best-effort probes).
+        $script:Fatal = $null
+        $allowed = $true
+        try { Assert-AdbExitCode -ExitCode 1 -Arguments @('shell', 'pidof com.miui.player') -AllowFailure }
+        catch { $allowed = $false }
+        if (-not $allowed) { $problems += 'exit1 AllowFailure threw' }
+        if ($null -ne $script:Fatal) { $problems += ('AllowFailure fatal={0}' -f $script:Fatal) }
+
+        if ($problems.Count -eq 0) {
+            Add-SelfTestPass -Number 16 -Detail 'ADB_NOISE warnings=2 dropped kept=1 exit1=fatal allowFailure=ok'
+        }
+        else {
+            Add-SelfTestFail -Number 16 -Detail ($problems -join '; ')
+        }
+    }
+    catch {
+        Add-SelfTestFail -Number 16 -Detail ('error={0}' -f $_.Exception.Message)
+    }
+    finally {
+        $script:Fatal = $null
     }
 
     if ($script:SelfTestFailures.Count -gt 0) {
