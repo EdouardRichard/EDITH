@@ -9,11 +9,11 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * Phase C (spec §6.6): how the conversation is laid out, decided without Android so it can be tested off-device.
+ * 0.23 P3 (spec §5.1.3, U9): how the conversation is laid out, decided without Android so it can be tested off-device.
  *
- * The rule the spec fixes is "AI replies on the left, the wearer's messages on the right", plus a header that names
- * the route in front of the wearer. The Activity builds the `TextView`s; **which** rows exist, which side each one
- * sits on, and which one is the live hint are decisions, and they are here.
+ * The rule changed with 0.23: **every line is left-aligned**, including the wearer's own words; the official panel
+ * separates the two roles by colour and size instead of by side. The Activity builds the `TextView`s; **which** rows
+ * exist, which side each one sits on, and which one is the live hint are decisions, and they are here.
  */
 class ConversationViewTest {
 
@@ -21,14 +21,12 @@ class ConversationViewTest {
         ConversationEntry(id, AssistantRoute.WAKE, role, text)
 
     @Test
-    fun assistantRepliesSitOnTheLeftAndTheWearersMessagesOnTheRight() {
+    fun everyLineSitsOnTheLeftLikeTheOfficialPanel() {
         val rows = ConversationView.rows(
             listOf(entry("a", ConversationRole.USER), entry("b", ConversationRole.ASSISTANT)), liveEntryId = null)
 
-        // The list is [USER, ASSISTANT], so the expected flags are [true, false]: the wearer's own words are the
-        // right-aligned ones.
-        assertEquals("a user message is right-aligned; an AI reply stays left",
-            listOf(true, false), rows.map { it.alignedToEnd })
+        assertTrue("the wearer's own words are left-aligned as well in 0.23: $rows",
+            rows.all { !it.alignedToEnd })
     }
 
     @Test

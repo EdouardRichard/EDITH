@@ -42,6 +42,18 @@ class BusyState(private val maxMillis: Long = MAX_MILLIS) {
     fun any(nowNanos: Long): Boolean = route(nowNanos) != null
 
     /**
+     * Whether **this** route is busy and still inside the bound.
+     *
+     * 0.23 P3/P4: the panel shows the state of the conversation in front of the wearer, so a proactive turn must not
+     * make the wake route look busy (or the reverse). `any` remains the answer for the two decisions that are about
+     * the whole assistant - the bottom-left "interrupt" copy and the BACK semantics.
+     */
+    fun isBusy(route: AssistantRoute, nowNanos: Long): Boolean {
+        val started = startedAt[route] ?: return false
+        return nowNanos - started <= maxMillis * 1_000_000L
+    }
+
+    /**
      * The route to name on the display: the one that started most recently and has not outlived the bound.
      *
      * The newest statement is the true one — the header says which conversation is being worked on, and when two are

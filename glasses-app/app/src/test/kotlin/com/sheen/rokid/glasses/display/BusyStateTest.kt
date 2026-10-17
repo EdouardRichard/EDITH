@@ -70,6 +70,29 @@ class BusyStateTest {
     }
 
     @Test
+    fun isBusyAnswersForOneRouteWithoutInventingTheOthers() {
+        // 0.23 P3/P4: the panel shows the state of the conversation in front of the wearer, so a proactive turn must
+        // not make the wake route look busy (or the reverse). `any` stays the answer for the BACK/tips decision.
+        val state = BusyState()
+        state.set(AssistantRoute.WAKE, true, 0)
+        assertTrue(state.isBusy(AssistantRoute.WAKE, 0))
+        assertFalse("the proactive route has not been told anything", state.isBusy(AssistantRoute.PROACTIVE, 0))
+        state.set(AssistantRoute.PROACTIVE, true, 1)
+        assertTrue(state.isBusy(AssistantRoute.PROACTIVE, 1))
+        state.set(AssistantRoute.WAKE, false, 2)
+        assertFalse(state.isBusy(AssistantRoute.WAKE, 2))
+        assertTrue("clearing one route must not clear the other", state.isBusy(AssistantRoute.PROACTIVE, 2))
+    }
+
+    @Test
+    fun isBusyExpiresAtTheSameBoundAsAny() {
+        val state = BusyState(maxMillis = 10_000)
+        state.set(AssistantRoute.WAKE, true, 0)
+        assertTrue(state.isBusy(AssistantRoute.WAKE, 9_999_999_999L))
+        assertFalse(state.isBusy(AssistantRoute.WAKE, 10_000_000_001L))
+    }
+
+    @Test
     fun resetClearsBothRoutes() {
         val state = BusyState()
         state.set(AssistantRoute.WAKE, true, 0)

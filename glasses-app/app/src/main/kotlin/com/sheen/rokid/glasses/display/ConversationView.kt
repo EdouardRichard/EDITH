@@ -20,9 +20,10 @@ object ConversationView {
     /**
      * One line of the conversation as the wearer will see it.
      *
-     * [alignedToEnd] is [ConversationRole.USER] — the wearer's own words go right, everything the assistant said
-     * stays left. [live] marks the entry a hint is currently standing behind: the rest of the conversation stays
-     * readable, but only this one is the thing the phone is waiting to have confirmed.
+     * [alignedToEnd] is kept as a field for the Activity's `gravity` plumbing but is **false for every role** in
+     * 0.23 (U9): the official panel left-aligns the wearer's line as well and separates the two roles by colour and
+     * size. [live] marks the entry a hint is currently standing behind: the rest of the conversation stays readable,
+     * but only this one is the thing the phone is waiting to have confirmed.
      */
     data class Row(val entry: ConversationEntry, val alignedToEnd: Boolean, val live: Boolean)
 
@@ -36,7 +37,7 @@ object ConversationView {
         entries.map { entry ->
             Row(
                 entry = entry,
-                alignedToEnd = entry.role == ConversationRole.USER,
+                alignedToEnd = false,
                 live = liveEntryId != null && entry.entryId == liveEntryId,
             )
         }
