@@ -3,7 +3,11 @@ package com.sheen.rokid.phone
 import com.sheen.rokid.plugin.StorageHandle
 import com.sheen.rokid.phone.debug.DebugMemoryLogSeed
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.MemoryLogView
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryKind
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemorySource
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -22,6 +26,14 @@ class DebugMemoryLogSeedTest {
         override fun write(key: String, value: ByteArray) = Unit
         override fun delete(key: String) = Unit
         override fun clear() = Unit
+    }
+
+    private class MapStorage : StorageHandle {
+        private val values = mutableMapOf<String, ByteArray>()
+        override fun read(key: String): ByteArray? = values[key]
+        override fun write(key: String, value: ByteArray) { values[key] = value }
+        override fun delete(key: String) { values.remove(key) }
+        override fun clear() = values.clear()
     }
 
     private val preview = MemoryLogView(EmptyStorage())
@@ -50,6 +62,24 @@ class DebugMemoryLogSeedTest {
 
     @Test
     fun `the two evidence memories never de-duplicate into one`() {
-        assertTrue(DebugMemoryLogSeed.SHORT_TEXT != DebugMemoryLogSeed.LONG_TEXT)
+        // Through the real MemoryLog, not just string inequality: the instrument records FACT + PREFERENCE, and the
+        // page must end up with two separate entries even when the sentences are similar.
+        val log = MemoryLog(MapStorage(), now = { 1_700_000_000_000L }, log = {})
+        log.record(MemoryKind.FACT, DebugMemoryLogSeed.SHORT_TEXT, MemorySource.EXPLICIT)
+        log.record(MemoryKind.PREFERENCE, DebugMemoryLogSeed.LONG_TEXT, MemorySource.EXPLICIT)
+
+        assertEquals(2, log.entries().size)
+        assertEquals(listOf(MemoryKind.FACT, MemoryKind.PREFERENCE), log.entries().map { it.kind })
+    }
+
+    @Test
+    fun `an existing backup is not overwritten unless forced`() {
+        assertTrue(DebugMemoryLogSeed.mayOverwriteBackup(existing = false, force = false))
+        assertTrue(DebugMemoryLogSeed.mayOverwriteBackup(existing = false, force = true))
+        assertTrue(DebugMemoryLogSeed.mayOverwriteBackup(existing = true, force = true))
+        assertFalse(
+            "a second backup after seed would capture the synthetic document and destroy the way back",
+            DebugMemoryLogSeed.mayOverwriteBackup(existing = true, force = false),
+        )
     }
 }

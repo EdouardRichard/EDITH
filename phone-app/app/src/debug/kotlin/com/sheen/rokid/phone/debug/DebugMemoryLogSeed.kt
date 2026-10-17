@@ -31,9 +31,10 @@ import java.io.File
  *
  * The order is enforced rather than documented: **seed refuses when no backup file exists**, and it refuses before the
  * destructive delete when that file cannot be decoded, because a seed with no usable way back would destroy the very
- * document this instrument promises to restore. `restore` reads the wrapper, writes the exact original bytes back (or
- * deletes the key when the backup recorded "no document"), then reads the key again and reports success only if the
- * bytes match.
+ * document this instrument promises to restore. **A second `backup` refuses when a backup file already exists** (pass
+ * `--ez force true` only when replacing it on purpose), and a verified `restore` removes the spent file. `restore` reads
+ * the wrapper, writes the exact original bytes back (or deletes the key when the backup recorded "no document"), then
+ * reads the key again and reports success only if the bytes match.
  *
  * Only counts, ids and SHA-256 values reach the log - never a memory sentence. It exists **only in the debug source set**
  * (`src/debug/AndroidManifest.xml`) and is `exported` so `am broadcast` can reach it; a release build contains no
@@ -45,8 +46,9 @@ class DebugMemoryLogSeed : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         if (intent.action != ACTION_SEED) return
         val store = storeFor(context)
+        val force = intent.getBooleanExtra(EXTRA_FORCE, false)
         when (intent.getStringExtra(EXTRA_MODE)) {
-            MODE_BACKUP -> backup(context, store)
+            MODE_BACKUP -> backup(context, store, force)
             MODE_SEED -> seed(context, store)
             MODE_RESTORE -> restore(context, store)
             else -> refuse(MODE_REFUSED, "UNKNOWN_MODE")
@@ -57,7 +59,7 @@ class DebugMemoryLogSeed : BroadcastReceiver() {
     private fun storeFor(context: Context): StorageHandle? =
         runCatching { (context.applicationContext as? EdithApplication)?.composition?.memoryStoreForProbe() }.getOrNull()
 
-    private fun backup(context: Context, store: StorageHandle?) {
+    private fun backup(context: Context, store: StorageHandle?, force: Boolean) {
         if (store == null) return refuse(MODE_BACKUP, "NO_STORE")
         val raw = try {
             store.read(MemoryLog.KEY)
@@ -65,6 +67,12 @@ class DebugMemoryLogSeed : BroadcastReceiver() {
             return refuse(MODE_BACKUP, "READ_FAILED")
         }
         val file = backupFile(context) ?: return refuse(MODE_BACKUP, "NO_EXTERNAL_DIR")
+        // The one way back must never be replaced by a backup of the synthetic document: a second `backup` after `seed`
+        // would capture the two evidence sentences, and `restore` would then verify "success" while the owner's real
+        // memories are gone. A deliberate replacement has to say so with `--ez force true`.
+        if (!mayOverwriteBackup(existing = file.isFile, force = force)) {
+            return refuse(MODE_BACKUP, "BACKUP_EXISTS")
+        }
         try {
             file.parentFile?.mkdirs()
             file.writeBytes(F4MemoryBackup.encode(raw))
@@ -147,7 +155,10 @@ class DebugMemoryLogSeed : BroadcastReceiver() {
         } catch (e: Exception) {
             -1
         }
-        P3Log.line("P3_P2MEM mode=restore verified=true entries=$entries")
+        // A restored backup is spent: leaving it behind is the only remaining way for a later `backup` to capture the
+        // synthetic document, and a spent file cannot restore anything the current bytes do not already hold.
+        val backupRemoved = runCatching { file.delete() }.getOrDefault(false)
+        P3Log.line("P3_P2MEM mode=restore verified=true entries=$entries backupRemoved=$backupRemoved")
     }
 
     private fun backupFile(context: Context): File? =
@@ -164,9 +175,21 @@ class DebugMemoryLogSeed : BroadcastReceiver() {
         /** The verb selector: `backup`, `seed` or `restore`. */
         const val EXTRA_MODE = "mode"
 
+        /** `--ez force true` is the only way to replace an existing backup; without it a second `backup` refuses. */
+        const val EXTRA_FORCE = "force"
+
         const val MODE_BACKUP = "backup"
         const val MODE_SEED = "seed"
         const val MODE_RESTORE = "restore"
+
+        /**
+         * Whether a `backup` may write over the file already on disk.
+         *
+         * Refusing by default is what keeps the one way back honest: after `seed` the current document is the synthetic
+         * one, so a second backup would overwrite the owner's bytes with the evidence sentences and `restore` would
+         * then report a verified success over lost memories. Replacing the file on purpose needs `force`.
+         */
+        fun mayOverwriteBackup(existing: Boolean, force: Boolean): Boolean = !existing || force
 
         /** Logged when the `mode` extra is absent or unknown; never treated as one of the three verbs. */
         private const val MODE_REFUSED = "REFUSED"
