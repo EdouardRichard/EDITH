@@ -9,7 +9,11 @@ import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -26,6 +30,9 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.SessionState
+import com.sheen.rokid.output.ConversationEntry
+import com.sheen.rokid.output.ConversationLog
+import com.sheen.rokid.output.ConversationRole
 import com.sheen.rokid.phone.app.AuditSection
 import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.phone.app.HostCompositionRoot
@@ -122,23 +129,34 @@ internal fun PhoneScreen(
                 }
             },
         ) { padding ->
-            Column(
-                Modifier.padding(padding).fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(12.dp),
-            ) {
-                if (selected != PhoneTab.SMART_ASSISTANT_PLUGIN_ID) {
-                    // The four tabs read the smart assistant's own state, so another plugin gets an honest sentence
-                    // rather than that state under the wrong name (spec §6.7 主体).
+            val body = Modifier.padding(padding).fillMaxSize()
+            if (selected != PhoneTab.SMART_ASSISTANT_PLUGIN_ID) {
+                // The four tabs read the smart assistant's own state, so another plugin gets an honest sentence
+                // rather than that state under the wrong name (spec §6.7 主体).
+                ScrollableTab(body) {
                     Text("「${pluginTitle(selected, plugins)}」未提供专属界面。", style = MaterialTheme.typography.bodyLarge)
                     Text("会话管理、插件选择与诊断在左上角菜单里。", style = MaterialTheme.typography.bodyMedium)
-                } else {
-                    when (phoneTabFor(tab.ordinal)) {
-                        PhoneTab.ASSISTANT -> AssistantTab(root.conversationLog)
-                        PhoneTab.SKILLS -> SkillsTab(root)
-                        PhoneTab.MEMORY -> root.memoryLogView?.let { MemorySection(it) } ?: Text("记忆服务不可用")
-                        PhoneTab.SETTINGS -> SettingsTab(
+                }
+            } else {
+                when (phoneTabFor(tab.ordinal)) {
+                    // U1: only the message list scrolls. The title, the route switch and the chat frame header stay
+                    // outside every scroll container, so a long record cannot take the switch away from the wearer.
+                    PhoneTab.ASSISTANT -> Column(body) {
+                        AssistantTab(root.conversationLog, Modifier.weight(1f))
+                        state.errorCode?.let {
+                            Text(
+                                errorLabel(it),
+                                color = MaterialTheme.colorScheme.error,
+                                modifier = Modifier.padding(horizontal = 20.dp, vertical = 4.dp),
+                            )
+                        }
+                    }
+                    PhoneTab.SKILLS -> ScrollableTab(body, state.errorCode) { SkillsTab(root) }
+                    PhoneTab.MEMORY -> ScrollableTab(body, state.errorCode) {
+                        root.memoryLogView?.let { MemorySection(it) } ?: Text("记忆服务不可用")
+                    }
+                    PhoneTab.SETTINGS -> ScrollableTab(body, state.errorCode) {
+                        SettingsTab(
                             state = state,
                             root = root,
                             profileViewModel = profileViewModel,
@@ -148,10 +166,30 @@ internal fun PhoneScreen(
                             notificationsGranted = notificationsGranted,
                         )
                     }
-                    state.errorCode?.let { Text(errorLabel(it), color = MaterialTheme.colorScheme.error) }
                 }
             }
         }
+    }
+}
+
+/**
+ * The whole-page scroll container the three list-like tabs still use.
+ *
+ * The assistant tab is the exception (U1): its title, route switch and chat frame header must not move while the
+ * messages scroll, so [AssistantTab] owns its own fixed frame and is deliberately not wrapped in this.
+ */
+@Composable
+private fun ScrollableTab(
+    body: Modifier,
+    errorCode: String? = null,
+    content: @Composable ColumnScope.() -> Unit,
+) {
+    Column(
+        body.verticalScroll(rememberScrollState()).padding(20.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        content()
+        errorCode?.let { Text(errorLabel(it), color = MaterialTheme.colorScheme.error) }
     }
 }
 
@@ -185,19 +223,34 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
 /**
  * The assistant's page (spec §6.7 助手: 对话上下文记录；顶部切换 WAKE/PROACTIVE).
  *
+ * U1 fixes the original defect: the title, the route switch and the chat frame's own header (route name + refresh
+ * icon) are **outside** every scroll container, so a long record cannot carry them off screen. Only the message
+ * `LazyColumn` scrolls.
+ *
+ * U2 puts the assistant's bubbles on the left and the wearer's on the right; the owner 2026-10-18 chose to show neither
+ * a role label nor a timestamp, so alignment and colour are the whole distinction.
+ *
  * The switch is **read-only**: it changes which conversation is in front of the wearer and nothing else. It reads the
  * same `ConversationLog` the glasses render — same shape, same order, same eviction — so the two screens cannot drift
  * apart the way two implementations would. They are not the same *instance*: the phone records what the plugin said,
  * the glasses what the display accepted, so a refused hint shows here and never there.
  *
  * The list re-reads itself while the tab is on screen, because a record that only updates when the wearer presses a
- * button is a record that looks frozen exactly when a turn is running.
+ * button is a record that looks frozen exactly when a turn is running. It follows new entries only when the reader is
+ * already at the bottom; the owner 2026-10-18 chose to start each route at its newest entry.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun AssistantTab(log: com.sheen.rokid.output.ConversationLog) {
+internal fun AssistantTab(log: ConversationLog, modifier: Modifier = Modifier) {
     var route by remember { mutableStateOf(AssistantRoute.WAKE) }
     var revision by remember { mutableStateOf(0) }
+    val entries = remember(revision, route) { log.entries(route) }
+    val listState = rememberLazyListState()
+    // The values the follow decision compares against. They reset with the route, because the list state belongs to one
+    // conversation at a time: carrying the old position into the other route would judge the wrong reader position.
+    var previousCount by remember(route) { mutableStateOf(entries.size) }
+    var previousLastId by remember(route) { mutableStateOf(entries.lastOrNull()?.entryId) }
+
     // The log is written from the host's drain thread and the plugin's task pool, so this is a poll rather than a
     // subscription: a cheap re-read every two seconds while the tab is composed, and nothing while it is not.
     LaunchedEffect(route) {
@@ -207,40 +260,111 @@ internal fun AssistantTab(log: com.sheen.rokid.output.ConversationLog) {
         }
     }
 
-    Text("对话上下文记录", style = MaterialTheme.typography.titleLarge)
-    SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-        AssistantRoute.entries.forEachIndexed { index, candidate ->
-            SegmentedButton(
-                selected = route == candidate,
-                onClick = { route = candidate },
-                shape = SegmentedButtonDefaults.itemShape(index = index, count = AssistantRoute.entries.size),
-            ) { Text(if (candidate == AssistantRoute.WAKE) "唤醒" else "主动") }
+    // Opening a route, or switching to the other one, starts at the newest entry (owner 2026-10-18). scrollToItem, not
+    // animateScrollToItem: a first frame that animates through the whole record would show the oldest line first.
+    LaunchedEffect(route) {
+        initialScrollTarget(entries.size)?.let { listState.scrollToItem(it) }
+        previousCount = entries.size
+        previousLastId = entries.lastOrNull()?.entryId
+    }
+
+    // Follow a newly appended entry only when the reader was already at the bottom. The bottom test compares the last
+    // visible index with the *previous* count, not with the new total: after an append the new item is not laid out yet
+    // on some frames, and "last visible < new total - 1" would then wrongly read as "the reader scrolled up".
+    LaunchedEffect(entries.size, entries.lastOrNull()?.entryId) {
+        val info = listState.layoutInfo
+        val lastVisible = info.visibleItemsInfo.lastOrNull()?.index
+        val atBottomBefore = lastVisible == null || lastVisible >= previousCount - 1
+        // Either a count increase or a changed last id is a new entry; the second covers the bounded log's cap, where
+        // an append evicts the oldest entry and leaves the count at 40.
+        val shouldFollow = shouldAutoScroll(atBottomBefore, previousCount, entries.size) ||
+            shouldFollowNewEntry(atBottomBefore, previousLastId, entries.lastOrNull()?.entryId)
+        if (entries.isNotEmpty() && shouldFollow) {
+            if (previousCount == 0) listState.scrollToItem(entries.lastIndex)
+            else listState.animateScrollToItem(entries.lastIndex)
+        }
+        previousCount = entries.size
+        previousLastId = entries.lastOrNull()?.entryId
+    }
+
+    Column(
+        modifier.fillMaxSize().padding(horizontal = 20.dp, vertical = 12.dp),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+    ) {
+        Text("对话上下文记录", style = MaterialTheme.typography.titleLarge)
+        SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
+            AssistantRoute.entries.forEachIndexed { index, candidate ->
+                SegmentedButton(
+                    selected = route == candidate,
+                    onClick = { route = candidate },
+                    shape = SegmentedButtonDefaults.itemShape(index = index, count = AssistantRoute.entries.size),
+                ) { Text(if (candidate == AssistantRoute.WAKE) "唤醒" else "主动") }
+            }
+        }
+        Text(
+            "只读视图：切换只改变这里显示哪一条对话，不影响正在运行的会话。眼镜上看的是同一份记录。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        Surface(
+            modifier = Modifier.weight(1f).fillMaxWidth(),
+            shape = RoundedCornerShape(12.dp),
+            tonalElevation = 1.dp,
+        ) {
+            Column(Modifier.fillMaxSize()) {
+                Row(
+                    Modifier.fillMaxWidth().padding(start = 12.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                ) {
+                    Text(routeLabel(route), style = MaterialTheme.typography.titleMedium)
+                    IconButton(onClick = { revision++ }) {
+                        Icon(
+                            Icons.Default.Refresh,
+                            contentDescription = REFRESH_DESCRIPTION,
+                        )
+                    }
+                }
+                if (entries.isEmpty()) {
+                    Box(Modifier.fillMaxWidth().weight(1f), contentAlignment = Alignment.Center) {
+                        Text("暂无记录", style = MaterialTheme.typography.bodyMedium)
+                    }
+                } else {
+                    LazyColumn(
+                        state = listState,
+                        modifier = Modifier.fillMaxWidth().weight(1f),
+                        contentPadding = PaddingValues(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(8.dp),
+                    ) {
+                        items(entries, key = { it.entryId }) { entry -> MessageBubble(entry) }
+                    }
+                }
+            }
         }
     }
-    Text(
-        "只读视图：切换只改变这里显示哪一条对话，不影响正在运行的会话。眼镜上看的是同一份记录。",
-        style = MaterialTheme.typography.bodySmall,
-    )
-    val entries = remember(revision, route) { log.entries(route) }
-    if (entries.isEmpty()) {
-        Text("暂无记录")
-    } else {
-        entries.forEach { entry ->
-            ListItem(
-                headlineContent = { Text(entry.text) },
-                supportingContent = {
-                    Text(if (entry.role == com.sheen.rokid.output.ConversationRole.USER) "你" else "助手")
+}
+
+/** One message: the assistant's on the left, the wearer's on the right (U2), content-sized up to 80% of the row. */
+@Composable
+private fun MessageBubble(entry: ConversationEntry) {
+    val side = sideFor(entry.role)
+    Row(
+        Modifier.fillMaxWidth(),
+        horizontalArrangement = if (side == BubbleSide.END) Arrangement.End else Arrangement.Start,
+    ) {
+        BoxWithConstraints {
+            Surface(
+                modifier = Modifier.widthIn(max = maxWidth * BUBBLE_MAX_WIDTH_FRACTION),
+                shape = RoundedCornerShape(12.dp),
+                color = if (entry.role == ConversationRole.USER) {
+                    MaterialTheme.colorScheme.primaryContainer
+                } else {
+                    MaterialTheme.colorScheme.surfaceVariant
                 },
-                leadingContent = {
-                    Icon(
-                        if (entry.role == com.sheen.rokid.output.ConversationRole.USER) Icons.Default.Person else Icons.Default.Info,
-                        contentDescription = null,
-                    )
-                },
-            )
+            ) {
+                Text(entry.text, modifier = Modifier.padding(12.dp))
+            }
         }
     }
-    OutlinedButton(onClick = { revision++ }) { Text("刷新") }
 }
 
 /**

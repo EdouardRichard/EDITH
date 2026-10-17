@@ -131,6 +131,20 @@
             </intent-filter>
         </receiver>
         <!--
+          0.23 P1 layout evidence seed. Same export rule and the same reason as the instruments above: the only caller is
+          an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
+          release build. It appends synthetic Chinese lines through the production ConversationLog.append API so the
+          assistant page can be screenshotted with a record longer than one screen. It logs counts only, never text.
+        -->
+        <receiver
+            android:name=".debug.DebugConversationSeed"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_CONVERSATION" />
+            </intent-filter>
+        </receiver>
+        <!--
           `DebugModelProbe` (the generic all-models-on-an-accelerator probe) is NOT registered here yet: it needs the
           process's single shared LiteRT `Environment`, which lives in the vendored `com.laya` file as a
           file-private object, so the probe cannot compile without making vendored code non-private. Its entry, its
