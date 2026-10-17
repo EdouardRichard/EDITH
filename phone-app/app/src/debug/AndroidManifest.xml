@@ -145,6 +145,21 @@
             </intent-filter>
         </receiver>
         <!--
+          0.23 P2 memory-page evidence seed. Same export rule and the same reason as the instruments above: the only
+          caller is an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist
+          in a release build. It saves the production memory document's exact bytes, replaces it with two synthetic
+          sentences either side of the 40-code-point preview cap, and puts the original bytes back with a byte-for-byte
+          verification. It logs counts, ids and SHA-256 only - never a memory sentence.
+        -->
+        <receiver
+            android:name=".debug.DebugMemoryLogSeed"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_MEMORY_LOG_SEED" />
+            </intent-filter>
+        </receiver>
+        <!--
           `DebugModelProbe` (the generic all-models-on-an-accelerator probe) is NOT registered here yet: it needs the
           process's single shared LiteRT `Environment`, which lives in the vendored `com.laya` file as a
           file-private object, so the probe cannot compile without making vendored code non-private. Its entry, its
