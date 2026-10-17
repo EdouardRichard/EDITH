@@ -172,12 +172,17 @@ class DebugMemoryLogSeed : BroadcastReceiver() {
         private const val MODE_REFUSED = "REFUSED"
 
         /** The sentence under the preview cap: the screenshot must show it whole. */
-        const val SHORT_TEXT = "P2 证据短记忆：周末去公园散步"
+        const val SHORT_TEXT = "P2 证据短记忆：周末散步"
 
-        /** The sentence above the preview cap: the screenshot must show `…` in the list and every character in detail. */
+        /**
+         * The sentence above the preview cap: the screenshot must show `…` in the list and every character in detail.
+         *
+         * Deliberately uses `、` and not `，`/`,`: the device probe splits its `labels` extra on those separators, so a
+         * comma inside the sentence would make the row's a11y label impossible to pass back to the probe verbatim.
+         */
         const val LONG_TEXT =
-            "P2 证据长记忆：这是一条用于验证记忆列表缩略与全屏详情完整全文的合成记录，" +
-                "长度明显超过四十个码点，列表里应当被截断并显示省略号。"
+            "P2 证据长记忆：这是一条用于验证记忆列表缩略与全屏详情完整全文的合成记录、" +
+                "长度明显超过四十个码点、列表里应当被截断并显示省略号。"
 
         /** Where the original document's wrapper lives, under the app's external files directory. */
         const val BACKUP_FILE = "p2-memory-backup.bin"
