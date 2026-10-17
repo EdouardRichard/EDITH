@@ -23,6 +23,13 @@
     -->
     <uses-permission android:name="android.permission.READ_CALENDAR" />
 
+    <!--
+      S1 (2026-10-16) survey: the floating-window half of the capability question. Declared but never requested from the
+      user; the operator grants the appop with `appops set edith.phone.a11yprobe SYSTEM_ALERT_WINDOW allow` before the
+      `overlay` scenario, and the scenario reports `SURVEY_O00_OVERLAY_SKIPPED` when it is absent rather than failing.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
     <application
         android:allowBackup="false"
         android:label="EDITH P3 T3b"
@@ -53,6 +60,43 @@
         </activity>
 
         <!--
+          Click-now: the unattended "click whichever of these labels is on screen" action, for dialogs that only the
+          accessibility tree can see (the MIUI install confirmation). Exported and reachable only by an explicit
+          `am start` carrying the action plus `confirm=true`, like A1 above, because it taps on someone else's window.
+
+          `Theme.Translucent.NoTitleBar` is deliberate: this activity is started *before* the dialog exists, so its own
+          window must not paint over the screen the dialog is coming up on. `excludeFromRecents` keeps the run out of the
+          operator's task list.
+        -->
+        <activity
+            android:name=".A11yClickActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="EDITH P3 click"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="edith.phone.a11yprobe.intent.CLICK_NOW" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          S1 (2026-10-16) survey runner. Same rule as A1 and click-now: reachable only by an explicit `am start` carrying
+          the action plus `confirm=true`, because it reads another app's window and dispatches touches. Not a launcher,
+          does not auto-run, and it is the only component the survey scenarios are driven through.
+        -->
+        <activity
+            android:name=".A11ySurveyActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="EDITH S1 survey">
+            <intent-filter>
+                <action android:name="edith.phone.a11yprobe.intent.SURVEY" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!--
           Enabled by the user in system settings; the probe cannot and must not enable itself. `canPerformGestures` is
           required for `dispatchGesture` (the coordinate mode), and `canRetrieveWindowContent` for the node mode.
         -->
@@ -67,6 +111,37 @@
             <meta-data
                 android:name="android.accessibilityservice"
                 android:resource="@xml/a11y_probe_config" />
+        </service>
+
+        <!--
+          S1 survey services. The pair differs in exactly two flags (`flagReportViewIds`,
+          `flagRetrieveInteractiveWindows`) so the survey can read one screen through both and report what those flags
+          change instead of citing it. Both are off unless the operator enables them in system settings.
+        -->
+        <service
+            android:name=".A11ySurveyService"
+            android:exported="false"
+            android:label="EDITH S1 survey (view ids)"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/a11y_survey_config" />
+        </service>
+
+        <service
+            android:name=".A11ySurveyNoIdsService"
+            android:exported="false"
+            android:label="EDITH S1 survey (no view ids)"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/a11y_survey_noids_config" />
         </service>
     </application>
 

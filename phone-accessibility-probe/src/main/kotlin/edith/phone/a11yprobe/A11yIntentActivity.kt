@@ -13,6 +13,20 @@ import android.util.Log
 import android.widget.TextView
 
 /**
+ * The raw extra value under [name], whatever type `am` decided to deliver; null when the extra is absent.
+ *
+ * One read for every `am` spelling, because the type delivered is not the type the caller asked for: `--esal` delivers an
+ * `ArrayList`, `--esa` a `String[]` and `--es` a single `String`. Callers decide what they can accept ([longExtraOr] for
+ * numbers, [normalizeLabels] for label lists) instead of each re-deriving the trap.
+ *
+ * `Bundle.get(String)` is deprecated as of API 33 in favour of `Bundle.get(String, Class)`, which does **not exist** on
+ * this probe's `minSdk = 28`; the untyped read is the only call that works across the supported range, so the warning is
+ * suppressed with that reason rather than left in the build output.
+ */
+@Suppress("DEPRECATION")
+internal fun Intent?.rawExtra(name: String): Any? = this?.extras?.get(name)
+
+/**
  * A long extra that accepts what `adb` can actually send.
  *
  * `--el dialogWaitMillis 15000` delivers a `Long`, but the shorter `--ei dialogWaitMillis 15000` delivers an
@@ -20,20 +34,16 @@ import android.widget.TextView
  * device. Reading the raw bundle value keeps both spellings usable, and anything unusable falls back to the default
  * rather than crashing the run.
  *
- * `Bundle.get(String)` is deprecated as of API 33 in favour of `Bundle.get(String, Class)`, which does **not exist** on
- * this probe's `minSdk = 28`; the untyped read is the only call that works across the supported range, so the warning is
- * suppressed with that reason rather than left in the build output.
+ * Shared with the click-now activity (`A11yClickActivity`) rather than copied: a second copy is how the `--ei` bug comes
+ * back, and it is the kind of bug that only appears on the device, mid-run, unattended.
  */
-@Suppress("DEPRECATION")
-private fun Intent?.longExtraOr(name: String, fallback: Long): Long {
-    val extras = this?.extras ?: return fallback
-    return when (val value = extras.get(name)) {
+internal fun Intent?.longExtraOr(name: String, fallback: Long): Long =
+    when (val value = rawExtra(name)) {
         is Long -> value
         is Int -> value.toLong()
         is String -> value.toLongOrNull() ?: fallback
         else -> fallback
     }
-}
 
 /**
  * P3.0 **A1**: the acceptance runner that judges *intent reached*, not *screen changed*.
@@ -52,7 +62,9 @@ private fun Intent?.longExtraOr(name: String, fallback: Long): Long {
  *     never pixels. An already-GRANTED permission is skipped and reported as `popupSkipped`, because a run that measured
  *     nothing must not be quotable as a success. How long the probe waits for that dialog is overridable
  *     (`--ei dialogWaitMillis 15000`), because "the dialog never appeared" and "the probe stopped waiting too early"
- *     look identical in the verdict and only a longer wait separates them.
+ *     look identical in the verdict and only a longer wait separates them. Which labels count as affirmative is
+ *     overridable too (`--esal affirmativeLabels "继续安装,安装,确定"`), because that wording belongs to the build being
+ *     driven and not to this code; absent, the constant default applies unchanged.
  *  3. **mis-tap rate** — `attempts` is every tap/click dispatched; `misTaps` counts, out of the **coordinate** taps, the
  *     ones that did not land on the intended row (a tap into empty space included). A node click is delivered by the
  *     framework to the node it names, so it cannot mis-land and is never counted: the numerator's evidence comes from
@@ -104,6 +116,7 @@ class A11yIntentActivity : Activity() {
     private data class Config(
         val targetLabels: List<String>,
         val markerLabels: List<String>,
+        val affirmativeLabels: List<String>,
         val permission: String,
         val maxScrolls: Int,
         val dialogWaitMillis: Long,
@@ -118,6 +131,8 @@ class A11yIntentActivity : Activity() {
             fun from(intent: Intent?): Config = Config(
                 targetLabels = intent?.getStringArrayListExtra(EXTRA_TARGET_LABELS) ?: TARGET_LABELS,
                 markerLabels = intent?.getStringArrayListExtra(EXTRA_MARKER_LABELS) ?: MARKER_LABELS,
+                // Absent extra keeps the constant default, so every earlier popup run means exactly what it meant.
+                affirmativeLabels = normalizeLabels(intent.rawExtra(EXTRA_AFFIRMATIVE_LABELS)) ?: AFFIRMATIVE_LABELS,
                 permission = intent?.getStringExtra(EXTRA_PERMISSION) ?: Manifest.permission.READ_CALENDAR,
                 maxScrolls = intent?.getIntExtra(EXTRA_MAX_SCROLLS, MAX_SCROLLS) ?: MAX_SCROLLS,
                 dialogWaitMillis = intent.longExtraOr(EXTRA_DIALOG_WAIT_MILLIS, DIALOG_WAIT_MILLIS),
@@ -397,8 +412,8 @@ class A11yIntentActivity : Activity() {
             // own window and wrongly report "no dialog". The wait is overridable because `no_dialog` cannot otherwise be
             // told apart from "the probe stopped waiting too early" — see `EXTRA_DIALOG_WAIT_MILLIS`.
             requestPermissions(arrayOf(configuration.permission), REQUEST_CODE)
-            val dialogSeen = waitForAny(service, AFFIRMATIVE_LABELS, configuration.dialogWaitMillis)
-            val affirmative = service.findNode(AFFIRMATIVE_LABELS)
+            val dialogSeen = waitForAny(service, configuration.affirmativeLabels, configuration.dialogWaitMillis)
+            val affirmative = service.findNode(configuration.affirmativeLabels)
             val clicked = affirmative != null && service.clickNode(service.clickableAncestor(affirmative) ?: affirmative)
             if (clicked) sleep(SETTLE_MILLIS)
 
@@ -491,8 +506,20 @@ class A11yIntentActivity : Activity() {
          *
          * `确定`/`OK` are on the list because several builds label the positive button that way; if a build uses wording
          * none of these match, the verdict says `no_affirmative` and the list is the fix.
+         *
+         * This is only the **default**: [EXTRA_AFFIRMATIVE_LABELS] replaces it for one run.
          */
         val AFFIRMATIVE_LABELS = listOf("允许", "始终允许", "确定", "Allow", "ALLOW", "While using the app", "OK")
+
+        /**
+         * Replaces [AFFIRMATIVE_LABELS] for the popup arm of this run: `--esal affirmativeLabels "继续安装,安装,确定"`.
+         *
+         * Added because the popup arm is also the only channel that can see *some* confirmations at all (on MIUI the
+         * install dialog's screenshots come back black and `uiautomator dump` returns a null root), and their wording is
+         * a property of the build, not of this code — discovering it must not require a rebuild. Absent, the constant
+         * default applies, so every earlier run's evidence still means exactly what it did.
+         */
+        const val EXTRA_AFFIRMATIVE_LABELS = "affirmativeLabels"
 
         private const val REQUEST_CODE = 0xA1
 
