@@ -2,8 +2,8 @@ package edith.phone
 
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
-import edith.plugins.diagnostic.DiagnosticHintPlugin
-import edith.plugins.diagnostic.DiagnosticTextPlugin
+import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticHintPlugin
+import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticTextPlugin
 
 /**
  * Debug-only registrations.

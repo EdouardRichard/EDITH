@@ -4,10 +4,10 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import com.sheen.rokid.plugin.StorageHandle
-import edith.plugins.smart.memory.MemoryKind
-import edith.plugins.smart.memory.MemoryLog
-import edith.plugins.smart.memory.MemorySource
-import edith.plugins.smart.memory.normalize
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryKind
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemorySource
+import com.sheen.rokid.phone.plugin.smarthelper.memory.normalize
 import java.io.File
 import java.security.MessageDigest
 

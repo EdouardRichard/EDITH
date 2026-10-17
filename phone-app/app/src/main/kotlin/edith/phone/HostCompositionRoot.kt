@@ -35,8 +35,8 @@ import com.sheen.rokid.model.*
 import com.sheen.rokid.output.ConversationLog
 import com.sheen.rokid.output.TraceRecorder
 import com.sheen.rokid.plugin.*
-import edith.plugins.smart.SmartAssistantPlugin
-import edith.plugins.interview.InterviewAssistantPlugin
+import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
+import com.sheen.rokid.phone.plugin.interview.InterviewAssistantPlugin
 import com.sheen.rokid.transport.CxrAuthorizationOutcome
 import com.sheen.rokid.transport.PcmFormatEvidence
 import com.sheen.rokid.storage.*

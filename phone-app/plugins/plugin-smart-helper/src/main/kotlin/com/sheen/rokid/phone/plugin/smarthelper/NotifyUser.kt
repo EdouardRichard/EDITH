@@ -1,0 +1,117 @@
+package com.sheen.rokid.phone.plugin.smarthelper
+
+import com.sheen.rokid.contracts.SpeechRequest
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.RiskLevel
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
+
+/**
+ * The four channels of spec §6.1.
+ *
+ * [wireName] is the string the model sends and the schema documents; it is deliberately not `name.lowercase()`,
+ * because the wire contract and the Kotlin identifier are two different things that must be free to differ.
+ */
+enum class NotifyChannel(val wireName: String) {
+    SCREEN("screen"),
+    VOICE("voice"),
+    BOTH("both"),
+    SILENT("silent"),
+    ;
+
+    companion object {
+        fun fromWire(raw: String): NotifyChannel? =
+            entries.firstOrNull { it.wireName == raw.trim().lowercase() }
+    }
+}
+
+/** What one notification does to the output path. */
+sealed class NotifyDecision {
+    /** Submit one hint; a non-null [optionalSpeech] is a request to speak it, which the host may still refuse. */
+    data class Show(val optionalSpeech: SpeechRequest?) : NotifyDecision()
+
+    /**
+     * Submit nothing, and mark the turn explicitly suppressed so the §6.2 fallback does not immediately contradict
+     * the model's own decision.
+     */
+    data object Suppress : NotifyDecision()
+}
+
+/**
+ * Maps a channel onto what the output path can express (spec §6.1).
+ *
+ * **`VOICE` has no voice-only representation and is mapped to `BOTH`.** `OutputArbiter` calls `device.show` for every
+ * accepted hint, and `core-contracts`' `Assistance` carries only `optionalSpeech: SpeechRequest?` — there is no way
+ * to say "speak this and do not display it". Changing that would be a public-contract change to `core-contracts`, so
+ * this version states the exposure (`NotifyChannel.VOICE.wireName` is logged by the caller) instead of inventing a
+ * distinction the host cannot honour. `SILENT` is the one channel that submits nothing.
+ */
+fun decideChannel(channel: NotifyChannel): NotifyDecision = when (channel) {
+    NotifyChannel.SCREEN -> NotifyDecision.Show(optionalSpeech = null)
+    NotifyChannel.BOTH, NotifyChannel.VOICE -> NotifyDecision.Show(optionalSpeech = SpeechRequest())
+    NotifyChannel.SILENT -> NotifyDecision.Suppress
+}
+
+/**
+ * The `notify_user` tool (spec §6.1): the only channel through which the model reaches the wearer.
+ *
+ * It is an [ActionExecutor] rather than a new tool port in `agent-runtime`, and each consequence of that choice is
+ * deliberate:
+ *
+ * - **L0, no confirmation.** The action policy allows `<= L1` outright, so a notification is never gated by the
+ *   whitelist or by a question — which is right, because showing the wearer a sentence is not a device action.
+ * - **`scope` is not `SCOPE_TERMINAL`.** A notification in the middle of a multi-step task must not end the run, or
+ *   §6.3's "the task continues" would be impossible.
+ * - **`auditTargetArgument` is `null`.** The audit line then carries no argument at all, which is what keeps the
+ *   wearer's notification text out of the trail.
+ * - **The result detail is `notified:<n>`.** `AgentLoop` feeds every tool result to `ProgressGuard`, which trips on
+ *   three identical consecutive fingerprints; a model that sends the same sentence twice would otherwise end its own
+ *   run as `NO_PROGRESS`. The counter keeps the fingerprints distinct and carries no content.
+ */
+class NotifyUserTool(private val onNotify: (NotifyChannel, String) -> Unit) : ActionExecutor {
+
+    private val sequence = AtomicInteger()
+
+    override fun descriptors(): List<ActionDescriptor> = listOf(DESCRIPTOR)
+
+    override fun execute(name: String, argsJson: String): ActionResult {
+        val args = runCatching { JSON.parseToJsonElement(argsJson).jsonObject }.getOrNull()
+            ?: return refused()
+        val text = (args["text"] as? JsonPrimitive)?.takeIf { it.isString }?.content?.trim()
+        if (text.isNullOrEmpty()) return refused()
+        val channel = (args["channel"] as? JsonPrimitive)
+            ?.takeIf { it.isString }
+            ?.content
+            ?.let { NotifyChannel.fromWire(it) }
+            ?: return refused()
+
+        onNotify(channel, text)
+        return ActionResult(ActionOutcome.Done, "notified:${sequence.incrementAndGet()}")
+    }
+
+    override fun cancel() = Unit
+
+    /** A refusal is a step the model can correct, never an exception into the loop. */
+    private fun refused() = ActionResult(ActionOutcome.Refused, "NOTIFY_ARGUMENTS_INVALID")
+
+    companion object {
+        private val JSON = Json { isLenient = true }
+
+        val DESCRIPTOR = ActionDescriptor(
+            name = "notify_user",
+            title = "向用户发送通知",
+            parametersJson = """{"type":"object","properties":{"text":{"type":"string","description":"要通知用户的内容"},"channel":{"type":"string","enum":["screen","voice","both","silent"],"description":"screen=仅眼镜显示，voice=仅语音播报，both=同时显示和播报，silent=不通知用户但阻止系统自动补发通知"},"final":{"type":"boolean","description":"true=模型声明任务结束（spec §3.7 决策5b）"}},"required":["text","channel"],"additionalProperties":false}""",
+            risk = RiskLevel.L0,
+            requiresConfirmation = false,
+            idempotent = true,
+            reversible = true,
+            scope = "notify",
+            auditTargetArgument = null,
+        )
+    }
+}

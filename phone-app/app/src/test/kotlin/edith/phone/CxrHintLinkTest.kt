@@ -17,7 +17,7 @@ import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
 import com.sheen.rokid.plugin.PluginLifecycle
-import edith.plugins.diagnostic.DiagnosticHintPlugin
+import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticHintPlugin
 import com.sheen.rokid.transport.CxrAuthorizationOutcome
 import com.sheen.rokid.storage.MemoryProfileRepository
 import org.junit.Assert.assertEquals

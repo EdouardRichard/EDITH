@@ -1,7 +1,7 @@
 package edith.probe.eval
 
-import edith.plugins.smart.admissionReport
-import edith.plugins.smart.admitByFeatures
+import com.sheen.rokid.phone.plugin.smarthelper.admissionReport
+import com.sheen.rokid.phone.plugin.smarthelper.admitByFeatures
 import java.io.File
 import kotlin.system.exitProcess
 

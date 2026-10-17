@@ -1,9 +1,9 @@
 package edith.phone
 
 import com.sheen.rokid.plugin.StorageHandle
-import edith.plugins.smart.memory.MemoryEntry
-import edith.plugins.smart.memory.MemoryKind
-import edith.plugins.smart.memory.MemoryLog
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryEntry
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryKind
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter

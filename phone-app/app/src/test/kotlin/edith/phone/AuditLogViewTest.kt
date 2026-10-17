@@ -1,7 +1,7 @@
 package edith.phone
 
 import com.sheen.rokid.plugin.StorageHandle
-import edith.plugins.smart.AuditTrail
+import com.sheen.rokid.phone.plugin.smarthelper.AuditTrail
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put

@@ -1,9 +1,9 @@
 package edith.phone
 
 import com.sheen.rokid.plugin.StorageHandle
-import edith.plugins.smart.memory.MemoryKind
-import edith.plugins.smart.memory.MemoryLog
-import edith.plugins.smart.memory.MemorySource
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryKind
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemorySource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue

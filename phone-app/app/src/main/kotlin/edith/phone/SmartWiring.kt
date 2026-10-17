@@ -7,9 +7,9 @@ import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.PluginConfiguration
-import edith.plugins.smart.SmartAssistantPlugin
-import edith.plugins.smart.context.ContextRoute
-import edith.plugins.smart.proactive.GateForm
+import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.GateForm
 import com.sheen.rokid.storage.ProfileRepository
 
 /**

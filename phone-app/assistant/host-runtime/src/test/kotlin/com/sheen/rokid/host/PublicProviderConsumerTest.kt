@@ -3,9 +3,9 @@ package com.sheen.rokid.host
 import com.sheen.rokid.contracts.*
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.output.*
-import edith.plugins.diagnostic.DiagnosticTextPlugin
-import edith.plugins.smart.SmartAssistantPlugin
-import edith.plugins.interview.InterviewAssistantPlugin
+import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticTextPlugin
+import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
+import com.sheen.rokid.phone.plugin.interview.InterviewAssistantPlugin
 import com.sheen.rokid.testsupport.*
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit

@@ -69,8 +69,8 @@ import com.sheen.rokid.plugin.SystemOneStatus
 import com.sheen.rokid.plugin.EmbedResult
 import com.sheen.rokid.plugin.EmbeddingService
 import com.sheen.rokid.plugin.ModelInfo
-import edith.plugins.diagnostic.DiagnosticHintPlugin
-import edith.plugins.smart.SmartAssistantPlugin
+import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticHintPlugin
+import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
 import com.sheen.rokid.transport.CxrAuthorizationOutcome
 import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.storage.ProfileRepository

@@ -3,7 +3,7 @@ package edith.phone
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
-import edith.plugins.smart.memory.MemoryMeasurementForm
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryMeasurementForm
 
 /**
  * Debug-only memory-form switch for Phase 7 F4 (design §3.1/§3.2).

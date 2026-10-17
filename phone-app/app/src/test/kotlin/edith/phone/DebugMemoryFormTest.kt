@@ -1,6 +1,6 @@
 package edith.phone
 
-import edith.plugins.smart.memory.MemoryMeasurementForm
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryMeasurementForm
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Test
