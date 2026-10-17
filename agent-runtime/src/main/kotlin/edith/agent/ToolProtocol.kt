@@ -50,7 +50,9 @@ data class ToolDescriptor(
     /**
      * Phase 6 (design D-9): projected from the plugin's descriptor; see
      * [edith.plugin.ActionDescriptor.countsTowardStepLimit]. `true` — the default — spends one step of the loop's
-     * `maxSteps` hang guard; `false` makes every call free of the guard without leaving `AgentRun.steps`.
+     * `maxSteps` hang guard. `false` means the call does **not** increment that counter; it does **not** bypass an
+     * already-exhausted guard (the next call is still stopped at `maxSteps`), and the call still appears in
+     * `AgentRun.steps`.
      */
     val countsTowardStepLimit: Boolean = true,
 )

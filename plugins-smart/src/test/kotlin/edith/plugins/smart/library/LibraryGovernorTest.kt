@@ -239,6 +239,23 @@ class LibraryGovernorTest {
         expectedDemoted.forEach { assertEquals(LibraryState.DORMANT, g.entry(it)?.state) }
     }
 
+    @Test fun `a cap-demoted entry is never observed`() {
+        // Counter-example to adding the cap-demoted ids to the counted set: they were never listed, so the model never
+        // saw their names and the turn is not evidence about them (rulings 11/14). A mutation that counts them makes
+        // this assertion fail.
+        val g = LibraryGovernor()
+        val cap = LibraryGovernor.MAX_CATALOG_ENTRIES
+        val ids = (1..cap + 2).map { "s%02d".format(it) }
+        val demoted = ids.sorted().drop(cap)
+        g.observeTurn(ids)
+        val listed = g.catalog(ids)
+        assertEquals(cap, listed.size)
+        demoted.forEach { id ->
+            assertEquals(0, g.entry(id)?.observedTurns, "$id was cap-demoted before it was ever listed")
+        }
+        assertEquals(1, g.entry(listed.first())?.observedTurns, "a listed entry still earns its observation")
+    }
+
     @Test fun `neverPulledCount counts entries seen in a catalog but never pulled`() {
         val g = LibraryGovernor()
         g.observeTurn(listOf("a", "b"))

@@ -32,7 +32,8 @@ interface SkillDirectory {
  *
  * **Two layers since Phase 6 (design D-1).** [catalog] advertises the enabled entries by `name` and `description`;
  * the body is pulled by name through [load], which reaches dormant entries too. [injection] (every enabled body whole,
- * D60) is kept for rollback and for the tests that pin it, and is no longer the production path.
+ * D60) has been **superseded by D73/D-1**: it has no caller in production or in tests, it is kept only as a rollback
+ * reference, and it **must not be re-connected to production**.
  */
 class SkillManager(
     private val directory: SkillDirectory,
@@ -65,6 +66,10 @@ class SkillManager(
      *
      * Empty when nothing is installed, which is the normal state on a device where the user has written none — and
      * which must not become a heading with nothing under it.
+     *
+     * **Superseded and not to be re-wired (design D-1):** the production path is [catalog] plus [load]. This method
+     * has no caller today — not in production and not in tests — so it exists only as a rollback reference; connecting
+     * it back to `instructionsFor` would restore D60's whole-library injection.
      */
     fun injection(): String = injectionFor(enabled())
 

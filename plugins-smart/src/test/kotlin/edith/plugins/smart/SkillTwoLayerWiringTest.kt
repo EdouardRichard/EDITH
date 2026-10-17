@@ -193,6 +193,35 @@ class SkillTwoLayerWiringTest {
     }
 
     @Test
+    fun `two system slot builds in one turn with the same loaded set are byte-identical`() {
+        // Design D-7 (the AC-3 range): with the same turn and the same loaded set, two builds of the SKILL segment are
+        // byte-identical. The catalog is recomputed per request (D-1), so this pins that recomputation against a library
+        // that did not change and a pull set that did not change; a per-build counter, timestamp or unstable sort order
+        // would show up as a difference here.
+        val marker = "正文标记-9701"
+        val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", marker))))
+        val generation = rig.plugin.beginSkillTurnForTest(owner = true)
+        try {
+            rig.plugin.loadSkillToolForTest().execute(LoadSkillTool.NAME, """{"name":"alpha"}""")
+            val first = rig.plugin.systemSlotForTest(ContextRoute.WAKE).filter { it.origin == SegmentOrigin.SKILL }
+            val second = rig.plugin.systemSlotForTest(ContextRoute.WAKE).filter { it.origin == SegmentOrigin.SKILL }
+
+            assertTrue(first.isNotEmpty(), "the slot must carry the catalog and the pulled body: $first")
+            assertTrue(
+                first.any { it.text.startsWith("## SKILL 目录") },
+                "the catalog is one of the two SKILL layers this test compares: $first",
+            )
+            assertTrue(first.any { marker in it.text }, "the loaded body is part of the compared segments: $first")
+            assertEquals(
+                first.map { it.text }, second.map { it.text },
+                "design D-7: two builds in one turn with the same loaded set must be byte-identical",
+            )
+        } finally {
+            rig.plugin.endSkillTurnForTest(generation)
+        }
+    }
+
+    @Test
     fun `a proactive turn followed by a wake turn records two observations`() {
         // Obligations 1 and 2: each route opens and closes its own turn. Without the proactive `endTurn()` the governor
         // stays open across the route switch and folds both turns into one observation — the exact silent arithmetic
