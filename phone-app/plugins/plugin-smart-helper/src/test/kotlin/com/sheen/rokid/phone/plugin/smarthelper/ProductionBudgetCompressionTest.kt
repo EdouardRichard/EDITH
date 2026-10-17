@@ -1,4 +1,7 @@
 package com.sheen.rokid.phone.plugin.smarthelper
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
+import com.sheen.rokid.phone.plugin.smarthelper.memory.VectorIndex
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextCompressor
 
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability

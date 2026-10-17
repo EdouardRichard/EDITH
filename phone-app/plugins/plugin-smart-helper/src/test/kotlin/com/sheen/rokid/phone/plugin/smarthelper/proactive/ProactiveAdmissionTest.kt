@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.proactive
 
 import kotlin.test.Test
 import kotlin.test.assertEquals

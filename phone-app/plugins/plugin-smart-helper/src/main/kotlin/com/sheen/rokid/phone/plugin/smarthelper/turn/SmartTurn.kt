@@ -1,4 +1,5 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.turn
+import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
 
 import com.sheen.rokid.agent.AgentLoop
 import com.sheen.rokid.contracts.Generation

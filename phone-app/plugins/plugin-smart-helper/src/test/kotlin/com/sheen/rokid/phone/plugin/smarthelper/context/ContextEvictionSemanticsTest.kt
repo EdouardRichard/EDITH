@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.context
+import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
 
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelHistoryItem

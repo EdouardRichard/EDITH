@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.skill
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
 
 /**
  * A SKILL: a prompt template that guides the model through a task it would otherwise explore its way through

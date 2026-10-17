@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.output
 
 import com.sheen.rokid.contracts.SpeechRequest
 import com.sheen.rokid.plugin.ActionDescriptor

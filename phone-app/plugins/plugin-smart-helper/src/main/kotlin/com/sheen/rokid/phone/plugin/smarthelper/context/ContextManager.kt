@@ -4,7 +4,7 @@ import com.sheen.rokid.agent.MemoryRetrieval
 import com.sheen.rokid.agent.Segment
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelHistoryItem
-import com.sheen.rokid.phone.plugin.smarthelper.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
 
 /**
  * What [ContextManager.buildPrompt] hands the loop: the request's pieces, already assembled and measured.

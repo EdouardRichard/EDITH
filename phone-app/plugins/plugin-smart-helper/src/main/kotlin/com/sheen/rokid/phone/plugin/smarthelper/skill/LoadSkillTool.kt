@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.skill
+import com.sheen.rokid.phone.plugin.smarthelper.output.NotifyUserTool
 
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor

@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.audit
 
 /**
  * The one thing a plugin may log about a failure that escaped a turn: a **shape-validated code**, never a payload.

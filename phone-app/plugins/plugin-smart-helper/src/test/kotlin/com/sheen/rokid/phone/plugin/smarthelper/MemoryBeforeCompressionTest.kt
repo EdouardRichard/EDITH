@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.phone.plugin.smarthelper.context.CompressionReport

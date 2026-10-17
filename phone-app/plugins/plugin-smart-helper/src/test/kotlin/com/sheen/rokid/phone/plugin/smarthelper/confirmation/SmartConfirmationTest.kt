@@ -1,4 +1,7 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.confirmation
+import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig
+import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeClock
+import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeScheduler
 
 import com.sheen.rokid.agent.ConfirmationGate
 import com.sheen.rokid.agent.ConfirmationOutcome

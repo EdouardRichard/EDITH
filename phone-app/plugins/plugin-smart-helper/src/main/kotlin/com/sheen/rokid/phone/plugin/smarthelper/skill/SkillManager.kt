@@ -1,6 +1,6 @@
 package com.sheen.rokid.phone.plugin.smarthelper.skill
 
-import com.sheen.rokid.phone.plugin.smarthelper.P3Log
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.library.GovernorVerdict
 import com.sheen.rokid.phone.plugin.smarthelper.library.LibraryGovernor
 import com.sheen.rokid.phone.plugin.smarthelper.library.LibraryState

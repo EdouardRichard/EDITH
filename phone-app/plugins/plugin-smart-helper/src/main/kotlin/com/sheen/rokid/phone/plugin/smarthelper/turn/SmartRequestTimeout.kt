@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.turn
 
 /**
  * How long **one model request** may take: the profile's own `timeoutMillis`, in nanos (D49).

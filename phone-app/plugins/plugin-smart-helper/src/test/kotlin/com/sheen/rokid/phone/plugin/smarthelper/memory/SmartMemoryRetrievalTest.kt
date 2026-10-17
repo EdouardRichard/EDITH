@@ -1,4 +1,6 @@
 package com.sheen.rokid.phone.plugin.smarthelper.memory
+import com.sheen.rokid.phone.plugin.smarthelper.SmartExplodingStorage
+import com.sheen.rokid.phone.plugin.smarthelper.skill.injectionFor
 
 import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeStorage
 import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig

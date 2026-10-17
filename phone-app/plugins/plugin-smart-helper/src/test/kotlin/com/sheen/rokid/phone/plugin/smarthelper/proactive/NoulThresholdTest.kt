@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.proactive
+import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
 
 import com.sheen.rokid.plugin.SystemOneAnswer
 import com.sheen.rokid.plugin.SystemOneResult

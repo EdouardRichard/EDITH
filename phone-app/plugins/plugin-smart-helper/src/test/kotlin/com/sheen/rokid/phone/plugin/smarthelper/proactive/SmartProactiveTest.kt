@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.proactive
 
 import com.sheen.rokid.contracts.AcousticLabel
 import kotlin.test.*

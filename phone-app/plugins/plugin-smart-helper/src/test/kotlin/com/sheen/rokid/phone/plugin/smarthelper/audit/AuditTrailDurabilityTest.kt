@@ -1,4 +1,6 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.audit
+import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeStorage
+import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeClock
 
 import com.sheen.rokid.agent.BoundedAuditLog
 import com.sheen.rokid.agent.ConfirmationSource

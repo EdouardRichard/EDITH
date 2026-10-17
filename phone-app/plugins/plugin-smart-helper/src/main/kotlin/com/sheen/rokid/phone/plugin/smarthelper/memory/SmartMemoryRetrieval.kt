@@ -3,7 +3,7 @@ package com.sheen.rokid.phone.plugin.smarthelper.memory
 import com.sheen.rokid.agent.MemoryRetrieval
 import com.sheen.rokid.agent.Segment
 import com.sheen.rokid.agent.SegmentOrigin
-import com.sheen.rokid.phone.plugin.smarthelper.P3Log
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import kotlin.math.roundToInt
 
 /**

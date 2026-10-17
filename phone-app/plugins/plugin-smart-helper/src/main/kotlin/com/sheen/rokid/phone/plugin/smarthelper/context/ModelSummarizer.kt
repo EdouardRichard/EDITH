@@ -9,8 +9,8 @@ import com.sheen.rokid.plugin.ModelClient
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.MonotonicClock
-import com.sheen.rokid.phone.plugin.smarthelper.P3Log
-import com.sheen.rokid.phone.plugin.smarthelper.safeFailureCode
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
+import com.sheen.rokid.phone.plugin.smarthelper.audit.safeFailureCode
 
 /**
  * The production [Summarizer] (spec §4.4 step 3): one request to the plugin's own configured profile, one sentence

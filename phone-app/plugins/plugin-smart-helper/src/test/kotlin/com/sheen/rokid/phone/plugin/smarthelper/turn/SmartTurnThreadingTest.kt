@@ -1,4 +1,9 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.turn
+import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig
+import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
+import com.sheen.rokid.phone.plugin.smarthelper.streamText
+import com.sheen.rokid.phone.plugin.smarthelper.smartAction
+import com.sheen.rokid.phone.plugin.smarthelper.OffThreadTasks
 
 import com.sheen.rokid.contracts.ConfirmationResult
 import com.sheen.rokid.contracts.TranscriptEvent

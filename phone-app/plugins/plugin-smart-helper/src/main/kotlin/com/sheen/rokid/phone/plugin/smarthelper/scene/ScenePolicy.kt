@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.scene
 
 /**
  * The scene policy: the one gate that stops the passive loop from answering a wake it should not answer yet.

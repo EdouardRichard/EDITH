@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.scene
 
 import com.sheen.rokid.plugin.ToolSpec
 

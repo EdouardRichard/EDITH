@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.proactive
 
 /**
  * The interpretable features a proactive candidate is judged on (P3.5 §W3).

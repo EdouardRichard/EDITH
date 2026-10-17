@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.context
+import com.sheen.rokid.phone.plugin.smarthelper.SkillTwoLayerWiringTest
 
 import com.sheen.rokid.agent.MemoryRetrieval
 import com.sheen.rokid.agent.Segment

@@ -1,4 +1,5 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.confirmation
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 
 import com.sheen.rokid.agent.ConfirmationGate
 import com.sheen.rokid.agent.ConfirmationOutcome

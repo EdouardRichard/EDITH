@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.audit
 
 /**
  * The single sink for the smart plugin's `P3_` lines Task 15's acceptance reads out of logcat.

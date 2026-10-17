@@ -1,4 +1,9 @@
 package com.sheen.rokid.phone.plugin.smarthelper
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.GateForm
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.GateOutcome
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGateState
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
 
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.plugin.Capability

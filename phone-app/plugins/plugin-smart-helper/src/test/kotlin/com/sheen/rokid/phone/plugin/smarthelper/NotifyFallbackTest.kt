@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 
 import com.sheen.rokid.contracts.SpeechRequest
 import com.sheen.rokid.plugin.Capability

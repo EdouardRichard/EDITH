@@ -1,4 +1,5 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.audit
+import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
 
 import com.sheen.rokid.agent.AuditEntry
 import com.sheen.rokid.agent.AuditSink

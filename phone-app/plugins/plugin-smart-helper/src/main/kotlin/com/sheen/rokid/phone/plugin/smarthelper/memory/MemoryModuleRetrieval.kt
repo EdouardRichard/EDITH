@@ -2,7 +2,7 @@ package com.sheen.rokid.phone.plugin.smarthelper.memory
 
 import com.sheen.rokid.agent.MemoryRetrieval
 import com.sheen.rokid.agent.Segment
-import com.sheen.rokid.phone.plugin.smarthelper.P3Log
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 
 /**
  * edith-0.2 Phase B (B5): makes the memory facade satisfy the agent runtime's retrieval port.

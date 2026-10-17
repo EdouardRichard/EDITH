@@ -1,4 +1,6 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.proactive
+import com.sheen.rokid.phone.plugin.smarthelper.memory.score
+import com.sheen.rokid.phone.plugin.smarthelper.memory.normalize
 
 import com.sheen.rokid.contracts.AcousticLabel
 

@@ -2,7 +2,7 @@ package com.sheen.rokid.phone.plugin.smarthelper.host.ui
 import kotlinx.serialization.json.JsonObject
 
 import com.sheen.rokid.plugin.StorageHandle
-import com.sheen.rokid.phone.plugin.smarthelper.AuditTrail
+import com.sheen.rokid.phone.plugin.smarthelper.audit.AuditTrail
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.contentOrNull
 import kotlinx.serialization.json.intOrNull

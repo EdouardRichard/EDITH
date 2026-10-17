@@ -1,4 +1,9 @@
 package com.sheen.rokid.phone.plugin.smarthelper
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
+import com.sheen.rokid.phone.plugin.smarthelper.context.TokenBudget
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextCompressor
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
 
 import com.sheen.rokid.contracts.Assistance
 import com.sheen.rokid.contracts.EventEnvelope

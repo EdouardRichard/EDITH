@@ -1,4 +1,6 @@
 package com.sheen.rokid.phone.plugin.smarthelper.context
+import com.sheen.rokid.phone.plugin.smarthelper.memory.VectorIndex
+import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
 
 import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel

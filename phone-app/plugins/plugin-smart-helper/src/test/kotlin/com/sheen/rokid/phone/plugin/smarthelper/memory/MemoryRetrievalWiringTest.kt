@@ -1,11 +1,12 @@
 package com.sheen.rokid.phone.plugin.smarthelper.memory
+import com.sheen.rokid.phone.plugin.smarthelper.scene.ScenePolicy
 
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.EmbedResult
 import com.sheen.rokid.plugin.EmbeddingService
 import com.sheen.rokid.plugin.FailureReason
 import com.sheen.rokid.plugin.ModelInfo
-import com.sheen.rokid.phone.plugin.smarthelper.P3Log
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeStorage
 import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig
 import com.sheen.rokid.phone.plugin.smarthelper.streamText

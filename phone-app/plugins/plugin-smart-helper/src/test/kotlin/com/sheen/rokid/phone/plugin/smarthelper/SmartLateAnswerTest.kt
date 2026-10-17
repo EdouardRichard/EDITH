@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper
+import com.sheen.rokid.phone.plugin.smarthelper.turn.SmartTurn
 
 import com.sheen.rokid.contracts.ConfirmationResult
 import com.sheen.rokid.contracts.TranscriptEvent

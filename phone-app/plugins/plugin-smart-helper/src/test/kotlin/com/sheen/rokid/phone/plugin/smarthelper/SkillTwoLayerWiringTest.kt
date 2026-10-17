@@ -1,4 +1,8 @@
 package com.sheen.rokid.phone.plugin.smarthelper
+import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.library.LibraryGovernor
+import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillDirectory
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.Segment

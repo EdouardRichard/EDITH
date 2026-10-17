@@ -4,7 +4,7 @@ import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.TaskScope
-import com.sheen.rokid.phone.plugin.smarthelper.P3Log
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryKind
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryModule
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemorySource

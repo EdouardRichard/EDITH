@@ -1,4 +1,7 @@
 package com.sheen.rokid.phone.plugin.smarthelper
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryModule
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryMeasurementFormTest
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryModuleRetrieval
 
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.plugin.Capability

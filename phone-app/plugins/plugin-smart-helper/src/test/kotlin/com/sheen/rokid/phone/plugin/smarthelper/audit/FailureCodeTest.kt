@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.plugin.smarthelper
+package com.sheen.rokid.phone.plugin.smarthelper.audit
 
 import com.sheen.rokid.contracts.ContractError
 import kotlin.test.Test

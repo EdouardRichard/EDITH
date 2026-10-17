@@ -1,7 +1,8 @@
 package com.sheen.rokid.phone.plugin.smarthelper.memory
+import com.sheen.rokid.phone.plugin.smarthelper.audit.AuditTrail
 
 import com.sheen.rokid.plugin.StorageHandle
-import com.sheen.rokid.phone.plugin.smarthelper.P3Log
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.add
@@ -20,7 +21,7 @@ data class MemorySnapshot(val entries: List<MemoryEntry>, val readOk: Boolean)
 
 /**
  * P3.4 §3.1: the long-term memory store - one bounded JSON document in the plugin's own encrypted namespace, shaped
- * exactly like [`com.sheen.rokid.phone.plugin.smarthelper.AuditTrail`]'s so the App can read it with the same kind of small view.
+ * exactly like [`com.sheen.rokid.phone.plugin.smarthelper.audit.AuditTrail`]'s so the App can read it with the same kind of small view.
  *
  * Four rules decide whether this is honest, and each has a test:
  *

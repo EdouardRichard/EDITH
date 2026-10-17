@@ -1,4 +1,9 @@
 package com.sheen.rokid.phone.plugin.smarthelper
+import com.sheen.rokid.phone.plugin.smarthelper.audit.AuditTrail
+import com.sheen.rokid.phone.plugin.smarthelper.scene.ScenePolicy
+import com.sheen.rokid.phone.plugin.smarthelper.memory.score
+import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 
 import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
