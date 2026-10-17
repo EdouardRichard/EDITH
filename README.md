@@ -1,6 +1,6 @@
 # EDITH for Rokid Glasses
 
-EDITH is an Android host for a Rokid Glasses assistant. Shared audio, speech, model, storage, display, and cancellation facilities belong to the app; the `plugins-smart` plugin owns scene triggers, business context, prompts, model decisions, and tool choices. The interview assistant (P4) is shelved for this version (D57).
+EDITH is an Android host for a Rokid Glasses assistant. Shared audio, speech, model, storage, display, and cancellation facilities belong to the app; the `plugin-smart-helper` plugin owns scene triggers, business context, prompts, model decisions, and tool choices. The interview assistant (P4) is shelved for this version (D57).
 
 ## Current state
 
