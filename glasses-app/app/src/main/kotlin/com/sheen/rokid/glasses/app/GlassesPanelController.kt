@@ -690,8 +690,11 @@ class GlassesPanelController(
             val previousTurn = log.entries(displayed.route)
                 .firstOrNull { it.entryId == entryId }
                 ?.turnId
+            // 0.24 S4 Task 17 (I1): the production notify_user answer has no streamed partial, so the turn comes from
+            // the accepted STATE instead (see [finalOnlyAnswerTurn]).
+            val turnId = previousTurn ?: finalOnlyAnswerTurn(displayed.route)
             val stored = log.append(
-                ConversationEntry(entryId, displayed.route, ConversationRole.ASSISTANT, displayed.text, previousTurn))
+                ConversationEntry(entryId, displayed.route, ConversationRole.ASSISTANT, displayed.text, turnId))
             if (!stored) {
                 // Refused only for a blank id or blank text, which the wire already rejects; recorded rather than
                 // dropped silently because "nothing appeared" would otherwise have no cause.
@@ -709,6 +712,37 @@ class GlassesPanelController(
             contentRevision++
         }
         applyAndRender()
+    }
+
+    /**
+     * The turn a final-only answer belongs to (0.24 S4 Task 17 I1).
+     *
+     * The product answer is `notify_user`, emitted mid-run, and it streams **no** `ANSWER` partial: its final `SHOW`
+     * carries no turn id either, so without this the answer becomes a turn-less item and the wearer's line never drops
+     * to 70%. The phone publishes one `STATE` for the turn immediately before submitting the hint (status 3, or 4 when
+     * the SHOW overtakes 3), and [officialTurn] records it.
+     *
+     * Two guards keep the unordered channel from inventing a pairing:
+     * - the accepted level must still belong to the answering round (3/4/7), and
+     * - the named turn must be the newest turn this route has logged and must not have an answer yet.
+     * A `SHOW` that overtook its own `STATE` can only see the previous turn, which fails both facts, so the entry
+     * stays turn-less (the documented legacy item) instead of joining an older question. The residual case - an old
+     * hint delivered after a new turn's `ASR` while the new turn's `STATE 3` is still in flight - cannot be told apart
+     * from the new answer without a turn on `SHOW`, so it remains a wire limitation (Task 22 candidate).
+     */
+    private fun finalOnlyAnswerTurn(route: AssistantRoute): String? {
+        val status = officialStatus[route]
+        if (status != OfficialStatus.ANSWERING &&
+            status != OfficialStatus.ASR_END &&
+            status != OfficialStatus.TOOL
+        ) {
+            return null
+        }
+        val named = officialTurn[route] ?: return null
+        val entries = log.entries(route)
+        if (entries.lastOrNull { it.turnId != null }?.turnId != named) return null
+        if (entries.any { it.role == ConversationRole.ASSISTANT && it.turnId == named }) return null
+        return named
     }
 
     // ---------------------------------------------------------------- BACK and pin

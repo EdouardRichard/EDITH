@@ -219,6 +219,9 @@ class GlassesPanelHost(
         callbacks.keepAwake(false)
         orbView.stop()
         thinkingIcon?.stop()
+        // 0.24 S4 Task 17 (review M1): parity with the thinking icon - a tool row that is still START must not keep
+        // its frame loop alive while the window is hidden (the view's detach would stop it, but only once removed).
+        toolIcon?.stop()
         stopTicker()
     }
 
@@ -285,6 +288,8 @@ class GlassesPanelHost(
         callbacks.keepAwake(false)
         orbView.stop()
         thinkingIcon?.stop()
+        // 0.24 S4 Task 17 (review M1): same parity as onStop - nothing may outlive the host.
+        toolIcon?.stop()
         stopTicker()
         executor.shutdownNow()
     }
@@ -476,6 +481,9 @@ class GlassesPanelHost(
 
     fun toolTextColorForProbe(): Int = toolTextView?.currentTextColor ?: 0
 
+    /** Whether the tool row's ring is still animating, so a lifecycle test can prove it stopped with the window. */
+    fun toolIconRunningForProbe(): Boolean = toolIcon?.isRunningForProbe() == true
+
     fun listeningTextForProbe(): String = listeningView.text.toString()
 
     fun thinkingTextForProbe(): String = thinkingTextView?.text?.toString().orEmpty()
@@ -486,6 +494,18 @@ class GlassesPanelHost(
 
     fun lastMessageRowForProbe(): TextView? =
         (0 until entriesView.childCount).mapNotNull { entriesView.getChildAt(it) as? TextView }.lastOrNull()
+
+    /**
+     * The conversation's direct text rows in render order (0.24 S4 Task 17 I1).
+     *
+     * The final-only notify answer test needs the wearer's line, not the last row: with one turn item the rows are
+     * `[asr, answer]`, and after the pairing fix the user row must be at 70 %.
+     */
+    fun conversationRowsForProbe(): List<TextView> =
+        (0 until entriesView.childCount).mapNotNull { entriesView.getChildAt(it) as? TextView }
+
+    /** The number of per-turn items currently rendered; a final SHOW must not append a second item. */
+    fun conversationTurnCountForProbe(): Int = renderedTurns?.size ?: 0
 
     fun scrollOffsetY(): Int = hintScroll.scrollY
 

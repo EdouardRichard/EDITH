@@ -267,6 +267,36 @@ class ConversationViewTest {
     }
 
     @Test
+    fun theProductionNotifyAnswerShapePairsWhenTheAnswerCarriesTheStateTurn() {
+        // The production notify_user answer has no streamed ANSWER partial: the controller takes the turn from the
+        // accepted STATE and writes it onto the say-${hintId} entry. With that turn the exchange is one item.
+        val paired = ConversationView.turns(
+            listOf(
+                turnEntry("asr-turn-1", ConversationRole.USER, "turn-1", "帮我看下日程"),
+                turnEntry("say-h-1", ConversationRole.ASSISTANT, "turn-1", "今天十点开会"),
+            ),
+            liveEntryId = "say-h-1",
+        ).single()
+        assertEquals("帮我看下日程", paired.asrText)
+        assertEquals("今天十点开会", paired.answerText)
+        assertTrue(paired.answerLive)
+        assertEquals("once the answer is in, the wearer's line drops to 70%",
+            GlassesPanelSpec.GREEN_NORMAL_70, paired.asrTextColor)
+
+        // The turn-less (legacy/proactive) final is the shape that must stay one item per entry (spec §5.6); the
+        // controller fallback must never be allowed to mint this pairing by guessing.
+        val unpaired = ConversationView.turns(
+            listOf(
+                turnEntry("asr-turn-1", ConversationRole.USER, "turn-1", "帮我看下日程"),
+                turnEntry("say-h-1", ConversationRole.ASSISTANT, null, "今天十点开会"),
+            ),
+        )
+        assertEquals(2, unpaired.size)
+        assertEquals(GlassesPanelSpec.GREEN_NORMAL, unpaired[0].asrTextColor)
+        assertNull(unpaired[1].asrText)
+    }
+
+    @Test
     fun thinkingAndToolRowsAttachToTheTurnTheyBelongTo() {
         val turns = ConversationView.turns(
             listOf(

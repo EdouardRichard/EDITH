@@ -40,12 +40,18 @@ class GlassesPanelSpecTest {
         assertEquals(0xFF40FF5E.toInt(), GlassesPanelSpec.GREEN_NORMAL)
         assertEquals(0xB340FF5E.toInt(), GlassesPanelSpec.GREEN_NORMAL_70)
         assertEquals(0x6600FF00.toInt(), GlassesPanelSpec.GREEN_40)
+        assertEquals("the tool row's running copy is the official `green`", 0xFF00FF00.toInt(),
+            GlassesPanelSpec.TOOL_TEXT_START)
+        assertEquals("the tool row's finished copy is the official `green_50`", 0x8000FF00.toInt(),
+            GlassesPanelSpec.TOOL_TEXT_END)
         assertEquals(0xFFCD0000.toInt(), GlassesPanelSpec.ALERT_RED)
         assertEquals(0xFF000000.toInt(), GlassesPanelSpec.BLACK)
         assertEquals(14f, GlassesPanelSpec.USER_TEXT_SIZE_PX)
         assertEquals(16f, GlassesPanelSpec.ASSISTANT_TEXT_SIZE_PX)
         assertEquals(14f, GlassesPanelSpec.LISTENING_TEXT_SIZE_PX)
         assertEquals(16f, GlassesPanelSpec.THINKING_TEXT_SIZE_PX)
+        assertEquals(22, GlassesPanelSpec.TOOL_ICON_PX)
+        assertEquals(16f, GlassesPanelSpec.TOOL_TEXT_SIZE_PX)
         assertEquals(14f, GlassesPanelSpec.TIPS_TEXT_SIZE_PX)
         assertEquals(12f, GlassesPanelSpec.COMPLIANCE_TEXT_SIZE_PX)
     }
@@ -112,9 +118,11 @@ class GlassesPanelSpecTest {
     fun everyRowUsesTheOfficialSizesAndColors() {
         assertEquals(14f, GlassesPanelSpec.textSizePx(ConversationRole.USER))
         assertEquals(16f, GlassesPanelSpec.textSizePx(ConversationRole.ASSISTANT))
-        assertEquals(0xB340FF5E.toInt(), GlassesPanelSpec.textColor(ConversationRole.USER))
-        assertEquals(0xFF40FF5E.toInt(), GlassesPanelSpec.textColor(ConversationRole.ASSISTANT))
         assertEquals(4, GlassesPanelSpec.maxLines(ConversationRole.USER))
         assertEquals(Int.MAX_VALUE, GlassesPanelSpec.maxLines(ConversationRole.ASSISTANT))
+        // Task 17 review M2: there is intentionally no role-only `textColor`; the wearer's colour depends on whether
+        // this turn already has an answer (ConversationView.TurnRow), so the rendered rule is pinned there.
+        assertFalse("a role-only colour would be a stale second authority",
+            GlassesPanelSpec::class.java.declaredMethods.any { it.name == "textColor" })
     }
 }

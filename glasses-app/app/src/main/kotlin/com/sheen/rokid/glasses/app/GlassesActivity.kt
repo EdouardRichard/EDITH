@@ -241,6 +241,8 @@ class GlassesActivity : Activity() {
 
     fun toolTextColorForProbe(): Int = host?.toolTextColorForProbe() ?: 0
 
+    fun toolIconRunningForProbe(): Boolean = host?.toolIconRunningForProbe() == true
+
     fun listeningTextForProbe(): String = host?.listeningTextForProbe().orEmpty()
 
     fun thinkingTextForProbe(): String = host?.thinkingTextForProbe().orEmpty()
@@ -250,6 +252,10 @@ class GlassesActivity : Activity() {
     fun complianceTextForProbe(): String = host?.complianceTextForProbe().orEmpty()
 
     fun lastMessageRowForProbe(): TextView? = host?.lastMessageRowForProbe()
+
+    fun conversationRowsForProbe(): List<TextView> = host?.conversationRowsForProbe().orEmpty()
+
+    fun conversationTurnCountForProbe(): Int = host?.conversationTurnCountForProbe() ?: 0
 
     fun scrollOffsetY(): Int = host?.scrollOffsetY() ?: 0
 

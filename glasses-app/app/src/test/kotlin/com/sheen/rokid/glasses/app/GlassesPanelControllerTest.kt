@@ -3,6 +3,7 @@ package com.sheen.rokid.glasses.app
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.glasses.display.BusyState
+import com.sheen.rokid.glasses.display.ConversationView
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.glasses.display.OrbState
 import com.sheen.rokid.output.ConversationRole
@@ -525,6 +526,56 @@ class GlassesPanelControllerTest {
     }
 
     @Test
+    fun aFinalOnlyNotifyAnswerJoinsTheAsrTurnNamedByTheAcceptedState() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.asr(turnId = "turn-1", revision = 1, text = "帮我看下日程")
+        harness.state(OfficialStatus.ANSWERING, sequence = 1, turnId = "turn-1")
+
+        // The production notify_user answer: no ANSWER partial precedes the final SHOW, so the STATE (published just
+        // before the submit) is the only carrier of the turn.
+        harness.show(sequence = 1, hintId = "h-1", text = "今天十点开会")
+
+        val model = harness.port.lastModel()
+        val answer = model.entries.single { it.role == ConversationRole.ASSISTANT }
+        assertEquals("the final-only answer takes the turn the accepted STATE named", "turn-1", answer.turnId)
+        val turn = ConversationView.turns(model.entries, model.liveEntryId).single()
+        assertEquals("the wearer's line and the answer are one item", "帮我看下日程", turn.asrText)
+        assertEquals("今天十点开会", turn.answerText)
+        assertTrue(turn.answerLive)
+        assertEquals("once the answer is in, the wearer's line drops to 70%",
+            GlassesPanelSpec.GREEN_NORMAL_70, turn.asrTextColor)
+    }
+
+    @Test
+    fun aFinalOnlyAnswerThatOvertookItsStateDoesNotJoinAnOlderTurn() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.asr(turnId = "turn-1", revision = 1, text = "第一问")
+        harness.state(OfficialStatus.ANSWERING, sequence = 1, turnId = "turn-1")
+        harness.show(sequence = 1, hintId = "h-1", text = "第一答")
+
+        // Turn 2 has started (the wearer's line is in) but its STATE has not arrived: the stored level still names
+        // turn 1. A SHOW for turn 2 that overtook its own STATE must not be attached to the answered turn 1.
+        harness.asr(turnId = "turn-2", revision = 1, text = "第二问")
+        harness.show(sequence = 2, hintId = "h-2", text = "第二答")
+
+        val model = harness.port.lastModel()
+        val second = model.entries.single { it.entryId == "say-h-2" }
+        assertNull("an overtaking final must not join an older turn", second.turnId)
+        val turns = ConversationView.turns(model.entries, model.liveEntryId)
+        assertEquals("the older turn keeps its pair, the current line and the stray final stay separate", 3, turns.size)
+        val first = turns.single { it.turnId == "turn-1" }
+        assertEquals("第一问", first.asrText)
+        assertEquals("第一答", first.answerText)
+        assertEquals(GlassesPanelSpec.GREEN_NORMAL_70, first.asrTextColor)
+        assertEquals("第二问", turns.single { it.turnId == "turn-2" }.asrText)
+        assertTrue("the stray final is its own legacy item", turns.any { it.turnId == null && it.answerText == "第二答" })
+    }
+
+    @Test
     fun outOfOrderAnswerRevisionsAreDropped() {
         val harness = Harness()
         harness.hello()
@@ -624,6 +675,24 @@ class GlassesPanelControllerTest {
         assertEquals("打开 App", ended.toolLabel)
         assertEquals(ToolPhase.END, ended.toolPhase)
         assertEquals("still no second entry", 0, ended.entries.size)
+    }
+
+    @Test
+    fun aSecondToolStartReplacesTheSameRowsLabelInsteadOfAddingARow() {
+        val harness = Harness()
+        harness.hello()
+        harness.state(OfficialStatus.TOOL, sequence = 1, turnId = "turn-7")
+
+        harness.tool(turnId = "turn-7", phase = ToolPhase.START, label = "打开 App")
+        harness.tool(turnId = "turn-7", phase = ToolPhase.START, label = "打开设置")
+
+        val started = harness.port.lastModel()
+        assertEquals("a second START is the same turn's row, not an append", "打开设置", started.toolLabel)
+        assertEquals(ToolPhase.START, started.toolPhase)
+        assertTrue("and still not a conversation entry", started.entries.isEmpty())
+
+        harness.tool(turnId = "turn-7", phase = ToolPhase.END, label = "打开设置")
+        assertEquals(ToolPhase.END, harness.port.lastModel().toolPhase)
     }
 
     @Test

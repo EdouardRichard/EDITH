@@ -47,6 +47,9 @@ class LoadingIndicatorView(
         invalidate()
     }
 
+    /** Instrumentation probe: whether the ring is still animating (0.24 S4 Task 17 M1 lifecycle parity). */
+    fun isRunningForProbe(): Boolean = animator != null
+
     override fun onDetachedFromWindow() {
         // A view that is gone must not keep an animator alive: it would hold the panel's frame loop open.
         stop()

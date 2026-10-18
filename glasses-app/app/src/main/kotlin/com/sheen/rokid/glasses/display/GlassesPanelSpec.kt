@@ -56,15 +56,14 @@ object GlassesPanelSpec {
     val GREEN_NORMAL_70: Int = 0xB340FF5E.toInt()
 
     /**
-     * 0.24 S4 Task 17: the tool row's start/end copy.
-     *
-     * Official `agentToolStatus` paints START with full `green` and END with `green_50`; EDITH keeps its own
-     * `green_normal` family (the panel already uses `green_normal` everywhere) and expresses "50%" as the same colour's
-     * 50% alpha. Task 19 replaces the stand-in icon with the official `ai_agent_tool_*` GIFs; the copy/contrast rules
-     * stay these.
+     * 0.24 S4 Task 17: the tool row's start/end copy, exactly the official `AiAdapter.agentToolStatus` runtime values -
+     * START binds `R.color.green` and END restyles the same label to `R.color.green_50` (`colors.xml`). The panel's
+     * conversation greys/greens (`green_normal`/`green_normal_70`) are a different scale and are not substituted here;
+     * spec §5.6's "绿阶保持不变" is about the existing conversation rows, not the new tool row. Task 19 replaces the
+     * stand-in icon with the official `ai_agent_tool_*` GIFs; the copy colours stay these.
      */
-    val TOOL_TEXT_START: Int = GREEN_NORMAL
-    val TOOL_TEXT_END: Int = 0x8040FF5E.toInt()
+    val TOOL_TEXT_START: Int = 0xFF00FF00.toInt()
+    val TOOL_TEXT_END: Int = 0x8000FF00.toInt()
 
     /** `green_40`: the two operation tips. */
     val GREEN_40: Int = 0x6600FF00.toInt()
@@ -163,10 +162,9 @@ object GlassesPanelSpec {
         ConversationRole.ASSISTANT -> ASSISTANT_TEXT_SIZE_PX
     }
 
-    fun textColor(role: ConversationRole): Int = when (role) {
-        ConversationRole.USER -> GREEN_NORMAL_70
-        ConversationRole.ASSISTANT -> GREEN_NORMAL
-    }
+    // 0.24 S4 Task 17 (review M2): `textColor(role)` was removed. The rendered rule is not per role alone - the
+    // wearer's line is full green while recognising and 70% once this turn's answer exists (`ConversationView.TurnRow`),
+    // so a role-only colour table was a stale second authority a future caller could reintroduce the old rule from.
 
     /** The tool row's label colour: full green while running, 50% once the action returned. */
     fun toolTextColor(phase: ToolPhase): Int = when (phase) {

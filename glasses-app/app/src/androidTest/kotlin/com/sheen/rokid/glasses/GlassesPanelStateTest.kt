@@ -2,6 +2,7 @@ package com.sheen.rokid.glasses
 
 import android.view.ViewGroup
 import android.widget.TextView
+import androidx.lifecycle.Lifecycle
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
@@ -303,7 +304,7 @@ class GlassesPanelStateTest {
                     GlassesPanelSpec.TOOL_ICON_PX, activity.toolIconWidthForProbe())
                 assertEquals("the label is 16 px", GlassesPanelSpec.TOOL_TEXT_SIZE_PX,
                     activity.toolLabelTextSizeForProbe(), 0.1f)
-                assertEquals("START is full green", GlassesPanelSpec.TOOL_TEXT_START,
+                assertEquals("START is the official full green #FF00FF00", 0xFF00FF00.toInt(),
                     activity.toolTextColorForProbe())
                 startedRow = activity.toolRowForProbe()
                 activity.acceptCommand(HintWireCodec.encode(
@@ -314,7 +315,7 @@ class GlassesPanelStateTest {
             scenario.onActivity { activity ->
                 assertSame("the END restyles the row it started, never a second row",
                     startedRow, activity.toolRowForProbe())
-                assertEquals("END is 50% green", GlassesPanelSpec.TOOL_TEXT_END,
+                assertEquals("END is the official 50% green #8000FF00", 0x8000FF00.toInt(),
                     activity.toolTextColorForProbe())
 
                 activity.acceptCommand(HintWireCodec.encode(
@@ -325,6 +326,35 @@ class GlassesPanelStateTest {
             scenario.onActivity { activity ->
                 assertFalse("the answer level retires the finished tool row", activity.toolVisibleForProbe())
             }
+        }
+    }
+
+    @Test
+    fun hidingThePanelStopsTheRunningToolIcon() {
+        // Task 17 review M1: the thinking icon was already stopped from onStop/destroy; the tool icon must not outlive
+        // the visible window either.
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-stop", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-stop", 1, AssistantRoute.WAKE, turnId = "turn-stop",
+                        status = OfficialStatus.TOOL.wire, sequence = 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Tool("s-stop", 1, AssistantRoute.WAKE, turnId = "turn-stop",
+                        phase = ToolPhase.START, label = "记笔记")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertTrue("the START ring runs while the panel is visible", activity.toolIconRunningForProbe())
+            }
+
+            scenario.moveToState(Lifecycle.State.CREATED)
+
+            scenario.onActivity { activity ->
+                assertFalse("the hidden window must stop the tool ring, as it already does the thinking one",
+                    activity.toolIconRunningForProbe())
+            }
+            scenario.moveToState(Lifecycle.State.RESUMED)
         }
     }
 
@@ -428,6 +458,55 @@ class GlassesPanelStateTest {
                 assertSame("an ASR revision patches the user row in place", userRow,
                     activity.lastMessageRowForProbe())
                 assertEquals("帮我看下日程", activity.lastMessageRowForProbe()?.text.toString())
+            }
+        }
+    }
+
+    /**
+     * 0.24 S4 Task 17 I1: the production answer is `notify_user` with no `ANSWER` partial. The final `SHOW` must join
+     * the user line under the turn the accepted `STATE 3` named and dim that line to 70 %, instead of appending a
+     * second, turn-less item.
+     */
+    @Test
+    fun aFinalOnlyNotifyAnswerPairsTheWearersLineAndDimsIt() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-pair", 1)))
+                syncFor(activity)
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Asr("s-pair", 1, AssistantRoute.WAKE, turnId = "turn-pair",
+                        revision = 1, text = "帮我看下日程")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                val rows = activity.conversationRowsForProbe()
+                assertEquals("only the wearer's line exists yet", 1, rows.size)
+                assertEquals("while recognising the line is full green",
+                    GlassesPanelSpec.GREEN_NORMAL, rows[0].currentTextColor)
+                assertEquals(1, activity.conversationTurnCountForProbe())
+
+                // The phone publishes STATE 3 for the turn before submitting the hint; the hint itself carries no turn.
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-pair", 1, AssistantRoute.WAKE, turnId = "turn-pair",
+                        status = OfficialStatus.ANSWERING.wire, sequence = 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Show("s-pair", 1, sequence = 1, hintId = "h-pair", revision = 1,
+                        syncId = "sync-s4", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 30_000,
+                        text = "今天十点开会")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                val rows = activity.conversationRowsForProbe()
+                assertEquals("the answer joins the same item instead of appending a second one",
+                    1, activity.conversationTurnCountForProbe())
+                assertEquals(2, rows.size)
+                assertEquals("帮我看下日程", rows[0].text.toString())
+                assertEquals("once the answer is in the wearer's line drops to 70%",
+                    GlassesPanelSpec.GREEN_NORMAL_70, rows[0].currentTextColor)
+                assertEquals("今天十点开会", rows[1].text.toString())
+                assertEquals("the answer itself stays full green",
+                    GlassesPanelSpec.GREEN_NORMAL, rows[1].currentTextColor)
+                assertFalse("the answer text retires the thinking row", activity.thinkingVisibleForProbe())
             }
         }
     }

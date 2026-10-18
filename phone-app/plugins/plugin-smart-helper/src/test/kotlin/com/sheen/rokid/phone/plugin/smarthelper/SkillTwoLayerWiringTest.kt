@@ -138,6 +138,32 @@ class SkillTwoLayerWiringTest {
     }
 
     @Test
+    fun `a load_skill pull resets the answer stream but paints no device tool row`() {
+        // Task 17 review M6(a): `load_skill` is a SKILL read, not an ExecutionRouter action, so it must never become a
+        // tool row on the glasses (the filter, not just the `notify_user` filter, is what is being pinned). Its round
+        // is still a real tool round for the answer-stream reset, so the pull must reach the model's second request.
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig(panelVisible = true, conversationStores = smartStores()).also {
+            it.activate(
+                overrides = mapOf(
+                    Capability.StorageAccess to
+                        SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", "正文"))),
+                    Capability.ConversationDisplay to display,
+                ),
+            )
+        }
+        pullThenAnswer(rig, "alpha")
+
+        rig.wakeAndFinal("帮我看看")
+
+        assertEquals(2, rig.model.requests.size, "the load_skill round-trip really happened")
+        assertTrue(
+            display.toolStatuses.isEmpty(),
+            "load_skill must not paint a device tool row: ${display.toolStatuses}",
+        )
+    }
+
+    @Test
     fun `the pulled body is gone from the next turn's first request`() {
         // Design D-2: the body lives for one turn. Accumulating it across turns would move the unbounded growth the
         // whole phase removes from the catalog into the conversation — so this half matters as much as the first.
