@@ -58,8 +58,11 @@ internal class SmartTurn private constructor(
         private set
 
     /**
-     * The turn's own deadline: the end of its listening window while it waits for an utterance, and the agent run's
-     * deadline once one arrived. [extendDeadline] moves it forward and never back.
+     * The turn's **machine** budget: when the agent run must stop.
+     *
+     * It is not a listening window. Since 0.24 S3 the official 10 s belongs to `ConversationCycle` and starts at
+     * `PANEL_SHOWN`; this number bounds the model/tool work and is re-anchored at the usable final ([extendDeadline]),
+     * so waiting for the wearer cannot eat the run's budget. [extendDeadline] moves it forward and never back.
      */
     var deadlineNanos: Long = deadlineNanos
         private set
@@ -94,9 +97,11 @@ internal class SmartTurn private constructor(
     /**
      * Moves the turn's deadline - and the hint window that follows it - to [newDeadlineNanos], never backwards.
      *
-     * A wake segment's blank final is evidence that the request has not been spoken yet, so it re-arms the listening
-     * window from that moment. Both halves have to move together: a hint assembled after the original deadline would
-     * otherwise be dropped as expired, and the plugin would go silent on exactly the path that must never be silent.
+     * 0.24 S3: this is the **machine budget**, not a listening window. `acceptTranscript` re-anchors it at the usable
+     * final (the official conversation may stay open for a long time while the wearer is still speaking), and the
+     * run-end path extends it by the human wait a confirmation consumed. Both halves have to move together: a hint
+     * assembled after the original deadline would otherwise be dropped as expired, and the plugin would go silent on
+     * exactly the path that must never be silent.
      */
     fun extendDeadline(newDeadlineNanos: Long) {
         if (newDeadlineNanos <= deadlineNanos) return
@@ -125,10 +130,11 @@ internal class SmartTurn private constructor(
          * Opens a turn in [SmartTurnPhase.AwaitingTranscript] and installs its hint assembler.
          *
          * The assembler is built here, once per turn, and its emit callback is the plugin's own — so a hint can only
-         * ever be emitted while this exact turn is still the plugin's current one. The turn's deadline is `now` plus
-         * the listening window the plugin chose (the configured profile's timeout, or its documented default), so a
-         * turn opened before a profile exists still gets a usable window and a later, honest failure rather than an
-         * unbounded one.
+         * ever be emitted while this exact turn is still the plugin's current one. [deadlineNanos] is the **machine
+         * budget** the caller chose (the configured profile's timeout, or its documented default), not a listening
+         * window: since 0.24 S3 the official 10 s lives in `ConversationCycle` and starts at `PANEL_SHOWN`, and the
+         * budget is re-anchored at the usable final. A turn opened before a profile exists still gets a usable budget
+         * and a later, honest failure rather than an unbounded one.
          */
         fun awaiting(
             turnId: String,

@@ -743,7 +743,9 @@ class SmartAssistantPluginTest {
     // ------------------------------------------------- D12: the wake segment's own final is not the utterance
 
     @Test fun `D12 the wake segment's blank final is ignored and the request in a later segment runs the turn`() {
-        val rig = SmartTestRig()
+        // A visible panel: the wake segment's blank final is the expected first ASR message, and the bounded wait for a
+        // panel that is already up is not armed (spec §5.3). A hidden panel would (correctly) close the round at 3 s.
+        val rig = SmartTestRig(panelVisible = true)
         rig.activate()
         rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
 
@@ -885,7 +887,8 @@ class SmartAssistantPluginTest {
         val (rig, display) = cycleRig()
 
         rig.plugin.handle(rig.wakeEvent())
-        rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS + 50_000)
+        // Inside the bounded wait (spec §5.3): the overlay's own start latency is not the wearer's silence.
+        rig.tick(2_999)
         assertTrue(display.closes.isEmpty(), "the overlay's own start latency is not the wearer's silence")
         assertTrue(display.states.isEmpty(), "STATE 1 waits until there is a panel to show it on")
         assertTrue(rig.hintTexts.isEmpty(), "waiting for the panel must not answer anything")
@@ -899,6 +902,38 @@ class SmartAssistantPluginTest {
         assertEquals(listOf(AssistantRoute.WAKE), display.closes)
         assertTrue(rig.hintTexts.isEmpty(), "the official timeout closes the conversation; it does not submit a hint")
         assertTrue(rig.model.requests.isEmpty())
+    }
+
+    @Test fun `S3 a panel that never comes up closes the listening round after three seconds`() {
+        val (rig, display) = cycleRig()
+
+        // Spec §5.3: the phone waits at most 3 s for the panel's first layout instead of waiting forever (the silent
+        // wake that used to have no ending path at all). No STATE 1 is displayed - there is no panel to show it on.
+        rig.plugin.handle(rig.wakeEvent())
+        assertEquals(1, rig.scheduler.pending(), "the bounded PANEL_SHOWN wait is armed")
+
+        rig.tick(2_999)
+        assertTrue(display.closes.isEmpty())
+        rig.tick(1)
+
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertTrue(display.states.isEmpty(), "the panel never showed, so no listening level was ever displayed")
+        assertEquals(0, rig.scheduler.pending())
+        assertEquals(1, rig.cancels.size, "the turn behind the missing panel is cancelled")
+    }
+
+    @Test fun `S3 the bounded panel wait survives the wake segment's blank ASR`() {
+        val (rig, display) = cycleRig()
+        rig.plugin.handle(rig.wakeEvent())
+        // The wake segment's own blank final is the expected first ASR message (D12). It cancels the 10 s window, but
+        // the panel-acquisition cap is not a silence timer: a panel that never comes up must still end the round.
+        rig.plugin.handle(TranscriptEvent(rig.transcript("", turnId = "asr-echo", revision = 0)))
+
+        rig.tick(3_000)
+
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertTrue(display.states.isEmpty(), "the panel never showed, so no listening level was ever displayed")
+        assertEquals(0, rig.scheduler.pending())
     }
 
     @Test fun `S3 a visible panel arms the window at wake and displays status one`() {
@@ -1076,6 +1111,41 @@ class SmartAssistantPluginTest {
         assertTrue(rig.hintTexts.isEmpty())
     }
 
+    @Test fun `S3 a pin set while answering survives the automatic continuation`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        val hintId = rig.displayedAnswer()
+
+        // The wearer pins while the answer is on screen; the answer then continues automatically. The official pin is
+        // a dialog field, so the continuation (same dialog) must keep it.
+        rig.plugin.handle(PinChanged(rig.envelope(), AssistantRoute.WAKE))
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last(), "the continuation opened a new window")
+
+        rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+        assertEquals(1, display.idleCalls.size, "the pin survived the continuation, so its timeout idles")
+        assertTrue(display.closes.isEmpty())
+
+        rig.tick(OfficialConversation.PINNED_CLOSE_MILLIS)
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes, "the pinned 120 s close still ends it")
+    }
+
+    @Test fun `S3 an ASR message in the pinned idle window does not cancel the 120 s close`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(PinChanged(rig.envelope(), AssistantRoute.WAKE))
+        rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+        assertEquals(1, display.idleCalls.size)
+        assertEquals(1, rig.scheduler.pending(), "the 120 s pinned close is armed")
+
+        // The CXR audio stream stays alive after the official-style exit (spec §10 item 20), so a blank wake echo can
+        // arrive here. Official `removeExit()` removes only the 1 s continue-off exit, not `Ai_Delay_Quit`.
+        rig.plugin.handle(TranscriptEvent(rig.transcript("", turnId = "asr-echo", revision = 0)))
+        rig.tick(OfficialConversation.PINNED_CLOSE_MILLIS - 1)
+        assertTrue(display.closes.isEmpty(), "the ASR message must not cancel the pinned close")
+        rig.tick(1)
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+    }
+
     @Test fun `S3 stop shows idle and keeps the panel`() {
         val (rig, display) = cycleRig(panelVisible = true)
         rig.plugin.handle(rig.wakeEvent())
@@ -1112,5 +1182,115 @@ class SmartAssistantPluginTest {
         assertEquals(0, rig.scheduler.pending(), "a session end must not leave a timer to close a future panel")
         rig.tick(OfficialConversation.PINNED_CLOSE_MILLIS + 1_000)
         assertTrue(display.closes.isEmpty())
+    }
+
+    // ------------------------------------------------- 0.24 S3 fix round: early speech and turn-scoped closes
+
+    @Test fun `S3 a SpeechFinished that beats the display ACK is consumed when the ACK arrives`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        var requests = 0
+        rig.model.onRequest = { request, listener ->
+            if (requests++ == 0) {
+                listener(smartToolCall("c1", "notify_user", """{"text":"答案","channel":"both"}"""))
+            }
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val hintId = rig.output.hints.single().hintId
+
+        // The local player can finish a short answer before the glasses' Displayed acknowledgement reaches the plugin.
+        rig.plugin.handle(SpeechFinished(rig.envelope(), hintId, SpeechResult.FINISHED))
+        assertTrue(
+            OfficialStatus.AUDIO_FINISHED.wire !in display.statuses,
+            "nothing may continue before the answer is known displayed",
+        )
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, display.statuses[display.statuses.size - 2],
+            "the remembered speech end settles the answer at the acknowledgement")
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last(), "and the next round opens")
+        assertEquals(2, display.count("working:WAKE"), "the continuation opened its own round; the model is not re-run")
+        assertEquals(1, rig.output.hints.size, "the next round waits for the wearer")
+    }
+
+    @Test fun `S3 a proactive hint's SpeechFinished cannot continue the wake conversation`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        var wakeToolSent = false
+        rig.model.onRequest = { request, listener ->
+            when {
+                request.turnId.startsWith("proactive-") ->
+                    listener(smartToolCall("p1", "propose_hint", """{"text":"记得喝水"}"""))
+                !wakeToolSent -> {
+                    wakeToolSent = true
+                    listener(smartToolCall("c1", "notify_user", """{"text":"答案","channel":"both"}"""))
+                }
+            }
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val wakeHint = rig.output.hints.single().hintId
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), wakeHint, OutputStatus.Displayed))
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses, "the wake answer waits for its speech")
+
+        // A proactive hint exists in the same session and spoke too. Its SpeechFinished names a different hint, so it
+        // must not be taken as the wake answer's playback end (Task 5 review: route by hintId, not "current route").
+        rig.plugin.handle(AcousticEvent(rig.envelope(), AcousticLabel.Speech))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了", turnId = "asr-proactive")))
+        rig.tick()
+        val proactiveHint = rig.output.hints.firstOrNull { it.route == AssistantRoute.PROACTIVE }?.hintId
+        assertNotNull(proactiveHint, "the proactive path submitted its own hint")
+        assertNotEquals(wakeHint, proactiveHint)
+
+        rig.plugin.handle(SpeechFinished(rig.envelope(), proactiveHint, SpeechResult.FINISHED))
+        assertTrue(
+            OfficialStatus.AUDIO_FINISHED.wire !in display.statuses,
+            "a proactive hint's speech may not continue the WAKE conversation",
+        )
+
+        rig.plugin.handle(SpeechFinished(rig.envelope(), wakeHint, SpeechResult.FINISHED))
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, display.statuses[display.statuses.size - 2])
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last())
+    }
+
+    @Test fun `S3 a close decided for the old turn does not tear down a concurrent wake`() {
+        // The continue-off close runs 1 s after a displayed answer, and the old turn is already Idle, so a wake can
+        // legitimately open the next turn. The cooldown is set to zero so that wake lands inside the close's own
+        // after-lock callback; the production default would refuse it instead of testing the interleaving.
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig(panelVisible = true, continueDialogue = false, cooldownNanos = 0L)
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val firstTurn = rig.output.hints.single().sourceTurnId
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), rig.output.hints.single().hintId, OutputStatus.Displayed))
+        assertEquals(1, rig.scheduler.pending(), "the continue-off close is armed")
+
+        display.onClosePanel = {
+            display.onClosePanel = null
+            // This is the concurrent wake: it runs inside the close decision, before the queued `cancelTurn`.
+            rig.plugin.handle(rig.wakeEvent())
+        }
+        rig.tick(1_000)
+        assertEquals(1, display.closes.size)
+        val secondTurn = display.states.last().turnId
+        assertNotEquals(firstTurn, secondTurn, "the concurrent wake opened a new turn")
+
+        // The new turn must still own the machine: its transcript reaches the model under its own turn id.
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+        val requestsBefore = rig.model.requests.size
+        rig.plugin.handle(TranscriptEvent(rig.transcript("再问一句", turnId = "asr-second")))
+        rig.tick()
+        assertEquals(requestsBefore + 1, rig.model.requests.size,
+            "a close queued for the old turn must not detach the concurrent wake")
+        assertEquals("asr-second", rig.model.requests.last().turnId)
+        assertTrue(rig.cancels.none { it.third == secondTurn }, "the new turn's output was never cancelled")
     }
 }

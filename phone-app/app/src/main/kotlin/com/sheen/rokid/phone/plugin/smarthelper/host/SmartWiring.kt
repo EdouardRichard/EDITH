@@ -28,6 +28,12 @@ internal class SmartWiring(
     clock: MonotonicClock,
     scheduler: DeadlineScheduler,
     cancelOutputTurn: (SessionId, Generation, String) -> Unit = { _, _, _ -> },
+    /**
+     * 0.24 S3 fix (C1): whether the glasses panel is visible right now, read by the conversation cycle's already-visible
+     * turn-open path. The production `create` passes the composition's accessor; the `{ false }` default keeps a
+     * stand-alone wiring (mostly tests) on the hidden-panel path.
+     */
+    isPanelVisible: () -> Boolean = { false },
 ) {
     /** The word list the plugin declares on activation; also the `Capability.WakeWord` provider's content. */
     val wakeWords: SmartWakeWordRegistry = SmartWakeWordRegistry(settings.wakeWords)
@@ -71,5 +77,8 @@ internal class SmartWiring(
         gateForm = GateForm.NOUL,
         // Phase 5: the production session owner. Non-null switches every turn onto the store + `RequestFrame` path.
         conversationStores = conversationStores,
+        // 0.24 S3 fix (C1): the production composition reads the link's live visibility, so a wake on an already-visible
+        // panel starts the official 10 s at once instead of waiting for a `PANEL_SHOWN` that will not be repeated.
+        isPanelVisible = isPanelVisible,
     )
 }

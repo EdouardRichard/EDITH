@@ -993,20 +993,34 @@ class HostCompositionRoot internal constructor(
     /**
      * The panel's first layout, delivered on a host thread (Task 11 exposes it; Task 12 owns the 10 s timer).
      *
-     * A named seam rather than a plugin event: the timer belongs to the conversation state machine, which will
-     * subscribe here in Task 12. It is deliberately not a wire command (the glasses never send `PANEL_SHOWN` to the
-     * plugin) and not a `HostEvent` the plugin capability gate would filter. The [HintIdentity] is the pair the link
-     * validated, so the timer owner can reject a queued event that belongs to a session that has moved on.
+     * A named seam rather than a plugin event: the timer belongs to the conversation state machine, and the
+     * composition's own `init` subscribes it here ([SmartAssistantPlugin.onPanelShown]). It is deliberately not a wire
+     * command (the glasses never send `PANEL_SHOWN` to the plugin) and not a `HostEvent` the plugin capability gate
+     * would filter. The [HintIdentity] is the pair the link validated, so the timer owner can reject a queued event
+     * that belongs to a session that has moved on.
      */
     internal var onPanelShown: ((identity: HintIdentity, route: AssistantRoute) -> Unit)? = null
 
     /**
      * The panel went hidden (`UI_CLOSED`), delivered on a host thread for the turn owner (0.24 spec §5.4).
      *
-     * Task 12 must be able to cancel a listening window whose panel closed; like [onPanelShown], this is a named seam
-     * rather than a plugin event, and the event has already been checked against the host's current identity.
+     * The conversation cycle needs it to cancel a listening window whose panel closed; like [onPanelShown], this is a
+     * named seam rather than a plugin event, the event has already been checked against the host's current identity,
+     * and the composition's own `init` subscribes the smart plugin to it.
      */
     internal var onUiClosed: ((route: AssistantRoute) -> Unit)? = null
+
+    init {
+        // 0.24 S3 fix (C1): a composition that owns the smart wiring **is** the production consumer of the two panel
+        // lifecycle seams. They used to be assigned only by tests, so a real wake waited for a `PANEL_SHOWN` that
+        // nobody delivered (no STATE 1, no 10 s) and a silent wake stuck in AwaitingTranscript. Wiring them in the
+        // composition (rather than one `create` call site) is what keeps the tested root and the shipped root the same
+        // object: `PassiveLoopWiringTest` builds this class directly.
+        smartWiring?.plugin?.let { plugin ->
+            onPanelShown = { _, route -> plugin.onPanelShown(route) }
+            onUiClosed = { route -> plugin.onPanelClosed(route) }
+        }
+    }
 
     /**
      * Whether the resident panel is visible right now (Task 12's already-visible turn-open path, spec §5.3).
@@ -1767,9 +1781,9 @@ class HostCompositionRoot internal constructor(
             // The smart plugin is registered and configured here, with the composition's own clock, scheduler,
             // profile lookup, output-turn cancellation and configured cooldown - Task 13 made it a real
             // `ConfiguredPlugin`, so the bare constructor would be refused by the host's configuration policy.
-            val smartWiring = SmartWiring(smartSettings, profiles, clock, scheduler) { sessionId, generation, turnId ->
+            val smartWiring = SmartWiring(smartSettings, profiles, clock, scheduler, { sessionId, generation, turnId ->
                 hostHolder[0]?.cancelOutputTurn(sessionId, generation, turnId)
-            }
+            }, isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false })
             // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
             // One router is the single `Capability.Actions` provider, so the advertised tool set is exactly the set of
             // channels that are up. Each channel is asked at read time, never cached.

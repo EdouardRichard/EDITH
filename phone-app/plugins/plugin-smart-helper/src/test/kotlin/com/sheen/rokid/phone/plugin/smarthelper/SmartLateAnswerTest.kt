@@ -51,7 +51,9 @@ class SmartLateAnswerTest {
      * returns the model's sentence, which is what the glasses are supposed to show.
      */
     private fun rigAsking(channel: OpenChannel, tasks: OffThreadTasks): SmartTestRig {
-        val rig = SmartTestRig()
+        // The result is displayed on an already-visible panel: the official listening window starts at the wake, and
+        // the 3 s PANEL_SHOWN wait (which a hidden panel without a shown event would trip at 3 s) is not armed.
+        val rig = SmartTestRig(panelVisible = true)
         rig.actions.descriptors += smartAction("uninstall", risk = RiskLevel.L3, scope = "app")
         rig.activate(
             maxLevel = "L4",

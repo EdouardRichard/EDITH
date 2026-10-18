@@ -150,6 +150,13 @@ internal class SmartRecordingDisplay : ConversationDisplay {
 
     val statuses: List<Int> get() = states.map { it.status }
 
+    /**
+     * Runs at the end of [closePanel] - i.e. while the conversation cycle still holds its lock, before the queued
+     * `cancelTurn` callback. The seam for the I4 interleaving test: a wake that opens the next turn in that gap must
+     * not be torn down by the close that was decided for the old one.
+     */
+    var onClosePanel: (() -> Unit)? = null
+
     fun count(prefix: String) = calls.count { it.startsWith(prefix) }
 
     override fun userMessage(route: AssistantRoute, text: String) {
@@ -181,6 +188,7 @@ internal class SmartRecordingDisplay : ConversationDisplay {
     override fun closePanel(route: AssistantRoute) {
         closes += route
         calls += "close:${route.name}"
+        onClosePanel?.invoke()
     }
 }
 
@@ -431,6 +439,11 @@ internal class SmartTestRig(
      * written before an automatic next round existed; the tests about the feature opt in.
      */
     var continueDialogue: Boolean = false,
+    /**
+     * 0.24 S3 fix (I4): the wake cooldown. The production default (3 s) is what every pre-0.24 test expects; the
+     * interleaving test needs a second wake inside the first round's 1 s close, so it opts out explicitly.
+     */
+    val cooldownNanos: Long = 3_000_000_000L,
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -456,6 +469,7 @@ internal class SmartTestRig(
             profileLookup = { profile },
             cancelOutputTurn = { s, g, t -> cancels += Triple(s, g, t) },
             onDisplayedAck = { displayedAcks += 1 },
+            cooldownNanos = cooldownNanos,
             contextForTurn = contextForTurn,
             compressor = compressor,
             interventionGate = interventionGate,

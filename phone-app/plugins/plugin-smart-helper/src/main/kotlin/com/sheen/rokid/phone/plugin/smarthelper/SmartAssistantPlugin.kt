@@ -229,7 +229,8 @@ private const val DEPENDENCY_HINT = "本地模型还没准备好，暂时不能�
  *   the wake word on its own, seconds before the request's own segment, so a blank final (or one that is only the
  *   wake word, with or without punctuation) is ignored instead of ending the turn (D12). Since 0.24 S3 the **official**
  *   10 s window belongs to `ConversationCycle` and every ASR message cancels it (spec §5.3), so a blank final neither
- *   ends the turn nor re-arms a timer; the panel stays listening until the wearer speaks or leaves;
+ *   ends the turn nor re-arms a timer; the panel stays listening until the wearer speaks, leaves, or the bounded
+ *   `PANEL_SHOWN` wait expires (3 s, `P3_CONV panel_not_shown`);
  * - **only a final transcript runs the loop** — a partial revision never reaches the model;
  * - **never silence, never a false success** — every run that reaches a terminal state submits a hint: the model's own
  *   text for `COMPLETED`, and a fixed honest sentence for every other outcome;
@@ -302,8 +303,8 @@ class SmartAssistantPlugin(
      * The official 10 s timeout starts when the dialog opens. EDITH substitutes the glasses' `PANEL_SHOWN` for that
      * moment, so a slow overlay start is not charged to the wearer's silence; a turn that opens while the resident
      * panel is already up has no `PANEL_SHOWN` to wait for and starts the window immediately. The production
-     * composition wires this to `HostCompositionRoot.isPanelVisible`; until it does, the hidden-panel path is the
-     * documented default.
+     * composition passes the host's live `isPanelVisible`; `{ false }` remains the default for a plugin built without
+     * a panel (tests, harnesses), which keeps every pre-0.24 hidden-panel path intact.
      */
     private val isPanelVisible: () -> Boolean = { false },
     /**
@@ -621,7 +622,7 @@ class SmartAssistantPlugin(
         continueDialogue = continueDialogue,
         openContinuation = { previousTurnId -> openContinuationTurn(previousTurnId) },
         isPanelVisible = isPanelVisible,
-        cancelTurn = { route -> cancelConversationTurn(route) },
+        cancelTurn = { route, expectedTurnId -> cancelConversationTurn(route, expectedTurnId) },
     )
 
     // ---------------------------------------------------------------- proactive state (P3.2)
@@ -1063,15 +1064,20 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * Ends the conversation's current turn (the official timeout/close paths).
+     * Ends the conversation's turn **only if it is still [expectedTurnId]** (the official timeout/close paths).
+     *
+     * The close decision is made under the cycle's lock, but this callback runs after that lock is released. A wake
+     * can open a new turn in that gap; without the identity check this call would tear the new turn down (and its state
+     * would already have armed the new round's window, leaving a later second `CLOSE`). A stale callback is inert.
      *
      * It clears the busy level as well: the ring must stop when the panel times out, exactly as it does when the
      * wearer's answer is shown. The proactive route has no conversation cycle, so only WAKE is meaningful here.
      */
-    private fun cancelConversationTurn(route: AssistantRoute) {
+    private fun cancelConversationTurn(route: AssistantRoute, expectedTurnId: String) {
         if (route != AssistantRoute.WAKE) return
         var stopped: SmartTurn? = null
         synchronized(gate) {
+            if (turn?.turnId != expectedTurnId) return
             wakeBusy = false
             stopped = detach()
         }
@@ -2595,7 +2601,13 @@ class SmartAssistantPlugin(
         val notifications = mutableListOf<String>()
     }
 
-    /** A terminal state reached before the loop could run at all (a blank utterance, or an expired listening window). */
+    /**
+     * A terminal state reached before the loop could run at all.
+     *
+     * The 0.24 official listening expiry is **not** one of these any more: the 10 s window belongs to
+     * [conversationCycle], which closes the conversation instead of submitting a failure hint. This serves the
+     * dependency/blank-utterance refusals only.
+     */
     private fun finishWithFailure(owned: SmartTurn, text: String) {
         val assembler = synchronized(gate) {
             if (turn !== owned || owned.closed) return

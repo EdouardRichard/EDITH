@@ -27,6 +27,7 @@ import com.sheen.rokid.testsupport.RecordingInputPort
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
@@ -338,6 +339,19 @@ class CxrLinkWiringTest {
             }
             assertTrue("the silent wire is not the production wire", display.wire is CxrHintLink)
             assertSame("`create` must pass its own hint link", root.hintLinkForProbe, display.wire)
+        } finally { root.close() }
+    }
+
+    @Test
+    fun theProductionAssemblySubscribesTheConversationTimersToThePanelLifecycle() {
+        // 0.24 S3 fix (C1): `onPanelShown`/`onUiClosed` used to be assigned only by tests, so a real wake waited for a
+        // PANEL_SHOWN that never reached the plugin (no STATE 1, no 10 s). `create` owns a smart wiring, so the
+        // composition itself must be the subscriber.
+        val root = HostCompositionRoot.create(android.content.ContextWrapper(null))
+        try {
+            assertNotNull("`create` must register the smart plugin", root.smartPluginForProbe)
+            assertNotNull("PANEL_SHOWN must reach the conversation cycle", root.onPanelShown)
+            assertNotNull("UI_CLOSED must reach the conversation cycle", root.onUiClosed)
         } finally { root.close() }
     }
 

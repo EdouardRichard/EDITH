@@ -6,6 +6,8 @@ import com.sheen.rokid.phone.storage.unavailable
 import com.sheen.rokid.phone.app.MainActivity
 import com.sheen.rokid.phone.app.CxrAudioChain
 import com.sheen.rokid.phone.bridge.CxrConnection
+import com.sheen.rokid.phone.bridge.CxrHintLink
+import com.sheen.rokid.phone.bridge.HintIdentity
 import com.sheen.rokid.phone.bridge.RokidConnection
 import com.sheen.rokid.phone.app.AudioChainEngines
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
@@ -39,6 +41,10 @@ import com.sheen.rokid.contracts.VerifiedPcm
 import com.sheen.rokid.contracts.WakeDetected
 import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.host.ResourceScope
+import com.sheen.rokid.output.HintCommand
+import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.output.OfficialConversation
+import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.phone.storage.AndroidProfileRepository
 import com.sheen.rokid.phone.storage.KeystoreVault
 import com.sheen.rokid.plugin.ActionDescriptor
@@ -195,6 +201,20 @@ private class NoConversationDisplay : ConversationDisplay {
     override fun assistantMessage(route: AssistantRoute, text: String) = Unit
     override fun working(route: AssistantRoute) = Unit
     override fun idle(route: AssistantRoute) = Unit
+}
+
+/** 0.24 S3 fix (C1): records the official levels the composition-level wake drove into the real plugin. */
+private class RecordingConversationDisplay : ConversationDisplay {
+    val states = CopyOnWriteArrayList<Pair<AssistantRoute, Int>>()
+    val closes = CopyOnWriteArrayList<AssistantRoute>()
+    override fun userMessage(route: AssistantRoute, text: String) = Unit
+    override fun assistantMessage(route: AssistantRoute, text: String) = Unit
+    override fun working(route: AssistantRoute) = Unit
+    override fun idle(route: AssistantRoute) = Unit
+    override fun state(route: AssistantRoute, turnId: String, status: Int, sequence: Long) {
+        states += route to status
+    }
+    override fun closePanel(route: AssistantRoute) { closes += route }
 }
 
 private class NoStorageAccess : StorageAccess {
@@ -1111,6 +1131,101 @@ private class NoStorageAccess : StorageAccess {
             root.host.currentState
             assertEquals("the switched-to plugin must receive the event its epoch produced",
                 1, alt.handled.filterIsInstance<WakeDetected>().size)
+        } finally {
+            root.close()
+        }
+    }
+
+    /**
+     * 0.24 S3 fix (C1): the **production composition**, not the tests, feeds the conversation timers.
+     *
+     * A real hidden wake used to take the hidden-panel path forever: `SmartWiring` never passed `isPanelVisible` and
+     * `HostCompositionRoot`'s `onPanelShown`/`onUiClosed` seams were assigned only by tests. This builds the same
+     * `HostCompositionRoot`/`SmartWiring` pair `create` builds (a real link included) and drives the panel lifecycle
+     * through the root's own entry points.
+     */
+    @Test
+    fun theCompositionFeedsPanelShownAndVisibilityToThePluginConversationTimers() {
+        val clock = FakeClock(0)
+        val scheduler = ManualScheduler(clock)
+        val display = RecordingConversationDisplay()
+        val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
+        val wiring = SmartWiring(
+            SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1",
+                whitelist = emptyList(), profileId = "p-1", cooldownMillis = 3000L),
+            FixedProfiles(profile("p-1")), clock, scheduler,
+            // Exactly the expression `create` passes: the composition's live link visibility, via the holder that does
+            // not exist yet when the wiring is built.
+            isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false },
+        )
+        val link = CxrHintLink(clock, scheduler, sendJson = { true })
+        val environment = CxrHostEnvironment(
+            clock = clock, input = RecordingInputPort(), liveOutput = { LiveDisplay() }, scheduler = scheduler,
+            providers = mapOf(
+                Capability.Model to InertModel(),
+                Capability.Asr to StubAsrSession(),
+                Capability.Actions to NoActions(),
+                Capability.Confirmation to NoConfirmations(),
+                Capability.WakeWord to wiring.wakeWords,
+                Capability.Context to EmptyContextSignals(),
+                Capability.StorageAccess to NoStorageAccess(),
+                Capability.SystemOne to ReadySystemOne(),
+                Capability.Embedding to ReadyEmbedding(),
+                Capability.ConversationDisplay to display,
+            ),
+            storageFor = { StubStorage() })
+        val root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
+            environment, hintLink = link, smartWiring = wiring,
+            rokidConnectionFactory = { FakeTransportConnection(null) })
+        rootHolder[0] = root
+        try {
+            root.registerPlugin(wiring.plugin)
+            root.attachCxrActivity(Any())
+            root.start("smart-assistant")
+            root.onSceneReady()
+            val identity = requireNotNull(root.host.currentIdentity())
+            val hintIdentity = HintIdentity(identity.first.value, identity.second.value)
+            // The vendor-callback hop is `CxrLinkWiringTest`'s; this is the composition hop, fed the way `create`
+            // feeds it (the link callback calls the root's marshal method).
+            link.onPanelShown = { validated, route -> root.panelShownArrived(validated, route) }
+            link.onUiState = { validated, state -> root.onUiStateFromLink(validated, state) }
+
+            assertTrue(link.onInbound(HintWireCodec.encode(
+                HintCommand.PanelShown(hintIdentity.sessionId, hintIdentity.generation, AssistantRoute.WAKE),
+            )))
+            root.host.currentState
+            assertTrue("the link's live visibility is what the production wiring reads", root.isPanelVisible())
+
+            // A wake on that already-visible panel must display STATE 1 and arm the 10 s at once - the behavior a
+            // missing `isPanelVisible` used to suppress (no STATE 1 at all, no timer).
+            assertTrue(root.host.onEvent(WakeDetected(
+                EventEnvelope(identity.first, identity.second, "wake-visible", 0L, 1L), "伊迪丝", 1.0,
+            )))
+            root.host.currentState
+            assertEquals(listOf(AssistantRoute.WAKE to OfficialStatus.LISTENING.wire), display.states)
+
+            clock.advance(OfficialConversation.LISTEN_TIMEOUT_MILLIS * 1_000_000L)
+            scheduler.runDue()
+            assertEquals(
+                "the visible wake's 10 s window closes the round through the composition",
+                listOf(AssistantRoute.WAKE),
+                display.closes,
+            )
+
+            // A second wake, then UI_CLOSED: the plugin's own window is cancelled by the composition's seam.
+            assertTrue(root.host.onEvent(WakeDetected(
+                EventEnvelope(identity.first, identity.second, "wake-2", 0L, 1L), "伊迪丝", 1.0,
+            )))
+            root.host.currentState
+            assertEquals("the second wake displayed its own STATE 1", 2, display.states.size)
+            assertTrue(link.onInbound(HintWireCodec.encode(
+                HintCommand.UiClosed(hintIdentity.sessionId, hintIdentity.generation, AssistantRoute.WAKE),
+            )))
+            root.host.currentState
+            val closesBefore = display.closes.size
+            clock.advance(OfficialConversation.LISTEN_TIMEOUT_MILLIS * 1_000_000L)
+            scheduler.runDue()
+            assertEquals("UI_CLOSED must cancel the plugin's listening window", closesBefore, display.closes.size)
         } finally {
             root.close()
         }
