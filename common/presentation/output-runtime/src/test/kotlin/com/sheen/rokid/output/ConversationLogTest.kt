@@ -4,6 +4,7 @@ import com.sheen.rokid.contracts.AssistantRoute
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -20,8 +21,9 @@ import kotlin.test.assertTrue
 class ConversationLogTest {
 
     private fun entry(id: String, route: AssistantRoute = AssistantRoute.WAKE,
-        role: ConversationRole = ConversationRole.USER, text: String = "第 $id 条") =
-        ConversationEntry(id, route, role, text)
+        role: ConversationRole = ConversationRole.USER, text: String = "第 $id 条",
+        turnId: String? = null) =
+        ConversationEntry(id, route, role, text, turnId)
 
     @Test
     fun `an entry is appended and read back in order`() {
@@ -157,5 +159,58 @@ class ConversationLogTest {
     fun `an impossible bound is refused rather than silently ignored`() {
         assertFalse(runCatching { ConversationLog(maxEntries = 0) }.isSuccess)
         assertFalse(runCatching { ConversationLog(maxChars = 0) }.isSuccess)
+    }
+
+    @Test
+    fun `a turn id is carried with the entry it was appended with`() {
+        // 0.24 S2: the wearer's utterance and the assistant reply that answers it share one turn id, so a screen can
+        // tie them together without re-deriving the pairing from order. The log carries the id; it does not mint it.
+        val log = ConversationLog()
+        assertTrue(log.append(entry("asr-t1", turnId = "t1")))
+        assertTrue(log.append(entry("say-h1", role = ConversationRole.ASSISTANT, turnId = "t1")))
+        assertEquals(listOf("t1", "t1"), log.entries(AssistantRoute.WAKE).map { it.turnId })
+    }
+
+    @Test
+    fun `an entry appended without a turn id reads back with null`() {
+        // Producers that predate the turn id keep working: the log must not invent a turn for them.
+        val log = ConversationLog()
+        log.append(entry("a"))
+        assertNull(log.entries(AssistantRoute.WAKE).single().turnId)
+    }
+
+    @Test
+    fun `an entry built without a turn id defaults it to null`() {
+        assertNull(ConversationEntry("a", AssistantRoute.WAKE, ConversationRole.USER, "文本").turnId,
+            "every existing constructor call must keep its meaning")
+    }
+
+    @Test
+    fun `a repeated id does not add a second entry`() {
+        val log = ConversationLog()
+        assertTrue(log.append(entry("asr-t1", text = "第一版", turnId = "t1")))
+        assertTrue(log.append(entry("asr-t1", text = "第二版", turnId = "t1")))
+        assertEquals(1, log.entries(AssistantRoute.WAKE).size)
+        assertEquals("第二版", log.entries(AssistantRoute.WAKE).single().text)
+    }
+
+    @Test
+    fun `a same-id update keeps its place and takes the turn id it was sent with`() {
+        val log = ConversationLog()
+        log.append(entry("say-h1", role = ConversationRole.ASSISTANT, text = "第一版", turnId = "t1"))
+        log.append(entry("say-h2", role = ConversationRole.ASSISTANT, text = "另一条", turnId = "t2"))
+        assertTrue(log.append(entry("say-h1", role = ConversationRole.ASSISTANT, text = "第二版", turnId = "t3")))
+        assertEquals(listOf("第二版", "另一条"), log.entries(AssistantRoute.WAKE).map { it.text },
+            "a revision stays where the original was, so the conversation does not reorder under the wearer")
+        assertEquals(listOf("t3", "t2"), log.entries(AssistantRoute.WAKE).map { it.turnId },
+            "the stored entry is the last one appended under that id")
+    }
+
+    @Test
+    fun `eviction still keeps the newest entry and its turn id`() {
+        val log = ConversationLog(maxEntries = 2, maxChars = 1_000)
+        (1..3).forEach { log.append(entry("e$it", text = "第 $it 条", turnId = "t$it")) }
+        assertEquals(listOf("第 2 条", "第 3 条"), log.entries(AssistantRoute.WAKE).map { it.text })
+        assertEquals(listOf("t2", "t3"), log.entries(AssistantRoute.WAKE).map { it.turnId })
     }
 }

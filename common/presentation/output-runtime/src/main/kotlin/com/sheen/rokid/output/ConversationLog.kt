@@ -10,12 +10,20 @@ enum class ConversationRole { USER, ASSISTANT }
  *
  * [entryId] is the identity the log dedupes and replaces on: the phone sends the hint's own `hintId` for an assistant
  * message (so a revised hint updates one entry rather than adding another) and a per-utterance id for the wearer's.
+ *
+ * [turnId] is the exchange the entry belongs to, when its producer knows one: the wearer's utterance and the
+ * assistant reply that answers it carry the same value, so a screen can keep them together without re-deriving the
+ * pairing from order. The log only carries it — it is not minted here and not derived from [entryId]. By convention
+ * an entry's id also names what produced it (`asr-${turnId}` for the wearer's utterance, `say-${hintId}` for the
+ * assistant's hint); the log never parses [entryId], and an entry from a producer that predates the turn reads back
+ * `null` rather than a guessed value.
  */
 data class ConversationEntry(
     val entryId: String,
     val route: AssistantRoute,
     val role: ConversationRole,
     val text: String,
+    val turnId: String? = null,
 )
 
 /**
