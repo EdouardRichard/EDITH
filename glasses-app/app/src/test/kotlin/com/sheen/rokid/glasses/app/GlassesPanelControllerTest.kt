@@ -106,8 +106,9 @@ class GlassesPanelControllerTest {
             route: AssistantRoute = AssistantRoute.WAKE,
             sessionId: String = "s-1",
             generation: Long = 1,
+            revision: Long = 1,
         ): Boolean = accept(
-            HintCommand.Show(sessionId, generation, sequence = sequence, hintId = hintId, revision = 1,
+            HintCommand.Show(sessionId, generation, sequence = sequence, hintId = hintId, revision = revision,
                 syncId = "sync-1", phoneSentNanos = clock.nanos, remainingTtlMillis = 5_000,
                 text = text, route = route),
         )
@@ -289,6 +290,92 @@ class GlassesPanelControllerTest {
             model.liveEntryId)
         assertEquals("but the conversation the wearer reads back from must survive it",
             "答案在这里", harness.controller.conversationText(AssistantRoute.WAKE))
+    }
+
+    // ---------------------------------------------------------------- new-content revision (the reveal signal)
+
+    @Test
+    fun anIdenticalShowWithAHigherRevisionStillCountsAsNewContent() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.show(sequence = 1, hintId = "h-same", text = "同一句答案", revision = 1)
+        val before = harness.port.lastModel()
+        val rendersBefore = harness.port.models.size
+
+        harness.show(sequence = 2, hintId = "h-same", text = "同一句答案", revision = 2)
+
+        val after = harness.port.lastModel()
+        assertEquals("the accepted SHOW must reach the port", rendersBefore + 1, harness.port.models.size)
+        assertEquals("the log replaces an equal entry, so what is stored is unchanged",
+            before.entries, after.entries)
+        assertEquals("but a newer revision is still new content the view must reveal",
+            before.contentRevision + 1, after.contentRevision)
+        assertEquals("h-same", after.liveEntryId)
+    }
+
+    @Test
+    fun anIdenticalSaidReplacementStillCountsAsNewContent() {
+        val harness = Harness()
+        harness.hello()
+        harness.said(sequence = 1, entryId = "said-same", text = "同一句话")
+        val before = harness.port.lastModel()
+        val rendersBefore = harness.port.models.size
+
+        harness.said(sequence = 2, entryId = "said-same", text = "同一句话")
+
+        val after = harness.port.lastModel()
+        assertEquals("a stored selected-route SAID must reach the port", rendersBefore + 1,
+            harness.port.models.size)
+        assertEquals("the replacement is data-class equal, so the stored conversation is unchanged",
+            before.entries, after.entries)
+        assertEquals("but storing it is still new content the view must reveal",
+            before.contentRevision + 1, after.contentRevision)
+        assertEquals(ConversationRole.USER, after.entries.single().role)
+    }
+
+    @Test
+    fun staleRefusedAndOtherRouteCommandsDoNotCountAsNewContent() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.show(sequence = 1, hintId = "h-1", text = "答案在这里", revision = 5)
+        harness.said(sequence = 2, entryId = "said-late", text = "先到的话")
+        val baseline = harness.port.lastModel()
+        val rendersBefore = harness.port.models.size
+
+        // A revision at or below the one already shown is refused by the hint gate.
+        harness.show(sequence = 2, hintId = "h-1", text = "答案在这里", revision = 5)
+        // A SAID for the conversation that is not on screen is stored but must not move the view.
+        assertTrue(harness.said(route = AssistantRoute.PROACTIVE, sequence = 1, entryId = "said-other",
+            text = "别处的话"))
+        // A SAID behind the ordering fence is refused.
+        harness.said(sequence = 1, entryId = "said-stale", text = "迟到的话")
+        // A SHOW for another session is refused.
+        harness.show(sequence = 3, hintId = "h-other", text = "别人的答案", sessionId = "s-other")
+
+        assertEquals("nothing on screen changed, so nothing was rendered", rendersBefore,
+            harness.port.models.size)
+        assertEquals("and none of it counted as new content for the view", baseline.contentRevision,
+            harness.port.lastModel().contentRevision)
+        assertEquals("only the accepted SHOW and SAID are stored", "答案在这里\n先到的话",
+            harness.controller.conversationText(AssistantRoute.WAKE))
+    }
+
+    @Test
+    fun aHintRetirementDoesNotCountAsNewContent() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.show()
+        val before = harness.port.lastModel().contentRevision
+
+        harness.clock.nanos += 6_000_000_000L
+        harness.scheduler.tasks.forEach { it() }
+
+        val after = harness.port.lastModel()
+        assertNull("the deadline retires the live row", after.liveEntryId)
+        assertEquals("retiring the live row is not new content to reveal", before, after.contentRevision)
     }
 
     // ---------------------------------------------------------------- BUSY / the listening-Hi signal

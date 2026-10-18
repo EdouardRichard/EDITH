@@ -232,6 +232,60 @@ class GlassesInteractionTest {
         }
     }
 
+    /**
+     * 0.24 S2 Task 8 fix: a valid SHOW that replaces an equal entry (same hint id and text, higher revision) is still
+     * new content. The pre-extraction Activity revealed on every accepted SHOW, including while pinned and paged;
+     * `PanelModel.contentRevision` is the explicit controller-owned signal that keeps that behavior.
+     */
+    @Test
+    fun anIdenticalShowWithAHigherRevisionStillRevealsTheNewestLine() {
+        val longText = buildString {
+            repeat(12) { index -> append("第${index + 1}点：这是用于重复内容证据的合成长文本，长度足以超出眼镜列表窗口。") }
+        }.take(390)
+        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                accept(activity, HintCommand.Hello("s-s2-repeat", 1))
+                accept(activity, HintCommand.Sync("sync-s2-repeat", 0, 1_000_000,
+                    System.nanoTime() + 120_000_000_000L))
+                accept(activity, HintCommand.Show("s-s2-repeat", 1, sequence = 1, hintId = "h-s2-short", revision = 1,
+                    syncId = "sync-s2-repeat", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = "第一句"))
+                accept(activity, HintCommand.Show("s-s2-repeat", 1, sequence = 2, hintId = "h-s2-repeat", revision = 1,
+                    syncId = "sync-s2-repeat", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = longText))
+            }
+            settle(900)
+            key(KeyEvent.KEYCODE_ENTER)
+            var revealTarget = 0
+            scenario.onActivity { activity ->
+                assertTrue("the long answer must be scrollable before paging", activity.maxScrollY() > 0)
+                assertTrue("ENTER must pin the reading position", activity.isPinnedForProbe())
+                revealTarget = activity.lastMessageTopForProbe().coerceAtMost(activity.maxScrollY())
+                assertTrue("the newest line must be below the list top, saw $revealTarget", revealTarget > 0)
+            }
+            // Page to the top so a restored position is demonstrably not the reveal target.
+            repeat(6) { key(KeyEvent.KEYCODE_DPAD_UP) }
+            var paged = 0
+            scenario.onActivity { activity ->
+                paged = activity.scrollOffsetY()
+                assertTrue("the page keys must move away from the newest line, saw $paged", paged < revealTarget)
+            }
+            // Same hint id and text; only the revision is newer, so ConversationLog replaces an equal entry.
+            scenario.onActivity { activity ->
+                accept(activity, HintCommand.Show("s-s2-repeat", 1, sequence = 3, hintId = "h-s2-repeat", revision = 2,
+                    syncId = "sync-s2-repeat", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = longText))
+            }
+            settle(900)
+            scenario.onActivity { activity ->
+                val expected = activity.lastMessageTopForProbe().coerceAtMost(activity.maxScrollY())
+                assertTrue("the pin must survive the reveal", activity.isPinnedForProbe())
+                assertEquals("an identical accepted SHOW must reveal the newest line again, not restore $paged",
+                    expected, activity.scrollOffsetY())
+            }
+        }
+    }
+
     @Test
     fun aBackWhileBusyWithADeadLinkExitsInsteadOfTrappingTheWearer() {
         // A STOP that could not be sent is not an interrupt: the phone cannot clear the level, so keeping the window

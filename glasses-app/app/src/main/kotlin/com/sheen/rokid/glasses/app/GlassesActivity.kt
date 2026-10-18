@@ -118,8 +118,9 @@ class GlassesActivity : Activity(), PanelPort {
      * starts. This is the "new content first" rule - it applies while pinned as well, because a pin is a reading
      * position, not a reason for the next answer to stay hidden.
      *
-     * Detected here from the published model's entries/live id, because "bring into view" is a scroll decision this
-     * view owns; the controller only says what the content is.
+     * Set from the controller-owned [PanelModel.contentRevision], because "bring into view" is a scroll decision this
+     * view owns; the controller only says that the content is new. Comparing entries directly would miss a replacement
+     * that leaves the stored list equal (same hint id/text with a higher revision, or a repeated utterance).
      */
     private var newEntryPending = false
 
@@ -321,12 +322,12 @@ class GlassesActivity : Activity(), PanelPort {
             stopTicker()
             userReadPaused = false
             newEntryPending = false
-        } else if (previous == null ||
-            model.entries != previous.entries ||
-            (model.liveEntryId != null && model.liveEntryId != previous.liveEntryId)
-        ) {
+        } else if (previous?.contentRevision != model.contentRevision) {
             // New content first, even while pinned: the pin is a reading position, not a reason for the next answer
-            // to stay hidden (P4). A retirement changes the live id to null and is deliberately not a reveal.
+            // to stay hidden (P4). The controller increments `contentRevision` for every accepted SHOW and every
+            // stored selected-route SAID - including a replacement that leaves the entry list equal (identical
+            // text with a higher revision, or a repeated utterance). A retirement does not increment, so it is
+            // deliberately not a reveal.
             newEntryPending = true
         }
 

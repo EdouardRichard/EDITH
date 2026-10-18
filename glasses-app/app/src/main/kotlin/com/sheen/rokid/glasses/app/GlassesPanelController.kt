@@ -42,6 +42,15 @@ data class PanelModel(
     val route: AssistantRoute,
     val entries: List<ConversationEntry>,
     val liveEntryId: String?,
+    /**
+     * Monotonic "new content" counter, owned by the controller.
+     *
+     * Incremented on **every accepted SHOW** and **every stored SAID for the selected route**, even when the resulting
+     * [ConversationEntry] replaces an equal one (same hint id/text with a newer revision, or a replacement utterance).
+     * The view reveals on a change of this field rather than on entry inequality, because the pre-extraction Activity
+     * revealed on every accepted update and the content can be equal while the event is still new.
+     */
+    val contentRevision: Long,
     /** The official status (0–7) once Task 12/13/17 supplies one; null means "no status model yet". */
     val status: OfficialStatus?,
     /** True while no route is working (the transitional form of official `showIdleStatus`). */
@@ -125,6 +134,14 @@ class GlassesPanelController(
 
     /** The entry id of the live hint; null means nothing is live now (the conversation itself is not erased). */
     private var liveEntryId: String? = null
+
+    /**
+     * How many content updates have been accepted; see [PanelModel.contentRevision].
+     *
+     * A SHOW or selected-route SAID that replaces an equal entry increments this even though [ConversationLog]
+     * returns the same list, so the view can still tell "new content arrived" from "nothing changed".
+     */
+    private var contentRevision = 0L
 
     /** Whether a deadline is already armed for the current busy spell; a repeat of the level must not push it back. */
     private var busyDeadlineArmed = false
@@ -259,6 +276,9 @@ class GlassesPanelController(
         // A SAID for the route that is not on screen is recorded but must not move the current view: only a SHOW
         // changes the route, and its render will bring the updated conversation in then.
         if (command.route == order.selected()) {
+            // A stored replacement is still an accepted update even when `ConversationLog` returns the same list; the
+            // old Activity revealed for every stored selected-route SAID, so the revision must move with it.
+            if (stored) contentRevision++
             renderModel()
         }
     }
@@ -301,6 +321,10 @@ class GlassesPanelController(
             // The display follows what arrived. Without this the wearer reading one conversation would never see a
             // hint filed under the other, which is precisely the failure the route tags exist to prevent.
             order.show(displayed.route)
+            // Every accepted SHOW is new content, even when the log replaces an equal entry (same hint id/text with a
+            // newer revision): the old Activity revealed unconditionally, and the view needs a signal that survives
+            // entry equality.
+            contentRevision++
         }
         applyAndRender()
     }
@@ -386,6 +410,7 @@ class GlassesPanelController(
             route = route,
             entries = entries,
             liveEntryId = liveEntryId,
+            contentRevision = contentRevision,
             // No official status model exists in Task 8; the wire statuses are wired in Task 12/13/17.
             status = null,
             idle = !busyAny,
