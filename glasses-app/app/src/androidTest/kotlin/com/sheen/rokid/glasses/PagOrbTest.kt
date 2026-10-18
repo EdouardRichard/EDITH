@@ -286,6 +286,98 @@ class PagOrbTest {
                     view.historyForProbe().drop(mark))
                 assertFalse("and it stays stopped", view.isRunningForProbe())
             }
+
+            // The no-work hold must not swallow the official IDLE command: it still plays the finish tail once.
+            scenario.onActivity { view.setIdle() }
+            assertTrue("official IDLE must still play finish_last after a no-work hold",
+                awaitNewSegment(scenario, view, "ai_finish_last.pag", mark))
+            scenario.onActivity {
+                assertEquals("finish_last", view.currentTagForProbe())
+                assertEquals("ai_finish_last.pag", view.currentSegmentForProbe())
+                assertEquals(OrbState.IDLE, view.state())
+            }
+
+            // ... and it stays deduped, exactly like an official IDLE with no hold before it.
+            var tailMark = 0
+            scenario.onActivity {
+                tailMark = view.historyForProbe().size
+                view.setIdle()
+            }
+            SystemClock.sleep(200)
+            scenario.onActivity {
+                assertEquals("a repeated official IDLE after a no-work hold must not replay the tail",
+                    emptyList<String>(), view.historyForProbe().drop(tailMark))
+            }
+        }
+    }
+
+    /**
+     * 0.24 S4 Task 18 review N1: a no-work hold keeps the official tag (status 4 needs `listener`), so the next
+     * listening status must resume/replay the held listener clip instead of asking for `listener_first`, which the
+     * official tag gate refuses while the tag is already `listener`.
+     *
+     * This is the view half of the routine repro: close/hide while status 0/1/2 is playing, then come back to a
+     * fresh/no-work model. All of status 0/1/2 must wake the held listener; status 4 must still chain from the kept
+     * `listener` tag, which is why the fix must not blind-reset the tag.
+     */
+    @Test
+    fun aHeldListenerResumesOnTheNextListeningStatusInsteadOfBeingTagGated() {
+        launchHostPanel().use { scenario ->
+            keepScreenOn(scenario)
+            var orb: PagOrbView? = null
+            scenario.onActivity { activity ->
+                val view = PagOrbView(activity)
+                activity.addContentView(view, ViewGroup.LayoutParams(
+                    GlassesPanelSpec.VOICE_ORB_WIDTH_PX,
+                    GlassesPanelSpec.VOICE_ORB_HEIGHT_PX))
+                view.start()
+                view.setStatus(OfficialStatus.LISTENING)
+                orb = view
+            }
+            val view = requireNotNull(orb)
+            assertTrue("the listener chain must reach the looping middle",
+                awaitNewSegment(scenario, view, "ai_listener_middle.pag", 0))
+
+            listOf(OfficialStatus.EMPTY, OfficialStatus.LISTENING, OfficialStatus.ASR).forEach { status ->
+                var mark = 0
+                scenario.onActivity {
+                    view.setState(OrbState.IDLE)
+                    mark = view.historyForProbe().size
+                }
+                scenario.onActivity {
+                    assertFalse("no-work hold stops the listener before $status",
+                        view.isRunningForProbe())
+                    assertEquals("the held tag stays the official listener", "listener",
+                        view.currentTagForProbe())
+                    assertEquals("ai_listener_middle.pag", view.currentSegmentForProbe())
+                }
+
+                scenario.onActivity { view.setStatus(status) }
+                scenario.onActivity {
+                    assertTrue("$status must resume the held listener, not be tag-gated",
+                        view.isRunningForProbe())
+                    assertEquals("ai_listener_middle.pag", view.currentSegmentForProbe())
+                    assertEquals("listener", view.currentTagForProbe())
+                    assertEquals(OrbState.LISTENING, view.state())
+                    assertFalse("$status must not restart from the gated listener_first",
+                        view.historyForProbe().drop(mark).contains("ai_listener_first.pag"))
+                }
+            }
+
+            // The tag is kept on purpose: status 4 still hands the listener over to the thought chain.
+            var mark = 0
+            scenario.onActivity {
+                view.setState(OrbState.IDLE)
+                mark = view.historyForProbe().size
+                view.setStatus(OfficialStatus.ASR_END)
+            }
+            assertTrue("status 4 must still chain from the kept listener tag",
+                awaitNewSegment(scenario, view, "ai_think_middle.pag", mark))
+            scenario.onActivity {
+                assertEquals("the status-4 chain",
+                    listOf("ai_listener_last.pag", "ai_think_first.pag", "ai_think_middle.pag"),
+                    view.historyForProbe().drop(mark))
+            }
         }
     }
 

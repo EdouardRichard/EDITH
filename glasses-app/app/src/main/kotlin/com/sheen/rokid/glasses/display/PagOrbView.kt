@@ -19,7 +19,9 @@ import org.libpag.PAGView
  *   allow is ignored - the table is a target chain, not a forced jump (spec §3.4).
  * - `setIdle` is **only** the official `showIdleStatus`/`IDLE` command (finish tail, then stop). The no-work
  *   `OrbState.IDLE` path (`setState`) stops/holds the current frame and never loads the tail (spec §5.6:353); the host
- *   re-renders the same model, so repeated no-work idle requests are deduped.
+ *   re-renders the same model, so repeated no-work idle requests are deduped. The hold keeps the official tag and
+ *   marks a listener clip suspended: the next status 0/1/2 resumes it instead of being refused by the `listener_first`
+ *   tag gate (review N1). The tag is never reset, so status 4's `listener` gate still works.
  * - `first`/`last` clips play once and `middle` clips loop (`repeatCount` 1/0, the official values).
  * - `start`/`stop` are the host window's visibility: a stopped once clip resumes from where it paused. A stopped
  *   middle resumes too; an ended tail does not replay just because the window came back.
@@ -67,6 +69,16 @@ class PagOrbView internal constructor(
     @Volatile
     private var ended: Boolean = false
 
+    /**
+     * 0.24 S4 Task 18 review N1: a no-work hold stopped a listener clip but the official tag was deliberately kept
+     * (`listener`), because status 4's `loadingGif()` gate needs it. While this is set, the next listening status must
+     * resume that held listener (the current `listener_first`/`listener_middle` segment) instead of asking for
+     * `listener_first`, which the official gate refuses while the tag is already `listener`. Cleared by the resume and
+     * by any successful segment load; never by resetting [tag].
+     */
+    @Volatile
+    private var held: Boolean = false
+
     /** The four-state probe shape, kept for the existing panel probes and the fallback view. */
     @Volatile
     private var orbState: OrbState = OrbState.IDLE
@@ -100,6 +112,12 @@ class PagOrbView internal constructor(
         fallbackView?.setState(orbState)
         if (lastRequest == status) return
         lastRequest = status
+        // 0.24 S4 Task 18 review N1: a no-work hold leaves the official tag at `listener`; waking the listener must
+        // resume the paused clip, not be refused by the `!listener` gate that guards a fresh listener_first load.
+        if (held && OrbPagChain.entryFor(status) == OrbPagChain.Segment.LISTENER_FIRST) {
+            resumeHeldListener()
+            return
+        }
         apply(OrbPagChain.entryFor(status))
     }
 
@@ -135,6 +153,11 @@ class PagOrbView internal constructor(
             OrbState.ANSWERING -> OfficialStatus.ANSWERING
             // IDLE is handled above: no-work idle has no official segment.
             OrbState.IDLE -> return
+        }
+        // The legacy path gets the same N1 wake-up: a held listener resumes rather than hitting the listener_first gate.
+        if (held && OrbPagChain.entryFor(status) == OrbPagChain.Segment.LISTENER_FIRST) {
+            resumeHeldListener()
+            return
         }
         apply(OrbPagChain.entryFor(status))
     }
@@ -224,8 +247,30 @@ class PagOrbView internal constructor(
         lastRequest = NO_WORK_IDLE_REQUEST
         playing = false
         ended = true
+        // N1: keep the official tag (status 4 needs `listener`) and remember that the paused clip is a listener. Only
+        // a real listener segment can be woken by the next 0/1/2 status; other tags keep the official gates.
+        held = pagView != null && tag == OrbPagChain.TAG_LISTENER
         pagView?.stop()
-        Log.i(TAG, "PAG_IDLE_HOLD tag=$tag segment=${segmentAsset ?: "none"}")
+        Log.i(TAG, "PAG_IDLE_HOLD tag=$tag segment=${segmentAsset ?: "none"} held=$held")
+    }
+
+    /**
+     * 0.24 S4 Task 18 review N1: wake the listener clip a no-work hold suspended.
+     *
+     * The renderer was paused, so `play()` resumes from the held position; no clip is reloaded and the official tag is
+     * untouched. When the window is hidden the clip stays paused here and the later [start] resumes it because [ended]
+     * is cleared. This is deliberately not a tag reset: status 4's `loadingGif()` still needs `tag=listener`.
+     */
+    private fun resumeHeldListener() {
+        held = false
+        ended = false
+        playing = false
+        val pag = pagView ?: return
+        if (running) {
+            pag.play()
+            playing = true
+        }
+        Log.i(TAG, "PAG_HELD_RESUME tag=$tag segment=${segmentAsset ?: "none"} running=$running")
     }
 
     /**
@@ -259,6 +304,8 @@ class PagOrbView internal constructor(
         if (history.size > HISTORY_LIMIT) history.removeFirst()
         playing = false
         ended = false
+        // Any real load supersedes a no-work hold: there is no paused listener left to wake.
+        held = false
         Log.i(TAG, "PAG_SEGMENT ${segment.asset} tag=$tag repeat=${segment.repeatCount} running=$running")
         if (running) {
             pag.play()
@@ -280,6 +327,7 @@ class PagOrbView internal constructor(
         pagView?.let { view -> runCatching { removeView(view) } }
         addView(voice, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         playing = false
+        held = false
         Log.e(TAG, "PAG_FALLBACK voice_orb=on state=${orbState.name}")
     }
 

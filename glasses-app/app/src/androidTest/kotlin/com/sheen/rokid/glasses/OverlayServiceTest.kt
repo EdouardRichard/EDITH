@@ -10,6 +10,8 @@ import android.os.IBinder
 import android.provider.Settings
 import android.view.Gravity
 import android.view.KeyEvent
+import android.view.View
+import android.view.ViewGroup
 import android.view.WindowManager
 import androidx.lifecycle.Lifecycle
 import androidx.test.core.app.ActivityScenario
@@ -18,6 +20,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.glasses.app.GlassesOverlayService
+import com.sheen.rokid.glasses.display.PagOrbView
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.output.OfficialConversation
@@ -616,6 +619,73 @@ class OverlayServiceTest {
     }
 
     /**
+     * 0.24 S4 Task 18 review N1: closing the panel while the official listener loops, then reopening with
+     * `PANEL_OPEN`, leaves the fresh/no-work model holding the official `listener` tag. The next `STATE` 1/2 must
+     * resume that held listener; `listener_first` is tag-gated while the listener tag is already current, so the orb
+     * would otherwise stay frozen until status 4.
+     *
+     * This drives the production overlay service (not a standalone view), so the close/reopen reset sequence that
+     * creates the held state is the real one.
+     */
+    @Test
+    fun panelOpenAfterClosingWhileListeningResumesTheHeldListenerOnTheNextState() {
+        val service = startAndBind()
+        service.setSenderForProbe { json -> sentJson += json; true }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-held-listener", 1)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.PanelOpen("s-held-listener", 1, AssistantRoute.WAKE)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.State("s-held-listener", 1, AssistantRoute.WAKE, turnId = "t-held",
+                    status = OfficialStatus.LISTENING.wire, sequence = 1)))
+        }
+        waitUntil("PANEL_SHOWN") { uiEvents().any { it is HintCommand.PanelShown } }
+        var orb: PagOrbView? = null
+        onMain { orb = findPagOrb(service.overlayViewForProbe()) }
+        val view = requireNotNull(orb) { "the production overlay must contain the PAG orb" }
+        waitUntil("the listener must reach the looping middle") {
+            onMain { view.currentSegmentForProbe() } == "ai_listener_middle.pag"
+        }
+        assertEquals("listener", onMain { view.currentTagForProbe() })
+
+        var sequence = 1L
+        for (status in listOf(OfficialStatus.ASR, OfficialStatus.LISTENING)) {
+            // Close while the listener is on screen: the window hides and the conversation cache is cleared.
+            instrumentation.runOnMainSync { service.hidePanel() }
+            waitUntil("the overlay is hidden") { !onMain { service.overlayShownForProbe() } }
+
+            // Reopen: PANEL_OPEN resets to an empty model, whose no-work hold keeps the official listener tag.
+            instrumentation.runOnMainSync {
+                service.acceptCommand(HintWireCodec.encode(
+                    HintCommand.PanelOpen("s-held-listener", 1, AssistantRoute.WAKE)))
+            }
+            waitUntil("the reopened overlay is visible") { onMain { service.overlayShownForProbe() } }
+            waitUntil("the reopened empty panel holds the listener") {
+                onMain { view.currentTagForProbe() } == "listener" &&
+                    onMain { view.currentSegmentForProbe() } == "ai_listener_middle.pag" &&
+                    !onMain { view.isRunningForProbe() }
+            }
+            val historyAtHold = onMain { view.historyForProbe() }
+
+            sequence += 1
+            instrumentation.runOnMainSync {
+                service.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-held-listener", 1, AssistantRoute.WAKE, turnId = "t-held",
+                        status = status.wire, sequence = sequence)))
+            }
+            waitUntil("STATE ${status.wire} must resume the held listener, not be tag-gated") {
+                onMain { view.isRunningForProbe() }
+            }
+            assertEquals("the held listener stays loaded", "ai_listener_middle.pag",
+                onMain { view.currentSegmentForProbe() })
+            assertEquals("the official listener tag is kept", "listener",
+                onMain { view.currentTagForProbe() })
+            assertFalse("STATE ${status.wire} must not restart from the gated listener_first",
+                onMain { view.historyForProbe().drop(historyAtHold.size).contains("ai_listener_first.pag") })
+        }
+    }
+
+    /**
      * Task 11 fix round: the re-announce is route-scoped. A `PANEL_OPEN` for another route while the WAKE window is up
      * must not claim that other route is shown to the phone (that would let Task 12 start a window for a panel the
      * wearer does not have), and must not reset the visible window either.
@@ -789,6 +859,18 @@ class OverlayServiceTest {
 
     private fun uiEvents(): List<HintCommand> = synchronized(sentJson) {
         sentJson.mapNotNull { json -> HintWireCodec.decode(json) }
+    }
+
+    /** Finds the panel's PAG orb in the service's real overlay view tree. */
+    private fun findPagOrb(view: View?): PagOrbView? {
+        if (view == null) return null
+        if (view is PagOrbView) return view
+        if (view is ViewGroup) {
+            for (index in 0 until view.childCount) {
+                findPagOrb(view.getChildAt(index))?.let { return it }
+            }
+        }
+        return null
     }
 
     private fun <T> onMain(block: () -> T): T {
