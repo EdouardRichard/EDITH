@@ -71,12 +71,17 @@ class GlassHintController(
             // the phone, which is the side that can compute the interval. The glasses learn the result from
             // SYNC, so neither message changes local state here.
             //
-            // SAID and BUSY are Phase C's conversation traffic. They are deliberately **not** this class's business:
-            // it owns the render/expiry state machine for one hint, while the conversation buffers and the working
-            // indicator live in the view (see `edith.glasses`). Keeping them out is what lets every ordering and
-            // expiry rule above stay testable as plain JVM behaviour with no notion of a conversation.
+            // SAID and BUSY are Phase C's conversation traffic, and 0.24's STATE/IDLE/ASR/ANSWER/TOOL/CLOSE/
+            // PIN/PANEL_*/UI_* are the official conversation traffic. They are deliberately **not** this class's
+            // business: it owns the render/expiry state machine for one hint, while the conversation buffers, the
+            // panel lifecycle and the working indicator live in the view (see `edith.glasses`). Keeping them out is
+            // what lets every ordering and expiry rule above stay testable as plain JVM behaviour with no notion of a
+            // conversation.
             is HintCommand.Ping, is HintCommand.Pong, is HintCommand.Ack,
-            is HintCommand.Said, is HintCommand.Busy, is HintCommand.Stop -> Unit
+            is HintCommand.Said, is HintCommand.Busy, is HintCommand.Stop,
+            is HintCommand.State, is HintCommand.Idle, is HintCommand.Asr, is HintCommand.Answer,
+            is HintCommand.Tool, is HintCommand.Close, is HintCommand.Pin, is HintCommand.PanelOpen,
+            is HintCommand.PanelShown, is HintCommand.UiReady, is HintCommand.UiClosed -> Unit
         }
     }
 

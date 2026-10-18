@@ -2,6 +2,7 @@ package com.sheen.rokid.output
 
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.OutputStatus
+import com.sheen.rokid.contracts.ToolPhase
 
 /**
  * Versioned hint wire shared by the phone and the glasses CustomApp (wire version 1).
@@ -65,6 +66,72 @@ sealed interface HintCommand {
      * against the session it established before it cancels anything.
      */
     data class Stop(val sessionId: String, val generation: Long) : HintCommand
+
+    /**
+     * A status level for [route] (0.24 spec §5.4, official status 0–7).
+     *
+     * `status` 0 is the official `showNoneView` — **not** idle; IDLE is its own command because it also finishes the
+     * current item and hides the Hi/thinking/"…" rows. [sequence] shares IDLE's domain: a later status for the same
+     * turn replaces an earlier one, and a state older than the last sequence the glasses applied is dropped there.
+     */
+    data class State(val sessionId: String, val generation: Long, val route: AssistantRoute,
+        val turnId: String, val status: Int, val sequence: Long) : HintCommand
+
+    /**
+     * The official `showIdleStatus` for [route]: hide Hi/thinking/"…", finish the current item, keep the panel and its
+     * content. It does not open a listening turn and carries the same [sequence] domain as [State].
+     */
+    data class Idle(val sessionId: String, val generation: Long, val route: AssistantRoute,
+        val sequence: Long) : HintCommand
+
+    /**
+     * A live user-transcript increment for [route]; the final utterance still travels as [Said].
+     *
+     * [revision] is monotonic within [turnId]. The encoder keeps only the last
+     * [MAX_TEXT_CODEPOINTS] code points (without splitting a surrogate pair), because this is a display increment:
+     * the glasses accept what arrives instead of rejecting an otherwise valid row for length.
+     */
+    data class Asr(val sessionId: String, val generation: Long, val route: AssistantRoute,
+        val turnId: String, val revision: Long, val text: String) : HintCommand
+
+    /**
+     * A live answer-text increment for [route]; the final answer still travels as [Show].
+     *
+     * [hintId] ties the increment to the final hint, and [revision] is monotonic within [turnId]. Text is trimmed
+     * to the last [MAX_TEXT_CODEPOINTS] code points at encode time, like [Asr].
+     */
+    data class Answer(val sessionId: String, val generation: Long, val route: AssistantRoute,
+        val turnId: String, val hintId: String, val revision: Long, val text: String) : HintCommand
+
+    /** A tool row for [route]: [phase] is spelled `start`/`end` on the wire. */
+    data class Tool(val sessionId: String, val generation: Long, val route: AssistantRoute,
+        val turnId: String, val phase: ToolPhase, val label: String) : HintCommand
+
+    /**
+     * Close the panel for [route] and clear the glasses cache; a `null` [route] means every route.
+     *
+     * The wire spells the whole-panel close as the literal `ALL`, which is not an [AssistantRoute] value.
+     */
+    data class Close(val sessionId: String, val generation: Long, val route: AssistantRoute?) : HintCommand
+
+    /**
+     * Glasses -> phone: the wearer pinned the conversation named by [route].
+     *
+     * One-way by design — once pinned, the panel is not unpinned by a message — so there is no boolean on the wire.
+     */
+    data class Pin(val sessionId: String, val generation: Long, val route: AssistantRoute) : HintCommand
+
+    /** Show the panel for [route] without changing its status. */
+    data class PanelOpen(val sessionId: String, val generation: Long, val route: AssistantRoute) : HintCommand
+
+    /** Glasses -> phone: the panel for [route] is visible; the phone may start its listening timer. */
+    data class PanelShown(val sessionId: String, val generation: Long, val route: AssistantRoute) : HintCommand
+
+    /** Glasses -> phone: the panel service is alive and can receive commands. Not route-scoped. */
+    data class UiReady(val sessionId: String, val generation: Long) : HintCommand
+
+    /** Glasses -> phone: the panel for [route] is hidden; the resident service is still alive. */
+    data class UiClosed(val sessionId: String, val generation: Long, val route: AssistantRoute) : HintCommand
 }
 
 object HintWireCodec {
@@ -170,6 +237,89 @@ object HintWireCodec {
                 fields["sessionId"] = command.sessionId
                 fields["generation"] = command.generation
             }
+            is HintCommand.State -> {
+                fields["command"] = "STATE"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["route"] = command.route.name
+                fields["turnId"] = command.turnId
+                fields["status"] = command.status
+                fields["sequence"] = command.sequence
+            }
+            is HintCommand.Idle -> {
+                fields["command"] = "IDLE"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["route"] = command.route.name
+                fields["sequence"] = command.sequence
+            }
+            is HintCommand.Asr -> {
+                fields["command"] = "ASR"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["route"] = command.route.name
+                fields["turnId"] = command.turnId
+                fields["revision"] = command.revision
+                fields["text"] = command.text.takeLastCodePoints(MAX_TEXT_CODEPOINTS)
+            }
+            is HintCommand.Answer -> {
+                fields["command"] = "ANSWER"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["route"] = command.route.name
+                fields["turnId"] = command.turnId
+                fields["hintId"] = command.hintId
+                fields["revision"] = command.revision
+                fields["text"] = command.text.takeLastCodePoints(MAX_TEXT_CODEPOINTS)
+            }
+            is HintCommand.Tool -> {
+                fields["command"] = "TOOL"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["route"] = command.route.name
+                fields["turnId"] = command.turnId
+                fields["phase"] = when (command.phase) {
+                    ToolPhase.START -> "start"
+                    ToolPhase.END -> "end"
+                }
+                fields["label"] = command.label
+            }
+            is HintCommand.Close -> {
+                fields["command"] = "CLOSE"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                // `null` means every route; "ALL" is a wire literal, not an AssistantRoute name.
+                fields["route"] = command.route?.name ?: "ALL"
+            }
+            is HintCommand.Pin -> {
+                fields["command"] = "PIN"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["route"] = command.route.name
+            }
+            is HintCommand.PanelOpen -> {
+                fields["command"] = "PANEL_OPEN"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["route"] = command.route.name
+            }
+            is HintCommand.PanelShown -> {
+                fields["command"] = "PANEL_SHOWN"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["route"] = command.route.name
+            }
+            is HintCommand.UiReady -> {
+                fields["command"] = "UI_READY"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+            }
+            is HintCommand.UiClosed -> {
+                fields["command"] = "UI_CLOSED"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["route"] = command.route.name
+            }
         }
         val json = buildString {
             append('{')
@@ -193,8 +343,8 @@ object HintWireCodec {
     fun decode(json: String): HintCommand? {
         if (json.isBlank() || json.length > MAX_MESSAGE_CHARS) return null
         val fields = parseFlatObject(json) ?: return null
-        if (fields["wireVersion"] != WIRE_VERSION.toString()) return null
-        return when (val command = fields["command"]) {
+        if (fields.rawNumber("wireVersion") != WIRE_VERSION.toString()) return null
+        return when (val command = fields.text("command")) {
             "HELLO" -> HintCommand.Hello(
                 sessionId = fields.text("sessionId") ?: return null,
                 generation = fields.long("generation") ?: return null)
@@ -257,7 +407,7 @@ object HintWireCodec {
                 sessionId = fields.text("sessionId") ?: return null,
                 generation = fields.long("generation") ?: return null,
                 route = fields.text("route")?.let { AssistantRoute.fromWire(it) } ?: return null,
-                busy = when (fields.text("busy")) {
+                busy = when (fields.rawNumber("busy")) {
                     "1" -> true
                     "0" -> false
                     else -> return null
@@ -265,6 +415,79 @@ object HintWireCodec {
             "STOP" -> HintCommand.Stop(
                 sessionId = fields.text("sessionId") ?: return null,
                 generation = fields.long("generation") ?: return null)
+            "STATE" -> {
+                val status = fields.int("status") ?: return null
+                if (status !in 0..7) return null
+                HintCommand.State(
+                    sessionId = fields.id("sessionId") ?: return null,
+                    generation = fields.long("generation") ?: return null,
+                    route = fields.requiredRoute() ?: return null,
+                    turnId = fields.id("turnId") ?: return null,
+                    status = status,
+                    sequence = fields.nonNegativeLong("sequence") ?: return null)
+            }
+            "IDLE" -> HintCommand.Idle(
+                sessionId = fields.id("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                route = fields.requiredRoute() ?: return null,
+                sequence = fields.nonNegativeLong("sequence") ?: return null)
+            "ASR" -> HintCommand.Asr(
+                sessionId = fields.id("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                route = fields.requiredRoute() ?: return null,
+                turnId = fields.id("turnId") ?: return null,
+                revision = fields.nonNegativeLong("revision") ?: return null,
+                text = fields.text("text") ?: return null)
+            "ANSWER" -> HintCommand.Answer(
+                sessionId = fields.id("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                route = fields.requiredRoute() ?: return null,
+                turnId = fields.id("turnId") ?: return null,
+                hintId = fields.id("hintId") ?: return null,
+                revision = fields.nonNegativeLong("revision") ?: return null,
+                text = fields.text("text") ?: return null)
+            "TOOL" -> {
+                val phase = when (fields.text("phase")) {
+                    "start" -> ToolPhase.START
+                    "end" -> ToolPhase.END
+                    else -> return null
+                }
+                HintCommand.Tool(
+                    sessionId = fields.id("sessionId") ?: return null,
+                    generation = fields.long("generation") ?: return null,
+                    route = fields.requiredRoute() ?: return null,
+                    turnId = fields.id("turnId") ?: return null,
+                    phase = phase,
+                    label = fields.text("label") ?: return null)
+            }
+            "CLOSE" -> {
+                val namedRoute = fields.text("route") ?: return null
+                val route = if (namedRoute == "ALL") null
+                    else (AssistantRoute.fromWire(namedRoute) ?: return null)
+                HintCommand.Close(
+                    sessionId = fields.id("sessionId") ?: return null,
+                    generation = fields.long("generation") ?: return null,
+                    route = route)
+            }
+            "PIN" -> HintCommand.Pin(
+                sessionId = fields.id("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                route = fields.requiredRoute() ?: return null)
+            "PANEL_OPEN" -> HintCommand.PanelOpen(
+                sessionId = fields.id("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                route = fields.requiredRoute() ?: return null)
+            "PANEL_SHOWN" -> HintCommand.PanelShown(
+                sessionId = fields.id("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                route = fields.requiredRoute() ?: return null)
+            "UI_READY" -> HintCommand.UiReady(
+                sessionId = fields.id("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null)
+            "UI_CLOSED" -> HintCommand.UiClosed(
+                sessionId = fields.id("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                route = fields.requiredRoute() ?: return null)
             else -> null
         }
     }
@@ -299,6 +522,37 @@ object HintWireCodec {
             }
             is HintCommand.Busy -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
             is HintCommand.Stop -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+            is HintCommand.State -> {
+                require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+                require(command.turnId.isNotBlank()) { "TURN_ID_REQUIRED" }
+                require(command.status in 0..7) { "STATUS_OUT_OF_RANGE" }
+                require(command.sequence >= 0) { "SEQUENCE_MUST_BE_NON_NEGATIVE" }
+            }
+            is HintCommand.Idle -> {
+                require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+                require(command.sequence >= 0) { "SEQUENCE_MUST_BE_NON_NEGATIVE" }
+            }
+            is HintCommand.Asr -> {
+                require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+                require(command.turnId.isNotBlank()) { "TURN_ID_REQUIRED" }
+                require(command.revision >= 0) { "REVISION_MUST_BE_NON_NEGATIVE" }
+            }
+            is HintCommand.Answer -> {
+                require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+                require(command.turnId.isNotBlank()) { "TURN_ID_REQUIRED" }
+                require(command.hintId.isNotBlank()) { "HINT_ID_REQUIRED" }
+                require(command.revision >= 0) { "REVISION_MUST_BE_NON_NEGATIVE" }
+            }
+            is HintCommand.Tool -> {
+                require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+                require(command.turnId.isNotBlank()) { "TURN_ID_REQUIRED" }
+            }
+            is HintCommand.Close -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+            is HintCommand.Pin -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+            is HintCommand.PanelOpen -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+            is HintCommand.PanelShown -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+            is HintCommand.UiReady -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+            is HintCommand.UiClosed -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
         }
     }
 
@@ -309,25 +563,64 @@ object HintWireCodec {
      * existed, and every such message was a wake hint, so it reads as [AssistantRoute.WAKE]; a `route` field whose
      * value this build does not know is a message we cannot file correctly, and the only honest answer is to refuse
      * it. Callers spell that as `fields.route() ?: return null`.
+     *
+     * The 0.24 commands never predate the field, so they use [requiredRoute] instead: a missing `route` there is a
+     * malformed message, not a wake hint.
      */
-    private fun Map<String, String>.route(): AssistantRoute? {
-        val named = get("route") ?: return AssistantRoute.WAKE
-        return AssistantRoute.fromWire(named)
+    private fun Map<String, WireField>.route(): AssistantRoute? {
+        val field = get("route") ?: return AssistantRoute.WAKE
+        if (!field.quoted) return null
+        return AssistantRoute.fromWire(field.value)
     }
 
+    /** A route that must be present and understood; `null` for a missing or unknown one. */
+    private fun Map<String, WireField>.requiredRoute(): AssistantRoute? =
+        text("route")?.let { AssistantRoute.fromWire(it) }
+
+    /** A text identifier that must not be blank. */
+    private fun Map<String, WireField>.id(key: String): String? =
+        text(key)?.takeIf { it.isNotBlank() }
+
+    private fun Map<String, WireField>.nonNegativeLong(key: String): Long? =
+        long(key)?.takeIf { it >= 0 }
+
+    /** A JSON number's literal text; a quoted number is a mistyped field, not an integer. */
+    private fun Map<String, WireField>.rawNumber(key: String): String? =
+        get(key)?.takeIf { !it.quoted }?.value
+
+    private fun Map<String, WireField>.long(key: String): Long? = rawNumber(key)?.toLongOrNull()
+    private fun Map<String, WireField>.int(key: String): Int? = rawNumber(key)?.toIntOrNull()
+    private fun Map<String, WireField>.text(key: String): String? =
+        get(key)?.takeIf { it.quoted }?.value
+
     private fun String.codePointCount(): Int = codePointCount(0, length)
+
+    /**
+     * The last [max] code points, never splitting a surrogate pair.
+     *
+     * 0.24 spec §5.4: `ASR`/`ANSWER` are display increments, so the phone sends their tail instead of refusing a long
+     * partial; `SHOW` remains the authoritative full-text path with its own bound.
+     */
+    private fun String.takeLastCodePoints(max: Int): String {
+        val count = codePointCount()
+        if (count <= max) return this
+        return substring(offsetByCodePoints(0, count - max))
+    }
+
+    /** A parsed flat field: [value] is decoded text for a string, or the literal text of an integer. */
+    private data class WireField(val value: String, val quoted: Boolean)
 
     /**
      * Minimal flat-object reader. The wire carries only a flat object of strings and integers, so a full JSON
      * parser is unnecessary surface; anything nested, duplicated or escaped beyond the supported set fails
      * the parse and the caller refuses the message.
      */
-    private fun parseFlatObject(json: String): Map<String, String>? {
+    private fun parseFlatObject(json: String): Map<String, WireField>? {
         val text = json.trim()
         if (text.length < 2 || text.first() != '{' || text.last() != '}') return null
         val body = text.substring(1, text.length - 1)
         if (body.isEmpty()) return emptyMap()
-        val fields = LinkedHashMap<String, String>()
+        val fields = LinkedHashMap<String, WireField>()
         var index = 0
         while (index < body.length) {
             while (index < body.length && body[index] == ',') index++
@@ -394,22 +687,19 @@ object HintWireCodec {
                     }
                     if (index >= body.length) return null
                     index++ // closing quote
-                    fields[key.toString()] = value.toString()
+                    fields[key.toString()] = WireField(value.toString(), quoted = true)
                 }
                 else -> {
                     val start = index
                     if (body.getOrNull(index) == '-') index++
                     while (index < body.length && body[index] in '0'..'9') index++
                     if (index == start) return null // only integers are carried
-                    fields[key.toString()] = body.substring(start, index)
+                    fields[key.toString()] = WireField(body.substring(start, index), quoted = false)
                 }
             }
         }
         return fields
     }
-
-    private fun Map<String, String>.long(key: String): Long? = get(key)?.toLongOrNull()
-    private fun Map<String, String>.text(key: String): String? = get(key)
 
     private fun escape(value: String): String = buildString {
         for (character in value) {
