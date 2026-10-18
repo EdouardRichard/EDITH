@@ -13,6 +13,17 @@
     -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
 
+    <!--
+      0.24 S2 Task 9 (D158): the production default is a foreground service that draws the official panel as a
+      TYPE_APPLICATION_OVERLAY window, so it can appear over another app and while the glasses screen is off. The
+      app-op must be granted by the wearer in settings; nothing here can grant it. specialUse is the only type that
+      describes a resident display service with no media/location/phone category, and S1 measured that this Android 12
+      build accepts it.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
     <application
         android:allowBackup="false"
         android:label="EDITH"
@@ -26,6 +37,12 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!-- The resident panel host; exported=false: only this app starts it. -->
+        <service
+            android:name=".app.GlassesOverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse" />
     </application>
 
 </manifest>

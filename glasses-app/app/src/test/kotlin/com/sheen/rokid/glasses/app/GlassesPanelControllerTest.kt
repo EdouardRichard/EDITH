@@ -535,6 +535,42 @@ class GlassesPanelControllerTest {
         assertTrue(harness.port.models.isEmpty())
     }
 
+    // ---------------------------------------------------------------- close/reset (0.24 S2 Task 9)
+
+    @Test
+    fun resetForCloseClearsTheConversationTheGatesTheBusyLevelThePinAndTheRevision() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.show()
+        harness.said(sequence = 2, entryId = "said-after", text = "之后说的话")
+        harness.busy(busy = true)
+        harness.controller.onKey(KEYCODE_ENTER, ACTION_DOWN)
+        val before = harness.port.lastModel()
+        assertEquals("h-1", before.liveEntryId)
+        assertTrue("the pin was set before the close", before.pinned)
+        assertFalse("a busy level was reported before the close", before.idle)
+        assertEquals(2, before.entries.size)
+        assertTrue("the accepted content moved the reveal counter", before.contentRevision > 0)
+
+        harness.controller.resetForClose()
+
+        val after = harness.port.lastModel()
+        assertEquals("a closed panel must not leave the conversation behind", "",
+            harness.controller.conversationText(AssistantRoute.WAKE))
+        assertTrue("no entry survives the close", after.entries.isEmpty())
+        assertNull("no hint is live after the close", after.liveEntryId)
+        assertTrue("the closed panel re-opens idle", after.idle)
+        assertFalse("the reading pin is cleared", after.pinned)
+        assertEquals("the reveal revision restarts with the cache", 0L, after.contentRevision)
+        assertEquals("the session identity survives a panel close; only the cache is cleared", "s-1" to 1L,
+            harness.controller.currentIdentity())
+
+        // The SAID ordering gate is part of the cache: a new window may start its sequence domain at 1 again.
+        harness.said(sequence = 1, entryId = "said-new", text = "新窗口第一句")
+        assertEquals("新窗口第一句", harness.controller.conversationText(AssistantRoute.WAKE))
+    }
+
     @Test
     fun disconnectDropsTheIdentityAndRetiresAVisibleHint() {
         val harness = Harness()

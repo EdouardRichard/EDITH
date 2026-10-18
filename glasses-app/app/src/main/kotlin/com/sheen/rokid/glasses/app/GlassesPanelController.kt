@@ -233,6 +233,27 @@ class GlassesPanelController(
     }
 
     /**
+     * The panel window closed (0.24 S2 Task 9): clear the **conversation cache** so nothing from the closed window can
+     * reappear when the panel is opened again.
+     *
+     * This is deliberately not [disconnect]: the link to the phone survives a panel close, so the session identity is
+     * kept and a later `SHOW` for the same session is still gated against it. Everything the next window must not
+     * inherit is cleared: the per-route log, the selected route/pin, the SAID ordering gate, the busy level, the live
+     * entry id and the reveal counter. The empty model is published so the view is cleared by the same path every
+     * other state change uses.
+     */
+    fun resetForClose() {
+        log.clear()
+        order.reset()
+        saidGate.reset()
+        busyState.reset()
+        liveEntryId = null
+        contentRevision = 0L
+        busyDeadlineArmed = false
+        applyAndRender()
+    }
+
+    /**
      * The session and generation the next command must name, or null before a `HELLO`.
      *
      * The identity stays the hint controller's: a second copy here could disagree with the one the SHOW gate uses.

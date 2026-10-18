@@ -1,8 +1,6 @@
 package com.sheen.rokid.glasses
-import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.glasses.display.HintPresentation
 
-import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
@@ -27,7 +25,7 @@ class HintVisibilityTest {
 
     @Test
     fun aShowBecomesVisibleAndAClearEmptiesTheView() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
                 activity.acceptCommand(HintWireCodec.encode(
@@ -49,7 +47,7 @@ class HintVisibilityTest {
 
     @Test
     fun aShowWithNoMappingIsNotRenderedAtAll() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
                 // No SYNC: the glasses have no mapping for this syncId, so the deadline cannot be trusted.
@@ -65,7 +63,7 @@ class HintVisibilityTest {
 
     @Test
     fun anUndecodableMessageIsIgnoredRatherThanThrown() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 // The bridge callback thread must survive garbage: a throw here would take the session down.
                 assertEquals(false, activity.acceptCommand("not json at all"))
@@ -77,7 +75,7 @@ class HintVisibilityTest {
 
     @Test
     fun aPingIsAcceptedAndLeavesTheViewAlone() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 // The answer itself goes out on the real bridge (no session is live here, so the send is refused and
                 // logged); what this pins is that a PING is understood and never touches the screen.
@@ -99,7 +97,7 @@ class HintVisibilityTest {
      */
     @Test
     fun aHintLongerThanTheLayoutShowsIsObservableAsScrollable() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
                 activity.acceptCommand(HintWireCodec.encode(
@@ -138,7 +136,7 @@ class HintVisibilityTest {
      */
     @Test
     fun anUtteranceLandsOnItsOwnRouteWithoutMovingTheView() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
                 activity.acceptCommand(HintWireCodec.encode(
@@ -160,7 +158,7 @@ class HintVisibilityTest {
     /** A `SHOW` **does** bring its route to the front: that is what makes a proactive hint visible at all. */
     @Test
     fun aShowBringsItsOwnRouteToTheFront() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
                 activity.acceptCommand(HintWireCodec.encode(
@@ -185,7 +183,7 @@ class HintVisibilityTest {
      */
     @Test
     fun aClearRetiresTheLiveHintButKeepsTheConversation() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
                 activity.acceptCommand(HintWireCodec.encode(
@@ -211,7 +209,7 @@ class HintVisibilityTest {
     /** An utterance the gates refuse must not enter the conversation: nobody read it, so it is not part of it. */
     @Test
     fun anUtteranceForAnotherSessionNeverEntersTheConversation() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-1", 1)))
                 activity.acceptCommand(HintWireCodec.encode(

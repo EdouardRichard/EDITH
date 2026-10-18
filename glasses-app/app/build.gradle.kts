@@ -22,6 +22,12 @@ android {
         }
     }
 
+    // 0.24 S2 Task 9: the debug-only Activity test host seam is gated on BuildConfig.DEBUG. AGP 9 no longer generates
+    // BuildConfig unless asked, so the seam (and its release-build guard) would otherwise not compile.
+    buildFeatures {
+        buildConfig = true
+    }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

@@ -1,11 +1,9 @@
 package com.sheen.rokid.glasses
 
 import android.content.Context
-import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
-import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import org.junit.Assert.assertEquals
@@ -39,7 +37,7 @@ class GlassesRouteIsolationTest {
 
     @Test
     fun aProactiveShowNeverMixesWakeContent() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-p6", 1)))
                 activity.acceptCommand(HintWireCodec.encode(

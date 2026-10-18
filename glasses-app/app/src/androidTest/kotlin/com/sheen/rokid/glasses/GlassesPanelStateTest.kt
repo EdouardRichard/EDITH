@@ -1,11 +1,9 @@
 package com.sheen.rokid.glasses
 
 import android.view.ViewGroup
-import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
-import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.glasses.display.GlassesPanelView
 import com.sheen.rokid.glasses.display.OrbState
@@ -52,7 +50,7 @@ class GlassesPanelStateTest {
      */
     @Test
     fun theActivityShowsTheExtractedPanelView() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 val content = requireNotNull(activity.findViewById<ViewGroup>(android.R.id.content)) {
                     "the Activity must have a content view"
@@ -65,7 +63,7 @@ class GlassesPanelStateTest {
 
     @Test
     fun aBusyWakeShowsListeningThenThinkingThenTheAnswer() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 assertEquals("nothing is happening yet", OrbState.IDLE, activity.orbStateForProbe())
                 assertFalse(activity.listeningVisibleForProbe())
@@ -119,7 +117,7 @@ class GlassesPanelStateTest {
 
     @Test
     fun aProactiveTurnThinksOnlyOnItsOwnRoute() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-p3", 1)))
                 activity.acceptCommand(HintWireCodec.encode(
@@ -164,7 +162,7 @@ class GlassesPanelStateTest {
 
     @Test
     fun thePanelCarriesTheOfficialFixedCopy() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 assertEquals(GlassesPanelSpec.COMPLIANCE_TEXT, activity.complianceTextForProbe())
                 assertEquals(GlassesPanelSpec.TIPS_EXIT, activity.tipsTextForProbe())
@@ -174,7 +172,7 @@ class GlassesPanelStateTest {
 
     @Test
     fun theWearersLineShowsTheNewestFourLinesAndAlignsLeft() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-p3", 1)))
                 activity.acceptCommand(HintWireCodec.encode(

@@ -3,7 +3,6 @@ package com.sheen.rokid.glasses
 import android.content.Context
 import android.view.KeyEvent
 import androidx.lifecycle.Lifecycle
-import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
@@ -51,7 +50,7 @@ class GlassesInteractionTest {
 
     @Test
     fun theTickerPinsPagesAndANewSessionClearsTheWindow() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             val longText = buildString {
                 repeat(12) { index -> append("第${index + 1}点：这是用于滚动证据的合成长文本，长度足以超出眼镜列表窗口。") }
             }.take(390)
@@ -168,7 +167,7 @@ class GlassesInteractionTest {
      */
     @Test
     fun aBackWhileBusyStopsWithoutExitingAndIdleBackExits() {
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.setStopSenderForProbe { true }
                 accept(activity, HintCommand.Hello("s-p5-back", 1))
@@ -200,7 +199,7 @@ class GlassesInteractionTest {
         val longText = buildString {
             repeat(12) { index -> append("第${index + 1}点：这是用于翻页证据的合成长文本，长度足以超出眼镜列表窗口。") }
         }.take(390)
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 accept(activity, HintCommand.Hello("s-p4-page", 1))
                 accept(activity, HintCommand.Sync("sync-page", 0, 1_000_000,
@@ -242,7 +241,7 @@ class GlassesInteractionTest {
         val longText = buildString {
             repeat(12) { index -> append("第${index + 1}点：这是用于重复内容证据的合成长文本，长度足以超出眼镜列表窗口。") }
         }.take(390)
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 accept(activity, HintCommand.Hello("s-s2-repeat", 1))
                 accept(activity, HintCommand.Sync("sync-s2-repeat", 0, 1_000_000,
@@ -290,7 +289,7 @@ class GlassesInteractionTest {
     fun aBackWhileBusyWithADeadLinkExitsInsteadOfTrappingTheWearer() {
         // A STOP that could not be sent is not an interrupt: the phone cannot clear the level, so keeping the window
         // open would trap the wearer until the local 60 s bound.
-        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+        launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 activity.setStopSenderForProbe { false }
                 accept(activity, HintCommand.Hello("s-p5-dead", 1))
