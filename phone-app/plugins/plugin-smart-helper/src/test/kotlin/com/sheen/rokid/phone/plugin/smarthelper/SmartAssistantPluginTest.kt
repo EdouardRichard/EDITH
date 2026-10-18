@@ -7,12 +7,18 @@ import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 
 import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
+import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.OutputStateEvent
 import com.sheen.rokid.contracts.OutputStatus
+import com.sheen.rokid.contracts.PinChanged
 import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.contracts.SpeechFinished
+import com.sheen.rokid.contracts.SpeechResult
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.contracts.UserAction
+import com.sheen.rokid.output.OfficialConversation
+import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ConfigSchema
 import com.sheen.rokid.plugin.DeactivationReason
@@ -20,6 +26,7 @@ import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.OutputSubmission
 import com.sheen.rokid.plugin.PluginConfiguration
 import com.sheen.rokid.plugin.PluginLifecycle
 import com.sheen.rokid.plugin.RiskLevel
@@ -759,22 +766,24 @@ class SmartAssistantPluginTest {
         assertEquals(listOf("答案。"), rig.hintTexts)
     }
 
-    @Test fun `D12 a wake followed only by blanks ends insufficient with no utterance after the window`() {
-        val rig = SmartTestRig()
-        rig.activate()
+    @Test fun `S3 blank finals cancel the official window without arming a failure answer`() {
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig(panelVisible = true)
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
 
         rig.plugin.handle(rig.wakeEvent())
         rig.plugin.handle(TranscriptEvent(rig.transcript("", turnId = "asr-wake-1", revision = 0)))
-        // A second blank segment extends the window instead of ending the turn...
-        rig.tick(millis = 9_000)
+        // A second blank segment is still an ASR message: the official handler removes the timeout before its blank
+        // check, so it must stay cancelled rather than being re-armed.
+        rig.tick(9_000)
         rig.plugin.handle(TranscriptEvent(rig.transcript("   ", turnId = "asr-wake-2", revision = 0)))
-        assertTrue(rig.hintTexts.isEmpty(), "a blank final must not end the listening turn")
+        rig.tick(60_000)
 
-        // ...and the window really does expire, after the configured profile's own timeout.
-        rig.tick(millis = 10_000)
-        rig.tick()
+        assertTrue(rig.hintTexts.isEmpty(), "a blank final must never become the 'did not catch it' failure hint")
         assertTrue(rig.model.requests.isEmpty(), "nothing usable was said, so no model request may be made")
-        assertEquals(listOf("我没听清这句请求，再说一次试试。"), rig.hintTexts)
+        assertTrue(display.closes.isEmpty(), "the ASR message cancelled the official window; no timer may close")
+        assertTrue(display.statuses.none { it == OfficialStatus.ASR.wire },
+            "a blank ASR must not publish an empty ASR row (spec §10 item 19)")
     }
 
     @Test fun `D12 a wake-word-only final is ignored and the request that follows still runs`() {
@@ -798,44 +807,38 @@ class SmartAssistantPluginTest {
         assertEquals("asr-request", rig.model.requests.single().turnId)
     }
 
-    @Test fun `D12 a stop during the listening window cancels it without submitting`() {
-        val rig = SmartTestRig()
-        rig.activate()
+    @Test fun `S3 a stop during the official window cancels it without submitting`() {
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig(panelVisible = true)
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
 
         rig.plugin.handle(rig.wakeEvent())
-        assertEquals(1, rig.scheduler.pending(), "the wake must arm exactly one bounded listening window")
-        rig.plugin.handle(TranscriptEvent(rig.transcript("", turnId = "asr-wake", revision = 0)))
-        assertEquals(
-            1,
-            rig.scheduler.pending(),
-            "extending the window replaces it rather than accumulating a second deadline",
-        )
+        assertEquals(1, rig.scheduler.pending(), "the visible-panel wake arms exactly one official window")
         rig.plugin.handle(UserAction(rig.envelope(), UserAction.Action.Stop))
         assertEquals(1, rig.cancels.size, "Stop must clear the pending output turn")
-        assertEquals(0, rig.scheduler.pending(), "Stop must release the armed listening window")
+        assertEquals(0, rig.scheduler.pending(), "Stop must release the official window")
 
-        // Far past the window: the cancelled listening deadline must not fire and nothing may be submitted.
+        // Far past the window: the cancelled deadline must not fire and nothing may be submitted.
         rig.tick(millis = 60_000)
         assertTrue(rig.model.requests.isEmpty(), "a stopped turn must never submit")
         assertTrue(rig.hintTexts.isEmpty(), "a stopped turn must never hint")
+        assertEquals(1, display.idleCalls.size, "STOP shows the official idle and keeps the panel")
+        assertTrue(display.closes.isEmpty())
     }
 
-    @Test fun `D12 the listening window falls back to the documented default when no profile exists`() {
-        val rig = SmartTestRig()
+    @Test fun `S3 the official window does not borrow the model profile timeout`() {
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig(panelVisible = true)
         rig.profile = null
-        rig.activate()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
 
         rig.plugin.handle(rig.wakeEvent())
-        rig.plugin.handle(TranscriptEvent(rig.transcript("", turnId = "asr-wake", revision = 0)))
-
-        // 14 s in, the turn is still listening: the default window is 15 s, not a zero-length one.
-        rig.tick(millis = 14_000)
-        assertTrue(rig.hintTexts.isEmpty(), "a missing profile must not collapse the listening window")
-        // Just past it, the turn ends honestly rather than waiting forever with no utterance at all.
-        rig.tick(millis = 1_100)
-        rig.tick()
-        assertEquals(listOf("我没听清这句请求，再说一次试试。"), rig.hintTexts)
+        rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS - 1)
+        assertTrue(display.closes.isEmpty(), "the official window is 10 s even when no profile can supply a timeout")
+        rig.tick(1)
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
         assertTrue(rig.model.requests.isEmpty())
+        assertTrue(rig.hintTexts.isEmpty())
     }
 
     @Test fun `strict configuration rejects bad levels revisions consent and unknown keys`() {
@@ -855,5 +858,259 @@ class SmartAssistantPluginTest {
         )) {
             assertFailsWith<IllegalArgumentException>("expected rejection for $bad") { rig.plugin.validate(bad) }
         }
+    }
+
+    // ------------------------------------------------- 0.24 S3 (Task 12): official conversation cycle
+
+    /** A rig with the official display port attached, so the cycle's levels and closes are observable. */
+    private fun cycleRig(
+        panelVisible: Boolean = false,
+        continueDialogue: Boolean = false,
+    ): Pair<SmartTestRig, SmartRecordingDisplay> {
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig(panelVisible = panelVisible, continueDialogue = continueDialogue)
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        return rig to display
+    }
+
+    private fun SmartTestRig.displayedAnswer(): String {
+        model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+        plugin.handle(wakeEvent())
+        plugin.handle(TranscriptEvent(transcript("问题")))
+        tick()
+        return output.hints.single().hintId
+    }
+
+    @Test fun `S3 a hidden panel starts the official window only at panel shown`() {
+        val (rig, display) = cycleRig()
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS + 50_000)
+        assertTrue(display.closes.isEmpty(), "the overlay's own start latency is not the wearer's silence")
+        assertTrue(display.states.isEmpty(), "STATE 1 waits until there is a panel to show it on")
+        assertTrue(rig.hintTexts.isEmpty(), "waiting for the panel must not answer anything")
+
+        rig.plugin.onPanelShown(AssistantRoute.WAKE)
+        assertEquals(listOf(OfficialStatus.LISTENING.wire), display.statuses)
+
+        rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS - 1)
+        assertTrue(display.closes.isEmpty(), "9_999 ms is inside the official window")
+        rig.tick(1)
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertTrue(rig.hintTexts.isEmpty(), "the official timeout closes the conversation; it does not submit a hint")
+        assertTrue(rig.model.requests.isEmpty())
+    }
+
+    @Test fun `S3 a visible panel arms the window at wake and displays status one`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+
+        rig.plugin.handle(rig.wakeEvent())
+
+        assertEquals(listOf(OfficialStatus.LISTENING.wire), display.statuses)
+        rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertEquals(1, display.count("working:WAKE"))
+        assertEquals(1, display.count("idle:WAKE"), "the closed turn's busy level must be cleared")
+    }
+
+    @Test fun `S3 a duplicate panel shown refreshes the window without a second state or close`() {
+        val (rig, display) = cycleRig()
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.onPanelShown(AssistantRoute.WAKE)
+
+        rig.tick(9_000)
+        // Task 11 re-announces PANEL_SHOWN; a delayed original can also arrive. Idempotent by contract.
+        rig.plugin.onPanelShown(AssistantRoute.WAKE)
+        rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS - 1)
+        assertTrue(display.closes.isEmpty(), "the duplicate must restart the 10 s window, not fire the first one")
+
+        rig.tick(1)
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertEquals(1, display.statuses.count { it == OfficialStatus.LISTENING.wire })
+        assertEquals(0, rig.scheduler.pending())
+    }
+
+    @Test fun `S3 any ASR message cancels the window even when blank`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+        rig.plugin.handle(rig.wakeEvent())
+        rig.tick(9_000)
+
+        rig.plugin.handle(TranscriptEvent(rig.transcript("", turnId = "asr-wake", revision = 0)))
+        rig.tick(60_000)
+
+        assertTrue(display.closes.isEmpty())
+        assertTrue(display.statuses.none { it == OfficialStatus.ASR.wire },
+            "a blank ASR must not publish an empty status-2 row (spec §10 item 19)")
+        assertTrue(rig.hintTexts.isEmpty())
+        assertTrue(rig.model.requests.isEmpty())
+    }
+
+    @Test fun `S3 a usable final displays the ASR statuses and cancels the timer`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+
+        assertEquals(
+            listOf(
+                OfficialStatus.LISTENING.wire,
+                OfficialStatus.ASR.wire,
+                OfficialStatus.ASR_END.wire,
+                OfficialStatus.ANSWERING.wire,
+            ),
+            display.statuses,
+        )
+        // The ASR final's own id replaces the wake placeholder before the official levels go out, so the glasses
+        // group the user row and the answer under the same turn.
+        assertEquals("asr-1", display.states.first { it.status == OfficialStatus.ASR.wire }.turnId)
+        assertEquals("asr-1", display.states.first { it.status == OfficialStatus.ASR_END.wire }.turnId)
+        assertTrue(display.closes.isEmpty())
+    }
+
+    @Test fun `S3 a displayed answer opens a continuation turn after status five`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        val hintId = rig.displayedAnswer()
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+
+        assertEquals(
+            listOf(
+                OfficialStatus.LISTENING.wire,
+                OfficialStatus.ASR.wire,
+                OfficialStatus.ASR_END.wire,
+                OfficialStatus.ANSWERING.wire,
+                OfficialStatus.AUDIO_FINISHED.wire,
+                OfficialStatus.LISTENING.wire,
+            ),
+            display.statuses,
+        )
+        val firstTurn = display.states.first().turnId
+        val nextTurn = display.states.last().turnId
+        assertNotEquals(firstTurn, nextTurn, "the continuation is a new turn, not a replayed level")
+        assertEquals(1, rig.model.requests.size, "the new round waits for the wearer; the model is not re-run")
+        assertTrue(display.closes.isEmpty())
+        assertEquals(2, display.count("working:WAKE"), "the continuation raises its own busy level")
+        assertTrue(rig.cancels.isEmpty(), "the answer the next round continues must stay on the panel")
+    }
+
+    @Test fun `S3 continue off closes one second after the displayed answer with no status five or new turn`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = false)
+        val hintId = rig.displayedAnswer()
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
+        assertEquals(1, display.statuses.count { it == OfficialStatus.LISTENING.wire })
+
+        rig.tick(999)
+        assertTrue(display.closes.isEmpty(), "the official scheduleExit(1000) is not immediate")
+        rig.tick(1)
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertEquals(1, rig.model.requests.size, "continue off must not open a new turn")
+        assertEquals(1, display.count("working:WAKE"))
+        assertEquals(1, display.count("idle:WAKE"))
+    }
+
+    @Test fun `S3 an answer the display rejected closes without a continuation`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        rig.output.submission = OutputSubmission.Rejected
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
+        assertEquals(1, rig.model.requests.size, "a rejected answer has no next round")
+        assertEquals(1, rig.output.hints.size)
+    }
+
+    @Test fun `S3 a displayed answer with speech waits for the matching SpeechFinished`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        var requests = 0
+        rig.model.onRequest = { request, listener ->
+            if (requests++ == 0) {
+                listener(smartToolCall("c1", "notify_user", """{"text":"答案","channel":"both"}"""))
+            }
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+
+        val hintId = rig.output.hints.single().hintId
+        assertNotNull(rig.output.hints.single().optionalSpeech, "the voice channel asks the host to speak")
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses,
+            "status 5 waits for the speech, not for the display alone")
+
+        rig.plugin.handle(SpeechFinished(rig.envelope(), "somebody-elses-hint", SpeechResult.FINISHED))
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses, "a stale hint id is ignored")
+
+        rig.plugin.handle(SpeechFinished(rig.envelope(), hintId, SpeechResult.FINISHED))
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, display.statuses[display.statuses.size - 2])
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last())
+        assertNotEquals(
+            display.states[display.states.size - 2].turnId,
+            display.states.last().turnId,
+            "the next turn really is new",
+        )
+    }
+
+    @Test fun `S3 pin then a quiet ten seconds idles and the pinned close follows at 120 seconds`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(PinChanged(rig.envelope(), AssistantRoute.WAKE))
+
+        rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+        assertEquals(1, display.idleCalls.size, "a pinned timeout shows idle instead of closing")
+        assertTrue(display.closes.isEmpty())
+
+        rig.tick(OfficialConversation.PINNED_CLOSE_MILLIS - 1)
+        assertTrue(display.closes.isEmpty(), "119_999 ms after idle is inside the pinned window")
+        rig.tick(1)
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertTrue(rig.model.requests.isEmpty())
+        assertTrue(rig.hintTexts.isEmpty())
+    }
+
+    @Test fun `S3 stop shows idle and keeps the panel`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+        rig.plugin.handle(rig.wakeEvent())
+
+        rig.plugin.handle(UserAction(rig.envelope(), UserAction.Action.Stop))
+
+        assertEquals(1, display.idleCalls.size)
+        assertTrue(display.closes.isEmpty())
+        assertEquals(0, rig.scheduler.pending())
+    }
+
+    @Test fun `S3 a panel closed by the glasses cancels the conversation and its window`() {
+        val (rig, display) = cycleRig()
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.onPanelShown(AssistantRoute.WAKE)
+
+        rig.plugin.onPanelClosed(AssistantRoute.WAKE)
+
+        assertTrue(display.closes.isEmpty(), "the panel is already hidden; no CLOSE is sent")
+        assertEquals(0, rig.scheduler.pending())
+        assertEquals(1, rig.cancels.size, "the turn behind the hidden panel is cancelled")
+    }
+
+    @Test fun `S3 deactivate releases the pinned close timer`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(PinChanged(rig.envelope(), AssistantRoute.WAKE))
+        rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+        assertEquals(1, display.idleCalls.size)
+        assertEquals(1, rig.scheduler.pending(), "the 120 s pinned close is the one thing still armed")
+
+        rig.plugin.deactivate(DeactivationReason.Stopped)
+
+        assertEquals(0, rig.scheduler.pending(), "a session end must not leave a timer to close a future panel")
+        rig.tick(OfficialConversation.PINNED_CLOSE_MILLIS + 1_000)
+        assertTrue(display.closes.isEmpty())
     }
 }

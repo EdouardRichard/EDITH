@@ -55,13 +55,16 @@ import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.HostEvent
 import com.sheen.rokid.contracts.OutputStateEvent
 import com.sheen.rokid.contracts.OutputStatus
+import com.sheen.rokid.contracts.PinChanged
 import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.contracts.SpeechFinished
 import com.sheen.rokid.contracts.SpeechRequest
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.contracts.TranscriptRevision
 import com.sheen.rokid.contracts.UserAction
 import com.sheen.rokid.contracts.WakeDetected
 import com.sheen.rokid.output.HintReadingBudget
+import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.ConfigSchema
@@ -119,6 +122,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoad
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoadReason
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillManager
 import com.sheen.rokid.phone.plugin.smarthelper.skill.StorageAccessSkillDirectory
+import com.sheen.rokid.phone.plugin.smarthelper.turn.ConversationCycle
 import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -135,14 +139,18 @@ private const val HINT_LIFETIME_MILLIS = 5_000L
 private const val DEFAULT_HINT_GRACE_MILLIS = 5_000L
 
 /**
- * How long a wake-opened turn listens for a usable utterance when its configured profile has no timeout to borrow.
+ * How much machine budget one turn's agent run gets when its configured profile has no timeout to borrow.
  *
- * The window is the profile's own `timeoutMillis` whenever there is one, because that is the number the user chose for
+ * The budget is the profile's own `timeoutMillis` whenever there is one, because that is the number the user chose for
  * this assistant; this is the documented fallback for the configurations that have no profile (or whose profile has
  * gone missing). It is deliberately longer than the ~5.5 s the device measured between the wake segment's blank final
- * and the request's own final.
+ * and the request's own final, because a turn whose model request runs in that segment must not be starved by the
+ * recogniser's own delay.
+ *
+ * The official **10 s listening window** is a different number and lives in `OfficialConversation` /
+ * `ConversationCycle`; it starts at `PANEL_SHOWN` and never bounds this run.
  */
-private const val DEFAULT_LISTEN_WINDOW_MILLIS = 15_000L
+private const val DEFAULT_TURN_BUDGET_MILLIS = 15_000L
 private const val AUDIT_CAPACITY = 512
 
 /**
@@ -219,12 +227,13 @@ private const val DEPENDENCY_HINT = "本地模型还没准备好，暂时不能�
  *   run and never reused; `Stop`/`deactivate` cancel the loop that is actually in flight;
  * - **a wake listens for a usable utterance, not for the first final** — the ASR finalises the segment that carried
  *   the wake word on its own, seconds before the request's own segment, so a blank final (or one that is only the
- *   wake word, with or without punctuation) is ignored and the bounded window is re-armed instead of ending the turn
- *   (D12). A window that really expires ends `INSUFFICIENT`/`NO_UTTERANCE`, never `BLANK_UTTERANCE`;
+ *   wake word, with or without punctuation) is ignored instead of ending the turn (D12). Since 0.24 S3 the **official**
+ *   10 s window belongs to `ConversationCycle` and every ASR message cancels it (spec §5.3), so a blank final neither
+ *   ends the turn nor re-arms a timer; the panel stays listening until the wearer speaks or leaves;
  * - **only a final transcript runs the loop** — a partial revision never reaches the model;
  * - **never silence, never a false success** — every run that reaches a terminal state submits a hint: the model's own
  *   text for `COMPLETED`, and a fixed honest sentence for every other outcome;
- * - **`Stop` is final and session-scoped** — it cancels the loop, the armed listening window and the pending output,
+ * - **`Stop` is final and session-scoped** — it cancels the loop, the conversation window and the pending output,
  *   and must not submit anything afterwards, and only a `Stop` for this session/generation may do so;
  * - **nothing is replayed across sessions** — the remembered final transcript belongs to the session that produced it,
  *   so `Help` after a re-activation runs this session's utterance or nothing at all.
@@ -287,6 +296,24 @@ class SmartAssistantPlugin(
      * manager-built transcript, so a re-activated session cannot replay the previous session's words.
      */
     private val conversationStores: Map<ContextRoute, ConversationStore>? = null,
+    /**
+     * 0.24 S3 (spec §5.3): whether the glasses panel is visible **right now**.
+     *
+     * The official 10 s timeout starts when the dialog opens. EDITH substitutes the glasses' `PANEL_SHOWN` for that
+     * moment, so a slow overlay start is not charged to the wearer's silence; a turn that opens while the resident
+     * panel is already up has no `PANEL_SHOWN` to wait for and starts the window immediately. The production
+     * composition wires this to `HostCompositionRoot.isPanelVisible`; until it does, the hidden-panel path is the
+     * documented default.
+     */
+    private val isPanelVisible: () -> Boolean = { false },
+    /**
+     * 0.24 S3 (spec §5.5): whether an answer opens the next listening round.
+     *
+     * `true` is the official default (`continue_dialogue` defaults to `"open"`): a displayed answer continues with
+     * status 5 and a fresh listening turn. `false` is the official `scheduleExit(1000)` path: no status 5, no new
+     * turn, close one second later. Task 14 wires this to the persisted `SmartSettings.continueDialogue`.
+     */
+    private val continueDialogue: () -> Boolean = { true },
 ) : PluginLifecycle, ConfiguredPlugin {
 
     init {
@@ -579,6 +606,24 @@ class SmartAssistantPlugin(
     private var lastFinalTranscript: String? = null
     private var lastFinalTurnId: String? = null
 
+    /**
+     * 0.24 S3 (spec §5.3): the official conversation's 10 s/120 s/IDLE state machine for the WAKE route.
+     *
+     * It owns **all** official conversation timers: the turn itself no longer arms a listening deadline, so there is
+     * exactly one window and exactly one close per round. The callbacks re-enter this plugin
+     * ([openContinuationTurn], [cancelConversationTurn]) and are invoked by the cycle outside its own lock; this class
+     * in turn never calls the cycle while holding [gate], so the two locks cannot invert.
+     */
+    private val conversationCycle = ConversationCycle(
+        clock = clock,
+        scheduler = scheduler,
+        display = { conversation() },
+        continueDialogue = continueDialogue,
+        openContinuation = { previousTurnId -> openContinuationTurn(previousTurnId) },
+        isPanelVisible = isPanelVisible,
+        cancelTurn = { route -> cancelConversationTurn(route) },
+    )
+
     // ---------------------------------------------------------------- proactive state (P3.2)
 
     /**
@@ -835,6 +880,10 @@ class SmartAssistantPlugin(
     }
 
     override fun deactivate(reason: DeactivationReason) {
+        // 0.24 S3: a session that ends takes the conversation's deadlines with it. A pinned 120 s close left armed
+        // would otherwise fire on the **next** session's panel (or a stale display port), which is a device bug that
+        // no later event could undo.
+        conversationCycle.reset()
         // Phase C: the level is cleared and reported **before** the context goes, because the conversation port is
         // resolved through it - reporting after `context = null` would resolve to nothing and leave the glasses' ring
         // turning until its own bound expired. Reported outside the lock, as `publishBusy` requires.
@@ -962,22 +1011,118 @@ class SmartAssistantPlugin(
         ContextRoute.PROACTIVE -> AssistantRoute.PROACTIVE
     }
 
+    // ---------------------------------------------------------------- official conversation cycle (0.24 S3)
+
+    /**
+     * 0.24 S3 (spec §5.3/§5.4): the glasses' `PANEL_SHOWN`, delivered by the host on its own thread after the link
+     * validated the session identity.
+     *
+     * Starts — or, for Task 11's idempotent re-announcement, refreshes — the official 10 s listening window. It never
+     * opens a turn: the wake already did, and a delayed/duplicated `PANEL_SHOWN` from the same panel must not create a
+     * second one.
+     */
+    fun onPanelShown(route: AssistantRoute) {
+        conversationCycle.onPanelShown(route)
+    }
+
+    /**
+     * 0.24 S3 (spec §5.4): `UI_CLOSED` / the panel went hidden.
+     *
+     * A hidden panel cannot be listening, so the cycle releases its deadlines and the turn behind it is cancelled. No
+     * `CLOSE` is sent: the panel is already gone.
+     */
+    fun onPanelClosed(route: AssistantRoute) {
+        conversationCycle.onClose(route)
+    }
+
+    /**
+     * 0.24 S3 (spec §5.5): continual dialogue. Opens the next listening turn without a wake, without the wake cooldown
+     * and without a chime.
+     *
+     * The callback carries the turn that just finished so a stale continuation (the turn was stopped or replaced while
+     * the answer was being displayed) opens nothing.
+     */
+    private fun openContinuationTurn(previousTurnId: String) {
+        var opened: SmartTurn? = null
+        synchronized(gate) {
+            val current = context ?: return
+            if (turn?.turnId != previousTurnId) return
+            val now = clock.nowNanos()
+            opened = openTurn(
+                now,
+                EventEnvelope(current.sessionId, current.generation, "continuation-${UUID.randomUUID()}", now, now),
+                bypassWakeGates = true,
+                continuation = true,
+            )
+        }
+        val created = opened ?: return
+        P3Log.line("P3_CONV continue turn=${created.turnId} from=$previousTurnId")
+        // Outside the lock: the cycle displays the new listening level through the host port.
+        conversationCycle.onWake(AssistantRoute.WAKE, created.turnId)
+        publishBusy()
+    }
+
+    /**
+     * Ends the conversation's current turn (the official timeout/close paths).
+     *
+     * It clears the busy level as well: the ring must stop when the panel times out, exactly as it does when the
+     * wearer's answer is shown. The proactive route has no conversation cycle, so only WAKE is meaningful here.
+     */
+    private fun cancelConversationTurn(route: AssistantRoute) {
+        if (route != AssistantRoute.WAKE) return
+        var stopped: SmartTurn? = null
+        synchronized(gate) {
+            wakeBusy = false
+            stopped = detach()
+        }
+        teardown(stopped)
+        publishBusy()
+    }
+
+    /**
+     * 0.24 S3: the answer of the current wake turn is final **and** the wearer has seen it.
+     *
+     * Must hold [gate]. The phase check is what keeps a mid-run notification's acknowledgement from opening a next
+     * round while the loop still runs; a later acknowledgement for the final answer is the one that continues.
+     * Returns whether the displayed answer carried speech (the cycle then waits for `SpeechFinished`), or `null` when
+     * there is nothing to settle.
+     */
+    private fun maybeAnswerDone(): Boolean? {
+        val owned = turn ?: return null
+        if (owned.closed || owned.phase != SmartTurnPhase.Idle) return null
+        if (!owned.displayed || owned.answerNotified) return null
+        owned.answerNotified = true
+        return owned.answerHadSpeech
+    }
+
+    /**
+     * 0.24 S3: the displayed answer's continuation/settlement, reported to the cycle outside [gate].
+     *
+     * The speech flag is read once under the lock so the answer cannot change between the decision and the report.
+     */
+    private fun settleDisplayedAnswer() {
+        val speech = synchronized(gate) { maybeAnswerDone() } ?: return
+        conversationCycle.onAnswerDone(AssistantRoute.WAKE, displayed = true, speech = speech)
+    }
+
 
     // ---------------------------------------------------------------- events
 
     override fun handle(event: HostEvent) {
         when (event) {
             is WakeDetected -> {
+                var opened: SmartTurn? = null
                 synchronized(gate) {
                     if (matches(event.envelope)) {
-                        openTurn(clock.nowNanos(), event.envelope, refusedWakeWord = event.word)?.let { opened ->
-                            // The plugin's half of P3_WAKE: the phone-side builder logs the word/confidence on
-                            // emission, and this names the turn the wake opened. A refused wake opens nothing and logs
-                            // no turn line.
-                            P3Log.line("P3_WAKE turn=${opened.turnId}")
-                        }
+                        opened = openTurn(clock.nowNanos(), event.envelope, refusedWakeWord = event.word)
+                        // The plugin's half of P3_WAKE: the phone-side builder logs the word/confidence on
+                        // emission, and this names the turn the wake opened. A refused wake opens nothing and logs
+                        // no turn line.
+                        opened?.let { P3Log.line("P3_WAKE turn=${it.turnId}") }
                     }
                 }
+                // 0.24 S3: outside the lock, because the cycle displays the official level through the host port.
+                opened?.let { conversationCycle.onWake(AssistantRoute.WAKE, it.turnId) }
                 // Phase C: outside the lock, because the report reaches the host's conversation port.
                 publishBusy()
             }
@@ -1016,21 +1161,49 @@ class SmartAssistantPlugin(
                     "P3_ASR revision=${event.revision.revision} final=${event.revision.final} " +
                         "chars=${event.revision.text.trim().length} usable=${isUsableUtterance(event.revision.text.trim())}",
                 )
+                var matched = false
+                var usableText = false
+                var consumedFinal = false
+                var consumedByConfirmation = false
+                var adoptedTurnId: String? = null
                 val (started, proactive) = synchronized(gate) {
                     if (!matches(event.envelope)) null to null
-                    // P3.3: a final that answers a live question is consumed here and nowhere else - it must not open
-                    // a wake turn or be reconsidered by the proactive path.
-                    else if (confirmation.onTranscript(event.revision)) null to null
                     else {
-                        val consumed = acceptTranscript(event.revision)
-                        // The segment that opened the turn is the one segment that may never also answer a question
-                        // the turn goes on to ask.
-                        if (consumed != null) confirmation.excludeSegment(event.revision.turnId)
-                        // The proactive path is only consulted when no wake turn took the utterance: a wake turn's own
-                        // transcript is not a proactive candidate, and evaluating it anyway only wrote a
-                        // `P3_PROACTIVE skip` line into the acceptance vocabulary.
-                        consumed to (if (consumed == null) proactiveTrigger(event.revision) else null)
+                        matched = true
+                        // 0.24 S3: the official `AsrMessageHandler` removes the timeout before it checks what the
+                        // payload says, so a blank or wake-word-only revision cancels the 10 s window too.
+                        usableText = isUsableUtterance(event.revision.text.trim())
+                        // P3.3: a final that answers a live question is consumed here and nowhere else - it must not
+                        // open a wake turn or be reconsidered by the proactive path.
+                        consumedByConfirmation = confirmation.onTranscript(event.revision)
+                        if (consumedByConfirmation) null to null
+                        else {
+                            val consumed = acceptTranscript(event.revision)
+                            consumedFinal = consumed != null
+                            // The ASR final's own id replaces the wake's placeholder; the official levels below
+                            // must carry that id, not the placeholder.
+                            if (consumed != null) {
+                                adoptedTurnId = turn?.turnId
+                                confirmation.excludeSegment(event.revision.turnId)
+                            }
+                            // The proactive path is only consulted when no wake turn took the utterance: a wake
+                            // turn's own transcript is not a proactive candidate, and evaluating it anyway only
+                            // wrote a `P3_PROACTIVE skip` line into the acceptance vocabulary.
+                            consumed to (if (consumed == null) proactiveTrigger(event.revision) else null)
+                        }
                     }
+                }
+                if (matched) {
+                    // Outside the lock: the cycle displays the official levels through the host port.
+                    conversationCycle.onAsr(AssistantRoute.WAKE)
+                    adoptedTurnId?.let { conversationCycle.onTurnId(AssistantRoute.WAKE, it) }
+                    // A blank/wake-word-only ASR deliberately publishes no status-2 row (spec §10 item 19); it still
+                    // cancelled the window above, which is the official half of the behavior. A transcript consumed
+                    // by a confirmation is not the conversation's user row either.
+                    if (usableText && !consumedByConfirmation) {
+                        conversationCycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ASR)
+                    }
+                    if (consumedFinal) conversationCycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ASR_END)
                 }
                 if (started != null) {
                     // Phase C: the utterance this turn consumed is the wearer's own side of the conversation. Published
@@ -1044,11 +1217,35 @@ class SmartAssistantPlugin(
             // P3.3 (spec §17.4): the host's answer to a question this plugin asked. It settles the gate; the loop,
             // which is blocked on that gate on the turn's own thread, then either executes or refuses.
             is ConfirmationResult -> confirmation.onConfirmationResult(event)
-            is OutputStateEvent -> synchronized(gate) {
-                if (matches(event.envelope)) {
-                    acceptDisplayed(event)
-                    acceptProactiveDisplayed(event)
+
+            // 0.24 S3 (spec §5.5): the wearer pinned the panel. One-way; the cycle owns the pinned-timeout outcome.
+            is PinChanged -> {
+                val mine = synchronized(gate) { matches(event.envelope) }
+                if (mine) conversationCycle.onPin(event.route)
+            }
+
+            // 0.24 S3 (spec §5.5): the phone's playback of the displayed answer finished. The route is decided by the
+            // hint the event names, never by "whatever is current": a stale hint must not continue a newer turn.
+            is SpeechFinished -> {
+                val mine = synchronized(gate) {
+                    val owned = turn
+                    matches(event.envelope) && owned != null && !owned.closed && event.hintId == owned.hintId
                 }
+                if (mine) conversationCycle.onSpeechFinished(AssistantRoute.WAKE, event.result)
+            }
+
+            is OutputStateEvent -> {
+                var mine = false
+                synchronized(gate) {
+                    if (matches(event.envelope)) {
+                        mine = true
+                        acceptDisplayed(event)
+                        acceptProactiveDisplayed(event)
+                    }
+                }
+                // 0.24 S3: the acknowledgement is also the answer-done signal. Reported outside the lock so the
+                // continuation opener can re-enter the plugin (spec §5.5).
+                if (mine) settleDisplayedAnswer()
             }
 
             is UserAction -> when (event.action) {
@@ -1088,6 +1285,12 @@ class SmartAssistantPlugin(
         transcriptTurnId: String? = null,
         bypassWakeGates: Boolean = false,
         refusedWakeWord: String? = null,
+        /**
+         * 0.24 S3 (spec §5.5): this turn continues the conversation after an answer. It must not start the wake
+         * cooldown (the official `cancelContinuation`/`startNewTalk` path is not a wake) and it starts already
+         * listening, with the official 10 s armed by the conversation cycle.
+         */
+        continuation: Boolean = false,
     ): SmartTurn? {
         val current = context ?: return null
         if (!bypassWakeGates) {
@@ -1099,14 +1302,16 @@ class SmartAssistantPlugin(
                 return null
             }
         }
-        scene.noteTurn(nowNanos)
+        if (!continuation) scene.noteTurn(nowNanos)
         val replaced = turn?.also { it.closed = true }
         val created = buildTurn(nowNanos, current, runsImmediately, transcriptTurnId)
         turn = created
-        teardown(replaced)
-        // Armed only after the turn is installed, so a scheduled expiry can never find a turn that is not yet the
-        // current one. `Help` runs immediately and has nothing to wait for.
-        if (!runsImmediately) armListening(created)
+        // 0.24 S3: a continuation replaces the finished turn but must **not** cancel its output - the answer is exactly
+        // what the next round continues, and the official status 5→1 keeps it on the panel.
+        teardown(replaced, cancelOutput = !continuation)
+        // 0.24 S3: the official 10 s window belongs to the conversation cycle, never to the turn (Task 12) - arming
+        // both would close one wake twice. `Help` runs immediately and has nothing to listen for; the caller of a
+        // wake/continuation arms the cycle once the turn is installed.
         // Phase C: a wake turn is now being worked on, and the wearer's ring should say so until it answers. The flag
         // is set here (under `gate`) and reported by the caller, because `publishBusy` must not run under the lock.
         wakeBusy = true
@@ -1126,7 +1331,7 @@ class SmartAssistantPlugin(
             generation = current.generation,
             clock = clock,
             scheduler = scheduler,
-            deadlineNanos = SmartTurn.saturatingAdd(nowNanos, listeningWindowNanos()),
+            deadlineNanos = SmartTurn.saturatingAdd(nowNanos, turnBudgetNanos()),
             hintGraceNanos = DEFAULT_HINT_GRACE_MILLIS * 1_000_000L,
             hintId = "hint-${UUID.randomUUID()}",
             onEmit = { text -> emit(text) },
@@ -1137,54 +1342,17 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * The window a wake-opened turn waits for a usable utterance in.
+     * The **machine budget** one turn's agent run gets: the configured profile's timeout when there is one (the number
+     * the user chose), otherwise [DEFAULT_TURN_BUDGET_MILLIS].
      *
-     * The configured profile's own timeout when there is one — the assistant's deadline is the number the user chose —
-     * otherwise [DEFAULT_LISTEN_WINDOW_MILLIS]. A profile that has gone missing therefore still gets a real window
-     * rather than a zero-length one: an unrelated configuration problem must not turn every wake into an instant
-     * failure.
+     * This is deliberately not the official 10 s listening window. Since 0.24 S3 that window belongs to
+     * [conversationCycle] and starts at `PANEL_SHOWN`; this number bounds the run that starts once a usable transcript
+     * arrives, and Task 12 re-anchors it at that moment rather than at the wake, so waiting a long time before speaking
+     * cannot eat the model's budget.
      */
-    private fun listeningWindowNanos(): Long {
+    private fun turnBudgetNanos(): Long {
         val configuredMillis = config?.let { profileLookup(it.profileId) }?.timeoutMillis ?: 0L
-        return if (configuredMillis > 0L) configuredMillis * 1_000_000L else DEFAULT_LISTEN_WINDOW_MILLIS * 1_000_000L
-    }
-
-    /**
-     * Arms (or re-arms) the turn's bounded listening window. Must be called under [gate] with [owned] installed.
-     *
-     * A blank or wake-word-only final proves the request has not been spoken yet, so it re-arms the window from that
-     * moment instead of ending the turn. The recogniser only finalises a segment after speech, so this cannot spin,
-     * and the turn is still released by `Stop`, `deactivate`, `Help` replacing it or its own next wake's turn.
-     */
-    private fun armListening(owned: SmartTurn) {
-        owned.extendDeadline(SmartTurn.saturatingAdd(clock.nowNanos(), listeningWindowNanos()))
-        owned.listeningExpiry?.cancel()
-        owned.listeningExpiry = scheduler.at(owned.deadlineNanos) { expireListening(owned) }
-    }
-
-    /**
-     * The listening window expired with nothing usable in it.
-     *
-     * The turn kept its tentative identity — no transcript was ever adopted — and never ran, so it ends with the
-     * honest `INSUFFICIENT` outcome under its own `NO_UTTERANCE` code and submits the fixed "did not catch it"
-     * sentence. A single blank final must never be able to short-circuit a turn into `BLANK_UTTERANCE`; only a window
-     * that really ran out ends it here.
-     */
-    private fun expireListening(owned: SmartTurn) {
-        val stillWaiting = synchronized(gate) {
-            if (turn !== owned || owned.closed || owned.phase != SmartTurnPhase.AwaitingTranscript) {
-                false
-            } else {
-                owned.listeningExpiry = null
-                owned.idle()
-                true
-            }
-        }
-        if (!stillWaiting) return
-        // No `P3_TURN start`: the loop was never about to run. The terminal line is the whole story, and its code
-        // says why there was nothing to run.
-        P3Log.line("P3_TURN end turn=${owned.turnId} outcome=${AgentOutcome.INSUFFICIENT} code=NO_UTTERANCE steps=0")
-        finishWithFailure(owned, FAILURE_HINTS.getValue(AgentOutcome.INSUFFICIENT))
+        return if (configuredMillis > 0L) configuredMillis * 1_000_000L else DEFAULT_TURN_BUDGET_MILLIS * 1_000_000L
     }
 
     /**
@@ -1198,7 +1366,9 @@ class SmartAssistantPlugin(
      *
      * A final that is blank, or that is only the wake word, is the segment that carried the wake finalising — not the
      * request (D12: measured on the device, the request is transcribed in a later segment ~5.5 s afterwards). It is
-     * neither remembered nor adopted, and it re-arms the waiting turn's bounded window instead of ending it.
+     * neither remembered nor adopted, and it does **not** restart a listening timer: 0.24's official window was
+     * already cancelled by the ASR message itself (spec §5.3), and inventing another one here would close a panel the
+     * official flow leaves open until the wearer speaks or leaves.
      */
     private fun acceptTranscript(revision: TranscriptRevision): Pair<SmartTurn, String>? {
         if (revision.final) {
@@ -1215,14 +1385,14 @@ class SmartAssistantPlugin(
         if (current.phase != SmartTurnPhase.AwaitingTranscript) return null
         if (!revision.final) return null
         val text = revision.text.trim()
-        if (!isUsableUtterance(text)) {
-            armListening(current)
-            return null
-        }
-        current.cancelListening()
+        if (!isUsableUtterance(text)) return null
         // The transcript's own turn id becomes the turn id from here on: the host keys `cancelOutputTurn` and the UI
         // correlate a hint by it, so the run and its hint must carry the ASR turn id rather than the wake's placeholder.
         current.adoptTranscriptTurnId(revision.turnId)
+        // 0.24 S3: the run's machine budget starts **now**, not at the wake. The official window may stay open as long
+        // as the wearer is still speaking (any ASR cancelled its timer), so a late transcript would otherwise hand the
+        // loop whatever was left of a window that began minutes ago.
+        current.extendDeadline(SmartTurn.saturatingAdd(clock.nowNanos(), turnBudgetNanos()))
         current.running()
         return current to text
     }
@@ -1462,6 +1632,13 @@ class SmartAssistantPlugin(
         // lose exactly the content compression exists to preserve.
         recordTurnAndCompress(ContextRoute.WAKE, text, run, ledger.notifications, gateway.lastTrim)
         submitOutcome(owned, run, ledger)
+        if (ledger.calls > 0) {
+            // 0.24 S3: when the model answered through `notify_user`, `submitOutcome` suppresses a second closing
+            // sentence - so there is no later emit to wait for. If that notification's `Displayed` arrived while the
+            // run was still unwinding, the continuation decision is owed now; if it has not arrived yet, its own event
+            // will settle it.
+            settleDisplayedAnswer()
+        }
         releaseParkedProactive()
     }
 
@@ -2440,6 +2617,7 @@ class SmartAssistantPlugin(
      */
     private fun emit(text: String, optionalSpeech: SpeechRequest? = null) {
         var owned: SmartTurn? = null
+        var finalAnswer = false
         val hint = synchronized(gate) {
             val current = turn ?: return
             if (current.closed) return
@@ -2464,6 +2642,11 @@ class SmartAssistantPlugin(
             current.submitting = true
             current.pendingAck = false
             current.hintExpiry = expiry
+            // 0.24 S3 (spec §5.5): the last hint this turn emits is the answer the conversation continues from. An
+            // answer emitted after the run reached Idle is the **final** one; anything earlier is a notification the
+            // run is still working behind. Only the final one may settle the conversation.
+            finalAnswer = current.phase == SmartTurnPhase.Idle
+            current.answerHadSpeech = optionalSpeech != null
             owned = current
             Assistance(
                 hintId = current.hintId,
@@ -2481,6 +2664,9 @@ class SmartAssistantPlugin(
         val current = owned ?: return
         val sink: OutputSink? = runCatching { currentContext()?.services?.textOutput() }.getOrNull()
         val stillCurrent = synchronized(gate) { turn === current }
+        // 0.24 S3: a hint is being put in front of the wearer, so the official level is ANSWERING (3). Outside the
+        // lock, because the cycle displays through the host port.
+        if (stillCurrent) conversationCycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
         val result = if (stillCurrent && sink != null) {
             // On submit: the hint's identity and size only. The text itself is the display content and never logged.
             P3Log.line("P3_HINT show hint=${hint.hintId} chars=${hint.text.length}")
@@ -2494,17 +2680,29 @@ class SmartAssistantPlugin(
         synchronized(gate) { wakeBusy = false }
         // Outside the lock, as `publishBusy` requires: the host's port is what ends the ring.
         publishBusy()
+        var ackAdmitted = false
         synchronized(gate) {
             current.submitting = false
             if (result == OutputSubmission.Accepted && turn === current && !current.closed) {
                 current.readable = true
                 if (current.pendingAck && !current.displayed && clock.nowNanos() < current.hintExpiry) {
                     current.displayed = true
+                    ackAdmitted = true
                     P3Log.line("P3_HINT ack hint=${current.hintId} status=${OutputStatus.Displayed}")
                     onDisplayedAck()
                 }
             }
             current.pendingAck = false
+        }
+        if (ackAdmitted) {
+            // The in-submit acknowledgement is the answer-done signal exactly like a delivered one; the cycle call
+            // happens outside the lock so the continuation can re-enter.
+            settleDisplayedAnswer()
+        } else if (finalAnswer && stillCurrent && result != OutputSubmission.Accepted) {
+            // 0.24 S3 (spec §5.5): an answer no display accepted has nothing for the next round to continue. Close and
+            // record `no_display`; opening a turn on top of an answer the wearer never saw is the failure the spec
+            // names.
+            conversationCycle.onAnswerDone(AssistantRoute.WAKE, displayed = false, speech = false)
         }
     }
 
@@ -2535,9 +2733,11 @@ class SmartAssistantPlugin(
      */
     private fun stopAll(envelope: EventEnvelope) {
         var cancelledProactive: ProactiveHint? = null
+        var accepted = false
         val stopped = synchronized(gate) {
             if (!matches(envelope)) null
             else {
+                accepted = true
                 // P3.2: a proactive request is in flight outside this lock; marking its hint cancelled is what the
                 // gateway's `stop` predicate reads, and what stops a late reply from being shown.
                 cancelledProactive = proactiveHint
@@ -2559,6 +2759,10 @@ class SmartAssistantPlugin(
         cancelledProactive?.let { hint ->
             runCatching { cancelOutputTurn(envelope.sessionId, envelope.generation, hint.turnId) }
         }
+        // 0.24 S3 (spec §5.5): STOP cancels the round and shows the official idle, keeping the panel. Outside the
+        // lock, because the cycle displays through the host port. A **foreign** Stop is not this session's stop and
+        // must not touch this conversation at all.
+        if (accepted) conversationCycle.onStop(AssistantRoute.WAKE)
         // Outside the lock, as `publishBusy` requires.
         publishBusy()
     }
@@ -2569,6 +2773,11 @@ class SmartAssistantPlugin(
      * with no current-session final transcript it does nothing.
      */
     private fun handleHelp(envelope: EventEnvelope) {
+        // 0.24 S3: `Help` replaces whatever the official conversation was waiting on. Releasing the cycle's timers and
+        // levels without a display call keeps a stale 10 s window from closing the panel during this turn. A foreign
+        // Help never reaches here, so it cannot reset this session's conversation.
+        if (!synchronized(gate) { matches(envelope) }) return
+        conversationCycle.reset()
         val started = synchronized(gate) {
             if (!matches(envelope)) return
             val text = lastFinalTranscript?.takeIf { it.isNotBlank() } ?: return
@@ -2595,17 +2804,22 @@ class SmartAssistantPlugin(
         turn = null
     }
 
-    /** Cancels everything a detached turn owns; the exact teardown the brief requires. */
-    private fun teardown(owned: SmartTurn?) {
+    /**
+     * Cancels everything a detached turn owns; the exact teardown the brief requires.
+     *
+     * [cancelOutput] is `false` only for the turn a **continuation** replaces: its answer was accepted and is the
+     * conversation the next round continues, so cancelling the hint would erase the sentence the official status 5
+     * just finalised.
+     */
+    private fun teardown(owned: SmartTurn?, cancelOutput: Boolean = true) {
         if (owned == null) return
-        // The armed listening window is part of what the turn owns: releasing it here is what makes a `Stop` during
-        // the wait, and a `deactivate`, provably unable to submit anything later.
-        owned.cancelListening()
+        // 0.24 S3: the listening deadline is the conversation cycle's, not the turn's. Teardown here cancels the loop,
+        // the assembler and the pending output; the cycle closes its own window when the conversation ends.
         runCatching { owned.loop?.cancel() }
         owned.cancelAssembler()
         val sessionId = owned.sessionId ?: return
         val generation = owned.generation ?: return
-        runCatching { cancelOutputTurn(sessionId, generation, owned.turnId) }
+        if (cancelOutput) runCatching { cancelOutputTurn(sessionId, generation, owned.turnId) }
         runCatching { currentContext()?.services?.actions()?.cancel() }
     }
 

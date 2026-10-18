@@ -4,7 +4,6 @@ import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
 import com.sheen.rokid.agent.AgentLoop
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
-import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.output.ReadableHintAssembler
@@ -37,9 +36,8 @@ internal enum class SmartTurnPhase { AwaitingTranscript, Running, Idle }
  * be admitted either until the submission came back `Accepted`. The first sets [pendingAck]; the emit path replays it
  * after admission.
  *
- * [listeningExpiry] is the turn's bounded listening window (D12): the scheduled task that ends a wake-opened turn
- * whose window expires with no usable utterance. It lives here, not in the plugin, so `Stop`, `deactivate` and a
- * replacement turn release it through the same teardown that cancels the in-flight loop.
+ * [listeningExpiry] is gone in 0.24 S3: the official 10 s listening window belongs to `ConversationCycle` (it starts
+ * at `PANEL_SHOWN` and belongs to the conversation, not to one turn), so this class owns no timer at all.
  */
 internal class SmartTurn private constructor(
     /**
@@ -68,7 +66,6 @@ internal class SmartTurn private constructor(
 
     var assembler: ReadableHintAssembler? = null
     var loop: AgentLoop? = null
-    var listeningExpiry: CancellationHandle? = null
     var hintValidUntil: Long = 0
     var hintExpiry: Long = 0
     var readable = false
@@ -76,6 +73,18 @@ internal class SmartTurn private constructor(
     var submitting = false
     var pendingAck = false
     var closed = false
+
+    /**
+     * 0.24 S3 (spec §5.5): whether the last hint this turn emitted carried speech.
+     *
+     * A displayed answer with speech does not continue until the phone reports `SpeechFinished`; an answer without
+     * speech continues at the `Displayed` acknowledgement. The last emit wins: a notification that is the turn's only
+     * answer is the one whose speech matters.
+     */
+    var answerHadSpeech = false
+
+    /** 0.24 S3: the answer-done decision was already reported, so a duplicate `Displayed` cannot continue twice. */
+    var answerNotified = false
 
     /** Moves the turn to [SmartTurnPhase.Running]: the final transcript has arrived and will open the loop. */
     fun running() {
@@ -93,12 +102,6 @@ internal class SmartTurn private constructor(
         if (newDeadlineNanos <= deadlineNanos) return
         deadlineNanos = newDeadlineNanos
         hintValidUntil = saturatingAdd(newDeadlineNanos, hintGraceNanos)
-    }
-
-    /** Releases the armed listening window, if any; safe to call more than once. */
-    fun cancelListening() {
-        listeningExpiry?.cancel()
-        listeningExpiry = null
     }
 
     /** Replaces the wake's placeholder turn id with the ASR turn id the transcript carries. */

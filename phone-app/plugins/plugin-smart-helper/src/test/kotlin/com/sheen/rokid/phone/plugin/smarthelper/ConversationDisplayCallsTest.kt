@@ -2,10 +2,10 @@ package com.sheen.rokid.phone.plugin.smarthelper
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.GateForm
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.GateOutcome
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGateState
-import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
 
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.output.OfficialConversation
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ConversationDisplay
 import com.sheen.rokid.plugin.DeactivationReason
@@ -197,30 +197,25 @@ class ConversationDisplayCallsTest {
     }
 
     @Test
-    fun anExpiredListeningWindowLeavesTheLevelsPaired() {
-        // The scheduler only runs what has come due, so the clock moves past the listening window first and the rig's
-        // own `tick` then fires it. The fixed "did not catch it" sentence is the turn's answer, which is what ends
-        // "working" - so the hints and the plugin's own terminal line are asserted too, to separate "the path did not
-        // run" from "the level was not cleared".
+    fun theOfficialTimeoutLeavesTheLevelsPaired() {
+        // 0.24 S3: the official 10 s window closes the conversation (no failure sentence, no turn outcome). The busy
+        // level raised at the wake must still be cleared, or the ring would keep turning on a panel that just closed.
         val display = RecordingDisplay()
-        val lines = mutableListOf<String>()
-        val previous = P3Log.sink
-        P3Log.sink = { lines += it }
-        try {
-            val rig = rig(display)
-            rig.plugin.handle(rig.wakeEvent())
-            rig.clock.advance(60_000_000_000L)
-            // Two releases: the first fires the listening window, and the sentence it produces is itself deferred by
-            // the assembler's hint grace, which is scheduled from inside that first callback.
-            rig.tick()
-            rig.tick()
+        val rig = SmartTestRig(panelVisible = true)
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
 
-            assertTrue(rig.hintTexts.isNotEmpty(),
-                "the expired window must still answer the wearer, hints=${rig.hintTexts} log=$lines")
-            assertEquals(display.count("working:WAKE"), display.count("idle:WAKE"), display.calls.toString())
-        } finally {
-            P3Log.sink = previous
-        }
+        rig.plugin.handle(rig.wakeEvent())
+        assertTrue(display.count("working:WAKE") >= 1, display.calls.toString())
+
+        rig.clock.advance(OfficialConversation.LISTEN_TIMEOUT_MILLIS * 1_000_000L)
+        rig.scheduler.runDue()
+
+        assertTrue(rig.hintTexts.isEmpty(), "the official timeout closes the panel; it does not answer the wearer")
+        assertEquals(
+            display.count("working:WAKE"),
+            display.count("idle:WAKE"),
+            "a closed conversation must clear its level: ${display.calls}",
+        )
     }
 
     @Test

@@ -6,6 +6,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.context.ContextCompressor
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
 
 import com.sheen.rokid.contracts.Assistance
+import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
@@ -17,6 +18,7 @@ import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ConversationDisplay
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.EmbedResult
 import com.sheen.rokid.plugin.EmbeddingService
@@ -129,6 +131,57 @@ internal class SmartFakeWakeWords(private val accept: Boolean = true) : WakeWord
     }
 
     override fun current(): List<String> = declarations.lastOrNull() ?: emptyList()
+}
+
+/**
+ * A [ConversationDisplay] that records every call, including the 0.24 official ones.
+ *
+ * `ConversationDisplay`'s 0.24 methods are default no-ops, which is right for old hosts and old fakes - but a test
+ * about the official conversation must observe the levels it produced, so this fake overrides them and keeps them in
+ * call order alongside `working`/`idle`.
+ */
+internal class SmartRecordingDisplay : ConversationDisplay {
+    data class StateCall(val route: AssistantRoute, val turnId: String, val status: Int, val sequence: Long)
+
+    val calls = mutableListOf<String>()
+    val states = mutableListOf<StateCall>()
+    val idleCalls = mutableListOf<Pair<AssistantRoute, Long>>()
+    val closes = mutableListOf<AssistantRoute>()
+
+    val statuses: List<Int> get() = states.map { it.status }
+
+    fun count(prefix: String) = calls.count { it.startsWith(prefix) }
+
+    override fun userMessage(route: AssistantRoute, text: String) {
+        calls += "user:${route.name}:$text"
+    }
+
+    override fun assistantMessage(route: AssistantRoute, text: String) {
+        calls += "said:${route.name}:$text"
+    }
+
+    override fun working(route: AssistantRoute) {
+        calls += "working:${route.name}"
+    }
+
+    override fun idle(route: AssistantRoute) {
+        calls += "idle:${route.name}"
+    }
+
+    override fun state(route: AssistantRoute, turnId: String, status: Int, sequence: Long) {
+        states += StateCall(route, turnId, status, sequence)
+        calls += "state:${route.name}:$turnId:$status:$sequence"
+    }
+
+    override fun showIdle(route: AssistantRoute, sequence: Long) {
+        idleCalls += route to sequence
+        calls += "showIdle:${route.name}:$sequence"
+    }
+
+    override fun closePanel(route: AssistantRoute) {
+        closes += route
+        calls += "close:${route.name}"
+    }
 }
 
 /** Records every executed action and every `cancel`, and answers with a scripted outcome. */
@@ -367,6 +420,17 @@ internal class SmartTestRig(
      * every pre-Phase-5 test uses, so those tests keep both old paths untouched.
      */
     conversationStores: Map<com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute, com.sheen.rokid.agent.ConversationStore>? = null,
+    /**
+     * 0.24 S3: whether the glasses panel is visible when a turn opens. The official 10 s window starts at
+     * `PANEL_SHOWN`; a turn that opens on an already-visible panel starts it immediately. Default `false` keeps every
+     * pre-0.24 test on the hidden-panel path (no official timer until the test shows the panel).
+     */
+    var panelVisible: Boolean = false,
+    /**
+     * 0.24 S3: continual dialogue after a displayed answer. Default `false` preserves the pre-0.24 tests, which were
+     * written before an automatic next round existed; the tests about the feature opt in.
+     */
+    var continueDialogue: Boolean = false,
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -397,6 +461,8 @@ internal class SmartTestRig(
             interventionGate = interventionGate,
             budget = budget,
             conversationStores = conversationStores,
+            isPanelVisible = { panelVisible },
+            continueDialogue = { continueDialogue },
         )
     }
 

@@ -196,28 +196,22 @@ class SmartObservabilityTest {
     }
 
     @Test
-    fun `a listening window that expires logs the insufficient outcome under its own code`() {
-        val rig = SmartTestRig()
+    fun `the official ten second window closes the conversation without a turn outcome`() {
+        // 0.24 S3 replaces the old "listening window expired -> INSUFFICIENT/NO_UTTERANCE hint" with the official
+        // `RokidAIController.onTimeout`: close the panel, leave the session running, say nothing.
+        val rig = SmartTestRig(panelVisible = true)
         rig.activate()
 
         val lines = withLines { captured ->
             rig.plugin.handle(rig.wakeEvent())
-            rig.plugin.handle(TranscriptEvent(rig.transcript("", turnId = "asr-wake", revision = 0)))
             rig.tick(millis = 10_000)
             captured.toList()
         }
 
-        val turnId = lines.single { it.startsWith("P3_WAKE turn=") }.removePrefix("P3_WAKE turn=")
+        assertTrue(lines.any { it == "P3_CONV close route=WAKE reason=timeout" }, lines.toString())
         assertTrue(lines.none { it.startsWith("P3_TURN start") }, "nothing ran, so there is no start line: $lines")
-        assertTrue(
-            lines.contains("P3_TURN end turn=$turnId outcome=INSUFFICIENT code=NO_UTTERANCE steps=0"),
-            lines.toString(),
-        )
-        assertTrue(
-            lines.none { it.contains("BLANK_UTTERANCE") },
-            "the wake segment's blank final must never become BLANK_UTTERANCE: $lines",
-        )
-        assertTrue(lines.contains("P3_TRANSCRIPT turn=asr-wake rev=0 final=true chars=0"), lines.toString())
+        assertTrue(lines.none { it.startsWith("P3_TURN end") }, "the official timeout is not a turn outcome: $lines")
+        assertTrue(rig.hintTexts.isEmpty(), "the official timeout must not submit the old failure sentence")
     }
 
     @Test
