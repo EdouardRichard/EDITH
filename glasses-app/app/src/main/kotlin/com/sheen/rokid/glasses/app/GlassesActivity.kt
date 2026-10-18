@@ -1,11 +1,7 @@
 package com.sheen.rokid.glasses.app
-import com.sheen.rokid.glasses.display.BusyState
 import com.sheen.rokid.glasses.display.HintPresentation
 import com.sheen.rokid.glasses.display.HintTicker
 import com.sheen.rokid.glasses.display.ConversationView
-import com.sheen.rokid.glasses.display.SaidSequenceGate
-import com.sheen.rokid.glasses.display.ConversationOrder
-import com.sheen.rokid.glasses.bridge.GlassClockResponder
 import com.sheen.rokid.glasses.bridge.RokidBridgeEndpoint
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.glasses.display.GlassesPanelView
@@ -21,6 +17,7 @@ import android.app.Activity
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
 import android.os.Bundle
+import android.os.Looper
 import android.os.PowerManager
 import android.util.TypedValue
 import android.view.Gravity
@@ -32,11 +29,6 @@ import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
 import com.sheen.rokid.contracts.AssistantRoute
-import com.sheen.rokid.output.ConversationEntry
-import com.sheen.rokid.output.ConversationLog
-import com.sheen.rokid.output.ConversationRole
-import com.sheen.rokid.output.DisplayedHint
-import com.sheen.rokid.output.GlassHintController
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.plugin.CancellationHandle
@@ -48,25 +40,26 @@ import java.util.concurrent.TimeUnit
 /**
  * The glasses-side CustomApp entry point: the conversation view and the T18 render rules.
  *
- * The phone never learns whether a hint became visible, so the last line of defence lives here: [GlassHintController]
- * refuses a `SHOW` for another session, an older revision, a sequence behind a `CLEAR` fence, an unknown or stale
- * clock mapping, or a deadline that has already passed - and it expires the text locally, because the phone may stop
- * sending `CLEAR` and must not be relied upon to deliver it.
+ * The phone never learns whether a hint became visible, so the last line of defence is [GlassesPanelController] (and
+ * the `GlassHintController` it owns): a `SHOW` for another session, an older revision, a sequence behind a `CLEAR`
+ * fence, an unknown or stale clock mapping, or a deadline that has already passed is refused, and the text expires
+ * locally because the phone may stop sending `CLEAR` and must not be relied upon to deliver it.
  *
  * Everything arrives on the bridge's callback thread, so commands are applied on the UI thread. That is what makes the
- * acknowledgement honest: `GlassHintController` reports `Displayed` only after the render callback has committed, and
+ * acknowledgement honest: the hint controller reports `Displayed` only after the render callback has committed, and
  * a view update that had merely been *posted* would have acknowledged something the wearer could not see yet.
  *
  * **0.23 P3/P4 changed what this screen is.** It shows one **conversation** at a time, every line left-aligned
  * (including the wearer's own), with the official bottom panel and a 1 px/frame ticker; the route is chosen by `SHOW`,
  * and `ENTER` pins the reading position. The live hint is not emphasised - it is simply the newest row; retiring it
- * does not erase anything (`render(null)` means "nothing is live now").
+ * does not erase anything (a null live id means "nothing is live now").
  *
- * [ConversationLog] is the single authority for what was said, in which order, under which route; the phone's
- * assistant tab renders the same object, so the two screens cannot disagree. The log is bounded, so a long session
- * cannot grow the view without limit.
+ * **0.24 S2 Task 8 moved the other half out.** The conversation log, the selected route, the `SAID` gate, the busy
+ * level and the BACK/pin decisions live in [GlassesPanelController]; this class only owns the view tree, the scroll
+ * mechanics, the wake lock and the key/threading glue. It implements [PanelPort] so the controller can ask for exactly
+ * that, and binds the published [PanelModel] to the views in [render].
  */
-class GlassesActivity : Activity() {
+class GlassesActivity : Activity(), PanelPort {
 
     private val clock = object : MonotonicClock { override fun nowNanos() = System.nanoTime() }
     private val executor = Executors.newSingleThreadScheduledExecutor { runnable ->
@@ -82,27 +75,22 @@ class GlassesActivity : Activity() {
         }
     }
 
-    private val controller by lazy {
-        GlassHintController(clock, scheduler, render = ::render, ack = ::acknowledge,
-            diagnostics = { message -> android.util.Log.i("EdithGlasses", message) })
-    }
+    /**
+     * 0.24 S2 Task 8: the panel's state, cache and decisions, extracted from this Activity.
+     *
+     * Set in `onCreate` before the bridge listener (and therefore before any command can arrive). It owns the
+     * conversation log, the selected route, the `SAID` gate, the busy level and the BACK/pin decisions; this Activity
+     * only forwards bytes/keys and binds the model it publishes to views through [render].
+     */
+    private lateinit var controller: GlassesPanelController
 
-    /** The handshake half: a `PING` is answered immediately, because the phone cannot compute a mapping without it. */
-    private val clockResponder by lazy {
-        GlassClockResponder(clock) { json -> RokidBridgeEndpoint.instance.send(json) }
-    }
-
-    /** What was said, per route (Phase C). Bounded; see [ConversationLog]. */
-    private val log = ConversationLog()
-
-    /** Which route is in front of the wearer, and whether the wearer pinned the reading position (`KEYCODE_ENTER`). */
-    private val order = ConversationOrder()
-
-    /** Rejects an out-of-order `SAID`; the custom-command channel promises nothing about ordering. */
-    private val saidGate = SaidSequenceGate()
-
-    /** Whether the assistant is working, per route (Phase C 加载动画); bounded so a leaked level cannot spin forever. */
-    private val busyState = BusyState()
+    /**
+     * The last model the controller published.
+     *
+     * The probes and the resume path read it; the controller stays the only writer through [render]. Null only before
+     * the first publish, which `onResume` performs before any probe can run.
+     */
+    private var model: PanelModel? = null
 
     /** The extracted view tree (0.24 S2 Task 7): every panel child this Activity touches lives there. */
     private lateinit var panel: GlassesPanelView
@@ -125,13 +113,13 @@ class GlassesActivity : Activity() {
     private var thinkingIcon: LoadingIndicatorView? = null
     private var thinkingTextView: TextView? = null
 
-    /** The entry id of the live hint, so exactly one row is emphasised. */
-    private var liveEntryId: String? = null
-
     /**
      * 0.23 P4: one entry arrived since the last rebuild, so the rebuild must bring it into view before the ticker
      * starts. This is the "new content first" rule - it applies while pinned as well, because a pin is a reading
      * position, not a reason for the next answer to stay hidden.
+     *
+     * Detected here from the published model's entries/live id, because "bring into view" is a scroll decision this
+     * view owns; the controller only says what the content is.
      */
     private var newEntryPending = false
 
@@ -158,9 +146,6 @@ class GlassesActivity : Activity() {
 
     private val powerManager by lazy { getSystemService(PowerManager::class.java) }
 
-    /** Whether a deadline is already armed for the current busy spell; see [applyPanelAndAnimation]. */
-    private var busyDeadlineArmed = false
-
     /** Held only while something is on screen that needs to be seen; see [holdAwakeFor]. */
     private var hintWakeLock: PowerManager.WakeLock? = null
 
@@ -186,6 +171,16 @@ class GlassesActivity : Activity() {
         // sample's placement is the one that is known to work on this ROM.
         installSideTouch(findViewById(android.R.id.content) ?: panel)
         setContentView(panel)
+        // 0.24 S2 Task 8: the controller is created before the bridge listener so no command can arrive before the
+        // state it updates exists. `this` is the PanelPort: the only Android things the controller is allowed to ask
+        // for are drawing a model, waking the panel, hiding it and telling the phone.
+        controller = GlassesPanelController(
+            clock = clock,
+            scheduler = scheduler,
+            port = this,
+            send = ::sendCommand,
+            diagnostics = { message -> android.util.Log.i("EdithGlasses", message) },
+        )
         // The endpoint outlives this Activity, so it is given a listener rather than a reference to it.
         RokidBridgeEndpoint.instance.setListener { json -> acceptCommand(json) }
     }
@@ -194,16 +189,18 @@ class GlassesActivity : Activity() {
     override fun onResume() {
         super.onResume()
         resumed = true
-        applyPanelAndAnimation()
-        // `applyPanelAndAnimation` restores the state row; the scroll needs its own start because `applyVisualState`
-        // deliberately does not touch the ticker.
+        // `onStart` re-applies the current level and re-arms the local busy bound. The view's rebuild follows the
+        // published model; the scroll needs its own start because `applyVisualState` deliberately does not touch it.
+        controller.onStart()
         startTickerIfNeeded()
     }
 
     override fun onPause() {
         super.onPause()
         resumed = false
-        // Leaving the foreground ends the visible hint's claim on the panel; the controller clears the text too.
+        controller.onStop()
+        // Leaving the foreground ends the visible hint's claim on the panel; the controller keeps its model, but a
+        // hidden screen must not hold the wake lock or keep animators running.
         holdAwakeFor(false)
         // The ring stops with the screen: it is not a progress bar whose state matters while nobody can see it, and a
         // running animator keeps the panel's frame loop busy.
@@ -215,64 +212,29 @@ class GlassesActivity : Activity() {
     /**
      * 0.23 P5 (U11, spec §5.3.1): the double-click's `KEYCODE_BACK`.
      *
-     * **Busy, with an established session identity**: send `STOP` to the phone and keep the window open - the phone
-     * cancels the turn/proactive request and broadcasts `BUSY=false`, which puts the thinking row and orb back to
-     * idle. **Idle, or busy with no identity to name**: exit, exactly as the wearer expects from a back key.
-     *
-     * Handled here rather than in `installSideTouch`: an Activity consumes BACK through its default key path before an
-     * unhandled-key listener can see it (the official app handles it in a `Dialog.onKeyUp` instead). Returning true
-     * stops the framework from also calling `onBackPressed()`.
+     * The decision itself now lives in [GlassesPanelController.onKey]: **busy, with an established session identity**
+     * sends `STOP` and keeps the window open; **idle, or busy with no identity to name** hides the panel. This override
+     * is only the Activity's key-path and cancelled-gesture glue: the panel consumes BACK through its default key path
+     * before an unhandled-key listener can see it (the official app handles it in a `Dialog.onKeyUp` instead), and a
+     * gesture cancelled mid-press (the window lost focus) is not a wearer decision.
      */
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
         if (keyCode == KeyEvent.KEYCODE_BACK) {
             // A cancelled gesture (the window lost focus mid-press) is not a wearer decision. Consume it without
             // finishing so a lost focus cannot close the panel.
             if (event.isCanceled) return true
-            val identity = controller.currentIdentity()
-            val busy = busyState.any(clock.nowNanos())
-            if (busy && identity != null) {
-                // A malformed identity/encoder failure must fall through to the exit branch rather than throw on the
-                // UI thread. `encode` is total for a decoded HELLO, but this is the one path a wearer uses to get out.
-                val sent = runCatching {
-                    val json = HintWireCodec.encode(HintCommand.Stop(identity.first, identity.second))
-                    stopSenderForProbe?.invoke(json) ?: RokidBridgeEndpoint.instance.send(json)
-                }.getOrDefault(false)
-                if (sent) {
-                    lastBackAction = "stop"
-                    lastBackStopSent = true
-                    android.util.Log.i("EdithGlasses",
-                        "P5_GLASS_BACK action=stop sent=true session=${identity.first} " +
-                            "generation=${identity.second}")
-                    return true
-                }
-                // The link is dead, so the STOP cannot reach the phone. Keeping the window open would trap the wearer
-                // until the local 60 s busy bound expires; a STOP that was not sent is not an interrupt.
-                lastBackAction = "exit"
-                lastBackStopSent = false
-                android.util.Log.i("EdithGlasses",
-                    "P5_GLASS_BACK action=exit reason=stop_unsent busy=true identity=true")
-                finish()
-                return true
-            }
-            lastBackAction = "exit"
-            lastBackStopSent = null
-            android.util.Log.i("EdithGlasses",
-                "P5_GLASS_BACK action=exit busy=$busy identity=${identity != null}")
-            finish()
-            return true
+            return controller.onKey(keyCode, event.action)
         }
         return super.onKeyUp(keyCode, event)
     }
 
     override fun onDestroy() {
         // Leaving the screen must never leave text on the glasses, and the endpoint must not keep a dead Activity.
+        // `disconnect` is the old hint-controller teardown: it drops the identity and retires a visible hint (which
+        // renders "nothing live" through this Activity's port). The conversation cache it owns dies with this object;
+        // the externally visible cleanup below is the part that must still happen explicitly.
         runCatching { controller.disconnect() }
         holdAwakeFor(false)
-        // The conversation is session state: a destroyed Activity must not hand its words to the next one.
-        log.clear()
-        order.reset()
-        saidGate.reset()
-        busyState.reset()
         orbView.stop()
         thinkingIcon?.stop()
         stopTicker()
@@ -286,68 +248,32 @@ class GlassesActivity : Activity() {
      *
      * Public because it is the production entry point the bridge listener drives; an instrumentation test drives the
      * same method rather than a test-only path.
+     *
+     * 0.24 S2 Task 8: the command decision lives in [GlassesPanelController.accept]. This method is only the Activity's
+     * threading glue. The bridge calls from its callback thread, so a decoded command must be posted to the UI thread;
+     * the return value is the decode answer, which the controller owns and which is therefore read here on the caller's
+     * thread before the post. Undecodable input is rejected immediately and never posted, exactly as before.
      */
     fun acceptCommand(json: String): Boolean {
-        val command = HintWireCodec.decode(json) ?: run {
-            // Recorded because this is the mixed-build safety net: an old glasses APK silently drops every command it
-            // does not know, and without a line here "the wearer saw nothing" has no cause on this side either. The
-            // length is a count, never the payload (the same rule as `HintPresentation.inboundReport`).
+        if (Looper.myLooper() == Looper.getMainLooper()) return controller.accept(json)
+        val understood = HintWireCodec.decode(json) != null
+        if (understood) {
+            runOnUiThread { controller.accept(json) }
+        } else {
+            // Same line the controller would record, on the thread that has to drop the message.
             android.util.Log.i("EdithGlasses", "inbound undecodable chars=${json.length}")
-            return false
         }
-        runOnUiThread {
-            when (command) {
-                // A PING is the one command the controller deliberately ignores: it is the phone's clock exchange, and
-                // answering it is this side's obligation. Everything else is the render/expiry state machine's business.
-                is HintCommand.Ping -> {
-                    val answered = clockResponder.onPing(command)
-                    android.util.Log.i("EdithGlasses", "ping answered=$answered syncId=${command.syncId}")
-                }
-
-                // Phase C: what the wearer said. Filed under its own route, never switching the view (an utterance is
-                // not something that needs to be looked at) and never acknowledged (it has no deadline to confirm).
-                is HintCommand.Said -> onSaid(command)
-
-                // Phase C: whether the assistant is working. Same session gate as a SHOW, because a stale level would
-                // light the ring for a session that has ended.
-                is HintCommand.Busy -> onBusy(command)
-
-                // A **new** session starts clean. Only a new one: the phone repeats its opening HELLO while it waits
-                // for the clock exchange (up to five times), and clearing on every HELLO wiped a conversation whose
-                // utterances had already arrived - the wearer's own words disappearing from the glasses while the
-                // phone still showed them.
-                is HintCommand.Hello -> {
-                    if (!controller.isCurrent(command.sessionId, command.generation)) {
-                        stopTicker()
-                        userReadPaused = false
-                        newEntryPending = false
-                        log.clear()
-                        order.reset()
-                        saidGate.reset()
-                        busyState.reset()
-                        liveEntryId = null
-                        panel.setLiveRow(null)
-                    }
-                    controller.accept(command)
-                    applyPanelAndAnimation()
-                    rebuild()
-                }
-
-                else -> controller.accept(command)
-            }
-        }
-        return true
+        return understood
     }
 
     /** The hint text as the wearer sees it, exposed so an instrumentation test can assert the committed view. */
     fun hintText(): String = panel.liveRow?.text?.toString().orEmpty()
 
-    /** Everything said in one conversation, one entry per line - the probe's view of [ConversationLog]. */
-    fun conversationText(route: AssistantRoute): String =
-        log.entries(route).joinToString("\n") { it.text }
+    /** Everything said in one conversation, one entry per line - the probe's view of the controller's log. */
+    fun conversationText(route: AssistantRoute): String = controller.conversationText(route)
 
     /** Which conversation is in front of the wearer, for the same reason. */
-    fun selectedRoute(): AssistantRoute = order.selected()
+    fun selectedRoute(): AssistantRoute = model?.route ?: AssistantRoute.WAKE
 
     private companion object {
         /**
@@ -357,165 +283,136 @@ class GlassesActivity : Activity() {
         const val HINT_HOLD_MILLIS = 15_000L
     }
 
+    // ---------------------------------------------------------------- PanelPort (0.24 S2 Task 8)
+
+    /** The panel is this Activity's content view; the controller never asks to show it in this task. */
+    override fun show(route: AssistantRoute) = Unit
+
     /**
-     * Files one accepted hint into its conversation and puts it on screen; `null` retires the live hint.
+     * The controller's exit branch. In this full-screen Activity, hiding the panel is finishing it; Task 9's overlay
+     * service replaces this with a real hide while keeping the resident service alive.
      *
-     * `null` means **nothing is live**, not "forget what was shown": the entries stay, and only the emphasis is
-     * removed. That distinction is the whole of spec §6.6 - a context view the phone can erase at will is not a
-     * context view.
+     * The two BACK probes are set at the send seam when a `STOP` is attempted. An idle exit has no STOP to observe, so
+     * it records here; an exit that followed a failed STOP keeps the `false` its line already recorded.
      */
-    private fun render(displayed: DisplayedHint?) {
-        if (displayed == null) {
-            liveEntryId = null
-            panel.setLiveRow(null)
-        } else {
-            val stored = log.append(
-                ConversationEntry(displayed.hintId, displayed.route, ConversationRole.ASSISTANT, displayed.text))
-            if (!stored) {
-                // Refused only for a blank id or blank text, which the wire already rejects; recorded rather than
-                // dropped silently because "nothing appeared" would otherwise have no cause.
-                android.util.Log.i("EdithGlasses", "hint refused by the conversation log: blank id or text")
-            }
-            liveEntryId = displayed.hintId
-            // The display follows what arrived. Without this the wearer reading one conversation would never see a
-            // hint filed under the other, which is precisely the failure the route tags exist to prevent.
-            order.show(displayed.route)
-            // A new entry has to be brought into view whatever the wearer was doing with the scroll: the pin exists
-            // so the continuous ticker never fights someone reading, not so that the next answer stays hidden (P4).
+    override fun hide() {
+        if (lastBackAction != "exit") {
+            lastBackAction = "exit"
+            lastBackStopSent = null
+        }
+        finish()
+    }
+
+    /**
+     * Binds one published model to the view tree.
+     *
+     * The controller owns what the panel means; this method only decides how it looks: which row is live, where the
+     * list is, whether the wake claim is held. A render also arrives while the screen is paused (the bridge outlives
+     * the Activity), so the same early-release rule the old `applyPanelAndAnimation` had is kept here.
+     */
+    override fun render(model: PanelModel) {
+        val previous = this.model
+        this.model = model
+
+        // A new session publishes an empty model: the old code reset the scroll state explicitly on that HELLO. Every
+        // retired hint stays in its conversation, so "empty and nothing live" can only mean a new window.
+        val newSession = model.entries.isEmpty() && model.liveEntryId == null
+        if (newSession) {
+            stopTicker()
+            userReadPaused = false
+            newEntryPending = false
+        } else if (previous == null ||
+            model.entries != previous.entries ||
+            (model.liveEntryId != null && model.liveEntryId != previous.liveEntryId)
+        ) {
+            // New content first, even while pinned: the pin is a reading position, not a reason for the next answer
+            // to stay hidden (P4). A retirement changes the live id to null and is deliberately not a reveal.
             newEntryPending = true
         }
-        holdAwakeFor(liveEntryId != null)
-        // The panel has two claimants, so it is resolved in one place: calling `holdAwakeFor` directly here released
-        // the wake lock a still-running proactive turn was holding (a hint expiring mid-turn is the ordinary case).
-        applyPanelAndAnimation()
-        rebuild()
+
+        // The pin's ticker half is view glue: the controller decides the pin, the scroll view decides how to stop.
+        if (previous != null && previous.pinned != model.pinned) {
+            if (model.pinned) stopTicker() else userReadPaused = false
+        }
+
+        // Two claimants share the panel (a live hint and a working turn), so the wake claim comes from the one model:
+        // `idle` is false while either route is busy, exactly the old `BusyState.any` expression. On a paused screen it
+        // is released, as the old early return did before anything could acquire it.
+        if (!resumed) holdAwakeFor(false) else holdAwakeFor(!model.idle || model.liveEntryId != null)
+        rebuild(model)
     }
 
-    /** Files one utterance the wearer made. Must run on the UI thread. */
-    private fun onSaid(command: HintCommand.Said) {
-        // The same gate a SHOW passes: a late utterance from the session before must not appear in this one's
-        // conversation. The identity lives in the controller, so this asks it rather than keeping a second copy that
-        // could disagree with it.
-        if (!controller.isCurrent(command.sessionId, command.generation)) {
-            android.util.Log.i("EdithGlasses", "said refused: session or generation mismatch")
-            return
-        }
-        if (!saidGate.accept(command.route, command.sequence)) {
-            android.util.Log.i("EdithGlasses", "said refused: sequence ${command.sequence} is not newer")
-            return
-        }
-        val stored = log.append(ConversationEntry(command.entryId, command.route, ConversationRole.USER, command.text))
-        android.util.Log.i("EdithGlasses",
-            "said stored=$stored route=${command.route.name} chars=${command.text.length}")
-        // A SAID for the route that is not on screen is recorded but must not move the current view: only a SHOW
-        // changes the route (U8), and its rebuild will bring the updated conversation in then.
-        if (command.route == order.selected()) {
-            if (stored) newEntryPending = true
-            rebuild()
-        }
+    /** The controller asks for the screen when something must be seen; the reason is in [holdAwakeFor]. */
+    override fun wakeScreen() {
+        holdAwakeFor(true)
     }
+
+    /** The panel is the Activity; there is no separate panel window yet. Task 11 wires `PANEL_SHOWN`/`UI_CLOSED`. */
+    override fun sendPanelShown() = Unit
+
+    override fun sendUiClosed() = Unit
 
     /**
-     * Records the level the phone stated and puts the ring and the panel in line with it.
+     * The official panel's state row, applied from the one model so the listening line, the thinking row, the orb and
+     * the tips cannot disagree with each other.
      *
-     * Must run on the UI thread. The level is bounded in [BusyState], so a "finished" that never arrives stops by
-     * itself rather than holding the ring and the wake lock for the life of the process.
+     * A command can arrive while the screen is paused (the bridge outlives the Activity); it must not restart the orb
+     * or the ticker behind a blank display. `onResume` applies the state once the screen is back.
      */
-    private fun onBusy(command: HintCommand.Busy) {
-        if (!controller.isCurrent(command.sessionId, command.generation)) {
-            android.util.Log.i("EdithGlasses", "busy refused: session or generation mismatch")
-            return
-        }
-        busyState.set(command.route, command.busy, clock.nowNanos())
-        android.util.Log.i("EdithGlasses",
-            "busy route=${command.route.name} stated=${command.busy} any=${busyState.any(clock.nowNanos())}")
-        applyPanelAndAnimation()
-        rebuild()
-    }
-
-    /**
-     * The single place that decides whether the panel is held and whether the ring turns.
-     *
-     * Two claimants share the panel — a live hint and a working turn — and they must be resolved in one place: two
-     * separate `holdAwakeFor` callers would release each other's claim, and the panel would go dark mid-answer.
-     *
-     * **The bound is armed, not merely computed.** `BusyState` answers "is it still busy" from the clock, but nothing
-     * asks it again once the phone stops talking — and the case the bound exists for is exactly that one (the phone
-     * died mid-turn, or the link dropped). Without a scheduled re-check the ring would turn and
-     * `FLAG_KEEP_SCREEN_ON` would stay set for the life of this process, on a device whose wearer cannot switch the
-     * display off from the app. So raising a level arms a deadline, and the deadline re-runs this method.
-     */
-    private fun applyPanelAndAnimation() {
-        // A command can arrive while paused; it must not re-acquire the wake lock or start animators behind a blank
-        // display. `onResume` applies the state again once the screen is back.
-        if (!resumed) {
-            holdAwakeFor(false)
-            return
-        }
-        val now = clock.nowNanos()
-        val busy = busyState.any(now)
-        // 0.23 P3: the whole-window loading ring is gone. The orb is the working indicator, and its state (idle /
-        // listening / thinking / answering) is applied by `applyVisualState` from the same busy level.
-        applyVisualState()
-        holdAwakeFor(busy || liveEntryId != null)
-        if (!busy) return
-        // One armed deadline per busy spell: a repeat of the same level must not keep pushing it back.
-        if (busyDeadlineArmed) return
-        busyDeadlineArmed = true
-        scheduler.at(now + BusyState.MAX_MILLIS * 1_000_000L) {
-            busyDeadlineArmed = false
-            applyPanelAndAnimation()
-            rebuild()
-        }
-    }
-
-    /**
-     * The official panel's state row, computed in one place so the listening line, the thinking row, the orb and the
-     * tips cannot disagree with each other.
-     *
-     * The busy boolean is **per displayed route** (`isBusy(selected)`): a proactive turn must not make the wake
-     * conversation look busy, and the other way round (0.23 P3/P4 route isolation). The tips and BACK use `any`,
-     * because either route working is something the wearer can interrupt.
-     */
-    private fun applyVisualState() {
+    private fun applyVisualState(model: PanelModel) {
         if (!::panel.isInitialized) return
-        // A command can arrive while the screen is paused (the bridge outlives the Activity); it must not restart the
-        // orb or the ticker behind a blank display. `onResume` applies the state once the screen is back.
         if (!resumed) return
-        val now = clock.nowNanos()
-        val route = order.selected()
-        val live = liveEntryId != null
-        val busyForRoute = busyState.isBusy(route, now)
-        val entries = log.entries(route)
-        val lastRole = entries.lastOrNull()?.role
-        val listening = GlassesPanelSpec.listeningVisible(busyForRoute, live, route, lastRole)
-        val thinking = GlassesPanelSpec.thinkingVisible(busyForRoute, live, route, lastRole)
+        val route = model.route
+        val live = model.liveEntryId != null
+        val listening = model.listeningVisible
+        val thinking = model.thinkingVisible
+        val pinned = model.pinned
+        val orb = orbStateFor(model)
 
-        listeningView.visibility = if (listening) View.VISIBLE else View.GONE
+        // Task 8 keeps Hi behaviour unchanged: the only listening row that exists today is `Hi, 我在听`, so it is the
+        // model's `hiVisible` field that drives it. Task 13/17 adds the separate "…" row and the official first-open
+        // rule, at which point `listeningVisible` gets its own view.
+        listeningView.visibility = if (model.hiVisible) View.VISIBLE else View.GONE
         panel.thinkingRow?.let { row -> row.visibility = if (thinking) View.VISIBLE else View.GONE }
         if (thinking) thinkingIcon?.start() else thinkingIcon?.stop()
-        orbView.setState(GlassesPanelSpec.orbState(busyForRoute, live, route, lastRole))
-        tipsView.text = GlassesPanelSpec.tipsText(busyState.any(now))
-        val pinned = order.isPinned()
+        orbView.setState(orb)
+        tipsView.text = model.tips
         pinTextView.visibility = if (pinned) View.GONE else View.VISIBLE
         pinIconView.visibility = if (pinned) View.VISIBLE else View.GONE
+        // The P3_STATE line keeps its historical fields. `any` is the model's transitional idle inverse; `busy` is the
+        // per-route value reconstructed from the rows it drives (a live answer plus any working route). Counts and
+        // state names only, never text - the same rule as every other P3/P4 line.
+        val busyAny = !model.idle
+        val busyForRoute = listening || thinking || (live && busyAny)
         android.util.Log.i("EdithGlasses",
-            "P3_STATE route=${route.name} busy=$busyForRoute any=${busyState.any(now)} live=$live " +
-                "orb=${GlassesPanelSpec.orbState(busyForRoute, live, route, lastRole).name} " +
-                "listening=$listening thinking=$thinking pinned=$pinned " +
+            "P3_STATE route=${route.name} busy=$busyForRoute any=$busyAny live=$live " +
+                "orb=${orb.name} listening=$listening thinking=$thinking pinned=$pinned " +
                 "offset=${scrollOffsetY()} max=${maxScrollY()} ticker=${tickerAnimator != null}")
+    }
+
+    /**
+     * The orb state from the one model, highest-priority first: a live answer, then listening, then thinking, then
+     * idle. This is the same order `GlassesPanelSpec.orbState` uses; deriving it from the model keeps the orb and the
+     * rows from disagreeing once the model is the only description of the state.
+     */
+    private fun orbStateFor(model: PanelModel): OrbState = when {
+        model.liveEntryId != null -> OrbState.ANSWERING
+        model.listeningVisible -> OrbState.LISTENING
+        model.thinkingVisible -> OrbState.THINKING
+        else -> OrbState.IDLE
     }
 
     /**
      * Redraws the conversation in front of the wearer.
      *
      * The list is rebuilt rather than patched: it is bounded at tens of entries, and a rebuild is what makes "the view
-     * shows the log" true by construction instead of by careful incremental updates.
+     * shows the model" true by construction instead of by careful incremental updates. The model supplies the route,
+     * the entries, the live id and whether the thinking row is visible; this method only builds `View`s from them.
      */
-    private fun rebuild() {
-        val route = order.selected()
-        val rows = ConversationView.rows(log.entries(route), liveEntryId)
-        val now = clock.nowNanos()
+    private fun rebuild(model: PanelModel) {
+        if (!::panel.isInitialized) return
+        val route = model.route
+        val rows = ConversationView.rows(model.entries, model.liveEntryId)
         // `removeAllViews` can clamp the scroll to zero, so the position to restore is read before the rebuild.
         val previousScroll = scrollOffsetY()
         entriesView.removeAllViews()
@@ -524,14 +421,12 @@ class GlassesActivity : Activity() {
         panel.setThinkingRow(null)
         thinkingTextView = null
         rows.forEach { row -> entriesView.addView(entryRow(row)) }
-        val busyForRoute = busyState.isBusy(route, now)
-        val lastRole = log.entries(route).lastOrNull()?.role
-        if (GlassesPanelSpec.thinkingVisible(busyForRoute, liveEntryId != null, route, lastRole)) {
+        if (model.thinkingVisible) {
             entriesView.addView(thinkingRow())
         }
         android.util.Log.i("EdithGlasses",
             HintPresentation.conversationReport(route, rows.size, rows.sumOf { it.entry.text.length }))
-        applyVisualState()
+        applyVisualState(model)
         val serial = ++rebuildSerial
         entriesView.post {
             // Only the newest rebuild may move the scroll. Several commands can arrive before the layout pass; a
@@ -569,7 +464,7 @@ class GlassesActivity : Activity() {
     private fun startTickerIfNeeded() {
         if (!resumed) return
         if (tickerAnimator != null) return
-        if (order.isPinned() || userReadPaused) return
+        if (model?.pinned == true || userReadPaused) return
         if (!HintTicker.shouldScroll(scrollOffsetY(), maxScrollY())) return
         tickerStartOffset = scrollOffsetY()
         tickerFrames = 0
@@ -719,8 +614,28 @@ class GlassesActivity : Activity() {
         hintWakeLock = null
     }
 
-    private fun acknowledge(ack: HintCommand.Ack) {
-        RokidBridgeEndpoint.instance.send(HintWireCodec.encode(ack))
+    /**
+     * The one outbound seam. The controller's `send` lambda and the `PONG` reply both use it, so an outbound command
+     * can only reach the bridge one way.
+     *
+     * The two BACK probes are recorded here because the send outcome is observable here: `"stop"`/`true` when a STOP
+     * went out, `"exit"`/`false` when it did not. A probe sender replaces the CXR send for STOP only, exactly as the
+     * pre-extraction Activity's BACK branch did.
+     */
+    private fun sendCommand(command: HintCommand): Boolean {
+        val sent = runCatching {
+            val json = HintWireCodec.encode(command)
+            if (command is HintCommand.Stop) {
+                stopSenderForProbe?.invoke(json) ?: RokidBridgeEndpoint.instance.send(json)
+            } else {
+                RokidBridgeEndpoint.instance.send(json)
+            }
+        }.getOrDefault(false)
+        if (command is HintCommand.Stop) {
+            lastBackAction = if (sent) "stop" else "exit"
+            lastBackStopSent = sent
+        }
+        return sent
     }
 
     /**
@@ -742,6 +657,9 @@ class GlassesActivity : Activity() {
     private fun installSideTouch(root: View) {
         root.addOnUnhandledKeyEventListener(View.OnUnhandledKeyEventListener { _, event ->
             if (event.action != KeyEvent.ACTION_DOWN) return@OnUnhandledKeyEventListener false
+            // 0.24 S2 Task 8: the controller owns the panel's key decisions (ENTER = pin). The four directions are the
+            // scroll view's, so they only page after the controller declines them.
+            if (controller.onKey(event.keyCode, event.action)) return@OnUnhandledKeyEventListener true
             when (event.keyCode) {
                 KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT -> {
                     pageBy(1)
@@ -749,18 +667,6 @@ class GlassesActivity : Activity() {
                 }
                 KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_LEFT -> {
                     pageBy(-1)
-                    true
-                }
-                KeyEvent.KEYCODE_ENTER -> {
-                    val pinned = order.togglePin()
-                    android.util.Log.i("EdithGlasses", "side touch: pinned=$pinned")
-                    if (pinned) {
-                        stopTicker()
-                    } else {
-                        userReadPaused = false
-                        startTickerIfNeeded()
-                    }
-                    applyVisualState()
                     true
                 }
                 else -> false
@@ -803,7 +709,7 @@ class GlassesActivity : Activity() {
             (entriesView.height - viewport).coerceAtLeast(0)
         } else 0
 
-    fun isPinnedForProbe(): Boolean = order.isPinned()
+    fun isPinnedForProbe(): Boolean = model?.pinned == true
 
     fun tickerRunningForProbe(): Boolean = tickerAnimator != null
 
