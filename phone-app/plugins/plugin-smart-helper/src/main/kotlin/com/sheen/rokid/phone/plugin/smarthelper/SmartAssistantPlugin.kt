@@ -19,6 +19,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.proactive.NoulThreshold
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.SmartProactive
 import com.sheen.rokid.phone.plugin.smarthelper.output.NotifyUserTool
 import com.sheen.rokid.phone.plugin.smarthelper.output.NotifyDecision
+import com.sheen.rokid.phone.plugin.smarthelper.output.ToolLabelMap
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 
 import com.sheen.rokid.agent.AgentLoop
@@ -1143,7 +1144,9 @@ class SmartAssistantPlugin(
         // A SKILL pull is a real tool round (its preamble must not leak into the answer stream) but not a device action,
         // so it resets the buffer above and stops before painting a row.
         if (action == LoadSkillTool.NAME) return
-        val label = labels[action] ?: action
+        // 0.24 S4 Task 19: the host title is the live source; the explicit map is the registered fallback for an EDITH
+        // action whose descriptor came without copy. A name in neither is the raw model name (spec §5.6).
+        val label = labels[action]?.takeIf { it.isNotBlank() } ?: ToolLabelMap.labelFor(action)
         P3Log.line("P3_CONV tool route=WAKE turn=$turnId phase=${phase.name} action=$action chars=${label.length}")
         // The row's state must already be 7 when the row arrives: the glasses hide the tool row outside status 7.
         if (phase == ToolPhase.START) {

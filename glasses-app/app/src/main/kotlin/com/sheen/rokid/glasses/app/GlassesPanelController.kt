@@ -75,6 +75,14 @@ data class PanelModel(
      */
     val listeningVisible: Boolean,
     /**
+     * 0.24 S4 Task 19: the ASR "…" waiting GIF row.
+     *
+     * With an official status this is `OfficialConversation.asrLoadingVisible` (status 0/1 only), except in the
+     * official idle state where it is hidden. An old phone without a status keeps the legacy listening signal so the
+     * degraded panel still shows that it is waiting.
+     */
+    val asrLoadingVisible: Boolean,
+    /**
      * The `Hi, 我在听` text.
      *
      * With an official status this is `OfficialConversation.hiVisible(status, firstOpen)`, so the automatic next turn
@@ -89,6 +97,13 @@ data class PanelModel(
     val toolTurnId: String?,
     val toolPhase: ToolPhase?,
     val tips: String,
+    /**
+     * 0.24 S4 Task 19: the assistant entry ids whose authoritative `SHOW` already arrived.
+     *
+     * Only these answer rows are Markwon-rendered; the streamed partials stay plain (spec §5.6). The set is per route
+     * and is cleared with the window/session, exactly like the conversation log it describes.
+     */
+    val finalAnswerEntryIds: Set<String> = emptySet(),
 )
 
 /** What the controller needs from the window: show/hide it, draw one model, wake the panel, tell the phone. */
@@ -160,6 +175,15 @@ class GlassesPanelController(
 
     /** The tool row each route last reported: only visible while that route is at status 7 (spec §5.6). */
     private val toolRows: MutableMap<AssistantRoute, ToolRowState> = mutableMapOf()
+
+    /**
+     * 0.24 S4 Task 19: the answer entries whose final `SHOW` was accepted, per route.
+     *
+     * This is the Markdown authority: `onAnswer` revisions are partials (plain text), and only the `SHOW` that passed
+     * every gate becomes the parsed Markdown row. The id (`say-${hintId}`) survives a later status/turn, so an old
+     * final does not fall back to plain text when the list is rebuilt.
+     */
+    private val finalAnswerEntries: MutableMap<AssistantRoute, MutableSet<String>> = mutableMapOf()
 
     /**
      * The first-open latch for Hi, per route.
@@ -353,6 +377,7 @@ class GlassesPanelController(
         answerGate.reset()
         busyState.reset()
         resetOfficialState(resetSequence = false)
+        finalAnswerEntries.clear()
         liveEntryId = null
         contentRevision = 0L
         busyDeadlineArmed = false
@@ -398,6 +423,7 @@ class GlassesPanelController(
             answerGate.reset()
             busyState.reset()
             resetOfficialState(resetSequence = true)
+            finalAnswerEntries.clear()
             liveEntryId = null
         }
         hints.accept(command)
@@ -703,6 +729,13 @@ class GlassesPanelController(
                 diagnostics("hint refused by the conversation log: blank id or text")
             } else {
                 answerGate.finalize(displayed.route, entryId)
+                // 0.24 S4 Task 19: the accepted final SHOW is the Markdown row; partials never enter this set. Bounded
+                // like the conversation log: a final whose entry the log has evicted does not need a marker.
+                val finals = finalAnswerEntries.getOrPut(displayed.route) { linkedSetOf() }
+                finals += entryId
+                while (finals.size > ConversationLog.MAX_ENTRIES) {
+                    finals.remove(finals.first())
+                }
             }
             liveEntryId = entryId
             // The display follows what arrived. Without this the wearer reading one conversation would never see a
@@ -884,6 +917,13 @@ class GlassesPanelController(
         } else {
             legacyListening
         }
+        // 0.24 S4 Task 19: the official "…" GIF is status 0/1 only and never the separate idle state; without a status
+        // the legacy busy level keeps the old-phone indicator (the degraded mode, not a second official rule).
+        val asrLoading = if (officialKnown) {
+            !idleForRoute && OfficialConversation.asrLoadingVisible(statusForRules)
+        } else {
+            legacyListening
+        }
         // 0.24 S4 Task 17 (spec §5.6): the thinking row is the "before the answer" row. Status 4 owns it, and status 3
         // keeps it until this turn's answer text actually exists - "答案到达隐藏", not merely "status 3 arrived". A live
         // final `SHOW` is an answer even when the hint carried no turn id (the legacy/first-answer shape), so the live
@@ -915,6 +955,7 @@ class GlassesPanelController(
             officialIdle = idleForRoute,
             pinned = pinned,
             listeningVisible = listening,
+            asrLoadingVisible = asrLoading,
             hiVisible = hi,
             thinkingVisible = thinking,
             thinkingTurnId = thinkingTurn,
@@ -922,6 +963,7 @@ class GlassesPanelController(
             toolTurnId = tool?.turnId,
             toolPhase = tool?.phase,
             tips = OfficialConversation.tipsText(effective, pinned),
+            finalAnswerEntryIds = finalAnswerEntries[route]?.toSet().orEmpty(),
         )
     }
 

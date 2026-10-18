@@ -415,4 +415,76 @@ class ConversationViewTest {
             coalescer.allow(1_050_000_000L))
         assertTrue("the cap is the task's ≤100 ms bound", RevealCoalescer.INTERVAL_NANOS <= 100_000_000L)
     }
+
+    // ---------------------------------------------------------------- official GIFs and Markdown (Task 19)
+
+    @Test
+    fun theAsrLoadingRowIsATransientItemInTheWaitingStatusesOnly() {
+        // Status 0/1 have no utterance yet: the official `imv_asr_loading` is the whole current item. Status 2 replaces
+        // it with the wearer's text, so the transient row disappears (spec §5.6).
+        val waiting = ConversationView.turns(emptyList(), asrLoadingVisible = true)
+        assertEquals(1, waiting.size)
+        assertTrue(waiting.single().asrLoadingVisible)
+        assertNull(waiting.single().asrText)
+        assertNull(waiting.single().answerText)
+
+        val answered = ConversationView.turns(
+            listOf(turnEntry("asr-t1", ConversationRole.USER, "t-1", "帮我看")),
+            asrLoadingVisible = false,
+        )
+        assertEquals("status 2 starts with the stored wearer line", 1, answered.size)
+        assertFalse(answered.single().asrLoadingVisible)
+        assertTrue("appearing/disappearing is structural",
+            ConversationView.plan(waiting, answered) is ConversationView.RenderPlan.Rebuild)
+    }
+
+    @Test
+    fun theAsrLoadingRowFollowsTheLatestTurnWithoutReorderingExistingItems() {
+        val turns = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t1", ConversationRole.USER, "t-1", "第一轮"),
+                turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "答一"),
+            ),
+            asrLoadingVisible = true,
+        )
+
+        assertEquals("the previous answer is not moved", listOf("t-1", null), turns.map { it.turnId })
+        assertFalse(turns[0].asrLoadingVisible)
+        assertTrue("the waiting indicator belongs to the current (not-yet-stored) turn",
+            turns[1].asrLoadingVisible)
+        assertEquals("答一", turns[0].answerText)
+    }
+
+    @Test
+    fun theFinalAnswerIsMarkedForMarkdownWhileThePartialStaysPlain() {
+        val entries = listOf(
+            turnEntry("asr-t1", ConversationRole.USER, "t-1", "帮我总结"),
+            turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "**重点**"),
+        )
+        val partial = ConversationView.turns(entries)
+        val final = ConversationView.turns(entries, finalAnswerEntryIds = setOf("say-h1"))
+
+        assertFalse("a streamed revision is not the Markwon row", partial.single().answerFinal)
+        assertTrue("the final SHOW marks the same entry", final.single().answerFinal)
+        assertEquals("the markdown render is style only: the row structure is unchanged",
+            ConversationView.RenderPlan.Update::class.java,
+            ConversationView.plan(partial, final)::class.java)
+        val update = ConversationView.plan(partial, final) as ConversationView.RenderPlan.Update
+        assertTrue("the final flag is part of the in-place update", update.answerFinalChanged)
+    }
+
+    @Test
+    fun aFinalAnswerStaysMarkedAfterLaterTurnsAndDuplicateRenders() {
+        val first = listOf(
+            turnEntry("asr-t1", ConversationRole.USER, "t-1", "问一"),
+            turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "答一"),
+        )
+        val later = first + listOf(turnEntry("asr-t2", ConversationRole.USER, "t-2", "问二"))
+        val turn = ConversationView.turns(later, finalAnswerEntryIds = setOf("say-h1")).first()
+
+        assertTrue("the already-final answer keeps its Markdown path when a later turn arrives", turn.answerFinal)
+        val model = ConversationView.turns(first, finalAnswerEntryIds = setOf("say-h1"))
+        assertTrue("a duplicate render is not new content",
+            ConversationView.plan(model, model) is ConversationView.RenderPlan.Unchanged)
+    }
 }

@@ -1093,6 +1093,42 @@ class GlassesPanelControllerTest {
             harness.controller.currentIdentity())
     }
 
+    // ---------------------------------------------------------------- official GIFs and Markdown (0.24 S4 Task 19)
+
+    @Test
+    fun theAsrWaitingGifFollowsOnlyTheOfficialWaitingStatuses() {
+        val harness = Harness()
+        harness.hello()
+        harness.state(OfficialStatus.EMPTY, 1)
+        assertTrue("status 0 is the waiting GIF", harness.port.lastModel().asrLoadingVisible)
+
+        harness.state(OfficialStatus.LISTENING, 2)
+        assertTrue("status 1 keeps the waiting GIF", harness.port.lastModel().asrLoadingVisible)
+
+        harness.state(OfficialStatus.ASR, 3)
+        assertFalse("status 2's wearer text replaces the GIF", harness.port.lastModel().asrLoadingVisible)
+
+        harness.state(OfficialStatus.ASR_END, 4)
+        assertFalse("status 4 is the thinking row, not the waiting GIF", harness.port.lastModel().asrLoadingVisible)
+    }
+
+    @Test
+    fun onlyTheAcceptedShowBecomesTheMarkdownFinal() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.answer(turnId = "turn-md", hintId = "h-md", text = "**一半**")
+        assertTrue("a streamed partial is not final", harness.port.lastModel().finalAnswerEntryIds.isEmpty())
+
+        harness.show(sequence = 1, hintId = "h-md", text = "**完整**")
+        assertTrue("the accepted SHOW is the final Markdown row",
+            "say-h-md" in harness.port.lastModel().finalAnswerEntryIds)
+
+        harness.state(OfficialStatus.AUDIO_FINISHED, 1, turnId = "turn-md")
+        assertTrue("a later status does not downgrade an old final row",
+            "say-h-md" in harness.port.lastModel().finalAnswerEntryIds)
+    }
+
     @Test
     fun disconnectDropsTheIdentityAndRetiresAVisibleHint() {
         val harness = Harness()

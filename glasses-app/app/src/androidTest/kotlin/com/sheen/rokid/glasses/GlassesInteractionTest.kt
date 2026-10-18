@@ -102,7 +102,12 @@ class GlassesInteractionTest {
             mark("long-mid")
             settle(500)
 
-            key(KeyEvent.KEYCODE_ENTER)
+            // Task 19 timing correction: `key()` settles 500 ms, and with the official item margins the remaining
+            // (max - offset) travel at the pin is ~28 px, so the ticker legitimately reached the list bottom during
+            // that 500 ms and stopped - the assertion then measured "end of list", not "pin stopped the ticker". The
+            // pin is checked a few frames after the key instead, which is what this assertion has always meant.
+            InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_ENTER)
+            settle(50)
             var pinnedOffset = 0
             scenario.onActivity { activity ->
                 assertTrue("ENTER must pin the reading position", activity.isPinnedForProbe())

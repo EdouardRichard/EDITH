@@ -236,6 +236,22 @@ class GlassesActivity : Activity() {
 
     fun thinkingIconWidthForProbe(): Int = host?.thinkingIconWidthForProbe() ?: 0
 
+    fun thinkingGifWidthForProbe(): Int = host?.thinkingGifWidthForProbe() ?: 0
+
+    fun thinkingGifHeightForProbe(): Int = host?.thinkingGifHeightForProbe() ?: 0
+
+    fun thinkingGifResourceForProbe(): String = host?.thinkingGifResourceForProbe().orEmpty()
+
+    fun thinkingGifRunningForProbe(): Boolean = host?.thinkingGifRunningForProbe() == true
+
+    fun thinkingGifAnimatedForProbe(): Boolean = host?.thinkingGifAnimatedForProbe() == true
+
+    fun thinkingGifIntrinsicWidthForProbe(): Int = host?.thinkingGifIntrinsicWidthForProbe() ?: 0
+
+    fun thinkingGifIntrinsicHeightForProbe(): Int = host?.thinkingGifIntrinsicHeightForProbe() ?: 0
+
+    fun thinkingRowHeightForProbe(): Int = host?.thinkingRowHeightForProbe() ?: 0
+
     fun thinkingTextSizeForProbe(): Float = host?.thinkingTextSizeForProbe() ?: 0f
 
     fun toolVisibleForProbe(): Boolean = host?.toolVisibleForProbe() ?: false
@@ -246,11 +262,50 @@ class GlassesActivity : Activity() {
 
     fun toolIconWidthForProbe(): Int = host?.toolIconWidthForProbe() ?: 0
 
+    fun toolGifWidthForProbe(): Int = host?.toolGifWidthForProbe() ?: 0
+
+    fun toolGifHeightForProbe(): Int = host?.toolGifHeightForProbe() ?: 0
+
+    fun toolGifResourceForProbe(): String = host?.toolGifResourceForProbe().orEmpty()
+
+    fun toolGifRunningForProbe(): Boolean = host?.toolGifRunningForProbe() == true
+
+    fun toolGifRepeatCountForProbe(): Int = host?.toolGifRepeatCountForProbe() ?: Int.MIN_VALUE
+
     fun toolLabelTextSizeForProbe(): Float = host?.toolLabelTextSizeForProbe() ?: 0f
 
     fun toolTextColorForProbe(): Int = host?.toolTextColorForProbe() ?: 0
 
     fun toolIconRunningForProbe(): Boolean = host?.toolIconRunningForProbe() == true
+
+    // 0.24 S4 Task 19: official GIFs and panel chrome.
+    fun asrGifVisibleForProbe(): Boolean = host?.asrGifVisibleForProbe() == true
+
+    fun asrGifViewForProbe(): android.view.View? = host?.asrGifViewForProbe()
+
+    fun asrGifWidthForProbe(): Int = host?.asrGifWidthForProbe() ?: 0
+
+    fun asrGifHeightForProbe(): Int = host?.asrGifHeightForProbe() ?: 0
+
+    fun asrGifRunningForProbe(): Boolean = host?.asrGifRunningForProbe() == true
+
+    fun asrGifAnimatedForProbe(): Boolean = host?.asrGifAnimatedForProbe() == true
+
+    fun asrGifIntrinsicWidthForProbe(): Int = host?.asrGifIntrinsicWidthForProbe() ?: 0
+
+    fun asrGifIntrinsicHeightForProbe(): Int = host?.asrGifIntrinsicHeightForProbe() ?: 0
+
+    fun topMaskHeightForProbe(): Int = host?.topMaskHeightForProbe() ?: 0
+
+    fun bottomMaskHeightForProbe(): Int = host?.bottomMaskHeightForProbe() ?: 0
+
+    fun complianceTextSizeForProbe(): Float = host?.complianceTextSizeForProbe() ?: 0f
+
+    fun pinIconWidthForProbe(): Int = host?.pinIconWidthForProbe() ?: 0
+
+    fun pinIconHeightForProbe(): Int = host?.pinIconHeightForProbe() ?: 0
+
+    fun pinIconAlphaForProbe(): Float = host?.pinIconAlphaForProbe() ?: 0f
 
     fun listeningTextForProbe(): String = host?.listeningTextForProbe().orEmpty()
 

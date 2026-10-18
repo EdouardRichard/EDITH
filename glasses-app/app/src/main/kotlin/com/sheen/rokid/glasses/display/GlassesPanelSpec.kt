@@ -48,6 +48,32 @@ object GlassesPanelSpec {
     const val TOOL_ICON_PX = 22
     const val TOOL_TEXT_SIZE_PX = 16f
 
+    // ---------------------------------------------------------------- official item spacing (Task 19)
+
+    /**
+     * `recycler_item_page_ai.xml`: the ASR item root is `marginTop=10px marginBottom=4px marginStart/End=10px`; the TTS
+     * line is `marginTop=5px marginBottom=10px` with `paddingStart/End=10px`; the thinking/tool rows are exactly
+     * `layout_height=22px` with a 10 px icon start margin and a 5 px copy start margin.
+     *
+     * The scroll view no longer re-adds a 10 px side padding: each row carries the official inset itself, so the two
+     * sources cannot double to 20 px.
+     */
+    const val ASR_ROW_MARGIN_TOP_PX = 10
+    const val ASR_ROW_MARGIN_BOTTOM_PX = 4
+    const val ASR_ROW_MARGIN_SIDE_PX = 10
+    const val TTS_ROW_MARGIN_TOP_PX = 5
+    const val TTS_ROW_MARGIN_BOTTOM_PX = 10
+    const val TTS_SIDE_PADDING_PX = 10
+    const val STATE_ROW_HEIGHT_PX = 22
+    const val STATE_ICON_MARGIN_START_PX = 10
+    const val STATE_TEXT_MARGIN_START_PX = 5
+
+    /** `imv_asr_loading`: the official 26x13 px ASR waiting GIF, with its own 10 px start/top margins. */
+    const val ASR_GIF_WIDTH_PX = 26
+    const val ASR_GIF_HEIGHT_PX = 13
+    const val ASR_GIF_MARGIN_START_PX = 10
+    const val ASR_GIF_MARGIN_TOP_PX = 10
+
     // ---------------------------------------------------------------- official green scale
 
     /** `green_normal`: the assistant's answer, the listening line, the thinking line and the orb. */
@@ -99,7 +125,6 @@ object GlassesPanelSpec {
 
     // ---------------------------------------------------------------- relative geometry (P3 layout)
 
-    const val LIST_PADDING_SIDE_PX = 10
     const val LIST_PADDING_TOP_PX = 10
     const val LIST_PADDING_BOTTOM_PX = 25
     const val LISTENING_MARGIN_TOP_PX = 6

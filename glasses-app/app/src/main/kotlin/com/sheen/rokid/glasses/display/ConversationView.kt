@@ -60,6 +60,17 @@ object ConversationView {
         val thinkingVisible: Boolean,
         val toolLabel: String?,
         val toolPhase: ToolPhase?,
+        /**
+         * 0.24 S4 Task 19: the assistant entry is the final `SHOW`, so the answer row is Markwon-rendered. A streamed
+         * partial leaves this false and the host assigns plain text (see [MarkdownPolicy]). A flag rather than a text
+         * heuristic: a partial may already contain `**` while it is still being streamed.
+         */
+        val answerFinal: Boolean = false,
+        /**
+         * 0.24 S4 Task 19: this item is the transient ASR waiting item (status 0/1), rendered as the official 26x13
+         * `gif_loading`. Status 2 removes it when the wearer's text replaces the "…".
+         */
+        val asrLoadingVisible: Boolean = false,
     ) {
         val asrTextSizePx: Float get() = GlassesPanelSpec.USER_TEXT_SIZE_PX
         val asrTextColor: Int
@@ -85,6 +96,10 @@ object ConversationView {
         thinkingVisible: Boolean = false,
         thinkingTurnId: String? = null,
         tool: ToolRowState? = null,
+        /** 0.24 S4 Task 19: entry ids whose `SHOW` was accepted; only these answers are Markwon-rendered. */
+        finalAnswerEntryIds: Set<String> = emptySet(),
+        /** 0.24 S4 Task 19: status 0/1's ASR waiting GIF, appended as the current transient item. */
+        asrLoadingVisible: Boolean = false,
     ): List<TurnRow> {
         val groups = LinkedHashMap<Any, MutableList<ConversationEntry>>()
         entries.forEachIndexed { index, entry ->
@@ -103,6 +118,7 @@ object ConversationView {
                 thinkingVisible = false,
                 toolLabel = null,
                 toolPhase = null,
+                answerFinal = assistant != null && assistant.entryId in finalAnswerEntryIds,
             )
         }.toMutableList()
 
@@ -118,6 +134,21 @@ object ConversationView {
             if (index >= 0) turns[index] = turns[index].copy(toolLabel = tool.label, toolPhase = tool.phase)
             else turns += TurnRow(tool.turnId, null, null, false, false, tool.label, tool.phase)
         }
+
+        if (asrLoadingVisible) {
+            // The official `imv_asr_loading` sits at the top of the current item. Status 0/1 have no current text yet,
+            // so the current item is a transient one after the last stored turn; appending it never reorders the log.
+            turns += TurnRow(
+                turnId = null,
+                asrText = null,
+                answerText = null,
+                answerLive = false,
+                thinkingVisible = false,
+                toolLabel = null,
+                toolPhase = null,
+                asrLoadingVisible = true,
+            )
+        }
         return turns
     }
 
@@ -131,6 +162,8 @@ object ConversationView {
             val turns: List<TurnRow>,
             val textChanged: Boolean,
             val liveChanged: Boolean,
+            /** 0.24 S4 Task 19: the partial became the final Markdown row; the host parses it in place. */
+            val answerFinalChanged: Boolean = false,
         ) : RenderPlan
 
         /** Nothing the view shows changed (an equal replacement, a duplicate revision). */
@@ -156,8 +189,12 @@ object ConversationView {
                 previous[it].toolPhase != next[it].toolPhase
         }
         val liveChanged = previous.indices.any { previous[it].answerLive != next[it].answerLive }
-        return if (textChanged || liveChanged) RenderPlan.Update(next, textChanged, liveChanged)
-        else RenderPlan.Unchanged(next)
+        val answerFinalChanged = previous.indices.any { previous[it].answerFinal != next[it].answerFinal }
+        return if (textChanged || liveChanged || answerFinalChanged) {
+            RenderPlan.Update(next, textChanged, liveChanged, answerFinalChanged)
+        } else {
+            RenderPlan.Unchanged(next)
+        }
     }
 
     /** What makes two turns the same item for the view: identity plus which rows exist, never their text. */
@@ -167,10 +204,12 @@ object ConversationView {
         val hasAnswer: Boolean,
         val thinking: Boolean,
         val hasTool: Boolean,
+        val asrLoading: Boolean,
     )
 
     private fun shape(row: TurnRow): Shape =
-        Shape(row.turnId, row.asrText != null, row.answerText != null, row.thinkingVisible, row.toolLabel != null)
+        Shape(row.turnId, row.asrText != null, row.answerText != null, row.thinkingVisible, row.toolLabel != null,
+            row.asrLoadingVisible)
 
     /** A distinct key for one entry that has no turn id, so two legacy lines never merge into one item. */
     private data class NullTurnKey(val index: Int)

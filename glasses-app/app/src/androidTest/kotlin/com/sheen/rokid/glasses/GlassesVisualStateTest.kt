@@ -104,6 +104,65 @@ class GlassesVisualStateTest {
         }
     }
 
+    /**
+     * 0.24 S4 Task 19: the official GIFs, the tool row and the Markdown answer, held long enough for a host capture.
+     *
+     * This is an instrument, not a gate; [GlassesPanelStateTest] asserts the same properties. It exists because the
+     * task's screenshots are captured from the host (`adb exec-out screencap`), which can only see what the panel is
+     * actually showing when the marker changes.
+     */
+    @Test
+    fun captureOfficialGifsToolRowAndMarkdown() {
+        launchHostPanel().use { scenario ->
+            settle()
+            hold("empty", 1_000)
+
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-visual-gif", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-visual-gif", 1, AssistantRoute.WAKE, turnId = "turn-visual-gif",
+                        status = 4, sequence = 1)))
+            }
+            settle()
+            hold("gif-thinking", 6_000)
+
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-visual-gif", 1, AssistantRoute.WAKE, turnId = "turn-visual-gif",
+                        status = 7, sequence = 2)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Tool("s-visual-gif", 1, AssistantRoute.WAKE, turnId = "turn-visual-gif",
+                        phase = com.sheen.rokid.contracts.ToolPhase.START, label = "打开 App")))
+            }
+            settle()
+            hold("gif-tool-start", 6_000)
+
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Tool("s-visual-gif", 1, AssistantRoute.WAKE, turnId = "turn-visual-gif",
+                        phase = com.sheen.rokid.contracts.ToolPhase.END, label = "打开 App")))
+            }
+            settle()
+            hold("gif-tool-end", 6_000)
+
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Sync("sync-visual-gif", 0, 1_000_000, System.nanoTime() + 60_000_000_000L)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-visual-gif", 1, AssistantRoute.WAKE, turnId = "turn-visual-gif",
+                        status = 3, sequence = 3)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Show("s-visual-gif", 1, sequence = 1, hintId = "h-visual-gif", revision = 1,
+                        syncId = "sync-visual-gif", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 30_000,
+                        text = "**重点**\n\n- 第一项\n- 第二项\n\n`code`")))
+            }
+            settle()
+            hold("markdown", 8_000)
+
+            mark("done")
+        }
+    }
+
     private companion object {
         const val MARKER = "visual-state"
     }

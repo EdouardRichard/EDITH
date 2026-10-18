@@ -48,6 +48,13 @@ dependencies {
     // 0.24 S4 Task 18 (D159/D166): the official PAG voice orb. The nine `.pag` assets are the decoded official
     // resources; libpag is the renderer those assets were authored for. Glasses-only: the phone never draws them.
     implementation("com.tencent.tav:libpag:4.5.27")
+    // 0.24 S4 Task 19: the official answer row renders Markdown with Markwon core (the same `setMarkdown` call the
+    // decompiled `AiAdapter` makes). Glasses-only: the phone's Compose assistant tab renders its own text.
+    implementation("io.noties.markwon:core:4.6.2")
+    // Markwon's POM pins androidx.annotation 1.1.0; the androidTest classpath already requires 1.8.1 (its explicit
+    // dependency below). Gradle's consistent resolution then refuses the test manifest unless the production classpath
+    // resolves the same version, so pin it explicitly here rather than letting Markwon's floor win.
+    implementation("androidx.annotation:annotation:1.8.1")
     // CXR-S: the glasses-side bridge. The same public bytes the phone side and the vendor's own glasses sample use.
     implementation("edith.vendor.cxr:cxr-service-bridge:1.0-20260715.121510-107@aar")
     testImplementation("junit:junit:4.13.2")

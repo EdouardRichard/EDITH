@@ -38,6 +38,9 @@ class GlassesPanelView(context: Context) : FrameLayout(context) {
     val pinTextView: TextView
     val pinIconView: PinIconView
     val complianceView: TextView
+
+    /** The two official 30 px fades above/below the conversation window. */
+    val topMask: GradientMaskView
     val bottomMask: GradientMaskView
 
     /** The thinking row currently in the list, so it can be hidden with the panel; null when not thinking. */
@@ -77,14 +80,16 @@ class GlassesPanelView(context: Context) : FrameLayout(context) {
             setBackgroundColor(Color.TRANSPARENT)
             isFocusable = false
             defaultFocusHighlightEnabled = false
-            setPadding(GlassesPanelSpec.LIST_PADDING_SIDE_PX, GlassesPanelSpec.LIST_PADDING_TOP_PX,
-                GlassesPanelSpec.LIST_PADDING_SIDE_PX, GlassesPanelSpec.LIST_PADDING_BOTTOM_PX)
+            // 0.24 S4 Task 19: the official item insets (ASR margin 10 px, TTS padding 10 px) live on the rows now, so
+            // the scroll view must not add another 10 px per side - that would double every row's official inset.
+            setPadding(0, GlassesPanelSpec.LIST_PADDING_TOP_PX,
+                0, GlassesPanelSpec.LIST_PADDING_BOTTOM_PX)
             addView(entriesView)
             // The bottom fade follows the scroll: visible while there is more below, gone at the bottom (official
             // `id_iv_recycler_bottom_mask` is gone by default for the same reason). The listener itself stays in
             // `GlassesActivity`: it is the render decision `updateScrollChrome`, not view construction.
         }
-        val topMask = GradientMaskView(context, MaskEdge.TOP)
+        topMask = GradientMaskView(context, MaskEdge.TOP)
         bottomMask = GradientMaskView(context, MaskEdge.BOTTOM)
         complianceView = TextView(context).apply {
             setTextColor(GlassesPanelSpec.ALERT_RED)

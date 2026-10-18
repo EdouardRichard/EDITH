@@ -125,4 +125,45 @@ class GlassesPanelSpecTest {
         assertFalse("a role-only colour would be a stale second authority",
             GlassesPanelSpec::class.java.declaredMethods.any { it.name == "textColor" })
     }
+
+    // ---------------------------------------------------------------- Task 19 panel visuals
+
+    @Test
+    fun theOfficialRowSpacingAndGifSizesArePinned() {
+        // `recycler_item_page_ai.xml`: the ASR item root is 10/4 (top/bottom) with 10 px side margins; the TTS line is
+        // 5/10 with 10 px side padding; both state rows are exactly 22 px with a 10 px icon start margin and 5 px copy
+        // start margin. These are the numbers the official layout states, not eyeballed screenshots.
+        assertEquals(10, GlassesPanelSpec.ASR_ROW_MARGIN_TOP_PX)
+        assertEquals(4, GlassesPanelSpec.ASR_ROW_MARGIN_BOTTOM_PX)
+        assertEquals(10, GlassesPanelSpec.ASR_ROW_MARGIN_SIDE_PX)
+        assertEquals(5, GlassesPanelSpec.TTS_ROW_MARGIN_TOP_PX)
+        assertEquals(10, GlassesPanelSpec.TTS_ROW_MARGIN_BOTTOM_PX)
+        assertEquals(10, GlassesPanelSpec.TTS_SIDE_PADDING_PX)
+        assertEquals("the thinking/tool row height is the official 22 px", 22,
+            GlassesPanelSpec.STATE_ROW_HEIGHT_PX)
+        assertEquals(10, GlassesPanelSpec.STATE_ICON_MARGIN_START_PX)
+        assertEquals(5, GlassesPanelSpec.STATE_TEXT_MARGIN_START_PX)
+
+        // `imv_asr_loading` is 26x13 px; thinking (`imv_loading`) and the agent icon are 22x22 px.
+        assertEquals(26, GlassesPanelSpec.ASR_GIF_WIDTH_PX)
+        assertEquals(13, GlassesPanelSpec.ASR_GIF_HEIGHT_PX)
+        assertEquals(10, GlassesPanelSpec.ASR_GIF_MARGIN_START_PX)
+        assertEquals(10, GlassesPanelSpec.ASR_GIF_MARGIN_TOP_PX)
+        assertEquals(22, GlassesPanelSpec.THINKING_ICON_PX)
+        assertEquals(22, GlassesPanelSpec.TOOL_ICON_PX)
+        assertEquals("the official pin is 20x20 at 40% alpha", 20, GlassesPanelSpec.PIN_ICON_PX)
+        assertEquals(0.4f, GlassesPanelSpec.PIN_ICON_ALPHA, 0.0001f)
+        assertEquals("the two edge fades are 30 px", 30, GlassesPanelSpec.MASK_HEIGHT_PX)
+        assertEquals(12f, GlassesPanelSpec.COMPLIANCE_TEXT_SIZE_PX)
+    }
+
+    @Test
+    fun onlyTheFinalAnswerIsRenderedAsMarkdown() {
+        assertEquals("a streamed partial stays plain text", AnswerTextMode.PLAIN,
+            MarkdownPolicy.modeFor(final = false))
+        assertEquals("the final SHOW is Markwon-rendered", AnswerTextMode.MARKDOWN,
+            MarkdownPolicy.modeFor(final = true))
+        assertTrue("the partial path must stay within the task's <=100 ms bound",
+            MarkdownPolicy.MAX_PARTIAL_THROTTLE_MILLIS <= 100L)
+    }
 }

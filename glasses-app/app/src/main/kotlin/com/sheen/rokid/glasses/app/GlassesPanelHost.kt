@@ -13,14 +13,17 @@ import android.widget.LinearLayout
 import android.widget.TextView
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.ToolPhase
+import com.sheen.rokid.glasses.R
 import com.sheen.rokid.glasses.bridge.RokidBridgeEndpoint
+import com.sheen.rokid.glasses.display.AnswerTextMode
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.glasses.display.GlassesPanelView
 import com.sheen.rokid.glasses.display.ConversationView
 import com.sheen.rokid.glasses.display.GradientMaskView
 import com.sheen.rokid.glasses.display.HintPresentation
 import com.sheen.rokid.glasses.display.HintTicker
-import com.sheen.rokid.glasses.display.LoadingIndicatorView
+import com.sheen.rokid.glasses.display.MarkdownPolicy
+import com.sheen.rokid.glasses.display.OfficialGifView
 import com.sheen.rokid.glasses.display.OrbState
 import com.sheen.rokid.glasses.display.PagOrbView
 import com.sheen.rokid.glasses.display.PinIconView
@@ -32,6 +35,10 @@ import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
+import io.noties.markwon.AbstractMarkwonPlugin
+import io.noties.markwon.Markwon
+import io.noties.markwon.core.CorePlugin
+import io.noties.markwon.core.MarkwonTheme
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
@@ -116,13 +123,39 @@ class GlassesPanelHost(
     private val complianceView: TextView get() = root.complianceView
     private val bottomMask: GradientMaskView get() = root.bottomMask
 
-    /** The thinking row currently in the list, so its ring can be stopped with the panel; null when not thinking. */
-    private var thinkingIcon: LoadingIndicatorView? = null
+    /** The thinking row currently in the list, so its GIF can be stopped with the panel; null when not thinking. */
+    private var thinkingIcon: OfficialGifView? = null
     private var thinkingTextView: TextView? = null
 
     /** The tool row's icon/copy (0.24 S4 Task 17); null when no tool row is on screen. */
-    private var toolIcon: LoadingIndicatorView? = null
+    private var toolIcon: OfficialGifView? = null
     private var toolTextView: TextView? = null
+
+    /** The status-0/1 ASR "…" GIF (0.24 S4 Task 19); null when the current item is not waiting. */
+    private var asrGif: OfficialGifView? = null
+
+    /**
+     * The one Markwon parser (0.24 S4 Task 19). Built lazily so a panel that never shows an answer pays nothing, and
+     * reused across rows because parsing is synchronous and must not allocate a parser per revision.
+     *
+     * The theme keeps the panel's colours: Markwon's default code colours assume a light background, which on the
+     * waveguide would read as a bright block. Code/list/link spans therefore stay on the official green scale.
+     */
+    private val markwon: Markwon by lazy {
+        Markwon.builder(context)
+            .usePlugin(CorePlugin.create())
+            .usePlugin(object : AbstractMarkwonPlugin() {
+                override fun configureTheme(builder: MarkwonTheme.Builder) {
+                    builder.codeTextColor(GlassesPanelSpec.GREEN_NORMAL)
+                        .codeBlockTextColor(GlassesPanelSpec.GREEN_NORMAL)
+                        .codeBackgroundColor(GlassesPanelSpec.BLACK)
+                        .codeBlockBackgroundColor(GlassesPanelSpec.BLACK)
+                        .linkColor(GlassesPanelSpec.GREEN_NORMAL)
+                        .listItemColor(GlassesPanelSpec.GREEN_NORMAL)
+                }
+            })
+            .build()
+    }
 
     /**
      * The turns last handed to the view and the row objects they became.
@@ -225,6 +258,8 @@ class GlassesPanelHost(
         // 0.24 S4 Task 17 (review M1): parity with the thinking icon - a tool row that is still START must not keep
         // its frame loop alive while the window is hidden (the view's detach would stop it, but only once removed).
         toolIcon?.stop()
+        // 0.24 S4 Task 19: the ASR waiting GIF must not animate behind a hidden panel either.
+        asrGif?.stop()
         stopTicker()
     }
 
@@ -293,6 +328,7 @@ class GlassesPanelHost(
         thinkingIcon?.stop()
         // 0.24 S4 Task 17 (review M1): same parity as onStop - nothing may outlive the host.
         toolIcon?.stop()
+        asrGif?.stop()
         stopTicker()
         executor.shutdownNow()
     }
@@ -385,6 +421,8 @@ class GlassesPanelHost(
             thinkingVisible = model.thinkingVisible,
             thinkingTurnId = model.thinkingTurnId,
             tool = tool,
+            finalAnswerEntryIds = model.finalAnswerEntryIds,
+            asrLoadingVisible = model.asrLoadingVisible,
         )
     }
 
@@ -433,6 +471,8 @@ class GlassesPanelHost(
         toolIcon?.stop()
         toolIcon = null
         toolTextView = null
+        asrGif?.stop()
+        asrGif = null
         renderedTurns = null
         renderedTurnViews = emptyList()
         revealCoalescer.reset()
@@ -471,6 +511,22 @@ class GlassesPanelHost(
 
     fun thinkingIconWidthForProbe(): Int = thinkingIcon?.width ?: 0
 
+    fun thinkingGifWidthForProbe(): Int = thinkingIcon?.width ?: 0
+
+    fun thinkingGifHeightForProbe(): Int = thinkingIcon?.height ?: 0
+
+    fun thinkingGifResourceForProbe(): String = thinkingIcon?.resourceNameForProbe().orEmpty()
+
+    fun thinkingGifRunningForProbe(): Boolean = thinkingIcon?.isRunningForProbe() == true
+
+    fun thinkingGifAnimatedForProbe(): Boolean = thinkingIcon?.isAnimatedForProbe() == true
+
+    fun thinkingGifIntrinsicWidthForProbe(): Int = thinkingIcon?.intrinsicWidthForProbe() ?: 0
+
+    fun thinkingGifIntrinsicHeightForProbe(): Int = thinkingIcon?.intrinsicHeightForProbe() ?: 0
+
+    fun thinkingRowHeightForProbe(): Int = root.thinkingRow?.height ?: 0
+
     fun thinkingTextSizeForProbe(): Float = thinkingTextView?.textSize ?: 0f
 
     /** True when the official status-7 tool row is on screen (0.24 S4 Task 17). */
@@ -483,12 +539,51 @@ class GlassesPanelHost(
 
     fun toolIconWidthForProbe(): Int = toolIcon?.width ?: 0
 
+    fun toolGifWidthForProbe(): Int = toolIcon?.width ?: 0
+
+    fun toolGifHeightForProbe(): Int = toolIcon?.height ?: 0
+
+    fun toolGifResourceForProbe(): String = toolIcon?.resourceNameForProbe().orEmpty()
+
+    fun toolGifRunningForProbe(): Boolean = toolIcon?.isRunningForProbe() == true
+
+    fun toolGifRepeatCountForProbe(): Int = toolIcon?.repeatCountForProbe() ?: Int.MIN_VALUE
+
     fun toolLabelTextSizeForProbe(): Float = toolTextView?.textSize ?: 0f
 
     fun toolTextColorForProbe(): Int = toolTextView?.currentTextColor ?: 0
 
-    /** Whether the tool row's ring is still animating, so a lifecycle test can prove it stopped with the window. */
+    /** Whether the tool row's GIF is still animating, so a lifecycle test can prove it stopped with the window. */
     fun toolIconRunningForProbe(): Boolean = toolIcon?.isRunningForProbe() == true
+
+    // 0.24 S4 Task 19: the ASR "…" GIF and the fixed panel chrome.
+    fun asrGifVisibleForProbe(): Boolean = asrGif?.visibility == View.VISIBLE
+
+    fun asrGifViewForProbe(): View? = asrGif
+
+    fun asrGifWidthForProbe(): Int = asrGif?.width ?: 0
+
+    fun asrGifHeightForProbe(): Int = asrGif?.height ?: 0
+
+    fun asrGifRunningForProbe(): Boolean = asrGif?.isRunningForProbe() == true
+
+    fun asrGifAnimatedForProbe(): Boolean = asrGif?.isAnimatedForProbe() == true
+
+    fun asrGifIntrinsicWidthForProbe(): Int = asrGif?.intrinsicWidthForProbe() ?: 0
+
+    fun asrGifIntrinsicHeightForProbe(): Int = asrGif?.intrinsicHeightForProbe() ?: 0
+
+    fun topMaskHeightForProbe(): Int = root.topMask.height
+
+    fun bottomMaskHeightForProbe(): Int = bottomMask.height
+
+    fun complianceTextSizeForProbe(): Float = complianceView.textSize
+
+    fun pinIconWidthForProbe(): Int = pinIconView.width
+
+    fun pinIconHeightForProbe(): Int = pinIconView.height
+
+    fun pinIconAlphaForProbe(): Float = pinIconView.alphaForProbe()
 
     fun listeningTextForProbe(): String = listeningView.text.toString()
 
@@ -557,10 +652,15 @@ class GlassesPanelHost(
         root.toolRow?.let { row -> row.visibility = if (tool) View.VISIBLE else View.GONE }
         if (tool) {
             toolTextView?.setTextColor(GlassesPanelSpec.toolTextColor(model.toolPhase ?: ToolPhase.START))
-            if (model.toolPhase == ToolPhase.END) toolIcon?.stop() else toolIcon?.start()
+            // START loops for as long as the action runs. END is a one-shot official animation: it is started once by
+            // the row builder / phase update and must not replay on every model re-render.
+            if (model.toolPhase == ToolPhase.START) toolIcon?.start()
         } else {
             toolIcon?.stop()
         }
+        // 0.24 S4 Task 19: the "…" GIF exists only while the model says the waiting status is on screen; a row created
+        // while the window was hidden is kept stopped and started here when the host resumes.
+        asrGif?.let { gif -> if (model.asrLoadingVisible) gif.start() else gif.stop() }
         // 0.24 S4 Task 18 (review I1): the official status names the exact PAG clip, and only the official
         // `showIdleStatus` command plays finish_last. `model.idle` is also true for "no status yet" and for no work;
         // those stop/hold the orb instead of playing the finish tail (spec §5.6:353).
@@ -592,6 +692,7 @@ class GlassesPanelHost(
         thinkingTextView = null
         toolIcon = null
         toolTextView = null
+        asrGif = null
         root.setThinkingRow(null)
         root.setToolRow(null)
         renderedTurnViews = turns.map { turn -> addTurn(turn) }
@@ -622,20 +723,36 @@ class GlassesPanelHost(
                 view.setTextColor(turn.asrTextColor)
             }
             views.answer?.let { view ->
-                if (view.text.toString() != turn.answerText) view.text = turn.answerText
+                val text = turn.answerText.orEmpty()
+                val textChanged = view.text.toString() != text
+                // 0.24 S4 Task 19: a partial is assigned as plain text; the final SHOW is parsed once by Markwon. The
+                // same row object is patched either way, so a final never rebuilds the list and never adds a second row.
+                if (textChanged || (turn.answerFinal && !views.markdownApplied)) {
+                    applyAnswerText(view, text, turn.answerFinal)
+                    views.markdownApplied = turn.answerFinal
+                }
             }
             views.toolText?.let { label ->
                 if (label.text.toString() != turn.toolLabel) label.text = turn.toolLabel
                 label.setTextColor(turn.toolTextColor)
-                if (turn.toolPhase == ToolPhase.END) views.toolIcon?.stop() else views.toolIcon?.start()
             }
+            if (views.toolIcon != null && views.toolPhaseApplied != turn.toolPhase) {
+                val phase = turn.toolPhase ?: ToolPhase.START
+                val running = phase == ToolPhase.START
+                views.toolIcon.setGif(toolGifRes(phase), repeatInfinite = running)
+                if (resumed) views.toolIcon.start()
+                views.toolPhaseApplied = phase
+            }
+            // A waiting-state update can leave the same transient row on screen; keep its GIF governed by the model.
+            views.asrGif?.let { gif -> if (resumed && turn.asrLoadingVisible) gif.start() else gif.stop() }
         }
         renderedTurns = plan.turns
         val liveIndex = plan.turns.indexOfFirst { it.answerLive }
         root.setLiveRow(if (liveIndex >= 0) renderedTurnViews.getOrNull(liveIndex)?.answer else null)
         applyVisualState(model)
         scheduleAfterContent(force = plan.liveChanged, previousScroll = previousScroll)
-        Log.i(TAG, "P3_PATCH turns=${plan.turns.size} text=${plan.textChanged} live=${plan.liveChanged}")
+        Log.i(TAG, "P3_PATCH turns=${plan.turns.size} text=${plan.textChanged} live=${plan.liveChanged} " +
+            "final=${plan.answerFinalChanged}")
     }
 
     /**
@@ -735,8 +852,11 @@ class GlassesPanelHost(
         val answer: TextView?,
         val thinking: LinearLayout?,
         val tool: LinearLayout?,
-        val toolIcon: LoadingIndicatorView?,
+        val toolIcon: OfficialGifView?,
         val toolText: TextView?,
+        val asrGif: OfficialGifView?,
+        var markdownApplied: Boolean,
+        var toolPhaseApplied: ToolPhase?,
     )
 
     /**
@@ -744,18 +864,23 @@ class GlassesPanelHost(
      * A `null` field means the row does not exist for this turn, so a later update can never patch the wrong view.
      */
     private fun addTurn(turn: ConversationView.TurnRow): TurnViews {
+        val asrGif = if (turn.asrLoadingVisible) {
+            asrLoadingGif().also { entriesView.addView(it) }
+        } else {
+            null
+        }
         val asr = turn.asrText?.let { text ->
             userRow(text, answered = turn.answerText != null).also { entriesView.addView(it) }
         }
         val answer = turn.answerText?.let { text ->
-            answerRow(text).also { view ->
+            answerRow(text, final = turn.answerFinal).also { view ->
                 entriesView.addView(view)
                 if (turn.answerLive) root.setLiveRow(view)
             }
         }
         val thinking = if (turn.thinkingVisible) thinkingRow().also { entriesView.addView(it) } else null
         var toolRowView: LinearLayout? = null
-        var toolIconView: LoadingIndicatorView? = null
+        var toolIconView: OfficialGifView? = null
         var toolTextViewView: TextView? = null
         if (turn.toolLabel != null && turn.toolPhase != null) {
             val built = toolRow(turn.toolLabel, turn.toolPhase)
@@ -764,7 +889,8 @@ class GlassesPanelHost(
             toolTextViewView = built.second
             entriesView.addView(toolRowView)
         }
-        return TurnViews(asr, answer, thinking, toolRowView, toolIconView, toolTextViewView)
+        return TurnViews(asr, answer, thinking, toolRowView, toolIconView, toolTextViewView, asrGif,
+            turn.answerFinal, turn.toolPhase)
     }
 
     /** The wearer's line: 14 px, full green while recognising, 70% once this turn's answer exists. */
@@ -775,40 +901,72 @@ class GlassesPanelHost(
             setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.USER_TEXT_SIZE_PX)
             gravity = Gravity.START
             layoutParams = LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            setPadding(0, rowVerticalPadding(), 0, rowVerticalPadding())
+                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                topMargin = GlassesPanelSpec.ASR_ROW_MARGIN_TOP_PX
+                bottomMargin = GlassesPanelSpec.ASR_ROW_MARGIN_BOTTOM_PX
+                marginStart = GlassesPanelSpec.ASR_ROW_MARGIN_SIDE_PX
+                marginEnd = GlassesPanelSpec.ASR_ROW_MARGIN_SIDE_PX
+            }
         }
 
-    /** The answer line: 16 px full green. Markdown waits for Task 19; the row identity is what Task 17 fixes. */
-    private fun answerRow(text: String): TextView = TextView(context).apply {
-        this.text = text
+    /**
+     * The answer line: 16 px full green. The final `SHOW` is Markwon-rendered; a streamed partial is plain text and
+     * patches the same `TextView` in place (0.24 S4 Task 19).
+     */
+    private fun answerRow(text: String, final: Boolean): TextView = TextView(context).apply {
         setTextColor(GlassesPanelSpec.GREEN_NORMAL)
         setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.ASSISTANT_TEXT_SIZE_PX)
         maxLines = GlassesPanelSpec.ASSISTANT_MAX_LINES
         gravity = Gravity.START
+        setPadding(GlassesPanelSpec.TTS_SIDE_PADDING_PX, 0, GlassesPanelSpec.TTS_SIDE_PADDING_PX, 0)
         layoutParams = LinearLayout.LayoutParams(
-            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-        setPadding(0, rowVerticalPadding(), 0, rowVerticalPadding())
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+            topMargin = GlassesPanelSpec.TTS_ROW_MARGIN_TOP_PX
+            bottomMargin = GlassesPanelSpec.TTS_ROW_MARGIN_BOTTOM_PX
+        }
+        applyAnswerText(this, text, final)
     }
 
-    /** The official 4 dp row padding used by every conversation line. */
-    private fun rowVerticalPadding(): Int = TypedValue.applyDimension(
-        TypedValue.COMPLEX_UNIT_DIP, 4f, context.resources.displayMetrics).toInt()
+    /** Applies one revision to the answer row: plain for a partial, Markwon for the accepted final. */
+    private fun applyAnswerText(view: TextView, text: String, final: Boolean) {
+        when (MarkdownPolicy.modeFor(final)) {
+            AnswerTextMode.PLAIN -> view.text = text
+            AnswerTextMode.MARKDOWN -> markwon.setMarkdown(view, text)
+        }
+    }
+
+    /** `imv_asr_loading`: the official 26x13 waiting GIF, top-left of the current item. */
+    private fun asrLoadingGif(): OfficialGifView = OfficialGifView(context, R.drawable.gif_loading).apply {
+        layoutParams = LinearLayout.LayoutParams(
+            GlassesPanelSpec.ASR_GIF_WIDTH_PX, GlassesPanelSpec.ASR_GIF_HEIGHT_PX).apply {
+            marginStart = GlassesPanelSpec.ASR_GIF_MARGIN_START_PX
+            topMargin = GlassesPanelSpec.ASR_GIF_MARGIN_TOP_PX
+        }
+        if (resumed) start() else stop()
+        asrGif = this
+    }
 
     /**
-     * The tool row: the official 22x22 icon slot plus the 16 px mapped copy, full green while running and 50% once the
-     * action returned (spec §5.6). The icon is the existing `LoadingIndicatorView` in that slot until Task 19 copies the
-     * official `ai_agent_tool_start/end` GIFs; the row geometry and copy rules are what this task fixes.
+     * The tool row: the official 22x22 GIF plus the 16 px mapped copy, full green while running and 50% once the action
+     * returned (spec §5.6). START loops; END swaps to `ai_agent_tool_end.gif` and plays it once, exactly the official
+     * `agentToolStatus` `setLoopCount(1)`.
      */
-    private fun toolRow(label: String, phase: ToolPhase): Triple<LoadingIndicatorView, TextView, LinearLayout> {
+    private fun toolRow(label: String, phase: ToolPhase): Triple<OfficialGifView, TextView, LinearLayout> {
         val row = LinearLayout(context).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
-            setPadding(0, rowVerticalPadding(), 0, rowVerticalPadding())
+            layoutParams = LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.MATCH_PARENT, GlassesPanelSpec.STATE_ROW_HEIGHT_PX)
         }
-        val icon = LoadingIndicatorView(context, dotRadiusPx = 2f, colorInt = GlassesPanelSpec.GREEN_NORMAL)
+        val icon = OfficialGifView(
+            context,
+            toolGifRes(phase),
+            repeatInfinite = phase == ToolPhase.START,
+        )
         row.addView(icon, LinearLayout.LayoutParams(
-            GlassesPanelSpec.TOOL_ICON_PX, GlassesPanelSpec.TOOL_ICON_PX))
+            GlassesPanelSpec.TOOL_ICON_PX, GlassesPanelSpec.TOOL_ICON_PX).apply {
+            marginStart = GlassesPanelSpec.STATE_ICON_MARGIN_START_PX
+        })
         val text = TextView(context).apply {
             this.text = label
             setTextColor(GlassesPanelSpec.toolTextColor(phase))
@@ -816,21 +974,30 @@ class GlassesPanelHost(
             gravity = Gravity.START
         }
         row.addView(text, LinearLayout.LayoutParams(
-            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = 5 })
-        if (phase == ToolPhase.START) icon.start() else icon.stop()
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            marginStart = GlassesPanelSpec.STATE_TEXT_MARGIN_START_PX
+        })
+        if (resumed) icon.start() else icon.stop()
         toolIcon = icon
         toolTextView = text
         root.setToolRow(row)
         return Triple(icon, text, row)
     }
 
-    /** The `正在思考` row: the official 22x22 icon plus 16 px full-green copy, as the last line. */
+    private fun toolGifRes(phase: ToolPhase): Int =
+        if (phase == ToolPhase.START) R.drawable.ai_agent_tool_start else R.drawable.ai_agent_tool_end
+
+    /** The `正在思考` row: the official 22x22 `ai_tts_thinking.gif` plus 16 px full-green copy, as the last line. */
     private fun thinkingRow(): LinearLayout = LinearLayout(context).apply {
         orientation = LinearLayout.HORIZONTAL
         gravity = Gravity.CENTER_VERTICAL
-        val icon = LoadingIndicatorView(context, dotRadiusPx = 2f, colorInt = GlassesPanelSpec.GREEN_NORMAL)
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, GlassesPanelSpec.STATE_ROW_HEIGHT_PX)
+        val icon = OfficialGifView(context, R.drawable.ai_tts_thinking)
         addView(icon, LinearLayout.LayoutParams(
-            GlassesPanelSpec.THINKING_ICON_PX, GlassesPanelSpec.THINKING_ICON_PX))
+            GlassesPanelSpec.THINKING_ICON_PX, GlassesPanelSpec.THINKING_ICON_PX).apply {
+            marginStart = GlassesPanelSpec.STATE_ICON_MARGIN_START_PX
+        })
         val label = TextView(context).apply {
             text = GlassesPanelSpec.THINKING_TEXT
             setTextColor(GlassesPanelSpec.GREEN_NORMAL)
@@ -838,7 +1005,10 @@ class GlassesPanelHost(
             gravity = Gravity.START
         }
         addView(label, LinearLayout.LayoutParams(
-            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = 5 })
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
+            marginStart = GlassesPanelSpec.STATE_TEXT_MARGIN_START_PX
+        })
+        if (resumed) icon.start() else icon.stop()
         thinkingIcon = icon
         root.setThinkingRow(this)
         thinkingTextView = label

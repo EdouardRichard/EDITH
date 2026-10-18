@@ -21,6 +21,9 @@ class PinIconView(context: Context) : View(context) {
         style = Paint.Style.FILL
     }
 
+    /** Instrumentation probe: the official `fillAlpha`/`strokeAlpha` 0.4. */
+    fun alphaForProbe(): Float = paint.alpha / 255f
+
     override fun onDraw(canvas: Canvas) {
         val centerX = width / 2f
         val headRadius = minOf(width, height) * 0.26f

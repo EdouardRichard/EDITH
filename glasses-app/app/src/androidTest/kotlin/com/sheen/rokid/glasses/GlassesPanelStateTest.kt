@@ -1,6 +1,10 @@
 package com.sheen.rokid.glasses
 
+import android.graphics.drawable.AnimatedImageDrawable
+import android.text.Spanned
+import android.view.KeyEvent
 import android.view.ViewGroup
+import android.widget.LinearLayout
 import android.widget.TextView
 import androidx.lifecycle.Lifecycle
 import androidx.test.ext.junit.runners.AndroidJUnit4
@@ -507,6 +511,236 @@ class GlassesPanelStateTest {
                 assertEquals("the answer itself stays full green",
                     GlassesPanelSpec.GREEN_NORMAL, rows[1].currentTextColor)
                 assertFalse("the answer text retires the thinking row", activity.thinkingVisibleForProbe())
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- official GIFs, Markdown and panel visuals (Task 19)
+
+    private fun spansOf(view: TextView): List<Any> {
+        val text = view.text as? Spanned ?: return emptyList()
+        return text.getSpans(0, text.length, Any::class.java).toList()
+    }
+
+    private fun hasSpan(view: TextView, simpleName: String): Boolean =
+        spansOf(view).any { it.javaClass.simpleName == simpleName }
+
+    @Test
+    fun theAsrWaitingGifIsTheOfficial26By13AndOnlyForStatusZeroAndOne() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-asrgif", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-asrgif", 1, AssistantRoute.WAKE, turnId = "turn-asrgif",
+                        status = OfficialStatus.EMPTY.wire, sequence = 1)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertTrue("status 0 shows the ASR waiting GIF", activity.asrGifVisibleForProbe())
+                assertEquals("the official `imv_asr_loading` is 26 px wide", 26, activity.asrGifWidthForProbe())
+                assertEquals(13, activity.asrGifHeightForProbe())
+                assertTrue("the official GIF is animated, not a static frame", activity.asrGifAnimatedForProbe())
+                assertTrue("the official GIF is playing", activity.asrGifRunningForProbe())
+                // `ImageDecoder` applies the resource density (the glasses are 240 dpi = 1.5x), so the 40x20 mdpi GIF
+                // reports 60x30 intrinsic pixels here; the view slot above is still the official 26x13 px.
+                val density = activity.resources.displayMetrics.density
+                assertEquals("the decoded official asset is the 40x20 gif_loading.gif",
+                    (40 * density).toInt(), activity.asrGifIntrinsicWidthForProbe())
+                assertEquals((20 * density).toInt(), activity.asrGifIntrinsicHeightForProbe())
+                val params = requireNotNull(activity.asrGifViewForProbe()?.layoutParams) {
+                    "the waiting GIF view must be attached"
+                } as LinearLayout.LayoutParams
+                assertEquals("official item marginLeft=10", GlassesPanelSpec.ASR_GIF_MARGIN_START_PX,
+                    params.marginStart)
+                assertEquals("official marginTop=10", GlassesPanelSpec.ASR_GIF_MARGIN_TOP_PX, params.topMargin)
+
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-asrgif", 1, AssistantRoute.WAKE, turnId = "turn-asrgif",
+                        status = OfficialStatus.LISTENING.wire, sequence = 2)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertTrue("status 1 keeps the waiting GIF; the automatic next turn only listens",
+                    activity.asrGifVisibleForProbe())
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Said("s-asrgif", 1, sequence = 1, route = AssistantRoute.WAKE,
+                        entryId = "said-asrgif", text = "现在几点了")))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-asrgif", 1, AssistantRoute.WAKE, turnId = "turn-asrgif",
+                        status = OfficialStatus.ASR.wire, sequence = 3)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertFalse("status 2's ASR text replaces the waiting GIF", activity.asrGifVisibleForProbe())
+            }
+        }
+    }
+
+    @Test
+    fun theThinkingAndToolRowsUseTheOfficialGifsAndStartEnd() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-gifs", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-gifs", 1, AssistantRoute.WAKE, turnId = "turn-gifs",
+                        status = OfficialStatus.ASR_END.wire, sequence = 1)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertTrue("status 4 paints the thinking row", activity.thinkingVisibleForProbe())
+                assertEquals("`imv_loading` is the official `ai_tts_thinking.gif`", "ai_tts_thinking",
+                    activity.thinkingGifResourceForProbe())
+                assertEquals(GlassesPanelSpec.THINKING_ICON_PX, activity.thinkingGifWidthForProbe())
+                assertEquals(GlassesPanelSpec.THINKING_ICON_PX, activity.thinkingGifHeightForProbe())
+                assertTrue("the official thinking GIF is animated", activity.thinkingGifAnimatedForProbe())
+                assertTrue("the thinking GIF must be running", activity.thinkingGifRunningForProbe())
+                val density = activity.resources.displayMetrics.density
+                assertEquals("the decoded official asset is the 72x72 ai_tts_thinking.gif",
+                    (72 * density).toInt(), activity.thinkingGifIntrinsicWidthForProbe())
+                assertEquals((72 * density).toInt(), activity.thinkingGifIntrinsicHeightForProbe())
+                assertEquals("the row is exactly the official 22 px tall", 22,
+                    activity.thinkingRowHeightForProbe())
+
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-gifs", 1, AssistantRoute.WAKE, turnId = "turn-gifs",
+                        status = OfficialStatus.TOOL.wire, sequence = 2)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Tool("s-gifs", 1, AssistantRoute.WAKE, turnId = "turn-gifs",
+                        phase = ToolPhase.START, label = "记一条笔记")))
+            }
+            waitForLayout()
+            var startedRow: android.view.View? = null
+            scenario.onActivity { activity ->
+                assertTrue(activity.toolVisibleForProbe())
+                assertEquals("START is the official `ai_agent_tool_start.gif`", "ai_agent_tool_start",
+                    activity.toolGifResourceForProbe())
+                assertEquals(GlassesPanelSpec.TOOL_ICON_PX, activity.toolGifWidthForProbe())
+                assertEquals(GlassesPanelSpec.TOOL_ICON_PX, activity.toolGifHeightForProbe())
+                assertTrue(activity.toolGifRunningForProbe())
+                assertEquals("the start GIF loops while the action runs", AnimatedImageDrawable.REPEAT_INFINITE,
+                    activity.toolGifRepeatCountForProbe())
+                assertEquals("the row is exactly the official 22 px tall", 22,
+                    requireNotNull(activity.toolRowForProbe()).height)
+                startedRow = activity.toolRowForProbe()
+
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Tool("s-gifs", 1, AssistantRoute.WAKE, turnId = "turn-gifs",
+                        phase = ToolPhase.END, label = "记一条笔记")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertSame("END restyles the same row", startedRow, activity.toolRowForProbe())
+                assertEquals("END swaps in the official `ai_agent_tool_end.gif`", "ai_agent_tool_end",
+                    activity.toolGifResourceForProbe())
+                assertEquals("the end GIF plays once, as the official CustomTarget sets loopCount(1)", 0,
+                    activity.toolGifRepeatCountForProbe())
+                assertEquals(0x8000FF00.toInt(), activity.toolTextColorForProbe())
+            }
+        }
+    }
+
+    @Test
+    fun theFinalShowRendersMarkdownBoldListAndCodeWhileThePartialStaysPlain() {
+        launchHostPanel().use { scenario ->
+            val partial = "**重点**\n\n- 第一项\n- 第二项\n\n`code`"
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-md", 1)))
+                syncFor(activity, syncId = "sync-md")
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-md", 1, AssistantRoute.WAKE, turnId = "turn-md",
+                        status = OfficialStatus.ANSWERING.wire, sequence = 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Answer("s-md", 1, AssistantRoute.WAKE, turnId = "turn-md",
+                        hintId = "h-md", revision = 1, text = partial)))
+            }
+            waitForLayout()
+            var streamedRow: TextView? = null
+            scenario.onActivity { activity ->
+                streamedRow = requireNotNull(activity.lastMessageRowForProbe())
+                assertFalse("a streamed partial is plain text, not parsed Markdown",
+                    hasSpan(streamedRow!!, "StrongEmphasisSpan") || hasSpan(streamedRow!!, "CodeSpan") ||
+                        hasSpan(streamedRow!!, "BulletListItemSpan"))
+                assertTrue("the partial still carries the literal markdown characters",
+                    streamedRow!!.text.toString().contains("**重点**"))
+                assertEquals("partial text is the official 16 px answer line",
+                    GlassesPanelSpec.ASSISTANT_TEXT_SIZE_PX, streamedRow!!.textSize, 0.1f)
+
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Show("s-md", 1, sequence = 1, hintId = "h-md", revision = 1,
+                        syncId = "sync-md", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 30_000,
+                        text = partial)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                val row = requireNotNull(activity.lastMessageRowForProbe())
+                assertSame("the final SHOW replaces the same answer row", streamedRow, row)
+                assertTrue("bold must become a Markwon strong span", hasSpan(row, "StrongEmphasisSpan"))
+                assertTrue("a list must become the official bullet span", hasSpan(row, "BulletListItemSpan"))
+                assertTrue("inline code must become a Markwon code span", hasSpan(row, "CodeSpan"))
+                assertFalse("the final text no longer shows the source markers", row.text.toString().contains("**"))
+                assertEquals(GlassesPanelSpec.GREEN_NORMAL, row.currentTextColor)
+            }
+        }
+    }
+
+    @Test
+    fun thePinnedPanelShowsTheOfficial20PxPinAtFortyPercent() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-pin", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-pin", 1, AssistantRoute.WAKE, turnId = "turn-pin",
+                        status = OfficialStatus.ANSWERING.wire, sequence = 1)))
+                assertTrue("ENTER down is consumed",
+                    activity.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER)))
+                assertTrue("ENTER up pins",
+                    activity.dispatchKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertTrue("the pin icon replaces the text", activity.pinIconVisibleForProbe())
+                assertFalse(activity.pinTextVisibleForProbe())
+                assertEquals("official icon_ai_hold is 20x20 px", 20, activity.pinIconWidthForProbe())
+                assertEquals(20, activity.pinIconHeightForProbe())
+                assertEquals("official fill/stroke alpha is 40%", 0.4f, activity.pinIconAlphaForProbe(), 0.01f)
+            }
+        }
+    }
+
+    @Test
+    fun theRowsUseTheOfficialItemMarginsAndThePanelChromeKeepsItsSizes() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-space", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Asr("s-space", 1, AssistantRoute.WAKE, turnId = "turn-space",
+                        revision = 1, text = "帮我看下")))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Answer("s-space", 1, AssistantRoute.WAKE, turnId = "turn-space",
+                        hintId = "h-space", revision = 1, text = "好的")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                val rows = activity.conversationRowsForProbe()
+                assertEquals("one user line and one answer line", 2, rows.size)
+                val userParams = requireNotNull(rows[0].layoutParams) as LinearLayout.LayoutParams
+                assertEquals("ASR item marginTop=10", GlassesPanelSpec.ASR_ROW_MARGIN_TOP_PX, userParams.topMargin)
+                assertEquals("ASR item marginBottom=4", GlassesPanelSpec.ASR_ROW_MARGIN_BOTTOM_PX,
+                    userParams.bottomMargin)
+                assertEquals("ASR item marginStart=10", GlassesPanelSpec.ASR_ROW_MARGIN_SIDE_PX,
+                    userParams.marginStart)
+                val answerParams = requireNotNull(rows[1].layoutParams) as LinearLayout.LayoutParams
+                assertEquals("TTS marginTop=5", GlassesPanelSpec.TTS_ROW_MARGIN_TOP_PX, answerParams.topMargin)
+                assertEquals("TTS marginBottom=10", GlassesPanelSpec.TTS_ROW_MARGIN_BOTTOM_PX,
+                    answerParams.bottomMargin)
+                assertEquals("TTS paddingStart=10", GlassesPanelSpec.TTS_SIDE_PADDING_PX, rows[1].paddingStart)
+
+                assertEquals("the top fade is 30 px", GlassesPanelSpec.MASK_HEIGHT_PX,
+                    activity.topMaskHeightForProbe())
+                assertEquals("the bottom fade is 30 px", GlassesPanelSpec.MASK_HEIGHT_PX,
+                    activity.bottomMaskHeightForProbe())
+                assertEquals("the compliance label is 12 px", GlassesPanelSpec.COMPLIANCE_TEXT_SIZE_PX,
+                    activity.complianceTextSizeForProbe(), 0.1f)
             }
         }
     }
