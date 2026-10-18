@@ -139,6 +139,16 @@ private const val HINT_LIFETIME_MILLIS = 5_000L
 private const val DEFAULT_HINT_GRACE_MILLIS = 5_000L
 
 /**
+ * 0.24 S3 Task 14 fix round (I2): how long a promised closing fallback may take to reach the display.
+ *
+ * `ReadableHintAssembler` merges for 150 ms and can then still decide there is nothing readable to emit (a
+ * one-character sentence like `好。`). One second is a wide margin over that single scheduled task while still
+ * removing the unbounded pre-answer state: when it fires with no answer emit, the conversation closes with
+ * `P3_CONV no_display`.
+ */
+private const val FALLBACK_EMIT_WAIT_MILLIS = 1_000L
+
+/**
  * How much machine budget one turn's agent run gets when its configured profile has no timeout to borrow.
  *
  * The budget is the profile's own `timeoutMillis` whenever there is one, because that is the number the user chose for
@@ -315,6 +325,21 @@ class SmartAssistantPlugin(
      * turn, close one second later. Task 14 wires this to the persisted `SmartSettings.continueDialogue`.
      */
     private val continueDialogue: () -> Boolean = { true },
+    /**
+     * 0.24 S3 Task 14 fix round (C2, spec risk row 17): whether the host can actually speak a hint right now.
+     *
+     * Production builds the speech player **only when「语音朗读」is on** and the engine is ready, so a `both`/`voice`
+     * answer in the default (speech-off) configuration has no playback and no `SpeechFinished` can ever arrive. A
+     * plugin that treats "the model asked for speech" as "speech will happen" then waits the liveness bound and
+     * closes `no_display` instead of continuing - the opposite of `continueDialogue = true`.
+     *
+     * When this is false, `both`/`voice` is display-only: the emitted [Assistance] carries no speech request and
+     * `answerEmitSpeech` is false, so the answer is settled from its `Displayed` acknowledgement (spec risk row 17:
+     * "EDITH「语音朗读」关闭时没有官方 audioFinished 事件 → 用答案 Displayed 作为下一轮触发"). `SmartWiring` passes the
+     * production player's presence; the default `{ true }` keeps the official-shaped host (which always has TTS) and
+     * the pre-fix test rigs behaving as before.
+     */
+    private val speechAvailable: () -> Boolean = { true },
 ) : PluginLifecycle, ConfiguredPlugin {
 
     init {
@@ -1089,7 +1114,7 @@ class SmartAssistantPlugin(
      * 0.24 S3: the answer of the current wake turn is final **and** the wearer has seen it.
      *
      * Must hold [gate]. The [SmartTurn.answerFinal] flag is what keeps a mid-run notification's acknowledgement from
-     * opening a next round while the loop still runs: the run end marks the turn's last emit as the answer (Task 14/II1),
+     * opening a next round while the loop still runs: the run end marks the turn's last emit as the answer (Task 14 I1),
      * so a `notify_user` answer emitted while `Running` settles exactly like the closing fallback emit. Returns whether
      * the displayed answer carried speech (the cycle then waits for `SpeechFinished`), or `null` when there is nothing
      * to settle.
@@ -1097,7 +1122,7 @@ class SmartAssistantPlugin(
     private fun maybeAnswerDone(): Boolean? {
         val owned = turn ?: return null
         if (owned.closed || !owned.answerFinal) return null
-        if (owned.answerEmitHintId == null || !owned.displayed || owned.answerNotified) return null
+        if (owned.answerEmitId == null || !owned.displayed || owned.answerNotified) return null
         owned.answerNotified = true
         return owned.answerEmitSpeech
     }
@@ -1170,10 +1195,15 @@ class SmartAssistantPlugin(
                 }
                 return@synchronized
             }
-            val emitted = owned.answerEmitHintId != null
+            val emitted = owned.answerEmitId != null
             owned.answerFinal = emitted
             when {
-                !emitted && fallbackExpected -> return@synchronized
+                !emitted && fallbackExpected -> {
+                    // Review I2: the assembler can legitimately emit nothing (a one-character closing answer), so
+                    // "a fallback is on its way" must be bounded. Without this deadline no timer exists at all.
+                    armFallbackSettlementLocked(owned)
+                    return@synchronized
+                }
                 !emitted -> noDisplay = true
                 owned.displayed -> displayedSpeech = owned.answerEmitSpeech
                 !owned.answerEmitAccepted || owned.answerTerminal != null -> noDisplay = true
@@ -1187,6 +1217,38 @@ class SmartAssistantPlugin(
     }
 
     /**
+     * 0.24 S3 Task 14 fix round (I2): the liveness bound for a fallback emit that never comes.
+     *
+     * The assembler's merge is 150 ms and its only remaining work is `readable()`; one second is a wide margin while
+     * still removing the "pre-answer status forever" state. The callback re-checks that [owned] still owns the turn
+     * and that nothing was emitted in the meantime, so a real emit (or a continuation) makes it inert.
+     */
+    private fun armFallbackSettlementLocked(owned: SmartTurn) {
+        owned.cancelFallbackWait()
+        val deadline = SmartTurn.saturatingAdd(clock.nowNanos(), FALLBACK_EMIT_WAIT_MILLIS * 1_000_000L)
+        owned.fallbackWait = scheduler.at(deadline) {
+            val close = synchronized(gate) {
+                turn === owned && !owned.closed && !owned.answerFinal && owned.answerEmitId == null
+            }
+            if (close) {
+                P3Log.line("P3_CONV no_display reason=fallback_missing")
+                settleNoDisplayAnswer()
+            }
+        }
+    }
+
+    /**
+     * 0.24 S3 Task 14 fix (C1): whether a host event names the answer's **current emit**.
+     *
+     * After the fix every emit carries its own `Assistance.emitId`, and the host copies it into
+     * `OutputStateEvent`/`SpeechFinished`; a superseded emit's terminal then fails this check and is ignored. A null
+     * emit id is a producer that predates the field (an older host, a proactive hint, a test); for those the legacy
+     * turn-hint comparison is kept, which is also what every pre-fix event looked like.
+     */
+    private fun namesCurrentAnswerEmit(owned: SmartTurn, hintId: String, emitId: String?): Boolean =
+        if (emitId != null) emitId == owned.answerEmitId else hintId == owned.hintId
+
+    /**
      * Must hold [gate]: remembers a terminal display status for the answer hint.
      *
      * `Expired`/`Rejected` for the final answer mean the wearer never saw it, so the answer-done decision is
@@ -1197,7 +1259,7 @@ class SmartAssistantPlugin(
     private fun noteAnswerTerminal(event: OutputStateEvent) {
         val owned = turn ?: return
         if (owned.closed) return
-        if (event.hintId != (owned.answerEmitHintId ?: owned.hintId)) return
+        if (!namesCurrentAnswerEmit(owned, event.hintId, event.emitId)) return
         when (event.status) {
             OutputStatus.Expired, OutputStatus.Rejected -> if (!owned.displayed) owned.answerTerminal = event.status
             else -> Unit
@@ -1209,7 +1271,7 @@ class SmartAssistantPlugin(
         val close = synchronized(gate) {
             val owned = turn ?: return
             !owned.closed && !owned.answerNotified && owned.answerFinal && !owned.displayed &&
-                owned.answerEmitHintId != null && owned.answerTerminal != null
+                owned.answerEmitId != null && owned.answerTerminal != null
         }
         if (close) settleNoDisplayAnswer()
     }
@@ -1335,11 +1397,15 @@ class SmartAssistantPlugin(
 
             // 0.24 S3 (spec §5.5): the phone's playback of the displayed answer finished. The route is decided by the
             // hint the event names, never by "whatever is current": a stale hint must not continue a newer turn.
+            //
+            // 0.24 S3 fix (C1): the hint id alone cannot tell a superseded emit's playback end from the current
+            // answer's (one turn keeps one hint id). The emit id is the identity; a mismatch is a stale result and is
+            // dropped instead of being stored as `earlySpeech`.
             is SpeechFinished -> {
                 val mine = synchronized(gate) {
                     val owned = turn
                     matches(event.envelope) && owned != null && !owned.closed &&
-                        event.hintId == (owned.answerEmitHintId ?: owned.hintId)
+                        namesCurrentAnswerEmit(owned, event.hintId, event.emitId)
                 }
                 if (mine) conversationCycle.onSpeechFinished(AssistantRoute.WAKE, event.result)
             }
@@ -2769,14 +2835,26 @@ class SmartAssistantPlugin(
             current.submitting = true
             current.pendingAck = false
             current.hintExpiry = expiry
+            // 0.24 S3 Task 14 fix (C1): every emit gets its own identity. The turn keeps one `hintId` (one conversation
+            // entry, spec §6), so without this a replacement's `Rejected` is indistinguishable from a rejection of the
+            // final answer, and a stale `SpeechFinished` is indistinguishable from the answer's own speech end.
+            val emitId = "emit-${UUID.randomUUID()}"
+            // 0.24 S3 Task 14 fix (C2, spec risk row 17): a `both`/`voice` request is only a speech request if a player
+            // can actually play it. With「语音朗读」off (the shipped default) no player exists, so the hint is
+            // display-only and the answer is settled from its `Displayed` acknowledgement instead of a
+            // `SpeechFinished` that can never arrive.
+            val speech = if (speechAvailable()) optionalSpeech else null
             // 0.24 S3 (spec §5.5): the closing answer is assembled after the run reached Idle; a `notify_user` answer
             // was emitted while the run was still `Running` and is marked as the final answer by
             // `settleAnswerAfterRun()` at the run end instead. Recording the emit identity here is what lets that
-            // run-end decision (and a terminal display event) name the right hint instead of asking the phase.
+            // run-end decision (and a terminal display event) name the right emit instead of asking the phase.
             finalAnswer = recordAsAnswer && current.phase == SmartTurnPhase.Idle
             if (recordAsAnswer) {
-                current.answerEmitHintId = current.hintId
-                current.answerEmitSpeech = optionalSpeech != null
+                // A real answer emit makes the fallback liveness bound unnecessary; releasing it keeps the scheduler
+                // (and the pending-deadline counts the tests read) honest.
+                current.cancelFallbackWait()
+                current.answerEmitId = emitId
+                current.answerEmitSpeech = speech != null
                 current.answerFinal = finalAnswer
                 current.answerTerminal = null
                 current.displayed = false
@@ -2791,8 +2869,9 @@ class SmartAssistantPlugin(
                 route = AssistantRoute.WAKE,
                 priority = 0,
                 text = text,
-                optionalSpeech = optionalSpeech,
+                optionalSpeech = speech,
                 expiresAtNanos = expiry,
+                emitId = emitId,
             )
         }
         val current = owned ?: return
@@ -2847,7 +2926,7 @@ class SmartAssistantPlugin(
     private fun acceptDisplayed(event: OutputStateEvent) {
         val owned = turn ?: return
         if (owned.closed || owned.displayed) return
-        if (event.hintId != (owned.answerEmitHintId ?: owned.hintId)) return
+        if (!namesCurrentAnswerEmit(owned, event.hintId, event.emitId)) return
         if (event.status != OutputStatus.Displayed) return
         if (clock.nowNanos() >= owned.hintExpiry) {
             // 0.24 S3 Task 14: a late acknowledgement cannot be admitted - the hint's display window is over. It is
@@ -2960,6 +3039,9 @@ class SmartAssistantPlugin(
         // the assembler and the pending output; the cycle closes its own window when the conversation ends.
         runCatching { owned.loop?.cancel() }
         owned.cancelAssembler()
+        // 0.24 S3 fix (I2): a pending fallback liveness bound belongs to this turn; leaving it armed would let it
+        // close a later panel (it re-checks the turn, but cancelling is the honest teardown).
+        owned.cancelFallbackWait()
         val sessionId = owned.sessionId ?: return
         val generation = owned.generation ?: return
         if (cancelOutput) runCatching { cancelOutputTurn(sessionId, generation, owned.turnId) }

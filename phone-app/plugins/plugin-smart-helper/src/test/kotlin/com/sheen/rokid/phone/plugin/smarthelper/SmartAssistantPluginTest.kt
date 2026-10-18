@@ -870,9 +870,14 @@ class SmartAssistantPluginTest {
     private fun cycleRig(
         panelVisible: Boolean = false,
         continueDialogue: Boolean = false,
+        speechAvailable: Boolean = true,
     ): Pair<SmartTestRig, SmartRecordingDisplay> {
         val display = SmartRecordingDisplay()
-        val rig = SmartTestRig(panelVisible = panelVisible, continueDialogue = continueDialogue)
+        val rig = SmartTestRig(
+            panelVisible = panelVisible,
+            continueDialogue = continueDialogue,
+            speechAvailable = speechAvailable,
+        )
         rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
         return rig to display
     }
@@ -1359,6 +1364,25 @@ class SmartAssistantPluginTest {
         }
     }
 
+    /**
+     * Two `notify_user` calls in **one** run (spec §6.3 supports a task-start and a task-done notice).
+     *
+     * Both are emitted under the turn's one hint id, so this is the production shape that used to make the second
+     * emit's arbiter replacement look like a rejection of the answer itself (fix round C1).
+     */
+    private fun twoNotifyAnswers(rig: SmartTestRig) {
+        var requests = 0
+        rig.model.onRequest = { request, listener ->
+            if (requests++ == 0) {
+                listener(smartToolCall("c1", "notify_user", """{"text":"第一句","channel":"screen"}"""))
+                listener(smartToolCall("c2", "notify_user", """{"text":"第二句","channel":"screen"}"""))
+            } else {
+                listener(ModelStreamEvent.TextDelta(request.requestId, "完成"))
+            }
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+    }
+
     @Test fun `S3 a notification answer emitted while running continues at its display ACK`() {
         val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
         notifyAnswer(rig, channel = "screen")
@@ -1498,5 +1522,134 @@ class SmartAssistantPluginTest {
 
         assertEquals(1, display.statuses.count { it == OfficialStatus.AUDIO_FINISHED.wire })
         assertEquals(2, display.count("working:WAKE"), "exactly one new round was opened")
+    }
+
+    @Test fun `S3 a one character final answer that assembles nothing closes at the fallback bound`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        // `ReadableHintAssembler` intentionally drops a sentence whose content is shorter than two code points, so a
+        // one-character terminal answer emits **no** hint at all. Without a liveness bound the cycle would sit at the
+        // pre-answer status forever: run end set nothing and no timer was armed (review I2).
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick() // the assembler's 150 ms merge runs and drops the sentence
+        assertTrue(rig.hintTexts.isEmpty(), "the assembler really did emit nothing")
+
+        rig.tick(799)
+        assertTrue(display.closes.isEmpty(), "the fallback bound is one second, not immediate")
+        rig.tick(1)
+
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes, "a fallback that emits nothing must not hang")
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses, "there is no displayed answer to continue")
+        assertEquals(1, rig.cancels.size, "the turn behind the missing answer is cancelled")
+    }
+
+    // ------------------------------------------------- 0.24 S3 fix round C1: per-emit identity
+
+    @Test fun `S3 a superseded notify emit's rejection does not settle the final answer`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        twoNotifyAnswers(rig)
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("帮我处理一下")))
+        rig.tick()
+
+        assertEquals(2, rig.output.hints.size)
+        val first = rig.output.hints[0]
+        val second = rig.output.hints[1]
+        assertEquals(first.hintId, second.hintId, "both emits are one conversation entry")
+        assertNotNull(first.emitId, "every emit carries its own identity")
+        assertNotEquals(first.emitId, second.emitId)
+
+        // The real arbiter's replacement terminal for the superseded emit, delivered before the final answer's ACK.
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), first.hintId, OutputStatus.Rejected, first.emitId))
+        assertTrue(display.closes.isEmpty(), "a superseded emit's rejection is not the final answer's terminal")
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), second.hintId, OutputStatus.Displayed, second.emitId))
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, display.statuses[display.statuses.size - 2])
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last(), "the final answer continues")
+        assertTrue(display.closes.isEmpty())
+    }
+
+    @Test fun `S3 a SpeechFinished for a superseded emit cannot satisfy the current answer's speech wait`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        notifyAnswer(rig, channel = "both")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val answer = rig.output.hints.single()
+        assertNotNull(answer.emitId)
+
+        // A playback end for an earlier emit of the same turn entry (same hint id, different emit id). Before the
+        // fix it matched by hint id and was stored as `earlySpeech`.
+        rig.plugin.handle(SpeechFinished(rig.envelope(), answer.hintId, SpeechResult.FINISHED, "emit-superseded"))
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), answer.hintId, OutputStatus.Displayed, answer.emitId))
+
+        assertTrue(
+            OfficialStatus.AUDIO_FINISHED.wire !in display.statuses,
+            "the current answer's speech is still pending; the stale result must not settle it",
+        )
+
+        rig.plugin.handle(SpeechFinished(rig.envelope(), answer.hintId, SpeechResult.FINISHED, answer.emitId))
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, display.statuses[display.statuses.size - 2])
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last())
+    }
+
+    // ------------------------------------------------- 0.24 S3 fix round C2: speech off
+
+    @Test fun `S3 speech off makes a both answer display only and continues on its display ACK`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true, speechAvailable = false)
+        notifyAnswer(rig, channel = "both")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val answer = rig.output.hints.single()
+        assertNull(answer.optionalSpeech, "speech off: the answer must not ask the host to speak")
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), answer.hintId, OutputStatus.Displayed, answer.emitId))
+
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, display.statuses[display.statuses.size - 2])
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last(), "the answer settles on Displayed")
+        assertTrue(display.closes.isEmpty())
+    }
+
+    @Test fun `S3 speech off makes a voice answer display only and continues on its display ACK`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true, speechAvailable = false)
+        notifyAnswer(rig, channel = "voice")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val answer = rig.output.hints.single()
+        assertNull(answer.optionalSpeech)
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), answer.hintId, OutputStatus.Displayed, answer.emitId))
+
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, display.statuses[display.statuses.size - 2])
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last())
+    }
+
+    @Test fun `S3 speech off with continue off still closes one second after the display ACK`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = false, speechAvailable = false)
+        notifyAnswer(rig, channel = "both")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val answer = rig.output.hints.single()
+        assertNull(answer.optionalSpeech)
+        val requestsAfterRun = rig.model.requests.size
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), answer.hintId, OutputStatus.Displayed, answer.emitId))
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses, "continue off never sends status 5")
+
+        rig.tick(999)
+        assertTrue(display.closes.isEmpty(), "the official scheduleExit(1000) is not immediate")
+        rig.tick(1)
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertEquals(requestsAfterRun, rig.model.requests.size, "continue off opens no next round")
     }
 }

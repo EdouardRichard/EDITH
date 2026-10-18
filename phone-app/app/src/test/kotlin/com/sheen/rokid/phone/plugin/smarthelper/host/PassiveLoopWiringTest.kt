@@ -953,6 +953,31 @@ private class NoStorageAccess : StorageAccess {
         assertFalse("the stored switch must reach the plugin", wiredSwitch(SmartSettings(continueDialogue = false)))
     }
 
+    /**
+     * 0.24 S3 Task 14 fix round (C2): whether a player exists must reach the plugin.
+     *
+     * With「语音朗读」off (the shipped default) production builds no player, so a `both`/`voice` answer has no
+     * `SpeechFinished` source and must be settled by its `Displayed` acknowledgement. The wiring is the only place the
+     * production composition can pass that fact to the plugin; a wiring that forgot it would keep the old
+     * wait-then-close behavior on every default configuration.
+     */
+    @Test
+    fun theSpeechPlayerPresenceReachesThePluginTheWiringBuilds() {
+        fun wiredSpeech(available: Boolean): Boolean {
+            val wiring = SmartWiring(
+                SmartSettings(), MemoryProfileRepository(), FakeClock(0), ManualScheduler(FakeClock(0)),
+                speechAvailable = { available },
+            )
+            val field = wiring.plugin.javaClass.getDeclaredField("speechAvailable")
+            field.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            return (field.get(wiring.plugin) as () -> Boolean).invoke()
+        }
+
+        assertFalse("no player means no speech", wiredSpeech(false))
+        assertTrue("a player means speech can happen", wiredSpeech(true))
+    }
+
     @Test
     fun withNoProfileAtAllTheWiringStillBuildsAConfigurationThePluginAccepts() {
         // An installed app with no profile yet: the shape must stay valid and the plugin must be able to activate

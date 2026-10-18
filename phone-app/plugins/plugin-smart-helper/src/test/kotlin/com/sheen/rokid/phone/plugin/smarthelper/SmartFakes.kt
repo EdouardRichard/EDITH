@@ -440,6 +440,11 @@ internal class SmartTestRig(
      */
     var continueDialogue: Boolean = false,
     /**
+     * 0.24 S3 Task 14 fix (C2): whether the host can actually speak. Default `true` keeps every pre-fix test on the
+     * official-shaped host (which always has TTS); the speech-off tests opt out explicitly.
+     */
+    val speechAvailable: Boolean = true,
+    /**
      * 0.24 S3 fix (I4): the wake cooldown. The production default (3 s) is what every pre-0.24 test expects; the
      * interleaving test needs a second wake inside the first round's 1 s close, so it opts out explicitly.
      */
@@ -477,6 +482,7 @@ internal class SmartTestRig(
             conversationStores = conversationStores,
             isPanelVisible = { panelVisible },
             continueDialogue = { continueDialogue },
+            speechAvailable = { speechAvailable },
         )
     }
 

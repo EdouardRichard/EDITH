@@ -5,6 +5,7 @@ import com.sheen.rokid.agent.AgentLoop
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.OutputStatus
 import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.output.ReadableHintAssembler
@@ -79,22 +80,26 @@ internal class SmartTurn private constructor(
     var closed = false
 
     /**
-     * 0.24 S3 Task 14 (spec §5.5, Task 12 carry I1): the identity of the answer this turn last emitted.
+     * 0.24 S3 Task 14 (spec §5.5, Task 12 carry I1): the per-emit identity of the answer this turn last emitted.
      *
      * The production answer shape is `notify_user` (spec §6.1), which is emitted **while the run is still `Running`**.
      * A `phase == Idle` test therefore cannot tell the final answer from a mid-run notification - or see it at all
-     * for the suppressed/rejected/silent endings. The turn records the hint it last put in front of the wearer here,
+     * for the suppressed/rejected/silent endings. The turn records the emit it last put in front of the wearer here,
      * and [answerFinal] marks the moment the run ended and that emit became the answer the conversation continues.
+     *
+     * **Fix round C1:** this is the emit id (`Assistance.emitId`), not [hintId]. A second emit in the same turn keeps
+     * the same entry hint id (spec §6: `say-${hintId}` is one row) but gets its own emit id, so the arbiter's
+     * replacement `Rejected` for the superseded emit can be told apart from a terminal of the current answer.
      */
-    var answerEmitHintId: String? = null
+    var answerEmitId: String? = null
 
-    /** Whether [answerEmitHintId] asked the host to speak. */
+    /** Whether [answerEmitId] asked the host to speak (and the host could). */
     var answerEmitSpeech = false
 
     /** Whether the host accepted that emit for display; a rejected submit has nothing to continue. */
     var answerEmitAccepted = false
 
-    /** The run ended, so [answerEmitHintId] is the final answer (or null when the turn never emitted one). */
+    /** The run ended, so [answerEmitId] is the final answer (or null when the turn never emitted one). */
     var answerFinal = false
 
     /**
@@ -107,6 +112,15 @@ internal class SmartTurn private constructor(
 
     /** 0.24 S3: the answer-done decision was already reported, so a duplicate `Displayed` cannot continue twice. */
     var answerNotified = false
+
+    /**
+     * 0.24 S3 Task 14 fix round (I2): the liveness bound for a closing fallback that the assembler may never emit.
+     *
+     * `ReadableHintAssembler` deliberately drops a sentence shorter than two code points after stripping punctuation,
+     * so a one-character terminal answer (`好。`) emits nothing. Without this deadline nothing would arm a timer and the
+     * panel would stay at the pre-answer status forever - the same "no timer" state the speech bound removes.
+     */
+    var fallbackWait: CancellationHandle? = null
 
     /** Moves the turn to [SmartTurnPhase.Running]: the final transcript has arrived and will open the loop. */
     fun running() {
@@ -142,6 +156,12 @@ internal class SmartTurn private constructor(
     fun cancelAssembler() {
         assembler?.cancel()
         assembler = null
+    }
+
+    /** Releases the fallback liveness bound, if one is armed; safe to call more than once. */
+    fun cancelFallbackWait() {
+        fallbackWait?.cancel()
+        fallbackWait = null
     }
 
     companion object {

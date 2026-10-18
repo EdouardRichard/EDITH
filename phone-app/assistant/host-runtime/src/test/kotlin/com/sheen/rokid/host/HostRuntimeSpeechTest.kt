@@ -70,7 +70,7 @@ class HostRuntimeSpeechTest {
             assertEquals(ActivationResult.Activated, host.activate(probe.descriptor.pluginId))
         }
 
-        fun submit(hintId: String, speech: Boolean = true, priority: Int = 0): OutputSubmission {
+        fun submit(hintId: String, speech: Boolean = true, priority: Int = 0, emitId: String? = "emit-$hintId"): OutputSubmission {
             val now = clock.nowNanos()
             val assistance = Assistance(
                 hintId = hintId,
@@ -81,6 +81,7 @@ class HostRuntimeSpeechTest {
                 text = "text-$hintId",
                 optionalSpeech = if (speech) SpeechRequest() else null,
                 expiresAtNanos = now + 5_000_000_000L,
+                emitId = emitId,
             )
             return probe.context!!.services.textOutput().submit(assistance)
         }
@@ -92,6 +93,19 @@ class HostRuntimeSpeechTest {
             val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
             while (System.nanoTime() < deadline) {
                 probe.events.filterIsInstance<SpeechFinished>().firstOrNull()?.let { return it }
+                Thread.sleep(5)
+            }
+            return null
+        }
+
+        /** Waits for any host event of [T] that satisfies [predicate]. */
+        inline fun <reified T : HostEvent> awaitEvent(
+            timeoutMillis: Long = 2_000,
+            predicate: (T) -> Boolean,
+        ): T? {
+            val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
+            while (System.nanoTime() < deadline) {
+                probe.events.filterIsInstance<T>().firstOrNull(predicate)?.let { return it }
                 Thread.sleep(5)
             }
             return null
@@ -112,6 +126,20 @@ class HostRuntimeSpeechTest {
         assertEquals(SpeechResult.FINISHED, event.result)
         assertEquals(SessionId("s"), event.envelope.sessionId)
         assertEquals(generation, event.envelope.generation, "the event carries the session identity it was played under")
+        assertEquals("emit-hint-1", event.emitId, "the event carries the per-emit identity (fix C1)")
+    }
+
+    @Test fun `a display event carries the emit identity of the hint it belongs to`() {
+        val rig = Rig()
+        rig.submit("hint-1", speech = false, emitId = "emit-hint-1")
+        rig.device.callbacks.last()(OutputStatus.Displayed)
+
+        val displayed = rig.awaitEvent<OutputStateEvent>(150) {
+            it.hintId == "hint-1" && it.status == OutputStatus.Displayed
+        }
+
+        assertNotNull(displayed, "the host must forward the display acknowledgement")
+        assertEquals("emit-hint-1", displayed.emitId, "a terminal/ACK must name the emit, not only the turn entry")
     }
 
     @Test fun `a failed playback becomes SpeechFinished with FAILED`() {

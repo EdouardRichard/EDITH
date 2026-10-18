@@ -34,6 +34,15 @@ internal class SmartWiring(
      * stand-alone wiring (mostly tests) on the hidden-panel path.
      */
     isPanelVisible: () -> Boolean = { false },
+    /**
+     * 0.24 S3 Task 14 fix (C2, spec risk row 17): whether the host can actually speak a hint right now.
+     *
+     * The production composition builds the speech player only when「语音朗读」is on and the engine is ready, so it
+     * passes `{ speechPlayer != null }` through a holder (the player is constructed after this wiring). The default
+     * `{ false }` is the honest value for a stand-alone wiring: no player exists, so `both`/`voice` must be settled by
+     * the answer's `Displayed` acknowledgement, never by a `SpeechFinished` that cannot arrive.
+     */
+    speechAvailable: () -> Boolean = { false },
 ) {
     /** The word list the plugin declares on activation; also the `Capability.WakeWord` provider's content. */
     val wakeWords: SmartWakeWordRegistry = SmartWakeWordRegistry(settings.wakeWords)
@@ -83,5 +92,8 @@ internal class SmartWiring(
         // 0.24 S3 (spec §5.5): the persisted「持续对话」switch. Read through the wiring's settings snapshot, which is the
         // same value the settings screen writes and `create` reads once at assembly time.
         continueDialogue = { settings.continueDialogue },
+        // 0.24 S3 Task 14 fix (C2): the production player's presence. With speech off (the default) no player is built,
+        // so a `both`/`voice` answer is display-only and continues on its `Displayed` acknowledgement.
+        speechAvailable = speechAvailable,
     )
 }

@@ -529,6 +529,28 @@ class ConversationCycleTest {
     }
 
     @Test
+    fun `a speech end after the answer done with continue off closes one second later`() {
+        // The review gate named this branch explicitly: the answer-done report arms the speech wait first, and only
+        // the later `SpeechFinished` reaches the official `scheduleExit(1000)` path. Only the early-result variant was
+        // covered before.
+        val rig = rig(panelVisible = true, continueOn = false)
+        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
+        rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
+        rig.cycle.onAnswerDone(AssistantRoute.WAKE, displayed = true, speech = true)
+
+        rig.advance(500)
+        rig.cycle.onSpeechFinished(AssistantRoute.WAKE, SpeechResult.FINISHED)
+
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in rig.display.statuses)
+        assertEquals(emptyList(), rig.continuations)
+        rig.advance(999)
+        assertEquals(0, rig.display.closed, "the official scheduleExit is 1_000 ms from the speech end")
+        rig.advance(1)
+        assertEquals(1, rig.display.closed)
+        assertEquals(emptyList(), rig.continuations)
+    }
+
+    @Test
     fun `an early speech finished is discarded by an answer that had no speech`() {
         val rig = rig(panelVisible = true)
         rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")

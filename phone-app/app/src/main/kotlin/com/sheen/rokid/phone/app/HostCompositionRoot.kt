@@ -1781,9 +1781,15 @@ class HostCompositionRoot internal constructor(
             // The smart plugin is registered and configured here, with the composition's own clock, scheduler,
             // profile lookup, output-turn cancellation and configured cooldown - Task 13 made it a real
             // `ConfiguredPlugin`, so the bare constructor would be refused by the host's configuration policy.
+            //
+            // 0.24 S3 Task 14 fix (C2): the plugin must know whether speech can actually happen. The player is built
+            // below (the wiring is assembled first), so the wiring reads it through this holder. Null means the
+            // `both`/`voice` answer is display-only and must be settled by its `Displayed` acknowledgement.
+            val speechPlayerHolder = java.util.concurrent.atomic.AtomicReference<com.sheen.rokid.plugin.SpeechPlayer?>(null)
             val smartWiring = SmartWiring(smartSettings, profiles, clock, scheduler, { sessionId, generation, turnId ->
                 hostHolder[0]?.cancelOutputTurn(sessionId, generation, turnId)
-            }, isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false })
+            }, isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false },
+                speechAvailable = { speechPlayerHolder.get() != null })
             // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
             // One router is the single `Capability.Actions` provider, so the advertised tool set is exactly the set of
             // channels that are up. Each channel is asked at read time, never cached.
@@ -1907,6 +1913,10 @@ class HostCompositionRoot internal constructor(
             val speechPlayer: com.sheen.rokid.plugin.SpeechPlayer? = if (speechEnabledNow) {
                 AndroidSpeechPlayer.create(context, playbackGate)
             } else null
+            // 0.24 S3 Task 14 fix (C2): the plugin's speech gate is the **player's presence**, not the stored switch:
+            // a switch that is on but whose engine failed to create still produces no SpeechFinished. Set before the
+            // host is built/activated so the value the plugin reads is the one the arbiter will honour.
+            speechPlayerHolder.set(speechPlayer)
             // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
             // assistant tab reads it. It has to be created here because the provider map is built before the root.
             val conversationLog = ConversationLog()

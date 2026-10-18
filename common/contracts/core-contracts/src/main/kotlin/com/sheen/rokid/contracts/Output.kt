@@ -16,10 +16,22 @@ data class Assistance(
      *
      * The glasses now show one conversation per route, so a hint that did not say where it came from could only be
      * filed by guessing. The default is [AssistantRoute.WAKE] because that is what every hint built before this
-     * field existed was: the assistant answering something the wearer said. It is the last parameter on purpose —
-     * existing callers pass the first eight positionally.
+     * field existed was: the assistant answering something the wearer said. It precedes [emitId] on purpose —
+     * existing callers pass the first eight parameters positionally.
      */
     val route: AssistantRoute = AssistantRoute.WAKE,
+    /**
+     * 0.24 S3 Task 14 fix (C1): the identity of **this emit**, not of the turn.
+     *
+     * [hintId] names the conversation entry: a task turn emits one entry, and the closing answer / a fallback / a
+     * mid-run notification that supersedes it all keep the same [hintId] (spec §6: `say-${hintId}` is one row, final
+     * `SHOW` replaces the same entry). The display arbiter therefore reports the **replaced** item's `Rejected` under
+     * the same [hintId] as the item that replaced it, and a host event alone cannot tell the two apart. This id is
+     * minted by the plugin for every `submit`, travels unchanged through the arbiter and back in
+     * [OutputStateEvent]/[SpeechFinished], and lets the plugin keep a terminal event for a superseded emit from
+     * settling the current one. It is phone-internal; nothing about it is on the wire.
+     */
+    val emitId: String? = null,
 ) {
     init {
         require(hintId.isNotBlank())
@@ -27,6 +39,7 @@ data class Assistance(
         require(priority >= 0)
         require(text.isNotBlank())
         require(expiresAtNanos >= 0)
+        require(emitId == null || emitId.isNotBlank())
     }
     fun isCurrent(session: SessionId, currentGeneration: Generation): Boolean = sessionId == session && generation == currentGeneration
 }

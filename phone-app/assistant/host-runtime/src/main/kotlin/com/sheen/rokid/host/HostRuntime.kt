@@ -69,15 +69,19 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
         { hint, status ->
             onEvent(OutputStateEvent(EventEnvelope(hint.sessionId, hint.generation,
                 "output-${java.util.UUID.randomUUID()}", environment.clock.nowNanos(), environment.clock.nowNanos()),
-                hint.hintId, status))
+                hint.hintId, status, hint.emitId))
         },
         { hint, result ->
             // 0.24 S3 (spec §5.5): the phone's playback of the displayed answer ended. `onEvent` is the identity gate:
             // a session that ended (or a generation that was replaced) receives nothing, exactly like every other host
             // event. There is no wire command for this - `SPEECH_DONE` is phone-internal (spec §5.4).
+            //
+            // 0.24 S3 Task 14 fix (C1): the event also carries the hint's **emit** id. A turn-wide hint id cannot tell
+            // a superseded emit's playback end from the final answer's, and the arbiter suppresses a cancelled
+            // playback after `remove` - but an event that was already queued before the replacement is delivered.
             onEvent(SpeechFinished(EventEnvelope(hint.sessionId, hint.generation,
                 "speech-${java.util.UUID.randomUUID()}", environment.clock.nowNanos(), environment.clock.nowNanos()),
-                hint.hintId, result))
+                hint.hintId, result, hint.emitId))
         })
     private val drainScheduled = AtomicBoolean()
     private val dispatcher = HostEventDispatcher(32, ::deliverEvent, ::onCriticalEventOverflow)

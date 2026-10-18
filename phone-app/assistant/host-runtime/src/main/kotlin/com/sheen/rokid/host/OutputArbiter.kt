@@ -112,6 +112,10 @@ class OutputArbiter private constructor(
      * and only while the hint is still the displayed one: a replaced/cleared/expired item's cancellation must not be
      * read as "the answer's speech finished" (Task 14's stale-hint rule). The callback can arrive on any thread, so it
      * is marshalled onto the arbiter's serial executor before it touches the item or the host.
+     *
+     * 0.24 S3 Task 14 fix (C1 review minor): the terminal callback also re-checks the hint's deadline, exactly like the
+     * display callback. A player can report its end after `expiresAtNanos` but before the queued `expire` task runs;
+     * forwarding that would name a hint that is already gone.
      */
     private fun onSpeechState(item: Item, state: SpeechPlayback) {
         val result = when (state) {
@@ -123,6 +127,7 @@ class OutputArbiter private constructor(
             if (item.speechSettled) return@execute
             item.speechSettled = true
             if (displayed !== item) return@execute
+            if (item.hint.expiresAtNanos <= nowNanos()) { expire(item); return@execute }
             onSpeech(item.hint, result)
         }
     }

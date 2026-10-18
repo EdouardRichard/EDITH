@@ -106,9 +106,16 @@ data class PinChanged(
  * Host→plugin and phone-internal (there is no wire command for it): from [result] the plugin decides whether the next
  * listening turn may start. [SpeechResult] lives here rather than in `plugin-api` so both sides of the boundary share
  * one type.
+ *
+ * [emitId] is the per-emit identity of the hint that was spoken (see `Assistance.emitId`; 0.24 S3 Task 14 fix C1):
+ * a superseded emit's playback end can outlive its replacement, and the plugin must not consume it as the current
+ * answer's speech end. Null is the legacy/proactive case where the hint had only one emit.
  */
 data class SpeechFinished(
     override val envelope: EventEnvelope,
     val hintId: String,
     val result: SpeechResult,
-) : HostEvent
+    val emitId: String? = null,
+) : HostEvent {
+    init { require(hintId.isNotBlank()); require(emitId == null || emitId.isNotBlank()) }
+}

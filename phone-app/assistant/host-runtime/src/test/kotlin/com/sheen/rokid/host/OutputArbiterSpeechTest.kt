@@ -259,4 +259,20 @@ class OutputArbiterSpeechTest {
 
         assertEquals(emptyList(), speeches, "only the hint that is still on screen may report its speech end")
     }
+
+    @Test fun `a playback end that races the queued expiry task is not reported`() {
+        // The device may report FINISHED after the hint's deadline but before the scheduled `expire` task runs (the
+        // two run on different threads). The terminal callback must apply the same deadline check the display callback
+        // applies, or the answer's speech end is forwarded for a hint that is already gone (review minor: expired
+        // suppression had no test).
+        val speech = ControlledSpeechPlayer()
+        val arbiter = speechArbiter(speech)
+        arbiter.submit(hint("h", expiry = 50, speech = SpeechRequest()))
+        clock.advance(50) // the deadline is due; the scheduler has not released it
+
+        speech.terminal("h", SpeechPlayback.FINISHED)
+        drain(arbiter)
+
+        assertEquals(emptyList(), speeches, "a hint past its deadline has no reportable speech end")
+    }
 }

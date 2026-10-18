@@ -289,7 +289,8 @@ class SmartSettingsStoreTest {
     }
 
     @Test
-    fun anUnreadableProfileRepositoryDoesNotStopTheSettingsFromResolving() {        // The composition reads the settings while it assembles the plugin. The profile repository can genuinely
+    fun anUnreadableProfileRepositoryDoesNotStopTheSettingsFromResolving() {
+        // The composition reads the settings while it assembles the plugin. The profile repository can genuinely
         // refuse (`ContractError.ConfigurationRejected("Storage unavailable; reconfigure")` when the keystore cannot
         // be opened), and an exception here would take the whole composition - and with it the passive loop - down.
         // The shape must stay usable so the caller can still build an accepted configuration.
