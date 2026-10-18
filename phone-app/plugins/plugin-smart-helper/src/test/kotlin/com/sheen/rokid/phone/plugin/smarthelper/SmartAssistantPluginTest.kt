@@ -936,6 +936,49 @@ class SmartAssistantPluginTest {
         assertEquals(0, rig.scheduler.pending())
     }
 
+    @Test fun `S3 a usable final before panel shown does not let the three second cap close the turn`() {
+        val (rig, display) = cycleRig(continueDialogue = true)
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.plugin.handle(rig.wakeEvent())
+            // The ASR final is ready while the overlay is still starting up: the plugin publishes status 2 and starts
+            // assembling the answer before the panel's first layout.
+            rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+            rig.tick()
+            assertEquals(OfficialStatus.ANSWERING.wire, display.statuses.last(), "the answer is being put on screen")
+
+            // The panel arrives 2 s after the wake, inside the 3 s acquisition cap.
+            rig.tick(1_800)
+            rig.panelVisible = true
+            rig.plugin.onPanelShown(AssistantRoute.WAKE)
+            // 0.2 + 1.8 + 1.0 == 3.0 s: this is where the old order fired `panel_not_shown` and closed the live turn.
+            rig.tick(1_000)
+        } finally {
+            P3Log.sink = previous
+        }
+
+        assertTrue(display.closes.isEmpty(), "the panel did show; the 3 s cap must not close the answering turn")
+        assertTrue(
+            lines.none { it.contains("P3_CONV panel_not_shown") },
+            "the shown panel must not be recorded as missing: $lines",
+        )
+        assertTrue(rig.cancels.isEmpty(), "the live turn must not be torn down")
+        assertEquals(
+            OfficialStatus.ANSWERING.wire,
+            display.statuses.last(),
+            "a round already at status 2 must not be reset to a listening level by the late panel",
+        )
+
+        // Still live: the answer's acknowledgement settles and continues it like any other displayed answer.
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), rig.output.hints.single().hintId, OutputStatus.Displayed))
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, display.statuses[display.statuses.size - 2])
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last(), "the answering turn survived to continue")
+    }
+
     @Test fun `S3 a visible panel arms the window at wake and displays status one`() {
         val (rig, display) = cycleRig(panelVisible = true)
 

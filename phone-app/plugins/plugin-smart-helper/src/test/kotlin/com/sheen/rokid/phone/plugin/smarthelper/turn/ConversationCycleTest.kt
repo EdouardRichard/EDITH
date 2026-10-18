@@ -269,6 +269,38 @@ class ConversationCycleTest {
     }
 
     @Test
+    fun `a panel shown after an early ASR keeps the answering round live`() {
+        val rig = rig()
+        rig.cycle.onWake(AssistantRoute.WAKE, "wake-1")
+        // The plugin's order before the overlay's first layout: any ASR message, then the usable final's status 2.
+        rig.cycle.onAsr(AssistantRoute.WAKE)
+        rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ASR)
+
+        // The panel arrives two seconds into the bounded wait, i.e. before the 3 s cap.
+        rig.advance(2_000)
+        rig.cycle.onPanelShown(AssistantRoute.WAKE)
+
+        // A panel that is up releases the acquisition wait, but the round is already at status 2: it must not invent a
+        // listening level or a 10 s window for it.
+        assertEquals(listOf(OfficialStatus.ASR.wire), rig.display.statuses)
+        assertEquals(0, rig.scheduler.pending(), "the shown panel releases the bounded wait it made unnecessary")
+
+        // The old bug fired the cap here and closed the live answering turn.
+        rig.advance(1_000)
+        assertEquals(0, rig.display.closed, "the panel did show; the 3 s cap must not close the round")
+        assertFalse(
+            rig.logs.any { it.contains("P3_CONV panel_not_shown") },
+            "the shown panel must not be recorded as missing: ${rig.logs}",
+        )
+
+        // The turn really is still live: its answer still settles into a continuation.
+        rig.cycle.onAnswerDone(AssistantRoute.WAKE, displayed = true, speech = false)
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, rig.display.statuses.last())
+        assertEquals(listOf("wake-1"), rig.continuations, "the answering turn was never torn down")
+        assertEquals(emptyList(), rig.cancelled)
+    }
+
+    @Test
     fun `status two four three are displayed but never arm a listening window`() {
         val rig = rig(panelVisible = true)
         rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")

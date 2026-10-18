@@ -167,10 +167,16 @@ internal class ConversationCycle(
             val current = state(route)
             val turnId = current.turnId ?: return
             if (current.idle) return
-            if (current.status != OfficialStatus.LISTENING && current.status != OfficialStatus.EMPTY) return
+            // The panel is up, so the acquisition wait is over whatever level this round has already reached. This must
+            // happen before the listening-only guard below: an early usable ASR publishes status 2 before the panel's
+            // first layout, and clearing the wait only for status 1/0 would leave the 3 s cap armed to close a live
+            // answering turn.
             val first = current.awaitingPanel
             current.awaitingPanel = false
             cancelPanelWaitLocked(current)
+            // The guard now covers only what a late panel may still do: display STATE 1 and start/refresh the 10 s
+            // window. A round already at 2/4/3/7 keeps its level and gets no listening timer.
+            if (current.status != OfficialStatus.LISTENING && current.status != OfficialStatus.EMPTY) return
             if (first) displayStateLocked(route, current, OfficialStatus.LISTENING)
             // Refreshed on first and duplicate equally: the deadline really is "10 s from the panel being up" -
             // unless an ASR message already cancelled this round's window (the official `removeTimeout` is the last
