@@ -469,6 +469,44 @@ class ConversationWireDisplayTest {
     }
 
     @Test
+    fun anAcknowledgementIsRecordedAsItsOwnAssistantEntry() {
+        val f = Fixture()
+        f.display.assistantPartial(AssistantRoute.WAKE, "t7", "h7", 1, "今天")
+        f.display.assistantFinal(AssistantRoute.WAKE, "t7", "h7", "今天晴。")
+        f.display.assistantNotice(AssistantRoute.WAKE, "好，我记下了。")
+
+        val entries = f.log.entries(AssistantRoute.WAKE)
+        assertEquals("the answer and the acknowledgement are two records", 2, entries.size)
+        val answer = entries.single { it.entryId == "say-h7" }
+        assertEquals(ConversationRole.ASSISTANT, answer.role)
+        assertEquals("今天晴。", answer.text)
+        val acknowledgement = entries.single { it.entryId != "say-h7" }
+        assertEquals(ConversationRole.ASSISTANT, acknowledgement.role)
+        assertEquals("好，我记下了。", acknowledgement.text)
+        assertTrue("an assistant record keeps the say- identity", acknowledgement.entryId.startsWith("say-"))
+        assertEquals(
+            "the acknowledgement is only the phone's record; the glasses already got it as the hint SHOW",
+            listOf(WireCall.Answer(AssistantRoute.WAKE, "t7", "h7", 1, "今天")),
+            f.wire.calls,
+        )
+    }
+
+    @Test
+    fun anAcknowledgementBeforeTheAnswerFinalNeverTakesTheAnswerEntry() {
+        // The explicit-memory + closing-fallback order: the acknowledgement is emitted before the assembler's final,
+        // while a streamed revision's pending entry is still open. It must not consume that pending `say-${hintId}`.
+        val f = Fixture()
+        f.display.assistantPartial(AssistantRoute.WAKE, "t7", "h7", 1, "今天")
+        f.display.assistantNotice(AssistantRoute.WAKE, "好，我记下了。")
+        f.display.assistantFinal(AssistantRoute.WAKE, "t7", "h7", "今天晴。")
+
+        val entries = f.log.entries(AssistantRoute.WAKE)
+        assertEquals(2, entries.size)
+        assertEquals("今天晴。", entries.single { it.entryId == "say-h7" }.text)
+        assertEquals("好，我记下了。", entries.single { it.entryId != "say-h7" }.text)
+    }
+
+    @Test
     fun aFinalWithoutAPartialKeepsTheOldEntryIdBehavior() {
         val f = Fixture()
         f.display.userMessage(AssistantRoute.WAKE, "没有部分")

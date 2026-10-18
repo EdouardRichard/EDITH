@@ -108,6 +108,7 @@ class ConversationDisplayContractTest {
             hintId = "hint-1",
             text = "今天晴。",
         )
+        display.assistantNotice(route = AssistantRoute.WAKE, text = "好，我记下了。")
         display.toolStatus(
             route = AssistantRoute.WAKE,
             turnId = "turn-1",
@@ -177,6 +178,10 @@ class ConversationDisplayContractTest {
             calls += "assistantFinal:$route:$turnId:$hintId:$text"
         }
 
+        override fun assistantNotice(route: AssistantRoute, text: String) {
+            calls += "assistantNotice:$route:$text"
+        }
+
         override fun toolStatus(route: AssistantRoute, turnId: String, phase: ToolPhase, label: String) {
             calls += "toolStatus:$route:$turnId:${phase.name}:$label"
         }
@@ -225,6 +230,7 @@ class ConversationDisplayContractTest {
             hintId = "hint-9",
             text = "附近有一家咖啡店。",
         )
+        display.assistantNotice(route = AssistantRoute.PROACTIVE, text = "好，我记下了。")
         display.toolStatus(
             route = AssistantRoute.PROACTIVE,
             turnId = "turn-9",
@@ -242,6 +248,7 @@ class ConversationDisplayContractTest {
                 "userFinal:PROACTIVE:turn-9:asr-turn-9:附近有",
                 "assistantPartial:PROACTIVE:turn-9:hint-9:8:附近有一家咖啡店",
                 "assistantFinal:PROACTIVE:turn-9:hint-9:附近有一家咖啡店。",
+                "assistantNotice:PROACTIVE:好，我记下了。",
                 "toolStatus:PROACTIVE:turn-9:END:get_location",
                 "panelOpen:PROACTIVE",
                 "closePanel:PROACTIVE",

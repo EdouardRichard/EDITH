@@ -95,6 +95,17 @@ interface ConversationDisplay {
     fun assistantFinal(route: AssistantRoute, turnId: String, hintId: String, text: String) {}
 
     /**
+     * 0.24 S4 Task 16 (I1): an assistant statement that is **not** this turn's answer - the explicit-memory
+     * acknowledgement is the current producer.
+     *
+     * The host records it as its own conversation entry. It must never replace or finalise the answer entry
+     * (`say-${hintId}`): the acknowledgement can be emitted after a `notify_user` answer, or while a closing answer is
+     * still being assembled. The statement already reaches the glasses as the hint (`SHOW`), so this carries only the
+     * phone's own record. Default no-op for a host that predates the official conversation.
+     */
+    fun assistantNotice(route: AssistantRoute, text: String) {}
+
+    /**
      * 0.24 spec §5.5: a tool row for the action labelled [label], before ([ToolPhase.START]) and after
      * ([ToolPhase.END]) it runs.
      *

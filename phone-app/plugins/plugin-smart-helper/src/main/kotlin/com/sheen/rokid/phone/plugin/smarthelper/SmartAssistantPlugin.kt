@@ -1068,6 +1068,20 @@ class SmartAssistantPlugin(
     }
 
     /**
+     * A **displayed** statement that is not this turn's answer - today the explicit-memory acknowledgement.
+     *
+     * 0.24 S4 Task 16 (I1): it is recorded under its own entry, never under `say-${hintId}`. The acknowledgement is
+     * emitted after a `notify_user` answer (or before the closing fallback answer), so publishing it as the answer's
+     * final would overwrite the wearer's answer in the phone record - deterministic on the first order, transient on
+     * the second. The statement itself already reaches the glasses as the hint (`SHOW`); this is the phone's record.
+     */
+    private fun publishAssistantNotice(route: ContextRoute, text: String) {
+        if (text.isBlank()) return
+        P3Log.line("P3_CONV notice route=${route.toContractRoute().name} chars=${text.length}")
+        conversation()?.assistantNotice(route.toContractRoute(), text)
+    }
+
+    /**
      * One streaming answer revision (0.24 S4 Task 16, spec §5.5).
      *
      * Runs on the model transport thread (the gateway's `onTextDelta` contract), while the final answer is assembled
@@ -1328,6 +1342,11 @@ class SmartAssistantPlugin(
         val owned = turn ?: return
         if (owned.closed) return
         if (!namesCurrentAnswerEmit(owned, event.hintId, event.emitId)) return
+        // 0.24 S4 Task 16 (I1): a non-answer statement emitted after the answer replaces it by hint id, and the arbiter
+        // reports that removal as `Rejected` naming the **answer's** emit. It means "superseded", not "the wearer never
+        // saw the answer": recording it would settle `no_display` while the answer's own `Displayed` ACK is still in
+        // flight. `Expired` is never produced by the replacement path, so only `Rejected` is filtered here.
+        if (owned.answerSupersededByNotice && event.status == OutputStatus.Rejected) return
         when (event.status) {
             OutputStatus.Expired, OutputStatus.Rejected -> if (!owned.displayed) owned.answerTerminal = event.status
             else -> Unit
@@ -1927,8 +1946,8 @@ class SmartAssistantPlugin(
         val report = extraction.afterTurn(utterance, succeeded)
         // Task 14 (Task 12 review minor 8): the acknowledgement is a hint, but it is not the answer the conversation
         // continues. Recording it as an answer would let a no-speech acknowledgement hide the notification answer's
-        // speech or settle a conversation on text the model did not mean as its reply (Task 16 owns the fuller
-        // per-entry classification).
+        // speech or settle a conversation on text the model did not mean as its reply. 0.24 S4 Task 16 (I1): it is
+        // recorded under its own entry, and its replacement of the answer is classified as a supersession.
         if (report.explicit) emit(MemoryExtraction.ACKNOWLEDGEMENT, recordAsAnswer = false)
     }
 
@@ -2904,8 +2923,8 @@ class SmartAssistantPlugin(
      * [OutputSubmission.Accepted] comes back.
      *
      * [recordAsAnswer] is `false` for the post-turn memory acknowledgement: it is displayed like any hint, but it is
-     * not the answer the conversation continues from (Task 12 review minor 8; Task 16 owns the fuller per-entry
-     * classification).
+     * not the answer the conversation continues from (Task 12 review minor 8). 0.24 S4 Task 16 (I1) records it under
+     * its own entry identity and classifies its replacement of the answer as a supersession, not a terminal.
      */
     private fun emit(text: String, optionalSpeech: SpeechRequest? = null, recordAsAnswer: Boolean = true) {
         var owned: SmartTurn? = null
@@ -2957,6 +2976,15 @@ class SmartAssistantPlugin(
                 current.answerFinal = finalAnswer
                 current.answerTerminal = null
                 current.displayed = false
+                // A new answer is the entry's current identity; an earlier acknowledgement's supersession no longer
+                // describes a terminal of this emit.
+                current.answerSupersededByNotice = false
+            } else if (current.answerEmitId != null) {
+                // 0.24 S4 Task 16 (I1): a non-answer statement (the memory acknowledgement) shares the turn's hint id,
+                // so submitting it replaces the answer and the arbiter reports the removed answer as `Rejected`.
+                // Remember that the supersession is what a later Rejected for the answer's emit means; it is not a
+                // terminal that proves the wearer never saw the answer.
+                current.answerSupersededByNotice = true
             }
             owned = current
             Assistance(
@@ -2996,8 +3024,14 @@ class SmartAssistantPlugin(
         // Phase C: the conversation record gets the sentence first - it is what the wearer is being told - and the
         // "working" level then ends, so the ring stops exactly when the answer appears rather than a moment before it.
         // 0.24 S4 Task 16: the final names the turn and the hint, so it replaces the same `say-${hintId}` row the
-        // streamed revisions opened (and blocks a later revision under that id).
-        publishAssistantFinal(ContextRoute.WAKE, hint.sourceTurnId ?: current.turnId, hint.hintId, hint.text)
+        // streamed revisions opened (and blocks a later revision under that id). A non-answer statement (the memory
+        // acknowledgement) is **not** the answer: it gets its own record entry, so it can never overwrite or finalize
+        // `say-${hintId}`.
+        if (recordAsAnswer) {
+            publishAssistantFinal(ContextRoute.WAKE, hint.sourceTurnId ?: current.turnId, hint.hintId, hint.text)
+        } else {
+            publishAssistantNotice(ContextRoute.WAKE, hint.text)
+        }
         synchronized(gate) { wakeBusy = false }
         // Outside the lock, as `publishBusy` requires: the host's port is what ends the ring.
         publishBusy()

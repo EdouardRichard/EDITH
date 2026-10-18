@@ -1,6 +1,8 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 import com.sheen.rokid.phone.plugin.smarthelper.audit.AuditTrail
 import com.sheen.rokid.phone.plugin.smarthelper.scene.ScenePolicy
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryExtraction
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
 import com.sheen.rokid.phone.plugin.smarthelper.memory.score
 import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
@@ -409,6 +411,87 @@ class SmartAssistantPluginTest {
         assertEquals(listOf(AssistantRoute.WAKE), display.closes, "an answer nobody saw closes, it never continues")
         assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
         assertEquals(1, display.assistantFinals.size, "the phone's record still names the final entry")
+    }
+
+    // ------------------------------------------------- 0.24 S4 (Task 16 I1): the memory acknowledgement is not the answer
+
+    /**
+     * The real explicit-memory path, not a hand-emitted acknowledgement.
+     *
+     * The utterance is an explicit instruction, so `rememberFromTurn` writes the memory and emits
+     * [MemoryExtraction.ACKNOWLEDGEMENT] with `recordAsAnswer = false` **after** the `notify_user` answer of the same
+     * run: the production order in which the acknowledgement used to become the last write under `say-${hintId}`.
+     */
+    private fun explicitMemoryNotifyRig(): Triple<SmartTestRig, SmartRecordingDisplay, SmartFakeStorage> {
+        val storage = SmartFakeStorage()
+        val (rig, display) = cycleRig(
+            panelVisible = true,
+            continueDialogue = true,
+            capabilities = mapOf(Capability.Storage to storage),
+        )
+        notifyAnswer(rig, channel = "screen")
+        return Triple(rig, display, storage)
+    }
+
+    @Test fun `S4 an explicit memory acknowledgement never becomes the notify answer entry`() {
+        val (rig, display, storage) = explicitMemoryNotifyRig()
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("记住我不吃香菜")))
+        rig.tick()
+
+        assertEquals(2, rig.output.hints.size, "the answer and its acknowledgement are two hints")
+        val answer = rig.output.hints[0]
+        val acknowledgement = rig.output.hints[1]
+        assertEquals("答案", answer.text)
+        assertEquals(MemoryExtraction.ACKNOWLEDGEMENT, acknowledgement.text)
+        assertEquals(answer.hintId, acknowledgement.hintId, "one turn keeps one conversation entry hint id")
+        assertNotNull(answer.emitId)
+        assertNotEquals(answer.emitId, acknowledgement.emitId, "each emit has its own identity")
+
+        // The real extractor wrote the instruction; this is not a synthetic acknowledgement.
+        assertEquals(
+            listOf("我不吃香菜"),
+            MemoryLog(storage = storage, now = { 1_000L }, log = { }).entries().map { it.text },
+        )
+
+        assertEquals(
+            listOf(SmartRecordingDisplay.AssistantFinalCall(AssistantRoute.WAKE, "asr-1", answer.hintId, "答案")),
+            display.assistantFinals,
+            "exactly one answer final, with the model's text; the acknowledgement is not the answer's final",
+        )
+        assertEquals(
+            listOf(SmartRecordingDisplay.AssistantNoticeCall(AssistantRoute.WAKE, MemoryExtraction.ACKNOWLEDGEMENT)),
+            display.assistantNotices,
+            "the acknowledgement is recorded under its own identity, never as the answer",
+        )
+        assertTrue(display.closes.isEmpty(), "the answer is still on screen; nothing settled no_display")
+    }
+
+    @Test fun `S4 the acknowledgement replacement rejection cannot settle the in flight answer`() {
+        val (rig, display, _) = explicitMemoryNotifyRig()
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("记住我不吃香菜")))
+        rig.tick()
+        val answer = rig.output.hints.first()
+        assertEquals(2, rig.output.hints.size, "the acknowledgement was emitted after the answer")
+        assertTrue(display.closes.isEmpty())
+
+        // The real arbiter's replacement terminal for the answer, emitted when the acknowledgement replaces it by
+        // hint id. The answer's own Displayed acknowledgement is still in flight at this point.
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), answer.hintId, OutputStatus.Rejected, answer.emitId))
+        assertTrue(
+            display.closes.isEmpty(),
+            "a Rejected caused by a non-answer emit superseding the answer is not the answer's terminal",
+        )
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
+
+        // The in-flight acknowledgement lands: the answer was displayed after all and continues exactly once.
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), answer.hintId, OutputStatus.Displayed, answer.emitId))
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, display.statuses[display.statuses.size - 2])
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last())
+        assertTrue(display.closes.isEmpty(), "the displayed answer continues instead of closing")
     }
 
     @Test fun `transcripts for another session or generation are ignored`() {
@@ -1064,6 +1147,8 @@ class SmartAssistantPluginTest {
         panelVisible: Boolean = false,
         continueDialogue: Boolean = false,
         speechAvailable: Boolean = true,
+        /** Extra host capabilities, e.g. `Storage` for a test that drives the real memory extraction. */
+        capabilities: Map<Capability, Any> = emptyMap(),
     ): Pair<SmartTestRig, SmartRecordingDisplay> {
         val display = SmartRecordingDisplay()
         val rig = SmartTestRig(
@@ -1071,7 +1156,7 @@ class SmartAssistantPluginTest {
             continueDialogue = continueDialogue,
             speechAvailable = speechAvailable,
         )
-        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display) + capabilities)
         return rig to display
     }
 

@@ -110,6 +110,17 @@ internal class SmartTurn private constructor(
      */
     var answerTerminal: OutputStatus? = null
 
+    /**
+     * 0.24 S4 Task 16 (I1): a non-answer emit (the explicit-memory acknowledgement) was submitted under this turn's
+     * hint id after the answer.
+     *
+     * `OutputArbiter` replaces an item with the **same hint id** and reports the removed answer as `Rejected` naming
+     * the answer's emit id. That status means "superseded by a later statement", not "the wearer never saw the
+     * answer", so [SmartAssistantPlugin.noteAnswerTerminal] must not record it as the answer's terminal. A new answer
+     * emit clears it: from then on a terminal names a different emit (or a real terminal of that new answer).
+     */
+    var answerSupersededByNotice = false
+
     /** 0.24 S3: the answer-done decision was already reported, so a duplicate `Displayed` cannot continue twice. */
     var answerNotified = false
 

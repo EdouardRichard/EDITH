@@ -10,11 +10,17 @@ import com.sheen.rokid.contracts.SpeechFinished
 import com.sheen.rokid.contracts.SpeechResult
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.contracts.TranscriptRevision
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.contracts.WakeDetected
 import com.sheen.rokid.host.ActivationResult
 import com.sheen.rokid.host.HostRuntime
+import com.sheen.rokid.output.ConversationLog
+import com.sheen.rokid.output.ConversationRole
 import com.sheen.rokid.output.OfficialStatus
+import com.sheen.rokid.phone.bridge.ConversationWire
+import com.sheen.rokid.phone.bridge.ConversationWireDisplay
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
+import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryExtraction
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
@@ -108,15 +114,73 @@ class AnswerEmitIdentityIntegrationTest {
         override fun clear(sessionId: SessionId, generation: Generation) = Unit
     }
 
+    /**
+     * The production [ConversationWireDisplay] plus the level/close observations the tests make.
+     *
+     * The real display is used so the phone's conversation record is part of the evidence: Task 16 I1 is about which
+     * entry a statement lands in, which a no-op fake cannot show.
+     */
     private class RecordingDisplay : ConversationDisplay {
+        val log = ConversationLog()
+
+        /** No official traffic is asserted here; the wire only has to exist for the production display. */
+        private val wire = object : ConversationWire {
+            override fun state(route: AssistantRoute, turnId: String, status: Int, sequence: Long) = true
+            override fun idle(route: AssistantRoute, sequence: Long) = true
+            override fun asr(route: AssistantRoute, turnId: String, revision: Long, text: String) = true
+            override fun answer(
+                route: AssistantRoute,
+                turnId: String,
+                hintId: String,
+                revision: Long,
+                text: String,
+            ) = true
+            override fun tool(route: AssistantRoute, turnId: String, phase: ToolPhase, label: String) = true
+            override fun panelOpen(route: AssistantRoute) = true
+            override fun close(route: AssistantRoute) = true
+        }
+        private val records = ConversationWireDisplay(
+            log = log,
+            wire = wire,
+            sendSaid = { _, _, _ -> true },
+            sendBusy = { _, _ -> true },
+        )
+
         val statuses = CopyOnWriteArrayList<Int>()
         val closes = CopyOnWriteArrayList<AssistantRoute>()
-        override fun state(route: AssistantRoute, turnId: String, status: Int, sequence: Long) { statuses += status }
-        override fun closePanel(route: AssistantRoute) { closes += route }
-        override fun userMessage(route: AssistantRoute, text: String) = Unit
-        override fun assistantMessage(route: AssistantRoute, text: String) = Unit
-        override fun working(route: AssistantRoute) = Unit
-        override fun idle(route: AssistantRoute) = Unit
+
+        override fun state(route: AssistantRoute, turnId: String, status: Int, sequence: Long) {
+            statuses += status
+            records.state(route, turnId, status, sequence)
+        }
+
+        override fun closePanel(route: AssistantRoute) {
+            closes += route
+            records.closePanel(route)
+        }
+
+        override fun showIdle(route: AssistantRoute, sequence: Long) = records.showIdle(route, sequence)
+        override fun userMessage(route: AssistantRoute, text: String) = records.userMessage(route, text)
+        override fun userPartial(route: AssistantRoute, turnId: String, revision: Long, text: String) =
+            records.userPartial(route, turnId, revision, text)
+        override fun userFinal(route: AssistantRoute, turnId: String, entryId: String, text: String) =
+            records.userFinal(route, turnId, entryId, text)
+        override fun assistantMessage(route: AssistantRoute, text: String) = records.assistantMessage(route, text)
+        override fun assistantPartial(
+            route: AssistantRoute,
+            turnId: String,
+            hintId: String,
+            revision: Long,
+            text: String,
+        ) = records.assistantPartial(route, turnId, hintId, revision, text)
+        override fun assistantFinal(route: AssistantRoute, turnId: String, hintId: String, text: String) =
+            records.assistantFinal(route, turnId, hintId, text)
+        override fun assistantNotice(route: AssistantRoute, text: String) = records.assistantNotice(route, text)
+        override fun toolStatus(route: AssistantRoute, turnId: String, phase: ToolPhase, label: String) =
+            records.toolStatus(route, turnId, phase, label)
+        override fun panelOpen(route: AssistantRoute) = records.panelOpen(route)
+        override fun working(route: AssistantRoute) = records.working(route)
+        override fun idle(route: AssistantRoute) = records.idle(route)
     }
 
     /**
@@ -402,6 +466,49 @@ class AnswerEmitIdentityIntegrationTest {
                 "the next listening round opened",
                 OfficialStatus.LISTENING.wire, rig.display.statuses.last(),
             )
+        }
+    }
+
+    @Test
+    fun aNotifyAnswerFollowedByTheMemoryAcknowledgementKeepsTheAnswerRecord() {
+        withRig { rig ->
+            rig.model.script = { index, request, listener ->
+                if (index == 0) {
+                    toolCall(request, listener, "答案", "screen")
+                } else {
+                    // The closing text is suppressed because the notification already reached the wearer.
+                    listener(ModelStreamEvent.TextDelta(request.requestId, "完成"))
+                }
+                complete(request, listener)
+            }
+
+            rig.wake()
+            rig.say("记住我不吃香菜")
+
+            assertEquals("the answer and the acknowledgement both reached the glasses", 2, rig.device.shown.size)
+            val answer = rig.device.shown.first { it.text == "答案" }
+            val acknowledgement = rig.device.shown.first { it.text == MemoryExtraction.ACKNOWLEDGEMENT }
+            assertEquals("both emits are one conversation entry", answer.hintId, acknowledgement.hintId)
+            assertTrue(
+                "the answer has not been settled: its Displayed ACK is still in flight",
+                rig.display.closes.isEmpty(),
+            )
+            assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in rig.display.statuses)
+
+            val entries = rig.display.log.entries(AssistantRoute.WAKE)
+            val answerEntry = entries.single { it.entryId == "say-${answer.hintId}" }
+            assertEquals(ConversationRole.ASSISTANT, answerEntry.role)
+            assertEquals("the acknowledgement must not overwrite the answer row", "答案", answerEntry.text)
+            assertEquals(
+                "exactly one entry has the answer identity",
+                1,
+                entries.count { it.entryId == "say-${answer.hintId}" },
+            )
+            val notice = entries.single {
+                it.role == ConversationRole.ASSISTANT && it.entryId != "say-${answer.hintId}"
+            }
+            assertEquals("the acknowledgement is its own entry", MemoryExtraction.ACKNOWLEDGEMENT, notice.text)
+            assertTrue("an assistant record keeps the say- identity", notice.entryId.startsWith("say-"))
         }
     }
 

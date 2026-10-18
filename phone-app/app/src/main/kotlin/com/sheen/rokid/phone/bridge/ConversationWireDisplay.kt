@@ -251,6 +251,22 @@ class ConversationWireDisplay(
         assistantMessage(route, turnId, hintId, text)
     }
 
+    /**
+     * 0.24 S4 Task 16 I1: one assistant statement that is not the turn's answer (the explicit-memory acknowledgement).
+     *
+     * It gets its own assistant entry - a fresh `say-` id - and deliberately does **not** consume
+     * [openAnswerEntry]. The acknowledgement can be emitted while a streamed answer's final is still pending (the
+     * explicit-memory + closing-fallback order), and consuming that pending entry would write the acknowledgement into
+     * the answer row before the answer final arrives. Nothing is sent: the glasses already received the statement as
+     * the hint (`SHOW`). The entry is not marked as a finalized answer either - it is not one.
+     */
+    override fun assistantNotice(route: AssistantRoute, text: String) {
+        if (text.isBlank()) return
+        synchronized(lockFor(route)) {
+            log.append(ConversationEntry("say-${UUID.randomUUID()}", route, ConversationRole.ASSISTANT, text))
+        }
+    }
+
     override fun working(route: AssistantRoute) {
         sendBusy(route, true)
     }
