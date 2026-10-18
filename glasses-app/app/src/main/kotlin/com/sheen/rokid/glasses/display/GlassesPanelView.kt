@@ -31,8 +31,8 @@ class GlassesPanelView(context: Context) : FrameLayout(context) {
     val hintScroll: ScrollView
     val listeningView: TextView
 
-    /** The official bottom cluster's voice orb; a [View] because Task 18 replaces the fallback with the PAG view. */
-    val orbView: View
+    /** The official bottom cluster's voice orb: the PAG view (0.24 S4 Task 18), with its own VoiceOrbView fallback. */
+    val orbView: PagOrbView
 
     val tipsView: TextView
     val pinTextView: TextView
@@ -114,7 +114,7 @@ class GlassesPanelView(context: Context) : FrameLayout(context) {
             text = GlassesPanelSpec.LISTENING_TEXT
             visibility = View.GONE
         }
-        orbView = VoiceOrbView(context)
+        orbView = PagOrbView(context)
         val stateRow = LinearLayout(context).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL

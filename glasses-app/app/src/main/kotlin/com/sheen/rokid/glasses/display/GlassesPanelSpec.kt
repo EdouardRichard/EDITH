@@ -3,6 +3,7 @@ package com.sheen.rokid.glasses.display
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.output.ConversationRole
+import com.sheen.rokid.output.OfficialStatus
 
 /**
  * 0.23 P3/P4 (spec §5.1): the official 「乐奇」 panel, as numbers and pure decisions.
@@ -176,6 +177,19 @@ object GlassesPanelSpec {
         ConversationRole.USER -> USER_MAX_LINES
         ConversationRole.ASSISTANT -> ASSISTANT_MAX_LINES
     }
+
+    /**
+     * 0.24 S4 Task 18: the four-state probe shape for an official status.
+     *
+     * This is the status branch of the Task 16/17 `orbStateOf` decision, moved here so the PAG view's fallback and the
+     * controller's probe cannot grow two different status tables: 0/1/2 are the listener chain, 4 is the thought, and
+     * 3/5/7 are the answer/finish chain (spec §3.4). It is not a PAG segment decision - [OrbPagChain] owns that.
+     */
+    fun orbStateForStatus(status: OfficialStatus): OrbState = when (status) {
+        OfficialStatus.ANSWERING, OfficialStatus.AUDIO_FINISHED, OfficialStatus.TOOL -> OrbState.ANSWERING
+        OfficialStatus.ASR_END -> OrbState.THINKING
+        OfficialStatus.EMPTY, OfficialStatus.LISTENING, OfficialStatus.ASR -> OrbState.LISTENING
+    }
 }
 
 /**
@@ -185,3 +199,105 @@ object GlassesPanelSpec {
  * the conversation is [GlassesPanelSpec.orbState].
  */
 enum class OrbState { IDLE, LISTENING, THINKING, ANSWERING }
+
+/**
+ * 0.24 S4 Task 18 (spec §3.4): the official PAG orb's status→segment and animation-end chain, as pure decisions.
+ *
+ * The official `AiAssistantDialog` owns one `id_pv` PAGView and nine clips. Two rules decide what plays: the incoming
+ * status asks for one segment, but the view only loads it when the official **tag** gate allows it; and every
+ * `onAnimationEnd` looks at the tag the view currently carries to pick the next segment. Both are reproduced here so
+ * the tag names, the guards and the loop cadence fail a JVM test instead of only being visible on a worn panel.
+ *
+ * Tag names are the official constants (`ANIMATION_LISTENER`, `ANIMATION_LISTENER_LAST`, ...). Note that
+ * `listener_first` and `listener_middle` deliberately share the tag `listener`: official `cycleListeningWaiting()`
+ * sets `ANIMATION_LISTENER` again after loading the middle, which is what makes the first → middle handover happen only
+ * once. Do not "fix" that into two tags; it would reload the first clip on every duplicate status.
+ */
+object OrbPagChain {
+
+    /** Official `ANIMATION_NONE`: the view before any clip. */
+    const val TAG_NONE = "none"
+
+    /** Official `ANIMATION_LISTENER`: both listener_first and listener_middle carry it. */
+    const val TAG_LISTENER = "listener"
+    const val TAG_LISTENER_LAST = "listener_last"
+    const val TAG_THINK_FIRST = "think_first"
+    const val TAG_THINK_MIDDLE = "think_middle"
+    const val TAG_THINK_LAST = "think_last"
+    const val TAG_FINISH_FIRST = "finish_first"
+    const val TAG_FINISH_MIDDLE = "finish_middle"
+    const val TAG_FINISH_LAST = "finish_last"
+
+    /** Every official tag, in chain order; the JVM gate test iterates it to prove the guards cover the whole domain. */
+    val ALL_TAGS: List<String> = listOf(
+        TAG_NONE, TAG_LISTENER, TAG_LISTENER_LAST, TAG_THINK_FIRST, TAG_THINK_MIDDLE, TAG_THINK_LAST,
+        TAG_FINISH_FIRST, TAG_FINISH_MIDDLE, TAG_FINISH_LAST,
+    )
+
+    /**
+     * One official clip. [repeatCount] is libpag's own unit: 1 plays once, 0 loops forever (verified against the
+     * pinned libpag 4.5.27 `PAGView.repeatCount()` contract), which is exactly how the official code drives first/last
+     * versus middle.
+     */
+    enum class Segment(val asset: String, val tag: String, val repeatCount: Int) {
+        LISTENER_FIRST("ai_listener_first.pag", TAG_LISTENER, 1),
+        LISTENER_MIDDLE("ai_listener_middle.pag", TAG_LISTENER, 0),
+        LISTENER_LAST("ai_listener_last.pag", TAG_LISTENER_LAST, 1),
+        THINK_FIRST("ai_think_first.pag", TAG_THINK_FIRST, 1),
+        THINK_MIDDLE("ai_think_middle.pag", TAG_THINK_MIDDLE, 0),
+        THINK_LAST("ai_think_last.pag", TAG_THINK_LAST, 1),
+        FINISH_FIRST("ai_finish_first.pag", TAG_FINISH_FIRST, 1),
+        FINISH_MIDDLE("ai_finish_middle.pag", TAG_FINISH_MIDDLE, 0),
+        FINISH_LAST("ai_finish_last.pag", TAG_FINISH_LAST, 1),
+    }
+
+    /** The segment a status asks for (spec §3.4's table). Whether it may load is [canLoad]'s decision. */
+    fun entryFor(status: OfficialStatus): Segment = when (status) {
+        // status 0 (`showNoneView`), 1 (`showListenerUI`) and 2 (`showASRResultMessage`) all call
+        // loadListeningWaitingGif(), which starts at listener_first unless the view is already in the listener tag.
+        OfficialStatus.EMPTY, OfficialStatus.LISTENING, OfficialStatus.ASR -> Segment.LISTENER_FIRST
+        // status 4 (`showTranslateStateUI`) calls loadingGif() from the listener tag.
+        OfficialStatus.ASR_END -> Segment.LISTENER_LAST
+        // status 3 (`showUpdateTTSUI`) and 7 (`agentToolStatus`) call loadSuccessGif().
+        OfficialStatus.ANSWERING, OfficialStatus.TOOL -> Segment.THINK_LAST
+        // status 5 (`showAudioFinishUI`) calls lastFinish() unconditionally.
+        OfficialStatus.AUDIO_FINISHED -> Segment.FINISH_LAST
+    }
+
+    /** Official `showIdleStatus` -> `lastFinish()`: the finish tail, then hold the last frame. */
+    fun idleEntry(): Segment = Segment.FINISH_LAST
+
+    /** The official tag gate for loading [segment] while the view carries [currentTag]. */
+    fun canLoad(segment: Segment, currentTag: String): Boolean = when (segment) {
+        // loadListeningWaitingGif(): `!ANIMATION_LISTENER.equals(getTag())`.
+        Segment.LISTENER_FIRST -> currentTag != TAG_LISTENER
+        // cycleListeningWaiting(): `ANIMATION_LISTENER.equals(getTag())`.
+        Segment.LISTENER_MIDDLE -> currentTag == TAG_LISTENER
+        // loadingGif(): `ANIMATION_LISTENER.equals(getTag())`.
+        Segment.LISTENER_LAST -> currentTag == TAG_LISTENER
+        // loadThinkGif(): `ANIMATION_LISTENER_LAST.equals(getTag())`.
+        Segment.THINK_FIRST -> currentTag == TAG_LISTENER_LAST
+        // cycleThinking(): `ANIMATION_THINK_FIRST.equals(getTag())`.
+        Segment.THINK_MIDDLE -> currentTag == TAG_THINK_FIRST
+        // loadSuccessGif(): think_middle, think_first or listener_last. Status 3 cannot force a cold listener.
+        Segment.THINK_LAST ->
+            currentTag == TAG_THINK_MIDDLE || currentTag == TAG_THINK_FIRST || currentTag == TAG_LISTENER_LAST
+        // loadFinish(): `ANIMATION_THINK_LAST.equals(getTag())`.
+        Segment.FINISH_FIRST -> currentTag == TAG_THINK_LAST
+        // cycleFinish(): `ANIMATION_FINISH_FIRST.equals(getTag())`.
+        Segment.FINISH_MIDDLE -> currentTag == TAG_FINISH_FIRST
+        // lastFinish() has no gate: status 5 and IDLE stop whatever clip is running.
+        Segment.FINISH_LAST -> true
+    }
+
+    /** The segment the official `onAnimationEnd` loads for [currentTag], or null when the chain stops there. */
+    fun nextOnEnd(currentTag: String): Segment? = when (currentTag) {
+        TAG_LISTENER -> Segment.LISTENER_MIDDLE
+        TAG_LISTENER_LAST -> Segment.THINK_FIRST
+        TAG_THINK_FIRST -> Segment.THINK_MIDDLE
+        TAG_THINK_LAST -> Segment.FINISH_FIRST
+        TAG_FINISH_FIRST -> Segment.FINISH_MIDDLE
+        // finish_last / finish_middle / think_middle / none have no official branch: they stop or loop in place.
+        else -> null
+    }
+}

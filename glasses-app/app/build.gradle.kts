@@ -45,6 +45,9 @@ dependencies {
     implementation(project(":common:presentation:output-runtime"))
     implementation(project(":common:contracts:core-contracts"))
     implementation(project(":common:contracts:plugin-api"))
+    // 0.24 S4 Task 18 (D159/D166): the official PAG voice orb. The nine `.pag` assets are the decoded official
+    // resources; libpag is the renderer those assets were authored for. Glasses-only: the phone never draws them.
+    implementation("com.tencent.tav:libpag:4.5.27")
     // CXR-S: the glasses-side bridge. The same public bytes the phone side and the vendor's own glasses sample use.
     implementation("edith.vendor.cxr:cxr-service-bridge:1.0-20260715.121510-107@aar")
     testImplementation("junit:junit:4.13.2")

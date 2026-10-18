@@ -21,6 +21,7 @@ import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.glasses.BuildConfig
 import com.sheen.rokid.glasses.bridge.RokidBridgeEndpoint
 import com.sheen.rokid.glasses.display.OrbState
+import com.sheen.rokid.glasses.display.PagOrbView
 
 /**
  * The CXR entry point.
@@ -214,6 +215,14 @@ class GlassesActivity : Activity() {
     fun selectedRoute(): AssistantRoute = host?.selectedRoute() ?: AssistantRoute.WAKE
 
     fun orbStateForProbe(): OrbState = host?.orbStateForProbe() ?: OrbState.IDLE
+
+    /**
+     * 0.24 S4 Task 18: the panel's PAG orb itself.
+     *
+     * The Activity getter is the replacement for the Task 7 `VoiceOrbView` cast: the panel now owns a [PagOrbView]
+     * (with its own fallback inside), and the device test asserts its tags/clips rather than inferring the animation.
+     */
+    fun orbViewForProbe(): PagOrbView? = host?.orbViewForProbe()
 
     fun listeningVisibleForProbe(): Boolean = host?.listeningVisibleForProbe() ?: false
 

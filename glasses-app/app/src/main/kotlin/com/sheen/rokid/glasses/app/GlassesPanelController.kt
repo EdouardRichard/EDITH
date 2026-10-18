@@ -955,14 +955,11 @@ class GlassesPanelController(
  * live/listening/thinking order decide. This is a pure decision so the orb priority fails a JVM test instead of only
  * being visible on a worn screen; `GlassesPanelHost.applyVisualState` renders it.
  */
-internal fun orbStateOf(model: PanelModel): OrbState = when (model.status) {
-    OfficialStatus.ANSWERING, OfficialStatus.AUDIO_FINISHED, OfficialStatus.TOOL -> OrbState.ANSWERING
-    OfficialStatus.ASR_END -> OrbState.THINKING
-    OfficialStatus.EMPTY, OfficialStatus.LISTENING, OfficialStatus.ASR -> OrbState.LISTENING
-    null -> when {
+internal fun orbStateOf(model: PanelModel): OrbState =
+    // One status→state table for both the probe and the PAG fallback (GlassesPanelSpec.orbStateForStatus, Task 18).
+    model.status?.let { GlassesPanelSpec.orbStateForStatus(it) } ?: when {
         model.liveEntryId != null -> OrbState.ANSWERING
         model.listeningVisible -> OrbState.LISTENING
         model.thinkingVisible -> OrbState.THINKING
         else -> OrbState.IDLE
     }
-}

@@ -22,11 +22,11 @@ import com.sheen.rokid.glasses.display.HintPresentation
 import com.sheen.rokid.glasses.display.HintTicker
 import com.sheen.rokid.glasses.display.LoadingIndicatorView
 import com.sheen.rokid.glasses.display.OrbState
+import com.sheen.rokid.glasses.display.PagOrbView
 import com.sheen.rokid.glasses.display.PinIconView
 import com.sheen.rokid.glasses.display.RevealCoalescer
 import com.sheen.rokid.glasses.display.TailTextView
 import com.sheen.rokid.glasses.display.ToolRowState
-import com.sheen.rokid.glasses.display.VoiceOrbView
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.plugin.CancellationHandle
@@ -109,7 +109,7 @@ class GlassesPanelHost(
     private val entriesView: LinearLayout get() = root.entriesView
     private val hintScroll get() = root.hintScroll
     private val listeningView: TextView get() = root.listeningView
-    private val orbView: VoiceOrbView get() = root.orbView as VoiceOrbView
+    private val orbView: PagOrbView get() = root.orbView
     private val tipsView: TextView get() = root.tipsView
     private val pinTextView: TextView get() = root.pinTextView
     private val pinIconView: PinIconView get() = root.pinIconView
@@ -208,6 +208,9 @@ class GlassesPanelHost(
     /** The host window is visible: re-apply the level and re-arm the local busy bound. */
     fun onStart() {
         resumed = true
+        // 0.24 S4 Task 18: resume the PAG clip before the render below can load a new one; an ended finish tail is
+        // deliberately not replayed (PagOrbView.start).
+        orbView.start()
         controller.onStart()
         startTickerIfNeeded()
     }
@@ -452,6 +455,9 @@ class GlassesPanelHost(
 
     fun orbStateForProbe(): OrbState = orbView.state()
 
+    /** The panel's PAG view (0.24 S4 Task 18), so the device test can assert tags/clips instead of only the state. */
+    fun orbViewForProbe(): PagOrbView = orbView
+
     fun listeningVisibleForProbe(): Boolean = model?.listeningVisible == true
 
     /** The `Hi, 我在听` TextView itself; separate from the "…" row because Task 13 decoupled them. */
@@ -555,7 +561,15 @@ class GlassesPanelHost(
         } else {
             toolIcon?.stop()
         }
-        orbView.setState(orb)
+        // 0.24 S4 Task 18: the official status names the exact PAG clip; the coarse [OrbState] is only the probe shape
+        // and the legacy (no `STATE`) busy path. `idle` here is the official `showIdleStatus` state, which plays
+        // finish_last; a fresh empty model is idle too and simply starts from the finish tail.
+        val status = model.status
+        when {
+            status != null -> orbView.setStatus(status)
+            model.idle -> orbView.setIdle()
+            else -> orbView.setState(orb)
+        }
         tipsView.text = model.tips
         pinTextView.visibility = if (pinned) View.GONE else View.VISIBLE
         pinIconView.visibility = if (pinned) View.VISIBLE else View.GONE
