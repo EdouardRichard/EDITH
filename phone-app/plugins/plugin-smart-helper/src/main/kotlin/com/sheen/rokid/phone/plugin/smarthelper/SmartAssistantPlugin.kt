@@ -1013,7 +1013,12 @@ class SmartAssistantPlugin(
         }
     }
 
-    /** One utterance the wearer made, for the route that consumed it. */
+    /**
+     * One utterance the wearer made, for the route that consumed it, when no turn id is available.
+     *
+     * This is the legacy/proactive path (a proactive trigger has no ASR turn). A wake final uses [publishUserFinal]
+     * below so it carries the exact `asr-${turnId}` entry id.
+     */
     private fun publishUserMessage(route: ContextRoute, text: String) {
         if (text.isBlank()) return
         // Which conversation this landed in, as a count and a route name and nothing else. Owner report (2026-10-15)
@@ -1022,6 +1027,30 @@ class SmartAssistantPlugin(
         // `P3_HINT show ... chars=`).
         P3Log.line("P3_CONV said route=${route.toContractRoute().name} chars=${text.length}")
         conversation()?.userMessage(route.toContractRoute(), text)
+    }
+
+    /**
+     * One streaming ASR revision of the current turn (0.24 spec §5.5).
+     *
+     * The row is identified by `asr-${turnId}`; every revision resends the turn, so the log's whole-entry replacement
+     * keeps the grouping. The caller has already decided the revision is usable and the turn is still waiting.
+     */
+    private fun publishUserPartial(route: ContextRoute, turnId: String, revision: Long, text: String) {
+        if (text.isBlank() || turnId.isBlank()) return
+        P3Log.line("P3_CONV asr route=${route.toContractRoute().name} rev=$revision chars=${text.length}")
+        conversation()?.userPartial(route.toContractRoute(), turnId, revision, text)
+    }
+
+    /**
+     * The final utterance of [turnId] (0.24 spec §5.5/§6).
+     *
+     * The entry id is `asr-${turnId}` - the same id [publishUserPartial] used - so the glasses replace one row. The
+     * plugin never mints the id: the display and the wire must agree, and a second minting site is a second identity.
+     */
+    private fun publishUserFinal(route: ContextRoute, turnId: String, text: String) {
+        if (text.isBlank() || turnId.isBlank()) return
+        P3Log.line("P3_CONV said route=${route.toContractRoute().name} chars=${text.length} final=true")
+        conversation()?.userFinal(route.toContractRoute(), turnId, "asr-$turnId", text)
     }
 
     /** One message the assistant is telling the wearer, for the route that produced it. */
@@ -1337,6 +1366,10 @@ class SmartAssistantPlugin(
                 var consumedFinal = false
                 var consumedByConfirmation = false
                 var adoptedTurnId: String? = null
+                // 0.24 S4: one usable non-final revision of the current conversation turn, held for publication
+                // outside the lock. The turn check is here, where `turn` is authoritative: a stray transcript after
+                // the final (or a proactive trigger) must not open a user row.
+                var livePartial: Triple<String, Long, String>? = null
                 val (started, proactive) = synchronized(gate) {
                     if (!matches(event.envelope)) null to null
                     else {
@@ -1349,6 +1382,16 @@ class SmartAssistantPlugin(
                         consumedByConfirmation = confirmation.onTranscript(event.revision)
                         if (consumedByConfirmation) null to null
                         else {
+                            // 0.24 S4: only a turn still waiting for its utterance has a streaming user row. Once
+                            // the final is accepted the turn runs, and a late revision must not reopen the line.
+                            if (!event.revision.final && usableText &&
+                                turn?.phase == SmartTurnPhase.AwaitingTranscript) {
+                                livePartial = Triple(
+                                    event.revision.turnId,
+                                    event.revision.revision,
+                                    event.revision.text.trim(),
+                                )
+                            }
                             val consumed = acceptTranscript(event.revision)
                             consumedFinal = consumed != null
                             // The ASR final's own id replaces the wake's placeholder; the official levels below
@@ -1375,12 +1418,20 @@ class SmartAssistantPlugin(
                         conversationCycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ASR)
                     }
                     if (consumedFinal) conversationCycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ASR_END)
+                    // The streaming revision is published after the status levels, outside the lock: the port is the
+                    // host's and must never be called while `gate` is held. `livePartial` is only set for a usable
+                    // non-final revision of a turn that is still waiting, so blank/echo revisions have no row.
+                    livePartial?.let { (turnId, revision, text) ->
+                        publishUserPartial(ContextRoute.WAKE, turnId, revision, text)
+                    }
                 }
                 if (started != null) {
-                    // Phase C: the utterance this turn consumed is the wearer's own side of the conversation. Published
-                    // here rather than inside the lock: the port is the host's, and a host that answered synchronously
-                    // must not be able to re-enter this plugin while `gate` is held.
-                    publishUserMessage(ContextRoute.WAKE, started.second)
+                    // Phase C: the utterance this turn consumed is the wearer's own side of the conversation. The
+                    // 0.24 final carries the ASR turn and the exact `asr-${turnId}` entry id, so the glasses replace
+                    // the row the partial opened instead of appending a second one. Published here rather than inside
+                    // the lock: the port is the host's, and a host that answered synchronously must not be able to
+                    // re-enter this plugin while `gate` is held.
+                    publishUserFinal(ContextRoute.WAKE, event.revision.turnId, started.second)
                     launchTurn(started.first, started.second)
                 } else if (proactive != null) runProactive(proactive)
             }
@@ -3010,13 +3061,20 @@ class SmartAssistantPlugin(
                 runsImmediately = true,
                 transcriptTurnId = lastFinalTurnId,
                 bypassWakeGates = true,
-            )?.let { it to text }
+            )?.let { Triple(it, text, lastFinalTurnId) }
         } ?: return
         // Phase C: Help opens a real turn and must raise the same level a wake does, or the ring never starts on a
         // path that is an acceptance row - and the idle emit reports at the end would be an unpaired report. Outside
         // the lock, as publishBusy requires.
         publishBusy()
-        publishUserMessage(ContextRoute.WAKE, started.second)
+        // The reused transcript keeps its `asr-${turnId}` identity, so Help replaces the row instead of adding a
+        // duplicate. A legacy final with no turn id keeps the old path.
+        val turnId = started.third
+        if (turnId == null) {
+            publishUserMessage(ContextRoute.WAKE, started.second)
+        } else {
+            publishUserFinal(ContextRoute.WAKE, turnId, started.second)
+        }
         launchTurn(started.first, started.second)
     }
 

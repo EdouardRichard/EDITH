@@ -4,6 +4,7 @@ import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.output.ConversationEntry
 import com.sheen.rokid.output.ConversationRole
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -43,5 +44,49 @@ class ConversationViewTest {
             liveEntryId = null)
 
         assertEquals(listOf("第 a 条", "第 b 条", "第 c 条"), rows.map { it.entry.text })
+    }
+
+    // ---------------------------------------------------------------- ASR revisions (0.24 S4 Task 15)
+
+    @Test
+    fun asrRevisionsAreMonotonicWithinOneTurn() {
+        val gate = AsrRevisionGate()
+
+        assertTrue(gate.accept(AssistantRoute.WAKE, "t-1", 1))
+        assertTrue(gate.accept(AssistantRoute.WAKE, "t-1", 2))
+        assertFalse("a revision at or below the applied one is late", gate.accept(AssistantRoute.WAKE, "t-1", 1))
+        assertFalse(gate.accept(AssistantRoute.WAKE, "t-1", 2))
+        assertTrue("a new turn starts its own revision domain", gate.accept(AssistantRoute.WAKE, "t-2", 1))
+    }
+
+    @Test
+    fun asrRevisionsAreIndependentPerRoute() {
+        val gate = AsrRevisionGate()
+
+        assertTrue(gate.accept(AssistantRoute.WAKE, "t-1", 5))
+        assertTrue("the other conversation has its own revisions", gate.accept(AssistantRoute.PROACTIVE, "t-1", 1))
+    }
+
+    @Test
+    fun aFinalizedUserEntryRejectsEveryLaterRevisionUntilTheWindowResets() {
+        val gate = AsrRevisionGate()
+        assertTrue(gate.accept(AssistantRoute.WAKE, "t-1", 1))
+
+        gate.finalize(AssistantRoute.WAKE, AsrRevisionGate.userEntryId("t-1"))
+        assertFalse("a final replaces the line; a late revision cannot reopen it",
+            gate.accept(AssistantRoute.WAKE, "t-1", 9))
+        assertTrue("a new turn is not the finalized entry", gate.accept(AssistantRoute.WAKE, "t-2", 1))
+
+        gate.reset()
+        assertTrue("a closed/reopened window starts clean", gate.accept(AssistantRoute.WAKE, "t-1", 1))
+    }
+
+    @Test
+    fun theAsrEntryIdConventionAndTurnRecoveryAreExplicit() {
+        assertEquals("asr-t-1", AsrRevisionGate.userEntryId("t-1"))
+        assertEquals("t-1", AsrRevisionGate.turnIdOf("asr-t-1"))
+        assertEquals("asr-1", AsrRevisionGate.turnIdOf("asr-asr-1"))
+        assertEquals(null, AsrRevisionGate.turnIdOf("said-1"))
+        assertEquals(null, AsrRevisionGate.turnIdOf("asr-"))
     }
 }

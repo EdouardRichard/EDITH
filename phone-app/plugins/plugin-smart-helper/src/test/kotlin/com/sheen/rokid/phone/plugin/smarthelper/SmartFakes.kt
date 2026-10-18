@@ -142,11 +142,25 @@ internal class SmartFakeWakeWords(private val accept: Boolean = true) : WakeWord
  */
 internal class SmartRecordingDisplay : ConversationDisplay {
     data class StateCall(val route: AssistantRoute, val turnId: String, val status: Int, val sequence: Long)
+    data class UserPartialCall(
+        val route: AssistantRoute,
+        val turnId: String,
+        val revision: Long,
+        val text: String,
+    )
+    data class UserFinalCall(
+        val route: AssistantRoute,
+        val turnId: String,
+        val entryId: String,
+        val text: String,
+    )
 
     val calls = mutableListOf<String>()
     val states = mutableListOf<StateCall>()
     val idleCalls = mutableListOf<Pair<AssistantRoute, Long>>()
     val closes = mutableListOf<AssistantRoute>()
+    val userPartials = mutableListOf<UserPartialCall>()
+    val userFinals = mutableListOf<UserFinalCall>()
 
     val statuses: List<Int> get() = states.map { it.status }
 
@@ -160,6 +174,18 @@ internal class SmartRecordingDisplay : ConversationDisplay {
     fun count(prefix: String) = calls.count { it.startsWith(prefix) }
 
     override fun userMessage(route: AssistantRoute, text: String) {
+        calls += "user:${route.name}:$text"
+    }
+
+    override fun userPartial(route: AssistantRoute, turnId: String, revision: Long, text: String) {
+        userPartials += UserPartialCall(route, turnId, revision, text)
+        calls += "partial:${route.name}:$turnId:$revision:$text"
+    }
+
+    override fun userFinal(route: AssistantRoute, turnId: String, entryId: String, text: String) {
+        userFinals += UserFinalCall(route, turnId, entryId, text)
+        // Deliberately the same shape as `userMessage`: this fake records the semantic "the wearer's line", and the
+        // existing level-pairing tests should not care which of the two ports carried it.
         calls += "user:${route.name}:$text"
     }
 

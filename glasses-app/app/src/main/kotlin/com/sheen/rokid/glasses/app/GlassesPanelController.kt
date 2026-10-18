@@ -2,6 +2,7 @@ package com.sheen.rokid.glasses.app
 
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.glasses.bridge.GlassClockResponder
+import com.sheen.rokid.glasses.display.AsrRevisionGate
 import com.sheen.rokid.glasses.display.BusyState
 import com.sheen.rokid.glasses.display.ConversationOrder
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
@@ -117,6 +118,9 @@ class GlassesPanelController(
     /** Rejects an out-of-order `SAID`; the custom-command channel promises nothing about ordering. */
     private val saidGate = SaidSequenceGate()
 
+    /** Rejects an out-of-order `ASR` revision, and any revision after the final `SAID` replaced that line. */
+    private val asrGate = AsrRevisionGate()
+
     /** Whether the assistant is working, per route; the level expires by itself inside the class. */
     private val busyState = BusyState()
 
@@ -214,6 +218,10 @@ class GlassesPanelController(
             // acknowledged (it has no deadline to confirm).
             is HintCommand.Said -> onSaid(command)
 
+            // 0.24 S4: one streaming user revision. It updates the row `asr-${turnId}` in place; the final still
+            // arrives as `SAID` under that same id.
+            is HintCommand.Asr -> onAsr(command)
+
             // Phase C: whether the assistant is working. Same session gate as a SHOW.
             is HintCommand.Busy -> onBusy(command)
 
@@ -309,6 +317,7 @@ class GlassesPanelController(
         log.clear()
         order.reset()
         saidGate.reset()
+        asrGate.reset()
         busyState.reset()
         resetOfficialState(resetSequence = false)
         liveEntryId = null
@@ -350,6 +359,7 @@ class GlassesPanelController(
             log.clear()
             order.reset()
             saidGate.reset()
+            asrGate.reset()
             busyState.reset()
             resetOfficialState(resetSequence = true)
             liveEntryId = null
@@ -371,15 +381,62 @@ class GlassesPanelController(
             diagnostics("said refused: sequence ${command.sequence} is not newer")
             return
         }
+        // A final replacing a streamed ASR line must keep the turn, or the glasses lose the per-turn grouping the
+        // partial established. `SAID` carries no turn field, so take it from the replaced entry; a final with no
+        // preceding partial recovers it from the documented `asr-${turnId}` id (spec §6).
+        val previousTurn = log.entries(command.route)
+            .firstOrNull { it.entryId == command.entryId }
+            ?.turnId
+        val turnId = previousTurn ?: AsrRevisionGate.turnIdOf(command.entryId)
         val stored = log.append(
-            ConversationEntry(command.entryId, command.route, ConversationRole.USER, command.text))
-        diagnostics("said stored=$stored route=${command.route.name} chars=${command.text.length}")
+            ConversationEntry(command.entryId, command.route, ConversationRole.USER, command.text, turnId))
+        if (stored) asrGate.finalize(command.route, command.entryId)
+        diagnostics("said stored=$stored route=${command.route.name} chars=${command.text.length} " +
+            "turn=${turnId ?: "none"}")
         // A SAID for the route that is not on screen is recorded but must not move the current view: only a SHOW
         // changes the route, and its render will bring the updated conversation in then.
         if (command.route == order.selected()) {
             // A stored replacement is still an accepted update even when `ConversationLog` returns the same list; the
             // old Activity revealed for every stored selected-route SAID, so the revision must move with it.
             if (stored) contentRevision++
+            renderModel()
+        }
+    }
+
+    /**
+     * One streaming ASR revision (0.24 spec §5.4/§6). Must run on the UI thread.
+     *
+     * The row is `asr-${turnId}`, the same id the final `SAID` replaces, so revisions update **one** user row in
+     * place. Revisions are monotonic per route/turn; an out-of-order one is dropped. A final already replaced the
+     * line, so any later revision for that entry is stale and dropped too - the final text is authoritative.
+     *
+     * Like `SAID`, a revision for the route that is not on screen is stored but does not move the view: only a `SHOW`
+     * changes the route.
+     */
+    private fun onAsr(command: HintCommand.Asr) {
+        if (!hints.isCurrent(command.sessionId, command.generation)) {
+            diagnostics("asr refused: session or generation mismatch")
+            return
+        }
+        if (command.text.isBlank()) {
+            diagnostics("asr refused: blank text")
+            return
+        }
+        if (asrGate.isFinalized(command.route, command.turnId)) {
+            diagnostics("asr refused: final already stored route=${command.route.name} turn=${command.turnId}")
+            return
+        }
+        if (!asrGate.accept(command.route, command.turnId, command.revision)) {
+            diagnostics("asr refused: revision ${command.revision} is not newer")
+            return
+        }
+        val entryId = AsrRevisionGate.userEntryId(command.turnId)
+        val stored = log.append(
+            ConversationEntry(entryId, command.route, ConversationRole.USER, command.text, command.turnId))
+        diagnostics("asr stored=$stored route=${command.route.name} rev=${command.revision} " +
+            "chars=${command.text.length}")
+        if (stored && command.route == order.selected()) {
+            contentRevision++
             renderModel()
         }
     }

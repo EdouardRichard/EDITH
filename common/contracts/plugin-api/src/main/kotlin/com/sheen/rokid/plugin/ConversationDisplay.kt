@@ -67,6 +67,16 @@ interface ConversationDisplay {
     fun userPartial(route: AssistantRoute, turnId: String, revision: Long, text: String) {}
 
     /**
+     * 0.24 spec §5.5/§6: the wearer's **final** utterance for [turnId], recorded under the exact [entryId] its
+     * streaming revisions used (`asr-${turnId}` by convention).
+     *
+     * Unlike [userMessage] this carries the turn and the stable entry id, so the final replaces the line the glasses
+     * already showed instead of appending a second row. Default no-op: a host that predates the official conversation
+     * keeps its old behavior.
+     */
+    fun userFinal(route: AssistantRoute, turnId: String, entryId: String, text: String) {}
+
+    /**
      * 0.24 spec §5.5: the assistant's streaming answer for [hintId] within [turnId], one [revision] at a time.
      *
      * [assistantMessage] remains the final statement; this only revises the answer line the wearer is reading.

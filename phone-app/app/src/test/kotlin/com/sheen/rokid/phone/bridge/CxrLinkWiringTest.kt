@@ -314,7 +314,7 @@ class CxrLinkWiringTest {
         // wire (the production one is the CxrHintLink, below) and that `state` really reaches it.
         val log = ConversationLog()
         val wire = RecordingWire()
-        val display = ConversationWireDisplay(log, wire, { _, _ -> true }, { _, _ -> true })
+        val display = ConversationWireDisplay(log, wire, { _, _, _ -> true }, { _, _ -> true })
         val root = HostCompositionRoot(
             HostRuntime(1), MemoryProfileRepository(), UnusedModel(), null,
             conversationLog = log, conversationDisplay = display,
@@ -340,6 +340,29 @@ class CxrLinkWiringTest {
             assertTrue("the silent wire is not the production wire", display.wire is CxrHintLink)
             assertSame("`create` must pass its own hint link", root.hintLinkForProbe, display.wire)
         } finally { root.close() }
+    }
+
+    @Test
+    fun theDisplayAndLinkTogetherSendTheFinalUtteranceUnderTheAsrEntryId() {
+        // The real composition shape: `ConversationWireDisplay` records, its `sendSaid` is `CxrHintLink.userSaid`, and
+        // the id the display chose - not one minted inside the link - is what the wire carries.
+        val clock = FakeClock(0)
+        val sent = mutableListOf<String>()
+        val link = CxrHintLink(clock, ManualScheduler(clock), sendJson = { json -> sent += json; true })
+        link.sessionEstablished("s-1", 1)
+        sent.clear()
+        val display = ConversationWireDisplay(
+            log = ConversationLog(),
+            wire = link,
+            sendSaid = { route, entryId, text -> link.userSaid(route, entryId, text) },
+            sendBusy = { route, busy -> link.busy(route, busy) },
+        )
+
+        display.userFinal(AssistantRoute.WAKE, "turn-7", "asr-turn-7", "最终的话")
+
+        val said = sent.mapNotNull { HintWireCodec.decode(it) as? HintCommand.Said }.single()
+        assertEquals("asr-turn-7", said.entryId)
+        assertEquals("最终的话", said.text)
     }
 
     @Test

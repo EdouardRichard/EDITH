@@ -11,7 +11,6 @@ import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.HintDevice
 import com.sheen.rokid.plugin.MonotonicClock
-import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -215,11 +214,16 @@ class CxrHintLink(
     /**
      * Reports one thing the wearer said, for the conversation named by [route].
      *
+     * [entryId] is the display's stable identity for the utterance (0.24 spec §6: `asr-${turnId}` for a final whose
+     * partials streamed). It is **passed through, never minted here**: the glasses replace on this id, so a second
+     * identity would append a second row for the same words. A blank id or text is refused.
+     *
      * Returns false when there is no session to say it to, or when the send was refused - the caller decides whether
      * that is worth recording, and the phone's own log keeps the words either way, so a broken link loses the display
      * of an utterance rather than the utterance.
      */
-    fun userSaid(route: AssistantRoute, text: String): Boolean {
+    fun userSaid(route: AssistantRoute, entryId: String, text: String): Boolean {
+        if (entryId.isBlank() || text.isBlank()) return false
         val identity = synchronized(handshakeGate) {
             val session = establishedSession ?: run {
                 diagnostics("conversation: no session yet - an utterance is not sent")
@@ -227,13 +231,12 @@ class CxrHintLink(
             }
             HintIdentity(session, establishedGeneration)
         }
-        if (text.isBlank()) return false
         val command = HintCommand.Said(
             sessionId = identity.sessionId,
             generation = identity.generation,
             sequence = conversationSequence.incrementAndGet(),
             route = route,
-            entryId = "said-${UUID.randomUUID()}",
+            entryId = entryId,
             text = text,
         )
         return runCatching { outbound(HintWireCodec.encode(command)) }.getOrDefault(false)

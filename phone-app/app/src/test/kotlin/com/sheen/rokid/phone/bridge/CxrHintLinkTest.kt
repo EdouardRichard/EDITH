@@ -324,12 +324,41 @@ class CxrHintLinkTest {
         link.sessionEstablished("s-1", 1)
         sent.clear()
 
-        assertTrue(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "第一句"))
-        assertTrue(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "第二句"))
+        assertTrue(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "said-1", "第一句"))
+        assertTrue(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "said-2", "第二句"))
 
         assertEquals(listOf(1L, 2L), sent.said().map { it.sequence })
         assertEquals("第一句", sent.said().first().text)
         assertEquals("s-1", sent.said().first().sessionId)
+        assertEquals(listOf("said-1", "said-2"), sent.said().map { it.entryId })
+    }
+
+    @Test
+    fun theFinalUtteranceCarriesTheExactAsrEntryIdTheDisplayChose() {
+        // 0.24 spec §6: the final SAID must name `asr-${turnId}`, the same id the ASR partial opened, or the glasses
+        // append a second row for the same utterance.
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 1)
+        sent.clear()
+
+        assertTrue(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "asr-turn-7", "最终的话"))
+
+        val said = sent.said().single()
+        assertEquals("asr-turn-7", said.entryId)
+        assertEquals("最终的话", said.text)
+        assertEquals(com.sheen.rokid.contracts.AssistantRoute.WAKE, said.route)
+    }
+
+    @Test
+    fun aBlankEntryIdIsNeverSent() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 1)
+        sent.clear()
+
+        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, " ", "有字但没身份"))
+        assertTrue(sent.isEmpty())
     }
 
     @Test
@@ -338,7 +367,7 @@ class CxrHintLinkTest {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
 
-        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "没人听的时候"))
+        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "said-1", "没人听的时候"))
         assertFalse(link.busy(com.sheen.rokid.contracts.AssistantRoute.WAKE, true))
         assertTrue(sent.isEmpty())
     }
@@ -351,7 +380,7 @@ class CxrHintLinkTest {
         link.sessionEnded()
         sent.clear()
 
-        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "会话结束之后"))
+        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "said-1", "会话结束之后"))
         assertFalse(link.busy(com.sheen.rokid.contracts.AssistantRoute.WAKE, true))
         assertTrue(sent.isEmpty())
     }
@@ -368,7 +397,7 @@ class CxrHintLinkTest {
             HintCommand.Pong(ping.syncId, ping.p0, ping.p0 + 1_000_000, ping.p0 + 1_000_000)))
         sent.clear()
 
-        assertTrue(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "交换之后"))
+        assertTrue(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "said-1", "交换之后"))
     }
 
     @Test
@@ -392,7 +421,7 @@ class CxrHintLinkTest {
         val link = linkInto(sent, accept = false)
         link.sessionEstablished("s-1", 1)
 
-        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "链接断了"))
+        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "said-1", "链接断了"))
     }
 
     @Test
@@ -402,7 +431,7 @@ class CxrHintLinkTest {
         link.sessionEstablished("s-1", 1)
         sent.clear()
 
-        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "   "))
+        assertFalse(link.userSaid(com.sheen.rokid.contracts.AssistantRoute.WAKE, "said-1", "   "))
         assertTrue(sent.isEmpty())
     }
 

@@ -89,6 +89,12 @@ class ConversationDisplayContractTest {
         )
         display.showIdle(route = AssistantRoute.WAKE, sequence = 4L)
         display.userPartial(route = AssistantRoute.WAKE, turnId = "turn-1", revision = 1L, text = "北京")
+        display.userFinal(
+            route = AssistantRoute.WAKE,
+            turnId = "turn-1",
+            entryId = "asr-turn-1",
+            text = "北京",
+        )
         display.assistantPartial(
             route = AssistantRoute.WAKE,
             turnId = "turn-1",
@@ -147,6 +153,10 @@ class ConversationDisplayContractTest {
             calls += "userPartial:$route:$turnId:$revision:$text"
         }
 
+        override fun userFinal(route: AssistantRoute, turnId: String, entryId: String, text: String) {
+            calls += "userFinal:$route:$turnId:$entryId:$text"
+        }
+
         override fun assistantPartial(
             route: AssistantRoute,
             turnId: String,
@@ -186,6 +196,12 @@ class ConversationDisplayContractTest {
             revision = 7L,
             text = "附近有",
         )
+        display.userFinal(
+            route = AssistantRoute.PROACTIVE,
+            turnId = "turn-9",
+            entryId = "asr-turn-9",
+            text = "附近有",
+        )
         display.assistantPartial(
             route = AssistantRoute.PROACTIVE,
             turnId = "turn-9",
@@ -207,6 +223,7 @@ class ConversationDisplayContractTest {
                 "state:PROACTIVE:turn-9:7:42",
                 "showIdle:PROACTIVE:43",
                 "userPartial:PROACTIVE:turn-9:7:附近有",
+                "userFinal:PROACTIVE:turn-9:asr-turn-9:附近有",
                 "assistantPartial:PROACTIVE:turn-9:hint-9:8:附近有一家咖啡店",
                 "toolStatus:PROACTIVE:turn-9:END:get_location",
                 "panelOpen:PROACTIVE",

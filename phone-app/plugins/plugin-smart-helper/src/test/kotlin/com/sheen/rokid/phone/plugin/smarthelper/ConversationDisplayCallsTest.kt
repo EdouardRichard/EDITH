@@ -37,6 +37,12 @@ class ConversationDisplayCallsTest {
             calls += "user:${route.name}:$text"
         }
 
+        override fun userFinal(route: AssistantRoute, turnId: String, entryId: String, text: String) {
+            // The plugin's final-user path is the semantic equivalent of the old `userMessage`; the level-pairing
+            // contract below is about the conversation, not which of the two ports carried the wearer's line.
+            calls += "user:${route.name}:$text"
+        }
+
         override fun assistantMessage(route: AssistantRoute, text: String) {
             calls += "said:${route.name}:$text"
         }
@@ -274,6 +280,8 @@ class ConversationDisplayCallsTest {
 
         val display = object : ConversationDisplay {
             override fun userMessage(route: AssistantRoute, text: String) = probe()
+            override fun userPartial(route: AssistantRoute, turnId: String, revision: Long, text: String) = probe()
+            override fun userFinal(route: AssistantRoute, turnId: String, entryId: String, text: String) = probe()
             override fun assistantMessage(route: AssistantRoute, text: String) = probe()
             override fun working(route: AssistantRoute) = probe()
             override fun idle(route: AssistantRoute) = probe()

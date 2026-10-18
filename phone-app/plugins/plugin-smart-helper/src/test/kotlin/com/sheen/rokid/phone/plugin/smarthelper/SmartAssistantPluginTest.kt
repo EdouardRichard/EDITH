@@ -218,6 +218,89 @@ class SmartAssistantPluginTest {
         assertEquals(listOf(InputPart.Text("最终问题")), rig.model.requests.single().input)
     }
 
+    @Test fun `S4 usable partial revisions are published before the final and the final names the asr entry id`() {
+        val rig = SmartTestRig()
+        val display = SmartRecordingDisplay()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript(" 帮我看 ", turnId = "t-7", revision = 1, final = false)))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("帮我看下", turnId = "t-7", revision = 2, final = false)))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("帮我看下日程", turnId = "t-7", revision = 3, final = true)))
+        rig.tick()
+
+        assertEquals(
+            listOf(
+                SmartRecordingDisplay.UserPartialCall(AssistantRoute.WAKE, "t-7", 1, "帮我看"),
+                SmartRecordingDisplay.UserPartialCall(AssistantRoute.WAKE, "t-7", 2, "帮我看下"),
+            ),
+            display.userPartials,
+        )
+        assertEquals(
+            listOf(SmartRecordingDisplay.UserFinalCall(AssistantRoute.WAKE, "t-7", "asr-t-7", "帮我看下日程")),
+            display.userFinals,
+        )
+        assertEquals(1, rig.model.requests.size)
+    }
+
+    @Test fun `S4 blank and wake-word-only partial revisions are not published`() {
+        val rig = SmartTestRig()
+        val display = SmartRecordingDisplay()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.plugin.handle(rig.wakeEvent())
+
+        rig.plugin.handle(TranscriptEvent(rig.transcript("   ", turnId = "asr-wake", revision = 0, final = false)))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("伊迪丝。", turnId = "asr-wake", revision = 1, final = false)))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("EDITH", turnId = "asr-wake", revision = 2, final = false)))
+
+        assertTrue(display.userPartials.isEmpty(), "a blank/echo partial has no user row: ${display.userPartials}")
+        assertTrue(display.userFinals.isEmpty())
+        assertTrue(rig.model.requests.isEmpty(), "a partial must never start the model")
+    }
+
+    @Test fun `S4 a partial for a transcript with no current turn is not published`() {
+        val rig = SmartTestRig()
+        val display = SmartRecordingDisplay()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+
+        rig.plugin.handle(TranscriptEvent(rig.transcript("没有唤醒的半句", turnId = "t-7", revision = 1, final = false)))
+
+        assertTrue(display.userPartials.isEmpty(), "no conversation turn means no user row: ${display.userPartials}")
+    }
+
+    @Test fun `S4 a late partial after the final is not published`() {
+        val rig = SmartTestRig()
+        val display = SmartRecordingDisplay()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("帮我看下日程", turnId = "t-7", revision = 1, final = true)))
+        rig.tick()
+        val partialsBefore = display.userPartials.size
+
+        rig.plugin.handle(TranscriptEvent(rig.transcript("迟到半句", turnId = "t-7", revision = 9, final = false)))
+
+        assertEquals(partialsBefore, display.userPartials.size,
+            "the final already replaced the line; a late revision must not reopen it")
+        assertEquals(1, display.userFinals.size)
+    }
+
+    @Test fun `S4 a blank partial still cancels the official listening window`() {
+        val rig = SmartTestRig(panelVisible = true)
+        val display = SmartRecordingDisplay()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.plugin.handle(rig.wakeEvent())
+        assertTrue(display.states.isNotEmpty(), "the visible panel starts at a listening level")
+
+        rig.plugin.handle(TranscriptEvent(rig.transcript("", turnId = "asr-echo", revision = 0, final = false)))
+        rig.clock.advance(OfficialConversation.LISTEN_TIMEOUT_MILLIS * 1_000_000L)
+        rig.scheduler.runDue()
+
+        assertTrue(display.closes.isEmpty(),
+            "a blank ASR is still an ASR message and cancels the 10 s window: ${display.calls}")
+        assertTrue(rig.hintTexts.isEmpty())
+    }
+
     @Test fun `transcripts for another session or generation are ignored`() {
         val rig = SmartTestRig()
         rig.activate()

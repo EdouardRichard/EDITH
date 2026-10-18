@@ -128,6 +128,17 @@ class GlassesPanelControllerTest {
                 entryId = entryId, text = text),
         )
 
+        fun asr(
+            route: AssistantRoute = AssistantRoute.WAKE,
+            turnId: String = "turn-1",
+            revision: Long = 1,
+            text: String = "半句",
+            sessionId: String = "s-1",
+            generation: Long = 1,
+        ): Boolean = accept(
+            HintCommand.Asr(sessionId, generation, route, turnId = turnId, revision = revision, text = text),
+        )
+
         fun busy(route: AssistantRoute = AssistantRoute.WAKE, busy: Boolean = true): Boolean =
             accept(HintCommand.Busy("s-1", 1, route, busy = busy))
 
@@ -264,6 +275,111 @@ class GlassesPanelControllerTest {
         assertEquals("the custom-command channel promises no ordering, so a late utterance is dropped",
             "后来的话", harness.controller.conversationText(AssistantRoute.WAKE))
         assertTrue(harness.diagnostics.any { it.contains("said refused: sequence") })
+    }
+
+    // ---------------------------------------------------------------- ASR partials (0.24 S4 Task 15)
+
+    @Test
+    fun anAsrRevisionUpdatesTheSameUserRowInPlace() {
+        val harness = Harness()
+        harness.hello()
+        val rendersBefore = harness.port.models.size
+
+        assertTrue(harness.asr(turnId = "turn-1", revision = 1, text = "帮我看"))
+        assertTrue(harness.asr(turnId = "turn-1", revision = 2, text = "帮我看下"))
+
+        val model = harness.port.lastModel()
+        assertEquals("the selected conversation changed, so each revision renders once",
+            rendersBefore + 2, harness.port.models.size)
+        assertEquals("two revisions are one row, not two", 1, model.entries.size)
+        val entry = model.entries.single()
+        assertEquals("asr-turn-1", entry.entryId)
+        assertEquals("turn-1", entry.turnId)
+        assertEquals(ConversationRole.USER, entry.role)
+        assertEquals("帮我看下", entry.text)
+        assertEquals("the live row is not the answer", null, model.liveEntryId)
+    }
+
+    @Test
+    fun anOutOfOrderAsrRevisionIsIgnored() {
+        val harness = Harness()
+        harness.hello()
+
+        harness.asr(turnId = "turn-1", revision = 2, text = "后来的话")
+        harness.asr(turnId = "turn-1", revision = 1, text = "迟到的话")
+
+        assertEquals("the wire promises no ordering; a late revision must not overwrite the row",
+            "后来的话", harness.controller.conversationText(AssistantRoute.WAKE))
+        assertEquals(1, harness.port.lastModel().contentRevision)
+        assertTrue(harness.diagnostics.any { it.contains("asr refused: revision") })
+    }
+
+    @Test
+    fun aFinalSaidReplacesTheAsrRowAndKeepsItsTurn() {
+        val harness = Harness()
+        harness.hello()
+        harness.asr(turnId = "turn-1", revision = 1, text = "帮我看")
+
+        assertTrue(harness.said(sequence = 2, entryId = "asr-turn-1", text = "帮我看下日程"))
+
+        val entry = harness.port.lastModel().entries.single()
+        assertEquals("the final SAID must replace the partial, not append a second row",
+            1, harness.port.lastModel().entries.size)
+        assertEquals("asr-turn-1", entry.entryId)
+        assertEquals("turn-1", entry.turnId)
+        assertEquals(ConversationRole.USER, entry.role)
+        assertEquals("帮我看下日程", entry.text)
+    }
+
+    @Test
+    fun aLateAsrRevisionCannotOverwriteTheFinalSaid() {
+        val harness = Harness()
+        harness.hello()
+        harness.asr(turnId = "turn-1", revision = 1, text = "帮我看")
+        harness.said(sequence = 2, entryId = "asr-turn-1", text = "帮我看下日程")
+
+        harness.asr(turnId = "turn-1", revision = 9, text = "迟到的半句")
+
+        assertEquals("帮我看下日程", harness.controller.conversationText(AssistantRoute.WAKE))
+        assertEquals(1, harness.port.lastModel().entries.size)
+        assertTrue(harness.diagnostics.any { it.contains("asr refused: final") })
+    }
+
+    @Test
+    fun aFinalSaidWithoutAnAsrRecoversTheTurnFromTheConventionId() {
+        val harness = Harness()
+        harness.hello()
+
+        harness.said(sequence = 1, entryId = "asr-turn-1", text = "帮我看下日程")
+
+        val entry = harness.port.lastModel().entries.single()
+        assertEquals("asr-turn-1", entry.entryId)
+        assertEquals("the documented asr-<turnId> id recovers the turn when no partial arrived",
+            "turn-1", entry.turnId)
+    }
+
+    @Test
+    fun anAsrForAnotherSessionNeverEntersTheConversation() {
+        val harness = Harness()
+        harness.hello("s-1", 1)
+
+        harness.asr(sessionId = "s-other", turnId = "turn-1", revision = 1, text = "别的会话")
+
+        assertEquals("", harness.controller.conversationText(AssistantRoute.WAKE))
+        assertTrue(harness.diagnostics.any { it.contains("asr refused: session or generation mismatch") })
+    }
+
+    @Test
+    fun resetForCloseClearsTheAsrRevisionAndFinalityGates() {
+        val harness = Harness()
+        harness.hello()
+        harness.asr(turnId = "turn-1", revision = 5, text = "关闭前的半句")
+        harness.said(sequence = 2, entryId = "asr-turn-1", text = "关闭前的最终话")
+
+        harness.controller.resetForClose()
+        harness.asr(turnId = "turn-1", revision = 1, text = "新窗口的第一句")
+
+        assertEquals("新窗口的第一句", harness.controller.conversationText(AssistantRoute.WAKE))
     }
 
     // ---------------------------------------------------------------- SHOW and the live row

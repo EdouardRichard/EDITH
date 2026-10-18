@@ -1925,7 +1925,7 @@ class HostCompositionRoot internal constructor(
             val conversationDisplay = ConversationWireDisplay(
                 log = conversationLog,
                 wire = hintLink,
-                sendSaid = { route, text -> hintLink.userSaid(route, text) },
+                sendSaid = { route, entryId, text -> hintLink.userSaid(route, entryId, text) },
                 sendBusy = { route, busy -> hintLink.busy(route, busy) },
             )
             val environment = CxrHostEnvironment(clock = clock, input = audio?.input ?: UnwiredInputPort,

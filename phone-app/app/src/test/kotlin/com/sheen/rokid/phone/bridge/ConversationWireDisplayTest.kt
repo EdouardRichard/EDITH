@@ -10,6 +10,8 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Phase C + 0.24 S2: the one place the plugin's "someone said something / someone is working / the official
@@ -84,18 +86,21 @@ class ConversationWireDisplayTest {
         override fun close(route: AssistantRoute): Boolean = record(WireCall.Close(route))
     }
 
+    /** One `SAID` the display asked the legacy path to carry: the route, the stable entry id and the words. */
+    private data class SaidCall(val route: AssistantRoute, val entryId: String, val text: String)
+
     private class Fixture {
         val log = ConversationLog()
         val wire = FakeWire(log)
-        val said = mutableListOf<Pair<AssistantRoute, String>>()
+        val said = mutableListOf<SaidCall>()
         val busy = mutableListOf<Pair<AssistantRoute, Boolean>>()
         var sendResult = true
         var logAtSaid: List<ConversationEntry> = emptyList()
         val display = ConversationWireDisplay(
             log = log,
             wire = wire,
-            sendSaid = { route, text ->
-                said += route to text
+            sendSaid = { route, entryId, text ->
+                said += SaidCall(route, entryId, text)
                 logAtSaid = AssistantRoute.entries.flatMap { log.entries(it) }
                 sendResult
             },
@@ -262,7 +267,9 @@ class ConversationWireDisplayTest {
         f.display.userPartial(AssistantRoute.WAKE, "t1", 1, "帮我看")
         f.display.userMessage(AssistantRoute.WAKE, "帮我看下日程")
 
-        assertEquals(listOf(AssistantRoute.WAKE to "帮我看下日程"), f.said)
+        // The final names the same id the partial opened rather than minting a fresh `said-…`: the glasses replace on
+        // the id, so a different one would append a second user row.
+        assertEquals(listOf(SaidCall(AssistantRoute.WAKE, "asr-t1", "帮我看下日程")), f.said)
         // One entry per turn: the final replaces the line the wearer already saw, keeping its turn.
         val entry = f.log.entries(AssistantRoute.WAKE).single()
         assertEquals("asr-t1", entry.entryId)
@@ -274,6 +281,95 @@ class ConversationWireDisplayTest {
             listOf<WireCall>(WireCall.Asr(AssistantRoute.WAKE, "t1", 1, "帮我看")),
             f.wire.calls,
         )
+    }
+
+    @Test
+    fun theFinalUtteranceUsesTheCallersExactEntryIdAndTurn() {
+        val f = Fixture()
+        f.display.userFinal(AssistantRoute.WAKE, "t9", "asr-t9", "最终的话")
+
+        val entry = f.log.entries(AssistantRoute.WAKE).single()
+        assertEquals("asr-t9", entry.entryId)
+        assertEquals("t9", entry.turnId)
+        assertEquals(ConversationRole.USER, entry.role)
+        assertEquals("最终的话", entry.text)
+        assertEquals(listOf(SaidCall(AssistantRoute.WAKE, "asr-t9", "最终的话")), f.said)
+        assertEquals("the final is not an official command", 0, f.wire.calls.size)
+    }
+
+    @Test
+    fun aFinalUtteranceAfterAPartialReplacesTheSameEntryAndSendsThatId() {
+        val f = Fixture()
+        f.display.userPartial(AssistantRoute.WAKE, "t1", 1, "帮我看")
+        f.display.userFinal(AssistantRoute.WAKE, "t1", "asr-t1", "帮我看下日程")
+
+        val entry = f.log.entries(AssistantRoute.WAKE).single()
+        assertEquals("asr-t1", entry.entryId)
+        assertEquals("t1", entry.turnId)
+        assertEquals("帮我看下日程", entry.text)
+        assertEquals(listOf(SaidCall(AssistantRoute.WAKE, "asr-t1", "帮我看下日程")), f.said)
+        assertEquals(
+            "only the partial travels as ASR; the final is a SAID",
+            listOf<WireCall>(WireCall.Asr(AssistantRoute.WAKE, "t1", 1, "帮我看")),
+            f.wire.calls,
+        )
+    }
+
+    @Test
+    fun aLatePartialForAFinalizedTurnCannotOverwriteTheFinal() {
+        val f = Fixture()
+        f.display.userFinal(AssistantRoute.WAKE, "t1", "asr-t1", "最终的话")
+        f.display.userPartial(AssistantRoute.WAKE, "t1", 9, "迟到的半句")
+
+        val entry = f.log.entries(AssistantRoute.WAKE).single()
+        assertEquals("asr-t1", entry.entryId)
+        assertEquals("t1", entry.turnId)
+        assertEquals("最终的话", entry.text)
+        assertTrue("a late partial must not be forwarded either", f.wire.calls.isEmpty())
+    }
+
+    @Test
+    fun aLatePartialForAnOlderFinalizedTurnCannotOverwriteItAfterANewerFinal() {
+        // Finality is per entry, not just "the last final on this route": a revision delayed across a whole turn
+        // boundary must still not reopen the older line once a newer turn has finalized its own.
+        val f = Fixture()
+        f.display.userFinal(AssistantRoute.WAKE, "t1", "asr-t1", "第一句最终")
+        f.display.userFinal(AssistantRoute.WAKE, "t2", "asr-t2", "第二句最终")
+        f.display.userPartial(AssistantRoute.WAKE, "t1", 9, "迟到的旧半句")
+
+        assertEquals(
+            listOf("第一句最终", "第二句最终"),
+            f.log.entries(AssistantRoute.WAKE).map { it.text },
+        )
+        assertTrue("the late revision of the older turn must not be forwarded", f.wire.calls.isEmpty())
+    }
+
+    @Test
+    fun aLateAnswerPartialCannotOverwriteTheFinalAnswer() {
+        val f = Fixture()
+        f.display.assistantPartial(AssistantRoute.WAKE, "t1", "h1", 1, "答案")
+        f.display.assistantMessage(AssistantRoute.WAKE, "答案完成")
+        f.display.assistantPartial(AssistantRoute.WAKE, "t1", "h1", 9, "迟到的答案")
+
+        val entry = f.log.entries(AssistantRoute.WAKE).single()
+        assertEquals("say-h1", entry.entryId)
+        assertEquals("t1", entry.turnId)
+        assertEquals("答案完成", entry.text)
+        assertEquals(
+            "a late answer partial must not be forwarded either",
+            listOf<WireCall>(WireCall.Answer(AssistantRoute.WAKE, "t1", "h1", 1, "答案")),
+            f.wire.calls,
+        )
+    }
+
+    @Test
+    fun aBlankFinalUtteranceIsNeitherRecordedNorSent() {
+        val f = Fixture()
+        f.display.userFinal(AssistantRoute.WAKE, "t1", "asr-t1", "   ")
+
+        assertEquals(0, f.log.size())
+        assertTrue(f.said.isEmpty())
+        assertTrue(f.wire.calls.isEmpty())
     }
 
     @Test
@@ -303,7 +399,7 @@ class ConversationWireDisplayTest {
         assertEquals("asr-t7", user.entryId)
         assertEquals("t7", user.turnId)
         assertEquals("最终的用户话", user.text)
-        assertEquals(listOf(AssistantRoute.WAKE to "最终的用户话"), f.said)
+        assertEquals(listOf(SaidCall(AssistantRoute.WAKE, "asr-t7", "最终的用户话")), f.said)
 
         val assistant = f.log.entries(AssistantRoute.WAKE).first { it.role == ConversationRole.ASSISTANT }
         assertEquals("say-h7", assistant.entryId)
@@ -417,7 +513,8 @@ class ConversationWireDisplayTest {
 
         assertEquals(listOf("帮我看下日程"), f.log.entries(AssistantRoute.WAKE).map { it.text })
         assertEquals(ConversationRole.USER, f.log.entries(AssistantRoute.WAKE).single().role)
-        assertEquals(listOf(AssistantRoute.WAKE to "帮我看下日程"), f.said)
+        assertEquals("帮我看下日程", f.said.single().text)
+        assertTrue("a plain utterance still mints its own stable id", f.said.single().entryId.startsWith("said-"))
     }
 
     @Test
@@ -487,5 +584,181 @@ class ConversationWireDisplayTest {
 
         assertEquals(listOf("再说一遍", "再说一遍"), f.log.entries(AssistantRoute.WAKE).map { it.text })
         assertFalse(f.log.entries(AssistantRoute.WAKE).first().entryId == f.log.entries(AssistantRoute.WAKE).last().entryId)
+    }
+
+    // ---------------------------------------------------------------- per-route serialization (0.24 S4 Task 15)
+
+    /**
+     * A wire with one blocking hook, so a test can hold the display **inside** a revision.
+     *
+     * This is the observable seam for the race the monitor must close: while the partial is blocked in its send, a
+     * final on another thread must not be able to record between the partial's append and its pending-set.
+     */
+    private class HookedWire(
+        private val onAsr: () -> Unit = {},
+        private val onAnswer: () -> Unit = {},
+    ) : ConversationWire {
+        val asrCalls = mutableListOf<WireCall.Asr>()
+        val answerCalls = mutableListOf<WireCall.Answer>()
+
+        override fun state(route: AssistantRoute, turnId: String, status: Int, sequence: Long): Boolean = true
+        override fun idle(route: AssistantRoute, sequence: Long): Boolean = true
+        override fun asr(route: AssistantRoute, turnId: String, revision: Long, text: String): Boolean {
+            asrCalls += WireCall.Asr(route, turnId, revision, text)
+            onAsr()
+            return true
+        }
+        override fun answer(
+            route: AssistantRoute,
+            turnId: String,
+            hintId: String,
+            revision: Long,
+            text: String,
+        ): Boolean {
+            answerCalls += WireCall.Answer(route, turnId, hintId, revision, text)
+            onAnswer()
+            return true
+        }
+        override fun tool(route: AssistantRoute, turnId: String, phase: ToolPhase, label: String): Boolean = true
+        override fun panelOpen(route: AssistantRoute): Boolean = true
+        override fun close(route: AssistantRoute): Boolean = true
+    }
+
+    /** Waits until [thread] is blocked entering a monitor, failing the test if it finishes or stays runnable. */
+    private fun awaitBlocked(thread: Thread, what: String) {
+        val deadline = System.nanoTime() + TimeUnit.SECONDS.toNanos(2)
+        while (thread.state != Thread.State.BLOCKED && System.nanoTime() < deadline) {
+            Thread.sleep(1)
+        }
+        assertEquals("$what must be waiting for the per-route monitor", Thread.State.BLOCKED, thread.state)
+    }
+
+    @Test
+    fun aFinalUtteranceWaitsForThePartialRevisionItRaced() {
+        val log = ConversationLog()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val wire = HookedWire(onAsr = {
+            entered.countDown()
+            assertTrue("the partial must be held until the test releases it", release.await(2, TimeUnit.SECONDS))
+        })
+        val sent = mutableListOf<String>()
+        val display = ConversationWireDisplay(
+            log = log,
+            wire = wire,
+            sendSaid = { _, entryId, _ -> sent += entryId; true },
+            sendBusy = { _, _ -> true },
+        )
+        val partial = Thread({ display.userPartial(AssistantRoute.WAKE, "t1", 1, "半句") }, "partial-revision")
+        val finalThread = Thread(
+            { display.userFinal(AssistantRoute.WAKE, "t1", "asr-t1", "最终的话") },
+            "final-utterance",
+        )
+        try {
+            partial.start()
+            assertTrue("the partial must reach its send", entered.await(2, TimeUnit.SECONDS))
+            finalThread.start()
+            awaitBlocked(finalThread, "the final utterance")
+
+            // The load-bearing assertion: while the partial is inside its record/pending/send sequence, a final cannot
+            // record. Without the per-route monitor this list is already non-empty here.
+            assertTrue("the final must not interleave with the partial", sent.isEmpty())
+        } finally {
+            release.countDown()
+            partial.join(2_000)
+            finalThread.join(2_000)
+        }
+        assertFalse("the partial thread must finish", partial.isAlive)
+        assertFalse("the final thread must finish", finalThread.isAlive)
+        assertEquals("the final is sent once, under the partial's id", listOf("asr-t1"), sent)
+        val entry = log.entries(AssistantRoute.WAKE).single()
+        assertEquals("asr-t1", entry.entryId)
+        assertEquals("t1", entry.turnId)
+        assertEquals("最终的话", entry.text)
+        assertEquals("one ASR revision and no second row", 1, wire.asrCalls.size)
+    }
+
+    @Test
+    fun aFinalAnswerWaitsForThePartialRevisionItRacedAndDoesNotCreateASecondUuidRow() {
+        // The same race on the assistant side: the final must wait for the partial's append/pending/send, so it sees
+        // the pending entry and replaces `say-h1` instead of minting `say-<UUID>` as a second row.
+        val log = ConversationLog()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val wire = HookedWire(onAnswer = {
+            entered.countDown()
+            assertTrue("the partial must be held until the test releases it", release.await(2, TimeUnit.SECONDS))
+        })
+        val display = ConversationWireDisplay(
+            log = log,
+            wire = wire,
+            sendSaid = { _, _, _ -> true },
+            sendBusy = { _, _ -> true },
+        )
+        val partial = Thread(
+            { display.assistantPartial(AssistantRoute.WAKE, "t1", "h1", 1, "答案") },
+            "partial-answer",
+        )
+        val finalThread = Thread({ display.assistantMessage(AssistantRoute.WAKE, "答案完成") }, "final-answer")
+        try {
+            partial.start()
+            assertTrue("the partial must reach its send", entered.await(2, TimeUnit.SECONDS))
+            finalThread.start()
+            awaitBlocked(finalThread, "the final answer")
+        } finally {
+            release.countDown()
+            partial.join(2_000)
+            finalThread.join(2_000)
+        }
+        assertFalse("the partial thread must finish", partial.isAlive)
+        assertFalse("the final thread must finish", finalThread.isAlive)
+        val entry = log.entries(AssistantRoute.WAKE).single()
+        assertEquals("say-h1", entry.entryId)
+        assertEquals("t1", entry.turnId)
+        assertEquals("答案完成", entry.text)
+        assertFalse("the final must not mint a fresh say-<UUID>", entry.entryId.startsWith("say-") &&
+            entry.entryId != "say-h1")
+        assertEquals("one answer revision", 1, wire.answerCalls.size)
+    }
+
+    @Test
+    fun aBlockedWakeRevisionDoesNotBlockTheOtherRoute() {
+        // The monitor is per route, not global: a stalled wake revision must not freeze proactive traffic behind it.
+        val log = ConversationLog()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val wire = HookedWire(onAsr = {
+            entered.countDown()
+            assertTrue("the wake partial must be held", release.await(2, TimeUnit.SECONDS))
+        })
+        val sent = mutableListOf<String>()
+        val display = ConversationWireDisplay(
+            log = log,
+            wire = wire,
+            sendSaid = { route, entryId, _ -> sent += "${route.name}:$entryId"; true },
+            sendBusy = { _, _ -> true },
+        )
+        val partial = Thread({ display.userPartial(AssistantRoute.WAKE, "t1", 1, "半句") }, "wake-partial")
+        val proactive = CountDownLatch(1)
+        try {
+            partial.start()
+            assertTrue("the wake partial must reach its send", entered.await(2, TimeUnit.SECONDS))
+            val other = Thread({
+                display.userFinal(AssistantRoute.PROACTIVE, "t2", "asr-t2", "主动的话")
+                proactive.countDown()
+            }, "proactive-final")
+            other.start()
+            assertTrue(
+                "the other route must not wait for the wake's monitor",
+                proactive.await(2, TimeUnit.SECONDS),
+            )
+            other.join(2_000)
+        } finally {
+            release.countDown()
+            partial.join(2_000)
+        }
+        assertEquals(listOf("PROACTIVE:asr-t2"), sent)
+        assertEquals(listOf("半句"), log.entries(AssistantRoute.WAKE).map { it.text })
+        assertEquals(listOf("主动的话"), log.entries(AssistantRoute.PROACTIVE).map { it.text })
     }
 }
