@@ -95,6 +95,17 @@ interface RokidBackend : AutoCloseable {
     fun addGlassesEventListener(listener: GlassesEvents): AutoCloseable? = null
 
     /**
+     * Installs the listener **before** a CXR session is created, as the official 1.1.2 sample does.
+     *
+     * `SessionHubViewModel.createSessionFromRequest` registers `IGlassesEventListener` on the created session and then
+     * calls `connect`, and calls that order critical because the SDK can deliver scene events from the first moment.
+     * The factory is invoked once per newly created session, so a reconnect gets exactly one new SDK registration and
+     * the replaced session's registration is released. Defaults to refusing, so a backend that cannot observe a scene
+     * cannot look like it registered one.
+     */
+    fun setGlassesEventListenerFactory(factory: (() -> GlassesEvents?)?) = Unit
+
+    /**
      * Registers a consumer for raw payloads on [channelKey], for traffic that is not text - the T17 audio uplink
      * sends PCM here. A registered channel is delivered as bytes and **never** decoded as UTF-8, because that decode
      * is lossy for arbitrary bytes and would corrupt audio into replacement characters.
@@ -302,6 +313,18 @@ class RokidSessionTransport(
     fun addGlassesEventListener(listener: GlassesEvents): AutoCloseable? {
         if (synchronized(gate) { closed }) return null
         return backend.addGlassesEventListener(listener)
+    }
+
+    /**
+     * Installs the pre-connect scene listener factory for the backend that owns the SDK session.
+     *
+     * Delegation only: the listener is registered on each newly created session before `connect`, which is the order
+     * the official CXR-L 1.1.2 sample uses. Refused after [close] so a torn-down transport cannot register on a new
+     * session.
+     */
+    fun setGlassesEventListenerFactory(factory: (() -> GlassesEvents?)?) {
+        if (synchronized(gate) { closed }) return
+        backend.setGlassesEventListenerFactory(factory)
     }
 
     fun send(route: RokidCommandRoute, json: String, correlation: RokidReplyCorrelation?,

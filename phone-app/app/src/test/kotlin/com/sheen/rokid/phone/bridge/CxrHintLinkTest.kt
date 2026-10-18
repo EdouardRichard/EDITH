@@ -488,6 +488,25 @@ class CxrHintLinkTest {
     }
 
     @Test
+    fun stoppingTheSessionClosesBothRoutesBeforeTheIdentityGoesAway() {
+        // Spec §5.1: 停止 ends the session and closes the panel. There is no new SESSION_END command; `CLOSE` is the
+        // existing route-scoped close, sent while the identity still exists to name.
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 4)
+        sent.clear()
+
+        link.sessionEnded()
+
+        val closes = sent.mapNotNull { HintWireCodec.decode(it) as? HintCommand.Close }
+        assertEquals("one close per route: $closes", 2, closes.size)
+        assertEquals(setOf(AssistantRoute.WAKE, AssistantRoute.PROACTIVE), closes.map { it.route }.toSet())
+        assertTrue("no new command name may be invented", sent.all {
+            HintWireCodec.decode(it) is HintCommand.Close || HintWireCodec.decode(it) is HintCommand.Busy
+        })
+    }
+
+    @Test
     fun theCompositionStopCheckMatchesTheSessionAcrossPauseResume() {
         // The link validates the STOP against the identity it knows; the composition must rule out a **different
         // session** (a stop/start) but accept the same session after pause/resume, which bumps the host generation
@@ -746,5 +765,264 @@ class CxrHintLinkTest {
         val link = linkInto(mutableListOf())
 
         assertFalse(link.openGlassesApp { })
+    }
+
+    // ---------------------------------------------------------------- Task 11: resident handshake and panel lifecycle
+
+    /**
+     * A link with the two clocks the resident handshake needs: the fake scheduler so the 5 s grace is observable, and
+     * the recording app-start seam so "only when needed" can be asserted.
+     */
+    private class ResidentRig {
+        val clock = FakeClock()
+        val scheduler = FakeScheduler()
+        val sent = mutableListOf<String>()
+        var starts = 0
+        var startAccepted = true
+        var startCallback: ((Boolean) -> Unit)? = null
+        val link = CxrHintLink(
+            clock = clock,
+            scheduler = scheduler,
+            sendJson = { json -> sent += json; true },
+            // The opening retry is a D15 path with its own tests; with a zero bound it cannot add noise to these.
+            maxRetries = 0,
+            startGlassesApp = { onResult -> starts++; startCallback = onResult; startAccepted },
+        )
+
+        fun establish(sessionId: String = "s-1", generation: Long = 3) {
+            link.sessionEstablished(sessionId, generation)
+        }
+
+        fun completeExchange() {
+            val ping = sent.mapNotNull { HintWireCodec.decode(it) as? HintCommand.Ping }.last()
+            clock.nanos = ping.p0 + 10_000_000L
+            link.onInbound(HintWireCodec.encode(
+                HintCommand.Pong(ping.syncId, ping.p0, ping.p0 + 1_005_000_000L, ping.p0 + 1_005_000_000L)))
+        }
+
+        fun uiReady(sessionId: String = "s-1", generation: Long = 3) {
+            link.onInbound(HintWireCodec.encode(HintCommand.UiReady(sessionId, generation)))
+        }
+
+        fun panelShown(route: AssistantRoute = AssistantRoute.WAKE, sessionId: String = "s-1",
+            generation: Long = 3) {
+            link.onInbound(HintWireCodec.encode(HintCommand.PanelShown(sessionId, generation, route)))
+        }
+
+        fun uiClosed(route: AssistantRoute = AssistantRoute.WAKE, sessionId: String = "s-1",
+            generation: Long = 3) {
+            link.onInbound(HintWireCodec.encode(HintCommand.UiClosed(sessionId, generation, route)))
+        }
+
+        fun advance(millis: Long) {
+            clock.nanos += millis * 1_000_000L
+            scheduler.fireDue(clock.nanos)
+        }
+
+        fun commands(): List<HintCommand> = sent.mapNotNull(HintWireCodec::decode)
+        fun panelOpens(): List<HintCommand.PanelOpen> = commands().filterIsInstance<HintCommand.PanelOpen>()
+    }
+
+    @Test
+    fun theSessionStartAsksForTheGlassesSceneOnlyAfterTheFiveSecondUiReadyGrace() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.sent.clear()
+
+        rig.advance(4_999)
+        assertEquals("the grace window must not be short-circuited", 0, rig.starts)
+
+        rig.advance(1)
+        assertEquals("no UI_READY inside 5 s means the scene must be started", 1, rig.starts)
+        assertTrue("the SDK accepted the request", rig.startCallback != null)
+
+        rig.sent.clear()
+        rig.startCallback!!.invoke(true)
+        assertTrue("a started scene must be re-introduced: ${rig.commands()}",
+            rig.commands().any { it is HintCommand.Hello })
+        assertTrue("the new scene needs a fresh clock exchange: ${rig.commands()}",
+            rig.commands().any { it is HintCommand.Ping })
+    }
+
+    @Test
+    fun aUiReadyInsideTheGraceWindowCancelsTheSceneStart() {
+        val rig = ResidentRig()
+        rig.establish()
+
+        rig.uiReady()
+        rig.advance(5_000)
+
+        assertEquals("a live resident service needs no appStart", 0, rig.starts)
+        assertTrue(rig.link.hasUiReady())
+    }
+
+    @Test
+    fun aUiReadyForAnotherSessionDoesNotCountForThisOne() {
+        val rig = ResidentRig()
+        rig.establish()
+        // The inbound identity gate refuses it; the grace must still fire for this session.
+        rig.uiReady(sessionId = "other")
+
+        rig.advance(5_000)
+
+        assertEquals(1, rig.starts)
+        assertFalse(rig.link.hasUiReady())
+    }
+
+    @Test
+    fun endingTheSessionCancelsTheUiReadyGrace() {
+        val rig = ResidentRig()
+        rig.establish()
+
+        rig.link.sessionEnded()
+        rig.advance(5_000)
+
+        assertEquals("a stopped session may not start the glasses scene", 0, rig.starts)
+    }
+
+    @Test
+    fun openingThePanelUsesTheLiveServiceWithoutStartingTheScene() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+
+        assertEquals("UI_READY + a live mapping means the service is already there", 0, rig.starts)
+        assertEquals(listOf(AssistantRoute.WAKE), rig.panelOpens().map { it.route })
+    }
+
+    @Test
+    fun openingThePanelStartsTheSceneThenReintroducesAndOpens() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.sent.clear()
+
+        assertTrue("the request must be accepted for asynchronous appStart", rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(1, rig.starts)
+        assertTrue("PANEL_OPEN may not travel before the scene has started", rig.panelOpens().isEmpty())
+
+        rig.sent.clear()
+        rig.startCallback!!.invoke(true)
+
+        val commands = rig.commands()
+        val hello = commands.indexOfFirst { it is HintCommand.Hello }
+        val ping = commands.indexOfFirst { it is HintCommand.Ping }
+        val open = commands.indexOfFirst { it is HintCommand.PanelOpen }
+        assertTrue("reintroduce must send HELLO/PING: $commands", hello >= 0 && ping >= 0)
+        assertTrue("PANEL_OPEN must follow the re-introduction: $commands", open > ping)
+        assertEquals(AssistantRoute.WAKE, rig.panelOpens().single().route)
+    }
+
+    @Test
+    fun aMissingClockMappingReintroducesTheEstablishedSessionBeforeOpening() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.uiReady()
+        // Deliberately no PONG: the service is alive, but the old scene's mapping is dead.
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+
+        assertEquals(0, rig.starts)
+        assertTrue(rig.commands().any { it is HintCommand.Hello })
+        assertTrue(rig.commands().any { it is HintCommand.Ping })
+        assertEquals(1, rig.panelOpens().size)
+    }
+
+    @Test
+    fun aPanelThatIsAlreadyVisibleIsNotReopenedOrResent() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.panelShown(AssistantRoute.WAKE)
+        rig.sent.clear()
+
+        assertFalse("an already-visible panel is a no-op", rig.link.requestPanelOpen(AssistantRoute.WAKE))
+
+        assertTrue("no PANEL_OPEN may be sent for a visible panel", rig.panelOpens().isEmpty())
+        assertEquals(0, rig.starts)
+        assertTrue(rig.link.isPanelVisible())
+    }
+
+    @Test
+    fun uiClosedMakesThePanelHiddenAgainSoTheNextOpenIsSent() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.panelShown(AssistantRoute.WAKE)
+        rig.uiClosed(AssistantRoute.WAKE)
+        rig.sent.clear()
+
+        assertFalse(rig.link.isPanelVisible())
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(1, rig.panelOpens().size)
+    }
+
+    @Test
+    fun panelShownIsDeliveredWithItsRouteAndMarksThePanelVisible() {
+        val rig = ResidentRig()
+        val shown = mutableListOf<AssistantRoute>()
+        rig.link.onPanelShown = { route -> shown += route }
+        rig.establish()
+
+        assertTrue(rig.link.onInbound(
+            HintWireCodec.encode(HintCommand.PanelShown("s-1", 3, AssistantRoute.PROACTIVE))))
+
+        assertEquals(listOf(AssistantRoute.PROACTIVE), shown)
+        assertTrue(rig.link.isPanelVisible())
+    }
+
+    @Test
+    fun aPanelShownForAnotherSessionIsRefused() {
+        val rig = ResidentRig()
+        var shown = 0
+        rig.link.onPanelShown = { shown++ }
+        rig.establish()
+
+        assertFalse(rig.link.onInbound(
+            HintWireCodec.encode(HintCommand.PanelShown("other", 3, AssistantRoute.WAKE))))
+        assertFalse(rig.link.onInbound(
+            HintWireCodec.encode(HintCommand.PanelShown("s-1", 2, AssistantRoute.WAKE))))
+
+        assertEquals(0, shown)
+        assertFalse(rig.link.isPanelVisible())
+    }
+
+    @Test
+    fun aRefusedSceneStartLeavesThePanelUnopened() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        rig.startCallback!!.invoke(false)
+
+        assertTrue("a refused appStart may not be followed by PANEL_OPEN", rig.panelOpens().isEmpty())
+    }
+
+    @Test
+    fun aWakeDuringTheUiReadyGraceDoesNotStartTheSceneTwiceAndStillOpensThePanel() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.sent.clear()
+
+        // The grace fires one appStart...
+        rig.advance(5_000)
+        assertEquals(1, rig.starts)
+
+        // ...and a wake arrives while CXR has not answered yet. It must queue the panel, not start the scene again.
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals("only one appStart may be in flight per session", 1, rig.starts)
+
+        rig.sent.clear()
+        rig.startCallback!!.invoke(true)
+
+        assertTrue("the queued wake must open the panel after the single start: ${rig.commands()}",
+            rig.panelOpens().isNotEmpty())
     }
 }

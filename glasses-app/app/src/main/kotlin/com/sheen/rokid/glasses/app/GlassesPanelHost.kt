@@ -64,7 +64,7 @@ class GlassesPanelHost(
         /** The controller decided the panel must be hidden (BACK idle, or a STOP that could not be sent). */
         fun hidePanel()
 
-        /** The controller asked to show the panel for [route] (Task 11 wires PANEL_OPEN; no caller yet). */
+        /** The host window was asked to show the panel for [route] (Task 11's `PANEL_OPEN` path / the debug host). */
         fun showPanel(route: AssistantRoute)
 
         /** Hold/release the host window's claim that the display stay awake. */
@@ -333,6 +333,19 @@ class GlassesPanelHost(
      */
     fun resetForClose() {
         controller.resetForClose()
+        resetVisuals()
+    }
+
+    /**
+     * Task 11: the panel is about to become visible from a hidden window. The conversation cache is cleared exactly
+     * like a close, so content that arrived while hidden cannot reappear; the session identity is kept.
+     */
+    fun resetForOpen() {
+        controller.resetForOpen()
+        resetVisuals()
+    }
+
+    private fun resetVisuals() {
         stopTicker()
         userReadPaused = false
         newEntryPending = false

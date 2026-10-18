@@ -361,6 +361,196 @@ class OverlayServiceTest {
         assertFalse("and release the wake lock", onMain { service.wakeLockHeldForProbe() })
     }
 
+    // ---------------------------------------------------------------- Task 11: PANEL_OPEN / route-scoped CLOSE
+
+    /**
+     * Task 11: a hidden panel reopened by `PANEL_OPEN` starts from nothing.
+     *
+     * The controller keeps accepting `SHOW`/`SAID` while the window is hidden (Task 9 I1), so the cache it accumulated
+     * under a hidden window must be thrown away on hidden→visible. The official rule behind this is `showAiDialog`'s
+     * `resetDialogUiState` when it is not already showing.
+     */
+    @Test
+    fun panelOpenFromHiddenShowsThePanelAndDropsWhateverArrivedWhileHidden() {
+        val service = startAndBind()
+        service.setSenderForProbe { json -> sentJson += json; true }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-panel-open", 1)))
+        }
+        waitUntil("UI_READY") { uiEvents().any { it is HintCommand.UiReady } }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.PanelOpen("s-panel-open", 1, AssistantRoute.WAKE)))
+        }
+        waitUntil("PANEL_OPEN adds the overlay") { onMain { service.overlayShownForProbe() } }
+        waitUntil("PANEL_SHOWN") { uiEvents().any { it is HintCommand.PanelShown } }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Sync("sync-panel-open", 0, 1_000_000, System.nanoTime() + 120_000_000_000L)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Show("s-panel-open", 1, sequence = 1, hintId = "h-panel-open", revision = 1,
+                    syncId = "sync-panel-open", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = "可见时的答案")))
+        }
+        waitUntil("the visible answer is rendered") {
+            onMain { service.hintTextForProbe() } == "可见时的答案"
+        }
+
+        // BACK / a service hide: visible→hidden. The cache is cleared here already; the late content below is the
+        // cache that hidden→visible must drop.
+        instrumentation.runOnMainSync { service.hidePanel() }
+        waitUntil("the first UI_CLOSED") { uiEvents().count { it is HintCommand.UiClosed } == 1 }
+        waitUntil("the overlay is hidden") { !onMain { service.overlayShownForProbe() } }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Show("s-panel-open", 1, sequence = 2, hintId = "h-panel-open-hidden", revision = 1,
+                    syncId = "sync-panel-open", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = "隐藏时收到的答案")))
+        }
+        waitUntil("the hidden panel still stores the late answer") {
+            onMain { service.hintTextForProbe() } == "隐藏时收到的答案"
+        }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.PanelOpen("s-panel-open", 1, AssistantRoute.WAKE)))
+        }
+        waitUntil("the second PANEL_OPEN adds the overlay") { onMain { service.overlayShownForProbe() } }
+        waitUntil("the second PANEL_SHOWN") {
+            uiEvents().filterIsInstance<HintCommand.PanelShown>().size == 2
+        }
+
+        assertEquals("hidden→visible must drop the cache built while hidden", "",
+            onMain { service.conversationTextForProbe(AssistantRoute.WAKE) })
+        assertEquals("no answer may survive a hidden→visible open", "", onMain { service.hintTextForProbe() })
+        assertEquals("the reveal revision must restart on the new window", 0L,
+            onMain { service.contentRevisionForProbe() })
+    }
+
+    /** Task 11: `PANEL_OPEN` while the window is already visible is a no-op - no reset, no duplicate shown event. */
+    @Test
+    fun panelOpenWhileVisibleDoesNotResetTheCache() {
+        val service = startAndBind()
+        service.setSenderForProbe { json -> sentJson += json; true }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-panel-visible", 1)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.PanelOpen("s-panel-visible", 1, AssistantRoute.WAKE)))
+        }
+        waitUntil("PANEL_SHOWN") { uiEvents().any { it is HintCommand.PanelShown } }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Sync("sync-panel-visible", 0, 1_000_000, System.nanoTime() + 120_000_000_000L)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Show("s-panel-visible", 1, sequence = 1, hintId = "h-panel-visible", revision = 1,
+                    syncId = "sync-panel-visible", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = "可见时保留的答案")))
+        }
+        waitUntil("the answer is rendered") { onMain { service.hintTextForProbe() } == "可见时保留的答案" }
+        val revisionBefore = onMain { service.contentRevisionForProbe() }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.PanelOpen("s-panel-visible", 1, AssistantRoute.WAKE)))
+        }
+
+        assertTrue("a visible panel stays visible", onMain { service.overlayShownForProbe() })
+        assertEquals("a visible PANEL_OPEN must not reset the cache", "可见时保留的答案",
+            onMain { service.hintTextForProbe() })
+        assertEquals("and must not restart the reveal revision", revisionBefore,
+            onMain { service.contentRevisionForProbe() })
+        assertEquals("and must not emit a second PANEL_SHOWN", 1,
+            uiEvents().count { it is HintCommand.PanelShown })
+    }
+
+    /** Task 11: `CLOSE` is route-scoped - another route's close may not hide the panel in front of the wearer. */
+    @Test
+    fun aCloseForAnotherRouteDoesNotHideTheVisiblePanel() {
+        val service = startAndBind()
+        service.setSenderForProbe { json -> sentJson += json; true }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-route-close", 1)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.PanelOpen("s-route-close", 1, AssistantRoute.WAKE)))
+        }
+        waitUntil("PANEL_SHOWN") { uiEvents().any { it is HintCommand.PanelShown } }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Sync("sync-route-close", 0, 1_000_000, System.nanoTime() + 120_000_000_000L)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Show("s-route-close", 1, sequence = 1, hintId = "h-route-close", revision = 1,
+                    syncId = "sync-route-close", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = "WAKE 的答案")))
+        }
+        waitUntil("the WAKE answer is rendered") { onMain { service.hintTextForProbe() } == "WAKE 的答案" }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Close("s-route-close", 1, route = AssistantRoute.PROACTIVE)))
+        }
+
+        assertTrue("another route's CLOSE must not hide the visible panel", onMain { service.overlayShownForProbe() })
+        assertEquals("and must not clear the visible route's content", "WAKE 的答案",
+            onMain { service.hintTextForProbe() })
+        assertEquals("and must not report a hidden transition", 0,
+            uiEvents().count { it is HintCommand.UiClosed })
+    }
+
+    /**
+     * Task 11: while hidden, any valid `CLOSE` still clears the cache - window presence is independent of the gate.
+     *
+     * This is the hidden-close rule (Task 9 I1) with a route that is **not** the last visible one, so a hidden close
+     * cannot be implemented by "only the visible route may clear".
+     */
+    @Test
+    fun aHiddenCloseForAnotherRouteStillClearsTheCache() {
+        val service = startAndBind()
+        service.setSenderForProbe { json -> sentJson += json; true }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-hidden-route", 2)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.PanelOpen("s-hidden-route", 2, AssistantRoute.WAKE)))
+        }
+        waitUntil("PANEL_SHOWN") { uiEvents().any { it is HintCommand.PanelShown } }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Sync("sync-hidden-route", 0, 1_000_000, System.nanoTime() + 120_000_000_000L)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Show("s-hidden-route", 2, sequence = 1, hintId = "h-hidden-route", revision = 1,
+                    syncId = "sync-hidden-route", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = "隐藏前的答案")))
+        }
+        waitUntil("the answer is rendered") { onMain { service.hintTextForProbe() } == "隐藏前的答案" }
+
+        instrumentation.runOnMainSync { service.hidePanel() }
+        waitUntil("the first UI_CLOSED") { uiEvents().count { it is HintCommand.UiClosed } == 1 }
+        waitUntil("the overlay is hidden") { !onMain { service.overlayShownForProbe() } }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Show("s-hidden-route", 2, sequence = 2, hintId = "h-hidden-route-late", revision = 1,
+                    syncId = "sync-hidden-route", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = "隐藏时收到的答案")))
+        }
+        waitUntil("the hidden cache holds the late answer") {
+            onMain { service.hintTextForProbe() } == "隐藏时收到的答案"
+        }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Close("s-hidden-route", 2, route = AssistantRoute.PROACTIVE)))
+        }
+
+        assertEquals("a hidden CLOSE must clear for any route", "",
+            onMain { service.conversationTextForProbe(AssistantRoute.WAKE) })
+        assertEquals("a hidden CLOSE must clear the live row", "", onMain { service.hintTextForProbe() })
+        assertEquals("a hidden CLOSE must not report a second hidden transition", 1,
+            uiEvents().count { it is HintCommand.UiClosed })
+    }
+
     // ---------------------------------------------------------------- the production default is the trampoline
 
     @Test

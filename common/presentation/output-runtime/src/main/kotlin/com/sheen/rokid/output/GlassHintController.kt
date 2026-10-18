@@ -118,6 +118,25 @@ class GlassHintController(
         }
     }
 
+    /**
+     * A panel window closed and was reopened for the **same** session (0.24 Task 11).
+     *
+     * The identity and clock mappings survive - the phone did not re-handshake, and a same-session `SHOW` is still
+     * valid - but the previous window's ordering and revision gates must not reject a hint the phone re-sends into the
+     * new window. Without this, closing and reopening the panel left `shownRevisions` holding the old revision and the
+     * same hint id could never be shown again.
+     */
+    fun resetForNewWindow() {
+        clearFence = Long.MIN_VALUE
+        lastSequence = Long.MIN_VALUE
+        shownRevisions.clear()
+        cancelExpiry()
+        if (visible) {
+            visible = false
+            render(null)
+        }
+    }
+
     private fun onHello(command: HintCommand.Hello) {
         // Stale means "the same session, an older generation" - the case this ordering rule was written for. A HELLO
         // for a **different** session is a new session and must be adopted even when its generation is lower: the

@@ -69,6 +69,9 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
     private val binaryChannels = mutableMapOf<String, MutableList<(ByteArray) -> Unit>>()
     @Volatile private var binding: Binding? = null
     @Volatile private var authCallback: ((AuthResult) -> Unit)? = null
+    /** The pre-connect scene listener factory; see [setGlassesEventListenerFactory]. Guarded by [listenerGate]. */
+    private val listenerGate = Any()
+    @Volatile private var glassesEventListenerFactory: (() -> GlassesEvents?)? = null
 
     private class Pending(val route: RokidCommandRoute, val correlation: RokidReplyCorrelation?,
         val listener: (String?) -> Unit) {
@@ -80,6 +83,13 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
         val usedReplyChannels = mutableSetOf<String>()
         /** Installed glasses-scene listeners; removed on release so a dead session cannot keep notifying the host. */
         val glassesEventListeners = CopyOnWriteArrayList<CxrGlassesEventListener>()
+        /**
+         * True once the SDK reported `onSessionClosed` for this session.
+         *
+         * Liveness has to end here, not only when a reconnect replaces [binding]: the SDK can deliver a late screen,
+         * wearing or scene callback from a closed-but-not-yet-replaced session, and it must not speak for the host.
+         */
+        val closed = AtomicBoolean(false)
         lateinit var lifecycle: ISessionLifecycleCbk
         lateinit var commands: ICustomCmdSessionCallback
         lateinit var installer: AudioInstaller
@@ -107,8 +117,12 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
                 var released = false
                 fence.dispatch {
                     if (request.get() == identity) {
+                        val previous = binding
                         val owned = callbacks(created, events)
                         binding = owned
+                        // Task 11: a reconnect gets a fresh pre-connect registration (inside `callbacks`); the replaced
+                        // session's SDK handle is released rather than left registered on a dead binding.
+                        previous?.let(::releaseGlassesEventListeners)
                         created.addLifecycleCallback(owned.lifecycle)
                         // The inbound custom-command registration is chosen inside `callbacks`: the client callback is
                         // preferred and the session registration is only a fallback, so it is not added here.
@@ -140,7 +154,12 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
             override fun onSessionResumed() { if (live()) events.ready() }
             override fun onSessionPaused(reason: PausedReason) { if (live()) events.interrupted() }
             override fun onSessionTerminating(reason: TerminatingReason, gracePeriodMs: Long) { if (live()) events.interrupted() }
-            override fun onSessionClosed(reason: CloseReason) { if (live()) events.interrupted() }
+            override fun onSessionClosed(reason: CloseReason) {
+                // The session is gone even while this binding is still the current reference. Mark it before the
+                // interruption so every listener attached to it stops forwarding at the same moment.
+                owned.closed.set(true)
+                if (live()) events.interrupted()
+            }
             override fun onConnectResult(success: Boolean, errorCode: SessionErrorCode?) {
                 if (!success && live()) events.error("CXR_CONNECT_FAILED")
             }
@@ -194,7 +213,54 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
             created.addCustomCmdCallback(owned.commands)
             Log.w(TAG, "client custom-command callback unavailable; fell back to the session registration")
         }
+        // Official CXR-L 1.1.2 order: every callback, `addGlassesEventListener` included, is registered on the created
+        // session before `connect`. Installing here - not on the first `ready()` - is what keeps the listener from
+        // double-registering on started+resumed and from missing first-moment scene events.
+        attachPreConnectGlassesListener(owned)
         return owned
+    }
+
+    /**
+     * Installs the factory's listener on a newly created session, before the caller runs `connect`.
+     *
+     * A factory (rather than a listener) so one registration can be minted per session: the adapter closes over the
+     * binding it belongs to, which is what makes a released/replaced session inert. A throwing factory is contained -
+     * a scene observer is optional and must not abort the connection.
+     */
+    private fun attachPreConnectGlassesListener(owned: Binding) {
+        val factory = synchronized(listenerGate) { glassesEventListenerFactory } ?: return
+        val listener = runCatching { factory() }.getOrElse { thrown ->
+            Log.e(TAG, "glasses-event factory failed: ${thrown.javaClass.simpleName}: ${thrown.message}")
+            null
+        } ?: return
+        installGlassesListener(owned, listener)
+    }
+
+    /** One adapter per listener per binding, with liveness owned by that binding. */
+    private fun installGlassesListener(owned: Binding, listener: GlassesEvents) {
+        val adapter = CxrGlassesEventListener(listener) { bindingLive(owned) }
+        try {
+            owned.session.addGlassesEventListener(adapter)
+            owned.glassesEventListeners += adapter
+        } catch (thrown: Throwable) {
+            Log.e(TAG, "addGlassesEventListener failed: ${thrown.javaClass.simpleName}: ${thrown.message}")
+        }
+    }
+
+    /**
+     * Whether [owned] may still speak for the host: the backend is open, the binding was not replaced, and the SDK has
+     * not reported the session closed.
+     */
+    private fun bindingLive(owned: Binding): Boolean =
+        !fence.isClosed() && binding === owned && !owned.closed.get()
+
+    /** Detaches and removes every listener still registered on [owned]; idempotent. */
+    private fun releaseGlassesEventListeners(owned: Binding) {
+        owned.glassesEventListeners.forEach { listener ->
+            listener.detach()
+            runCatching { owned.session.removeGlassesEventListener(listener) }
+        }
+        owned.glassesEventListeners.clear()
     }
     /**
      * Delivers an activity result to the pending authorization request and reports the verdict the SDK's own parse of
@@ -355,8 +421,8 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
      */
     override fun addGlassesEventListener(listener: GlassesEvents): AutoCloseable? {
         val owned = binding ?: return null
-        if (fence.isClosed() || binding !== owned) return null
-        val adapter = CxrGlassesEventListener(listener) { !fence.isClosed() && binding === owned }
+        if (fence.isClosed() || binding !== owned || owned.closed.get()) return null
+        val adapter = CxrGlassesEventListener(listener) { bindingLive(owned) }
         return try {
             owned.session.addGlassesEventListener(adapter)
             owned.glassesEventListeners += adapter
@@ -371,6 +437,17 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
         }
     }
 
+    /**
+     * Installs the factory for the session-level scene listener (Task 11).
+     *
+     * The official sample exercises this before `connect`, so the factory is called inside the connection's callback
+     * installation rather than from the caller. It is invoked once per new session; replacing the binding also releases
+     * the previous session's SDK registration.
+     */
+    override fun setGlassesEventListenerFactory(factory: (() -> GlassesEvents?)?) {
+        synchronized(listenerGate) { glassesEventListenerFactory = factory }
+    }
+
     override fun close() {
         cancelAuthorization()
         val owned = binding
@@ -383,11 +460,7 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
             runCatching { owned.commandSubscription.release() }
             // 0.24: a released session must not keep calling scene events into the host. Detach first so an in-flight
             // vendor callback is inert even if the SDK's own removal races it.
-            owned.glassesEventListeners.forEach { listener ->
-                listener.detach()
-                runCatching { owned.session.removeGlassesEventListener(listener) }
-            }
-            owned.glassesEventListeners.clear()
+            releaseGlassesEventListeners(owned)
             owned.session.removeLifecycleCallback(owned.lifecycle)
             owned.session.removeCustomCmdCallback(owned.commands)
         } finally {

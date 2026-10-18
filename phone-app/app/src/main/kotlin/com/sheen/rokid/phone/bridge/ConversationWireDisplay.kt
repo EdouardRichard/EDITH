@@ -96,7 +96,8 @@ private object SilentConversationWire : ConversationWire {
  */
 class ConversationWireDisplay(
     private val log: ConversationLog,
-    private val wire: ConversationWire,
+    /** The wire every official command is forwarded to; the production assembly passes the CXR link. */
+    internal val wire: ConversationWire,
     private val sendSaid: (AssistantRoute, String) -> Boolean,
     private val sendBusy: (AssistantRoute, Boolean) -> Boolean,
 ) : ConversationDisplay {

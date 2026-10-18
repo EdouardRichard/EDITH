@@ -75,6 +75,14 @@ internal class CxrBackendRig {
     var glassesEventListenerRemovals = 0
 
     /**
+     * The SDK calls in the order the backend made them.
+     *
+     * The official 1.1.2 sample says the listener registration must happen **before** `CxrSession.connect`; a count
+     * alone cannot tell that order, so the factory tests read this list.
+     */
+    val order = mutableListOf<String>()
+
+    /**
      * The app-start seam; `null` models a live session whose glasses client cannot be reached.
      *
      * Injected for the same reason as the audio and command installers: `ExternalAppClient` is a concrete AAR class
@@ -84,16 +92,20 @@ internal class CxrBackendRig {
 
     private val session = proxy<CxrSession> { method, args ->
         when (method) {
-            "connect" -> { connects++; null }
+            "connect" -> { order += "connect"; connects++; null }
             "close" -> { closes++; null }
             "addCustomCmdCallback" -> { commandCallback = args!![0] as ICustomCmdSessionCallback; null }
             "addLifecycleCallback" -> { lifecycleCallback = args!![0] as ISessionLifecycleCbk; null }
             "addGlassesEventListener" -> {
+                order += "addGlassesEventListener"
                 glassesEventListenerRegistrations++
                 glassesEventListener = args!![0] as IGlassesEventListener
                 null
             }
-            "removeGlassesEventListener" -> { glassesEventListenerRemovals++; null }
+            "removeGlassesEventListener" -> {
+                order += "removeGlassesEventListener"
+                glassesEventListenerRemovals++; null
+            }
             // Modelled because the audio path depends on it: before this the proxy returned null and the backend
             // threw, which is why no test had ever driven audio start to completion.
             "startAudioStream" -> {
@@ -109,7 +121,7 @@ internal class CxrBackendRig {
     }
     private val manager = proxy<CxrSessionManager> { method, args ->
         when (method) {
-            "create" -> { duringCreate(); session }
+            "create" -> { order += "create"; duringCreate(); session }
             "requestAuthorization" -> {
                 authorizationRequests++
                 @Suppress("UNCHECKED_CAST")

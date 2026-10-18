@@ -1,5 +1,6 @@
 package com.sheen.rokid.transport
 
+import com.rokid.cxr.session.CloseReason
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -151,5 +152,97 @@ class CxrGlassesEventListenerTest {
         sdk.onAiInterruptChanged(true)
 
         assertFalse("only the five consumed events may be forwarded: ${sink.received}", sink.received.isNotEmpty())
+    }
+
+    // ---------------------------------------------------------------- pre-connect registration (Task 11)
+
+    @Test
+    fun thePreConnectListenerIsAttachedBeforeTheSessionConnectsAndOnlyOnce() {
+        // Official CXR-L 1.1.2 `SessionHubViewModel.createSessionFromRequest`: after `manager.create(...)` every
+        // callback - `addGlassesEventListener(this)` included - is registered, and only then is `created.connect(token)`
+        // called. The order is called critical there because the SDK can deliver events from the very first moment.
+        val rig = CxrBackendRig()
+        val sink = Sink()
+        rig.backend.setGlassesEventListenerFactory { sink }
+
+        rig.authorize()
+
+        assertEquals("exactly one listener handle may be attached per session",
+            1, rig.glassesEventListenerRegistrations)
+        val registration = rig.order.indexOf("addGlassesEventListener")
+        val connect = rig.order.indexOf("connect")
+        assertTrue("the listener must be registered at all: ${rig.order}", registration >= 0)
+        assertTrue("the listener must be registered before connect: ${rig.order}", registration < connect)
+        assertEquals("the factory is the pre-connect path, not a second registration",
+            1, rig.glassesEventListenerRegistrations)
+    }
+
+    @Test
+    fun startedAndResumedBothReportingReadyDoNotRegisterTheListenerTwice() {
+        // `ISessionLifecycleCbk.ready()` is emitted for both onSessionStarted and onSessionResumed. Registering from
+        // that signal - instead of from session creation - would double-listen on every resume.
+        val rig = CxrBackendRig()
+        val sink = Sink()
+        rig.backend.setGlassesEventListenerFactory { sink }
+        rig.authorize()
+        val lifecycle = requireNotNull(rig.lifecycleCallback)
+
+        lifecycle.onSessionStarted()
+        lifecycle.onSessionResumed()
+
+        assertEquals("ready() firing twice may not double-register the listener",
+            1, rig.glassesEventListenerRegistrations)
+    }
+
+    @Test
+    fun aReconnectRegistersOneNewListenerAndReleasesTheOldRegistration() {
+        val rig = CxrBackendRig()
+        val sink = Sink()
+        rig.backend.setGlassesEventListenerFactory { sink }
+        rig.authorize()
+        val oldAdapter = requireNotNull(rig.glassesEventListener)
+
+        // A second accepted connection replaces the binding; the new session must get its own pre-connect listener
+        // and the old SDK registration must be released rather than left to call into a dead binding.
+        rig.authorize()
+        val newAdapter = requireNotNull(rig.glassesEventListener)
+
+        assertEquals(2, rig.glassesEventListenerRegistrations)
+        assertEquals("the replaced registration must be removed", 1, rig.glassesEventListenerRemovals)
+        oldAdapter.onScreenOff()
+        oldAdapter.onWearingStatusChanged(false)
+        assertTrue("the replaced adapter must be inert: ${sink.received}", sink.received.isEmpty())
+        newAdapter.onScreenOn()
+        assertEquals(listOf("screenOn"), sink.received)
+    }
+
+    @Test
+    fun aClosedSessionStopsForwardingBeforeItIsReplaced() {
+        // Task 10 review gate: liveness must end on `onSessionClosed`, not only when a reconnect replaces the binding.
+        // The SDK may deliver a late callback from the closed session; it must not speak for the host.
+        val rig = rig()
+        val sink = Sink()
+        rig.backend.setGlassesEventListenerFactory { sink }
+        rig.authorize()
+        val adapter = requireNotNull(rig.glassesEventListener)
+
+        requireNotNull(rig.lifecycleCallback).onSessionClosed(CloseReason.USER_CLOSED)
+
+        adapter.onGlassesAppResumed()
+        adapter.onGlassesAppPaused()
+        adapter.onWearingStatusChanged(false)
+        adapter.onScreenOff()
+        adapter.onScreenOn()
+        assertTrue("a closed-but-not-replaced session may not forward: ${sink.received}", sink.received.isEmpty())
+    }
+
+    @Test
+    fun aFactoryThatReturnsNothingRegistersNoListener() {
+        val rig = CxrBackendRig()
+        rig.backend.setGlassesEventListenerFactory { null }
+
+        rig.authorize()
+
+        assertEquals(0, rig.glassesEventListenerRegistrations)
     }
 }

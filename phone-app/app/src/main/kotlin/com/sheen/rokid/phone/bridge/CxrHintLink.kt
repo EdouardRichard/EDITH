@@ -161,6 +161,15 @@ class CxrHintLink(
     var onUiState: ((UiState) -> Unit)? = null
 
     /**
+     * The glasses reported that the panel's first layout completed for [route] (0.24 spec §5.2).
+     *
+     * This is the event Task 12's 10 s listening window waits for: the timer must not start before the wearer can
+     * actually see the panel. Runs on the vendor callback thread; the composition marshals it to the host thread and
+     * exposes it as a named seam rather than letting a vendor callback own timing policy.
+     */
+    var onPanelShown: ((AssistantRoute) -> Unit)? = null
+
+    /**
      * The identifier of the mapping that is live **right now**, or null while nothing can be displayed.
      *
      * A fresh `syncId` is minted per exchange, so this is the identity of one mapping. A caller that must act once
@@ -301,6 +310,33 @@ class CxrHintLink(
     private var openingRetry: CancellationHandle? = null
 
     /**
+     * The resident handshake's 5 s grace (0.24 spec §5.5).
+     *
+     * The glasses scene may or may not be started by the SDK's own connect flow (`glassesApkPath=null`), so the phone
+     * waits for `UI_READY` after establishing the session and only then asks CXR to start the app. A timer per session,
+     * cancelled by the first matching `UI_READY`, by [sessionEnded] or by [linkLost].
+     */
+    private var uiReadyGrace: CancellationHandle? = null
+
+    /** True once the resident service answered `UI_READY` for [establishedSession]. */
+    private var uiReadyForSession = false
+
+    /** True only after a matching `PANEL_SHOWN` and false again after `UI_CLOSED`/session end. */
+    private var panelVisible = false
+
+    /** A `PANEL_OPEN` waiting on an asynchronous app-start result; prevents a second request racing the first. */
+    private var panelOpenInFlight = false
+
+    /**
+     * The scene start requested by either the `UI_READY` grace or a wake, while it is still awaiting CXR's answer.
+     *
+     * At most one `appStart` may be in flight per session: a wake arriving during the 5 s grace would otherwise start
+     * the same scene twice. The wake's route is remembered and opened once the single start is accepted.
+     */
+    private var sceneStartInFlight = false
+    private var panelRouteAwaitingScene: AssistantRoute? = null
+
+    /**
      * True only while a hint could actually be displayed: a live clock mapping exists, so the glasses would accept
      * the `SHOW`. Before the exchange completes, advertising a display would let a plugin start and then lose hints.
      */
@@ -316,8 +352,15 @@ class CxrHintLink(
         conversationSequence.set(0)
         openingRetries = 0
         cancelOpeningRetry()
+        // A new session may be a new glasses process: neither readiness nor a visible panel can be assumed.
+        uiReadyForSession = false
+        panelVisible = false
+        panelOpenInFlight = false
+        sceneStartInFlight = false
+        panelRouteAwaitingScene = null
         clockSync.sessionEstablished(sessionId, generation)
         scheduleOpeningRetry()
+        scheduleUiReadyGrace(sessionId)
     }
 
     /**
@@ -356,6 +399,91 @@ class CxrHintLink(
     fun openGlassesApp(onResult: (Boolean) -> Unit): Boolean = startGlassesApp(onResult)
 
     /**
+     * Opens the conversation panel for [route] if it is not already visible (0.24 spec §5.5).
+     *
+     * Three states decide the path, and the cheapest correct one is used:
+     * - **already visible**: no-op. A `PANEL_OPEN` for a visible panel must not reset the conversation;
+     * - **`UI_READY` + a live clock mapping**: the resident service is there, so only `PANEL_OPEN` travels;
+     * - **no `UI_READY`**: the scene is not running (or was never reachable), so ask CXR to start it and re-introduce
+     *   the established session before sending the panel command;
+     * - **`UI_READY` but the mapping is gone**: the service is alive but its scene restarted, so re-introduce the
+     *   session (HELLO/PING) first, then open.
+     *
+     * The app-start result is asynchronous: this returns whether the request was accepted, and the `PANEL_OPEN` is
+     * sent only after a positive scene answer. A refused scene start leaves the panel closed rather than opening a
+     * window whose `PANEL_SHOWN` the phone could never correlate.
+     */
+    fun requestPanelOpen(route: AssistantRoute): Boolean {
+        val session = establishedSession ?: run {
+            diagnostics("panel: no session - PANEL_OPEN is not sent")
+            return false
+        }
+        if (panelVisible) {
+            diagnostics("panel: already visible - PANEL_OPEN ignored route=${route.name}")
+            return false
+        }
+        if (panelOpenInFlight) {
+            diagnostics("panel: an open is already waiting for appStart - request ignored")
+            return false
+        }
+        if (!uiReadyForSession) {
+            if (sceneStartInFlight) {
+                // The 5 s grace already asked CXR to start the scene; queue this wake's panel instead of a second start.
+                panelOpenInFlight = true
+                panelRouteAwaitingScene = route
+                diagnostics("panel: an appStart is already in flight - PANEL_OPEN queued route=${route.name}")
+                return true
+            }
+            panelOpenInFlight = true
+            // The grace exists to make this same attempt; a wake that gets there first supersedes it.
+            cancelUiReadyGrace()
+            sceneStartInFlight = true
+            val accepted = runCatching {
+                startGlassesApp { started ->
+                    sceneStartInFlight = false
+                    if (establishedSession != session) {
+                        diagnostics("panel: session changed while appStart was pending - panel stays closed")
+                        return@startGlassesApp
+                    }
+                    if (!started) {
+                        panelRouteAwaitingScene = null
+                        panelOpenInFlight = false
+                        diagnostics("panel: appStart was refused - panel stays hidden")
+                        return@startGlassesApp
+                    }
+                    diagnostics("panel: appStart accepted - reintroducing session=${session}")
+                    reintroduce()
+                    panelOpenInFlight = false
+                    // A later wake may have queued its own route while this start was pending; the latest one wins.
+                    if (panelRouteAwaitingScene == null) {
+                        panelOpen(route)
+                    } else {
+                        openQueuedPanel(session)
+                    }
+                }
+            }.getOrDefault(false)
+            if (!accepted) {
+                sceneStartInFlight = false
+                panelRouteAwaitingScene = null
+                panelOpenInFlight = false
+                diagnostics("panel: no CXR client accepted appStart - panel stays hidden")
+            }
+            return accepted
+        }
+        if (!clockSync.hasLiveMapping()) {
+            diagnostics("panel: no live mapping - reintroducing before PANEL_OPEN")
+            reintroduce()
+        }
+        return panelOpen(route)
+    }
+
+    /** True once the resident service answered `UI_READY` for the current session. */
+    fun hasUiReady(): Boolean = uiReadyForSession
+
+    /** True after a matching `PANEL_SHOWN`, false after `UI_CLOSED` or a session end. */
+    fun isPanelVisible(): Boolean = panelVisible
+
+    /**
      * D15: the session ended without the link being torn down, so the opening handshake must not be repeated again.
      *
      * Separate from [linkLost] on purpose: this is the composition's `stop`, which keeps the link (and the clock
@@ -368,18 +496,93 @@ class CxrHintLink(
         val session = establishedSession
         if (session != null) {
             AssistantRoute.entries.forEach { route -> runCatching { busy(route, false) } }
+            // 0.24 S2 Task 11: 停止 also closes the panel. There is deliberately no new `SESSION_END` command -
+            // `CLOSE` already means "hide this window and drop its cache", and the resident service keeps its session
+            // identity only until this link clears it below. A hidden panel clears on the same command.
+            AssistantRoute.entries.forEach { route -> runCatching { close(route) } }
         }
         openingSession = null
         // Phase C: a stopped session must not keep accepting conversation traffic - the glasses will refuse it, and
         // sending it would put the wearer's words on a wire for a session that is over.
         establishedSession = null
         cancelOpeningRetry()
+        cancelUiReadyGrace()
+        uiReadyForSession = false
+        panelVisible = false
+        panelOpenInFlight = false
+        sceneStartInFlight = false
+        panelRouteAwaitingScene = null
     }
 
     /** Cancels a scheduled repeat, if any. Idempotent. */
     private fun cancelOpeningRetry() {
         openingRetry?.cancel()
         openingRetry = null
+    }
+
+    /**
+     * Arms the one-shot 5 s `UI_READY` grace for [sessionId].
+     *
+     * The check is repeated when the timer fires - the service can answer, or the session can end, between scheduling
+     * and the deadline - and the session identity is captured so a timer from the previous session can never start the
+     * scene for the current one. If the CXR call itself is refused there is no scene to re-introduce, so the case is
+     * recorded rather than retried into the void.
+     */
+    private fun scheduleUiReadyGrace(sessionId: String) {
+        cancelUiReadyGrace()
+        uiReadyGrace = scheduler.at(clock.nowNanos() + UI_READY_GRACE_MILLIS * 1_000_000L) {
+            uiReadyGrace = null
+            if (establishedSession != sessionId || uiReadyForSession) return@at
+            if (sceneStartInFlight) {
+                diagnostics("handshake: no UI_READY yet, but an appStart is already in flight - not repeating it")
+                return@at
+            }
+            diagnostics("handshake: no UI_READY within ${UI_READY_GRACE_MILLIS}ms - starting the glasses scene")
+            sceneStartInFlight = true
+            val accepted = runCatching {
+                startGlassesApp { started ->
+                    sceneStartInFlight = false
+                    if (establishedSession != sessionId) {
+                        diagnostics("handshake: session changed while appStart was pending - not re-introduced")
+                        return@startGlassesApp
+                    }
+                    if (!started) {
+                        panelRouteAwaitingScene = null
+                        panelOpenInFlight = false
+                        diagnostics("handshake: appStart was refused - UI_READY will not arrive from this attempt")
+                        return@startGlassesApp
+                    }
+                    diagnostics("handshake: appStart accepted - re-introducing session=$sessionId")
+                    reintroduce()
+                    openQueuedPanel(sessionId)
+                }
+            }.getOrDefault(false)
+            if (!accepted) {
+                sceneStartInFlight = false
+                panelRouteAwaitingScene = null
+                diagnostics("handshake: no CXR client accepted appStart for session=$sessionId")
+            }
+        }
+    }
+
+    /** Cancels the scheduled `UI_READY` grace, if any. Idempotent. */
+    private fun cancelUiReadyGrace() {
+        uiReadyGrace?.cancel()
+        uiReadyGrace = null
+    }
+
+    /**
+     * Opens the panel a wake asked for while the grace's single `appStart` was still in flight.
+     *
+     * Called after a successful re-introduction; the route is dropped if the session ended or changed meanwhile, so a
+     * stale wake cannot open a window for a conversation it did not belong to.
+     */
+    private fun openQueuedPanel(sessionId: String) {
+        val route = panelRouteAwaitingScene ?: return
+        panelRouteAwaitingScene = null
+        panelOpenInFlight = false
+        if (establishedSession != sessionId) return
+        panelOpen(route)
     }
 
     /**
@@ -448,14 +651,26 @@ class CxrHintLink(
         }
         if (command is HintCommand.UiReady) {
             if (!isEstablished(command.sessionId, command.generation, "UI_READY")) return false
+            uiReadyForSession = true
+            cancelUiReadyGrace()
             diagnostics("UI_READY accepted: session=${command.sessionId} generation=${command.generation}")
             deliver("UI_READY") { onUiState?.invoke(UiState.Ready) }
             return true
         }
         if (command is HintCommand.UiClosed) {
             if (!isEstablished(command.sessionId, command.generation, "UI_CLOSED")) return false
+            // The resident service is still alive; only the panel window went away.
+            panelVisible = false
             diagnostics("UI_CLOSED accepted: session=${command.sessionId} route=${command.route}")
             deliver("UI_CLOSED") { onUiState?.invoke(UiState.Closed(command.route)) }
+            return true
+        }
+        if (command is HintCommand.PanelShown) {
+            if (!isEstablished(command.sessionId, command.generation, "PANEL_SHOWN")) return false
+            panelVisible = true
+            panelOpenInFlight = false
+            diagnostics("PANEL_SHOWN accepted: session=${command.sessionId} route=${command.route}")
+            deliver("PANEL_SHOWN") { onPanelShown?.invoke(command.route) }
             return true
         }
         return rokidDevice.onCommand(json)
@@ -523,5 +738,12 @@ class CxrHintLink(
 
         /** D15: the bound on repeats of the opening handshake, after which the link reports and stops. */
         const val OPENING_MAX_RETRIES = 5
+
+        /**
+         * 0.24 S2 spec §5.5: how long the phone waits for `UI_READY` after establishing a session before it asks CXR
+         * to start the glasses scene. Five seconds is the S2 initial value; it is a grace for a scene the SDK may
+         * already be starting, not a retry period.
+         */
+        const val UI_READY_GRACE_MILLIS = 5_000L
     }
 }

@@ -572,6 +572,25 @@ class GlassesPanelControllerTest {
     }
 
     @Test
+    fun aClosedPanelCanDisplayTheSameHintAgainAfterReopen() {
+        // Task 9 carry to Task 11: a window close must not make the phone's retransmitted hint permanently undisplayable.
+        // The session identity and clock mapping survive; only the previous window's ordering/revision gates are reset.
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.show()
+
+        harness.controller.resetForClose()
+        harness.show()
+
+        val reopened = harness.port.lastModel()
+        assertEquals("the same hint id must be displayable in the new window", "h-1", reopened.liveEntryId)
+        assertEquals("答案在这里", harness.controller.conversationText(AssistantRoute.WAKE))
+        assertEquals("the session identity survives the window reset", "s-1" to 1L,
+            harness.controller.currentIdentity())
+    }
+
+    @Test
     fun disconnectDropsTheIdentityAndRetiresAVisibleHint() {
         val harness = Harness()
         harness.hello()

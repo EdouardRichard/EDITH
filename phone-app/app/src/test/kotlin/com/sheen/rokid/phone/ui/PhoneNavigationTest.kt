@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.ui
 
+import com.sheen.rokid.contracts.SessionState
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -44,5 +45,18 @@ class PhoneNavigationTest {
     @Test
     fun theSmartAssistantIsThePluginWhoseTabsTheseAre() {
         assertEquals("smart-assistant", PhoneTab.SMART_ASSISTANT_PLUGIN_ID)
+    }
+
+    @Test
+    fun theSessionStatusIndicatorSaysResidentListeningOrSessionRunning() {
+        // 0.24 spec §5.5: one 开始 makes the session resident, and closing the panel does not end it. The top
+        // indicator therefore describes the resident process rather than the old "未开始/监听中" turn wording.
+        assertEquals("常驻监听中", residentSessionLabel(SessionState.Idle))
+        SessionState.entries
+            .filter { it != SessionState.Idle && it != SessionState.Error }
+            .forEach { state ->
+                assertEquals("会话运行中", residentSessionLabel(state))
+            }
+        assertEquals("会话异常", residentSessionLabel(SessionState.Error))
     }
 }

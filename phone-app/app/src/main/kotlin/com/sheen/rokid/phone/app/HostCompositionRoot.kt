@@ -33,6 +33,7 @@ import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
 import com.sheen.rokid.phone.storage.AndroidSpeakerProfileStore
 import com.sheen.rokid.phone.context.NotificationCategoryService
 import com.sheen.rokid.phone.bridge.CxrHintLink
+import com.sheen.rokid.phone.bridge.UiState
 import com.sheen.rokid.phone.bridge.UplinkReport
 import com.sheen.rokid.phone.session.PlaybackGate
 import com.sheen.rokid.phone.bridge.CxrConnection
@@ -97,6 +98,7 @@ import com.sheen.rokid.plugin.*
 import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
 import com.sheen.rokid.phone.plugin.interview.InterviewAssistantPlugin
 import com.sheen.rokid.transport.CxrAuthorizationOutcome
+import com.sheen.rokid.transport.GlassesEvents
 import com.sheen.rokid.transport.PcmFormatEvidence
 import com.sheen.rokid.storage.*
 import com.sheen.rokid.phone.storage.*
@@ -183,6 +185,22 @@ class HostCompositionRoot internal constructor(
      * long session cannot grow either view without limit.
      */
     internal val conversationLog: ConversationLog = ConversationLog(),
+    /**
+     * The production [ConversationWireDisplay], built once in [create] and passed here so tests can assert the
+     * **actual** wire it forwards to.
+     *
+     * Task 6 review gate: the provider must not keep using the silent 3-arg constructor while the official commands
+     * look wired. `create` builds this with `wire = hintLink`; a composition built by hand may pass its own display.
+     */
+    internal val conversationDisplay: ConversationWireDisplay? = null,
+    /**
+     * Marshals a vendor-thread callback onto a host-owned thread.
+     *
+     * `IGlassesEventListener`/inbound custom-command callbacks arrive on the vendor's own thread; host policy
+     * (`HostRuntime.onEvent`, the 10 s timer owner) must not run there. Production injects the composition's deadline
+     * scheduler, whose executor is already part of the composition; tests default to running the task inline.
+     */
+    private val dispatchHostEvent: (() -> Unit) -> Unit = { it() },
     /**
      * Phase C (spec §6.7 技能页签): the SKILL directory as the page sees it.
      *
@@ -964,6 +982,90 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
+     * 0.24 S2 Task 11: the link the production assembly owns, for composition-level tests.
+     *
+     * Exposed `internal` only so [com.sheen.rokid.phone.bridge.CxrLinkWiringTest] can prove the display's wire is this
+     * very object rather than the silent fallback. No production code reads it.
+     */
+    internal val hintLinkForProbe: CxrHintLink? get() = hintLink
+
+    /**
+     * The panel's first layout, delivered on a host thread (Task 11 exposes it; Task 12 owns the 10 s timer).
+     *
+     * A named seam rather than a plugin event: the timer belongs to the conversation state machine, which will
+     * subscribe here in Task 12. It is deliberately not a wire command (the glasses never send `PANEL_SHOWN` to the
+     * plugin) and not a `HostEvent` the plugin capability gate would filter.
+     */
+    internal var onPanelShown: ((AssistantRoute) -> Unit)? = null
+
+    /**
+     * Receives `PIN` from the link, off the vendor callback thread, as the official `PinChanged` host event.
+     *
+     * The link has already validated the session/generation against the identity it introduced. The envelope is
+     * stamped with the host's **current** identity at delivery time: a host that has moved on refuses the event rather
+     * than letting a pin from a previous session change the new conversation's state.
+     */
+    internal fun onPinFromLink(route: AssistantRoute) {
+        dispatchHostEvent { deliverPin(route) }
+    }
+
+    private fun deliverPin(route: AssistantRoute) {
+        if (closed) return
+        val identity = host.currentIdentity() ?: run {
+            P3Log.line("P3_CXR pin route=${route.name} result=no_session")
+            return
+        }
+        val now = clock.nowNanos()
+        val accepted = host.onEvent(PinChanged(
+            EventEnvelope(identity.first, identity.second, "pin-${UUID.randomUUID()}", now, now),
+            route,
+        ))
+        P3Log.line("P3_CXR pin route=${route.name} accepted=$accepted")
+    }
+
+    /** Receives `PANEL_SHOWN` from the link and hands it to [onPanelShown] on a host thread. */
+    internal fun panelShownArrived(route: AssistantRoute) {
+        dispatchHostEvent {
+            if (closed) return@dispatchHostEvent
+            P3Log.line("P3_PANEL shown route=${route.name}")
+            onPanelShown?.invoke(route)
+        }
+    }
+
+    /** Resident-service liveness from the link, recorded where a device log can separate the two UI states. */
+    internal fun onUiStateFromLink(state: UiState) {
+        dispatchHostEvent {
+            if (closed) return@dispatchHostEvent
+            when (state) {
+                UiState.Ready -> P3Log.line("P3_UI_STATE ready")
+                is UiState.Closed -> P3Log.line("P3_UI_STATE closed route=${state.route.name}")
+            }
+        }
+    }
+
+    /**
+     * One `IGlassesEventListener` fact, recorded off the vendor thread.
+     *
+     * Behaviour (screen-off/wear/reconnect) is Task 20's scope; this task only re-establishes the official pre-connect
+     * registration so those callbacks are observable at all.
+     */
+    internal fun onGlassesSceneEvent(name: String) {
+        dispatchHostEvent {
+            if (closed) return@dispatchHostEvent
+            P3Log.line("P3_CXR glasses_event=$name")
+        }
+    }
+
+    /**
+     * 0.24 S2 Task 11: the wake/turn-open panel request.
+     *
+     * Exposed on the composition because the wake detector owns the moment, while the link owns the resident
+     * handshake. Returns whether the request was accepted for delivery (the panel may open asynchronously after an
+     * `appStart`); the 10 s timer still waits for [onPanelShown].
+     */
+    internal fun requestPanelOpen(route: AssistantRoute): Boolean = hintLink?.requestPanelOpen(route) ?: false
+
+    /**
      * 0.23 P5 (spec §5.3.2, U11): the wearer's double-click on the glasses, raised as `UserAction.Stop`.
      *
      * The caller passes the session/generation the STOP was validated against (not just "a stop happened"), and the
@@ -1424,7 +1526,12 @@ class HostCompositionRoot internal constructor(
             // reads the holder rather than capturing a connection that does not exist yet.
             val hintLink = CxrHintLink(clock, scheduler,
                 sendJson = { json -> connection[0]?.sendCommand(json) ?: false },
-                diagnostics = { message -> android.util.Log.i("EdithHint", message) })
+                diagnostics = { message -> android.util.Log.i("EdithHint", message) },
+                // Task 11: the production app-start path. The connection is built lazily, so the link reads it through
+                // the holder; the backend still decides whether a CXR client is reachable at all.
+                startGlassesApp = { onResult ->
+                    connection[0]?.input?.openGlassesApp(onResult) ?: false
+                })
             // Plugin background work gets its own pool: the deadline executor must not be delayed by it, **and** a turn
             // blocked on a confirmation question (P3.3) must not stall perception or ACK handling behind it. The factory
             // names each thread apart, because P3.3's ANR was read off a thread dump and one repeated name there hides
@@ -1482,6 +1589,18 @@ class HostCompositionRoot internal constructor(
             // local gate here is what made `root.playbackGate.begin()` suppress nothing.
             val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
             val hostHolder = arrayOfNulls<HostRuntime>(1)
+            // 0.24 S2 Task 11: the production `IGlassesEventListener`. The backend registers it on every newly created
+            // session **before** `connect` (official CXR-L 1.1.2 order). The listener never runs host policy on the
+            // vendor thread; the composition records the fact and Task 20 owns the screen-off/wear behaviour.
+            val glassesEvents = object : GlassesEvents {
+                override fun appResumed() { rootHolder[0]?.onGlassesSceneEvent("app_resumed") }
+                override fun appPaused() { rootHolder[0]?.onGlassesSceneEvent("app_paused") }
+                override fun wearingChanged(wearing: Boolean) {
+                    rootHolder[0]?.onGlassesSceneEvent("wearing=$wearing")
+                }
+                override fun screenOn() { rootHolder[0]?.onGlassesSceneEvent("screen_on") }
+                override fun screenOff() { rootHolder[0]?.onGlassesSceneEvent("screen_off") }
+            }
             // Phase C: the speech player is built further down (it depends on the user's 「语音朗读」 setting). 0.23 P5
             // (D135) replaced the fixed TTS phrase with a short chime, so the wake path no longer needs a holder here:
             // the chime sink is independent of the TTS engine and works even when the engine is missing.
@@ -1568,6 +1687,10 @@ class HostCompositionRoot internal constructor(
                             clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
                         P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
                     }
+                    // 0.24 S2 Task 11: a wake opens the resident panel. The link decides whether the service is
+                    // already there or whether the scene must be started first; Task 12 starts the 10 s timer only
+                    // after the resulting `PANEL_SHOWN`.
+                    root?.requestPanelOpen(com.sheen.rokid.contracts.AssistantRoute.WAKE)
                     emitWakeDetected(host, clock, word, confidence)
                 } },
                 // Task 4 (P3.2): the same per-emission identity resolution for the acoustic gate, so a label that
@@ -1718,6 +1841,14 @@ class HostCompositionRoot internal constructor(
             // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
             // assistant tab reads it. It has to be created here because the provider map is built before the root.
             val conversationLog = ConversationLog()
+            // 0.24 S2 Task 11 / Task 6 review: the production display must send through the **real** CXR link, not the
+            // silent 3-arg constructor. Built here because the provider map is assembled before the composition exists.
+            val conversationDisplay = ConversationWireDisplay(
+                log = conversationLog,
+                wire = hintLink,
+                sendSaid = { route, text -> hintLink.userSaid(route, text) },
+                sendBusy = { route, busy -> hintLink.busy(route, busy) },
+            )
             val environment = CxrHostEnvironment(clock = clock, input = audio?.input ?: UnwiredInputPort,
                 liveOutput = hintLink::liveOutput, scheduler = scheduler, speech = speechPlayer,
                 providers = buildMap {
@@ -1748,13 +1879,9 @@ class HostCompositionRoot internal constructor(
                     put(Capability.StorageAccess, storageAccess)
                     // edith-0.2 Phase C: the conversation view. Always answerable - the phone's own record exists with
                     // or without a live display, and a refused send only costs the display of an utterance (see
-                    // `ConversationWireDisplay`). With no link the two senders are no-ops that report false, which is
-                    // exactly what "there is nowhere to show this" means.
-                    put(Capability.ConversationDisplay, ConversationWireDisplay(
-                        log = conversationLog,
-                        sendSaid = { route, text -> hintLink?.userSaid(route, text) ?: false },
-                        sendBusy = { route, busy -> hintLink?.busy(route, busy) ?: false },
-                    ))                    // edith-0.2 Phase B (B9/B11): the two local models become answerable, which is what lets the
+                    // `ConversationWireDisplay`). The wire is the real `CxrHintLink` (Task 11), not the silent fallback.
+                    put(Capability.ConversationDisplay, conversationDisplay)
+                    // edith-0.2 Phase B (B9/B11): the two local models become answerable, which is what lets the
                     // plugin serve at all - declaring them as hard dependencies meant a host that could not provide
                     // them correctly refused to activate it. Both are constructed here and load on their own threads;
                     // a missing artifact leaves the service UNAVAILABLE and the plugin refuses service, which is the
@@ -1792,11 +1919,22 @@ class HostCompositionRoot internal constructor(
                     RokidConnection(activity.asCxrActivity(), CxrGlassesTarget.config(), host, scene::onSceneReady,
                         clock, { data -> observerHolder[0](data) },
                         // Task 14a item 5: the receiver's offer outcome is what turns an overflow into a report.
-                        onOffer = { offer -> rootHolder[0]?.onPcmOffer(offer) }).also { connection[0] = it }
+                        onOffer = { offer -> rootHolder[0]?.onPcmOffer(offer) }).also { built ->
+                        connection[0] = built
+                        // 0.24 S2 Task 11: register the scene listener **before** the session is created/connected,
+                        // exactly where the official 1.1.2 sample does. One factory registration per new session; the
+                        // backend releases the previous session's handle on reconnect.
+                        built.input.setGlassesEventListenerFactory { glassesEvents }
+                    }
                 },
                 authorizeResult = { resultCode, data -> connection[0]?.onAuthorizationResult(resultCode, data) },
                 hintLink = hintLink,
                 conversationLog = conversationLog,
+                conversationDisplay = conversationDisplay,
+                // Vendor callbacks (PIN / PANEL_SHOWN / UI state / scene events) are marshalled onto the composition's
+                // own scheduler thread; the timer is already the host's off-main executor, and a late task after close
+                // is inert in the receiving method.
+                dispatchHostEvent = { task -> scheduler.at(clock.nowNanos(), task) },
                 smartWiring = smartWiring,
                 smartSettingsStore = smartSettingsStore,
                 proactiveArming = proactiveArming,
@@ -1871,6 +2009,11 @@ class HostCompositionRoot internal constructor(
             hintLink.onStopRequest = { sessionId, generation ->
                 rootHolder[0]?.requestStop(sessionId, generation) ?: false
             }
+            // 0.24 S2 Task 11: the resident handshake and panel lifecycle. Each link callback runs on the vendor
+            // callback thread, so the root methods below marshal it (Task 12's timer consumes `onPanelShown`).
+            hintLink.onPin = { route -> rootHolder[0]?.onPinFromLink(route) }
+            hintLink.onUiState = { state -> rootHolder[0]?.onUiStateFromLink(state) }
+            hintLink.onPanelShown = { route -> rootHolder[0]?.panelShownArrived(route) }
             scene.composition = root
             // Task 14a item 1: the real plugin, not `SmartAssistantPlugin()` with defaults. Its configuration is
             // applied by `activateSelected` before every activation, from the same settings this root was built with.

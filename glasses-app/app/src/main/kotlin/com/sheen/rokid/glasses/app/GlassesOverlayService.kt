@@ -47,9 +47,11 @@ import com.sheen.rokid.output.HintWireCodec
  * generation and must receive a new `UI_READY`, while a repeated `HELLO` for the same identity must not duplicate it.
  * `PANEL_SHOWN` follows the overlay's first layout; `UI_CLOSED` follows the visible-to-hidden transition.
  *
- * This task does not implement the phone handshake, `PANEL_OPEN`/`STATE`/`IDLE` routing or the conversation state
- * machine (Tasks 10-19). The only inbound lifecycle command handled here is `CLOSE`, whose Task 9 obligation is to
- * hide the window and clear the glasses cache via [GlassesPanelController.resetForClose].
+ * This task implements the S2 panel lifecycle: `PANEL_OPEN` shows a hidden window (resetting the hidden cache) and
+ * leaves an already-visible one untouched, `CLOSE` is route-scoped and clears the hidden/visible cache without ending
+ * the resident session, and the phone's `UI_READY`/`UI_CLOSED`/`PANEL_SHOWN` handshake is driven from here. It does not
+ * implement the conversation state machine (Task 12), the official key/tips matrix (Task 13), or the wear/screen-down
+ * behaviour (Task 20).
  */
 class GlassesOverlayService : Service() {
 
@@ -63,6 +65,14 @@ class GlassesOverlayService : Service() {
     private var overlayRoot: FrameLayout? = null
     private var overlayParams: WindowManager.LayoutParams? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    /**
+     * The route the visible overlay was opened for, or null while hidden.
+     *
+     * Kept beside the window rather than inferred from the controller's rendered model: `CLOSE` is route-scoped and
+     * must match the window the wearer is looking at, even before the first `SHOW` selects a conversation.
+     */
+    private var visibleRoute: AssistantRoute? = null
 
     /**
      * The session identity `UI_READY` was last sent for, or null when it has never gone out.
@@ -146,6 +156,7 @@ class GlassesOverlayService : Service() {
             Log.i(TAG, "OVERLAY already-visible route=${route.name}")
             return
         }
+        visibleRoute = route
         acquireWakeLock()
         val root = OverlayRoot(this).apply {
             isFocusable = true
@@ -175,6 +186,7 @@ class GlassesOverlayService : Service() {
             windowManager.addView(root, params)
         } catch (t: Throwable) {
             Log.e(TAG, "OVERLAY add_failed=${t.javaClass.simpleName}:${t.message}")
+            visibleRoute = null
             releaseWakeLock()
             return
         }
@@ -214,6 +226,7 @@ class GlassesOverlayService : Service() {
         val root = overlayRoot
         if (root == null) {
             pendingPanelShownRoute = null
+            visibleRoute = null
             // No window to remove, but the hidden cache is still a cache: a valid CLOSE must clear it.
             host.resetForClose()
             Log.i(TAG, "PANEL_HIDDEN hidden=true conversation_cleared=true ui_closed=already-hidden")
@@ -221,7 +234,8 @@ class GlassesOverlayService : Service() {
         }
         overlayRoot = null
         overlayParams = null
-        val route = host.selectedRoute()
+        val route = visibleRoute ?: host.selectedRoute()
+        visibleRoute = null
         pendingPanelShownRoute = null
         runCatching { windowManager.removeView(root) }
             .onFailure { Log.w(TAG, "OVERLAY remove_failed=${it.javaClass.simpleName}:${it.message}") }
@@ -260,6 +274,10 @@ class GlassesOverlayService : Service() {
 
     private fun acceptOnMain(json: String): Boolean {
         val command = HintWireCodec.decode(json)
+        if (command is HintCommand.PanelOpen) {
+            onPanelOpen(command)
+            return true
+        }
         if (command is HintCommand.Close) {
             onClose(command)
             return true
@@ -270,9 +288,32 @@ class GlassesOverlayService : Service() {
     }
 
     /**
-     * Task 9's only lifecycle command: a valid `CLOSE` hides the panel and clears the cache. Route scoping and the
-     * phone's panel-state handshake are Task 11; here a stale identity is refused rather than allowed to close a newer
-     * session's window.
+     * Task 11 `PANEL_OPEN`: show the hidden panel, with a cache reset only on hidden→visible.
+     *
+     * A duplicate open for an already-visible panel is a no-op - the official `showAiDialog` does not reset an
+     * `isShowing()` dialog. Opening from hidden clears whatever arrived while the window was hidden; the phone's
+     * record is untouched.
+     */
+    private fun onPanelOpen(command: HintCommand.PanelOpen) {
+        val identity = host.currentIdentity()
+        if (identity == null || identity.first != command.sessionId || identity.second != command.generation) {
+            Log.i(TAG, "PANEL_OPEN refused: session or generation mismatch")
+            return
+        }
+        if (overlayRoot != null) {
+            Log.i(TAG, "PANEL_OPEN already-visible route=${command.route.name} reset=false")
+            return
+        }
+        Log.i(TAG, "PANEL_OPEN accepted session=${command.sessionId} route=${command.route.name} reset=hidden-to-visible")
+        host.resetForOpen()
+        showPanel(command.route)
+    }
+
+    /**
+     * Task 11 `CLOSE`, route-scoped: only the visible route's close hides the window.
+     *
+     * While hidden, any valid close still clears the cache - that is the Task 9 I1 rule and it is independent of window
+     * presence. `route == null` is the official ALL form and closes the visible panel.
      */
     private fun onClose(command: HintCommand.Close) {
         val identity = host.currentIdentity()
@@ -280,7 +321,14 @@ class GlassesOverlayService : Service() {
             Log.i(TAG, "CLOSE refused: session or generation mismatch")
             return
         }
-        Log.i(TAG, "CLOSE accepted session=${command.sessionId} route=${command.route?.name ?: "ALL"}")
+        val visible = visibleRoute
+        val closeRoute = command.route
+        if (visible != null && closeRoute != null && closeRoute != visible) {
+            Log.i(TAG, "CLOSE ignored route=${closeRoute.name} visible=${visible.name}")
+            return
+        }
+        Log.i(TAG, "CLOSE accepted session=${command.sessionId} route=${closeRoute?.name ?: "ALL"} " +
+            "visible=${visible?.name ?: "none"}")
         hidePanel()
     }
 

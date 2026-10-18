@@ -55,7 +55,6 @@ import com.sheen.rokid.phone.bridge.cxrStatusLabel
 import com.sheen.rokid.phone.app.errorLabel
 import com.sheen.rokid.phone.actions.executionChannelLabel
 import com.sheen.rokid.phone.ui.pluginPickerOptions
-import com.sheen.rokid.phone.app.sessionLabel
 import com.sheen.rokid.plugin.Capability
 import kotlinx.coroutines.launch
 
@@ -200,6 +199,20 @@ private fun ScrollableTab(
 }
 
 /**
+ * The top bar's session state, in the resident vocabulary (0.24 spec §5.5).
+ *
+ * One 开始 makes the session resident - closing the glasses panel does not end it - so the old turn words
+ * (未开始/监听中) do not describe what the wearer is now running. `Idle` therefore reads 「常驻监听中」 (the resident
+ * process at rest) and any live session reads 「会话运行中」. An error is still named as an error, because hiding it
+ * would make the indicator lie about a state the user has to act on.
+ */
+internal fun residentSessionLabel(state: SessionState): String = when (state) {
+    SessionState.Idle -> "常驻监听中"
+    SessionState.Error -> "会话异常"
+    else -> "会话运行中"
+}
+
+/**
  * The read-only session indicator (spec §6.7 右上角：会话状态指示器（仅展示）).
  *
  * "Only displays" is the requirement: the controls that change the session live in the menu, so this must not become a
@@ -215,7 +228,7 @@ private fun SessionStatusIndicator(session: SessionState) {
             tint = if (running) Color(0xFF126B50) else MaterialTheme.colorScheme.onSurfaceVariant,
         )
         Spacer(Modifier.width(4.dp))
-        Text(sessionLabel(session), style = MaterialTheme.typography.labelLarge)
+        Text(residentSessionLabel(session), style = MaterialTheme.typography.labelLarge)
     }
 }
 

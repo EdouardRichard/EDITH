@@ -242,7 +242,26 @@ class GlassesPanelController(
      * entry id and the reveal counter. The empty model is published so the view is cleared by the same path every
      * other state change uses.
      */
-    fun resetForClose() {
+    fun resetForClose() = clearConversation()
+
+    /**
+     * The panel is being opened from a hidden window (Task 11 `PANEL_OPEN`): the same cache reset as a close.
+     *
+     * The controller accepts `SHOW`/`SAID` while the window is hidden, so waking the panel must not surface content
+     * that arrived while the wearer could not see it. A `PANEL_OPEN` for an already-visible panel never reaches this
+     * method - the window host treats that as a no-op, and no reset is allowed there.
+     */
+    fun resetForOpen() = clearConversation()
+
+    /**
+     * Clears everything the next window must not inherit: the per-route log, the selected route/pin, the `SAID`
+     * ordering gate, the busy level, the live entry id and the reveal counter. The session identity is deliberately
+     * kept by both callers, so a later `SHOW` for the same session is still gated against it.
+     */
+    private fun clearConversation() {
+        // Keep the session identity (the link survives a window close), but forget the previous window's ordering and
+        // revision gates so the phone may re-send the same hint id into the reopened window (Task 9 carry, Task 11).
+        hints.resetForNewWindow()
         log.clear()
         order.reset()
         saidGate.reset()

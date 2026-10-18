@@ -1,13 +1,22 @@
 package com.sheen.rokid.phone.bridge
-import com.sheen.rokid.phone.app.MainActivity
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
 import android.app.Activity
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.HostEvent
+import com.sheen.rokid.contracts.PinChanged
 import com.sheen.rokid.host.HostRuntime
+import com.sheen.rokid.output.ConversationLog
 import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.ConfigSchema
+import com.sheen.rokid.plugin.DeactivationReason
 import com.sheen.rokid.plugin.ModelClient
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.PluginContext
+import com.sheen.rokid.plugin.PluginDescriptor
+import com.sheen.rokid.plugin.PluginLifecycle
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.transport.CxrAuthorizationOutcome
 import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
@@ -17,6 +26,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -248,6 +258,153 @@ class CxrLinkWiringTest {
                 CxrAuthorizationOutcome.CONFIRMED, root.state.value.cxrAuthorization,
             )
             assertEquals(CxrAuthorizationOutcome.UNEXPECTED, root.state.value.cxrAuthorization)
+        } finally { root.close() }
+    }
+
+    // ---------------------------------------------------------------- Task 11: real conversation wire
+
+    /** One conversation wire that records every official command the display forwards. */
+    private class RecordingWire : ConversationWire {
+        val calls = mutableListOf<String>()
+
+        override fun state(route: AssistantRoute, turnId: String, status: Int, sequence: Long): Boolean {
+            calls += "state:$route:$turnId:$status:$sequence"
+            return true
+        }
+
+        override fun idle(route: AssistantRoute, sequence: Long): Boolean {
+            calls += "idle:$route:$sequence"
+            return true
+        }
+
+        override fun asr(route: AssistantRoute, turnId: String, revision: Long, text: String): Boolean {
+            calls += "asr:$route:$turnId:$revision"
+            return true
+        }
+
+        override fun answer(route: AssistantRoute, turnId: String, hintId: String, revision: Long,
+            text: String): Boolean {
+            calls += "answer:$route:$turnId:$hintId:$revision"
+            return true
+        }
+
+        override fun tool(route: AssistantRoute, turnId: String, phase: ToolPhase, label: String): Boolean {
+            calls += "tool:$route:$turnId:$phase:$label"
+            return true
+        }
+
+        override fun panelOpen(route: AssistantRoute): Boolean {
+            calls += "panelOpen:$route"
+            return true
+        }
+
+        override fun close(route: AssistantRoute): Boolean {
+            calls += "close:$route"
+            return true
+        }
+    }
+
+    @Test
+    fun theConversationDisplayForwardsAStateToTheWireItWasBuiltWith() {
+        // Task 6 review gate: a production display built with the 3-arg constructor would look identical to the real
+        // one and silently refuse every official command. This asserts the composition-level object is built with a
+        // wire (the production one is the CxrHintLink, below) and that `state` really reaches it.
+        val log = ConversationLog()
+        val wire = RecordingWire()
+        val display = ConversationWireDisplay(log, wire, { _, _ -> true }, { _, _ -> true })
+        val root = HostCompositionRoot(
+            HostRuntime(1), MemoryProfileRepository(), UnusedModel(), null,
+            conversationLog = log, conversationDisplay = display,
+        )
+        try {
+            assertSame("the composition must own the display it was given", display, root.conversationDisplay)
+
+            root.conversationDisplay!!.state(AssistantRoute.WAKE, "t-1", 1, 5)
+
+            assertEquals(listOf("state:WAKE:t-1:1:5"), wire.calls)
+        } finally { root.close() }
+    }
+
+    @Test
+    fun theProductionAssemblyUsesTheRealHintLinkAsTheConversationWire() {
+        // The 3-arg silent constructor is for old links/tests only. The production `create` must pass the real
+        // `hintLink`, or the whole official wire stays silently dead while the display tests pass.
+        val root = HostCompositionRoot.create(android.content.ContextWrapper(null))
+        try {
+            val display = requireNotNull(root.conversationDisplay) {
+                "the production composition must build a ConversationWireDisplay"
+            }
+            assertTrue("the silent wire is not the production wire", display.wire is CxrHintLink)
+            assertSame("`create` must pass its own hint link", root.hintLinkForProbe, display.wire)
+        } finally { root.close() }
+    }
+
+    // ---------------------------------------------------------------- Task 11: vendor-thread marshalling
+
+    private class RecordingPlugin : PluginLifecycle {
+        val events = mutableListOf<HostEvent>()
+        override val descriptor = PluginDescriptor(
+            "recording", "1.0.0", 1, "Recording", emptyList(), ConfigSchema(1))
+        override fun activate(context: PluginContext) = Unit
+        override fun handle(event: HostEvent) { events += event }
+        override fun deactivate(reason: DeactivationReason) = Unit
+    }
+
+    @Test
+    fun aPinIsDeliveredAsPinChangedOffTheVendorCallbackThread() {
+        // `CxrHintLink.onPin` runs on the vendor's callback thread. The composition must wrap it in the host event
+        // with the current identity and marshal it away from that thread, or the vendor callback runs host policy.
+        val clock = FakeClock(1_000_000_000L)
+        val environment = CxrHostEnvironment(
+            clock = clock,
+            input = RecordingInputPort(),
+            liveOutput = { null },
+            scheduler = ManualScheduler(clock),
+        )
+        val dispatched = mutableListOf<() -> Unit>()
+        val plugin = RecordingPlugin()
+        val root = HostCompositionRoot(
+            HostRuntime(1, environment), MemoryProfileRepository(), UnusedModel(), environment,
+            dispatchHostEvent = { task -> dispatched += task },
+        )
+        try {
+            root.registerPlugin(plugin)
+            root.onSceneReady()
+            root.start("recording")
+
+            root.onPinFromLink(AssistantRoute.PROACTIVE)
+
+            assertTrue("nothing may run inline on the vendor thread: ${plugin.events}", plugin.events.isEmpty())
+            assertEquals("the pin must be queued for another thread", 1, dispatched.size)
+            dispatched.removeAt(0).invoke()
+            // HostRuntime delivers events on its own executor, so the wrapped event is observable shortly after the
+            // hand-off rather than synchronously in the dispatching task.
+            val deadline = System.nanoTime() + 2_000_000_000L
+            while (plugin.events.none { it is PinChanged } && System.nanoTime() < deadline) Thread.sleep(10)
+            val pin = plugin.events.filterIsInstance<PinChanged>().single()
+            assertEquals(AssistantRoute.PROACTIVE, pin.route)
+        } finally { root.close() }
+    }
+
+    @Test
+    fun aPanelShownIsDeliveredOffTheVendorCallbackThreadForTheTurnTimingOwner() {
+        // Task 12 owns the 10 s timer and may only start it after the panel's first layout. Task 11 exposes that event
+        // as a host-thread callback, not as a direct vendor-thread invocation.
+        val pending = mutableListOf<() -> Unit>()
+        val root = HostCompositionRoot(
+            HostRuntime(1), MemoryProfileRepository(), UnusedModel(), null,
+            dispatchHostEvent = { task -> pending += task },
+        )
+        try {
+            val shown = mutableListOf<AssistantRoute>()
+            root.onPanelShown = { route -> shown += route }
+
+            root.panelShownArrived(AssistantRoute.WAKE)
+
+            assertTrue("the timing owner must not run on the vendor thread", shown.isEmpty())
+            assertEquals(1, pending.size)
+            pending.removeAt(0).invoke()
+            assertEquals(listOf(AssistantRoute.WAKE), shown)
         } finally { root.close() }
     }
 }
