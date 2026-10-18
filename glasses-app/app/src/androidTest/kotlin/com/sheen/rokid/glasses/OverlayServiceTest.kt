@@ -430,9 +430,18 @@ class OverlayServiceTest {
             onMain { service.contentRevisionForProbe() })
     }
 
-    /** Task 11: `PANEL_OPEN` while the window is already visible is a no-op - no reset, no duplicate shown event. */
+    /**
+     * Task 11 fix round: `PANEL_OPEN` while visible keeps the official no-reset rule **and re-announces
+     * `PANEL_SHOWN`**.
+     *
+     * `PANEL_SHOWN` is EDITH's correlation/liveness event, not official content. The phone can be visible without a
+     * live mapping for a bounded grace (C2's `UI_READY` → `PANEL_SHOWN` before the first `PONG`); if it ever loses the
+     * event (or clears the visible flag after the grace), a repeated `PANEL_OPEN` must let it re-correlate with the
+     * window the wearer is still looking at. The re-announce is idempotent: the official `showAiDialog` no-op is kept,
+     * so no cache reset and no revision change.
+     */
     @Test
-    fun panelOpenWhileVisibleDoesNotResetTheCache() {
+    fun panelOpenWhileVisibleReannouncesPanelShownWithoutResettingTheCache() {
         val service = startAndBind()
         service.setSenderForProbe { json -> sentJson += json; true }
         instrumentation.runOnMainSync {
@@ -456,14 +465,58 @@ class OverlayServiceTest {
             service.acceptCommand(HintWireCodec.encode(
                 HintCommand.PanelOpen("s-panel-visible", 1, AssistantRoute.WAKE)))
         }
+        waitUntil("the repeated PANEL_OPEN re-announces PANEL_SHOWN") {
+            uiEvents().count { it is HintCommand.PanelShown } == 2
+        }
 
+        val shown = uiEvents().filterIsInstance<HintCommand.PanelShown>()
+        assertEquals("the re-announce must name the visible route", AssistantRoute.WAKE, shown[1].route)
+        assertEquals("and the accepted session, never a fabricated one", "s-panel-visible", shown[1].sessionId)
+        assertEquals(1L, shown[1].generation)
         assertTrue("a visible panel stays visible", onMain { service.overlayShownForProbe() })
         assertEquals("a visible PANEL_OPEN must not reset the cache", "可见时保留的答案",
             onMain { service.hintTextForProbe() })
         assertEquals("and must not restart the reveal revision", revisionBefore,
             onMain { service.contentRevisionForProbe() })
-        assertEquals("and must not emit a second PANEL_SHOWN", 1,
+    }
+
+    /**
+     * Task 11 fix round: the re-announce is route-scoped. A `PANEL_OPEN` for another route while the WAKE window is up
+     * must not claim that other route is shown to the phone (that would let Task 12 start a window for a panel the
+     * wearer does not have), and must not reset the visible window either.
+     */
+    @Test
+    fun panelOpenForAnotherRouteWhileVisibleDoesNotReannounce() {
+        val service = startAndBind()
+        service.setSenderForProbe { json -> sentJson += json; true }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-panel-other-route", 4)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.PanelOpen("s-panel-other-route", 4, AssistantRoute.WAKE)))
+        }
+        waitUntil("PANEL_SHOWN") { uiEvents().any { it is HintCommand.PanelShown } }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Sync("sync-panel-other-route", 0, 1_000_000,
+                    System.nanoTime() + 120_000_000_000L)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Show("s-panel-other-route", 4, sequence = 1, hintId = "h-panel-other-route",
+                    revision = 1, syncId = "sync-panel-other-route", phoneSentNanos = System.nanoTime(),
+                    remainingTtlMillis = 120_000, text = "WAKE 的答案")))
+        }
+        waitUntil("the answer is rendered") { onMain { service.hintTextForProbe() } == "WAKE 的答案" }
+        val revisionBefore = onMain { service.contentRevisionForProbe() }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.PanelOpen("s-panel-other-route", 4, AssistantRoute.PROACTIVE)))
+        }
+
+        assertEquals("another route's PANEL_OPEN may not re-announce the visible WAKE route", 1,
             uiEvents().count { it is HintCommand.PanelShown })
+        assertTrue("the WAKE window stays visible", onMain { service.overlayShownForProbe() })
+        assertEquals("and keeps its content", "WAKE 的答案", onMain { service.hintTextForProbe() })
+        assertEquals("and its revision", revisionBefore, onMain { service.contentRevisionForProbe() })
     }
 
     /** Task 11: `CLOSE` is route-scoped - another route's close may not hide the panel in front of the wearer. */

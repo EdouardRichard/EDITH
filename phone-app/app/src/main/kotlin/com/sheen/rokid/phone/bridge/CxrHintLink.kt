@@ -365,6 +365,16 @@ class CxrHintLink(
     private var panelVisible = false
 
     /**
+     * When [panelVisible] was last established by a matching `PANEL_SHOWN` (monotonic nanos).
+     *
+     * Visibility alone is not proof that the service that reported it is gone: `PANEL_SHOWN` is sent as soon as the
+     * window has laid out, and the first `PONG` that produces a clock mapping can arrive later. The flag is therefore
+     * only ever treated as stale after [PANEL_VISIBLE_GRACE_MILLIS]; the timestamp is what bounds that grace. Zero
+     * while hidden or after a session/visibility reset.
+     */
+    private var panelVisibleSinceNanos = 0L
+
+    /**
      * The route a wake asked to open while the resident service could not receive a `PANEL_OPEN` yet.
      *
      * Kept until a valid `UI_READY` or a live PONG mapping proves the service is there. The spec's order is
@@ -378,6 +388,15 @@ class CxrHintLink(
     private var panelOpenRoute: AssistantRoute? = null
     private var panelOpenRetries = 0
     private var panelOpenRetry: CancellationHandle? = null
+
+    /**
+     * The identity of the current open attempt, incremented by every `PANEL_OPEN` actually sent.
+     *
+     * The bounded repeat captures this outside the send section. A close + reopen of the **same route** keeps the
+     * session, route and awaiting flag identical, so without an attempt token the captured retry would send a
+     * duplicate into the new window and re-arm its repeat under the new open's state.
+     */
+    private var panelOpenEpoch = 0L
 
     /**
      * The single app-start in flight (0.24 spec §5.7).
@@ -429,6 +448,7 @@ class CxrHintLink(
             // previous session's late appStart answer inert (the callback compares the request by reference).
             uiReadyForSession = false
             panelVisible = false
+            panelVisibleSinceNanos = 0
             panelRoutePending = null
             panelOpenAwaitingShown = false
             panelOpenRoute = null
@@ -491,9 +511,13 @@ class CxrHintLink(
      * session survives, and a sticky `UI_READY` would then suppress the only recovery path. The states are:
      * - **already visible with a live mapping**: no-op. A `PANEL_OPEN` for a visible panel must not reset the
      *   conversation;
-     * - **visible without a live mapping**: the visible flag outlived the service that reported it. It is cleared and
-     *   the no-mapping recovery below runs, so the next wake can start the scene again instead of reporting a phantom
-     *   panel to Task 12;
+     * - **visible without a live mapping, inside [PANEL_VISIBLE_GRACE_MILLIS]**: no-op. `PANEL_SHOWN` needs only the
+     *   session identity, so a genuinely visible panel can legitimately precede the first `PONG`; treating that gap
+     *   as a dead service would start a redundant scene and make the phone forget a panel the wearer can still see;
+     * - **visible without a live mapping, after the grace**: the visible flag outlived the service that reported it.
+     *   It is cleared and the no-mapping recovery below runs, so the next wake can start the scene again instead of
+     *   reporting a phantom panel to Task 12. The glasses answer the resulting `PANEL_OPEN` for the still-visible
+     *   route with an idempotent `PANEL_SHOWN` re-announce, which lets the phone re-correlate;
      * - **live mapping**: the service answered a recent `PING`, so only `PANEL_OPEN` travels; no `appStart`;
      * - **no live mapping**: ask CXR to start the scene (or queue while an earlier start is still in flight) and keep
      *   the route pending. `reintroduce()` runs when the start is accepted, and `PANEL_OPEN` is sent only after a
@@ -533,8 +557,20 @@ class CxrHintLink(
                     diagnostics("panel: already visible - PANEL_OPEN ignored route=${route.name}")
                     return false
                 }
-                diagnostics("panel: visible without a live mapping - clearing the stale panel")
+                val visibleForNanos = now - panelVisibleSinceNanos
+                if (visibleForNanos < PANEL_VISIBLE_GRACE_MILLIS * 1_000_000L) {
+                    // The panel may be genuinely visible before the first PONG: `PANEL_SHOWN` needs only the session
+                    // identity, so the mapping gap is ordinary startup, not a dead service. Clearing it here would
+                    // start a redundant scene and hide a panel the wearer can still see; after the grace the stale
+                    // branch below still recovers a service that really died.
+                    diagnostics("panel: visible without a mapping yet - within the ${PANEL_VISIBLE_GRACE_MILLIS}ms " +
+                        "readiness grace route=${route.name}")
+                    return false
+                }
+                diagnostics("panel: visible without a live mapping after the ${PANEL_VISIBLE_GRACE_MILLIS}ms grace " +
+                    "- clearing the stale panel")
                 panelVisible = false
+                panelVisibleSinceNanos = 0
             }
             if (panelOpenAwaitingShown) {
                 diagnostics("panel: a PANEL_OPEN is already awaiting PANEL_SHOWN - request ignored")
@@ -657,6 +693,9 @@ class CxrHintLink(
         panelRoutePending = null
         panelOpenAwaitingShown = true
         panelOpenRoute = route
+        // Every actual send is a new attempt. The captured retry below compares it so a close + reopen of the same
+        // route cannot look like the attempt that retry was armed for.
+        panelOpenEpoch++
         diagnostics("panel: sending PANEL_OPEN route=${route.name} session=${identity.sessionId}")
         val sent = runCatching {
             outbound(HintWireCodec.encode(HintCommand.PanelOpen(identity.sessionId, identity.generation, route)))
@@ -669,9 +708,9 @@ class CxrHintLink(
      * Arms the single bounded repeat for a `PANEL_OPEN` that has not been followed by `PANEL_SHOWN`.
      *
      * The repeat is deliberately a repeat of `PANEL_OPEN`, not of `HELLO`/`PING`: once the service is known ready,
-     * the only lost fact can be the open itself, and the glasses treat an `PANEL_OPEN` for an already-visible panel as
-     * a no-op (no cache reset, no second `PANEL_SHOWN`), so a lost `PANEL_SHOWN` cannot turn the repeat into a second
-     * visible window.
+     * the only lost fact can be the open itself. The glasses treat an `PANEL_OPEN` for an already-visible panel as the
+     * official no-reset no-op, but re-announce `PANEL_SHOWN` for the same route as an idempotent liveness event, so a
+     * lost `PANEL_SHOWN` can be recovered without opening a second window.
      */
     private fun armPanelOpenRetryLocked() {
         panelOpenRetry?.cancel()
@@ -688,6 +727,7 @@ class CxrHintLink(
         panelOpenRetry = scheduler.at(clock.nowNanos() + PANEL_OPEN_RETRY_DELAY_MILLIS * 1_000_000L) {
             var route: AssistantRoute? = null
             var identity: HintIdentity? = null
+            var epoch = 0L
             synchronized(handshakeGate) {
                 panelOpenRetry = null
                 if (!panelOpenAwaitingShown || panelVisible) return@at
@@ -700,19 +740,23 @@ class CxrHintLink(
                 }
                 route = commandRoute
                 identity = HintIdentity(session, establishedGeneration)
+                epoch = panelOpenEpoch
             }
             val resendRoute = route ?: return@at
             val resendIdentity = identity ?: return@at
+            val resendEpoch = epoch
             diagnostics("panel: no PANEL_SHOWN yet - repeating PANEL_OPEN " +
                 "(attempt $attempt/$PANEL_OPEN_MAX_RETRIES)")
             synchronized(handshakeGate) {
                 if (panelOpenAwaitingShown && !panelVisible) {
-                    // Re-check the identity and route inside the send section: a session change or a close+new open
-                    // can land between the capture above and here. Sending the captured command then would put the
-                    // old route/identity on the wire, overwrite the new open, and cancel its repeat.
+                    // Re-check the identity, route and attempt inside the send section: a session change or a
+                    // close+new open can land between the capture above and here. Sending the captured command then
+                    // would put the old route/identity on the wire, overwrite the new open, and cancel its repeat.
+                    // The attempt matters for a close+reopen of the *same* route, where session and route are both
+                    // unchanged but the retry belongs to a window that no longer exists.
                     val sameSession = establishedSession == resendIdentity.sessionId &&
                         establishedGeneration == resendIdentity.generation
-                    if (sameSession && panelOpenRoute == resendRoute) {
+                    if (sameSession && panelOpenRoute == resendRoute && panelOpenEpoch == resendEpoch) {
                         sendPanelOpenLocked(resendRoute, resendIdentity)
                     } else {
                         diagnostics("panel: stale PANEL_OPEN retry dropped route=${resendRoute.name}")
@@ -756,6 +800,7 @@ class CxrHintLink(
             cancelUiReadyGraceLocked()
             uiReadyForSession = false
             panelVisible = false
+            panelVisibleSinceNanos = 0
             panelRoutePending = null
             panelOpenAwaitingShown = false
             panelOpenRoute = null
@@ -931,6 +976,7 @@ class CxrHintLink(
                 // The resident service is still alive; only the panel window went away. The hidden window also ends
                 // any pending repeat: a panel that was shown and then closed must not be reopened by a retry.
                 panelVisible = false
+                panelVisibleSinceNanos = 0
                 cancelPanelOpenRetryLocked()
                 panelOpenAwaitingShown = false
                 panelOpenRoute = null
@@ -946,6 +992,9 @@ class CxrHintLink(
             synchronized(handshakeGate) {
                 if (!isEstablishedLocked(command.sessionId, command.generation, "PANEL_SHOWN")) return false
                 panelVisible = true
+                // The grace for "visible but no mapping yet" is anchored here: this is the moment the wearer can see
+                // the window, and the first PONG may still be in flight.
+                panelVisibleSinceNanos = clock.nowNanos()
                 panelRoutePending = null
                 panelOpenAwaitingShown = false
                 panelOpenRoute = null
@@ -1026,6 +1075,18 @@ class CxrHintLink(
          * process start without suppressing recovery forever.
          */
         const val SCENE_READY_TIMEOUT_MILLIS = 10_000L
+
+        /**
+         * How long a `PANEL_SHOWN` may stand without a live clock mapping before a wake treats it as stale.
+         *
+         * `PANEL_SHOWN` is emitted on the window's first layout and needs only the session identity, so it can
+         * legitimately arrive before the first `PONG` completes the exchange; the panel is genuinely visible during
+         * that gap. Five seconds is the same S2 initial grace as [UI_READY_GRACE_MILLIS] and covers the measured
+         * 3.45 s glasses subscription delay (see [OPENING_RETRY_DELAY_MILLIS]) with room for a slow first exchange.
+         * A service that really died is still recovered: the next wake after the grace clears the phantom visibility
+         * and starts the scene. Nothing is cleared or started on a wake inside the grace.
+         */
+        const val PANEL_VISIBLE_GRACE_MILLIS = 5_000L
 
         /**
          * How long a sent `PANEL_OPEN` waits for `PANEL_SHOWN` before it is repeated.

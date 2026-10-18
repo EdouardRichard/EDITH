@@ -48,7 +48,8 @@ import com.sheen.rokid.output.HintWireCodec
  * `PANEL_SHOWN` follows the overlay's first layout; `UI_CLOSED` follows the visible-to-hidden transition.
  *
  * This task implements the S2 panel lifecycle: `PANEL_OPEN` shows a hidden window (resetting the hidden cache) and
- * leaves an already-visible one untouched, `CLOSE` is route-scoped and clears the hidden/visible cache without ending
+ * leaves an already-visible one's content untouched while re-announcing `PANEL_SHOWN` for the visible route, `CLOSE`
+ * is route-scoped and clears the hidden/visible cache without ending
  * the resident session, and the phone's `UI_READY`/`UI_CLOSED`/`PANEL_SHOWN` handshake is driven from here. It does not
  * implement the conversation state machine (Task 12), the official key/tips matrix (Task 13), or the wear/screen-down
  * behaviour (Task 20).
@@ -290,9 +291,13 @@ class GlassesOverlayService : Service() {
     /**
      * Task 11 `PANEL_OPEN`: show the hidden panel, with a cache reset only on hidden→visible.
      *
-     * A duplicate open for an already-visible panel is a no-op - the official `showAiDialog` does not reset an
-     * `isShowing()` dialog. Opening from hidden clears whatever arrived while the window was hidden; the phone's
-     * record is untouched.
+     * A duplicate open for an already-visible panel keeps the official no-reset behaviour - the official
+     * `showAiDialog` only calls `setAiItemInfo` for an `isShowing()` dialog and never `resetDialogUiState`. EDITH adds
+     * one idempotent fact: for the **same route** it re-sends `PANEL_SHOWN` with the accepted identity. `PANEL_SHOWN`
+     * is EDITH's correlation/liveness event, and the phone can have missed the original one (or cleared its visible
+     * flag after the readiness grace); without the re-announce, that recovery path would wait for a `PANEL_SHOWN` that
+     * the official no-op can never produce. No content, cache or revision is touched, and a `PANEL_OPEN` for another
+     * route keeps the plain no-op because that route is not the one on screen.
      */
     private fun onPanelOpen(command: HintCommand.PanelOpen) {
         val identity = host.currentIdentity()
@@ -301,7 +306,9 @@ class GlassesOverlayService : Service() {
             return
         }
         if (overlayRoot != null) {
-            Log.i(TAG, "PANEL_OPEN already-visible route=${command.route.name} reset=false")
+            val sameRoute = visibleRoute == command.route
+            Log.i(TAG, "PANEL_OPEN already-visible route=${command.route.name} reset=false reannounce=$sameRoute")
+            if (sameRoute) sendPanelShown(command.route)
             return
         }
         Log.i(TAG, "PANEL_OPEN accepted session=${command.sessionId} route=${command.route.name} reset=hidden-to-visible")

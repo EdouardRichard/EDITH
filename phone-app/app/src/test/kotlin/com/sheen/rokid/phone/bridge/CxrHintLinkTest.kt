@@ -1138,6 +1138,59 @@ class CxrHintLinkTest {
         assertTrue("PANEL_OPEN still waits for readiness: ${rig.commands()}", rig.panelOpens().isEmpty())
     }
 
+    /**
+     * The readiness gap: `PANEL_SHOWN` can arrive before the first PONG.
+     *
+     * C2's order is `appStart -> UI_READY -> PANEL_OPEN -> PANEL_SHOWN`, and `PANEL_SHOWN` only needs the session
+     * identity, not a clock mapping. Treating that genuinely visible panel as stale would start a second scene and let
+     * Task 12 report a hidden panel while the wearer is looking at it. Inside the bounded grace it is a no-op.
+     */
+    @Test
+    fun aVisiblePanelInsideTheReadinessGraceIsNotClearedOrStarted() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.uiReady()
+        rig.panelShown(AssistantRoute.WAKE)
+        rig.advance(1_000)
+        rig.sent.clear()
+
+        assertFalse("a visible panel inside the readiness grace is a no-op",
+            rig.link.requestPanelOpen(AssistantRoute.WAKE))
+
+        assertTrue("the visible flag must survive a wake inside the grace", rig.link.isPanelVisible())
+        assertEquals("a genuinely visible panel must not start the scene", 0, rig.starts)
+        assertTrue("no PANEL_OPEN may be sent for a visible panel: ${rig.commands()}", rig.panelOpens().isEmpty())
+    }
+
+    /**
+     * After the bounded grace, the same visible flag with no mapping is stale and recovery resumes.
+     *
+     * The grace only covers the legitimate startup gap; a service that died after reporting `PANEL_SHOWN` must still be
+     * recovered, and `PANEL_OPEN` must still wait for readiness.
+     */
+    @Test
+    fun aVisiblePanelStillWithoutMappingAfterTheReadinessGraceIsClearedAndRecovered() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.uiReady()
+        rig.panelShown(AssistantRoute.WAKE)
+        rig.sent.clear()
+
+        // No PONG: the first clock exchange never completed, and the grace has run out.
+        rig.advance(5_000)
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+
+        assertFalse("a visible flag with no mapping after the grace is stale", rig.link.isPanelVisible())
+        assertEquals("the stale visible flag must not suppress recovery", 1, rig.starts)
+        assertTrue("PANEL_OPEN still waits for readiness: ${rig.commands()}", rig.panelOpens().isEmpty())
+
+        rig.startCallback!!.invoke(true)
+        assertTrue("the new scene must be re-introduced: ${rig.commands()}",
+            rig.commands().any { it is HintCommand.Hello })
+        assertTrue("no PANEL_OPEN before UI_READY/PONG: ${rig.commands()}", rig.panelOpens().isEmpty())
+    }
+
     @Test
     fun uiClosedMakesThePanelHiddenAgainSoTheNextOpenIsSent() {
         val rig = ResidentRig()
@@ -1365,6 +1418,35 @@ class CxrHintLinkTest {
         assertEquals("a retry captured for another route may not add a PANEL_OPEN: ${rig.commands()}",
             1, rig.panelOpens().size)
         assertEquals(AssistantRoute.PROACTIVE, rig.panelOpens().single().route)
+    }
+
+    @Test
+    fun aStalePanelOpenRetryCannotResendAfterACloseAndReopenOfTheSameRoute() {
+        val gate = BlockingRetryGate()
+        val rig = ResidentRig(diagnostics = gate.diagnostics)
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(1, rig.panelOpens().size)
+
+        rig.clock.nanos += 1_000_000_000L
+        val retry = kotlin.concurrent.thread { rig.scheduler.fireDue(rig.clock.nanos) }
+        assertTrue("the retry must reach its capture point", gate.awaitCaptured())
+
+        // The panel closes and the same route reopens before the captured retry reaches its send. Route and session are
+        // unchanged, so only the open attempt (epoch) can tell the retry it belongs to the cancelled window.
+        rig.uiClosed(AssistantRoute.WAKE)
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(listOf(AssistantRoute.WAKE), rig.panelOpens().map { it.route })
+
+        gate.release()
+        retry.join(5_000)
+
+        assertEquals("a retry captured for the closed open may not resend into the reopened one: ${rig.commands()}",
+            1, rig.panelOpens().size)
     }
 
     /**
