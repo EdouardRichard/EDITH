@@ -20,6 +20,7 @@ import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.libpag.PAGFile
@@ -39,6 +40,17 @@ class PagOrbTest {
 
     private val instrumentation get() = InstrumentationRegistry.getInstrumentation()
     private val context get() = instrumentation.targetContext
+
+    /**
+     * The glasses' screen-off timeout is 5 s. A scenario launched onto a sleeping display can wake through its
+     * `FLAG_KEEP_SCREEN_ON` window flag but still sleep five seconds later, freezing libpag's progress at ~0.02
+     * (measured in the Task 18 report, §1.3). A real key wake before each test makes the run about libpag, not the
+     * display timeout; the window flag then keeps the screen on for the test body.
+     */
+    @Before
+    fun wakeTheDisplay() {
+        instrumentation.uiAutomation.executeShellCommand("input keyevent KEYCODE_WAKEUP").close()
+    }
 
     /**
      * The nine official clips, in the order the chain can touch them (spec §3.4). The names are the asset names in
@@ -199,6 +211,110 @@ class PagOrbTest {
                     view.isRunningForProbe())
                 assertEquals("ai_finish_last.pag", view.currentSegmentForProbe())
             }
+
+            // The official IDLE command is idempotent: re-publishing the same idle must not replay the tail.
+            scenario.onActivity {
+                mark = view.historyForProbe().size
+                view.setIdle()
+                view.setIdle()
+            }
+            SystemClock.sleep(200)
+            scenario.onActivity {
+                assertEquals("a repeated official IDLE must not replay finish_last",
+                    emptyList<String>(), view.historyForProbe().drop(mark))
+                assertEquals("ai_finish_last.pag", view.currentSegmentForProbe())
+                assertFalse("the tail stays stopped", view.isRunningForProbe())
+            }
+        }
+    }
+
+    /**
+     * 0.24 S4 Task 18 review I1: `OrbState.IDLE` is "no work", not the official `showIdleStatus`.
+     *
+     * The spec separates the two (spec §5.6:353): a fresh/legacy no-work panel stops (the old `VoiceOrbView` only
+     * stopped its breathing animator), while only the official IDLE command plays `finish_last`. This test also pins the
+     * dedupe: the host re-applies the same model on every render, so a repeated `setState(IDLE)` must be a no-op.
+     */
+    @Test
+    fun noWorkIdleStopsWithoutTheFinishTailAndRepeatedIdleDoesNotReplay() {
+        launchHostPanel().use { scenario ->
+            keepScreenOn(scenario)
+            var orb: PagOrbView? = null
+            scenario.onActivity { activity ->
+                val view = PagOrbView(activity)
+                activity.addContentView(view, ViewGroup.LayoutParams(
+                    GlassesPanelSpec.VOICE_ORB_WIDTH_PX,
+                    GlassesPanelSpec.VOICE_ORB_HEIGHT_PX))
+                view.start()
+                view.setState(OrbState.IDLE)
+                orb = view
+            }
+            val view = requireNotNull(orb)
+
+            scenario.onActivity {
+                assertEquals("a fresh no-work idle must load no clip",
+                    emptyList<String>(), view.historyForProbe())
+                assertEquals("", view.currentSegmentForProbe())
+                assertEquals("no clip means the official none tag", "none", view.currentTagForProbe())
+                assertFalse("a fresh no-work idle is stopped", view.isRunningForProbe())
+            }
+
+            // A running listener clip + no-work idle: stop/hold where it is, never load the finish tail.
+            scenario.onActivity { view.setStatus(OfficialStatus.LISTENING) }
+            assertTrue("the listener clip must start", awaitNewSegment(scenario, view, "ai_listener_middle.pag", 0))
+            var mark = 0
+            scenario.onActivity {
+                mark = view.historyForProbe().size
+                view.setState(OrbState.IDLE)
+            }
+            scenario.onActivity {
+                assertEquals("no-work idle must not load anything", emptyList<String>(),
+                    view.historyForProbe().drop(mark))
+                assertEquals("the listener clip is held", "ai_listener_middle.pag",
+                    view.currentSegmentForProbe())
+                assertFalse("no-work idle stops the clip", view.isRunningForProbe())
+            }
+
+            // The host re-renders the same model on every update; repeated no-work idle is deduped.
+            scenario.onActivity {
+                view.setState(OrbState.IDLE)
+                view.setState(OrbState.IDLE)
+            }
+            SystemClock.sleep(200)
+            scenario.onActivity {
+                assertEquals("repeated no-work idle must not load or replay anything", emptyList<String>(),
+                    view.historyForProbe().drop(mark))
+                assertFalse("and it stays stopped", view.isRunningForProbe())
+            }
+        }
+    }
+
+    /**
+     * The production host starts from an empty model (no `STATE` yet). That model is idle but it is **not** the
+     * official idle command, so the panel must not play the finish tail on open; the later status chain still runs.
+     */
+    @Test
+    fun aFreshHostPanelDoesNotPlayTheFinishTail() {
+        launchHostPanel().use { scenario ->
+            keepScreenOn(scenario)
+            scenario.onActivity { activity ->
+                val orb = panelOrb(activity)
+                assertEquals("a fresh window has no official status", OrbState.IDLE,
+                    activity.orbStateForProbe())
+                assertEquals("a fresh empty model must load no PAG clip", emptyList<String>(),
+                    orb.historyForProbe())
+                assertFalse("a fresh empty model must not play the finish tail", orb.isRunningForProbe())
+            }
+
+            // The fix must not block the normal chain once the official status arrives.
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-fresh", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-fresh", 1, AssistantRoute.WAKE, turnId = "t-fresh",
+                        status = OfficialStatus.LISTENING.wire, sequence = 1)))
+            }
+            assertTrue("the first official status still starts the listener chain",
+                awaitActivitySegment(scenario, "ai_listener_middle.pag", 0))
         }
     }
 

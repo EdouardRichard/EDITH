@@ -62,8 +62,10 @@ data class PanelModel(
     val contentRevision: Long,
     /** The official status (0–7) for the selected route; null before a `STATE`/`IDLE` or while the route is idle. */
     val status: OfficialStatus?,
-    /** True while the selected route is in the official `showIdleStatus` state (not status 0). */
+    /** Whether nothing is in progress for the selected route; true before the first status and for official idle. */
     val idle: Boolean,
+    /** True only for the official `showIdleStatus`/`IDLE` command; false for "no status yet" and no work. */
+    val officialIdle: Boolean,
     val pinned: Boolean,
     /**
      * The ASR "…"/listener indicator row.
@@ -910,6 +912,7 @@ class GlassesPanelController(
             contentRevision = contentRevision,
             status = official,
             idle = if (officialKnown) idleForRoute else !busyAny,
+            officialIdle = idleForRoute,
             pinned = pinned,
             listeningVisible = listening,
             hiVisible = hi,
@@ -963,3 +966,27 @@ internal fun orbStateOf(model: PanelModel): OrbState =
         model.thinkingVisible -> OrbState.THINKING
         else -> OrbState.IDLE
     }
+
+/** What the PAG orb should do for one published model (0.24 S4 Task 18 review I1). */
+internal sealed interface OrbRequest {
+    /** An official status names the exact PAG segment. */
+    data class Status(val status: OfficialStatus) : OrbRequest
+
+    /** The official `showIdleStatus`/`IDLE` command: play the finish tail once, then stop. */
+    data object OfficialIdle : OrbRequest
+
+    /** No official status: the legacy busy-level path; [state] `IDLE` means stop/hold, never `finish_last`. */
+    data class Legacy(val state: OrbState) : OrbRequest
+}
+
+/**
+ * The orb request for one model, kept as a pure decision so the "no work" and official-idle cases fail a JVM test.
+ *
+ * `PanelModel.idle` is "nothing is happening" and is true both before the first `STATE` and after the official `IDLE`
+ * command; only `PanelModel.officialIdle` is the command that plays `finish_last` (spec §5.6:353).
+ */
+internal fun orbRequestOf(model: PanelModel): OrbRequest = when {
+    model.status != null -> OrbRequest.Status(model.status)
+    model.officialIdle -> OrbRequest.OfficialIdle
+    else -> OrbRequest.Legacy(orbStateOf(model))
+}

@@ -561,14 +561,13 @@ class GlassesPanelHost(
         } else {
             toolIcon?.stop()
         }
-        // 0.24 S4 Task 18: the official status names the exact PAG clip; the coarse [OrbState] is only the probe shape
-        // and the legacy (no `STATE`) busy path. `idle` here is the official `showIdleStatus` state, which plays
-        // finish_last; a fresh empty model is idle too and simply starts from the finish tail.
-        val status = model.status
-        when {
-            status != null -> orbView.setStatus(status)
-            model.idle -> orbView.setIdle()
-            else -> orbView.setState(orb)
+        // 0.24 S4 Task 18 (review I1): the official status names the exact PAG clip, and only the official
+        // `showIdleStatus` command plays finish_last. `model.idle` is also true for "no status yet" and for no work;
+        // those stop/hold the orb instead of playing the finish tail (spec §5.6:353).
+        when (val request = orbRequestOf(model)) {
+            is OrbRequest.Status -> orbView.setStatus(request.status)
+            OrbRequest.OfficialIdle -> orbView.setIdle()
+            is OrbRequest.Legacy -> orbView.setState(request.state)
         }
         tipsView.text = model.tips
         pinTextView.visibility = if (pinned) View.GONE else View.VISIBLE
@@ -576,7 +575,8 @@ class GlassesPanelHost(
         Log.i(TAG,
             "P3_STATE route=${route.name} busy=${listening || thinking || (live && !model.idle)} " +
                 "any=${!model.idle} live=$live orb=${orb.name} listening=$listening hi=$hi thinking=$thinking " +
-                "tool=$tool status=${model.status?.name ?: "none"} idle=${model.idle} pinned=$pinned " +
+                "tool=$tool status=${model.status?.name ?: "none"} idle=${model.idle} " +
+                "officialIdle=${model.officialIdle} pinned=$pinned " +
                 "offset=${scrollOffsetY()} max=${maxScrollY()} ticker=${tickerAnimator != null}")
     }
 

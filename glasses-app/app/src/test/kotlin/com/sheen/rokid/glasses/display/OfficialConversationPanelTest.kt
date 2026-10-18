@@ -2,8 +2,10 @@ package com.sheen.rokid.glasses.display
 
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.glasses.app.GlassesPanelController
+import com.sheen.rokid.glasses.app.OrbRequest
 import com.sheen.rokid.glasses.app.PanelModel
 import com.sheen.rokid.glasses.app.PanelPort
+import com.sheen.rokid.glasses.app.orbRequestOf
 import com.sheen.rokid.output.BackAction
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
@@ -460,5 +462,50 @@ class OfficialConversationPanelTest {
             assertFalse("$code down", harness.controller.onKey(code, ACTION_DOWN))
             assertFalse("$code up", harness.controller.onKey(code, ACTION_UP))
         }
+    }
+
+    // ------------------------------------------------ no-work idle vs the official showIdleStatus command (Task 18 I1)
+
+    @Test
+    fun aFreshEmptyPanelIsNoWorkIdleAndDoesNotAskForTheFinishTail() {
+        val harness = Harness()
+        harness.hello()
+
+        val fresh = harness.lastModel()
+        assertTrue("no work is still the idle model", fresh.idle)
+        assertFalse("no showIdleStatus command has arrived yet", fresh.officialIdle)
+        assertEquals("a fresh panel must stop/hold, not play finish_last",
+            OrbRequest.Legacy(OrbState.IDLE), orbRequestOf(fresh))
+    }
+
+    @Test
+    fun onlyTheOfficialIdleCommandAsksForTheFinishTail() {
+        val harness = Harness()
+        harness.hello()
+        harness.state(OfficialStatus.LISTENING, sequence = 1)
+
+        harness.idle(sequence = 2)
+
+        val idle = harness.lastModel()
+        assertTrue("IDLE is the official showIdleStatus state", idle.idle)
+        assertTrue("the explicit official idle is distinguishable from no-work idle", idle.officialIdle)
+        assertNull("IDLE is not status 0", idle.status)
+        assertEquals("only showIdleStatus asks the orb for finish_last",
+            OrbRequest.OfficialIdle, orbRequestOf(idle))
+    }
+
+    @Test
+    fun aLaterStateClearsTheOfficialIdleMarkAndNamesItsSegment() {
+        val harness = Harness()
+        harness.hello()
+        harness.idle(sequence = 1)
+        assertTrue(harness.lastModel().officialIdle)
+
+        harness.state(OfficialStatus.ANSWERING, sequence = 2)
+
+        val answering = harness.lastModel()
+        assertFalse("a later STATE leaves the official idle", answering.officialIdle)
+        assertEquals("an official status asks for its exact PAG segment",
+            OrbRequest.Status(OfficialStatus.ANSWERING), orbRequestOf(answering))
     }
 }

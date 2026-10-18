@@ -17,6 +17,9 @@ import org.libpag.PAGView
  *
  * - `setStatus` / `setIdle` translate the panel's model into one clip request. A request that the current tag does not
  *   allow is ignored - the table is a target chain, not a forced jump (spec §3.4).
+ * - `setIdle` is **only** the official `showIdleStatus`/`IDLE` command (finish tail, then stop). The no-work
+ *   `OrbState.IDLE` path (`setState`) stops/holds the current frame and never loads the tail (spec §5.6:353); the host
+ *   re-renders the same model, so repeated no-work idle requests are deduped.
  * - `first`/`last` clips play once and `middle` clips loop (`repeatCount` 1/0, the official values).
  * - `start`/`stop` are the host window's visibility: a stopped once clip resumes from where it paused. A stopped
  *   middle resumes too; an ended tail does not replay just because the window came back.
@@ -69,8 +72,8 @@ class PagOrbView internal constructor(
     private var orbState: OrbState = OrbState.IDLE
 
     /**
-     * The last request applied (a status, a legacy [OrbState], or the idle marker). Repeated renders publish the same
-     * status; without this a status 5 re-render would restart `finish_last` every time.
+     * The last request applied (a status, a legacy [OrbState], the official idle command or the no-work hold).
+     * Repeated renders publish the same model; without this a repeated request would restart a clip every time.
      */
     private var lastRequest: Any? = null
 
@@ -104,30 +107,34 @@ class PagOrbView internal constructor(
     fun setIdle() {
         orbState = OrbState.IDLE
         fallbackView?.setState(OrbState.IDLE)
-        if (lastRequest === IDLE_REQUEST) return
-        lastRequest = IDLE_REQUEST
+        if (lastRequest === OFFICIAL_IDLE_REQUEST) return
+        lastRequest = OFFICIAL_IDLE_REQUEST
         apply(OrbPagChain.idleEntry())
     }
 
     /**
      * The legacy busy-level path (an old phone with no `STATE`/`IDLE`). It asks for the same segment the equivalent
      * official status would; no new visual rule is introduced.
+     *
+     * `OrbState.IDLE` is **no work**, not the official `IDLE` command: it stops/holds the current frame and never plays
+     * `finish_last` (spec §5.6:353). The host applies the same model on every render, so a repeated no-work idle is a
+     * no-op.
      */
     fun setState(state: OrbState) {
         orbState = state
         fallbackView?.setState(state)
-        if (lastRequest == state) return
         if (state == OrbState.IDLE) {
-            lastRequest = IDLE_REQUEST
-            apply(OrbPagChain.idleEntry())
+            holdNoWorkIdle()
             return
         }
+        if (lastRequest == state) return
         lastRequest = state
         val status = when (state) {
             OrbState.LISTENING -> OfficialStatus.LISTENING
             OrbState.THINKING -> OfficialStatus.ASR_END
             OrbState.ANSWERING -> OfficialStatus.ANSWERING
-            OrbState.IDLE -> OfficialStatus.AUDIO_FINISHED
+            // IDLE is handled above: no-work idle has no official segment.
+            OrbState.IDLE -> return
         }
         apply(OrbPagChain.entryFor(status))
     }
@@ -205,6 +212,20 @@ class PagOrbView internal constructor(
             return
         }
         load(segment)
+    }
+
+    /**
+     * `OrbState.IDLE` is "no work" (spec §5.6:353), not the official `showIdleStatus` command: stop on the current
+     * frame and never load `finish_last`. Marking the clip ended keeps a later window [start] from resuming a stale
+     * frame; the next status [load] clears the flag. Repeated models are deduped by [lastRequest].
+     */
+    private fun holdNoWorkIdle() {
+        if (lastRequest === NO_WORK_IDLE_REQUEST) return
+        lastRequest = NO_WORK_IDLE_REQUEST
+        playing = false
+        ended = true
+        pagView?.stop()
+        Log.i(TAG, "PAG_IDLE_HOLD tag=$tag segment=${segmentAsset ?: "none"}")
     }
 
     /**
@@ -292,6 +313,11 @@ class PagOrbView internal constructor(
         const val TAG = "EdithGlasses"
         const val ASSET_ROOT = "pag/"
         const val HISTORY_LIMIT = 64
-        val IDLE_REQUEST = Any()
+
+        /** Marks an applied official `showIdleStatus` request; distinct from the no-work hold. */
+        val OFFICIAL_IDLE_REQUEST = Any()
+
+        /** Marks an applied `OrbState.IDLE` (no work) request; never plays `finish_last`. */
+        val NO_WORK_IDLE_REQUEST = Any()
     }
 }
