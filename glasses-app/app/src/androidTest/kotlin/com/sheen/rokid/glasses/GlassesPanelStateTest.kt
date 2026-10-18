@@ -1,11 +1,13 @@
 package com.sheen.rokid.glasses
 
+import android.view.ViewGroup
 import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
+import com.sheen.rokid.glasses.display.GlassesPanelView
 import com.sheen.rokid.glasses.display.OrbState
 import com.sheen.rokid.glasses.display.TailTextView
 import com.sheen.rokid.output.HintCommand
@@ -40,6 +42,26 @@ class GlassesPanelStateTest {
         HintCommand.Sync("sync-p3", offsetLowerNanos = 0, offsetUpperNanos = 1_000_000,
             validUntilGlassNanos = System.nanoTime() + 30_000_000_000L),
     )
+
+    /**
+     * 0.24 S2 Task 7: the panel tree lives in [GlassesPanelView]; this pins that the Activity shows that view.
+     *
+     * The assertion is deliberately structural. The extraction's contract is that the *one* panel the wearer sees is
+     * the extracted class - an indirect probe (a text or an orb state) would still pass if the Activity built a second,
+     * stale tree, which is exactly the regression this refactor must not introduce.
+     */
+    @Test
+    fun theActivityShowsTheExtractedPanelView() {
+        ActivityScenario.launch(GlassesActivity::class.java).use { scenario ->
+            scenario.onActivity { activity ->
+                val content = requireNotNull(activity.findViewById<ViewGroup>(android.R.id.content)) {
+                    "the Activity must have a content view"
+                }
+                assertTrue("the Activity's content must be the extracted GlassesPanelView, was ${content.getChildAt(0)}",
+                    content.getChildAt(0) is GlassesPanelView)
+            }
+        }
+    }
 
     @Test
     fun aBusyWakeShowsListeningThenThinkingThenTheAnswer() {
