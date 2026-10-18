@@ -44,6 +44,21 @@ enum class CxrAuthorizationOutcome {
     UNEXPECTED,
 }
 
+/**
+ * The glasses-scene events EDITH consumes (0.24 spec §5.7).
+ *
+ * The vendor interface is `com.rokid.cxr.session.IGlassesEventListener` (nine callbacks, javap of the pinned
+ * `client-l-1.1.2.aar`); this type names only the five that drive EDITH's behaviour. The others stay vendor defaults,
+ * so a host listener is not forced to implement facts it ignores.
+ */
+interface GlassesEvents {
+    fun appResumed()
+    fun appPaused()
+    fun wearingChanged(wearing: Boolean)
+    fun screenOn()
+    fun screenOff()
+}
+
 interface RokidBackend : AutoCloseable {
     interface Events {
         fun ready()
@@ -59,6 +74,25 @@ interface RokidBackend : AutoCloseable {
     fun cancelAuthorization() = Unit
     fun start(audio: Audio): Boolean
     fun stop(audio: Audio)
+
+    /**
+     * Asks the SDK to start the glasses scene, and reports the SDK's own answer asynchronously.
+     *
+     * The synchronous return answers only "was there a live client to ask?". A scene that refuses to open is an
+     * accepted call whose callback is `false`. The callback runs on this backend's worker, never inline on the
+     * caller's thread, and is not invented when no client could be asked.
+     *
+     * Defaults to refusing, so a test backend that has not modelled the path cannot look like it started a scene.
+     */
+    fun openGlassesApp(onResult: (Boolean) -> Unit): Boolean = false
+
+    /**
+     * Registers a consumer for the SDK's glasses-scene events; the returned handle removes it.
+     *
+     * Defaults to `null` - "this backend cannot observe the scene" - so an old fake keeps compiling and cannot
+     * silently claim to forward events.
+     */
+    fun addGlassesEventListener(listener: GlassesEvents): AutoCloseable? = null
 
     /**
      * Registers a consumer for raw payloads on [channelKey], for traffic that is not text - the T17 audio uplink
@@ -245,6 +279,29 @@ class RokidSessionTransport(
         return runCatching {
             enqueue { backend.sendCommand(RokidCommandRoute.CustomClient, json) }
         }.isSuccess
+    }
+
+    /**
+     * Forwards an app-start request to the backend that owns the SDK session.
+     *
+     * Deliberately unconditional while the transport is alive: deciding *when* a scene is needed belongs to the
+     * composition (no `UI_READY`/`PONG`), and the backend is the only layer that can honestly answer whether a
+     * client exists. After [close] nothing may be started, so this refuses.
+     */
+    fun openGlassesApp(onResult: (Boolean) -> Unit): Boolean {
+        if (synchronized(gate) { closed }) return false
+        return backend.openGlassesApp(onResult)
+    }
+
+    /**
+     * Forwards a glasses-scene event registration; the returned handle belongs to the caller.
+     *
+     * The transport only refuses after [close]. When there is no live session the backend answers `null`, and the
+     * caller must treat that as "events are not observable right now" rather than retrying into the void.
+     */
+    fun addGlassesEventListener(listener: GlassesEvents): AutoCloseable? {
+        if (synchronized(gate) { closed }) return null
+        return backend.addGlassesEventListener(listener)
     }
 
     fun send(route: RokidCommandRoute, json: String, correlation: RokidReplyCorrelation?,

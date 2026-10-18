@@ -1,8 +1,10 @@
 package com.sheen.rokid.phone.bridge
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
+import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.contracts.SessionState
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
@@ -496,5 +498,253 @@ class CxrHintLinkTest {
         assertTrue("pause/resume keeps the session id; generation is the link's concern",
             com.sheen.rokid.phone.app.stopSessionMatches(
                 com.sheen.rokid.contracts.SessionId("s-1") to com.sheen.rokid.contracts.Generation(4), "s-1"))
+    }
+
+    // ---------------------------------------------------------------- 0.24: official conversation wire sends
+
+    @Test
+    fun everyOfficialConversationSendCarriesTheEstablishedIdentityAndItsOwnFields() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 3)
+        sent.clear()
+
+        assertTrue(link.state(AssistantRoute.PROACTIVE, "t-1", 3, 7))
+        assertTrue(link.idle(AssistantRoute.WAKE, 8))
+        assertTrue(link.asr(AssistantRoute.WAKE, "t-1", 2, "你好"))
+        assertTrue(link.answer(AssistantRoute.PROACTIVE, "t-1", "h-1", 4, "答案"))
+        assertTrue(link.tool(AssistantRoute.WAKE, "t-1", ToolPhase.START, "search"))
+        assertTrue(link.panelOpen(AssistantRoute.WAKE))
+        assertTrue(link.close(AssistantRoute.PROACTIVE))
+
+        assertEquals(listOf(
+            HintCommand.State("s-1", 3, AssistantRoute.PROACTIVE, "t-1", 3, 7),
+            HintCommand.Idle("s-1", 3, AssistantRoute.WAKE, 8),
+            HintCommand.Asr("s-1", 3, AssistantRoute.WAKE, "t-1", 2, "你好"),
+            HintCommand.Answer("s-1", 3, AssistantRoute.PROACTIVE, "t-1", "h-1", 4, "答案"),
+            HintCommand.Tool("s-1", 3, AssistantRoute.WAKE, "t-1", ToolPhase.START, "search"),
+            HintCommand.PanelOpen("s-1", 3, AssistantRoute.WAKE),
+            HintCommand.Close("s-1", 3, AssistantRoute.PROACTIVE),
+        ), sent.mapNotNull(HintWireCodec::decode))
+    }
+
+    @Test
+    fun aStateSendIsTheExactOfficialWireShape() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 3)
+        sent.clear()
+
+        assertTrue(link.state(AssistantRoute.PROACTIVE, "t-1", 1, 5))
+
+        assertEquals(
+            """{"wireVersion":1,"command":"STATE","sessionId":"s-1","generation":3,"route":"PROACTIVE","turnId":"t-1","status":1,"sequence":5}""",
+            sent.single())
+    }
+
+    @Test
+    fun everyOfficialConversationSendIsDroppedBeforeASessionExists() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+
+        assertFalse(link.state(AssistantRoute.WAKE, "t-1", 1, 1))
+        assertFalse(link.idle(AssistantRoute.WAKE, 1))
+        assertFalse(link.asr(AssistantRoute.WAKE, "t-1", 1, "你好"))
+        assertFalse(link.answer(AssistantRoute.WAKE, "t-1", "h-1", 1, "答案"))
+        assertFalse(link.tool(AssistantRoute.WAKE, "t-1", ToolPhase.START, "search"))
+        assertFalse(link.panelOpen(AssistantRoute.WAKE))
+        assertFalse(link.close(AssistantRoute.WAKE))
+        assertTrue("a refused command may not reach the wire: $sent", sent.isEmpty())
+    }
+
+    @Test
+    fun aRefusedOfficialSendIsReportedRatherThanAssumedToHaveArrived() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent, accept = false)
+        link.sessionEstablished("s-1", 3)
+
+        assertFalse(link.state(AssistantRoute.WAKE, "t-1", 1, 1))
+        assertFalse(link.panelOpen(AssistantRoute.WAKE))
+    }
+
+    // ---------------------------------------------------------------- 0.24: inbound PIN and UI state
+
+    @Test
+    fun aMatchingPinIsRoutedWithItsRoute() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        val pinned = mutableListOf<AssistantRoute>()
+        link.onPin = { pinned += it }
+        link.sessionEstablished("s-1", 3)
+
+        assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.Pin("s-1", 3, AssistantRoute.PROACTIVE))))
+
+        assertEquals(listOf(AssistantRoute.PROACTIVE), pinned)
+    }
+
+    @Test
+    fun aPinForAnotherSessionOrGenerationIsRefused() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        var pinned = 0
+        link.onPin = { pinned++ }
+        link.sessionEstablished("s-1", 3)
+
+        assertFalse("another session cannot pin this one",
+            link.onInbound(HintWireCodec.encode(HintCommand.Pin("other", 3, AssistantRoute.WAKE))))
+        assertFalse("another generation is another session's state",
+            link.onInbound(HintWireCodec.encode(HintCommand.Pin("s-1", 2, AssistantRoute.WAKE))))
+        assertEquals(0, pinned)
+    }
+
+    @Test
+    fun aPinBeforeASessionExistsIsRefused() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        var pinned = 0
+        link.onPin = { pinned++ }
+
+        assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.Pin("s-1", 3, AssistantRoute.WAKE))))
+        assertEquals(0, pinned)
+    }
+
+    @Test
+    fun aThrowingPinCallbackDoesNotEscapeTheSdkThread() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.onPin = { error("the host died") }
+        link.sessionEstablished("s-1", 3)
+
+        assertTrue("the link still handled the PIN",
+            link.onInbound(HintWireCodec.encode(HintCommand.Pin("s-1", 3, AssistantRoute.WAKE))))
+    }
+
+    @Test
+    fun uiReadyIsRoutedForTheEstablishedIdentity() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        val states = mutableListOf<UiState>()
+        link.onUiState = { states += it }
+        link.sessionEstablished("s-1", 3)
+
+        assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.UiReady("s-1", 3))))
+
+        assertEquals(listOf(UiState.Ready), states)
+    }
+
+    @Test
+    fun uiClosedIsRoutedWithItsRoute() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        val states = mutableListOf<UiState>()
+        link.onUiState = { states += it }
+        link.sessionEstablished("s-1", 3)
+
+        assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.UiClosed("s-1", 3, AssistantRoute.PROACTIVE))))
+
+        assertEquals(listOf(UiState.Closed(AssistantRoute.PROACTIVE)), states)
+    }
+
+    @Test
+    fun uiStateForAnotherIdentityIsRefused() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        var states = 0
+        link.onUiState = { states++ }
+        link.sessionEstablished("s-1", 3)
+
+        assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.UiReady("other", 3))))
+        assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.UiReady("s-1", 2))))
+        assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.UiClosed("s-1", 2, AssistantRoute.WAKE))))
+        assertEquals(0, states)
+    }
+
+    @Test
+    fun uiStateBeforeASessionExistsIsRefused() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        var states = 0
+        link.onUiState = { states++ }
+
+        assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.UiReady("s-1", 3))))
+        assertEquals(0, states)
+    }
+
+    @Test
+    fun aThrowingUiStateCallbackDoesNotEscapeTheSdkThread() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.onUiState = { error("the host died") }
+        link.sessionEstablished("s-1", 3)
+
+        assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.UiReady("s-1", 3))))
+    }
+
+    // ---------------------------------------------------------------- 0.24: reintroduce and appStart
+
+    @Test
+    fun reintroduceRestartsTheOpeningHandshakeWithoutChangingTheConversationIdentity() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+        link.sessionEstablished("s-1", 4)
+        sent.clear()
+
+        link.reintroduce()
+
+        val commands = sent.mapNotNull(HintWireCodec::decode)
+        assertEquals(1, commands.filterIsInstance<HintCommand.Hello>().size)
+        assertEquals(HintCommand.Hello("s-1", 4), commands.first())
+        assertEquals(1, commands.filterIsInstance<HintCommand.Ping>().size)
+        assertTrue("a live session must keep accepting conversation traffic after reintroduce",
+            link.state(AssistantRoute.WAKE, "t-1", 1, 1))
+    }
+
+    @Test
+    fun reintroduceDropsTheOldClockMappingUntilANewExchangeCompletes() {
+        val clock = FakeClock()
+        val sent = mutableListOf<String>()
+        val link = CxrHintLink(clock, FakeScheduler(), sendJson = { sent += it; true })
+        link.sessionEstablished("s-1", 4)
+        val ping = sent.mapNotNull { HintWireCodec.decode(it) as? HintCommand.Ping }.last()
+        clock.nanos = ping.p0 + 10_000_000
+        link.onInbound(HintWireCodec.encode(HintCommand.Pong(ping.syncId, ping.p0,
+            ping.p0 + 1_000_000, ping.p0 + 1_000_000)))
+        assertNotNull("the first exchange must have produced a live display", link.liveOutput())
+
+        link.reintroduce()
+
+        assertNull("the new glasses scene has no mapping for the old interval", link.liveOutput())
+    }
+
+    @Test
+    fun reintroduceWithoutASessionDoesNothing() {
+        val sent = mutableListOf<String>()
+        val link = linkInto(sent)
+
+        link.reintroduce()
+
+        assertTrue(sent.isEmpty())
+    }
+
+    @Test
+    fun openGlassesAppIsDelegatedToTheInjectedStarter() {
+        var starts = 0
+        var result: ((Boolean) -> Unit)? = null
+        val link = CxrHintLink(FakeClock(), FakeScheduler(), sendJson = { true },
+            startGlassesApp = { callback -> starts++; result = callback; true })
+        var observed: Boolean? = null
+
+        assertTrue(link.openGlassesApp { observed = it })
+        assertEquals(1, starts)
+        result!!.invoke(false)
+
+        assertEquals(false, observed)
+    }
+
+    @Test
+    fun aLinkWithNoStarterRefusesToStartTheGlassesApp() {
+        val link = linkInto(mutableListOf())
+
+        assertFalse(link.openGlassesApp { })
     }
 }

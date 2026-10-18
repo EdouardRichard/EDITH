@@ -5,8 +5,11 @@ import android.content.Context
 import android.content.Intent
 import android.util.Log
 import com.rokid.cxr.Caps
+import com.rokid.cxr.link.callbacks.IGlassAppCbk
 import com.rokid.cxr.session.*
+import com.rokid.sprite.aiapp.externalapp.example.ExternalAppClient
 import com.sheen.rokid.plugin.CancellationHandle
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.Executor
 import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.atomic.AtomicBoolean
@@ -40,6 +43,14 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
      * session-level audio registration had.
      */
     private val commandInstaller: (CxrSession) -> CustomCmdInstaller = { it.customCmdInstallerOrNull() ?: UnavailableCustomCmdInstaller },
+    /**
+     * Resolves where the glasses scene can be started.
+     *
+     * Injectable for the same reason as [audioInstaller] and [commandInstaller], plus one of its own: the vendor
+     * `ExternalAppClient` is a concrete AAR class that loads a native library, so a JVM test cannot construct it.
+     * `null` is an honest "no client is reachable", not a failed start.
+     */
+    private val glassAppStarter: (CxrSession) -> GlassAppStarter? = { it.glassAppStarterOrNull() },
 ) : RokidBackend {
     constructor(context: Context, config: RokidConnectionConfig, worker: Executor) : this(config, worker,
         { CxrSessionManager.getInstance(context) }, { activity, action -> activity.runOnUiThread(action) },
@@ -67,6 +78,8 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
         val audio = mutableMapOf<RokidBackend.Audio, AudioInstaller>()
         val pending = linkedMapOf<Long, Pending>()
         val usedReplyChannels = mutableSetOf<String>()
+        /** Installed glasses-scene listeners; removed on release so a dead session cannot keep notifying the host. */
+        val glassesEventListeners = CopyOnWriteArrayList<CxrGlassesEventListener>()
         lateinit var lifecycle: ISessionLifecycleCbk
         lateinit var commands: ICustomCmdSessionCallback
         lateinit var installer: AudioInstaller
@@ -299,6 +312,65 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
         return sendSdk(owned.session, route.outbound, json)
     }
 
+    /**
+     * Starts the glasses scene through the vendor client, exactly as the official phone sample does:
+     * `ExternalAppClient.appStart(activityName, IGlassAppCbk)` (javap of the pinned `client-l-1.1.2.aar`).
+     *
+     * Three facts are kept separate rather than collapsed into one boolean:
+     * - no live binding/client to ask: `false`, and the callback is **not** invented;
+     * - the SDK call was accepted: `true`; the scene's own answer arrives later as `onOpenAppResult`;
+     * - the SDK call itself threw: `false`; no `onOpenAppResult` exists to report.
+     *
+     * The activity name is the one this session was configured with, so an `edith.cxr.glassesActivity` override cannot
+     * silently start a different screen from the session the phone established.
+     */
+    override fun openGlassesApp(onResult: (Boolean) -> Unit): Boolean {
+        val owned = binding ?: return false
+        if (fence.isClosed() || binding !== owned) return false
+        val starter = runCatching { glassAppStarter(owned.session) }.getOrNull() ?: return false
+        // The SDK may answer synchronously on a fake transport or later on its own thread; the host sees one answer,
+        // on this backend's worker, and only while the session that asked is still the live one.
+        val reported = AtomicBoolean()
+        fun report(success: Boolean) {
+            if (!reported.compareAndSet(false, true)) return
+            enqueue {
+                if (!fence.isClosed() && binding === owned) onResult(success)
+            }
+        }
+        return try {
+            starter.start(config.glassesActivityName) { success -> report(success) }
+        } catch (thrown: Throwable) {
+            Log.e(TAG, "appStart(${config.glassesActivityName}) failed: " +
+                "${thrown.javaClass.simpleName}: ${thrown.message}")
+            false
+        }
+    }
+
+    /**
+     * Registers the five glasses-scene events on the **session**, matching the official 1.1.2 sample
+     * (`created.addGlassesEventListener(this)`; `javap` shows `addGlassesEventListener` on `CxrSession`).
+     *
+     * `null` means no live session could be observed. The handle removes the registration exactly once; backend release
+     * removes anything still installed, so a closed session cannot keep calling into the host.
+     */
+    override fun addGlassesEventListener(listener: GlassesEvents): AutoCloseable? {
+        val owned = binding ?: return null
+        if (fence.isClosed() || binding !== owned) return null
+        val adapter = CxrGlassesEventListener(listener) { !fence.isClosed() && binding === owned }
+        return try {
+            owned.session.addGlassesEventListener(adapter)
+            owned.glassesEventListeners += adapter
+            AutoCloseable {
+                adapter.detach()
+                owned.glassesEventListeners.remove(adapter)
+                runCatching { owned.session.removeGlassesEventListener(adapter) }
+            }
+        } catch (thrown: Throwable) {
+            Log.e(TAG, "addGlassesEventListener failed: ${thrown.javaClass.simpleName}: ${thrown.message}")
+            null
+        }
+    }
+
     override fun close() {
         cancelAuthorization()
         val owned = binding
@@ -309,6 +381,13 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
             // Releases the client-installed subscriptions; the session callback list is no longer used for audio.
             owned.audio.values.toList().forEach { runCatching { it.release() } }
             runCatching { owned.commandSubscription.release() }
+            // 0.24: a released session must not keep calling scene events into the host. Detach first so an in-flight
+            // vendor callback is inert even if the SDK's own removal races it.
+            owned.glassesEventListeners.forEach { listener ->
+                listener.detach()
+                runCatching { owned.session.removeGlassesEventListener(listener) }
+            }
+            owned.glassesEventListeners.clear()
             owned.session.removeLifecycleCallback(owned.lifecycle)
             owned.session.removeCustomCmdCallback(owned.commands)
         } finally {
@@ -363,3 +442,77 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
             if (media) listOf(GlassPermission.MICROPHONE, GlassPermission.MEDIA) else listOf(GlassPermission.MICROPHONE)
     }
 }
+
+/**
+ * Starts the glasses scene for one live session.
+ *
+ * A seam, not a wrapper: the production implementation makes exactly one vendor call
+ * (`ExternalAppClient.appStart(activityName, IGlassAppCbk)`), and tests record the activity name and drive the
+ * callback without constructing the vendor client.
+ */
+interface GlassAppStarter {
+    /** Returns whether the SDK accepted the request; [onResult] carries the scene's own answer when it arrives. */
+    fun start(activityName: String, onResult: (Boolean) -> Unit): Boolean
+}
+
+/**
+ * The official `appStart` call, verified with `javap` on the pinned `client-l-1.1.2.aar`:
+ * `ExternalAppClient.appStart(String, IGlassAppCbk) -> void`, with the result in `IGlassAppCbk.onOpenAppResult`.
+ *
+ * `IGlassAppCbk` has six abstract callbacks. Only `onOpenAppResult` answers this request; the install/uninstall/stop/
+ * query results cannot arrive from an app start, and `onGlassAppResume` is a separate scene-lifecycle event that the
+ * session-level `IGlassesEventListener` reports. They are implemented as explicit no-ops rather than omitted because
+ * the interface has no defaults.
+ */
+internal class ExternalAppClientGlassAppStarter(private val client: ExternalAppClient) : GlassAppStarter {
+    override fun start(activityName: String, onResult: (Boolean) -> Unit): Boolean = try {
+        client.appStart(activityName, object : IGlassAppCbk {
+            override fun onInstallAppResult(success: Boolean) = Unit
+            override fun onUnInstallAppResult(success: Boolean) = Unit
+            override fun onOpenAppResult(success: Boolean) { onResult(success) }
+            override fun onStopAppResult(success: Boolean) = Unit
+            override fun onGlassAppResume(resumed: Boolean) = Unit
+            override fun onQueryAppResult(installed: Boolean) = Unit
+        })
+        true
+    } catch (thrown: Throwable) {
+        Log.e(APP_START_TAG, "appStart($activityName) failed: ${thrown.javaClass.simpleName}: ${thrown.message}")
+        false
+    }
+}
+
+/** Resolves the app-start seam from the client the official sample starts scenes on; `null` when none is reachable. */
+internal fun CxrSession.glassAppStarterOrNull(): GlassAppStarter? =
+    glassesClientOrNull()?.let(::ExternalAppClientGlassAppStarter)
+
+/**
+ * Translates the vendor's nine-callback `IGlassesEventListener` into EDITH's five [GlassesEvents].
+ *
+ * `javap` shows every method has a `DefaultImpls` default, so the four EDITH ignores are left to the SDK. The adapter
+ * detaches before the SDK registration is removed, which makes an in-flight vendor callback inert; and it contains a
+ * host failure rather than letting it escape into the vendor's callback thread.
+ */
+internal class CxrGlassesEventListener(
+    private val events: GlassesEvents,
+    /** Whether the binding that installed this adapter is still the session the host is using. */
+    private val live: () -> Boolean,
+) : IGlassesEventListener {
+    @Volatile private var active = true
+
+    /** Makes every later vendor callback a no-op. Idempotent. */
+    fun detach() { active = false }
+
+    private inline fun emit(action: () -> Unit) {
+        // `active` covers the owner's handle or release; `live()` covers a reconnect that replaced the binding while
+        // the SDK still holds this session's callback. Neither may let a dead session speak for the current one.
+        if (active && live()) runCatching { action() }
+    }
+
+    override fun onGlassesAppResumed() = emit(events::appResumed)
+    override fun onGlassesAppPaused() = emit(events::appPaused)
+    override fun onWearingStatusChanged(wearing: Boolean) = emit { events.wearingChanged(wearing) }
+    override fun onScreenOff() = emit(events::screenOff)
+    override fun onScreenOn() = emit(events::screenOn)
+}
+
+private const val APP_START_TAG = "EdithCxrCommand"

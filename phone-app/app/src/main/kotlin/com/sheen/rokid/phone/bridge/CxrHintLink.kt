@@ -6,12 +6,28 @@ import com.sheen.rokid.output.HintExchange
 import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.output.RokidHintDevice
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.HintDevice
 import com.sheen.rokid.plugin.MonotonicClock
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicLong
+
+/**
+ * What the glasses' resident panel reported about its UI (0.24 spec §5.4).
+ *
+ * `UI_READY` is not route-scoped: it says the service is alive and can receive commands for the established session,
+ * which is what lets the phone distinguish "the scene needs starting" from "the panel is merely hidden". `UI_CLOSED`
+ * names the route whose panel went away and says nothing about the service's life.
+ */
+sealed interface UiState {
+    /** The panel service is ready for the established session. */
+    data object Ready : UiState
+
+    /** The panel for [route] is hidden; the resident service is still alive. */
+    data class Closed(val route: AssistantRoute) : UiState
+}
 
 /**
  * The App-side hint link: the object that owns the display path for a live CXR connection.
@@ -55,7 +71,15 @@ class CxrHintLink(
     private val retryDelayMillis: Long = OPENING_RETRY_DELAY_MILLIS,
     /** D15: the bound on repeats; zero disables them. */
     private val maxRetries: Int = OPENING_MAX_RETRIES,
-) : AutoCloseable {
+    /**
+     * Where an app-start request goes (0.24 spec §5.7).
+     *
+     * The link already owns the display path but not the transport, and it must not grow a second connection seam:
+     * the composition injects the transport's `openGlassesApp` here. The default refuses, exactly like a composition
+     * with no CXR client, so an old test link cannot look like it started the glasses scene.
+     */
+    private val startGlassesApp: (onResult: (Boolean) -> Unit) -> Boolean = { false },
+) : ConversationWire, AutoCloseable {
     init {
         require(retryDelayMillis > 0) { "RETRY_DELAY_OUT_OF_RANGE" }
         require(maxRetries >= 0) { "RETRY_BOUND_OUT_OF_RANGE" }
@@ -117,6 +141,24 @@ class CxrHintLink(
      * turn an old STOP into a cancellation of the new session.
      */
     var onStopRequest: ((sessionId: String, generation: Long) -> Unit)? = null
+
+    /**
+     * The wearer pinned the panel for [route] (0.24 spec §5.4).
+     *
+     * PIN is one-way and route-scoped; it is validated against the established session **and** generation before it
+     * is delivered, so a pin from a previous session cannot change the current conversation's state. Runs on the
+     * vendor callback thread; a throw is contained here.
+     */
+    var onPin: ((route: AssistantRoute) -> Unit)? = null
+
+    /**
+     * The resident glasses panel reported its own state (0.24 spec §5.4).
+     *
+     * Validated like [onPin]: `UI_READY`/`UI_CLOSED` for another session or generation is not this conversation's
+     * fact. `UI_READY` is deliberately not one-shot - the same identity may report it again after its service is
+     * recreated - while `UI_CLOSED` names the route whose panel is now hidden.
+     */
+    var onUiState: ((UiState) -> Unit)? = null
 
     /**
      * The identifier of the mapping that is live **right now**, or null while nothing can be displayed.
@@ -188,6 +230,58 @@ class CxrHintLink(
     }
 
     /**
+     * Sends one official conversation command for the established session (0.24 spec §5.4).
+     *
+     * Deliberately the same identity rule as [userSaid]/[busy]: with no session introduced to the glasses, a command
+     * has nobody to be true for, so it is refused rather than queued for a session that may never exist. The return
+     * value is what this link can honestly say about its own send; the phone's record was written before the call.
+     */
+    private fun sendConversation(what: String, build: (sessionId: String, generation: Long) -> HintCommand): Boolean {
+        val session = establishedSession
+        if (session == null) {
+            diagnostics("conversation: no session yet - $what is not sent")
+            return false
+        }
+        return runCatching { outbound(HintWireCodec.encode(build(session, establishedGeneration))) }
+            .getOrDefault(false)
+    }
+
+    override fun state(route: AssistantRoute, turnId: String, status: Int, sequence: Long): Boolean =
+        sendConversation("a state") { session, generation ->
+            HintCommand.State(session, generation, route, turnId, status, sequence)
+        }
+
+    override fun idle(route: AssistantRoute, sequence: Long): Boolean =
+        sendConversation("an idle") { session, generation ->
+            HintCommand.Idle(session, generation, route, sequence)
+        }
+
+    override fun asr(route: AssistantRoute, turnId: String, revision: Long, text: String): Boolean =
+        sendConversation("an ASR revision") { session, generation ->
+            HintCommand.Asr(session, generation, route, turnId, revision, text)
+        }
+
+    override fun answer(route: AssistantRoute, turnId: String, hintId: String, revision: Long, text: String): Boolean =
+        sendConversation("an answer revision") { session, generation ->
+            HintCommand.Answer(session, generation, route, turnId, hintId, revision, text)
+        }
+
+    override fun tool(route: AssistantRoute, turnId: String, phase: ToolPhase, label: String): Boolean =
+        sendConversation("a tool row") { session, generation ->
+            HintCommand.Tool(session, generation, route, turnId, phase, label)
+        }
+
+    override fun panelOpen(route: AssistantRoute): Boolean =
+        sendConversation("a panel open") { session, generation ->
+            HintCommand.PanelOpen(session, generation, route)
+        }
+
+    override fun close(route: AssistantRoute): Boolean =
+        sendConversation("a panel close") { session, generation ->
+            HintCommand.Close(session, generation, route)
+        }
+
+    /**
      * The generation the current session was introduced with (Phase C).
      *
      * The glasses gate every message on session **and** generation, so conversation traffic has to carry the same pair
@@ -225,6 +319,41 @@ class CxrHintLink(
         clockSync.sessionEstablished(sessionId, generation)
         scheduleOpeningRetry()
     }
+
+    /**
+     * Introduces the **already established** session again, without changing the link's identity or conversation.
+     *
+     * This is the recovery path for a glasses scene that was just started: the SDK session never went away, but the
+     * new glasses process has not heard the `HELLO`/`PING` the old one answered, so the clock mapping is dead. The
+     * conversation sequence is deliberately kept - this is the same conversation, not a new one - while the clock
+     * exchange restarts from the session identity the glasses already have.
+     *
+     * A no-op with no established session: there is nothing to reintroduce, and inventing an identity here would let a
+     * stopped session look alive again.
+     */
+    fun reintroduce() {
+        val session = establishedSession
+        if (session == null) {
+            diagnostics("handshake: reintroduce ignored - no established session")
+            return
+        }
+        openingSession = session
+        openingGeneration = establishedGeneration
+        openingRetries = 0
+        cancelOpeningRetry()
+        clockSync.sessionEstablished(session, establishedGeneration)
+        // The new scene needs the same bounded opening repeat as a fresh session: the 2026-10-09 device measurement
+        // showed the first HELLO/PING can be sent before the glasses has subscribed.
+        scheduleOpeningRetry()
+    }
+
+    /**
+     * Asks the composition's transport to start the glasses scene (0.24 spec §5.7).
+     *
+     * Delegation only: deciding *when* the scene is needed belongs to the composition, which knows whether
+     * `UI_READY`/`PONG` is missing. The injected seam keeps this link transport-free and testable.
+     */
+    fun openGlassesApp(onResult: (Boolean) -> Unit): Boolean = startGlassesApp(onResult)
 
     /**
      * D15: the session ended without the link being torn down, so the opening handshake must not be repeated again.
@@ -311,7 +440,42 @@ class CxrHintLink(
             }
             return true
         }
+        if (command is HintCommand.Pin) {
+            if (!isEstablished(command.sessionId, command.generation, "pin")) return false
+            diagnostics("pin accepted: session=${command.sessionId} route=${command.route}")
+            deliver("pin") { onPin?.invoke(command.route) }
+            return true
+        }
+        if (command is HintCommand.UiReady) {
+            if (!isEstablished(command.sessionId, command.generation, "UI_READY")) return false
+            diagnostics("UI_READY accepted: session=${command.sessionId} generation=${command.generation}")
+            deliver("UI_READY") { onUiState?.invoke(UiState.Ready) }
+            return true
+        }
+        if (command is HintCommand.UiClosed) {
+            if (!isEstablished(command.sessionId, command.generation, "UI_CLOSED")) return false
+            diagnostics("UI_CLOSED accepted: session=${command.sessionId} route=${command.route}")
+            deliver("UI_CLOSED") { onUiState?.invoke(UiState.Closed(command.route)) }
+            return true
+        }
         return rokidDevice.onCommand(json)
+    }
+
+    /**
+     * True only for the session/generation this link introduced to the glasses; logs the refusal, because a stale
+     * identity arriving here is otherwise indistinguishable from a lost message.
+     */
+    private fun isEstablished(sessionId: String, generation: Long, what: String): Boolean {
+        val session = establishedSession
+        if (session != null && sessionId == session && generation == establishedGeneration) return true
+        diagnostics("$what refused: session=$sessionId generation=$generation " +
+            "established=${session ?: "none"}/$establishedGeneration")
+        return false
+    }
+
+    /** Runs one host callback on the vendor callback thread without letting a host failure take the SDK down. */
+    private inline fun deliver(what: String, action: () -> Unit) {
+        runCatching(action).onFailure { diagnostics("$what callback failed: ${it.javaClass.simpleName}") }
     }
 
     /** Fires [onDisplayBecameLive] only on a not-live -> live transition, and [onMappingLive] on every live mapping. */

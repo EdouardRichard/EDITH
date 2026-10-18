@@ -64,12 +64,36 @@ internal class CxrBackendRig {
     var audioStreamStartCalls = 0
     var audioStreamStopCalls = 0
 
+    /**
+     * The live glasses-event listener, recorded so a test can deliver an SDK callback exactly as the vendor would.
+     *
+     * Official sample evidence (CXR-L 1.1.2 `SessionHubViewModel`): `IGlassesEventListener` is registered on the
+     * **session** (`created.addGlassesEventListener(this)`), not on the client.
+     */
+    var glassesEventListener: IGlassesEventListener? = null
+    var glassesEventListenerRegistrations = 0
+    var glassesEventListenerRemovals = 0
+
+    /**
+     * The app-start seam; `null` models a live session whose glasses client cannot be reached.
+     *
+     * Injected for the same reason as the audio and command installers: `ExternalAppClient` is a concrete AAR class
+     * that loads a native library, so a JVM test cannot construct it.
+     */
+    var glassAppStarter: GlassAppStarter? = RecordingGlassAppStarter()
+
     private val session = proxy<CxrSession> { method, args ->
         when (method) {
             "connect" -> { connects++; null }
             "close" -> { closes++; null }
             "addCustomCmdCallback" -> { commandCallback = args!![0] as ICustomCmdSessionCallback; null }
             "addLifecycleCallback" -> { lifecycleCallback = args!![0] as ISessionLifecycleCbk; null }
+            "addGlassesEventListener" -> {
+                glassesEventListenerRegistrations++
+                glassesEventListener = args!![0] as IGlassesEventListener
+                null
+            }
+            "removeGlassesEventListener" -> { glassesEventListenerRemovals++; null }
             // Modelled because the audio path depends on it: before this the proxy returned null and the backend
             // threw, which is why no test had ever driven audio start to completion.
             "startAudioStream" -> {
@@ -103,7 +127,7 @@ internal class CxrBackendRig {
     }
     val backend = CxrBackend(RokidConnectionConfig("com.sheen.rokid.glasses", "com.sheen.rokid.glasses.Main", null, "test"),
         worker, { manager }, { _, action -> ui.add(action) }, { _, command, json -> sends.add(command); sentJson.add(command to json); sendSuccess },
-        { installer }, { commandInstaller })
+        { installer }, { commandInstaller }, { glassAppStarter })
 
     fun authorize() {
         backend.connect(Activity(), CxrBackendTestEvents())
@@ -153,12 +177,21 @@ internal class CxrBackendRig {
         } as T
 }
 
-/** Executor that runs inline and refuses work once closed, matching the backend's shutdown expectations. */
+/** Executor that runs inline by default and refuses work once closed, matching the backend's shutdown expectations. */
 internal class CxrBackendTestWorker : Executor {
     var closed = false
+    /** Set to false to hold work until [runPending], which is how a test observes the worker boundary itself. */
+    var inline = true
+    private val pending = ArrayDeque<Runnable>()
+
     override fun execute(command: Runnable) {
         if (closed) throw RejectedExecutionException("synthetic closed executor")
-        command.run()
+        if (inline) command.run() else pending += command
+    }
+
+    /** Runs work held while [inline] was false, in submission order. */
+    fun runPending() {
+        while (pending.isNotEmpty()) pending.removeFirst().run()
     }
 }
 
@@ -196,6 +229,27 @@ internal class CxrBackendTestEvents : RokidBackend.Events {
     override fun ready() { readyCount.set(readyCount.get() + 1) }
     override fun interrupted() = Unit
     override fun error(code: String) = Unit
+}
+
+/**
+ * Records the app-start call instead of reaching the vendor client.
+ *
+ * [result] is what the SDK would later report through `IGlassAppCbk.onOpenAppResult`; [throwOnStart] models the
+ * synchronous failure of the SDK call itself, which is a different fact from the scene refusing to open.
+ */
+internal class RecordingGlassAppStarter : GlassAppStarter {
+    val activityNames = mutableListOf<String>()
+    var starts = 0
+    var result = true
+    var throwOnStart = false
+
+    override fun start(activityName: String, onResult: (Boolean) -> Unit): Boolean {
+        starts++
+        activityNames += activityName
+        if (throwOnStart) error("synthetic appStart failure")
+        onResult(result)
+        return true
+    }
 }
 
 /**
