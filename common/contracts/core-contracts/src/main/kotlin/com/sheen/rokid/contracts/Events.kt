@@ -88,3 +88,27 @@ data class ConfirmationResult(
 ) : HostEvent {
     init { require(requestId.isNotBlank()) }
 }
+
+/**
+ * 0.24 spec §5.5: the wearer pinned the glasses panel (the glasses' `PIN` command).
+ *
+ * Host→plugin: the plugin sets its `pinned` flag; it is deliberately not a `ConversationDisplay` call because that
+ * port runs in the opposite direction. `UI_READY`/`UI_CLOSED` never reach the plugin as events.
+ */
+data class PinChanged(
+    override val envelope: EventEnvelope,
+    val route: AssistantRoute,
+) : HostEvent
+
+/**
+ * 0.24 spec §5.5: a speech request for [hintId] finished on the phone.
+ *
+ * Host→plugin and phone-internal (there is no wire command for it): from [result] the plugin decides whether the next
+ * listening turn may start. [SpeechResult] lives here rather than in `plugin-api` so both sides of the boundary share
+ * one type.
+ */
+data class SpeechFinished(
+    override val envelope: EventEnvelope,
+    val hintId: String,
+    val result: SpeechResult,
+) : HostEvent
