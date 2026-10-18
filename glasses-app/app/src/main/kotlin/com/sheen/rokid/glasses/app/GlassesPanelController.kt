@@ -1,6 +1,7 @@
 package com.sheen.rokid.glasses.app
 
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.glasses.bridge.GlassClockResponder
 import com.sheen.rokid.glasses.display.AnswerRevisionGate
 import com.sheen.rokid.glasses.display.AsrRevisionGate
@@ -9,6 +10,7 @@ import com.sheen.rokid.glasses.display.ConversationOrder
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.glasses.display.OrbState
 import com.sheen.rokid.glasses.display.SaidSequenceGate
+import com.sheen.rokid.glasses.display.ToolRowState
 import com.sheen.rokid.output.BackAction
 import com.sheen.rokid.output.ConversationEntry
 import com.sheen.rokid.output.ConversationLog
@@ -78,7 +80,12 @@ data class PanelModel(
      */
     val hiVisible: Boolean,
     val thinkingVisible: Boolean,
+    /** The turn the thinking row belongs to; null whenever [thinkingVisible] is false. */
+    val thinkingTurnId: String?,
     val toolLabel: String?,
+    /** The turn and phase of [toolLabel]; both null whenever the tool row is not on screen (not status 7). */
+    val toolTurnId: String?,
+    val toolPhase: ToolPhase?,
     val tips: String,
 )
 
@@ -140,6 +147,17 @@ class GlassesPanelController(
 
     /** Whether each route is in the official idle state. A later `STATE` clears it. */
     private val officialIdle: MutableMap<AssistantRoute, Boolean> = mutableMapOf()
+
+    /**
+     * The turn an accepted `STATE` named for each route (0.24 S4 Task 17).
+     *
+     * The per-turn grouping needs to know which item a transient row (thinking, tool) belongs to; `STATE` is the only
+     * command that names the current turn without creating an entry. It is cleared with the window/new session.
+     */
+    private val officialTurn: MutableMap<AssistantRoute, String> = mutableMapOf()
+
+    /** The tool row each route last reported: only visible while that route is at status 7 (spec §5.6). */
+    private val toolRows: MutableMap<AssistantRoute, ToolRowState> = mutableMapOf()
 
     /**
      * The first-open latch for Hi, per route.
@@ -230,6 +248,9 @@ class GlassesPanelController(
             // 0.24 S4 Task 16: one streaming answer revision. It updates the row `say-${hintId}` in place; the final
             // still arrives as the hint `SHOW` under that same id.
             is HintCommand.Answer -> onAnswer(command)
+
+            // 0.24 S4 Task 17: the tool row's START/END (the row is visible only at the official status 7).
+            is HintCommand.Tool -> onTool(command)
 
             // Phase C: whether the assistant is working. Same session gate as a SHOW.
             is HintCommand.Busy -> onBusy(command)
@@ -344,6 +365,8 @@ class GlassesPanelController(
      */
     private fun resetOfficialState(resetSequence: Boolean) {
         officialStatus.clear()
+        officialTurn.clear()
+        toolRows.clear()
         AssistantRoute.entries.forEach { route ->
             officialIdle[route] = false
             hiFirstOpen[route] = true
@@ -493,6 +516,46 @@ class GlassesPanelController(
     }
 
     /**
+     * One tool row's START/END (0.24 S4 Task 17, spec §5.6). Must run on the UI thread.
+     *
+     * A tool row belongs to the turn the current `STATE 7` named: the plugin publishes the status before the row, and
+     * the custom-command channel promises no ordering, so a row for a different turn is a stray from a previous turn
+     * and is refused rather than replacing the live one. There is no sequence on `TOOL`, so a delayed END for a turn
+     * whose row no longer exists is stored (it is the only information there is) and simply stays hidden unless the
+     * route is back at status 7.
+     *
+     * The row is **not** a conversation entry: it exists only while status 7 is on screen. A new START replaces the
+     * label (a second tool call is a new row, not an append), and END only restyles the same row.
+     */
+    private fun onTool(command: HintCommand.Tool) {
+        if (!hints.isCurrent(command.sessionId, command.generation)) {
+            diagnostics("tool refused: session or generation mismatch")
+            return
+        }
+        if (command.turnId.isBlank() || command.label.isBlank()) {
+            diagnostics("tool refused: blank turn or label")
+            return
+        }
+        val currentTurn = officialTurn[command.route]
+        val currentStatus = officialStatus[command.route]
+        // Only a row for a turn other than the **displayed tool turn** is a stray. A TOOL that overtakes its STATE is
+        // stored (still hidden) rather than refused: the unordered channel may deliver the two in either order, and the
+        // row becomes visible when its status 7 arrives.
+        if (currentStatus == OfficialStatus.TOOL && currentTurn != null && currentTurn != command.turnId) {
+            diagnostics("tool refused: turn=${command.turnId} is not the displayed turn=$currentTurn")
+            return
+        }
+        toolRows[command.route] = ToolRowState(command.turnId, command.label, command.phase)
+        diagnostics("tool route=${command.route.name} turn=${command.turnId} phase=${command.phase.name} " +
+            "chars=${command.label.length}")
+        if (command.route == order.selected()) {
+            // The row appearing/restyling is content the view must reveal, like a conversation revision.
+            contentRevision++
+            renderModel()
+        }
+    }
+
+    /**
      * Records the level the phone stated and puts the panel in line with it.
      *
      * The level is bounded in [BusyState], so a "finished" that never arrives stops by itself rather than holding the
@@ -533,6 +596,7 @@ class GlassesPanelController(
             return
         }
         officialStatus[command.route] = status
+        officialTurn[command.route] = command.turnId
         officialIdle[command.route] = false
         if (status != OfficialStatus.EMPTY && status != OfficialStatus.LISTENING) {
             hiFirstOpen[command.route] = false
@@ -784,7 +848,24 @@ class GlassesPanelController(
         } else {
             legacyListening
         }
-        val thinking = if (officialKnown) statusForRules == OfficialStatus.ASR_END else legacyThinking
+        // 0.24 S4 Task 17 (spec §5.6): the thinking row is the "before the answer" row. Status 4 owns it, and status 3
+        // keeps it until this turn's answer text actually exists - "答案到达隐藏", not merely "status 3 arrived". A live
+        // final `SHOW` is an answer even when the hint carried no turn id (the legacy/first-answer shape), so the live
+        // emphasis is checked as well as the per-turn entry.
+        val statusTurn = officialTurn[route]
+        val thinking = if (officialKnown) {
+            (statusForRules == OfficialStatus.ASR_END || statusForRules == OfficialStatus.ANSWERING) &&
+                !live && !answerArrived(entries, statusTurn)
+        } else {
+            legacyThinking
+        }
+        val thinkingTurn = if (thinking) statusTurn ?: entries.lastOrNull()?.turnId else null
+        // The tool row exists only at the official tool level, and only for the turn that level names.
+        val tool = if (officialKnown && !idleForRoute && statusForRules == OfficialStatus.TOOL) {
+            toolRows[route]?.takeIf { statusTurn == null || it.turnId == statusTurn }
+        } else {
+            null
+        }
         val effective = effectiveStatus(route, now)
         val pinned = order.isPinned()
 
@@ -799,10 +880,26 @@ class GlassesPanelController(
             listeningVisible = listening,
             hiVisible = hi,
             thinkingVisible = thinking,
-            // No tool rows yet (Task 17).
-            toolLabel = null,
+            thinkingTurnId = thinkingTurn,
+            toolLabel = tool?.label,
+            toolTurnId = tool?.turnId,
+            toolPhase = tool?.phase,
             tips = OfficialConversation.tipsText(effective, pinned),
         )
+    }
+
+    /**
+     * Whether an answer row already exists for [turnId] (or, for a legacy turn-less log, after the last user line).
+     *
+     * This is the only fact that retires the thinking row before status 3: the status says the model is answering, but
+     * the wearer must keep seeing "正在思考" until there is an answer line to read.
+     */
+    private fun answerArrived(entries: List<ConversationEntry>, turnId: String?): Boolean {
+        if (turnId != null) {
+            return entries.any { it.role == ConversationRole.ASSISTANT && it.turnId == turnId }
+        }
+        val lastUser = entries.indexOfLast { it.role == ConversationRole.USER }
+        return entries.drop(lastUser + 1).any { it.role == ConversationRole.ASSISTANT }
     }
 
     private companion object {

@@ -1,5 +1,6 @@
 package com.sheen.rokid.agent
 
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
@@ -83,6 +84,15 @@ data class AgentRequest(
      * [AgentRun.finalText], and streaming is display-only (a lost callback can never change the answer).
      */
     val onTextDelta: ((String) -> Unit)? = null,
+    /**
+     * 0.24 S4 (spec §5.6): the display row for every tool this run handles.
+     *
+     * Called with [ToolPhase.START] before the action is decided/executed and [ToolPhase.END] after its result exists
+     * (including a refusal, an unavailable confirmation channel, a denial and a timeout). The pair is emitted even when
+     * the executor throws, so the wearer never keeps a "running" row. Display-only: the callback's failure is
+     * swallowed, exactly like [onTextDelta], because losing a row must never change the run's outcome.
+     */
+    val onToolStatus: ((action: String, phase: ToolPhase) -> Unit)? = null,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -394,7 +404,12 @@ class AgentLoop(
                 // D-9: one declaration decides both halves — an exempt call is recorded but spends no step, while an
                 // unknown name declared nothing and therefore still spends one.
                 if (registered == null || registered.descriptor.countsTowardStepLimit) spentSteps++
-                val result = if (registered == null) {
+                // 0.24 S4: the row opens before any execution attempt and closes only once the result exists. The pair
+                // covers refusals, an unavailable/denied confirmation and a throwing executor; the callback itself is
+                // display-only (see `AgentRequest.onToolStatus`).
+                notifyToolStatus(request, call.name, ToolPhase.START)
+                val result = try {
+                    if (registered == null) {
                     // An unknown name is a step to feed back and never reaches the policy. It is *not* an execution, so
                     // it carries its own stable audit label instead of sharing `executed` with a real tool run.
                     val unknown = registry.execute(call)
@@ -467,7 +482,10 @@ class AgentLoop(
                                 }
                             }
                         }
+                        }
                     }
+                } finally {
+                    notifyToolStatus(request, call.name, ToolPhase.END)
                 }
                 steps += AgentStep(steps.size + 1, call.name, if (result.ok) "ok" else result.payload)
                 history += ModelHistoryItem.ToolOutput(call.id, result.payload)
@@ -483,6 +501,11 @@ class AgentLoop(
                 }
             }
         }
+    }
+
+    /** Display-only tool-row notification: a throwing/blocking observer must never change the run's outcome. */
+    private fun notifyToolStatus(request: AgentRequest, action: String, phase: ToolPhase) {
+        runCatching { request.onToolStatus?.invoke(action, phase) }
     }
 
     /**

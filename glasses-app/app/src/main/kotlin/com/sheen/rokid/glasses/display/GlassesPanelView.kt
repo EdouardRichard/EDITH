@@ -44,6 +44,10 @@ class GlassesPanelView(context: Context) : FrameLayout(context) {
     var thinkingRow: View? = null
         private set
 
+    /** The tool row currently in the list (0.24 S4 Task 17); null when the panel is not showing one. */
+    var toolRow: View? = null
+        private set
+
     /** The row the live hint occupies, so the layout report and the probe read the hint rather than the list. */
     var liveRow: TextView? = null
         private set
@@ -172,6 +176,11 @@ class GlassesPanelView(context: Context) : FrameLayout(context) {
     /** The thinking row currently in the list; null when the list has none. The same object the Activity added. */
     fun setThinkingRow(row: View?) {
         thinkingRow = row
+    }
+
+    /** The tool row currently in the list; null when the list has none. The same object the Activity added. */
+    fun setToolRow(row: View?) {
+        toolRow = row
     }
 
     /** The row the live hint occupies; null when nothing is live. The same object the Activity added. */

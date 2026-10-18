@@ -1,9 +1,11 @@
 package com.sheen.rokid.glasses
 
 import android.view.ViewGroup
+import android.widget.TextView
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.glasses.display.GlassesPanelView
 import com.sheen.rokid.glasses.display.OrbState
@@ -14,6 +16,7 @@ import com.sheen.rokid.output.OfficialConversation
 import com.sheen.rokid.output.OfficialStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -265,7 +268,166 @@ class GlassesPanelStateTest {
                 assertEquals("and aligns left like every other line",
                     android.view.Gravity.LEFT,
                     absolute and android.view.Gravity.HORIZONTAL_GRAVITY_MASK)
-                assertEquals(GlassesPanelSpec.GREEN_NORMAL_70, userRow.currentTextColor)
+                assertEquals("0.24 S4: while the turn is still recognising, the wearer's line is full green",
+                    GlassesPanelSpec.GREEN_NORMAL, userRow.currentTextColor)
+            }
+        }
+    }
+
+    // ---------------------------------------------------------------- per-turn items (0.24 S4 Task 17)
+
+    private fun syncFor(activity: com.sheen.rokid.glasses.app.GlassesActivity, syncId: String = "sync-s4") {
+        activity.acceptCommand(HintWireCodec.encode(
+            HintCommand.Sync(syncId, offsetLowerNanos = 0, offsetUpperNanos = 1_000_000,
+                validUntilGlassNanos = System.nanoTime() + 30_000_000_000L)))
+    }
+
+    @Test
+    fun aToolRunShowsThe22PxToolRowAndTheEndRestylesTheSameRow() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-tool", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-tool", 1, AssistantRoute.WAKE, turnId = "turn-tool",
+                        status = OfficialStatus.TOOL.wire, sequence = 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Tool("s-tool", 1, AssistantRoute.WAKE, turnId = "turn-tool",
+                        phase = ToolPhase.START, label = "记笔记")))
+            }
+            waitForLayout()
+            var startedRow: android.view.View? = null
+            scenario.onActivity { activity ->
+                assertTrue("status 7 must paint the tool row", activity.toolVisibleForProbe())
+                assertEquals("记笔记", activity.toolTextForProbe())
+                assertEquals("the tool icon slot is the official 22 px",
+                    GlassesPanelSpec.TOOL_ICON_PX, activity.toolIconWidthForProbe())
+                assertEquals("the label is 16 px", GlassesPanelSpec.TOOL_TEXT_SIZE_PX,
+                    activity.toolLabelTextSizeForProbe(), 0.1f)
+                assertEquals("START is full green", GlassesPanelSpec.TOOL_TEXT_START,
+                    activity.toolTextColorForProbe())
+                startedRow = activity.toolRowForProbe()
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Tool("s-tool", 1, AssistantRoute.WAKE, turnId = "turn-tool",
+                        phase = ToolPhase.END, label = "记笔记")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertSame("the END restyles the row it started, never a second row",
+                    startedRow, activity.toolRowForProbe())
+                assertEquals("END is 50% green", GlassesPanelSpec.TOOL_TEXT_END,
+                    activity.toolTextColorForProbe())
+
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-tool", 1, AssistantRoute.WAKE, turnId = "turn-tool",
+                        status = OfficialStatus.ANSWERING.wire, sequence = 2)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertFalse("the answer level retires the finished tool row", activity.toolVisibleForProbe())
+            }
+        }
+    }
+
+    @Test
+    fun theThinkingRowUsesThe22PxIconAnd16PxCopyAndStaysUntilTheAnswerTextArrives() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-think", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-think", 1, AssistantRoute.WAKE, turnId = "turn-think",
+                        status = OfficialStatus.ANSWERING.wire, sequence = 1)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertTrue("status 3 with no answer text yet still thinks", activity.thinkingVisibleForProbe())
+                assertEquals(GlassesPanelSpec.THINKING_ICON_PX, activity.thinkingIconWidthForProbe())
+                assertEquals(GlassesPanelSpec.THINKING_TEXT_SIZE_PX,
+                    activity.thinkingTextSizeForProbe(), 0.1f)
+
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Answer("s-think", 1, AssistantRoute.WAKE, turnId = "turn-think",
+                        hintId = "h-think", revision = 1, text = "答案来了")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertFalse("the answer row replaces the thinking row", activity.thinkingVisibleForProbe())
+                assertEquals("答案来了", requireNotNull(activity.lastMessageRowForProbe()).text.toString())
+            }
+        }
+    }
+
+    @Test
+    fun anAnswerRevisionPatchesTheSameRowAndTheFinalShowKeepsIt() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-stream", 1)))
+                syncFor(activity)
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Answer("s-stream", 1, AssistantRoute.WAKE, turnId = "turn-stream",
+                        hintId = "h-stream", revision = 1, text = "今天")))
+            }
+            waitForLayout()
+            var streamedRow: TextView? = null
+            scenario.onActivity { activity ->
+                streamedRow = requireNotNull(activity.lastMessageRowForProbe())
+                assertEquals("今天", streamedRow?.text.toString())
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Answer("s-stream", 1, AssistantRoute.WAKE, turnId = "turn-stream",
+                        hintId = "h-stream", revision = 2, text = "今天晴。")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertSame("a revision must patch the row, not rebuild the list",
+                    streamedRow, activity.lastMessageRowForProbe())
+                assertEquals("今天晴。", activity.lastMessageRowForProbe()?.text.toString())
+
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Show("s-stream", 1, sequence = 1, hintId = "h-stream", revision = 1,
+                        syncId = "sync-s4", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 30_000,
+                        text = "今天晴。")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertSame("the final SHOW replaces the same turn/answer row",
+                    streamedRow, activity.lastMessageRowForProbe())
+                assertEquals("今天晴。", activity.hintText())
+
+                // A late revision after the final must not reopen or overwrite the row.
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Answer("s-stream", 1, AssistantRoute.WAKE, turnId = "turn-stream",
+                        hintId = "h-stream", revision = 9, text = "迟到答案")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertSame(streamedRow, activity.lastMessageRowForProbe())
+                assertEquals("今天晴。", activity.lastMessageRowForProbe()?.text.toString())
+            }
+        }
+    }
+
+    @Test
+    fun anAsrRevisionPatchesTheSameUserRow() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-asr", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Asr("s-asr", 1, AssistantRoute.WAKE, turnId = "turn-asr",
+                        revision = 1, text = "帮我看")))
+            }
+            waitForLayout()
+            var userRow: TextView? = null
+            scenario.onActivity { activity ->
+                userRow = requireNotNull(activity.lastMessageRowForProbe())
+                assertEquals("帮我看", userRow?.text.toString())
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Asr("s-asr", 1, AssistantRoute.WAKE, turnId = "turn-asr",
+                        revision = 2, text = "帮我看下日程")))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertSame("an ASR revision patches the user row in place", userRow,
+                    activity.lastMessageRowForProbe())
+                assertEquals("帮我看下日程", activity.lastMessageRowForProbe()?.text.toString())
             }
         }
     }

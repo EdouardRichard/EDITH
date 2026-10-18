@@ -10,6 +10,7 @@ import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.contracts.TranscriptRevision
 import com.sheen.rokid.contracts.WakeDetected
 import com.sheen.rokid.plugin.ActionDescriptor
@@ -171,6 +172,12 @@ internal class SmartRecordingDisplay : ConversationDisplay {
         val route: AssistantRoute,
         val text: String,
     )
+    data class ToolStatusCall(
+        val route: AssistantRoute,
+        val turnId: String,
+        val phase: ToolPhase,
+        val label: String,
+    )
 
     val calls = mutableListOf<String>()
     val states = mutableListOf<StateCall>()
@@ -181,6 +188,7 @@ internal class SmartRecordingDisplay : ConversationDisplay {
     val assistantPartials = mutableListOf<AssistantPartialCall>()
     val assistantFinals = mutableListOf<AssistantFinalCall>()
     val assistantNotices = mutableListOf<AssistantNoticeCall>()
+    val toolStatuses = mutableListOf<ToolStatusCall>()
 
     val statuses: List<Int> get() = states.map { it.status }
 
@@ -234,6 +242,11 @@ internal class SmartRecordingDisplay : ConversationDisplay {
     override fun assistantNotice(route: AssistantRoute, text: String) {
         assistantNotices += AssistantNoticeCall(route, text)
         calls += "notice:${route.name}:$text"
+    }
+
+    override fun toolStatus(route: AssistantRoute, turnId: String, phase: ToolPhase, label: String) {
+        toolStatuses += ToolStatusCall(route, turnId, phase, label)
+        calls += "tool:${route.name}:$turnId:${phase.name}:$label"
     }
 
     override fun working(route: AssistantRoute) {

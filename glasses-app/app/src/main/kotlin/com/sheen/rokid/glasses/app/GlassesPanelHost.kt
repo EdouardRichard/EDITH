@@ -12,6 +12,7 @@ import android.view.animation.LinearInterpolator
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.glasses.bridge.RokidBridgeEndpoint
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.glasses.display.GlassesPanelView
@@ -22,9 +23,10 @@ import com.sheen.rokid.glasses.display.HintTicker
 import com.sheen.rokid.glasses.display.LoadingIndicatorView
 import com.sheen.rokid.glasses.display.OrbState
 import com.sheen.rokid.glasses.display.PinIconView
+import com.sheen.rokid.glasses.display.RevealCoalescer
 import com.sheen.rokid.glasses.display.TailTextView
+import com.sheen.rokid.glasses.display.ToolRowState
 import com.sheen.rokid.glasses.display.VoiceOrbView
-import com.sheen.rokid.output.ConversationRole
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.plugin.CancellationHandle
@@ -117,6 +119,23 @@ class GlassesPanelHost(
     /** The thinking row currently in the list, so its ring can be stopped with the panel; null when not thinking. */
     private var thinkingIcon: LoadingIndicatorView? = null
     private var thinkingTextView: TextView? = null
+
+    /** The tool row's icon/copy (0.24 S4 Task 17); null when no tool row is on screen. */
+    private var toolIcon: LoadingIndicatorView? = null
+    private var toolTextView: TextView? = null
+
+    /**
+     * The turns last handed to the view and the row objects they became.
+     *
+     * This is what makes a streamed revision an in-place patch: the next model is compared structurally with these
+     * rows ([ConversationView.plan]); only a new/removed row rebuilds the list. A row's text is applied to the exact
+     * `TextView` the wearer is already looking at, which is also what makes the final `SHOW` replace the same row.
+     */
+    private var renderedTurns: List<ConversationView.TurnRow>? = null
+    private var renderedTurnViews: List<TurnViews> = emptyList()
+
+    /** The official 50 ms reveal/layout cadence for streamed text; text itself is applied immediately. */
+    private val revealCoalescer = RevealCoalescer()
 
     /** New content arrived since the last rebuild; see [PanelModel.contentRevision]. */
     private var newEntryPending = false
@@ -331,7 +350,34 @@ class GlassesPanelHost(
         } else {
             callbacks.keepAwake(!model.idle || model.liveEntryId != null)
         }
-        rebuild(model)
+        when (val plan = ConversationView.plan(renderedTurns, turnsOf(model))) {
+            is ConversationView.RenderPlan.Rebuild -> rebuild(model, plan.turns)
+            is ConversationView.RenderPlan.Update -> updateRows(model, plan)
+            is ConversationView.RenderPlan.Unchanged -> {
+                renderedTurns = plan.turns
+                applyVisualState(model)
+                // Nothing on the list changed; only a new-content event still needs its reveal.
+                if (newEntryPending) scheduleAfterContent(force = false)
+            }
+        }
+    }
+
+    /** The official per-turn items for one published model (0.24 S4 Task 17). */
+    private fun turnsOf(model: PanelModel): List<ConversationView.TurnRow> {
+        val tool = model.toolLabel?.let { label ->
+            ToolRowState(
+                turnId = model.toolTurnId ?: "",
+                label = label,
+                phase = model.toolPhase ?: ToolPhase.START,
+            )
+        }
+        return ConversationView.turns(
+            entries = model.entries,
+            liveEntryId = model.liveEntryId,
+            thinkingVisible = model.thinkingVisible,
+            thinkingTurnId = model.thinkingTurnId,
+            tool = tool,
+        )
     }
 
     override fun wakeScreen() {
@@ -376,7 +422,14 @@ class GlassesPanelHost(
         thinkingIcon?.stop()
         thinkingIcon = null
         thinkingTextView = null
+        toolIcon?.stop()
+        toolIcon = null
+        toolTextView = null
+        renderedTurns = null
+        renderedTurnViews = emptyList()
+        revealCoalescer.reset()
         root.setThinkingRow(null)
+        root.setToolRow(null)
         root.setLiveRow(null)
     }
 
@@ -404,6 +457,24 @@ class GlassesPanelHost(
     fun pinIconVisibleForProbe(): Boolean = pinIconView.visibility == View.VISIBLE
 
     fun thinkingVisibleForProbe(): Boolean = root.thinkingRow?.visibility == View.VISIBLE
+
+    fun thinkingIconWidthForProbe(): Int = thinkingIcon?.width ?: 0
+
+    fun thinkingTextSizeForProbe(): Float = thinkingTextView?.textSize ?: 0f
+
+    /** True when the official status-7 tool row is on screen (0.24 S4 Task 17). */
+    fun toolVisibleForProbe(): Boolean = root.toolRow?.visibility == View.VISIBLE
+
+    fun toolTextForProbe(): String = toolTextView?.text?.toString().orEmpty()
+
+    /** The row object itself, so a test can prove END restyles the START row instead of adding a second one. */
+    fun toolRowForProbe(): View? = root.toolRow
+
+    fun toolIconWidthForProbe(): Int = toolIcon?.width ?: 0
+
+    fun toolLabelTextSizeForProbe(): Float = toolTextView?.textSize ?: 0f
+
+    fun toolTextColorForProbe(): Int = toolTextView?.currentTextColor ?: 0
 
     fun listeningTextForProbe(): String = listeningView.text.toString()
 
@@ -450,12 +521,20 @@ class GlassesPanelHost(
         val listening = model.listeningVisible
         val hi = model.hiVisible
         val thinking = model.thinkingVisible
+        val tool = model.toolLabel != null
         val pinned = model.pinned
         val orb = orbStateFor(model)
 
         listeningView.visibility = if (hi) View.VISIBLE else View.GONE
         root.thinkingRow?.let { row -> row.visibility = if (thinking) View.VISIBLE else View.GONE }
         if (thinking) thinkingIcon?.start() else thinkingIcon?.stop()
+        root.toolRow?.let { row -> row.visibility = if (tool) View.VISIBLE else View.GONE }
+        if (tool) {
+            toolTextView?.setTextColor(GlassesPanelSpec.toolTextColor(model.toolPhase ?: ToolPhase.START))
+            if (model.toolPhase == ToolPhase.END) toolIcon?.stop() else toolIcon?.start()
+        } else {
+            toolIcon?.stop()
+        }
         orbView.setState(orb)
         tipsView.text = model.tips
         pinTextView.visibility = if (pinned) View.GONE else View.VISIBLE
@@ -463,29 +542,78 @@ class GlassesPanelHost(
         Log.i(TAG,
             "P3_STATE route=${route.name} busy=${listening || thinking || (live && !model.idle)} " +
                 "any=${!model.idle} live=$live orb=${orb.name} listening=$listening hi=$hi thinking=$thinking " +
-                "status=${model.status?.name ?: "none"} idle=${model.idle} pinned=$pinned " +
+                "tool=$tool status=${model.status?.name ?: "none"} idle=${model.idle} pinned=$pinned " +
                 "offset=${scrollOffsetY()} max=${maxScrollY()} ticker=${tickerAnimator != null}")
     }
 
     /** The orb state from the one model; the pure priority rule lives in `orbStateOf` so it is JVM-testable. */
     private fun orbStateFor(model: PanelModel): OrbState = orbStateOf(model)
 
-    /** Redraws the conversation in front of the wearer from the published model. */
-    private fun rebuild(model: PanelModel) {
-        val route = model.route
-        val rows = ConversationView.rows(model.entries, model.liveEntryId)
+    /** Rebuilds the conversation list from the per-turn items; only a structural change takes this path. */
+    private fun rebuild(model: PanelModel, turns: List<ConversationView.TurnRow>) {
         val previousScroll = scrollOffsetY()
         entriesView.removeAllViews()
         root.setLiveRow(null)
         thinkingIcon = null
-        root.setThinkingRow(null)
         thinkingTextView = null
-        rows.forEach { row -> entriesView.addView(entryRow(row)) }
-        if (model.thinkingVisible) {
-            entriesView.addView(thinkingRow())
-        }
-        Log.i(TAG, HintPresentation.conversationReport(route, rows.size, rows.sumOf { it.entry.text.length }))
+        toolIcon = null
+        toolTextView = null
+        root.setThinkingRow(null)
+        root.setToolRow(null)
+        renderedTurnViews = turns.map { turn -> addTurn(turn) }
+        renderedTurns = turns
+        Log.i(TAG, HintPresentation.conversationReport(
+            model.route,
+            turns.size,
+            turns.sumOf { (it.asrText?.length ?: 0) + (it.answerText?.length ?: 0) },
+        ))
         applyVisualState(model)
+        revealCoalescer.reset()
+        scheduleAfterContent(force = true, previousScroll = previousScroll)
+    }
+
+    /**
+     * Applies a text/style-only model to the rows already on screen (0.24 S4 Task 17).
+     *
+     * This is the streaming path: an `ASR`/`ANSWER` revision (and the final `SHOW`, which replaces the same
+     * `say-${hintId}` row) changes one `TextView`'s text, so the other rows keep their objects, their scroll position
+     * and their selection. Only [plan]'s [ConversationView.RenderPlan.Update] reaches this method.
+     */
+    private fun updateRows(model: PanelModel, plan: ConversationView.RenderPlan.Update) {
+        val previousScroll = scrollOffsetY()
+        plan.turns.forEachIndexed { index, turn ->
+            val views = renderedTurnViews.getOrNull(index) ?: return@forEachIndexed
+            views.asr?.let { view ->
+                if (view.text.toString() != turn.asrText) view.text = turn.asrText
+                view.setTextColor(turn.asrTextColor)
+            }
+            views.answer?.let { view ->
+                if (view.text.toString() != turn.answerText) view.text = turn.answerText
+            }
+            views.toolText?.let { label ->
+                if (label.text.toString() != turn.toolLabel) label.text = turn.toolLabel
+                label.setTextColor(turn.toolTextColor)
+                if (turn.toolPhase == ToolPhase.END) views.toolIcon?.stop() else views.toolIcon?.start()
+            }
+        }
+        renderedTurns = plan.turns
+        val liveIndex = plan.turns.indexOfFirst { it.answerLive }
+        root.setLiveRow(if (liveIndex >= 0) renderedTurnViews.getOrNull(liveIndex)?.answer else null)
+        applyVisualState(model)
+        scheduleAfterContent(force = plan.liveChanged, previousScroll = previousScroll)
+        Log.i(TAG, "P3_PATCH turns=${plan.turns.size} text=${plan.textChanged} live=${plan.liveChanged}")
+    }
+
+    /**
+     * Posts the expensive reveal/scroll/layout pass.
+     *
+     * Text is always applied synchronously before this; the pass is coalesced to the official 50 ms cadence so a delta
+     * burst cannot queue one reveal per revision. A structural rebuild and the final `SHOW` force the pass through.
+     */
+    private fun scheduleAfterContent(force: Boolean, previousScroll: Int = scrollOffsetY()) {
+        val now = System.nanoTime()
+        if (force) revealCoalescer.reset()
+        if (!revealCoalescer.allow(now)) return
         val serial = ++rebuildSerial
         entriesView.post {
             if (serial != rebuildSerial || destroyed) return@post
@@ -565,30 +693,101 @@ class GlassesPanelHost(
             if (HintTicker.shouldScroll(scrollOffsetY(), maxScrollY())) View.VISIBLE else View.GONE
     }
 
-    /** One row of the conversation, in the official style (same rules as the pre-extraction Activity). */
-    private fun entryRow(row: ConversationView.Row): TextView {
-        val role = row.entry.role
-        val view: TextView = if (role == ConversationRole.USER) {
-            TailTextView(context, maxVisibleLines = GlassesPanelSpec.maxLines(ConversationRole.USER))
-        } else {
-            TextView(context)
+    // ---------------------------------------------------------------- per-turn rows (0.24 S4 Task 17)
+
+    /** One turn's views, kept so a text-only update patches the objects already on screen. */
+    private class TurnViews(
+        val asr: TextView?,
+        val answer: TextView?,
+        val thinking: LinearLayout?,
+        val tool: LinearLayout?,
+        val toolIcon: LoadingIndicatorView?,
+        val toolText: TextView?,
+    )
+
+    /**
+     * Adds one turn's item in the official order (ASR line, answer line, thinking row, tool row) and returns its views.
+     * A `null` field means the row does not exist for this turn, so a later update can never patch the wrong view.
+     */
+    private fun addTurn(turn: ConversationView.TurnRow): TurnViews {
+        val asr = turn.asrText?.let { text ->
+            userRow(text, answered = turn.answerText != null).also { entriesView.addView(it) }
         }
-        view.apply {
-            text = row.entry.text
-            setTextColor(GlassesPanelSpec.textColor(role))
-            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.textSizePx(role))
-            if (role != ConversationRole.USER) {
-                maxLines = GlassesPanelSpec.maxLines(role)
+        val answer = turn.answerText?.let { text ->
+            answerRow(text).also { view ->
+                entriesView.addView(view)
+                if (turn.answerLive) root.setLiveRow(view)
             }
+        }
+        val thinking = if (turn.thinkingVisible) thinkingRow().also { entriesView.addView(it) } else null
+        var toolRowView: LinearLayout? = null
+        var toolIconView: LoadingIndicatorView? = null
+        var toolTextViewView: TextView? = null
+        if (turn.toolLabel != null && turn.toolPhase != null) {
+            val built = toolRow(turn.toolLabel, turn.toolPhase)
+            toolRowView = built.third
+            toolIconView = built.first
+            toolTextViewView = built.second
+            entriesView.addView(toolRowView)
+        }
+        return TurnViews(asr, answer, thinking, toolRowView, toolIconView, toolTextViewView)
+    }
+
+    /** The wearer's line: 14 px, full green while recognising, 70% once this turn's answer exists. */
+    private fun userRow(text: String, answered: Boolean): TextView =
+        TailTextView(context, maxVisibleLines = GlassesPanelSpec.USER_MAX_LINES).apply {
+            this.text = text
+            setTextColor(if (answered) GlassesPanelSpec.GREEN_NORMAL_70 else GlassesPanelSpec.GREEN_NORMAL)
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.USER_TEXT_SIZE_PX)
             gravity = Gravity.START
             layoutParams = LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
-            val vertical = TypedValue.applyDimension(
-                TypedValue.COMPLEX_UNIT_DIP, 4f, context.resources.displayMetrics).toInt()
-            setPadding(0, vertical, 0, vertical)
-            if (row.live) root.setLiveRow(this)
+            setPadding(0, rowVerticalPadding(), 0, rowVerticalPadding())
         }
-        return view
+
+    /** The answer line: 16 px full green. Markdown waits for Task 19; the row identity is what Task 17 fixes. */
+    private fun answerRow(text: String): TextView = TextView(context).apply {
+        this.text = text
+        setTextColor(GlassesPanelSpec.GREEN_NORMAL)
+        setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.ASSISTANT_TEXT_SIZE_PX)
+        maxLines = GlassesPanelSpec.ASSISTANT_MAX_LINES
+        gravity = Gravity.START
+        layoutParams = LinearLayout.LayoutParams(
+            LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT)
+        setPadding(0, rowVerticalPadding(), 0, rowVerticalPadding())
+    }
+
+    /** The official 4 dp row padding used by every conversation line. */
+    private fun rowVerticalPadding(): Int = TypedValue.applyDimension(
+        TypedValue.COMPLEX_UNIT_DIP, 4f, context.resources.displayMetrics).toInt()
+
+    /**
+     * The tool row: the official 22x22 icon slot plus the 16 px mapped copy, full green while running and 50% once the
+     * action returned (spec §5.6). The icon is the existing `LoadingIndicatorView` in that slot until Task 19 copies the
+     * official `ai_agent_tool_start/end` GIFs; the row geometry and copy rules are what this task fixes.
+     */
+    private fun toolRow(label: String, phase: ToolPhase): Triple<LoadingIndicatorView, TextView, LinearLayout> {
+        val row = LinearLayout(context).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, rowVerticalPadding(), 0, rowVerticalPadding())
+        }
+        val icon = LoadingIndicatorView(context, dotRadiusPx = 2f, colorInt = GlassesPanelSpec.GREEN_NORMAL)
+        row.addView(icon, LinearLayout.LayoutParams(
+            GlassesPanelSpec.TOOL_ICON_PX, GlassesPanelSpec.TOOL_ICON_PX))
+        val text = TextView(context).apply {
+            this.text = label
+            setTextColor(GlassesPanelSpec.toolTextColor(phase))
+            setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.TOOL_TEXT_SIZE_PX)
+            gravity = Gravity.START
+        }
+        row.addView(text, LinearLayout.LayoutParams(
+            0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = 5 })
+        if (phase == ToolPhase.START) icon.start() else icon.stop()
+        toolIcon = icon
+        toolTextView = text
+        root.setToolRow(row)
+        return Triple(icon, text, row)
     }
 
     /** The `正在思考` row: the official 22x22 icon plus 16 px full-green copy, as the last line. */

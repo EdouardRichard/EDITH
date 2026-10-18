@@ -1,6 +1,7 @@
 package com.sheen.rokid.glasses.display
 
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.output.ConversationRole
 
 /**
@@ -42,6 +43,10 @@ object GlassesPanelSpec {
     /** `imv_loading` in the thinking row. */
     const val THINKING_ICON_PX = 22
 
+    /** 0.24 S4 Task 17: the tool row's icon slot and copy, the official 22x22 / 16 px pair. */
+    const val TOOL_ICON_PX = 22
+    const val TOOL_TEXT_SIZE_PX = 16f
+
     // ---------------------------------------------------------------- official green scale
 
     /** `green_normal`: the assistant's answer, the listening line, the thinking line and the orb. */
@@ -49,6 +54,17 @@ object GlassesPanelSpec {
 
     /** `green_normal_70`: the wearer's own line once the answer has arrived. */
     val GREEN_NORMAL_70: Int = 0xB340FF5E.toInt()
+
+    /**
+     * 0.24 S4 Task 17: the tool row's start/end copy.
+     *
+     * Official `agentToolStatus` paints START with full `green` and END with `green_50`; EDITH keeps its own
+     * `green_normal` family (the panel already uses `green_normal` everywhere) and expresses "50%" as the same colour's
+     * 50% alpha. Task 19 replaces the stand-in icon with the official `ai_agent_tool_*` GIFs; the copy/contrast rules
+     * stay these.
+     */
+    val TOOL_TEXT_START: Int = GREEN_NORMAL
+    val TOOL_TEXT_END: Int = 0x8040FF5E.toInt()
 
     /** `green_40`: the two operation tips. */
     val GREEN_40: Int = 0x6600FF00.toInt()
@@ -150,6 +166,12 @@ object GlassesPanelSpec {
     fun textColor(role: ConversationRole): Int = when (role) {
         ConversationRole.USER -> GREEN_NORMAL_70
         ConversationRole.ASSISTANT -> GREEN_NORMAL
+    }
+
+    /** The tool row's label colour: full green while running, 50% once the action returned. */
+    fun toolTextColor(phase: ToolPhase): Int = when (phase) {
+        ToolPhase.START -> TOOL_TEXT_START
+        ToolPhase.END -> TOOL_TEXT_END
     }
 
     fun maxLines(role: ConversationRole): Int = when (role) {

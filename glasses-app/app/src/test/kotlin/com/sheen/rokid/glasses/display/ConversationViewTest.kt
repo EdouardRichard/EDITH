@@ -1,11 +1,13 @@
 package com.sheen.rokid.glasses.display
 
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.output.ConversationEntry
 import com.sheen.rokid.output.ConversationLog
 import com.sheen.rokid.output.ConversationRole
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -169,5 +171,218 @@ class ConversationViewTest {
     @Test
     fun theAnswerEntryIdConventionIsExplicit() {
         assertEquals("say-hint-9", AnswerRevisionGate.answerEntryId("hint-9"))
+    }
+
+    // ---------------------------------------------------------------- per-turn items (0.24 S4 Task 17)
+
+    private fun turnEntry(
+        id: String,
+        role: ConversationRole,
+        turnId: String?,
+        text: String = "第 $id 条",
+    ) = ConversationEntry(id, AssistantRoute.WAKE, role, text, turnId)
+
+    @Test
+    fun turnsGroupTheWearersLineAndItsAnswerByTurnId() {
+        val turns = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t1", ConversationRole.USER, "t-1", "问一"),
+                turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "答一"),
+                turnEntry("asr-t2", ConversationRole.USER, "t-2", "问二"),
+            ),
+        )
+
+        assertEquals("one item per turn, in the order the turns first appeared",
+            listOf("t-1", "t-2"), turns.map { it.turnId })
+        assertEquals("问一", turns[0].asrText)
+        assertEquals("答一", turns[0].answerText)
+        assertEquals("问二", turns[1].asrText)
+        assertEquals(null, turns[1].answerText)
+    }
+
+    @Test
+    fun entriesWithoutATurnIdStayOneItemEach() {
+        // Spec §5.6: an old/no-turn producer is rendered one entry per item rather than being guessed into a group.
+        val turns = ConversationView.turns(
+            listOf(
+                turnEntry("said-1", ConversationRole.USER, null, "一"),
+                turnEntry("said-2", ConversationRole.ASSISTANT, null, "二"),
+                turnEntry("said-3", ConversationRole.USER, null, "三"),
+            ),
+        )
+
+        assertEquals(3, turns.size)
+        assertTrue("a null turn id is never merged with another null entry", turns.all { it.turnId == null })
+        assertEquals(listOf("一", "二", "三"), turns.map { it.asrText ?: it.answerText })
+    }
+
+    @Test
+    fun aMixedLogKeepsTheFirstAppearanceOrderAndTheNullEntriesInPlace() {
+        val turns = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t2", ConversationRole.USER, "t-2", "第二轮"),
+                turnEntry("said-legacy", ConversationRole.ASSISTANT, null, "旧回答"),
+                turnEntry("asr-t1", ConversationRole.USER, "t-1", "第一轮"),
+            ),
+        )
+
+        assertEquals("no sorting by turn id or timestamp", listOf("t-2", null, "t-1"), turns.map { it.turnId })
+        assertEquals(listOf("第二轮", "旧回答", "第一轮"), turns.map { it.asrText ?: it.answerText })
+    }
+
+    @Test
+    fun theLiveAnswerIsMarkedOnItsOwnTurnOnly() {
+        val turns = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t1", ConversationRole.USER, "t-1"),
+                turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "答一"),
+                turnEntry("say-h2", ConversationRole.ASSISTANT, "t-2", "答二"),
+            ),
+            liveEntryId = "say-h2",
+        )
+
+        assertFalse(turns[0].answerLive)
+        assertTrue("a final SHOW marks the same turn row the partial opened", turns[1].answerLive)
+    }
+
+    @Test
+    fun turnRowsCarryTheOfficialRoleStyles() {
+        val beforeAnswer = ConversationView.turns(
+            listOf(turnEntry("asr-t1", ConversationRole.USER, "t-1")),
+        ).single()
+        assertEquals(GlassesPanelSpec.USER_TEXT_SIZE_PX, beforeAnswer.asrTextSizePx)
+        assertEquals("while recognising, the wearer's line is full green",
+            GlassesPanelSpec.GREEN_NORMAL, beforeAnswer.asrTextColor)
+
+        val afterAnswer = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t1", ConversationRole.USER, "t-1"),
+                turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "答一"),
+            ),
+        ).single()
+        assertEquals("once the answer is in, the wearer's line drops to 70%",
+            GlassesPanelSpec.GREEN_NORMAL_70, afterAnswer.asrTextColor)
+        assertEquals(GlassesPanelSpec.ASSISTANT_TEXT_SIZE_PX, afterAnswer.answerTextSizePx)
+        assertEquals(GlassesPanelSpec.GREEN_NORMAL, afterAnswer.answerTextColor)
+    }
+
+    @Test
+    fun thinkingAndToolRowsAttachToTheTurnTheyBelongTo() {
+        val turns = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t1", ConversationRole.USER, "t-1"),
+                turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "答一"),
+                turnEntry("asr-t2", ConversationRole.USER, "t-2"),
+            ),
+            thinkingVisible = true,
+            thinkingTurnId = "t-2",
+            tool = ToolRowState("t-2", "打开 App", ToolPhase.START),
+        )
+
+        assertFalse(turns[0].thinkingVisible)
+        assertNull(turns[0].toolLabel)
+        assertTrue("status 4 thinking belongs to the turn being worked on", turns[1].thinkingVisible)
+        assertEquals("打开 App", turns[1].toolLabel)
+        assertEquals(ToolPhase.START, turns[1].toolPhase)
+    }
+
+    @Test
+    fun aTransientRowWithNoEntryYetIsAppendedAtTheEnd() {
+        val turns = ConversationView.turns(
+            listOf(turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "答一")),
+            thinkingVisible = true,
+            thinkingTurnId = "t-2",
+            tool = ToolRowState("t-2", "尚未映射的动作", ToolPhase.END),
+        )
+
+        assertEquals(listOf("t-1", "t-2"), turns.map { it.turnId })
+        assertTrue("a new turn may think before its utterance is stored", turns[1].thinkingVisible)
+        assertEquals("尚未映射的动作", turns[1].toolLabel)
+        assertEquals(ToolPhase.END, turns[1].toolPhase)
+    }
+
+    // ---------------------------------------------------------------- the incremental render plan (0.24 S4 Task 17)
+
+    @Test
+    fun anAnswerRevisionIsAnInPlaceUpdateRatherThanARebuild() {
+        val first = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t1", ConversationRole.USER, "t-1"),
+                turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "今天"),
+            ),
+        )
+        val second = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t1", ConversationRole.USER, "t-1"),
+                turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "今天晴。"),
+            ),
+        )
+
+        val plan = ConversationView.plan(first, second)
+
+        assertTrue("partial answer text must patch the row, never rebuild the list: $plan",
+            plan is ConversationView.RenderPlan.Update)
+        assertTrue((plan as ConversationView.RenderPlan.Update).textChanged)
+    }
+
+    @Test
+    fun theFinalShowReplacesTheSameRowAsAnUpdate() {
+        val partial = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t1", ConversationRole.USER, "t-1"),
+                turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "今天晴"),
+            ),
+        )
+        val final = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t1", ConversationRole.USER, "t-1"),
+                turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "今天晴。"),
+            ),
+            liveEntryId = "say-h1",
+        )
+
+        val plan = ConversationView.plan(partial, final)
+
+        assertTrue("the final SHOW is the same entry row: $plan", plan is ConversationView.RenderPlan.Update)
+        val update = plan as ConversationView.RenderPlan.Update
+        assertTrue(update.textChanged)
+        assertTrue("the final only adds the live emphasis", update.liveChanged)
+    }
+
+    @Test
+    fun aNewRowNeedsARebuildButAnIdenticalModelDoesNot() {
+        val one = ConversationView.turns(listOf(turnEntry("asr-t1", ConversationRole.USER, "t-1")))
+        val two = ConversationView.turns(
+            listOf(
+                turnEntry("asr-t1", ConversationRole.USER, "t-1"),
+                turnEntry("say-h1", ConversationRole.ASSISTANT, "t-1", "答一"),
+            ),
+        )
+
+        assertTrue(ConversationView.plan(null, one) is ConversationView.RenderPlan.Rebuild)
+        assertTrue("a new answer row changes the list structure",
+            ConversationView.plan(one, two) is ConversationView.RenderPlan.Rebuild)
+        assertTrue(ConversationView.plan(two, two) is ConversationView.RenderPlan.Unchanged)
+    }
+
+    @Test
+    fun theSameAsrTextUpdateIsNotCountedAsNewText() {
+        val first = ConversationView.turns(listOf(turnEntry("asr-t1", ConversationRole.USER, "t-1", "帮我看")))
+        val same = ConversationView.turns(listOf(turnEntry("asr-t1", ConversationRole.USER, "t-1", "帮我看")))
+
+        assertTrue(ConversationView.plan(first, same) is ConversationView.RenderPlan.Unchanged)
+    }
+
+    @Test
+    fun theRevealPassIsCoalescedToTheOfficialFiftyMillisecondCadence() {
+        val coalescer = RevealCoalescer()
+
+        assertTrue("the first revision always passes", coalescer.allow(1_000_000_000L))
+        assertFalse("a burst inside 50 ms does not run a second layout/reveal pass",
+            coalescer.allow(1_020_000_000L))
+        assertFalse(coalescer.allow(1_049_000_000L))
+        assertTrue("at the official 50 ms boundary the pass runs again",
+            coalescer.allow(1_050_000_000L))
+        assertTrue("the cap is the task's ≤100 ms bound", RevealCoalescer.INTERVAL_NANOS <= 100_000_000L)
     }
 }

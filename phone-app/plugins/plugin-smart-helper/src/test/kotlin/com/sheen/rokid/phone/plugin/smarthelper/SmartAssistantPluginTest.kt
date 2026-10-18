@@ -17,10 +17,13 @@ import com.sheen.rokid.contracts.PinChanged
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.contracts.SpeechFinished
 import com.sheen.rokid.contracts.SpeechResult
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.contracts.UserAction
 import com.sheen.rokid.output.OfficialConversation
 import com.sheen.rokid.output.OfficialStatus
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ConfigSchema
 import com.sheen.rokid.plugin.DeactivationReason
@@ -411,6 +414,119 @@ class SmartAssistantPluginTest {
         assertEquals(listOf(AssistantRoute.WAKE), display.closes, "an answer nobody saw closes, it never continues")
         assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
         assertEquals(1, display.assistantFinals.size, "the phone's record still names the final entry")
+    }
+
+    // ------------------------------------------------- 0.24 S4 (Task 17): tool status rows
+
+    /** A panel-visible rig whose host advertises one L1 action with a caller-chosen user-facing title. */
+    private fun toolRig(title: String = "记笔记"): Pair<SmartTestRig, SmartRecordingDisplay> {
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig(panelVisible = true)
+        rig.actions.descriptors += smartAction("compose_note", risk = RiskLevel.L1, scope = "note", title = title)
+        rig.actions.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "记好了") }
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        return rig to display
+    }
+
+    /** First request: one text delta then a tool call; second request: the closing answer. */
+    private fun SmartTestRig.composeNoteRun(preamble: String?) {
+        var requests = 0
+        model.onRequest = { request, listener ->
+            if (requests++ == 0) {
+                preamble?.let { listener(ModelStreamEvent.TextDelta(request.requestId, it)) }
+                listener(ModelStreamEvent.ToolCallTerminal(request.requestId, "item-1", "call-1", "compose_note", "{}"))
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(request, listener, "已经记好了。")
+            }
+        }
+    }
+
+    @Test fun `S4 a tool call is published as START and END under the action's mapped label`() {
+        val (rig, display) = toolRig(title = "记笔记")
+        rig.composeNoteRun(preamble = null)
+        rig.wakeAndFinal("帮我记一条笔记")
+        rig.tick()
+
+        assertEquals(
+            listOf(
+                SmartRecordingDisplay.ToolStatusCall(AssistantRoute.WAKE, "asr-1", ToolPhase.START, "记笔记"),
+                SmartRecordingDisplay.ToolStatusCall(AssistantRoute.WAKE, "asr-1", ToolPhase.END, "记笔记"),
+            ),
+            display.toolStatuses,
+            "the row must name the EDITH action with its host-declared label, not the raw name",
+        )
+        assertEquals(listOf("compose_note" to "{}"), rig.actions.executed)
+        assertEquals(listOf("已经记好了。"), rig.hintTexts, "the tool call never becomes the answer")
+    }
+
+    @Test fun `S4 an unknown action name is published raw rather than guessed`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+        var requests = 0
+        rig.model.onRequest = { request, listener ->
+            if (requests++ == 0) {
+                listener(ModelStreamEvent.ToolCallTerminal(request.requestId, "item-1", "call-1", "mystery_tool", "{}"))
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(request, listener, "答案。")
+            }
+        }
+        rig.wakeAndFinal("试一个未知动作")
+        rig.tick()
+
+        assertEquals(
+            listOf(
+                SmartRecordingDisplay.ToolStatusCall(AssistantRoute.WAKE, "asr-1", ToolPhase.START, "mystery_tool"),
+                SmartRecordingDisplay.ToolStatusCall(AssistantRoute.WAKE, "asr-1", ToolPhase.END, "mystery_tool"),
+            ),
+            display.toolStatuses,
+        )
+    }
+
+    @Test fun `S4 the plugin's own answer and skill tools never paint a tool row`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        notifyAnswer(rig, channel = "screen")
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题", turnId = "asr-1")))
+        rig.tick()
+
+        assertTrue(rig.output.hints.isNotEmpty(),
+            "the run really called notify_user: ${rig.actions.executed}")
+        assertTrue(display.toolStatuses.isEmpty(),
+            "notify_user/load_skill are EDITH internals, not device actions: ${display.toolStatuses}")
+    }
+
+    @Test fun `S4 a tool round starts the official tool level before the row and the answer retires it`() {
+        val (rig, display) = toolRig()
+        rig.composeNoteRun(preamble = null)
+        rig.wakeAndFinal("帮我记一条笔记")
+        rig.tick()
+
+        val statuses = display.statuses
+        assertTrue(OfficialStatus.TOOL.wire in statuses,
+            "the official tool level 7 must be displayed while the action runs: $statuses")
+        assertTrue(statuses.indexOf(OfficialStatus.TOOL.wire) > statuses.indexOf(OfficialStatus.ASR_END.wire),
+            "the tool level follows the thinking level")
+        assertEquals(OfficialStatus.ANSWERING.wire, statuses.last(), "the closing answer is the last level")
+        val toolIndex = display.calls.indexOfFirst { it.startsWith("tool:") }
+        val answerIndex = display.calls.indexOfFirst { it.startsWith("answer:") }
+        assertTrue(toolIndex in 0 until answerIndex,
+            "the tool row is published before the streamed answer: ${display.calls}")
+    }
+
+    @Test fun `S4 a tool round's preamble does not accumulate into the final answer row`() {
+        val (rig, display) = toolRig()
+        rig.composeNoteRun(preamble = "先想一下。")
+        rig.wakeAndFinal("帮我记一条笔记")
+        rig.tick()
+
+        assertEquals(
+            listOf("先想一下。", "已经记好了。"),
+            display.assistantPartials.map { it.text },
+            "the second request's revision starts a fresh accumulation; the preamble is not re-sent with the answer",
+        )
+        assertEquals("已经记好了。", rig.output.hints.single().text,
+            "the final answer assembly is unchanged")
     }
 
     // ------------------------------------------------- 0.24 S4 (Task 16 I1): the memory acknowledgement is not the answer

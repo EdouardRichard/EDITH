@@ -1,6 +1,7 @@
 package com.sheen.rokid.glasses.app
 
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.glasses.display.BusyState
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.glasses.display.OrbState
@@ -156,8 +157,24 @@ class GlassesPanelControllerTest {
         fun busy(route: AssistantRoute = AssistantRoute.WAKE, busy: Boolean = true): Boolean =
             accept(HintCommand.Busy("s-1", 1, route, busy = busy))
 
-        fun state(status: OfficialStatus, sequence: Long, route: AssistantRoute = AssistantRoute.WAKE): Boolean =
-            accept(HintCommand.State("s-1", 1, route, turnId = "turn-$sequence", status = status.wire,
+        fun tool(
+            route: AssistantRoute = AssistantRoute.WAKE,
+            turnId: String = "turn-1",
+            phase: ToolPhase = ToolPhase.START,
+            label: String = "打开 App",
+            sessionId: String = "s-1",
+            generation: Long = 1,
+        ): Boolean = accept(
+            HintCommand.Tool(sessionId, generation, route, turnId = turnId, phase = phase, label = label),
+        )
+
+        fun state(
+            status: OfficialStatus,
+            sequence: Long,
+            route: AssistantRoute = AssistantRoute.WAKE,
+            turnId: String = "turn-$sequence",
+        ): Boolean =
+            accept(HintCommand.State("s-1", 1, route, turnId = turnId, status = status.wire,
                 sequence = sequence))
 
         fun pin(): Boolean {
@@ -584,6 +601,121 @@ class GlassesPanelControllerTest {
         val model = harness.port.lastModel()
         assertNull("the wearer speaking ends the previous answer's live state", model.liveEntryId)
         assertEquals(OrbState.LISTENING, orbStateOf(model))
+    }
+
+    // ---------------------------------------------------------------- tool rows (0.24 S4 Task 17)
+
+    @Test
+    fun aToolStartAndEndUpdateOneToolRowAndAddNoConversationEntry() {
+        val harness = Harness()
+        harness.hello()
+        harness.state(OfficialStatus.TOOL, sequence = 1, turnId = "turn-7")
+
+        harness.tool(turnId = "turn-7", phase = ToolPhase.START, label = "打开 App")
+        val started = harness.port.lastModel()
+        assertEquals("turn-7", started.toolTurnId)
+        assertEquals("打开 App", started.toolLabel)
+        assertEquals(ToolPhase.START, started.toolPhase)
+        assertTrue("a tool row is not a conversation entry", started.entries.isEmpty())
+
+        harness.tool(turnId = "turn-7", phase = ToolPhase.END, label = "打开 App")
+        val ended = harness.port.lastModel()
+        assertEquals("the end restyles the same turn row", "turn-7", ended.toolTurnId)
+        assertEquals("打开 App", ended.toolLabel)
+        assertEquals(ToolPhase.END, ended.toolPhase)
+        assertEquals("still no second entry", 0, ended.entries.size)
+    }
+
+    @Test
+    fun theToolRowExistsOnlyAtStatusSeven() {
+        val harness = Harness()
+        harness.hello()
+        harness.state(OfficialStatus.ASR_END, sequence = 1, turnId = "turn-7")
+        harness.tool(turnId = "turn-7", phase = ToolPhase.START, label = "打开 App")
+
+        val thinking = harness.port.lastModel()
+        assertNull("status 4 is the thinking row, not the tool row", thinking.toolLabel)
+        assertNull(thinking.toolPhase)
+
+        harness.state(OfficialStatus.TOOL, sequence = 2, turnId = "turn-7")
+        assertEquals("打开 App", harness.port.lastModel().toolLabel)
+
+        harness.state(OfficialStatus.ANSWERING, sequence = 3, turnId = "turn-7")
+        assertNull("the answer retires the tool row", harness.port.lastModel().toolLabel)
+    }
+
+    @Test
+    fun aToolForAnotherTurnIsRefusedRatherThanReplacingTheCurrentToolRow() {
+        val harness = Harness()
+        harness.hello()
+        harness.state(OfficialStatus.TOOL, sequence = 1, turnId = "turn-7")
+        harness.tool(turnId = "turn-7", phase = ToolPhase.START, label = "当前动作")
+
+        harness.tool(turnId = "turn-old", phase = ToolPhase.END, label = "迟到动作")
+
+        assertEquals("当前动作", harness.port.lastModel().toolLabel)
+        assertEquals(ToolPhase.START, harness.port.lastModel().toolPhase)
+        assertTrue(harness.diagnostics.any { it.contains("tool refused: turn") })
+    }
+
+    @Test
+    fun aToolForAnotherSessionNeverReachesTheSelectedRows() {
+        val harness = Harness()
+        harness.hello("s-1", 1)
+        harness.state(OfficialStatus.TOOL, sequence = 1, turnId = "turn-7")
+
+        harness.tool(turnId = "turn-7", phase = ToolPhase.START, label = "别人的动作", sessionId = "s-other")
+
+        assertNull(harness.port.lastModel().toolLabel)
+        assertTrue(harness.diagnostics.any { it.contains("tool refused: session or generation mismatch") })
+    }
+
+    @Test
+    fun resetForCloseClearsTheToolAndStatusTurnState() {
+        val harness = Harness()
+        harness.hello()
+        harness.state(OfficialStatus.TOOL, sequence = 1, turnId = "turn-7")
+        harness.tool(turnId = "turn-7", phase = ToolPhase.START, label = "关闭前的动作")
+
+        harness.controller.resetForClose()
+
+        val after = harness.port.lastModel()
+        assertNull(after.toolLabel)
+        assertNull(after.toolTurnId)
+        assertNull(after.toolPhase)
+    }
+
+    // ---------------------------------------------------------------- thinking per status (0.24 S4 Task 17)
+
+    @Test
+    fun statusThreeThinksUntilTheAnswerTextActuallyArrives() {
+        val harness = Harness()
+        harness.hello()
+        harness.asr(turnId = "turn-7", revision = 1, text = "帮我看")
+        harness.state(OfficialStatus.ANSWERING, sequence = 1, turnId = "turn-7")
+
+        assertTrue("status 3 before any answer text still owns the thinking row",
+            harness.port.lastModel().thinkingVisible)
+
+        harness.answer(turnId = "turn-7", hintId = "h-7", revision = 1, text = "答案是")
+
+        val answered = harness.port.lastModel()
+        assertFalse("the answer row replaces the thinking row", answered.thinkingVisible)
+        assertNull("a hidden thinking row names no turn", answered.thinkingTurnId)
+        assertEquals("答案是", answered.entries.single { it.role == ConversationRole.ASSISTANT }.text)
+    }
+
+    @Test
+    fun statusFourThinkingIsRetiredByAStreamedAnswerOfTheSameTurn() {
+        val harness = Harness()
+        harness.hello()
+        harness.asr(turnId = "turn-7", revision = 1, text = "帮我看")
+        harness.state(OfficialStatus.ASR_END, sequence = 1, turnId = "turn-7")
+        assertTrue(harness.port.lastModel().thinkingVisible)
+
+        harness.answer(turnId = "turn-7", hintId = "h-7", revision = 1, text = "答")
+
+        assertFalse(harness.port.lastModel().thinkingVisible)
     }
 
     // ---------------------------------------------------------------- new-content revision (the reveal signal)

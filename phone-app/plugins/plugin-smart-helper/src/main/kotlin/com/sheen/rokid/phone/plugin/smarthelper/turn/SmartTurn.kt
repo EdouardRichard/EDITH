@@ -149,6 +149,21 @@ internal class SmartTurn private constructor(
     }
 
     /**
+     * 0.24 S4 Task 17: a tool call ended the model request whose text was being streamed.
+     *
+     * That text is the **round's preamble**, not the answer: the request that follows the tool starts a new answer,
+     * and appending its deltas to the preamble would show the preamble as part of the final answer's stream. Clearing
+     * the buffer keeps the revision counter monotonic (the glasses/phone gates compare revisions, not text) while the
+     * next delta publishes only the new request's text. Must be called under the plugin's `gate`.
+     *
+     * This does not retract text already shown: the wire has no retraction command. The final `SHOW` still replaces
+     * the whole row, so the authoritative answer is unchanged (review note carried into the Task 17 report).
+     */
+    fun resetAnswerStream() {
+        streamedAnswer.setLength(0)
+    }
+
+    /**
      * 0.24 S3 Task 14 fix round (I2): the liveness bound for a closing fallback that the assembler may never emit.
      *
      * `ReadableHintAssembler` deliberately drops a sentence shorter than two code points after stripping punctuation,

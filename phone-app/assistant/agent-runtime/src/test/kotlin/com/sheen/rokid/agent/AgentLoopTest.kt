@@ -1,5 +1,6 @@
 package com.sheen.rokid.agent
 
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.MessageRole
@@ -26,6 +27,7 @@ class AgentLoopTest {
         deadlineNanos: Long = Long.MAX_VALUE,
         requestTimeoutNanos: Long = 0L,
         onTextDelta: ((String) -> Unit)? = null,
+        onToolStatus: ((String, ToolPhase) -> Unit)? = null,
     ) = AgentRequest(
         turnId = "turn-7",
         utterance = "把音量调小一点",
@@ -34,6 +36,7 @@ class AgentLoopTest {
         deadlineNanos = deadlineNanos,
         requestTimeoutNanos = requestTimeoutNanos,
         onTextDelta = onTextDelta,
+        onToolStatus = onToolStatus,
     )
 
     private fun newLoop(
@@ -291,6 +294,100 @@ class AgentLoopTest {
             second,
         )
         assertEquals(RecordedAuditEntry("turn-7", "device.get_volume", "executed", "ok"), audit.entries.single())
+    }
+
+    // ---------------------------------------------------------------- tool status callbacks (0.24 S4 Task 17)
+
+    @Test fun `a tool call reports START before it executes and END after it returns`() {
+        val events = mutableListOf<String>()
+        val executor = executorOf("device.get_volume")
+        executor.outcome = { _, _ ->
+            events += "execute"
+            ActionResult(ActionOutcome.Done, "volume=5")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("call-1", "device.get_volume"))), reply(text = "音量是 5")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(onToolStatus = { action, phase -> events += "${phase.name}:$action" }),
+        )
+
+        assertEquals(
+            listOf("START:device.get_volume", "execute", "END:device.get_volume"),
+            events,
+            "the row must exist while the action runs, and the end must follow the result",
+        )
+    }
+
+    @Test fun `every call of one round is paired START END in call order`() {
+        val events = mutableListOf<String>()
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("a"), actionDescriptor("b")))
+        executor.outcome = { name, _ ->
+            events += "execute:$name"
+            ActionResult(ActionOutcome.Done, "payload-$name")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "a"), call("c2", "b"))), reply(text = "done")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(onToolStatus = { action, phase -> events += "${phase.name}:$action" }),
+        )
+
+        assertEquals(
+            listOf(
+                "START:a", "execute:a", "END:a",
+                "START:b", "execute:b", "END:b",
+            ),
+            events,
+        )
+    }
+
+    @Test fun `a refused call still reports a paired START and END`() {
+        val events = mutableListOf<String>()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "a"))), reply(text = "done")),
+        )
+        val policy = ScriptedPolicy(fallback = PolicyDecision.Refuse)
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executorOf("a"))), policy = policy).run(
+            request(onToolStatus = { action, phase -> events += "${phase.name}:$action" }),
+        )
+
+        assertEquals(listOf("START:a", "END:a"), events)
+    }
+
+    @Test fun `an unknown tool reports its raw name and never reaches the policy`() {
+        val events = mutableListOf<String>()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "mystery_tool"))), reply(text = "done")),
+        )
+
+        newLoop(gateway).run(request(onToolStatus = { action, phase -> events += "${phase.name}:$action" }))
+
+        assertEquals(listOf("START:mystery_tool", "END:mystery_tool"), events)
+    }
+
+    @Test fun `a throwing tool still reports END`() {
+        val events = mutableListOf<String>()
+        val executor = executorOf("a").apply { failure = RuntimeException("boom") }
+        val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "a"))), reply(text = "done")))
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(onToolStatus = { action, phase -> events += "${phase.name}:$action" }),
+        )
+
+        assertEquals(listOf("START:a", "END:a"), events)
+    }
+
+    @Test fun `a text-only run reports no tool status at all`() {
+        val events = mutableListOf<String>()
+        val gateway = ScriptedGateway(listOf(reply(text = "直接回答")))
+
+        newLoop(gateway).run(request(onToolStatus = { action, phase -> events += "${phase.name}:$action" }))
+
+        assertTrue(events.isEmpty())
     }
 
     @Test fun `every call of a turn is echoed before any of its outputs, in call order`() {

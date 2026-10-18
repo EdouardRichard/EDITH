@@ -1,7 +1,9 @@
 package com.sheen.rokid.glasses.display
 
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.output.ConversationEntry
+import com.sheen.rokid.output.ConversationRole
 
 /**
  * How the conversation is laid out, decided without Android so it can be tested off-device.
@@ -38,6 +40,173 @@ object ConversationView {
                 live = liveEntryId != null && entry.entryId == liveEntryId,
             )
         }
+
+    // ---------------------------------------------------------------- per-turn items (0.24 S4 Task 17)
+
+    /**
+     * One **turn** as the panel draws it (spec §5.6): the wearer's line, the answer that belongs to it, and the two
+     * transient rows the turn may own (thinking and tool). A turn with neither line is not produced except for a
+     * transient-only turn, where the thinking/tool row is the whole item.
+     *
+     * The fields are the display decisions, not the Android views: the host maps [asrText]/[answerText] to
+     * `TextView`s, [thinkingVisible]/[toolLabel] to their rows. [asrTextColor] is the official rule "recognising is full
+     * green, after the answer it drops to 70%", so a style drift fails a JVM test.
+     */
+    data class TurnRow(
+        val turnId: String?,
+        val asrText: String?,
+        val answerText: String?,
+        val answerLive: Boolean,
+        val thinkingVisible: Boolean,
+        val toolLabel: String?,
+        val toolPhase: ToolPhase?,
+    ) {
+        val asrTextSizePx: Float get() = GlassesPanelSpec.USER_TEXT_SIZE_PX
+        val asrTextColor: Int
+            get() = if (answerText != null) GlassesPanelSpec.GREEN_NORMAL_70 else GlassesPanelSpec.GREEN_NORMAL
+        val answerTextSizePx: Float get() = GlassesPanelSpec.ASSISTANT_TEXT_SIZE_PX
+        val answerTextColor: Int get() = GlassesPanelSpec.GREEN_NORMAL
+        val toolTextColor: Int get() = GlassesPanelSpec.toolTextColor(toolPhase ?: ToolPhase.START)
+    }
+
+    /**
+     * Groups the flat conversation log into the official per-turn items, **without reordering it**.
+     *
+     * Entries with the same non-null `turnId` belong to one item; entries with no turn id are one item **each** (spec
+     * §5.6, the legacy producer). Group order is first appearance and entry order inside a group is the log's, so this
+     * is a grouping, never a sort. The transient rows are attached to the turn that owns them: thinking to
+     * [thinkingTurnId] (or the last item when no turn id exists, the legacy shape), the tool row to [tool.turnId]. A
+     * transient row whose entry has not arrived yet is appended as its own item rather than being dropped, because the
+     * status that names it is still live.
+     */
+    fun turns(
+        entries: List<ConversationEntry>,
+        liveEntryId: String? = null,
+        thinkingVisible: Boolean = false,
+        thinkingTurnId: String? = null,
+        tool: ToolRowState? = null,
+    ): List<TurnRow> {
+        val groups = LinkedHashMap<Any, MutableList<ConversationEntry>>()
+        entries.forEachIndexed { index, entry ->
+            // A null id is unique per entry; using the index as the key is what keeps two legacy lines in two items.
+            groups.getOrPut(entry.turnId ?: NullTurnKey(index)) { mutableListOf() } += entry
+        }
+        val turns = groups.map { (key, group) ->
+            val turnId = key as? String
+            val user = group.lastOrNull { it.role == ConversationRole.USER }
+            val assistant = group.lastOrNull { it.role == ConversationRole.ASSISTANT }
+            TurnRow(
+                turnId = turnId,
+                asrText = user?.text,
+                answerText = assistant?.text,
+                answerLive = assistant != null && assistant.entryId == liveEntryId,
+                thinkingVisible = false,
+                toolLabel = null,
+                toolPhase = null,
+            )
+        }.toMutableList()
+
+        if (thinkingVisible) {
+            val index = if (thinkingTurnId == null) turns.lastIndex
+            else turns.indexOfFirst { it.turnId == thinkingTurnId }
+            if (index >= 0) turns[index] = turns[index].copy(thinkingVisible = true)
+            else turns += TurnRow(thinkingTurnId, null, null, false, true, null, null)
+        }
+
+        if (tool != null) {
+            val index = turns.indexOfFirst { it.turnId == tool.turnId }
+            if (index >= 0) turns[index] = turns[index].copy(toolLabel = tool.label, toolPhase = tool.phase)
+            else turns += TurnRow(tool.turnId, null, null, false, false, tool.label, tool.phase)
+        }
+        return turns
+    }
+
+    /** A render plan for one published model: rebuild the list only when its structure changed. */
+    sealed interface RenderPlan {
+        /** The row list must be rebuilt (a new/removed row, a new turn, thinking/tool appearing or disappearing). */
+        data class Rebuild(val turns: List<TurnRow>) : RenderPlan
+
+        /** The rows are the same objects; patch text/live/style in place. */
+        data class Update(
+            val turns: List<TurnRow>,
+            val textChanged: Boolean,
+            val liveChanged: Boolean,
+        ) : RenderPlan
+
+        /** Nothing the view shows changed (an equal replacement, a duplicate revision). */
+        data class Unchanged(val turns: List<TurnRow>) : RenderPlan
+    }
+
+    /**
+     * Compares the turns already on screen with the newly published ones.
+     *
+     * The **structure** is the identity of each item and which rows it has; a text-only difference is an [Update],
+     * which is what makes ASR/ANSWER revisions patch one `TextView` instead of rebuilding the list. A tool phase change
+     * is an update too (it only restyles the label); a new answer row or a turn is a [Rebuild]. `live` is style only:
+     * a final `SHOW` replacing the same `say-${hintId}` row is an update, never a second item.
+     */
+    fun plan(previous: List<TurnRow>?, next: List<TurnRow>): RenderPlan {
+        if (previous == null || previous.size != next.size) return RenderPlan.Rebuild(next)
+        val sameStructure = previous.indices.all { shape(previous[it]) == shape(next[it]) }
+        if (!sameStructure) return RenderPlan.Rebuild(next)
+        val textChanged = previous.indices.any {
+            previous[it].asrText != next[it].asrText ||
+                previous[it].answerText != next[it].answerText ||
+                previous[it].toolLabel != next[it].toolLabel ||
+                previous[it].toolPhase != next[it].toolPhase
+        }
+        val liveChanged = previous.indices.any { previous[it].answerLive != next[it].answerLive }
+        return if (textChanged || liveChanged) RenderPlan.Update(next, textChanged, liveChanged)
+        else RenderPlan.Unchanged(next)
+    }
+
+    /** What makes two turns the same item for the view: identity plus which rows exist, never their text. */
+    private data class Shape(
+        val turnId: String?,
+        val hasAsr: Boolean,
+        val hasAnswer: Boolean,
+        val thinking: Boolean,
+        val hasTool: Boolean,
+    )
+
+    private fun shape(row: TurnRow): Shape =
+        Shape(row.turnId, row.asrText != null, row.answerText != null, row.thinkingVisible, row.toolLabel != null)
+
+    /** A distinct key for one entry that has no turn id, so two legacy lines never merge into one item. */
+    private data class NullTurnKey(val index: Int)
+}
+
+/** One tool row's wire state (0.24 S4 Task 17): the turn it belongs to, its mapped copy and whether it still runs. */
+data class ToolRowState(val turnId: String, val label: String, val phase: ToolPhase)
+
+/**
+ * The expensive-pass cadence for streamed answer updates (0.24 S4 Task 17).
+ *
+ * The official `AIModeManager.handleTtsData` accumulates TTS text and dispatches it on a 50 ms boundary; EDITH receives
+ * one full-text `ANSWER` revision per delta and patches the row immediately (so no revision is ever delayed or lost),
+ * while the reveal/layout pass behind it is coalesced to the same 50 ms cadence. The class is pure so the cadence is a
+ * JVM test rather than a stopwatch on the glasses.
+ */
+class RevealCoalescer(private val intervalNanos: Long = INTERVAL_NANOS) {
+    private var lastPassNanos: Long? = null
+
+    /** True when a full reveal/log pass may run at [nowNanos]; records the pass when it does. */
+    fun allow(nowNanos: Long): Boolean {
+        val last = lastPassNanos
+        if (last != null && nowNanos - last < intervalNanos) return false
+        lastPassNanos = nowNanos
+        return true
+    }
+
+    /** A new list/session: the next pass is never treated as "too soon". */
+    fun reset() {
+        lastPassNanos = null
+    }
+
+    companion object {
+        /** The official coalescing boundary; the task's bound is ≤100 ms. */
+        const val INTERVAL_NANOS = 50_000_000L
+    }
 }
 
 /**

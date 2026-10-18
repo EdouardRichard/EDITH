@@ -59,6 +59,7 @@ import com.sheen.rokid.contracts.PinChanged
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.contracts.SpeechFinished
 import com.sheen.rokid.contracts.SpeechRequest
+import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.contracts.TranscriptRevision
 import com.sheen.rokid.contracts.UserAction
@@ -1113,6 +1114,44 @@ class SmartAssistantPlugin(
         conversation()?.assistantPartial(AssistantRoute.WAKE, turnId, hintId, revision, text)
     }
 
+    /**
+     * One tool START/END from the agent loop (0.24 S4 Task 17, spec §5.6).
+     *
+     * Runs on the plugin's run thread. The turn is captured by the caller, so a late callback from a superseded run is
+     * inert. A START opens the official status 7 (the tool/PAG level) **before** the row, and clears the streamed-answer
+     * buffer: the text streamed before a tool call is that request's preamble, not part of the answer the next request
+     * will stream. END closes the row but deliberately leaves the level at 7 - the answer emit moves the conversation to
+     * status 3, and the official chain has no "back to thinking" transition between a tool and its answer.
+     *
+     * [NotifyUserTool] and [LoadSkillTool] are the plugin's own channels (the answer and the SKILL body), not device
+     * actions; they must never appear as tool rows. A name no descriptor declared is shown raw, per spec §5.6.
+     */
+    private fun publishToolStatus(
+        owned: SmartTurn,
+        action: String,
+        phase: ToolPhase,
+        labels: Map<String, String>,
+    ) {
+        // The answer channel is not a tool row, and it must not reset the streamed answer either.
+        if (action == NotifyUserTool.DESCRIPTOR.name) return
+        var turnId = ""
+        synchronized(gate) {
+            if (turn !== owned || owned.closed) return
+            if (phase == ToolPhase.START) owned.resetAnswerStream()
+            turnId = owned.turnId
+        }
+        // A SKILL pull is a real tool round (its preamble must not leak into the answer stream) but not a device action,
+        // so it resets the buffer above and stops before painting a row.
+        if (action == LoadSkillTool.NAME) return
+        val label = labels[action] ?: action
+        P3Log.line("P3_CONV tool route=WAKE turn=$turnId phase=${phase.name} action=$action chars=${label.length}")
+        // The row's state must already be 7 when the row arrives: the glasses hide the tool row outside status 7.
+        if (phase == ToolPhase.START) {
+            conversationCycle.onStatus(AssistantRoute.WAKE, OfficialStatus.TOOL)
+        }
+        conversation()?.toolStatus(AssistantRoute.WAKE, turnId, phase, label)
+    }
+
     /** The contract's name for a route; the plugin's own enum stays internal to this module. */
     private fun ContextRoute.toContractRoute(): AssistantRoute = when (this) {
         ContextRoute.WAKE -> AssistantRoute.WAKE
@@ -1814,6 +1853,11 @@ class SmartAssistantPlugin(
         // (rather than inside `buildLoop`) so the frame's tool table and the loop's own are the same table.
         val registry = registryFor(current, owned, ledger)
         val gateway = gatewayFor(current, owned)
+        // 0.24 S4 Task 17 (spec §5.6): the tool row's copy. `ToolDescriptor.description` is the host action's own
+        // user-facing title, so the labels cannot drift from the actions `ExecutionRouter` actually advertises; a name
+        // no descriptor declared falls back to the raw model name. The plugin's own answer/skill tools are not device
+        // actions and are filtered out before the display.
+        val toolLabels = registry.descriptors().associate { it.name to it.description }
         // A **builder**, not a one-shot frame: a tool round makes this run ask the model a second time, and that
         // request must be rendered by the same renderer from the transcript it continues. Only the store path gets one;
         // the legacy path keeps its frame-less behaviour byte for byte.
@@ -1858,6 +1902,8 @@ class SmartAssistantPlugin(
                     // 0.24 S4 (spec §5.5): every text delta of the run is a display revision for this exact turn.
                     // The turn is captured here, so a late transport callback from a superseded run is inert.
                     onTextDelta = { delta -> publishAssistantPartial(owned, delta) },
+                    // 0.24 S4 Task 17: one START/END pair per tool, with the action's mapped label.
+                    onToolStatus = { action, phase -> publishToolStatus(owned, action, phase, toolLabels) },
                 ),
             )
         } catch (failure: Throwable) {

@@ -225,6 +225,22 @@ class GlassesActivity : Activity() {
 
     fun thinkingVisibleForProbe(): Boolean = host?.thinkingVisibleForProbe() ?: false
 
+    fun thinkingIconWidthForProbe(): Int = host?.thinkingIconWidthForProbe() ?: 0
+
+    fun thinkingTextSizeForProbe(): Float = host?.thinkingTextSizeForProbe() ?: 0f
+
+    fun toolVisibleForProbe(): Boolean = host?.toolVisibleForProbe() ?: false
+
+    fun toolTextForProbe(): String = host?.toolTextForProbe().orEmpty()
+
+    fun toolRowForProbe(): android.view.View? = host?.toolRowForProbe()
+
+    fun toolIconWidthForProbe(): Int = host?.toolIconWidthForProbe() ?: 0
+
+    fun toolLabelTextSizeForProbe(): Float = host?.toolLabelTextSizeForProbe() ?: 0f
+
+    fun toolTextColorForProbe(): Int = host?.toolTextColorForProbe() ?: 0
+
     fun listeningTextForProbe(): String = host?.listeningTextForProbe().orEmpty()
 
     fun thinkingTextForProbe(): String = host?.thinkingTextForProbe().orEmpty()
