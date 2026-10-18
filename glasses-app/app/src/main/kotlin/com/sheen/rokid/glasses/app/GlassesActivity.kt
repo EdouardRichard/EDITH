@@ -102,6 +102,12 @@ class GlassesActivity : Activity() {
         host?.onStop()
     }
 
+    override fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        val host = host
+        if (host != null && host.onKeyDown(keyCode, event)) return true
+        return super.onKeyDown(keyCode, event)
+    }
+
     override fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean =
         host?.onKeyUp(keyCode, event) ?: super.onKeyUp(keyCode, event)
 
@@ -210,6 +216,12 @@ class GlassesActivity : Activity() {
     fun orbStateForProbe(): OrbState = host?.orbStateForProbe() ?: OrbState.IDLE
 
     fun listeningVisibleForProbe(): Boolean = host?.listeningVisibleForProbe() ?: false
+
+    fun hiVisibleForProbe(): Boolean = host?.hiVisibleForProbe() ?: false
+
+    fun pinTextVisibleForProbe(): Boolean = host?.pinTextVisibleForProbe() ?: false
+
+    fun pinIconVisibleForProbe(): Boolean = host?.pinIconVisibleForProbe() ?: false
 
     fun thinkingVisibleForProbe(): Boolean = host?.thinkingVisibleForProbe() ?: false
 

@@ -52,6 +52,18 @@ class HintTickerTest {
     }
 
     @Test
+    fun theTickerRunsOnlyWhileThereIsSomethingToScrollAndNobodyStoppedIt() {
+        // 0.24 spec §3.3/§5.3: the pin no longer stops the ticker. The only stops are "nothing below the fold", the
+        // wearer's own page, and the host being paused/hidden.
+        assertTrue(HintTicker.shouldRun(hasOverflow = true, userPaused = false, paused = false))
+        assertFalse("everything fits", HintTicker.shouldRun(hasOverflow = false, userPaused = false, paused = false))
+        assertFalse("the wearer paged by hand",
+            HintTicker.shouldRun(hasOverflow = true, userPaused = true, paused = false))
+        assertFalse("the host is paused",
+            HintTicker.shouldRun(hasOverflow = true, userPaused = false, paused = true))
+    }
+
+    @Test
     fun theConstantsAreTheOfficialOnes() {
         assertEquals(1, HintTicker.PIXELS_PER_FRAME)
         assertEquals(3, HintTicker.SKIP_FRAMES)

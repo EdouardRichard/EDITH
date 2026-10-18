@@ -20,6 +20,8 @@ import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.glasses.app.GlassesOverlayService
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.output.OfficialConversation
+import com.sheen.rokid.output.OfficialStatus
 import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -359,6 +361,139 @@ class OverlayServiceTest {
         waitUntil("UI_CLOSED after the BACK hide") { uiEvents().any { it is HintCommand.UiClosed } }
         assertFalse("the close reset must also drop the pin", onMain { service.isPinnedForProbe() })
         assertFalse("and release the wake lock", onMain { service.wakeLockHeldForProbe() })
+    }
+
+    // ---------------------------------------------------------------- Task 13: official BACK/tips/Hi on the overlay
+
+    /**
+     * 0.24 S3 Task 13: the production overlay applies the official status matrix end to end.
+     *
+     * It proves three things on the real window rather than in a JVM fake: the automatic next turn (status 5 → 1)
+     * listens without restoring Hi; the tip says "双击打断" only after the pin + status 3; and BACK in that state sends
+     * `STOP` and keeps the window, while the pinned idle's BACK removes the window and emits `UI_CLOSED`.
+     */
+    @Test
+    fun theOverlayKeepsHiOffOnContinuationAndRunsThePinnedBackMatrix() {
+        val service = startAndBind()
+        val stops = Collections.synchronizedList(mutableListOf<HintCommand>())
+        service.setSenderForProbe { json -> sentJson += json; true }
+        service.setStopSenderForProbe { json ->
+            HintWireCodec.decode(json)?.let { stops += it }
+            true
+        }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-task13", 1)))
+            service.showPanel(AssistantRoute.WAKE)
+        }
+        waitUntil("PANEL_SHOWN") { uiEvents().any { it is HintCommand.PanelShown } }
+        waitUntil("the overlay window is focused") { onMain { service.overlayHasWindowFocusForProbe() } }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.State("s-task13", 1, AssistantRoute.WAKE, turnId = "t13-1",
+                    status = OfficialStatus.LISTENING.wire, sequence = 1)))
+        }
+        waitUntil("first-open Hi") { onMain { service.hiVisibleForProbe() } }
+        assertTrue("status 1 also owns the \"…\" row", onMain { service.listeningVisibleForProbe() })
+        assertEquals(OfficialConversation.TIPS_EXIT, onMain { service.tipsTextForProbe() })
+        assertTrue("unpinned: 单击钉住 is shown", onMain { service.pinTextVisibleForProbe() })
+        assertFalse(onMain { service.pinIconVisibleForProbe() })
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.State("s-task13", 1, AssistantRoute.WAKE, turnId = "t13-1",
+                    status = OfficialStatus.AUDIO_FINISHED.wire, sequence = 2)))
+        }
+        waitUntil("status 5 hides Hi") { !onMain { service.hiVisibleForProbe() } }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.State("s-task13", 1, AssistantRoute.WAKE, turnId = "t13-2",
+                    status = OfficialStatus.LISTENING.wire, sequence = 3)))
+        }
+        waitUntil("the continuation listens") { onMain { service.listeningVisibleForProbe() } }
+        assertFalse("showListenerUI never restores Hi", onMain { service.hiVisibleForProbe() })
+
+        instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_ENTER)
+        waitUntil("ENTER pins on the up") { onMain { service.isPinnedForProbe() } }
+        assertFalse("pinned hides 单击钉住", onMain { service.pinTextVisibleForProbe() })
+        assertTrue("and shows the pin icon", onMain { service.pinIconVisibleForProbe() })
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.State("s-task13", 1, AssistantRoute.WAKE, turnId = "t13-2",
+                    status = OfficialStatus.ANSWERING.wire, sequence = 4)))
+        }
+        waitUntil("pinned + answering says interrupt") {
+            onMain { service.tipsTextForProbe() } == OfficialConversation.TIPS_STOP
+        }
+        val closedBefore = uiEvents().count { it is HintCommand.UiClosed }
+
+        instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+        waitUntil("BACK in pinned answering sends STOP") { synchronized(stops) { stops.isNotEmpty() } }
+        waitUntil("the STOP branch is recorded") { onMain { service.lastBackActionForProbe() } == "stop" }
+        assertTrue("a sent STOP keeps the panel", onMain { service.overlayShownForProbe() })
+        assertEquals("a STOP is not a close", closedBefore, uiEvents().count { it is HintCommand.UiClosed })
+        assertTrue("the STOP names the accepted session",
+            stops.filterIsInstance<HintCommand.Stop>().single().sessionId == "s-task13")
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Idle("s-task13", 1, AssistantRoute.WAKE, sequence = 5)))
+        }
+        waitUntil("the pinned idle is back to the exit copy") {
+            onMain { service.tipsTextForProbe() } == OfficialConversation.TIPS_EXIT
+        }
+        instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+        waitUntil("the pinned idle's BACK hides the overlay") {
+            !onMain { service.overlayShownForProbe() }
+        }
+        waitUntil("and reports UI_CLOSED") {
+            uiEvents().count { it is HintCommand.UiClosed } == closedBefore + 1
+        }
+        assertEquals("the exit branch is recorded", "exit", onMain { service.lastBackActionForProbe() })
+    }
+
+    /**
+     * 0.24 S3 Task 13 key timing on the production overlay router: ENTER/BACK act on `ACTION_UP` and consume the
+     * `ACTION_DOWN`; the vertical directions page on `ACTION_DOWN` and do not consume the up; left/right are not the
+     * panel's keys at all.
+     */
+    @Test
+    fun theOverlayKeyTimingSplitsDownAndUpAndLeavesLeftRightAlone() {
+        val service = startAndBind()
+        service.setSenderForProbe { _ -> true }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-task13-keys", 1)))
+            service.showPanel(AssistantRoute.WAKE)
+        }
+        waitUntil("the overlay is up") { onMain { service.overlayShownForProbe() } }
+
+        instrumentation.runOnMainSync {
+            assertTrue("ENTER down is consumed", service.dispatchKeyForProbe(
+                KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER)))
+            assertFalse("but does not pin", service.isPinnedForProbe())
+            assertTrue("ENTER up is consumed", service.dispatchKeyForProbe(
+                KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER)))
+            assertTrue("and pins", service.isPinnedForProbe())
+
+            assertTrue("DPAD_DOWN acts on the down", service.dispatchKeyForProbe(
+                KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_DOWN)))
+            assertFalse("and its up is not consumed", service.dispatchKeyForProbe(
+                KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_DOWN)))
+            assertTrue("DPAD_UP acts on the down", service.dispatchKeyForProbe(
+                KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_UP)))
+            assertFalse("and its up is not consumed", service.dispatchKeyForProbe(
+                KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_DPAD_UP)))
+
+            assertFalse("left is not the panel's", service.dispatchKeyForProbe(
+                KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT)))
+            assertFalse("right is not the panel's", service.dispatchKeyForProbe(
+                KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT)))
+
+            assertTrue("BACK down is consumed", service.dispatchKeyForProbe(
+                KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK)))
+            assertTrue("but does not hide on the down", service.overlayShownForProbe())
+        }
     }
 
     // ---------------------------------------------------------------- Task 11: PANEL_OPEN / route-scoped CLOSE

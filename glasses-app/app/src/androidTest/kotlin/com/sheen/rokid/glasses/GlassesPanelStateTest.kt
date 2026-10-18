@@ -10,6 +10,8 @@ import com.sheen.rokid.glasses.display.OrbState
 import com.sheen.rokid.glasses.display.TailTextView
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.output.OfficialConversation
+import com.sheen.rokid.output.OfficialStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -62,23 +64,25 @@ class GlassesPanelStateTest {
     }
 
     @Test
-    fun aBusyWakeShowsListeningThenThinkingThenTheAnswer() {
+    fun theOfficialListeningStatesShowHiThenThinkingThenTheAnswer() {
         launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 assertEquals("nothing is happening yet", OrbState.IDLE, activity.orbStateForProbe())
                 assertFalse(activity.listeningVisibleForProbe())
+                assertFalse(activity.hiVisibleForProbe())
                 assertFalse(activity.thinkingVisibleForProbe())
             }
 
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-p3", 1)))
                 activity.acceptCommand(HintWireCodec.encode(
-                    HintCommand.Busy("s-p3", 1, AssistantRoute.WAKE, busy = true)))
+                    HintCommand.State("s-p3", 1, AssistantRoute.WAKE, turnId = "turn-p3",
+                        status = OfficialStatus.LISTENING.wire, sequence = 1)))
             }
             waitForLayout()
             scenario.onActivity { activity ->
-                assertTrue("a busy wake before the wearer speaks is the listening state",
-                    activity.listeningVisibleForProbe())
+                assertTrue("status 1 owns the \"…\"/listener row", activity.listeningVisibleForProbe())
+                assertTrue("the first listening turn shows Hi", activity.hiVisibleForProbe())
                 assertFalse(activity.thinkingVisibleForProbe())
                 assertEquals(OrbState.LISTENING, activity.orbStateForProbe())
                 assertEquals(GlassesPanelSpec.LISTENING_TEXT, activity.listeningTextForProbe())
@@ -88,18 +92,38 @@ class GlassesPanelStateTest {
                 activity.acceptCommand(HintWireCodec.encode(
                     HintCommand.Said("s-p3", 1, sequence = 1, route = AssistantRoute.WAKE,
                         entryId = "said-p3", text = "现在几点了")))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-p3", 1, AssistantRoute.WAKE, turnId = "turn-p3",
+                        status = OfficialStatus.ASR.wire, sequence = 2)))
             }
             waitForLayout()
             scenario.onActivity { activity ->
-                assertFalse("once the wearer's line is in, listening is over",
-                    activity.listeningVisibleForProbe())
-                assertTrue("and the thinking row takes over", activity.thinkingVisibleForProbe())
+                assertFalse("status 2 retires the listening row", activity.listeningVisibleForProbe())
+                assertFalse("and Hi", activity.hiVisibleForProbe())
+                assertFalse("status 2 is ASR in progress, not the thinking row", activity.thinkingVisibleForProbe())
+                assertEquals("the listener orb still belongs to ASR", OrbState.LISTENING,
+                    activity.orbStateForProbe())
+            }
+
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-p3", 1, AssistantRoute.WAKE, turnId = "turn-p3",
+                        status = OfficialStatus.ASR_END.wire, sequence = 3)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertFalse(activity.listeningVisibleForProbe())
+                assertFalse(activity.hiVisibleForProbe())
+                assertTrue("status 4 is the official thinking row", activity.thinkingVisibleForProbe())
                 assertEquals(OrbState.THINKING, activity.orbStateForProbe())
                 assertEquals(GlassesPanelSpec.THINKING_TEXT, activity.thinkingTextForProbe())
             }
 
             scenario.onActivity { activity ->
                 activity.acceptCommand(syncJson())
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-p3", 1, AssistantRoute.WAKE, turnId = "turn-p3",
+                        status = OfficialStatus.ANSWERING.wire, sequence = 4)))
                 activity.acceptCommand(HintWireCodec.encode(
                     HintCommand.Show("s-p3", 1, sequence = 3, hintId = "h-p3", revision = 1,
                         syncId = "sync-p3", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 5_000,
@@ -109,8 +133,48 @@ class GlassesPanelStateTest {
             scenario.onActivity { activity ->
                 assertEquals(OrbState.ANSWERING, activity.orbStateForProbe())
                 assertFalse(activity.listeningVisibleForProbe())
+                assertFalse(activity.hiVisibleForProbe())
                 assertFalse(activity.thinkingVisibleForProbe())
                 assertEquals("现在是凌晨十二点", activity.hintText())
+            }
+        }
+    }
+
+    @Test
+    fun theAutomaticNextTurnListensWithoutSayingHiAgain() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-hi", 1)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-hi", 1, AssistantRoute.WAKE, turnId = "turn-hi-1",
+                        status = OfficialStatus.LISTENING.wire, sequence = 1)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertTrue("first listening turn: Hi is visible", activity.hiVisibleForProbe())
+            }
+
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-hi", 1, AssistantRoute.WAKE, turnId = "turn-hi-1",
+                        status = OfficialStatus.AUDIO_FINISHED.wire, sequence = 2)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertFalse("status 5 has finished speaking", activity.hiVisibleForProbe())
+            }
+
+            scenario.onActivity { activity ->
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-hi", 1, AssistantRoute.WAKE, turnId = "turn-hi-2",
+                        status = OfficialStatus.LISTENING.wire, sequence = 3)))
+            }
+            waitForLayout()
+            scenario.onActivity { activity ->
+                assertTrue("the continuation owns the \"…\" row", activity.listeningVisibleForProbe())
+                assertFalse("but showListenerUI never restores Hi", activity.hiVisibleForProbe())
+                assertTrue("unpinned: the 单击钉住 hint is shown", activity.pinTextVisibleForProbe())
+                assertFalse("and the pin icon is not", activity.pinIconVisibleForProbe())
             }
         }
     }
@@ -121,7 +185,8 @@ class GlassesPanelStateTest {
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-p3", 1)))
                 activity.acceptCommand(HintWireCodec.encode(
-                    HintCommand.Busy("s-p3", 1, AssistantRoute.PROACTIVE, busy = true)))
+                    HintCommand.State("s-p3", 1, AssistantRoute.PROACTIVE, turnId = "turn-pro",
+                        status = OfficialStatus.ASR_END.wire, sequence = 1)))
             }
             waitForLayout()
             scenario.onActivity { activity ->
@@ -134,6 +199,9 @@ class GlassesPanelStateTest {
 
             scenario.onActivity { activity ->
                 activity.acceptCommand(syncJson())
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-p3", 1, AssistantRoute.PROACTIVE, turnId = "turn-pro",
+                        status = OfficialStatus.ANSWERING.wire, sequence = 2)))
                 activity.acceptCommand(HintWireCodec.encode(
                     HintCommand.Show("s-p3", 1, sequence = 1, hintId = "h-proactive", revision = 1,
                         syncId = "sync-p3", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 30_000,
@@ -149,11 +217,14 @@ class GlassesPanelStateTest {
             scenario.onActivity { activity ->
                 activity.acceptCommand(HintWireCodec.encode(
                     HintCommand.Clear("s-p3", 1, sequence = 2)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.State("s-p3", 1, AssistantRoute.PROACTIVE, turnId = "turn-pro",
+                        status = OfficialStatus.ASR_END.wire, sequence = 3)))
             }
             waitForLayout()
             scenario.onActivity { activity ->
                 assertEquals(AssistantRoute.PROACTIVE, activity.selectedRoute())
-                assertTrue("with the answer retired and the turn still busy, the proactive route thinks",
+                assertTrue("with the answer retired and status 4, the proactive route thinks",
                     activity.thinkingVisibleForProbe())
                 assertEquals(OrbState.THINKING, activity.orbStateForProbe())
             }
@@ -165,7 +236,7 @@ class GlassesPanelStateTest {
         launchHostPanel().use { scenario ->
             scenario.onActivity { activity ->
                 assertEquals(GlassesPanelSpec.COMPLIANCE_TEXT, activity.complianceTextForProbe())
-                assertEquals(GlassesPanelSpec.TIPS_EXIT, activity.tipsTextForProbe())
+                assertEquals(OfficialConversation.TIPS_EXIT, activity.tipsTextForProbe())
             }
         }
     }

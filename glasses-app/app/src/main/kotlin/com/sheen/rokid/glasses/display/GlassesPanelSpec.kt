@@ -8,8 +8,11 @@ import com.sheen.rokid.output.ConversationRole
  *
  * Every value here is either an official resource (B level: `dialog_page_ai.xml`, `recycler_item_page_ai.xml`,
  * `colors.xml`) or a device measurement (A level). `GlassesActivity` only draws them; anything that can be decided
- * without Android - which line is visible, which orb state, which tips copy, how tall a row may grow - lives here so a
- * drift fails a JVM test instead of needing someone to put the glasses on.
+ * without Android - which line is visible, which orb state, how tall a row may grow - lives here so a drift fails a
+ * JVM test instead of needing someone to put the glasses on.
+ *
+ * The operating tips are **not** a panel constant: their copy and their pinned+answering condition belong to
+ * `OfficialConversation` (0.24 Rule I2), so there is one source for both ends of the wire.
  *
  * **Units are px on purpose.** The official layout writes `android:textSize="16.0px"`, not `sp`: on a fixed 480x640 /
  * 240dpi panel the layout must not change with a font-scale setting. The Activity therefore passes these to
@@ -76,8 +79,6 @@ object GlassesPanelSpec {
     const val LISTENING_TEXT = "Hi, 我在听"
     const val THINKING_TEXT = "正在思考"
     const val COMPLIANCE_TEXT = "内容由 AI 生成"
-    const val TIPS_EXIT = "滑动翻页 / 双击退出"
-    const val TIPS_STOP = "滑动翻页 / 双击打断"
     const val PIN_TEXT = "单击钉住"
 
     // ---------------------------------------------------------------- relative geometry (P3 layout)
@@ -137,9 +138,6 @@ object GlassesPanelSpec {
         thinkingVisible(busy, live, route, lastRole) -> OrbState.THINKING
         else -> OrbState.IDLE
     }
-
-    /** The bottom-left copy: the official panel says "interrupt" exactly while the assistant is working. */
-    fun tipsText(busy: Boolean): String = if (busy) TIPS_STOP else TIPS_EXIT
 
     /** The bottom-right compliance label; official copy, never translated by a template. */
     fun complianceText(): String = COMPLIANCE_TEXT

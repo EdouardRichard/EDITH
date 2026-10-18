@@ -480,6 +480,11 @@ class GlassesOverlayService : Service() {
         senderForProbe = sender
     }
 
+    /** The host's one outbound seam for the control commands (STOP/PIN); test-only. */
+    fun setStopSenderForProbe(sender: ((String) -> Boolean)?) {
+        host.setStopSenderForProbe(sender)
+    }
+
     fun overlayShownForProbe(): Boolean = overlayRoot != null
 
     fun overlayViewForProbe(): View? = overlayRoot
@@ -491,6 +496,21 @@ class GlassesOverlayService : Service() {
     fun overlayHasWindowFocusForProbe(): Boolean = overlayRoot?.hasWindowFocus() == true
 
     fun isPinnedForProbe(): Boolean = host.isPinnedForProbe()
+
+    fun listeningVisibleForProbe(): Boolean = host.listeningVisibleForProbe()
+
+    fun hiVisibleForProbe(): Boolean = host.hiVisibleForProbe()
+
+    fun pinTextVisibleForProbe(): Boolean = host.pinTextVisibleForProbe()
+
+    fun pinIconVisibleForProbe(): Boolean = host.pinIconVisibleForProbe()
+
+    fun tipsTextForProbe(): String = host.tipsTextForProbe()
+
+    fun lastBackActionForProbe(): String? = host.lastBackActionForProbe()
+
+    /** Drives the production overlay's key router directly (the same path as the focused window's dispatch). */
+    fun dispatchKeyForProbe(event: KeyEvent): Boolean = host.dispatchKeyEvent(event)
 
     /**
      * Task 9 review I4: read the platform's own record instead of a service field.

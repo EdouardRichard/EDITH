@@ -10,8 +10,9 @@ import com.sheen.rokid.contracts.AssistantRoute
  * follows `SHOW`, `SAID` does not move it, and the other log is only retained in memory for the current window.
  *
  * The pin is the only view-level state left. It maps the official "single tap = hold" gesture to EDITH's reading
- * control (D133): pinning stops the ticker, unpinning lets it continue. It is deliberately **not** a route state, so a
- * new answer can still be brought into view while the pin is held.
+ * control: one tap pins, and there is no unpin gesture (official `holdAIAssistant()` has no cancel path). Pinning no
+ * longer stops the ticker; it only means "do not auto-exit". It is deliberately **not** a route state, so a new answer
+ * can still be brought into view while the pin is held.
  */
 class ConversationOrder {
 
@@ -36,10 +37,12 @@ class ConversationOrder {
         return selected
     }
 
-    /** A tap flips the pin and returns its new state. */
-    fun togglePin(): Boolean {
-        pinned = !pinned
-        return pinned
+    /**
+     * Pins the reading position. **One-way**: the official `holdAIAssistant()` has no cancel path, so a second tap
+     * changes nothing. Only [reset] (a new session/window) clears it.
+     */
+    fun pin() {
+        pinned = true
     }
 
     /** A new session opens on the wake conversation, unpinned. */

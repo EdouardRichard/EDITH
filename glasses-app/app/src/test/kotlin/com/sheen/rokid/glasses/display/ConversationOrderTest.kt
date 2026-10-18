@@ -27,24 +27,27 @@ class ConversationOrderTest {
         // The pin is a view state, not a route state: switching to the proactive answer must not silently unpin the
         // wearer's reading position.
         val order = ConversationOrder()
-        order.togglePin()
+        order.pin()
         assertEquals(AssistantRoute.PROACTIVE, order.show(AssistantRoute.PROACTIVE))
         assertEquals(AssistantRoute.PROACTIVE, order.selected())
         assertTrue("pin is a view state, not a route state", order.isPinned())
     }
 
     @Test
-    fun aTapPinsAndASecondTapUnpins() {
+    fun aTapPinsOnceAndASecondTapStaysPinned() {
+        // 0.24 spec §3.3: the official hold is one-way. There is no unpin gesture; a new window resets it.
         val order = ConversationOrder()
-        assertTrue(order.togglePin())
-        assertFalse(order.togglePin())
+        order.pin()
+        assertTrue(order.isPinned())
+        order.pin()
+        assertTrue("a second tap must not unpin", order.isPinned())
     }
 
     @Test
     fun aNewSessionResetsRouteAndPin() {
         val order = ConversationOrder()
         order.show(AssistantRoute.PROACTIVE)
-        order.togglePin()
+        order.pin()
         order.reset()
         assertEquals(AssistantRoute.WAKE, order.selected())
         assertFalse(order.isPinned())

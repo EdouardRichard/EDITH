@@ -2,6 +2,7 @@ package com.sheen.rokid.glasses.display
 
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.output.ConversationRole
+import com.sheen.rokid.output.OfficialConversation
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -87,12 +88,24 @@ class GlassesPanelSpecTest {
 
     @Test
     fun theTipsAndComplianceUseTheOfficialCopy() {
-        assertEquals("滑动翻页 / 双击退出", GlassesPanelSpec.tipsText(busy = false))
-        assertEquals("滑动翻页 / 双击打断", GlassesPanelSpec.tipsText(busy = true))
+        // Rule I2 (Task 2 review): the tips copy has one source, `OfficialConversation`; this spec object must not
+        // restate it. These two assertions pin the exact official strings at their one authority.
+        assertEquals("滑动翻页 / 双击退出", OfficialConversation.TIPS_EXIT)
+        assertEquals("滑动翻页 / 双击打断", OfficialConversation.TIPS_STOP)
         assertEquals("内容由 AI 生成", GlassesPanelSpec.complianceText())
         assertEquals("Hi, 我在听", GlassesPanelSpec.LISTENING_TEXT)
         assertEquals("正在思考", GlassesPanelSpec.THINKING_TEXT)
         assertEquals("单击钉住", GlassesPanelSpec.PIN_TEXT)
+    }
+
+    @Test
+    fun theOldDuplicatedTipsLiteralsAreGoneFromTheSpec() {
+        // Rule I2: a transitional duplicate is not allowed after Task 13. A later edit that re-adds either literal here
+        // would reintroduce the second source of truth this task removes.
+        val fields = GlassesPanelSpec::class.java.declaredFields.map { it.name }.toSet()
+        assertFalse("TIPS_EXIT must live only in OfficialConversation", fields.contains("TIPS_EXIT"))
+        assertFalse("TIPS_STOP must live only in OfficialConversation", fields.contains("TIPS_STOP"))
+        assertTrue("the spec still owns the Hi text it renders", fields.contains("LISTENING_TEXT"))
     }
 
     @Test

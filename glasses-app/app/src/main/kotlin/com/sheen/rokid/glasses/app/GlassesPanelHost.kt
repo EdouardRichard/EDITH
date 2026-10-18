@@ -27,6 +27,7 @@ import com.sheen.rokid.glasses.display.VoiceOrbView
 import com.sheen.rokid.output.ConversationRole
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
@@ -154,22 +155,30 @@ class GlassesPanelHost(
     // ---------------------------------------------------------------- lifecycle
 
     /**
-     * Installs the side-touch key channel on [touchRoot].
+     * Installs the side-touch key channel on [touchRoot] for the Activity test host.
      *
-     * The Activity passes its content view (the official sample registers there); the overlay service passes its
-     * focusable window root. Only `ACTION_DOWN` is handled, as the official sample warns, and `true` stops one gesture
-     * from being acted on twice.
+     * The official sample registers on the content view. This path only owns the keys the Activity's own callbacks do
+     * not reliably see: ENTER is acted on **`ACTION_UP`** (the official `AiAssistantDialog.onKeyUp`) and its DOWN is
+     * consumed; the vertical page keys page on `ACTION_DOWN` (the official `ErAIRecyclerView.dispatchKeyEvent`). Left
+     * and right are deliberately **not** consumed, so the window keeps them.
      */
     fun installSideTouch(touchRoot: View) {
         touchRoot.addOnUnhandledKeyEventListener(View.OnUnhandledKeyEventListener { _, event ->
-            if (event.action != KeyEvent.ACTION_DOWN) return@OnUnhandledKeyEventListener false
-            if (controller.onKey(event.keyCode, event.action)) return@OnUnhandledKeyEventListener true
             when (event.keyCode) {
-                KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT -> {
+                KeyEvent.KEYCODE_ENTER -> {
+                    if (event.action != KeyEvent.ACTION_DOWN && event.action != KeyEvent.ACTION_UP) {
+                        return@OnUnhandledKeyEventListener false
+                    }
+                    if (event.isCanceled) return@OnUnhandledKeyEventListener true
+                    controller.onKey(event.keyCode, event.action)
+                }
+                KeyEvent.KEYCODE_DPAD_DOWN -> {
+                    if (event.action != KeyEvent.ACTION_DOWN) return@OnUnhandledKeyEventListener false
                     pageBy(1)
                     true
                 }
-                KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_LEFT -> {
+                KeyEvent.KEYCODE_DPAD_UP -> {
+                    if (event.action != KeyEvent.ACTION_DOWN) return@OnUnhandledKeyEventListener false
                     pageBy(-1)
                     true
                 }
@@ -196,11 +205,24 @@ class GlassesPanelHost(
     }
 
     /**
-     * The Activity's BACK key path. The controller decides; a cancelled gesture (a lost focus mid-press) is not a
-     * wearer decision and is consumed without ending anything.
+     * The Activity's key-down path. The panel consumes ENTER/BACK's down so no other handler acts on it; the action
+     * itself waits for the up. The vertical page keys are handled by [installSideTouch], and left/right stay the
+     * window's.
+     */
+    fun onKeyDown(keyCode: Int, event: KeyEvent): Boolean {
+        if (event.action != KeyEvent.ACTION_DOWN) return false
+        return when (keyCode) {
+            KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_ENTER -> controller.onKey(keyCode, event.action)
+            else -> false
+        }
+    }
+
+    /**
+     * The Activity's key-up path. BACK and ENTER act here, exactly as the official `AiAssistantDialog.onKeyUp`; a
+     * cancelled gesture (a lost focus mid-press) is consumed without acting because it is not a wearer decision.
      */
     fun onKeyUp(keyCode: Int, event: KeyEvent): Boolean {
-        if (keyCode == KeyEvent.KEYCODE_BACK) {
+        if (keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_ENTER) {
             if (event.isCanceled) return true
             return controller.onKey(keyCode, event.action)
         }
@@ -210,32 +232,31 @@ class GlassesPanelHost(
     /**
      * The overlay window's full key path.
      *
-     * The overlay is the focused window, so it receives the side keys directly (S1 proved all six arrive). BACK is
-     * handled on UP like the Activity does, and its DOWN is consumed so the system never interprets it as leaving the
-     * focused window; ENTER/pin and the four page directions are handled on DOWN.
+     * The overlay is the focused window, so it receives the side keys directly (S1 proved all six arrive). ENTER/BACK
+     * act on UP and consume their DOWN; the vertical page keys page on DOWN and do not consume their UP; left/right are
+     * returned to the system untouched.
      */
     fun dispatchKeyEvent(event: KeyEvent): Boolean {
-        if (event.keyCode == KeyEvent.KEYCODE_BACK) {
-            if (event.action == KeyEvent.ACTION_DOWN) return true
-            if (event.action == KeyEvent.ACTION_UP) {
-                if (event.isCanceled) return true
-                return controller.onKey(event.keyCode, event.action)
+        if (event.action == KeyEvent.ACTION_DOWN) {
+            if (controller.onKey(event.keyCode, event.action)) return true
+            return when (event.keyCode) {
+                KeyEvent.KEYCODE_DPAD_DOWN -> {
+                    pageBy(1)
+                    true
+                }
+                KeyEvent.KEYCODE_DPAD_UP -> {
+                    pageBy(-1)
+                    true
+                }
+                else -> false
             }
-            return false
         }
-        if (event.action != KeyEvent.ACTION_DOWN) return false
-        if (controller.onKey(event.keyCode, event.action)) return true
-        return when (event.keyCode) {
-            KeyEvent.KEYCODE_DPAD_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT -> {
-                pageBy(1)
-                true
-            }
-            KeyEvent.KEYCODE_DPAD_UP, KeyEvent.KEYCODE_DPAD_LEFT -> {
-                pageBy(-1)
-                true
-            }
-            else -> false
+        if (event.action == KeyEvent.ACTION_UP) {
+            if (event.keyCode != KeyEvent.KEYCODE_BACK && event.keyCode != KeyEvent.KEYCODE_ENTER) return false
+            if (event.isCanceled) return true
+            return controller.onKey(event.keyCode, event.action)
         }
+        return false
     }
 
     /** The host is going away: retire a visible hint, stop animators, release the wake claim and the scheduler. */
@@ -300,9 +321,9 @@ class GlassesPanelHost(
             newEntryPending = true
         }
 
-        if (previous != null && previous.pinned != model.pinned) {
-            if (model.pinned) stopTicker() else userReadPaused = false
-        }
+        // 0.24 spec §3.3/§5.3: the pin is one-way "do not auto-exit" and never stops or starts the ticker. The official
+        // `startAutoScroll` keeps running after `holdAIAssistant()`; only a manual page, the end of the list or a
+        // hidden panel stops it.
 
         if (!resumed) {
             callbacks.keepAwake(false)
@@ -321,7 +342,11 @@ class GlassesPanelHost(
     /** The service sends PANEL_SHOWN after the overlay's first layout; there is no controller caller yet. */
     override fun sendPanelShown() = Unit
 
-    /** The service sends UI_CLOSED after the overlay is removed; there is no controller caller yet. */
+    /**
+     * The production service owns the visible→hidden event: its `hidePanel()` removes the window and sends
+     * `UI_CLOSED` with the visible route. The controller's EXIT branch triggers that transition through [hide], so a
+     * second send here would report a close that already happened.
+     */
     override fun sendUiClosed() = Unit
 
     // ---------------------------------------------------------------- reset (Task 9)
@@ -370,7 +395,14 @@ class GlassesPanelHost(
 
     fun orbStateForProbe(): OrbState = orbView.state()
 
-    fun listeningVisibleForProbe(): Boolean = listeningView.visibility == View.VISIBLE
+    fun listeningVisibleForProbe(): Boolean = model?.listeningVisible == true
+
+    /** The `Hi, 我在听` TextView itself; separate from the "…" row because Task 13 decoupled them. */
+    fun hiVisibleForProbe(): Boolean = listeningView.visibility == View.VISIBLE
+
+    fun pinTextVisibleForProbe(): Boolean = pinTextView.visibility == View.VISIBLE
+
+    fun pinIconVisibleForProbe(): Boolean = pinIconView.visibility == View.VISIBLE
 
     fun thinkingVisibleForProbe(): Boolean = root.thinkingRow?.visibility == View.VISIBLE
 
@@ -417,11 +449,12 @@ class GlassesPanelHost(
         val route = model.route
         val live = model.liveEntryId != null
         val listening = model.listeningVisible
+        val hi = model.hiVisible
         val thinking = model.thinkingVisible
         val pinned = model.pinned
         val orb = orbStateFor(model)
 
-        listeningView.visibility = if (model.hiVisible) View.VISIBLE else View.GONE
+        listeningView.visibility = if (hi) View.VISIBLE else View.GONE
         root.thinkingRow?.let { row -> row.visibility = if (thinking) View.VISIBLE else View.GONE }
         if (thinking) thinkingIcon?.start() else thinkingIcon?.stop()
         orbView.setState(orb)
@@ -430,14 +463,17 @@ class GlassesPanelHost(
         pinIconView.visibility = if (pinned) View.VISIBLE else View.GONE
         Log.i(TAG,
             "P3_STATE route=${route.name} busy=${listening || thinking || (live && !model.idle)} " +
-                "any=${!model.idle} live=$live orb=${orb.name} listening=$listening thinking=$thinking " +
-                "pinned=$pinned offset=${scrollOffsetY()} max=${maxScrollY()} ticker=${tickerAnimator != null}")
+                "any=${!model.idle} live=$live orb=${orb.name} listening=$listening hi=$hi thinking=$thinking " +
+                "status=${model.status?.name ?: "none"} idle=${model.idle} pinned=$pinned " +
+                "offset=${scrollOffsetY()} max=${maxScrollY()} ticker=${tickerAnimator != null}")
     }
 
-    /** The orb state from the one model; same priority order as before the extraction. */
+    /** The orb state from the one model; same priority order as before the extraction, now status-aware. */
     private fun orbStateFor(model: PanelModel): OrbState = when {
-        model.liveEntryId != null -> OrbState.ANSWERING
-        model.listeningVisible -> OrbState.LISTENING
+        model.status == OfficialStatus.ANSWERING ||
+            model.status == OfficialStatus.AUDIO_FINISHED ||
+            model.liveEntryId != null -> OrbState.ANSWERING
+        model.listeningVisible || model.status == OfficialStatus.ASR -> OrbState.LISTENING
         model.thinkingVisible -> OrbState.THINKING
         else -> OrbState.IDLE
     }
@@ -480,12 +516,17 @@ class GlassesPanelHost(
         }
     }
 
-    /** Starts the official ticker when there is somewhere to go and the wearer has not stopped it. */
+    /** Starts the official ticker when there is somewhere to go and neither the wearer nor the host stopped it. */
     private fun startTickerIfNeeded() {
-        if (!resumed) return
         if (tickerAnimator != null) return
-        if (model?.pinned == true || userReadPaused) return
-        if (!HintTicker.shouldScroll(scrollOffsetY(), maxScrollY())) return
+        if (!HintTicker.shouldRun(
+                hasOverflow = HintTicker.shouldScroll(scrollOffsetY(), maxScrollY()),
+                userPaused = userReadPaused,
+                paused = !resumed,
+            )
+        ) {
+            return
+        }
         tickerStartOffset = scrollOffsetY()
         tickerFrames = 0
         tickerAnimator = android.animation.ValueAnimator.ofInt(0, Int.MAX_VALUE).apply {

@@ -6,6 +6,8 @@ import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.output.ConversationRole
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.output.OfficialConversation
+import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
@@ -23,9 +25,9 @@ import org.junit.Test
  * decisions, and the model the view renders. Every assertion reads the production controller through a fake
  * [PanelPort], so a decision that drifts fails here instead of needing the glasses on a desk.
  *
- * The official first-open Hi rule is **not** wired in this task; `hiVisible` carries the existing listening signal
- * unchanged and this test pins that transitional value (Task 13/17 replaces it with
- * `OfficialConversation.hiVisible(status, firstOpen)`).
+ * The official status/first-open rules were wired in Task 13; this test still covers the legacy `BUSY`-only world
+ * (an old phone with no `STATE`/`IDLE`) as the spec's degraded mode, and the new official branches are pinned in
+ * `OfficialConversationPanelTest`.
  */
 class GlassesPanelControllerTest {
 
@@ -34,6 +36,7 @@ class GlassesPanelControllerTest {
         const val ACTION_DOWN = 0
         const val ACTION_UP = 1
         const val KEYCODE_BACK = 4
+        const val KEYCODE_DPAD_DOWN = 20
         const val KEYCODE_ENTER = 66
     }
 
@@ -127,6 +130,15 @@ class GlassesPanelControllerTest {
 
         fun busy(route: AssistantRoute = AssistantRoute.WAKE, busy: Boolean = true): Boolean =
             accept(HintCommand.Busy("s-1", 1, route, busy = busy))
+
+        fun state(status: OfficialStatus, sequence: Long, route: AssistantRoute = AssistantRoute.WAKE): Boolean =
+            accept(HintCommand.State("s-1", 1, route, turnId = "turn-$sequence", status = status.wire,
+                sequence = sequence))
+
+        fun pin(): Boolean {
+            controller.onKey(KEYCODE_ENTER, ACTION_DOWN)
+            return controller.onKey(KEYCODE_ENTER, ACTION_UP)
+        }
     }
 
     // ---------------------------------------------------------------- Hello and identity
@@ -150,7 +162,7 @@ class GlassesPanelControllerTest {
         assertFalse(model.hiVisible)
         assertFalse(model.thinkingVisible)
         assertNull(model.toolLabel)
-        assertEquals(GlassesPanelSpec.TIPS_EXIT, model.tips)
+        assertEquals(OfficialConversation.TIPS_EXIT, model.tips)
     }
 
     @Test
@@ -182,7 +194,7 @@ class GlassesPanelControllerTest {
         harness.hello("s-1", 1)
         harness.said()
         harness.accept(HintCommand.Ping("sync-old", p0 = 10L))
-        harness.controller.onKey(KEYCODE_ENTER, ACTION_DOWN)
+        harness.pin()
         assertTrue("the pin was set before the session changed", harness.port.lastModel().pinned)
 
         harness.hello("s-2", 1)
@@ -381,7 +393,7 @@ class GlassesPanelControllerTest {
     // ---------------------------------------------------------------- BUSY / the listening-Hi signal
 
     @Test
-    fun aBusyWakeShowsTheListeningHiSignalAndTheInterruptTip() {
+    fun aBusyWakeKeepsTheLegacyListeningRowsButTheOfficialExitTip() {
         val harness = Harness()
         harness.hello()
 
@@ -390,9 +402,10 @@ class GlassesPanelControllerTest {
         val model = harness.port.lastModel()
         assertFalse(model.idle)
         assertTrue("a busy wake before the wearer speaks is listening", model.listeningVisible)
-        assertTrue("Task 8 keeps the current Hi behaviour; the view reads this field", model.hiVisible)
+        assertTrue("the legacy world still shows its Hi text", model.hiVisible)
         assertFalse(model.thinkingVisible)
-        assertEquals(GlassesPanelSpec.TIPS_STOP, model.tips)
+        assertEquals("the official interrupt copy is reserved for pinned + status 3",
+            OfficialConversation.TIPS_EXIT, model.tips)
     }
 
     @Test
@@ -405,10 +418,10 @@ class GlassesPanelControllerTest {
 
         val model = harness.port.lastModel()
         assertFalse("the Hi/listening row is over once the wearer's line is in", model.listeningVisible)
-        assertFalse("and the Hi text stays transitional with it", model.hiVisible)
+        assertFalse("and the legacy Hi text with it", model.hiVisible)
         assertTrue("the thinking row takes over", model.thinkingVisible)
-        assertEquals("the assistant is still working, so the tip still says interrupt",
-            GlassesPanelSpec.TIPS_STOP, model.tips)
+        assertEquals("the assistant is still working, but without a status the official interrupt copy is not claimed",
+            OfficialConversation.TIPS_EXIT, model.tips)
     }
 
     @Test
@@ -440,29 +453,35 @@ class GlassesPanelControllerTest {
 
         val model = harness.port.lastModel()
         assertTrue("a busy level that is never cleared must expire by itself", model.idle)
-        assertEquals(GlassesPanelSpec.TIPS_EXIT, model.tips)
+        assertEquals(OfficialConversation.TIPS_EXIT, model.tips)
     }
 
     // ---------------------------------------------------------------- keys: ENTER pin / BACK
 
     @Test
-    fun enterTogglesThePinDecision() {
+    fun enterPinsOnTheUpAndASecondPressStaysPinned() {
         val harness = Harness()
         harness.hello()
 
-        assertTrue("ENTER is consumed on the down action", harness.controller.onKey(KEYCODE_ENTER, ACTION_DOWN))
+        assertTrue("ENTER's down is consumed", harness.controller.onKey(KEYCODE_ENTER, ACTION_DOWN))
+        assertFalse("but it does not pin", harness.port.lastModel().pinned)
+        assertTrue(harness.controller.onKey(KEYCODE_ENTER, ACTION_UP))
         assertTrue(harness.port.lastModel().pinned)
         assertTrue(harness.controller.onKey(KEYCODE_ENTER, ACTION_DOWN))
-        assertFalse(harness.port.lastModel().pinned)
-        assertFalse("a key the controller does not own is not consumed", harness.controller.onKey(KEYCODE_BACK,
-            ACTION_DOWN))
+        assertTrue(harness.controller.onKey(KEYCODE_ENTER, ACTION_UP))
+        assertTrue("a second press must not unpin", harness.port.lastModel().pinned)
+        assertTrue("BACK's down is consumed by the panel too",
+            harness.controller.onKey(KEYCODE_BACK, ACTION_DOWN))
+        assertFalse("a direction key is the host's",
+            harness.controller.onKey(KEYCODE_DPAD_DOWN, ACTION_DOWN))
     }
 
     @Test
-    fun backWhileBusySendsStopAndLeavesThePanelOpen() {
+    fun backWhilePinnedAndAnsweringSendsStopAndLeavesThePanelOpen() {
         val harness = Harness()
         harness.hello()
-        harness.busy(busy = true)
+        harness.state(OfficialStatus.ANSWERING, sequence = 1)
+        harness.pin()
         harness.sent.clear()
 
         assertTrue(harness.controller.onKey(KEYCODE_BACK, ACTION_UP))
@@ -470,7 +489,7 @@ class GlassesPanelControllerTest {
         val stop = harness.sent.filterIsInstance<HintCommand.Stop>().single()
         assertEquals("s-1", stop.sessionId)
         assertEquals(1L, stop.generation)
-        assertEquals("a STOP that was sent keeps the panel for the phone's BUSY=false", 0, harness.port.hides)
+        assertEquals("a STOP that was sent keeps the panel for the phone's IDLE", 0, harness.port.hides)
         assertTrue(harness.diagnostics.any { it.contains("P5_GLASS_BACK action=stop sent=true") })
     }
 
@@ -478,7 +497,8 @@ class GlassesPanelControllerTest {
     fun backWhenTheStopCannotBeSentHidesThePanelInsteadOfTrappingTheWearer() {
         val harness = Harness()
         harness.hello()
-        harness.busy(busy = true)
+        harness.state(OfficialStatus.ANSWERING, sequence = 1)
+        harness.pin()
         harness.sendResult = false
 
         assertTrue(harness.controller.onKey(KEYCODE_BACK, ACTION_UP))
@@ -497,7 +517,7 @@ class GlassesPanelControllerTest {
 
         assertEquals(1, harness.port.hides)
         assertTrue("nothing to interrupt while idle", harness.sent.none { it is HintCommand.Stop })
-        assertTrue(harness.diagnostics.any { it.contains("P5_GLASS_BACK action=exit busy=false identity=true") })
+        assertTrue(harness.diagnostics.any { it.contains("P5_GLASS_BACK action=exit") })
     }
 
     @Test
@@ -545,7 +565,7 @@ class GlassesPanelControllerTest {
         harness.show()
         harness.said(sequence = 2, entryId = "said-after", text = "之后说的话")
         harness.busy(busy = true)
-        harness.controller.onKey(KEYCODE_ENTER, ACTION_DOWN)
+        harness.pin()
         val before = harness.port.lastModel()
         assertEquals("h-1", before.liveEntryId)
         assertTrue("the pin was set before the close", before.pinned)

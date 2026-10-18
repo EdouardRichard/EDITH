@@ -42,4 +42,14 @@ object HintTicker {
 
     /** True while the list has somewhere further to go. */
     fun shouldScroll(offsetPx: Int, maxOffsetPx: Int): Boolean = offsetPx < maxOffsetPx
+
+    /**
+     * Whether the ticker may run.
+     *
+     * 0.24 spec §3.3/§5.3: **the pin is not a condition**. The official auto-scroll is stopped by the wearer's own page,
+     * by reaching the end, or by the panel hiding - never by `holdAIAssistant()`. Kept here as one pure decision so the
+     * host cannot quietly add a pin term back.
+     */
+    fun shouldRun(hasOverflow: Boolean, userPaused: Boolean, paused: Boolean): Boolean =
+        hasOverflow && !userPaused && !paused
 }

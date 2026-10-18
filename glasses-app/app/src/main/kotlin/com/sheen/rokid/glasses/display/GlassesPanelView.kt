@@ -9,6 +9,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.ScrollView
 import android.widget.TextView
+import com.sheen.rokid.output.OfficialConversation
 
 /**
  * 0.24 S2 (Task 7): the official panel's view tree, extracted from `GlassesActivity.buildLayout()` unchanged.
@@ -125,7 +126,7 @@ class GlassesPanelView(context: Context) : FrameLayout(context) {
             setTextColor(GlassesPanelSpec.GREEN_40)
             setTextSize(TypedValue.COMPLEX_UNIT_PX, GlassesPanelSpec.TIPS_TEXT_SIZE_PX)
             gravity = Gravity.START
-            text = GlassesPanelSpec.tipsText(busy = false)
+            text = OfficialConversation.TIPS_EXIT
         }
         pinTextView = TextView(context).apply {
             setTextColor(GlassesPanelSpec.GREEN_40)

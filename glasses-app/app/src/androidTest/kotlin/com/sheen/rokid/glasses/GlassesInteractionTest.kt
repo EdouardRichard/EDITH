@@ -3,12 +3,15 @@ package com.sheen.rokid.glasses
 import android.content.Context
 import android.view.KeyEvent
 import androidx.lifecycle.Lifecycle
+import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.output.OfficialConversation
+import com.sheen.rokid.output.OfficialStatus
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -44,6 +47,21 @@ class GlassesInteractionTest {
         settle(500)
     }
 
+    /**
+     * Real key injection goes to whatever window has focus. A preceding test finishing can leave the launcher focused for
+     * a moment, and then the injected ENTER/BACK never reaches this panel. Wait for the host window before the first key.
+     */
+    private fun awaitWindowFocus(scenario: ActivityScenario<GlassesActivity>, timeoutMillis: Long = 5_000) {
+        val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
+        while (System.nanoTime() < deadline) {
+            var focused = false
+            scenario.onActivity { activity -> focused = activity.hasWindowFocus() }
+            if (focused) return
+            Thread.sleep(50)
+        }
+        error("the panel window did not take focus within ${timeoutMillis}ms")
+    }
+
     private fun accept(activity: GlassesActivity, command: HintCommand) {
         activity.acceptCommand(HintWireCodec.encode(command))
     }
@@ -51,9 +69,10 @@ class GlassesInteractionTest {
     @Test
     fun theTickerPinsPagesAndANewSessionClearsTheWindow() {
         launchHostPanel().use { scenario ->
+            awaitWindowFocus(scenario)
             val longText = buildString {
                 repeat(12) { index -> append("第${index + 1}点：这是用于滚动证据的合成长文本，长度足以超出眼镜列表窗口。") }
-            }.take(390)
+            }.take(384).chunked(24).joinToString("\n")
 
             scenario.onActivity { activity ->
                 accept(activity, HintCommand.Hello("s-p4", 1))
@@ -72,7 +91,7 @@ class GlassesInteractionTest {
             }
             assertTrue("the long synthetic answer must overflow the window, max=$max", max > 0)
             mark("long-start")
-            settle(1_500)
+            settle(500)
 
             scenario.onActivity { activity ->
                 assertTrue("the ticker must have advanced: first=$first now=${activity.scrollOffsetY()}",
@@ -81,22 +100,26 @@ class GlassesInteractionTest {
                     activity.scrollOffsetY() <= activity.maxScrollY())
             }
             mark("long-mid")
-            settle(1_500)
+            settle(500)
 
             key(KeyEvent.KEYCODE_ENTER)
             var pinnedOffset = 0
             scenario.onActivity { activity ->
                 assertTrue("ENTER must pin the reading position", activity.isPinnedForProbe())
-                assertFalse("a pinned list must not keep ticking", activity.tickerRunningForProbe())
+                assertTrue("official pin must not stop the ticker", activity.tickerRunningForProbe())
+                assertFalse("pinned: the 单击钉住 hint is hidden", activity.pinTextVisibleForProbe())
+                assertTrue("pinned: the pin icon is shown", activity.pinIconVisibleForProbe())
                 pinnedOffset = activity.scrollOffsetY()
             }
             mark("pinned")
             settle(2_000)
             scenario.onActivity { activity ->
-                assertEquals("a pinned offset must not move", pinnedOffset, activity.scrollOffsetY())
+                assertTrue("the ticker must keep advancing after the pin: was $pinnedOffset " +
+                    "now=${activity.scrollOffsetY()}", activity.scrollOffsetY() > pinnedOffset)
             }
 
-            // New content first, even while pinned: the next answer is brought into view but the ticker stays stopped.
+            // New content first, even while pinned: the next answer is brought into view and the ticker continues
+            // (the pin is not a ticker condition in the official panel).
             scenario.onActivity { activity ->
                 accept(activity, HintCommand.Show("s-p4", 1, sequence = 2, hintId = "h-p4-new", revision = 1,
                     syncId = "sync-p4", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
@@ -105,7 +128,6 @@ class GlassesInteractionTest {
             settle(900)
             scenario.onActivity { activity ->
                 assertTrue(activity.isPinnedForProbe())
-                assertFalse(activity.tickerRunningForProbe())
                 val expected = activity.lastMessageTopForProbe().coerceAtMost(activity.maxScrollY())
                 assertEquals("the new entry's top must be in view while pinned", expected,
                     activity.scrollOffsetY())
@@ -125,17 +147,15 @@ class GlassesInteractionTest {
             mark("paged")
             settle(2_000)
 
-            // Unpinning is the other half of the pin contract: the ticker resumes from the current position.
-            // P6 review: on a slow device the ticker can reach `max` before the fixed 500 ms wait, so "running" alone is
-            // a transient; either state proves it resumed. If it did not, both are false and this still fails.
-            var beforeUnpin = 0
-            scenario.onActivity { activity -> beforeUnpin = activity.scrollOffsetY() }
+            // A second ENTER is not an unpin: the official hold has no cancel path. The manual page keeps the ticker
+            // stopped, and the pin must not restart it either.
             key(KeyEvent.KEYCODE_ENTER)
             settle(500)
             scenario.onActivity { activity ->
-                assertFalse("a second ENTER unpins", activity.isPinnedForProbe())
-                assertTrue("unpinning must resume the ticker or advance the offset",
-                    activity.tickerRunningForProbe() || activity.scrollOffsetY() > beforeUnpin)
+                assertTrue("a second ENTER must not unpin", activity.isPinnedForProbe())
+                assertTrue("pinned: the pin icon stays", activity.pinIconVisibleForProbe())
+                assertFalse("the manual page (not the pin) is what stops the ticker",
+                    activity.tickerRunningForProbe())
             }
 
             // A new session is a new window: both conversations empty, wake route, unpinned, nothing to scroll.
@@ -162,34 +182,50 @@ class GlassesInteractionTest {
     }
 
     /**
-     * 0.23 P5 (U11, spec §5.3.1): the same BACK key means "interrupt" while the assistant works and "exit" when it
-     * does not. The busy half must not close the window; the idle half must.
+     * 0.24 S3 Task 13 (spec §3.3/§5.3): the official three-state BACK.
+     *
+     * Pinned + status 3 sends STOP and keeps the window; after the phone's IDLE the same BACK (pinned, not answering)
+     * exits. The test observes the STOP the production controller actually sent, not a log line.
      */
     @Test
-    fun aBackWhileBusyStopsWithoutExitingAndIdleBackExits() {
+    fun aBackWhilePinnedAndAnsweringStopsThenThePinnedIdleBackExits() {
         launchHostPanel().use { scenario ->
+            awaitWindowFocus(scenario)
             scenario.onActivity { activity ->
                 activity.setStopSenderForProbe { true }
                 accept(activity, HintCommand.Hello("s-p5-back", 1))
-                accept(activity, HintCommand.Busy("s-p5-back", 1, AssistantRoute.WAKE, busy = true))
+                accept(activity, HintCommand.State("s-p5-back", 1, AssistantRoute.WAKE,
+                    turnId = "turn-p5-back", status = OfficialStatus.LISTENING.wire, sequence = 1))
             }
-            settle(700)
+            settle(500)
+            key(KeyEvent.KEYCODE_ENTER)
+            scenario.onActivity { activity ->
+                assertTrue("the matrix case needs the pin", activity.isPinnedForProbe())
+                accept(activity, HintCommand.State("s-p5-back", 1, AssistantRoute.WAKE,
+                    turnId = "turn-p5-back", status = OfficialStatus.ANSWERING.wire, sequence = 2))
+                assertEquals("pinned + status 3 is the one interrupt copy",
+                    OfficialConversation.TIPS_STOP, activity.tipsTextForProbe())
+            }
+            settle(500)
 
             key(KeyEvent.KEYCODE_BACK)
             settle(700)
             scenario.onActivity { activity ->
-                assertEquals("a busy BACK is a STOP, not an exit", "stop", activity.lastBackActionForProbe())
+                assertEquals("pinned ANSWERING BACK is a STOP, not an exit", "stop",
+                    activity.lastBackActionForProbe())
                 assertEquals(true, activity.lastBackStopSentForProbe())
-                assertFalse("and the window stays open", activity.isFinishing)
+                assertFalse("and the window stays open for the phone's IDLE", activity.isFinishing)
             }
 
             scenario.onActivity { activity ->
-                accept(activity, HintCommand.Busy("s-p5-back", 1, AssistantRoute.WAKE, busy = false))
+                accept(activity, HintCommand.Idle("s-p5-back", 1, AssistantRoute.WAKE, sequence = 3))
+                assertEquals("after the phone's idle the pinned panel says exit again",
+                    OfficialConversation.TIPS_EXIT, activity.tipsTextForProbe())
             }
             settle(500)
             key(KeyEvent.KEYCODE_BACK)
             settle(1_000)
-            assertEquals("an idle BACK must exit the glasses window",
+            assertEquals("a pinned but not-answering BACK must exit the glasses window",
                 Lifecycle.State.DESTROYED, scenario.state)
         }
     }
@@ -200,6 +236,7 @@ class GlassesInteractionTest {
             repeat(12) { index -> append("第${index + 1}点：这是用于翻页证据的合成长文本，长度足以超出眼镜列表窗口。") }
         }.take(390)
         launchHostPanel().use { scenario ->
+            awaitWindowFocus(scenario)
             scenario.onActivity { activity ->
                 accept(activity, HintCommand.Hello("s-p4-page", 1))
                 accept(activity, HintCommand.Sync("sync-page", 0, 1_000_000,
@@ -242,6 +279,7 @@ class GlassesInteractionTest {
             repeat(12) { index -> append("第${index + 1}点：这是用于重复内容证据的合成长文本，长度足以超出眼镜列表窗口。") }
         }.take(390)
         launchHostPanel().use { scenario ->
+            awaitWindowFocus(scenario)
             scenario.onActivity { activity ->
                 accept(activity, HintCommand.Hello("s-s2-repeat", 1))
                 accept(activity, HintCommand.Sync("sync-s2-repeat", 0, 1_000_000,
@@ -279,27 +317,72 @@ class GlassesInteractionTest {
             scenario.onActivity { activity ->
                 val expected = activity.lastMessageTopForProbe().coerceAtMost(activity.maxScrollY())
                 assertTrue("the pin must survive the reveal", activity.isPinnedForProbe())
-                assertEquals("an identical accepted SHOW must reveal the newest line again, not restore $paged",
-                    expected, activity.scrollOffsetY())
+                assertTrue("an identical accepted SHOW must reveal the newest line again, not restore $paged; " +
+                    "expected at least $expected, saw ${activity.scrollOffsetY()}",
+                    activity.scrollOffsetY() >= expected)
             }
         }
     }
 
     @Test
-    fun aBackWhileBusyWithADeadLinkExitsInsteadOfTrappingTheWearer() {
+    fun aBackWhilePinnedAnsweringWithADeadLinkExitsInsteadOfTrappingTheWearer() {
         // A STOP that could not be sent is not an interrupt: the phone cannot clear the level, so keeping the window
         // open would trap the wearer until the local 60 s bound.
         launchHostPanel().use { scenario ->
+            awaitWindowFocus(scenario)
             scenario.onActivity { activity ->
                 activity.setStopSenderForProbe { false }
                 accept(activity, HintCommand.Hello("s-p5-dead", 1))
-                accept(activity, HintCommand.Busy("s-p5-dead", 1, AssistantRoute.WAKE, busy = true))
+                accept(activity, HintCommand.State("s-p5-dead", 1, AssistantRoute.WAKE,
+                    turnId = "turn-p5-dead", status = OfficialStatus.LISTENING.wire, sequence = 1))
             }
-            settle(700)
+            settle(300)
+            key(KeyEvent.KEYCODE_ENTER)
+            scenario.onActivity { activity ->
+                assertTrue("the dead-link case is the pinned answering one", activity.isPinnedForProbe())
+                accept(activity, HintCommand.State("s-p5-dead", 1, AssistantRoute.WAKE,
+                    turnId = "turn-p5-dead", status = OfficialStatus.ANSWERING.wire, sequence = 2))
+            }
+            settle(500)
 
             key(KeyEvent.KEYCODE_BACK)
             settle(1_000)
             assertEquals("the dead-link BACK must exit the window", Lifecycle.State.DESTROYED, scenario.state)
+        }
+    }
+
+    /**
+     * 0.24 S3 Task 13 (official `AiAssistantDialog.onKeyUp` + `ErAIRecyclerView.dispatchKeyEvent`): ENTER/BACK act on
+     * the up and consume the down; the vertical keys act on the down; left/right are returned to the window.
+     *
+     * This calls the Activity's real dispatch path, not the controller directly. DPAD down/up consumption is pinned on
+     * the production overlay in [OverlayServiceTest] because the Activity test host routes those through its unhandled
+     * key listener.
+     */
+    @Test
+    fun theActivityKeyPathActsOnEnterUpAndLeavesTheSideDirectionsAlone() {
+        launchHostPanel().use { scenario ->
+            awaitWindowFocus(scenario)
+            scenario.onActivity { activity ->
+                accept(activity, HintCommand.Hello("s-p5-keys", 1))
+                assertTrue("ENTER down is consumed", activity.dispatchKeyEvent(
+                    KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_ENTER)))
+                assertFalse("but the pin happens on the up", activity.isPinnedForProbe())
+                assertTrue("ENTER up is consumed", activity.dispatchKeyEvent(
+                    KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_ENTER)))
+                assertTrue("and pins once", activity.isPinnedForProbe())
+                assertFalse(activity.pinTextVisibleForProbe())
+                assertTrue(activity.pinIconVisibleForProbe())
+
+                assertTrue("BACK down is consumed", activity.dispatchKeyEvent(
+                    KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_BACK)))
+                assertFalse("BACK down does not exit", activity.isFinishing)
+
+                assertFalse("left is not the panel's", activity.dispatchKeyEvent(
+                    KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_LEFT)))
+                assertFalse("right is not the panel's", activity.dispatchKeyEvent(
+                    KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_DPAD_RIGHT)))
+            }
         }
     }
 }

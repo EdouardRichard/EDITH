@@ -6,6 +6,7 @@ import com.sheen.rokid.glasses.display.BusyState
 import com.sheen.rokid.glasses.display.ConversationOrder
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
 import com.sheen.rokid.glasses.display.SaidSequenceGate
+import com.sheen.rokid.output.BackAction
 import com.sheen.rokid.output.ConversationEntry
 import com.sheen.rokid.output.ConversationLog
 import com.sheen.rokid.output.ConversationRole
@@ -13,6 +14,7 @@ import com.sheen.rokid.output.DisplayedHint
 import com.sheen.rokid.output.GlassHintController
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
+import com.sheen.rokid.output.OfficialConversation
 import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
@@ -34,9 +36,11 @@ import com.sheen.rokid.plugin.MonotonicClock
  *   whole state machine runs in a JVM test with a fake [PanelPort]; this is what lets a decision regress without the
  *   glasses on a desk.
  *
- * The official status/idle/tool model is not produced yet (Task 12/13/17): [PanelModel.status] is null,
- * [PanelModel.toolLabel] is null, and [PanelModel.idle] is the transitional "no busy level on either route" value the
- * view already used to decide whether the panel needs to stay awake.
+ * The official status/idle/tool model is not produced yet (Task 17): [PanelModel.toolLabel] is null and per-turn rows
+ * are still one flat log. Task 13 wires the status levels the phone publishes (`STATE`/`IDLE`) into the two official
+ * decisions that are visible today: the back/tips matrix and the first-open Hi rule. An old phone that only has
+ * `BUSY` keeps the legacy listening/thinking rows as the spec's degraded mode, but never claims the official
+ * "interrupt" copy.
  */
 data class PanelModel(
     val route: AssistantRoute,
@@ -51,19 +55,23 @@ data class PanelModel(
      * revealed on every accepted update and the content can be equal while the event is still new.
      */
     val contentRevision: Long,
-    /** The official status (0–7) once Task 12/13/17 supplies one; null means "no status model yet". */
+    /** The official status (0–7) for the selected route; null before a `STATE`/`IDLE` or while the route is idle. */
     val status: OfficialStatus?,
-    /** True while no route is working (the transitional form of official `showIdleStatus`). */
+    /** True while the selected route is in the official `showIdleStatus` state (not status 0). */
     val idle: Boolean,
     val pinned: Boolean,
-    /** The ASR "…"/listener indicator row. Task 8 has no separate "…" row yet, so this mirrors [hiVisible]. */
+    /**
+     * The ASR "…"/listener indicator row.
+     *
+     * With an official status this is `OfficialConversation.listeningVisible` (status 0/1 only); without one it keeps
+     * the legacy `BUSY`-derived row for an old phone. It is **not** the Hi text.
+     */
     val listeningVisible: Boolean,
     /**
      * The `Hi, 我在听` text.
      *
-     * Task 8 keeps the current Hi behaviour: it is the same listening signal the Activity used before. Task 13/17
-     * replaces it with `OfficialConversation.hiVisible(status, firstOpen)` so a continuation turn does not say Hi
-     * again; until then this field must render exactly what the old code rendered.
+     * With an official status this is `OfficialConversation.hiVisible(status, firstOpen)`, so the automatic next turn
+     * (status 5 → 1) listens without saying Hi again. An old phone without a status keeps the legacy signal.
      */
     val hiVisible: Boolean,
     val thinkingVisible: Boolean,
@@ -111,6 +119,37 @@ class GlassesPanelController(
 
     /** Whether the assistant is working, per route; the level expires by itself inside the class. */
     private val busyState = BusyState()
+
+    /**
+     * The official status for each route, as last published by `STATE`.
+     *
+     * Null means no official level has arrived for that route (an old phone, or a fresh window); the model then keeps
+     * the legacy `BUSY` interpretation. `IDLE` removes the status rather than storing status 0, because the official
+     * `showIdleStatus` is a separate state (spec §3.3/§5.3).
+     */
+    private val officialStatus: MutableMap<AssistantRoute, OfficialStatus> = mutableMapOf()
+
+    /** Whether each route is in the official idle state. A later `STATE` clears it. */
+    private val officialIdle: MutableMap<AssistantRoute, Boolean> = mutableMapOf()
+
+    /**
+     * The first-open latch for Hi, per route.
+     *
+     * True until the first listening turn (status 0/1) has ended, an idle arrives, or the window closes. Official
+     * `showListenerUI` never restores `idv_tv_speak`, so the automatic status-5-to-1 turn must not say Hi again.
+     */
+    private val hiFirstOpen: MutableMap<AssistantRoute, Boolean> =
+        AssistantRoute.entries.associateWithTo(mutableMapOf()) { true }
+
+    /**
+     * The last official sequence applied per route.
+     *
+     * `STATE` and `IDLE` share one sequence domain (spec §5.4): a late status older than the applied level must not
+     * overwrite it. The domain is reset only by a new session identity, not by a panel close, so stale commands queued
+     * across a hidden window still lose.
+     */
+    private val lastStateSequence: MutableMap<AssistantRoute, Long> =
+        AssistantRoute.entries.associateWithTo(mutableMapOf()) { Long.MIN_VALUE }
 
     /**
      * The render/expiry gates for one hint.
@@ -178,6 +217,11 @@ class GlassesPanelController(
             // Phase C: whether the assistant is working. Same session gate as a SHOW.
             is HintCommand.Busy -> onBusy(command)
 
+            // 0.24 S3: the official status level and the separate showIdleStatus state. The two share one sequence
+            // domain, and the visible back/tips/Hi rules are derived from them in buildModel.
+            is HintCommand.State -> onState(command)
+            is HintCommand.Idle -> onIdle(command)
+
             // A **new** session starts clean. Only a new one: the phone repeats its opening HELLO while it waits for
             // the clock exchange, and clearing on every HELLO would wipe a conversation whose utterances had already
             // arrived.
@@ -191,19 +235,19 @@ class GlassesPanelController(
     /**
      * One key from the ring, in Android's raw `KeyEvent` numbers so this class stays Android-free.
      *
+     * The timing is the official one (`AiAssistantDialog.onKeyUp` plus `ErAIRecyclerView.dispatchKeyEvent`): ENTER and
+     * BACK are acted on **`ACTION_UP`**, while their `ACTION_DOWN` is consumed so no other handler can claim the
+     * gesture. The direction keys belong to the host (which pages on `ACTION_DOWN`); the controller never consumes them,
+     * so left/right stay available to the window.
+     *
      * Returns whether the panel consumed the key. The Activity answers a cancelled BACK before delegating (a lost
      * focus mid-press is not a wearer decision) and keeps the page gestures for its scroll view; both are window glue,
      * not panel state.
      */
     fun onKey(keyCode: Int, action: Int): Boolean = when {
-        // The official side-touch tap is the pin. The Activity's unhandled-key listener only forwards ACTION_DOWN,
-        // exactly as it did when this branch lived there; the controller stays honest about that timing.
-        keyCode == KEYCODE_ENTER && action == ACTION_DOWN -> {
-            val pinned = order.togglePin()
-            diagnostics("side touch: pinned=$pinned")
-            applyAndRender()
-            true
-        }
+        keyCode == KEYCODE_ENTER && action == ACTION_DOWN -> true
+        keyCode == KEYCODE_BACK && action == ACTION_DOWN -> true
+        keyCode == KEYCODE_ENTER && action == ACTION_UP -> onEnter()
         keyCode == KEYCODE_BACK && action == ACTION_UP -> onBack()
         else -> false
     }
@@ -266,10 +310,26 @@ class GlassesPanelController(
         order.reset()
         saidGate.reset()
         busyState.reset()
+        resetOfficialState(resetSequence = false)
         liveEntryId = null
         contentRevision = 0L
         busyDeadlineArmed = false
         applyAndRender()
+    }
+
+    /**
+     * Drops the official status/idle/hi-latch of the previous window.
+     *
+     * A panel close keeps [lastStateSequence] (a late level queued across the hidden window must still lose); a new
+     * session identity resets it too, because the phone starts a new sequence domain with the new session.
+     */
+    private fun resetOfficialState(resetSequence: Boolean) {
+        officialStatus.clear()
+        AssistantRoute.entries.forEach { route ->
+            officialIdle[route] = false
+            hiFirstOpen[route] = true
+            if (resetSequence) lastStateSequence[route] = Long.MIN_VALUE
+        }
     }
 
     /**
@@ -291,6 +351,7 @@ class GlassesPanelController(
             order.reset()
             saidGate.reset()
             busyState.reset()
+            resetOfficialState(resetSequence = true)
             liveEntryId = null
         }
         hints.accept(command)
@@ -341,6 +402,84 @@ class GlassesPanelController(
     }
 
     /**
+     * One official status level (0.24 spec §5.4).
+     *
+     * A status for a route that is not on screen is stored but does not move the view: only a `SHOW` brings a
+     * conversation forward (Task 8's rule, unchanged). The first listening turn leaves [hiFirstOpen] true so a status
+     * 0 → 1 sequence keeps the greeting; any non-listening status ends that turn and latches Hi off.
+     */
+    private fun onState(command: HintCommand.State) {
+        if (!hints.isCurrent(command.sessionId, command.generation)) {
+            diagnostics("state refused: session or generation mismatch")
+            return
+        }
+        if (!acceptStateSequence(command.route, command.sequence)) {
+            diagnostics("state refused: sequence ${command.sequence} is not newer")
+            return
+        }
+        val status = OfficialStatus.entries.firstOrNull { it.wire == command.status }
+        if (status == null) {
+            // Status 6 is the official JSUI card, which is out of EDITH's scope (plan Tasks 8/12/15). It is consumed
+            // and its sequence is spent, but it must not repaint the panel or invent a level.
+            diagnostics("state status=${command.status} ignored")
+            return
+        }
+        officialStatus[command.route] = status
+        officialIdle[command.route] = false
+        if (status != OfficialStatus.EMPTY && status != OfficialStatus.LISTENING) {
+            hiFirstOpen[command.route] = false
+        }
+        diagnostics("state route=${command.route.name} status=${status.name} sequence=${command.sequence}")
+        if (command.route == order.selected()) applyAndRender()
+    }
+
+    /** The official `showIdleStatus`: not status 0, and it ends the window's first listening turn. */
+    private fun onIdle(command: HintCommand.Idle) {
+        if (!hints.isCurrent(command.sessionId, command.generation)) {
+            diagnostics("idle refused: session or generation mismatch")
+            return
+        }
+        if (!acceptStateSequence(command.route, command.sequence)) {
+            diagnostics("idle refused: sequence ${command.sequence} is not newer")
+            return
+        }
+        officialStatus.remove(command.route)
+        officialIdle[command.route] = true
+        hiFirstOpen[command.route] = false
+        diagnostics("idle route=${command.route.name} sequence=${command.sequence}")
+        if (command.route == order.selected()) {
+            // showIdleStatus finalises the current item; the content stays for read-back, the emphasis does not.
+            liveEntryId = null
+            applyAndRender()
+        }
+    }
+
+    /**
+     * One sequence domain shared by `STATE` and `IDLE`, per route. A duplicate or late level loses; a new session
+     * identity starts a new domain, while a panel close deliberately keeps it so a command queued across the hidden
+     * window cannot repaint a fresh one.
+     */
+    private fun acceptStateSequence(route: AssistantRoute, sequence: Long): Boolean {
+        val last = lastStateSequence.getValue(route)
+        if (sequence <= last) return false
+        lastStateSequence[route] = sequence
+        return true
+    }
+
+    /**
+     * The status the visible decisions use.
+     *
+     * An official status wins. In the old-phone world (no `STATE`/`IDLE` at all) the legacy `BUSY` level is the only
+     * evidence of "answering"; an idle old phone maps to the listening/exit copy. The fallback is deliberately
+     * conservative: without a status the glasses never claim the official interrupt copy unless they are also pinned.
+     */
+    private fun effectiveStatus(route: AssistantRoute, now: Long): OfficialStatus {
+        officialStatus[route]?.let { return it }
+        if (officialIdle[route] == true) return OfficialStatus.EMPTY
+        return if (busyState.isBusy(route, now)) OfficialStatus.ANSWERING else OfficialStatus.LISTENING
+    }
+
+    /**
      * One accepted hint, or `null` when nothing is live any more.
      *
      * `null` means **nothing is live**, not "forget what was shown": the entries stay, and only the emphasis is
@@ -369,36 +508,79 @@ class GlassesPanelController(
         applyAndRender()
     }
 
-    // ---------------------------------------------------------------- BACK
+    // ---------------------------------------------------------------- BACK and pin
 
     /**
-     * The official back decision, as the panel has always made it.
+     * The official hold: one-way, acted on ENTER's `ACTION_UP`, and announced to the phone **once**.
      *
-     * Busy with an identity sends `STOP` and keeps the window: the phone cancels the turn and broadcasts its new level.
-     * A STOP that could not be sent is not an interrupt - keeping the window open would trap the wearer until the local
-     * bound expires - so that case falls through to the exit branch, as does an idle back.
+     * The official `holdAIAssistant()` sets `isHold = true` with no cancel path and tells the service "not-auto-exit".
+     * EDITH's `PIN` command is set-only on the wire (no boolean), so a second press is a no-op, not a duplicate event.
+     * The pin is applied locally even before an identity exists: the wearer's reading position does not depend on the
+     * link, and only the announcement to the phone does.
+     */
+    private fun onEnter(): Boolean {
+        if (order.isPinned()) {
+            diagnostics("side touch: pinned=true already_pinned=true")
+            return true
+        }
+        order.pin()
+        val identity = hints.currentIdentity()
+        val sent = if (identity == null) {
+            diagnostics("pin deferred: no session identity")
+            false
+        } else {
+            runCatching {
+                send(HintCommand.Pin(identity.first, identity.second, order.selected()))
+            }.getOrDefault(false)
+        }
+        diagnostics("side touch: pinned=true route=${order.selected().name} pinSent=$sent")
+        applyAndRender()
+        return true
+    }
+
+    /**
+     * The official back decision (spec §3.3/§5.3), as `OfficialConversation.backAction` states it.
+     *
+     * Unpinned always exits; pinned while answering sends `STOP` and keeps the window (the phone shows its idle); pinned
+     * in any other status exits. A STOP that could not be sent is not an interrupt - keeping the window would trap the
+     * wearer until the local bound expires - so that case falls through to the exit branch, as does a missing identity.
+     *
+     * [PanelPort.hide] is the host's visible-to-hidden transition; the production service sends `UI_CLOSED` there
+     * (Task 9's window ownership), so the controller must not emit a duplicate event of its own.
      */
     private fun onBack(): Boolean {
         val identity = hints.currentIdentity()
-        val busy = busyState.any(clock.nowNanos())
-        if (busy && identity != null) {
-            // A malformed identity/encoder failure must fall through to the exit branch rather than throw on the UI
-            // thread. `encode` is total for a decoded HELLO, but this is the one path a wearer uses to get out.
-            val sent = runCatching {
-                send(HintCommand.Stop(identity.first, identity.second))
-            }.getOrDefault(false)
-            if (sent) {
-                diagnostics("P5_GLASS_BACK action=stop sent=true session=${identity.first} " +
-                    "generation=${identity.second}")
+        val pinned = order.isPinned()
+        val status = effectiveStatus(order.selected(), clock.nowNanos())
+        when (OfficialConversation.backAction(status, pinned)) {
+            BackAction.STOP -> {
+                if (identity != null) {
+                    // A malformed identity/encoder failure must fall through to the exit branch rather than throw on
+                    // the UI thread; this is the one path a wearer uses to get out.
+                    val sent = runCatching {
+                        send(HintCommand.Stop(identity.first, identity.second))
+                    }.getOrDefault(false)
+                    if (sent) {
+                        diagnostics("P5_GLASS_BACK action=stop sent=true session=${identity.first} " +
+                            "generation=${identity.second} pinned=$pinned status=${status.name}")
+                        return true
+                    }
+                    diagnostics("P5_GLASS_BACK action=exit reason=stop_unsent pinned=$pinned " +
+                        "status=${status.name}")
+                } else {
+                    diagnostics("P5_GLASS_BACK action=exit reason=no_identity pinned=$pinned " +
+                        "status=${status.name}")
+                }
+                port.hide()
                 return true
             }
-            diagnostics("P5_GLASS_BACK action=exit reason=stop_unsent busy=true identity=true")
-            port.hide()
-            return true
+            BackAction.EXIT -> {
+                diagnostics("P5_GLASS_BACK action=exit reason=matrix pinned=$pinned status=${status.name} " +
+                    "identity=${identity != null}")
+                port.hide()
+                return true
+            }
         }
-        diagnostics("P5_GLASS_BACK action=exit busy=$busy identity=${identity != null}")
-        port.hide()
-        return true
     }
 
     // ---------------------------------------------------------------- model
@@ -431,12 +613,12 @@ class GlassesPanelController(
     }
 
     /**
-     * The panel's state row, computed in one place so the listening line, the thinking row, the pin and the tips
-     * cannot disagree with each other.
+     * The panel's state row, computed in one place so the listening line, the Hi line, the thinking row, the pin and
+     * the tips cannot disagree with each other.
      *
-     * The busy boolean is **per displayed route** for the two rows (a proactive turn must not make the wake
-     * conversation look busy, and the other way round); the tips use `any`, because either route working is something
-     * the wearer can interrupt. Both rules are the ones the Activity applied before the extraction.
+     * With an official status the rows and the back/tips copy are the official rules. Without one (an old phone, or a
+     * fresh hidden window) the two rows keep the legacy `BUSY` interpretation; that is the spec's degraded mode, not a
+     * second status source. The legacy rows are per displayed route so a proactive turn cannot paint the wake view.
      */
     private fun buildModel(now: Long): PanelModel {
         val route = order.selected()
@@ -445,24 +627,42 @@ class GlassesPanelController(
         val busyAny = busyState.any(now)
         val entries = log.entries(route)
         val lastRole = entries.lastOrNull()?.role
-        val listening = GlassesPanelSpec.listeningVisible(busyForRoute, live, route, lastRole)
+
+        val official = officialStatus[route]
+        val idleForRoute = officialIdle[route] == true
+        val officialKnown = official != null || idleForRoute
+        val statusForRules = official ?: OfficialStatus.EMPTY
+
+        val legacyListening = GlassesPanelSpec.listeningVisible(busyForRoute, live, route, lastRole)
+        val legacyThinking = GlassesPanelSpec.thinkingVisible(busyForRoute, live, route, lastRole)
+        val listening = if (officialKnown) {
+            OfficialConversation.listeningVisible(statusForRules, idleForRoute, hiSeen = !hiFirstOpen.getValue(route))
+        } else {
+            legacyListening
+        }
+        val hi = if (officialKnown) {
+            OfficialConversation.hiVisible(statusForRules, firstOpen = hiFirstOpen.getValue(route))
+        } else {
+            legacyListening
+        }
+        val thinking = if (officialKnown) statusForRules == OfficialStatus.ASR_END else legacyThinking
+        val effective = effectiveStatus(route, now)
+        val pinned = order.isPinned()
+
         return PanelModel(
             route = route,
             entries = entries,
             liveEntryId = liveEntryId,
             contentRevision = contentRevision,
-            // No official status model exists in Task 8; the wire statuses are wired in Task 12/13/17.
-            status = null,
-            idle = !busyAny,
-            pinned = order.isPinned(),
+            status = official,
+            idle = if (officialKnown) idleForRoute else !busyAny,
+            pinned = pinned,
             listeningVisible = listening,
-            // Task 8 rule: do not change Hi behaviour. The current panel's Hi text was the listening line, so the
-            // safest existing signal keeps the rendered view identical until the official first-open rule lands.
-            hiVisible = listening,
-            thinkingVisible = GlassesPanelSpec.thinkingVisible(busyForRoute, live, route, lastRole),
+            hiVisible = hi,
+            thinkingVisible = thinking,
             // No tool rows yet (Task 17).
             toolLabel = null,
-            tips = GlassesPanelSpec.tipsText(busyAny),
+            tips = OfficialConversation.tipsText(effective, pinned),
         )
     }
 
