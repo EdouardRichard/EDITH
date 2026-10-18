@@ -33,6 +33,7 @@ import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
 import com.sheen.rokid.phone.storage.AndroidSpeakerProfileStore
 import com.sheen.rokid.phone.context.NotificationCategoryService
 import com.sheen.rokid.phone.bridge.CxrHintLink
+import com.sheen.rokid.phone.bridge.HintIdentity
 import com.sheen.rokid.phone.bridge.UiState
 import com.sheen.rokid.phone.bridge.UplinkReport
 import com.sheen.rokid.phone.session.PlaybackGate
@@ -994,51 +995,105 @@ class HostCompositionRoot internal constructor(
      *
      * A named seam rather than a plugin event: the timer belongs to the conversation state machine, which will
      * subscribe here in Task 12. It is deliberately not a wire command (the glasses never send `PANEL_SHOWN` to the
-     * plugin) and not a `HostEvent` the plugin capability gate would filter.
+     * plugin) and not a `HostEvent` the plugin capability gate would filter. The [HintIdentity] is the pair the link
+     * validated, so the timer owner can reject a queued event that belongs to a session that has moved on.
      */
-    internal var onPanelShown: ((AssistantRoute) -> Unit)? = null
+    internal var onPanelShown: ((identity: HintIdentity, route: AssistantRoute) -> Unit)? = null
+
+    /**
+     * The panel went hidden (`UI_CLOSED`), delivered on a host thread for the turn owner (0.24 spec §5.4).
+     *
+     * Task 12 must be able to cancel a listening window whose panel closed; like [onPanelShown], this is a named seam
+     * rather than a plugin event, and the event has already been checked against the host's current identity.
+     */
+    internal var onUiClosed: ((route: AssistantRoute) -> Unit)? = null
+
+    /**
+     * Whether the resident panel is visible right now (Task 12's already-visible turn-open path, spec §5.3).
+     *
+     * A turn that opens while the panel is already shown must start its 10 s window immediately rather than wait for
+     * a `PANEL_SHOWN` that will not be sent again. Read-only: the link owns the state.
+     */
+    internal fun isPanelVisible(): Boolean = hintLink?.isPanelVisible() ?: false
+
+    /**
+     * True when [identity] is the pair [HostRuntime] currently accepts events for.
+     *
+     * The link validated an inbound event against the identity it introduced; a queued event can outlive that
+     * session. Checking the pair again here is what keeps a stale `PANEL_SHOWN`/`UI_CLOSED` from touching the new
+     * conversation.
+     */
+    private fun identityIsCurrent(identity: HintIdentity): Boolean {
+        val current = runCatching { host.currentIdentity() }.getOrNull() ?: return false
+        return current.first.value == identity.sessionId && current.second.value == identity.generation
+    }
 
     /**
      * Receives `PIN` from the link, off the vendor callback thread, as the official `PinChanged` host event.
      *
-     * The link has already validated the session/generation against the identity it introduced. The envelope is
-     * stamped with the host's **current** identity at delivery time: a host that has moved on refuses the event rather
-     * than letting a pin from a previous session change the new conversation's state.
+     * The link has already validated the session/generation against the identity it introduced, and the event carries
+     * that **validated** pair. The envelope is built from it rather than from `currentIdentity()` at delivery time:
+     * this is the opposite of the earlier comment here, and the difference matters - a host that has moved on refuses
+     * the old pair, while a delivery-time stamp would have relabelled the old pin as the new session's pin.
      */
-    internal fun onPinFromLink(route: AssistantRoute) {
-        dispatchHostEvent { deliverPin(route) }
+    internal fun onPinFromLink(identity: HintIdentity, route: AssistantRoute) {
+        dispatchHostEvent { deliverPin(identity, route) }
     }
 
-    private fun deliverPin(route: AssistantRoute) {
+    private fun deliverPin(identity: HintIdentity, route: AssistantRoute) {
         if (closed) return
-        val identity = host.currentIdentity() ?: run {
-            P3Log.line("P3_CXR pin route=${route.name} result=no_session")
-            return
-        }
         val now = clock.nowNanos()
-        val accepted = host.onEvent(PinChanged(
-            EventEnvelope(identity.first, identity.second, "pin-${UUID.randomUUID()}", now, now),
-            route,
-        ))
-        P3Log.line("P3_CXR pin route=${route.name} accepted=$accepted")
+        val accepted = runCatching {
+            host.onEvent(PinChanged(
+                EventEnvelope(
+                    SessionId(identity.sessionId), Generation(identity.generation),
+                    "pin-${UUID.randomUUID()}", now, now,
+                ),
+                route,
+            ))
+        }.getOrDefault(false)
+        P3Log.line("P3_CXR pin route=${route.name} session=${identity.sessionId} " +
+            "generation=${identity.generation} accepted=$accepted")
     }
 
-    /** Receives `PANEL_SHOWN` from the link and hands it to [onPanelShown] on a host thread. */
-    internal fun panelShownArrived(route: AssistantRoute) {
+    /**
+     * Receives `PANEL_SHOWN` from the link and hands it to [onPanelShown] on a host thread.
+     *
+     * The validated identity is checked against the host's current one at delivery, so a queued event from a previous
+     * session cannot start the new conversation's timer.
+     */
+    internal fun panelShownArrived(identity: HintIdentity, route: AssistantRoute) {
         dispatchHostEvent {
             if (closed) return@dispatchHostEvent
+            if (!identityIsCurrent(identity)) {
+                P3Log.line("P3_PANEL shown route=${route.name} session=${identity.sessionId} result=stale")
+                return@dispatchHostEvent
+            }
             P3Log.line("P3_PANEL shown route=${route.name}")
-            onPanelShown?.invoke(route)
+            onPanelShown?.invoke(identity, route)
         }
     }
 
-    /** Resident-service liveness from the link, recorded where a device log can separate the two UI states. */
-    internal fun onUiStateFromLink(state: UiState) {
+    /**
+     * Resident-service state from the link, recorded where a device log can separate the two UI states.
+     *
+     * `UI_CLOSED` also reaches [onUiClosed] after the same identity check: a queued close from a previous session
+     * must not cancel the new session's listening window. `UI_READY` is informational here; the link itself owns the
+     * readiness decision, and only a live clock mapping counts as liveness.
+     */
+    internal fun onUiStateFromLink(identity: HintIdentity, state: UiState) {
         dispatchHostEvent {
             if (closed) return@dispatchHostEvent
+            if (!identityIsCurrent(identity)) {
+                P3Log.line("P3_UI_STATE stale session=${identity.sessionId} generation=${identity.generation}")
+                return@dispatchHostEvent
+            }
             when (state) {
                 UiState.Ready -> P3Log.line("P3_UI_STATE ready")
-                is UiState.Closed -> P3Log.line("P3_UI_STATE closed route=${state.route.name}")
+                is UiState.Closed -> {
+                    P3Log.line("P3_UI_STATE closed route=${state.route.name}")
+                    onUiClosed?.invoke(state.route)
+                }
             }
         }
     }
@@ -2010,10 +2065,11 @@ class HostCompositionRoot internal constructor(
                 rootHolder[0]?.requestStop(sessionId, generation) ?: false
             }
             // 0.24 S2 Task 11: the resident handshake and panel lifecycle. Each link callback runs on the vendor
-            // callback thread, so the root methods below marshal it (Task 12's timer consumes `onPanelShown`).
-            hintLink.onPin = { route -> rootHolder[0]?.onPinFromLink(route) }
-            hintLink.onUiState = { state -> rootHolder[0]?.onUiStateFromLink(state) }
-            hintLink.onPanelShown = { route -> rootHolder[0]?.panelShownArrived(route) }
+            // callback thread, so the root methods below marshal it (Task 12's timer consumes `onPanelShown`), and
+            // each carries the identity the link validated against - never the identity current at delivery time.
+            hintLink.onPin = { identity, route -> rootHolder[0]?.onPinFromLink(identity, route) }
+            hintLink.onUiState = { identity, state -> rootHolder[0]?.onUiStateFromLink(identity, state) }
+            hintLink.onPanelShown = { identity, route -> rootHolder[0]?.panelShownArrived(identity, route) }
             scene.composition = root
             // Task 14a item 1: the real plugin, not `SmartAssistantPlugin()` with defaults. Its configuration is
             // applied by `activateSelected` before every activation, from the same settings this root was built with.

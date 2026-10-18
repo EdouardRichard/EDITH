@@ -7,6 +7,8 @@ import com.sheen.rokid.contracts.HostEvent
 import com.sheen.rokid.contracts.PinChanged
 import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.output.ConversationLog
+import com.sheen.rokid.output.HintCommand
+import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.ConfigSchema
 import com.sheen.rokid.plugin.DeactivationReason
@@ -351,9 +353,10 @@ class CxrLinkWiringTest {
     }
 
     @Test
-    fun aPinIsDeliveredAsPinChangedOffTheVendorCallbackThread() {
+    fun aPinIsDeliveredAsPinChangedOffTheVendorCallbackThreadWithTheValidatedIdentity() {
         // `CxrHintLink.onPin` runs on the vendor's callback thread. The composition must wrap it in the host event
-        // with the current identity and marshal it away from that thread, or the vendor callback runs host policy.
+        // with the identity the link validated - not the identity current at delivery time - and marshal it away from
+        // that thread, or the vendor callback runs host policy.
         val clock = FakeClock(1_000_000_000L)
         val environment = CxrHostEnvironment(
             clock = clock,
@@ -363,16 +366,18 @@ class CxrLinkWiringTest {
         )
         val dispatched = mutableListOf<() -> Unit>()
         val plugin = RecordingPlugin()
+        val host = HostRuntime(1, environment)
         val root = HostCompositionRoot(
-            HostRuntime(1, environment), MemoryProfileRepository(), UnusedModel(), environment,
+            host, MemoryProfileRepository(), UnusedModel(), environment,
             dispatchHostEvent = { task -> dispatched += task },
         )
         try {
             root.registerPlugin(plugin)
             root.onSceneReady()
             root.start("recording")
+            val identity = requireNotNull(host.currentIdentity()) { "the started session has an identity" }
 
-            root.onPinFromLink(AssistantRoute.PROACTIVE)
+            root.onPinFromLink(HintIdentity(identity.first.value, identity.second.value), AssistantRoute.PROACTIVE)
 
             assertTrue("nothing may run inline on the vendor thread: ${plugin.events}", plugin.events.isEmpty())
             assertEquals("the pin must be queued for another thread", 1, dispatched.size)
@@ -383,28 +388,148 @@ class CxrLinkWiringTest {
             while (plugin.events.none { it is PinChanged } && System.nanoTime() < deadline) Thread.sleep(10)
             val pin = plugin.events.filterIsInstance<PinChanged>().single()
             assertEquals(AssistantRoute.PROACTIVE, pin.route)
+            assertEquals("the envelope must carry the identity the link validated", identity.first,
+                pin.envelope.sessionId)
+            assertEquals("the envelope must carry the generation the link validated", identity.second,
+                pin.envelope.generation)
+        } finally { root.close() }
+    }
+
+    @Test
+    fun aQueuedPinFromThePreviousSessionIsRefusedAfterTheHostMovesOn() {
+        // Review I2: the link validates PIN against the established session/generation, but the composition used to
+        // stamp the queued event with `currentIdentity()` at delivery time. A session switch before the queued task ran
+        // therefore turned an old pin into the new conversation's pin. The envelope now carries the validated pair.
+        val clock = FakeClock(1_000_000_000L)
+        val environment = CxrHostEnvironment(
+            clock = clock, input = RecordingInputPort(), liveOutput = { null }, scheduler = ManualScheduler(clock),
+        )
+        val dispatched = mutableListOf<() -> Unit>()
+        val plugin = RecordingPlugin()
+        val host = HostRuntime(1, environment)
+        val root = HostCompositionRoot(
+            host, MemoryProfileRepository(), UnusedModel(), environment,
+            dispatchHostEvent = { task -> dispatched += task },
+        )
+        try {
+            root.registerPlugin(plugin)
+            root.onSceneReady()
+            root.start("recording")
+            val old = requireNotNull(host.currentIdentity())
+
+            root.onPinFromLink(HintIdentity(old.first.value, old.second.value), AssistantRoute.PROACTIVE)
+            assertEquals(1, dispatched.size)
+
+            root.stop()
+            root.start("recording")
+            val current = requireNotNull(host.currentIdentity())
+            assertNotEquals("the session must have moved on", old.first, current.first)
+
+            dispatched.removeAt(0).invoke()
+            Thread.sleep(50)
+            assertTrue("a pin validated for the old session must not reach the new one: ${plugin.events}",
+                plugin.events.filterIsInstance<PinChanged>().isEmpty())
         } finally { root.close() }
     }
 
     @Test
     fun aPanelShownIsDeliveredOffTheVendorCallbackThreadForTheTurnTimingOwner() {
         // Task 12 owns the 10 s timer and may only start it after the panel's first layout. Task 11 exposes that event
-        // as a host-thread callback, not as a direct vendor-thread invocation.
+        // as a host-thread callback, not as a direct vendor-thread invocation, and carries the validated identity so a
+        // queued event from a previous session cannot start the new session's timer.
+        val clock = FakeClock(1_000_000_000L)
+        val environment = CxrHostEnvironment(
+            clock = clock, input = RecordingInputPort(), liveOutput = { null }, scheduler = ManualScheduler(clock),
+        )
         val pending = mutableListOf<() -> Unit>()
+        val host = HostRuntime(1, environment)
         val root = HostCompositionRoot(
-            HostRuntime(1), MemoryProfileRepository(), UnusedModel(), null,
+            host, MemoryProfileRepository(), UnusedModel(), environment,
             dispatchHostEvent = { task -> pending += task },
         )
         try {
-            val shown = mutableListOf<AssistantRoute>()
-            root.onPanelShown = { route -> shown += route }
+            root.registerPlugin(RecordingPlugin())
+            root.onSceneReady()
+            root.start("recording")
+            val identity = requireNotNull(host.currentIdentity())
+            val shown = mutableListOf<Pair<HintIdentity, AssistantRoute>>()
+            root.onPanelShown = { validated, route -> shown += validated to route }
 
-            root.panelShownArrived(AssistantRoute.WAKE)
+            root.panelShownArrived(HintIdentity(identity.first.value, identity.second.value), AssistantRoute.WAKE)
 
             assertTrue("the timing owner must not run on the vendor thread", shown.isEmpty())
             assertEquals(1, pending.size)
             pending.removeAt(0).invoke()
-            assertEquals(listOf(AssistantRoute.WAKE), shown)
+            assertEquals(listOf(HintIdentity(identity.first.value, identity.second.value) to AssistantRoute.WAKE), shown)
+        } finally { root.close() }
+    }
+
+    @Test
+    fun aQueuedPanelShownFromThePreviousSessionIsDropped() {
+        val clock = FakeClock(1_000_000_000L)
+        val environment = CxrHostEnvironment(
+            clock = clock, input = RecordingInputPort(), liveOutput = { null }, scheduler = ManualScheduler(clock),
+        )
+        val pending = mutableListOf<() -> Unit>()
+        val host = HostRuntime(1, environment)
+        val root = HostCompositionRoot(
+            host, MemoryProfileRepository(), UnusedModel(), environment,
+            dispatchHostEvent = { task -> pending += task },
+        )
+        try {
+            root.registerPlugin(RecordingPlugin())
+            root.onSceneReady()
+            root.start("recording")
+            val old = requireNotNull(host.currentIdentity())
+            root.panelShownArrived(HintIdentity(old.first.value, old.second.value), AssistantRoute.WAKE)
+            assertEquals(1, pending.size)
+
+            root.stop()
+            root.start("recording")
+            val shown = mutableListOf<Pair<HintIdentity, AssistantRoute>>()
+            root.onPanelShown = { validated, route -> shown += validated to route }
+
+            pending.removeAt(0).invoke()
+            assertTrue("a queued PANEL_SHOWN from the previous session must be dropped: $shown", shown.isEmpty())
+        } finally { root.close() }
+    }
+
+    @Test
+    fun thePanelVisibilityIsReadableAndUiClosedReachesTheTurnOwner() {
+        // Review I5: Task 12 can start its 10 s window on a turn open when the panel is already visible only if the
+        // composition exposes that state, and it needs the close event to cancel a window whose panel went away.
+        val clock = FakeClock(1_000_000_000L)
+        val environment = CxrHostEnvironment(
+            clock = clock, input = RecordingInputPort(), liveOutput = { null }, scheduler = ManualScheduler(clock),
+        )
+        val sent = mutableListOf<String>()
+        val link = CxrHintLink(clock, ManualScheduler(clock), sendJson = { json -> sent += json; true })
+        val pending = mutableListOf<() -> Unit>()
+        val host = HostRuntime(1, environment)
+        val root = HostCompositionRoot(
+            host, MemoryProfileRepository(), UnusedModel(), environment,
+            hintLink = link, dispatchHostEvent = { task -> pending += task },
+        )
+        try {
+            root.registerPlugin(RecordingPlugin())
+            root.onSceneReady()
+            root.start("recording")
+            val identity = requireNotNull(host.currentIdentity())
+            val hintIdentity = HintIdentity(identity.first.value, identity.second.value)
+            val closed = mutableListOf<AssistantRoute>()
+            root.onUiClosed = { route -> closed += route }
+            link.onUiState = { validated, state -> root.onUiStateFromLink(validated, state) }
+
+            assertFalse("nothing is visible before PANEL_SHOWN", root.isPanelVisible())
+            assertTrue(link.onInbound(HintWireCodec.encode(
+                HintCommand.PanelShown(hintIdentity.sessionId, hintIdentity.generation, AssistantRoute.WAKE))))
+            assertTrue("an already-visible panel must be readable on the turn-open path", root.isPanelVisible())
+
+            assertTrue(link.onInbound(HintWireCodec.encode(
+                HintCommand.UiClosed(hintIdentity.sessionId, hintIdentity.generation, AssistantRoute.WAKE))))
+            pending.forEach { it() }
+            assertEquals(listOf(AssistantRoute.WAKE), closed)
+            assertFalse(root.isPanelVisible())
         } finally { root.close() }
     }
 }

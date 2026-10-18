@@ -589,16 +589,16 @@ class CxrHintLinkTest {
     // ---------------------------------------------------------------- 0.24: inbound PIN and UI state
 
     @Test
-    fun aMatchingPinIsRoutedWithItsRoute() {
+    fun aMatchingPinIsRoutedWithItsRouteAndValidatedIdentity() {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
-        val pinned = mutableListOf<AssistantRoute>()
-        link.onPin = { pinned += it }
+        val pinned = mutableListOf<Pair<HintIdentity, AssistantRoute>>()
+        link.onPin = { identity, route -> pinned += identity to route }
         link.sessionEstablished("s-1", 3)
 
         assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.Pin("s-1", 3, AssistantRoute.PROACTIVE))))
 
-        assertEquals(listOf(AssistantRoute.PROACTIVE), pinned)
+        assertEquals(listOf(HintIdentity("s-1", 3) to AssistantRoute.PROACTIVE), pinned)
     }
 
     @Test
@@ -606,7 +606,7 @@ class CxrHintLinkTest {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
         var pinned = 0
-        link.onPin = { pinned++ }
+        link.onPin = { _, _ -> pinned++ }
         link.sessionEstablished("s-1", 3)
 
         assertFalse("another session cannot pin this one",
@@ -621,7 +621,7 @@ class CxrHintLinkTest {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
         var pinned = 0
-        link.onPin = { pinned++ }
+        link.onPin = { _, _ -> pinned++ }
 
         assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.Pin("s-1", 3, AssistantRoute.WAKE))))
         assertEquals(0, pinned)
@@ -631,7 +631,7 @@ class CxrHintLinkTest {
     fun aThrowingPinCallbackDoesNotEscapeTheSdkThread() {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
-        link.onPin = { error("the host died") }
+        link.onPin = { _, _ -> error("the host died") }
         link.sessionEstablished("s-1", 3)
 
         assertTrue("the link still handled the PIN",
@@ -643,7 +643,7 @@ class CxrHintLinkTest {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
         val states = mutableListOf<UiState>()
-        link.onUiState = { states += it }
+        link.onUiState = { _, state -> states += state }
         link.sessionEstablished("s-1", 3)
 
         assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.UiReady("s-1", 3))))
@@ -656,7 +656,7 @@ class CxrHintLinkTest {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
         val states = mutableListOf<UiState>()
-        link.onUiState = { states += it }
+        link.onUiState = { _, state -> states += state }
         link.sessionEstablished("s-1", 3)
 
         assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.UiClosed("s-1", 3, AssistantRoute.PROACTIVE))))
@@ -669,7 +669,7 @@ class CxrHintLinkTest {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
         var states = 0
-        link.onUiState = { states++ }
+        link.onUiState = { _, _ -> states++ }
         link.sessionEstablished("s-1", 3)
 
         assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.UiReady("other", 3))))
@@ -683,7 +683,7 @@ class CxrHintLinkTest {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
         var states = 0
-        link.onUiState = { states++ }
+        link.onUiState = { _, _ -> states++ }
 
         assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.UiReady("s-1", 3))))
         assertEquals(0, states)
@@ -693,7 +693,7 @@ class CxrHintLinkTest {
     fun aThrowingUiStateCallbackDoesNotEscapeTheSdkThread() {
         val sent = mutableListOf<String>()
         val link = linkInto(sent)
-        link.onUiState = { error("the host died") }
+        link.onUiState = { _, _ -> error("the host died") }
         link.sessionEstablished("s-1", 3)
 
         assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.UiReady("s-1", 3))))
@@ -895,7 +895,7 @@ class CxrHintLinkTest {
     }
 
     @Test
-    fun openingThePanelStartsTheSceneThenReintroducesAndOpens() {
+    fun openingThePanelStartsTheSceneThenWaitsForUiReadyBeforeOpening() {
         val rig = ResidentRig()
         rig.establish()
         rig.sent.clear()
@@ -910,26 +910,105 @@ class CxrHintLinkTest {
         val commands = rig.commands()
         val hello = commands.indexOfFirst { it is HintCommand.Hello }
         val ping = commands.indexOfFirst { it is HintCommand.Ping }
-        val open = commands.indexOfFirst { it is HintCommand.PanelOpen }
         assertTrue("reintroduce must send HELLO/PING: $commands", hello >= 0 && ping >= 0)
-        assertTrue("PANEL_OPEN must follow the re-introduction: $commands", open > ping)
+        assertTrue("PANEL_OPEN must not travel before UI_READY proves the service can receive it: $commands",
+            rig.panelOpens().isEmpty())
+
+        rig.uiReady()
+        assertEquals("exactly one PANEL_OPEN once the service reports ready", 1, rig.panelOpens().size)
         assertEquals(AssistantRoute.WAKE, rig.panelOpens().single().route)
     }
 
     @Test
-    fun aMissingClockMappingReintroducesTheEstablishedSessionBeforeOpening() {
+    fun aStaleUiReadyWithoutALiveMappingStartsWithTheSceneAndWaitsForReadiness() {
         val rig = ResidentRig()
         rig.establish()
         rig.uiReady()
-        // Deliberately no PONG: the service is alive, but the old scene's mapping is dead.
+        // Deliberately no PONG: UI_READY was seen once, but no live mapping proves the service can still receive
+        // commands. It may have died since it reported ready, so a wake must recover it with appStart.
         rig.sent.clear()
 
         assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
 
-        assertEquals(0, rig.starts)
-        assertTrue(rig.commands().any { it is HintCommand.Hello })
-        assertTrue(rig.commands().any { it is HintCommand.Ping })
+        assertEquals("a UI_READY with no live mapping may belong to a service that died", 1, rig.starts)
+        assertTrue("PANEL_OPEN may not travel before readiness is proven: ${rig.commands()}",
+            rig.panelOpens().isEmpty())
+
+        rig.startCallback!!.invoke(true)
+        assertTrue("the new scene must be introduced: ${rig.commands()}",
+            rig.commands().any { it is HintCommand.Hello })
+        assertTrue("PANEL_OPEN still may not travel before UI_READY/PONG: ${rig.commands()}",
+            rig.panelOpens().isEmpty())
+
+        rig.completeExchange()
+        assertEquals("a live PONG mapping proves the service is ready", 1, rig.panelOpens().size)
+    }
+
+    @Test
+    fun aWakeWithALiveMappingDoesNotStartTheSceneEvenWithoutUiReady() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        // No UI_READY in this test: the live PONG mapping is itself proof that the resident service is there.
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+
+        assertEquals("a live mapping must never trigger another appStart", 0, rig.starts)
+        assertEquals(listOf(AssistantRoute.WAKE), rig.panelOpens().map { it.route })
+    }
+
+    @Test
+    fun aPanelOpenWithoutPanelShownIsRetriedAndStopsOnPanelShown() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
         assertEquals(1, rig.panelOpens().size)
+
+        rig.advance(1_000)
+        assertEquals("a PANEL_OPEN that was lost before PANEL_SHOWN must be repeated", 2, rig.panelOpens().size)
+
+        rig.panelShown(AssistantRoute.WAKE)
+        rig.advance(10_000)
+        assertEquals("PANEL_SHOWN must stop the repeats", 2, rig.panelOpens().size)
+    }
+
+    @Test
+    fun panelOpenRetriesAreBoundedWhenPanelShownNeverArrives() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        repeat(10) { rig.advance(1_000) }
+
+        assertEquals("one open plus three bounded repeats", 4, rig.panelOpens().size)
+    }
+
+    @Test
+    fun aLaterOpenAfterAGiveUpGetsItsOwnBoundedRetries() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        repeat(10) { rig.advance(1_000) }
+        assertEquals(4, rig.panelOpens().size)
+
+        // The failure did not mark the service dead. The next turn's open must be a fresh command with its own bound,
+        // not inherit the exhausted retry counter and give up without one repeat.
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(1, rig.panelOpens().size)
+        rig.advance(1_000)
+        assertEquals("a new open must repeat on its own counter", 2, rig.panelOpens().size)
     }
 
     @Test
@@ -964,16 +1043,16 @@ class CxrHintLinkTest {
     }
 
     @Test
-    fun panelShownIsDeliveredWithItsRouteAndMarksThePanelVisible() {
+    fun panelShownIsDeliveredWithItsRouteAndValidatedIdentity() {
         val rig = ResidentRig()
-        val shown = mutableListOf<AssistantRoute>()
-        rig.link.onPanelShown = { route -> shown += route }
+        val shown = mutableListOf<Pair<HintIdentity, AssistantRoute>>()
+        rig.link.onPanelShown = { identity, route -> shown += identity to route }
         rig.establish()
 
         assertTrue(rig.link.onInbound(
             HintWireCodec.encode(HintCommand.PanelShown("s-1", 3, AssistantRoute.PROACTIVE))))
 
-        assertEquals(listOf(AssistantRoute.PROACTIVE), shown)
+        assertEquals(listOf(HintIdentity("s-1", 3) to AssistantRoute.PROACTIVE), shown)
         assertTrue(rig.link.isPanelVisible())
     }
 
@@ -981,7 +1060,7 @@ class CxrHintLinkTest {
     fun aPanelShownForAnotherSessionIsRefused() {
         val rig = ResidentRig()
         var shown = 0
-        rig.link.onPanelShown = { shown++ }
+        rig.link.onPanelShown = { _, _ -> shown++ }
         rig.establish()
 
         assertFalse(rig.link.onInbound(
@@ -1022,7 +1101,142 @@ class CxrHintLinkTest {
         rig.sent.clear()
         rig.startCallback!!.invoke(true)
 
-        assertTrue("the queued wake must open the panel after the single start: ${rig.commands()}",
+        assertTrue("the queued wake may not open the panel before readiness: ${rig.commands()}",
+            rig.panelOpens().isEmpty())
+        rig.uiReady()
+        assertTrue("the queued wake must open the panel once UI_READY proves the service is there: ${rig.commands()}",
             rig.panelOpens().isNotEmpty())
+    }
+
+    @Test
+    fun aStaleAppStartCallbackCannotOpenOrClearTheNextSessionsHandshake() {
+        val rig = ResidentRig()
+        rig.establish("s-1", 3)
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        val stale = requireNotNull(rig.startCallback)
+
+        // The session moves on while CXR still owes an answer for the old one.
+        rig.establish("s-2", 4)
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(2, rig.starts)
+        rig.sent.clear()
+
+        stale(true)
+
+        assertTrue("a stale appStart answer may not re-introduce the new session: ${rig.commands()}",
+            rig.commands().isEmpty())
+        assertTrue("the new session's queued open must survive the stale answer",
+            rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals("a stale answer must not allow a second start for the new session", 2, rig.starts)
+
+        rig.uiReady("s-2", 4)
+        assertEquals(1, rig.panelOpens().size)
+        assertEquals("s-2", rig.panelOpens().single().sessionId)
+    }
+
+    @Test
+    fun aStaleAppStartCallbackCannotAllowASecondSceneStartForTheNewSession() {
+        val rig = ResidentRig()
+        rig.establish("s-1", 3)
+        rig.link.requestPanelOpen(AssistantRoute.WAKE)
+        val stale = requireNotNull(rig.startCallback)
+
+        rig.establish("s-2", 4)
+        rig.advance(5_000)
+        assertEquals("the grace starts the new session's scene once", 2, rig.starts)
+
+        stale(true)
+
+        assertTrue("a wake during the new scene's start must queue", rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals("the stale answer must not clear the new session's in-flight start", 2, rig.starts)
+    }
+
+    @Test
+    fun aStaleUiReadyCannotOpenTheNextSessionsPanel() {
+        val rig = ResidentRig()
+        rig.establish("s-1", 3)
+        rig.link.requestPanelOpen(AssistantRoute.WAKE)
+        rig.establish("s-2", 4)
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.PROACTIVE))
+        rig.sent.clear()
+
+        assertFalse("an old session's UI_READY is not this session's fact",
+            rig.link.onInbound(HintWireCodec.encode(HintCommand.UiReady("s-1", 3))))
+        assertTrue("no PANEL_OPEN may be sent for the old session's UI_READY", rig.panelOpens().isEmpty())
+
+        rig.uiReady("s-2", 4)
+        assertEquals(listOf(AssistantRoute.PROACTIVE), rig.panelOpens().map { it.route })
+    }
+
+    @Test
+    fun closingOrEndingTheSessionCancelsTheOpenRetries() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        rig.advance(1_000)
+        assertEquals(2, rig.panelOpens().size)
+
+        rig.link.close(AssistantRoute.WAKE)
+        rig.advance(5_000)
+        assertEquals("CLOSE must cancel the retry", 2, rig.panelOpens().size)
+
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        rig.advance(1_000)
+        assertEquals(2, rig.panelOpens().size)
+        rig.link.sessionEnded()
+        rig.advance(5_000)
+        assertEquals("a session end must cancel the retry", 2, rig.panelOpens().size)
+    }
+
+    /**
+     * Handshake concurrency: a wake and a `UI_READY` arriving together may produce one `appStart`, and after readiness
+     * is signalled the panel is opened exactly once. The state is serialized under one gate, so the two interleavings
+     * are both valid; neither may double-start or double-open.
+     */
+    @Test
+    fun concurrentWakeAndUiReadyProduceOneSceneStartAndOnePanelOpen() {
+        repeat(200) { round ->
+            val starts = java.util.concurrent.atomic.AtomicInteger()
+            val callback = java.util.concurrent.atomic.AtomicReference<((Boolean) -> Unit)?>(null)
+            val sent = java.util.Collections.synchronizedList(mutableListOf<String>())
+            val link = CxrHintLink(
+                clock = FakeClock(),
+                scheduler = FakeScheduler(),
+                sendJson = { json -> sent += json; true },
+                maxRetries = 0,
+                startGlassesApp = { onResult -> starts.incrementAndGet(); callback.set(onResult); true },
+            )
+            val session = "c-$round"
+            link.sessionEstablished(session, 3)
+            sent.clear()
+
+            val barrier = java.util.concurrent.CyclicBarrier(3)
+            val wake = kotlin.concurrent.thread {
+                barrier.await()
+                link.requestPanelOpen(AssistantRoute.WAKE)
+            }
+            val ready = kotlin.concurrent.thread {
+                barrier.await()
+                link.onInbound(HintWireCodec.encode(HintCommand.UiReady(session, 3)))
+            }
+            barrier.await()
+            wake.join(5_000)
+            ready.join(5_000)
+
+            assertEquals("round $round: one appStart", 1, starts.get())
+            callback.get()?.invoke(true)
+            // A second UI_READY is the same identity reporting ready again; it must not open a second window.
+            link.onInbound(HintWireCodec.encode(HintCommand.UiReady(session, 3)))
+
+            val opens = synchronized(sent) { sent.toList() }.mapNotNull(HintWireCodec::decode)
+                .filterIsInstance<HintCommand.PanelOpen>()
+            assertEquals("round $round: exactly one PANEL_OPEN", 1, opens.size)
+            link.sessionEnded()
+        }
     }
 }

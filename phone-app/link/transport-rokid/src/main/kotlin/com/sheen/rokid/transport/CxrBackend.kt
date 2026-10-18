@@ -392,15 +392,17 @@ internal class CxrBackend(private val config: RokidConnectionConfig, private val
      */
     override fun openGlassesApp(onResult: (Boolean) -> Unit): Boolean {
         val owned = binding ?: return false
-        if (fence.isClosed() || binding !== owned) return false
+        if (fence.isClosed() || binding !== owned || owned.closed.get()) return false
         val starter = runCatching { glassAppStarter(owned.session) }.getOrNull() ?: return false
         // The SDK may answer synchronously on a fake transport or later on its own thread; the host sees one answer,
-        // on this backend's worker, and only while the session that asked is still the live one.
+        // on this backend's worker, and only while the session that asked is still live. `owned.closed` is checked at
+        // delivery too: the session can close between the SDK answer and the marshalled callback, and a dead session's
+        // answer must not touch the next session's handshake state.
         val reported = AtomicBoolean()
         fun report(success: Boolean) {
             if (!reported.compareAndSet(false, true)) return
             enqueue {
-                if (!fence.isClosed() && binding === owned) onResult(success)
+                if (!fence.isClosed() && binding === owned && !owned.closed.get()) onResult(success)
             }
         }
         return try {
