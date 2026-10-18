@@ -1,9 +1,11 @@
 package com.sheen.rokid.glasses.app
 
+import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
@@ -40,8 +42,10 @@ import com.sheen.rokid.output.HintWireCodec
  * it is hidden or the service dies, with the same ten-minute local max hold the S1 probe used.
  *
  * `UI_READY` is only ever sent with the session identity the controller actually accepted. Before a `HELLO` there is
- * nothing to name, so the send is deferred and recorded, and the first accepted `HELLO` sends it. `PANEL_SHOWN`
- * follows the overlay's first layout; `UI_CLOSED` follows removal.
+ * nothing to name, so the send is deferred and recorded, and the first accepted `HELLO` sends it. It is **per accepted
+ * session identity**, not once per service: a phone restart while this service stays resident opens a new session
+ * generation and must receive a new `UI_READY`, while a repeated `HELLO` for the same identity must not duplicate it.
+ * `PANEL_SHOWN` follows the overlay's first layout; `UI_CLOSED` follows the visible-to-hidden transition.
  *
  * This task does not implement the phone handshake, `PANEL_OPEN`/`STATE`/`IDLE` routing or the conversation state
  * machine (Tasks 10-19). The only inbound lifecycle command handled here is `CLOSE`, whose Task 9 obligation is to
@@ -60,8 +64,14 @@ class GlassesOverlayService : Service() {
     private var overlayParams: WindowManager.LayoutParams? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
-    /** True once `UI_READY` has actually gone out in this service lifetime. */
-    private var uiReadySent = false
+    /**
+     * The session identity `UI_READY` was last sent for, or null when it has never gone out.
+     *
+     * Per identity rather than one boolean: the resident service can outlive the phone app, and the next accepted
+     * session must announce itself. A repeated `HELLO` for the same identity is not a new session and must not produce
+     * a duplicate event.
+     */
+    private var lastUiReadyIdentity: Pair<String, Long>? = null
 
     /** A `PANEL_SHOWN` whose layout already happened before the session identity arrived; sent on the first HELLO. */
     private var pendingPanelShownRoute: AssistantRoute? = null
@@ -186,7 +196,13 @@ class GlassesOverlayService : Service() {
     }
 
     /**
-     * Removes the overlay, releases the wake lock and clears the panel's conversation cache.
+     * Removes the overlay when it is visible, releases the wake lock and **always** clears the panel's conversation
+     * cache.
+     *
+     * The reset is independent of window presence: the controller keeps accepting `SHOW`/`SAID` while the panel is
+     * hidden, so a `CLOSE` in that state must still throw the hidden cache away or it would reappear on the next show
+     * (Task 9 review I1). `UI_CLOSED` reports a **visible-to-hidden transition**, so it is sent only when this call
+     * actually removed a window; an already-hidden close clears the cache without reporting a second close.
      *
      * The service itself stays alive: a panel close is not the end of the phone session (spec §5.1).
      */
@@ -195,8 +211,12 @@ class GlassesOverlayService : Service() {
             mainHandler.post { hidePanel() }
             return
         }
-        val root = overlayRoot ?: run {
-            Log.i(TAG, "PANEL_HIDE ignored: no overlay")
+        val root = overlayRoot
+        if (root == null) {
+            pendingPanelShownRoute = null
+            // No window to remove, but the hidden cache is still a cache: a valid CLOSE must clear it.
+            host.resetForClose()
+            Log.i(TAG, "PANEL_HIDDEN hidden=true conversation_cleared=true ui_closed=already-hidden")
             return
         }
         overlayRoot = null
@@ -267,24 +287,37 @@ class GlassesOverlayService : Service() {
     // ---------------------------------------------------------------- outbound UI events
 
     /**
-     * `UI_READY` is service-scoped and needs the session identity the controller accepted. Before the first HELLO the
-     * send is deferred (and logged); a failed send is retried on the next accepted command rather than recorded as
-     * sent.
+     * Sends `UI_READY` once per accepted session identity.
+     *
+     * Before the first HELLO there is nothing to name, so the send is deferred (and logged). A repeated HELLO for the
+     * identity already announced is not a new session and produces no duplicate. A failed send is not recorded as
+     * announced, so the next accepted command retries it. A new accepted identity always sends a new event, which is
+     * what lets the phone re-establish readiness after its own restart while this resident service kept running.
      */
     private fun maybeSendUiReady() {
-        if (uiReadySent) return
         val identity = host.currentIdentity() ?: run {
             Log.i(TAG, "UI_READY deferred: no session identity yet")
             return
         }
-        val sent = send(HintCommand.UiReady(identity.first, identity.second))
-        uiReadySent = sent
-        Log.i(TAG, "UI_READY session=${identity.first} generation=${identity.second} sent=$sent")
-        val pending = pendingPanelShownRoute
-        if (pending != null && sent) {
-            pendingPanelShownRoute = null
-            sendPanelShown(pending)
+        if (identity == lastUiReadyIdentity) {
+            flushPendingPanelShown()
+            return
         }
+        val sent = send(HintCommand.UiReady(identity.first, identity.second))
+        if (sent) {
+            lastUiReadyIdentity = identity
+            Log.i(TAG, "UI_READY session=${identity.first} generation=${identity.second} sent=true")
+            flushPendingPanelShown()
+        } else {
+            Log.i(TAG, "UI_READY session=${identity.first} generation=${identity.second} sent=false (will retry)")
+        }
+    }
+
+    /** Sends a `PANEL_SHOWN` that was deferred until an accepted identity existed. */
+    private fun flushPendingPanelShown() {
+        val pending = pendingPanelShownRoute ?: return
+        pendingPanelShownRoute = null
+        sendPanelShown(pending)
     }
 
     /** Sent after the overlay's first layout, with the accepted identity only. */
@@ -399,6 +432,35 @@ class GlassesOverlayService : Service() {
     fun overlayParamsForProbe(): WindowManager.LayoutParams? = overlayParams
 
     fun wakeLockHeldForProbe(): Boolean = wakeLock?.isHeld == true
+
+    fun overlayHasWindowFocusForProbe(): Boolean = overlayRoot?.hasWindowFocus() == true
+
+    fun isPinnedForProbe(): Boolean = host.isPinnedForProbe()
+
+    /**
+     * Task 9 review I4: read the platform's own record instead of a service field.
+     *
+     * `getRunningServices` is deprecated but still returns this app's services (and only this app's) with the
+     * `foreground` flag, which is the system's answer to "is this service foreground", not ours.
+     */
+    @Suppress("DEPRECATION")
+    fun serviceForegroundForProbe(): Boolean {
+        val manager = getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
+        val self = ComponentName(this, GlassesOverlayService::class.java)
+        return manager.getRunningServices(Int.MAX_VALUE).any { it.service == self && it.foreground }
+    }
+
+    /** True when the platform actually holds the `FOREGROUND_ID` notification for this app. */
+    fun activeForegroundNotificationForProbe(): Boolean {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        return manager.activeNotifications.any { it.packageName == packageName && it.id == FOREGROUND_ID }
+    }
+
+    /** The posted channel's importance, read back from the platform; -1 means the channel is missing. */
+    fun foregroundChannelImportanceForProbe(): Int {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        return manager.getNotificationChannel(CHANNEL_ID)?.importance ?: -1
+    }
 
     fun hintTextForProbe(): String = host.hintText()
 

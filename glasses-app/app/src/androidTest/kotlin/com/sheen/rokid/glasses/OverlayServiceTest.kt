@@ -1,5 +1,6 @@
 package com.sheen.rokid.glasses
 
+import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -8,7 +9,10 @@ import android.graphics.PixelFormat
 import android.os.IBinder
 import android.provider.Settings
 import android.view.Gravity
+import android.view.KeyEvent
 import android.view.WindowManager
+import androidx.lifecycle.Lifecycle
+import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
@@ -84,6 +88,15 @@ class OverlayServiceTest {
             sentJson += json
             true
         }
+
+        // Task 9 review I4: a resident panel must be a real foreground service with a low-importance notification.
+        // All three values are read from the platform (ActivityManager / NotificationManager), not from service fields.
+        assertTrue("the overlay service must be running as a foreground service",
+            onMain { service.serviceForegroundForProbe() })
+        assertTrue("the FOREGROUND_ID notification must be active",
+            onMain { service.activeForegroundNotificationForProbe() })
+        assertEquals("the resident notification must be low importance",
+            NotificationManager.IMPORTANCE_LOW, onMain { service.foregroundChannelImportanceForProbe() })
 
         assertTrue("no UI_READY may be fabricated before a HELLO establishes the identity",
             uiEvents().none { it is HintCommand.UiReady })
@@ -211,6 +224,143 @@ class OverlayServiceTest {
         assertEquals("", onMain { service.conversationTextForProbe(AssistantRoute.WAKE) })
     }
 
+    /**
+     * Task 9 review I1: a `CLOSE` that arrives while the overlay is already hidden must still clear the cache.
+     *
+     * The controller keeps accepting `SHOW`/`SAID` while the window is hidden, so a late answer can sit in the cache
+     * after BACK hid the panel. A hidden `CLOSE` is the only command that can throw it away before the next show.
+     * `UI_CLOSED` must not be sent a second time: the phone already learned that this window hid, and a duplicate would
+     * report a transition that did not happen.
+     */
+    @Test
+    fun aCloseWhileHiddenClearsTheCacheAndDoesNotDuplicateUiClosed() {
+        val service = startAndBind()
+        service.setSenderForProbe { json -> sentJson += json; true }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-hidden-close", 5)))
+            service.showPanel(AssistantRoute.WAKE)
+        }
+        waitUntil("UI_READY") { uiEvents().any { it is HintCommand.UiReady } }
+        waitUntil("PANEL_SHOWN") { uiEvents().any { it is HintCommand.PanelShown } }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Sync("sync-hidden-close", 0, 1_000_000, System.nanoTime() + 120_000_000_000L)))
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Show("s-hidden-close", 5, sequence = 1, hintId = "h-hidden-visible", revision = 1,
+                    syncId = "sync-hidden-close", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = "可见时收到的答案")))
+        }
+        waitUntil("the visible answer is on the panel") {
+            onMain { service.hintTextForProbe() } == "可见时收到的答案"
+        }
+
+        // BACK / a service hide: the window is gone, the session stays, and UI_CLOSED has been sent once.
+        instrumentation.runOnMainSync { service.hidePanel() }
+        waitUntil("the first UI_CLOSED") { uiEvents().count { it is HintCommand.UiClosed } == 1 }
+        waitUntil("the overlay is hidden") { !onMain { service.overlayShownForProbe() } }
+
+        // Late content accepted while hidden: this is the cache a hidden CLOSE must clear.
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(
+                HintCommand.Show("s-hidden-close", 5, sequence = 2, hintId = "h-hidden-late", revision = 1,
+                    syncId = "sync-hidden-close", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 120_000,
+                    text = "隐藏时收到的答案")))
+        }
+        waitUntil("the hidden panel still stores the late answer in its cache") {
+            onMain { service.hintTextForProbe() } == "隐藏时收到的答案" &&
+                onMain { service.conversationTextForProbe(AssistantRoute.WAKE) }.contains("隐藏时收到的答案")
+        }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Close("s-hidden-close", 5, route = null)))
+        }
+        assertEquals("a hidden CLOSE must still clear the conversation cache", "",
+            onMain { service.conversationTextForProbe(AssistantRoute.WAKE) })
+        assertEquals("a hidden CLOSE must reset the reveal revision", 0L,
+            onMain { service.contentRevisionForProbe() })
+        assertEquals("a hidden CLOSE must clear the live row", "", onMain { service.hintTextForProbe() })
+        assertEquals("a hidden CLOSE must not report a second hidden transition", 1,
+            uiEvents().count { it is HintCommand.UiClosed })
+
+        // Re-open: the empty cache is what the wearer sees.
+        instrumentation.runOnMainSync { service.showPanel(AssistantRoute.WAKE) }
+        waitUntil("the re-opened overlay") { onMain { service.overlayShownForProbe() } }
+        assertEquals("no conversation may survive a hidden CLOSE", "",
+            onMain { service.conversationTextForProbe(AssistantRoute.WAKE) })
+        assertEquals("no answer may survive a hidden CLOSE", "", onMain { service.hintTextForProbe() })
+    }
+
+    /**
+     * Task 9 review I2 / Task 11 policy: `UI_READY` is per accepted session identity, not once per service.
+     *
+     * The phone restarting while the resident service stays alive opens a new session identity; that new session must
+     * get its own readiness event, while the repeated opening HELLO (the phone repeats it while waiting for the clock
+     * exchange) must not duplicate it.
+     */
+    @Test
+    fun uiReadyIsPerAcceptedSessionIdentityNotOncePerService() {
+        val service = startAndBind()
+        service.setSenderForProbe { json -> sentJson += json; true }
+
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-ready", 1)))
+        }
+        assertEquals("the first accepted HELLO emits one UI_READY", 1,
+            uiEvents().count { it is HintCommand.UiReady })
+        assertEquals(1L, uiEvents().filterIsInstance<HintCommand.UiReady>().single().generation)
+
+        instrumentation.runOnMainSync {
+            // The phone repeats its opening HELLO while the clock exchange is pending: same identity, no new event.
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-ready", 1)))
+        }
+        assertEquals("a repeated HELLO with the same identity must not duplicate UI_READY", 1,
+            uiEvents().count { it is HintCommand.UiReady })
+
+        instrumentation.runOnMainSync {
+            // A new session generation (e.g. the phone app restarted while this service stayed resident).
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-ready", 2)))
+        }
+        waitUntil("UI_READY for the new generation") {
+            uiEvents().count { it is HintCommand.UiReady } == 2
+        }
+        val ready = uiEvents().filterIsInstance<HintCommand.UiReady>()
+        assertEquals("the new generation must be named by the new UI_READY", 2L, ready[1].generation)
+        assertEquals("UI_READY must name, never fabricate, the accepted session", "s-ready", ready[1].sessionId)
+    }
+
+    // ---------------------------------------------------------------- the production overlay's key path
+
+    /**
+     * Task 9 review I3: the production overlay's `dispatchKeyEvent` path is the only wearer input on the device.
+     *
+     * The 21 legacy tests drive the Activity's `onKeyUp`/unhandled-key listener, not the overlay root. This test shows
+     * the panel because that is when the window can take focus, waits for the real window focus, then injects the same
+     * `KeyEvent`s through `sendKeyDownUpSync` (the platform injection path the existing key tests use). It proves the
+     * overlay's handler runs for ENTER and BACK; it does not claim anything about the ring's physical key delivery.
+     */
+    @Test
+    fun theProductionOverlayKeyPathPinsOnEnterAndHidesOnBack() {
+        val service = startAndBind()
+        service.setSenderForProbe { json -> sentJson += json; true }
+        instrumentation.runOnMainSync {
+            service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-keys", 7)))
+            service.showPanel(AssistantRoute.WAKE)
+        }
+        waitUntil("PANEL_SHOWN") { uiEvents().any { it is HintCommand.PanelShown } }
+        waitUntil("the overlay window is focused") { onMain { service.overlayHasWindowFocusForProbe() } }
+        assertFalse("nothing may be pinned before ENTER", onMain { service.isPinnedForProbe() })
+
+        instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_ENTER)
+        waitUntil("ENTER pins the overlay's reading position") { onMain { service.isPinnedForProbe() } }
+        assertTrue("a pin must not close the panel", onMain { service.overlayShownForProbe() })
+
+        instrumentation.sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+        waitUntil("BACK hides the overlay") { !onMain { service.overlayShownForProbe() } }
+        waitUntil("UI_CLOSED after the BACK hide") { uiEvents().any { it is HintCommand.UiClosed } }
+        assertFalse("the close reset must also drop the pin", onMain { service.isPinnedForProbe() })
+        assertFalse("and release the wake lock", onMain { service.wakeLockHeldForProbe() })
+    }
+
     // ---------------------------------------------------------------- the production default is the trampoline
 
     @Test
@@ -219,14 +369,22 @@ class OverlayServiceTest {
         context.stopService(serviceIntent)
         waitUntil("no service before the trampoline launch") { GlassesOverlayService.instanceForTest == null }
 
+        // Task 9 review I5: launch the real no-extra path through ActivityScenario and prove it reaches DESTROYED.
+        // The service-start assertion is unchanged; the destroyed state adds "and the Activity is not hosting a panel".
         val intent = Intent(context, GlassesActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-        context.startActivity(intent)
-        waitUntil("the default Activity starts GlassesOverlayService") {
-            GlassesOverlayService.instanceForTest != null
+        val scenario = ActivityScenario.launch<GlassesActivity>(intent)
+        try {
+            waitUntil("the default Activity starts GlassesOverlayService") {
+                GlassesOverlayService.instanceForTest != null
+            }
+            val started = requireNotNull(GlassesOverlayService.instanceForTest)
+            assertEquals("the trampoline Activity must finish after starting the service",
+                Lifecycle.State.DESTROYED, scenario.state)
+            assertFalse("the default path must not draw the panel inside the Activity; the service starts hidden",
+                onMain { started.overlayShownForProbe() })
+        } finally {
+            runCatching { scenario.close() }
         }
-        val started = requireNotNull(GlassesOverlayService.instanceForTest)
-        assertFalse("the default path must not draw the panel inside the Activity; the service starts hidden",
-            onMain { started.overlayShownForProbe() })
     }
 
     // ---------------------------------------------------------------- helpers
