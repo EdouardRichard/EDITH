@@ -773,7 +773,7 @@ class CxrHintLinkTest {
      * A link with the two clocks the resident handshake needs: the fake scheduler so the 5 s grace is observable, and
      * the recording app-start seam so "only when needed" can be asserted.
      */
-    private class ResidentRig {
+    private class ResidentRig(private val diagnostics: (String) -> Unit = {}) {
         val clock = FakeClock()
         val scheduler = FakeScheduler()
         val sent = mutableListOf<String>()
@@ -784,6 +784,7 @@ class CxrHintLinkTest {
             clock = clock,
             scheduler = scheduler,
             sendJson = { json -> sent += json; true },
+            diagnostics = diagnostics,
             // The opening retry is a D15 path with its own tests; with a zero bound it cannot add noise to these.
             maxRetries = 0,
             startGlassesApp = { onResult -> starts++; startCallback = onResult; startAccepted },
@@ -821,6 +822,27 @@ class CxrHintLinkTest {
 
         fun commands(): List<HintCommand> = sent.mapNotNull(HintWireCodec::decode)
         fun panelOpens(): List<HintCommand.PanelOpen> = commands().filterIsInstance<HintCommand.PanelOpen>()
+    }
+
+    /**
+     * Holds the first `PANEL_OPEN` retry between its capture and send sections.
+     *
+     * The `panel: no PANEL_SHOWN yet` line is emitted outside the handshake gate, which is exactly the gap in which a
+     * session change or a close+new open can land before the retry sends.
+     */
+    private class BlockingRetryGate {
+        private val captured = java.util.concurrent.CountDownLatch(1)
+        private val release = java.util.concurrent.CountDownLatch(1)
+        private val armed = java.util.concurrent.atomic.AtomicBoolean(true)
+        val diagnostics: (String) -> Unit = { message ->
+            if (message.startsWith("panel: no PANEL_SHOWN yet") && armed.compareAndSet(true, false)) {
+                captured.countDown()
+                release.await(5, java.util.concurrent.TimeUnit.SECONDS)
+            }
+        }
+
+        fun awaitCaptured(): Boolean = captured.await(5, java.util.concurrent.TimeUnit.SECONDS)
+        fun release() = release.countDown()
     }
 
     @Test
@@ -959,6 +981,72 @@ class CxrHintLinkTest {
     }
 
     @Test
+    fun anAcceptedSceneStartThatNeverBecomesReadyDoesNotStallALaterWake() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(1, rig.starts)
+        rig.startCallback!!.invoke(true)
+        assertEquals("acceptance alone may not start a second scene", 1, rig.starts)
+
+        // Inside the 10 s readiness window a wake queues behind the start instead of issuing a second one.
+        rig.advance(9_999)
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(1, rig.starts)
+
+        // The accepted start never produced UI_READY/PONG. The pending route may not outlive that window: if it did,
+        // every later wake would update it and return true without ever asking CXR to start the scene again.
+        rig.advance(1)
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals("an accepted but never-ready scene must be started again", 2, rig.starts)
+        assertTrue("PANEL_OPEN still waits for readiness: ${rig.commands()}", rig.panelOpens().isEmpty())
+    }
+
+    @Test
+    fun aLostSceneStartAnswerExpiresSoTheNextWakeCanRecover() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(1, rig.starts)
+        // The SDK never answers (the backend drops an appStart answer for a binding that closed meanwhile).
+
+        rig.advance(9_999)
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals("a wake inside the answer window may only queue", 1, rig.starts)
+
+        rig.advance(1)
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals("a lost appStart answer must expire instead of blocking every later wake", 2, rig.starts)
+    }
+
+    @Test
+    fun aReadyLivePanelIsNotStartedAgain() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        rig.startCallback!!.invoke(true)
+        rig.uiReady()
+        rig.panelShown(AssistantRoute.WAKE)
+        rig.completeExchange()
+        assertNotNull("the resident service is live and its panel visible", rig.link.liveOutput())
+        rig.sent.clear()
+
+        assertFalse("a ready, live, visible panel is a no-op", rig.link.requestPanelOpen(AssistantRoute.WAKE))
+
+        assertEquals("the recovery path must not start a live scene again", 1, rig.starts)
+        assertTrue("no PANEL_OPEN for a visible panel: ${rig.commands()}", rig.panelOpens().isEmpty())
+        assertTrue(rig.link.isPanelVisible())
+    }
+
+    @Test
     fun aPanelOpenWithoutPanelShownIsRetriedAndStopsOnPanelShown() {
         val rig = ResidentRig()
         rig.establish()
@@ -1018,6 +1106,7 @@ class CxrHintLinkTest {
         rig.completeExchange()
         rig.uiReady()
         rig.panelShown(AssistantRoute.WAKE)
+        assertNotNull("the live mapping is what makes the visible panel trustworthy", rig.link.liveOutput())
         rig.sent.clear()
 
         assertFalse("an already-visible panel is a no-op", rig.link.requestPanelOpen(AssistantRoute.WAKE))
@@ -1025,6 +1114,28 @@ class CxrHintLinkTest {
         assertTrue("no PANEL_OPEN may be sent for a visible panel", rig.panelOpens().isEmpty())
         assertEquals(0, rig.starts)
         assertTrue(rig.link.isPanelVisible())
+    }
+
+    @Test
+    fun aVisiblePanelWhoseServiceStoppedIsClearedAndRecoveredOnTheNextWake() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.panelShown(AssistantRoute.WAKE)
+        assertTrue(rig.link.isPanelVisible())
+
+        // No PONG for longer than the mapping's validity: the resident service that reported the panel is gone.
+        rig.advance(31_000)
+        assertNull("the mapping must really be dead for this test", rig.link.liveOutput())
+        assertTrue("nothing but a wake has cleared the stale flag yet", rig.link.isPanelVisible())
+        rig.sent.clear()
+
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+
+        assertFalse("a visible flag with no live mapping is stale and must be cleared", rig.link.isPanelVisible())
+        assertEquals("the next wake must recover the dead resident service", 1, rig.starts)
+        assertTrue("PANEL_OPEN still waits for readiness: ${rig.commands()}", rig.panelOpens().isEmpty())
     }
 
     @Test
@@ -1191,6 +1302,69 @@ class CxrHintLinkTest {
         rig.link.sessionEnded()
         rig.advance(5_000)
         assertEquals("a session end must cancel the retry", 2, rig.panelOpens().size)
+    }
+
+    @Test
+    fun aStalePanelOpenRetryCannotResendIntoTheNextSession() {
+        val gate = BlockingRetryGate()
+        val rig = ResidentRig(diagnostics = gate.diagnostics)
+        rig.establish("s-1", 3)
+        rig.completeExchange()
+        rig.uiReady("s-1", 3)
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(1, rig.panelOpens().size)
+
+        // Let the retry capture the old route/identity, then hold it outside the gate.
+        rig.clock.nanos += 1_000_000_000L
+        val retry = kotlin.concurrent.thread { rig.scheduler.fireDue(rig.clock.nanos) }
+        assertTrue("the retry must reach its capture point", gate.awaitCaptured())
+
+        // The session moves on, gets its own live service and opens its own panel.
+        rig.link.sessionEstablished("s-2", 4)
+        rig.completeExchange()
+        rig.uiReady("s-2", 4)
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.PROACTIVE))
+        assertEquals(listOf(AssistantRoute.PROACTIVE), rig.panelOpens().map { it.route })
+
+        gate.release()
+        retry.join(5_000)
+
+        assertEquals("a retry captured for the old session may not add a PANEL_OPEN: ${rig.commands()}",
+            1, rig.panelOpens().size)
+        assertEquals("the new session's PANEL_OPEN must survive the stale retry", "s-2",
+            rig.panelOpens().single().sessionId)
+        assertEquals(AssistantRoute.PROACTIVE, rig.panelOpens().single().route)
+    }
+
+    @Test
+    fun aStalePanelOpenRetryCannotOverwriteAnotherRoutesOpen() {
+        val gate = BlockingRetryGate()
+        val rig = ResidentRig(diagnostics = gate.diagnostics)
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertEquals(1, rig.panelOpens().size)
+
+        rig.clock.nanos += 1_000_000_000L
+        val retry = kotlin.concurrent.thread { rig.scheduler.fireDue(rig.clock.nanos) }
+        assertTrue("the retry must reach its capture point", gate.awaitCaptured())
+
+        // The panel hides and a new turn opens another route before the stale retry reaches its send.
+        rig.uiClosed(AssistantRoute.WAKE)
+        rig.sent.clear()
+        assertTrue(rig.link.requestPanelOpen(AssistantRoute.PROACTIVE))
+        assertEquals(listOf(AssistantRoute.PROACTIVE), rig.panelOpens().map { it.route })
+
+        gate.release()
+        retry.join(5_000)
+
+        assertEquals("a retry captured for another route may not add a PANEL_OPEN: ${rig.commands()}",
+            1, rig.panelOpens().size)
+        assertEquals(AssistantRoute.PROACTIVE, rig.panelOpens().single().route)
     }
 
     /**

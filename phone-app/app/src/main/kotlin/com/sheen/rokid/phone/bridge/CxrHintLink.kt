@@ -403,7 +403,7 @@ class CxrHintLink(
     private val handshakeGate = Any()
 
     /** One app-start request; its object identity is the token a late answer must still match. */
-    private class SceneStart(val sessionId: String, val generation: Long)
+    private class SceneStart(val sessionId: String, val generation: Long, val answerDeadlineNanos: Long)
 
     /**
      * True only while a hint could actually be displayed: a live clock mapping exists, so the glasses would accept
@@ -489,13 +489,19 @@ class CxrHintLink(
      *
      * Readiness is a **live clock mapping**, not "UI_READY was seen once": the resident service can die while the CXR
      * session survives, and a sticky `UI_READY` would then suppress the only recovery path. The states are:
-     * - **already visible**: no-op. A `PANEL_OPEN` for a visible panel must not reset the conversation;
+     * - **already visible with a live mapping**: no-op. A `PANEL_OPEN` for a visible panel must not reset the
+     *   conversation;
+     * - **visible without a live mapping**: the visible flag outlived the service that reported it. It is cleared and
+     *   the no-mapping recovery below runs, so the next wake can start the scene again instead of reporting a phantom
+     *   panel to Task 12;
      * - **live mapping**: the service answered a recent `PING`, so only `PANEL_OPEN` travels; no `appStart`;
      * - **no live mapping**: ask CXR to start the scene (or queue while an earlier start is still in flight) and keep
      *   the route pending. `reintroduce()` runs when the start is accepted, and `PANEL_OPEN` is sent only after a
      *   valid `UI_READY` or a live PONG mapping proves the new scene can receive it. Sending it in the start burst
      *   would repeat the measured 2026-10-09 loss of the first `HELLO`/`PING` while the glasses subscribed;
-     * - **a scene was started moments ago**: queue instead of starting it again while it comes up.
+     * - **a scene was started moments ago**: queue instead of starting it again while it comes up. The queue only
+     *   outlives the `appStart` answer window and the accepted start's readiness window; once either expires without
+     *   `UI_READY`/`PONG`, a wake starts the scene again rather than queueing forever.
      *
      * The app-start result is asynchronous: this returns whether the request was accepted, and the `PANEL_OPEN` is
      * sent only after readiness. A refused scene start leaves the panel closed rather than opening a window whose
@@ -508,19 +514,47 @@ class CxrHintLink(
                 diagnostics("panel: no session - PANEL_OPEN is not sent")
                 return false
             }
+            val now = clock.nowNanos()
+            // An appStart the SDK never answered (the backend deliberately drops answers once the binding closed) must
+            // not reserve the handshake forever. The request token expires after the same window an accepted start
+            // gets to prove readiness; a later wake can then start the scene again instead of queueing into a void.
+            val inFlight = sceneStart
+            if (inFlight != null && now >= inFlight.answerDeadlineNanos) {
+                diagnostics("panel: appStart was never answered - the request expires")
+                sceneStart = null
+                panelRoutePending = null
+                sceneReadyDeadlineNanos = 0
+            }
             if (panelVisible) {
-                diagnostics("panel: already visible - PANEL_OPEN ignored route=${route.name}")
-                return false
+                // Visibility is only credible while a live mapping proves the service that reported it is still
+                // there. A resident service that died while its panel was shown would otherwise block every later
+                // wake and report a phantom panel to Task 12.
+                if (clockSync.hasLiveMapping()) {
+                    diagnostics("panel: already visible - PANEL_OPEN ignored route=${route.name}")
+                    return false
+                }
+                diagnostics("panel: visible without a live mapping - clearing the stale panel")
+                panelVisible = false
             }
             if (panelOpenAwaitingShown) {
                 diagnostics("panel: a PANEL_OPEN is already awaiting PANEL_SHOWN - request ignored")
                 return false
             }
             if (panelRoutePending != null) {
-                // A later wake updates the route of the open that is already waiting; it cannot be sent sooner.
-                panelRoutePending = route
-                diagnostics("panel: an open is already waiting for readiness - route=${route.name}")
-                return true
+                val inFlightStart = sceneStart
+                val startStillComing = inFlightStart != null && now < inFlightStart.answerDeadlineNanos
+                val readyWindowStillOpen = inFlightStart == null && now < sceneReadyDeadlineNanos
+                if (startStillComing || readyWindowStillOpen) {
+                    // A later wake updates the route of the open that is already waiting; it cannot be sent sooner.
+                    panelRoutePending = route
+                    diagnostics("panel: an open is already waiting for readiness - route=${route.name}")
+                    return true
+                }
+                // The start or its readiness window expired without UI_READY/PONG. The queued open belongs to a
+                // recovery that failed, so this wake must start a fresh one rather than merely update the route.
+                diagnostics("panel: the queued open's scene start never became ready - retrying recovery")
+                panelRoutePending = null
+                sceneReadyDeadlineNanos = 0
             }
             if (clockSync.hasLiveMapping()) {
                 diagnostics("panel: live mapping - opening without appStart route=${route.name}")
@@ -532,7 +566,7 @@ class CxrHintLink(
                 diagnostics("panel: an appStart is already in flight - PANEL_OPEN queued route=${route.name}")
                 return true
             }
-            if (clock.nowNanos() < sceneReadyDeadlineNanos) {
+            if (now < sceneReadyDeadlineNanos) {
                 panelRoutePending = route
                 diagnostics("panel: a scene start was accepted recently - PANEL_OPEN queued route=${route.name}")
                 return true
@@ -540,7 +574,8 @@ class CxrHintLink(
             panelRoutePending = route
             // The grace exists to make this same attempt; a wake that gets there first supersedes it.
             cancelUiReadyGraceLocked()
-            start = SceneStart(session, establishedGeneration)
+            start = SceneStart(session, establishedGeneration,
+                now + SCENE_READY_TIMEOUT_MILLIS * 1_000_000L)
             sceneStart = start
         }
         diagnostics("panel: starting the glasses scene for a missing service")
@@ -671,7 +706,18 @@ class CxrHintLink(
             diagnostics("panel: no PANEL_SHOWN yet - repeating PANEL_OPEN " +
                 "(attempt $attempt/$PANEL_OPEN_MAX_RETRIES)")
             synchronized(handshakeGate) {
-                if (panelOpenAwaitingShown && !panelVisible) sendPanelOpenLocked(resendRoute, resendIdentity)
+                if (panelOpenAwaitingShown && !panelVisible) {
+                    // Re-check the identity and route inside the send section: a session change or a close+new open
+                    // can land between the capture above and here. Sending the captured command then would put the
+                    // old route/identity on the wire, overwrite the new open, and cancel its repeat.
+                    val sameSession = establishedSession == resendIdentity.sessionId &&
+                        establishedGeneration == resendIdentity.generation
+                    if (sameSession && panelOpenRoute == resendRoute) {
+                        sendPanelOpenLocked(resendRoute, resendIdentity)
+                    } else {
+                        diagnostics("panel: stale PANEL_OPEN retry dropped route=${resendRoute.name}")
+                    }
+                }
             }
         }
     }
@@ -750,7 +796,8 @@ class CxrHintLink(
                 // A live mapping is proof the resident service is there; the grace exists only for a missing service.
                 if (clockSync.hasLiveMapping()) return@at
                 diagnostics("handshake: no UI_READY within ${UI_READY_GRACE_MILLIS}ms - starting the glasses scene")
-                start = SceneStart(sessionId, generation)
+                start = SceneStart(sessionId, generation,
+                    clock.nowNanos() + SCENE_READY_TIMEOUT_MILLIS * 1_000_000L)
                 sceneStart = start
             }
             val request = start ?: return@at
