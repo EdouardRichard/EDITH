@@ -65,10 +65,20 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     }
     private val arbiter = OutputArbiter(environment.clock,
         (environment as? ScheduledHostEnvironment)?.scheduler ?: deadlineScheduler,
-        environment.output, environment.speech, { eventIdentity }) { hint, status ->
-        onEvent(OutputStateEvent(EventEnvelope(hint.sessionId, hint.generation,
-            "output-${java.util.UUID.randomUUID()}", environment.clock.nowNanos(), environment.clock.nowNanos()), hint.hintId, status))
-    }
+        environment.output, environment.speech, { eventIdentity },
+        { hint, status ->
+            onEvent(OutputStateEvent(EventEnvelope(hint.sessionId, hint.generation,
+                "output-${java.util.UUID.randomUUID()}", environment.clock.nowNanos(), environment.clock.nowNanos()),
+                hint.hintId, status))
+        },
+        { hint, result ->
+            // 0.24 S3 (spec §5.5): the phone's playback of the displayed answer ended. `onEvent` is the identity gate:
+            // a session that ended (or a generation that was replaced) receives nothing, exactly like every other host
+            // event. There is no wire command for this - `SPEECH_DONE` is phone-internal (spec §5.4).
+            onEvent(SpeechFinished(EventEnvelope(hint.sessionId, hint.generation,
+                "speech-${java.util.UUID.randomUUID()}", environment.clock.nowNanos(), environment.clock.nowNanos()),
+                hint.hintId, result))
+        })
     private val drainScheduled = AtomicBoolean()
     private val dispatcher = HostEventDispatcher(32, ::deliverEvent, ::onCriticalEventOverflow)
     val currentGeneration: Generation get() = if (closed) generation else command { generation }
@@ -328,7 +338,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
             is AudioEvent, is DiscontinuityEvent -> Capability.Audio
             is TranscriptEvent -> Capability.Asr
             is SpeakerEvent -> Capability.Speaker
-            is OutputStateEvent -> Capability.TextOutput
+            is OutputStateEvent, is SpeechFinished -> Capability.TextOutput
             is WakeDetected -> Capability.WakeWord
             is AcousticEvent, is ContextChanged -> Capability.Context
             is ConfirmationResult -> Capability.Actions

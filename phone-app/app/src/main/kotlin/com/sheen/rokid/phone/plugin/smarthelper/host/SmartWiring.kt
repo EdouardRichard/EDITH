@@ -80,5 +80,8 @@ internal class SmartWiring(
         // 0.24 S3 fix (C1): the production composition reads the link's live visibility, so a wake on an already-visible
         // panel starts the official 10 s at once instead of waiting for a `PANEL_SHOWN` that will not be repeated.
         isPanelVisible = isPanelVisible,
+        // 0.24 S3 (spec §5.5): the persisted「持续对话」switch. Read through the wiring's settings snapshot, which is the
+        // same value the settings screen writes and `create` reads once at assembly time.
+        continueDialogue = { settings.continueDialogue },
     )
 }

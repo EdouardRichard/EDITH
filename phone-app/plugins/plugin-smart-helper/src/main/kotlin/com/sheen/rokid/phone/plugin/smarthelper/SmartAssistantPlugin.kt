@@ -1088,27 +1088,130 @@ class SmartAssistantPlugin(
     /**
      * 0.24 S3: the answer of the current wake turn is final **and** the wearer has seen it.
      *
-     * Must hold [gate]. The phase check is what keeps a mid-run notification's acknowledgement from opening a next
-     * round while the loop still runs; a later acknowledgement for the final answer is the one that continues.
-     * Returns whether the displayed answer carried speech (the cycle then waits for `SpeechFinished`), or `null` when
-     * there is nothing to settle.
+     * Must hold [gate]. The [SmartTurn.answerFinal] flag is what keeps a mid-run notification's acknowledgement from
+     * opening a next round while the loop still runs: the run end marks the turn's last emit as the answer (Task 14/II1),
+     * so a `notify_user` answer emitted while `Running` settles exactly like the closing fallback emit. Returns whether
+     * the displayed answer carried speech (the cycle then waits for `SpeechFinished`), or `null` when there is nothing
+     * to settle.
      */
     private fun maybeAnswerDone(): Boolean? {
         val owned = turn ?: return null
-        if (owned.closed || owned.phase != SmartTurnPhase.Idle) return null
-        if (!owned.displayed || owned.answerNotified) return null
+        if (owned.closed || !owned.answerFinal) return null
+        if (owned.answerEmitHintId == null || !owned.displayed || owned.answerNotified) return null
         owned.answerNotified = true
-        return owned.answerHadSpeech
+        return owned.answerEmitSpeech
     }
 
     /**
      * 0.24 S3: the displayed answer's continuation/settlement, reported to the cycle outside [gate].
      *
-     * The speech flag is read once under the lock so the answer cannot change between the decision and the report.
+     * The speech flag and the answer's own display window are read once under the lock so the answer cannot change
+     * between the decision and the report; the window lets the cycle's speech liveness bound wait until the answer
+     * really leaves the panel before it gives up on a missing `SpeechFinished`.
      */
     private fun settleDisplayedAnswer() {
-        val speech = synchronized(gate) { maybeAnswerDone() } ?: return
-        conversationCycle.onAnswerDone(AssistantRoute.WAKE, displayed = true, speech = speech)
+        val (speech, visibleUntil) = synchronized(gate) {
+            val displayedSpeech = maybeAnswerDone() ?: return
+            displayedSpeech to (turn?.hintExpiry ?: 0L)
+        }
+        conversationCycle.onAnswerDone(
+            AssistantRoute.WAKE,
+            displayed = true,
+            speech = speech,
+            answerVisibleUntilNanos = visibleUntil,
+        )
+    }
+
+    /**
+     * 0.24 S3 Task 14 (spec §5.5 line 324): an answer nothing displayable reached the wearer.
+     *
+     * Used for a suppressed/silent answer, a rejected submit and a terminal `Expired`/`Rejected` for the final hint.
+     * Must be called once per turn: [SmartTurn.answerNotified] is set under [gate] before the cycle is told, so a late
+     * second event cannot close a panel a continuation already opened.
+     */
+    private fun settleNoDisplayAnswer() {
+        val turnId = synchronized(gate) {
+            val owned = turn ?: return
+            if (owned.closed || owned.answerNotified) return
+            owned.answerNotified = true
+            owned.turnId
+        }
+        P3Log.line("P3_CONV no_display turn=$turnId")
+        conversationCycle.onAnswerDone(AssistantRoute.WAKE, displayed = false, speech = false)
+    }
+
+    /**
+     * 0.24 S3 Task 14 (the Task 12 carry I1): settle the answer once the agent run has really ended.
+     *
+     * The production answer is `notify_user`, emitted **while the run is `Running`**, so the answer-done decision
+     * cannot be keyed on the turn's phase. At the run end the last recorded emit becomes the final answer:
+     * - displayed → the normal continuation/speech decision;
+     * - rejected, or a terminal `Expired`/`Rejected` already arrived → close with `no_display`;
+     * - a handler that suppressed every notification (silent) → close with `no_display`;
+     * - accepted but not yet acknowledged → its own `Displayed`/`Expired` event settles it.
+     *
+     * The closing fallback emit (`submitOutcome` → assembler) is asynchronous, so when no notification was sent the
+     * turn is left to that emit: it is the one emitted after the run reached `Idle`, and [emit] marks it final.
+     *
+     * @param fallbackExpected `submitOutcome` scheduled the closing answer through the assembler, which emits about
+     *   150 ms later. Its absence at this instant is not "nothing was shown"; the later emit decides.
+     */
+    private fun settleAnswerAfterRun(fallbackExpected: Boolean) {
+        var displayedSpeech: Boolean? = null
+        var noDisplay = false
+        synchronized(gate) {
+            val owned = turn ?: return
+            if (owned.closed || owned.answerNotified) return
+            if (owned.answerFinal) {
+                // A fallback emit that really did run synchronously is already the final answer.
+                when {
+                    owned.displayed -> displayedSpeech = owned.answerEmitSpeech
+                    !owned.answerEmitAccepted || owned.answerTerminal != null -> noDisplay = true
+                }
+                return@synchronized
+            }
+            val emitted = owned.answerEmitHintId != null
+            owned.answerFinal = emitted
+            when {
+                !emitted && fallbackExpected -> return@synchronized
+                !emitted -> noDisplay = true
+                owned.displayed -> displayedSpeech = owned.answerEmitSpeech
+                !owned.answerEmitAccepted || owned.answerTerminal != null -> noDisplay = true
+            }
+        }
+        if (displayedSpeech != null) {
+            settleDisplayedAnswer()
+        } else if (noDisplay) {
+            settleNoDisplayAnswer()
+        }
+    }
+
+    /**
+     * Must hold [gate]: remembers a terminal display status for the answer hint.
+     *
+     * `Expired`/`Rejected` for the final answer mean the wearer never saw it, so the answer-done decision is
+     * `displayed = false` (spec §5.5 line 324). The status is remembered until [settleTerminalAnswer] runs outside the
+     * lock, and it survives an event that arrives **before** the run end (the run-end settlement consumes it). A
+     * `Displayed` acknowledgement clears it: a later terminal for a superseded emit must not undo a real display.
+     */
+    private fun noteAnswerTerminal(event: OutputStateEvent) {
+        val owned = turn ?: return
+        if (owned.closed) return
+        if (event.hintId != (owned.answerEmitHintId ?: owned.hintId)) return
+        when (event.status) {
+            OutputStatus.Expired, OutputStatus.Rejected -> if (!owned.displayed) owned.answerTerminal = event.status
+            else -> Unit
+        }
+    }
+
+    /** Reports the remembered terminal answer as `no_display`, once, outside [gate]. */
+    private fun settleTerminalAnswer() {
+        val close = synchronized(gate) {
+            val owned = turn ?: return
+            !owned.closed && !owned.answerNotified && owned.answerFinal && !owned.displayed &&
+                owned.answerEmitHintId != null && owned.answerTerminal != null
+        }
+        if (close) settleNoDisplayAnswer()
     }
 
 
@@ -1235,7 +1338,8 @@ class SmartAssistantPlugin(
             is SpeechFinished -> {
                 val mine = synchronized(gate) {
                     val owned = turn
-                    matches(event.envelope) && owned != null && !owned.closed && event.hintId == owned.hintId
+                    matches(event.envelope) && owned != null && !owned.closed &&
+                        event.hintId == (owned.answerEmitHintId ?: owned.hintId)
                 }
                 if (mine) conversationCycle.onSpeechFinished(AssistantRoute.WAKE, event.result)
             }
@@ -1247,11 +1351,16 @@ class SmartAssistantPlugin(
                         mine = true
                         acceptDisplayed(event)
                         acceptProactiveDisplayed(event)
+                        noteAnswerTerminal(event)
                     }
                 }
                 // 0.24 S3: the acknowledgement is also the answer-done signal. Reported outside the lock so the
-                // continuation opener can re-enter the plugin (spec §5.5).
-                if (mine) settleDisplayedAnswer()
+                // continuation opener can re-enter the plugin (spec §5.5). A terminal `Expired`/`Rejected` for the
+                // final answer settles the same way with `displayed = false` (Task 14 / Task 12 carry I1).
+                if (mine) {
+                    settleDisplayedAnswer()
+                    settleTerminalAnswer()
+                }
             }
 
             is UserAction -> when (event.action) {
@@ -1638,13 +1747,11 @@ class SmartAssistantPlugin(
         // lose exactly the content compression exists to preserve.
         recordTurnAndCompress(ContextRoute.WAKE, text, run, ledger.notifications, gateway.lastTrim)
         submitOutcome(owned, run, ledger)
-        if (ledger.calls > 0) {
-            // 0.24 S3: when the model answered through `notify_user`, `submitOutcome` suppresses a second closing
-            // sentence - so there is no later emit to wait for. If that notification's `Displayed` arrived while the
-            // run was still unwinding, the continuation decision is owed now; if it has not arrived yet, its own event
-            // will settle it.
-            settleDisplayedAnswer()
-        }
+        // 0.24 S3 (spec §5.5, Task 14 / Task 12 carry I1): the run has ended, so the last emit is the final answer -
+        // whether it was a mid-run `notify_user` or the closing fallback the assembler is about to emit. This is where
+        // the displayed/rejected/silent decision is made, not in `emit`'s phase check (a `notify_user` answer is
+        // emitted while the run is still `Running`).
+        settleAnswerAfterRun(fallbackExpected = ledger.calls == 0 && !ledger.suppressed)
         releaseParkedProactive()
     }
 
@@ -1659,7 +1766,11 @@ class SmartAssistantPlugin(
         val extraction = memoryExtraction ?: return
         val succeeded = run.steps.filter { it.result == "ok" }.map { it.action }
         val report = extraction.afterTurn(utterance, succeeded)
-        if (report.explicit) emit(MemoryExtraction.ACKNOWLEDGEMENT)
+        // Task 14 (Task 12 review minor 8): the acknowledgement is a hint, but it is not the answer the conversation
+        // continues. Recording it as an answer would let a no-speech acknowledgement hide the notification answer's
+        // speech or settle a conversation on text the model did not mean as its reply (Task 16 owns the fuller
+        // per-entry classification).
+        if (report.explicit) emit(MemoryExtraction.ACKNOWLEDGEMENT, recordAsAnswer = false)
     }
 
     /**
@@ -2626,8 +2737,12 @@ class SmartAssistantPlugin(
      * delivered from inside `submit` (the phone UI is live during a run) can re-enter [handle] without deadlocking.
      * If that ACK arrives mid-submit it is only *remembered* ([SmartTurn.pendingAck]) and admitted after
      * [OutputSubmission.Accepted] comes back.
+     *
+     * [recordAsAnswer] is `false` for the post-turn memory acknowledgement: it is displayed like any hint, but it is
+     * not the answer the conversation continues from (Task 12 review minor 8; Task 16 owns the fuller per-entry
+     * classification).
      */
-    private fun emit(text: String, optionalSpeech: SpeechRequest? = null) {
+    private fun emit(text: String, optionalSpeech: SpeechRequest? = null, recordAsAnswer: Boolean = true) {
         var owned: SmartTurn? = null
         var finalAnswer = false
         val hint = synchronized(gate) {
@@ -2654,11 +2769,18 @@ class SmartAssistantPlugin(
             current.submitting = true
             current.pendingAck = false
             current.hintExpiry = expiry
-            // 0.24 S3 (spec §5.5): the last hint this turn emits is the answer the conversation continues from. An
-            // answer emitted after the run reached Idle is the **final** one; anything earlier is a notification the
-            // run is still working behind. Only the final one may settle the conversation.
-            finalAnswer = current.phase == SmartTurnPhase.Idle
-            current.answerHadSpeech = optionalSpeech != null
+            // 0.24 S3 (spec §5.5): the closing answer is assembled after the run reached Idle; a `notify_user` answer
+            // was emitted while the run was still `Running` and is marked as the final answer by
+            // `settleAnswerAfterRun()` at the run end instead. Recording the emit identity here is what lets that
+            // run-end decision (and a terminal display event) name the right hint instead of asking the phase.
+            finalAnswer = recordAsAnswer && current.phase == SmartTurnPhase.Idle
+            if (recordAsAnswer) {
+                current.answerEmitHintId = current.hintId
+                current.answerEmitSpeech = optionalSpeech != null
+                current.answerFinal = finalAnswer
+                current.answerTerminal = null
+                current.displayed = false
+            }
             owned = current
             Assistance(
                 hintId = current.hintId,
@@ -2695,6 +2817,9 @@ class SmartAssistantPlugin(
         var ackAdmitted = false
         synchronized(gate) {
             current.submitting = false
+            if (recordAsAnswer && turn === current && !current.closed) {
+                current.answerEmitAccepted = result == OutputSubmission.Accepted
+            }
             if (result == OutputSubmission.Accepted && turn === current && !current.closed) {
                 current.readable = true
                 if (current.pendingAck && !current.displayed && clock.nowNanos() < current.hintExpiry) {
@@ -2714,7 +2839,7 @@ class SmartAssistantPlugin(
             // 0.24 S3 (spec §5.5): an answer no display accepted has nothing for the next round to continue. Close and
             // record `no_display`; opening a turn on top of an answer the wearer never saw is the failure the spec
             // names.
-            conversationCycle.onAnswerDone(AssistantRoute.WAKE, displayed = false, speech = false)
+            settleNoDisplayAnswer()
         }
     }
 
@@ -2722,13 +2847,19 @@ class SmartAssistantPlugin(
     private fun acceptDisplayed(event: OutputStateEvent) {
         val owned = turn ?: return
         if (owned.closed || owned.displayed) return
-        if (event.hintId != owned.hintId) return
+        if (event.hintId != (owned.answerEmitHintId ?: owned.hintId)) return
         if (event.status != OutputStatus.Displayed) return
-        if (clock.nowNanos() >= owned.hintExpiry) return
+        if (clock.nowNanos() >= owned.hintExpiry) {
+            // 0.24 S3 Task 14: a late acknowledgement cannot be admitted - the hint's display window is over. It is
+            // the same situation as an `Expired` result: the answer never reached the wearer.
+            if (owned.answerFinal) owned.answerTerminal = OutputStatus.Expired
+            return
+        }
         if (owned.submitting) {
             owned.pendingAck = true
         } else if (owned.readable) {
             owned.displayed = true
+            owned.answerTerminal = null
             P3Log.line("P3_HINT ack hint=${owned.hintId} status=${event.status}")
             onDisplayedAck()
         }

@@ -430,7 +430,8 @@ class ConversationCycleTest {
         rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
         rig.cycle.onAnswerDone(AssistantRoute.WAKE, displayed = true, speech = true)
 
-        rig.advance(60_000)
+        // The wait is bounded since Task 14 (official TIME_WAITE_TTS); inside the bound nothing closes or continues.
+        rig.advance(OfficialConversation.SPEECH_WAIT_MILLIS - 1)
         assertEquals(0, rig.display.closed, "the answer's speech is the next-turn gate")
         assertEquals(emptyList(), rig.continuations)
         assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in rig.display.statuses)
@@ -439,6 +440,54 @@ class ConversationCycleTest {
         rig.cycle.onSpeechFinished(AssistantRoute.WAKE, SpeechResult.FAILED)
         assertEquals(OfficialStatus.AUDIO_FINISHED.wire, rig.display.statuses.last())
         assertEquals(listOf("turn-1"), rig.continuations)
+    }
+
+    @Test
+    fun `a speech end that never arrives closes at the bounded wait instead of answering forever`() {
+        val rig = rig(panelVisible = true)
+        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
+        rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
+        // The answer's display window: the liveness guard may never fire while the answer is still on the panel,
+        // because the phone's TTS can legitimately still be speaking a long answer.
+        val visibleUntil = rig.clock.nowNanos + 5_000_000_000L
+        rig.cycle.onAnswerDone(
+            AssistantRoute.WAKE, displayed = true, speech = true, answerVisibleUntilNanos = visibleUntil,
+        )
+
+        rig.advance(6_199)
+        assertEquals(0, rig.display.closed, "the bound is the display window plus the official wait")
+        assertEquals(emptyList(), rig.continuations)
+
+        rig.advance(1)
+        assertEquals(1, rig.display.closed, "a missing speech end must not leave the panel answering forever")
+        assertEquals(emptyList(), rig.continuations, "spec §5.5: no next round without a confirmable speech end")
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in rig.display.statuses)
+        assertEquals(listOf(AssistantRoute.WAKE to "turn-1"), rig.cancelled)
+        assertTrue(
+            rig.logs.any { it.contains("P3_CONV no_display") && it.contains("speech_timeout") },
+            "the missing end is evidence, not silence: ${rig.logs}",
+        )
+        assertEquals(0, rig.scheduler.pending(), "the failed wait releases its own deadline")
+    }
+
+    @Test
+    fun `a speech end inside the bound cancels the bounded wait`() {
+        val rig = rig(panelVisible = true)
+        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
+        rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
+        val visibleUntil = rig.clock.nowNanos + 5_000_000_000L
+        rig.cycle.onAnswerDone(
+            AssistantRoute.WAKE, displayed = true, speech = true, answerVisibleUntilNanos = visibleUntil,
+        )
+
+        rig.advance(1_200)
+        rig.cycle.onSpeechFinished(AssistantRoute.WAKE, SpeechResult.FINISHED)
+        assertEquals(listOf("turn-1"), rig.continuations)
+
+        // The cancelled deadline must not fire later and close the continued conversation.
+        rig.advance(120_000)
+        assertEquals(0, rig.display.closed)
+        assertEquals(1, rig.continuations.size)
     }
 
     @Test
@@ -582,61 +631,39 @@ class ConversationCycleTest {
         assertEquals(emptyList(), rig.continuations)
     }
 
-    // ---------------------------------------------------------------- BACK
+    // ---------------------------------------------------------------- production BACK mapping (STOP / UI_CLOSED)
 
     @Test
-    fun `back while pinned and answering stops to idle`() {
+    fun `the phone's stop maps a pinned answering turn to idle and keeps the panel`() {
+        // The glasses own the BACK matrix (`OfficialConversation.backAction`, Task 13): pinned + ANSWERING sends the
+        // wire STOP and keeps the window; every other BACK hides the panel and sends UI_CLOSED. The phone therefore has
+        // exactly two production inputs - STOP -> `onStop` and UI_CLOSED -> `onClose` - and this is the STOP half.
         val rig = rig(panelVisible = true)
         rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
         rig.cycle.onPin(AssistantRoute.WAKE)
         rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
 
-        rig.cycle.onBack(AssistantRoute.WAKE)
+        rig.cycle.onStop(AssistantRoute.WAKE)
 
-        assertEquals(1, rig.display.idled, "pinned + ANSWERING is the official interrupt, not an exit")
+        assertEquals(1, rig.display.idled, "the official interrupt shows idle, it does not close the panel")
         assertEquals(0, rig.display.closed)
         assertEquals(listOf(AssistantRoute.WAKE to "turn-1"), rig.cancelled)
+        assertEquals(0, rig.scheduler.pending(), "STOP releases every deadline of the interrupted turn")
     }
 
     @Test
-    fun `back while unpinned closes and clears pin`() {
+    fun `a pinned answering UI_CLOSED clears the pin without a second close`() {
+        // The other production BACK outcome: the glasses already hid the panel, so the phone must not send CLOSE.
         val rig = rig(panelVisible = true)
         rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
+        rig.cycle.onPin(AssistantRoute.WAKE)
+        rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
 
-        rig.cycle.onBack(AssistantRoute.WAKE)
+        rig.cycle.onClose(AssistantRoute.WAKE)
 
-        assertEquals(1, rig.display.closed)
+        assertEquals(0, rig.display.closed)
         assertFalse(rig.cycle.isPinned(AssistantRoute.WAKE))
         assertEquals(listOf(AssistantRoute.WAKE to "turn-1"), rig.cancelled)
-        rig.advance(200_000)
-        assertEquals(1, rig.display.closed, "a closed conversation must not be closed again by a stale timer")
-    }
-
-    @Test
-    fun `back while pinned but not answering closes`() {
-        val rig = rig(panelVisible = true)
-        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
-        rig.cycle.onPin(AssistantRoute.WAKE)
-        rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ASR_END)
-
-        rig.cycle.onBack(AssistantRoute.WAKE)
-
-        assertEquals(1, rig.display.closed)
-        assertFalse(rig.cycle.isPinned(AssistantRoute.WAKE))
-    }
-
-    @Test
-    fun `back after a pinned idle closes the retained panel`() {
-        val rig = rig(panelVisible = true)
-        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
-        rig.cycle.onPin(AssistantRoute.WAKE)
-        rig.advance(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
-        assertEquals(1, rig.display.idled)
-
-        rig.cycle.onBack(AssistantRoute.WAKE)
-
-        assertEquals(1, rig.display.closed)
-        assertFalse(rig.cycle.isPinned(AssistantRoute.WAKE))
     }
 
     // ---------------------------------------------------------------- close / stop / new wake
@@ -734,7 +761,8 @@ class ConversationCycleTest {
             rig.cycle.onWake(AssistantRoute.WAKE, "turn-2")
         }
 
-        rig.cycle.onBack(AssistantRoute.WAKE) // unpinned BACK exits and closes
+        // The unpinned 10 s window is the production close path (`onListenTimeout`).
+        rig.advance(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
 
         assertEquals(1, rig.display.closed)
         assertEquals(
@@ -766,10 +794,10 @@ class ConversationCycleTest {
     }
 
     @Test
-    fun `status updates after close are ignored`() {
+    fun `status updates after stop are ignored`() {
         val rig = rig(panelVisible = true)
         rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
-        rig.cycle.onBack(AssistantRoute.WAKE)
+        rig.cycle.onStop(AssistantRoute.WAKE)
         val before = rig.display.calls.size
 
         rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)

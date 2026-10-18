@@ -62,6 +62,15 @@ data class SmartSettings(
      * and takes the default (off), which is the safe upgrade path.
      */
     val speechEnabled: Boolean = false,
+    /**
+     * 0.24 S3 (spec §5.5): the 「持续对话」 switch, persisted globally and **on by default**.
+     *
+     * It is the official `settings_ai_assistant_continue_dialogue` (default `"open"`): a displayed answer opens the
+     * next listening round. Off takes the official `scheduleExit(1000)` branch instead - no status 5, no new turn,
+     * the panel closes one second after the answer/speech end. A blob written before 0.24 lacks this key and takes the
+     * default (on); once the user turns it off, no path may turn it back on automatically.
+     */
+    val continueDialogue: Boolean = true,
 ) {
     /**
      * The plugin's own cooldown parameter.
@@ -177,6 +186,7 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
             put("proactiveSensitivity", settings.effectiveProactiveSensitivity())
             put("proactiveEnabled", settings.proactiveEnabled)
             put("speechEnabled", settings.speechEnabled)
+            put("continueDialogue", settings.continueDialogue)
         })
     }
 
@@ -204,6 +214,10 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
                 // Absent in a blob written before P5: takes the default (off), which is the safe upgrade path.
                 speechEnabled = json["speechEnabled"]?.jsonPrimitive?.booleanOrNull
                     ?: SmartSettings().speechEnabled,
+                // Absent in a blob written before 0.24: takes the official default (on). The key is new, so a pre-0.24
+                // blob must continue conversations; only the user's explicit off is stored as false.
+                continueDialogue = json["continueDialogue"]?.jsonPrimitive?.booleanOrNull
+                    ?: SmartSettings().continueDialogue,
             )
         }.getOrNull()
     }

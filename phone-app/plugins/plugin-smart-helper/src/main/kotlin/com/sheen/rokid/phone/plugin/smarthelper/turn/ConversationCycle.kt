@@ -2,7 +2,6 @@ package com.sheen.rokid.phone.plugin.smarthelper.turn
 
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.SpeechResult
-import com.sheen.rokid.output.BackAction
 import com.sheen.rokid.output.OfficialConversation
 import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
@@ -26,7 +25,10 @@ import com.sheen.rokid.plugin.MonotonicClock
  *   `scheduleExit(1000)` with **no** status 5 and no new turn.
  * - `RokidAIController.onTimeout` + `showIdleStatus`: a pinned timeout idles the panel (not status 0, not a close) and
  *   the service closes it **120 s** later ([OfficialConversation.PINNED_CLOSE_MILLIS]).
- * - `AiAssistantDialog.onKeyUp`: BACK exits unless pinned while answering, where it interrupts to idle.
+ * - `AiAssistantDialog.onKeyUp`: BACK exits unless pinned while answering, where it interrupts to idle. The **glasses**
+ *   own that matrix (`OfficialConversation.backAction`, Task 13); the phone's production inputs are STOP (`onStop`,
+ *   keep the panel and show idle) and UI_CLOSED (`onClose`, the panel is already gone). There is deliberately no
+ *   phone-side `onBack`: the wire has no BACK command, and a duplicate of the decision here was dead code.
  * - The pin belongs to the **dialog**, not to a turn: `AiAssistantDialog.isHold` is cleared by
  *   `resetDialogUiState` when the dialog is dismissed - not by the automatic continuation (`startNewTalk`, which keeps
  *   the dialog) and not by a wake on an already visible panel (`showAiDialog` then only calls `setAiItemInfo`).
@@ -85,6 +87,16 @@ internal class ConversationCycle(
         /** Official `scheduleExit(1000)` when continual dialogue is off. Removed by any ASR (`MSG_EXIT`). */
         var continueOffExpiry: CancellationHandle? = null
 
+        /**
+         * 0.24 S3 Task 14 (spec §5.5): the bounded wait for `SpeechFinished`.
+         *
+         * The official `TIME_WAITE_TTS` is a cue cadence that re-arms forever; EDITH needs a terminating liveness
+         * bound, because a host that never reports the playback end would otherwise leave the panel ANSWERING with no
+         * timer. A missing end means "no confirmable speech end" (spec §5.5 line 324), so it closes with
+         * `P3_CONV no_display` instead of continuing.
+         */
+        var speechWaitExpiry: CancellationHandle? = null
+
         /** Official `Ai_Delay_Quit`, 120 s after a pinned idle. **Never** removed by an ASR message. */
         var pinnedCloseExpiry: CancellationHandle? = null
 
@@ -98,6 +110,7 @@ internal class ConversationCycle(
         var panelWaitEpoch = 0L
         var continueOffEpoch = 0L
         var pinnedCloseEpoch = 0L
+        var speechWaitEpoch = 0L
 
         var answerDone = false
         var speechPending = false
@@ -258,7 +271,18 @@ internal class ConversationCycle(
      * When [speech] is true the answer is still playing, so the decision waits for [onSpeechFinished] exactly as the
      * official TTS path does - unless the result already arrived (see [onSpeechFinished]); then it is consumed here.
      */
-    fun onAnswerDone(route: AssistantRoute, displayed: Boolean, speech: Boolean) {
+    fun onAnswerDone(
+        route: AssistantRoute,
+        displayed: Boolean,
+        speech: Boolean,
+        /**
+         * 0.24 S3 Task 14: when the answer stops being on screen (the hint's own display window). The bounded wait for
+         * [onSpeechFinished] never ends before this instant plus [OfficialConversation.SPEECH_WAIT_MILLIS], because the
+         * phone's TTS legitimately keeps speaking a long answer while it is still displayed. Zero means "unknown"; the
+         * wait then starts at the report itself.
+         */
+        answerVisibleUntilNanos: Long = 0L,
+    ) {
         val continueOn = continueDialogue()
         var continuation: String? = null
         var cancelledTurn: String? = null
@@ -270,7 +294,7 @@ internal class ConversationCycle(
             cancelListenLocked(current)
             when {
                 !displayed -> {
-                    log("P3_CONV close route=${route.name} reason=no_display")
+                    log("P3_CONV no_display route=${route.name} reason=not_displayed")
                     cancelledTurn = turnId
                     closeLocked(route, current)
                 }
@@ -282,6 +306,7 @@ internal class ConversationCycle(
                         continuation = settleSpokenAnswerLocked(route, current, continueOn)
                     } else {
                         current.speechPending = true
+                        armSpeechWaitLocked(route, current, answerVisibleUntilNanos)
                     }
                 }
                 continueOn -> {
@@ -310,6 +335,8 @@ internal class ConversationCycle(
         synchronized(lock) {
             val current = state(route)
             val turnId = current.turnId ?: return
+            // The bounded wait exists only while the result is missing.
+            cancelSpeechWaitLocked(current)
             if (!current.speechPending) {
                 if (!current.answerDone) {
                     current.earlySpeech = result
@@ -341,7 +368,7 @@ internal class ConversationCycle(
         null
     }
 
-    // ---------------------------------------------------------------- pin / BACK / close
+    // ---------------------------------------------------------------- pin / STOP / close
 
     /** Pin is one-way: a second click is not an unpin; only a new window or a close clears it. */
     fun onPin(route: AssistantRoute) {
@@ -351,41 +378,12 @@ internal class ConversationCycle(
     }
 
     /**
-     * The glasses' BACK key, as the official three-way matrix.
-     *
-     * `OfficialConversation.backAction` is the one authority: pinned + ANSWERING stops to idle and keeps the panel;
-     * everything else exits and closes. Unlike the pin timeout, STOP does **not** arm the 120 s close — the official
-     * service-side delayed exit for `sendExitToService(2)` has not been confirmed on device (spec §10 item 18).
-     */
-    fun onBack(route: AssistantRoute) {
-        var cancelledTurn: String? = null
-        synchronized(lock) {
-            val current = state(route)
-            if (current.turnId == null && !current.idle) return
-            val turnId = current.turnId
-            cancelAllTimersLocked(current)
-            when (OfficialConversation.backAction(current.status, current.pinned)) {
-                BackAction.STOP -> {
-                    log("P3_CONV idle route=${route.name} reason=back_stop")
-                    showIdleLocked(route, current)
-                    current.turnId = null
-                    current.awaitingPanel = false
-                    cancelledTurn = turnId
-                }
-                BackAction.EXIT -> {
-                    log("P3_CONV close route=${route.name} reason=back_exit")
-                    cancelledTurn = turnId
-                    closeLocked(route, current)
-                }
-            }
-        }
-        cancelledTurn?.let { cancelTurn(route, it) }
-    }
-
-    /**
      * The phone's `Stop` (the glasses' double-click arrived as `UserAction.Stop`): cancel the round and show idle.
      * The panel stays — spec §5.5's "取消当前 turn、发 IDLE、不关闭面板". An explicit STOP keeps the pre-fix behavior of
      * releasing every timer, including a pending pinned close (spec §10 item 18 leaves that unproven).
+     *
+     * This is also the **production mapping of the glasses' pins/ANSWERING BACK**: the glasses decide the official
+     * three-way matrix and send STOP for that branch, keeping the panel (Task 13); there is no phone-side BACK command.
      */
     fun onStop(route: AssistantRoute) {
         var cancelledTurn: String? = null
@@ -466,6 +464,27 @@ internal class ConversationCycle(
         ) { onPinnedCloseTimeout(route, epoch) }
     }
 
+    /**
+     * 0.24 S3 Task 14: the terminal liveness bound for the missing `SpeechFinished`.
+     *
+     * The wait starts at the later of "now" and the answer's own display window ([answerVisibleUntilNanos]): the phone
+     * may legitimately still be speaking a long answer while it is on screen, so the bound must never fire before the
+     * answer stops being displayed. `TIME_WAITE_TTS` is the official first wait; the official scheduler would then
+     * re-arm at 4 s forever, which is exactly the unbounded state this bound removes.
+     */
+    private fun armSpeechWaitLocked(
+        route: AssistantRoute,
+        current: RouteState,
+        answerVisibleUntilNanos: Long,
+    ) {
+        cancelSpeechWaitLocked(current)
+        val epoch = current.speechWaitEpoch
+        val anchor = maxOf(clock.nowNanos(), answerVisibleUntilNanos)
+        val delta = OfficialConversation.SPEECH_WAIT_MILLIS * 1_000_000L
+        val deadline = if (anchor > Long.MAX_VALUE - delta) Long.MAX_VALUE else anchor + delta
+        current.speechWaitExpiry = scheduler.at(deadline) { onSpeechWaitTimeout(route, epoch) }
+    }
+
     private fun cancelListenLocked(current: RouteState) {
         current.listenExpiry?.cancel()
         current.listenExpiry = null
@@ -490,11 +509,18 @@ internal class ConversationCycle(
         current.pinnedCloseEpoch++
     }
 
+    private fun cancelSpeechWaitLocked(current: RouteState) {
+        current.speechWaitExpiry?.cancel()
+        current.speechWaitExpiry = null
+        current.speechWaitEpoch++
+    }
+
     private fun cancelAllTimersLocked(current: RouteState) {
         cancelListenLocked(current)
         cancelPanelWaitLocked(current)
         cancelContinueOffLocked(current)
         cancelPinnedCloseLocked(current)
+        cancelSpeechWaitLocked(current)
     }
 
     private fun deadlineAfter(millis: Long): Long {
@@ -567,6 +593,29 @@ internal class ConversationCycle(
             current.pinnedCloseExpiry = null
             log("P3_CONV close route=${route.name} reason=pinned_timeout")
             cancelledTurn = current.turnId
+            closeLocked(route, current)
+        }
+        cancelledTurn?.let { cancelTurn(route, it) }
+    }
+
+    /**
+     * 0.24 S3 Task 14: no `SpeechFinished` arrived inside the bound.
+     *
+     * Spec §5.5 line 324: "no confirmable speech end" must **not** open the next round; close the panel and record
+     * `P3_CONV no_display`. This is the one path that ends the ANSWERING level without a status 5, exactly like the
+     * not-displayed branch.
+     */
+    private fun onSpeechWaitTimeout(route: AssistantRoute, epoch: Long) {
+        var cancelledTurn: String? = null
+        synchronized(lock) {
+            val current = state(route)
+            if (current.speechWaitEpoch != epoch) return
+            current.speechWaitExpiry = null
+            if (!current.speechPending) return
+            val turnId = current.turnId ?: return
+            current.speechPending = false
+            log("P3_CONV no_display route=${route.name} reason=speech_timeout")
+            cancelledTurn = turnId
             closeLocked(route, current)
         }
         cancelledTurn?.let { cancelTurn(route, it) }

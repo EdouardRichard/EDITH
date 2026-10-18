@@ -33,6 +33,11 @@ object SmartSettingsForm {
         val proactiveCooldown: String = "60000",
         /** P3.2: the sensitivity level; a set of three, so the screen edits it as a chooser. */
         val proactiveSensitivity: String = "LOW",
+        /**
+         * 0.24 S3 (spec §5.5): the 「持续对话」 switch. A boolean, not text, so there is nothing to parse and no
+         * rejection to report - it is carried through exactly as the user set it.
+         */
+        val continueDialogue: Boolean = true,
     )
 
     /**
@@ -60,6 +65,7 @@ object SmartSettingsForm {
         whitelist = settings.whitelist.joinToString(","),
         proactiveCooldown = settings.proactiveCooldownMillis.toString(),
         proactiveSensitivity = settings.effectiveProactiveSensitivity(),
+        continueDialogue = settings.continueDialogue,
     )
 
     /**
@@ -87,6 +93,7 @@ object SmartSettingsForm {
                 whitelist = whitelist,
                 proactiveCooldownMillis = proactiveCooldown ?: base.proactiveCooldownMillis,
                 proactiveSensitivity = proactiveSensitivity ?: base.effectiveProactiveSensitivity(),
+                continueDialogue = draft.continueDialogue,
             ),
             errors = errors,
         )

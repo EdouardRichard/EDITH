@@ -516,9 +516,11 @@ class SmartAssistantPluginTest {
         rig.wakeAndFinal("问题")
         val hintId = rig.output.hints.single().hintId
 
-        for (status in listOf(OutputStatus.Accepted, OutputStatus.Queued, OutputStatus.Expired, OutputStatus.Rejected)) {
+        for (status in listOf(OutputStatus.Accepted, OutputStatus.Queued)) {
             rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, status))
         }
+        // `Expired`/`Rejected` are deliberately absent: since Task 14 they settle the answer as not displayed and
+        // close the conversation (the I1 tests below cover them), so a later `Displayed` could not be admitted.
         assertEquals(0, rig.displayedAcks)
         rig.plugin.handle(OutputStateEvent(rig.envelope(com.sheen.rokid.contracts.Generation(9)), hintId, OutputStatus.Displayed))
         rig.plugin.handle(OutputStateEvent(rig.envelope(), "somebody-elses-hint", OutputStatus.Displayed))
@@ -1335,5 +1337,166 @@ class SmartAssistantPluginTest {
             "a close queued for the old turn must not detach the concurrent wake")
         assertEquals("asr-second", rig.model.requests.last().turnId)
         assertTrue(rig.cancels.none { it.third == secondTurn }, "the new turn's output was never cancelled")
+    }
+
+    // ------------------------------------------------- 0.24 S3 Task 14 (I1): notification answers and terminal output
+
+    /**
+     * A model answer that reaches the wearer through `notify_user` and therefore is emitted **while the run is still
+     * `Running`** - the production answer shape (spec §6.1), and the one Task 12's `phase == Idle` check could not see.
+     */
+    private fun notifyAnswer(rig: SmartTestRig, channel: String = "screen") {
+        var requests = 0
+        rig.model.onRequest = { request, listener ->
+            if (requests++ == 0) {
+                listener(smartToolCall("c1", "notify_user", """{"text":"答案","channel":"$channel"}"""))
+            } else {
+                // The tool round: a normal closing answer. `submitOutcome` suppresses it because the notification
+                // already reached the wearer, so it must not create a second hint.
+                listener(ModelStreamEvent.TextDelta(request.requestId, "完成"))
+            }
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+    }
+
+    @Test fun `S3 a notification answer emitted while running continues at its display ACK`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        notifyAnswer(rig, channel = "screen")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val hintId = rig.output.hints.single().hintId
+        val requestsAfterRun = rig.model.requests.size
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses,
+            "a notify_user answer must not continue before its display is acknowledged")
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, display.statuses[display.statuses.size - 2])
+        assertEquals(OfficialStatus.LISTENING.wire, display.statuses.last(), "the notification answer settles once")
+        assertEquals(1, display.statuses.count { it == OfficialStatus.AUDIO_FINISHED.wire })
+        assertEquals(2, display.count("working:WAKE"), "the continuation opened exactly one new round")
+        assertEquals(requestsAfterRun, rig.model.requests.size, "the next round waits for the wearer")
+
+        // A duplicate ACK cannot continue a second time.
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+        assertEquals(1, display.statuses.count { it == OfficialStatus.AUDIO_FINISHED.wire })
+    }
+
+    @Test fun `S3 an expired notification answer closes without a continuation or status five`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        notifyAnswer(rig, channel = "screen")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val hintId = rig.output.hints.single().hintId
+        val requestsAfterRun = rig.model.requests.size
+
+        // The arbiter's deadline fires before the glasses ever acknowledge the display.
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Expired))
+
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes, "an answer nobody saw closes the panel")
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
+        assertEquals(requestsAfterRun, rig.model.requests.size, "there is no next round to open")
+        assertEquals(1, rig.cancels.size, "the turn behind the missing answer is cancelled")
+        assertTrue(rig.hintTexts.isNotEmpty(), "the hint was submitted; it simply never reached the wearer")
+    }
+
+    @Test fun `S3 a late display ACK after the hint expired closes without a continuation`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        notifyAnswer(rig, channel = "screen")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val hintId = rig.output.hints.single().hintId
+        val requestsAfterRun = rig.model.requests.size
+
+        // The ACK arrives after the hint's own display window: it can no longer be honoured as "displayed".
+        rig.clock.advance(6_000_000_000L)
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
+        assertEquals(requestsAfterRun, rig.model.requests.size)
+        assertEquals(1, display.closes.size, "a repeated late ACK must not close twice")
+    }
+
+    @Test fun `S3 a rejected notification answer closes without a continuation`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        rig.output.submission = OutputSubmission.Rejected
+        notifyAnswer(rig, channel = "screen")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val requestsAfterRun = rig.model.requests.size
+
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
+        assertEquals(requestsAfterRun, rig.model.requests.size)
+        assertEquals(1, rig.cancels.size)
+    }
+
+    @Test fun `S3 a silent answer closes without a continuation`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        notifyAnswer(rig, channel = "silent")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val requestsAfterRun = rig.model.requests.size
+
+        assertTrue(rig.hintTexts.isEmpty(), "a silent answer is never displayed")
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes, "there is nothing to continue, so close")
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
+        assertEquals(requestsAfterRun, rig.model.requests.size)
+        assertEquals(1, rig.cancels.size)
+    }
+
+    @Test fun `S3 a spoken answer whose speech end never arrives closes at the bounded wait`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        notifyAnswer(rig, channel = "both")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val hintId = rig.output.hints.single().hintId
+        val requestsAfterRun = rig.model.requests.size
+        assertNotNull(rig.output.hints.single().optionalSpeech)
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses, "the speech is still pending")
+
+        // The answer's display window is 5 s from the emit, and the bound is that window plus the official
+        // TIME_WAITE_TTS: the emit happened 200 ms before this point (the tool call runs inline), so 6_000 ms remain
+        // from the acknowledgement.
+        rig.tick(5_999)
+        assertTrue(display.closes.isEmpty(), "the answer's display window plus the wait is still open: closes=${display.closes}")
+        rig.tick(1)
+
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes, "a missing speech end closes, it never hangs")
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
+        assertEquals(requestsAfterRun, rig.model.requests.size, "no next round without a confirmable speech end")
+        assertEquals(1, rig.cancels.size)
+    }
+
+    @Test fun `S3 a duplicated SpeechFinished does not continue the conversation twice`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        notifyAnswer(rig, channel = "both")
+
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.tick()
+        val hintId = rig.output.hints.single().hintId
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+
+        rig.plugin.handle(SpeechFinished(rig.envelope(), hintId, SpeechResult.FINISHED))
+        rig.plugin.handle(SpeechFinished(rig.envelope(), hintId, SpeechResult.FINISHED))
+
+        assertEquals(1, display.statuses.count { it == OfficialStatus.AUDIO_FINISHED.wire })
+        assertEquals(2, display.count("working:WAKE"), "exactly one new round was opened")
     }
 }

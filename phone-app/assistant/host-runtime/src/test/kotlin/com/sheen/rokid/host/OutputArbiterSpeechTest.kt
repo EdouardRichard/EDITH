@@ -151,4 +151,112 @@ class OutputArbiterSpeechTest {
         // No exception, no crash; device.show called normally
         assertEquals(1, device.shown.size)
     }
+
+    // ---------------------------------------------------------------- 0.24 S3 Task 14: speech completion
+
+    private val speeches = mutableListOf<Pair<String, SpeechResult>>()
+
+    /**
+     * A player whose terminal callback the test fires by hand.
+     *
+     * The arbiter posts the callback to its own serial executor, so [done] runs the test's later `clear` as a
+     * barrier: every task queued before it (including the posted callback) has run when `clear` returns.
+     */
+    private class ControlledSpeechPlayer : SpeechPlayer {
+        val played = mutableListOf<String>()
+        val callbacks = mutableMapOf<String, (SpeechPlayback) -> Unit>()
+        override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit): CancellationHandle {
+            played += assistance.hintId
+            callbacks[assistance.hintId] = onState
+            onState(SpeechPlayback.STARTED)
+            return object : CancellationHandle { override fun cancel() = Unit }
+        }
+        fun terminal(hintId: String, state: SpeechPlayback) { callbacks.getValue(hintId)(state) }
+    }
+
+    private fun speechArbiter(player: SpeechPlayer): OutputArbiter = OutputArbiter(
+        clock,
+        scheduler,
+        device,
+        player,
+        { identity },
+        { hint, status -> states += hint.hintId to status },
+        { hint, result -> speeches += hint.hintId to result },
+    )
+
+    private fun drain(arbiter: OutputArbiter) {
+        // A command on the arbiter's serial executor: anything posted before it has executed when it returns.
+        arbiter.clear(SessionId("s"), Generation(1))
+    }
+
+    @Test fun `a finished playback reports the hint and result exactly once`() {
+        val speech = ControlledSpeechPlayer()
+        val arbiter = speechArbiter(speech)
+        arbiter.submit(hint("h", speech = SpeechRequest()))
+
+        speech.terminal("h", SpeechPlayback.FINISHED)
+        // A player that violates its own "exactly once" contract must not continue the conversation twice.
+        speech.terminal("h", SpeechPlayback.FINISHED)
+        drain(arbiter)
+
+        assertEquals(listOf("h" to SpeechResult.FINISHED), speeches)
+    }
+
+    @Test fun `a failed playback reports FAILED`() {
+        val speech = ControlledSpeechPlayer()
+        val arbiter = speechArbiter(speech)
+        arbiter.submit(hint("h", speech = SpeechRequest()))
+
+        speech.terminal("h", SpeechPlayback.FAILED)
+        drain(arbiter)
+
+        assertEquals(listOf("h" to SpeechResult.FAILED), speeches, "a failed playback is still a terminal result")
+    }
+
+    @Test fun `started alone is not a completion`() {
+        val speech = ControlledSpeechPlayer()
+        val arbiter = speechArbiter(speech)
+        arbiter.submit(hint("h", speech = SpeechRequest()))
+
+        // `play` reported STARTED synchronously; no FINISHED/FAILED has arrived.
+        drain(arbiter)
+
+        assertEquals(emptyList(), speeches)
+    }
+
+    @Test fun `a hint without speech never reports a completion`() {
+        val speech = ControlledSpeechPlayer()
+        val arbiter = speechArbiter(speech)
+        arbiter.submit(hint("plain"))
+
+        drain(arbiter)
+
+        assertEquals(emptyList(), speeches, "there was no playback to finish")
+    }
+
+    @Test fun `a completion for a hint that left the screen is not reported`() {
+        val speech = ControlledSpeechPlayer()
+        val arbiter = speechArbiter(speech)
+        arbiter.submit(hint("h", speech = SpeechRequest()))
+        arbiter.clear(SessionId("s"), Generation(1))
+
+        // What a player reports when its playback is cancelled after the hint was cleared.
+        speech.terminal("h", SpeechPlayback.FINISHED)
+        drain(arbiter)
+
+        assertEquals(emptyList(), speeches, "a cancelled hint's playback end must not drive the conversation")
+    }
+
+    @Test fun `a replaced hint's finished playback is not reported`() {
+        val speech = ControlledSpeechPlayer()
+        val arbiter = speechArbiter(speech)
+        arbiter.submit(hint("first", priority = 2, speech = SpeechRequest()))
+        // A higher-priority hint takes the screen; the first item is removed and its speech handle cancelled.
+        arbiter.submit(hint("second", priority = 3, speech = SpeechRequest()))
+
+        speech.terminal("first", SpeechPlayback.FINISHED)
+        drain(arbiter)
+
+        assertEquals(emptyList(), speeches, "only the hint that is still on screen may report its speech end")
+    }
 }

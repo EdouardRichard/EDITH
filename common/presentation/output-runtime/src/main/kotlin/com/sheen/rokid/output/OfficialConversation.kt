@@ -40,6 +40,18 @@ object OfficialConversation {
     const val PINNED_CLOSE_MILLIS = 120_000L
 
     /**
+     * Official `RokidAIController.TIME_WAITE_TTS`: how long the official assistant waits for the TTS result.
+     *
+     * The official scheduler starts this wait at ASR end and, when it fires, plays a cue and re-arms itself with
+     * `TIME_WAITE_TTS_INTERVAL` (4 s) forever (`AiHandlerScheduler`, message 3). EDITH uses the same 1 200 ms as a
+     * **terminal** liveness bound in `ConversationCycle`: once the answer's display window is over and the host has
+     * still not reported a speech end, the panel is closed and `P3_CONV no_display` is recorded instead of waiting
+     * for a result that may never come. The official 4 s re-arm is deliberately not copied - it is a cue cadence, not
+     * an ending, and copying it would reintroduce the unbounded wait this bound exists to remove.
+     */
+    const val SPEECH_WAIT_MILLIS = 1_200L
+
+    /**
      * Official `launcher_chatbox_tips_exit`. The 0.24 rules own the copy; a consumer (the panel, its render model)
      * must reference these constants instead of restating the literals.
      */

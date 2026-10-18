@@ -25,8 +25,34 @@ class SmartSettingsFormTest {
         proactiveCooldownMillis: Long = 60_000L,
         proactiveSensitivity: String = "LOW",
         proactiveEnabled: Boolean = true,
+        continueDialogue: Boolean = true,
     ) = SmartSettings(wakeWords, maxLevel, whitelist, profileId, cooldownMillis,
-        proactiveCooldownMillis, proactiveSensitivity, proactiveEnabled)
+        proactiveCooldownMillis, proactiveSensitivity, proactiveEnabled, continueDialogue = continueDialogue)
+
+    // ---- 0.24 S3: the continual-dialogue switch -----------------------------------------------------
+
+    @Test
+    fun theContinueDialogueSwitchRoundTripsThroughTheForm() {
+        val base = settings(continueDialogue = true)
+
+        val draft = SmartSettingsForm.fromSettings(base)
+        assertTrue("the screen must show the stored switch", draft.continueDialogue)
+
+        val off = SmartSettingsForm.toSettings(draft.copy(continueDialogue = false), base)
+        assertTrue("a valid switch reports no errors: ${off.errors}", off.errors.isEmpty())
+        assertFalse("turning the switch off must be stored", off.settings.continueDialogue)
+    }
+
+    @Test
+    fun aFormSaveDoesNotTurnAStoredOffContinueDialogueBackOn() {
+        val storedOff = settings(continueDialogue = false)
+
+        val draft = SmartSettingsForm.fromSettings(storedOff)
+        assertFalse("loading the stored value must not assume the default", draft.continueDialogue)
+
+        val result = SmartSettingsForm.toSettings(draft, storedOff)
+        assertFalse("saving an untouched form must not re-enable it", result.settings.continueDialogue)
+    }
 
     // ---- P3.2: the proactive cooldown and sensitivity fields ----------------------------------------
 

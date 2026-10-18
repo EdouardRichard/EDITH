@@ -124,6 +124,9 @@ class OfficialConversationTest {
     fun `the official timeouts are exact`() {
         assertEquals(10_000L, OfficialConversation.LISTEN_TIMEOUT_MILLIS)
         assertEquals(120_000L, OfficialConversation.PINNED_CLOSE_MILLIS)
+        // Official `RokidAIController.TIME_WAITE_TTS`; EDITH turns the first wait into a terminal liveness bound
+        // (spec §5.5 line 324) instead of the official endless 4 s re-arm.
+        assertEquals(1_200L, OfficialConversation.SPEECH_WAIT_MILLIS)
     }
 
     @Test

@@ -931,6 +931,28 @@ private class NoStorageAccess : StorageAccess {
         assertEquals("3", resolved.values["profileRevision"])
     }
 
+    /**
+     * 0.24 S3 (spec §5.5): the persisted「持续对话」switch must reach the plugin the composition builds.
+     *
+     * The plugin's `continueDialogue` seam is a private lambda (the plugin is in another Gradle module, so this module
+     * cannot read an `internal` accessor). Reading the field is the honest composition-level proof: the constructor
+     * argument is what the plugin actually consults, and a wiring that forgot to pass it would fail here, not only on
+     * the device.
+     */
+    @Test
+    fun thePersistedContinueDialogueSwitchReachesThePluginTheWiringBuilds() {
+        fun wiredSwitch(settings: SmartSettings): Boolean {
+            val wiring = SmartWiring(settings, MemoryProfileRepository(), FakeClock(0), ManualScheduler(FakeClock(0)))
+            val field = wiring.plugin.javaClass.getDeclaredField("continueDialogue")
+            field.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            return (field.get(wiring.plugin) as () -> Boolean).invoke()
+        }
+
+        assertTrue("the official default is on", wiredSwitch(SmartSettings()))
+        assertFalse("the stored switch must reach the plugin", wiredSwitch(SmartSettings(continueDialogue = false)))
+    }
+
     @Test
     fun withNoProfileAtAllTheWiringStillBuildsAConfigurationThePluginAccepts() {
         // An installed app with no profile yet: the shape must stay valid and the plugin must be able to activate

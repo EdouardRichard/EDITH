@@ -3,6 +3,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
 
 import com.sheen.rokid.agent.AgentLoop
 import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.OutputStatus
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
@@ -78,13 +79,31 @@ internal class SmartTurn private constructor(
     var closed = false
 
     /**
-     * 0.24 S3 (spec §5.5): whether the last hint this turn emitted carried speech.
+     * 0.24 S3 Task 14 (spec §5.5, Task 12 carry I1): the identity of the answer this turn last emitted.
      *
-     * A displayed answer with speech does not continue until the phone reports `SpeechFinished`; an answer without
-     * speech continues at the `Displayed` acknowledgement. The last emit wins: a notification that is the turn's only
-     * answer is the one whose speech matters.
+     * The production answer shape is `notify_user` (spec §6.1), which is emitted **while the run is still `Running`**.
+     * A `phase == Idle` test therefore cannot tell the final answer from a mid-run notification - or see it at all
+     * for the suppressed/rejected/silent endings. The turn records the hint it last put in front of the wearer here,
+     * and [answerFinal] marks the moment the run ended and that emit became the answer the conversation continues.
      */
-    var answerHadSpeech = false
+    var answerEmitHintId: String? = null
+
+    /** Whether [answerEmitHintId] asked the host to speak. */
+    var answerEmitSpeech = false
+
+    /** Whether the host accepted that emit for display; a rejected submit has nothing to continue. */
+    var answerEmitAccepted = false
+
+    /** The run ended, so [answerEmitHintId] is the final answer (or null when the turn never emitted one). */
+    var answerFinal = false
+
+    /**
+     * The last terminal display status (`Expired`/`Rejected`) reported for the answer hint while it was not displayed.
+     *
+     * Cleared by a `Displayed` acknowledgement. Spec §5.5 line 324: a rejected/expired answer closes the conversation
+     * and records `P3_CONV no_display` instead of opening a next round.
+     */
+    var answerTerminal: OutputStatus? = null
 
     /** 0.24 S3: the answer-done decision was already reported, so a duplicate `Displayed` cannot continue twice. */
     var answerNotified = false

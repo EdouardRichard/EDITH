@@ -239,9 +239,57 @@ class SmartSettingsStoreTest {
         assertEquals(true, loaded.proactiveEnabled)
     }
 
+    // ---- 0.24 S3 (spec §5.5): continual dialogue ---------------------------------------------------
+
     @Test
-    fun anUnreadableProfileRepositoryDoesNotStopTheSettingsFromResolving() {
-        // The composition reads the settings while it assembles the plugin. The profile repository can genuinely
+    fun continualDialogueIsOnByDefault() {
+        // The official `settings_ai_assistant_continue_dialogue` defaults to "open"; a fresh install must continue.
+        assertEquals(true, SmartSettings().continueDialogue)
+    }
+
+    @Test
+    fun continualDialogueSurvivesASaveAndLoadInBothDirections() {
+        val blobs = TestBlobs()
+        SmartSettingsStore(blobs).save(SmartSettings(continueDialogue = false))
+        assertEquals("off must persist", false, SmartSettingsStore(blobs).load().continueDialogue)
+
+        SmartSettingsStore(blobs).save(SmartSettings(continueDialogue = true))
+        assertEquals(true, SmartSettingsStore(blobs).load().continueDialogue)
+    }
+
+    @Test
+    fun aBlobWrittenBeforeTheContinueDialogueKeyExistedLoadsItAsOn() {
+        // The key is new in 0.24: the official default is on, and turning it off must be the user's explicit act.
+        val blobs = TestBlobs()
+        writeJson(blobs, SmartSettingsStore.BLOB_ID, buildJsonObject {
+            put("version", 1)
+            put("wakeWords", buildJsonArray { add("伊迪丝") })
+            put("maxLevel", "L1")
+            put("whitelist", buildJsonArray {})
+            put("cooldownMillis", 3000L)
+        })
+
+        val loaded = SmartSettingsStore(blobs).load()
+
+        assertEquals(true, loaded.continueDialogue)
+        assertEquals("the rest of the old blob must still load", "L1", loaded.maxLevel)
+    }
+
+    @Test
+    fun anExplicitlyDisabledContinueDialogueIsNotReEnabledByAnythingElseInTheBlob() {
+        val blobs = TestBlobs()
+        // The screen saves the whole value; every other field changing must not flip the switch back on.
+        SmartSettingsStore(blobs).save(SmartSettings(continueDialogue = false, maxLevel = "L2", cooldownMillis = 5000L))
+
+        val reloaded = SmartSettingsStore(blobs).load()
+
+        assertEquals(false, reloaded.continueDialogue)
+        assertEquals("L2", reloaded.maxLevel)
+        assertEquals(5000L, reloaded.cooldownMillis)
+    }
+
+    @Test
+    fun anUnreadableProfileRepositoryDoesNotStopTheSettingsFromResolving() {        // The composition reads the settings while it assembles the plugin. The profile repository can genuinely
         // refuse (`ContractError.ConfigurationRejected("Storage unavailable; reconfigure")` when the keystore cannot
         // be opened), and an exception here would take the whole composition - and with it the passive loop - down.
         // The shape must stay usable so the caller can still build an accepted configuration.

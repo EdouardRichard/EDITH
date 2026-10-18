@@ -12,14 +12,28 @@ class OutputArbiter private constructor(
     private val speech: SpeechPlayer?,
     private val current: (() -> Pair<SessionId, Generation>?)?,
     private val onState: (Assistance, OutputStatus) -> Unit,
+    /**
+     * 0.24 S3 (spec §5.5): the only speech event a plugin acts on - a played hint's playback ended (`FINISHED` or
+     * `FAILED`). `STARTED` is internal to the gate and is not reported here.
+     *
+     * The callback runs on the arbiter's serial executor for a hint that is **still on screen**; a hint that was
+     * replaced, cleared or expired before its playback ended is not reported. That distinction is what keeps a
+     * cancelled answer's playback end from opening the next conversation round (Task 14).
+     */
+    private val onSpeech: (Assistance, SpeechResult) -> Unit,
 ) {
-    constructor(nowNanos: () -> Long) : this(nowNanos, null, null, null, null, { _, _ -> })
+    constructor(nowNanos: () -> Long) : this(nowNanos, null, null, null, null, { _, _ -> }, { _, _ -> })
     constructor(clock: MonotonicClock, scheduler: DeadlineScheduler, device: HintDevice,
         current: () -> Pair<SessionId, Generation>?, onState: (Assistance, OutputStatus) -> Unit) :
-        this(clock::nowNanos, scheduler, device, null, current, onState)
+        this(clock::nowNanos, scheduler, device, null, current, onState, { _, _ -> })
     constructor(clock: MonotonicClock, scheduler: DeadlineScheduler, device: HintDevice,
         speech: SpeechPlayer?, current: () -> Pair<SessionId, Generation>?, onState: (Assistance, OutputStatus) -> Unit) :
-        this(clock::nowNanos, scheduler, device, speech, current, onState)
+        this(clock::nowNanos, scheduler, device, speech, current, onState, { _, _ -> })
+    constructor(clock: MonotonicClock, scheduler: DeadlineScheduler, device: HintDevice,
+        speech: SpeechPlayer?, current: () -> Pair<SessionId, Generation>?,
+        onState: (Assistance, OutputStatus) -> Unit,
+        onSpeech: (Assistance, SpeechResult) -> Unit) :
+        this(clock::nowNanos, scheduler, device, speech, current, onState, onSpeech)
 
     private var ownerThread: Thread? = null
     private val executor = Executors.newSingleThreadExecutor { task ->
@@ -27,7 +41,7 @@ class OutputArbiter private constructor(
     }
     private data class Item(val hint: Assistance, val revision: Long, val sequence: Long,
         var output: CancellationHandle? = null, var deadline: CancellationHandle? = null,
-        var speechHandle: CancellationHandle? = null)
+        var speechHandle: CancellationHandle? = null, var speechSettled: Boolean = false)
     private val policy = HintPolicy()
     private val queue = mutableListOf<Item>()
     private var displayed: Item? = null
@@ -87,7 +101,29 @@ class OutputArbiter private constructor(
         } catch (_: Exception) { remove(item, OutputStatus.Rejected); next(); return }
         if (displayed === item) item.output = handle else runCatching { handle.cancel() }
         if (displayed === item && item.hint.optionalSpeech != null && speech != null) {
-            item.speechHandle = speech.play(item.hint) { /* FINISHED/FAILED only bookkeep; lifecycle unchanged */ }
+            item.speechHandle = speech.play(item.hint) { state -> onSpeechState(item, state) }
+        }
+    }
+
+    /**
+     * 0.24 S3 (spec §5.5): a playback state reported by [SpeechPlayer].
+     *
+     * `STARTED` only drives the host's own playback gate and is not forwarded. A terminal state is forwarded **once**
+     * and only while the hint is still the displayed one: a replaced/cleared/expired item's cancellation must not be
+     * read as "the answer's speech finished" (Task 14's stale-hint rule). The callback can arrive on any thread, so it
+     * is marshalled onto the arbiter's serial executor before it touches the item or the host.
+     */
+    private fun onSpeechState(item: Item, state: SpeechPlayback) {
+        val result = when (state) {
+            SpeechPlayback.STARTED -> return
+            SpeechPlayback.FINISHED -> SpeechResult.FINISHED
+            SpeechPlayback.FAILED -> SpeechResult.FAILED
+        }
+        executor.execute {
+            if (item.speechSettled) return@execute
+            item.speechSettled = true
+            if (displayed !== item) return@execute
+            onSpeech(item.hint, result)
         }
     }
 

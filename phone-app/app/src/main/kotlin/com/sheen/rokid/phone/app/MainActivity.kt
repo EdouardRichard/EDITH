@@ -298,6 +298,20 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                 }) }
         }
     }
+    // 0.24 S3 (spec §5.5): the official `continue_dialogue` switch, on by default. Persisted with the rest of the
+    // section and read by the composition at its next assembly, exactly like the fields above.
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("持续对话")
+            Text(
+                "答案显示/播报结束后自动进入下一轮聆听；关闭后答案结束约 1 秒关闭面板，不发 status 5。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Switch(checked = draft.continueDialogue, onCheckedChange = {
+            draft = draft.copy(continueDialogue = it); errors = emptyList(); saved = false
+        })
+    }
     errors.forEach { Text(it, color = MaterialTheme.colorScheme.error) }
     if (saved) {
         if (errors.isEmpty()) Text("已保存，将于下次重启 App 后生效")
