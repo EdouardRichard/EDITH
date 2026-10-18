@@ -8,6 +8,8 @@ import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
@@ -70,6 +72,14 @@ class GlassesVisualStateTest {
                         entryId = "said-visual-1", text = "现在几点了")))
             }
             settle()
+            // P6 review: the screenshot is only evidence if the thinking row is actually on screen when the marker is
+            // written. The first P6 capture showed an idle panel (tips "双击退出"), so assert the state here; if this
+            // fails the instrument is wrong, not the product, and the capture must be retried.
+            scenario.onActivity { activity ->
+                assertTrue("the thinking row must be visible for the thinking screenshot",
+                    activity.thinkingVisibleForProbe())
+                assertEquals("正在思考", activity.thinkingTextForProbe())
+            }
             hold("thinking", 8_000)
 
             scenario.onActivity { activity ->

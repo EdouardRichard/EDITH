@@ -10,10 +10,11 @@
     2026-10-05 result set and is not a module of the root `settings.gradle.kts`; counting it would
     silently add 11/48 from an old run.
 
-    The `testsuite` start tag is read directly instead of parsing the whole document: one Gradle
-    result file (`EngineBundleProvisioningTest`) embeds a Windows exception message whose raw
-    control character makes the XML invalid, and a whole-document parse would silently drop that
-    suite's 7 tests. The start tag is well formed even when the body is not.
+    Each document is read with `File.ReadAllText(..., UTF8)` and parsed as a whole. **Do not use
+    `Get-Content` here**: under Windows PowerShell 5.1 it decodes UTF-8 as ANSI, which makes a
+    perfectly valid Gradle XML file (one whose skip message contains a non-ASCII path) fail `[xml]`
+    with a misleading "unexpected token". That was a P6 review finding; the explicit UTF-8 read
+    parses all project-only files.
 #>
 param([string] $Root = (Get-Location).Path)
 
@@ -26,21 +27,23 @@ $xml = Get-ChildItem -LiteralPath $Root -Recurse -Filter 'TEST-*.xml' -ErrorActi
 
 $suites = 0; $tests = 0; $failures = 0; $errors = 0; $skipped = 0; $malformed = @()
 foreach ($file in $xml) {
-    $line = Get-Content -LiteralPath $file.FullName -TotalCount 5 -ErrorAction SilentlyContinue |
-        Where-Object { $_ -match '<testsuite\b' } | Select-Object -First 1
-    if (-not $line -or $line -notmatch '<testsuite\b([^>]*)>') {
+    $text = [System.IO.File]::ReadAllText($file.FullName, [System.Text.Encoding]::UTF8)
+    try {
+        [xml] $doc = $text
+    } catch {
         $malformed += $file.FullName
         continue
     }
-    $attrs = $Matches[1]
+    $suite = $doc.testsuite
+    if ($null -eq $suite) { $malformed += $file.FullName; continue }
     $suites++
-    $tests += [int]([regex]::Match($attrs, 'tests="(\d+)"').Groups[1].Value)
-    $failures += [int]([regex]::Match($attrs, 'failures="(\d+)"').Groups[1].Value)
-    $errors += [int]([regex]::Match($attrs, 'errors="(\d+)"').Groups[1].Value)
-    $skipped += [int]([regex]::Match($attrs, 'skipped="(\d+)"').Groups[1].Value)
+    $tests += [int] $suite.tests
+    $failures += [int] $suite.failures
+    $errors += [int] $suite.errors
+    $skipped += [int] $suite.skipped
 }
 "suites=$suites tests=$tests failures=$failures errors=$errors skipped=$skipped"
 if ($malformed.Count -gt 0) {
-    Write-Warning "unreadable suite tags: $($malformed.Count)"
+    Write-Warning "unreadable XML files: $($malformed.Count)"
     $malformed | ForEach-Object { Write-Warning "  $_" }
 }

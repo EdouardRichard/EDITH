@@ -10,6 +10,7 @@ import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import org.junit.runner.RunWith
 import java.io.File
@@ -17,9 +18,10 @@ import java.io.File
 /**
  * 0.23 P6 evidence instrument for U-11 (D154): the glasses show one route and never mix the other one in.
  *
- * The assertions are the contract; the marker only lets the host take the screenshot while the proactive route is on
- * screen. The injected text is synthetic; no real conversation content and no real model turn is involved. This is a
- * renderer-level device check, not a model round trip - the plugin/log half is pinned by JVM tests.
+ * The test reads the production route/log state **and** the live row's View text (`hintText()`); the host screenshot is
+ * the panel-level renderer evidence for both rows. The injected text is synthetic; no real conversation content and no
+ * real model turn is involved. This is a renderer-level device check, not a model round trip - the plugin half is pinned
+ * by JVM tests.
  */
 @RunWith(AndroidJUnit4::class)
 class GlassesRouteIsolationTest {
@@ -50,13 +52,21 @@ class GlassesRouteIsolationTest {
                     HintCommand.Show("s-p6", 1, sequence = 2, hintId = "h-proactive", revision = 1,
                         syncId = "sync-p6", phoneSentNanos = System.nanoTime(), remainingTtlMillis = 30_000,
                         text = "主动提醒一句", route = AssistantRoute.PROACTIVE)))
+                activity.acceptCommand(HintWireCodec.encode(
+                    HintCommand.Said("s-p6", 1, sequence = 3, route = AssistantRoute.PROACTIVE,
+                        entryId = "said-proactive", text = "主动说的话")))
             }
             settle()
             scenario.onActivity { activity ->
                 assertEquals(AssistantRoute.PROACTIVE, activity.selectedRoute())
-                assertEquals("主动提醒一句", activity.conversationText(AssistantRoute.PROACTIVE))
+                assertTrue("the live row must render the proactive hint",
+                    activity.hintText().contains("主动提醒一句"))
+                assertTrue("主动提醒一句", activity.conversationText(AssistantRoute.PROACTIVE).contains("主动提醒一句"))
+                assertTrue("the proactive route owns its own utterance",
+                    activity.conversationText(AssistantRoute.PROACTIVE).contains("主动说的话"))
                 assertEquals("唤醒说的话", activity.conversationText(AssistantRoute.WAKE))
                 assertFalse(activity.conversationText(AssistantRoute.WAKE).contains("主动提醒一句"))
+                assertFalse(activity.conversationText(AssistantRoute.WAKE).contains("主动说的话"))
             }
             mark("proactive")
             Thread.sleep(8_000)

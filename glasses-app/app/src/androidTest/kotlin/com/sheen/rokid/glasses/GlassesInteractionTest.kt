@@ -127,11 +127,16 @@ class GlassesInteractionTest {
             settle(2_000)
 
             // Unpinning is the other half of the pin contract: the ticker resumes from the current position.
+            // P6 review: on a slow device the ticker can reach `max` before the fixed 500 ms wait, so "running" alone is
+            // a transient; either state proves it resumed. If it did not, both are false and this still fails.
+            var beforeUnpin = 0
+            scenario.onActivity { activity -> beforeUnpin = activity.scrollOffsetY() }
             key(KeyEvent.KEYCODE_ENTER)
             settle(500)
             scenario.onActivity { activity ->
                 assertFalse("a second ENTER unpins", activity.isPinnedForProbe())
-                assertTrue("unpinning must resume the ticker", activity.tickerRunningForProbe())
+                assertTrue("unpinning must resume the ticker or advance the offset",
+                    activity.tickerRunningForProbe() || activity.scrollOffsetY() > beforeUnpin)
             }
 
             // A new session is a new window: both conversations empty, wake route, unpinned, nothing to scroll.
