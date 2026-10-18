@@ -4,8 +4,16 @@ import com.sheen.rokid.phone.app.MainActivity
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.HostEvent
+import com.sheen.rokid.contracts.UserAction
 import com.sheen.rokid.host.HostRuntime
+import com.sheen.rokid.output.HintCommand
+import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.plugin.*
+import com.sheen.rokid.testsupport.FakeClock
+import com.sheen.rokid.testsupport.ManualScheduler
+import com.sheen.rokid.testsupport.RecordingInputPort
 import com.sheen.rokid.transport.CxrAuthorizationOutcome
 import com.sheen.rokid.storage.MemoryProfileRepository
 import org.junit.Assert.*
@@ -167,6 +175,180 @@ class CxrWiringTest {
                     lines.none { it.contains("result=ok") })
             }
         } finally { root.close() }
+    }
+
+    // ---------------------------------------------------------------- Task 20: wear-off + CXR reconnect
+
+    /** A plugin whose only job is to show what the host actually delivered. */
+    private class ScenePlugin : PluginLifecycle {
+        val events = java.util.concurrent.CopyOnWriteArrayList<HostEvent>()
+        override val descriptor = PluginDescriptor("scene", "1.0.0", 1, "Scene", emptyList(), ConfigSchema(1))
+        override fun activate(context: PluginContext) = Unit
+        override fun handle(event: HostEvent) { events += event }
+        override fun deactivate(reason: DeactivationReason) = Unit
+    }
+
+    /** The production-shaped link/connection pair, so the composition reset is observed on the real objects. */
+    private class Task20Rig : AutoCloseable {
+        val clock = FakeClock(1_000_000_000L)
+        val scheduler = ManualScheduler(clock)
+        val connection = FakeConnection()
+        val plugin = ScenePlugin()
+        /** Every app-start request the link sent; the lambda is the SDK's asynchronous answer for the test. */
+        val appStarts = java.util.concurrent.CopyOnWriteArrayList<() -> Unit>()
+        val host: HostRuntime
+        val root: HostCompositionRoot
+        val link: CxrHintLink
+
+        init {
+            val environment = CxrHostEnvironment(
+                clock = clock, input = RecordingInputPort(), liveOutput = { null }, scheduler = scheduler)
+            host = HostRuntime(1, environment)
+            link = CxrHintLink(
+                clock,
+                scheduler,
+                sendJson = { json -> connection.sendCommand(json) },
+                startGlassesApp = { onResult -> appStarts += { onResult(true) }; true },
+            )
+            root = HostCompositionRoot(
+                host, MemoryProfileRepository(), UnusedModel(), environment,
+                rokidConnectionFactory = { connection }, hintLink = link,
+            )
+            root.registerPlugin(plugin)
+        }
+
+        /** 开始 with the transport already reporting a session: the production order that introduces the identity. */
+        fun startEstablished() {
+            root.connectCxr(activity = Any())
+            connection.ready = true
+            root.onSceneReady()
+            root.start("scene")
+            requireNotNull(host.currentIdentity()) { "the scene plugin must be active" }
+        }
+
+        /** Completes the clock exchange, which is what makes the display real. */
+        fun completeExchange() {
+            val ping = connection.sentCommands.mapNotNull { HintWireCodec.decode(it) as? HintCommand.Ping }.last()
+            clock.nowNanos = ping.p0 + 10_000_000
+            connection.inbound!!(HintWireCodec.encode(HintCommand.Pong(ping.syncId, ping.p0,
+                ping.p0 + 1_005_000_000, ping.p0 + 1_005_000_000)))
+        }
+
+        fun identity(): HintIdentity {
+            val current = requireNotNull(host.currentIdentity())
+            return HintIdentity(current.first.value, current.second.value)
+        }
+
+        /** What the glasses report while the window is on screen: readiness, visibility and a live mapping. */
+        fun markPanelVisibleAndReady() {
+            val identity = identity()
+            assertTrue(link.onInbound(HintWireCodec.encode(
+                HintCommand.UiReady(identity.sessionId, identity.generation))))
+            assertTrue(link.onInbound(HintWireCodec.encode(
+                HintCommand.PanelShown(identity.sessionId, identity.generation, AssistantRoute.WAKE))))
+        }
+
+        override fun close() = root.close()
+    }
+
+    @Test
+    fun wearOffCancelsTheTurnAndSendsTheAllRouteClose() {
+        Task20Rig().use { rig ->
+            rig.startEstablished()
+            rig.completeExchange()
+            rig.markPanelVisibleAndReady()
+            val identity = rig.identity()
+            rig.connection.sentCommands.clear()
+
+            withP3Sink { lines ->
+                rig.root.onWearingChanged(false)
+
+                val closes = rig.connection.sentCommands.mapNotNull { HintWireCodec.decode(it) }
+                    .filterIsInstance<HintCommand.Close>()
+                assertEquals("wear-off must tell the glasses to close the panel", 1, closes.size)
+                assertNull("the ALL form closes whichever route is visible", closes.single().route)
+                assertEquals(identity.sessionId, closes.single().sessionId)
+                assertTrue("the wear status must be recorded with its value",
+                    lines.contains("P3_CXR glasses_event=wearing=false"))
+                assertTrue("the wear-off action must be recorded: ${lines.filter { it.contains("wear") }}",
+                    lines.any { it.startsWith("P3_CXR wear=off") })
+            }
+
+            val deadline = System.nanoTime() + 2_000_000_000L
+            while (rig.plugin.events.none { it is UserAction && it.action == UserAction.Action.Stop } &&
+                System.nanoTime() < deadline) {
+                Thread.sleep(10)
+            }
+            assertTrue("wear-off must cancel the current turn: ${rig.plugin.events}",
+                rig.plugin.events.any { it is UserAction && it.action == UserAction.Action.Stop })
+
+            rig.connection.sentCommands.clear()
+            rig.plugin.events.clear()
+            rig.root.onWearingChanged(true)
+            Thread.sleep(100)
+            assertTrue("putting the glasses back on is diagnostic only: ${rig.connection.sentCommands}",
+                rig.connection.sentCommands.isEmpty())
+            assertTrue("and it must not cancel a turn", rig.plugin.events.isEmpty())
+        }
+    }
+
+    @Test
+    fun screenAndAppEventsAreRecordedWithoutBehaviour() {
+        Task20Rig().use { rig ->
+            rig.startEstablished()
+            rig.connection.sentCommands.clear()
+            withP3Sink { lines ->
+                rig.root.onGlassesSceneEvent("screen_off")
+                rig.root.onGlassesSceneEvent("screen_on")
+                rig.root.onGlassesSceneEvent("app_paused")
+                rig.root.onGlassesSceneEvent("app_resumed")
+                listOf("screen_off", "screen_on", "app_paused", "app_resumed").forEach { event ->
+                    assertTrue("$event must be recorded: $lines", lines.contains("P3_CXR glasses_event=$event"))
+                }
+            }
+            Thread.sleep(100)
+            assertTrue("screen/app events must not send anything: ${rig.connection.sentCommands}",
+                rig.connection.sentCommands.isEmpty())
+        }
+    }
+
+    @Test
+    fun aCxrDisconnectResetsStaleLinkStateSoTheNextLiveSessionTakesTheRecoveryPath() {
+        Task20Rig().use { rig ->
+            rig.startEstablished()
+            rig.completeExchange()
+            rig.markPanelVisibleAndReady()
+            assertNotNull("precondition: the mapping is live", rig.link.liveSyncId())
+            assertTrue(rig.link.hasUiReady())
+            assertTrue(rig.link.isPanelVisible())
+            assertTrue(rig.root.state.value.cxrLinkReady)
+
+            rig.host.interrupt()
+
+            assertNull("a disconnect must drop the live clock mapping", rig.link.liveSyncId())
+            assertFalse("UI_READY belonged to the dead session", rig.link.hasUiReady())
+            assertFalse("a panel the dead link reported must not stay visible", rig.link.isPanelVisible())
+            assertFalse("the page must not keep claiming a live link", rig.root.state.value.cxrLinkReady)
+
+            // A new session exists on the phone, but the transport has not reported a live session for it yet. The
+            // stale readiness from the closed link must not let a wake start the scene before that signal, and the
+            // dead transport itself must be asked to reconnect by 开始 (D53-③), or the next scene can never come up.
+            rig.connection.ready = true
+            val connectsBefore = rig.connection.connectedWith.size
+            rig.root.start("scene")
+            assertEquals("开始 must reconnect the transport the disconnect killed",
+                connectsBefore + 1, rig.connection.connectedWith.size)
+            val appStartsBefore = rig.appStarts.size
+            assertFalse("a wake before the new transport is live may not use the dead link's readiness",
+                rig.root.requestPanelOpen(AssistantRoute.WAKE))
+            assertEquals("and must not start the scene into a dead session", appStartsBefore, rig.appStarts.size)
+
+            rig.root.onSceneReady()
+            assertTrue("the first wake on the new live session must take the recovery path",
+                rig.root.requestPanelOpen(AssistantRoute.WAKE))
+            assertEquals("appStart is the recovery path, not a stale PANEL_OPEN",
+                appStartsBefore + 1, rig.appStarts.size)
+        }
     }
 
     private class FakeConnection : CxrConnection {

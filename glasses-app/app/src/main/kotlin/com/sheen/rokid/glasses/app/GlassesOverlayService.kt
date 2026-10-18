@@ -50,9 +50,11 @@ import com.sheen.rokid.output.HintWireCodec
  * This task implements the S2 panel lifecycle: `PANEL_OPEN` shows a hidden window (resetting the hidden cache) and
  * leaves an already-visible one's content untouched while re-announcing `PANEL_SHOWN` for the visible route, `CLOSE`
  * is route-scoped and clears the hidden/visible cache without ending
- * the resident session, and the phone's `UI_READY`/`UI_CLOSED`/`PANEL_SHOWN` handshake is driven from here. It does not
- * implement the conversation state machine (Task 12), the official key/tips matrix (Task 13), or the wear/screen-down
- * behaviour (Task 20).
+ * the resident session, and the phone's `UI_READY`/`UI_CLOSED`/`PANEL_SHOWN` handshake is driven from here. The S5 Task
+ * 20 integration adds the screen/wear/reconnect edges: the wake lock is a waking screen lock with a bounded hold, a CXR
+ * disconnect (the bridge's own `onDisconnected`) hides the panel, releases the lock, clears the cache and stops this
+ * service so the next wake's `appStart` starts a fresh one, and the phone's wear-off arrives as the wire's ALL-route
+ * `CLOSE`.
  */
 class GlassesOverlayService : Service() {
 
@@ -66,6 +68,9 @@ class GlassesOverlayService : Service() {
     private var overlayRoot: FrameLayout? = null
     private var overlayParams: WindowManager.LayoutParams? = null
     private var wakeLock: PowerManager.WakeLock? = null
+
+    /** The timeout the current acquire call was given; read by [wakeLockTimeoutAppliedForProbe]. */
+    private var wakeLockTimeoutAppliedMs = 0L
 
     /**
      * The route the visible overlay was opened for, or null while hidden.
@@ -116,6 +121,8 @@ class GlassesOverlayService : Service() {
         host = GlassesPanelHost(this, callbacks, GlassesPanelHost.WakePolicy.PANEL_VISIBLE)
         // The endpoint outlives every screen; the listener points at the resident service.
         RokidBridgeEndpoint.instance.setListener { json -> acceptCommand(json) }
+        // Task 20: the CXR-S bridge reports the link's own death. It arrives on the bridge thread; the handler posts.
+        RokidBridgeEndpoint.instance.setDisconnectionListener { onCxrDisconnected() }
         instanceForTest = this
         // No identity before a HELLO, so this records the deferral instead of fabricating a session.
         maybeSendUiReady()
@@ -133,6 +140,7 @@ class GlassesOverlayService : Service() {
     override fun onDestroy() {
         runCatching { hidePanel() }
         releaseWakeLock()
+        RokidBridgeEndpoint.instance.setDisconnectionListener(null)
         RokidBridgeEndpoint.instance.setListener(null)
         if (this::host.isInitialized) host.destroy()
         instanceForTest = null
@@ -254,6 +262,29 @@ class GlassesOverlayService : Service() {
     private inner class OverlayRoot(context: Context) : FrameLayout(context) {
         override fun dispatchKeyEvent(event: KeyEvent): Boolean =
             if (host.dispatchKeyEvent(event)) true else super.dispatchKeyEvent(event)
+    }
+
+    // ---------------------------------------------------------------- CXR disconnect (Task 20)
+
+    /**
+     * The CXR-S link went away (spec §5.7): hide the panel, release the waking screen lock, clear the cache and stop
+     * this resident service.
+     *
+     * Stopping is the recovery contract, not an extra flourish: the phone only learns that a resident service is
+     * missing from the absent `UI_READY`/`PONG`, and only calls `appStart` when it needs a scene. A service kept alive
+     * across a dead CXR session would answer the next HELLO with the old identity and its first `UI_READY` could race
+     * the new session; stopping it means the next wake starts a clean one. The phone's `CLOSE` path deliberately does
+     * **not** stop the service - only the link's own death does.
+     */
+    private fun onCxrDisconnected() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post { onCxrDisconnected() }
+            return
+        }
+        Log.i(TAG, "CXR_DISCONNECTED overlay=${overlayRoot != null}")
+        hidePanel()
+        Log.i(TAG, "CXR_DISCONNECTED service_stop_requested=true")
+        stopSelf()
     }
 
     // ---------------------------------------------------------------- inbound
@@ -455,20 +486,24 @@ class GlassesOverlayService : Service() {
     @Suppress("DEPRECATION")
     private fun acquireWakeLock() {
         if (wakeLock?.isHeld == true) return
+        val timeoutMs = WAKE_LOCK_TIMEOUT_MS
         val lock = powerManager.newWakeLock(
             PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
             "edith:overlay",
         ).apply {
             setReferenceCounted(false)
-            acquire(WAKE_LOCK_TIMEOUT_MS)
+            acquire(timeoutMs)
         }
         wakeLock = lock
-        Log.i(TAG, "WAKE_LOCK acquire held=${lock.isHeld} interactive=${powerManager.isInteractive}")
+        wakeLockTimeoutAppliedMs = timeoutMs
+        Log.i(TAG, "WAKE_LOCK acquire held=${lock.isHeld} interactive=${powerManager.isInteractive} " +
+            "timeoutMs=$timeoutMs")
     }
 
     private fun releaseWakeLock() {
         val lock = wakeLock ?: return
         wakeLock = null
+        wakeLockTimeoutAppliedMs = 0L
         runCatching { if (lock.isHeld) lock.release() }
         Log.i(TAG, "WAKE_LOCK release held=${lock.isHeld}")
     }
@@ -492,6 +527,47 @@ class GlassesOverlayService : Service() {
     fun overlayParamsForProbe(): WindowManager.LayoutParams? = overlayParams
 
     fun wakeLockHeldForProbe(): Boolean = wakeLock?.isHeld == true
+
+    /**
+     * The platform's own acquired lock description (`WakeLock{… held/refCount}`), for the S5 wake-lock check.
+     *
+     * This Android 12 build's `toString()` does not print the flags, so the flag half is read back from the platform
+     * object's own field by [wakeLockFlagsForProbe] and the hold half is the value the acquire call was given
+     * ([wakeLockTimeoutAppliedForProbe]) - both are facts about the object this service actually asked the platform
+     * for, not claims about a constant.
+     */
+    fun wakeLockDescriptionForProbe(): String? = wakeLock?.toString()
+
+    /** The acquired lock's platform flags (`SCREEN_BRIGHT_WAKE_LOCK | ACQUIRE_CAUSES_WAKEUP` = 0x1000000a). */
+    fun wakeLockFlagsForProbe(): Int = readWakeLockField("mFlags", -1)
+
+    /**
+     * The timeout (ms) this service actually passed to `PowerManager.WakeLock.acquire`, or 0 while not held.
+     *
+     * The client-side `WakeLock` does not retain the timeout - it is sent to the power service and this Android 12
+     * build's `toString()` only prints `held/refCount` - so the honest checkable fact on this side is the value the
+     * acquire call was given. The flag half is read back from the platform object above.
+     */
+    fun wakeLockTimeoutAppliedForProbe(): Long = if (wakeLock?.isHeld == true) wakeLockTimeoutAppliedMs else 0L
+
+    private fun <T> readWakeLockField(name: String, fallback: T): T {
+        val lock = wakeLock ?: return fallback
+        return runCatching {
+            @Suppress("UNCHECKED_CAST")
+            PowerManager.WakeLock::class.java.getDeclaredField(name)
+                .apply { isAccessible = true }
+                .get(lock) as T
+        }.getOrDefault(fallback)
+    }
+
+    /**
+     * Drives the exact production CXR-disconnect path (`onCxrDisconnected`) from the instrumentation suite.
+     *
+     * The real callback can only come from a live CXR-S bridge; this seam exercises the same method the bridge's
+     * `onDisconnected` installs, so the hide/stop behaviour is proved on the production service without pretending the
+     * real link was exercised (that stays `NotMeasured` until the Task 21 walkthrough).
+     */
+    fun onCxrDisconnectedForProbe() = onCxrDisconnected()
 
     fun overlayHasWindowFocusForProbe(): Boolean = overlayRoot?.hasWindowFocus() == true
 

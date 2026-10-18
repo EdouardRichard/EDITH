@@ -398,6 +398,9 @@ class HostCompositionRoot internal constructor(
         // a session ending must not disarm a feature the user asked to have on, and it must not re-arm one they turned
         // off either. There is deliberately no `deactivate()` call on this path any more.
         mutableState.update { it.copy(session = session, capabilityReasons = capabilityReasons(), executionChannels = executionChannels()) }
+        // 0.24 S5 Task 20: `HostRuntime.interrupt()` is what the transport's `onInterrupted` does for a CXR close
+        // (`onSessionClosed`/session-terminating/audio failure). The link state must not outlive the session it names.
+        if (session == SessionState.Interrupted) onCxrLinkInterrupted()
     }
     private var closed = false
     private var activatedPlugin: String? = null
@@ -850,7 +853,7 @@ class HostCompositionRoot internal constructor(
     }
 
     /** True once the transport reported a live session; kept so a later session start can still establish the link. */
-    private var linkReady = false
+    @Volatile private var linkReady = false
     private var activeSessionId: String? = null
 
     /**
@@ -1113,16 +1116,71 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
-     * One `IGlassesEventListener` fact, recorded off the vendor thread.
+     * One diagnostic `IGlassesEventListener` fact, recorded off the vendor thread.
      *
-     * Behaviour (screen-off/wear/reconnect) is Task 20's scope; this task only re-establishes the official pre-connect
-     * registration so those callbacks are observable at all.
+     * 0.24 S5 Task 20: the screen-on/off and app-paused/resumed callbacks are **diagnostics only** - they are recorded
+     * where a device log can separate them, and deliberately do not change any state. Wake-on-screen-off is the
+     * glasses overlay's platform wake lock (`GlassesOverlayService`), not a phone-side reaction. Wear-off is the one
+     * scene event with behaviour; it goes through [onWearingChanged].
      */
     internal fun onGlassesSceneEvent(name: String) {
         dispatchHostEvent {
             if (closed) return@dispatchHostEvent
             P3Log.line("P3_CXR glasses_event=$name")
         }
+    }
+
+    /**
+     * 0.24 S5 Task 20: the wearer took the glasses off (spec §5.7).
+     *
+     * The vendor reports it as `IGlassesEventListener.onWearingStatusChanged(false)`; there is no wire command for the
+     * sensor fact itself. The EDITH behaviour is the same two facts the spec names: cancel the current turn (the same
+     * `UserAction.Stop` a glasses double-click raises, so the active plugin settles its timers and output) and tell the
+     * resident panel to close (the official ALL form, because the wearer does not tell us which route is visible).
+     * Putting the glasses back on changes nothing.
+     *
+     * Runs through [dispatchHostEvent] like every other vendor callback: host policy must not execute on the SDK's
+     * callback thread.
+     */
+    internal fun onWearingChanged(wearing: Boolean) {
+        dispatchHostEvent {
+            if (closed) return@dispatchHostEvent
+            P3Log.line("P3_CXR glasses_event=wearing=$wearing")
+            if (wearing) return@dispatchHostEvent
+            val identity = runCatching { host.currentIdentity() }.getOrNull()
+            val cancelled = if (identity == null) false else {
+                val now = clock.nowNanos()
+                host.onEvent(UserAction(
+                    EventEnvelope(identity.first, identity.second, "wear-off-${UUID.randomUUID()}", now, now),
+                    UserAction.Action.Stop,
+                ))
+            }
+            // Send the close even when no plugin turn was active: the panel may still be visible with a closed turn.
+            val closed = hintLink?.closeAll() ?: false
+            P3Log.line("P3_CXR wear=off cancel=${if (cancelled) "accepted" else "none"} close=$closed")
+        }
+    }
+
+    /**
+     * 0.24 S5 Task 20: the CXR session died underneath this composition.
+     *
+     * `HostRuntime.interrupt()` is reached from the transport's `onInterrupted` (`onSessionClosed`, session-terminating
+     * or a failed audio stream), so this observer is the one place the composition learns that the link is gone. A
+     * closed link's `establishedSession`/`UI_READY`/`panelVisible`/clock mapping must not survive it: while the mapping
+     * remains valid, the next wake would take the "already ready" path and send `PANEL_OPEN` into a dead scene.
+     * `linkLost()` clears all of them. `linkReady` is cleared as well, so a following 开始 waits for the transport's own
+     * live-session signal again instead of trusting the dead link's readiness; the first wake on the next live session
+     * then takes the `appStart` recovery path (spec §5.7). The dead transport is marked unbuilt so that 开始 really asks
+     * it to connect again (`D53`③: 开始 = 确保连接，必要时重连); the transport is idempotent for an already-live session.
+     */
+    private fun onCxrLinkInterrupted() {
+        if (closed) return
+        hintLink?.linkLost()
+        linkReady = false
+        linkBuilt = false
+        retriedMappingSyncId = null
+        mutableState.update { it.copy(cxrLinkReady = false) }
+        P3Log.line("P3_CXR disconnect link=lost panel_reset=true recovery=appStart")
     }
 
     /**
@@ -1660,12 +1718,12 @@ class HostCompositionRoot internal constructor(
             val hostHolder = arrayOfNulls<HostRuntime>(1)
             // 0.24 S2 Task 11: the production `IGlassesEventListener`. The backend registers it on every newly created
             // session **before** `connect` (official CXR-L 1.1.2 order). The listener never runs host policy on the
-            // vendor thread; the composition records the fact and Task 20 owns the screen-off/wear behaviour.
+            // vendor thread. Task 20: screen/app events are diagnostics; wear-off cancels the turn and closes the panel.
             val glassesEvents = object : GlassesEvents {
                 override fun appResumed() { rootHolder[0]?.onGlassesSceneEvent("app_resumed") }
                 override fun appPaused() { rootHolder[0]?.onGlassesSceneEvent("app_paused") }
                 override fun wearingChanged(wearing: Boolean) {
-                    rootHolder[0]?.onGlassesSceneEvent("wearing=$wearing")
+                    rootHolder[0]?.onWearingChanged(wearing)
                 }
                 override fun screenOn() { rootHolder[0]?.onGlassesSceneEvent("screen_on") }
                 override fun screenOff() { rootHolder[0]?.onGlassesSceneEvent("screen_off") }

@@ -25,10 +25,27 @@ import com.rokid.cxr.Caps
 class RokidBridgeEndpoint private constructor() {
     @Volatile private var listener: ((String) -> Unit)? = null
 
+    /**
+     * Receives the CXR-S bridge's own `onDisconnected` (0.24 S5 Task 20).
+     *
+     * The status listener is owned by the one bridge instance above, so the panel service cannot observe the link
+     * itself without a second `CXRServiceBridge`; this seam is how the service learns that the phone side of the
+     * session is gone. Invoked on the CXR callback thread - the consumer must marshal to the main thread. Null while no
+     * service is resident.
+     */
+    @Volatile private var disconnectionListener: (() -> Unit)? = null
+
     private val bridge = CXRServiceBridge().apply {
         setStatusListener(object : CXRServiceBridge.StatusListener {
             override fun onConnected(p0: String?, p1: String?, p2: Int) { Log.i(TAG, "CXR connected") }
-            override fun onDisconnected() { Log.i(TAG, "CXR disconnected") }
+            override fun onDisconnected() {
+                Log.i(TAG, "CXR disconnected")
+                disconnectionListener?.let { callback ->
+                    runCatching { callback() }.onFailure { failure ->
+                        Log.w(TAG, "disconnect listener failed", failure)
+                    }
+                }
+            }
             override fun onConnecting(p0: String?, p1: String?, p2: Int) = Unit
             override fun onARTCStatus(p0: Float, p1: Boolean) = Unit
             override fun onRokidAccountChanged(p0: String?) = Unit
@@ -51,6 +68,14 @@ class RokidBridgeEndpoint private constructor() {
     /** The current consumer; null means "no screen is listening" and inbound commands are dropped. */
     fun setListener(value: ((String) -> Unit)?) {
         listener = value
+    }
+
+    /**
+     * Installs the consumer of the bridge's `onDisconnected`, or clears it (the service does the latter in
+     * `onDestroy`). One consumer because this endpoint is a process singleton.
+     */
+    fun setDisconnectionListener(value: (() -> Unit)?) {
+        disconnectionListener = value
     }
 
     /** Sends one payload to the phone on the reply channel, in the official sample's `Caps` layout. */

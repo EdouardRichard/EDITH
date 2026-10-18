@@ -328,6 +328,27 @@ class CxrHintLink(
     }
 
     /**
+     * Closes the panel for **every** route, using the wire's official ALL form (`CLOSE` with no route).
+     *
+     * 0.24 S5 Task 20: taking the glasses off is not a route-scoped event - the wearer does not tell us which route the
+     * visible panel belonged to - so the ALL form is the honest command. Any queued or already-sent-but-unshown
+     * `PANEL_OPEN` is dropped for both routes before the close leaves, for the same reason [close] does it for one: a
+     * bounded repeat must not reopen a window the wearer just took the glasses off for. A failure to send is reported
+     * as the boolean this link can honestly answer.
+     */
+    fun closeAll(): Boolean {
+        synchronized(handshakeGate) {
+            panelRoutePending = null
+            cancelPanelOpenRetryLocked()
+            panelOpenAwaitingShown = false
+            panelOpenRoute = null
+        }
+        return sendConversation("a panel close (ALL)") { session, generation ->
+            HintCommand.Close(session, generation, null)
+        }
+    }
+
+    /**
      * The generation the current session was introduced with (Phase C).
      *
      * The glasses gate every message on session **and** generation, so conversation traffic has to carry the same pair
@@ -1031,6 +1052,7 @@ class CxrHintLink(
 
     /** The link is gone: the mapping is dropped so no stale interval can be used for a fresh deadline. */
     fun linkLost() {
+        diagnostics("link lost: session, clock mapping and panel state cleared")
         sessionEnded()
         synchronized(handshakeGate) {
             clockSync.linkLost()
