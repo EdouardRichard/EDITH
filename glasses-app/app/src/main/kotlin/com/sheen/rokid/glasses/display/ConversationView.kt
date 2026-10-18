@@ -49,21 +49,30 @@ object ConversationView {
  * and the wire, and this class owns only the ordering rules, so the matrix is testable without Android.
  *
  * Revisions are counted per **(route, turn)**: a new turn starts its own revision domain, and the two conversations
- * are independent. A final entry id is remembered per route; the next turn's entry has a different id and is not
- * blocked by it.
+ * are independent. The **recently finalized** entry ids are remembered per route (bounded, oldest evicted first): a new
+ * turn's entry has a different id and is not blocked by them, while a revision delayed across a turn boundary still
+ * cannot reopen an older final (0.24 Task 15 review I1).
  */
 class AsrRevisionGate {
 
     /** The last applied revision per route, then per turn. */
     private val lastRevision: MutableMap<AssistantRoute, MutableMap<String, Long>> = mutableMapOf()
 
-    /** The final entry id per route; a late revision for that id is stale. */
-    private val finalizedEntry: MutableMap<AssistantRoute, String> = mutableMapOf()
+    /**
+     * The recently finalized user entry ids per route, oldest first.
+     *
+     * A **set** rather than only the latest id matters because the channel is unordered across a turn boundary: after
+     * turn 2 finalizes, a delayed revision of turn 1 must still not reopen turn 1's final. A new turn has a new entry id
+     * and is therefore not blocked. Bounded so a long session cannot grow the gate without end; dropping the oldest
+     * only means a revision older than that many finalized turns could reopen its own row (the same documented
+     * trade-off as the phone's display, which keeps the same number of ids).
+     */
+    private val finalizedEntries: MutableMap<AssistantRoute, MutableSet<String>> = mutableMapOf()
 
     /** True when [revision] is newer than everything applied for this route/turn and no final has claimed the line. */
     fun accept(route: AssistantRoute, turnId: String, revision: Long): Boolean {
         if (turnId.isBlank() || revision < 0) return false
-        if (finalizedEntry[route] == userEntryId(turnId)) return false
+        if (isFinalized(route, turnId)) return false
         val perTurn = lastRevision.getOrPut(route) { mutableMapOf() }
         val previous = perTurn[turnId] ?: Long.MIN_VALUE
         if (revision <= previous) return false
@@ -73,21 +82,36 @@ class AsrRevisionGate {
 
     /** True when a final already replaced the line for [turnId]; a later `ASR` revision is stale. */
     fun isFinalized(route: AssistantRoute, turnId: String): Boolean =
-        finalizedEntry[route] == userEntryId(turnId)
+        finalizedEntries[route]?.contains(userEntryId(turnId)) == true
 
-    /** A final `SAID`/`SHOW` replaced [entryId]; no later revision may reopen that line. */
+    /** A final `SAID` replaced [entryId]; no later revision may reopen that line. */
     fun finalize(route: AssistantRoute, entryId: String) {
-        if (entryId.isNotBlank()) finalizedEntry[route] = entryId
+        if (entryId.isBlank()) return
+        // Only the documented `asr-${turnId}` shape is queryable through `isFinalized`, so a legacy/minted id is not
+        // worth a slot: remembering it could evict a real final without ever being asked about.
+        val turnId = turnIdOf(entryId) ?: return
+        val finalized = finalizedEntries.getOrPut(route) { linkedSetOf() }
+        finalized += entryId
+        while (finalized.size > MAX_FINALIZED_ENTRIES_PER_ROUTE) {
+            val oldest = finalized.firstOrNull() ?: break
+            finalized.remove(oldest)
+        }
+        // The finalized turn's revision domain is dead. Dropping it bounds the per-turn map to turns that have not
+        // finalized yet; a late revision still loses to `isFinalized` above for as long as the id is remembered.
+        lastRevision[route]?.remove(turnId)
     }
 
     /** A new session or a closed/reopened window starts a clean revision domain. */
     fun reset() {
         lastRevision.clear()
-        finalizedEntry.clear()
+        finalizedEntries.clear()
     }
 
     companion object {
         private const val USER_PREFIX = "asr-"
+
+        /** How many finalized user entry ids one route keeps; the same bound the phone's display uses. */
+        private const val MAX_FINALIZED_ENTRIES_PER_ROUTE = 8
 
         /** 0.24 spec §6: the wearer's entry id is derived from the turn, not minted per statement. */
         fun userEntryId(turnId: String): String = "$USER_PREFIX$turnId"

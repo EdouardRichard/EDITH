@@ -2,6 +2,7 @@ package com.sheen.rokid.glasses.display
 
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.output.ConversationEntry
+import com.sheen.rokid.output.ConversationLog
 import com.sheen.rokid.output.ConversationRole
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -79,6 +80,37 @@ class ConversationViewTest {
 
         gate.reset()
         assertTrue("a closed/reopened window starts clean", gate.accept(AssistantRoute.WAKE, "t-1", 1))
+    }
+
+    @Test
+    fun aLateRevisionForAnOlderFinalizedTurnStaysRejectedAfterANewerTurnFinalizes() {
+        // 0.24 Task 15 review I1: the channel is unordered, so after turn 2 finalizes a revision of turn 1 may still be
+        // in flight. A single "last finalized id" forgets turn 1 when turn 2 claims the slot; a bounded set must not.
+        val gate = AsrRevisionGate()
+        assertTrue(gate.accept(AssistantRoute.WAKE, "t-1", 1))
+        gate.finalize(AssistantRoute.WAKE, AsrRevisionGate.userEntryId("t-1"))
+        assertTrue(gate.accept(AssistantRoute.WAKE, "t-2", 1))
+        gate.finalize(AssistantRoute.WAKE, AsrRevisionGate.userEntryId("t-2"))
+
+        assertFalse("a newer final must not forget that the older turn was finalized",
+            gate.accept(AssistantRoute.WAKE, "t-1", 2))
+        assertTrue("the older turn is still final", gate.isFinalized(AssistantRoute.WAKE, "t-1"))
+        assertTrue("the newer final is remembered too", gate.isFinalized(AssistantRoute.WAKE, "t-2"))
+    }
+
+    @Test
+    fun theFinalizedIdMemoryIsBoundedAndEvictsTheOldest() {
+        // Bounded like the phone's display: a long session must not grow this set without end. Dropping the oldest only
+        // means a revision older than that many finalized turns could reopen its row (the documented trade-off).
+        val gate = AsrRevisionGate()
+        val cap = ConversationLog.MAX_ENTRIES
+        repeat(cap + 1) { index ->
+            gate.finalize(AssistantRoute.WAKE, AsrRevisionGate.userEntryId("t-$index"))
+        }
+
+        assertFalse("the oldest final is forgotten once a whole log's worth of turns has finalized",
+            gate.isFinalized(AssistantRoute.WAKE, "t-0"))
+        assertTrue("the newest final is remembered", gate.isFinalized(AssistantRoute.WAKE, "t-$cap"))
     }
 
     @Test

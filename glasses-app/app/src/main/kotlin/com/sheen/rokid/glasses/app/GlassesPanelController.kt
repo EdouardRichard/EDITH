@@ -408,7 +408,8 @@ class GlassesPanelController(
      *
      * The row is `asr-${turnId}`, the same id the final `SAID` replaces, so revisions update **one** user row in
      * place. Revisions are monotonic per route/turn; an out-of-order one is dropped. A final already replaced the
-     * line, so any later revision for that entry is stale and dropped too - the final text is authoritative.
+     * line, so any later revision for that entry is stale and dropped too while the gate still remembers that final
+     * (a bounded history per route) - the final text is authoritative.
      *
      * Like `SAID`, a revision for the route that is not on screen is stored but does not move the view: only a `SHOW`
      * changes the route.

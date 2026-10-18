@@ -370,6 +370,25 @@ class GlassesPanelControllerTest {
     }
 
     @Test
+    fun aLateAsrRevisionForAnOlderTurnCannotOverwriteItsFinalAfterANewerTurnFinalized() {
+        // 0.24 Task 15 review I1: the custom-command channel is unordered and ASR precedes SAID, so the delayed
+        // revision of turn 1 can arrive after turn 2's final. The final text of turn 1 is authoritative.
+        val harness = Harness()
+        harness.hello()
+        harness.asr(turnId = "turn-1", revision = 1, text = "第一轮半句")
+        harness.said(sequence = 2, entryId = "asr-turn-1", text = "第一轮的最终话")
+        harness.asr(turnId = "turn-2", revision = 1, text = "第二轮半句")
+        harness.said(sequence = 3, entryId = "asr-turn-2", text = "第二轮的最终话")
+
+        harness.asr(turnId = "turn-1", revision = 2, text = "迟到的一轮半句")
+
+        assertEquals("a revision delayed across a turn boundary must not reopen the older final",
+            "第一轮的最终话\n第二轮的最终话", harness.controller.conversationText(AssistantRoute.WAKE))
+        assertEquals("no row was added or replaced", 2, harness.port.lastModel().entries.size)
+        assertTrue(harness.diagnostics.any { it.contains("asr refused: final") })
+    }
+
+    @Test
     fun resetForCloseClearsTheAsrRevisionAndFinalityGates() {
         val harness = Harness()
         harness.hello()
