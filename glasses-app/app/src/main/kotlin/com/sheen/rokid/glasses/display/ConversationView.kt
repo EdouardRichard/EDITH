@@ -127,3 +127,72 @@ class AsrRevisionGate {
                 ?.removePrefix(USER_PREFIX)
     }
 }
+
+/**
+ * The answer revision/finality gate (0.24 spec §6, Task 16).
+ *
+ * The answer side of [AsrRevisionGate]'s rule: `ANSWER` revisions are display increments of one answer entry, the
+ * custom-command channel promises no ordering, and the final `SHOW` replaces the line under `say-${hintId}`. A late
+ * revision must therefore neither overwrite a newer one nor reopen a line the final already replaced. Revisions are
+ * counted per **(route, hint)**: a new hint starts its own domain, and the two conversations are independent.
+ *
+ * Finalized entry ids are remembered per route in a bounded set (oldest evicted first), exactly like the ASR gate: a
+ * revision delayed across a later answer's final still cannot reopen its own older row.
+ */
+class AnswerRevisionGate {
+
+    /** The last applied revision per route, then per hint id. */
+    private val lastRevision: MutableMap<AssistantRoute, MutableMap<String, Long>> = mutableMapOf()
+
+    /** The recently finalized answer entry ids per route, oldest first. */
+    private val finalizedEntries: MutableMap<AssistantRoute, MutableSet<String>> = mutableMapOf()
+
+    /** True when [revision] is newer than everything applied for this route/hint and no final claimed the line. */
+    fun accept(route: AssistantRoute, hintId: String, revision: Long): Boolean {
+        if (hintId.isBlank() || revision < 0) return false
+        if (isFinalized(route, hintId)) return false
+        val perHint = lastRevision.getOrPut(route) { mutableMapOf() }
+        val previous = perHint[hintId] ?: Long.MIN_VALUE
+        if (revision <= previous) return false
+        perHint[hintId] = revision
+        return true
+    }
+
+    /** True when the final `SHOW` already replaced the line for [hintId]. */
+    fun isFinalized(route: AssistantRoute, hintId: String): Boolean =
+        finalizedEntries[route]?.contains(answerEntryId(hintId)) == true
+
+    /** A final `SHOW` replaced [entryId]; no later revision may reopen that line. */
+    fun finalize(route: AssistantRoute, entryId: String) {
+        if (entryId.isBlank()) return
+        val hintId = hintIdOf(entryId) ?: return
+        val finalized = finalizedEntries.getOrPut(route) { linkedSetOf() }
+        finalized += entryId
+        while (finalized.size > MAX_FINALIZED_ENTRIES_PER_ROUTE) {
+            val oldest = finalized.firstOrNull() ?: break
+            finalized.remove(oldest)
+        }
+        lastRevision[route]?.remove(hintId)
+    }
+
+    /** A new session or a closed/reopened window starts a clean revision domain. */
+    fun reset() {
+        lastRevision.clear()
+        finalizedEntries.clear()
+    }
+
+    companion object {
+        private const val ANSWER_PREFIX = "say-"
+
+        /** How many finalized answer entry ids one route keeps; the same bound the ASR gate uses. */
+        private const val MAX_FINALIZED_ENTRIES_PER_ROUTE = 8
+
+        /** 0.24 spec §6: the assistant's entry id is derived from the hint, not minted per statement. */
+        fun answerEntryId(hintId: String): String = "$ANSWER_PREFIX$hintId"
+
+        /** The hint named by an answer entry id, or null when the id is not the documented `say-${hintId}` shape. */
+        fun hintIdOf(entryId: String): String? =
+            entryId.takeIf { it.startsWith(ANSWER_PREFIX) && it.length > ANSWER_PREFIX.length }
+                ?.removePrefix(ANSWER_PREFIX)
+    }
+}

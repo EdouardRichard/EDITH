@@ -27,7 +27,6 @@ import com.sheen.rokid.glasses.display.VoiceOrbView
 import com.sheen.rokid.output.ConversationRole
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
-import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
@@ -468,15 +467,8 @@ class GlassesPanelHost(
                 "offset=${scrollOffsetY()} max=${maxScrollY()} ticker=${tickerAnimator != null}")
     }
 
-    /** The orb state from the one model; same priority order as before the extraction, now status-aware. */
-    private fun orbStateFor(model: PanelModel): OrbState = when {
-        model.status == OfficialStatus.ANSWERING ||
-            model.status == OfficialStatus.AUDIO_FINISHED ||
-            model.liveEntryId != null -> OrbState.ANSWERING
-        model.listeningVisible || model.status == OfficialStatus.ASR -> OrbState.LISTENING
-        model.thinkingVisible -> OrbState.THINKING
-        else -> OrbState.IDLE
-    }
+    /** The orb state from the one model; the pure priority rule lives in `orbStateOf` so it is JVM-testable. */
+    private fun orbStateFor(model: PanelModel): OrbState = orbStateOf(model)
 
     /** Redraws the conversation in front of the wearer from the published model. */
     private fun rebuild(model: PanelModel) {

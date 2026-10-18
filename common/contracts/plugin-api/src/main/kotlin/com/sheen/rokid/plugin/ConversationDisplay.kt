@@ -84,6 +84,17 @@ interface ConversationDisplay {
     fun assistantPartial(route: AssistantRoute, turnId: String, hintId: String, revision: Long, text: String) {}
 
     /**
+     * 0.24 spec §5.5/§6: the assistant's **final** answer for [turnId], recorded under the exact entry id its
+     * streaming revisions used (`say-${hintId}` by convention).
+     *
+     * Task 16: the final answer already reaches the glasses as the hint (`SHOW`), so this carries only the phone's own
+     * record. Like [userFinal] it names the turn and the hint, so the final replaces the line
+     * [assistantPartial] opened even when no revision was ever streamed. Default no-op for a host that predates the
+     * official conversation.
+     */
+    fun assistantFinal(route: AssistantRoute, turnId: String, hintId: String, text: String) {}
+
+    /**
      * 0.24 spec §5.5: a tool row for the action labelled [label], before ([ToolPhase.START]) and after
      * ([ToolPhase.END]) it runs.
      *

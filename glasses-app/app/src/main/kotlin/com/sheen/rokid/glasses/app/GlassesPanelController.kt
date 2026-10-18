@@ -2,10 +2,12 @@ package com.sheen.rokid.glasses.app
 
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.glasses.bridge.GlassClockResponder
+import com.sheen.rokid.glasses.display.AnswerRevisionGate
 import com.sheen.rokid.glasses.display.AsrRevisionGate
 import com.sheen.rokid.glasses.display.BusyState
 import com.sheen.rokid.glasses.display.ConversationOrder
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
+import com.sheen.rokid.glasses.display.OrbState
 import com.sheen.rokid.glasses.display.SaidSequenceGate
 import com.sheen.rokid.output.BackAction
 import com.sheen.rokid.output.ConversationEntry
@@ -121,6 +123,9 @@ class GlassesPanelController(
     /** Rejects an out-of-order `ASR` revision, and any revision after the final `SAID` replaced that line. */
     private val asrGate = AsrRevisionGate()
 
+    /** Rejects an out-of-order `ANSWER` revision, and any revision after the final `SHOW` replaced that line. */
+    private val answerGate = AnswerRevisionGate()
+
     /** Whether the assistant is working, per route; the level expires by itself inside the class. */
     private val busyState = BusyState()
 
@@ -222,6 +227,10 @@ class GlassesPanelController(
             // arrives as `SAID` under that same id.
             is HintCommand.Asr -> onAsr(command)
 
+            // 0.24 S4 Task 16: one streaming answer revision. It updates the row `say-${hintId}` in place; the final
+            // still arrives as the hint `SHOW` under that same id.
+            is HintCommand.Answer -> onAnswer(command)
+
             // Phase C: whether the assistant is working. Same session gate as a SHOW.
             is HintCommand.Busy -> onBusy(command)
 
@@ -318,6 +327,7 @@ class GlassesPanelController(
         order.reset()
         saidGate.reset()
         asrGate.reset()
+        answerGate.reset()
         busyState.reset()
         resetOfficialState(resetSequence = false)
         liveEntryId = null
@@ -360,6 +370,7 @@ class GlassesPanelController(
             order.reset()
             saidGate.reset()
             asrGate.reset()
+            answerGate.reset()
             busyState.reset()
             resetOfficialState(resetSequence = true)
             liveEntryId = null
@@ -443,6 +454,45 @@ class GlassesPanelController(
     }
 
     /**
+     * One streaming answer revision (0.24 spec §5.6/§6, Task 16). Must run on the UI thread.
+     *
+     * The row is `say-${hintId}`, the same id the final `SHOW` replaces, so revisions update **one** assistant row in
+     * place. Revisions are monotonic per route/hint; an out-of-order one is dropped. A final already replaced the
+     * line, so any later revision for that entry is stale and dropped too while the gate still remembers that final
+     * (a bounded history per route) - the final text is authoritative.
+     *
+     * Like `SAID`/`ASR`, a revision for the route that is not on screen is stored but does not move the view: only a
+     * `SHOW` changes the route.
+     */
+    private fun onAnswer(command: HintCommand.Answer) {
+        if (!hints.isCurrent(command.sessionId, command.generation)) {
+            diagnostics("answer refused: session or generation mismatch")
+            return
+        }
+        if (command.text.isBlank()) {
+            diagnostics("answer refused: blank text")
+            return
+        }
+        if (answerGate.isFinalized(command.route, command.hintId)) {
+            diagnostics("answer refused: final already stored route=${command.route.name} hint=${command.hintId}")
+            return
+        }
+        if (!answerGate.accept(command.route, command.hintId, command.revision)) {
+            diagnostics("answer refused: revision ${command.revision} is not newer")
+            return
+        }
+        val entryId = AnswerRevisionGate.answerEntryId(command.hintId)
+        val stored = log.append(
+            ConversationEntry(entryId, command.route, ConversationRole.ASSISTANT, command.text, command.turnId))
+        diagnostics("answer stored=$stored route=${command.route.name} rev=${command.revision} " +
+            "chars=${command.text.length}")
+        if (stored && command.route == order.selected()) {
+            contentRevision++
+            renderModel()
+        }
+    }
+
+    /**
      * Records the level the phone stated and puts the panel in line with it.
      *
      * The level is bounded in [BusyState], so a "finished" that never arrives stops by itself rather than holding the
@@ -488,7 +538,29 @@ class GlassesPanelController(
             hiFirstOpen[command.route] = false
         }
         diagnostics("state route=${command.route.name} status=${status.name} sequence=${command.sequence}")
-        if (command.route == order.selected()) applyAndRender()
+        if (command.route == order.selected()) {
+            // 0.24 S4 Task 16 (Task 13 carry I1): a level that names something other than "an answer is in front of
+            // the wearer" retires the previous answer's live emphasis. Without this a live answer left over from
+            // `SHOW` kept the orb ANSWERING through status 5 -> 1 and could mask status 4's thinking orb.
+            if (retiresLiveAnswer(status)) liveEntryId = null
+            applyAndRender()
+        }
+    }
+
+    /**
+     * Whether [status] ends the previous answer's live emphasis.
+     *
+     * `AUDIO_FINISHED` is the official `AudioFinishedHandler`: the answer item is finalised and the following status 1
+     * is a new listening round. Status 0/1/2/4 each name a state in which no answer is the current item (listening,
+     * ASR, thinking), so they outrank a prior answer too. Status 3 (answering) and 7 (tool work) keep the live row.
+     */
+    private fun retiresLiveAnswer(status: OfficialStatus): Boolean = when (status) {
+        OfficialStatus.EMPTY,
+        OfficialStatus.LISTENING,
+        OfficialStatus.ASR,
+        OfficialStatus.ASR_END,
+        OfficialStatus.AUDIO_FINISHED -> true
+        OfficialStatus.ANSWERING, OfficialStatus.TOOL -> false
     }
 
     /** The official `showIdleStatus`: not status 0, and it ends the window's first listening turn. */
@@ -547,14 +619,23 @@ class GlassesPanelController(
         if (displayed == null) {
             liveEntryId = null
         } else {
+            // 0.24 S4 Task 16 (spec §6): the answer row is `say-${hintId}` on both screens. The final SHOW replaces
+            // the row the streamed `ANSWER` revisions opened instead of appending a second assistant line; the turn
+            // the partial carried survives the replacement (SHOW itself has no turn field).
+            val entryId = AnswerRevisionGate.answerEntryId(displayed.hintId)
+            val previousTurn = log.entries(displayed.route)
+                .firstOrNull { it.entryId == entryId }
+                ?.turnId
             val stored = log.append(
-                ConversationEntry(displayed.hintId, displayed.route, ConversationRole.ASSISTANT, displayed.text))
+                ConversationEntry(entryId, displayed.route, ConversationRole.ASSISTANT, displayed.text, previousTurn))
             if (!stored) {
                 // Refused only for a blank id or blank text, which the wire already rejects; recorded rather than
                 // dropped silently because "nothing appeared" would otherwise have no cause.
                 diagnostics("hint refused by the conversation log: blank id or text")
+            } else {
+                answerGate.finalize(displayed.route, entryId)
             }
-            liveEntryId = displayed.hintId
+            liveEntryId = entryId
             // The display follows what arrived. Without this the wearer reading one conversation would never see a
             // hint filed under the other, which is precisely the failure the route tags exist to prevent.
             order.show(displayed.route)
@@ -731,5 +812,26 @@ class GlassesPanelController(
         const val ACTION_UP = 1
         const val KEYCODE_BACK = 4
         const val KEYCODE_ENTER = 66
+    }
+}
+
+/**
+ * The orb state from one published model (0.24 S4 Task 16, Task 13 carry I1).
+ *
+ * An official status outranks a leftover live answer: the status names what the panel is doing **now**. Status 0/1/2
+ * are the listener segments, 4 is the thinking segment, and 3/5/7 are the answer/finish segments (spec §3.4's PAG
+ * table). Only when no official status exists - an old phone, or a fresh window - does the legacy
+ * live/listening/thinking order decide. This is a pure decision so the orb priority fails a JVM test instead of only
+ * being visible on a worn screen; `GlassesPanelHost.applyVisualState` renders it.
+ */
+internal fun orbStateOf(model: PanelModel): OrbState = when (model.status) {
+    OfficialStatus.ANSWERING, OfficialStatus.AUDIO_FINISHED, OfficialStatus.TOOL -> OrbState.ANSWERING
+    OfficialStatus.ASR_END -> OrbState.THINKING
+    OfficialStatus.EMPTY, OfficialStatus.LISTENING, OfficialStatus.ASR -> OrbState.LISTENING
+    null -> when {
+        model.liveEntryId != null -> OrbState.ANSWERING
+        model.listeningVisible -> OrbState.LISTENING
+        model.thinkingVisible -> OrbState.THINKING
+        else -> OrbState.IDLE
     }
 }

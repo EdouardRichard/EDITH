@@ -568,6 +568,36 @@ class ConversationCycleTest {
     }
 
     @Test
+    fun `an early speech finished is discarded when a newer answer emit starts`() {
+        // 0.24 S4 Task 16 (Task 14 carry): `earlySpeech` is remembered per route/turn, not per emit. A short playback
+        // that ends before the answer-done report belongs to the emit that was current when it ended; a superseding
+        // answer emit must not let that stale result satisfy its own speech wait.
+        val rig = rig(panelVisible = true)
+        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
+        rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
+
+        rig.cycle.onSpeechFinished(AssistantRoute.WAKE, SpeechResult.FINISHED)
+        // A second, superseding answer emit for the same turn: the earlier playback end is now stale.
+        rig.cycle.onAnswerEmit(AssistantRoute.WAKE)
+        rig.cycle.onAnswerDone(AssistantRoute.WAKE, displayed = true, speech = true)
+
+        assertEquals(
+            emptyList<String>(),
+            rig.continuations,
+            "the superseded emit's speech end must not continue the newer answer",
+        )
+        assertTrue(
+            OfficialStatus.AUDIO_FINISHED.wire !in rig.display.statuses,
+            "the newer answer still waits for its own speech end",
+        )
+
+        rig.cycle.onSpeechFinished(AssistantRoute.WAKE, SpeechResult.FINISHED)
+
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, rig.display.statuses.last())
+        assertEquals(listOf("turn-1"), rig.continuations, "its own speech end continues exactly once")
+    }
+
+    @Test
     fun `speech finished without a pending spoken answer does not continue anything`() {
         val rig = rig(panelVisible = true)
         rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")

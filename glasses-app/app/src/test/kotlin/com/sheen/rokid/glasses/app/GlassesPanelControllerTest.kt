@@ -3,6 +3,7 @@ package com.sheen.rokid.glasses.app
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.glasses.display.BusyState
 import com.sheen.rokid.glasses.display.GlassesPanelSpec
+import com.sheen.rokid.glasses.display.OrbState
 import com.sheen.rokid.output.ConversationRole
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
@@ -137,6 +138,19 @@ class GlassesPanelControllerTest {
             generation: Long = 1,
         ): Boolean = accept(
             HintCommand.Asr(sessionId, generation, route, turnId = turnId, revision = revision, text = text),
+        )
+
+        fun answer(
+            route: AssistantRoute = AssistantRoute.WAKE,
+            turnId: String = "turn-1",
+            hintId: String = "h-1",
+            revision: Long = 1,
+            text: String = "一半",
+            sessionId: String = "s-1",
+            generation: Long = 1,
+        ): Boolean = accept(
+            HintCommand.Answer(sessionId, generation, route, turnId = turnId, hintId = hintId,
+                revision = revision, text = text),
         )
 
         fun busy(route: AssistantRoute = AssistantRoute.WAKE, busy: Boolean = true): Boolean =
@@ -413,9 +427,10 @@ class GlassesPanelControllerTest {
 
         val model = harness.port.lastModel()
         assertEquals("a SHOW is what brings a route to the front", AssistantRoute.PROACTIVE, model.route)
-        assertEquals("h-p", model.liveEntryId)
+        assertEquals("the live row is the documented say-hintId answer entry", "say-h-p", model.liveEntryId)
         val entry = model.entries.single()
         assertEquals(ConversationRole.ASSISTANT, entry.role)
+        assertEquals("say-h-p", entry.entryId)
         assertEquals("主动提醒一句", entry.text)
         val ack = harness.sent.filterIsInstance<HintCommand.Ack>().single()
         assertEquals("the ACK follows the committed row", "h-p", ack.hintId)
@@ -427,7 +442,7 @@ class GlassesPanelControllerTest {
         harness.hello()
         harness.sync()
         harness.show(text = "答案在这里")
-        assertEquals("h-1", harness.port.lastModel().liveEntryId)
+        assertEquals("say-h-1", harness.port.lastModel().liveEntryId)
 
         harness.clock.nanos += 6_000_000_000L
         harness.scheduler.tasks.forEach { it() }
@@ -437,6 +452,138 @@ class GlassesPanelControllerTest {
             model.liveEntryId)
         assertEquals("but the conversation the wearer reads back from must survive it",
             "答案在这里", harness.controller.conversationText(AssistantRoute.WAKE))
+    }
+
+    // ---------------------------------------------------------------- streamed answers (0.24 S4 Task 16)
+
+    @Test
+    fun streamedAnswerRevisionsUpdateOneAssistantRowInPlaceAndKeepTheirTurn() {
+        val harness = Harness()
+        harness.hello()
+
+        harness.answer(revision = 1, text = "今天")
+        harness.answer(revision = 2, text = "今天晴。")
+
+        val model = harness.port.lastModel()
+        val entry = model.entries.single()
+        assertEquals("say-h-1", entry.entryId)
+        assertEquals(ConversationRole.ASSISTANT, entry.role)
+        assertEquals("the revision carries its turn so a screen can group the exchange", "turn-1", entry.turnId)
+        assertEquals("the later revision replaces the row in place", "今天晴。", entry.text)
+        assertTrue("a stored revision is new content the view must reveal", model.contentRevision > 0)
+        assertNull("only a SHOW makes a row live", model.liveEntryId)
+    }
+
+    @Test
+    fun theFinalShowReplacesTheStreamedAnswerRowAndUsesTheSameEntryIdentity() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+
+        harness.answer(revision = 2, text = "今天晴")
+        harness.show(sequence = 1, hintId = "h-1", text = "今天晴。")
+
+        val model = harness.port.lastModel()
+        val entry = model.entries.single()
+        assertEquals("the final answer is the same say-hintId row the revisions opened", "say-h-1", entry.entryId)
+        assertEquals("the final keeps the turn its partial established", "turn-1", entry.turnId)
+        assertEquals("今天晴。", entry.text)
+        assertEquals("the live row names the entry id, not the bare hint id", "say-h-1", model.liveEntryId)
+        val ack = harness.sent.filterIsInstance<HintCommand.Ack>().single()
+        assertEquals("the ACK keeps the wire hint id", "h-1", ack.hintId)
+    }
+
+    @Test
+    fun aFinalShowWithoutAnyRevisionStillUsesTheSayEntryIdentity() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+
+        harness.show(hintId = "h-9", text = "直接给出的答案")
+
+        val model = harness.port.lastModel()
+        val entry = model.entries.single()
+        assertEquals("the documented convention is producer-independent", "say-h-9", entry.entryId)
+        assertEquals("say-h-9", model.liveEntryId)
+    }
+
+    @Test
+    fun outOfOrderAnswerRevisionsAreDropped() {
+        val harness = Harness()
+        harness.hello()
+
+        harness.answer(revision = 2, text = "答案二")
+        harness.answer(revision = 1, text = "迟到的答案一")
+
+        assertEquals("答案二", harness.controller.conversationText(AssistantRoute.WAKE))
+    }
+
+    @Test
+    fun aStreamedRevisionAfterTheFinalShowIsDropped() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.answer(revision = 1, text = "答案")
+        harness.show(sequence = 1, hintId = "h-1", text = "答案。")
+        val rendersBefore = harness.port.models.size
+
+        harness.answer(revision = 9, text = "迟到的答案")
+
+        assertEquals("the final SHOW is authoritative", "答案。",
+            harness.controller.conversationText(AssistantRoute.WAKE))
+        assertEquals("a dropped revision does not repaint", rendersBefore, harness.port.models.size)
+    }
+
+    @Test
+    fun theAnsweringOrbRetiresAtStatusFiveSoTheAutomaticNextRoundListens() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.show(hintId = "h-1", text = "答案在这里")
+
+        harness.state(OfficialStatus.ANSWERING, sequence = 1)
+        assertEquals(OrbState.ANSWERING, orbStateOf(harness.port.lastModel()))
+
+        harness.state(OfficialStatus.AUDIO_FINISHED, sequence = 2)
+        val finished = harness.port.lastModel()
+        assertNull("status five finalises the previous answer item", finished.liveEntryId)
+        assertEquals("status five still plays the finish animation", OrbState.ANSWERING, orbStateOf(finished))
+
+        harness.state(OfficialStatus.LISTENING, sequence = 3)
+        val listening = harness.port.lastModel()
+        assertNull("the next round has no live answer of its own yet", listening.liveEntryId)
+        assertTrue(listening.listeningVisible)
+        assertFalse("the automatic next round must not say Hi again", listening.hiVisible)
+        assertEquals("SHOW -> 3 -> 5 -> 1 ends in a listening orb", OrbState.LISTENING, orbStateOf(listening))
+    }
+
+    @Test
+    fun statusFourOutranksAPriorLiveAnswer() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.show(hintId = "h-1", text = "上一条答案")
+
+        harness.state(OfficialStatus.ASR_END, sequence = 1)
+
+        val model = harness.port.lastModel()
+        assertNull("a thinking status is not the previous answer's state", model.liveEntryId)
+        assertTrue(model.thinkingVisible)
+        assertEquals("a prior live answer must not mask the thinking orb", OrbState.THINKING, orbStateOf(model))
+    }
+
+    @Test
+    fun statusTwoRetiresAPriorLiveAnswerForTheListeningOrb() {
+        val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.show(hintId = "h-1", text = "上一条答案")
+
+        harness.state(OfficialStatus.ASR, sequence = 1)
+
+        val model = harness.port.lastModel()
+        assertNull("the wearer speaking ends the previous answer's live state", model.liveEntryId)
+        assertEquals(OrbState.LISTENING, orbStateOf(model))
     }
 
     // ---------------------------------------------------------------- new-content revision (the reveal signal)
@@ -458,7 +605,7 @@ class GlassesPanelControllerTest {
             before.entries, after.entries)
         assertEquals("but a newer revision is still new content the view must reveal",
             before.contentRevision + 1, after.contentRevision)
-        assertEquals("h-same", after.liveEntryId)
+        assertEquals("say-h-same", after.liveEntryId)
     }
 
     @Test
@@ -702,7 +849,7 @@ class GlassesPanelControllerTest {
         harness.busy(busy = true)
         harness.pin()
         val before = harness.port.lastModel()
-        assertEquals("h-1", before.liveEntryId)
+        assertEquals("say-h-1", before.liveEntryId)
         assertTrue("the pin was set before the close", before.pinned)
         assertFalse("a busy level was reported before the close", before.idle)
         assertEquals(2, before.entries.size)
@@ -739,7 +886,7 @@ class GlassesPanelControllerTest {
         harness.show()
 
         val reopened = harness.port.lastModel()
-        assertEquals("the same hint id must be displayable in the new window", "h-1", reopened.liveEntryId)
+        assertEquals("the same hint id must be displayable in the new window", "say-h-1", reopened.liveEntryId)
         assertEquals("答案在这里", harness.controller.conversationText(AssistantRoute.WAKE))
         assertEquals("the session identity survives the window reset", "s-1" to 1L,
             harness.controller.currentIdentity())
@@ -751,7 +898,7 @@ class GlassesPanelControllerTest {
         harness.hello()
         harness.sync()
         harness.show()
-        assertEquals("h-1", harness.port.lastModel().liveEntryId)
+        assertEquals("say-h-1", harness.port.lastModel().liveEntryId)
 
         harness.controller.disconnect()
 

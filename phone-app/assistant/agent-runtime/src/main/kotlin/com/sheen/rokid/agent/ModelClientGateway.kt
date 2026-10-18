@@ -144,7 +144,16 @@ class ModelClientGateway(
         val wakeAtDeadline = scheduler.at(request.deadlineNanos) { accumulated.wake() }
         val caller = Thread.currentThread()
         val handle = try {
-            client.request(modelRequest) { event -> accumulated.accept(event, Thread.currentThread() === caller) }
+            client.request(modelRequest) { event ->
+                val accepted = accumulated.accept(event, Thread.currentThread() === caller)
+                // 0.24 S4 (spec §5.5): every accepted text delta is handed to the display observer on the transport
+                // thread. It is deliberately outside the accumulator's lock (the turn thread waits on that lock) and
+                // best-effort: a display that throws is a lost revision, never a lost answer. A delta after the
+                // verdict is not accepted and therefore not streamed - the final text stays authoritative.
+                if (accepted && event is ModelStreamEvent.TextDelta) {
+                    runCatching { request.onTextDelta?.invoke(event.text) }
+                }
+            }
         } catch (error: Throwable) {
             wakeAtDeadline.cancel()
             throw error
@@ -418,21 +427,31 @@ class ModelClientGateway(
             terminalCalls.map { ToolCall(it.callId, it.name, it.argsJson, it.itemId) }
         }
 
-        fun accept(event: ModelStreamEvent, onCallingThread: Boolean) {
+        fun accept(event: ModelStreamEvent, onCallingThread: Boolean): Boolean {
             lock.withLock {
                 // One verdict: everything after the terminal is a late delivery and is dropped.
-                if (terminalEvent != null) return
+                if (terminalEvent != null) return false
                 sawSynchronous = sawSynchronous || onCallingThread
-                when (event) {
-                    is ModelStreamEvent.TextDelta -> text.append(event.text)
-                    is ModelStreamEvent.ToolCallDelta -> deltaItems += event.itemId
+                return when (event) {
+                    is ModelStreamEvent.TextDelta -> {
+                        text.append(event.text)
+                        // Only text is a display increment; the other events stay internal to the accumulation, so
+                        // the observer is called exactly once per accepted answer chunk.
+                        true
+                    }
+                    is ModelStreamEvent.ToolCallDelta -> {
+                        deltaItems += event.itemId
+                        false
+                    }
                     is ModelStreamEvent.ToolCallTerminal -> {
                         terminalItems += event.itemId
                         terminalCalls += event
+                        false
                     }
                     is ModelStreamEvent.Terminal -> {
                         terminalEvent = event
                         ready.signalAll()
+                        false
                     }
                 }
             }

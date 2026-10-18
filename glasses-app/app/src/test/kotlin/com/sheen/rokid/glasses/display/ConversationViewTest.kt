@@ -121,4 +121,53 @@ class ConversationViewTest {
         assertEquals(null, AsrRevisionGate.turnIdOf("said-1"))
         assertEquals(null, AsrRevisionGate.turnIdOf("asr-"))
     }
+
+    // ---------------------------------------------------------------- answer revisions (0.24 S4 Task 16)
+
+    @Test
+    fun answerRevisionsAreMonotonicPerHint() {
+        val gate = AnswerRevisionGate()
+
+        assertTrue(gate.accept(AssistantRoute.WAKE, "h-1", 1))
+        assertTrue(gate.accept(AssistantRoute.WAKE, "h-1", 2))
+        assertFalse("a revision at or below the applied one is late", gate.accept(AssistantRoute.WAKE, "h-1", 2))
+        assertFalse(gate.accept(AssistantRoute.WAKE, "h-1", 1))
+        assertTrue("a new answer entry starts its own revision domain", gate.accept(AssistantRoute.WAKE, "h-2", 1))
+        assertTrue("the other conversation has its own revisions", gate.accept(AssistantRoute.PROACTIVE, "h-1", 1))
+    }
+
+    @Test
+    fun aFinalizedAnswerEntryRejectsEveryLaterRevisionUntilTheWindowResets() {
+        val gate = AnswerRevisionGate()
+        assertTrue(gate.accept(AssistantRoute.WAKE, "h-1", 1))
+
+        gate.finalize(AssistantRoute.WAKE, AnswerRevisionGate.answerEntryId("h-1"))
+        assertFalse("the final SHOW replaces the line; a late revision cannot reopen it",
+            gate.accept(AssistantRoute.WAKE, "h-1", 9))
+        assertTrue("a new hint is not the finalized entry", gate.accept(AssistantRoute.WAKE, "h-2", 1))
+
+        gate.reset()
+        assertTrue("a closed/reopened window starts clean", gate.accept(AssistantRoute.WAKE, "h-1", 1))
+    }
+
+    @Test
+    fun aLateAnswerRevisionForAnOlderFinalizedHintStaysRejectedAfterANewerHintFinalizes() {
+        // Same unordered-channel rule as ASR: after answer 2 finalizes, a delayed revision of answer 1 may still be in
+        // flight, so the gate keeps a bounded set of finalized answer entries rather than only the latest.
+        val gate = AnswerRevisionGate()
+        assertTrue(gate.accept(AssistantRoute.WAKE, "h-1", 1))
+        gate.finalize(AssistantRoute.WAKE, AnswerRevisionGate.answerEntryId("h-1"))
+        assertTrue(gate.accept(AssistantRoute.WAKE, "h-2", 1))
+        gate.finalize(AssistantRoute.WAKE, AnswerRevisionGate.answerEntryId("h-2"))
+
+        assertFalse("a newer final must not forget the older answer",
+            gate.accept(AssistantRoute.WAKE, "h-1", 2))
+        assertTrue(gate.isFinalized(AssistantRoute.WAKE, "h-1"))
+        assertTrue(gate.isFinalized(AssistantRoute.WAKE, "h-2"))
+    }
+
+    @Test
+    fun theAnswerEntryIdConventionIsExplicit() {
+        assertEquals("say-hint-9", AnswerRevisionGate.answerEntryId("hint-9"))
+    }
 }

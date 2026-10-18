@@ -75,6 +75,14 @@ data class AgentRequest(
      * compose its system slot, the memory it captured for the turn, the given transcript, and `USER_INPUT` last.
      */
     val frameFor: ((transcript: List<ModelHistoryItem>) -> RequestFrame)? = null,
+    /**
+     * 0.24 S4 (spec §5.5): the streaming display observer for every model request of this run.
+     *
+     * Forwarded verbatim to each [GatewayTurn] — a run issues more than one request (a tool round, a retry) and the
+     * answer may be assembled from the last one. The loop itself never reads the chunks: the final assembly is still
+     * [AgentRun.finalText], and streaming is display-only (a lost callback can never change the answer).
+     */
+    val onTextDelta: ((String) -> Unit)? = null,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -318,6 +326,8 @@ class AgentLoop(
                         turnDeadlineNanos
                     },
                     frame = frameForTurn,
+                    // 0.24 S4: one observer for every request of the run; it owns no request state itself.
+                    onTextDelta = request.onTextDelta,
                 ),
             )
             // A turn that was blocked when `cancel()` arrived must not complete the run with a late answer.

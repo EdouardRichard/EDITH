@@ -22,13 +22,18 @@ import kotlin.test.assertTrue
 
 class AgentLoopTest {
 
-    private fun request(deadlineNanos: Long = Long.MAX_VALUE, requestTimeoutNanos: Long = 0L) = AgentRequest(
+    private fun request(
+        deadlineNanos: Long = Long.MAX_VALUE,
+        requestTimeoutNanos: Long = 0L,
+        onTextDelta: ((String) -> Unit)? = null,
+    ) = AgentRequest(
         turnId = "turn-7",
         utterance = "把音量调小一点",
         instructions = "You are Edith.",
         profileId = "deepseek-default",
         deadlineNanos = deadlineNanos,
         requestTimeoutNanos = requestTimeoutNanos,
+        onTextDelta = onTextDelta,
     )
 
     private fun newLoop(
@@ -1019,6 +1024,31 @@ class AgentLoopTest {
 
         assertEquals(AgentOutcome.DEADLINE, run.outcome, "只有等人的时间被排除，机器的时间仍要计入预算")
         assertEquals(1, gateway.requests.size)
+    }
+
+    // --------------------------------------------- streaming text deltas (0.24 S4 Task 16)
+
+    @Test fun `every gateway turn of one run carries the request's text delta observer`() {
+        // A run asks the model more than once (a tool round does), and the answer may be assembled from the last
+        // request. The observer therefore belongs to the whole run, not just the opening turn.
+        val seen = mutableListOf<String>()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "答案")),
+        )
+
+        newLoop(gateway).run(request(onTextDelta = { seen += it }))
+
+        assertEquals(2, gateway.requests.size, "the fixture took exactly one tool round")
+        gateway.requests.forEach { it.onTextDelta?.invoke("流") }
+        assertEquals(listOf("流", "流"), seen, "each request must forward the same observer")
+    }
+
+    @Test fun `a run without a text delta observer leaves every gateway turn's observer null`() {
+        val gateway = ScriptedGateway(listOf(reply(text = "答案")))
+
+        newLoop(gateway).run(request())
+
+        assertNull(gateway.requests.single().onTextDelta, "no observer means no callback wiring, exactly as before 0.24")
     }
 
     // --------------------------------------------- the per-request cap is not the turn budget (D49)

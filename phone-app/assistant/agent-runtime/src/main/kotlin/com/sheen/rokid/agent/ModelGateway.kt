@@ -44,6 +44,14 @@ data class GatewayTurn(
      * null（默认）时完全保持 Phase 3 之前的 `split(history)` 行为 ⇒ 既有调用点一行不改。
      */
     val frame: RequestFrame? = null,
+    /**
+     * 0.24 S4 (spec §5.5): the streaming display observer for this turn's answer text.
+     *
+     * It is called once per accepted `TextDelta` with the raw chunk, on the thread the transport delivers on. The final
+     * assembly is unchanged: [GatewayReply.text] remains the accumulated text read at the terminal. A callback that
+     * fails is the display's problem and must not turn a delivered answer into a failed turn.
+     */
+    val onTextDelta: ((String) -> Unit)? = null,
 )
 
 /**

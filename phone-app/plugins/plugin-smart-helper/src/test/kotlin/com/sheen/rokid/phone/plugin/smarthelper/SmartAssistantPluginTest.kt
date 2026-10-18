@@ -301,6 +301,116 @@ class SmartAssistantPluginTest {
         assertTrue(rig.hintTexts.isEmpty())
     }
 
+    // ------------------------------------------------- 0.24 S4 (Task 16): answer streaming
+
+    @Test fun `S4 answer deltas revise one answer row and the final keeps the model's text`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+        rig.model.onRequest = { request, listener ->
+            listener(ModelStreamEvent.TextDelta(request.requestId, "今天"))
+            listener(ModelStreamEvent.TextDelta(request.requestId, "晴。"))
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("今天天气", turnId = "t-7")))
+        rig.tick()
+
+        val hint = rig.output.hints.single()
+        assertEquals("今天晴。", hint.text, "streaming must not change the final answer assembly")
+        assertEquals(
+            listOf(
+                SmartRecordingDisplay.AssistantPartialCall(AssistantRoute.WAKE, "t-7", hint.hintId, 1, "今天"),
+                SmartRecordingDisplay.AssistantPartialCall(AssistantRoute.WAKE, "t-7", hint.hintId, 2, "今天晴。"),
+            ),
+            display.assistantPartials,
+            "every revision carries the final hint id and the accumulated text, with a monotonic revision",
+        )
+        assertEquals(
+            listOf(SmartRecordingDisplay.AssistantFinalCall(AssistantRoute.WAKE, "t-7", hint.hintId, "今天晴。")),
+            display.assistantFinals,
+            "the final statement names the same entry identity the revisions used",
+        )
+        assertEquals(1, rig.output.hints.size, "streaming never submits a hint of its own")
+    }
+
+    @Test fun `S4 a blank delta publishes no row and the first real delta starts at revision one`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+        rig.model.onRequest = { request, listener ->
+            listener(ModelStreamEvent.TextDelta(request.requestId, ""))
+            listener(ModelStreamEvent.TextDelta(request.requestId, "答案。"))
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问", turnId = "t-4")))
+        rig.tick()
+
+        val hint = rig.output.hints.single()
+        assertEquals(
+            listOf(SmartRecordingDisplay.AssistantPartialCall(AssistantRoute.WAKE, "t-4", hint.hintId, 1, "答案。")),
+            display.assistantPartials,
+        )
+    }
+
+    @Test fun `S4 a delta after the final answer is dropped`() {
+        val (rig, display) = cycleRig(panelVisible = true)
+        rig.model.onRequest = { request, listener ->
+            listener(ModelStreamEvent.TextDelta(request.requestId, "答案。"))
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问", turnId = "t-5")))
+        rig.tick()
+        val partialsBefore = display.assistantPartials.size
+
+        // A transport that delivers after its own terminal: the gateway drops it, so the display path is never reached.
+        rig.model.callbacks.single()(ModelStreamEvent.TextDelta("t-5", "迟到的一句话"))
+
+        assertEquals(partialsBefore, display.assistantPartials.size, "the final is authoritative: no late revision")
+        assertEquals("答案。", rig.output.hints.single().text)
+    }
+
+    @Test fun `S4 a streamed answer whose final ACK races the run end settles once on the final emit`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        rig.model.onRequest = { request, listener ->
+            listener(ModelStreamEvent.TextDelta(request.requestId, "答案。"))
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        rig.output.onSubmit = { hint ->
+            rig.output.onSubmit = null
+            rig.plugin.handle(OutputStateEvent(rig.envelope(), hint.hintId, OutputStatus.Displayed, hint.emitId))
+        }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题", turnId = "t-6")))
+        rig.tick()
+
+        assertEquals(1, rig.displayedAcks, "the in-submit ACK is admitted once the final emit is accepted")
+        assertEquals(1, display.assistantPartials.size)
+        assertEquals(1, display.assistantFinals.size)
+        assertEquals(
+            listOf(OfficialStatus.AUDIO_FINISHED.wire, OfficialStatus.LISTENING.wire),
+            display.statuses.takeLast(2),
+            "the streamed display did not settle the answer: the run end does, once, then the next round listens",
+        )
+        assertEquals(2, display.count("working:WAKE"), "exactly one continuation was opened")
+        assertTrue(display.closes.isEmpty())
+    }
+
+    @Test fun `S4 streamed partials do not stand in for a final answer the display rejected`() {
+        val (rig, display) = cycleRig(panelVisible = true, continueDialogue = true)
+        rig.output.submission = OutputSubmission.Rejected
+        rig.model.onRequest = { request, listener ->
+            listener(ModelStreamEvent.TextDelta(request.requestId, "答案。"))
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题", turnId = "t-8")))
+        rig.tick()
+
+        assertTrue(display.assistantPartials.isNotEmpty(), "the deltas really reached the display port")
+        assertEquals(listOf(AssistantRoute.WAKE), display.closes, "an answer nobody saw closes, it never continues")
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses)
+        assertEquals(1, display.assistantFinals.size, "the phone's record still names the final entry")
+    }
+
     @Test fun `transcripts for another session or generation are ignored`() {
         val rig = SmartTestRig()
         rig.activate()

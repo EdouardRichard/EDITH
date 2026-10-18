@@ -19,6 +19,7 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import java.io.ByteArrayOutputStream
 import java.io.PrintStream
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -68,7 +69,9 @@ class ModelClientGatewayTest {
         // `frame = null` is exactly today's `split(history)` behaviour. `frame` is the last parameter.
         limitBytes: Int = Int.MAX_VALUE,
         frame: RequestFrame? = null,
-    ) = GatewayTurn(turnId, profileId, instructions, history, tools, deadlineNanos, limitBytes, frame)
+        // 0.24 S4 Task 16: the streaming observer, appended so every positional call site keeps its meaning.
+        onTextDelta: ((String) -> Unit)? = null,
+    ) = GatewayTurn(turnId, profileId, instructions, history, tools, deadlineNanos, limitBytes, frame, onTextDelta)
 
     private fun scripted(vararg events: ModelStreamEvent) =
         FakeModelClient { _, listener -> events.forEach(listener) }
@@ -264,6 +267,78 @@ class ModelClientGatewayTest {
         assertEquals("answer", reply.text)
         assertTrue(reply.toolCalls.isEmpty())
         assertEquals(ModelEnd.COMPLETED, reply.terminal)
+    }
+
+    // ------------------------------------------------------------ 4b. streaming text deltas (0.24 S4 Task 16)
+
+    @Test fun `text deltas reach the observer in wire order and leave the accumulated final text unchanged`() {
+        val seen = CopyOnWriteArrayList<String>()
+        val client = scripted(
+            ModelStreamEvent.TextDelta("turn-7", "今天"),
+            ModelStreamEvent.TextDelta("turn-7", "晴。"),
+            ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null),
+        )
+
+        val reply = gateway(client).turn(turn(onTextDelta = { seen += it }))
+
+        assertEquals(listOf("今天", "晴。"), seen, "every delta is handed over in the order the transport delivered it")
+        assertEquals("今天晴。", reply.text, "the observer must not change the final assembly")
+        assertEquals(ModelEnd.COMPLETED, reply.terminal)
+    }
+
+    @Test fun `a tool only stream invokes no text observer`() {
+        val seen = CopyOnWriteArrayList<String>()
+        val client = scripted(
+            ModelStreamEvent.ToolCallTerminal("turn-7", "item-1", "call-1", "notify_user", "{}"),
+            ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null),
+        )
+
+        gateway(client).turn(turn(onTextDelta = { seen += it }))
+
+        assertTrue(seen.isEmpty(), "there is no answer text to stream: $seen")
+    }
+
+    @Test fun `a delta after the terminal is neither observed nor allowed to change the final text`() {
+        val seen = CopyOnWriteArrayList<String>()
+        val client = scripted(
+            ModelStreamEvent.TextDelta("turn-7", "答案"),
+            ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null),
+            ModelStreamEvent.TextDelta("turn-7", "尾巴"),
+        )
+
+        val reply = gateway(client).turn(turn(onTextDelta = { seen += it }))
+
+        assertEquals(listOf("答案"), seen, "a late delta is after the verdict and must not reach the display path")
+        assertEquals("答案", reply.text, "the final text is the accumulated text at the terminal")
+    }
+
+    @Test fun `a throwing text observer does not break the model turn`() {
+        val client = scripted(
+            ModelStreamEvent.TextDelta("turn-7", "答案"),
+            ModelStreamEvent.Terminal("turn-7", ModelEnd.COMPLETED, null, null),
+        )
+
+        val reply = gateway(client).turn(turn(onTextDelta = { error("the display refused the revision") }))
+
+        assertEquals(ModelEnd.COMPLETED, reply.terminal)
+        assertEquals("答案", reply.text, "a best-effort display callback must never lose the answer")
+    }
+
+    @Test fun `the text observer runs on the transport thread`() {
+        val threads = CopyOnWriteArrayList<String>()
+        lateinit var delivery: Thread
+        val client = FakeModelClient { request, listener ->
+            delivery = thread(name = "gateway-transport") {
+                listener(ModelStreamEvent.TextDelta(request.requestId, "流"))
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            }
+        }
+
+        val reply = gateway(client).turn(turn(onTextDelta = { threads += Thread.currentThread().name }))
+        delivery.join(5_000)
+
+        assertEquals(ModelEnd.COMPLETED, reply.terminal)
+        assertEquals(listOf("gateway-transport"), threads, "the callback belongs to the transport thread, not the loop's")
     }
 
     @Test fun `a terminal call is a tool call even without a preceding delta`() {

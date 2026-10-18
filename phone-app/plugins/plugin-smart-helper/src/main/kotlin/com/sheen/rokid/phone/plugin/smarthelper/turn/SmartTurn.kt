@@ -114,6 +114,30 @@ internal class SmartTurn private constructor(
     var answerNotified = false
 
     /**
+     * 0.24 S4 Task 16: the answer text the gateway has streamed for **this** turn.
+     *
+     * Display-only. The final answer is still assembled by [assembler] and submitted as the one hint emit; this buffer
+     * exists so every `TextDelta` can be published as the full accumulated revision the glasses replace in place. It is
+     * guarded by the plugin's `gate` (the callback runs on the transport thread), and it never feeds the model or the
+     * final text.
+     */
+    private val streamedAnswer = StringBuilder()
+    private var streamedAnswerRevision = 0L
+
+    /**
+     * Appends one accepted model text delta and returns this revision's number and the accumulated text.
+     *
+     * Must be called under the plugin's `gate`; an empty delta is not a revision. The turn id and hint id are the
+     * caller's to read from the same locked snapshot, so a revision can never be published under a newer turn's ids.
+     */
+    fun appendAnswerDelta(delta: String): Pair<Long, String>? {
+        if (delta.isEmpty()) return null
+        streamedAnswer.append(delta)
+        streamedAnswerRevision += 1
+        return streamedAnswerRevision to streamedAnswer.toString()
+    }
+
+    /**
      * 0.24 S3 Task 14 fix round (I2): the liveness bound for a closing fallback that the assembler may never emit.
      *
      * `ReadableHintAssembler` deliberately drops a sentence shorter than two code points after stripping punctuation,

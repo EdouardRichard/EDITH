@@ -154,6 +154,19 @@ internal class SmartRecordingDisplay : ConversationDisplay {
         val entryId: String,
         val text: String,
     )
+    data class AssistantPartialCall(
+        val route: AssistantRoute,
+        val turnId: String,
+        val hintId: String,
+        val revision: Long,
+        val text: String,
+    )
+    data class AssistantFinalCall(
+        val route: AssistantRoute,
+        val turnId: String,
+        val hintId: String,
+        val text: String,
+    )
 
     val calls = mutableListOf<String>()
     val states = mutableListOf<StateCall>()
@@ -161,6 +174,8 @@ internal class SmartRecordingDisplay : ConversationDisplay {
     val closes = mutableListOf<AssistantRoute>()
     val userPartials = mutableListOf<UserPartialCall>()
     val userFinals = mutableListOf<UserFinalCall>()
+    val assistantPartials = mutableListOf<AssistantPartialCall>()
+    val assistantFinals = mutableListOf<AssistantFinalCall>()
 
     val statuses: List<Int> get() = states.map { it.status }
 
@@ -190,6 +205,24 @@ internal class SmartRecordingDisplay : ConversationDisplay {
     }
 
     override fun assistantMessage(route: AssistantRoute, text: String) {
+        calls += "said:${route.name}:$text"
+    }
+
+    override fun assistantPartial(
+        route: AssistantRoute,
+        turnId: String,
+        hintId: String,
+        revision: Long,
+        text: String,
+    ) {
+        assistantPartials += AssistantPartialCall(route, turnId, hintId, revision, text)
+        calls += "answer:${route.name}:$turnId:$hintId:$revision:$text"
+    }
+
+    override fun assistantFinal(route: AssistantRoute, turnId: String, hintId: String, text: String) {
+        assistantFinals += AssistantFinalCall(route, turnId, hintId, text)
+        // The semantic equivalent of the old `assistantMessage`: this fake records "the assistant's line", and the
+        // level-pairing tests must not care which of the two ports carried it.
         calls += "said:${route.name}:$text"
     }
 

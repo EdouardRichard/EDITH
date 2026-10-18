@@ -80,11 +80,13 @@ private object SilentConversationWire : ConversationWire {
  * from this class at all: it reaches the glasses as the hint (`SHOW`), which already carries its route, ack and TTL.
  *
  * **One serial executor per route.** [userPartial]/[assistantPartial] run on the plugin pool, the final-user statement
- * runs there too, and Task 16's text deltas will run on the transport thread. The record, the pending-entry memory and
+ * runs there too, and Task 16's answer deltas run on the transport thread. The record, the pending-entry memory and
  * the send must be one atomic step per route, or a final can land between a partial's append and its pending-set and
  * mint a second row (`say-<UUID>` / `said-<UUID>`). [routeLocks] is that serial executor; the two routes are
  * independent, so a stalled wake send cannot freeze proactive traffic. A partial that arrives **after** its final is
  * dropped as well: the final is the authoritative text, and re-recording a late revision would overwrite it.
+ * [lastAnswerRevision] adds the other half of the unordered-channel rule: a revision older than the one already
+ * applied is dropped before it touches either screen.
  *
  * **The turn id is re-sent on every revision.** [ConversationLog] replaces the whole entry when an entry id repeats,
  * so a partial revision that carried only its new text would erase the `turnId` the previous revision stored and
@@ -140,6 +142,15 @@ class ConversationWireDisplay(
      */
     private val finalizedUserEntries = mutableMapOf<AssistantRoute, MutableSet<String>>()
     private val finalizedAnswerEntries = mutableMapOf<AssistantRoute, MutableSet<String>>()
+
+    /**
+     * The last accepted answer revision per route, as (entry id, revision).
+     *
+     * Task 16: `ANSWER` revisions arrive on the transport thread and the channel promises no ordering, so a revision
+     * that lost the race must not overwrite a newer one in the phone record or on the glasses. The domain is the
+     * answer entry: a new hint id starts fresh. Guarded by the route's monitor.
+     */
+    private val lastAnswerRevision = mutableMapOf<AssistantRoute, Pair<String, Long>>()
 
     private fun lockFor(route: AssistantRoute): Any = routeLocks.getValue(route)
 
@@ -229,6 +240,17 @@ class ConversationWireDisplay(
         }
     }
 
+    /**
+     * 0.24 S4 Task 16: the exact-identity final answer from the plugin.
+     *
+     * Delegates to [assistantMessage]'s turn-carrying shape: the same `say-${hintId}` entry the revisions used, with
+     * the final text, and no wire send (the glasses get it as the hint `SHOW`). Switching to this call is what keys
+     * `finalizedAnswerEntries` to the documented id even when no revision was ever streamed.
+     */
+    override fun assistantFinal(route: AssistantRoute, turnId: String, hintId: String, text: String) {
+        assistantMessage(route, turnId, hintId, text)
+    }
+
     override fun working(route: AssistantRoute) {
         sendBusy(route, true)
     }
@@ -270,6 +292,9 @@ class ConversationWireDisplay(
         val entryId = "say-$hintId"
         synchronized(lockFor(route)) {
             if (isFinalized(finalizedAnswerEntries, route, entryId)) return
+            val last = lastAnswerRevision[route]
+            if (last != null && last.first == entryId && revision <= last.second) return
+            lastAnswerRevision[route] = entryId to revision
             log.append(ConversationEntry(entryId, route, ConversationRole.ASSISTANT, text, turnId))
             openAnswerEntry[route] = OpenEntry(entryId, turnId)
             wire.answer(route, turnId, hintId, revision, text)

@@ -47,6 +47,12 @@ class ConversationDisplayCallsTest {
             calls += "said:${route.name}:$text"
         }
 
+        override fun assistantFinal(route: AssistantRoute, turnId: String, hintId: String, text: String) {
+            // 0.24 S4 Task 16: the exact-identity final is the semantic equivalent of the old `assistantMessage`; the
+            // level-pairing contract below is about the conversation, not which of the two ports carried the answer.
+            calls += "said:${route.name}:$text"
+        }
+
         override fun working(route: AssistantRoute) {
             calls += "working:${route.name}"
         }
@@ -283,6 +289,7 @@ class ConversationDisplayCallsTest {
             override fun userPartial(route: AssistantRoute, turnId: String, revision: Long, text: String) = probe()
             override fun userFinal(route: AssistantRoute, turnId: String, entryId: String, text: String) = probe()
             override fun assistantMessage(route: AssistantRoute, text: String) = probe()
+            override fun assistantFinal(route: AssistantRoute, turnId: String, hintId: String, text: String) = probe()
             override fun working(route: AssistantRoute) = probe()
             override fun idle(route: AssistantRoute) = probe()
         }
@@ -403,6 +410,35 @@ class ConversationDisplayCallsTest {
         val hintTurn = rig.output.hints.single().sourceTurnId
         assertTrue(rig.cancels.contains(Triple(rig.sessionId, rig.generation, hintTurn)),
             "the accepted-then-stopped hint must be cancelled: ${rig.cancels}")
+    }
+
+    @Test
+    fun aProactiveHintIsRecordedUnderItsOwnSayEntryIdentity() {
+        // 0.24 S4 Task 16: the proactive route has no streamed revisions, so its one statement is the final. It must
+        // still use the documented `say-${hintId}` identity (and its own turn) rather than a minted UUID, so the two
+        // screens' records agree about which hint the sentence belongs to.
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.model.onRequest = { request, listener ->
+            if (request.tools.any { it.name == "propose_hint" }) {
+                listener(smartToolCall("c1", "propose_hint", """{"text":"主动提醒一句"}""",
+                    requestId = request.requestId))
+            }
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+
+        rig.plugin.handle(com.sheen.rokid.contracts.AcousticEvent(rig.envelope(),
+            com.sheen.rokid.contracts.AcousticLabel.Speech))
+        rig.plugin.handle(com.sheen.rokid.contracts.TranscriptEvent(rig.transcript("现在几点了")))
+        rig.tick()
+
+        val hint = rig.output.hints.single()
+        val recorded = display.assistantFinals.single()
+        assertEquals(AssistantRoute.PROACTIVE, recorded.route)
+        assertEquals("主动提醒一句", recorded.text)
+        assertEquals(hint.hintId, recorded.hintId)
+        assertEquals(hint.sourceTurnId, recorded.turnId)
     }
 
     private class DecliningGate : com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate {

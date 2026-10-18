@@ -408,6 +408,66 @@ class ConversationWireDisplayTest {
         assertTrue("neither final is an official command", f.wire.calls.isEmpty())
     }
 
+    // ---------------------------------------------------------------- streamed answers (0.24 S4 Task 16)
+
+    @Test
+    fun theAnswerFinalNamesTheHintEntryEvenWithoutAPartial() {
+        // M6: the final answer must use the same documented `say-${hintId}` identity the revisions use, or a hint that
+        // streamed nothing would mint a `say-<UUID>` row that a following late revision could not be matched against.
+        val f = Fixture()
+        f.display.assistantFinal(AssistantRoute.WAKE, "t7", "h7", "最终的答案")
+
+        val entry = f.log.entries(AssistantRoute.WAKE).single()
+        assertEquals("say-h7", entry.entryId)
+        assertEquals("t7", entry.turnId)
+        assertEquals(ConversationRole.ASSISTANT, entry.role)
+        assertEquals("最终的答案", entry.text)
+        assertTrue("the final answer rides the hint SHOW, not the official wire", f.wire.calls.isEmpty())
+    }
+
+    @Test
+    fun streamedAnswerRevisionsAndTheirFinalStayOneRow() {
+        val f = Fixture()
+        f.display.assistantPartial(AssistantRoute.WAKE, "t7", "h7", 1, "今天")
+        f.display.assistantPartial(AssistantRoute.WAKE, "t7", "h7", 2, "今天晴。")
+        f.display.assistantFinal(AssistantRoute.WAKE, "t7", "h7", "今天晴。")
+
+        val entry = f.log.entries(AssistantRoute.WAKE).single()
+        assertEquals("say-h7", entry.entryId)
+        assertEquals("t7", entry.turnId)
+        assertEquals("今天晴。", entry.text)
+        assertEquals(
+            "the final is not re-sent: it reaches the glasses as the hint SHOW",
+            listOf(
+                WireCall.Answer(AssistantRoute.WAKE, "t7", "h7", 1, "今天"),
+                WireCall.Answer(AssistantRoute.WAKE, "t7", "h7", 2, "今天晴。"),
+            ),
+            f.wire.calls,
+        )
+    }
+
+    @Test
+    fun anOutOfOrderAnswerRevisionIsNeitherRecordedNorForwarded() {
+        val f = Fixture()
+        f.display.assistantPartial(AssistantRoute.WAKE, "t7", "h7", 2, "答案二")
+        f.display.assistantPartial(AssistantRoute.WAKE, "t7", "h7", 1, "迟到的答案一")
+
+        val entry = f.log.entries(AssistantRoute.WAKE).single()
+        assertEquals("答案二", entry.text)
+        assertEquals("a revision at or below the applied one is stale", 1, f.wire.calls.size)
+    }
+
+    @Test
+    fun anAnswerRevisionAfterTheFinalIsDroppedEvenWhenNoPartialPrecededIt() {
+        val f = Fixture()
+        f.display.assistantFinal(AssistantRoute.WAKE, "t7", "h7", "最终答案")
+        f.display.assistantPartial(AssistantRoute.WAKE, "t7", "h7", 1, "迟到的答案")
+
+        val entry = f.log.entries(AssistantRoute.WAKE).single()
+        assertEquals("最终答案", entry.text)
+        assertTrue("a late revision must not even reach the wire", f.wire.calls.isEmpty())
+    }
+
     @Test
     fun aFinalWithoutAPartialKeepsTheOldEntryIdBehavior() {
         val f = Fixture()
@@ -719,6 +779,53 @@ class ConversationWireDisplayTest {
         assertFalse("the final must not mint a fresh say-<UUID>", entry.entryId.startsWith("say-") &&
             entry.entryId != "say-h1")
         assertEquals("one answer revision", 1, wire.answerCalls.size)
+    }
+
+    @Test
+    fun aFinalAnswerWaitsForTheStreamedDeltaItRaced() {
+        // Task 16: the final answer now arrives through the same turn/hint identity as the streamed revisions, and the
+        // transport thread can be inside `assistantPartial` when the run-end final lands on the plugin pool. The
+        // per-route monitor must make the final wait, so it replaces `say-h1` and the glasses are not sent a stale
+        // revision after the authoritative final.
+        val log = ConversationLog()
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val wire = HookedWire(onAnswer = {
+            entered.countDown()
+            assertTrue("the streamed revision must be held", release.await(2, TimeUnit.SECONDS))
+        })
+        val display = ConversationWireDisplay(
+            log = log,
+            wire = wire,
+            sendSaid = { _, _, _ -> true },
+            sendBusy = { _, _ -> true },
+        )
+        val delta = Thread(
+            { display.assistantPartial(AssistantRoute.WAKE, "t1", "h1", 7, "答案") },
+            "streamed-delta",
+        )
+        val finalThread = Thread(
+            { display.assistantFinal(AssistantRoute.WAKE, "t1", "h1", "答案完成") },
+            "final-answer",
+        )
+        try {
+            delta.start()
+            assertTrue("the streamed revision must reach its send", entered.await(2, TimeUnit.SECONDS))
+            finalThread.start()
+            awaitBlocked(finalThread, "the final answer")
+        } finally {
+            release.countDown()
+            delta.join(2_000)
+            finalThread.join(2_000)
+        }
+        assertFalse("the delta thread must finish", delta.isAlive)
+        assertFalse("the final thread must finish", finalThread.isAlive)
+        val entry = log.entries(AssistantRoute.WAKE).single()
+        assertEquals("say-h1", entry.entryId)
+        assertEquals("t1", entry.turnId)
+        assertEquals("the final replaces the streamed text", "答案完成", entry.text)
+        assertEquals("one streamed revision and no late one", 1, wire.answerCalls.size)
+        assertEquals("答案", wire.answerCalls.single().text)
     }
 
     @Test

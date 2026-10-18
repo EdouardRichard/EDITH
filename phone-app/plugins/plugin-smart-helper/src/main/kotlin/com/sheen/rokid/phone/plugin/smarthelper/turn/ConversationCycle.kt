@@ -261,6 +261,20 @@ internal class ConversationCycle(
     // ---------------------------------------------------------------- answer completion
 
     /**
+     * 0.24 S4 Task 16 (Task 14 carry): a new answer emit starts a new speech identity for this route/turn.
+     *
+     * [RouteState.earlySpeech] is keyed by route/turn, so without this a `SpeechFinished` remembered for a superseded
+     * emit could satisfy the newer answer's speech wait. The plugin already drops a stale result by emit id when it
+     * arrives; this closes the window where it arrived **before** the superseding emit existed. Clearing is not a
+     * decision to continue: the new answer still has to be displayed and its own speech still has to end.
+     */
+    fun onAnswerEmit(route: AssistantRoute) {
+        synchronized(lock) {
+            state(route).earlySpeech = null
+        }
+    }
+
+    /**
      * The answer reached the wearer ([displayed] is the host's `Displayed` acknowledgement).
      *
      * Official `AudioFinishedHandler`:

@@ -1053,11 +1053,50 @@ class SmartAssistantPlugin(
         conversation()?.userFinal(route.toContractRoute(), turnId, "asr-$turnId", text)
     }
 
-    /** One message the assistant is telling the wearer, for the route that produced it. */
-    private fun publishAssistantMessage(route: ContextRoute, text: String) {
-        if (text.isBlank()) return
+    /**
+     * The final answer the assistant is telling the wearer, under the entry identity its revisions used.
+     *
+     * 0.24 S4 Task 16 (spec §5.5/§6): the entry id is `say-${hintId}` on both screens. The plugin passes the turn and
+     * the hint it emitted, so a final with no streamed revision still replaces the same documented row; a late delta
+     * is then matched against that id and dropped. The final itself reaches the glasses as the hint (`SHOW`), so this
+     * is the phone's record.
+     */
+    private fun publishAssistantFinal(route: ContextRoute, turnId: String, hintId: String, text: String) {
+        if (text.isBlank() || turnId.isBlank() || hintId.isBlank()) return
         P3Log.line("P3_CONV answer route=${route.toContractRoute().name} chars=${text.length}")
-        conversation()?.assistantMessage(route.toContractRoute(), text)
+        conversation()?.assistantFinal(route.toContractRoute(), turnId, hintId, text)
+    }
+
+    /**
+     * One streaming answer revision (0.24 S4 Task 16, spec §5.5).
+     *
+     * Runs on the model transport thread (the gateway's `onTextDelta` contract), while the final answer is assembled
+     * on the plugin pool and `Stop` arrives on the host dispatcher. The turn identity is read under [gate] and the port
+     * is called **outside** it, like every other display call. The callback is best-effort: any condition that is not
+     * "this exact turn is running and has not emitted its answer yet" drops the revision silently.
+     *
+     * [owned] is captured when the run starts, not read from the current `turn`: a late transport callback from a
+     * previous run must never paint text into the next turn's answer row.
+     */
+    private fun publishAssistantPartial(owned: SmartTurn, delta: String) {
+        if (delta.isEmpty()) return
+        var turnId = ""
+        var hintId = ""
+        var revision = 0L
+        var text = ""
+        synchronized(gate) {
+            if (turn !== owned || owned.closed) return
+            // Once an answer was emitted, the `SHOW` is the authoritative text: nothing streamed after it may revise
+            // the row, and the run-end answer-done decision must stay attached to that emit.
+            if (owned.answerFinal || owned.answerEmitId != null) return
+            val streamed = owned.appendAnswerDelta(delta) ?: return
+            turnId = owned.turnId
+            hintId = owned.hintId
+            revision = streamed.first
+            text = streamed.second
+        }
+        P3Log.line("P3_CONV answer route=WAKE rev=$revision chars=${text.length}")
+        conversation()?.assistantPartial(AssistantRoute.WAKE, turnId, hintId, revision, text)
     }
 
     /** The contract's name for a route; the plugin's own enum stays internal to this module. */
@@ -1797,6 +1836,9 @@ class SmartAssistantPlugin(
                     // drop is the one that matches the "the utterance is already in the history" convention.)
                     history = store?.history() ?: prompt?.history?.dropLast(1).orEmpty(),
                     frameFor = frameFor,
+                    // 0.24 S4 (spec §5.5): every text delta of the run is a display revision for this exact turn.
+                    // The turn is captured here, so a late transport callback from a superseded run is inert.
+                    onTextDelta = { delta -> publishAssistantPartial(owned, delta) },
                 ),
             )
         } catch (failure: Throwable) {
@@ -2551,7 +2593,7 @@ class SmartAssistantPlugin(
                         // submission's, not the compressor's: the compressor's truncation is what writes the dropped
                         // messages to memory, and the trigger belongs to the conversation whether or not the display
                         // accepted it.
-                        recordProactiveTurn(trigger.transcript, text, gateway.lastTrim)
+                        recordProactiveTurn(trigger.transcript, text, hint.hintId, hint.turnId, gateway.lastTrim)
                         submitProactiveHint(hint, text)
                     }
                 }
@@ -2571,12 +2613,18 @@ class SmartAssistantPlugin(
      * recorded: a turn that ended in silence said nothing, and a proactive turn has no memory-extraction candidate
      * (spec §5.5's habits are what the *wearer* keeps doing, which a proactive hint is not).
      */
-    private fun recordProactiveTurn(triggerTranscript: String, hintText: String, trim: TrimCounts?) {
+    private fun recordProactiveTurn(
+        triggerTranscript: String,
+        hintText: String,
+        hintId: String,
+        turnId: String,
+        trim: TrimCounts?,
+    ) {
         if (triggerTranscript.isBlank()) return
         // Phase C: the trigger is what this route records as its user side (see this method's note above), so it is also
         // what the wearer's conversation shows as their own words on the proactive route.
         publishUserMessage(ContextRoute.PROACTIVE, triggerTranscript)
-        publishAssistantMessage(ContextRoute.PROACTIVE, hintText)
+        publishAssistantFinal(ContextRoute.PROACTIVE, turnId, hintId, hintText)
         recordTurnAndCompress(
             ContextRoute.PROACTIVE,
             triggerTranscript,
@@ -2930,7 +2978,14 @@ class SmartAssistantPlugin(
         val stillCurrent = synchronized(gate) { turn === current }
         // 0.24 S3: a hint is being put in front of the wearer, so the official level is ANSWERING (3). Outside the
         // lock, because the cycle displays through the host port.
-        if (stillCurrent) conversationCycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
+        //
+        // 0.24 S4 Task 16: a new answer emit also starts a new speech identity, so a `SpeechFinished` remembered for a
+        // superseded emit cannot satisfy this answer's wait (Task 14 carry). Only for the turn that still owns the
+        // wire: a late emit from a replaced turn must not clear the new turn's memory.
+        if (stillCurrent) {
+            if (recordAsAnswer) conversationCycle.onAnswerEmit(AssistantRoute.WAKE)
+            conversationCycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
+        }
         val result = if (stillCurrent && sink != null) {
             // On submit: the hint's identity and size only. The text itself is the display content and never logged.
             P3Log.line("P3_HINT show hint=${hint.hintId} chars=${hint.text.length}")
@@ -2940,7 +2995,9 @@ class SmartAssistantPlugin(
         }
         // Phase C: the conversation record gets the sentence first - it is what the wearer is being told - and the
         // "working" level then ends, so the ring stops exactly when the answer appears rather than a moment before it.
-        publishAssistantMessage(ContextRoute.WAKE, hint.text)
+        // 0.24 S4 Task 16: the final names the turn and the hint, so it replaces the same `say-${hintId}` row the
+        // streamed revisions opened (and blocks a later revision under that id).
+        publishAssistantFinal(ContextRoute.WAKE, hint.sourceTurnId ?: current.turnId, hint.hintId, hint.text)
         synchronized(gate) { wakeBusy = false }
         // Outside the lock, as `publishBusy` requires: the host's port is what ends the ring.
         publishBusy()
