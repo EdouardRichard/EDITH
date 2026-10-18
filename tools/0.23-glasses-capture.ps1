@@ -1,4 +1,4 @@
-#requires -Version 7.0
+#requires -Version 5.1
 <#
 .SYNOPSIS
     Capture EDITH glasses screenshots driven by the instrumentation marker file (0.23 P3/P4 evidence).
@@ -26,7 +26,11 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# `powershell -File script.ps1 -States a,b,c` (Windows PowerShell 5.1) delivers one string, not an array.
+if ($States.Count -eq 1 -and $States[0].Contains(',')) { $States = $States[0].Split(',') }
 New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
+# A stale `done` from a previous run would make the poll loop exit before the test writes its first state.
+adb -s $Serial shell "rm -f $Marker" 2>$null | Out-Null
 
 if ($StartTest) {
     $null = Start-Job -ScriptBlock {
@@ -39,7 +43,7 @@ if ($StartTest) {
 $last = ''
 $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
 while ((Get-Date) -lt $deadline) {
-    $state = (adb -s $Serial shell cat $Marker 2>$null | Out-String).Trim()
+    $state = (adb -s $Serial shell "cat $Marker 2>/dev/null" | Out-String).Trim()
     if ($state -and $state -ne $last) {
         if ($state -eq 'done') { $last = $state; break }
         if ($States.Count -eq 0 -or $States -contains $state) {
