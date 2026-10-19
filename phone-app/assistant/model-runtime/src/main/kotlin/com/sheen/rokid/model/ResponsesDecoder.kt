@@ -263,11 +263,25 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
         // layer a successful empty turn and silently swallow the call.
         if (end == ModelEnd.COMPLETED && !terminalToolMatches())
             return terminal(ModelEnd.INCOMPLETE, usage, "TOOL_CALL_DELIVERY_INCOMPLETE")
+        // 0.25 Task 13 / R70: a failed response carrying the provider's context-length error is the one failed verdict
+        // the gateway can recover from deterministically, so it gets its own stable code.
+        val failedCode = if (end == ModelEnd.FAILED && responseSignalsContextOverflow(response)) {
+            com.sheen.rokid.agent.CONTEXT_OVERFLOW
+        } else {
+            "PROVIDER_FAILED"
+        }
         return terminal(end, usage, when (end) {
-            ModelEnd.FAILED -> "PROVIDER_FAILED"
+            ModelEnd.FAILED -> failedCode
             ModelEnd.INCOMPLETE -> "PROVIDER_INCOMPLETE"
             else -> null
         })
+    }
+
+    /** The provider's `error.code`/`type`/`message`, matched without keeping any of it. */
+    private fun responseSignalsContextOverflow(response: JsonObject): Boolean {
+        val error = response["error"] as? JsonObject ?: return false
+        fun field(name: String): String? = (error[name] as? JsonPrimitive)?.contentOrNull
+        return isProviderContextOverflow(field("code"), field("type"), field("message"))
     }
 
     /** Mirrors the text path's `text.keys.all { it in delivered }`: every observed call must have its done sentinel. */

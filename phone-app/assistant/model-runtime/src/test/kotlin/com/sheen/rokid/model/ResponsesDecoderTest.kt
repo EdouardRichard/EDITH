@@ -34,6 +34,26 @@ class ResponsesDecoderTest {
     private fun fixture(name: String) = checkNotNull(javaClass.getResource("/responses/$name.sse")).readText()
         .replace("\\u63d0\\u793a", "\u63d0\u793a").replace("\\ud83d\\ude00", "\ud83d\ude00").toByteArray(Charsets.UTF_8)
 
+    @Test fun `a failed response carrying a context length error is CONTEXT_OVERFLOW`() {
+        // 0.25 Task 13 / R70: the Responses error object's machine code is the provider's overflow signal.
+        val events = ResponsesDecoder("q").accept(
+            terminal(
+                "failed",
+                response = """{"id":"r","status":"failed","error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}""",
+            ),
+        )
+        val end = ends(events).single()
+        assertEquals(ModelEnd.FAILED, end.end)
+        assertEquals(com.sheen.rokid.agent.CONTEXT_OVERFLOW, end.safeCode)
+    }
+
+    @Test fun `a failed response without an overflow signal keeps PROVIDER_FAILED`() {
+        val events = ResponsesDecoder("q").accept(terminal("failed"))
+        val end = ends(events).single()
+        assertEquals(ModelEnd.FAILED, end.end)
+        assertEquals("PROVIDER_FAILED", end.safeCode)
+    }
+
     @Test fun `done text is not appended twice`() {
         val decoder = ResponsesDecoder("q")
         val result = decoder.accept(delta(text = "\u63d0\u793a")) + decoder.accept(done(text = "\u63d0\u793a"))

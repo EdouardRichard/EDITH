@@ -59,3 +59,12 @@ interface MediaSource {
      */
     fun resolveImage(artifactId: String): ResolvedImage? = null
 }
+
+/**
+ * The visible text an encoder puts on the wire for a **historical** image whose artifact is gone (0.25 R71).
+ *
+ * The current input still refuses a missing image: that image is the thing being asked about, and silently replacing it
+ * would answer a different question. A tool result from an earlier round, by contrast, is history — its text survives
+ * and this line makes the loss visible instead of dropping the image silently.
+ */
+internal fun imageUnavailablePlaceholder(artifactId: String): String = "[image unavailable: $artifactId]"

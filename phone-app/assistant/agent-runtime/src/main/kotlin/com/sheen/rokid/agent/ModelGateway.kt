@@ -18,6 +18,15 @@ interface ModelGateway {
 }
 
 /**
+ * The stable safe code for "the request does not fit the model's context window" (0.25 R70 / D100).
+ *
+ * It is both a provider verdict (a 400/`response.failed` carrying a context-length error is mapped to it in
+ * `model-runtime`) and this gateway's final answer after its two deterministic recoveries are exhausted. It is a wire
+ * value other layers may read, so it lives beside [GatewayReply.safeCode]'s other codes.
+ */
+const val CONTEXT_OVERFLOW = "CONTEXT_OVERFLOW"
+
+/**
  * One model turn request.
  *
  * [profileId] is the model profile this run belongs to; the loop only forwards it, so the adapter that owns a profile

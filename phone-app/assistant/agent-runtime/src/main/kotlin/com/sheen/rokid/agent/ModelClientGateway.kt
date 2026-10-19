@@ -1,5 +1,6 @@
 package com.sheen.rokid.agent
 
+import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
@@ -12,6 +13,7 @@ import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.OutputModality
 import kotlinx.serialization.json.Json
@@ -38,6 +40,9 @@ private const val TOOL_CALL_DELIVERY_INCOMPLETE = "TOOL_CALL_DELIVERY_INCOMPLETE
  * how long an observed `stop` can go unnoticed when the scheduler is not the one delivering time.
  */
 private const val WAIT_STEP_MILLIS = 10L
+
+/** R70: at most two deterministic recovery re-sends — compress the historical tool rounds, then hard-truncate. */
+private const val MAX_OVERFLOW_RECOVERIES = 2
 
 /** Lenient by construction: a `TOOL_ROUND` body is a JSON document assembled by a caller, and a bad one falls back. */
 private val toolRoundJson = Json { isLenient = true }
@@ -87,6 +92,25 @@ class ModelClientGateway(
     var lastTrim: TrimCounts? = null
         private set
 
+    /**
+     * 0.25 Task 13 (R70; D100): how many deterministic overflow recoveries this gateway has performed.
+     *
+     * Counts only — a recovery sends the **same** turn's request again with a cheaper shape, never a summary request.
+     * It accumulates across the model turns of one run (a gateway instance serves one run), so Task 14's `P3_METRIC`
+     * can read it as the run's `overflows=`. Zero for a run that never overflowed.
+     */
+    var overflowRecoveries: Int = 0
+        private set
+
+    /**
+     * 0.25 Task 13 (R70): how many turns ended with [CONTEXT_OVERFLOW] after both recoveries were exhausted.
+     *
+     * Separate from [overflowRecoveries] on purpose: "the request needed a cheaper retry" and "the request could not be
+     * made to fit" are different facts, and a metric that merged them would hide an outage behind a healthy retry count.
+     */
+    var overflowFailures: Int = 0
+        private set
+
     companion object {
         /**
          * The byte budget a frame is trimmed to, in the same unit and against the same bound `ContextBudgeter`
@@ -95,11 +119,12 @@ class ModelClientGateway(
          * The `- [FIXED_OVERHEAD]` is a **deliberate 32-byte safety margin**, not a correction.
          * [TurnTrimmer.total] and `ContextBudgeter.prepare` (`ContextBudgeter.kt:55-65`) compute structurally
          * identical totals against the same `minOf(...)` limit — the same per-item `bytes + 32`, the same fixed 32,
-         * and `instructions == frame.systemText` — so with one shared limit they would already agree exactly. Taking
-         * one more 32 off makes the trimmer 32 bytes **stricter** than the check it must satisfy, which is the safe
-         * direction; the cost is that a frame within 32 bytes of fitting is trimmed one message earlier than strictly
-         * necessary. Nothing here claims the subtraction is what prevents a rejection: the acceptance test's
-         * discriminating assertion is the send-time `prepare` call itself.
+         * and `instructions == frame.systemText` — so with one shared limit they would already agree exactly. They
+         * also charge the same `ImageBudget.UNITS_PER_IMAGE` per image (R68), so an image-bearing request keeps that
+         * identity. Taking one more 32 off makes the trimmer 32 bytes **stricter** than the check it must satisfy,
+         * which is the safe direction; the cost is that a frame within 32 bytes of fitting is trimmed one message
+         * earlier than strictly necessary. Nothing here claims the subtraction is what prevents a rejection: the
+         * acceptance test's discriminating assertion is the send-time `prepare` call itself.
          */
         internal fun windowBytes(profile: ModelProfile): Int =
             minOf(
@@ -111,38 +136,112 @@ class ModelClientGateway(
     override fun turn(request: GatewayTurn): GatewayReply {
         val profile = profileLookup(request.profileId)
             ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, PROFILE_MISSING)
-        // Phase 5: an assembled RequestFrame is trimmed to the window here and mapped to the request's shape; without
-        // one, the pre-Phase-5 `split(history)` path is kept verbatim.
+        // Phase 5: an assembled RequestFrame is trimmed below and mapped to the request's shape; without one, the
+        // pre-Phase-5 `split(history)` path is kept verbatim, including its "a transport exception escapes" contract.
         val frame = request.frame
-        val transcript = if (frame == null) {
-            split(request.history)
+        if (frame == null) {
+            val transcript = split(request.history)
                 ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN)
-        } else {
-            // The window is the same expression `ContextBudgeter` bounds the send with, minus the deliberate
-            // 32-byte margin (see [windowBytes]). A caller-supplied `limitBytes` (test seam) wins.
-            val limit = if (request.limitBytes == Int.MAX_VALUE) windowBytes(profile) else request.limitBytes
-            val report = TurnTrimmer().trim(frame, limit)
-            lastTrim = report.counts
-            frameToTranscript(report.kept)
-                ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN)
+            return sendTurn(request, modelRequest(request, profile, request.instructions, transcript))
         }
+        // The window is the same expression `ContextBudgeter` bounds the send with, minus the deliberate
+        // 32-byte margin (see [windowBytes]). A caller-supplied `limitBytes` (test seam) wins.
+        val limit = if (request.limitBytes == Int.MAX_VALUE) windowBytes(profile) else request.limitBytes
+        return turnWithOverflowRecovery(request, profile, frame, limit)
+    }
+
+    /**
+     * The frame path with R70's bounded recovery: one normal send, then up to [MAX_OVERFLOW_RECOVERIES] deterministic
+     * re-sends of the **same** turn with a cheaper shape, then [CONTEXT_OVERFLOW].
+     *
+     * The two detectors are the send-time budget's `ConfigurationRejected` and the provider's own overflow verdict
+     * ([GatewayReply.safeCode] carrying [CONTEXT_OVERFLOW]). Recovery ① drops the historical tool rounds; recovery ②
+     * hard-truncates to the newest turn + the current input. No LLM summary is ever asked for: a summary affects the
+     * *next* turn, not this request (D100), and spending another model call to rescue one would be the failure mode the
+     * ruling forbids.
+     */
+    private fun turnWithOverflowRecovery(
+        request: GatewayTurn,
+        profile: ModelProfile,
+        frame: RequestFrame,
+        limit: Int,
+    ): GatewayReply {
+        var mode = TrimMode.STANDARD
+        var recoveries = 0
+        while (true) {
+            val report = TurnTrimmer().trim(frame, limit, mode)
+            lastTrim = report.counts
+            val transcript = frameToTranscript(report.kept)
+                ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN)
+            val modelRequest = modelRequest(request, profile, frame.systemText, transcript)
+            val reply = try {
+                sendTurn(request, modelRequest)
+            } catch (rejected: ContractError.ConfigurationRejected) {
+                // The one local rejection this path may answer with a cheaper request: the send-time budget refused
+                // the shape the trimmer produced. A capability refusal is a different exception and still escapes.
+                if (recoveries >= MAX_OVERFLOW_RECOVERIES) return contextOverflowFailure()
+                recoveries++
+                overflowRecoveries++
+                mode = mode.next()
+                continue
+            }
+            if (isContextOverflow(reply)) {
+                if (recoveries >= MAX_OVERFLOW_RECOVERIES) return contextOverflowFailure(reply.usage)
+                recoveries++
+                overflowRecoveries++
+                mode = mode.next()
+                continue
+            }
+            return reply
+        }
+    }
+
+    private fun TrimMode.next(): TrimMode = when (this) {
+        TrimMode.STANDARD -> TrimMode.AGGRESSIVE
+        TrimMode.AGGRESSIVE, TrimMode.HARD -> TrimMode.HARD
+    }
+
+    /** A provider verdict, never a message match: only the stable code the transport mapped the wire error to. */
+    private fun isContextOverflow(reply: GatewayReply): Boolean =
+        reply.safeCode?.contains(CONTEXT_OVERFLOW, ignoreCase = true) == true
+
+    private fun contextOverflowFailure(usage: ModelUsage? = null): GatewayReply {
+        overflowFailures++
+        return GatewayReply(emptyList(), "", ModelEnd.FAILED, CONTEXT_OVERFLOW, usage)
+    }
+
+    /** Builds the one stateless request shape every model call of this gateway uses. */
+    private fun modelRequest(
+        request: GatewayTurn,
+        profile: ModelProfile,
+        instructions: String,
+        transcript: Transcript,
+    ): ModelRequest {
         val startedAt = clock.nowNanos()
         // The loop's turn id is the only id this adapter owns, and one turn finishes before the next one starts, so it
         // is also the request id the stream's events echo back.
         val requestId = request.turnId
-        val modelRequest = ModelRequest(
+        return ModelRequest(
             envelope = envelopeFor(requestId, startedAt, startedAt),
             requestId = requestId,
             turnId = request.turnId,
             profileId = profile.id,
             profileRevision = profile.revision,
-            instructions = if (frame == null) request.instructions else frame.systemText,
+            instructions = instructions,
             input = transcript.input + (audioParts?.invoke() ?: emptyList()),
             history = transcript.history,
             output = OutputModality.TEXT,
             deadlineNanos = request.deadlineNanos,
             tools = request.tools,
         )
+    }
+
+    /**
+     * One model round trip: send the request, wait for the terminal (or the deadline/stop), and turn the accumulated
+     * stream into a [GatewayReply]. Extracted verbatim from [turn] so overflow recovery can repeat it; a transport
+     * failure is still not caught here.
+     */
+    private fun sendTurn(request: GatewayTurn, modelRequest: ModelRequest): GatewayReply {
         val accumulated = Accumulated()
         val wakeAtDeadline = scheduler.at(request.deadlineNanos) { accumulated.wake() }
         val caller = Thread.currentThread()

@@ -131,6 +131,8 @@ import com.sheen.rokid.phone.context.ForegroundAppSource
 import com.sheen.rokid.phone.context.NotificationCategorySource
 import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
 import com.sheen.rokid.phone.model.ProfileProbeGate
+import com.sheen.rokid.phone.artifacts.FileArtifactStore
+import com.sheen.rokid.phone.model.ArtifactMediaSource
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -1703,8 +1705,13 @@ class HostCompositionRoot internal constructor(
                 // `P3_HTTP` line keeps telling the truth about what the client saw. Inert until armed.
                 .addInterceptor(scriptedWire)
                 .addInterceptor(ModelHttpLog(clock::nowNanos)).build()
+            // 0.25 Task 13 (R67/R71/R72): the one artifact store of this composition. The kernel writes a screenshot
+            // into it; both model adapters read the same instance back through the one `MediaSource` the controlled
+            // client holds. App-cache scratch, bounded and LRU — never the repository, never a log line.
+            val artifactStore = FileArtifactStore(File(context.cacheDir, "edith-artifacts"))
+            val artifactMediaSource = ArtifactMediaSource(artifactStore)
             val model = ControlledModelClient(http, profiles, resolver, CapabilityGate(), ContextBudgeter(), clock, scheduler,
-                consentSource(probeGate::requestConsent))
+                consentSource(probeGate::requestConsent), mediaSource = artifactMediaSource)
             val controlledTester = ControlledProfileTester(model, profiles, clock)
             val tester = object : ProfileTester {
                 override fun testText(profileId: String, listener: (ModelStreamEvent) -> Unit): CancellationHandle {
@@ -1896,7 +1903,8 @@ class HostCompositionRoot internal constructor(
             // P5 (C1+C2+C3 fix): bridge audio capture → segment source → media source.
             val audioBridge = audio?.let { AudioSegmentBridge(it.audioCapture) }
             audioBridge?.let {
-                model.setMediaSource(it)
+                // The same artifact store keeps serving images; audio keeps delegating to the existing bridge.
+                model.setMediaSource(ArtifactMediaSource(artifactStore, audio = it))
                 setGlobalAudioSegmentSource(it)
                 // Wire the bridge into the pipeline's emit callback so sealForTurn fires on final transcripts.
                 audio.bridgeRef?.set(it)
@@ -1958,6 +1966,9 @@ class HostCompositionRoot internal constructor(
                 // the exact instance the service's adapter mints refs into, even if the accessibility
                 // service connects later. There is deliberately no fallback registry.
                 registry = EdithAccessibilityService.registry(),
+                // 0.25 Task 13 (R67): screenshots become real artifact references in the same store the model's
+                // `ArtifactMediaSource` resolves, instead of the `pending` placeholder.
+                artifactStore = artifactStore,
             )
             val screenProjector = ScreenProjector(ObservationRenderer(deviceKernel.registry), deviceKernel.registry)
             val deviceTool = DeviceTool(DeviceKernelOperations(deviceKernel), screenProjector)

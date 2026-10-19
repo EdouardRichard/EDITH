@@ -154,19 +154,32 @@ class ChatImageTest {
     }
 
     @Test
-    fun `an unresolvable image in a tool output is refused instead of silently dropped`() {
-        assertFailsWith<ContractError.CapabilityMissing> {
-            encode(
-                history = listOf(
-                    ModelHistoryItem.Text(MessageRole.USER, "screenshot the screen"),
-                    ModelHistoryItem.Text(MessageRole.ASSISTANT, "Taking it."),
-                    ModelHistoryItem.ToolCall("call_shot", "screenshot", "{}"),
-                    ModelHistoryItem.ToolOutput(
-                        "call_shot", "captured",
-                        listOf(ImageRef("gone", "image/jpeg", 100, 50, "sha256-gone")),
-                    ),
+    fun `an unresolvable image in a tool output becomes a visible text placeholder, not a refusal`() {
+        // 0.25 Task 13 / R71: a historical image whose artifact expired degrades to a visible placeholder. Only the
+        // current input may still refuse (`CapabilityMissing`), because that is the turn being asked.
+        val messages = encode(
+            history = listOf(
+                ModelHistoryItem.Text(MessageRole.USER, "screenshot the screen"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "Taking it."),
+                ModelHistoryItem.ToolCall("call_shot", "screenshot", "{}"),
+                ModelHistoryItem.ToolOutput(
+                    "call_shot", "captured",
+                    listOf(ImageRef("gone", "image/jpeg", 100, 50, "sha256-gone")),
                 ),
-            )
-        }
+            ),
+        )
+
+        // The tool message stays a string and the image message follows it, carrying a text part instead of bytes.
+        assertEquals(5, messages.size, "user, assistant(tool_calls), tool, placeholder user, current user: $messages")
+        assertEquals("tool", messages[2].jsonObject.getValue("role").jsonPrimitive.content)
+        val placeholderMessage = messages[3].jsonObject
+        assertEquals("user", placeholderMessage.getValue("role").jsonPrimitive.content)
+        val parts = placeholderMessage.parts()
+        assertEquals(1, parts.size, "no image part may be sent for a missing artifact: $parts")
+        assertEquals("text", parts[0].jsonObject.getValue("type").jsonPrimitive.content)
+        assertEquals(
+            "[image unavailable: gone]",
+            parts[0].jsonObject.getValue("text").jsonPrimitive.content,
+        )
     }
 }

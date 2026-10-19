@@ -14,8 +14,10 @@ import java.util.Locale
  * 0.25 (§4.10) adds images to the budgeted (live) path: the current turn's `InputPart.Image` becomes an `input_image`
  * content item on its user message, and a tool result's `ImageRef`s ride in `function_call_output.output` as the
  * content-item array the endpoint documents (D9). A text-only request and a text-only tool result keep their exact
- * pre-0.25 string shapes. The legacy [encode] frame overload is deliberately left text-only: its images live in the
- * structured history (`ToolOutput.images`, restored by `ModelClientGateway`), never in `TOOL_ROUND` JSON (R6).
+ * pre-0.25 string shapes. A **historical** tool image whose artifact expired degrades to a visible
+ * `[image unavailable: …]` `input_text` item (R71); the current input image still refuses the request. The legacy
+ * [encode] frame overload is deliberately left text-only: its images live in the structured history
+ * (`ToolOutput.images`, restored by `ModelClientGateway`), never in `TOOL_ROUND` JSON (R6).
  */
 class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
     val support = ProtocolSupport("DEEPSEEK_RESPONSES",
@@ -167,7 +169,12 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             if (item.images.isEmpty()) put("output", item.output)
             else put("output", buildJsonArray {
                 add(inputTextPart(item.output))
-                item.images.forEach { add(inputImagePart(resolveImage(it.artifactId))) }
+                item.images.forEach { image ->
+                    val resolved = media?.resolveImage(image.artifactId)
+                    // R71: a historical image whose artifact expired degrades visibly; the request still encodes.
+                    if (resolved == null) add(inputTextPart(imageUnavailablePlaceholder(image.artifactId)))
+                    else add(inputImagePart(resolved))
+                }
             })
         }
     }
@@ -192,7 +199,7 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
         put("detail", "auto")
     }
 
-    /** An unresolvable image ref refuses the request; an empty or dropped image is never put on the wire. */
+    /** The current input image still refuses the request; only a historical one may degrade to a placeholder (R71). */
     private fun resolveImage(artifactId: String): ResolvedImage =
         media?.resolveImage(artifactId)
             ?: throw ContractError.CapabilityMissing("image ref unresolvable: $artifactId")

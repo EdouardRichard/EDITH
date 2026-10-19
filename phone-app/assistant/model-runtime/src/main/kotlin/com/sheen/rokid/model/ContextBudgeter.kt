@@ -2,14 +2,15 @@ package com.sheen.rokid.model
 
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.contracts.ImageBudget
 
 /**
- * 0.25 spec §4.9 (ruling R4): one image's cost in the budgeter's existing unit — UTF-8 bytes, the unit
- * `inputBudgetTokens` is already treated as. DeepSeek publishes roughly 1024 tokens per image; this project does not
- * invent a token-to-byte formula, so the published ceiling is used directly as the coarse per-image byte unit. It is
- * deliberately one shared constant so a later calibration changes the price in one place.
+ * 0.25 spec §4.9 (ruling R68): one image's cost in the budgeter's existing unit — UTF-8 bytes, the unit
+ * `inputBudgetTokens` is already treated as. The single source is [ImageBudget.UNITS_PER_IMAGE] in core-contracts, which
+ * `TurnTrimmer` charges too: two pre-send stages that priced an image differently would let the trimmer hand the
+ * budgeter a request the budgeter rejects.
  */
-internal const val IMAGE_BUDGET_UNITS = 1024L
+private val IMAGE_BUDGET_UNITS = ImageBudget.UNITS_PER_IMAGE
 
 data class BudgetedRequest(val request: ModelRequest, val estimatedInputTokens: Int, val removedIds: List<String>, val estimated: Boolean)
 

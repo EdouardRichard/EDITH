@@ -146,6 +146,16 @@ class TurnTranscriptRecordTest {
     fun `an image reference stored with a tool round reaches the next request`() {
         val stores = stores()
         val rig = rig(stores)
+        // Task 13 (R68) made the trimmer charge ImageBudget.UNITS_PER_IMAGE for an image the adapter will put on the
+        // wire; the rig's default 2 000-byte window cannot hold this round plus its image. This test is about the
+        // store → segment → gateway channel, not about eviction, so give it the same wide window `wireProfile` uses and
+        // let the shape, never the size, be what it proves.
+        rig.profile = smartProfile().copy(
+            usableWindowTokens = 100_000,
+            inputBudgetTokens = 93_000,
+            maxOutputTokens = 6_000,
+            safetyTokens = 1_000,
+        )
         // A completed earlier turn with a screenshot round. `appendTranscript` is the production record path, so the
         // seed is the same shape the plugin writes after a run.
         stores.getValue(ContextRoute.WAKE).appendTranscript(

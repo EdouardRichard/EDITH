@@ -56,8 +56,9 @@ import java.util.concurrent.atomic.AtomicBoolean
  * known fingerprint limitation).
  *
  * **Rendering.** The kernel deliberately does not render. [DeviceEnvelope.data] stays null and
- * [latestObservation] carries the snapshot; Task 10 projects the §4.6 `data.screen` (full/diff) and
- * Task 13 wires the artifact store for [screenshot]'s `ImageRef`.
+ * [latestObservation] carries the snapshot; Task 10 projects the §4.6 `data.screen` (full/diff) and Task 13 wires the
+ * artifact store for [screenshot]'s `ImageRef`. A screenshot's bytes never enter [DeviceEnvelope.data]: they are handed
+ * to the injected [ArtifactStore] and only the resulting reference travels.
  *
  * The kernel owns a daemon thread pool; callers must [close] it. A closed kernel reports
  * [DeviceErrorCodes.CANCELLED] instead of accepting work.
@@ -68,6 +69,12 @@ class DeviceKernel(
     private val clock: () -> Long = { System.nanoTime() / 1_000_000L },
     val registry: RefRegistry = RefRegistry(),
     private val settlePolicy: SettlePolicy = SettlePolicy(),
+    /**
+     * 0.25 Task 13 (R67): where [screenshot]'s encoded bytes go. `null` — the default, so every pre-Task-13 caller
+     * keeps compiling and behaving — leaves the `pending` placeholder with a diagnostic; a store that throws degrades
+     * the same way. A `pending` reference is never mistaken for a stored artifact: its `sha256` is empty.
+     */
+    private val artifactStore: ArtifactStore? = null,
 ) : AutoCloseable {
 
     private val planner = ActionPlanner(accessibility, shell)
@@ -248,10 +255,14 @@ class DeviceKernel(
     /**
      * Takes one screenshot and reports it as an artifact reference, never as inline bytes.
      *
-     * The `artifactId` is the placeholder [PENDING_ARTIFACT_ID] until Task 10/13 injects the real
-     * artifact store (spec §4.6/§5.3); [Screenshot.bytes] stays inside the kernel and is not copied
-     * into [DeviceEnvelope.data]. A channel that cannot take screenshots reports
-     * [DeviceErrorCodes.UNSUPPORTED], which is distinct from [DeviceErrorCodes.CHANNEL_UNAVAILABLE].
+     * With an [ArtifactStore] the captured bytes are stored and the envelope carries the real reference (its artifact
+     * id, mime, dimensions and sha256). Without one — or when the store throws — the envelope still succeeds with the
+     * `pending` placeholder and a `diagnostic=screenshot_artifact_pending; reason=…` line in [DeviceEnvelope.data], so
+     * a caller can tell "the screenshot worked, the store did not" from "the screenshot failed". The bytes themselves
+     * are never copied into [DeviceEnvelope.data].
+     *
+     * A channel that cannot take screenshots reports [DeviceErrorCodes.UNSUPPORTED], which is distinct from
+     * [DeviceErrorCodes.CHANNEL_UNAVAILABLE].
      */
     fun screenshot(): DeviceEnvelope =
         runSerial(ACTION_SCREENSHOT, CHANNEL_ACCESSIBILITY, DEFAULT_OPERATION_TIMEOUT_MILLIS) { token ->
@@ -296,17 +307,40 @@ class DeviceKernel(
                     timing = timing(started, observeMs = readMs),
                 )
             } else {
+                val image = storeScreenshot(shot)
                 DeviceEnvelope.success(
                     action = ACTION_SCREENSHOT,
                     channel = CHANNEL_ACCESSIBILITY,
                     accepted = true,
                     applied = null,
                     verified = null,
-                    images = listOf(ImageRef(PENDING_ARTIFACT_ID, shot.mime, shot.width, shot.height, "")),
+                    data = image.diagnostic,
+                    images = listOf(image.reference),
                     timing = timing(started, observeMs = readMs),
                 )
             }
         }
+
+    /** One screenshot's artifact outcome: a real reference, or the placeholder plus the reason it stayed pending. */
+    private data class ScreenshotArtifact(val reference: ImageRef, val diagnostic: String? = null)
+
+    /**
+     * Stores the captured bytes and answers the reference to report (R67).
+     *
+     * Failure is a data problem, never a failed screenshot: the capture succeeded either way, so the envelope keeps
+     * `ok = true` and only the reference degrades to [PENDING_ARTIFACT_ID] with a diagnostic. The exception's message is
+     * not copied into the diagnostic — a file path is not something a model or a log line needs.
+     */
+    private fun storeScreenshot(shot: Screenshot): ScreenshotArtifact {
+        val pending = ImageRef(PENDING_ARTIFACT_ID, shot.mime, shot.width, shot.height, "")
+        val store = artifactStore
+            ?: return ScreenshotArtifact(pending, "$SCREENSHOT_PENDING_DIAGNOSTIC; reason=NO_STORE")
+        return try {
+            ScreenshotArtifact(store.put(shot.bytes, shot.mime, shot.width, shot.height))
+        } catch (t: Exception) {
+            ScreenshotArtifact(pending, "$SCREENSHOT_PENDING_DIAGNOSTIC; reason=STORE_FAILED")
+        }
+    }
 
     /**
      * Waits, with bounded polling, until the screen shows [text], the foreground app matches
@@ -1106,6 +1140,9 @@ class DeviceKernel(
         private const val VERIFIED_IDLE = "idle"
 
         private const val PENDING_ARTIFACT_ID = "pending"
+
+        /** R67: the one-line reason a screenshot's reference is the placeholder rather than a stored artifact. */
+        private const val SCREENSHOT_PENDING_DIAGNOSTIC = "diagnostic=screenshot_artifact_pending"
 
         private const val SHELL_INPUT_KEYEVENT = "input keyevent"
 

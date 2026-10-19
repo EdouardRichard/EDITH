@@ -403,13 +403,18 @@ class DeviceKernelTest {
         assertEquals("accessibility", envelope.channel)
         assertTrue(envelope.accepted)
         assertNull(envelope.applied)
-        assertNull(envelope.data, "image bytes must never be inlined into data")
         val image = envelope.images.single()
+        // R67: without an artifact store the honest answer is still the pending placeholder, but it now carries a
+        // diagnostic instead of silently looking like a real reference.
         assertEquals("pending", image.artifactId)
         assertEquals("image/jpeg", image.mime)
         assertEquals(768, image.width)
         assertEquals(1664, image.height)
         assertEquals("", image.sha256)
+        val diagnostic = requireNotNull(envelope.data) { "a pending reference must explain itself" }
+        assertTrue(diagnostic.contains("screenshot_artifact_pending"), diagnostic)
+        assertTrue(diagnostic.contains("NO_STORE"), diagnostic)
+        assertEquals(false, diagnostic.contains("1, 2, 3"), "image bytes must never be inlined into data")
         assertEquals(0L, kernel.revision, "a screenshot is not an observation")
     }
 

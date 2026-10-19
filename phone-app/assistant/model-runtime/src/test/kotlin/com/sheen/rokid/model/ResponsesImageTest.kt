@@ -135,19 +135,30 @@ class ResponsesImageTest {
     }
 
     @Test
-    fun `an unresolvable image in a tool output is refused instead of silently dropped`() {
-        assertFailsWith<ContractError.CapabilityMissing> {
-            encode(
-                history = listOf(
-                    ModelHistoryItem.Text(MessageRole.USER, "screenshot the screen"),
-                    ModelHistoryItem.Text(MessageRole.ASSISTANT, "Taking it."),
-                    ModelHistoryItem.ToolCall("call_shot", "screenshot", "{}"),
-                    ModelHistoryItem.ToolOutput(
-                        "call_shot", "captured",
-                        listOf(ImageRef("gone", "image/jpeg", 100, 50, "sha256-gone")),
-                    ),
+    fun `an unresolvable image in a tool output becomes a visible text placeholder, not a refusal`() {
+        // 0.25 Task 13 / R71: a historical image whose artifact expired degrades to a visible placeholder. Only the
+        // current input may still refuse (`CapabilityMissing`), because that is the turn being asked.
+        val input = encode(
+            history = listOf(
+                ModelHistoryItem.Text(MessageRole.USER, "screenshot the screen"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "Taking it."),
+                ModelHistoryItem.ToolCall("call_shot", "screenshot", "{}"),
+                ModelHistoryItem.ToolOutput(
+                    "call_shot", "captured",
+                    listOf(ImageRef("gone", "image/jpeg", 100, 50, "sha256-gone")),
                 ),
-            )
-        }
+            ),
+        )
+
+        val output = input.functionCallOutput()
+        val items = output.getValue("output").jsonArray
+        assertEquals(2, items.size, "the tool's text and one visible placeholder: $items")
+        assertEquals("input_text", items[0].jsonObject.type())
+        assertEquals("captured", items[0].jsonObject.getValue("text").jsonPrimitive.content)
+        assertEquals("input_text", items[1].jsonObject.type())
+        assertEquals(
+            "[image unavailable: gone]",
+            items[1].jsonObject.getValue("text").jsonPrimitive.content,
+        )
     }
 }

@@ -15,8 +15,10 @@ import java.util.Base64
  *
  * Protocol id is `OPENAI_CHAT_COMPLETIONS` (family name, not vendor name). Audio is sent as base64-encoded WAV
  * inside `input_audio` content parts; text-only requests omit the audio part entirely. The adapter refuses to encode
- * a request whose audio or image ref cannot be resolved — sending an empty payload would silently degrade to
- * text-only at the model side, which violates the capability gate's intent.
+ * a request whose audio or current-input image ref cannot be resolved — sending an empty payload would silently degrade
+ * to text-only at the model side, which violates the capability gate's intent. A **historical** tool image whose
+ * artifact expired is different (R71): it becomes a visible `[image unavailable: …]` text part so the rest of the
+ * request still reaches the model.
  *
  * 0.25 (§4.10) adds images and tool history to the budgeted (live) path: the history's tool round-trip is rendered as
  * `assistant.tool_calls` + one `role:"tool"` message per output, and images — from the current input or a tool result —
@@ -255,7 +257,14 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             if (output.images.isEmpty()) return
             pendingImages += buildJsonObject {
                 put("role", "user")
-                put("content", buildJsonArray { output.images.forEach { add(imagePart(resolveImage(it))) } })
+                put("content", buildJsonArray {
+                    output.images.forEach { image ->
+                        val resolved = media.resolveImage(image.artifactId)
+                        // R71: a historical image whose artifact expired degrades visibly; the request still encodes.
+                        if (resolved == null) add(textPart(imageUnavailablePlaceholder(image.artifactId)))
+                        else add(imagePart(resolved))
+                    }
+                })
             }
         }
 
@@ -310,10 +319,6 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             put("arguments", call.argsJson)
         })
     }
-
-    private fun resolveImage(ref: ImageRef): ResolvedImage =
-        media.resolveImage(ref.artifactId)
-            ?: throw ContractError.CapabilityMissing("image ref unresolvable: ${ref.artifactId}")
 
     private fun textPart(text: String) = buildJsonObject {
         put("type", "text")

@@ -13,8 +13,12 @@ class TurnTrimmerTest {
     private fun userTurn(text: String) = Segment(SegmentOrigin.TRANSCRIPT, true, text, SegmentRole.USER)
 
     @Test fun `the fixed order is declared and compression is last`() {
-        assertEquals(listOf("OLDEST_TURNS", "MEMORY_EVIDENCE", "COMPRESSION"), TrimOrder.ORDER)
-        assertEquals(listOf("OLDEST_TURNS", "MEMORY_EVIDENCE"), TrimOrder.COMPRESSION_AFTER)
+        // 0.25 Task 13 (R69): the type-aware cut ⓪ is inserted before D97's ①, as an explicit extension of D81.
+        assertEquals(listOf("TYPE_AWARE", "OLDEST_TURNS", "MEMORY_EVIDENCE", "COMPRESSION"), TrimOrder.ORDER)
+        assertEquals(
+            listOf("TYPE_AWARE", "OLDEST_TURNS", "MEMORY_EVIDENCE"),
+            TrimOrder.COMPRESSION_AFTER,
+        )
     }
 
     @Test fun `a frame already inside the limit is untouched`() {

@@ -67,6 +67,31 @@ class ControlledModelClientTest {
         assertEquals("HTTP_STATUS", rig.events.filterIsInstance<ModelStreamEvent.Terminal>().single().safeCode)
     }
 
+    @Test fun `a provider context overflow 400 is reported as CONTEXT_OVERFLOW`() = Rig().use { rig ->
+        // 0.25 Task 13 / R70: the provider's own overflow signal is one of the two detectors the gateway recovers from.
+        rig.server.enqueue(MockResponse().setResponseCode(400)
+            .addHeader("Content-Type", "application/json")
+            .setBody("""{"error":{"code":"context_length_exceeded","message":"maximum context length exceeded"}}"""))
+        rig.start(); rig.awaitTerminal()
+        assertEquals(listOf(ModelEnd.FAILED), rig.ends())
+        assertEquals(
+            com.sheen.rokid.agent.CONTEXT_OVERFLOW,
+            rig.events.filterIsInstance<ModelStreamEvent.Terminal>().single().safeCode,
+        )
+    }
+
+    @Test fun `an unrelated provider 400 keeps the existing HTTP_STATUS code`() = Rig().use { rig ->
+        rig.server.enqueue(MockResponse().setResponseCode(400)
+            .addHeader("Content-Type", "application/json")
+            .setBody("""{"error":{"code":"invalid_api_key","message":"bad key"}}"""))
+        rig.start(); rig.awaitTerminal()
+        assertEquals(listOf(ModelEnd.FAILED), rig.ends())
+        assertEquals(
+            "HTTP_STATUS",
+            rig.events.filterIsInstance<ModelStreamEvent.Terminal>().single().safeCode,
+        )
+    }
+
     @Test fun `profile change before registration is fenced before secret or call`() = Rig().use { rig ->
         val input = rig.request()
         var first = true

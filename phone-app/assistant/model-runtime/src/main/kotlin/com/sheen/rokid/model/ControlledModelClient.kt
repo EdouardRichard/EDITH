@@ -15,6 +15,9 @@ import java.util.concurrent.atomic.AtomicBoolean
 import com.sheen.rokid.contracts.ContractError
 import kotlinx.serialization.json.*
 
+/** R70: a bounded read of a provider error body — enough for its machine code, never a full diagnostic dump. */
+private const val MAX_ERROR_BODY_BYTES = 8_192L
+
 class ControlledModelClient(
     http: OkHttpClient, private val repository: ProfileRepository, private val resolver: SecretResolver,
     private val gate: CapabilityGate, private val budgeter: ContextBudgeter, private val clock: MonotonicClock,
@@ -126,7 +129,7 @@ class ControlledModelClient(
                                 return@use
                             }
                         }
-                        pending.end(ModelEnd.FAILED, if (response.code == 401) "HTTP_AUTH" else "HTTP_STATUS")
+                        pending.end(ModelEnd.FAILED, httpFailureCode(response))
                         return@use
                     }
                     val body = response.body
@@ -173,6 +176,17 @@ class ControlledModelClient(
             catch (_: Exception) { pending.end(ModelEnd.FAILED, "TRANSPORT_FAILED") }
             finally { call.cancel(); pending.detachCall(call) }
         } } catch (_: Exception) { call.cancel(); pending.end(ModelEnd.FAILED, "TRANSPORT_FAILED") }
+    }
+
+    /**
+     * A non-successful HTTP answer's stable code. 401 keeps its dedicated code; any other answer is inspected for the
+     * provider's context-overflow signal (R70) before falling back to `HTTP_STATUS`. The body is read bounded and only
+     * matched — it is never logged or carried upward.
+     */
+    private fun httpFailureCode(response: Response): String {
+        if (response.code == 401) return "HTTP_AUTH"
+        val body = runCatching { response.peekBody(MAX_ERROR_BODY_BYTES).string() }.getOrNull()
+        return providerContextOverflow(body) ?: "HTTP_STATUS"
     }
 
     private fun retryDelay(value: String?): Long? {

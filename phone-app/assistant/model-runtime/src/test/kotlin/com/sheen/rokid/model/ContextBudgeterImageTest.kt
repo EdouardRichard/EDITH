@@ -1,6 +1,7 @@
 package com.sheen.rokid.model
 
 import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.contracts.ImageBudget
 import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.MessageRole
@@ -16,8 +17,9 @@ import kotlin.test.assertTrue
  * 0.25 Task 1: images are part of the request, so the one byte-based window budget must charge for them.
  *
  * The unit is the existing `estimateText` one (UTF-8 bytes, the profile's `inputBudgetTokens` is used as a byte cap), and
- * one image costs [IMAGE_BUDGET_UNITS] in that same unit — the deliberate coarse approximation the 0.25 spec chose
- * instead of inventing a token formula. Text-only requests must keep their exact previous cost.
+ * one image costs [ImageBudget.UNITS_PER_IMAGE] in that same unit — the deliberate coarse approximation the 0.25 spec
+ * chose instead of inventing a token formula. The constant lives in core-contracts (Task 13 / R68) so `TurnTrimmer` and
+ * `ContextBudgeter` cannot drift apart. Text-only requests must keep their exact previous cost.
  */
 class ContextBudgeterImageTest {
 
@@ -32,7 +34,7 @@ class ContextBudgeterImageTest {
         budgeter.prepare(profile, request).estimatedInputTokens
 
     @Test fun `one image costs one thousand twenty four byte units`() {
-        assertEquals(1024L, IMAGE_BUDGET_UNITS)
+        assertEquals(1024L, ImageBudget.UNITS_PER_IMAGE)
     }
 
     @Test fun `an image input part is accepted and adds one image budget unit`() {
