@@ -11,6 +11,14 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.longOrNull
+import java.util.concurrent.Callable
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.ExecutorService
+import java.util.concurrent.Executors
+import java.util.concurrent.Future
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** The six terminal states of one agent run (spec §6.3). */
 enum class AgentOutcome { COMPLETED, INSUFFICIENT, NO_PROGRESS, DEADLINE, CANCELLED, FAILED }
@@ -94,10 +102,40 @@ data class AgentRequest(
      * swallowed, exactly like [onTextDelta], because losing a row must never change the run's outcome.
      */
     val onToolStatus: ((action: String, phase: ToolPhase) -> Unit)? = null,
+    /**
+     * 0.25 Task 12 (R58): whether a text-only **plan** answer may be nudged back into executing it.
+     *
+     * `false` — the default — keeps every pre-0.25 caller byte for byte: a text turn with no tool call is the answer.
+     * The production plugin sets it `true` for the WAKE route (the wearer is waiting for an action) and leaves it
+     * `false` for PROACTIVE, whose single request is a proposal, not a plan to execute (D3 §1.6). A nudge is loop
+     * scaffolding: it is never persisted and `withoutRetryScaffolding` strips it.
+     */
+    val allowPlanNudge: Boolean = false,
+    /**
+     * 0.25 Task 12 (R59): the device/loop state to fold into each request as one untrusted `RUNTIME_STATE` segment.
+     *
+     * `null` — the default — injects nothing. The provider may return `null` when it has no honest state to report. The
+     * loop calls it once per model request and **skips a state identical to the previous request's**, so a steady screen
+     * does not pay the same few hundred bytes every round. The state never enters the transcript, a `ConversationStore`
+     * or a tool result; it lives only in the assembled request and is folded into the request input by the gateway.
+     */
+    val runtimeState: (() -> TurnRuntimeState?)? = null,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
-data class AgentStep(val index: Int, val action: String, val result: String)
+data class AgentStep(
+    val index: Int,
+    val action: String,
+    val result: String,
+    /**
+     * 0.25 Task 12 (R55): `false` means a loop detector **skipped** this call (the warning path): it was recorded and
+     * consumed its descriptor's step allowance, but it produced no observation fingerprint, no global no-progress
+     * count and no error-streak entry. Every other step — an execution, a policy refusal, an unavailable/denied
+     * confirmation — keeps the default `true`, exactly as before Task 12. The default keeps every pre-0.25 `AgentStep`
+     * comparison unchanged.
+     */
+    val executed: Boolean = true,
+)
 
 /**
  * The terminal result of one run.
@@ -150,6 +188,18 @@ data class AgentRun(
      * `P3_TURN` / `P3_TOOL` log shapes deliberately do not change.
      */
     val usage: ModelUsage? = null,
+    /**
+     * 0.25 Task 12 (R61): how many calls whose descriptor declared `observation = true` this run made, including the
+     * ones a detector skipped. It is a separate budget from [spentSteps]: observing is how the model learns, but
+     * unlimited observing is how a run burns a turn without acting. At `maxObservations` (24, D3 §1.8) the run ends
+     * `NO_PROGRESS / OBSERVATION_BUDGET`.
+     */
+    val spentObservations: Int = 0,
+    /**
+     * 0.25 Task 12 (R58): `1` when a plan-only answer reached the nudge cap (three nudges) and was accepted as the final
+     * answer, `0` otherwise. It is the count Task 14's `P3_METRIC` reads as `planNudgeCap`; no log line changes here.
+     */
+    val planNudgeCap: Int = 0,
 )
 
 private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
@@ -175,6 +225,40 @@ private const val AUDIT_ALLOW = "allow"
 private const val AUDIT_REFUSE = "refuse"
 private const val AUDIT_REQUIRE_CONFIRMATION = "require_confirmation"
 
+// 0.25 Task 12 (R55–R61): loop protection codes and bounds. Each one is a wire value the plugin/eval may read.
+private const val ACTION_TIMEOUT = "ACTION_TIMEOUT"
+private const val ACTION_TIMEOUT_UNCERTAIN = "ACTION_TIMEOUT_UNCERTAIN"
+private const val REPEATED_ERROR = "REPEATED_ERROR"
+private const val OBSERVATION_BUDGET = "OBSERVATION_BUDGET"
+private const val ACTION_TIMEOUT_NOTE =
+    "the action may or may not have taken effect; observe the screen before deciding."
+private const val ACTION_TIMEOUT_UNCERTAIN_NOTE =
+    "the tool did not stop within the grace window; the run is stopping and the channel must be re-observed."
+/** R58: the loop instruction that turns a plan-only answer back into a tool call. Never stored. */
+private const val PLAN_NUDGE_INSTRUCTION =
+    "You described a plan but did not execute it. Observe first, then act: call the tool now instead of only promising it."
+private const val MAX_PLAN_NUDGES = 3
+private const val MAX_PLAN_TEXT_CHARS = 1_200
+private const val TOOL_EXECUTOR_THREAD_NAME = "agent-tool-call"
+/** R60: how long a timed-out call is given to really stop before the run reports `ACTION_TIMEOUT_UNCERTAIN`. */
+private const val TOOL_TIMEOUT_GRACE_NANOS = 2_000_000_000L
+/** While waiting for a tool, the loop re-checks `cancel()` this often instead of blocking on the whole timeout. */
+private const val TOOL_POLL_STEP_NANOS = 10_000_000L
+private const val DEFAULT_TOOL_TIMEOUT_MILLIS = 30_000L
+
+/** Plan wording (D3 §1.6). Matched case-insensitively for the Latin markers; Chinese markers are literal. */
+private val PLAN_MARKERS = listOf(
+    "接下来", "下一步", "我将", "我会", "稍后", "先", "然后", "再",
+    "i will", "i'll", "next", "let me", "first",
+)
+
+/** Wording that means the turn is reporting an outcome, not describing work it is about to do. */
+private val PLAN_COMPLETION_MARKERS = listOf(
+    "已完成", "已经完成", "完成如下", "总结如下", "无法继续", "没有权限", "无权限", "抱歉",
+    "无法", "不能", "已处理", "已为你", "以下是",
+    "done", "unable", "cannot", "no permission", "summary",
+)
+
 /** The audit summary is read from the model's own arguments string, which is kotlinx-lenient by construction. */
 private val auditArguments = Json { isLenient = true }
 
@@ -188,7 +272,10 @@ private val auditArguments = Json { isLenient = true }
  * 2. a tool call is a *step*, never a verdict — an unknown tool, invalid arguments, a policy refusal, a missing
  *    confirmation channel and an executor failure all come back to the model as `ok = false` results; only a
  *    **successful** terminal-scope tool ends the run with `COMPLETED`;
- * 3. the guard observes only payloads that exist *after* an action ran.
+ * 3. the progress guard observes only a **fingerprint that exists after an action ran** — never a payload and never a
+ *    pre-action observation. Task 12's four detectors decide **before** execution, so a repeated step is answered with a
+ *    synthetic tool result in the same tool round instead of another model request; the first critical detector ends the
+ *    run as `NO_PROGRESS` with its own `LOOP_*` safe code.
  *
  * The transcript is assembled so it never ends on the pending user turn (`ContextBudgeter` rejects a trailing lone
  * text item): every tool round is opened by an assistant text before its calls, a retry appends an assistant text
@@ -215,7 +302,17 @@ class AgentLoop(
      * exactly - the action is refused with `CONFIRMATION_UNAVAILABLE` and never runs.
      */
     private val confirmation: ConfirmationPort? = null,
+    /**
+     * 0.25 Task 12 (R61): the observation budget (D3 §1.8's 24). Counts calls whose descriptor declared
+     * `observation = true`, whether or not they also spend a step; reaching it ends the run as
+     * `NO_PROGRESS / OBSERVATION_BUDGET`. It is a parameter so a test can prove the boundary without 24 fixture calls'
+     * worth of unrelated setup, not a caller-tunable production knob.
+     */
+    private val maxObservations: Int = 24,
 ) {
+    init {
+        require(maxObservations >= 1) { "maxObservations must be at least 1, was $maxObservations" }
+    }
     @Volatile
     private var started = false
 
@@ -250,6 +347,25 @@ class AgentLoop(
      */
     private var usage: ModelUsage? = null
 
+    /** 0.25 Task 12 (R61): observation-budget spent, per-run like [usage]; reported on every finish path. */
+    private var spentObservations = 0
+
+    /** 0.25 Task 12 (R58): `1` once the plan-nudge cap was reached and the text was accepted (metrics input). */
+    private var planNudgeCap = 0
+
+    /** R59: the hash of the runtime state last injected, so an unchanged state is sent only once. */
+    private var lastRuntimeStateHash: String? = null
+
+    /** R58: the last text that was nudged, so an identical plan cannot be nudged again in place. */
+    private var lastNudgedText: String? = null
+    private var nudges = 0
+
+    /** R58: "the run has really used a tool" — a plan from a pure Q&A turn is never nudged. */
+    private var successfulToolExecutions = 0
+
+    /** R61: `cancel()` asks the executors to stop at most once, so repeated cancels are idempotent. */
+    private val cancelSignalled = AtomicBoolean(false)
+
     /**
      * The wall clock this run has measured waiting for a person **so far** — the same number the returned [AgentRun]
      * carries, exposed for the caller that never gets an [AgentRun] at all.
@@ -263,10 +379,15 @@ class AgentLoop(
 
     /**
      * Requests that the run stop at its next check. Safe to call from another thread, including while a gateway turn
-     * is in flight: the loop reads the flag again as soon as that turn returns.
+     * or a tool call is in flight: the flag is read again as soon as either returns, and the first cancel also asks
+     * every executor to stop the work it is running (R61 — before Task 12 a blocked tool never saw the flag at all).
+     * Repeated calls are idempotent: the executors are asked exactly once.
      */
     fun cancel() {
         cancelled = true
+        if (cancelSignalled.compareAndSet(false, true)) {
+            runCatching { registry.cancel() }
+        }
     }
 
     /**
@@ -280,11 +401,31 @@ class AgentLoop(
             "AgentLoop is single-use: one loop instance serves one run, so construct a loop per turn"
         }
         started = true
+        // R60: every `registry.execute` goes through this one executor, so a tool that blocks cannot hold the loop
+        // past the call's timeout. Daemon, so a tool that ignores interruption can never keep the process alive;
+        // `shutdownNow` in the `finally` means a normal run leaks no worker thread.
+        val toolExecutor = Executors.newSingleThreadExecutor { runnable ->
+            Thread(runnable, TOOL_EXECUTOR_THREAD_NAME).apply { isDaemon = true }
+        }
+        return try {
+            runInternal(request, toolExecutor)
+        } finally {
+            toolExecutor.shutdownNow()
+        }
+    }
+
+    private fun runInternal(request: AgentRequest, toolExecutor: ExecutorService): AgentRun {
         // A guard may be shared with (or reused after) another run: this run's first observation must be a first
         // observation, not the continuation of an inherited streak.
         guard.reset()
         humanWaitNanos = 0L
         usage = null
+        spentObservations = 0
+        planNudgeCap = 0
+        lastRuntimeStateHash = null
+        lastNudgedText = null
+        nudges = 0
+        successfulToolExecutions = 0
         val tools = registry.descriptors().map { ToolSpec(it.name, it.description, it.parametersJson) }
         // Phase 3: TurnRunner owns request assembly. For now, the system slot carries only INSTRUCTIONS;
         // memory evidence, perception, and conversation store will be wired in later phases.
@@ -320,6 +461,9 @@ class AgentLoop(
         // shifted forward by however long that call waits (D49): with a 120 s decision window (D47) charging the wait to
         // the turn would make every considered answer end the turn as DEADLINE.
         var turnDeadlineNanos = request.deadlineNanos
+        // Task 12: per-run protection state. Both are per-run by construction (a loop instance is single-use).
+        val detectors = LoopDetectors()
+        val errors = ErrorTracker()
 
         while (true) {
             if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
@@ -340,7 +484,7 @@ class AgentLoop(
                 request.frameFor != null -> request.frameFor(frameTranscript(history, utteranceIndex))
                 openingTurn -> request.frame
                 else -> null
-            }
+            }?.let { withRuntimeState(it, request) }
             openingTurn = false
             val reply = gateway.turn(
                 GatewayTurn(
@@ -407,6 +551,18 @@ class AgentLoop(
                     appendRetry(history, reply.text)
                     continue
                 }
+                // R58: a text-only plan while the run has already acted is not an answer. Nudge it back into action
+                // (at most three times), then accept the text honestly as the final answer.
+                if (shouldPlanNudge(reply.text, request, turnDeadlineNanos, spentSteps)) {
+                    if (nudges < MAX_PLAN_NUDGES && reply.text != lastNudgedText) {
+                        lastNudgedText = reply.text
+                        nudges++
+                        appendPlanNudge(history, reply.text)
+                        continue
+                    }
+                    if (nudges >= MAX_PLAN_NUDGES) planNudgeCap = 1
+                    return finish(AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps)
+                }
                 return finish(AgentOutcome.COMPLETED, null, reply.text, steps, history, reply.text, spentSteps)
             }
 
@@ -424,102 +580,193 @@ class AgentLoop(
             }
             for (call in reply.toolCalls) {
                 if (spentSteps >= maxSteps) return finish(AgentOutcome.FAILED, STEP_LIMIT, null, steps, history, "", spentSteps)
+                // R60: the per-call cap is min(descriptor timeout, deadline - now); an already-expired deadline must not
+                // start another tool at all.
+                if (clock.nowNanos() >= turnDeadlineNanos) {
+                    return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                }
                 val registered = registry.resolve(call.name)
                 // D-9: one declaration decides both halves — an exempt call is recorded but spends no step, while an
                 // unknown name declared nothing and therefore still spends one.
                 if (registered == null || registered.descriptor.countsTowardStepLimit) spentSteps++
+                val descriptor = registered?.descriptor
+                // R61: every call whose descriptor declares an observation spends the observation budget, executed or
+                // skipped, step-exempt or not.
+                if (descriptor?.observation == true) spentObservations++
                 // 0.24 S4: the row opens before any execution attempt and closes only once the result exists. The pair
                 // covers refusals, an unavailable/denied confirmation and a throwing executor; the callback itself is
                 // display-only (see `AgentRequest.onToolStatus`).
                 notifyToolStatus(request, call.name, ToolPhase.START)
-                val result = try {
+                val execution = try {
+                    // R55: detection happens **before** execution. A warning returns a synthetic tool result in the
+                    // same tool round (no extra model request); a critical ends the run without executing the call.
+                    when (val decision = detectors.beforeCall(call.name, call.argsJson, descriptor?.observation == true)) {
+                        is LoopDecision.Warn -> {
+                            val warning = loopWarningPayload(decision.pattern)
+                            steps += AgentStep(steps.size + 1, call.name, warning, executed = false)
+                            history += ModelHistoryItem.ToolOutput(call.id, warning)
+                            // A skipped observation still spends the observation budget (D3 §1.8), and a cancel or an
+                            // expired deadline still ends the run. Nothing else about a skipped call is recorded: no
+                            // fingerprint, no guard feed, no global no-progress count, no error streak.
+                            if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+                            if (spentObservations >= maxObservations) {
+                                return finish(
+                                    AgentOutcome.NO_PROGRESS, OBSERVATION_BUDGET, null, steps, history, "", spentSteps,
+                                )
+                            }
+                            if (clock.nowNanos() >= turnDeadlineNanos) {
+                                return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
+                            }
+                            continue
+                        }
+                        is LoopDecision.Critical -> {
+                            val code = decision.pattern.safeCode
+                            steps += AgentStep(steps.size + 1, call.name, code, executed = false)
+                            history += ModelHistoryItem.ToolOutput(call.id, code)
+                            return finish(AgentOutcome.NO_PROGRESS, code, null, steps, history, "", spentSteps)
+                        }
+                        LoopDecision.Allow -> Unit
+                    }
                     if (registered == null) {
-                    // An unknown name is a step to feed back and never reaches the policy. It is *not* an execution, so
-                    // it carries its own stable audit label instead of sharing `executed` with a real tool run.
-                    val unknown = registry.execute(call)
-                    audit.record(request.turnId, call.name, AUDIT_UNKNOWN_TOOL, outcomeOf(unknown))
-                    unknown
-                } else {
-                    val shape = registered.descriptor
-                    when (val decision = policy.decide(shape)) {
-                        PolicyDecision.Allow -> {
-                            val executed = registry.execute(call)
-                            // P3.1's summary stays verbatim on a plain allow: only the structured fields are new, and
-                            // rewriting a P3.1-era audit line's four original fields would be a silent record change.
-                            audit.record(
-                                request.turnId, call.name, AUDIT_EXECUTED, outcomeOf(executed),
-                                scope = shape.scope, risk = shape.risk.name, decision = AUDIT_ALLOW,
-                            )
-                            executed
+                        // An unknown name is a step to feed back and never reaches the policy. It is *not* an execution,
+                        // so it carries its own stable audit label instead of sharing `executed` with a real tool run.
+                        val unknown = runTool(call, DEFAULT_TOOL_TIMEOUT_MILLIS, turnDeadlineNanos, toolExecutor)
+                        if (!unknown.cancelled) {
+                            audit.record(request.turnId, call.name, AUDIT_UNKNOWN_TOOL, outcomeOf(unknown.result))
                         }
-                        PolicyDecision.Refuse -> {
-                            audit.record(
-                                request.turnId, call.name, AUDIT_POLICY, AUDIT_REFUSED,
-                                scope = shape.scope, risk = shape.risk.name, decision = AUDIT_REFUSE,
-                            )
-                            ToolResult.error(call.id, REFUSED_BY_POLICY)
-                        }
-                        is PolicyDecision.RequireConfirmation -> {
-                            // Waiting on a person is not the turn spending its own budget (D49): measure the call and
-                            // shift the deadline by the same amount. `finally` so a channel that throws is not punished
-                            // for the time it already spent waiting. The same measurement is **published** as it is taken
-                            // ([measuredHumanWaitNanos]), so a caller whose own windows derive from the deadline can move
-                            // them even when this run ends by throwing instead of returning (review I-1).
-                            val waitStartedNanos = clock.nowNanos()
-                            val outcome = try {
-                                confirmation?.request(call.id, decision.summary)
-                            } finally {
-                                val waitedNanos = clock.nowNanos() - waitStartedNanos
-                                if (waitedNanos > 0L) {
-                                    humanWaitNanos += waitedNanos
-                                    turnDeadlineNanos += waitedNanos
+                        unknown
+                    } else {
+                        val shape = registered.descriptor
+                        when (val decision = policy.decide(shape)) {
+                            PolicyDecision.Allow -> {
+                                val executed = runTool(call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor)
+                                if (!executed.cancelled) {
+                                    // P3.1's summary stays verbatim on a plain allow: only the structured fields are
+                                    // new, and rewriting a P3.1-era audit line's four original fields would be a silent
+                                    // record change.
+                                    audit.record(
+                                        request.turnId, call.name, AUDIT_EXECUTED, outcomeOf(executed.result),
+                                        scope = shape.scope, risk = shape.risk.name, decision = AUDIT_ALLOW,
+                                    )
+                                }
+                                executed
+                            }
+                            PolicyDecision.Refuse -> {
+                                audit.record(
+                                    request.turnId, call.name, AUDIT_POLICY, AUDIT_REFUSED,
+                                    scope = shape.scope, risk = shape.risk.name, decision = AUDIT_REFUSE,
+                                )
+                                ToolExecution(ToolResult.error(call.id, REFUSED_BY_POLICY), executed = false)
+                            }
+                            is PolicyDecision.RequireConfirmation -> {
+                                // Waiting on a person is not the turn spending its own budget (D49): measure the call and
+                                // shift the deadline by the same amount. `finally` so a channel that throws is not
+                                // punished for the time it already spent waiting. The same measurement is **published**
+                                // as it is taken ([measuredHumanWaitNanos]), so a caller whose own windows derive from
+                                // the deadline can move them even when this run ends by throwing instead of returning
+                                // (review I-1).
+                                val waitStartedNanos = clock.nowNanos()
+                                val outcome = try {
+                                    confirmation?.request(call.id, decision.summary)
+                                } finally {
+                                    val waitedNanos = clock.nowNanos() - waitStartedNanos
+                                    if (waitedNanos > 0L) {
+                                        humanWaitNanos += waitedNanos
+                                        turnDeadlineNanos += waitedNanos
+                                    }
+                                }
+                                when {
+                                    // No channel at all: P3.1's behaviour, and an unconfirmed action never runs.
+                                    outcome == null -> {
+                                        audit.record(
+                                            request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE,
+                                            scope = shape.scope, risk = shape.risk.name,
+                                            decision = AUDIT_REQUIRE_CONFIRMATION,
+                                        )
+                                        ToolExecution(ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE), executed = false)
+                                    }
+                                    outcome.approved -> {
+                                        val executed = runTool(call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor)
+                                        if (!executed.cancelled) {
+                                            audit.record(
+                                                request.turnId, call.name, auditSummary(shape, call.argsJson),
+                                                outcomeOf(executed.result), scope = shape.scope, risk = shape.risk.name,
+                                                decision = AUDIT_REQUIRE_CONFIRMATION, confirmationSource = outcome.source,
+                                            )
+                                        }
+                                        executed
+                                    }
+                                    else -> {
+                                        val code = if (outcome.source == ConfirmationSource.TIMEOUT) CONFIRMATION_TIMEOUT
+                                        else CONFIRMATION_DENIED
+                                        audit.record(
+                                            request.turnId, call.name, code, code, scope = shape.scope,
+                                            risk = shape.risk.name, decision = AUDIT_REQUIRE_CONFIRMATION,
+                                            confirmationSource = outcome.source,
+                                        )
+                                        ToolExecution(ToolResult.error(call.id, code), executed = false)
+                                    }
                                 }
                             }
-                            when {
-                                // No channel at all: P3.1's behaviour, and an unconfirmed action never runs.
-                                outcome == null -> {
-                                    audit.record(
-                                        request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE,
-                                        scope = shape.scope, risk = shape.risk.name,
-                                        decision = AUDIT_REQUIRE_CONFIRMATION,
-                                    )
-                                    ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE)
-                                }
-                                outcome.approved -> {
-                                    val executed = registry.execute(call)
-                                    audit.record(
-                                        request.turnId, call.name, auditSummary(shape, call.argsJson),
-                                        outcomeOf(executed), scope = shape.scope, risk = shape.risk.name,
-                                        decision = AUDIT_REQUIRE_CONFIRMATION, confirmationSource = outcome.source,
-                                    )
-                                    executed
-                                }
-                                else -> {
-                                    val code = if (outcome.source == ConfirmationSource.TIMEOUT) CONFIRMATION_TIMEOUT
-                                    else CONFIRMATION_DENIED
-                                    audit.record(
-                                        request.turnId, call.name, code, code, scope = shape.scope,
-                                        risk = shape.risk.name, decision = AUDIT_REQUIRE_CONFIRMATION,
-                                        confirmationSource = outcome.source,
-                                    )
-                                    ToolResult.error(call.id, code)
-                                }
-                            }
-                        }
                         }
                     }
                 } finally {
                     notifyToolStatus(request, call.name, ToolPhase.END)
                 }
-                steps += AgentStep(steps.size + 1, call.name, if (result.ok) "ok" else result.payload)
-                history += ModelHistoryItem.ToolOutput(call.id, result.payload)
-                // The guard sees only a fingerprint that exists after this action ran — never a pre-action observation.
-                guard.observeAfterAction(result.payload)
+                // A cancel that arrived while the tool was running is not a tool failure: no output is appended for the
+                // unfinished call (R61), so the model never sees a half-finished step as if it had completed.
+                if (execution.cancelled) {
+                    return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+                }
+                // R60: a call that did not stop within the grace window ends the run; no later write may run while the
+                // previous one may still be in flight.
+                if (execution.uncertain) {
+                    steps += AgentStep(steps.size + 1, call.name, execution.result.payload, executed = true)
+                    history += ModelHistoryItem.ToolOutput(call.id, execution.result.payload)
+                    return finish(AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps)
+                }
+                val result = execution.result
+                val write = descriptor?.let { !it.observation } ?: false
+                // R57/R62: the detectors see only a fingerprint that exists **after** this call ran; the guard is fed
+                // only by a fingerprint-bearing write (a non-observation tool). The payload is never used as a
+                // fingerprint — a payload that carries timing or a counter could never trip the guard.
+                val after = detectors.afterCall(execution.executed, write, result.fingerprint)
+                if (execution.executed && write && result.fingerprint != null) {
+                    guard.observeAfterAction(result.fingerprint)
+                }
+                // R56: the error streak is fed by every attempt with a stable code (a policy refusal counts, a
+                // confirmation decision does not, see `ErrorTracker`). A success resets it only when it was a write.
+                val errorsSeen = errors.assess(
+                    call.name, result, writeSucceeded = execution.executed && write && result.ok,
+                )
+                // The step keeps the raw stable code (`ok` on success, as before Task 12); the model-facing output
+                // additionally carries the one-time hints and the one-time global notice.
+                val stepResult = if (result.ok) "ok" else result.payload
+                val historyPayload = buildString {
+                    append(result.payload)
+                    errorsSeen.hint?.let { append("\n\n").append(it) }
+                    if (after.notice) append("\n\n").append(GLOBAL_NO_PROGRESS_NOTICE)
+                }
+                steps += AgentStep(steps.size + 1, call.name, stepResult, executed = true)
+                history += ModelHistoryItem.ToolOutput(call.id, historyPayload)
+                if (execution.executed && result.ok) successfulToolExecutions++
                 if (guard.tripped) return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps)
+                if (errorsSeen.repeatTerminated) {
+                    return finish(AgentOutcome.FAILED, REPEATED_ERROR, null, steps, history, "", spentSteps)
+                }
+                if (after.critical) {
+                    return finish(
+                        AgentOutcome.NO_PROGRESS, LoopPattern.GLOBAL_CIRCUIT_BREAKER.safeCode,
+                        null, steps, history, "", spentSteps,
+                    )
+                }
                 if (registered?.descriptor?.scope == SCOPE_TERMINAL && result.ok) {
                     return finish(AgentOutcome.COMPLETED, null, result.payload, steps, history, "", spentSteps)
                 }
                 if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
+                if (spentObservations >= maxObservations) {
+                    return finish(AgentOutcome.NO_PROGRESS, OBSERVATION_BUDGET, null, steps, history, "", spentSteps)
+                }
                 if (clock.nowNanos() >= turnDeadlineNanos) {
                     return finish(AgentOutcome.DEADLINE, null, null, steps, history, "", spentSteps)
                 }
@@ -540,6 +787,165 @@ class AgentLoop(
      */
     private fun frameTranscript(history: List<ModelHistoryItem>, utteranceIndex: Int): List<ModelHistoryItem> =
         if (history.size == utteranceIndex + 1) history.take(utteranceIndex) else history.toList()
+
+    // ---------------------------------------------------------------- Task 12: tool timeout (R60)
+
+    /**
+     * One tool attempt's outcome, including the three states the old synchronous call could not express: cancelled,
+     * timed out (confirmed stop) and uncertain (the tool did not stop).
+     */
+    private class ToolExecution(
+        val result: ToolResult,
+        val executed: Boolean,
+        val timedOut: Boolean = false,
+        val uncertain: Boolean = false,
+        val cancelled: Boolean = false,
+    )
+
+    /**
+     * Runs one `registry.execute` on the loop's single tool executor, bounded by the earlier of the descriptor's own
+     * timeout and the turn's remaining budget (R60).
+     *
+     * A completed call is returned as-is. A call that overruns is cancelled through [ToolRegistry.cancel] and then given
+     * a fixed grace window to really stop: a stop confirmed by its future completing is `ACTION_TIMEOUT` (the model gets
+     * one more chance and must observe before deciding); a tool still running after the grace is
+     * `ACTION_TIMEOUT_UNCERTAIN`, which the caller turns into the run's terminal state — no later write may run while an
+     * earlier one may still be in flight. The real result of a timed-out call is deliberately discarded: it arrived
+     * after the model was told the call failed, and reporting two outcomes for one call would be a lie either way.
+     */
+    private fun runTool(
+        call: ToolCall,
+        timeoutMillis: Long,
+        turnDeadlineNanos: Long,
+        toolExecutor: ExecutorService,
+    ): ToolExecution {
+        val budgetNanos = (turnDeadlineNanos - clock.nowNanos()).coerceAtLeast(1L)
+        val timeoutNanos = minOf(timeoutMillis.coerceAtLeast(1L) * 1_000_000L, budgetNanos)
+        val future: Future<ToolResult> = toolExecutor.submit(Callable { registry.execute(call) })
+        val startedAt = System.nanoTime()
+        while (true) {
+            if (cancelled) {
+                awaitToolStop(future)
+                return ToolExecution(ToolResult.error(call.id, ACTION_TIMEOUT), executed = false, cancelled = true)
+            }
+            val remaining = timeoutNanos - (System.nanoTime() - startedAt)
+            if (remaining <= 0L) break
+            try {
+                // A short poll (not one long get) is what lets `cancel()` reach a running tool promptly. A result
+                // that does arrive is a real completed call: it is recorded like before Task 12, and the loop's own
+                // cancellation check right after the call ends the run.
+                val completed = future.get(minOf(remaining, TOOL_POLL_STEP_NANOS), TimeUnit.NANOSECONDS)
+                return ToolExecution(completed, executed = true)
+            } catch (_: TimeoutException) {
+                // Keep waiting; the loop above re-checks cancellation and the remaining budget.
+            } catch (_: ExecutionException) {
+                return ToolExecution(ToolResult.error(call.id, "TOOL_THREW"), executed = true)
+            } catch (interrupted: InterruptedException) {
+                Thread.currentThread().interrupt()
+                runCatching { registry.cancel() }
+                awaitToolStop(future)
+                return ToolExecution(ToolResult.error(call.id, ACTION_TIMEOUT), executed = false, cancelled = true)
+            }
+        }
+        runCatching { registry.cancel() }
+        val stopped = awaitToolStop(future)
+        return if (stopped) {
+            ToolExecution(
+                ToolResult(call.id, ok = false, payload = "$ACTION_TIMEOUT: $ACTION_TIMEOUT_NOTE"),
+                executed = true,
+                timedOut = true,
+            )
+        } else {
+            ToolExecution(
+                ToolResult(call.id, ok = false, payload = "$ACTION_TIMEOUT_UNCERTAIN: $ACTION_TIMEOUT_UNCERTAIN_NOTE"),
+                executed = true,
+                uncertain = true,
+            )
+        }
+    }
+
+    /** Waits up to the fixed grace window for [future] to finish; returns whether it did. */
+    private fun awaitToolStop(future: Future<ToolResult>): Boolean {
+        val untilNanos = System.nanoTime() + TOOL_TIMEOUT_GRACE_NANOS
+        while (System.nanoTime() < untilNanos) {
+            if (future.isDone) return true
+            try {
+                val remaining = (untilNanos - System.nanoTime()).coerceAtLeast(1L)
+                future.get(minOf(remaining, TOOL_POLL_STEP_NANOS), TimeUnit.NANOSECONDS)
+                return true
+            } catch (_: TimeoutException) {
+                // Still running inside the grace window.
+            } catch (_: ExecutionException) {
+                return true
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return future.isDone
+            }
+        }
+        return future.isDone
+    }
+
+    // ---------------------------------------------------------------- Task 12: runtime state (R59)
+
+    /**
+     * Folds the current [AgentRequest.runtimeState] into [frame] as one untrusted `RUNTIME_STATE` segment before the
+     * frame's `USER_INPUT`, unless it is byte-identical to the state the previous request carried.
+     *
+     * The segment is request metadata: it is not appended to `history`, so it never reaches [AgentRun.transcript], a
+     * `ConversationStore` or a tool result. A provider that returns `null` or throws contributes nothing — the model
+     * simply gets no state line, never a fabricated one.
+     */
+    private fun withRuntimeState(frame: RequestFrame, request: AgentRequest): RequestFrame {
+        val state = runCatching { request.runtimeState?.invoke() }.getOrNull() ?: return frame
+        val hash = sha256Hex(state.text)
+        if (hash == lastRuntimeStateHash) return frame
+        lastRuntimeStateHash = hash
+        val flow = frame.conversationFlow
+        val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
+        if (inputIndex < 0) return frame
+        return frame.copy(
+            conversationFlow = flow.take(inputIndex) +
+                Segment(SegmentOrigin.RUNTIME_STATE, trusted = false, text = state.text) +
+                flow.drop(inputIndex),
+        )
+    }
+
+    // ---------------------------------------------------------------- Task 12: plan nudge (R58)
+
+    /**
+     * Whether [text] is a **plan** that should be nudged into execution instead of accepted as the answer.
+     *
+     * Every condition of R58 must hold: the route allows nudging, this run has already executed a tool successfully,
+     * the text is short enough, it carries a plan marker and no completion marker, and the run is not at its deadline /
+     * step / observation budget. A pure Q&A turn (no successful tool) is never nudged; neither is a text that reports
+     * an outcome. The "identical text after a nudge" rule lives at the call site, where the nudge count is known.
+     */
+    private fun shouldPlanNudge(
+        text: String,
+        request: AgentRequest,
+        turnDeadlineNanos: Long,
+        spentSteps: Int,
+    ): Boolean {
+        if (!request.allowPlanNudge) return false
+        if (successfulToolExecutions == 0) return false
+        if (text.length > MAX_PLAN_TEXT_CHARS) return false
+        if (clock.nowNanos() >= turnDeadlineNanos) return false
+        if (spentSteps >= maxSteps) return false
+        if (spentObservations >= maxObservations) return false
+        val lower = text.lowercase()
+        if (PLAN_COMPLETION_MARKERS.any { text.contains(it) || lower.contains(it) }) return false
+        return PLAN_MARKERS.any { marker -> text.contains(marker) || lower.contains(marker) }
+    }
+
+    /**
+     * Adds `[assistant plan text, USER nudge]`. The assistant half keeps the history alternating (the endpoint is
+     * stateless and a lone user instruction would be an unpaired turn); the user half is loop scaffolding and
+     * [withoutRetryScaffolding] strips the pair before a caller stores the transcript.
+     */
+    private fun appendPlanNudge(history: MutableList<ModelHistoryItem>, text: String) {
+        history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT })
+        history += ModelHistoryItem.Text(MessageRole.USER, PLAN_NUDGE_INSTRUCTION)
+    }
 
     /**
      * Returns a run and records the transcript it leaves behind, closing a still-pending user turn first: a transcript
@@ -562,6 +968,7 @@ class AgentLoop(
         lastTranscript = history.toList()
         return AgentRun(
             outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps, usage,
+            spentObservations, planNudgeCap,
         )
     }
 
@@ -615,18 +1022,18 @@ class AgentLoop(
 
     companion object {
         /**
-         * [items] without the loop-internal retry scaffolding ([appendRetry]): each retry contributes exactly
-         * `[assistant text, RETRY_INSTRUCTION]`.
+         * [items] without the loop-internal retry **and plan-nudge** scaffolding: each retry contributes exactly
+         * `[assistant text, RETRY_INSTRUCTION]` and each plan nudge `[assistant plan text, PLAN_NUDGE_INSTRUCTION]`.
          *
-         * The instruction is the loop talking to the model, not the wearer, and the assistant half is either the
-         * `(empty turn)` placeholder or a cut-off partial reply the wearer never received — spec §5.1's stored
-         * conversation has only the user's own turns, the assistant's real replies and tool rounds. A caller that
-         * persists a run's transcript therefore filters the pairs out (0.25 review ruling R16). The instruction is
-         * matched by its constant here, in the file that owns it, rather than duplicated in the caller.
+         * The instructions are the loop talking to the model, not the wearer, and the assistant half is either a
+         * placeholder, a cut-off partial reply or a plan the model never executed — spec §5.1's stored conversation has
+         * only the user's own turns, the assistant's real replies and tool rounds. A caller that persists a run's
+         * transcript therefore filters the pairs out (0.25 review ruling R16, Task 12 R58). The instructions are
+         * matched by their constants here, in the file that owns them, rather than duplicated in the caller.
          *
-         * A retry pair is never split by the caller's tail boundary: both items are appended together, after the
-         * turn's utterance. The only false positive would be a wearer typing the loop's instruction verbatim directly
-         * after an assistant turn; that string is loop-authored and not user-facing.
+         * A scaffolding pair is never split by the caller's tail boundary: both items are appended together, after the
+         * turn's utterance. The only false positive would be a wearer typing one of the loop's instructions verbatim
+         * directly after an assistant turn; those strings are loop-authored and not user-facing.
          */
         fun withoutRetryScaffolding(items: List<ModelHistoryItem>): List<ModelHistoryItem> {
             if (items.size < 2) return items
@@ -635,9 +1042,10 @@ class AgentLoop(
             while (index < items.size) {
                 val item = items[index]
                 val next = items.getOrNull(index + 1)
-                val retryPair = item is ModelHistoryItem.Text && item.role == MessageRole.ASSISTANT &&
-                    next is ModelHistoryItem.Text && next.role == MessageRole.USER && next.text == RETRY_INSTRUCTION
-                if (retryPair) {
+                val scaffoldingPair = item is ModelHistoryItem.Text && item.role == MessageRole.ASSISTANT &&
+                    next is ModelHistoryItem.Text && next.role == MessageRole.USER &&
+                    (next.text == RETRY_INSTRUCTION || next.text == PLAN_NUDGE_INSTRUCTION)
+                if (scaffoldingPair) {
                     index += 2
                 } else {
                     kept += item

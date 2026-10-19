@@ -134,6 +134,10 @@ class ScopedHostServices(
         // next turn's re-arm as well. Without this override the interface's default no-op runs here and
         // the production kernel (behind ToolCatalog) stays cancelled for the rest of the process.
         override fun beginTurn() = scope.active { provider.beginTurn() }
+        // 0.25 Task 12 (R59/R81): the plugin reads the runtime-state provider through this scoped executor. Without
+        // this override the interface default `null` runs and the plugin would never see the device kernel's state,
+        // even though the production provider implements it.
+        override fun runtimeState(): String? = scope.active { provider.runtimeState() }
     }
     private fun scopedContext(provider: ContextSignals) = object : ContextSignals {
         override fun snapshot() = scope.active { provider.snapshot() }

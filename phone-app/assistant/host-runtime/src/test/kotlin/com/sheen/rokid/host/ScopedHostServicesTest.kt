@@ -242,6 +242,39 @@ class ScopedHostServicesTest {
         assertEquals(1, begins)
     }
 
+    @Test fun `a granted actions channel forwards runtimeState under the same scope fence`() {
+        // 0.25 Task 12 (R81): the plugin reads the runtime-state provider through the **scoped** executor it was
+        // granted. Without an override here the interface default `null` runs, so the plugin would never see the
+        // device kernel's state even though the production provider implements it.
+        val provider = object : ActionExecutor {
+            override fun descriptors() = emptyList<ActionDescriptor>()
+            override fun execute(name: String, argsJson: String) = ActionResult(ActionOutcome.Done, "")
+            override fun cancel() = Unit
+            override fun runtimeState() = "foreground=com.android.settings revision=4 generation=2"
+        }
+        val scope = scope()
+        val services = ScopedHostServices(scope, setOf(Capability.Actions),
+            mapOf(Capability.Actions to provider), FakeTaskScope())
+        val actions = services.actions()
+
+        assertEquals("foreground=com.android.settings revision=4 generation=2", actions.runtimeState())
+
+        scope.revoke()
+        assertFailsWith<ContractError.Cancelled> { actions.runtimeState() }
+    }
+
+    @Test fun `an executor without runtime state answers null through the wrapper`() {
+        val provider = object : ActionExecutor {
+            override fun descriptors() = emptyList<ActionDescriptor>()
+            override fun execute(name: String, argsJson: String) = ActionResult(ActionOutcome.Done, "")
+            override fun cancel() = Unit
+        }
+        val services = ScopedHostServices(scope(), setOf(Capability.Actions),
+            mapOf(Capability.Actions to provider), FakeTaskScope())
+
+        assertNull(services.actions().runtimeState())
+    }
+
     @Test fun `a granted actions channel forwards precheck and a revoked scope never reaches the classifier`() {
         val seen = mutableListOf<Pair<String, String>>()
         val provider = object : ActionExecutor {

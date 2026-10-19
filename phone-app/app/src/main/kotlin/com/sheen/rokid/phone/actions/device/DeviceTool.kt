@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.actions.device
 
 import com.sheen.rokid.device.ActKind
+import com.sheen.rokid.device.Bounds
 import com.sheen.rokid.device.DeviceEnvelope
 import com.sheen.rokid.device.DeviceErrorCodes
 import com.sheen.rokid.device.DeviceKernel
@@ -17,6 +18,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
+import java.security.MessageDigest
 
 /**
  * The kernel surface [DeviceTool] needs, as a seam.
@@ -27,6 +29,17 @@ import kotlinx.serialization.json.put
  */
 interface DeviceOperations {
     val latestObservation: Observation?
+
+    /**
+     * Task 12 (R59): the kernel's monotonic observation counter, or `null` when the implementation has none.
+     *
+     * Additive default so every hand-scripted test implementation keeps compiling; it is only used to render the one
+     * runtime-state line, never to decide an action.
+     */
+    val revision: Long? get() = null
+
+    /** Task 12 (R59): the kernel's monotonic write counter, or `null` when the implementation has none. */
+    val generation: Long? get() = null
 
     fun observe(filter: ScreenFilter): DeviceEnvelope
 
@@ -58,6 +71,12 @@ class DeviceKernelOperations(private val kernel: DeviceKernel) : DeviceOperation
 
     override val latestObservation: Observation?
         get() = kernel.latestObservation
+
+    override val revision: Long?
+        get() = kernel.revision
+
+    override val generation: Long?
+        get() = kernel.generation
 
     override fun observe(filter: ScreenFilter): DeviceEnvelope = kernel.observe(filter)
 
@@ -127,6 +146,27 @@ class DeviceTool(
 
     fun close() = operations.close()
 
+    /**
+     * Task 12 (R59): one plain-state line for the loop's non-persistent `RUNTIME_STATE` segment, or `null` before the
+     * first observation.
+     *
+     * Only state that the kernel really knows is reported — foreground package/window, the latest observation revision
+     * and the write generation. Steps/observations spent and typed-but-unsent text belong to the loop/IME, not here, so
+     * they are not invented. `null` is the honest answer when there is no observation yet.
+     */
+    override fun runtimeState(): String? {
+        val observation = operations.latestObservation ?: return null
+        val foregroundWindow = observation.windows.firstOrNull { it.packageName != null }
+            ?: observation.windows.firstOrNull()
+        val text = buildString {
+            append("foreground=").append(foregroundWindow?.packageName ?: "?")
+            append(" window=").append(foregroundWindow?.id ?: 0)
+            append(" revision=").append(operations.revision ?: observation.revision)
+            operations.generation?.let { append(" generation=").append(it) }
+        }
+        return text.takeIf { it.length <= RUNTIME_STATE_MAX_CHARS }
+    }
+
     /** The tool's own call shape (one argument object); [ActionExecutor.execute] adds the name. */
     fun execute(argsJson: String): ActionResult = execute(NAME, argsJson)
 
@@ -153,7 +193,7 @@ class DeviceTool(
         }
         lastFilter = filter
         val envelope = operations.observe(filter)
-        return result(envelope, project(envelope, filter))
+        return result(envelope, project(envelope, filter), fingerprintAfter(envelope))
     }
 
     private fun act(args: JsonObject): ActionResult {
@@ -172,7 +212,7 @@ class DeviceTool(
             key = args.stringArg("key"),
             timeoutMillis = timeout,
         )
-        return result(envelope, project(envelope, lastFilter))
+        return result(envelope, project(envelope, lastFilter), fingerprintAfter(envelope))
     }
 
     /**
@@ -202,19 +242,19 @@ class DeviceTool(
                 timeoutMillis = remaining,
             )
             if (!scrolled.ok && scrolled.error?.code != DeviceErrorCodes.ACCEPTED_NO_EFFECT) {
-                return result(scrolled.copy(action = ACTION_ACT), project(scrolled, lastFilter))
+                return result(scrolled.copy(action = ACTION_ACT), project(scrolled, lastFilter), fingerprintAfter(scrolled))
             }
             val waited = operations.waitFor(text, null, false, remaining)
             last = waited
             if (waited.ok) {
-                return result(waited.copy(action = ACTION_ACT), project(waited, lastFilter))
+                return result(waited.copy(action = ACTION_ACT), project(waited, lastFilter), fingerprintAfter(waited))
             }
             if (waited.error?.code != DeviceErrorCodes.VERIFY_TIMEOUT) {
-                return result(waited.copy(action = ACTION_ACT), project(waited, lastFilter))
+                return result(waited.copy(action = ACTION_ACT), project(waited, lastFilter), fingerprintAfter(waited))
             }
         } while (clock() - started < timeoutMillis)
         val envelope = last ?: operations.waitFor(text, null, false, 1L)
-        return result(envelope.copy(action = ACTION_ACT), project(envelope, lastFilter))
+        return result(envelope.copy(action = ACTION_ACT), project(envelope, lastFilter), fingerprintAfter(envelope))
     }
 
     private fun screenshot(): ActionResult {
@@ -268,14 +308,69 @@ class DeviceTool(
         }
     }
 
-    private fun result(envelope: DeviceEnvelope, data: JsonObject): ActionResult {
+    private fun result(envelope: DeviceEnvelope, data: JsonObject, fingerprint: String? = null): ActionResult {
         val outcome = when {
             envelope.ok -> ActionOutcome.Done
             envelope.error?.recoverable == true -> ActionOutcome.Refused
             else -> ActionOutcome.Failed
         }
-        return ActionResult(outcome, renderEnvelope(envelope, data))
+        return ActionResult(outcome, renderEnvelope(envelope, data), fingerprint)
     }
+
+    /**
+     * Task 12 (R57): the post-call observation fingerprint, or `null` when this call has no screen to fingerprint.
+     *
+     * The kernel observes after every `observe`/`act` (a successful write, a refusal, an `ACCEPTED_NO_EFFECT`), so the
+     * newest [DeviceOperations.latestObservation] is the state the call left behind. A kernel diagnostic in `data`
+     * means the observation itself failed (R32) — a diagnostic is not a screen, and fingerprinting the previous
+     * snapshot would report "no change" for a call that simply could not look. The fingerprint excludes the revision
+     * and all timing: the same screen must hash identically across observations.
+     */
+    private fun fingerprintAfter(envelope: DeviceEnvelope): String? {
+        if (!envelope.data.isNullOrBlank()) return null
+        val observation = operations.latestObservation ?: return null
+        return observationFingerprint(observation)
+    }
+
+    /**
+     * A stable SHA-256 of the screen's **content**: every window and node field the model can act on, with the
+     * revision, timing and artifact ids left out. Two observations of the same screen therefore produce one
+     * fingerprint, which is what lets the loop's poll/global detectors see "nothing changed" without ever reading a
+     * payload body.
+     */
+    private fun observationFingerprint(observation: Observation): String {
+        val content = StringBuilder()
+        content.append(observation.windows.size).append('|')
+        observation.windows.forEach { window ->
+            content.field(window.id).field(window.type).field(window.layer)
+                .field(window.bounds).field(window.packageName).field(window.title)
+        }
+        content.append(observation.nodes.size).append('|')
+        observation.nodes.forEach { node ->
+            content.field(node.role).field(node.text).field(node.contentDescription).field(node.viewId)
+                .field(node.bounds).field(node.windowId).field(node.depth)
+                .field(node.states.sorted().joinToString(","))
+                .field(node.actions.joinToString(","))
+                .field(node.hint).field(node.paneTitle).field(node.tooltip).field(node.drawingOrder)
+                .field(node.collection?.toString()).field(node.range?.toString())
+        }
+        content.field(observation.truncated)
+        return MessageDigest.getInstance("SHA-256")
+            .digest(content.toString().toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+    }
+
+    private fun StringBuilder.field(value: Int?): StringBuilder = append(value ?: -1).append('|')
+
+    private fun StringBuilder.field(value: Boolean): StringBuilder = append(if (value) 1 else 0).append('|')
+
+    private fun StringBuilder.field(value: Bounds): StringBuilder =
+        append(value.left).append(',').append(value.top).append(',')
+            .append(value.right).append(',').append(value.bottom).append('|')
+
+    /** Length-prefixed so content containing the separator cannot make two different screens hash identically. */
+    private fun StringBuilder.field(value: String?): StringBuilder =
+        append(value?.length ?: -1).append(':').append(value.orEmpty()).append('|')
 
     private fun renderEnvelope(envelope: DeviceEnvelope, data: JsonObject): String = buildJsonObject {
         put("ok", envelope.ok)
@@ -343,6 +438,9 @@ class DeviceTool(
         /** Default per-operation budget, matching [DeviceKernel.DEFAULT_OPERATION_TIMEOUT_MILLIS]. */
         const val DEFAULT_TIMEOUT_MILLIS = 30_000L
 
+        /** R59: the same cap `TurnRuntimeState` enforces; the provider must never hand over a line it would reject. */
+        const val RUNTIME_STATE_MAX_CHARS = 300
+
         private const val ACTION_OBSERVE = "observe"
         private const val ACTION_ACT = "act"
         private const val ACTION_SCREENSHOT = "screenshot"
@@ -399,6 +497,10 @@ class DeviceTool(
             idempotent = false,
             reversible = false,
             scope = "app.ui",
+            // Task 12 (R57/R61): every `device` call comes back with an observation (the kernel's post-action
+            // snapshot), so the loop counts it against the observation budget and fingerprints it. It is deliberately
+            // *not* a ProgressGuard input: the poll/global detectors own the repeated-observation case.
+            observation = true,
         )
     }
 }

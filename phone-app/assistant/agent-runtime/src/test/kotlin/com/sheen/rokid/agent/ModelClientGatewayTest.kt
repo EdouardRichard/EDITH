@@ -554,6 +554,26 @@ class ModelClientGatewayTest {
         assertEquals(0, sent.history.size, "旧回合被裁掉了")
     }
 
+    @Test fun `a runtime state segment folds into the request input and never into the history`() {
+        // Task 12 (R59): RUNTIME_STATE is request metadata like a RETRY instruction — it must not become a lone user
+        // history group, which `ContextBudgeter` rejects, and it must not push the wearer's own turn out of `input`.
+        val client = terminalClient()
+        val flow = listOf(
+            Segment(SegmentOrigin.RUNTIME_STATE, false, "foreground=com.android.settings revision=4"),
+            Segment(SegmentOrigin.USER_INPUT, true, "现在呢"),
+        )
+        val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
+
+        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+
+        val sent = client.requests.single()
+        assertEquals(0, sent.history.size, "runtime state is not a conversation turn")
+        val input = sent.input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(input.indexOf("foreground=") >= 0, input)
+        assertTrue(input.indexOf("foreground=") < input.indexOf("现在呢"), "state rides ahead of the input: $input")
+        assertTrue(input.endsWith("现在呢"), "the wearer's turn stays the input: $input")
+    }
+
     @Test fun `a clean-body summary reaches the wire bounded exactly once inside the leading user message`() {
         // AC-6 / I-1: the frame path must render the boundary itself. The store hands over the **bounded** text
         // (I-2), so a frame whose summary arrives pre-rendered would pass even with the render arm deleted —

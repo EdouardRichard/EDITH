@@ -116,6 +116,21 @@ class TurnTrimmerTest {
         assertTrue(r.compressionOwed, "摘要必须计入 total()（未计入时不该还欠压缩）")
     }
 
+    @Test fun `runtime state is never evicted even when whole turns are`() {
+        // Task 12 (R59): RUNTIME_STATE is protected exactly like USER_INPUT, but it still counts toward the budget.
+        // 口径复算：总 = 32(固定) + 35(sys) + 34(u1) + 34(a1) + 58(runtime，26 字节) + 35(now) = 228；
+        // 裁掉回合组 u1+a1 后 = 160。limitBytes 取 200 ⇒ 只掉一回合、runtime 与 now 仍在。
+        val runtime = Segment(SegmentOrigin.RUNTIME_STATE, false, "foreground=com.x revision=4")
+        val f = frame(userTurn("u1"), assistant("a1"), runtime, user("now"))
+
+        val r = TurnTrimmer().trim(f, limitBytes = 200)
+
+        assertEquals(1, r.droppedTurns)
+        assertTrue(r.kept.conversationFlow.any { it.origin == SegmentOrigin.RUNTIME_STATE },
+            "runtime state must survive turn eviction: ${r.kept.conversationFlow}")
+        assertEquals(SegmentOrigin.USER_INPUT, r.kept.conversationFlow.last().origin)
+    }
+
     @Test fun `the system slot is never trimmed`() {
         val f = frame(userTurn("u1"), assistant("a1"), user("now"))
         val r = TurnTrimmer().trim(f, limitBytes = 1)

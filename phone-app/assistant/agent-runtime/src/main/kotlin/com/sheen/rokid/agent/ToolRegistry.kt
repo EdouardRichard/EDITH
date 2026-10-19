@@ -90,11 +90,34 @@ class ToolRegistry(
         } catch (_: Exception) {
             return ToolResult.error(call.id, TOOL_THREW)
         }
+        // R57: the observation fingerprint rides through verbatim, on every outcome — a refused write that left the
+        // screen unchanged is exactly the evidence the poll/global detectors need.
         return when (result.outcome) {
-            ActionOutcome.Done -> ToolResult(call.id, ok = true, payload = result.detail)
-            ActionOutcome.Refused -> ToolResult(call.id, ok = false, payload = "${ActionOutcome.Refused.name}: ${result.detail}")
-            ActionOutcome.Failed -> ToolResult(call.id, ok = false, payload = "${ActionOutcome.Failed.name}: ${result.detail}")
+            ActionOutcome.Done -> ToolResult(call.id, ok = true, payload = result.detail, fingerprint = result.fingerprint)
+            ActionOutcome.Refused -> ToolResult(
+                call.id, ok = false, payload = "${ActionOutcome.Refused.name}: ${result.detail}",
+                fingerprint = result.fingerprint,
+            )
+            ActionOutcome.Failed -> ToolResult(
+                call.id, ok = false, payload = "${ActionOutcome.Failed.name}: ${result.detail}",
+                fingerprint = result.fingerprint,
+            )
         }
+    }
+
+    /**
+     * Task 12 (R60/R61): asks every executor to stop the work a cancelled/timed-out call may still be running.
+     *
+     * The device kernel's `cancel` is best-effort (a wedged platform call may ignore it), which is exactly why the loop
+     * waits a grace window and reports `ACTION_TIMEOUT_UNCERTAIN` when a call does not stop. A throwing executor must not
+     * stop the others from being cancelled: this is the teardown path, so every executor is attempted and the first
+     * failure is swallowed.
+     */
+    fun cancel() {
+        // Cancel the executors this registry was built from, including one whose every descriptor lost a duplicate-name
+        // merge: an executor that declared a tool must stop when the turn ends even if another declaration was the one
+        // the model saw.
+        executors.forEach { executor -> runCatching { executor.cancel() } }
     }
 
     private fun argumentsParse(argsJson: String): Boolean =
@@ -113,4 +136,6 @@ private fun ActionDescriptor.toToolDescriptor() = ToolDescriptor(
     scope = scope,
     auditTargetArgument = auditTargetArgument,
     countsTowardStepLimit = countsTowardStepLimit,
+    observation = observation,
+    timeoutMillis = timeoutMillis,
 )

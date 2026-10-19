@@ -62,7 +62,7 @@ class StepLimitExemptionTest {
 
     @Test fun `an exempt tool may be called more times than maxSteps without STEP_LIMIT`() {
         val gateway = ScriptedGateway(
-            List(6) { reply(calls = listOf(call("c$it", EXEMPT_TOOL))) } + reply(text = "资料齐了"),
+            List(6) { reply(calls = listOf(call("c$it", EXEMPT_TOOL, """{"skill":"s$it"}"""))) } + reply(text = "资料齐了"),
         )
 
         val run = newLoop(gateway, ToolRegistry(listOf(exemptExecutor())), maxSteps = 2).run(request())
@@ -87,7 +87,7 @@ class StepLimitExemptionTest {
 
     @Test fun `an exempt call still appears in run steps with a contiguous index`() {
         val gateway = ScriptedGateway(
-            List(6) { reply(calls = listOf(call("c$it", EXEMPT_TOOL))) } + reply(text = "资料齐了"),
+            List(6) { reply(calls = listOf(call("c$it", EXEMPT_TOOL, """{"skill":"s$it"}"""))) } + reply(text = "资料齐了"),
         )
 
         val run = newLoop(gateway, ToolRegistry(listOf(exemptExecutor())), maxSteps = 2).run(request())
@@ -98,7 +98,7 @@ class StepLimitExemptionTest {
 
     @Test fun `spentSteps counts only the declared calls`() {
         val exemptRun = newLoop(
-            ScriptedGateway(List(6) { reply(calls = listOf(call("c$it", EXEMPT_TOOL))) } + reply(text = "资料齐了")),
+            ScriptedGateway(List(6) { reply(calls = listOf(call("c$it", EXEMPT_TOOL, """{"skill":"s$it"}"""))) } + reply(text = "资料齐了")),
             ToolRegistry(listOf(exemptExecutor())),
             maxSteps = 2,
         ).run(request())

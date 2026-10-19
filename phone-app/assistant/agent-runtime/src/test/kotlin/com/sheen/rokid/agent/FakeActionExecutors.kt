@@ -42,6 +42,9 @@ internal fun actionDescriptor(
     scope: String = "test",
     auditTargetArgument: String? = null,
     countsTowardStepLimit: Boolean = true,
+    // Task 12 (R57): additive descriptor metadata. The defaults keep every pre-0.25 fixture byte-for-byte.
+    observation: Boolean = false,
+    timeoutMillis: Long = 30_000L,
 ) = ActionDescriptor(
     name = name,
     title = "Title of $name",
@@ -53,6 +56,8 @@ internal fun actionDescriptor(
     scope = scope,
     auditTargetArgument = auditTargetArgument,
     countsTowardStepLimit = countsTowardStepLimit,
+    observation = observation,
+    timeoutMillis = timeoutMillis,
 )
 
 /** An executor offering exactly one tool, described by [actionDescriptor] defaults. */

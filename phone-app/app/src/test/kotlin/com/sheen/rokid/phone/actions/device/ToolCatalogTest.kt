@@ -210,6 +210,54 @@ class ToolCatalogTest {
         }
     }
 
+    @Test
+    fun `only device declares observation and its runtime state is forwarded`() {
+        val operations = RecordingDeviceOperations(
+            observation = Observation(
+                7,
+                listOf(ObservationWindow(0, "application", 0, Bounds(0, 0, 10, 10), "com.example.settings", null)),
+                emptyList(),
+                false,
+            ),
+            revision = 7L,
+            generation = 3L,
+        )
+        val catalog = catalog(deviceOperations = operations)
+
+        val byName = catalog.descriptors().associateBy { it.name }
+        assertTrue(byName.getValue("device").observation)
+        listOf("shell", "open", "dial").forEach { name ->
+            assertFalse("$name must stay outside the observation seam", byName.getValue(name).observation)
+        }
+        assertEquals("foreground=com.example.settings window=0 revision=7 generation=3", catalog.runtimeState())
+    }
+
+    @Test
+    fun `runtime state is absent while the device channel is unavailable`() {
+        val operations = RecordingDeviceOperations(
+            observation = Observation(1, emptyList(), emptyList(), false),
+            revision = 1L,
+            generation = 0L,
+        )
+        val catalog = catalog(probes = Probes(a11y = false), deviceOperations = operations)
+
+        assertEquals(null, catalog.runtimeState())
+    }
+
+    @Test
+    fun `the shell call timeout leaves room for the command-level confirmation`() {
+        val descriptors = catalog().descriptors().associateBy { it.name }
+
+        // The plugin's ConfirmingActions asks the wearer inside the same execute call; D47's decision window is 120 s.
+        // A 30 s machine cap there would turn a slow but legal answer into ACTION_TIMEOUT and could cancel a command
+        // the wearer just approved. The turn deadline still bounds the run.
+        assertEquals(120_000L + 30_000L, descriptors.getValue("shell").timeoutMillis)
+        // The other tools have no human wait inside execute and keep the ordinary-tool cap.
+        listOf("device", "open", "dial").forEach { name ->
+            assertEquals("$name keeps the ordinary cap", 30_000L, descriptors.getValue(name).timeoutMillis)
+        }
+    }
+
     // - helpers -
 
     private fun catalog(
@@ -259,8 +307,13 @@ class ToolCatalogTest {
         override fun cancel() = Unit
     }
 
-    private class RecordingDeviceOperations : DeviceOperations {
-        override val latestObservation: Observation? = null
+    private class RecordingDeviceOperations(
+        private val observation: Observation? = null,
+        override val revision: Long? = null,
+        override val generation: Long? = null,
+    ) : DeviceOperations {
+        override val latestObservation: Observation?
+            get() = observation
         val observeEnvelopes = mutableListOf<DeviceEnvelope>()
         var cancels = 0
         var begins = 0

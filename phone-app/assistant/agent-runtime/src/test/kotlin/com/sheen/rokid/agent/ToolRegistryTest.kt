@@ -260,4 +260,47 @@ class ToolRegistryTest {
 
         assertTrue(result.ok)
     }
+
+    // ---------------------------------------------------------------- Task 12 (R57/R60/R61)
+
+    @Test fun `descriptors project the observation and timeout declarations additively`() {
+        val declared = RecordingActionExecutor(
+            listOf(actionDescriptor("device", observation = true, timeoutMillis = 5_000L)),
+        )
+        val descriptor = ToolRegistry(listOf(declared)).descriptors().single()
+
+        assertTrue(descriptor.observation)
+        assertEquals(5_000L, descriptor.timeoutMillis)
+
+        // The defaults reproduce the pre-0.25 declaration exactly: not an observation, ordinary 30 s cap.
+        val plain = ToolRegistry(listOf(executorOf("lookup"))).descriptors().single()
+        assertFalse(plain.observation)
+        assertEquals(30_000L, plain.timeoutMillis)
+    }
+
+    @Test fun `the fingerprint rides through every outcome`() {
+        val executor = executorOf("device")
+        val registry = ToolRegistry(listOf(executor))
+
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "screen", fingerprint = "fp-1") }
+        assertEquals("fp-1", registry.execute(ToolCall("c1", "device", "{}")).fingerprint)
+
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Refused, "NODE_STALE", fingerprint = "fp-1") }
+        val refused = registry.execute(ToolCall("c2", "device", "{}"))
+        assertFalse(refused.ok)
+        assertEquals("fp-1", refused.fingerprint, "a refused write still reports the screen it left behind")
+    }
+
+    @Test fun `cancel reaches every executor once including a duplicate that lost the merge`() {
+        val survivor = executorOf("shared", risk = RiskLevel.L1)
+        val loser = executorOf("shared", risk = RiskLevel.L0)
+        val distinct = executorOf("other")
+        val registry = ToolRegistry(listOf(survivor, loser, distinct))
+
+        registry.cancel()
+
+        assertEquals(1, survivor.cancellations)
+        assertEquals(1, loser.cancellations, "an executor that declared a tool must stop even if it lost the merge")
+        assertEquals(1, distinct.cancellations)
+    }
 }

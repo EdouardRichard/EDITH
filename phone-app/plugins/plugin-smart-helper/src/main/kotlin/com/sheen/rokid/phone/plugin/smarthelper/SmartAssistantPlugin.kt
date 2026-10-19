@@ -42,6 +42,7 @@ import com.sheen.rokid.agent.SegmentOrigin
 import com.sheen.rokid.agent.SegmentRole
 import com.sheen.rokid.agent.ToolRegistry
 import com.sheen.rokid.agent.TrimCounts
+import com.sheen.rokid.agent.TurnRuntimeState
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.plugin.ConversationDisplay
 import com.sheen.rokid.plugin.conversationDisplay
@@ -2036,6 +2037,13 @@ class SmartAssistantPlugin(
                     onTextDelta = { delta -> publishAssistantPartial(owned, delta) },
                     // 0.24 S4 Task 17: one START/END pair per tool, with the action's mapped label.
                     onToolStatus = { action, phase -> publishToolStatus(owned, action, phase, toolLabels) },
+                    // 0.25 Task 12 (R58): the WAKE route is the wearer waiting for an action, so a text-only plan
+                    // may be nudged into executing it. PROACTIVE never builds an `AgentRequest` at all (its single
+                    // request is a proposal), so the field's `false` default is the PROACTIVE answer structurally.
+                    allowPlanNudge = true,
+                    // 0.25 Task 12 (R59): one short state line from the scoped executor, folded into the request by
+                    // the loop. It is never written to the store: the loop keeps it out of the transcript.
+                    runtimeState = { runtimeStateForTurn() },
                 ),
             )
         } catch (failure: Throwable) {
@@ -2312,6 +2320,24 @@ class SmartAssistantPlugin(
         },
         stop = { owned.closed },
     )
+
+    /**
+     * 0.25 Task 12 (R59): the one runtime-state line the agent loop folds into its next request, or `null`.
+     *
+     * It is read through the **scoped** executor this plugin was granted, which is why the host's wrapper forwards
+     * `runtimeState()` (R81): without that forwarding the interface default `null` would be all the plugin ever saw and
+     * the feature would be silently dead in production.
+     *
+     * The line is pure state. A missing, blank or oversized line contributes nothing (the loop's `TurnRuntimeState`
+     * cap is the same bound), and a provider that throws is a state problem, never a failed turn — the wearer still
+     * gets an answer. Nothing here logs or stores the text: it travels only inside the assembled request.
+     */
+    private fun runtimeStateForTurn(): TurnRuntimeState? {
+        val line = runCatching { currentContext()?.services?.actions()?.runtimeState() }.getOrNull() ?: return null
+        val text = line.trim()
+        if (text.isEmpty() || text.length > TurnRuntimeState.MAX_CHARS) return null
+        return TurnRuntimeState(text)
+    }
 
     /**
      * Phase 5's request shape for one turn: the system slot (instructions + the fixed memory policy), the route's
@@ -2821,6 +2847,10 @@ class SmartAssistantPlugin(
             buildFrame(it, ContextRoute.PROACTIVE, message, prompt, listOf(SmartPrompts.PROPOSE_HINT))
         }
         val reply = try {
+            // 0.25 Task 12 (R58/R59): this route deliberately has **no** `AgentLoop` and no `AgentRequest` — it is one
+            // proposal request with `propose_hint` as the only control channel. A plan nudge (which exists to push a
+            // text plan into tool execution) and a loop-injected runtime state are therefore structurally absent here;
+            // the `AgentRequest.allowPlanNudge` default `false` is the PROACTIVE answer wherever a loop is used.
             gateway.turn(GatewayTurn(
                 turnId = hint.turnId,
                 profileId = configured.profileId,

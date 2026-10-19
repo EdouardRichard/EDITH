@@ -282,6 +282,9 @@ internal class SmartFakeActions(
     var cancellations = 0
     var outcome: (String, String) -> ActionResult = { _, _ -> ActionResult(ActionOutcome.Done, "已记录") }
 
+    /** Task 12 (R59): the runtime-state line the plugin reads through the scoped executor, or `null`. */
+    var runtimeStateLine: String? = null
+
     override fun descriptors(): List<ActionDescriptor> = descriptors
 
     override fun execute(name: String, argsJson: String): ActionResult {
@@ -290,6 +293,8 @@ internal class SmartFakeActions(
     }
 
     override fun cancel() { cancellations++ }
+
+    override fun runtimeState(): String? = runtimeStateLine
 }
 
 /**

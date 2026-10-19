@@ -164,10 +164,13 @@ class TurnTrimmer(private val measure: (Segment) -> Int = { utf8BytesPlusOverhea
     /**
      * Whether a segment may enter the eviction candidate set. `USER_INPUT` (AC-5) and `SUMMARY`
      * (a summary is not a turn) never may — this filter is the construction that keeps the current
-     * input out of every cut.
+     * input out of every cut. `RUNTIME_STATE` is protected for the same reason (R59): it is request
+     * metadata, not an old turn, and it is only a few hundred characters.
      */
     private fun isEvictable(segment: Segment): Boolean =
-        segment.origin != SegmentOrigin.USER_INPUT && segment.origin != SegmentOrigin.SUMMARY
+        segment.origin != SegmentOrigin.USER_INPUT &&
+            segment.origin != SegmentOrigin.SUMMARY &&
+            segment.origin != SegmentOrigin.RUNTIME_STATE
 }
 
 /**

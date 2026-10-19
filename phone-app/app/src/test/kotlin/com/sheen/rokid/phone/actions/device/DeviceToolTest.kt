@@ -27,6 +27,9 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.long
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -427,6 +430,77 @@ class DeviceToolTest {
         data = data,
     )
 
+    // - Task 12 (R57/R59): observation fingerprint and runtime state -
+
+    @Test
+    fun `observe and act carry a content fingerprint that ignores the revision`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        val tool = tool(operations)
+
+        val first = tool.execute("""{"action":"observe"}""")
+        // The same screen observed again: the revision advanced, the content did not.
+        operations.observation = observation(rev = 2, nodes = listOf(node("A")))
+        val second = tool.execute("""{"action":"observe"}""")
+
+        assertNotNull(first.fingerprint)
+        assertEquals("revision is not screen content", first.fingerprint, second.fingerprint)
+
+        // The kernel's post-action observation is a different screen, so the fingerprint changes.
+        operations.observation = observation(rev = 3, nodes = listOf(node("B")))
+        val act = tool.execute("""{"action":"act","kind":"tap","ref":"#n1"}""")
+
+        assertNotNull(act.fingerprint)
+        assertNotEquals(first.fingerprint, act.fingerprint)
+    }
+
+    @Test
+    fun `a device call without a screen carries no fingerprint`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        // A write whose result could not be observed: the kernel reports a diagnostic line instead of a snapshot.
+        operations.actEnvelope = DeviceEnvelope.success(
+            action = "act",
+            channel = "accessibility",
+            accepted = true,
+            applied = null,
+            verified = null,
+            timing = Timing(0, 0, 0),
+            data = "no observation",
+        )
+
+        val result = tool(operations).execute("""{"action":"act","kind":"tap","ref":"#n1"}""")
+
+        assertNull("a diagnostic is not an observation and must not be fingerprinted", result.fingerprint)
+    }
+
+    @Test
+    fun `wait status and screenshot carry no observation fingerprint`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        val tool = tool(operations)
+
+        assertNull(tool.execute("""{"action":"status"}""").fingerprint)
+        assertNull(tool.execute("""{"action":"screenshot"}""").fingerprint)
+        assertNull(tool.execute("""{"action":"wait","idle":true}""").fingerprint)
+    }
+
+    @Test
+    fun `runtimeState is one bounded line of kernel state`() {
+        val operations = FakeDeviceOperations(
+            observation(rev = 9, windows = listOf(window(packageName = "com.android.settings"))),
+        )
+        operations.revisionValue = 9L
+        operations.generationValue = 4L
+
+        val state = tool(operations).runtimeState()
+
+        assertEquals("foreground=com.android.settings window=0 revision=9 generation=4", state)
+        assertTrue("the state line must fit TurnRuntimeState.MAX_CHARS", state!!.length <= 300)
+    }
+
+    @Test
+    fun `runtimeState is null before the first observation`() {
+        assertNull(tool(FakeDeviceOperations()).runtimeState())
+    }
+
     private fun failure(action: String, code: String, recoverable: Boolean): DeviceEnvelope =
         DeviceEnvelope.failure(
             action = action,
@@ -519,6 +593,15 @@ class DeviceToolTest {
 
         override val latestObservation: Observation?
             get() = observation
+
+        var revisionValue: Long? = null
+        var generationValue: Long? = null
+
+        override val revision: Long?
+            get() = revisionValue
+
+        override val generation: Long?
+            get() = generationValue
 
         override fun observe(filter: ScreenFilter): DeviceEnvelope {
             observeFilter = filter

@@ -56,6 +56,25 @@ data class ActionDescriptor(
      * `false` keeps every existing action on the serial path unchanged.
      */
     val readOnly: Boolean = false,
+    /**
+     * 0.25 Task 12 (R57): whether one call of this action returns a **post-call observation fingerprint** — the identity
+     * the loop's poll/global detectors and its observation budget work with.
+     *
+     * This is a declaration, not something the runtime infers from a tool's name (D110's rule: plugins declare
+     * capability, the framework implements the channel). `false` — the default — keeps every existing action on the
+     * pre-0.25 behaviour: no fingerprint is expected, `spentObservations` does not count it and the poll/global
+     * detectors ignore it. A tool that both reads and writes (`device`: `observe` and `act`) declares `true` once,
+     * because every one of its calls comes back with an observation.
+     */
+    val observation: Boolean = false,
+    /**
+     * 0.25 Task 12 (R60): the longest one call of this action may run before the loop treats it as timed out.
+     *
+     * The loop uses `min(timeoutMillis, turnDeadline - now)`, so this can only shorten a turn, never extend one. The
+     * default is the D3 §1.7 ordinary-tool value (30 s); a very long operation can declare a larger budget, and a
+     * cheap local tool a smaller one. A timeout is a tool result (`ACTION_TIMEOUT`), never a silent retry.
+     */
+    val timeoutMillis: Long = 30_000L,
 ) {
     init {
         require(name.isNotBlank())
@@ -72,10 +91,23 @@ data class ActionDescriptor(
         require(schema.startsWith("{") && schema.endsWith("}")) {
             "parametersJson must be shaped like a JSON object"
         }
+        require(timeoutMillis > 0L) { "timeoutMillis must be positive, was $timeoutMillis" }
     }
 }
 
-data class ActionResult(val outcome: ActionOutcome, val detail: String)
+/**
+ * 0.25 Task 12 (R57): one action's result, plus the optional observation fingerprint described above.
+ *
+ * [fingerprint] is a stable hash of the **screen/window content after the call** (never of the call's output text and
+ * never a timing value: a timestamp would make every result look like progress). Two calls that leave the same screen
+ * produce the same fingerprint, which is what lets `poll_no_progress` and the global breaker see "nothing changed".
+ * `null` — the default, and what every action except `device` returns — means this call has no observation state.
+ */
+data class ActionResult(
+    val outcome: ActionOutcome,
+    val detail: String,
+    val fingerprint: String? = null,
+)
 
 /**
  * 0.25 Task 11 (R49): what an action executor thinks should happen to one call **before** it runs.
@@ -125,4 +157,18 @@ interface ActionExecutor {
      * that owns turn-scoped state (the device kernel) overrides it to re-arm.
      */
     fun beginTurn() = Unit
+
+    /**
+     * 0.25 Task 12 (R59): one short, plain-state line describing where the device currently is, or `null`.
+     *
+     * The plugin folds this into the next model request as an untrusted `RUNTIME_STATE` segment so the model can reason
+     * about the current screen without paying for another full observation. The line is pure state — foreground
+     * package/window, latest revision/generation — never user text, and the agent runtime caps it at
+     * `TurnRuntimeState.MAX_CHARS`.
+     *
+     * The default is `null`: an executor with no device state has nothing honest to say, and every pre-0.25 executor
+     * keeps its behaviour exactly. The host's scoped wrapper must forward this method (R81), or the plugin would only
+     * ever see this default.
+     */
+    fun runtimeState(): String? = null
 }

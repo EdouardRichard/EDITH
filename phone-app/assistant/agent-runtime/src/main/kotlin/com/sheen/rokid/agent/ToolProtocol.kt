@@ -24,8 +24,18 @@ data class ToolCall(val id: String, val name: String, val argsJson: String, val 
  *
  * A `ok = false` result is *information*, never a run-ending verdict: an unknown tool, unparsable arguments, a refusal
  * and an executor failure all come back here so the model can correct itself.
+ *
+ * [fingerprint] (Task 12, R57) is the executor's optional **post-call observation fingerprint**, projected verbatim from
+ * `plugin-api`'s `ActionResult.fingerprint`. It is a hash of the screen/window content, never the payload and never a
+ * timing value; the loop feeds it to the poll/global detectors and (for a write) to `ProgressGuard`. `null` means this
+ * call has no observation state, and no detector may invent one from the payload.
  */
-data class ToolResult(val id: String, val ok: Boolean, val payload: String) {
+data class ToolResult(
+    val id: String,
+    val ok: Boolean,
+    val payload: String,
+    val fingerprint: String? = null,
+) {
     companion object {
         /** A failed step whose payload is a stable machine-readable code rather than an exception message. */
         fun error(id: String, safeCode: String): ToolResult = ToolResult(id = id, ok = false, payload = safeCode)
@@ -55,6 +65,17 @@ data class ToolDescriptor(
      * `AgentRun.steps`.
      */
     val countsTowardStepLimit: Boolean = true,
+    /**
+     * Task 12 (R57): projected from `ActionDescriptor.observation`. `true` means each call returns an observation
+     * fingerprint: it counts toward `AgentRun.spentObservations` (R61) and the poll/global detectors may use it. The
+     * runtime never infers this from a tool's name.
+     */
+    val observation: Boolean = false,
+    /**
+     * Task 12 (R60): projected from `ActionDescriptor.timeoutMillis` — the per-call bound the loop enforces (further
+     * capped by the turn deadline). Defaults to the ordinary-tool value so every pre-0.25 descriptor is unchanged.
+     */
+    val timeoutMillis: Long = 30_000L,
 )
 
 /** A descriptor bound to the executor that declared it. */

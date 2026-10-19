@@ -3,7 +3,7 @@ package com.sheen.rokid.agent
 import com.sheen.rokid.plugin.ImageRef
 
 /**
- * The ten origins a request segment can have (spec §3.2).
+ * The eleven origins a request segment can have (spec §3.2 + Task 12's RUNTIME_STATE).
  *
  * Each segment carries its origin as structured metadata — never inferred from rendered text.
  * Attribution is supplied when the fragment is produced, not reverse-engineered later.
@@ -29,6 +29,11 @@ enum class SegmentOrigin {
     TOOL_ROUND,
     /** Retry instruction. Conversation flow. Single-turn. Trusted. */
     RETRY,
+    /**
+     * One non-persistent loop state line (Task 12, R59). Untrusted, request-scoped metadata: the gateway folds it into
+     * the request input, it is never written to a `ConversationStore`, and `TurnTrimmer` protects it from eviction.
+     */
+    RUNTIME_STATE,
 }
 
 /** 会话流里一条消息的说话人。归属是元数据，**永不**由文本推断。 */
