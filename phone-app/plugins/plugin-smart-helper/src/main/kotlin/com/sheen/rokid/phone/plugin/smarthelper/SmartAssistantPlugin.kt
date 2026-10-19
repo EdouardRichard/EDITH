@@ -228,6 +228,18 @@ private val FAILURE_HINTS = mapOf(
 private const val BLANK_UTTERANCE_HINT = "没有听清内容，请再说一次。"
 
 /**
+ * 0.25 Task 26 (R140): the fixed, loop-internal wording a continuation request carries as its `USER_INPUT`.
+ *
+ * Once a tool round or a retry has appended after this turn's utterance, `AgentLoop` keeps the utterance in the
+ * transcript and the frame builder must not append it a second time as the request input — the gateway maps the
+ * transcript into the request history, so the same question would be asked twice. The frame still needs exactly one
+ * `USER_INPUT` (a frame without one is refused, and the tool result must not become the input), so it carries this cue
+ * instead. It is a constant with no user text and no turn-specific content, so a continuation can never leak or repeat
+ * the wearer's words into the input.
+ */
+internal const val CONTINUE_AFTER_TOOL = "Continue after the tool result."
+
+/**
  * The one sentence the assistant says when a hard dependency is missing (spec §1.3 C2).
  *
  * It is deliberately about the assistant rather than about the model: the wearer asked for something and cannot get
@@ -2392,6 +2404,16 @@ class SmartAssistantPlugin(
      * `TurnTrimmer`'s whole-turn boundary is still visible. No text is folded together here: that stays
      * `frameToTranscript`'s single job.
      *
+     * ## One question, one input (0.25 Task 26, R140)
+     *
+     * The pending-utterance rule above holds only for the **opening** request. A tool round or a retry appends after the
+     * utterance, so the loop keeps it in the transcript (it is now an interior turn of the run) and the frame receives
+     * it at [pinnedCount]. Appending the same text as `USER_INPUT` again would put it in the request history **and** in
+     * the input — the gateway maps everything before the input into history — so the model would read the question
+     * twice. In that case the frame's one `USER_INPUT` is [CONTINUE_AFTER_TOOL] instead (see [continuationInput]); the
+     * opening request still carries the wearer's own text. The detection is positional and exact-text, and any doubt
+     * keeps the pre-Task-26 behaviour: a repeated question is better than a lost one.
+     *
      * ## The two items the flat transcript cannot attribute
      *
      * A `List<ModelHistoryItem>` carries no [SegmentOrigin], and two items need one that its text cannot supply:
@@ -2426,10 +2448,45 @@ class SmartAssistantPlugin(
                         )
                     }
                     addAll(prompt?.memorySegments.orEmpty())
-                    add(Segment(SegmentOrigin.USER_INPUT, trusted = true, text = userInput))
+                    add(
+                        Segment(
+                            SegmentOrigin.USER_INPUT,
+                            trusted = true,
+                            text = continuationInput(transcript, pinnedCount, userInput),
+                        ),
+                    )
                 },
                 tools = tools,
             )
+        }
+    }
+
+    /**
+     * R140: the text of the frame's one `USER_INPUT` for [transcript].
+     *
+     * The loop appends this turn's utterance to the caller's history itself, at the store's pinned boundary. While that
+     * utterance is still the pending turn, the loop's `frameTranscript` excludes it from the transcript and the frame
+     * must render it as `USER_INPUT` (the opening request's behaviour). Once a tool round or a retry appended after it,
+     * the loop keeps it in the transcript and the frame receives it here, at exactly [pinnedCount]; rendering the same
+     * text as `USER_INPUT` again would duplicate the question across the request's history and input.
+     *
+     * The check is deliberately narrow: the item at the pinned index must be a **user** [ModelHistoryItem.Text] whose
+     * text is byte-identical to [userInput]. Anything else — an out-of-range index (the pending first request), a
+     * different role, a different text — keeps the original utterance as the input, so an unrecognised shape can only
+     * repeat the question (the pre-R140 behaviour), never lose it. The cue is a fixed constant and carries no user
+     * content.
+     */
+    private fun continuationInput(
+        transcript: List<ModelHistoryItem>,
+        pinnedCount: Int,
+        userInput: String,
+    ): String {
+        if (pinnedCount !in transcript.indices) return userInput
+        val item = transcript[pinnedCount]
+        return if (item is ModelHistoryItem.Text && item.role == MessageRole.USER && item.text == userInput) {
+            CONTINUE_AFTER_TOOL
+        } else {
+            userInput
         }
     }
 

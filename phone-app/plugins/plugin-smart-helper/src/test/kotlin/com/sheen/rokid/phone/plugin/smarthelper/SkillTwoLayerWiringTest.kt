@@ -342,6 +342,16 @@ class SkillTwoLayerWiringTest {
         val rig = rig(
             SmartFakeSkills(names.associate { name -> "/sdcard/EDITH/skills/$name.md" to smartSkillDoc(name, "正文-$name") }),
         )
+        // This test is about the receipt counter surviving across requests, not about eviction. 0.25 Task 26 replaced
+        // a short fixture question in the continuation input with the fixed cue, which is a few bytes longer; with the
+        // default 2 000-byte window that was enough to make the trimmer evict the only turn of this deliberately large
+        // three-round fixture. A wide window keeps the assertions on receipt identity and removes the unrelated trim.
+        rig.profile = smartProfile().copy(
+            usableWindowTokens = 100_000,
+            inputBudgetTokens = 93_000,
+            maxOutputTokens = 6_000,
+            safetyTokens = 1_000,
+        )
         var calls = 0
         rig.model.onRequest = { request, listener ->
             if (calls < names.size) {

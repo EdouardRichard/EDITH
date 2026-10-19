@@ -24,6 +24,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
@@ -227,10 +228,21 @@ class StoreSessionWiringTest {
         )
 
         val second = rig.model.requests[1]
-        // The frame's one `USER_INPUT` is this turn's utterance and is rendered last on the wire (that is the frame
-        // path's deliberate shape), so the continuation carries it as `input`; the transcript it continues stays in
-        // `history` and ends on the tool round.
-        assertEquals(listOf("香菜"), second.input.filterIsInstance<InputPart.Text>().map { it.text })
+        // 0.25 Task 26 (R140): the transcript already carries this turn's utterance, so the frame's one `USER_INPUT`
+        // is the fixed loop-internal cue — not the question again. The gateway maps everything before it into the
+        // history, so the continuation still carries the utterance exactly once, and the tool output stays last.
+        assertEquals(
+            listOf(CONTINUE_AFTER_TOOL),
+            second.input.filterIsInstance<InputPart.Text>().map { it.text },
+            "the continuation must not repeat this turn's utterance as the request input: ${second.input}",
+        )
+        assertEquals(
+            1,
+            second.history.count {
+                it is ModelHistoryItem.Text && it.role == MessageRole.USER && it.text == "香菜"
+            },
+            "the conversation history must carry this turn's utterance exactly once: ${second.history}",
+        )
         assertTrue(
             second.history.lastOrNull() is ModelHistoryItem.ToolOutput,
             "the tool output must stay last in the transcript: ${second.history}",
@@ -395,6 +407,11 @@ class StoreSessionWiringTest {
         val lines = withLines { captured -> rig.wakeAndFinal("现在几点了"); captured.toList() }
 
         assertEquals(3, rig.model.requests.size, "every empty turn must be retried: $lines")
+        assertEquals(
+            listOf("现在几点了"),
+            rig.model.requests.first().input.filterIsInstance<InputPart.Text>().map { it.text },
+            "the opening request still carries the wearer's own question as its input",
+        )
         assertTrue(lines.none { it.contains("NO_USER_TURN") }, "no retry may be refused: $lines")
         assertTrue(
             lines.contains("P3_TURN end turn=asr-1 outcome=COMPLETED code=- steps=0"),
@@ -410,7 +427,22 @@ class StoreSessionWiringTest {
                 retryInput.contains("no tool call and no text"),
                 "the loop's retry instruction must actually be sent: $retryInput",
             )
-            assertTrue(retryInput.contains("现在几点了"), "the wearer's utterance must still be sent: $retryInput")
+            assertTrue(
+                retryInput.endsWith(CONTINUE_AFTER_TOOL),
+                "0.25 Task 26 (R140): the retry's input is the loop-internal cue, not a second copy of the question: " +
+                    retryInput,
+            )
+            assertFalse(
+                retryInput.contains("现在几点了"),
+                "the retry continuation must not repeat this turn's utterance as the input: $retryInput",
+            )
+            assertEquals(
+                1,
+                retry.history.count {
+                    it is ModelHistoryItem.Text && it.role == MessageRole.USER && it.text == "现在几点了"
+                },
+                "the transcript must carry this turn's utterance exactly once: ${retry.history}",
+            )
         }
     }
 
