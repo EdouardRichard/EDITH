@@ -76,13 +76,15 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
     // ── 0.25 device-control port (Task 9) ────────────────────────────────────
 
     /**
-     * The one [RefRegistry] the adapter and the kernel must share (R36).
+     * The one [RefRegistry] the adapter and the kernel share (R36).
      *
-     * Task 10 MUST construct the kernel with this exact instance:
+     * This is the class-level [sharedRegistry], not a per-instance field: the composition builds the
+     * kernel at app start, and the accessibility service may connect afterwards. Task 10 MUST
+     * construct the kernel with that same instance:
      * `DeviceKernel(accessibility = service.port(), ..., registry = service.registry)`.
      * A second registry would render refs that [performNodeAction] cannot resolve.
      */
-    val registry = RefRegistry()
+    val registry: RefRegistry get() = sharedRegistry
 
     private val adapter by lazy { AccessibilityAdapter(AndroidAccessibilityPlatform(this), registry) }
 
@@ -417,12 +419,17 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
         fun port(): AccessibilityPort? = instance
 
         /**
-         * The live [RefRegistry] the kernel must share (R36), or `null` while disabled.
+         * The one [RefRegistry] every service instance and the kernel share (R36).
          *
-         * Task 10 constructs `DeviceKernel(accessibility = port(), ..., registry = registry())`; a second
-         * registry would render refs [performNodeAction] cannot resolve.
+         * Created with the class, not with a connected service: `HostCompositionRoot` builds the
+         * kernel during app start, which can happen before Android binds the accessibility service.
+         * Task 10 constructs `DeviceKernel(accessibility = port(), ..., registry = registry())`
+         * unconditionally; a fallback registry would render refs [performNodeAction] cannot resolve.
          */
-        fun registry(): RefRegistry? = instance?.registry
+        fun registry(): RefRegistry = sharedRegistry
+
+        /** The production registry, shared by all service instances (there is at most one). */
+        private val sharedRegistry = RefRegistry()
     }
 }
 

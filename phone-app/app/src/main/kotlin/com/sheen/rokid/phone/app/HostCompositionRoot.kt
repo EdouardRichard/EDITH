@@ -120,7 +120,6 @@ import com.sheen.rokid.device.DeviceKernel
 import com.sheen.rokid.device.Gesture
 import com.sheen.rokid.device.ObservationRenderer
 import com.sheen.rokid.device.Ref
-import com.sheen.rokid.device.RefRegistry
 import com.sheen.rokid.device.ScreenFilter as DeviceScreenFilter
 import com.sheen.rokid.phone.actions.intent.AppLaunchResolver
 import com.sheen.rokid.phone.actions.intent.ContextIntentLauncher
@@ -1922,9 +1921,10 @@ class HostCompositionRoot internal constructor(
             val deviceKernel = DeviceKernel(
                 accessibility = accessibilityPort,
                 shell = PrivilegedShellPort(shizukuShell),
-                // `?: RefRegistry()` is the composition-start fallback while the service has not connected; `device`
-                // is unadvertised then, so no call can reach the kernel with the fallback registry.
-                registry = EdithAccessibilityService.registry() ?: RefRegistry(),
+                // The companion registry exists with the class, so the kernel built during app start holds
+                // the exact instance the service's adapter mints refs into, even if the accessibility
+                // service connects later. There is deliberately no fallback registry.
+                registry = EdithAccessibilityService.registry(),
             )
             val screenProjector = ScreenProjector(ObservationRenderer(deviceKernel.registry), deviceKernel.registry)
             val deviceTool = DeviceTool(DeviceKernelOperations(deviceKernel), screenProjector)
