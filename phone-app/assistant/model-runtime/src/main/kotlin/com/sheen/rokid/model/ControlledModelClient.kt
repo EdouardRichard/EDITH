@@ -21,11 +21,17 @@ private const val MAX_ERROR_BODY_BYTES = 8_192L
 class ControlledModelClient(
     http: OkHttpClient, private val repository: ProfileRepository, private val resolver: SecretResolver,
     private val gate: CapabilityGate, private val budgeter: ContextBudgeter, private val clock: MonotonicClock,
-    private val scheduler: DeadlineScheduler, private val consent: () -> RequestConsent,
+    private val scheduler: DeadlineScheduler,
+    /**
+     * 0.25 R75: the consent for one profile. The profile is a parameter because image upload is decided by the
+     * profile's declared `IMAGE` modality, not by the running session alone; text/audio remain the owner's policy
+     * (`HostCompositionRoot.consentSource`). Existing callers' `{ RequestConsent(...) }` lambdas are unchanged.
+     */
+    private val consent: (ModelProfile) -> RequestConsent,
     private val wallClock: Clock = Clock.systemUTC(), private val allowLocalHttp: Boolean = false,
     /** P5 (C1 fix): real MediaSource for resolving audio segment refs at encode time. Null = no audio path. */
     private val mediaSource: MediaSource? = null,
-) : ModelClient, AutoCloseable {
+) : ModelClient, ProfileProbeTransport, AutoCloseable {
     private val transport = http.newBuilder().followRedirects(false).followSslRedirects(false)
         .retryOnConnectionFailure(false).authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE).build()
     private val executor = Executors.newCachedThreadPool { runnable -> Thread(runnable, "edith-model-http").apply { isDaemon = true } }
@@ -48,7 +54,7 @@ class ControlledModelClient(
 
     override fun request(request: ModelRequest, listener: (ModelStreamEvent) -> Unit): CancellationHandle = admit(request, listener, false)
 
-    internal fun probe(request: ModelRequest, listener: (ModelStreamEvent) -> Unit): CancellationHandle = admit(request, listener, true)
+    override fun probe(request: ModelRequest, listener: (ModelStreamEvent) -> Unit): CancellationHandle = admit(request, listener, true)
 
     private fun admit(input: ModelRequest, listener: (ModelStreamEvent) -> Unit, probe: Boolean): CancellationHandle {
         val profile = repository.get(input.profileId) ?: rejected()
@@ -56,7 +62,7 @@ class ControlledModelClient(
             "OPENAI_CHAT_COMPLETIONS" -> openAiAdapter.support
             else -> deepSeekAdapter.support
         }
-        gate.check(profile, input, support.takeIf { it.id == profile.protocolId }, consent(), probe)
+        gate.check(profile, input, support.takeIf { it.id == profile.protocolId }, consent(profile), probe)
         val prepared = budgeter.prepare(profile, input)
         val endpoint = if (profile.protocolId == "OPENAI_CHAT_COMPLETIONS")
             ModelEndpoint.chatCompletions(profile.baseUrl, allowLocalHttp)

@@ -446,6 +446,7 @@ internal fun capabilityLabel(capability: Capability) = when (capability) {
 internal fun errorLabel(code: String) = when (code) {
     "BLUETOOTH_PERMISSION_DENIED" -> "蓝牙权限未获授权"
     "CAPABILITY_MISSING" -> "会话所需服务尚不可用"
+    "PROFILE_MODEL_NOT_MULTIMODAL" -> "该模型档案不支持图片输入；请更换支持图片的模型/档案（本版要求 IMAGE+TEXT）"
     "FOREGROUND_START_DENIED", "FOREGROUND_UI_REQUIRED" -> "会话未能启动"
     "UNKNOWN_PLUGIN" -> "插件不可用"
     else -> "会话异常"

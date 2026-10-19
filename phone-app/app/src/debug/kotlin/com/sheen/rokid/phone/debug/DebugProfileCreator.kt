@@ -41,8 +41,11 @@ class DebugProfileCreator : BroadcastReceiver() {
                 ?: throw IllegalArgumentException("missing property: $name")
 
             val protocolId = prop("protocolId")
+            // 0.25 R74: the assistant is TEXT+IMAGE. This debug creator must not seed a profile the session gate would
+            // refuse; the Chat protocol keeps its pre-existing AUDIO input as an extra, it no longer substitutes for IMAGE.
             val inputs = if (protocolId == "OPENAI_CHAT_COMPLETIONS")
-                setOf(InputModality.TEXT, InputModality.AUDIO) else setOf(InputModality.TEXT)
+                setOf(InputModality.TEXT, InputModality.IMAGE, InputModality.AUDIO)
+            else setOf(InputModality.TEXT, InputModality.IMAGE)
 
             val apiKey = prop("apiKey")
             require(apiKey.all { it.code in 33..126 }) { "apiKey contains non-printable chars" }

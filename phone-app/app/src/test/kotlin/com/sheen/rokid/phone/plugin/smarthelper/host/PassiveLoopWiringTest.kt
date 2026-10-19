@@ -116,7 +116,8 @@ class PassiveLoopWiringTest {
     private fun profile(id: String) = ModelProfile(id, 3, "Synthetic $id", "Synthetic",
         "https://synthetic.example/v1", "DEEPSEEK_RESPONSES", "synthetic-model",
         object : SecretHandle { override val id = "draft-placeholder" },
-        4096, 2048, 1024, 128, 5000, setOf(InputModality.TEXT), setOf(OutputModality.TEXT), emptyList())
+        4096, 2048, 1024, 128, 5000, setOf(InputModality.TEXT, InputModality.IMAGE),
+        setOf(OutputModality.TEXT), emptyList())
 
     // ---- fakes ---------------------------------------------------------------------------------------------------
 
@@ -604,6 +605,23 @@ private class NoStorageAccess : StorageAccess {
         }
     }
 
+    @Test
+    fun aSessionOnATextOnlyProfileIsRefusedBeforeItStartsAndNamesTheMultimodalCode() {
+        // R74: the assistant is a TEXT+IMAGE product. A profile that does not declare IMAGE is a configuration
+        // refusal, not a silent text-only downgrade: no session, no epoch, and the UI-visible code is the ruling's.
+        val root = compositionRoot(RecordingInputPort(),
+            profile = profile("p-1").copy(inputs = setOf(InputModality.TEXT)))
+        try {
+            root.start("smart-assistant")
+
+            assertEquals("PROFILE_MODEL_NOT_MULTIMODAL", root.state.value.errorCode)
+            assertEquals("a refused start begins no session", SessionState.Idle, root.host.currentState)
+            assertNull("and arms nothing", root.currentAudioEpoch())
+        } finally {
+            root.close()
+        }
+    }
+
     // ---- P3_WAKE / P3_AUDIO: the P3.1 acceptance lines ----------------------------------------------------------
 
     @Test
@@ -778,11 +796,12 @@ private class NoStorageAccess : StorageAccess {
         input: InputPort,
         transport: InputPort = RecordingInputPort(),
         withConnection: Boolean = true,
+        profile: ModelProfile = profile("p-1"),
         register: (HostCompositionRoot) -> Unit = {},
     ): HostCompositionRoot {
         val wiring = SmartWiring(SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1",
-            whitelist = emptyList(), profileId = "p-1", cooldownMillis = 3000L),
-            FixedProfiles(profile("p-1")),
+            whitelist = emptyList(), profileId = profile.id, cooldownMillis = 3000L),
+            FixedProfiles(profile),
             FakeClock(0), ManualScheduler(FakeClock(0)))
         val environment = CxrHostEnvironment(clock = FakeClock(0), input = input, liveOutput = { LiveDisplay() },
             scheduler = ManualScheduler(FakeClock(0)),

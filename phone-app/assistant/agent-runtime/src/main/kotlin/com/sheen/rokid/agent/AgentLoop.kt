@@ -138,6 +138,25 @@ data class AgentStep(
 )
 
 /**
+ * 0.25 Task 14 (R78): one run's **count-only** metrics, the source of the single `P3_METRIC` line.
+ *
+ * [modelMillis] is the run's summed time inside model turns, [toolMillis] the summed machine time of its tool calls,
+ * and [observeMillis] the subset of that time spent in calls whose descriptor declared `observation = true`. [images]
+ * is the number of distinct image artifacts the run's requests carried. Every field is a count; none can carry a
+ * page, a transcript or a credential.
+ */
+data class AgentMetrics(
+    val calls: Int = 0,
+    val toolCalls: Int = 0,
+    val modelMillis: Long = 0,
+    val toolMillis: Long = 0,
+    val observeMillis: Long = 0,
+    val images: Int = 0,
+    val nudges: Int = 0,
+    val overflows: Int = 0,
+)
+
+/**
  * The terminal result of one run.
  *
  * [safeCode] carries the provider's reason (or the loop's own stable code for `INSUFFICIENT` / `NO_PROGRESS` /
@@ -200,6 +219,11 @@ data class AgentRun(
      * answer, `0` otherwise. It is the count Task 14's `P3_METRIC` reads as `planNudgeCap`; no log line changes here.
      */
     val planNudgeCap: Int = 0,
+    /**
+     * 0.25 Task 14 (R78): the count-only metrics this run reports, and the values its one `P3_METRIC` line carries.
+     * A default instance keeps every pre-0.25 `AgentRun` comparison and construction unchanged.
+     */
+    val metrics: AgentMetrics = AgentMetrics(),
 )
 
 private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
@@ -240,6 +264,8 @@ private const val PLAN_NUDGE_INSTRUCTION =
 private const val MAX_PLAN_NUDGES = 3
 private const val MAX_PLAN_TEXT_CHARS = 1_200
 private const val TOOL_EXECUTOR_THREAD_NAME = "agent-tool-call"
+/** R78: nanoseconds in one reported millisecond (integer division keeps the line count-only and deterministic). */
+private const val NANOS_PER_MILLI = 1_000_000L
 /** R60: how long a timed-out call is given to really stop before the run reports `ACTION_TIMEOUT_UNCERTAIN`. */
 private const val TOOL_TIMEOUT_GRACE_NANOS = 2_000_000_000L
 /**
@@ -317,6 +343,14 @@ class AgentLoop(
      * worth of unrelated setup, not a caller-tunable production knob.
      */
     private val maxObservations: Int = 24,
+    /**
+     * 0.25 Task 14 (R78): where the run's one `P3_METRIC` line goes. `{}` (the default) emits nothing, keeping every
+     * pre-0.25 caller and test byte-for-byte; the production plugin passes its log sink. The loop still reports the
+     * same numbers in [AgentRun.metrics] for a caller that has its own consumer.
+     *
+     * Observability must never change the outcome, so a throwing sink is swallowed like the display callbacks are.
+     */
+    private val metricLine: (String) -> Unit = {},
 ) {
     init {
         require(maxObservations >= 1) { "maxObservations must be at least 1, was $maxObservations" }
@@ -367,6 +401,15 @@ class AgentLoop(
     /** R58: the last text that was nudged, so an identical plan cannot be nudged again in place. */
     private var lastNudgedText: String? = null
     private var nudges = 0
+
+    // 0.25 Task 14 (R78): per-run metric counters, reset on entry like `usage` so every terminal path reports this run's
+    // numbers and a reused loop (not supported, but cheap to keep honest) starts clean.
+    private var metricCalls = 0
+    private var metricModelNanos = 0L
+    private var metricToolNanos = 0L
+    private var metricObserveNanos = 0L
+    private var metricOverflows = 0
+    private val metricImageIds = LinkedHashSet<String>()
 
     /** R100: loop-owned runtime-state flags — the latest state-changing call could not be verified by an observation. */
     private var lastWriteUnverified = false
@@ -442,6 +485,12 @@ class AgentLoop(
         lastWriteUnverified = false
         typedUnsent = false
         successfulToolExecutions = 0
+        metricCalls = 0
+        metricModelNanos = 0L
+        metricToolNanos = 0L
+        metricObserveNanos = 0L
+        metricOverflows = 0
+        metricImageIds.clear()
         val tools = registry.descriptors().map { ToolSpec(it.name, it.description, it.parametersJson) }
         // Phase 3: TurnRunner owns request assembly. For now, the system slot carries only INSTRUCTIONS;
         // memory evidence, perception, and conversation store will be wired in later phases.
@@ -502,6 +551,11 @@ class AgentLoop(
                 else -> null
             }?.let { withRuntimeState(it, request, spentSteps) }
             openingTurn = false
+            // R78: count this request's images before it is sent. Distinct artifact ids, so a picture carried by two
+            // requests of the same run is one image, not two.
+            recordMetricImages(frameForTurn, history)
+            metricCalls++
+            val modelStartedNanos = clock.nowNanos()
             val reply = gateway.turn(
                 GatewayTurn(
                     request.turnId,
@@ -521,9 +575,13 @@ class AgentLoop(
                     onTextDelta = request.onTextDelta,
                 ),
             )
+            metricModelNanos += (clock.nowNanos() - modelStartedNanos).coerceAtLeast(0L)
             // A turn's accounting belongs to the run even when the turn's verdict is about to end it: accumulate here,
             // before any branch below can return, so every finish path reports what the provider billed.
             usage = accumulatedUsage(usage, reply.usage)
+            // R78: an overflow recovery and a terminal context overflow are both overflow events for the metric.
+            metricOverflows += reply.overflowRecoveries
+            if (reply.terminal == ModelEnd.FAILED && reply.safeCode == CONTEXT_OVERFLOW) metricOverflows++
             // A turn that was blocked when `cancel()` arrived must not complete the run with a late answer.
             if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
 
@@ -613,6 +671,12 @@ class AgentLoop(
                 // covers refusals, an unavailable/denied confirmation and a throwing executor; the callback itself is
                 // display-only (see `AgentRequest.onToolStatus`).
                 notifyToolStatus(request, call.name, ToolPhase.START)
+                // R78: machine time of one tool call. The person's confirmation wait and the mayAskHuman overrun are
+                // excluded exactly as the turn budget excludes them (D49), so a considered approval is not billed to
+                // the tool. A run-ending branch inside the block returns before the addition below; the counts it must
+                // report are still complete, and the time of the one call that ended the run is the only undercount.
+                val toolStartedNanos = clock.nowNanos()
+                val humanWaitBefore = humanWaitNanos
                 val execution = try {
                     // R55: detection happens **before** execution. A warning returns a synthetic tool result in the
                     // same tool round (no extra model request); a critical ends the run without executing the call.
@@ -735,6 +799,10 @@ class AgentLoop(
                 } finally {
                     notifyToolStatus(request, call.name, ToolPhase.END)
                 }
+                val machineToolNanos = (clock.nowNanos() - toolStartedNanos -
+                    (humanWaitNanos - humanWaitBefore) - execution.deadlineShiftNanos).coerceAtLeast(0L)
+                metricToolNanos += machineToolNanos
+                if (descriptor?.observation == true) metricObserveNanos += machineToolNanos
                 // R99/D49: a mayAskHuman call may have spent part of D47's decision window inside `execute`; that time
                 // belongs to the person, not the turn. Shift it before any deadline check below can charge the run for
                 // a legal approval. Every other call contributes nothing.
@@ -1073,10 +1141,60 @@ class AgentLoop(
             history += ModelHistoryItem.Text(MessageRole.ASSISTANT, closingText.ifBlank { CLOSED_TURN_TEXT })
         }
         lastTranscript = history.toList()
+        val metrics = AgentMetrics(
+            calls = metricCalls,
+            toolCalls = steps.size,
+            modelMillis = metricModelNanos / NANOS_PER_MILLI,
+            toolMillis = metricToolNanos / NANOS_PER_MILLI,
+            observeMillis = metricObserveNanos / NANOS_PER_MILLI,
+            images = metricImageIds.size,
+            nudges = nudges,
+            overflows = metricOverflows,
+        )
+        // 0.25 Task 14 (R78): exactly one count-only line per run. The sink is observability, never a verdict: a
+        // throwing logger must not turn a completed run into an exception.
+        runCatching { metricLine(renderMetric(metrics)) }
         return AgentRun(
             outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps, usage,
-            spentObservations, planNudgeCap,
+            spentObservations, planNudgeCap, metrics,
         )
+    }
+
+    /**
+     * The one `P3_METRIC` line's exact shape (R78): counts only, fixed field order. The usage three-state rule (R21) is
+     * carried by the two token fields: no accounting at all is `missing`, an accounting object with an absent counter
+     * is `unknown`, and a reported zero is `0`.
+     */
+    private fun renderMetric(metrics: AgentMetrics): String = buildString {
+        append("P3_METRIC")
+        append(" calls=").append(metrics.calls)
+        append(" toolCalls=").append(metrics.toolCalls)
+        append(" modelMs=").append(metrics.modelMillis)
+        append(" toolMs=").append(metrics.toolMillis)
+        append(" observeMs=").append(metrics.observeMillis)
+        append(" inputTokens=").append(tokenField(usage, usage?.inputTokens))
+        append(" outputTokens=").append(tokenField(usage, usage?.outputTokens))
+        append(" images=").append(metrics.images)
+        append(" nudges=").append(metrics.nudges)
+        append(" overflows=").append(metrics.overflows)
+    }
+
+    private fun tokenField(total: ModelUsage?, value: Long?): String = when {
+        total == null -> "missing"
+        value == null -> "unknown"
+        else -> value.toString()
+    }
+
+    /**
+     * Adds the images one model request carries to the run's distinct-image count (R78): a request-flow segment's
+     * `images` and a history tool output's `images`. Artifact ids key the set, so the same screenshot echoed by two
+     * requests of one run counts once.
+     */
+    private fun recordMetricImages(frame: RequestFrame?, history: List<ModelHistoryItem>) {
+        frame?.conversationFlow?.forEach { segment -> segment.images.forEach { metricImageIds += it.artifactId } }
+        history.forEach { item ->
+            if (item is ModelHistoryItem.ToolOutput) item.images.forEach { metricImageIds += it.artifactId }
+        }
     }
 
     /**

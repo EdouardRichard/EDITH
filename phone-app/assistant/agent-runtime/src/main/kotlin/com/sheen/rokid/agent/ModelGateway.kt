@@ -84,4 +84,10 @@ data class GatewayReply(
      * per turn into [AgentRun.usage], and the last parameter default keeps every pre-0.25 call site compiling.
      */
     val usage: ModelUsage? = null,
+    /**
+     * 0.25 Task 14 (R78): how many deterministic overflow recoveries this model turn performed before it produced this
+     * reply. `0` — the default — keeps every pre-0.25 construction and scripted gateway unchanged. The loop sums it into
+     * [AgentRun.metrics] `overflows`, adding one when the reply is the terminal `CONTEXT_OVERFLOW` verdict.
+     */
+    val overflowRecoveries: Int = 0,
 )

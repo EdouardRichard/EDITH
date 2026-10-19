@@ -131,6 +131,7 @@ import com.sheen.rokid.phone.context.ForegroundAppSource
 import com.sheen.rokid.phone.context.NotificationCategorySource
 import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
 import com.sheen.rokid.phone.model.ProfileProbeGate
+import com.sheen.rokid.phone.model.profileStartupError
 import com.sheen.rokid.phone.artifacts.FileArtifactStore
 import com.sheen.rokid.phone.model.ArtifactMediaSource
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -139,9 +140,22 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import okhttp3.OkHttpClient
 import java.io.File
+import java.util.Base64
 import java.util.UUID
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+
+/**
+ * 0.25 Task 14 (R76): the fixed synthetic image the `testImage` probe sends — a 32×32 solid-red PNG.
+ *
+ * One constant, never a file read and never a user image: the image probe proves the IMAGE operation end to end
+ * (encode → provider → terminal), and its content is deliberately trivial so the probe carries nothing to protect.
+ */
+private const val PROBE_IMAGE_BASE64 =
+    "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAIAAAD8GO2jAAAAJ0lEQVR42u3NsQkAAAjAsP7/tF7hIASyp6lTCQQCgUAgEAgEgi/BAjLD/C5w/SM9AAAAAElFTkSuQmCC"
+private const val PROBE_IMAGE_WIDTH = 32
+private const val PROBE_IMAGE_HEIGHT = 32
+private val PROBE_IMAGE_PNG: ByteArray = Base64.getDecoder().decode(PROBE_IMAGE_BASE64)
 
 /**
  * Whether a STOP's validated identity still names the session the host is running.
@@ -712,6 +726,13 @@ class HostCompositionRoot internal constructor(
         if (closed) return
         pendingStart = null
         mutableState.update { it.copy(selectedPluginId = pluginId, errorCode = null) }
+        // 0.25 Task 14 (R74): the assistant is TEXT+IMAGE. A profile that does not declare IMAGE refuses the session
+        // **before** anything is started, with a UI-visible code; it is never silently downgraded to a text-only run.
+        val startupError = profileStartupError(selectedProfile(pluginId))
+        if (startupError != null) {
+            mutableState.update { it.copy(errorCode = startupError) }
+            return
+        }
         val session = SessionId(UUID.randomUUID().toString())
         host.startSession(session)
         activeSessionId = session.value
@@ -1495,11 +1516,20 @@ class HostCompositionRoot internal constructor(
 
     private fun activateSelected() {
         val selected = state.value.selectedPluginId ?: return
+        // 0.25 Task 14 (R74): the same startup gate on every activation path (resume included), so a profile edited
+        // back to text-only between sessions is refused visibly instead of starting a request the gate would deny.
+        val chosenProfile = selectedProfile(selected)
+        profileStartupError(chosenProfile)?.let { code ->
+            disarmAudioEpoch()
+            host.pause()
+            error(code)
+            return
+        }
         // One configuration, built once - settings keys and profile selection together - and applied only to the
         // plugin it belongs to. `HostRuntime.configure` replaces the stored configuration, so a second call carrying
         // just the profile selection silently dropped the smart keys the user configured (Task 14a-fix item 1), and
         // sending the smart keys to a plugin whose key set is different refuses the whole activation (item 2).
-        configurationFor(selected, selectedProfile(selected))?.let { configuration ->
+        configurationFor(selected, chosenProfile)?.let { configuration ->
             if (!host.configure(selected, configuration)) {
                 android.util.Log.i("EdithHost", "configuration refused for $selected")
                 // Mirrors the activation-refusal branch below: no refusal may leave the previously active plugin
@@ -1710,12 +1740,22 @@ class HostCompositionRoot internal constructor(
             // client holds. App-cache scratch, bounded and LRU — never the repository, never a log line.
             val artifactStore = FileArtifactStore(File(context.cacheDir, "edith-artifacts"))
             val artifactMediaSource = ArtifactMediaSource(artifactStore)
+            // 0.25 Task 14 (R76): the fixed synthetic image `testImage` sends. It is registered lazily, on the first
+            // image probe, into the same artifact store the screenshots use, so the adapters resolve it through the one
+            // `MediaSource` (no inline bytes in a request builder, and the probe cannot silently send a text-only
+            // request). Registering it at assembly time would write a file for every composition, even one that never
+            // probes an image.
             val model = ControlledModelClient(http, profiles, resolver, CapabilityGate(), ContextBudgeter(), clock, scheduler,
                 consentSource(probeGate::requestConsent), mediaSource = artifactMediaSource)
-            val controlledTester = ControlledProfileTester(model, profiles, clock)
+            val controlledTester = ControlledProfileTester(model, profiles, clock, probeImageRef = {
+                artifactStore.put(PROBE_IMAGE_PNG, "image/png", PROBE_IMAGE_WIDTH, PROBE_IMAGE_HEIGHT).artifactId
+            })
             val tester = object : ProfileTester {
                 override fun testText(profileId: String, listener: (ModelStreamEvent) -> Unit): CancellationHandle {
                     return probeGate.test(controlledTester, profileId, listener)
+                }
+                override fun testImage(profileId: String, listener: (ModelStreamEvent) -> Unit): CancellationHandle {
+                    return probeGate.testImage(controlledTester, profileId, listener)
                 }
             }
             val connection = arrayOfNulls<RokidConnection>(1)
@@ -2278,20 +2318,25 @@ class HostCompositionRoot internal constructor(
         }
 
         /**
-         * `D53`① (2026-10-11): the consent the gated model client consults, and the **only** one it is given.
+         * `D53`① (2026-10-11) and 0.25 R75: the consent the gated model client consults, and the **only** one it is given.
          *
          * The session-level upload switch is gone - the owner's ruling was "zero knobs": **"会话在运行"即允许** the
          * transcript and its turn context to reach the configured model service, and the only consenting action is
          * pressing 开始. The gated client asks this for every real turn, and the session is running exactly when a turn
          * can be built, so `text` is allowed unconditionally here.
          *
-         * What must **not** change: only `text` is added. `image` and `audio` stay the probe gate's answer, and the
-         * probe flow's own `syntheticProbe` flag is never invented by this source - otherwise a real turn would quietly
-         * satisfy the probe confirmation that flow requires. A named production seam for the same reason as
-         * [playbackSuppression]: `create` needs a real Android `Context`, so the merge is driven from a JVM test here.
+         * What must **not** change: `image` is not granted by the session. It is granted only when the **profile**
+         * declares `IMAGE` (0.25 R75; the session cannot start on a text-only profile at all, R74) and never by a
+         * blanket OR; `audio` stays ungranted (not part of this version). The probe flow's own `syntheticProbe` flag is
+         * passed through untouched - otherwise a real turn would quietly satisfy the probe confirmation that flow
+         * requires. A named production seam for the same reason as [playbackSuppression]: `create` needs a real Android
+         * `Context`, so the merge is driven from a JVM test here.
          */
-        internal fun consentSource(probe: () -> RequestConsent): () -> RequestConsent =
-            { probe().copy(text = true) }
+        internal fun consentSource(probe: () -> RequestConsent): (ModelProfile) -> RequestConsent =
+            { profile ->
+                val consent = probe()
+                consent.copy(text = true, image = consent.image || InputModality.IMAGE in profile.inputs)
+            }
 
         /**
          * The wake detector's self-audio guard over the composition's one [HostCompositionRoot.playbackGate]

@@ -177,7 +177,7 @@ class ModelClientGateway(
             val report = TurnTrimmer().trim(frame, limit, mode)
             lastTrim = report.counts
             val transcript = frameToTranscript(report.kept)
-                ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN)
+                ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN, overflowRecoveries = recoveries)
             val modelRequest = modelRequest(request, profile, frame.systemText, transcript)
             val reply = try {
                 sendTurn(request, modelRequest)
@@ -185,20 +185,22 @@ class ModelClientGateway(
                 // The one local rejection this path may answer with a cheaper request: the send-time budget refused
                 // the shape the trimmer produced. A plain `ConfigurationRejected` is a different refusal and still
                 // escapes; a capability refusal is a different exception and still escapes.
-                if (recoveries >= MAX_OVERFLOW_RECOVERIES) return contextOverflowFailure()
+                if (recoveries >= MAX_OVERFLOW_RECOVERIES) return contextOverflowFailure(recoveries = recoveries)
                 recoveries++
                 overflowRecoveries++
                 mode = mode.next()
                 continue
             }
             if (isContextOverflow(reply)) {
-                if (recoveries >= MAX_OVERFLOW_RECOVERIES) return contextOverflowFailure(reply.usage)
+                if (recoveries >= MAX_OVERFLOW_RECOVERIES) {
+                    return contextOverflowFailure(reply.usage, recoveries = recoveries)
+                }
                 recoveries++
                 overflowRecoveries++
                 mode = mode.next()
                 continue
             }
-            return reply
+            return reply.copy(overflowRecoveries = recoveries)
         }
     }
 
@@ -211,9 +213,9 @@ class ModelClientGateway(
     private fun isContextOverflow(reply: GatewayReply): Boolean =
         reply.safeCode?.contains(CONTEXT_OVERFLOW, ignoreCase = true) == true
 
-    private fun contextOverflowFailure(usage: ModelUsage? = null): GatewayReply {
+    private fun contextOverflowFailure(usage: ModelUsage? = null, recoveries: Int = 0): GatewayReply {
         overflowFailures++
-        return GatewayReply(emptyList(), "", ModelEnd.FAILED, CONTEXT_OVERFLOW, usage)
+        return GatewayReply(emptyList(), "", ModelEnd.FAILED, CONTEXT_OVERFLOW, usage, recoveries)
     }
 
     /** Builds the one stateless request shape every model call of this gateway uses. */

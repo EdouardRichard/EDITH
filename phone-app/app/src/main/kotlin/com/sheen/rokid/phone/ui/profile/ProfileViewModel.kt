@@ -12,7 +12,14 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import java.net.URI
 
-data class ProbeConsent(val id: String, val revision: Long, val domain: String)
+/**
+ * The user's confirmation for one probe.
+ *
+ * [image] distinguishes the synthetic image probe (0.25 R76) from the text probe: the two operations are verified
+ * separately (`TEXT_REQUEST` / `IMAGE_REQUEST`), so the confirmation dialog and the gate admission must name which one
+ * the user is about to allow.
+ */
+data class ProbeConsent(val id: String, val revision: Long, val domain: String, val image: Boolean = false)
 data class ProfileUiState(val profiles: List<ModelProfile> = emptyList(), val selections: Map<String, String> = emptyMap(),
     val loadingId: String? = null, val error: String? = null, val confirmation: ProbeConsent? = null)
 class ProfileViewModel(private val repository: AndroidProfileRepository, private val tester: ProfileTester,
@@ -81,6 +88,25 @@ class ProfileViewModel(private val repository: AndroidProfileRepository, private
             mutable.value = mutable.value.copy(confirmation = ProbeConsent(id, profile.revision, domain(profile.baseUrl)), error = null)
         } catch (error: Exception) { refresh(if (error is ContractError.CapabilityMissing) "CAPABILITY_MISSING" else "STORAGE_RECONFIGURE") }
     }
+
+    /**
+     * 0.25 Task 14 (R76): the synthetic image probe. It needs a profile that declares both TEXT (the fixed question)
+     * and IMAGE (the synthetic picture) and a protocol that supports images; anything else is a visible capability
+     * refusal, never a hidden text-only test.
+     */
+    @Synchronized fun testImage(id: String) {
+        if (closed) return
+        cancelTest()
+        try {
+            val profile = repository.get(id) ?: throw IllegalArgumentException()
+            if (profile.protocolId !in setOf("DEEPSEEK_RESPONSES", "OPENAI_CHAT_COMPLETIONS") ||
+                InputModality.TEXT !in profile.inputs || InputModality.IMAGE !in profile.inputs ||
+                OutputModality.TEXT !in profile.outputs)
+                throw ContractError.CapabilityMissing("Image test unavailable")
+            mutable.value = mutable.value.copy(
+                confirmation = ProbeConsent(id, profile.revision, domain(profile.baseUrl), image = true), error = null)
+        } catch (error: Exception) { refresh(if (error is ContractError.CapabilityMissing) "CAPABILITY_MISSING" else "STORAGE_RECONFIGURE") }
+    }
     @Synchronized fun confirmTest() {
         if (closed) return
         val consent = mutable.value.confirmation ?: return
@@ -91,7 +117,8 @@ class ProfileViewModel(private val repository: AndroidProfileRepository, private
             val operation = ++serial
             mutable.value = mutable.value.copy(loadingId = consent.id, error = null)
             grant(consent)
-            val returned = tester.testText(consent.id) { event -> terminal(operation, consent, event) }
+            val returned = if (consent.image) tester.testImage(consent.id) { event -> terminal(operation, consent, event) }
+            else tester.testText(consent.id) { event -> terminal(operation, consent, event) }
             if (serial == operation && mutable.value.loadingId == consent.id) pending = returned
         } catch (error: Exception) {
             ++serial; pending = null

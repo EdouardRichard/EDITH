@@ -2494,6 +2494,8 @@ class SmartAssistantPlugin(
             clock = clock,
             // P3.3: the loop asks before it acts on anything the policy flagged, and never acts without an answer.
             confirmation = confirmation,
+            // 0.25 Task 14 (R78): the run's one count-only metric line reaches the plugin's single P3 sink.
+            metricLine = P3Log::line,
         )
 
     // ---------------------------------------------------------------- proactive turn (P3.2)

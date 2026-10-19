@@ -48,7 +48,15 @@ import com.sheen.rokid.plugin.*
                 val evidence = profile.verifications.filter { it.profileRevision == profile.revision && it.operation == "TEXT_REQUEST" }
                     .withIndex().maxWithOrNull(compareBy<IndexedValue<CapabilityVerification>> { it.value.testedAtEpochMillis }.thenBy { it.index })?.value
                 Text("文本实测：${verificationLabel(evidence?.state ?: VerificationState.Unverified)}", style = MaterialTheme.typography.bodyMedium)
-                if (InputModality.IMAGE in profile.inputs) Text("图片：未接入 / 未验证", style = MaterialTheme.typography.bodyMedium)
+                if (InputModality.IMAGE in profile.inputs) {
+                    val imageEvidence = profile.verifications.filter { it.profileRevision == profile.revision && it.operation == "IMAGE_REQUEST" }
+                        .withIndex().maxWithOrNull(compareBy<IndexedValue<CapabilityVerification>> { it.value.testedAtEpochMillis }.thenBy { it.index })?.value
+                    Text("图片实测：${verificationLabel(imageEvidence?.state ?: VerificationState.Unverified)}", style = MaterialTheme.typography.bodyMedium)
+                } else {
+                    // R74: a text-only profile cannot start the assistant session; the prompt says what to change.
+                    Text("图片：未声明（本版要求 IMAGE+TEXT，会话无法启动；请更换支持图片的模型/档案）",
+                        style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.error)
+                }
                 if (InputModality.AUDIO in profile.inputs || OutputModality.AUDIO in profile.outputs) Text("语音：未接入 / 未验证", style = MaterialTheme.typography.bodyMedium)
                 FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     ToolIcon("编辑 ${profile.name}", { editingId = profile.id; editor = true }) { Icon(Icons.Default.Edit, "编辑 ${profile.name}") }
@@ -56,7 +64,12 @@ import com.sheen.rokid.plugin.*
                     if (state.loadingId == profile.id) {
                         CircularProgressIndicator(Modifier.size(24.dp))
                         OutlinedButton(onClick = viewModel::cancelTest) { Icon(Icons.Default.Close, null); Text("取消测试") }
-                    } else OutlinedButton(onClick = { viewModel.testText(profile.id) }) { Icon(Icons.Default.NetworkCheck, null); Spacer(Modifier.width(4.dp)); Text("文本连接测试") }
+                    } else {
+                        OutlinedButton(onClick = { viewModel.testText(profile.id) }) { Icon(Icons.Default.NetworkCheck, null); Spacer(Modifier.width(4.dp)); Text("文本连接测试") }
+                        if (InputModality.IMAGE in profile.inputs) {
+                            OutlinedButton(onClick = { viewModel.testImage(profile.id) }) { Icon(Icons.Default.Star, null); Spacer(Modifier.width(4.dp)); Text("图片连接测试") }
+                        }
+                    }
                 }
             }
             HorizontalDivider()
@@ -76,8 +89,11 @@ import com.sheen.rokid.plugin.*
     deleting?.let { profile -> AlertDialog(onDismissRequest = { deleting = null }, title = { Text("删除 ${profile.name}？") },
         text = { Text("该档案的凭证与验证结果将被删除。") }, confirmButton = { TextButton(onClick = { viewModel.delete(profile.id); deleting = null }) { Text("删除") } },
         dismissButton = { TextButton(onClick = { deleting = null }) { Text("取消") } }) }
-    state.confirmation?.let { consent -> AlertDialog(onDismissRequest = viewModel::cancelTest, title = { Text("确认文本上传") },
-        text = { Column { Text("目标域：${consent.domain}"); Text("内容类别：固定合成测试文本"); Text("只回复测试通过") } },
+    state.confirmation?.let { consent -> AlertDialog(onDismissRequest = viewModel::cancelTest,
+        title = { Text(if (consent.image) "确认图片上传" else "确认文本上传") },
+        text = { Column { Text("目标域：${consent.domain}")
+            Text(if (consent.image) "内容类别：固定合成测试图片" else "内容类别：固定合成测试文本")
+            Text(if (consent.image) "图片检验：模型描述合成图片" else "只回复测试通过") } },
         confirmButton = { TextButton(onClick = viewModel::confirmTest) { Text("同意并测试") } },
         dismissButton = { TextButton(onClick = viewModel::cancelTest) { Text("取消") } }) }
 }
@@ -91,10 +107,10 @@ import com.sheen.rokid.plugin.*
 private fun verificationLabel(state: VerificationState) = when (state) { VerificationState.Unverified -> "未验证"; VerificationState.Verified -> "已验证"; VerificationState.Failed -> "失败" }
 private fun profileError(code: String) = when (code) {
     "STORAGE_RECONFIGURE" -> "存储不可用，请重新配置"
-    "CAPABILITY_MISSING" -> "该档案不支持文本连接测试"
+    "CAPABILITY_MISSING" -> "该档案不支持所选的连接测试"
     "SAVE_FAILED" -> "保存未完成，请检查档案状态"
     "DELETE_FAILED" -> "删除未完成，请检查档案状态"
     "SELECTION_FAILED" -> "选择未完成"
-    "BASE_URL_INVALID", "API_KEY_REQUIRED" -> profileFormErrorMessage(code)
+    "BASE_URL_INVALID", "API_KEY_REQUIRED", "PROFILE_MODEL_NOT_MULTIMODAL" -> profileFormErrorMessage(code)
     else -> "连接测试失败"
 }

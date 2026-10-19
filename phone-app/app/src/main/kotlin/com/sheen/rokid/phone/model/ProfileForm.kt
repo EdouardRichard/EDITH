@@ -78,9 +78,20 @@ internal fun profileFormErrorMessage(code: String): String = when (code) {
     "API_KEY_REQUIRED" -> "API Key：新建档案必填"
     "INPUTS_REQUIRED" -> "声明输入：至少选择一项"
     "OUTPUTS_REQUIRED" -> "声明输出：至少选择一项"
+    "PROFILE_MODEL_NOT_MULTIMODAL" -> "该档案未声明图片输入（IMAGE）；本版助手要求 IMAGE+TEXT，请更换支持图片的模型/档案"
     "MAX_INPUT_INVALID" -> "最大输入：须为正数 K tokens，精确对应整数 token 且不超过 2097151.9990234375 K tokens"
     "MAX_OUTPUT_INVALID" -> "最大输出：须为正数 K tokens，精确对应整数 token 且不超过 2097151.9990234375 K tokens"
     "CAPACITY_OUTPUT_CONFLICT" -> "最大输入容量不足：须大于最大输出与内部安全余量之和"
     "TIMEOUT_INVALID" -> "超时：须为正整数毫秒且不超过 9223372036854775807"
     else -> "保存未完成，请重试"
 }
+
+/**
+ * 0.25 Task 14 (R74): the session-start gate for the assistant.
+ *
+ * The product sends TEXT + IMAGE; a profile that does not declare `IMAGE` is refused with
+ * `PROFILE_MODEL_NOT_MULTIMODAL` and must be replaced, never silently downgraded to text-only. An absent profile is a
+ * different failure (the host's capability/config path), so it is not this check's answer.
+ */
+internal fun profileStartupError(profile: ModelProfile?): String? =
+    if (profile != null && InputModality.IMAGE !in profile.inputs) "PROFILE_MODEL_NOT_MULTIMODAL" else null
