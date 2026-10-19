@@ -245,15 +245,17 @@ class ToolCatalogTest {
     }
 
     @Test
-    fun `the shell call timeout leaves room for the command-level confirmation`() {
+    fun `the shell call declares a human wait allowance and keeps its machine cap`() {
         val descriptors = catalog().descriptors().associateBy { it.name }
 
         // The plugin's ConfirmingActions asks the wearer inside the same execute call; D47's decision window is 120 s.
-        // A 30 s machine cap there would turn a slow but legal answer into ACTION_TIMEOUT and could cancel a command
-        // the wearer just approved. The turn deadline still bounds the run.
-        assertEquals(120_000L + 30_000L, descriptors.getValue("shell").timeoutMillis)
-        // The other tools have no human wait inside execute and keep the ordinary-tool cap.
+        // R99: the descriptor keeps the ordinary machine cap and declares the human wait separately, so the loop adds
+        // the allowance. Inflating timeoutMillis instead would be clamped by the turn deadline and cut a legal answer.
+        assertTrue(descriptors.getValue("shell").mayAskHuman)
+        assertEquals(30_000L, descriptors.getValue("shell").timeoutMillis)
+        // The other tools have no human wait inside execute and must not claim the allowance.
         listOf("device", "open", "dial").forEach { name ->
+            assertFalse("$name has no human wait", descriptors.getValue(name).mayAskHuman)
             assertEquals("$name keeps the ordinary cap", 30_000L, descriptors.getValue(name).timeoutMillis)
         }
     }

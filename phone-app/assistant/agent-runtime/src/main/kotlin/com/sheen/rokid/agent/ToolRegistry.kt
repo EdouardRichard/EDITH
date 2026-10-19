@@ -156,4 +156,5 @@ private fun ActionDescriptor.toToolDescriptor() = ToolDescriptor(
     countsTowardStepLimit = countsTowardStepLimit,
     observation = observation,
     timeoutMillis = timeoutMillis,
+    mayAskHuman = mayAskHuman,
 )

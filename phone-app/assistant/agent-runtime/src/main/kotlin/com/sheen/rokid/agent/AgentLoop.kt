@@ -242,6 +242,14 @@ private const val MAX_PLAN_TEXT_CHARS = 1_200
 private const val TOOL_EXECUTOR_THREAD_NAME = "agent-tool-call"
 /** R60: how long a timed-out call is given to really stop before the run reports `ACTION_TIMEOUT_UNCERTAIN`. */
 private const val TOOL_TIMEOUT_GRACE_NANOS = 2_000_000_000L
+/**
+ * R99: how long a `mayAskHuman` call may additionally wait for a person inside `execute`.
+ *
+ * It is D47's 120 s confirmation window, the same window the plugin's confirming wrapper uses. The allowance is added
+ * to the descriptor's machine cap and is never charged to the turn (D49): the loop shifts the measured part back out
+ * of `turnDeadlineNanos` after the call returns.
+ */
+private const val HUMAN_CONFIRMATION_ALLOWANCE_NANOS = 120_000L * 1_000_000L
 /** While waiting for a tool, the loop re-checks `cancel()` this often instead of blocking on the whole timeout. */
 private const val TOOL_POLL_STEP_NANOS = 10_000_000L
 private const val DEFAULT_TOOL_TIMEOUT_MILLIS = 30_000L
@@ -360,6 +368,12 @@ class AgentLoop(
     private var lastNudgedText: String? = null
     private var nudges = 0
 
+    /** R100: loop-owned runtime-state flags — the latest state-changing call could not be verified by an observation. */
+    private var lastWriteUnverified = false
+
+    /** R100: loop-owned runtime-state flag — a text-entry call ran and no later state-changing call followed it. */
+    private var typedUnsent = false
+
     /** R58: "the run has really used a tool" — a plan from a pure Q&A turn is never nudged. */
     private var successfulToolExecutions = 0
 
@@ -425,6 +439,8 @@ class AgentLoop(
         lastRuntimeStateHash = null
         lastNudgedText = null
         nudges = 0
+        lastWriteUnverified = false
+        typedUnsent = false
         successfulToolExecutions = 0
         val tools = registry.descriptors().map { ToolSpec(it.name, it.description, it.parametersJson) }
         // Phase 3: TurnRunner owns request assembly. For now, the system slot carries only INSTRUCTIONS;
@@ -484,7 +500,7 @@ class AgentLoop(
                 request.frameFor != null -> request.frameFor(frameTranscript(history, utteranceIndex))
                 openingTurn -> request.frame
                 else -> null
-            }?.let { withRuntimeState(it, request) }
+            }?.let { withRuntimeState(it, request, spentSteps) }
             openingTurn = false
             val reply = gateway.turn(
                 GatewayTurn(
@@ -639,7 +655,10 @@ class AgentLoop(
                         val shape = registered.descriptor
                         when (val decision = policy.decide(shape)) {
                             PolicyDecision.Allow -> {
-                                val executed = runTool(call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor)
+                                val executed = runTool(
+                                    call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor,
+                                    mayAskHuman = shape.mayAskHuman,
+                                )
                                 if (!executed.cancelled) {
                                     // P3.1's summary stays verbatim on a plain allow: only the structured fields are
                                     // new, and rewriting a P3.1-era audit line's four original fields would be a silent
@@ -686,7 +705,10 @@ class AgentLoop(
                                         ToolExecution(ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE), executed = false)
                                     }
                                     outcome.approved -> {
-                                        val executed = runTool(call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor)
+                                        val executed = runTool(
+                                            call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor,
+                                            mayAskHuman = shape.mayAskHuman,
+                                        )
                                         if (!executed.cancelled) {
                                             audit.record(
                                                 request.turnId, call.name, auditSummary(shape, call.argsJson),
@@ -713,6 +735,10 @@ class AgentLoop(
                 } finally {
                     notifyToolStatus(request, call.name, ToolPhase.END)
                 }
+                // R99/D49: a mayAskHuman call may have spent part of D47's decision window inside `execute`; that time
+                // belongs to the person, not the turn. Shift it before any deadline check below can charge the run for
+                // a legal approval. Every other call contributes nothing.
+                if (execution.deadlineShiftNanos > 0L) turnDeadlineNanos += execution.deadlineShiftNanos
                 // A cancel that arrived while the tool was running is not a tool failure: no output is appended for the
                 // unfinished call (R61), so the model never sees a half-finished step as if it had completed.
                 if (execution.cancelled) {
@@ -733,20 +759,29 @@ class AgentLoop(
                     registry.beginTurn()
                 }
                 val result = execution.result
-                val write = descriptor?.let { !it.observation } ?: false
-                // R57/R62/R98: the detectors see only a fingerprint that exists **after** this call ran. The guard is
-                // fed by a fingerprint-bearing **state-changing** call — the tool's per-call declaration, not
-                // `!observation` (`device` declares observation=true for act too, and an act is still a write). A read
+                // R98/R100: the per-call state-changing declaration is the only write signal — `device` declares
+                // observation=true for act too, so `!descriptor.observation` would treat `notify_user` as a write and a
+                // real device act as a read. It feeds the detectors' progress reset, the error streak's reset and the
+                // runtime-state flags below.
+                val stateChanging = execution.executed && result.stateChanging
+                // R57/R62/R98: the guard sees only a fingerprint that exists **after** a state-changing call ran. A read
                 // never feeds it and the payload is never used as a fingerprint (a payload with timing or a counter
                 // could never trip the guard).
-                val after = detectors.afterCall(execution.executed, write, result.fingerprint)
-                if (execution.executed && result.stateChanging && result.fingerprint != null) {
+                val after = detectors.afterCall(execution.executed, stateChanging, result.fingerprint)
+                if (stateChanging && result.fingerprint != null) {
                     guard.observeAfterAction(result.fingerprint)
                 }
+                // R100: the state line's flags are loop-owned. A state-changing call that came back without an
+                // observation fingerprint is a write the loop could not verify; a successful call carrying the
+                // text-entry payload is typed-but-unsent until the next successful state-changing call.
+                if (stateChanging) {
+                    lastWriteUnverified = result.fingerprint == null
+                    if (result.ok) typedUnsent = carriesTypedInput(call.argsJson)
+                }
                 // R56: the error streak is fed by every attempt with a stable code (a policy refusal counts, a
-                // confirmation decision does not, see `ErrorTracker`). A success resets it only when it was a write.
+                // confirmation decision does not, see `ErrorTracker`). A success resets it only when it changed state.
                 val errorsSeen = errors.assess(
-                    call.name, result, writeSucceeded = execution.executed && write && result.ok,
+                    call.name, result, writeSucceeded = stateChanging && result.ok,
                 )
                 // The step keeps the raw stable code (`ok` on success, as before Task 12); the model-facing output
                 // additionally carries the one-time hints and the one-time global notice.
@@ -809,6 +844,11 @@ class AgentLoop(
         val timedOut: Boolean = false,
         val uncertain: Boolean = false,
         val cancelled: Boolean = false,
+        /**
+         * R99/D49: the time this call spent waiting for a person beyond its machine cap, which the loop adds to the
+         * turn deadline. `0` for every ordinary call.
+         */
+        val deadlineShiftNanos: Long = 0L,
     )
 
     /**
@@ -821,15 +861,26 @@ class AgentLoop(
      * `ACTION_TIMEOUT_UNCERTAIN`, which the caller turns into the run's terminal state — no later write may run while an
      * earlier one may still be in flight. The real result of a timed-out call is deliberately discarded: it arrived
      * after the model was told the call failed, and reporting two outcomes for one call would be a lie either way.
+     *
+     * R99: [mayAskHuman] is the descriptor's declaration that the executor may spend D47's decision window inside
+     * `execute`. Such a call is bounded by `timeoutMillis + HUMAN_CONFIRMATION_ALLOWANCE_NANOS` and **not** clamped by
+     * the turn deadline; whatever it spent beyond the machine cap is reported as [ToolExecution.deadlineShiftNanos] so
+     * the caller can shift the turn deadline (D49). Every other call keeps `min(timeoutMillis, deadline - now)`.
      */
     private fun runTool(
         call: ToolCall,
         timeoutMillis: Long,
         turnDeadlineNanos: Long,
         toolExecutor: ExecutorService,
+        mayAskHuman: Boolean = false,
     ): ToolExecution {
-        val budgetNanos = (turnDeadlineNanos - clock.nowNanos()).coerceAtLeast(1L)
-        val timeoutNanos = minOf(timeoutMillis.coerceAtLeast(1L) * 1_000_000L, budgetNanos)
+        val machineBudgetNanos = timeoutMillis.coerceAtLeast(1L) * 1_000_000L
+        val timeoutNanos = if (mayAskHuman) {
+            machineBudgetNanos + HUMAN_CONFIRMATION_ALLOWANCE_NANOS
+        } else {
+            val budgetNanos = (turnDeadlineNanos - clock.nowNanos()).coerceAtLeast(1L)
+            minOf(machineBudgetNanos, budgetNanos)
+        }
         val future: Future<ToolResult> = toolExecutor.submit(Callable { registry.execute(call) })
         val startedAt = System.nanoTime()
         while (true) {
@@ -844,7 +895,11 @@ class AgentLoop(
                 // that does arrive is a real completed call: it is recorded like before Task 12, and the loop's own
                 // cancellation check right after the call ends the run.
                 val completed = future.get(minOf(remaining, TOOL_POLL_STEP_NANOS), TimeUnit.NANOSECONDS)
-                return ToolExecution(completed, executed = true)
+                return ToolExecution(
+                    completed,
+                    executed = true,
+                    deadlineShiftNanos = humanWaitShiftNanos(mayAskHuman, startedAt, machineBudgetNanos),
+                )
             } catch (_: TimeoutException) {
                 // Keep waiting; the loop above re-checks cancellation and the remaining budget.
             } catch (_: ExecutionException) {
@@ -858,11 +913,13 @@ class AgentLoop(
         }
         runCatching { registry.cancel() }
         val stopped = awaitToolStop(future)
+        val humanShift = humanWaitShiftNanos(mayAskHuman, startedAt, machineBudgetNanos)
         return if (stopped) {
             ToolExecution(
                 ToolResult(call.id, ok = false, payload = "$ACTION_TIMEOUT: $ACTION_TIMEOUT_NOTE"),
                 executed = true,
                 timedOut = true,
+                deadlineShiftNanos = humanShift,
             )
         } else {
             ToolExecution(
@@ -871,6 +928,20 @@ class AgentLoop(
                 uncertain = true,
             )
         }
+    }
+
+    /**
+     * R99/D49: the part of a `mayAskHuman` call that must not be charged to the turn — the time it spent beyond its
+     * machine cap, bounded by the fixed allowance. Machine time inside the cap was already the turn's own budget.
+     */
+    private fun humanWaitShiftNanos(
+        mayAskHuman: Boolean,
+        startedAtNanos: Long,
+        machineBudgetNanos: Long,
+    ): Long {
+        if (!mayAskHuman) return 0L
+        return (System.nanoTime() - startedAtNanos - machineBudgetNanos)
+            .coerceIn(0L, HUMAN_CONFIRMATION_ALLOWANCE_NANOS)
     }
 
     /** Waits up to the fixed grace window for [future] to finish; returns whether it did. */
@@ -900,13 +971,24 @@ class AgentLoop(
      * Folds the current [AgentRequest.runtimeState] into [frame] as one untrusted `RUNTIME_STATE` segment before the
      * frame's `USER_INPUT`, unless it is byte-identical to the state the previous request carried.
      *
+     * R100: the line is composed, not only forwarded. The loop-owned `spentSteps`/`spentObservations` and the
+     * last-write-unverified / typed-unsent flags come first (so the cap can never hide them), then the provider's device
+     * state fits in what remains. The result is capped at [TurnRuntimeState.MAX_CHARS] and carries no user content.
+     *
      * The segment is request metadata: it is not appended to `history`, so it never reaches [AgentRun.transcript], a
      * `ConversationStore` or a tool result. A provider that returns `null` or throws contributes nothing — the model
      * simply gets no state line, never a fabricated one.
      */
-    private fun withRuntimeState(frame: RequestFrame, request: AgentRequest): RequestFrame {
+    private fun withRuntimeState(frame: RequestFrame, request: AgentRequest, spentSteps: Int): RequestFrame {
         val state = runCatching { request.runtimeState?.invoke() }.getOrNull() ?: return frame
-        val hash = sha256Hex(state.text)
+        val composed = TurnRuntimeState.compose(
+            deviceText = state.text,
+            spentSteps = spentSteps,
+            spentObservations = spentObservations,
+            lastWriteUnverified = lastWriteUnverified,
+            typedUnsent = typedUnsent,
+        )
+        val hash = sha256Hex(composed.text)
         if (hash == lastRuntimeStateHash) return frame
         lastRuntimeStateHash = hash
         val flow = frame.conversationFlow
@@ -914,9 +996,25 @@ class AgentLoop(
         if (inputIndex < 0) return frame
         return frame.copy(
             conversationFlow = flow.take(inputIndex) +
-                Segment(SegmentOrigin.RUNTIME_STATE, trusted = false, text = state.text) +
+                Segment(SegmentOrigin.RUNTIME_STATE, trusted = false, text = composed.text) +
                 flow.drop(inputIndex),
         )
+    }
+
+    /**
+     * R100: whether one call carries the model's text-entry payload — the `value` member the `device` schema uses for
+     * a typed value (`ActionPlanner` types `value` and falls back to `text`).
+     *
+     * Only the **presence** of a non-blank member is read; its content never leaves the tool call and never reaches the
+     * runtime state. The seam has no declarative "this call types" signal (the descriptor only says
+     * `observation`), so this is deliberately conservative: a call that does not use `value` cannot set the flag, which
+     * is better than reporting text the model never typed. The next successful state-changing call clears it.
+     */
+    private fun carriesTypedInput(argsJson: String): Boolean {
+        val args = runCatching { auditArguments.parseToJsonElement(argsJson) as? JsonObject }.getOrNull()
+            ?: return false
+        val value = (args["value"] as? JsonPrimitive)?.takeIf { it.isString }?.content
+        return !value.isNullOrBlank()
     }
 
     // ---------------------------------------------------------------- Task 12: plan nudge (R58)

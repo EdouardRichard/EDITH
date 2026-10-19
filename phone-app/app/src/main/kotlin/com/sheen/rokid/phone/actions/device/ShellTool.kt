@@ -182,6 +182,9 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
             scope = "device.shell",
             // A raw command may contain user data, so no part of it is ever written to the audit trail.
             auditTargetArgument = null,
+            // R99: the plugin's confirming wrapper asks the wearer inside `execute` (D47's 120 s window). The loop must
+            // add its human allowance to the machine cap instead of clamping the whole call by the turn deadline.
+            mayAskHuman = true,
         )
     }
 }

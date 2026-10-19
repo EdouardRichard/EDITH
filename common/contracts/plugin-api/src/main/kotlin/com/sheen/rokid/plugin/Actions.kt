@@ -75,6 +75,18 @@ data class ActionDescriptor(
      * cheap local tool a smaller one. A timeout is a tool result (`ACTION_TIMEOUT`), never a silent retry.
      */
     val timeoutMillis: Long = 30_000L,
+    /**
+     * 0.25 Task 12 fix (R99): whether one call of this action may **wait for a person** inside `execute`.
+     *
+     * The `shell` tool is the one such action in this version: the plugin's confirming wrapper asks the wearer
+     * (D47's 120 s decision window) inside the same `execute` call the loop time-bounds, so the loop cannot see the
+     * human decision itself. For a `true` descriptor the call's budget is its [timeoutMillis] **machine** cap plus a
+     * fixed human allowance, not clamped by the turn deadline; after it returns, the time spent beyond the machine cap
+     * is shifted out of the turn (D49). `false` — the default, and every other action — keeps the pre-R99
+     * `min(timeoutMillis, turnDeadline - now)` behaviour exactly; `timeoutMillis` must not be inflated to fake a
+     * human wait, because the turn deadline would still clamp it.
+     */
+    val mayAskHuman: Boolean = false,
 ) {
     init {
         require(name.isNotBlank())

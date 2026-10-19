@@ -85,6 +85,12 @@ data class ToolDescriptor(
      * capped by the turn deadline). Defaults to the ordinary-tool value so every pre-0.25 descriptor is unchanged.
      */
     val timeoutMillis: Long = 30_000L,
+    /**
+     * Task 12 fix (R99): projected from `ActionDescriptor.mayAskHuman`. `true` means the call may spend up to D47's
+     * human decision window inside `execute`; the loop adds its fixed allowance to [timeoutMillis] and shifts the wait
+     * out of the turn deadline instead of letting either cut a legal answer (D49).
+     */
+    val mayAskHuman: Boolean = false,
 )
 
 /** A descriptor bound to the executor that declared it. */

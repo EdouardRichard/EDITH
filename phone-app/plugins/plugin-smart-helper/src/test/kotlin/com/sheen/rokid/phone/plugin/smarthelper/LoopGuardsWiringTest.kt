@@ -57,25 +57,23 @@ class LoopGuardsWiringTest {
     }
 
     @Test
-    fun `an unchanged runtime state is injected once across a tool round`() {
+    fun `an unchanged runtime state is injected once across a retry`() {
         // The production wiring always injects the per-route stores, which is what gives every request a frame the
-        // loop can fold the state into; the store-less path is the pre-Phase-5 test shape only.
+        // loop can fold the state into; the store-less path is the pre-Phase-5 test shape only. A retry executes no
+        // tool, so every loop-owned field in the composed line is unchanged too: the second request must save it.
         val rig = readyRig(smartStores())
         rig.actions.runtimeStateLine = stateLine
         var turn = 0
         rig.model.onRequest = { request, listener ->
             when (turn++) {
-                0 -> {
-                    listener(smartToolCall("c1", "device", """{"action":"status"}""", requestId = request.requestId))
-                    listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
-                }
-                else -> streamText(request, listener, "看过了。")
+                0 -> listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+                else -> streamText(request, listener, "好。")
             }
         }
 
         rig.wakeAndFinal("看一下屏幕")
 
-        assertEquals(2, rig.model.requests.size, "the fixture must make a tool round")
+        assertEquals(2, rig.model.requests.size, "the fixture must make a retry")
         assertEquals(1, rig.model.requests.count { stateLine in inputText(it) }, "an unchanged state is sent once")
     }
 

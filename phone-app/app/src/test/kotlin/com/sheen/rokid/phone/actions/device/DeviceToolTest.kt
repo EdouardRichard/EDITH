@@ -435,6 +435,7 @@ class DeviceToolTest {
     @Test
     fun `observe and act carry a content fingerprint that ignores the revision`() {
         val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.revisionValue = 1L
         val tool = tool(operations)
 
         val first = tool.execute("""{"action":"observe"}""")
@@ -451,6 +452,48 @@ class DeviceToolTest {
 
         assertNotNull(act.fingerprint)
         assertNotEquals(first.fingerprint, act.fingerprint)
+    }
+
+    @Test
+    fun `a failed observe returns no fingerprint when the revision did not advance`() {
+        // The kernel's `latestObservation` is still the pre-call screen: the failed read observed nothing, so the
+        // tool must not report the previous screen as this call's post-state (poll/global would see a false "no change").
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.revisionValue = 1L
+        operations.advanceRevisionOnObserve = false
+        operations.observeEnvelope = failure("observe", "CHANNEL_UNAVAILABLE", recoverable = true)
+
+        val result = tool(operations).execute("""{"action":"observe"}""")
+
+        assertNull("a call that observed nothing must not report the previous screen", result.fingerprint)
+    }
+
+    @Test
+    fun `an early rejected act returns no fingerprint`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.revisionValue = 1L
+        operations.advanceRevisionOnAct = false
+        operations.actEnvelope = failure("act", "DEVICE_LOCKED", recoverable = true)
+
+        val result = tool(operations).execute("""{"action":"act","kind":"tap","ref":"#n1"}""")
+
+        assertNull("a rejected act never observed its effect", result.fingerprint)
+    }
+
+    @Test
+    fun `a failed act that still observed reports the current fingerprint`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.revisionValue = 1L
+        // The act was refused, yet the kernel did observe afterwards: the revision advanced and the new screen is
+        // exactly the state the failed call left behind.
+        operations.actEnvelope = failure("act", "VERIFY_TIMEOUT", recoverable = true)
+        operations.observation = observation(rev = 2, nodes = listOf(node("B")))
+
+        val result = tool(operations).execute("""{"action":"act","kind":"tap","ref":"#n1"}""")
+
+        assertNotNull(result.fingerprint)
+        val reread = tool(operations).execute("""{"action":"observe"}""")
+        assertEquals("the fingerprint names the screen the call observed", result.fingerprint, reread.fingerprint)
     }
 
     @Test
@@ -611,6 +654,10 @@ class DeviceToolTest {
 
         var revisionValue: Long? = null
         var generationValue: Long? = null
+        // A successful observe/act really advances the kernel's observation revision; a failed one answers before
+        // observing. Tests that script a failed call flip the matching switch off.
+        var advanceRevisionOnObserve = true
+        var advanceRevisionOnAct = true
 
         override val revision: Long?
             get() = revisionValue
@@ -621,6 +668,7 @@ class DeviceToolTest {
         override fun observe(filter: ScreenFilter): DeviceEnvelope {
             observeFilter = filter
             calls += "observe:${filter.name}"
+            if (advanceRevisionOnObserve) revisionValue = revisionValue?.plus(1)
             return observeEnvelope
         }
 
@@ -635,6 +683,7 @@ class DeviceToolTest {
         ): DeviceEnvelope {
             calls += "act:${kind.name}"
             actCalls += ActCall(kind, ref, text, value, direction, key, timeoutMillis)
+            if (advanceRevisionOnAct) revisionValue = revisionValue?.plus(1)
             return actEnvelope
         }
 

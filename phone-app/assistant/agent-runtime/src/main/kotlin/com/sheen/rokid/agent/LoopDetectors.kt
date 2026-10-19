@@ -4,6 +4,7 @@ import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import java.security.MessageDigest
 
 /**
@@ -207,9 +208,10 @@ class LoopDetectors(
      * Records the result of the call just attempted.
      *
      * The loop calls this for **every** attempt, with `executed = false` for a refusal/denial; only an executed call
-     * contributes a fingerprint, a global no-progress count or ping-pong progress evidence. [write] is the descriptor's
-     * "this call mutates state" declaration (`!observation` in the additive seam): only a write with a changed
-     * fingerprint resets the generic streak.
+     * contributes a fingerprint, a global no-progress count or ping-pong progress evidence. [write] is the executor's
+     * per-call "this call mutates state" declaration (`ToolResult.stateChanging`, R98): only a state-changing call with
+     * a changed fingerprint resets the generic streak. A successful read (`stateChanging = false`) is never progress by
+     * itself; `device` declares `observation = true` for every call, so the descriptor alone cannot answer this.
      */
     fun afterCall(executed: Boolean, write: Boolean, fingerprint: String?): LoopAfterCall {
         val current = attempts.lastOrNull() ?: return LoopAfterCall()
@@ -300,7 +302,7 @@ private val ERROR_HINTS = mapOf(
 
 private val STABLE_TOKEN = Regex("[A-Z][A-Z0-9_]{1,}")
 private val PREFIXED_CODE = Regex("^([A-Z][A-Z0-9_]{1,})\\s*:")
-private val JSON_CODE = Regex("\"code\"\\s*:\\s*\"([A-Z][A-Z0-9_]{1,})\"")
+private val REFUSED_PREFIXES = listOf("Refused:", "Failed:")
 
 /**
  * Extracts the **identity** of a failed result without keeping its body (R56: D117 allows a hash, never the text).
@@ -309,24 +311,52 @@ private val JSON_CODE = Regex("\"code\"\\s*:\\s*\"([A-Z][A-Z0-9_]{1,})\"")
  * 1. `Refused: CODE` / `Failed: CODE` — the token right after the prefix when it looks like a stable code;
  * 2. a bare all-caps token (`UNKNOWN_TOOL`, `REFUSED_BY_POLICY`);
  * 3. a leading `CODE:` (`ACTION_TIMEOUT: may or may not have taken effect`);
- * 4. an `"error":{"code":"CODE"}` member of a JSON payload (the device tools render their stable code there);
- * 5. otherwise SHA-256(payload) truncated to 16 hex characters.
+ * 4. an `"error":{"code":"CODE"}` member of the payload's JSON (the device/shell tools render their stable code there,
+ *    and `ToolRegistry` prefixes that whole JSON with `Refused:`/`Failed:`);
+ * 5. otherwise SHA-256 truncated to 16 hex characters. A JSON body is canonicalised and its `timing` member removed
+ *    first, so the same failure with different timing values (the device envelope embeds per-call timings) hashes
+ *    identically instead of looking like a new error on every attempt.
  *
  * A `Refused: the channel …` detail whose first token is prose falls through to the hash: the first token of a sentence
  * is not a stable code, and treating every "the" as the same identity would end runs on unrelated failures.
  */
 internal fun stableCodeOf(payload: String): String {
     val text = payload.trim()
-    for (prefix in listOf("Refused:", "Failed:")) {
-        if (text.startsWith(prefix)) {
-            val token = text.substring(prefix.length).trim().substringBefore(' ').substringBefore('\n')
-            return if (STABLE_TOKEN.matches(token)) token else sha256Hex(text).take(16)
-        }
+    val prefix = REFUSED_PREFIXES.firstOrNull { text.startsWith(it) }
+    val body = if (prefix == null) text else text.substring(prefix.length).trim()
+    if (prefix != null) {
+        val token = body.substringBefore(' ').substringBefore('\n')
+        if (STABLE_TOKEN.matches(token)) return token
+    } else {
+        if (STABLE_TOKEN.matches(body)) return body
+        PREFIXED_CODE.find(body)?.let { return it.groupValues[1] }
     }
-    if (STABLE_TOKEN.matches(text)) return text
-    PREFIXED_CODE.find(text)?.let { return it.groupValues[1] }
-    JSON_CODE.find(text)?.let { return it.groupValues[1] }
+    // The production device/shell failure is JSON behind the prefix; its stable code lives inside the payload.
+    jsonErrorCode(body)?.let { return it }
+    if (body.startsWith("{")) return sha256Hex(canonicalJsonWithoutTiming(body)).take(16)
+    // Prose behind a prefix (or a bare sentence) keeps the old whole-payload identity; there is nothing to strip.
     return sha256Hex(text).take(16)
+}
+
+/** The `error.code` member of a JSON payload, when it is present and shaped like a stable code. */
+private fun jsonErrorCode(body: String): String? {
+    val root = runCatching { canonicalJson.parseToJsonElement(body) as? JsonObject }.getOrNull() ?: return null
+    val error = root["error"] as? JsonObject ?: return null
+    val code = (error["code"] as? JsonPrimitive)?.takeIf { it.isString }?.content ?: return null
+    return code.takeIf { STABLE_TOKEN.matches(it) }
+}
+
+/**
+ * The payload with its `timing` member removed, canonicalised (sorted keys, normalised whitespace).
+ *
+ * Only reached when a JSON payload carries no stable code. Timing is the one part of an otherwise identical failure
+ * that legitimately changes on every call, so it must not leak into the identity; dropping it keeps the error streak
+ * and the per-code hints reachable. Out-of-memory/parse failures fall back to the raw body, which is still hashed.
+ */
+private fun canonicalJsonWithoutTiming(body: String): String {
+    val parsed = runCatching { canonicalJson.parseToJsonElement(body) }.getOrNull() ?: return body.trim()
+    val stable = if (parsed is JsonObject) JsonObject(parsed.filterKeys { it != "timing" }) else parsed
+    return canonicalize(stable).toString()
 }
 
 /** What one failed/successful result means for the run's error streak. */

@@ -44,12 +44,11 @@ class ToolCatalog(
     override fun descriptors(): List<ActionDescriptor> = buildList {
         if (a11yAvailable()) add(device.descriptors().single())
         if (shellAvailable()) {
-            // Task 12 (R60): the *plugin* wraps this executor in `ConfirmingActions`, which asks the wearer before a
-            // risky command reaches the shell — inside the same `execute` call the loop time-bounds. A 30 s machine
-            // cap would turn a slow (but legal, D47 120 s) human decision into `ACTION_TIMEOUT`, so the shell call
-            // declares room for the full decision window plus the command itself. The turn deadline still bounds the
-            // run: `min(descriptor.timeoutMillis, turnDeadline - now)` is what the loop enforces.
-            add(shell.descriptors().single().copy(timeoutMillis = SHELL_CALL_TIMEOUT_MILLIS))
+            // Task 12 fix (R99): the shell descriptor keeps its machine cap and declares `mayAskHuman`; the plugin wraps
+            // this executor in `ConfirmingActions`, which asks the wearer inside the same `execute` call, and the agent
+            // loop adds the human allowance plus shifts the measured wait out of the turn (D49). Inflating
+            // `timeoutMillis` here would be clamped by the turn deadline and cut a legal 120 s decision.
+            add(shell.descriptors().single())
             add(open.descriptors().single())
         }
         if (callAvailable()) add(dial.descriptors().single())
@@ -107,14 +106,6 @@ class ToolCatalog(
         const val CHANNEL_UNAVAILABLE = "CHANNEL_UNAVAILABLE"
         const val CALL_PERMISSION_MISSING = "CALL_PERMISSION_MISSING"
         const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
-
-        /**
-         * Task 12 (R60): the confirmation window (D47: 120 s) plus the shell tool's own default command budget.
-         *
-         * This is not a second confirmation timeout — it is the machine-time cap the loop must not apply while the
-         * wearer is still deciding. The run's turn deadline remains the outer bound.
-         */
-        const val SHELL_CALL_TIMEOUT_MILLIS = 120_000L + 30_000L
     }
 }
 

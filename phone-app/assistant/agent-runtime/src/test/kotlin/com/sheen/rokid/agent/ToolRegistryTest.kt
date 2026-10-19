@@ -278,6 +278,14 @@ class ToolRegistryTest {
         assertEquals(30_000L, plain.timeoutMillis)
     }
 
+    @Test fun `descriptors project the human confirmation allowance additively`() {
+        val shell = RecordingActionExecutor(listOf(actionDescriptor("shell", mayAskHuman = true)))
+        assertTrue(ToolRegistry(listOf(shell)).descriptors().single().mayAskHuman)
+
+        // No other tool may claim a human wait inside execute: the default keeps every existing action unchanged.
+        assertFalse(ToolRegistry(listOf(executorOf("lookup"))).descriptors().single().mayAskHuman)
+    }
+
     @Test fun `the fingerprint rides through every outcome`() {
         val executor = executorOf("device")
         val registry = ToolRegistry(listOf(executor))

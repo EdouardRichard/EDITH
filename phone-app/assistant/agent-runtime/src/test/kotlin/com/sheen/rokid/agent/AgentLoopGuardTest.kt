@@ -67,10 +67,24 @@ class AgentLoopGuardTest {
         maxObservations = maxObservations,
     )
 
-    private fun descriptor(name: String, observation: Boolean = false, timeoutMillis: Long = 30_000L) =
-        actionDescriptor(name, observation = observation, timeoutMillis = timeoutMillis)
+    private fun descriptor(
+        name: String,
+        observation: Boolean = false,
+        timeoutMillis: Long = 30_000L,
+        mayAskHuman: Boolean = false,
+    ) = actionDescriptor(
+        name,
+        observation = observation,
+        timeoutMillis = timeoutMillis,
+        mayAskHuman = mayAskHuman,
+    )
 
     private fun executor(vararg descriptors: ActionDescriptor) = RecordingActionExecutor(descriptors.toList())
+
+    /** The production clock shape: the R99 deadline checks must run against the same wall the tool sleeps on. */
+    private fun realClock(): MonotonicClock = object : MonotonicClock {
+        override fun nowNanos(): Long = System.nanoTime()
+    }
 
     private fun outputs(run: AgentRun): List<ModelHistoryItem.ToolOutput> =
         run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>()
@@ -272,16 +286,21 @@ class AgentLoopGuardTest {
 
     @Test
     fun `a successful write resets the consecutive error streak`() {
-        val executor = executor(descriptor("device"), descriptor("recover"))
+        // The reset is the per-call state-changing declaration (R98), not "not an observation": `device` declares
+        // observation=true for every call, so a real device act is the write that must reset the streak.
+        val executor = executor(descriptor("device", observation = true), descriptor("recover", observation = true))
         executor.outcome = { name, _ ->
-            if (name == "recover") ActionResult(ActionOutcome.Done, "done", fingerprint = "screen")
-            else ActionResult(ActionOutcome.Refused, "NODE_STALE")
+            if (name == "recover") {
+                ActionResult(ActionOutcome.Done, "done", fingerprint = "screen", stateChanging = true)
+            } else {
+                ActionResult(ActionOutcome.Refused, "NODE_STALE")
+            }
         }
         val gateway = ScriptedGateway(
             listOf(
                 reply(calls = listOf(call("c1", "device", """{"step":1}"""))),
                 reply(calls = listOf(call("c2", "device", """{"step":2}"""))),
-                reply(calls = listOf(call("c3", "recover", "{}"))),
+                reply(calls = listOf(call("c3", "recover", """{"action":"act"}"""))),
                 reply(calls = listOf(call("c4", "device", """{"step":4}"""))),
                 reply(calls = listOf(call("c5", "device", """{"step":5}"""))),
                 reply(text = "好了"),
@@ -294,6 +313,77 @@ class AgentLoopGuardTest {
         assertEquals("好了", run.finalText)
         assertEquals(5, run.steps.size)
     }
+
+    @Test
+    fun `successful notify and load skill results never reset the error streak`() {
+        // R56/R98: only a state-changing success is progress for the error streak. A successful answer or reference
+        // read is not evidence the device works, so it must not hide three identical device failures.
+        val executor = executor(
+            descriptor("device"),
+            descriptor("notify_user"),
+            descriptor("load_skill", observation = false),
+        )
+        executor.outcome = { name, _ ->
+            when (name) {
+                "notify_user" -> ActionResult(ActionOutcome.Done, "notified")
+                "load_skill" -> ActionResult(ActionOutcome.Done, "loaded")
+                else -> ActionResult(ActionOutcome.Refused, "NODE_STALE")
+            }
+        }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "device", """{"step":1}"""))),
+                reply(calls = listOf(call("c2", "notify_user", """{"text":"wait"}"""))),
+                reply(calls = listOf(call("c3", "device", """{"step":2}"""))),
+                reply(calls = listOf(call("c4", "load_skill", """{"skill":"navigation"}"""))),
+                reply(calls = listOf(call("c5", "device", """{"step":3}"""))),
+                reply(text = "不可达"),
+            ),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.FAILED, run.outcome)
+        assertEquals("REPEATED_ERROR", run.safeCode)
+        assertEquals(5, run.steps.size)
+    }
+
+    @Test
+    fun `three identical device failures with different timings fail as REPEATED_ERROR`() {
+        // The production shape: ToolRegistry wraps a failed ActionResult as `Refused: <detail>` and DeviceTool's detail
+        // is the whole envelope, whose timing block differs on every call. The error.code inside the JSON is the
+        // identity; if the loop hashes the payload body instead, these are three different failures and the run
+        // never terminates.
+        val executor = executor(descriptor("device"))
+        var attempt = 0
+        executor.outcome = { _, _ ->
+            attempt++
+            ActionResult(ActionOutcome.Refused, deviceFailure(totalMs = attempt.toLong()))
+        }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "device", """{"step":1}"""))),
+                reply(calls = listOf(call("c2", "device", """{"step":2}"""))),
+                reply(calls = listOf(call("c3", "device", """{"step":3}"""))),
+                reply(text = "不可达"),
+            ),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.FAILED, run.outcome, "three identical NODE_STALE failures must end the run")
+        assertEquals("REPEATED_ERROR", run.safeCode)
+        assertEquals(3, run.steps.size)
+        assertTrue(
+            outputs(run).first().output.contains("LOOP_HINT:NODE_STALE"),
+            "the NODE_STALE hint must reach the model: ${outputs(run).first().output}",
+        )
+    }
+
+    private fun deviceFailure(totalMs: Long): String =
+        """{"ok":false,"tool":"device","action":"act","channel":"accessibility","accepted":false,"applied":null,""" +
+            """"verified":null,"images":[],"timing":{"actMs":1,"observeMs":2,"totalMs":$totalMs},"data":null,""" +
+            """"error":{"code":"NODE_STALE","message":"the node reference is stale","recoverable":true}}"""
 
     // ---------------------------------------------------------------- plan nudge (R58)
 
@@ -451,6 +541,53 @@ class AgentLoopGuardTest {
         assertEquals(1, executor.beginTurns.get(), "the timeout recovery path re-arms exactly once")
     }
 
+    // ---------------------------------------------------------------- human confirmation allowance (R99)
+
+    @Test
+    fun `a may ask human call that outlives the turn deadline still returns its result and shifts the deadline`() {
+        // The plugin's ConfirmingActions asks the wearer inside `execute` for up to 120 s (D47). The call must get its
+        // machine cap plus that human allowance and must not be clamped by the turn deadline; the wait is then shifted
+        // out of the turn (D49), so the run continues instead of reporting DEADLINE right after a legal approval.
+        val executor = SleepingExecutor(
+            descriptor("confirm", timeoutMillis = 50L, mayAskHuman = true),
+            sleepMillis = 500L,
+        )
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "confirm"))), reply(text = "done")),
+        )
+        val clock = realClock()
+
+        val run = loop(gateway, ToolRegistry(listOf(executor)), clock = clock).run(
+            request(deadlineNanos = System.nanoTime() + 400_000_000L),
+        )
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome, "the shifted deadline must not end the run as DEADLINE")
+        assertEquals(2, gateway.requests.size)
+        assertEquals("ok", run.steps.single().result, "the human allowance, not the turn deadline, bounds this call")
+        executor.awaitWorkers(1_000)
+    }
+
+    @Test
+    fun `a non human call is still bounded by the descriptor cap and the turn deadline`() {
+        // The allowance is additive only for a descriptor that declares it. An ordinary tool keeps
+        // min(timeoutMillis, deadline - now): here the 30 s machine cap would let a 5 s sleep finish, but the turn
+        // deadline is 100 ms, so the call times out and the run continues with ACTION_TIMEOUT.
+        val executor = SleepingExecutor(descriptor("slow", timeoutMillis = 30_000L), sleepMillis = 5_000L)
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "slow"))), reply(text = "done")),
+        )
+        val clock = realClock()
+
+        val run = loop(gateway, ToolRegistry(listOf(executor)), clock = clock).run(
+            request(deadlineNanos = System.nanoTime() + 100_000_000L),
+        )
+
+        assertEquals(AgentOutcome.DEADLINE, run.outcome, "an ordinary call is still clamped by the turn deadline")
+        assertEquals(1, gateway.requests.size, "the deadline ends the turn before another model request")
+        assertTrue(run.steps.single().result.startsWith("ACTION_TIMEOUT"), run.steps.single().result)
+        executor.awaitWorkers(1_000)
+    }
+
     // ---------------------------------------------------------------- observation budget (R61)
 
     @Test
@@ -522,20 +659,24 @@ class AgentLoopGuardTest {
 
     @Test
     fun `an unchanged runtime state is injected only once`() {
+        // A retry is the one continuation that executes no tool: the loop-owned counters are unchanged, so the whole
+        // composed line — device state and counters — is identical and the second request must save those tokens.
         val gateway = ScriptedGateway(
             listOf(
-                reply(calls = listOf(call("c1", "lookup"))),
+                reply(),
                 reply(text = "done"),
             ),
         )
 
-        loop(gateway, ToolRegistry(listOf(executorOf("lookup")))).run(
+        val run = loop(gateway, ToolRegistry(emptyList())).run(
             request(
                 runtimeState = { TurnRuntimeState("foreground=com.android.settings revision=4") },
                 frameFor = minimalFrame("打开设置"),
             ),
         )
 
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(2, gateway.requests.size)
         assertEquals(
             1,
             gateway.requests[0].frame!!.conversationFlow.count { it.origin == SegmentOrigin.RUNTIME_STATE },
@@ -546,6 +687,82 @@ class AgentLoopGuardTest {
             "the identical state was already sent and must save tokens",
         )
     }
+
+    @Test
+    fun `the runtime state carries loop counters and write and typing flags`() {
+        // R100: the loop's own state is part of the line, not just the device's. A state-changing call with no
+        // fingerprint is an unverified write; a state-changing call that carries an input value is typed-but-unsent
+        // until the next state-changing call.
+        val executor = executor(descriptor("device", observation = true))
+        var step = 0
+        executor.outcome = { _, _ ->
+            when (++step) {
+                1 -> ActionResult(ActionOutcome.Done, "typed", stateChanging = true)
+                2 -> ActionResult(ActionOutcome.Done, "pressed", fingerprint = "screen", stateChanging = true)
+                else -> ActionResult(ActionOutcome.Done, "observed")
+            }
+        }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(
+                    calls = listOf(
+                        call("c1", "device", """{"action":"act","kind":"type","ref":"#n1","value":"hello"}"""),
+                    ),
+                ),
+                reply(calls = listOf(call("c2", "device", """{"action":"act","kind":"press_key","key":"enter"}"""))),
+                reply(calls = listOf(call("c3", "device", """{"action":"observe"}"""))),
+                reply(text = "done"),
+            ),
+        )
+
+        loop(gateway, ToolRegistry(listOf(executor))).run(
+            request(
+                runtimeState = { TurnRuntimeState("foreground=com.android.settings revision=4") },
+                frameFor = minimalFrame("打开设置"),
+            ),
+        )
+
+        val opening = runtimeStateOf(gateway.requests[0])!!
+        assertTrue(opening.contains("foreground=com.android.settings"), opening)
+        assertTrue(opening.contains("steps=0"), opening)
+        assertTrue(opening.contains("observations=0"), opening)
+        assertTrue(opening.contains("writeUnverified=no"), opening)
+        assertTrue(opening.contains("typedUnsent=no"), opening)
+
+        val afterTyping = runtimeStateOf(gateway.requests[1])!!
+        assertTrue(afterTyping.contains("steps=1"), afterTyping)
+        assertTrue(afterTyping.contains("observations=1"), afterTyping)
+        assertTrue(afterTyping.contains("writeUnverified=yes"), "a write with no fingerprint: $afterTyping")
+        assertTrue(afterTyping.contains("typedUnsent=yes"), "a typed input was not followed by a write: $afterTyping")
+
+        val afterSend = runtimeStateOf(gateway.requests[2])!!
+        assertTrue(afterSend.contains("writeUnverified=no"), "the write carries a fingerprint: $afterSend")
+        assertTrue(afterSend.contains("typedUnsent=no"), "the next state-changing call clears the flag: $afterSend")
+    }
+
+    @Test
+    fun `a composed runtime state stays within the 300 character bound`() {
+        // The provider hands over a line already at the cap; the loop-owned fields must still be present, so the
+        // composition trims the device half instead of dropping the counters or exceeding `TurnRuntimeState.MAX_CHARS`.
+        val gateway = ScriptedGateway(listOf(reply(text = "好。")))
+
+        loop(gateway, ToolRegistry(emptyList())).run(
+            request(
+                runtimeState = { TurnRuntimeState("x".repeat(TurnRuntimeState.MAX_CHARS)) },
+                frameFor = minimalFrame("现在几点了"),
+            ),
+        )
+
+        val state = runtimeStateOf(gateway.requests.single())!!
+        assertTrue(state.length <= TurnRuntimeState.MAX_CHARS, "length=${state.length}")
+        assertTrue(state.contains("steps=0"), state)
+        assertTrue(state.contains("observations=0"), state)
+        assertTrue(state.contains("writeUnverified=no"), state)
+        assertTrue(state.contains("typedUnsent=no"), state)
+    }
+
+    private fun runtimeStateOf(turn: GatewayTurn): String? =
+        turn.frame?.conversationFlow?.singleOrNull { it.origin == SegmentOrigin.RUNTIME_STATE }?.text
 
     @Test
     fun `a runtime state is bounded to 300 characters and never blank`() {

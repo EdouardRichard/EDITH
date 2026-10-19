@@ -31,10 +31,12 @@ interface DeviceOperations {
     val latestObservation: Observation?
 
     /**
-     * Task 12 (R59): the kernel's monotonic observation counter, or `null` when the implementation has none.
+     * Task 12 (R59/R57 fix): the kernel's monotonic observation counter, or `null` when the implementation has none.
      *
-     * Additive default so every hand-scripted test implementation keeps compiling; it is only used to render the one
-     * runtime-state line, never to decide an action.
+     * Additive default so every hand-scripted test implementation keeps compiling. It renders the one runtime-state
+     * line and, more importantly, is the proof that a call really observed something: `fingerprintAfter` only reports a
+     * post-call fingerprint when this counter advanced during the call. A `null` counter therefore means "cannot prove
+     * an observation" and yields no fingerprint, never a stale one.
      */
     val revision: Long? get() = null
 
@@ -192,8 +194,9 @@ class DeviceTool(
             else -> return refused(INVALID_ARGUMENTS)
         }
         lastFilter = filter
+        val revisionBefore = operations.revision
         val envelope = operations.observe(filter)
-        return result(envelope, project(envelope, filter), fingerprintAfter(envelope))
+        return result(envelope, project(envelope, filter), fingerprintAfter(envelope, revisionBefore))
     }
 
     private fun act(args: JsonObject): ActionResult {
@@ -203,6 +206,7 @@ class DeviceTool(
         if (timeout <= 0L) return refused(INVALID_ARGUMENTS)
         if (kind == ActKind.SCROLL_TO_TEXT) return scrollToText(args, timeout)
         val ref = args.stringArg("ref")?.trim()?.takeIf { it.isNotEmpty() }?.let(::Ref)
+        val revisionBefore = operations.revision
         val envelope = operations.act(
             kind = kind,
             ref = ref,
@@ -215,7 +219,7 @@ class DeviceTool(
         return result(
             envelope,
             project(envelope, lastFilter),
-            fingerprintAfter(envelope),
+            fingerprintAfter(envelope, revisionBefore),
             stateChanging = true,
         )
     }
@@ -234,6 +238,7 @@ class DeviceTool(
             ?: return refused(INVALID_ARGUMENTS)
         val direction = args.stringArg("direction")?.trim()?.takeIf { it.isNotEmpty() } ?: "forward"
         val started = clock()
+        val revisionBefore = operations.revision
         var last: DeviceEnvelope? = null
         do {
             val remaining = (timeoutMillis - (clock() - started)).coerceAtLeast(1L)
@@ -250,7 +255,7 @@ class DeviceTool(
                 return result(
                     scrolled.copy(action = ACTION_ACT),
                     project(scrolled, lastFilter),
-                    fingerprintAfter(scrolled),
+                    fingerprintAfter(scrolled, revisionBefore),
                     stateChanging = true,
                 )
             }
@@ -260,7 +265,7 @@ class DeviceTool(
                 return result(
                     waited.copy(action = ACTION_ACT),
                     project(waited, lastFilter),
-                    fingerprintAfter(waited),
+                    fingerprintAfter(waited, revisionBefore),
                     stateChanging = true,
                 )
             }
@@ -268,7 +273,7 @@ class DeviceTool(
                 return result(
                     waited.copy(action = ACTION_ACT),
                     project(waited, lastFilter),
-                    fingerprintAfter(waited),
+                    fingerprintAfter(waited, revisionBefore),
                     stateChanging = true,
                 )
             }
@@ -277,7 +282,7 @@ class DeviceTool(
         return result(
             envelope.copy(action = ACTION_ACT),
             project(envelope, lastFilter),
-            fingerprintAfter(envelope),
+            fingerprintAfter(envelope, revisionBefore),
             stateChanging = true,
         )
     }
@@ -355,16 +360,21 @@ class DeviceTool(
     }
 
     /**
-     * Task 12 (R57): the post-call observation fingerprint, or `null` when this call has no screen to fingerprint.
+     * Task 12 (R57): the post-call observation fingerprint, or `null` when this call observed no new screen.
      *
      * The kernel observes after every `observe`/`act` (a successful write, a refusal, an `ACCEPTED_NO_EFFECT`), so the
-     * newest [DeviceOperations.latestObservation] is the state the call left behind. A kernel diagnostic in `data`
-     * means the observation itself failed (R32) — a diagnostic is not a screen, and fingerprinting the previous
-     * snapshot would report "no change" for a call that simply could not look. The fingerprint excludes the revision
-     * and all timing: the same screen must hash identically across observations.
+     * newest [DeviceOperations.latestObservation] is the state the call left behind — but only if the kernel's
+     * monotonic observation revision actually advanced during **this** call. A refused observe and an act rejected
+     * before it ran leave the previous snapshot in place; reporting that stale screen as this call's post-state would
+     * make the loop's poll/global detectors see "no change" for a call that never looked, and would credit a failed
+     * write with evidence it does not have. A kernel diagnostic in `data` means the observation itself failed (R32):
+     * a diagnostic is not a screen either. The fingerprint excludes the revision and all timing: the same screen must
+     * hash identically across observations.
      */
-    private fun fingerprintAfter(envelope: DeviceEnvelope): String? {
+    private fun fingerprintAfter(envelope: DeviceEnvelope, revisionBefore: Long?): String? {
         if (!envelope.data.isNullOrBlank()) return null
+        val revisionAfter = operations.revision ?: return null
+        if (revisionBefore == null || revisionAfter <= revisionBefore) return null
         val observation = operations.latestObservation ?: return null
         return observationFingerprint(observation)
     }

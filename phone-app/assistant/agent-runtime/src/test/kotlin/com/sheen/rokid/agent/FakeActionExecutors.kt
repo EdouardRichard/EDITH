@@ -52,6 +52,8 @@ internal fun actionDescriptor(
     // Task 12 (R57): additive descriptor metadata. The defaults keep every pre-0.25 fixture byte-for-byte.
     observation: Boolean = false,
     timeoutMillis: Long = 30_000L,
+    // Task 12 fix (R99): whether the executor may wait for a person inside `execute`.
+    mayAskHuman: Boolean = false,
 ) = ActionDescriptor(
     name = name,
     title = "Title of $name",
@@ -65,6 +67,7 @@ internal fun actionDescriptor(
     countsTowardStepLimit = countsTowardStepLimit,
     observation = observation,
     timeoutMillis = timeoutMillis,
+    mayAskHuman = mayAskHuman,
 )
 
 /** An executor offering exactly one tool, described by [actionDescriptor] defaults. */

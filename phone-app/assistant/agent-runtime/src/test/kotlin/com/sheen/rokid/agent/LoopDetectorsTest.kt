@@ -351,4 +351,51 @@ class LoopDetectorsTest {
         assertTrue(first.hint?.startsWith("LOOP_HINT:NODE_STALE") == true, "hint: ${first.hint}")
         assertNull(second.hint, "the same code is hinted once per run")
     }
+
+    // ---------------------------------------------------------------- production error identity (review R56)
+
+    /**
+     * The exact payload the production path produces for a failed `device` call: `ToolRegistry` prefixes the outcome
+     * and `DeviceTool` renders the whole envelope (error code and timing included) as one JSON object. The timing values
+     * differ on every call; the failure is the same.
+     */
+    private fun deviceFailure(totalMs: Long): String =
+        "Refused: " + """{"ok":false,"tool":"device","action":"act","channel":"accessibility","accepted":false,""" +
+            """"applied":null,"verified":null,"data":{"screen":null,"diagnostic":"accepted the action but could not """ +
+            """observe"},"images":[],"timing":{"actMs":1,"observeMs":2,"totalMs":$totalMs},"error":{"code":"NODE_STALE",""" +
+            """"message":"the node reference is stale","recoverable":true}}"""
+
+    @Test
+    fun `a production device failure keeps its json error code across timing values`() {
+        val first = stableCodeOf(deviceFailure(totalMs = 7L))
+        val second = stableCodeOf(deviceFailure(totalMs = 913L))
+
+        assertEquals("NODE_STALE", first, "the JSON error.code must win over the Refused: prefix token")
+        assertEquals(first, second, "identical failures with different timing must share one identity")
+
+        // The per-code hint and the 3-in-a-row streak are both reachable only if the identity is stable.
+        val tracker = ErrorTracker()
+        val hinted = tracker.assess("device", ToolResult.error("c1", deviceFailure(totalMs = 7L)), false)
+        assertTrue(hinted.hint?.startsWith("LOOP_HINT:NODE_STALE") == true, "hint: ${hinted.hint}")
+        tracker.assess("device", ToolResult.error("c2", deviceFailure(totalMs = 8L)), false)
+        assertTrue(
+            tracker.assess("device", ToolResult.error("c3", deviceFailure(totalMs = 9L)), false).repeatTerminated,
+            "three NODE_STALE failures must terminate the run as a repeated error",
+        )
+    }
+
+    @Test
+    fun `an unclassifiable prefixed json payload hashes without its timing or key order`() {
+        val first = stableCodeOf(
+            """Refused: {"ok":false,"data":{"screen":null,"diagnostic":"no code here"},"error":null,""" +
+                """"timing":{"actMs":1,"observeMs":2,"totalMs":3}}""",
+        )
+        val second = stableCodeOf(
+            """Refused: {"error":null,"timing":{"totalMs":999,"observeMs":4,"actMs":5},"data":""" +
+                """{"screen":null,"diagnostic":"no code here"},"ok":false}""",
+        )
+
+        assertTrue(first.matches(Regex("[0-9a-f]{16}")), first)
+        assertEquals(first, second, "the fallback hash must ignore timing and object key order")
+    }
 }
