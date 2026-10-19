@@ -162,7 +162,8 @@ data class AgentMetrics(
  * [safeCode] carries the provider's reason (or the loop's own stable code for `INSUFFICIENT` / `NO_PROGRESS` /
  * `STEP_LIMIT`) and is `null` when nothing meaningful applies. [finalText] is set only for [AgentOutcome.COMPLETED].
  *
- * [humanWaitNanos] is the wall clock this run spent waiting for a **person** (the confirmation port), and it is
+ * [humanWaitNanos] is the wall clock this run spent waiting for a **person** — the confirmation port and the bounded
+ * mayAskHuman wait a tool reports as its deadline shift (the shell/`ConfirmingActions` wrapper) — and it is
  * additive: `0` is the behaviour every caller and test had before it existed. The loop shifts its own budget by this
  * amount (D49) but knows nothing about what the caller derives from the deadline — the plugin's hint window is
  * `deadline + grace`, so without this number a result assembled after a late answer is reported as already expired and
@@ -806,7 +807,14 @@ class AgentLoop(
                 // R99/D49: a mayAskHuman call may have spent part of D47's decision window inside `execute`; that time
                 // belongs to the person, not the turn. Shift it before any deadline check below can charge the run for
                 // a legal approval. Every other call contributes nothing.
-                if (execution.deadlineShiftNanos > 0L) turnDeadlineNanos += execution.deadlineShiftNanos
+                if (execution.deadlineShiftNanos > 0L) {
+                    turnDeadlineNanos += execution.deadlineShiftNanos
+                    // Review I7: the same wait is the person's wall clock the run must hand back, exactly as the policy
+                    // confirmation path above adds its own measured wait. It is added *after* `machineToolNanos` (which
+                    // already subtracts the shift) so this call's machine time cannot be double-counted; the next call's
+                    // `humanWaitBefore` reads the updated total, so the next subtraction covers only its own wait too.
+                    humanWaitNanos += execution.deadlineShiftNanos
+                }
                 // A cancel that arrived while the tool was running is not a tool failure: no output is appended for the
                 // unfinished call (R61), so the model never sees a half-finished step as if it had completed.
                 if (execution.cancelled) {

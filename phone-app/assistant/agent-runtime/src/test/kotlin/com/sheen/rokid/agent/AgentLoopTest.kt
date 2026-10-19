@@ -1065,6 +1065,38 @@ class AgentLoopTest {
         assertEquals(5_000_000_000L, run.humanWaitNanos, "等人的墙钟必须随 run 交回调用方")
     }
 
+    @Test fun `a shell wait is added to the policy confirmation wait without double counting`() {
+        // Review I7: the policy confirmation path already adds its own measured wait. A gated tool that also waits for a
+        // person inside `execute` (`mayAskHuman`) contributes its bounded deadline shift on top - once, not twice.
+        val clock = FakeClock(0)
+        val executor = RecordingActionExecutor(
+            listOf(
+                actionDescriptor(
+                    "device.set_volume", requiresConfirmation = true, timeoutMillis = 50L, mayAskHuman = true,
+                ),
+            ),
+        )
+        executor.outcome = { _, _ ->
+            Thread.sleep(400L)
+            ActionResult(ActionOutcome.Done, "done")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "已经调低了")),
+        )
+
+        val run = newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), clock = clock,
+            confirmation = WaitingConfirmation(clock, waitNanos = 5_000_000_000L),
+        ).run(request(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome, "两段等待都应被排除在预算之外")
+        assertEquals(1, executor.calls.size, "批准过的动作必须真的执行")
+        // 5 s policy wait + ~350 ms shell wait (400 ms sleep over the 50 ms machine cap). The lower bound proves the
+        // shift reached the run; the upper bound proves the 5 s policy wait was not added a second time.
+        assertTrue(run.humanWaitNanos >= 5_250_000_000L, "shell 等待也要计入人时：${run.humanWaitNanos}")
+        assertTrue(run.humanWaitNanos < 9_000_000_000L, "策略确认等待不得被重复累加：${run.humanWaitNanos}")
+    }
+
     @Test fun `machine time is not reported as a human wait`() {
         val clock = FakeClock(0)
         val executor = gatedExecutor()

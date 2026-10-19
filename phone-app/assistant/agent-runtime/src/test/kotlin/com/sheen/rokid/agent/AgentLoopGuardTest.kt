@@ -56,6 +56,7 @@ class AgentLoopGuardTest {
         clock: MonotonicClock = FakeClock(),
         maxSteps: Int = 24,
         maxObservations: Int = 24,
+        metricLine: (String) -> Unit = {},
     ) = AgentLoop(
         gateway,
         registry,
@@ -65,6 +66,7 @@ class AgentLoopGuardTest {
         clock,
         maxSteps = maxSteps,
         maxObservations = maxObservations,
+        metricLine = metricLine,
     )
 
     private fun descriptor(
@@ -564,6 +566,50 @@ class AgentLoopGuardTest {
         assertEquals(AgentOutcome.COMPLETED, run.outcome, "the shifted deadline must not end the run as DEADLINE")
         assertEquals(2, gateway.requests.size)
         assertEquals("ok", run.steps.single().result, "the human allowance, not the turn deadline, bounds this call")
+        executor.awaitWorkers(1_000)
+    }
+
+    @Test
+    fun `a may ask human wait is reported as human wait and kept out of the tool metric`() {
+        // Review I7: the plugin's ConfirmingActions asks the wearer inside `execute` (the shell wrapper), so its wait
+        // reached the run only as the deadline shift. A caller that extends its hint window from
+        // `run.humanWaitNanos` must see that part too, and it must not be reported as machine (tool) time.
+        val executor = SleepingExecutor(
+            descriptor("confirm", timeoutMillis = 50L, mayAskHuman = true),
+            sleepMillis = 400L,
+        )
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "confirm"))), reply(text = "done")),
+        )
+        val metricLines = mutableListOf<String>()
+        val startedAt = System.nanoTime()
+
+        val run = loop(
+            gateway, ToolRegistry(listOf(executor)), clock = realClock(), metricLine = { metricLines += it },
+        ).run(request(deadlineNanos = System.nanoTime() + 1_000_000_000L))
+        val elapsed = System.nanoTime() - startedAt
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        // The 400 ms sleep minus the 50 ms machine cap is ~350 ms of person time: additive to the run's total and
+        // bounded by the wall clock the run actually took.
+        assertTrue(
+            run.humanWaitNanos >= 250_000_000L,
+            "the shell confirmation wait must reach humanWaitNanos: ${run.humanWaitNanos}",
+        )
+        assertTrue(
+            run.humanWaitNanos <= elapsed,
+            "human wait cannot exceed the wall clock the run took: ${run.humanWaitNanos} > $elapsed",
+        )
+        // The same wait must stay out of machine time: toolMs is the 50 ms cap, not the 400 ms sleep.
+        assertTrue(
+            run.metrics.toolMillis < 300L,
+            "the human wait must stay out of toolMs: ${run.metrics.toolMillis}",
+        )
+        val toolMs = Regex(" toolMs=(\\d+) ").find(metricLines.single())?.groupValues?.get(1)?.toLong()
+        assertEquals(
+            run.metrics.toolMillis, toolMs,
+            "P3_METRIC.toolMs must carry the same machine-time count: ${metricLines.single()}",
+        )
         executor.awaitWorkers(1_000)
     }
 
