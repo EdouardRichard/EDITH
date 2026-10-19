@@ -154,11 +154,16 @@ class ModelClientGateway(
      * The frame path with R70's bounded recovery: one normal send, then up to [MAX_OVERFLOW_RECOVERIES] deterministic
      * re-sends of the **same** turn with a cheaper shape, then [CONTEXT_OVERFLOW].
      *
-     * The two detectors are the send-time budget's `ConfigurationRejected` and the provider's own overflow verdict
-     * ([GatewayReply.safeCode] carrying [CONTEXT_OVERFLOW]). Recovery ① drops the historical tool rounds; recovery ②
-     * hard-truncates to the newest turn + the current input. No LLM summary is ever asked for: a summary affects the
-     * *next* turn, not this request (D100), and spending another model call to rescue one would be the failure mode the
-     * ruling forbids.
+     * The two detectors are the send-time budget's dedicated overflow signal
+     * ([ContractError.ContextWindowExceeded], thrown only when the request does not fit) and the provider's own overflow
+     * verdict ([GatewayReply.safeCode] carrying [CONTEXT_OVERFLOW]). Recovery ① drops the historical tool rounds;
+     * recovery ② hard-truncates to the newest turn + the current input. No LLM summary is ever asked for: a summary
+     * affects the *next* turn, not this request (D100), and spending another model call to rescue one would be the
+     * failure mode the ruling forbids.
+     *
+     * A different [ContractError.ConfigurationRejected] — a profile-revision race, an invalid endpoint, a client-state
+     * refusal — is **not** an overflow (R101) and escapes this method unchanged: retrying it with a cheaper context
+     * would spend a recovery and relabel the real cause as `CONTEXT_OVERFLOW`.
      */
     private fun turnWithOverflowRecovery(
         request: GatewayTurn,
@@ -176,9 +181,10 @@ class ModelClientGateway(
             val modelRequest = modelRequest(request, profile, frame.systemText, transcript)
             val reply = try {
                 sendTurn(request, modelRequest)
-            } catch (rejected: ContractError.ConfigurationRejected) {
+            } catch (rejected: ContractError.ContextWindowExceeded) {
                 // The one local rejection this path may answer with a cheaper request: the send-time budget refused
-                // the shape the trimmer produced. A capability refusal is a different exception and still escapes.
+                // the shape the trimmer produced. A plain `ConfigurationRejected` is a different refusal and still
+                // escapes; a capability refusal is a different exception and still escapes.
                 if (recoveries >= MAX_OVERFLOW_RECOVERIES) return contextOverflowFailure()
                 recoveries++
                 overflowRecoveries++

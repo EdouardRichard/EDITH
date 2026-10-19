@@ -16,7 +16,11 @@ data class BudgetedRequest(val request: ModelRequest, val estimatedInputTokens: 
 
 class ContextBudgeter {
     fun prepare(profile: ModelProfile, request: ModelRequest): BudgetedRequest {
+        // Malformed shapes and configuration races stay `ConfigurationRejected`. Only "the request does not fit the
+        // window" gets the dedicated signal (R101), so the gateway's overflow recovery cannot mistake a profile
+        // revision mismatch, an invalid endpoint or a client-state refusal for an overflow and retry it.
         fun rejected(): Nothing = throw ContractError.ConfigurationRejected("Explicit context exceeds safe budget or is malformed")
+        fun overflowed(): Nothing = throw ContractError.ContextWindowExceeded("Context window exceeded")
         if (request.profileId != profile.id || request.profileRevision != profile.revision) rejected()
         val input = request.input.toList()
         // TEXT and IMAGE are the modalities this version sends. Audio encoding is not part of it, so a request that
@@ -91,7 +95,7 @@ class ContextBudgeter {
                 removed += "history:$removedGroups"
                 removedGroups++
             }
-            if (total > limit) rejected()
+            if (total > limit) overflowed()
             val removedCount = groups.take(removedGroups).sumOf { it.size }
             val keptHistory = history.drop(removedCount)
             // `ModelRequest` requires a request to carry something. A history-only continuation (empty `input`) whose

@@ -94,7 +94,7 @@ class ContextBudgeterImageTest {
         val fits = cost(withImage)
         val tooSmall = profileFixture().copy(inputBudgetTokens = fits - 1)
 
-        assertFailsWith<ContractError.ConfigurationRejected> { budgeter.prepare(tooSmall, withImage) }
+        assertFailsWith<ContractError.ContextWindowExceeded> { budgeter.prepare(tooSmall, withImage) }
     }
 
     @Test fun `an old turn carrying images is evicted whole and its image cost with it`() {

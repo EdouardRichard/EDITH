@@ -1,5 +1,6 @@
 package com.sheen.rokid.model
 
+import com.sheen.rokid.agent.CONTEXT_OVERFLOW
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.GatewayTurn
 import com.sheen.rokid.agent.ModelClientGateway
@@ -82,11 +83,33 @@ class GatewayWindowAcceptanceTest {
     }
 
     /**
+     * A [ModelClient] that answers the provider's overflow verdict for its first [overflows] requests and completes the
+     * turn afterwards, recording every request. This is how an overflow the byte budget cannot see (the provider counts
+     * tokens, not bytes) reaches the gateway's recovery path.
+     */
+    private class OverflowFirstModelClient(private val overflows: Int) : ModelClient {
+        val requests = mutableListOf<ModelRequest>()
+        override fun request(request: ModelRequest, listener: (ModelStreamEvent) -> Unit): CancellationHandle {
+            requests += request
+            val overflow = requests.size <= overflows
+            listener(
+                ModelStreamEvent.Terminal(
+                    request.requestId,
+                    if (overflow) ModelEnd.FAILED else ModelEnd.COMPLETED,
+                    null,
+                    if (overflow) CONTEXT_OVERFLOW else null,
+                ),
+            )
+            return object : CancellationHandle { override fun cancel() = Unit }
+        }
+    }
+
+    /**
      * A gateway over [recording] (the shared [client] by default) whose profile lookup answers [chosen]. A fresh
      * instance per test keeps a tight-profile turn from leaking into another test through [ModelClientGateway.lastTrim].
      */
     private fun gateway(
-        recording: RecordingModelClient = client,
+        recording: ModelClient = client,
         chosen: ModelProfile = profile,
     ) = ModelClientGateway(
         client = recording,
@@ -185,7 +208,7 @@ class GatewayWindowAcceptanceTest {
         val sent = client.requests.single()
         try {
             budgeter.prepare(profile, sent)
-        } catch (rejected: ContractError.ConfigurationRejected) {
+        } catch (rejected: ContractError) {
             fail("the gateway trimmed to a request the send-time ContextBudgeter rejects: ${rejected.message}")
         }
         // Supporting observations, not the discriminator: the untrimmed frame's transcript survives as history and
@@ -233,7 +256,7 @@ class GatewayWindowAcceptanceTest {
         // The discriminating assertion: the real send-time budgeter accepts the trimmed request.
         try {
             budgeter.prepare(tightProfile(), sent)
-        } catch (rejected: ContractError.ConfigurationRejected) {
+        } catch (rejected: ContractError) {
             fail("a tightly trimmed frame must still be sendable: ${rejected.message}")
         }
         // …and what survived is the current turn's input, with the old turn gone.
@@ -268,7 +291,7 @@ class GatewayWindowAcceptanceTest {
         // The new order is accepted (the discriminating assertion).
         try {
             budgeter.prepare(profile, sent)
-        } catch (rejected: ContractError.ConfigurationRejected) {
+        } catch (rejected: ContractError) {
             fail("the merged leading context must be a sendable shape: ${rejected.message}")
         }
         // …and it really is the merged order: memory folded into the head user message, not a second user turn.
@@ -399,7 +422,7 @@ class GatewayWindowAcceptanceTest {
         // The discriminating assertion: the real budgeter accepts the shape the production path actually sends.
         try {
             budgeter.prepare(profile, sent)
-        } catch (rejected: ContractError.ConfigurationRejected) {
+        } catch (rejected: ContractError) {
             fail("the production shaped store backed frame must be sendable: ${rejected.message}")
         }
         // …and it is the production shape, not merely accepted: summary + memory are folded into the one leading user
@@ -428,6 +451,67 @@ class GatewayWindowAcceptanceTest {
         // The tool round survives `frameToTranscript` as **one** leading user group: the property whole-group eviction
         // depends on, and the reason the memory cannot be a standalone user message.
         assertEquals(1, sent.history.count { it is ModelHistoryItem.Text && it.role == MessageRole.USER })
+    }
+
+    /**
+     * R70's two deterministic recoveries must keep the transcript a shape the real send-time [ContextBudgeter] accepts.
+     *
+     * The frame is the production WAKE shape with **two tool rounds in one user turn**, rendered exactly as
+     * `frameBuilderFor` renders the store's items (`toSegment`): `USER, ASSISTANT opener, TOOL_ROUND, ASSISTANT,
+     * TOOL_ROUND, ASSISTANT final`.
+     *
+     * Recovery ① may drop `TOOL_ROUND` segments. Dropping only those leaves the opener of the dropped round beside the
+     * next assistant text — two assistant texts in a row, a shape `ContextBudgeter` rejects **by design** — so the first
+     * recovery must also merge the assistant texts the removal brought together. Recovery ② (HARD) must additionally
+     * drop the older current-turn round: otherwise a multi-round turn ends `CONTEXT_OVERFLOW` at a size the compression
+     * already fit.
+     */
+    @Test fun `overflow recovery on the production store shape is accepted by the real budgeter`() {
+        val store = ConversationStore()
+        store.appendUser("旧问题")
+        store.appendAssistant("我来看看")
+        store.appendToolCall("c1", "device", "{}")
+        store.appendToolOutput("c1", "旧观察")
+        store.appendAssistant("看到了")
+        store.appendToolCall("c2", "device", "{}")
+        store.appendToolOutput("c2", "新观察")
+        store.appendAssistant("最终答案")
+        val frame = RequestFrame(
+            systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")),
+            conversationFlow = store.history().map { it.toSegment() } + Segment(SegmentOrigin.USER_INPUT, true, "现在呢"),
+            tools = emptyList(),
+        )
+
+        // The provider reports an overflow the byte budget cannot see **twice**; the third attempt is the hard truncate.
+        val overflowClient = OverflowFirstModelClient(overflows = 2)
+        gateway(recording = overflowClient).turn(turn(frame))
+
+        assertEquals(3, overflowClient.requests.size, "one normal send and two deterministic recoveries")
+        val aggressive = overflowClient.requests[1]
+        val hard = overflowClient.requests[2]
+        // (a) the AGGRESSIVE retry must be a request the real budgeter would send.
+        try {
+            budgeter.prepare(profile, aggressive)
+        } catch (rejected: ContractError) {
+            fail("the AGGRESSIVE recovery sent a shape the real ContextBudgeter rejects: ${rejected.message}")
+        }
+        // (b) HARD's shape must be accepted too, and it must have dropped the older current-turn round.
+        try {
+            budgeter.prepare(profile, hard)
+        } catch (rejected: ContractError) {
+            fail("the HARD recovery sent a shape the real ContextBudgeter rejects: ${rejected.message}")
+        }
+        assertEquals(listOf("c2"), hard.history.filterIsInstance<ModelHistoryItem.ToolCall>().map { it.callId })
+        assertTrue(
+            hard.history.filterIsInstance<ModelHistoryItem.Text>().none { it.text == "我来看看" },
+            "the dropped round's assistant opener must not survive HARD: ${hard.history}",
+        )
+        // Both recovered shapes drop the older round; AGGRESSIVE keeps the conversation text around it.
+        assertEquals(listOf("c2"), aggressive.history.filterIsInstance<ModelHistoryItem.ToolCall>().map { it.callId })
+        assertTrue(
+            aggressive.history.filterIsInstance<ModelHistoryItem.Text>().any { it.text.contains("旧问题") },
+            "AGGRESSIVE drops the round, not the conversation: ${aggressive.history}",
+        )
     }
 }
 

@@ -27,15 +27,18 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
- * 0.25 Task 13 / R70 (D100): two overflow detectors and at most two deterministic recoveries.
+ * 0.25 Task 13 / R70 (D100) + R101: two overflow detectors and at most two deterministic recoveries.
  *
- * A local `ConfigurationRejected` from the send-time budget and a provider `CONTEXT_OVERFLOW` verdict both mean the
- * same thing to this turn: the request that was assembled did not fit. Recovery is deterministic and NEVER an LLM
+ * The budgeter's dedicated [ContractError.ContextWindowExceeded] and a provider `CONTEXT_OVERFLOW` verdict both mean
+ * the same thing to this turn: the request that was assembled did not fit. Recovery is deterministic and NEVER an LLM
  * summary request:
  *
  * 1. re-trim with the historical tool rounds compressed away;
  * 2. hard-truncate to system + the latest turn + the current input;
  * 3. a third overflow returns `CONTEXT_OVERFLOW` instead of sending a fourth request.
+ *
+ * A plain [ContractError.ConfigurationRejected] is **not** that signal (R101): it also means a profile-revision race,
+ * an invalid endpoint or a client-state refusal, so it is neither retried with a cheaper context nor relabelled.
  */
 class ContextOverflowTest {
 
@@ -136,7 +139,14 @@ class ContextOverflowTest {
 
     // ── the scripted transport ─────────────────────────────────────────────────────────────────────
 
-    private enum class Fault { LOCAL_REJECT, PROVIDER_OVERFLOW, HTTP_FAILURE, CAPABILITY_MISSING, COMPLETED }
+    private enum class Fault {
+        LOCAL_REJECT,
+        CONFIG_REJECTED,
+        PROVIDER_OVERFLOW,
+        HTTP_FAILURE,
+        CAPABILITY_MISSING,
+        COMPLETED,
+    }
 
     private class ScriptedOverflowClient(private val faults: MutableList<Fault>) : ModelClient {
         val requests = mutableListOf<ModelRequest>()
@@ -145,7 +155,10 @@ class ContextOverflowTest {
             requests += request
             when (faults.removeFirstOrNull() ?: Fault.COMPLETED) {
                 Fault.LOCAL_REJECT ->
-                    throw ContractError.ConfigurationRejected("Explicit context exceeds safe budget or is malformed")
+                    throw ContractError.ContextWindowExceeded("Context window exceeded")
+
+                Fault.CONFIG_REJECTED ->
+                    throw ContractError.ConfigurationRejected("Profile revision mismatch")
 
                 Fault.PROVIDER_OVERFLOW ->
                     listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.FAILED, null, CONTEXT_OVERFLOW))
@@ -281,8 +294,23 @@ class ContextOverflowTest {
     }
 
     @Test
+    fun `a non-overflow configuration rejection is neither retried nor relabelled`() {
+        // R101: `ConfigurationRejected` is also a profile-revision race, an invalid endpoint or a client-state refusal.
+        // Only the budgeter's dedicated overflow signal may be answered with a cheaper resend; anything else must reach
+        // the caller unchanged, with no recovery count spent and no `CONTEXT_OVERFLOW` relabel hiding the real cause.
+        val client = ScriptedOverflowClient(mutableListOf(Fault.CONFIG_REJECTED))
+        val gateway = gateway(client)
+
+        val rejected = assertFailsWith<ContractError.ConfigurationRejected> { gateway.turn(turn()) }
+        assertEquals("Profile revision mismatch", rejected.message)
+        assertEquals(1, client.requests.size, "an unrelated configuration rejection is not retried")
+        assertEquals(0, gateway.overflowRecoveries, "no overflow recovery was attempted")
+        assertEquals(0, gateway.overflowFailures, "the failure was not counted as an overflow")
+    }
+
+    @Test
     fun `the pre-phase-5 history path still lets a local rejection escape unchanged`() {
-        val client = ScriptedOverflowClient(mutableListOf(Fault.LOCAL_REJECT))
+        val client = ScriptedOverflowClient(mutableListOf(Fault.CONFIG_REJECTED))
         val gateway = gateway(client)
         val legacy = GatewayTurn(
             turnId = "turn-7",

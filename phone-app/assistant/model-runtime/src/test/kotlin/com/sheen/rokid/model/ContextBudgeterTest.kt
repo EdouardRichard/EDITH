@@ -42,7 +42,7 @@ class ContextBudgeterTest {
     }
 
     @Test fun `required input over limit is rejected without truncation`() {
-        assertFailsWith<ContractError.ConfigurationRejected> { budgeter.prepare(smallProfile(99), required()) }
+        assertFailsWith<ContractError.ContextWindowExceeded> { budgeter.prepare(smallProfile(99), required()) }
     }
 
     @Test fun `a history only continuation that cannot keep any history is rejected`() {
@@ -64,7 +64,7 @@ class ContextBudgeterTest {
         val result = budgeter.prepare(profileFixture(), requestFixture(listOf(InputPart.Text("\u4e2d"))).copy(instructions = "i"))
         assertEquals(100, result.estimatedInputTokens) // 1 + 3 bytes + 32 request + 2 * 32 message framing.
         assertTrue(result.estimated)
-        assertFailsWith<ContractError.ConfigurationRejected> {
+        assertFailsWith<ContractError.ContextWindowExceeded> {
             budgeter.prepare(smallProfile(99), result.request)
         }
     }
@@ -91,7 +91,7 @@ class ContextBudgeterTest {
     @Test fun `large valid int window does not overflow combined accounting`() {
         val profile = profileFixture().copy(usableWindowTokens = Int.MAX_VALUE, inputBudgetTokens = 1,
             maxOutputTokens = Int.MAX_VALUE - 2, safetyTokens = 1)
-        assertFailsWith<ContractError.ConfigurationRejected> { budgeter.prepare(profile, requestFixture()) }
+        assertFailsWith<ContractError.ContextWindowExceeded> { budgeter.prepare(profile, requestFixture()) }
     }
 
     @Test fun `profile mismatch is rejected by budget preparation`() {

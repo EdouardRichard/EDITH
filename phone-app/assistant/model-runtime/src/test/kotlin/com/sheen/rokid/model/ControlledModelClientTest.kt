@@ -217,7 +217,9 @@ class ControlledModelClientTest {
         rig.profile = rig.repository.save(rig.profile.copy(baseUrl = "https://user:pass@example.test/?secret=x"))
         rig.verify()
         assertFailsWith<ContractError.ConfigurationRejected> { rig.start() }
-        assertFailsWith<ContractError.ConfigurationRejected> {
+        // R101: the budget's own overflow is a dedicated signal; a plain `ConfigurationRejected` stays for every
+        // configuration refusal that a cheaper context could not fix.
+        assertFailsWith<ContractError.ContextWindowExceeded> {
             rig.client.request(rig.request().copy(instructions = "x".repeat(5000)), rig::event)
         }
         assertEquals(0, rig.resolutions.get())

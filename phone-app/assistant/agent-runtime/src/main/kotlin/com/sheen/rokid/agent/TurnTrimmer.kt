@@ -54,9 +54,11 @@ object TrimOrder {
  *
  * [STANDARD] is the every-request behaviour the spec fixes: old UI trees and older-than-K images are elided, a long
  * non-last tool result keeps head+tail, and the **last** tool result is exempt. [AGGRESSIVE] is overflow recovery ①:
- * the historical tool rounds (every `TOOL_ROUND` segment before the newest round) are dropped first, then ⓪ runs.
+ * the historical tool rounds (every `TOOL_ROUND` segment before the newest round) are dropped first, then ⓪ runs; the
+ * assistant texts the removal brings together are merged, so the result is still a shape `ContextBudgeter` sends.
  * [HARD] is overflow recovery ②: only the newest whole turn and the current input remain (plus request-scoped
- * `RUNTIME_STATE`/`RETRY` metadata and the untouched system slot).
+ * `RUNTIME_STATE`/`RETRY` metadata and the untouched system slot), and within that turn only the newest tool round,
+ * its assistant opener and the closing assistant text survive.
  */
 enum class TrimMode { STANDARD, AGGRESSIVE, HARD }
 
@@ -449,8 +451,11 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
      * Overflow recovery ①: every `TOOL_ROUND` segment before the newest contiguous tool-round run leaves the context.
      *
      * The newest run is kept intact so the current call/output pairing is not broken; older rounds are the expensive
-     * history the model can live without for one emergency resend. Conversation text is untouched (recovery ② removes
-     * that if it is still too large).
+     * history the model can live without for one emergency resend. Conversation text is untouched — except that two
+     * assistant texts separated only by a dropped round become adjacent, a shape the endpoint and `ContextBudgeter`
+     * reject by design (an assistant text may follow another only after a tool round). Those two texts are one
+     * assistant turn that happened to continue across the round, so they are merged into one message instead of leaving
+     * an unsendable transcript. Recovery ② removes the remaining conversation if it is still too large.
      */
     private fun dropOlderToolRounds(flow: List<Segment>): List<Segment> {
         val lastTool = flow.indexOfLast { it.origin == SegmentOrigin.TOOL_ROUND }
@@ -459,28 +464,95 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
         while (newestRunStart > 0 && flow[newestRunStart - 1].origin == SegmentOrigin.TOOL_ROUND) {
             newestRunStart--
         }
-        return flow.filterIndexed { index, segment ->
+        val withoutOldRounds = flow.filterIndexed { index, segment ->
             segment.origin != SegmentOrigin.TOOL_ROUND || index >= newestRunStart
         }
+        return mergeAdjacentAssistantTexts(withoutOldRounds)
     }
 
     /**
-     * Overflow recovery ②: system slot + the newest whole turn + the current input.
+     * Merges every pair of adjacent assistant transcript texts into one message, preserving flow order.
      *
-     * A request-scoped `RUNTIME_STATE`/`RETRY`/`SUMMARY` is not a turn: the first two ride with the current input
-     * (they are loop metadata), while a stored `SUMMARY`/`MEMORY_EVIDENCE`/`PERCEPTION` is exactly the "old context"
-     * this hard cut is trying to remove. With no turn group at all, only the metadata and the current input remain.
+     * This is what keeps recovery ① sendable: dropping a tool round brings the assistant opener that introduced it and
+     * the assistant reply that followed it together, and `ContextBudgeter` rejects two assistant texts in a row unless
+     * a tool round sits between them. Merging keeps the text whole while restoring the
+     * `USER → ASSISTANT → (tool run →) ASSISTANT` shape the endpoint accepts. The production transcript attaches no
+     * images to these texts; if a frame does, they are concatenated rather than dropped.
+     */
+    private fun mergeAdjacentAssistantTexts(flow: List<Segment>): List<Segment> {
+        val merged = mutableListOf<Segment>()
+        for (segment in flow) {
+            val previous = merged.lastOrNull()
+            if (previous != null && isAssistantTranscript(previous) && isAssistantTranscript(segment)) {
+                merged[merged.lastIndex] = previous.copy(
+                    text = previous.text + "\n\n" + segment.text,
+                    images = previous.images + segment.images,
+                )
+            } else {
+                merged += segment
+            }
+        }
+        return merged
+    }
+
+    /** A conversation-flow assistant text: `ContextBudgeter` renders a `TRANSCRIPT` without `USER` as the assistant. */
+    private fun isAssistantTranscript(segment: Segment): Boolean =
+        segment.origin == SegmentOrigin.TRANSCRIPT && segment.role != SegmentRole.USER
+
+    /**
+     * Overflow recovery ②: system slot + the newest whole turn + the current input, reduced to the newest tool round.
+     *
+     * Within the newest turn only the latest contiguous tool-round run survives, together with its assistant opener
+     * (a tool run must be preceded by an assistant text, and the user turn must not end on a lone half) and the
+     * assistant text(s) that follow it (the turn's closing answer). The older rounds of the same turn are exactly the
+     * "compression was not enough" cost this cut exists to remove; keeping them let a multi-round turn end
+     * `CONTEXT_OVERFLOW` at a size this truncation already fits. A newest turn with no tool round keeps its text only.
+     * Request-scoped `RUNTIME_STATE`/`RETRY` metadata and `USER_INPUT` always survive in flow order; a stored
+     * `SUMMARY`/`MEMORY_EVIDENCE`/`PERCEPTION` is exactly the "old context" this hard cut removes. With no turn group
+     * at all, only the metadata and the current input remain.
      */
     private fun hardTruncate(flow: List<Segment>): List<Segment> {
         val lastTurn = flow.indexOfLast { isTurnStart(it) }
         val kept = if (lastTurn < 0) flow else flow.subList(lastTurn, flow.size)
-        return kept.filter {
-            it.origin == SegmentOrigin.TRANSCRIPT ||
-                it.origin == SegmentOrigin.TOOL_ROUND ||
-                it.origin == SegmentOrigin.USER_INPUT ||
-                it.origin == SegmentOrigin.RUNTIME_STATE ||
-                it.origin == SegmentOrigin.RETRY
+        val lastTool = kept.indexOfLast { it.origin == SegmentOrigin.TOOL_ROUND }
+        if (lastTool < 0) {
+            return kept.filter {
+                it.origin == SegmentOrigin.TRANSCRIPT ||
+                    it.origin == SegmentOrigin.USER_INPUT ||
+                    it.origin == SegmentOrigin.RUNTIME_STATE ||
+                    it.origin == SegmentOrigin.RETRY
+            }
         }
+        var newestRunStart = lastTool
+        while (newestRunStart > 0 && kept[newestRunStart - 1].origin == SegmentOrigin.TOOL_ROUND) {
+            newestRunStart--
+        }
+        // The assistant text immediately before the newest run. Every production round is opened by one (AgentLoop
+        // appends a placeholder when the model sent no text); if a frame has none, the run is kept as it is and the
+        // send-time budgeter remains the judge of the orphaned-call shape.
+        val opener = (newestRunStart - 1 downTo 0).firstOrNull { index -> isAssistantTranscript(kept[index]) }
+        // The turn's own opening user text: the history must open on a user item and the turn must not be a lone half.
+        val turnUser = (0 until newestRunStart).firstOrNull { index ->
+            kept[index].origin == SegmentOrigin.TRANSCRIPT && kept[index].role == SegmentRole.USER
+        }
+        val keep = mutableSetOf<Int>()
+        // Request-scoped metadata and the current input are never evicted, wherever the turn put them.
+        kept.forEachIndexed { index, segment ->
+            if (segment.origin == SegmentOrigin.USER_INPUT ||
+                segment.origin == SegmentOrigin.RUNTIME_STATE ||
+                segment.origin == SegmentOrigin.RETRY
+            ) {
+                keep += index
+            }
+        }
+        turnUser?.let(keep::add)
+        opener?.let(keep::add)
+        (newestRunStart..lastTool).forEach(keep::add)
+        // Everything the assistant said after its last tool round is the turn's closing answer, kept in flow order.
+        for (index in (lastTool + 1) until kept.size) {
+            if (kept[index].origin == SegmentOrigin.TRANSCRIPT) keep += index
+        }
+        return kept.filterIndexed { index, _ -> index in keep }
     }
 
     // ── shared helpers ───────────────────────────────────────────────────────────────────────────
