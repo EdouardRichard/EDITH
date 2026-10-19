@@ -83,6 +83,44 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
         add(ModelHistoryItem.ToolOutput(callId, output), SegmentOrigin.TOOL_ROUND, null)
 
     /**
+     * Appends a turn's transcript in order — the user text, the tool calls and their outputs, and the closing
+     * assistant text (0.25 spec §5.1/§5.3). This is the production record path: the plugin hands over the run's own
+     * transcript instead of rebuilding it from two text halves, so a multi-step turn keeps its tool rounds and their
+     * image references across turns.
+     *
+     * ## Only complete tool rounds are stored
+     *
+     * A run that ends early (step limit, cancellation, provider failure) can leave a `ToolCall` whose `ToolOutput`
+     * never arrived. Storing it would make the next request echo a call the endpoint never gets an answer for, and the
+     * wire shape refuses an unanswered call (R10). The rule is local to this append: a call is kept only when the same
+     * batch carries an output with the same call id, and an output with no call in the batch is dropped for the same
+     * reason. Text items are never dropped by this filter, so a truncated turn still records what was said.
+     *
+     * The items are stored as they are, including [ModelHistoryItem.ToolOutput.images]: the store keeps image
+     * references (never bytes) and the frame renderer writes them back into the tool-round JSON.
+     */
+    @Synchronized
+    fun appendTranscript(items: List<ModelHistoryItem>) {
+        if (items.isEmpty()) return
+        val callIds = items.filterIsInstance<ModelHistoryItem.ToolCall>().mapTo(mutableSetOf()) { it.callId }
+        val outputIds = items.filterIsInstance<ModelHistoryItem.ToolOutput>().mapTo(mutableSetOf()) { it.callId }
+        val completeRounds = callIds intersect outputIds
+        for (item in items) {
+            when (item) {
+                is ModelHistoryItem.Text -> add(item, SegmentOrigin.TRANSCRIPT, roleOf(item.role))
+                is ModelHistoryItem.ToolCall ->
+                    if (item.callId in completeRounds) add(item, SegmentOrigin.TOOL_ROUND, null)
+                is ModelHistoryItem.ToolOutput ->
+                    if (item.callId in completeRounds) add(item, SegmentOrigin.TOOL_ROUND, null)
+            }
+        }
+    }
+
+    /** The segment role a transcript text carries: only `USER` is user speech; every other text is the assistant's. */
+    private fun roleOf(role: MessageRole): SegmentRole =
+        if (role == MessageRole.USER) SegmentRole.USER else SegmentRole.ASSISTANT
+
+    /**
      * Appends a tool round summary as a TOOL_ROUND item trusted=true, with [SegmentRole.ASSISTANT].
      */
     @Synchronized

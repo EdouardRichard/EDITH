@@ -2082,8 +2082,7 @@ class SmartAssistantPlugin(
         if (store != null) {
             // Phase 5's production path: the route's own store is the transcript. Order is the spec's (memory write →
             // transcript record → compression): this is called after `rememberFromTurn`.
-            store.appendUser(userText)
-            store.appendAssistant(reply)
+            recordStoreTurn(store, userText, run, reply)
             // D-4's ③ gate: cut ③ may start **only after cut ① really happened**. `compressionOwed` alone is also true
             // for an over-budget frame whose flow holds no turn to give (an empty store, or memory as the only thing
             // trimmed), and a summary started there would be invented content.
@@ -2095,6 +2094,64 @@ class SmartAssistantPlugin(
         context.appendUser(userText)
         contexts.appendAssistantMessage(route, reply)
         activeCompressor?.compressIfNeeded(context, contexts.historyBudgetTokens())
+    }
+
+    /**
+     * Records the turn that just ended into the route's store (0.25 spec §5.1).
+     *
+     * The run hands over its own transcript — this turn's user text, every tool call/output (image references
+     * included) and the loop's closing text — so the store keeps the whole multi-step turn instead of only its two
+     * text halves. The transcript is this turn **on top of** the history the request started from (the plugin passes
+     * the store itself as `AgentRequest.history`), so only the tail past the stored items is new: appending the whole
+     * list would duplicate the session on every turn.
+     *
+     * The assistant half is written from [reply] rather than copied verbatim. When a tool round precedes the final
+     * answer the loop does not append that text to its transcript at all (the run ends on the last `ToolOutput`), and
+     * when it does close a turn the appended text is a wire placeholder for an empty/failed model reply. [reply] is
+     * the sentence the wearer actually received (notification bodies + closing text, or the stable failure hint), so
+     * the trailing assistant text is **replaced**, not kept beside it — two assistant texts in a row are a shape
+     * `ContextBudgeter` rejects.
+     *
+     * Falls back to the pre-0.25 `appendUser`/`appendAssistant` pair when the run never produced a transcript (a
+     * transport failure makes the plugin's catch build an empty `AgentRun`) or when the transcript does not continue
+     * the store it was built from. Losing the turn's tool round is worse than falling back, but losing the turn
+     * itself would be worse still.
+     */
+    private fun recordStoreTurn(
+        store: ConversationStore,
+        userText: String,
+        run: AgentRun,
+        reply: String,
+    ) {
+        val pinned = store.history()
+        val transcript = run.transcript
+        val turn = if (transcript.size > pinned.size && transcript.subList(0, pinned.size) == pinned) {
+            transcript.drop(pinned.size)
+        } else {
+            emptyList()
+        }
+        if (turn.isEmpty()) {
+            store.appendUser(userText)
+            store.appendAssistant(reply)
+            return
+        }
+        store.appendTranscript(closeStoreTurnWithReply(turn, reply))
+    }
+
+    /**
+     * The turn as the store should keep it: the run's items with [reply] as the closing assistant text.
+     *
+     * The loop's own last assistant text is either the same closing text (a plain answer) or a wire placeholder
+     * (`(no reply)` / a partial reply the wearer never got); in both cases [reply] is the authoritative record of the
+     * assistant half. A trailing `ToolOutput` has no text to replace, so the reply is simply appended.
+     */
+    private fun closeStoreTurnWithReply(
+        turn: List<ModelHistoryItem>,
+        reply: String,
+    ): List<ModelHistoryItem> {
+        val last = turn.lastOrNull()
+        val kept = if (last is ModelHistoryItem.Text && last.role == MessageRole.ASSISTANT) turn.dropLast(1) else turn
+        return kept + ModelHistoryItem.Text(MessageRole.ASSISTANT, reply)
     }
 
     /**
@@ -3328,7 +3385,7 @@ class SmartAssistantPlugin(
  * continuation whose tool round arrived as plain text would hand the endpoint an assistant message where it expects the
  * function call it produced, and two assistant texts in a row are a shape `ContextBudgeter` rejects.
  */
-private fun ModelHistoryItem.toSegment(): Segment = when (this) {
+internal fun ModelHistoryItem.toSegment(): Segment = when (this) {
     is ModelHistoryItem.Text -> Segment(
         origin = SegmentOrigin.TRANSCRIPT,
         trusted = true,
@@ -3359,6 +3416,28 @@ private fun ModelHistoryItem.toSegment(): Segment = when (this) {
                     put("type", "output")
                     put("callId", callId)
                     put("output", output)
+                    // 0.25 spec §5.3: this JSON entry is the only channel from the store to the model request, so an
+                    // image reference the tool produced must ride here or it is lost at the adapter boundary. The
+                    // member is omitted when there is nothing to carry: a pre-0.25 round keeps its exact shape, and
+                    // `ModelClientGateway` decodes a missing member as an empty list.
+                    if (images.isNotEmpty()) {
+                        put(
+                            "images",
+                            buildJsonArray {
+                                images.forEach { image ->
+                                    add(
+                                        buildJsonObject {
+                                            put("artifactId", image.artifactId)
+                                            put("mime", image.mime)
+                                            put("width", image.width)
+                                            put("height", image.height)
+                                            put("sha256", image.sha256)
+                                        },
+                                    )
+                                }
+                            },
+                        )
+                    }
                 },
             )
         }.toString(),
