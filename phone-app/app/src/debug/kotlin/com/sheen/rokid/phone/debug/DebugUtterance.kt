@@ -14,6 +14,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.os.SystemClock
+import java.security.MessageDigest
 import java.util.concurrent.atomic.AtomicLong
 
 /**
@@ -42,9 +43,11 @@ import java.util.concurrent.atomic.AtomicLong
  * An explicitly blank route or an unknown route is refused **before** `emitWake`, and so are a blank utterance and a
  * missing session identity: a refused request must never leave a panel open with no turn behind it.
  *
- * **Evidence discipline.** Logcat receives `P3_UTTERANCE state=… route=… turn=<id> rev=<n> chars=<n>` only: a status, a
- * route name, the fixed turn id, the revision and the character count. The text is never logged, and the turn id is
- * sanitised to ASCII `[A-Za-z0-9_-]` so the log line itself cannot become a channel for utterance text.
+ * **Evidence discipline.** Logcat receives
+ * `P3_UTTERANCE state=… route=… turn=<id> rev=<n> chars=<n> textSha256=<hex>` only: a status, a route name, the fixed
+ * turn id, the revision, the character count and the UTF-8 SHA-256 of the injected text. The text is never logged, and
+ * the turn id is sanitised to ASCII `[A-Za-z0-9_-]` so the log line itself cannot become a channel for utterance text.
+ * The digest is what lets the acceptance harness prove the frozen question it broadcast is the question the turn saw.
  */
 class DebugUtterance : BroadcastReceiver() {
 
@@ -69,11 +72,17 @@ class DebugUtterance : BroadcastReceiver() {
             nowNanos = SystemClock.elapsedRealtimeNanos(),
             wake = { composition.emitWake(host, DebugUtteranceInjection.WAKE_WORD, 1.0) },
         )
-        // Counts, ids, a route and the App's own state/error code only. Never the text: a log must not carry it.
+        // Counts, ids, a route, a digest and the App's own state/error code only. Never the text: a log must not carry it.
         val ui = composition.state.value
-        report("state=${injection.outcome.logName} route=${injection.route?.logName ?: "none"} " +
-            "turn=${DebugUtteranceInjection.ident(turnId)} rev=$revision chars=${text.length} " +
-            "session=${ui.session.name} error=${ui.errorCode ?: "none"}")
+        report(DebugUtteranceLog.fields(
+            state = injection.outcome.logName,
+            route = injection.route?.logName,
+            turnId = turnId,
+            revision = revision,
+            text = text,
+            session = ui.session.name,
+            error = ui.errorCode,
+        ))
     }
 
     private fun report(fields: String) = P3Log.line("P3_UTTERANCE $fields")
@@ -97,6 +106,35 @@ class DebugUtterance : BroadcastReceiver() {
          */
         internal val revisions = DebugUtteranceRevisions()
     }
+}
+
+/**
+ * The `P3_UTTERANCE` field builder for the injection receiver.
+ *
+ * Split out so a JVM test can hold the two evidence promises without an Android runtime: the digest is the plain
+ * lower-case SHA-256 of the **UTF-8** bytes (the same value the harness computes over the frozen question), and the
+ * line carries the character count and the digest in place of the text. Nothing here can log the utterance itself.
+ */
+internal object DebugUtteranceLog {
+
+    /** Lower-case hex SHA-256 of [text]'s UTF-8 bytes; the only form in which the utterance reaches the log. */
+    fun sha256(text: String): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(text.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
+
+    /** The `P3_UTTERANCE` fields, in the order the corpus harness greps; [text] enters only as [chars] and [textSha256]. */
+    fun fields(
+        state: String,
+        route: String?,
+        turnId: String,
+        revision: Long,
+        text: String,
+        session: String,
+        error: String?,
+    ): String =
+        "state=$state route=${route ?: "none"} turn=${DebugUtteranceInjection.ident(turnId)} rev=$revision " +
+            "chars=${text.length} textSha256=${sha256(text)} session=$session error=${error ?: "none"}"
 }
 
 /**

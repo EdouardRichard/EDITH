@@ -314,6 +314,46 @@ class DebugUtteranceTest {
     }
 
     /**
+     * 0.25 Task 28 (R146): the acceptance harness verifies its input by hashing the frozen question itself and comparing
+     * it with the `textSha256` field. The field must therefore be the plain UTF-8 SHA-256 in lower-case hex - the same
+     * digest `sha256sum` prints for the bytes the harness broadcast - not a salted or locale-dependent summary.
+     */
+    @Test
+    fun theUtteranceHashIsTheUtf8Sha256InLowerCaseHex() {
+        assertEquals("ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", DebugUtteranceLog.sha256("abc"))
+        assertEquals("e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", DebugUtteranceLog.sha256(""))
+        assertEquals("fbf5a9b60f376fdebef992190ba3952fbd2dae55b68f50b4e6c1859e428c0367",
+            DebugUtteranceLog.sha256("把屏幕亮度调到最低"))
+        // Stable across calls, and always the full 64-character hex width.
+        assertEquals(DebugUtteranceLog.sha256("把屏幕亮度调到最低"), DebugUtteranceLog.sha256("把屏幕亮度调到最低"))
+        assertEquals(64, DebugUtteranceLog.sha256("把屏幕亮度调到最低").length)
+    }
+
+    /**
+     * The line may carry the digest and the character count but never the utterance: a fixed corpus question is still
+     * text, and the evidence rule is that logcat never becomes a channel for it. Any CJK fragment counts as a leak.
+     */
+    @Test
+    fun theLogFieldsCarryTheHashAndTheCountButNeverTheText() {
+        val text = "把屏幕亮度调到最低"
+        val fields = DebugUtteranceLog.fields(
+            state = "accepted",
+            route = "wake",
+            turnId = "corpus-t2-1",
+            revision = 7L,
+            text = text,
+            session = "Active",
+            error = null,
+        )
+        assertTrue("the hash field is the whole point: $fields", fields.contains("textSha256=fbf5a9b60f376fdebef992190ba3952fbd2dae55b68f50b4e6c1859e428c0367"))
+        assertTrue("the character count stays alongside it: $fields", fields.contains("chars=9"))
+        assertTrue(fields.contains("turn=corpus-t2-1"))
+        assertFalse("the utterance text must never reach the line: $fields", fields.contains(text))
+        assertFalse("no fragment of it either: $fields", fields.contains("亮度"))
+        assertFalse(fields.lowercase().contains("text="))
+    }
+
+    /**
      * The turn id is caller-chosen and ends up in logcat. `Char.isLetterOrDigit()` accepts CJK, so a turn id could have
      * carried utterance text into the log; the sanitiser must keep only the documented ASCII alphabet.
      */
