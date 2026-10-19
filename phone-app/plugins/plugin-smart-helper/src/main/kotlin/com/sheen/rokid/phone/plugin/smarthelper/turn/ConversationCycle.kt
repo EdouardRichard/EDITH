@@ -90,10 +90,10 @@ internal class ConversationCycle(
         /**
          * 0.24 S3 Task 14 (spec §5.5): the bounded wait for `SpeechFinished`.
          *
-         * The official `TIME_WAITE_TTS` is a cue cadence that re-arms forever; EDITH needs a terminating liveness
-         * bound, because a host that never reports the playback end would otherwise leave the panel ANSWERING with no
-         * timer. A missing end means "no confirmable speech end" (spec §5.5 line 324), so it closes with
-         * `P3_CONV no_display` instead of continuing.
+         * R106: the bound is [OfficialConversation.SPEECH_LIVENESS_MILLIS] (120 s after the answer's display window),
+         * not the official 1 200 ms cue cadence. Long TTS may still be playing after the reading window ends; ending
+         * the turn there cut the audio. A host that never reports the end is still bounded: it closes with
+         * `P3_CONV no_display` instead of leaving the panel ANSWERING forever.
          */
         var speechWaitExpiry: CancellationHandle? = null
 
@@ -311,9 +311,9 @@ internal class ConversationCycle(
         speech: Boolean,
         /**
          * 0.24 S3 Task 14: when the answer stops being on screen (the hint's own display window). The bounded wait for
-         * [onSpeechFinished] never ends before this instant plus [OfficialConversation.SPEECH_WAIT_MILLIS], because the
-         * phone's TTS legitimately keeps speaking a long answer while it is still displayed. Zero means "unknown"; the
-         * wait then starts at the report itself.
+         * [onSpeechFinished] never ends before this instant plus [OfficialConversation.SPEECH_LIVENESS_MILLIS] (R106:
+         * long TTS may still be speaking), because the phone's TTS legitimately keeps speaking a long answer while it is
+         * still displayed. Zero means "unknown"; the wait then starts at the report itself.
          */
         answerVisibleUntilNanos: Long = 0L,
     ) {
@@ -522,12 +522,14 @@ internal class ConversationCycle(
     }
 
     /**
-     * 0.24 S3 Task 14: the terminal liveness bound for the missing `SpeechFinished`.
+     * 0.24 S3 Task 14 / R106: the terminal liveness bound for the missing `SpeechFinished`.
      *
      * The wait starts at the later of "now" and the answer's own display window ([answerVisibleUntilNanos]): the phone
      * may legitimately still be speaking a long answer while it is on screen, so the bound must never fire before the
-     * answer stops being displayed. `TIME_WAITE_TTS` is the official first wait; the official scheduler would then
-     * re-arm at 4 s forever, which is exactly the unbounded state this bound removes.
+     * answer stops being displayed. R106 separates this from the official 1 200 ms cue cadence: the terminal bound is
+     * [OfficialConversation.SPEECH_LIVENESS_MILLIS] (120 s), because a long TTS outliving the display window is normal
+     * playback, not a lost event. The wait remains bounded so a host that never reports the end still cannot leave the
+     * panel ANSWERING forever.
      */
     private fun armSpeechWaitLocked(
         route: AssistantRoute,
@@ -537,7 +539,7 @@ internal class ConversationCycle(
         cancelSpeechWaitLocked(current)
         val epoch = current.speechWaitEpoch
         val anchor = maxOf(clock.nowNanos(), answerVisibleUntilNanos)
-        val delta = OfficialConversation.SPEECH_WAIT_MILLIS * 1_000_000L
+        val delta = OfficialConversation.SPEECH_LIVENESS_MILLIS * 1_000_000L
         val deadline = if (anchor > Long.MAX_VALUE - delta) Long.MAX_VALUE else anchor + delta
         current.speechWaitExpiry = scheduler.at(deadline) { onSpeechWaitTimeout(route, epoch) }
     }
@@ -681,11 +683,13 @@ internal class ConversationCycle(
     }
 
     /**
-     * 0.24 S3 Task 14: no `SpeechFinished` arrived inside the bound.
+     * 0.24 S3 Task 14 / R106: no `SpeechFinished` arrived inside the liveness bound.
      *
-     * Spec §5.5 line 324: "no confirmable speech end" must **not** open the next round; close the panel and record
-     * `P3_CONV no_display`. This is the one path that ends the ANSWERING level without a status 5, exactly like the
-     * not-displayed branch.
+     * The bound is [OfficialConversation.SPEECH_LIVENESS_MILLIS] measured from the later of now and the answer's display
+     * window, never the official 1 200 ms cue cadence; a long TTS outliving the window is normal playback and must not
+     * be cut. Reaching this bound at all means the host never confirmed the end, so spec §5.5 line 324 applies: it must
+     * **not** open the next round; close the panel and record `P3_CONV no_display`. This is the one path that ends the
+     * ANSWERING level without a status 5, exactly like the not-displayed branch.
      */
     private fun onSpeechWaitTimeout(route: AssistantRoute, epoch: Long) {
         var cancelledTurn: String? = null

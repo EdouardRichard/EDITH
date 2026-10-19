@@ -124,9 +124,12 @@ class OfficialConversationTest {
     fun `the official timeouts are exact`() {
         assertEquals(10_000L, OfficialConversation.LISTEN_TIMEOUT_MILLIS)
         assertEquals(120_000L, OfficialConversation.PINNED_CLOSE_MILLIS)
-        // Official `RokidAIController.TIME_WAITE_TTS`; EDITH turns the first wait into a terminal liveness bound
-        // (spec §5.5 line 324) instead of the official endless 4 s re-arm.
+        // Official `RokidAIController.TIME_WAITE_TTS` is a 1 200 ms cue cadence; EDITH keeps the decompiled value but
+        // never uses it as the end-of-turn bound (R106).
         assertEquals(1_200L, OfficialConversation.SPEECH_WAIT_MILLIS)
+        // R106: the terminal liveness bound for a missing `SpeechFinished`. Long TTS may outlive the display window, so
+        // the old display window + 1 200 ms bound cut the audio; this one is bounded but long enough to let it finish.
+        assertEquals(120_000L, OfficialConversation.SPEECH_LIVENESS_MILLIS)
     }
 
     @Test

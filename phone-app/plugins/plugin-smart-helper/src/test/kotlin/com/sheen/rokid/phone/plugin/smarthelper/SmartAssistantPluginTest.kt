@@ -1908,11 +1908,11 @@ class SmartAssistantPluginTest {
         rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
         assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in display.statuses, "the speech is still pending")
 
-        // The answer's display window is 5 s from the emit, and the bound is that window plus the official
-        // TIME_WAITE_TTS: the emit happened 200 ms before this point (the tool call runs inline), so 6_000 ms remain
-        // from the acknowledgement.
-        rig.tick(5_999)
-        assertTrue(display.closes.isEmpty(), "the answer's display window plus the wait is still open: closes=${display.closes}")
+        // The answer's display window is 5 s from the emit, and the terminal bound is that window plus
+        // SPEECH_LIVENESS_MILLIS (120 s, R106 - no longer the official 1 200 ms cue cadence): the emit happened 200 ms
+        // before this point (the tool call runs inline), so 124_800 ms remain from the acknowledgement.
+        rig.tick(124_799)
+        assertTrue(display.closes.isEmpty(), "the answer's display window plus the liveness wait is still open: closes=${display.closes}")
         rig.tick(1)
 
         assertEquals(listOf(AssistantRoute.WAKE), display.closes, "a missing speech end closes, it never hangs")

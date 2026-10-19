@@ -43,13 +43,28 @@ object OfficialConversation {
      * Official `RokidAIController.TIME_WAITE_TTS`: how long the official assistant waits for the TTS result.
      *
      * The official scheduler starts this wait at ASR end and, when it fires, plays a cue and re-arms itself with
-     * `TIME_WAITE_TTS_INTERVAL` (4 s) forever (`AiHandlerScheduler`, message 3). EDITH uses the same 1 200 ms as a
-     * **terminal** liveness bound in `ConversationCycle`: once the answer's display window is over and the host has
-     * still not reported a speech end, the panel is closed and `P3_CONV no_display` is recorded instead of waiting
-     * for a result that may never come. The official 4 s re-arm is deliberately not copied - it is a cue cadence, not
-     * an ending, and copying it would reintroduce the unbounded wait this bound exists to remove.
+     * `TIME_WAITE_TTS_INTERVAL` (4 s) forever (`AiHandlerScheduler`, message 3). That makes it a **cue cadence**, not an
+     * end-of-turn deadline: the official assistant never treats one 1 200 ms expiry as "the answer has finished".
+     *
+     * R106 (user report 2026-10-20): EDITH used this value as the terminal liveness bound for `SpeechFinished`, so a
+     * long TTS that outlived the answer's display window plus 1.2 s was cut by the next continuation/teardown. The
+     * terminal bound is now [SPEECH_LIVENESS_MILLIS]; this constant keeps the decompiled official value for the cue
+     * cadence it really is.
      */
     const val SPEECH_WAIT_MILLIS = 1_200L
+
+    /**
+     * R106: the bounded wait for `SpeechFinished` once the answer leaves the display window.
+     *
+     * Long TTS legitimately outlives the hint's reading window, and a finished playback is what gates the next round,
+     * so the old `display window + 1 200 ms` bound ended turns the wearer could still hear. `ConversationCycle` now
+     * waits up to this long after the answer's own display window (later of "now" and the reported window end) and only
+     * then records `P3_CONV no_display`. The wait stays **bounded** on purpose: a host that never reports the end must
+     * not leave the panel answering forever (spec §5.5 line 324), and 120 s mirrors the official
+     * [PINNED_CLOSE_MILLIS] scale - longer than any answer the wearer is still hearing, short enough to repair a lost
+     * event.
+     */
+    const val SPEECH_LIVENESS_MILLIS = 120_000L
 
     /**
      * Official `launcher_chatbox_tips_exit`. The 0.24 rules own the copy; a consumer (the panel, its render model)

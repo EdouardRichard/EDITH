@@ -23,8 +23,12 @@ import kotlinx.serialization.json.put
  *  - ambiguity is `Refused` with `error.code = APP_AMBIGUOUS` and
  *    `data.candidates = [{"label":...,"packageName":...}]` — never a `Done`, and never parsed out of
  *    a `CODE:payload` detail string (R20);
- *  - an unknown name is `APP_NOT_FOUND`; a package-shaped token counts as a package only when the
- *    catalog knows it, otherwise it is resolved like a label and an unknown one is `APP_NOT_FOUND`;
+ *  - an unknown name is `APP_NOT_FOUND`; a package-shaped token counts as a package when the catalog knows it, and
+ *    after name resolution fails it is still opened by package when the shell confirms it installed (R105: the
+ *    catalog is a `PackageManager` view, so a system app can be launchable and absent from it). An uninstalled one is
+ *    `APP_NOT_FOUND`;
+ *  - `list=true` enumerates the **launchable** set from the shell's launcher activity query (R104: user and system
+ *    apps), falling back to every package when that query is unusable - never to the old third-party-only filter;
  *  - a package launch resolves its launcher component first
  *    (`cmd package resolve-activity --brief -c android.intent.category.LAUNCHER <pkg>`), then
  *    `am start -W -n <component>`; no component falls back to the launcher intent;
@@ -79,21 +83,33 @@ class OpenTool(
     // ── list ─────────────────────────────────────────────────────────────────
 
     private fun listApps(): ActionResult {
-        val result = shell?.let { runSafely(it, "pm list packages -3") } ?: return channelUnavailable()
-        if (result.failure != null || result.exitCode != 0) return channelUnavailable()
-        val packages = result.stdout.lineSequence()
-            .map { it.trim() }
-            .filter { it.startsWith(PACKAGE_PREFIX) }
-            .map { it.removePrefix(PACKAGE_PREFIX).trim() }
-            .filter { it.isNotEmpty() }
-            .distinct()
-            .toList()
+        val target = shell ?: return channelUnavailable()
+        // R104 (user report 2026-10-20): the wearer asked for the file manager / gallery / camera / settings / music,
+        // and `pm list packages -3` hid every one of them (K40: 20 third-party packages vs 346 installed). The launcher
+        // activity query is the **launchable** set - 31 components on the K40, system apps included. A failed, empty or
+        // unparseable reply falls back to every package, never to the third-party filter that caused the defect.
+        val launcherReply = runSafely(target, LAUNCHER_QUERY)
+        val launcherPackages = launcherReply
+            ?.takeIf { it.failure == null && it.exitCode == 0 }
+            ?.let { parseLauncherPackages(it.stdout) }
+            .orEmpty()
+        val packages: List<String>
+        val replyTruncated: Boolean
+        if (launcherPackages.isNotEmpty()) {
+            packages = launcherPackages
+            replyTruncated = launcherReply?.truncated == true
+        } else {
+            val all = runSafely(target, PACKAGE_LIST_COMMAND) ?: return channelUnavailable()
+            if (all.failure != null || all.exitCode != 0) return channelUnavailable()
+            packages = parsePackageLines(all.stdout)
+            replyTruncated = all.truncated
+        }
         val labels = catalog.visibleApps().associate { entry -> entry.packageName to entry.label }
         val rows = packages.map { packageName ->
             val label = labels[packageName]?.takeIf { it.isNotBlank() } ?: packageName
             AppRow(label = label, packageName = packageName)
         }
-        val truncated = result.truncated || rows.size > MAX_LIST_ROWS
+        val truncated = replyTruncated || rows.size > MAX_LIST_ROWS
         val visible = rows.take(MAX_LIST_ROWS)
         val data = buildJsonObject {
             put(
@@ -115,13 +131,38 @@ class OpenTool(
         return done(data)
     }
 
+    /**
+     * R104: one package per launchable component line (`com.pkg/.Activity` or `com.pkg/com.pkg.Activity`), deduplicated
+     * in the shell's order. Headers (`priority=0 preferredOrder=0`), blanks and anything else are not components.
+     */
+    private fun parseLauncherPackages(stdout: String): List<String> = stdout.lineSequence()
+        .mapNotNull { line ->
+            val trimmed = line.trim()
+            val slash = trimmed.indexOf('/')
+            if (slash <= 0 || slash == trimmed.lastIndex) return@mapNotNull null
+            trimmed.substring(0, slash).takeIf { PACKAGE_NAME.matches(it) }
+        }
+        .distinct()
+        .toList()
+
+    /** R104 fallback: every installed package (`package:<name>` lines), deduplicated in the shell's order. */
+    private fun parsePackageLines(stdout: String): List<String> = stdout.lineSequence()
+        .map { it.trim() }
+        .filter { it.startsWith(PACKAGE_PREFIX) }
+        .map { it.removePrefix(PACKAGE_PREFIX).trim() }
+        .filter { it.isNotEmpty() }
+        .distinct()
+        .toList()
+
     // ── app launch ───────────────────────────────────────────────────────────
 
     private fun launchApp(target: String, relaunch: Boolean): ActionResult {
-        // A package-shaped token is a package only when the catalog actually knows that package
-        // (R43 fix): "youtube" is a label, so it must fall through to name resolution, and an
-        // uninstalled "com.nope" must be APP_NOT_FOUND instead of a launch attempt.
-        val known = if (PACKAGE_NAME.matches(target)) {
+        // A package-shaped token is a package when the catalog actually knows that package (R43 fix): "youtube" is a
+        // label, so it must fall through to name resolution. R105: when the catalog misses an installed package (the
+        // system apps `pm list packages -3` already hid are the motivating case), the shell's `pm list packages
+        // <target>` is the installed check before refusing - the catalog is only one view of what is installed.
+        val packageShaped = PACKAGE_NAME.matches(target)
+        val known = if (packageShaped) {
             catalog.visibleApps().firstOrNull { it.packageName == target }
         } else {
             null
@@ -135,11 +176,14 @@ class OpenTool(
                     resolution.target.label,
                 )
                 is LaunchResolution.Ambiguous -> return ambiguous(resolution.candidates)
-                LaunchResolution.NotFound -> return failure(
-                    code = APP_NOT_FOUND,
-                    message = "no installed app matches the target",
-                    recoverable = true,
-                )
+                LaunchResolution.NotFound -> {
+                    if (!packageShaped) return appNotFound()
+                    when (shellInstalled(target)) {
+                        true -> LaunchTarget(target, target)
+                        null -> return channelUnavailable()
+                        false -> return appNotFound()
+                    }
+                }
             }
         }
         if (!relaunch && foreground() == resolved.packageName) {
@@ -238,6 +282,20 @@ class OpenTool(
     private fun runSafely(target: PrivilegedShell, command: String): ShellResult? =
         runCatching { target.run(command) }.getOrNull()
 
+    /**
+     * R105: whether the shell itself reports [packageName] installed, or `null` when the probe itself could not be read.
+     *
+     * `pm list packages <filter>` matches substrings, so the exact `package:<name>` line is the installed answer: the
+     * catalog may still miss a system app that the shell can launch. A probe that could not cross the channel is not
+     * "not installed" - it is an unusable channel, and the caller says so instead of claiming the app is absent.
+     */
+    private fun shellInstalled(packageName: String): Boolean? {
+        val target = shell ?: return null
+        val result = runSafely(target, "$PACKAGE_LIST_COMMAND $packageName") ?: return null
+        if (result.failure != null || result.exitCode != 0) return null
+        return result.stdout.lineSequence().any { it.trim() == "$PACKAGE_PREFIX$packageName" }
+    }
+
     // R98: every `open` call is a write, whatever its outcome — launching an app, a page or a URL changes the
     // foreground state; the declaration describes the call class, not whether the launch got to run.
     private fun done(data: kotlinx.serialization.json.JsonObject): ActionResult = ActionResult(
@@ -261,6 +319,12 @@ class OpenTool(
             error = ToolFailure(code, message, recoverable),
         ),
         stateChanging = true,
+    )
+
+    private fun appNotFound(): ActionResult = failure(
+        code = APP_NOT_FOUND,
+        message = "no installed app matches the target",
+        recoverable = true,
     )
 
     private fun channelUnavailable(): ActionResult = failure(
@@ -295,6 +359,14 @@ class OpenTool(
         private const val CHANNEL = "shell"
         private const val MAX_LIST_ROWS = 100
         private const val PACKAGE_PREFIX = "package:"
+
+        /** R104: the launchable set - one component per line, user and system apps alike. */
+        private const val LAUNCHER_QUERY =
+            "cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER"
+
+        /** R104 fallback: every installed package, never the third-party-only `-3` filter that hid system apps. */
+        private const val PACKAGE_LIST_COMMAND = "pm list packages"
+
         private const val STATUS_OK = "Status: ok"
         private const val APP_AMBIGUOUS = "APP_AMBIGUOUS"
         private const val APP_NOT_FOUND = "APP_NOT_FOUND"

@@ -436,6 +436,10 @@ class ConversationCycleTest {
         assertEquals(listOf("turn-1"), rig.continuations, "the continuation is opened once, for the finished turn")
         assertEquals(0, rig.display.closed)
         assertEquals(emptyList(), rig.cancelled, "a normal continued answer must not cancel a turn")
+        // R106: only an answer that asked to be spoken waits; the speech-off path still settles at `Displayed`.
+        assertEquals(0, rig.scheduler.pending(), "a silent answer arms no speech wait")
+        rig.advance(OfficialConversation.SPEECH_LIVENESS_MILLIS)
+        assertEquals(0, rig.display.closed)
     }
 
     @Test
@@ -510,8 +514,8 @@ class ConversationCycleTest {
         rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
         rig.cycle.onAnswerDone(AssistantRoute.WAKE, displayed = true, speech = true)
 
-        // The wait is bounded since Task 14 (official TIME_WAITE_TTS); inside the bound nothing closes or continues.
-        rig.advance(OfficialConversation.SPEECH_WAIT_MILLIS - 1)
+        // R106: the wait is the terminal liveness bound (120 s), not the official 1 200 ms cue cadence.
+        rig.advance(OfficialConversation.SPEECH_LIVENESS_MILLIS - 1)
         assertEquals(0, rig.display.closed, "the answer's speech is the next-turn gate")
         assertEquals(emptyList(), rig.continuations)
         assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in rig.display.statuses)
@@ -534,8 +538,8 @@ class ConversationCycleTest {
             AssistantRoute.WAKE, displayed = true, speech = true, answerVisibleUntilNanos = visibleUntil,
         )
 
-        rig.advance(6_199)
-        assertEquals(0, rig.display.closed, "the bound is the display window plus the official wait")
+        rig.advance(5_000 + OfficialConversation.SPEECH_LIVENESS_MILLIS - 1)
+        assertEquals(0, rig.display.closed, "the bound is the display window plus the terminal liveness wait")
         assertEquals(emptyList(), rig.continuations)
 
         rig.advance(1)
@@ -548,6 +552,37 @@ class ConversationCycleTest {
             "the missing end is evidence, not silence: ${rig.logs}",
         )
         assertEquals(0, rig.scheduler.pending(), "the failed wait releases its own deadline")
+    }
+
+    @Test
+    fun `a long answer's speech outliving the display window is never cut`() {
+        val rig = rig(panelVisible = true)
+        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
+        rig.cycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ANSWERING)
+        val visibleUntil = rig.clock.nowNanos + 5_000_000_000L
+        rig.cycle.onAnswerDone(
+            AssistantRoute.WAKE, displayed = true, speech = true, answerVisibleUntilNanos = visibleUntil,
+        )
+
+        // The reading window is over, but the long answer is still being spoken fifteen seconds later. The old
+        // 1_200 ms cue cadence treated that as a missing end, closed the panel and the next teardown/QUEUE_FLUSH cut the
+        // audio; the wearer heard the answer stop mid-sentence (R106, user report 2026-10-20).
+        rig.advance(5_000 + 10_000)
+        assertEquals(0, rig.display.closed, "speech still playing after the display window must not be cut")
+        assertEquals(emptyList(), rig.continuations, "no next round before the speech really ends")
+        assertTrue(OfficialStatus.AUDIO_FINISHED.wire !in rig.display.statuses)
+        assertFalse(
+            rig.logs.any { it.contains("P3_CONV no_display") },
+            "a playing answer is not a missing speech end: ${rig.logs}",
+        )
+        assertEquals(1, rig.scheduler.pending(), "the liveness bound stays armed while waiting")
+
+        rig.cycle.onSpeechFinished(AssistantRoute.WAKE, SpeechResult.FINISHED)
+
+        assertEquals(OfficialStatus.AUDIO_FINISHED.wire, rig.display.statuses.last())
+        assertEquals(listOf("turn-1"), rig.continuations)
+        assertEquals(0, rig.display.closed, "the normal path ends with SpeechFinished, not a timeout")
+        assertEquals(0, rig.scheduler.pending(), "the satisfied wait releases its deadline")
     }
 
     @Test
