@@ -192,7 +192,11 @@ class ModelClientGateway(
 
     private fun cancel(handle: CancellationHandle, accumulated: Accumulated): GatewayReply {
         handle.cancel()
-        return GatewayReply(emptyList(), accumulated.text(), ModelEnd.CANCELLED, CANCELLED)
+        // The stop may race a terminal that was already delivered; when it was, the provider's accounting is still
+        // real and rides the cancelled reply up to the run.
+        return GatewayReply(
+            emptyList(), accumulated.text(), ModelEnd.CANCELLED, CANCELLED, accumulated.terminal?.usage,
+        )
     }
 
     private fun reply(accumulated: Accumulated): GatewayReply {
@@ -207,11 +211,11 @@ class ModelClientGateway(
             terminal.end != ModelEnd.FAILED && terminal.end != ModelEnd.DEADLINE && terminal.end != ModelEnd.CANCELLED
         return if (truncated) {
             // Keep the provider's own machine-readable reason when it sent one: re-labelling the verdict must not erase
-            // what the transport actually reported.
+            // what the transport actually reported. The token accounting survives the re-label for the same reason.
             val code = terminal.safeCode?.let { "$TOOL_CALL_DELIVERY_INCOMPLETE:$it" } ?: TOOL_CALL_DELIVERY_INCOMPLETE
-            GatewayReply(emptyList(), text, ModelEnd.INCOMPLETE, code)
+            GatewayReply(emptyList(), text, ModelEnd.INCOMPLETE, code, terminal.usage)
         } else {
-            GatewayReply(calls, text, terminal.end, terminal.safeCode)
+            GatewayReply(calls, text, terminal.end, terminal.safeCode, terminal.usage)
         }
     }
 

@@ -4,6 +4,7 @@ import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.ToolSpec
 import kotlinx.serialization.json.Json
@@ -139,6 +140,16 @@ data class AgentRun(
      * `toolCalls`, whose exact shapes are pinned and whose meaning is `steps.size`, not this number.
      */
     val spentSteps: Int = 0,
+    /**
+     * Task 6 (spec §4.8 / §4.13): the provider's token accounting for the run, summed over **every** model turn it
+     * made — a tool round and a retry each cost a turn, so the run's total is their sum, not the last turn's counts.
+     * Each component is summed independently (a turn that reported only one counter leaves the other total intact).
+     *
+     * `null` — the default — means no turn reported usage at all, which is different from a reported zero. Counts only:
+     * no text, prompt or completion body reaches this field. It is the source Task 14's `P3_METRIC` reads; the existing
+     * `P3_TURN` / `P3_TOOL` log shapes deliberately do not change.
+     */
+    val usage: ModelUsage? = null,
 )
 
 private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
@@ -233,6 +244,13 @@ class AgentLoop(
     private var humanWaitNanos = 0L
 
     /**
+     * The token accounting this run has accumulated so far — per-run state like [humanWaitNanos]: reset on entry and
+     * summed from every model turn's [GatewayReply.usage]. It is a field rather than a `finish` argument so **every**
+     * terminal path reports it, including one that ends on a failed or cancelled turn.
+     */
+    private var usage: ModelUsage? = null
+
+    /**
      * The wall clock this run has measured waiting for a person **so far** — the same number the returned [AgentRun]
      * carries, exposed for the caller that never gets an [AgentRun] at all.
      *
@@ -266,6 +284,7 @@ class AgentLoop(
         // observation, not the continuation of an inherited streak.
         guard.reset()
         humanWaitNanos = 0L
+        usage = null
         val tools = registry.descriptors().map { ToolSpec(it.name, it.description, it.parametersJson) }
         // Phase 3: TurnRunner owns request assembly. For now, the system slot carries only INSTRUCTIONS;
         // memory evidence, perception, and conversation store will be wired in later phases.
@@ -342,6 +361,9 @@ class AgentLoop(
                     onTextDelta = request.onTextDelta,
                 ),
             )
+            // A turn's accounting belongs to the run even when the turn's verdict is about to end it: accumulate here,
+            // before any branch below can return, so every finish path reports what the provider billed.
+            usage = accumulatedUsage(usage, reply.usage)
             // A turn that was blocked when `cancel()` arrived must not complete the run with a late answer.
             if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
 
@@ -538,7 +560,29 @@ class AgentLoop(
             history += ModelHistoryItem.Text(MessageRole.ASSISTANT, closingText.ifBlank { CLOSED_TURN_TEXT })
         }
         lastTranscript = history.toList()
-        return AgentRun(outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps)
+        return AgentRun(
+            outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps, usage,
+        )
+    }
+
+    /**
+     * Adds one turn's accounting to the run's total. A turn that reported nothing contributes nothing; the two
+     * counters are summed independently because [ModelUsage] admits one side being absent. The total stays `null`
+     * until the first turn reports something, so "no accounting" is never fabricated as a zero count.
+     */
+    private fun accumulatedUsage(total: ModelUsage?, turn: ModelUsage?): ModelUsage? {
+        if (turn == null) return total
+        if (total == null) return turn
+        return ModelUsage(
+            inputTokens = sumTokens(total.inputTokens, turn.inputTokens),
+            outputTokens = sumTokens(total.outputTokens, turn.outputTokens),
+        )
+    }
+
+    private fun sumTokens(first: Long?, second: Long?): Long? = when {
+        first == null -> second
+        second == null -> first
+        else -> first + second
     }
 
     /**

@@ -2,6 +2,7 @@ package com.sheen.rokid.agent
 
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.ToolSpec
 
 /**
@@ -66,4 +67,12 @@ data class GatewayReply(
     val text: String,
     val terminal: ModelEnd?,
     val safeCode: String?,
+    /**
+     * The provider's token accounting for this one model turn, or `null` when it reported none.
+     *
+     * Counts only — [ModelUsage] carries no body text. A turn's verdict ([terminal]) and its accounting are
+     * independent: a failed, cut-off or cancelled turn still reports what the provider billed. [AgentLoop] sums this
+     * per turn into [AgentRun.usage], and the last parameter default keeps every pre-0.25 call site compiling.
+     */
+    val usage: ModelUsage? = null,
 )
