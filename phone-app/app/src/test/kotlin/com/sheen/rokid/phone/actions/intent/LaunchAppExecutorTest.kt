@@ -10,6 +10,7 @@ import com.sheen.rokid.phone.storage.unavailable
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.RiskLevel
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -17,9 +18,10 @@ import org.junit.Test
  * The Shizuku-backed launch and list tools (T2.2 + T2.3).
  *
  * launch_app resolves a spoken name through [AppLaunchResolver] and, when exactly one candidate survives, asks the
- * privileged shell to start it. Ambiguity is returned as data rather than a guess — the same rule the resolver itself
- * enforces, now carried through to the action's outcome. list_apps formats the catalog into lines the model can read,
- * truncating at 100 entries so a device with hundreds of packages does not flood the context window.
+ * privileged shell to start it. Ambiguity is refused with its candidates attached rather than reported as success —
+ * the resolver's rule carried through to the action's outcome, so the model can ask the user to pick. list_apps
+ * formats the catalog into lines the model can read, truncating at 100 entries so a device with hundreds of packages
+ * does not flood the context window.
  */
 class LaunchAppExecutorTest {
 
@@ -169,10 +171,10 @@ class LaunchAppExecutorTest {
         }
     }
 
-    // ── launch_app: Ambiguous → Done with candidate JSON ───────────────────────
+    // ── launch_app: Ambiguous → Refused APP_AMBIGUOUS with candidate JSON ───────
 
     @Test
-    fun `launch_app ambiguous returns Done with candidate list`() {
+    fun `launch_app ambiguous returns Refused APP_AMBIGUOUS with candidate list`() {
         val shell = FakeShell()
         val catalog = FakeCatalog(listOf(
             entry("Camera", "com.one"),
@@ -182,7 +184,12 @@ class LaunchAppExecutorTest {
 
         val result = executor.execute("launch_app", """{"name":"Camera"}""")
 
-        assertEquals(ActionOutcome.Done, result.outcome)
+        assertNotEquals("ambiguity must never look like success", ActionOutcome.Done, result.outcome)
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertTrue(
+            "detail must start with the APP_AMBIGUOUS error code",
+            result.detail.startsWith("APP_AMBIGUOUS:"),
+        )
         assertTrue("detail must contain packageName", result.detail.contains("com.one"))
         assertTrue("detail must contain packageName", result.detail.contains("com.two"))
         assertTrue("shell must not be touched for ambiguity", shell.commands.isEmpty())

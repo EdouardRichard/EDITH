@@ -19,6 +19,7 @@ private const val LIST_APPS = "list_apps"
 private const val ARGUMENTS_INVALID = "ARGUMENTS_INVALID"
 private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
 private const val APP_NOT_FOUND = "APP_NOT_FOUND"
+private const val APP_AMBIGUOUS = "APP_AMBIGUOUS"
 private const val STATE_UNCHANGED = "STATE_UNCHANGED"
 private const val ACTION_CHANNEL_UNAVAILABLE = "ACTION_CHANNEL_UNAVAILABLE"
 
@@ -37,8 +38,9 @@ private val argumentsJson = Json { isLenient = true }
  * backends, same shell — each action group answers for itself.
  *
  * `launch_app` resolves a spoken name through [AppLaunchResolver] and, when exactly one candidate survives, asks the
- * shell to start it with `am start -W`. Ambiguity is returned as structured data rather than a guess: the same rule
- * the resolver enforces internally, now carried through to the action outcome so the model can ask the user to pick.
+ * shell to start it with `am start -W`. Ambiguity is **refused** with the candidates attached rather than reported as
+ * success: a `Done` outcome would tell the model the app opened, while the user still has to pick. The model sees
+ * `APP_AMBIGUOUS:[{"label":...,"packageName":...}]` and can ask which one to launch.
  *
  * `list_apps` formats the catalog into lines the model can read. Non-launchable entries are excluded (the resolver
  * already treats them as invisible) and the list is truncated at [MAX_LIST_ENTRIES] with an explicit marker so the
@@ -96,7 +98,8 @@ class LaunchAppExecutor(
         val name = args["name"]?.stringOrNull() ?: return refused(ARGUMENTS_INVALID)
         return when (val resolution = resolver.resolve(name)) {
             is LaunchResolution.NotFound -> refused(APP_NOT_FOUND)
-            is LaunchResolution.Ambiguous -> done(formatCandidates(resolution.candidates))
+            is LaunchResolution.Ambiguous ->
+                refused(APP_AMBIGUOUS, formatCandidates(resolution.candidates))
             is LaunchResolution.Found -> launchTarget(resolution.target)
         }
     }
@@ -164,6 +167,12 @@ class LaunchAppExecutor(
         .replace("\t", "\\t")
 
     private fun done(detail: String) = ActionResult(ActionOutcome.Done, detail)
-    private fun refused(code: String) = ActionResult(ActionOutcome.Refused, code)
+
+    /**
+     * A refusal always names its error code. [detail] is the optional payload that code alone cannot carry (for
+     * ambiguity, the candidate JSON), appended as `CODE:payload` so the code remains the stable leading token.
+     */
+    private fun refused(code: String, detail: String? = null) =
+        ActionResult(ActionOutcome.Refused, if (detail == null) code else "$code:$detail")
     private fun failed(code: String) = ActionResult(ActionOutcome.Failed, code)
 }
