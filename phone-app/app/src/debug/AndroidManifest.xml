@@ -58,6 +58,21 @@
             </intent-filter>
         </receiver>
         <!--
+          0.25 Task 15 (R82 / D116): the text turn injection seam the frozen acceptance corpus runs on. Same export
+          rule and the same reason as the instruments above: the only caller is an `adb shell am broadcast` from the
+          host, so it must be exported, and it must therefore never exist in a release build. It submits a synthetic
+          final `TranscriptRevision` through the production host entry (no KWS/ASR), and logs a status, a route name, the
+          fixed turn id, the revision and a character count - never the utterance text.
+        -->
+        <receiver
+            android:name=".debug.DebugUtterance"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_UTTERANCE" />
+            </intent-filter>
+        </receiver>
+        <!--
           Laya backend probe. Same export rule and the same reason as the instruments above: the only caller is
           an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in
           a release build. It exists because MIUI on the K40 refuses the androidTest APK, so the CPU-vs-GPU
