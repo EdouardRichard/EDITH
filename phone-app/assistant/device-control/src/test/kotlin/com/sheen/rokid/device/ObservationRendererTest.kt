@@ -144,6 +144,37 @@ class ObservationRendererTest {
     }
 
     @Test
+    fun `the byte budget counts UTF-8 bytes rather than characters`() {
+        val nodes = (0 until 60).map {
+            node(
+                role = "text",
+                text = "标签-$it",
+                viewId = null,
+                states = emptySet(),
+                actions = emptyList(),
+            )
+        }
+
+        val output = ObservationRenderer().render(
+            observation(nodes = nodes),
+            ScreenFilter.ALL,
+            budgetBytes = 300,
+            maxLines = 400,
+        )
+        val bytes = output.toByteArray(Charsets.UTF_8)
+
+        assertTrue(bytes.size <= 300, "output must respect the UTF-8 byte budget: ${bytes.size}")
+        assertEquals("truncated: true", output.trimEnd().lines().last())
+        assertTrue(output.nodeLines().size < 60, "the render must not contain every node")
+        assertTrue(output.nodeLines().all { it.endsWith("]") }, "a node line is never cut mid-line")
+        assertTrue(output.contains("标签"), "the kept lines must carry the multi-byte text")
+        assertTrue(
+            bytes.size > output.trimEnd().length,
+            "this fixture only cuts on the byte budget when bytes, not characters, are counted",
+        )
+    }
+
+    @Test
     fun `the line budget alone can cut a render that fits the byte budget`() {
         val nodes = (0 until 60).map {
             node(role = "text", text = "Node-$it", viewId = null, states = emptySet(), actions = emptyList())

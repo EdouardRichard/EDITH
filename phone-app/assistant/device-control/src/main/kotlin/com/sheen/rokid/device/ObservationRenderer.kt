@@ -30,9 +30,12 @@ enum class ScreenFilter {
  * with no visible node after the filter is omitted. When the observation has no window metadata,
  * only node lines are emitted.
  *
- * Refs come from [registry], injected through the constructor. A kernel must pass the same
- * registry it uses for [RefRegistry.resolve], otherwise the text would hand the model refs the
- * kernel cannot act on. Refs are assigned for every node — including nodes hidden by [filter] — so
+ * Refs come from [registry], injected through the constructor. The kernel MUST pass the same
+ * registry it uses for [RefRegistry.resolve]; the default `RefRegistry()` exists only for one-shot
+ * diagnostics and tests. A renderer that owns a private registry prints refs the kernel cannot
+ * resolve, so production wiring must always inject the shared instance.
+ *
+ * Refs are assigned for every node — including nodes hidden by [filter] — so
  * changing the filter never renumbers the visible refs.
  *
  * [budgetBytes] is a UTF-8 byte budget and [maxLines] a line budget (including headers and the
@@ -126,10 +129,7 @@ class ObservationRenderer(
     }
 
     private fun StringBuilder.appendBounds(bounds: Bounds) {
-        append('[').append(bounds.left).append(',')
-        append(bounds.top).append(',')
-        append(bounds.right).append(',')
-        append(bounds.bottom).append(']')
+        append('[').append(bounds.toFieldString()).append(']')
     }
 
     private fun fit(

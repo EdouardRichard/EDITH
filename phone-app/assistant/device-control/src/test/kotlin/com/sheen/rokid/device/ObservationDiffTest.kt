@@ -102,6 +102,49 @@ class ObservationDiffTest {
     }
 
     @Test
+    fun `exactly sixty changed paths stays in diff mode`() {
+        val oldNodes = (0 until 400).map { node("Item-$it", depth = if (it == 0) 0 else 1) }
+        val newNodes = oldNodes.mapIndexed { index, node ->
+            if (index in 1..60) node.copy(text = "Changed-$index") else node
+        }
+
+        val diff = ObservationDiff.between(observation(1, oldNodes), observation(2, newNodes))
+
+        assertEquals(60, diff.updated.size)
+        assertEquals("diff", diff.mode)
+    }
+
+    @Test
+    fun `a change covering exactly half of the baseline stays in diff mode`() {
+        val oldNodes = (0 until 40).map { node("Item-$it", depth = if (it == 0) 0 else 1) }
+        val newNodes = oldNodes.mapIndexed { index, node ->
+            if (index in 1..20) node.copy(text = "Changed-$index") else node
+        }
+
+        val diff = ObservationDiff.between(observation(1, oldNodes), observation(2, newNodes))
+
+        assertEquals(20, diff.updated.size)
+        assertEquals("diff", diff.mode)
+    }
+
+    @Test
+    fun `an insertion in the middle shifts later paths and is reported positionally`() {
+        val oldNodes = (0 until 40).map { node("Item-$it", depth = if (it == 0) 0 else 1) }
+        val newNodes = oldNodes.toMutableList().apply {
+            add(19, node("Inserted", depth = 1))
+        }
+
+        val diff = ObservationDiff.between(observation(1, oldNodes), observation(2, newNodes))
+
+        // The inserted node takes path 0/18; every sibling after it shifts one path down.
+        assertEquals(listOf("0/39"), diff.added)
+        assertEquals((18..38).map { "0/$it" }, diff.updated)
+        assertTrue(diff.removed.isEmpty(), "a positional shift is not a removal")
+        assertEquals(22, diff.added.size + diff.updated.size)
+        assertEquals("full", diff.mode)
+    }
+
+    @Test
     fun `more than sixty changed paths forces full mode even under half of the baseline`() {
         val oldNodes = (0 until 200).map { node("Item-$it", depth = if (it == 0) 0 else 1) }
         val newNodes = oldNodes.mapIndexed { index, node ->

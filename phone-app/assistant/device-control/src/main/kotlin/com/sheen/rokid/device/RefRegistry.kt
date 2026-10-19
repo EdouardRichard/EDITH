@@ -31,14 +31,21 @@ sealed interface RefResult {
  * two observations of an unchanged tree resolve to the same refs. A node whose text changes gets a
  * new identity — and therefore a new ref from [assign].
  *
- * **Rebind.** A ref whose exact identity is gone may follow a node that stayed in the same
- * structural slot with the same view id, role and bounds but a different text/description (a label
- * update, a counter, a connection state). That weaker key deliberately includes the structural
- * path and the bounds, so list reflow (a different item occupying the slot) or a node that moved
- * is never silently re-targeted. A ref gets at most [MAX_REBINDS] successful identity rebinds; a
- * further mismatch is [RefResult.Stale]. A ref that is merely absent from a truncated observation
- * is stale with a truncation-specific reason and does not spend the rebind budget, because
- * absence there proves nothing.
+ * **Rebind.** A ref whose exact identity is gone may follow a node that kept the same structural
+ * slot, view id, role and bounds but changed only its text/description (a label update, a counter,
+ * a connection state). That weaker key excludes text on purpose: a recycled list row or any other
+ * replacement occupying the same slot with the same geometry is treated as the same node and IS
+ * rebound — those fields are the only anchor the producer gives us. A node that moved, or that
+ * changed view id, role or structural path, is never silently re-targeted and goes
+ * [RefResult.Stale]. A ref gets at most [MAX_REBINDS] successful identity rebinds; a further
+ * mismatch is [RefResult.Stale]. A ref that is merely absent from a truncated observation is stale
+ * with a truncation-specific reason and does not spend the rebind budget, because absence there
+ * proves nothing.
+ *
+ * **Lifecycle.** Every distinct identity ever assigned keeps one map entry for the lifetime of the
+ * registry, so a long-lived registry grows with the app's UI history. A kernel should own one
+ * registry per task/session and [reset] it between them (or create a fresh one). Ref numbers stay
+ * monotonic across a reset, so a retained old ref can never silently address a node minted later.
  *
  * **Keys.** [assign] returns one entry per node keyed by the structural path also used by
  * [ObservationDiff] (`0`, `0/1`, ...). That is the key callers use to associate a diff entry with
@@ -77,6 +84,18 @@ class RefRegistry {
     }
 
     /**
+     * Forgets every issued ref, e.g. at the task/session boundary of a long-lived registry.
+     *
+     * Ref numbers keep increasing, so a ref retained from before the reset goes [RefResult.Stale]
+     * as unknown instead of silently addressing a node minted afterwards.
+     */
+    @Synchronized
+    fun reset() {
+        byIdentity.clear()
+        byReference.clear()
+    }
+
+    /**
      * Resolves [ref] against [observation].
      *
      * Resolution order: exact identity, then a single identity rebind (up to [MAX_REBINDS] times
@@ -111,7 +130,14 @@ class RefRegistry {
         }
 
         val node = observation.nodes[candidate]
+        val previousRef = binding.ref
         val rebound = refFor(node, paths[candidate])
+        // The identity this ref used to answer to is no longer this binding's identity. Drop the
+        // stale lookup entry so a later observation of that old identity mints a fresh ref instead
+        // of handing out a ref that has been rebound away.
+        if (byIdentity[binding.identity] == previousRef) {
+            byIdentity.remove(binding.identity)
+        }
         binding.identity = identityOf(node, paths[candidate])
         binding.ref = rebound
         binding.rebinds += 1
@@ -120,15 +146,18 @@ class RefRegistry {
 
     private fun refFor(node: DeviceNode, path: String): Ref {
         val identity = identityOf(node, path)
-        return byIdentity.getOrPut(identity) {
-            val minted = Ref("#n${issued++}")
-            byReference[minted.value] = Binding(
-                identity = identity,
-                rebindKey = rebindKeyOf(node, path),
-                ref = minted,
-            )
-            minted
+        val existing = byIdentity[identity]
+        if (existing != null && byReference[existing.value]?.identity == identity) {
+            return existing
         }
+        val minted = Ref("#n${issued++}")
+        byIdentity[identity] = minted
+        byReference[minted.value] = Binding(
+            identity = identity,
+            rebindKey = rebindKeyOf(node, path),
+            ref = minted,
+        )
+        return minted
     }
 
     private fun identityOf(node: DeviceNode, path: String): String = buildString {
@@ -137,7 +166,7 @@ class RefRegistry {
         append(node.text.orEmpty()).append(FIELD)
         append(node.contentDescription.orEmpty()).append(FIELD)
         append(path).append(FIELD)
-        appendBounds(node.bounds)
+        append(node.bounds.toFieldString())
     }
 
     /** Identity minus text/description: what must still match for a ref to be re-bound. */
@@ -145,14 +174,7 @@ class RefRegistry {
         append(node.viewId.orEmpty()).append(FIELD)
         append(node.role).append(FIELD)
         append(path).append(FIELD)
-        appendBounds(node.bounds)
-    }
-
-    private fun StringBuilder.appendBounds(bounds: Bounds) {
-        append(bounds.left).append(',')
-        append(bounds.top).append(',')
-        append(bounds.right).append(',')
-        append(bounds.bottom)
+        append(node.bounds.toFieldString())
     }
 
     private companion object {

@@ -39,6 +39,38 @@ class ObservationTest {
         assertEquals(emptyList(), NodeStructure.paths(emptyList()))
     }
 
+    @Test
+    fun `collection range tooltip and drawing order default to absent`() {
+        val node = node(depth = 0)
+
+        assertEquals(null, node.collection)
+        assertEquals(null, node.range)
+        assertEquals(null, node.tooltip)
+        assertEquals(0, node.drawingOrder)
+    }
+
+    @Test
+    fun `a node carries collection range tooltip and drawing order metadata`() {
+        val collection = CollectionInfo(
+            rowCount = 4,
+            columnCount = 2,
+            hierarchical = true,
+            selectionMode = "single",
+        )
+        val range = RangeInfo(current = 40f, min = 0f, max = 100f, type = "percent")
+        val node = node(depth = 0).copy(
+            collection = collection,
+            range = range,
+            tooltip = "Battery level",
+            drawingOrder = 7,
+        )
+
+        assertEquals(collection, node.collection)
+        assertEquals(range, node.range)
+        assertEquals("Battery level", node.tooltip)
+        assertEquals(7, node.drawingOrder)
+    }
+
     private fun node(depth: Int) = DeviceNode(
         role = "text",
         text = "node",

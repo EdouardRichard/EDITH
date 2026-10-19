@@ -14,6 +14,41 @@ data class Bounds(
 )
 
 /**
+ * `left,top,right,bottom`: the one textual form used both by ref identity and by rendered node
+ * lines, so the two cannot drift apart.
+ */
+internal fun Bounds.toFieldString(): String = "$left,$top,$right,$bottom"
+
+/**
+ * Collection metadata of a container node (a list or a grid), mirroring the shape of the platform
+ * `AccessibilityNodeInfo.CollectionInfo` so Task 9 can populate it without a translation layer.
+ *
+ * [rowCount] and [columnCount] are `-1` when the platform cannot determine them. [hierarchical]
+ * tells whether the collection is organised in a hierarchy, and [selectionMode] is `"none"`,
+ * `"single"`, `"multiple"`, or null when unknown.
+ */
+data class CollectionInfo(
+    val rowCount: Int,
+    val columnCount: Int,
+    val hierarchical: Boolean = false,
+    val selectionMode: String? = null,
+)
+
+/**
+ * Range metadata of an adjustable node (a slider or a progress indicator), mirroring the shape of
+ * the platform `AccessibilityNodeInfo.RangeInfo`.
+ *
+ * [type] is `"int"`, `"float"`, `"percent"`, or null when unknown. [current], [min] and [max] are
+ * [Float] because the platform stores every range type as a float.
+ */
+data class RangeInfo(
+    val current: Float,
+    val min: Float,
+    val max: Float,
+    val type: String? = null,
+)
+
+/**
  * One accessibility node flattened out of the screen tree.
  *
  * Nodes are listed in pre-order (the order the accessibility service walks the tree) and [depth]
@@ -24,6 +59,11 @@ data class Bounds(
  * `editable`, `scrollable`, `checkable`, `checked`, `selected`, `enabled`, `focused` and
  * `click`, `long_click`, `set_text`, ...). This module only compares and renders them; it never
  * parses them back into platform types.
+ *
+ * [collection], [range], [tooltip] and [drawingOrder] are descriptive metadata (spec §4.4). They are
+ * deliberately not part of a node's ref identity: a slider whose [RangeInfo.current] moved, or a
+ * container whose collection size changed, is still the same node for [RefRegistry]. [drawingOrder]
+ * is the platform's z-order hint, `0` when the producer has none.
  */
 data class DeviceNode(
     val role: String,
@@ -35,6 +75,10 @@ data class DeviceNode(
     val actions: List<String>,
     val hint: String?,
     val paneTitle: String?,
+    val collection: CollectionInfo? = null,
+    val range: RangeInfo? = null,
+    val tooltip: String? = null,
+    val drawingOrder: Int = 0,
     val windowId: Int,
     val depth: Int,
 )

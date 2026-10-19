@@ -76,6 +76,83 @@ class RefRegistryTest {
     }
 
     @Test
+    fun `an identity that comes back after its ref was rebound away gets a fresh usable ref`() {
+        val registry = RefRegistry()
+        val original = registry.assign(observation(1, node(text = "A"))).getValue("0")
+
+        val b = observation(2, node(text = "B"))
+        registry.assign(b)
+        assertIs<RefResult.Ok>(registry.resolve(b, original))
+
+        val c = observation(3, node(text = "C"))
+        registry.assign(c)
+        assertIs<RefResult.Ok>(registry.resolve(c, original))
+
+        val aAgain = observation(4, node(text = "A"))
+        val reassigned = registry.assign(aAgain).getValue("0")
+
+        assertNotEquals(
+            original,
+            reassigned,
+            "the original ref now aliases another node; reusing it would print an unusable ref",
+        )
+        assertEquals(RefResult.Ok(reassigned), registry.resolve(aAgain, reassigned))
+    }
+
+    @Test
+    fun `absence from a truncated observation is stale without spending the rebind budget`() {
+        val registry = RefRegistry()
+        val ref = registry.assign(observation(1, node(text = "v1"))).getValue("0")
+
+        repeat(3) { attempt ->
+            val truncated = observation(
+                2,
+                node(text = "something else", viewId = "android:id/other"),
+                truncated = true,
+            )
+            val stale = assertIs<RefResult.Stale>(registry.resolve(truncated, ref))
+            assertTrue(
+                stale.reason.contains("truncated"),
+                "attempt $attempt should report the truncation-specific reason: ${stale.reason}",
+            )
+        }
+
+        val visibleAgain = observation(3, node(text = "v2"))
+        registry.assign(visibleAgain)
+
+        assertIs<RefResult.Ok>(registry.resolve(visibleAgain, ref))
+    }
+
+    @Test
+    fun `reset forgets old refs but never recycles their numbers`() {
+        val registry = RefRegistry()
+        val old = registry.assign(observation(1, node())).getValue("0")
+
+        registry.reset()
+
+        val stale = assertIs<RefResult.Stale>(registry.resolve(observation(2, node()), old))
+        assertTrue(stale.reason.contains("unknown"), "unexpected reason: ${stale.reason}")
+
+        val fresh = registry.assign(observation(3, node())).getValue("0")
+        assertNotEquals(old, fresh, "a ref value must not be recycled after reset")
+        assertEquals(RefResult.Ok(fresh), registry.resolve(observation(3, node()), fresh))
+    }
+
+    @Test
+    fun `ref identity ignores collection range tooltip and drawing order metadata`() {
+        val registry = RefRegistry()
+        val first = registry.assign(observation(1, node())).getValue("0")
+        val withMetadata = node().copy(
+            collection = CollectionInfo(rowCount = 2, columnCount = 1),
+            range = RangeInfo(current = 0.5f, min = 0f, max = 1f),
+            tooltip = "Help",
+            drawingOrder = 4,
+        )
+
+        assertEquals(first, registry.assign(observation(2, withMetadata)).getValue("0"))
+    }
+
+    @Test
     fun `a ref whose node disappeared is stale`() {
         val registry = RefRegistry()
         val ref = registry.assign(observation(1, node())).getValue("0")
