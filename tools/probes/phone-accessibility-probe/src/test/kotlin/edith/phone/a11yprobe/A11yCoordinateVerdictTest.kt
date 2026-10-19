@@ -107,6 +107,45 @@ class A11yCoordinateVerdictTest {
         )
     }
 
+    /**
+     * Asking for an outside point **without naming the window it must miss** cannot be checked: the bounds are what
+     * makes "outside" true. Such a run must fail closed instead of dispatching, or a completed gesture inside the
+     * dialog would be quoted as an outside tap the probe never made. The verdict stays distinct from `no_dialog`,
+     * which means a marker was named but never appeared, and still prints every field so the refusal is reviewable.
+     */
+    @Test
+    fun requireOutsideWithoutAMarkerFailsClosed() {
+        val screen = ProbeScreenSize(width = 1080, height = 2400)
+        assertEquals(
+            "no bounds to compare against ⇒ refuse, never dispatch",
+            "outside_requires_marker",
+            coordinateOutcome(
+                x = 540,
+                y = 400,
+                screen = screen,
+                markerRequired = false,
+                dialogBounds = null,
+                requireOutside = true,
+                dispatched = true,
+                completed = true,
+            ),
+        )
+        assertEquals(
+            "A1CLICK_AT x=540 y=400 screenW=1080 screenH=2400 inScreen=true dialogBounds=none " +
+                "outsideDialog=none dispatched=false completed=false outcome=outside_requires_marker",
+            coordinateVerdictLine(
+                x = 540,
+                y = 400,
+                screen = screen,
+                markerRequired = false,
+                dialogBounds = null,
+                requireOutside = true,
+                dispatched = false,
+                completed = false,
+            ),
+        )
+    }
+
     // ------------------------------------------------------------------ the verdict line
 
     /**

@@ -46,6 +46,9 @@ fun pointOnScreen(x: Int, y: Int, screen: ProbeScreenSize): Boolean =
  *  - `out_of_screen` — the point is not a pixel of the screen read at dispatch time (negative or past the edge).
  *  - `no_dialog` — the caller named a marker label and it never appeared within the wait budget, so the bounds that
  *    should bound the tap are unknown and the outside-tap premise cannot be established.
+ *  - `outside_requires_marker` — the caller demanded a point outside the marker window but named no marker, so there
+ *    are no bounds to compare against. Refused rather than dispatched: a completed gesture would otherwise be written
+ *    up as an outside tap whose "outside" was never established, and could have landed inside the dialog.
  *  - `inside_dialog_bounds` — the caller asked for a point **outside** the active window and this one is inside it: the
  *    gesture would not test the outside case, so it is refused rather than dispatched and mis-read as evidence.
  *  - `click_refused` — the platform refused to inject the gesture (`dispatchGesture` returned false).
@@ -69,6 +72,7 @@ fun coordinateOutcome(
     x == null || y == null -> "missing_coordinates"
     !pointOnScreen(x, y, screen) -> "out_of_screen"
     markerRequired && dialogBounds == null -> "no_dialog"
+    requireOutside && dialogBounds == null -> "outside_requires_marker"
     requireOutside && dialogBounds != null && dialogBounds.contains(x, y) -> "inside_dialog_bounds"
     !dispatched -> "click_refused"
     !completed -> "gesture_not_completed"

@@ -301,6 +301,10 @@ class A11yClickActivity : Activity() {
          *
          * Without this, a point that landed inside the dialog would still be dispatched and the run could quote a
          * completed gesture as an outside tap it never made. Refusing leaves an `inside_dialog_bounds` verdict instead.
+         *
+         * It **requires a marker**: the bounds that make "outside" checkable come from the marker window. Asking for
+         * `requireOutside` without a `label` fails closed with `outside_requires_marker` and dispatches nothing - a
+         * completed gesture with unknown bounds would be evidence of no outside tap at all.
          */
         const val EXTRA_REQUIRE_OUTSIDE = "requireOutside"
 
