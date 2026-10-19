@@ -1,10 +1,11 @@
 package com.sheen.rokid.phone.debug
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.HostEvent
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.contracts.TranscriptRevision
 import com.sheen.rokid.contracts.UserAction
-import com.sheen.rokid.contracts.WakeDetected
 import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.phone.app.EdithApplication
 import com.sheen.rokid.phone.platform.P3Log
@@ -31,15 +32,19 @@ import java.util.concurrent.atomic.AtomicLong
  * ```
  *
  * `route` names which **production turn entry** the final transcript enters through (it is not a bypass):
- * - `wake` (default): a synthetic `WakeDetected` (the event the keyword spotter emits - not the spotter itself)
- *   followed by the final transcript, i.e. the normal conversation turn the corpus exercises;
+ * - `wake` (default, when the extra is absent): calls the composition's production `emitWake`, which asks the glasses
+ *   for the resident panel and submits the production `WakeDetected`, then submits the final transcript, i.e. the normal
+ *   conversation turn the corpus exercises. `emitWake` is deliberately called **without** the wearer-facing chime lambda
+ *   (production passes it from the detector's emission); the corpus judges model behaviour, not the acknowledgement tone.
  * - `help`: the final transcript followed by the production manual `Help` action, which starts the turn immediately
  *   from the last final transcript without a wake.
- * `transcript` submits only the final `TranscriptRevision`, for checking the gate itself.
+ * - `transcript` submits only the final `TranscriptRevision`, for checking the gate itself.
+ * An explicitly blank route or an unknown route is refused **before** `emitWake`, and so are a blank utterance and a
+ * missing session identity: a refused request must never leave a panel open with no turn behind it.
  *
  * **Evidence discipline.** Logcat receives `P3_UTTERANCE state=… route=… turn=<id> rev=<n> chars=<n>` only: a status, a
  * route name, the fixed turn id, the revision and the character count. The text is never logged, and the turn id is
- * sanitised to `[A-Za-z0-9_-]` so the log line itself cannot become a channel for utterance text.
+ * sanitised to ASCII `[A-Za-z0-9_-]` so the log line itself cannot become a channel for utterance text.
  */
 class DebugUtterance : BroadcastReceiver() {
 
@@ -49,47 +54,29 @@ class DebugUtterance : BroadcastReceiver() {
         val composition = app?.composition
             ?: return report("state=refused reason=NO_COMPOSITION")
         val host = composition.host
-        val route = DebugUtteranceInjection.routeOf(intent.getStringExtra(EXTRA_ROUTE))
-            ?: return report("state=refused reason=UNKNOWN_ROUTE")
         val revision = revisions.next()
         val turnId = intent.getStringExtra(EXTRA_TURN)?.takeIf { it.isNotBlank() } ?: "debug-utterance-$revision"
         val text = intent.getStringExtra(EXTRA_TEXT).orEmpty()
-        var outcome: DebugUtteranceInjection.Outcome
-        if (route == DebugUtteranceInjection.Route.WAKE) {
-            // The production wake path, not a bare host event: `emitWake` is what requests the glasses panel and plays
-            // the chime before the host sees the wake. Without that half the conversation cycle's panel wait expires
-            // and the turn is cancelled after ~3 s - measured on the K40 at 23:24:59 (`panel_not_shown`, CANCELLED).
-            // The detector's own acoustic half is still not run; only its emission sink is.
-            composition.emitWake(host, DebugUtteranceInjection.WAKE_WORD, 1.0)
-            outcome = DebugUtteranceInjection.deliver(
-                host = host,
-                text = text,
-                route = DebugUtteranceInjection.Route.TRANSCRIPT,
-                turnId = turnId,
-                revision = revision,
-                nowNanos = SystemClock.elapsedRealtimeNanos(),
-            )
-        } else {
-            outcome = DebugUtteranceInjection.deliver(
-                host = host,
-                text = text,
-                route = route,
-                turnId = turnId,
-                revision = revision,
-                nowNanos = SystemClock.elapsedRealtimeNanos(),
-            )
-        }
+        // The exact sequence this instrument runs: validate, ask for the production wake, then submit the transcript.
+        // Binding the composition's own `emitWake` here (not a copy of its body) is what keeps the seam honest: the
+        // panel request, `WakeDetected` and the plugin's wake admission stay production code.
+        val injection = DebugUtteranceInjection.inject(
+            host = host,
+            text = text,
+            rawRoute = intent.getStringExtra(EXTRA_ROUTE),
+            turnId = turnId,
+            revision = revision,
+            nowNanos = SystemClock.elapsedRealtimeNanos(),
+            wake = { composition.emitWake(host, DebugUtteranceInjection.WAKE_WORD, 1.0) },
+        )
         // Counts, ids, a route and the App's own state/error code only. Never the text: a log must not carry it.
         val ui = composition.state.value
-        report("state=${outcome.logName} route=${route.logName} turn=${ident(turnId)} rev=$revision " +
-            "chars=${text.length} session=${ui.session.name} error=${ui.errorCode ?: "none"}")
+        report("state=${injection.outcome.logName} route=${injection.route?.logName ?: "none"} " +
+            "turn=${DebugUtteranceInjection.ident(turnId)} rev=$revision chars=${text.length} " +
+            "session=${ui.session.name} error=${ui.errorCode ?: "none"}")
     }
 
     private fun report(fields: String) = P3Log.line("P3_UTTERANCE $fields")
-
-    /** A log-safe identity: the turn id is caller-chosen and must not be able to inject text into the log. */
-    private fun ident(raw: String): String =
-        raw.filter { it.isLetterOrDigit() || it == '-' || it == '_' }.take(MAX_TURN_CHARS).ifEmpty { "none" }
 
     companion object {
         /** Explicit action so a stray broadcast cannot start a turn. */
@@ -98,13 +85,11 @@ class DebugUtterance : BroadcastReceiver() {
         /** The fixed utterance text, delivered as if ASR had just finalised it. Never logged. */
         const val EXTRA_TEXT = "text"
 
-        /** `wake` (default) / `help` / `transcript`; see the class KDoc. */
+        /** `wake` (default when absent) / `help` / `transcript`; see the class KDoc. */
         const val EXTRA_ROUTE = "route"
 
         /** Optional fixed turn id; defaults to `debug-utterance-<revision>` so every injection is identifiable. */
         const val EXTRA_TURN = "turn"
-
-        private const val MAX_TURN_CHARS = 64
 
         /**
          * One counter for the **process**, not the receiver instance: a manifest receiver is instantiated per broadcast,
@@ -128,11 +113,13 @@ internal class DebugUtteranceRevisions {
 }
 
 /**
- * The pure half of the injection seam: builds the production events from the host's current identity and submits them
- * with `HostRuntime.onEvent`, and answers a status value instead of throwing.
+ * The pure half of the injection seam: validates the caller's request, builds the production events from the host's
+ * current identity and submits them with `HostRuntime.onEvent`, and answers a status value instead of throwing.
  *
  * Separate from the receiver so the event shape (identity, turn id, final flag, revision, monotonic timestamps, route
  * order) is pinned by JVM tests while the Android half stays "resolve the composition and read the intent extras".
+ * The `wake` sink is the composition's own `emitWake`, passed by the receiver; [inject] calls it only after every
+ * validation has passed, so a refused request cannot open a panel with no turn behind it.
  */
 internal object DebugUtteranceInjection {
 
@@ -149,12 +136,21 @@ internal object DebugUtteranceInjection {
         ACCEPTED("accepted"),
         NO_SESSION("no_session"),
         BLANK_TEXT("blank_text"),
+        UNKNOWN_ROUTE("unknown_route"),
         HOST_REFUSED("host_refused"),
     }
 
-    /** `null` when the caller supplied a route this seam does not know; absent/blank means the default `wake`. */
+    /** What one receiver injection did, and under which route (null when the route itself was refused). */
+    data class Injection(val route: Route?, val outcome: Outcome)
+
+    /**
+     * `null` for an explicitly blank or unknown route; an **absent** extra (`null`) keeps the documented `wake` default.
+     *
+     * The absent-vs-blank distinction is deliberate: omitting the extra means "the default turn entry", while supplying
+     * an empty value is a caller error that must be refused before the panel half runs.
+     */
     fun routeOf(raw: String?): Route? = when (raw?.trim()?.lowercase()) {
-        null, "" -> Route.WAKE
+        null -> Route.WAKE
         "wake" -> Route.WAKE
         "help" -> Route.HELP
         "transcript" -> Route.TRANSCRIPT
@@ -162,28 +158,62 @@ internal object DebugUtteranceInjection {
     }
 
     /**
-     * Submits one synthetic final utterance and the production entry that turns it into a run.
+     * A log-safe identity: the turn id is caller-chosen and must not be able to inject text into the log.
+     *
+     * `Char.isLetterOrDigit()` accepts CJK, so the filter is the explicit ASCII alphabet the KDoc promises - otherwise
+     * a Chinese turn id would carry utterance text straight into logcat.
+     */
+    fun ident(raw: String): String =
+        raw.filter { it in 'A'..'Z' || it in 'a'..'z' || it in '0'..'9' || it == '-' || it == '_' }
+            .take(MAX_TURN_CHARS)
+            .ifEmpty { "none" }
+
+    /**
+     * The receiver's whole sequence, in the order that matters:
+     * route (blank/unknown refused) → text (blank refused) → session identity → `wake()` → final transcript.
      *
      * The envelope is built from `HostRuntime.currentIdentity()` rather than from a caller-supplied session: an event
      * under any other identity is dropped by the host's gate, so asking the host is the only honest way to be sure the
      * injection reaches the active plugin. A null identity (nothing active) is refused without submitting anything.
      *
-     * [wake] exists because the production `wake` route must go through the composition's own emission sink (it also
-     * asks for the glasses panel); when it is null the synthetic `WakeDetected` is submitted directly, which is the
-     * shape the JVM tests pin.
+     * [wake] is the production wake half (`HostCompositionRoot.emitWake` in the receiver). It is invoked **after** the
+     * checks above so a blank/unknown request never leaves an overlay open with no turn to close it; for the non-wake
+     * routes it is not invoked at all.
      */
-    fun deliver(
+    fun inject(
         host: HostRuntime,
+        text: String,
+        rawRoute: String?,
+        turnId: String,
+        revision: Long,
+        nowNanos: Long,
+        wake: () -> Unit,
+    ): Injection {
+        val route = routeOf(rawRoute) ?: return Injection(null, Outcome.UNKNOWN_ROUTE)
+        if (text.isBlank()) return Injection(route, Outcome.BLANK_TEXT)
+        require(revision >= 0) { "revision must be non-negative" }
+        val identity = runCatching { host.currentIdentity() }.getOrNull()
+            ?: return Injection(route, Outcome.NO_SESSION)
+        return when (route) {
+            Route.WAKE -> {
+                wake()
+                Injection(route, submit(host, identity, text, Route.TRANSCRIPT, turnId, revision, nowNanos))
+            }
+            Route.HELP, Route.TRANSCRIPT ->
+                Injection(route, submit(host, identity, text, route, turnId, revision, nowNanos))
+        }
+    }
+
+    /** Builds and submits the transcript (plus the production manual action for `help`). */
+    private fun submit(
+        host: HostRuntime,
+        identity: Pair<SessionId, Generation>,
         text: String,
         route: Route,
         turnId: String,
         revision: Long,
         nowNanos: Long,
-        wake: (() -> Unit)? = null,
     ): Outcome {
-        if (text.isBlank()) return Outcome.BLANK_TEXT
-        require(revision >= 0) { "revision must be non-negative" }
-        val identity = runCatching { host.currentIdentity() }.getOrNull() ?: return Outcome.NO_SESSION
         val envelope = EventEnvelope(
             sessionId = identity.first,
             generation = identity.second,
@@ -201,16 +231,15 @@ internal object DebugUtteranceInjection {
             endNanos = nowNanos,
         )
         val events: List<HostEvent> = when (route) {
-            Route.WAKE -> buildList {
-                if (wake != null) wake.invoke() else add(WakeDetected(envelope.copy(eventId = "debug-wake-$revision"), WAKE_WORD, 1.0))
-                add(TranscriptEvent(transcript))
-            }
             Route.HELP -> listOf(
                 TranscriptEvent(transcript),
                 UserAction(envelope.copy(eventId = "debug-help-$revision"), UserAction.Action.Help),
             )
             Route.TRANSCRIPT -> listOf(TranscriptEvent(transcript))
+            Route.WAKE -> error("the wake half is the composition's emitWake; inject submits its transcript")
         }
         return if (events.all { host.onEvent(it) }) Outcome.ACCEPTED else Outcome.HOST_REFUSED
     }
+
+    private const val MAX_TURN_CHARS = 64
 }

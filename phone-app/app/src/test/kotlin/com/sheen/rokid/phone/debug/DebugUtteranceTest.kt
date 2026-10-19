@@ -13,6 +13,7 @@ import com.sheen.rokid.host.ActivationResult
 import com.sheen.rokid.host.HostEnvironment
 import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.host.ResourceScope
+import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ConfigSchema
@@ -20,17 +21,22 @@ import com.sheen.rokid.plugin.DeactivationReason
 import com.sheen.rokid.plugin.EmptyHostServices
 import com.sheen.rokid.plugin.HintDevice
 import com.sheen.rokid.plugin.InputPort
+import com.sheen.rokid.plugin.ModelClient
+import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
 import com.sheen.rokid.plugin.PluginLifecycle
+import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 0.25 Task 15 (R82/D116): the debug-only text-turn injection seam, pinned at the entry the corpus actually uses.
+ * 0.25 Task 15 (R82/D116), fix round 1: the debug-only text-turn injection seam, pinned at the entry the corpus uses.
  *
  * The seam exists because the acceptance corpus must not be rewritten by ASR: a fixed utterance delivered as a final
  * `TranscriptRevision` is the only way "the model did the wrong thing" stays distinguishable from "the recogniser heard
@@ -38,6 +44,11 @@ import org.junit.Test
  * `HostRuntime.onEvent`, the same gate every production event passes, with the session/generation the host currently
  * accepts, a turn id the harness can identify afterwards, a monotonically increasing revision and a monotonic timestamp.
  * No test-only host entry is introduced.
+ *
+ * The receiver's own sequence is `inject(...)`: validate the route and the text, ask the production composition for the
+ * wake (panel request + `WakeDetected`), then submit the final transcript. These tests drive that same function - the
+ * `wake` argument is the composition's `emitWake`, exactly what the receiver passes - so the production branch is what
+ * is under test rather than a test-only WAKE branch of a helper.
  */
 class DebugUtteranceTest {
 
@@ -70,6 +81,12 @@ class DebugUtteranceTest {
         override fun services(scope: ResourceScope, granted: Set<Capability>) = EmptyHostServices
     }
 
+    /** The composition only needs a model reference here; the injection never asks it for a request. */
+    private class InertModel : ModelClient {
+        override fun request(request: ModelRequest, listener: (ModelStreamEvent) -> Unit): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+    }
+
     private fun rig(): Pair<HostRuntime, RecordingPlugin> {
         val host = HostRuntime(1, InjectionEnvironment())
         val plugin = RecordingPlugin()
@@ -80,69 +97,141 @@ class DebugUtteranceTest {
         return host to plugin
     }
 
+    /**
+     * The receiver path with the **production** `emitWake`, not a stand-in: a real composition (minimal wiring, but the
+     * real method) submits the `WakeDetected` the plugin sees, then the seam submits the fixed final transcript. This is
+     * the branch the receiver calls; the old test-only WAKE branch of the delivery helper is gone.
+     */
     @Test
-    fun wakeRouteEntersAsWakeThenFinalTranscriptThroughTheProductionHostEntry() {
+    fun theReceiverPathCallsTheProductionEmitWakeThenDeliversTheFinalTranscript() {
         val (host, plugin) = rig()
+        val composition = HostCompositionRoot(host, MemoryProfileRepository(), InertModel(), null)
         try {
-            val identity = requireNotNull(host.currentIdentity())
-            val before = System.nanoTime()
-            val outcome = DebugUtteranceInjection.deliver(
+            var wakeCalls = 0
+            val injection = DebugUtteranceInjection.inject(
                 host = host,
-                text = "把屏幕亮度调到最低",
-                route = DebugUtteranceInjection.Route.WAKE,
-                turnId = "debug-turn-fixed",
-                revision = 7L,
-                nowNanos = before,
+                text = "打开设置",
+                rawRoute = null,
+                turnId = "receiver-path-1",
+                revision = 4L,
+                nowNanos = 5_000L,
+                wake = {
+                    wakeCalls++
+                    composition.emitWake(host, DebugUtteranceInjection.WAKE_WORD, 1.0)
+                },
             )
-            assertEquals(DebugUtteranceInjection.Outcome.ACCEPTED, outcome)
-            // Reading a command result is the barrier that proves the host's dispatcher drained.
+            // A command result is the barrier that proves the host's dispatcher drained.
             host.currentState
 
-            assertEquals(2, plugin.events.size)
+            assertEquals(DebugUtteranceInjection.Outcome.ACCEPTED, injection.outcome)
+            assertEquals(DebugUtteranceInjection.Route.WAKE, injection.route)
+            assertEquals("the receiver path must ask for the wake exactly once", 1, wakeCalls)
+            assertEquals("the wake must precede the transcript", 2, plugin.events.size)
             val wake = plugin.events[0] as WakeDetected
             assertEquals("伊迪丝", wake.word)
-            assertEquals(identity.first, wake.envelope.sessionId)
-            assertEquals(identity.second, wake.envelope.generation)
-
             val transcript = (plugin.events[1] as TranscriptEvent).revision
             assertTrue("the injected revision must be final", transcript.final)
-            assertEquals("the injected revision must reach the same session", identity.first, transcript.envelope.sessionId)
-            assertEquals(identity.second, transcript.envelope.generation)
-            assertEquals("the turn id must be the fixed judgeable one", "debug-turn-fixed", transcript.turnId)
-            assertEquals(7L, transcript.revision)
-            assertEquals("把屏幕亮度调到最低", transcript.text)
-            assertTrue("the timestamp must be the monotonic-clock reading", transcript.startNanos >= before)
-            assertTrue(transcript.endNanos >= transcript.startNanos)
-            assertTrue("the submitted event's envelope timestamps must satisfy the envelope invariant",
-                transcript.envelope.endNanos >= transcript.envelope.startNanos)
+            assertEquals("receiver-path-1", transcript.turnId)
+            assertEquals(4L, transcript.revision)
+            assertEquals("打开设置", transcript.text)
+            assertEquals("the transcript must reach the same session as the wake",
+                wake.envelope.sessionId, transcript.envelope.sessionId)
+            assertEquals(wake.envelope.generation, transcript.envelope.generation)
+        } finally {
+            composition.close()
+        }
+    }
+
+    @Test
+    fun unknownRouteIsRefusedBeforeAnyWakeSideEffect() {
+        val (host, plugin) = rig()
+        try {
+            var wakeCalls = 0
+            val injection = DebugUtteranceInjection.inject(
+                host = host,
+                text = "打开设置",
+                rawRoute = "bogus",
+                turnId = "turn-fixed",
+                revision = 1L,
+                nowNanos = 1_000L,
+                wake = { wakeCalls++ },
+            )
+            assertEquals(DebugUtteranceInjection.Outcome.UNKNOWN_ROUTE, injection.outcome)
+            assertNull("an unknown route has no route to report", injection.route)
+            assertEquals("an unknown route must not open a panel", 0, wakeCalls)
+            host.currentState
+            assertTrue("an unknown route must not submit an event", plugin.events.isEmpty())
         } finally {
             host.close()
         }
     }
 
     @Test
-    fun theCompositionWakeHookReplacesTheSyntheticWakeAndRunsBeforeTheTranscript() {
+    fun blankRouteIsRefusedInsteadOfOpeningTheWakePanel() {
         val (host, plugin) = rig()
         try {
-            val calls = mutableListOf<String>()
-            val outcome = DebugUtteranceInjection.deliver(
+            var wakeCalls = 0
+            val injection = DebugUtteranceInjection.inject(
                 host = host,
                 text = "打开设置",
-                route = DebugUtteranceInjection.Route.WAKE,
-                turnId = "debug-hook-fixed",
-                revision = 9L,
-                nowNanos = 2_000L,
-                wake = { calls += "wake" },
+                rawRoute = "   ",
+                turnId = "turn-fixed",
+                revision = 1L,
+                nowNanos = 1_000L,
+                wake = { wakeCalls++ },
             )
-            assertEquals(DebugUtteranceInjection.Outcome.ACCEPTED, outcome)
+            assertEquals("an explicitly blank route is a caller error, not the wake default",
+                DebugUtteranceInjection.Outcome.UNKNOWN_ROUTE, injection.outcome)
+            assertEquals("a blank route must not open a panel", 0, wakeCalls)
             host.currentState
-            // The composition's own emission sink owns the panel request; the seam must not also submit a bare
-            // WakeDetected, or the plugin would open two turns for one injection.
-            assertEquals(listOf("wake"), calls)
-            assertEquals(1, plugin.events.size)
-            val transcript = (plugin.events.single() as TranscriptEvent).revision
-            assertEquals("debug-hook-fixed", transcript.turnId)
-            assertEquals(9L, transcript.revision)
+            assertTrue(plugin.events.isEmpty())
+        } finally {
+            host.close()
+        }
+    }
+
+    @Test
+    fun blankTextIsRefusedBeforeAnyWakeSideEffect() {
+        val (host, plugin) = rig()
+        try {
+            var wakeCalls = 0
+            val injection = DebugUtteranceInjection.inject(
+                host = host,
+                text = "   ",
+                rawRoute = "wake",
+                turnId = "turn-fixed",
+                revision = 1L,
+                nowNanos = 1_000L,
+                wake = { wakeCalls++ },
+            )
+            assertEquals(DebugUtteranceInjection.Outcome.BLANK_TEXT, injection.outcome)
+            assertEquals("a blank utterance must not open a panel", 0, wakeCalls)
+            host.currentState
+            assertTrue("a blank utterance must not open a turn", plugin.events.isEmpty())
+        } finally {
+            host.close()
+        }
+    }
+
+    @Test
+    fun noSessionIdentityIsRefusedBeforeAnyWakeSideEffect() {
+        val host = HostRuntime(1)
+        val plugin = RecordingPlugin()
+        host.register(plugin)
+        try {
+            var wakeCalls = 0
+            val injection = DebugUtteranceInjection.inject(
+                host = host,
+                text = "打开设置",
+                rawRoute = null,
+                turnId = "turn-fixed",
+                revision = 1L,
+                nowNanos = 1_000L,
+                wake = { wakeCalls++ },
+            )
+            assertEquals(DebugUtteranceInjection.Outcome.NO_SESSION, injection.outcome)
+            assertEquals("nothing active means no panel request either", 0, wakeCalls)
+            assertTrue("no event may be submitted without a session identity", plugin.events.isEmpty())
         } finally {
             host.close()
         }
@@ -152,15 +241,18 @@ class DebugUtteranceTest {
     fun helpRouteEntersAsFinalTranscriptThenTheProductionManualAction() {
         val (host, plugin) = rig()
         try {
-            val outcome = DebugUtteranceInjection.deliver(
+            var wakeCalls = 0
+            val injection = DebugUtteranceInjection.inject(
                 host = host,
                 text = "打开设置",
-                route = DebugUtteranceInjection.Route.HELP,
+                rawRoute = "help",
                 turnId = "debug-help-fixed",
                 revision = 8L,
                 nowNanos = 1_000L,
+                wake = { wakeCalls++ },
             )
-            assertEquals(DebugUtteranceInjection.Outcome.ACCEPTED, outcome)
+            assertEquals(DebugUtteranceInjection.Outcome.ACCEPTED, injection.outcome)
+            assertEquals("the help route does not fake a wake", 0, wakeCalls)
             host.currentState
 
             assertEquals(2, plugin.events.size)
@@ -177,41 +269,36 @@ class DebugUtteranceTest {
     }
 
     @Test
-    fun noSessionIdentityRefusesBeforeAnyEventAndReportsTheReason() {
-        val host = HostRuntime(1)
-        val plugin = RecordingPlugin()
-        host.register(plugin)
-        try {
-            val outcome = DebugUtteranceInjection.deliver(
-                host = host,
-                text = "打开设置",
-                route = DebugUtteranceInjection.Route.WAKE,
-                turnId = "debug-turn-fixed",
-                revision = 1L,
-                nowNanos = 1_000L,
-            )
-            assertEquals(DebugUtteranceInjection.Outcome.NO_SESSION, outcome)
-            assertTrue("no event may be submitted without a session identity", plugin.events.isEmpty())
-        } finally {
-            host.close()
-        }
-    }
-
-    @Test
-    fun blankTextIsRefusedBeforeAnyEventReachesTheHost() {
+    fun transcriptRouteSubmitsOnlyTheFinalRevisionWithTheProductionIdentityAndTimestamps() {
         val (host, plugin) = rig()
         try {
-            val outcome = DebugUtteranceInjection.deliver(
+            val identity = requireNotNull(host.currentIdentity())
+            val before = System.nanoTime()
+            var wakeCalls = 0
+            val injection = DebugUtteranceInjection.inject(
                 host = host,
-                text = "   ",
-                route = DebugUtteranceInjection.Route.WAKE,
+                text = "把屏幕亮度调到最低",
+                rawRoute = "transcript",
                 turnId = "debug-turn-fixed",
-                revision = 1L,
-                nowNanos = 1_000L,
+                revision = 7L,
+                nowNanos = before,
+                wake = { wakeCalls++ },
             )
-            assertEquals(DebugUtteranceInjection.Outcome.BLANK_TEXT, outcome)
+            assertEquals(DebugUtteranceInjection.Outcome.ACCEPTED, injection.outcome)
+            assertEquals("the transcript route is not a wake", 0, wakeCalls)
             host.currentState
-            assertTrue("a blank utterance must not open a turn", plugin.events.isEmpty())
+
+            val transcript = (plugin.events.single() as TranscriptEvent).revision
+            assertTrue(transcript.final)
+            assertEquals(identity.first, transcript.envelope.sessionId)
+            assertEquals(identity.second, transcript.envelope.generation)
+            assertEquals("debug-turn-fixed", transcript.turnId)
+            assertEquals(7L, transcript.revision)
+            assertEquals("把屏幕亮度调到最低", transcript.text)
+            assertTrue("the timestamp must be the monotonic-clock reading", transcript.startNanos >= before)
+            assertTrue(transcript.endNanos >= transcript.startNanos)
+            assertTrue("the submitted event's envelope timestamps must satisfy the envelope invariant",
+                transcript.envelope.endNanos >= transcript.envelope.startNanos)
         } finally {
             host.close()
         }
@@ -224,5 +311,22 @@ class DebugUtteranceTest {
         assertEquals(2L, revisions.next())
         assertEquals(3L, revisions.next())
         assertFalse("a revision is never reused", revisions.next() <= 3L)
+    }
+
+    /**
+     * The turn id is caller-chosen and ends up in logcat. `Char.isLetterOrDigit()` accepts CJK, so a turn id could have
+     * carried utterance text into the log; the sanitiser must keep only the documented ASCII alphabet.
+     */
+    @Test
+    fun theTurnIdSanitiserKeepsOnlyTheAsciiLogAlphabet() {
+        assertEquals("turn-A_1", DebugUtteranceInjection.ident("turn-A_1"))
+        assertEquals("xy9_z-", DebugUtteranceInjection.ident("\u5468\u6770\u4f26 x y\t9_z-"))
+        assertEquals("none", DebugUtteranceInjection.ident("\u5468\u6770\u4f26"))
+    }
+
+    @Test
+    fun theTurnIdSanitiserCapsLengthAndFallsBackWhenNothingSurvives() {
+        assertEquals(64, DebugUtteranceInjection.ident("a".repeat(80)).length)
+        assertEquals("none", DebugUtteranceInjection.ident(" !!!\n"))
     }
 }
