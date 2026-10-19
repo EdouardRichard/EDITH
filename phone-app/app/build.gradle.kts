@@ -86,6 +86,10 @@ dependencies {
     implementation(project(":common:contracts:core-contracts"))
     implementation(project(":common:contracts:plugin-api"))
     implementation(project(":phone-app:assistant:host-runtime"))
+    // 0.25 Task 9: the pure-JVM device-control kernel model (Observation/DeviceNode/RefRegistry).
+    // This is the only module the accessibility adapter is allowed to share a ref registry with:
+    // Task 10 constructs `DeviceKernel(..., registry = service.registry)`.
+    implementation(project(":phone-app:assistant:device-control"))
     implementation(project(":phone-app:persistence:storage-runtime"))
     implementation(project(":phone-app:assistant:model-runtime"))
     implementation(project(":phone-app:perception:audio-runtime"))

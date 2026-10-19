@@ -1,13 +1,34 @@
 package com.sheen.rokid.phone.actions.a11y
 
 import android.accessibilityservice.AccessibilityService
+import android.accessibilityservice.GestureDescription
+import android.app.KeyguardManager
+import android.graphics.Bitmap
+import android.graphics.Path
 import android.graphics.Rect
 import android.os.Build
 import android.os.Bundle
+import android.os.PowerManager
+import android.view.Display
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
+import android.view.accessibility.AccessibilityWindowInfo
+import com.sheen.rokid.device.AccessibilityPort
+import com.sheen.rokid.device.Bounds
+import com.sheen.rokid.device.Foreground
+import com.sheen.rokid.device.Gesture
+import com.sheen.rokid.device.Observation
+import com.sheen.rokid.device.Ref
+import com.sheen.rokid.device.RefRegistry
+import com.sheen.rokid.device.Screenshot
+import com.sheen.rokid.device.ScreenFilter as DeviceScreenFilter
+import java.io.ByteArrayOutputStream
 import java.security.MessageDigest
-import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.Executor
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * The production accessibility service (P3.3 Task 10): the only thing in this app that may drive **another** app's UI.
@@ -23,8 +44,13 @@ import java.util.UUID
  *
  * Extended in T1.3 with snapshot-based semantic actions. The service now tracks a "current valid snapshot" and
  * invalidates it after any mutating action. Using a stale snapshotId returns false.
+ *
+ * Extended in 0.25 Task 9 with the device-control port. This class is now the production
+ * [com.sheen.rokid.device.AccessibilityPort]: it exposes [registry] to the kernel (R36) and delegates
+ * observation and node actions to [AccessibilityAdapter], whose pure half is JVM-testable. The old
+ * [AccessibilityUi] surface above is unchanged and still serves the legacy tool path.
  */
-class EdithAccessibilityService : AccessibilityService(), AccessibilityUi {
+class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, AccessibilityPort {
 
     // ── Snapshot lifecycle ───────────────────────────────────────────────────
 
@@ -47,6 +73,104 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi {
         currentNodeMap = emptyMap()
     }
 
+    // ── 0.25 device-control port (Task 9) ────────────────────────────────────
+
+    /**
+     * The one [RefRegistry] the adapter and the kernel must share (R36).
+     *
+     * Task 10 MUST construct the kernel with this exact instance:
+     * `DeviceKernel(accessibility = service.port(), ..., registry = service.registry)`.
+     * A second registry would render refs that [performNodeAction] cannot resolve.
+     */
+    val registry = RefRegistry()
+
+    private val adapter by lazy { AccessibilityAdapter(AndroidAccessibilityPlatform(this), registry) }
+
+    /** Latest `TYPE_WINDOW_STATE_CHANGED` package; strings only, never content (spec §8.3). */
+    @Volatile
+    private var foregroundPackage: String? = null
+
+    /** Latest `TYPE_WINDOW_STATE_CHANGED` activity class; null until the first window-state event. */
+    @Volatile
+    private var foregroundActivity: String? = null
+
+    override fun isBound(): Boolean = true
+
+    /**
+     * Screen-on state. A failed probe answers `false`: this version never unlocks anything, so
+     * reporting "interactive" when unsure is the more dangerous error for the kernel.
+     */
+    override fun isInteractive(): Boolean = runCatching {
+        getSystemService(PowerManager::class.java)?.isInteractive == true
+    }.getOrDefault(false)
+
+    /**
+     * Keyguard state. A failed probe answers `true` (locked): the kernel must not drive the screen
+     * when the service cannot prove it is unlocked.
+     */
+    override fun isKeyguardLocked(): Boolean = runCatching {
+        getSystemService(KeyguardManager::class.java)?.isKeyguardLocked ?: true
+    }.getOrDefault(true)
+
+    /** Collects the full tree; [filter] only affects rendering, never collection (R37). */
+    override fun observe(filter: DeviceScreenFilter): Observation = adapter.observe(filter)
+
+    override fun performNodeAction(ref: Ref, action: String): Boolean = adapter.performNodeAction(ref, action)
+
+    override fun dispatchGesture(gesture: Gesture): Boolean = adapter.dispatchGesture(gesture)
+
+    override fun foreground(): Foreground {
+        val packageName = foregroundPackage
+            ?: runCatching { rootInActiveWindow?.packageName?.toString() }.getOrNull()
+        return Foreground(packageName, foregroundActivity)
+    }
+
+    /**
+     * Takes one JPEG screenshot through the platform's `takeScreenshot` (API 30+).
+     *
+     * The encoded bytes are returned to the caller only; the service never writes the payload to
+     * disk (the Task 13 artifact store owns persistence). Every failure - old platform, refusal,
+     * exception, five-second timeout - answers `null`.
+     */
+    override fun screenshot(): Screenshot? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R) return null
+        return try {
+            val latch = CountDownLatch(1)
+            val captured = AtomicReference<AccessibilityService.ScreenshotResult?>()
+            takeScreenshot(
+                Display.DEFAULT_DISPLAY,
+                Executor { command -> command.run() },
+                object : AccessibilityService.TakeScreenshotCallback {
+                    override fun onSuccess(result: AccessibilityService.ScreenshotResult) {
+                        captured.set(result)
+                        latch.countDown()
+                    }
+
+                    override fun onFailure(errorCode: Int) {
+                        latch.countDown()
+                    }
+                },
+            )
+            if (!latch.await(SCREENSHOT_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS)) {
+                return null
+            }
+            val result = captured.get() ?: return null
+            val buffer = result.hardwareBuffer
+            try {
+                val hardware = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace) ?: return null
+                // Hardware bitmaps are read-only; copy to ARGB_8888 before the JPEG encoder runs.
+                val software = hardware.copy(Bitmap.Config.ARGB_8888, false) ?: return null
+                val output = ByteArrayOutputStream()
+                if (!software.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, output)) return null
+                Screenshot(output.toByteArray(), "image/jpeg", software.width, software.height)
+            } finally {
+                buffer.close()
+            }
+        } catch (t: Throwable) {
+            null
+        }
+    }
+
     // ── Service lifecycle ────────────────────────────────────────────────────
 
     override fun onServiceConnected() {
@@ -64,8 +188,19 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi {
         super.onDestroy()
     }
 
-    /** The service is driven on demand; events are not used for anything, so nothing is consumed here. */
-    override fun onAccessibilityEvent(event: AccessibilityEvent?) = Unit
+    /**
+     * Tracks the foreground package/class for [foreground].
+     *
+     * Only the package and class strings are read - never text, descriptions or any other node
+     * content, and nothing is logged. A window-state change is the event that names the window now
+     * in front; content-change events do not change which window that is, so they are deliberately
+     * not consumed (they would also let IME content churn overwrite the foreground app).
+     */
+    override fun onAccessibilityEvent(event: AccessibilityEvent?) {
+        if (event?.eventType != AccessibilityEvent.TYPE_WINDOW_STATE_CHANGED) return
+        event.packageName?.toString()?.let { foregroundPackage = it }
+        event.className?.toString()?.let { foregroundActivity = it }
+    }
 
     override fun onInterrupt() = Unit
 
@@ -277,5 +412,274 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi {
 
         /** The live UI port, or `null` while the user has the service switched off. */
         fun ui(): AccessibilityUi? = instance
+
+        /** The live device-control port for Task 10's kernel wiring, or `null` while disabled. */
+        fun port(): AccessibilityPort? = instance
     }
 }
+
+/** Five seconds is the whole budget for one screenshot or one synthetic gesture. */
+private const val SCREENSHOT_TIMEOUT_MILLIS = 5_000L
+private const val GESTURE_TIMEOUT_MILLIS = 5_000L
+
+/** JPEG quality of the encoded screenshot. */
+private const val JPEG_QUALITY = 85
+
+/**
+ * The Android implementation of [AccessibilityPlatform] (0.25 Task 9).
+ *
+ * It is the only class that turns `AccessibilityNodeInfo`/`AccessibilityWindowInfo` into the
+ * platform-neutral shapes [AccessibilityAdapter] consumes, and the only one that performs platform
+ * node actions and gesture dispatch. Node ids are transient handles into the latest [collect];
+ * the adapter never uses an id from an older collection.
+ */
+private class AndroidAccessibilityPlatform(
+    private val service: EdithAccessibilityService,
+) : AccessibilityPlatform {
+
+    @Volatile
+    private var nodesById: Map<Int, AccessibilityNodeInfo> = emptyMap()
+
+    override fun collect(maxNodes: Int): PlatformSnapshot {
+        val collectedNodes = LinkedHashMap<Int, AccessibilityNodeInfo>()
+        val windows = try {
+            service.windows?.toList().orEmpty()
+        } catch (t: Throwable) {
+            emptyList()
+        }
+        val snapshot = if (windows.isEmpty()) {
+            collectActiveWindow(maxNodes, collectedNodes)
+        } else {
+            try {
+                collectWindows(windows, maxNodes, collectedNodes)
+            } catch (t: Throwable) {
+                // A window that cannot be read must not hide the active one: fall back to the same
+                // single-window shape `getWindows()` failure uses.
+                collectedNodes.clear()
+                collectActiveWindow(maxNodes, collectedNodes)
+            }
+        }
+        nodesById = collectedNodes
+        return snapshot
+    }
+
+    override fun click(nodeId: Int): Boolean =
+        nodesById[nodeId]?.performAction(AccessibilityNodeInfo.ACTION_CLICK) ?: false
+
+    override fun longClick(nodeId: Int): Boolean =
+        nodesById[nodeId]?.performAction(AccessibilityNodeInfo.ACTION_LONG_CLICK) ?: false
+
+    override fun scrollForward(nodeId: Int): Boolean =
+        nodesById[nodeId]?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_FORWARD) ?: false
+
+    override fun scrollBackward(nodeId: Int): Boolean =
+        nodesById[nodeId]?.performAction(AccessibilityNodeInfo.ACTION_SCROLL_BACKWARD) ?: false
+
+    override fun setText(nodeId: Int, text: String): Boolean {
+        val node = nodesById[nodeId] ?: return false
+        val arguments = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        }
+        return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments)
+    }
+
+    override fun dispatchGesture(gesture: Gesture): Boolean {
+        val description = try {
+            buildGesture(gesture)
+        } catch (t: Throwable) {
+            return false
+        }
+        val latch = CountDownLatch(1)
+        val completed = AtomicBoolean(false)
+        val accepted = service.dispatchGesture(
+            description,
+            object : AccessibilityService.GestureResultCallback() {
+                override fun onCompleted(gestureDescription: GestureDescription?) {
+                    completed.set(true)
+                    latch.countDown()
+                }
+
+                override fun onCancelled(gestureDescription: GestureDescription?) {
+                    latch.countDown()
+                }
+            },
+            null,
+        )
+        if (!accepted) return false
+        return try {
+            latch.await(GESTURE_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS) && completed.get()
+        } catch (t: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
+
+    private fun collectWindows(
+        windows: List<AccessibilityWindowInfo>,
+        maxNodes: Int,
+        nodesById: MutableMap<Int, AccessibilityNodeInfo>,
+    ): PlatformSnapshot {
+        val platformWindows = ArrayList<PlatformWindow>(windows.size)
+        var nextNodeId = 0
+        var visited = 0
+        var truncated = false
+
+        for (window in windows) {
+            val root = runCatching { window.root }.getOrNull()
+            val windowBounds = Rect()
+            runCatching { window.getBoundsInScreen(windowBounds) }
+            val windowNodes = ArrayList<PlatformNode>()
+
+            if (root != null) {
+                val stack = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+                stack.addLast(root to 0)
+                walk@ while (stack.isNotEmpty()) {
+                    if (visited >= maxNodes) {
+                        truncated = true
+                        break@walk
+                    }
+                    val (node, depth) = stack.removeLast()
+                    val nodeId = nextNodeId++
+                    nodesById[nodeId] = node
+                    windowNodes += node.toPlatformNode(nodeId = nodeId, windowId = window.id, depth = depth)
+                    visited++
+                    for (index in node.childCount - 1 downTo 0) {
+                        node.getChild(index)?.let { stack.addLast(it to depth + 1) }
+                    }
+                }
+            }
+
+            platformWindows += PlatformWindow(
+                id = window.id,
+                type = window.type,
+                layer = window.layer,
+                bounds = windowBounds.toBounds(),
+                packageName = root?.packageName?.toString(),
+                title = runCatching { window.title }.getOrNull()?.toString(),
+                nodes = windowNodes,
+            )
+            if (truncated) break
+        }
+        return PlatformSnapshot(windows = platformWindows, truncated = truncated)
+    }
+
+    private fun collectActiveWindow(
+        maxNodes: Int,
+        nodesById: MutableMap<Int, AccessibilityNodeInfo>,
+    ): PlatformSnapshot {
+        val root = runCatching { service.rootInActiveWindow }.getOrNull()
+            ?: return PlatformSnapshot(windows = emptyList())
+        val windowBounds = Rect()
+        runCatching { root.getBoundsInScreen(windowBounds) }
+        val windowId = root.windowId
+        val windowNodes = ArrayList<PlatformNode>()
+        var nextNodeId = 0
+        var visited = 0
+        var truncated = false
+
+        val stack = ArrayDeque<Pair<AccessibilityNodeInfo, Int>>()
+        stack.addLast(root to 0)
+        while (stack.isNotEmpty()) {
+            if (visited >= maxNodes) {
+                truncated = true
+                break
+            }
+            val (node, depth) = stack.removeLast()
+            val nodeId = nextNodeId++
+            nodesById[nodeId] = node
+            windowNodes += node.toPlatformNode(nodeId = nodeId, windowId = windowId, depth = depth)
+            visited++
+            for (index in node.childCount - 1 downTo 0) {
+                node.getChild(index)?.let { stack.addLast(it to depth + 1) }
+            }
+        }
+
+        val window = PlatformWindow(
+            id = windowId,
+            type = PlatformWindowTypes.APPLICATION,
+            layer = 0,
+            bounds = windowBounds.toBounds(),
+            packageName = root.packageName?.toString(),
+            title = null,
+            nodes = windowNodes,
+        )
+        return PlatformSnapshot(windows = listOf(window), truncated = truncated)
+    }
+
+    private fun AccessibilityNodeInfo.toPlatformNode(
+        nodeId: Int,
+        windowId: Int,
+        depth: Int,
+    ): PlatformNode {
+        val bounds = Rect()
+        getBoundsInScreen(bounds)
+        return PlatformNode(
+            nodeId = nodeId,
+            windowId = windowId,
+            depth = depth,
+            className = className?.toString(),
+            text = text?.toString(),
+            contentDescription = contentDescription?.toString(),
+            viewIdResourceName = viewIdResourceName,
+            bounds = bounds.toBounds(),
+            clickable = isClickable,
+            longClickable = isLongClickable,
+            editable = isEditable,
+            scrollable = isScrollable,
+            checkable = isCheckable,
+            checked = isChecked,
+            selected = isSelected,
+            enabled = isEnabled,
+            focused = isFocused,
+            hintText = hintText?.toString(),
+            paneTitle = paneTitle?.toString(),
+            tooltipText = tooltipText?.toString(),
+            drawingOrder = drawingOrder,
+            actionIds = actionList.map { it.id },
+            collection = collectionInfo?.let {
+                PlatformCollectionInfo(
+                    rowCount = it.rowCount,
+                    columnCount = it.columnCount,
+                    hierarchical = it.isHierarchical,
+                    selectionMode = it.selectionMode,
+                )
+            },
+            range = rangeInfo?.let {
+                PlatformRangeInfo(
+                    current = it.current,
+                    min = it.min,
+                    max = it.max,
+                    type = it.type,
+                )
+            },
+        )
+    }
+
+    private fun buildGesture(gesture: Gesture): GestureDescription {
+        val builder = GestureDescription.Builder()
+        gesture.strokes.forEach { stroke ->
+            val first = stroke.points.firstOrNull()
+                ?: throw IllegalArgumentException("a stroke needs at least one point")
+            val path = Path().apply {
+                moveTo(first.x.toFloat(), first.y.toFloat())
+                stroke.points.drop(1).forEach { lineTo(it.x.toFloat(), it.y.toFloat()) }
+            }
+            builder.addStroke(
+                GestureDescription.StrokeDescription(
+                    path,
+                    stroke.startTimeMillis,
+                    stroke.durationMillis,
+                ),
+            )
+        }
+        if (gesture.strokes.isEmpty()) throw IllegalArgumentException("a gesture needs at least one stroke")
+        return builder.build()
+    }
+}
+
+private fun Rect.toBounds(): Bounds = Bounds(
+    left = left,
+    top = top,
+    right = right,
+    bottom = bottom,
+)
