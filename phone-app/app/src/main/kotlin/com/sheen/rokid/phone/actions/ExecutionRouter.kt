@@ -30,6 +30,12 @@ interface ExecutionBackend {
  * The single `Capability.Actions` provider: it merges the channels that are **up** and routes a call to the one that
  * declared it.
  *
+ * **Retired from production in 0.25 Task 10 (R47).** `HostCompositionRoot` now wires
+ * `com.sheen.rokid.phone.actions.device.ToolCatalog`, whose four tools (`device`/`shell`/`open`/`dial`) are the whole
+ * model-visible device surface; this class stays only for the existing router tests and the historical record. It is
+ * deliberately not `@Deprecated` because those tests still exercise it as the generic channel-router pattern, not as a
+ * production path.
+ *
  * Two properties are the whole reason this type exists rather than handing a list of executors to `ToolRegistry`:
  * 1. **an unavailable channel's actions are not advertised.** The model never sees a tool that would only be refused,
  *    so a degradation costs no turns and the capability panel can name the channel that is down;

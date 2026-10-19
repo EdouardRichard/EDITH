@@ -62,6 +62,29 @@ class ObservationRenderer(
         return fit(lines, observation.truncated, budgetBytes, maxLines)
     }
 
+    /**
+     * Renders only the nodes at [paths] (the structural paths [ObservationDiff] and [RefRegistry]
+     * use), in the observation's pre-order.
+     *
+     * This is the diff half of spec §4.6's `data.screen`: the tool layer needs the same node line an
+     * `added`/`updated` entry would have had in a full render, and re-implementing the format there
+     * would let the two drift. The ref comes from the same [registry] [render] uses, so a tool that
+     * renders a diff line does not mint a ref the kernel cannot resolve. No window headers and no
+     * budget are applied: the caller is rendering a handful of changed nodes, and the diff mode is
+     * only chosen below the full-render thresholds. Unknown paths are ignored; an empty selection is
+     * an empty string.
+     */
+    fun renderNodes(observation: Observation, paths: Collection<String>): String {
+        if (paths.isEmpty()) return ""
+        val wanted = paths.toSet()
+        val refs = registry.assign(observation)
+        val nodePaths = NodeStructure.paths(observation.nodes)
+        val lines = observation.nodes.indices
+            .filter { nodePaths[it] in wanted }
+            .map { nodeLine(refs.getValue(nodePaths[it]), observation.nodes[it]) }
+        return renderLines(lines)
+    }
+
     private fun buildLines(observation: Observation, filter: ScreenFilter): List<String> {
         val refs = registry.assign(observation)
         val paths = NodeStructure.paths(observation.nodes)

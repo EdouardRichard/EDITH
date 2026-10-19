@@ -1808,6 +1808,10 @@ class SmartAssistantPlugin(
             val cfg = config ?: return
             c to cfg
         }
+        // 0.25 Task 10 (R42): a new assistant turn re-arms the turn-scoped action executor. `teardown` cancels it
+        // when a turn ends (`Stop`, a replaced turn, a session end); without the matching begin the next turn would
+        // keep getting CANCELLED from the device kernel for the rest of the process.
+        runCatching { current.services.actions().beginTurn() }
         // B9 (spec §1.3 C2): a hard dependency that is missing refuses the turn *here*, before the loop is built and
         // before the listening window has anything to wait for. A refusal is a per-turn judgement, not a latch: the
         // models are resident and their state can change between turns, so a slow load that finishes later serves
@@ -2595,6 +2599,9 @@ class SmartAssistantPlugin(
             val cfg = config ?: return
             Triple(c, cfg, proactive)
         }
+        // 0.25 Task 10 (R42): the proactive route is an assistant turn too, and it may run beside a wake turn that
+        // already cancelled/ended. Re-arm the turn-scoped executor before this route uses it.
+        runCatching { current.services.actions().beginTurn() }
         // B9 applied at the other entry point. The proactive path is the one the decision model *is* the gate for, so
         // a proactive turn reaching the cloud model with no local model behind it would be the exact cost the
         // dependency exists to avoid. Same judgement, same code, same sentence as `runTurn`.

@@ -81,4 +81,15 @@ interface ActionExecutor {
     fun descriptors(): List<ActionDescriptor>
     fun execute(name: String, argsJson: String): ActionResult
     fun cancel()
+
+    /**
+     * 0.25 Task 10 (R42): called at the start of every new assistant turn.
+     *
+     * [cancel] is **turn-scoped**: the host cancels an executor when a turn is torn down
+     * (`Stop`, a replaced turn, a session end), and without a matching begin the executor would stay
+     * cancelled for the rest of the process. The default is a no-op so every existing executor and
+     * every hand-built test executor keeps compiling and behaving exactly as before; an executor
+     * that owns turn-scoped state (the device kernel) overrides it to re-arm.
+     */
+    fun beginTurn() = Unit
 }

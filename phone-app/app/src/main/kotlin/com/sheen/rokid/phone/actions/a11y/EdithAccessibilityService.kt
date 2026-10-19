@@ -415,6 +415,14 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
 
         /** The live device-control port for Task 10's kernel wiring, or `null` while disabled. */
         fun port(): AccessibilityPort? = instance
+
+        /**
+         * The live [RefRegistry] the kernel must share (R36), or `null` while disabled.
+         *
+         * Task 10 constructs `DeviceKernel(accessibility = port(), ..., registry = registry())`; a second
+         * registry would render refs [performNodeAction] cannot resolve.
+         */
+        fun registry(): RefRegistry? = instance?.registry
     }
 }
 

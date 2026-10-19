@@ -103,23 +103,26 @@ import com.sheen.rokid.transport.GlassesEvents
 import com.sheen.rokid.transport.PcmFormatEvidence
 import com.sheen.rokid.storage.*
 import com.sheen.rokid.phone.storage.*
-import com.sheen.rokid.phone.actions.intent.AppLaunchResolver
-import com.sheen.rokid.phone.actions.ExecutionRouter
-import com.sheen.rokid.phone.actions.IntentExecutionBackend
-import com.sheen.rokid.phone.actions.intent.LaunchAppExecutor
 import com.sheen.rokid.phone.actions.shizuku.RootProbe
 import com.sheen.rokid.phone.actions.shizuku.RootStatus
-import com.sheen.rokid.phone.actions.shizuku.ShizukuExecutionBackend
-import com.sheen.rokid.phone.actions.shizuku.ShizukuTargetState
-import com.sheen.rokid.phone.actions.intent.SystemActionExecutor
 import com.sheen.rokid.phone.actions.shizuku.ShizukuUserServiceShell
-import com.sheen.rokid.phone.actions.a11y.AccessibilityExecutionBackend
-import com.sheen.rokid.phone.actions.a11y.AccessibilityUi
-import com.sheen.rokid.phone.actions.a11y.AppliedSemanticsPostProcessor
 import com.sheen.rokid.phone.actions.a11y.EdithAccessibilityService
-import com.sheen.rokid.phone.actions.a11y.ScreenFilter
-import com.sheen.rokid.phone.actions.a11y.ScreenFingerprint
-import com.sheen.rokid.phone.actions.a11y.ScrollDirection
+import com.sheen.rokid.phone.actions.device.DeviceKernelOperations
+import com.sheen.rokid.phone.actions.device.DeviceTool
+import com.sheen.rokid.phone.actions.device.DialTool
+import com.sheen.rokid.phone.actions.device.OpenTool
+import com.sheen.rokid.phone.actions.device.PrivilegedShellPort
+import com.sheen.rokid.phone.actions.device.ScreenProjector
+import com.sheen.rokid.phone.actions.device.ShellTool
+import com.sheen.rokid.phone.actions.device.ToolCatalog
+import com.sheen.rokid.device.AccessibilityPort
+import com.sheen.rokid.device.DeviceKernel
+import com.sheen.rokid.device.Gesture
+import com.sheen.rokid.device.ObservationRenderer
+import com.sheen.rokid.device.Ref
+import com.sheen.rokid.device.RefRegistry
+import com.sheen.rokid.device.ScreenFilter as DeviceScreenFilter
+import com.sheen.rokid.phone.actions.intent.AppLaunchResolver
 import com.sheen.rokid.phone.actions.intent.ContextIntentLauncher
 import com.sheen.rokid.phone.actions.intent.IntentActionExecutor
 import com.sheen.rokid.phone.actions.intent.PackageManagerAppCatalog
@@ -1891,41 +1894,57 @@ class HostCompositionRoot internal constructor(
                     rootHolder[0]?.refreshExecutionChannels()
                 })
             val rootProbe = RootProbe.onDevice()
-            val accessibilityUi = object : AccessibilityUi {
-                private fun live() = EdithAccessibilityService.ui()
-                override fun clickText(text: String) = live()?.clickText(text) ?: false
-                override fun setText(text: String) = live()?.setText(text) ?: false
-                override fun screenFingerprint() = live()?.screenFingerprint() ?: ""
-                // T1.3 extended methods — delegate to the live service
-                override fun snapshot(filter: ScreenFilter) = live()?.snapshot(filter)
-                    ?: throw IllegalStateException("accessibility service not connected")
-                override fun clickByIndex(snapshotId: String, index: Int) = live()?.clickByIndex(snapshotId, index) ?: false
-                override fun longPressByIndex(snapshotId: String, index: Int) = live()?.longPressByIndex(snapshotId, index) ?: false
-                override fun scroll(direction: ScrollDirection) = live()?.scroll(direction) ?: false
-                override fun setTextByIndex(snapshotId: String, index: Int, text: String) = live()?.setTextByIndex(snapshotId, index, text) ?: false
-                override fun structuralFingerprint() = live()?.structuralFingerprint()
-                    ?: ScreenFingerprint(hash = "", nodeCount = 0, clickableCount = 0, truncated = false)
-            }
-            // T2.7: the app catalog and launch resolver are shared between the intent backend (which already has
-            // `actions`) and the new Shizuku-backed launch executor. Built here rather than inside either backend so
-            // both read one package list per turn.
+            // T2.7: one package catalog for the app-name resolution and the label fallback of `open`/`list`.
             val appCatalog = PackageManagerAppCatalog(context)
-            val appLaunchResolver = AppLaunchResolver(appCatalog)
-            val executionRouter = AppliedSemanticsPostProcessor(
-                ExecutionRouter(
-                    listOf(
-                        IntentExecutionBackend(actions),
-                        ShizukuExecutionBackend(shizukuShell, ShizukuTargetState(shizukuShell)) { shizukuShell.ready() },
-                        AccessibilityExecutionBackend(
-                            ui = accessibilityUi,
-                            connected = { EdithAccessibilityService.connected() },
-                        ),
-                        // T2.7: Shizuku-backed app launch and system action executors. They share the same channel
-                        // probe as ShizukuExecutionBackend — one binder, three tool sets.
-                        LaunchAppExecutor(appLaunchResolver, appCatalog, shizukuShell) { shizukuShell.ready() },
-                        SystemActionExecutor(shizukuShell) { shizukuShell.ready() },
-                    ),
+            // ---- 0.25 Task 10: the six-tool surface (spec §4.7) -------------------------------------------------------
+            // `ToolCatalog` is the single `Capability.Actions` provider: four host tools whose channels are probed at
+            // read time (device/shell/open/dial). The old 21-tool `ExecutionRouter` is deliberately no longer wired -
+            // the plugin adds `notify_user`/`load_skill` beside this catalog, which makes exactly six.
+            //
+            // The accessibility port is resolved per call through the service's companion: the user can switch the
+            // service off at any moment, and `a11yAvailable` is what stops `device` being advertised while it is. A
+            // call that somehow arrives while it is down fails on the kernel's own bound gate instead of dereferencing
+            // null. The delegate must share the service's registry (R36), so the refs rendered by ScreenProjector are
+            // the refs `performNodeAction` resolves.
+            val accessibilityPort = object : AccessibilityPort {
+                private fun live(): AccessibilityPort = EdithAccessibilityService.port()
+                    ?: throw IllegalStateException("the accessibility service is not connected")
+
+                override fun isBound() = live().isBound()
+                override fun isInteractive() = live().isInteractive()
+                override fun isKeyguardLocked() = live().isKeyguardLocked()
+                override fun observe(filter: DeviceScreenFilter) = live().observe(filter)
+                override fun performNodeAction(ref: Ref, action: String) = live().performNodeAction(ref, action)
+                override fun dispatchGesture(gesture: Gesture) = live().dispatchGesture(gesture)
+                override fun screenshot() = live().screenshot()
+                override fun foreground() = live().foreground()
+            }
+            val deviceKernel = DeviceKernel(
+                accessibility = accessibilityPort,
+                shell = PrivilegedShellPort(shizukuShell),
+                // `?: RefRegistry()` is the composition-start fallback while the service has not connected; `device`
+                // is unadvertised then, so no call can reach the kernel with the fallback registry.
+                registry = EdithAccessibilityService.registry() ?: RefRegistry(),
+            )
+            val screenProjector = ScreenProjector(ObservationRenderer(deviceKernel.registry), deviceKernel.registry)
+            val deviceTool = DeviceTool(DeviceKernelOperations(deviceKernel), screenProjector)
+            val callAvailable: () -> Boolean = {
+                context.checkSelfPermission(android.Manifest.permission.CALL_PHONE) ==
+                    android.content.pm.PackageManager.PERMISSION_GRANTED
+            }
+            val toolCatalog = ToolCatalog(
+                device = deviceTool,
+                shell = ShellTool(shizukuShell),
+                open = OpenTool(
+                    shell = shizukuShell,
+                    catalog = appCatalog,
+                    foreground = { EdithAccessibilityService.port()?.foreground()?.packageName },
                 ),
+                // The number validation/permission check/ACTION_CALL hand-off stay in the one executor that owns them.
+                dial = DialTool(actions, callAvailable),
+                a11yAvailable = { EdithAccessibilityService.connected() },
+                shellAvailable = { shizukuShell.ready() },
+                callAvailable = callAvailable,
             )
             val confirmationUi = object : ConfirmationUi {
                 // Through the holder: this object is built inside `create`, where no composition instance exists yet,
@@ -2024,8 +2043,9 @@ class HostCompositionRoot internal constructor(
                     audio?.let { put(Capability.Asr, it.asrSession) }
                     // Task 12: always answerable - the five L0/L1 actions need no engine, no transport and no
                     // permission at assembly time, so the advertised set and the answerable set stay equal.
-                    // P3.3 Task 13: it is now the *router*, which advertises only the channels that are up.
-                    put(Capability.Actions, executionRouter)
+                    // 0.25 Task 10 (R40/R47): it is now the four-tool `ToolCatalog`, whose descriptors are gated on
+                    // live channel probes; the old 21-tool router is retired from production.
+                    put(Capability.Actions, toolCatalog)
                     // P3.3: the confirmation channel is answerable whenever the composition has a screen to show the
                     // question on; a host that cannot ask must refuse the action, and this provider is what lets it ask.
                     put(Capability.Confirmation, confirmationPresenter)
@@ -2072,6 +2092,9 @@ class HostCompositionRoot internal constructor(
                     timer.shutdownNow(); pluginTasks.shutdownNow()
                     http.dispatcher.executorService.shutdown(); http.connectionPool.evictAll()
                 })
+                // 0.25 Task 10 (R42): closing the catalog closes the device kernel (its worker pool), so a closed
+                // composition cannot leave a device thread behind.
+                add(toolCatalog)
                 // Closes the pipeline (and with it the native engines) with the composition that owns them.
                 audio?.let { add(it) }
                 // 0.23 P5: the chime's ToneGenerator is a native resource; release it with the composition.

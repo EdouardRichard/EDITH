@@ -224,6 +224,48 @@ class ObservationRendererTest {
         assertIs<RefResult.Ok>(registry.resolve(observation, ref))
     }
 
+    @Test
+    fun `renderNodes renders only the requested paths in the same line format as render`() {
+        val registry = RefRegistry()
+        val renderer = ObservationRenderer(registry)
+        val observation = observation(
+            nodes = listOf(
+                node(text = "First"),
+                node(text = "Second", viewId = "android:id/second"),
+            ),
+        )
+        val allLines = renderer.render(observation, ScreenFilter.ALL).nodeLines()
+        assertEquals(2, allLines.size, "fixture must render one line per node")
+
+        val selected = renderer.renderNodes(observation, listOf("1"))
+
+        assertEquals(allLines[1], selected.trimEnd())
+        assertTrue(
+            selected.startsWith(registry.assign(observation).getValue("1").value),
+            "the node line must carry the shared registry's ref",
+        )
+        assertEquals("", renderer.renderNodes(observation, emptyList()))
+    }
+
+    @Test
+    fun `renderNodes of several paths preserves the observation order`() {
+        val renderer = ObservationRenderer()
+        val observation = observation(
+            nodes = listOf(
+                node(text = "First"),
+                node(text = "Second", viewId = "android:id/second"),
+                node(text = "Third", viewId = "android:id/third"),
+            ),
+        )
+
+        val output = renderer.renderNodes(observation, setOf("2", "0"))
+
+        val lines = output.trimEnd().lines()
+        assertEquals(2, lines.size)
+        assertTrue(lines[0].contains("\"First\""), "unexpected line: ${lines[0]}")
+        assertTrue(lines[1].contains("\"Third\""), "unexpected line: ${lines[1]}")
+    }
+
     private fun String.nodeLines(): List<String> = lines().filter { it.startsWith("#n") }
 
     private fun node(
