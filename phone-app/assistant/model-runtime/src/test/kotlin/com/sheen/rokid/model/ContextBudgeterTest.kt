@@ -77,11 +77,14 @@ class ContextBudgeterTest {
         }
     }
 
-    @Test fun `media without estimator is missing even when optional history is removable`() {
-        for (part in listOf(InputPart.Image("local:dummy"), InputPart.Audio("local:dummy"))) {
-            assertFailsWith<ContractError.CapabilityMissing> {
-                budgeter.prepare(profileFixture(inputs = InputModality.entries.toSet()), requestFixture(listOf(part)))
-            }
+    @Test fun `audio without an estimator is still missing even when optional history is removable`() {
+        // 0.25 admits images (ContextBudgeterImageTest pins their cost); audio encoding is not part of this version, so
+        // an audio part keeps the pre-0.25 refusal whatever the profile claims to support.
+        assertFailsWith<ContractError.CapabilityMissing> {
+            budgeter.prepare(
+                profileFixture(inputs = InputModality.entries.toSet()),
+                requestFixture(listOf(InputPart.Audio("local:dummy"))),
+            )
         }
     }
 

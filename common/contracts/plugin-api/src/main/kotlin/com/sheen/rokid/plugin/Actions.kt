@@ -48,6 +48,14 @@ data class ActionDescriptor(
      * (including exempt ones) in `AgentRun.steps`; only its local step counter ignores exempt calls.
      */
     val countsTowardStepLimit: Boolean = true,
+    /**
+     * 0.25 spec §4.8/§6.1: whether one call of this action only **reads** — no device side effect, no state change.
+     *
+     * The concurrent tool executor may run read-only calls beside each other (at most three) while every write stays
+     * serial. The declaration lives here because plugins declare capability and the framework schedules; the default
+     * `false` keeps every existing action on the serial path unchanged.
+     */
+    val readOnly: Boolean = false,
 ) {
     init {
         require(name.isNotBlank())

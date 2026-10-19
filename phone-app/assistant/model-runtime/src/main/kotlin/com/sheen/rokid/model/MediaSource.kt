@@ -17,10 +17,45 @@ data class ResolvedAudio(val bytes: ByteArray, val format: String, val durationM
 }
 
 /**
+ * Resolved image bytes ready for encoding into a model request (0.25 spec §4.10/§6.3).
+ *
+ * The encoded image is kept as the artifact store holds it; the adapter turns it into a `data:` URL or a provider
+ * `file_id`, and the mime/size metadata rides along because the wire format states it explicitly.
+ *
+ * @param bytes the encoded image (JPEG/PNG bytes, not a raw bitmap)
+ * @param mime the artifact's media type, e.g. "image/jpeg"
+ * @param width the image's pixel width, 0 when the artifact's metadata does not carry one
+ * @param height the image's pixel height, 0 when the artifact's metadata does not carry one
+ */
+data class ResolvedImage(val bytes: ByteArray, val mime: String, val width: Int, val height: Int) {
+    override fun equals(other: Any?): Boolean {
+        if (this === other) return true
+        if (other !is ResolvedImage) return false
+        return bytes.contentEquals(other.bytes) && mime == other.mime && width == other.width && height == other.height
+    }
+    override fun hashCode(): Int {
+        var result = bytes.contentHashCode()
+        result = 31 * result + mime.hashCode()
+        result = 31 * result + width
+        result = 31 * result + height
+        return result
+    }
+}
+
+/**
  * Host-owned port that resolves an opaque audio reference (from [com.sheen.rokid.plugin.AudioSegmentHandle.ref]) into actual
  * bytes at encode time. Unknown or expired refs return null so the adapter can refuse the request rather than send
  * an empty audio payload.
  */
 interface MediaSource {
     fun resolveAudio(ref: String): ResolvedAudio?
+
+    /**
+     * Resolves an image artifact id (from [com.sheen.rokid.plugin.ImageRef.artifactId]) into bytes at encode time.
+     *
+     * Unknown or expired artifacts return null, and the encoder decides whether that is a visible text placeholder or
+     * a refusal — never a silently sent empty image. Defaults to null so every existing audio-only implementation
+     * keeps compiling and keeps its behaviour (0.25 spec §6.3).
+     */
+    fun resolveImage(artifactId: String): ResolvedImage? = null
 }

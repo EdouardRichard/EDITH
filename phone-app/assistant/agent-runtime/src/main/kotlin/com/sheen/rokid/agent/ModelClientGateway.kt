@@ -3,6 +3,7 @@ package com.sheen.rokid.agent
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelClient
@@ -15,8 +16,10 @@ import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.OutputModality
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
+import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonPrimitive
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
@@ -335,7 +338,8 @@ class ModelClientGateway(
      *
      * Answers an empty list for anything this cannot read — a plain tool-round summary, or an unparsable body — so the
      * caller can fall back to the segment's text. An entry missing the identity the contract type requires (`callId`,
-     * `name`) is skipped rather than defaulted: a call with an invented id could never be matched to its output.
+     * `name`) is skipped rather than defaulted: a call with an invented id could never be matched to its output. The
+     * `images` member is optional, so a tool round stored before 0.25 (no member) still decodes.
      */
     private fun toolRoundItems(text: String): List<ModelHistoryItem> {
         val array = runCatching { toolRoundJson.parseToJsonElement(text) as? JsonArray }.getOrNull() ?: return emptyList()
@@ -361,10 +365,40 @@ class ModelClientGateway(
                     if (callId.isNullOrBlank()) {
                         null
                     } else {
-                        ModelHistoryItem.ToolOutput(callId, obj["output"]?.jsonPrimitive?.contentOrNull ?: "")
+                        ModelHistoryItem.ToolOutput(
+                            callId = callId,
+                            output = obj["output"]?.jsonPrimitive?.contentOrNull ?: "",
+                            images = imageRefs(obj["images"]),
+                        )
                     }
                 }
                 else -> null
+            }
+        }
+    }
+
+    /**
+     * The optional `images` member of an output item, in order. A tool round stored before 0.25 has no member and
+     * decodes to an empty list, so old history keeps working. An entry without the artifact identity is skipped the
+     * same way a call without its own identity is; the numeric metadata is forward-tolerant (missing means 0) because
+     * the encoder re-reads it from the resolved artifact anyway.
+     */
+    private fun imageRefs(element: JsonElement?): List<ImageRef> {
+        val array = element as? JsonArray ?: return emptyList()
+        return array.mapNotNull { entry ->
+            val obj = entry as? JsonObject ?: return@mapNotNull null
+            val artifactId = obj["artifactId"]?.jsonPrimitive?.contentOrNull
+            val mime = obj["mime"]?.jsonPrimitive?.contentOrNull
+            if (artifactId.isNullOrBlank() || mime.isNullOrBlank()) {
+                null
+            } else {
+                ImageRef(
+                    artifactId = artifactId,
+                    mime = mime,
+                    width = obj["width"]?.jsonPrimitive?.intOrNull ?: 0,
+                    height = obj["height"]?.jsonPrimitive?.intOrNull ?: 0,
+                    sha256 = obj["sha256"]?.jsonPrimitive?.contentOrNull ?: "",
+                )
             }
         }
     }

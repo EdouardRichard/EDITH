@@ -80,6 +80,21 @@ data class ToolSpec(val name: String, val description: String, val parametersJso
 }
 
 /**
+ * One image the host holds as an artifact, referenced from a request or a request history instead of inlined.
+ *
+ * The bytes stay in the artifact store; this is the metadata that travels with a tool result or a request-flow
+ * segment (0.25 spec §4.6/§5.3) so the encoder can resolve the artifact through `MediaSource.resolveImage` at encode
+ * time. [sha256] is the artifact's content hash, which tells two stored revisions apart without reading the bytes.
+ */
+data class ImageRef(
+    val artifactId: String,
+    val mime: String,
+    val width: Int,
+    val height: Int,
+    val sha256: String,
+)
+
+/**
  * One entry of a stateless request history. [Text] is what the P2 history always was; [ToolCall] and [ToolOutput] are
  * the extension that makes a tool exchange round-trip: the endpoint is stateless, so the call the model produced must
  * be echoed back beside its result.
@@ -98,7 +113,15 @@ sealed interface ModelHistoryItem {
         }
         override fun toString() = "ToolCall(callId=$callId, redacted)"
     }
-    data class ToolOutput(val callId: String, val output: String) : ModelHistoryItem {
+    data class ToolOutput(
+        val callId: String,
+        val output: String,
+        /**
+         * Images the tool produced, referenced by artifact id (0.25 spec §4.6/§5.3). Empty is the default, so a
+         * pre-0.25 tool round keeps its exact shape and a tool that produces no image pays nothing extra.
+         */
+        val images: List<ImageRef> = emptyList(),
+    ) : ModelHistoryItem {
         init { require(callId.isNotBlank()) }
         override fun toString() = "ToolOutput(callId=$callId, redacted)"
     }

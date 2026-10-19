@@ -3,6 +3,14 @@ package com.sheen.rokid.model
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.contracts.ContractError
 
+/**
+ * 0.25 spec §4.9 (ruling R4): one image's cost in the budgeter's existing unit — UTF-8 bytes, the unit
+ * `inputBudgetTokens` is already treated as. DeepSeek publishes roughly 1024 tokens per image; this project does not
+ * invent a token-to-byte formula, so the published ceiling is used directly as the coarse per-image byte unit. It is
+ * deliberately one shared constant so a later calibration changes the price in one place.
+ */
+internal const val IMAGE_BUDGET_UNITS = 1024L
+
 data class BudgetedRequest(val request: ModelRequest, val estimatedInputTokens: Int, val removedIds: List<String>, val estimated: Boolean)
 
 class ContextBudgeter {
@@ -10,8 +18,11 @@ class ContextBudgeter {
         fun rejected(): Nothing = throw ContractError.ConfigurationRejected("Explicit context exceeds safe budget or is malformed")
         if (request.profileId != profile.id || request.profileRevision != profile.revision) rejected()
         val input = request.input.toList()
-        if (input.any { it !is InputPart.Text }) {
-            throw ContractError.CapabilityMissing("Media estimator and encoder unavailable")
+        // TEXT and IMAGE are the modalities this version sends. Audio encoding is not part of it, so a request that
+        // carries an audio part is still refused exactly as before — visibly, never by silently dropping the part.
+        // Images are admitted and priced below.
+        if (input.any { it is InputPart.Audio }) {
+            throw ContractError.CapabilityMissing("Audio estimator and encoder unavailable")
         }
         val history = request.history.toList()
         // Text alternates USER/ASSISTANT from a leading USER, with one deliberate exception: an ASSISTANT text may
@@ -53,13 +64,22 @@ class ContextBudgeter {
         if (groups.isNotEmpty() && groups.last().size == 1) rejected()
         try {
             fun message(text: String) = Math.addExact(estimateText(text), 32L)
+            fun imageCost(images: List<ImageRef>) = Math.multiplyExact(images.size.toLong(), IMAGE_BUDGET_UNITS)
+            fun partCost(part: InputPart): Long = when (part) {
+                is InputPart.Text -> message(part.text)
+                // An image part carries no text of its own: it charges exactly the per-image unit, which is what makes
+                // the whole-request identity "text cost + images × IMAGE_BUDGET_UNITS" true for both image carriers.
+                is InputPart.Image -> IMAGE_BUDGET_UNITS
+                // Unreachable: audio was refused above, before the history was inspected.
+                is InputPart.Audio -> throw ContractError.CapabilityMissing("Audio estimator and encoder unavailable")
+            }
             fun itemCost(item: ModelHistoryItem): Long = when (item) {
                 is ModelHistoryItem.Text -> message(item.text)
                 is ModelHistoryItem.ToolCall -> message(item.name + item.argsJson)
-                is ModelHistoryItem.ToolOutput -> message(item.output)
+                is ModelHistoryItem.ToolOutput -> Math.addExact(message(item.output), imageCost(item.images))
             }
             var total = Math.addExact(32L, message(request.instructions))
-            input.forEach { total = Math.addExact(total, message((it as InputPart.Text).text)) }
+            input.forEach { total = Math.addExact(total, partCost(it)) }
             history.forEach { total = Math.addExact(total, itemCost(it)) }
             val limit = minOf(profile.inputBudgetTokens.toLong(),
                 profile.usableWindowTokens.toLong() - profile.maxOutputTokens.toLong() - profile.safetyTokens.toLong())

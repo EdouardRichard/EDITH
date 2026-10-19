@@ -1,5 +1,7 @@
 package com.sheen.rokid.agent
 
+import com.sheen.rokid.plugin.ImageRef
+
 /**
  * The ten origins a request segment can have (spec §3.2).
  *
@@ -40,12 +42,14 @@ enum class SegmentRole { USER, ASSISTANT }
  * [text] is the segment's content; always non-blank.
  * [role] is the speaker of a conversation-flow segment, or `null` for every segment that is not
  * conversation flow. `role` 只对会话流段有意义；系统槽与记忆段为 `null`。
+ * [images] 是本段附带的图片 artifact 引用（0.25 spec §5.3），默认空以保持旧段形状不变。
  */
 data class Segment(
     val origin: SegmentOrigin,
     val trusted: Boolean,
     val text: String,
     val role: SegmentRole? = null,
+    val images: List<ImageRef> = emptyList(),
 ) {
     init {
         require(text.isNotBlank()) { "Segment text must not be blank" }
