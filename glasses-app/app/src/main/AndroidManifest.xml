@@ -28,15 +28,32 @@
         android:allowBackup="false"
         android:label="EDITH"
         android:theme="@android:style/Theme.Material.NoActionBar">
+        <!--
+          0.24 S5 Task 21 follow-up (owner decision A): the production CXR scene must stay RESUMED but must not cover
+          the launcher. `Theme.Edith.CxrScene` makes this a translucent ActivityRecord (platform `Theme.Translucent`),
+          so ActivityManager keeps the activity below visible; the 480x380 panel is the service's overlay window, not
+          this Activity. The debug EXTRA_HOST_PANEL host lives on its own opaque component below.
+        -->
         <activity
             android:name=".app.GlassesActivity"
             android:exported="true"
+            android:theme="@style/Theme.Edith.CxrScene"
             android:label="EDITH">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+
+        <!--
+          The debug-only EXTRA_HOST_PANEL seam keeps the pre-Task-21 full-screen opaque panel window unchanged
+          (`Theme.Material.NoActionBar`). Instrumentation launches it; production/CXR appStart never names it.
+        -->
+        <activity
+            android:name=".app.GlassesPanelHostActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:label="EDITH" />
 
         <!-- The resident panel host; exported=false: only this app starts it. -->
         <service

@@ -1,10 +1,13 @@
 package com.sheen.rokid.glasses
 
+import android.app.Activity
 import android.app.NotificationManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.ServiceConnection
+import android.graphics.Bitmap
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.IBinder
 import android.os.PowerManager
@@ -32,6 +35,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
+import org.junit.Assert.fail
 import org.junit.Before
 import org.junit.Test
 import org.junit.runner.RunWith
@@ -850,6 +854,7 @@ class OverlayServiceTest {
             var backgroundTransparent = false
             var contentWidth = -1
             var contentHeight = -1
+            var themeTranslucent = false
             scenario.onActivity { activity ->
                 sceneHost = activity.isSceneHostForProbe()
                 panelHost = activity.isPanelHostForProbe()
@@ -858,6 +863,7 @@ class OverlayServiceTest {
                 backgroundTransparent = activity.sceneHostBackgroundTransparentForProbe()
                 contentWidth = activity.sceneHostContentWidthForProbe()
                 contentHeight = activity.sceneHostContentHeightForProbe()
+                themeTranslucent = windowIsTranslucent(activity)
             }
             assertTrue("the production path must enter the transparent scene host", sceneHost)
             assertFalse("the scene host must never build the debug Activity panel", panelHost)
@@ -867,6 +873,9 @@ class OverlayServiceTest {
                 flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE != 0)
             assertEquals("the scene window must be translucent, or it composites as opaque black over the launcher",
                 PixelFormat.TRANSLUCENT, format)
+            assertTrue("the scene Activity theme must declare android:windowIsTranslucent; a runtime " +
+                "Window.setFormat alone leaves the ActivityRecord opaque and ActivityManager stops the launcher " +
+                "behind it (measured: translucent=false, launcher task visibleRequested=false)", themeTranslucent)
             assertTrue("the scene window background must be transparent", backgroundTransparent)
             assertEquals("the scene host keeps only a 1x1 transparent content view", 1, contentWidth)
             assertEquals(1, contentHeight)
@@ -913,6 +922,95 @@ class OverlayServiceTest {
         }
     }
 
+    /**
+     * 0.24 S5 Task 21 follow-up: with no panel shown, the launcher behind the scene must really be on screen.
+     *
+     * The Task 21 fix made the scene RESUMED and translucent, but the Activity stayed a **full-screen opaque**
+     * ActivityRecord (no `windowIsTranslucent` in its theme): the launcher task was forced invisible
+     * (`visibleRequested=false`) and the composited result was a black screen whenever the 480×380 overlay was
+     * hidden. A resume-only assertion cannot see that, so this test puts the real launcher behind the scene and
+     * reads the display: the launcher's centre hint band must still be drawn through the scene window. It also
+     * proves the reported sequence - panel shown, panel hidden - leaves the launcher visible and the scene resumed.
+     */
+    @Test
+    fun theSceneWindowLetsTheLauncherShowThroughWhenThePanelIsHidden() {
+        context.stopService(serviceIntent)
+        waitUntil("no service before the launcher-visibility scene launch") {
+            GlassesOverlayService.instanceForTest == null
+        }
+
+        val display = holdDisplayOn()
+        val scenario = try {
+            // The launcher is the "previous app" a wearer sees between turns. HOME is a key event, not a UI tap.
+            instrumentation.uiAutomation.executeShellCommand("input keyevent KEYCODE_HOME").close()
+            waitForLauncherBandVisible("the launcher must be the visible app before the scene launches")
+
+            ActivityScenario.launch<GlassesActivity>(
+                Intent(context, GlassesActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK))
+        } catch (t: Throwable) {
+            runCatching { display.release() }
+            throw t
+        }
+        try {
+            waitUntil("the default scene host and its service") { GlassesOverlayService.instanceForTest != null }
+            val service = requireNotNull(GlassesOverlayService.instanceForTest) {
+                "the scene Activity must start GlassesOverlayService"
+            }
+            assertEquals("precondition: the production Activity is the RESUMED scene host",
+                Lifecycle.State.RESUMED, scenario.state)
+            assertFalse("with no PANEL_OPEN the service must not draw a panel", onMain {
+                service.overlayShownForProbe()
+            })
+            val hiddenPanelBand = waitForLauncherBandVisible(
+                "the launcher must show through the scene while the panel is hidden")
+            assertTrue("the launcher centre band must be really drawn, not an opaque scene (non-black pixels=" +
+                "$hiddenPanelBand)", hiddenPanelBand >= LAUNCHER_BAND_MIN_PIXELS)
+
+            // The reported failure was after a panel cycle: show the real overlay, hide it, then read the display.
+            onMain {
+                service.setSenderForProbe { true }
+                service.acceptCommand(HintWireCodec.encode(HintCommand.Hello("s-scene-launcher", 1)))
+                service.acceptCommand(HintWireCodec.encode(
+                    HintCommand.PanelOpen("s-scene-launcher", 1, AssistantRoute.WAKE)))
+            }
+            waitUntil("the panel to appear over the scene") { onMain { service.overlayShownForProbe() } }
+            onMain { service.hidePanel() }
+            waitUntil("the panel to be hidden again") { !onMain { service.overlayShownForProbe() } }
+            assertEquals("a panel close is not a CXR scene end: the Activity must stay RESUMED",
+                Lifecycle.State.RESUMED, scenario.state)
+            assertNotNull("a panel close must keep the resident service alive",
+                GlassesOverlayService.instanceForTest)
+            val afterHideBand = waitForLauncherBandVisible(
+                "the launcher must still show through after the panel is hidden")
+            assertTrue("the launcher must be visible after hiding the panel (non-black pixels=$afterHideBand)",
+                afterHideBand >= LAUNCHER_BAND_MIN_PIXELS)
+        } finally {
+            runCatching { scenario.close() }
+            runCatching { display.release() }
+        }
+    }
+
+    /**
+     * The translucent theme is production-only. The debug `EXTRA_HOST_PANEL` seam must keep the old full-screen,
+     * opaque Activity window it has always had, otherwise the existing interaction/visual instrumentation would be
+     * asserting a different window than the one it was written against.
+     *
+     * This is the regression guard for the Task 21 follow-up split: `GlassesActivity` is the translucent CXR scene
+     * component, while the debug extra is hosted by `GlassesPanelHostActivity` with the original
+     * `Theme.Material.NoActionBar`.
+     */
+    @Test
+    fun theDebugHostPanelActivityKeepsItsOpaqueWindow() {
+        launchHostPanel().use { scenario ->
+            scenario.onActivity { activity ->
+                assertTrue("the debug extra must still build the Activity panel host", activity.isPanelHostForProbe())
+                assertFalse("the debug host must not become the production CXR scene", activity.isSceneHostForProbe())
+                assertFalse("the translucent theme must stay production-only; the debug host keeps its opaque " +
+                    "window for the existing interaction/visual suite", windowIsTranslucent(activity))
+            }
+        }
+    }
+
     // ---------------------------------------------------------------- helpers
 
     /**
@@ -933,6 +1031,64 @@ class OverlayServiceTest {
         lock.acquire(TEST_DISPLAY_HOLD_MILLIS)
         waitUntil("the glasses display to wake for the scene-host test") { powerManager.isInteractive }
         return lock
+    }
+
+    /**
+     * The theme the platform actually applied to [activity].
+     *
+     * `android:windowIsTranslucent` is an Activity **theme** attribute, read by PackageManager/ActivityManager before
+     * the process starts; it is what makes the ActivityRecord translucent and keeps the activity below visible. A
+     * runtime `Window.setFormat(PixelFormat.TRANSLUCENT)` does not change it.
+     */
+    private fun windowIsTranslucent(activity: Activity): Boolean {
+        val attrs = activity.theme.obtainStyledAttributes(intArrayOf(android.R.attr.windowIsTranslucent))
+        return try {
+            attrs.getBoolean(0, false)
+        } finally {
+            attrs.recycle()
+        }
+    }
+
+    private fun screenshot(): Bitmap = requireNotNull(instrumentation.uiAutomation.takeScreenshot()) {
+        "UiAutomation.takeScreenshot() returned null; the display must be interactive"
+    }
+
+    /**
+     * The non-black pixels in the launcher's centre hint band of the **composited display**.
+     *
+     * The glasses launcher draws its green hint text and icons in this band over a black background. A full-screen
+     * opaque scene replaces the band with black (measured 0 non-black pixels on the broken build), while a
+     * translucent scene lets the same launcher pixels through (measured ~1 900). The clock/signal line sits outside
+     * the band, so a screenshot pair taken seconds apart is comparable.
+     */
+    private fun launcherBandNonBlack(bitmap: Bitmap): Int {
+        var count = 0
+        val bottom = minOf(LAUNCHER_BAND_BOTTOM, bitmap.height)
+        val right = minOf(LAUNCHER_BAND_RIGHT, bitmap.width)
+        for (y in LAUNCHER_BAND_TOP until bottom) {
+            for (x in LAUNCHER_BAND_LEFT until right) {
+                val color = bitmap.getPixel(x, y)
+                if (Color.red(color) > BAND_CHANNEL_THRESHOLD ||
+                    Color.green(color) > BAND_CHANNEL_THRESHOLD ||
+                    Color.blue(color) > BAND_CHANNEL_THRESHOLD
+                ) {
+                    count++
+                }
+            }
+        }
+        return count
+    }
+
+    private fun waitForLauncherBandVisible(what: String, timeoutMillis: Long = 10_000): Int {
+        val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
+        var last = -1
+        while (System.nanoTime() < deadline) {
+            last = launcherBandNonBlack(screenshot())
+            if (last >= LAUNCHER_BAND_MIN_PIXELS) return last
+            Thread.sleep(200)
+        }
+        fail("$what (last non-black pixels in the launcher band=$last, need >= $LAUNCHER_BAND_MIN_PIXELS)")
+        return last
     }
 
     private fun startAndBind(): GlassesOverlayService {
@@ -990,5 +1146,17 @@ class OverlayServiceTest {
     private companion object {
         /** Long enough for one scene-host test, short enough that a broken release cannot pin the panel forever. */
         const val TEST_DISPLAY_HOLD_MILLIS = 30_000L
+
+        /** The launcher's centre hint band on the 480×640 home screen; the clock/signal line is outside it. */
+        const val LAUNCHER_BAND_TOP = 300
+        const val LAUNCHER_BAND_BOTTOM = 450
+        const val LAUNCHER_BAND_LEFT = 40
+        const val LAUNCHER_BAND_RIGHT = 440
+
+        /** Measured ~1 900 non-black pixels here on the launcher; the opaque broken scene measured 0. */
+        const val LAUNCHER_BAND_MIN_PIXELS = 800
+
+        /** Any channel above this counts as drawn content (the launcher background is black). */
+        const val BAND_CHANNEL_THRESHOLD = 40
     }
 }

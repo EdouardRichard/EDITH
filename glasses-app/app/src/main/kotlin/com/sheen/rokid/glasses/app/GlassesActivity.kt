@@ -41,14 +41,23 @@ import java.lang.ref.WeakReference
  * outlive the session. Without the overlay permission it shows the minimal permission screen first and switches to the
  * same transparent scene host once the grant is back.
  *
+ * **The scene must not cover the launcher (Task 21 follow-up)**: keeping it resumed is necessary but not sufficient.
+ * With the old opaque Activity theme, ActivityManager still treated the scene as a full-screen opaque window and
+ * stopped the app behind it, so with the 480×380 panel hidden the composited screen was black. The manifest declares
+ * this Activity with the translucent `Theme.Edith.CxrScene` (`android:windowIsTranslucent=true`); that is what keeps
+ * the launcher (or any previous app) visible behind the empty scene. A runtime `Window.setFormat(TRANSLUCENT)` cannot
+ * do it: the translucent decision is read from the Activity theme before the process starts.
+ *
  * **The debug-only test host** (`EXTRA_HOST_PANEL`, honoured only in `BuildConfig.DEBUG`) keeps the old full-screen
  * Activity panel for the existing instrumentation suite. It is a test seam, not a product path: CXR `appStart` never
- * sets the extra, so the production default above is always the scene host.
+ * sets the extra, so the production default above is always the scene host. The extra is hosted by
+ * [GlassesPanelHostActivity], the one component declared with the old opaque theme, so the translucent scene theme
+ * cannot change the window the interaction/visual tests were written against.
  *
  * Everything the old Activity did after Task 7/8 (view, controller, rendering glue) now lives in [GlassesPanelHost];
  * this class only chooses the entry mode, owns the Activity window's keep-screen-on flag and forwards the probes.
  */
-class GlassesActivity : Activity() {
+open class GlassesActivity : Activity() {
 
     private var host: GlassesPanelHost? = null
     private var permissionScreen: View? = null
@@ -173,8 +182,24 @@ class GlassesActivity : Activity() {
         setContentView(content, ViewGroup.LayoutParams(SCENE_CONTENT_PX, SCENE_CONTENT_PX))
         sceneContent = content
         claimSceneHost()
-        Log.i(TAG, "SCENE transparent host active canDrawOverlays=true flags=NOT_FOCUSABLE|NOT_TOUCHABLE " +
-            "content=${SCENE_CONTENT_PX}x$SCENE_CONTENT_PX")
+        Log.i(TAG, "SCENE transparent host active canDrawOverlays=true themeTranslucent=${windowIsTranslucentTheme()} " +
+            "flags=NOT_FOCUSABLE|NOT_TOUCHABLE content=${SCENE_CONTENT_PX}x$SCENE_CONTENT_PX")
+    }
+
+    /**
+     * The theme attribute the platform reads to decide whether this is a translucent ActivityRecord.
+     *
+     * ActivityManager resolves it from the manifest theme **before** the process starts; that is why only
+     * `Theme.Edith.CxrScene` (`android:windowIsTranslucent=true`) keeps the launcher visible behind the empty scene.
+     * It is logged so the device evidence quotes the platform value instead of our constant.
+     */
+    private fun windowIsTranslucentTheme(): Boolean {
+        val attrs = theme.obtainStyledAttributes(intArrayOf(android.R.attr.windowIsTranslucent))
+        return try {
+            attrs.getBoolean(0, false)
+        } finally {
+            attrs.recycle()
+        }
     }
 
     /**
