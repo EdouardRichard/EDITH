@@ -574,6 +574,9 @@ class AgentLoop(
                     frame = frameForTurn,
                     // 0.24 S4: one observer for every request of the run; it owns no request state itself.
                     onTextDelta = request.onTextDelta,
+                    // 0.25 Task 27 (R143): the gateway's trim safety net restores this question if cut ① evicts the
+                    // current turn's USER transcript; the continuation cue alone would otherwise be the whole input.
+                    userUtterance = request.utterance,
                 ),
             )
             metricModelNanos += (clock.nowNanos() - modelStartedNanos).coerceAtLeast(0L)

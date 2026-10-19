@@ -11,6 +11,7 @@ import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
+import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -89,11 +90,12 @@ class ContinuationUtteranceTest {
     /**
      * The body the production Responses encoder puts on the wire for [request]: the real send-time budgeter plus the
      * real adapter. A request the budgeter refuses throws here rather than pretending to be sendable, so a shape
-     * regression is a failure too.
+     * regression is a failure too. [profile] defaults to the wide [wireProfile]; the tight-window test passes the
+     * profile it actually ran, so the restored shape is proven sendable at that window and not merely encodable.
      */
-    private fun wireJson(request: ModelRequest): String {
-        val budgeted = ContextBudgeter().prepare(wireProfile, request)
-        return DeepSeekResponsesAdapter().encode(wireProfile, budgeted).toString(Charsets.UTF_8)
+    private fun wireJson(request: ModelRequest, profile: ModelProfile = wireProfile): String {
+        val budgeted = ContextBudgeter().prepare(profile, request)
+        return DeepSeekResponsesAdapter().encode(profile, budgeted).toString(Charsets.UTF_8)
     }
 
     private fun occurrences(haystack: String, needle: String): Int = haystack.split(needle).size - 1
@@ -149,6 +151,90 @@ class ContinuationUtteranceTest {
             occurrences(continuationWire, utterance),
             "the continuation wire body must ask the question once, was ${occurrences(continuationWire, utterance)} " +
                 "times: $continuationWire",
+        )
+        assertTrue(
+            lines.none { it.contains(utterance) },
+            "the user's text must never reach the diagnostic log: $lines",
+        )
+    }
+
+    /**
+     * A profile whose frame window fits exactly the system slot plus the widest of [inputs] and **no transcript
+     * turn**. The plugin's frame builder still renders the fixed cue (the transcript carries the utterance), so cut ①
+     * has to evict the whole current turn and leave the `USER_INPUT` alone — the window this test exists to create.
+     */
+    private fun windowSizedForInput(vararg inputs: String): ModelProfile {
+        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+        // `buildFrame`'s system slot when the SKILL catalog is empty: the route's instructions then the memory policy.
+        val system = SmartPrompts.instructions() + "\n" + SmartPrompts.MEMORY_POLICY
+        val window = 32 + measure(system) + inputs.maxOf(::measure) + 8
+        val inputBudget = window + 32
+        return wireProfile.copy(
+            usableWindowTokens = inputBudget + 1_000 + 100,
+            inputBudgetTokens = inputBudget,
+            maxOutputTokens = 1_000,
+            safetyTokens = 100,
+        )
+    }
+
+    @Test
+    fun `a continuation whose transcript the trim drops restores the utterance`() {
+        // 0.25 Task 27 (R143): the cue is right while the transcript carries the question — but TurnTrimmer cut ① may
+        // evict that whole turn under a tight window, leaving the cue as the only input. The gateway must restore the
+        // wearer's utterance, and it must do so once (nothing is duplicated: the history is empty).
+        val rig = rig()
+        val tight = windowSizedForInput(utterance, CONTINUE_AFTER_TOOL)
+        rig.profile = tight
+        var requests = 0
+        rig.model.onRequest = { request, listener ->
+            requests++
+            if (requests == 1) {
+                listener(
+                    smartToolCall(
+                        "c1", "notify_user", """{"text":"稍等","channel":"screen"}""",
+                        requestId = request.requestId,
+                    ),
+                )
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(request, listener, "已经看过了。")
+            }
+        }
+
+        val (_, lines) = withLines { rig.wakeAndFinal(utterance) }
+
+        assertEquals(2, rig.model.requests.size, "the tool round must issue a continuation request: $lines")
+        val (opening, continuation) = rig.model.requests
+
+        // The opening request is unchanged by the safety net: the utterance is its input, exactly once on the wire.
+        assertEquals(listOf(utterance), inputTexts(opening), "the opening input is still the wearer's question")
+        assertEquals(
+            1,
+            occurrences(wireJson(opening, tight), utterance),
+            "the opening wire body carries the question once",
+        )
+
+        // The window really did evict the current turn's transcript: no USER item survives to carry the question.
+        assertEquals(
+            emptyList(),
+            continuation.history,
+            "cut ① must have evicted the whole current turn under this window: ${continuation.history}",
+        )
+        assertEquals(
+            listOf(utterance),
+            inputTexts(continuation),
+            "the gateway must restore the question when trim drops it, not send the cue alone",
+        )
+        val continuationWire = wireJson(continuation, tight)
+        assertEquals(
+            1,
+            occurrences(continuationWire, utterance),
+            "the continuation wire body must carry the question once, was " +
+                "${occurrences(continuationWire, utterance)} times: $continuationWire",
+        )
+        assertFalse(
+            continuationWire.contains(CONTINUE_AFTER_TOOL),
+            "the fixed cue must not be the only thing the model reads: $continuationWire",
         )
         assertTrue(
             lines.none { it.contains(utterance) },

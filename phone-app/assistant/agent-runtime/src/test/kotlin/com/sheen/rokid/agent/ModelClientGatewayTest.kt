@@ -71,7 +71,12 @@ class ModelClientGatewayTest {
         frame: RequestFrame? = null,
         // 0.24 S4 Task 16: the streaming observer, appended so every positional call site keeps its meaning.
         onTextDelta: ((String) -> Unit)? = null,
-    ) = GatewayTurn(turnId, profileId, instructions, history, tools, deadlineNanos, limitBytes, frame, onTextDelta)
+        // 0.25 Task 27 (R143): the wearer's utterance the frame path may restore when trim drops it; null is the
+        // pre-Task-27 construction and keeps every existing call site unchanged.
+        userUtterance: String? = null,
+    ) = GatewayTurn(
+        turnId, profileId, instructions, history, tools, deadlineNanos, limitBytes, frame, onTextDelta, userUtterance,
+    )
 
     private fun scripted(vararg events: ModelStreamEvent) =
         FakeModelClient { _, listener -> events.forEach(listener) }
@@ -758,6 +763,75 @@ class ModelClientGatewayTest {
         val sent = client.requests.single()
         assertTrue(sent.history.isEmpty(), "nothing but the current turn fits")
         assertEquals(listOf("现在几点"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+    }
+
+    @Test fun `a trim that drops the current user transcript restores the utterance as the input`() {
+        // 0.25 Task 27 (R143): the production continuation asks with the fixed cue because the loop's transcript
+        // already carries the question. At a tight window, cut ① evicts that whole turn (it is the only transcript),
+        // so without a safety net the cue would be the *only* thing the model reads. The utterance must ride the
+        // request input again — and it cannot be duplicated, because no USER text survives in the history.
+        val utterance = "把客厅的灯调暗一点"
+        val cue = "Continue after the tool result."
+        val toolRound = """[{"type":"call","callId":"c1","name":"notify_user","argsJson":"{}"},""" +
+            """{"type":"output","callId":"c1","output":"ok"}]"""
+        val flow = listOf(
+            Segment(SegmentOrigin.TRANSCRIPT, true, utterance, SegmentRole.USER),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "(tool call)", SegmentRole.ASSISTANT),
+            Segment(SegmentOrigin.TOOL_ROUND, true, toolRound),
+            Segment(SegmentOrigin.USER_INPUT, true, cue),
+        )
+        val system = Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")
+        val frame = RequestFrame(listOf(system), flow, emptyList())
+        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+        // Exactly the frame without the current turn's transcript: ① has to drop that one group and then stops.
+        val limit = FIXED_OVERHEAD + measure(system.text) + measure(cue)
+        val client = terminalClient()
+        val gateway = gateway(client)
+
+        gateway.turn(turn(frame = frame, limitBytes = limit, userUtterance = utterance))
+
+        assertEquals(
+            1,
+            requireNotNull(gateway.lastTrim).droppedTurns,
+            "cut ① must evict the current turn's USER transcript",
+        )
+        val sent = client.requests.single()
+        assertTrue(sent.history.isEmpty(), "the evicted turn leaves no USER text: ${sent.history}")
+        assertEquals(
+            listOf(utterance),
+            sent.input.filterIsInstance<InputPart.Text>().map { it.text },
+            "the input must be the wearer's question, not the cue, once the question left the history",
+        )
+        assertFalse(
+            sent.input.filterIsInstance<InputPart.Text>().any { it.text == cue },
+            "the cue must not be the only input: ${sent.input}",
+        )
+    }
+
+    @Test fun `restoring the utterance keeps the runtime state ahead of it`() {
+        // The state line is request metadata, not a conversation turn: cut ① cannot evict it, and the restoration must
+        // not drop it either. It rides ahead of the question exactly as the frame had arranged it.
+        val utterance = "现在几点了"
+        val cue = "Continue after the tool result."
+        val state = "foreground=com.android.settings revision=4"
+        val flow = listOf(
+            Segment(SegmentOrigin.RUNTIME_STATE, false, state),
+            Segment(SegmentOrigin.TRANSCRIPT, true, utterance, SegmentRole.USER),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "(tool call)", SegmentRole.ASSISTANT),
+            Segment(SegmentOrigin.USER_INPUT, true, cue),
+        )
+        val system = Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")
+        val frame = RequestFrame(listOf(system), flow, emptyList())
+        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+        val limit = FIXED_OVERHEAD + measure(system.text) + measure(state) + measure(cue)
+        val client = terminalClient()
+
+        gateway(client).turn(turn(frame = frame, limitBytes = limit, userUtterance = utterance))
+
+        val input = client.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(input.startsWith(state), "the runtime state must stay ahead of the restored question: $input")
+        assertTrue(input.endsWith(utterance), "the question must be the restored input: $input")
+        assertFalse(input.contains(cue), "the cue must be replaced by the question: $input")
     }
 
     @Test fun `a frame whose transcript opens on an assistant text is refused as NO_USER_TURN`() {

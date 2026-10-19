@@ -176,7 +176,7 @@ class ModelClientGateway(
         while (true) {
             val report = TurnTrimmer().trim(frame, limit, mode)
             lastTrim = report.counts
-            val transcript = frameToTranscript(report.kept)
+            val transcript = frameToTranscript(report.kept, request.userUtterance)
                 ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN, overflowRecoveries = recoveries)
             val modelRequest = modelRequest(request, profile, frame.systemText, transcript)
             val reply = try {
@@ -360,6 +360,18 @@ class ModelClientGateway(
      * a user turn, or a history that ends on a lone user message (the last one is the shape cut ① leaves when the
      * only surviving turn is an unanswered user half).
      *
+     * ## Cut ① may evict the only copy of the question (Task 27, R143)
+     *
+     * A continuation frame renders the fixed loop cue as its `USER_INPUT` precisely because the transcript already
+     * carries the wearer's question (Task 26). `TurnTrimmer` cut ① removes whole turns from the oldest end and the
+     * current turn is a turn too: under a tight window it can evict the current `USER` transcript and leave the cue as
+     * the model's **only** input. When no `Text(USER)` survives in the built history and [fallbackUtterance] is
+     * non-blank, the request input is rebuilt from that utterance instead of the cue. The request-scoped metadata that
+     * normally rides ahead of the input (`RUNTIME_STATE`/`RETRY`, or the folded context when the history is empty) is
+     * kept, so the first turn — whose input already is the utterance — is rendered byte for byte as before. When a
+     * `USER` text does survive, the input is left untouched: restoring it there would reintroduce the duplicate Task 26
+     * removed. A blank fallback changes nothing; the gateway never invents a question.
+     *
      * ## A `RETRY` is folded into the request `input`, never a history turn
      *
      * A retry instruction is the loop talking to the model, not the wearer speaking. As a history turn it would open
@@ -379,7 +391,7 @@ class ModelClientGateway(
      * removed), which the gateway's deliberate 32-byte window margin absorbs; the trimmer's verdict therefore stays
      * the conservative one either way and no fold can push a request over the limit.
      */
-    private fun frameToTranscript(frame: RequestFrame): Transcript? {
+    private fun frameToTranscript(frame: RequestFrame, fallbackUtterance: String?): Transcript? {
         val flow = frame.conversationFlow
         val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
         if (inputIndex < 0) return null
@@ -442,7 +454,33 @@ class ModelClientGateway(
         // design** (`groups.last().size == 1` — whole-group eviction depends on it). Handing it to the transport would
         // make every later turn fail with `ConfigurationRejected` until a restart (the 2026-10-14 incident).
         if (history.isNotEmpty() && !lastGroupIsClosed(history)) return null
-        return transcript
+        return restoreCurrentUtterance(transcript, leading + leadingInput, fallbackUtterance)
+    }
+
+    /**
+     * R143's safety net: when the trimmed history carries no `USER` text, the current input is rebuilt on
+     * [fallbackUtterance] (the wearer's question) rather than on the frame's fixed cue.
+     *
+     * Only the frame's own `USER_INPUT` is interchangeable here. The leading texts — the folded summary/memory context,
+     * runtime state, a retry instruction — are not the wearer's conversation turn and stay ahead of it, exactly as
+     * [frameToTranscript] had arranged them. That is also why the opening turn is unchanged: its input already is the
+     * utterance, so the rebuilt string is byte-identical.
+     *
+     * A history that still carries a `USER` text keeps its input: the question is already there once, and replacing the
+     * input would be the duplicate Task 26 removed. A null or blank fallback never invents content.
+     */
+    private fun restoreCurrentUtterance(
+        transcript: Transcript,
+        prefix: List<String>,
+        fallbackUtterance: String?,
+    ): Transcript {
+        val fallback = fallbackUtterance?.takeIf { it.isNotBlank() } ?: return transcript
+        val historyCarriesUser = transcript.history.any {
+            it is ModelHistoryItem.Text && it.role == MessageRole.USER
+        }
+        if (historyCarriesUser) return transcript
+        val restoredInput = listOf(InputPart.Text((prefix + fallback).joinToString("\n\n")))
+        return Transcript(restoredInput, transcript.history)
     }
 
     /**

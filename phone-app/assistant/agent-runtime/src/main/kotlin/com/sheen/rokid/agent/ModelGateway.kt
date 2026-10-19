@@ -62,6 +62,15 @@ data class GatewayTurn(
      * fails is the display's problem and must not turn a delivered answer into a failed turn.
      */
     val onTextDelta: ((String) -> Unit)? = null,
+    /**
+     * 0.25 Task 27 (R143): the wearer's utterance this turn is answering, carried only so the frame path can restore
+     * it when `TurnTrimmer` cut ① evicts the **current** turn's `USER` transcript — at a tight window that is the only
+     * copy of the question, and the frame's fixed continuation cue would otherwise be the model's sole input.
+     *
+     * The gateway never re-asserts it while the history still carries a `USER` text (that would re-introduce the
+     * duplicate Task 26 removed). `null` — the default — keeps every pre-Task-27 construction and caller unaltered.
+     */
+    val userUtterance: String? = null,
 )
 
 /**
