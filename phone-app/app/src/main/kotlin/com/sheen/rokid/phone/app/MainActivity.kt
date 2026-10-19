@@ -96,11 +96,9 @@ class MainActivity : ComponentActivity() {
                 // The previous `raisedForConfirmation` gate meant the dialog only appeared when the system raised the
                 // page via ACTION_SHOW_CONFIRMATION; when the user was already in the app, only the below-the-fold card
                 // showed. Now the dialog is the sole confirmation surface regardless of how the page got here.
-                if (pending != null && remainingSeconds > 0L &&
-                    dismissedRequestId != pending.requestId
-                ) {
+                if (pending != null && remainingSeconds > 0L) {
                     AlertDialog(
-                        onDismissRequest = { dismissedRequestId = pending.requestId },
+                        onDismissRequest = keepConfirmationOnDismissRequest,
                         title = { Text("需要你确认的动作") },
                         text = { Text(pending.summary) },
                         // All three buttons travel in **one** slot: Material3 re-flows `confirmButton` against
@@ -150,9 +148,6 @@ class MainActivity : ComponentActivity() {
      * below-the-fold card.
      */
     private var raisedForConfirmation by mutableStateOf(false)
-
-    /** The question the user waved away; it must not be pushed at them again while it is still the same one. */
-    private var dismissedRequestId by mutableStateOf<String?>(null)
 
     /**
      * P3.3 (§17.4): **visibility**, reported to the composition so a confirmation question can reach the notification
@@ -207,6 +202,16 @@ class MainActivity : ComponentActivity() {
     private fun notificationsGranted() = Build.VERSION.SDK_INT < 33 ||
         ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED
 }
+
+/**
+ * R109 (user report 2026-10-20, pocket false touch): a confirmation is settled **only** by its 拒绝 / 急停 / 允许
+ * buttons. Material3's `AlertDialog` calls `onDismissRequest` for a tap outside the dialog (on the scrim) and for
+ * system BACK; in a pocket either happens by accident, which is how the question used to vanish unasked. This handler
+ * therefore does **nothing**: the dialog stays composed and the pending question stays pending, unanswered on both
+ * the phone and the glasses. The only non-button exit is the countdown reaching zero, i.e. the plugin gate's own
+ * 120 s denial delivered through `hideConfirmation` - existing policy, not a user cancel.
+ */
+private val keepConfirmationOnDismissRequest: () -> Unit = {}
 
 /**
  * The countdown lives on the Allow button (owner directive 2026-10-10), so its **geometry** must not move: the label
