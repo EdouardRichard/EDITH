@@ -1,10 +1,14 @@
 package com.sheen.rokid.phone.actions.device
 
+import com.sheen.rokid.device.AccessibilityPort
 import com.sheen.rokid.device.ActKind
 import com.sheen.rokid.device.Bounds
 import com.sheen.rokid.device.DeviceEnvelope
 import com.sheen.rokid.device.DeviceError
+import com.sheen.rokid.device.DeviceKernel
 import com.sheen.rokid.device.DeviceNode
+import com.sheen.rokid.device.Foreground
+import com.sheen.rokid.device.Gesture
 import com.sheen.rokid.device.Observation
 import com.sheen.rokid.device.ObservationRenderer
 import com.sheen.rokid.device.ObservationWindow
@@ -12,7 +16,9 @@ import com.sheen.rokid.device.Ref
 import com.sheen.rokid.device.RefRegistry
 import com.sheen.rokid.device.RefResult
 import com.sheen.rokid.device.ScreenFilter
+import com.sheen.rokid.device.Screenshot
 import com.sheen.rokid.device.Timing
+import com.sheen.rokid.phone.artifacts.FileArtifactStore
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.ImageRef
@@ -32,6 +38,7 @@ import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.nio.file.Files
 
 /**
  * R41/R42/R44/R46: `device` tool behaviour over the kernel seam.
@@ -321,6 +328,78 @@ class DeviceToolTest {
         assertEquals("UNSUPPORTED", body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
     }
 
+    @Test
+    fun `a real kernel screenshot carries its stored artifact reference in the action result`() {
+        // 0.25 Task 24 (C1/R133/R135): production shape, not a hand-built envelope. The real kernel stores the bytes
+        // and answers the real ImageRef; the tool must project it onto ActionResult.images, which is the only channel
+        // the agent loop can carry to the model request.
+        val root = Files.createTempDirectory("edith-device-tool-shot-").toFile()
+        try {
+            val bytes = byteArrayOf(0xFF.toByte(), 0xD8.toByte(), 1, 2, 3)
+            val kernel = DeviceKernel(
+                accessibility = ScreenshotPort(Screenshot(bytes, "image/jpeg", 768, 1664)),
+                shell = null,
+                artifactStore = FileArtifactStore(root),
+            )
+            val screenTool = DeviceTool(
+                DeviceKernelOperations(kernel),
+                ScreenProjector(ObservationRenderer(registry), registry),
+                { 0L },
+            )
+            try {
+                val result = screenTool.execute("""{"action":"screenshot"}""")
+
+                assertEquals(ActionOutcome.Done, result.outcome)
+                val image = result.images.single()
+                assertNotEquals("a stored screenshot is a real reference, not the pending placeholder", "pending", image.artifactId)
+                assertEquals("image/jpeg", image.mime)
+                assertEquals(768, image.width)
+                assertEquals(1664, image.height)
+                assertTrue("the artifact identity is the store's content hash: $image", image.sha256.isNotBlank())
+
+                // R131: the existing diagnostic JSON is unchanged; the image reference is carried beside it.
+                val body = body(result)
+                assertEquals(
+                    "screenshot is an artifact reference; bytes are not inlined",
+                    body["data"]!!.jsonObject["diagnostic"]!!.jsonPrimitive.content,
+                )
+                assertEquals(
+                    image.artifactId,
+                    body["images"]!!.jsonArray.single().jsonObject["artifactId"]!!.jsonPrimitive.content,
+                )
+            } finally {
+                screenTool.close()
+            }
+        } finally {
+            root.deleteRecursively()
+        }
+    }
+
+    @Test
+    fun `a screenshot without a store still carries the pending reference and the kernel diagnostic`() {
+        val kernel = DeviceKernel(
+            accessibility = ScreenshotPort(Screenshot(byteArrayOf(9, 9, 9), "image/jpeg", 768, 1664)),
+            shell = null,
+            artifactStore = null,
+        )
+        val screenTool = DeviceTool(
+            DeviceKernelOperations(kernel),
+            ScreenProjector(ObservationRenderer(registry), registry),
+            { 0L },
+        )
+        try {
+            val result = screenTool.execute("""{"action":"screenshot"}""")
+
+            assertEquals(ActionOutcome.Done, result.outcome)
+            assertEquals(ImageRef("pending", "image/jpeg", 768, 1664, ""), result.images.single())
+            val diagnostic = body(result)["data"]!!.jsonObject["diagnostic"]!!.jsonPrimitive.content
+            assertTrue("the kernel's pending reason must survive: $diagnostic", diagnostic.contains("screenshot_artifact_pending"))
+            assertTrue("the store's absence must survive: $diagnostic", diagnostic.contains("NO_STORE"))
+        } finally {
+            screenTool.close()
+        }
+    }
+
     // - wait -
 
     @Test
@@ -606,6 +685,18 @@ class DeviceToolTest {
     @Test
     fun `runtimeState is null before the first observation`() {
         assertNull(tool(FakeDeviceOperations()).runtimeState())
+    }
+
+    /** The accessibility port seam, scripted with one screenshot and no observation; the surface the real kernel reads. */
+    private class ScreenshotPort(private val shot: Screenshot) : AccessibilityPort {
+        override fun isBound() = true
+        override fun isInteractive() = true
+        override fun isKeyguardLocked() = false
+        override fun observe(filter: ScreenFilter) = Observation(0, emptyList(), emptyList(), false)
+        override fun performNodeAction(ref: Ref, action: String) = false
+        override fun dispatchGesture(gesture: Gesture) = false
+        override fun screenshot(): Screenshot? = shot
+        override fun foreground() = Foreground("com.example.app", null)
     }
 
     private fun failure(action: String, code: String, recoverable: Boolean): DeviceEnvelope =

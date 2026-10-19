@@ -184,6 +184,56 @@ class TurnTranscriptRecordTest {
         )
     }
 
+    @Test
+    fun `a tool produced image reaches the next request with no hand built tool output`() {
+        // 0.25 Task 24 (C1/R133/R135): the whole production chain, not a seeded transcript. A tool's ActionResult
+        // carries the ImageRef → ToolRegistry → AgentLoop's ToolOutput → this plugin's toSegment() TOOL_ROUND JSON →
+        // ModelClientGateway's decoder → the transport-facing ModelRequest. Before the result carrier existed the
+        // image stopped at the executor and every stage after it had an empty list to carry.
+        val stores = stores()
+        val rig = rig(stores)
+        rig.profile = smartProfile().copy(
+            usableWindowTokens = 100_000,
+            inputBudgetTokens = 93_000,
+            maxOutputTokens = 6_000,
+            safetyTokens = 1_000,
+        )
+        rig.actions.descriptors += smartAction("device")
+        rig.actions.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, """{"ok":true}""", images = listOf(reference))
+        }
+        var request = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            request++
+            if (request == 1) {
+                listener(smartToolCall("c1", "device", """{"action":"screenshot"}""", requestId = modelRequest.requestId))
+                listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(modelRequest, listener, "看到了。")
+            }
+        }
+
+        rig.wakeAndFinal("看一下屏幕")
+
+        assertEquals(2, rig.model.requests.size, "the tool round must issue a continuation request")
+        val continuation = rig.model.requests[1]
+        val output = continuation.history.filterIsInstance<ModelHistoryItem.ToolOutput>()
+            .single { it.callId == "c1" }
+        assertEquals(
+            listOf(reference),
+            output.images,
+            "a tool's image must reach the next request through the production chain: ${continuation.history}",
+        )
+        val carriedImages = continuation.history.flatMap { item ->
+            if (item is ModelHistoryItem.ToolOutput) item.images else emptyList()
+        }
+        assertEquals(
+            listOf(reference),
+            carriedImages,
+            "the frame path and the history path are one channel: the artifact must be sent once, not twice",
+        )
+    }
+
     // ------------------------------------------------------------ the production record path
 
     @Test

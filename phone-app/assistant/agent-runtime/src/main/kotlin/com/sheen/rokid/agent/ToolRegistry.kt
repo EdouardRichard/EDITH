@@ -93,18 +93,20 @@ class ToolRegistry(
         // R57: the observation fingerprint rides through verbatim, on every outcome — a refused write that left the
         // screen unchanged is exactly the evidence the poll/global detectors need. R98: so does the per-call
         // state-changing declaration, which is what tells a write that returns an observation apart from a read.
+        // 0.25 Task 24 (R133): so do the images the call produced: a screenshot's reference reaches the model through
+        // the tool output, and dropping it here would make the whole image path unreachable again.
         return when (result.outcome) {
             ActionOutcome.Done -> ToolResult(
                 call.id, ok = true, payload = result.detail,
-                fingerprint = result.fingerprint, stateChanging = result.stateChanging,
+                fingerprint = result.fingerprint, stateChanging = result.stateChanging, images = result.images,
             )
             ActionOutcome.Refused -> ToolResult(
                 call.id, ok = false, payload = "${ActionOutcome.Refused.name}: ${result.detail}",
-                fingerprint = result.fingerprint, stateChanging = result.stateChanging,
+                fingerprint = result.fingerprint, stateChanging = result.stateChanging, images = result.images,
             )
             ActionOutcome.Failed -> ToolResult(
                 call.id, ok = false, payload = "${ActionOutcome.Failed.name}: ${result.detail}",
-                fingerprint = result.fingerprint, stateChanging = result.stateChanging,
+                fingerprint = result.fingerprint, stateChanging = result.stateChanging, images = result.images,
             )
         }
     }

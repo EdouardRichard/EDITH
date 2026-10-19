@@ -361,7 +361,11 @@ class DeviceTool(
             envelope.error?.recoverable == true -> ActionOutcome.Refused
             else -> ActionOutcome.Failed
         }
-        return ActionResult(outcome, renderEnvelope(envelope, data), fingerprint, stateChanging)
+        // 0.25 Task 24 (R133): the envelope's image references are the call's result, not a detail of the rendered
+        // JSON. A screenshot answers a real stored `ImageRef` (or the `pending` placeholder with its diagnostic), and
+        // this projection is what lets the agent loop carry it to the model request. Every other action's envelope
+        // carries an empty list, so their results keep the old shape.
+        return ActionResult(outcome, renderEnvelope(envelope, data), fingerprint, stateChanging, images = envelope.images)
     }
 
     /**

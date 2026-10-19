@@ -1,6 +1,7 @@
 package com.sheen.rokid.agent
 
 import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.RiskLevel
 
 /**
@@ -44,6 +45,15 @@ data class ToolResult(
      * also carries a [fingerprint]; `false` — the default, and every plugin tool — keeps the R62 read-only exclusion.
      */
     val stateChanging: Boolean = false,
+    /**
+     * 0.25 Task 24 (R133): the image artifacts this call produced, projected verbatim from `plugin-api`'s
+     * `ActionResult.images` — metadata only, the bytes stay in the artifact store.
+     *
+     * It is what puts a screenshot on the `ModelHistoryItem.ToolOutput` of the tool round, and from there on the model
+     * request. Empty — the default — keeps every pre-0.25 result and every non-image tool source-compatible and its
+     * tool round byte-for-byte unchanged; an image is never invented from the payload.
+     */
+    val images: List<ImageRef> = emptyList(),
 ) {
     companion object {
         /** A failed step whose payload is a stable machine-readable code rather than an exception message. */

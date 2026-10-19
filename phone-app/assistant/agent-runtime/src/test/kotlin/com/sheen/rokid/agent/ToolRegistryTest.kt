@@ -2,6 +2,7 @@ package com.sheen.rokid.agent
 
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.RiskLevel
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
@@ -317,6 +318,26 @@ class ToolRegistryTest {
 
         executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", stateChanging = true) }
         assertTrue(registry.execute(ToolCall("c3", "device", "{}")).stateChanging)
+    }
+
+    @Test fun `the images a tool produced ride through every outcome`() {
+        // 0.25 Task 24 (C1/R133): the result carrier is the only channel from a screenshot's artifact reference to the
+        // model request. A refused or failed call keeps whatever the executor reported, exactly like the fingerprint.
+        val executor = executorOf("device")
+        val registry = ToolRegistry(listOf(executor))
+        val image = ImageRef("img-shot-1", "image/jpeg", 768, 1664, "sha-256-shot-1")
+
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "captured", images = listOf(image)) }
+        assertEquals(listOf(image), registry.execute(ToolCall("c1", "device", "{}")).images)
+
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Refused, "NODE_STALE", images = listOf(image)) }
+        assertEquals(listOf(image), registry.execute(ToolCall("c2", "device", "{}")).images)
+
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "SCREENSHOT_FAILED", images = listOf(image)) }
+        assertEquals(listOf(image), registry.execute(ToolCall("c3", "device", "{}")).images)
+
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done") }
+        assertEquals(emptyList(), registry.execute(ToolCall("c4", "device", "{}")).images)
     }
 
     @Test fun `cancel reaches every executor once including a duplicate that lost the merge`() {

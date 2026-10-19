@@ -816,7 +816,9 @@ class AgentLoop(
                 // previous one may still be in flight.
                 if (execution.uncertain) {
                     steps += AgentStep(steps.size + 1, call.name, execution.result.payload, executed = true)
-                    history += ModelHistoryItem.ToolOutput(call.id, execution.result.payload)
+                    history += ModelHistoryItem.ToolOutput(
+                        call.id, execution.result.payload, execution.result.images,
+                    )
                     return finish(AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps)
                 }
                 // R97: the stop a timeout issued is turn-scoped on the host side (DeviceKernel.cancel refuses every call
@@ -860,7 +862,10 @@ class AgentLoop(
                     if (after.notice) append("\n\n").append(GLOBAL_NO_PROGRESS_NOTICE)
                 }
                 steps += AgentStep(steps.size + 1, call.name, stepResult, executed = true)
-                history += ModelHistoryItem.ToolOutput(call.id, historyPayload)
+                // 0.25 Task 24 (R133): the executor's images ride on the tool output exactly as the payload does. An
+                // empty list keeps the pre-0.25 item shape, and the plugin's TOOL_ROUND segment is the one channel that
+                // carries these references to the next model request.
+                history += ModelHistoryItem.ToolOutput(call.id, historyPayload, result.images)
                 if (execution.executed && result.ok) successfulToolExecutions++
                 if (guard.tripped) return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps)
                 if (errorsSeen.repeatTerminated) {

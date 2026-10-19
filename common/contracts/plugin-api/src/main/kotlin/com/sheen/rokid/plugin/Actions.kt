@@ -132,6 +132,18 @@ data class ActionResult(
      * means this call only reads.
      */
     val stateChanging: Boolean = false,
+    /**
+     * 0.25 Task 24 (R133): the image artifacts this call produced, referenced by [ImageRef] — never inline bytes.
+     *
+     * `device.screenshot` is the one 0.25 action that answers an image: the kernel stores the captured bytes and reports
+     * the reference here (a real artifact, or the `pending` placeholder plus its diagnostic). The host's agent loop
+     * projects the list onto `ToolResult.images` and then onto the tool output it feeds back to the model, which is the
+     * only channel from a tool's picture to the model request (0.25 spec §4.6/§5.3).
+     *
+     * Empty — the default — keeps every existing action and every pre-0.25 construction source-compatible, and a tool
+     * that produces no image pays nothing extra on the wire.
+     */
+    val images: List<ImageRef> = emptyList(),
 )
 
 /**
