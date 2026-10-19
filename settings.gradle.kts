@@ -78,6 +78,8 @@ include(
     ":phone-app:assistant:model-runtime",
     // P3.1 agent loop: platform-independent tool protocol, registry and loop (Tasks 4-8).
     ":phone-app:assistant:agent-runtime",
+    // 0.25 DeviceControl kernel: pure-JVM observation/ref/diff/render model (Task 7).
+    ":phone-app:assistant:device-control",
     ":common:presentation:output-runtime",
     ":phone-app:plugins:plugin-diagnostic",
     ":tools:probes:p2-text-probe",
