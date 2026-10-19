@@ -2,13 +2,25 @@ package com.sheen.rokid.phone.plugin.smarthelper
 
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.SegmentOrigin
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.model.ContextBudgeter
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ImageRef
+import com.sheen.rokid.plugin.InputModality
+import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.SecretHandle
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.jsonArray
@@ -17,6 +29,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
 import kotlin.test.assertTrue
 
 /**
@@ -45,6 +58,53 @@ class TurnTranscriptRecordTest {
         SmartTestRig(conversationStores = stores).also {
             it.activate(overrides = mapOf(Capability.Storage to SmartFakeStorage()))
         }
+
+    /**
+     * A wide-window profile for the **real** send-time budgeter: only the history's shape can reject this fixture, never
+     * its size, so an over-budget profile cannot be mistaken for the defect.
+     */
+    private val wireProfile = ModelProfile(
+        id = "wire-profile",
+        revision = 1,
+        name = "Wire shape profile",
+        service = "fake",
+        baseUrl = "https://invalid.test",
+        protocolId = "DEEPSEEK_RESPONSES",
+        model = "fake-model",
+        secret = object : SecretHandle { override val id = "wire-secret" },
+        usableWindowTokens = 100_000,
+        inputBudgetTokens = 93_000,
+        maxOutputTokens = 6_000,
+        safetyTokens = 1_000,
+        timeoutMillis = 30_000,
+        inputs = setOf(InputModality.TEXT),
+        outputs = setOf(OutputModality.TEXT),
+        verifications = emptyList(),
+    )
+
+    /**
+     * The next turn's request carrying [history], through the **real** send-time budgeter — the component whose
+     * rejection poisons every later turn. A locally re-implemented shape rule could drift from the shipped one; this
+     * cannot.
+     */
+    private fun assertSendableAsNextHistory(history: List<ModelHistoryItem>) {
+        val request = ModelRequest(
+            envelope = EventEnvelope(SessionId("wire-session"), Generation(1), "wire-request", 0, 0),
+            requestId = "wire-next",
+            turnId = "wire-next",
+            profileId = wireProfile.id,
+            profileRevision = wireProfile.revision,
+            instructions = "instructions",
+            input = listOf(InputPart.Text("下一句")),
+            history = history,
+            output = OutputModality.TEXT,
+            deadlineNanos = 10_000,
+        )
+
+        val budgeted = ContextBudgeter().prepare(wireProfile, request)
+
+        assertEquals(history, budgeted.request.history, "the whole stored transcript must fit this fixture")
+    }
 
     // ------------------------------------------------------------ the renderer's wire contract
 
@@ -218,6 +278,123 @@ class TurnTranscriptRecordTest {
             ),
             history,
             "an empty transcript must still leave an answerable text turn",
+        )
+    }
+
+    @Test
+    fun `a store changed during the run falls back to the two text halves`() {
+        // The other reachable fallback: the asynchronous summary (ContextCompressor launches it on the host pool) lands
+        // while the turn is still in flight, so by record time the store no longer prefixes the run's transcript.
+        val stores = stores()
+        val rig = rig(stores)
+        val store = stores.getValue(ContextRoute.WAKE)
+        store.appendUser("之前的问题")
+        store.appendAssistant("之前的回答")
+        rig.actions.descriptors += smartAction("finish_task", scope = "terminal")
+        rig.actions.outcome = { _, _ ->
+            store.appendSummary("较早的会话摘要")
+            ActionResult(ActionOutcome.Done, "做完了")
+        }
+        rig.model.onRequest = { modelRequest, listener ->
+            listener(smartToolCall("c1", "finish_task", requestId = modelRequest.requestId))
+            listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+        }
+
+        rig.wakeAndFinal("帮我处理")
+
+        val history = store.history()
+        val head = assertIs<ModelHistoryItem.Text>(history.firstOrNull(), "the summary must stay at the head: $history")
+        assertTrue(head.text.contains("较早的会话摘要"), "the summary must survive the fallback: $history")
+        assertTrue(
+            history.none { it is ModelHistoryItem.ToolCall || it is ModelHistoryItem.ToolOutput },
+            "the prefix-mismatch fallback cannot attribute the tool round, so it must not store half of it: $history",
+        )
+        assertEquals(
+            listOf("之前的问题", "之前的回答", "帮我处理", "做完了"),
+            history.drop(1).filterIsInstance<ModelHistoryItem.Text>().map { it.text },
+            "the fallback must append the turn's two text halves after the changed store: $history",
+        )
+    }
+
+    // ------------------------------------------------------------ runs that end on a non-conversation boundary
+
+    /**
+     * The review's Critical finding: `AgentLoop` appends its assistant opener and the model's calls, then may return
+     * `STEP_LIMIT` at the **next** call before it runs, leaving a dangling `ToolCall` in `run.transcript`. The plugin
+     * then appended the reply after the loop's opener, and `appendTranscript` dropped the call — leaving
+     * `[Text(ASSISTANT, "(tool call)"), Text(ASSISTANT, reply)]`, the shape `ContextBudgeter` refuses. Every later
+     * turn of that session then failed until the app restarted.
+     */
+    @Test
+    fun `a step limit run stores complete rounds and a reply, never a dangling call`() {
+        val stores = stores()
+        val rig = rig(stores)
+        rig.actions.descriptors += smartAction("lookup")
+        rig.actions.outcome = { _, args -> ActionResult(ActionOutcome.Done, "done:$args") }
+        var requests = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            requests += 1
+            listener(smartToolCall("c$requests", "lookup", """{"n":$requests}""", requestId = modelRequest.requestId))
+            listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+        }
+
+        rig.wakeAndFinal("一直查")
+
+        // `AgentLoop`'s default maxSteps is 24: the 24th call runs and the 25th is refused before it executes.
+        assertEquals(25, requests, "the fixture must actually reach STEP_LIMIT")
+        val history = stores.getValue(ContextRoute.WAKE).history()
+
+        val calls = history.filterIsInstance<ModelHistoryItem.ToolCall>().map { it.callId }
+        val outputs = history.filterIsInstance<ModelHistoryItem.ToolOutput>().map { it.callId }
+        assertEquals(24, calls.size, "every executed call must be stored: $history")
+        assertEquals(calls.toSet(), outputs.toSet(), "a stored call must have its output and vice versa: $history")
+
+        history.zipWithNext().forEach { (left, right) ->
+            assertFalse(
+                left is ModelHistoryItem.Text && left.role == MessageRole.ASSISTANT &&
+                    right is ModelHistoryItem.Text && right.role == MessageRole.ASSISTANT,
+                "two adjacent assistant texts are the shape the send-time budgeter rejects: $history",
+            )
+        }
+        val closing = assertIs<ModelHistoryItem.Text>(history.last(), "the turn must close on assistant text: $history")
+        assertEquals(MessageRole.ASSISTANT, closing.role)
+        assertEquals(
+            "智能助手这次没能给出结果。",
+            closing.text,
+            "the stored closing text must be the sentence the wearer got, not the loop's opener placeholder",
+        )
+        assertSendableAsNextHistory(history)
+    }
+
+    /**
+     * The review's Important finding (R16): a retried empty turn left `Text(ASSISTANT, "(empty turn)")` and the
+     * loop-internal retry instruction in the store as if the wearer had said it. Spec §5.1's stored conversation has
+     * only the user's own turns, the assistant's real replies and tool rounds.
+     */
+    @Test
+    fun `an empty turn's retry scaffolding is not stored as conversation`() {
+        val stores = stores()
+        val rig = rig(stores)
+        var requests = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            requests += 1
+            if (requests <= 2) {
+                listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.INCOMPLETE, null, null))
+            } else {
+                streamText(modelRequest, listener, "好。")
+            }
+        }
+
+        rig.wakeAndFinal("现在几点了")
+
+        assertEquals(3, requests, "two empty turns must be retried before the answer")
+        assertEquals(
+            listOf(
+                ModelHistoryItem.Text(MessageRole.USER, "现在几点了"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "好。"),
+            ),
+            stores.getValue(ContextRoute.WAKE).history(),
+            "the retry instruction and its placeholder are loop-internal, not wearer/assistant speech",
         )
     }
 }

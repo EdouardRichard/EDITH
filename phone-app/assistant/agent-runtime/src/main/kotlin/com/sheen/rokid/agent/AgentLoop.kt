@@ -121,7 +121,9 @@ data class AgentRun(
      *
      * Handed over so the caller that supplied [AgentRequest.history] can store what the turn actually said instead
      * of reconstructing it — the retry nudges and the tool-round echoes are the loop's, and a caller rebuilding them
-     * from [`finalText`] would get a different conversation than the one the model saw.
+     * from [`finalText`] would get a different conversation than the one the model saw. A caller that stores the
+     * conversation (rather than continuing it) additionally applies [withoutRetryScaffolding]: a retry nudge is
+     * loop-internal and must not be persisted as the wearer's speech (0.25 review ruling R16).
      */
     val transcript: List<ModelHistoryItem> = emptyList(),
     /**
@@ -565,5 +567,40 @@ class AgentLoop(
             (auditArguments.parseToJsonElement(argsJson) as? JsonObject)?.get(name) as? JsonPrimitive
         }.getOrNull() ?: return ""
         return if (member.isString) "$name=${member.content}" else member.longOrNull?.let { "$name=$it" } ?: ""
+    }
+
+    companion object {
+        /**
+         * [items] without the loop-internal retry scaffolding ([appendRetry]): each retry contributes exactly
+         * `[assistant text, RETRY_INSTRUCTION]`.
+         *
+         * The instruction is the loop talking to the model, not the wearer, and the assistant half is either the
+         * `(empty turn)` placeholder or a cut-off partial reply the wearer never received — spec §5.1's stored
+         * conversation has only the user's own turns, the assistant's real replies and tool rounds. A caller that
+         * persists a run's transcript therefore filters the pairs out (0.25 review ruling R16). The instruction is
+         * matched by its constant here, in the file that owns it, rather than duplicated in the caller.
+         *
+         * A retry pair is never split by the caller's tail boundary: both items are appended together, after the
+         * turn's utterance. The only false positive would be a wearer typing the loop's instruction verbatim directly
+         * after an assistant turn; that string is loop-authored and not user-facing.
+         */
+        fun withoutRetryScaffolding(items: List<ModelHistoryItem>): List<ModelHistoryItem> {
+            if (items.size < 2) return items
+            val kept = ArrayList<ModelHistoryItem>(items.size)
+            var index = 0
+            while (index < items.size) {
+                val item = items[index]
+                val next = items.getOrNull(index + 1)
+                val retryPair = item is ModelHistoryItem.Text && item.role == MessageRole.ASSISTANT &&
+                    next is ModelHistoryItem.Text && next.role == MessageRole.USER && next.text == RETRY_INSTRUCTION
+                if (retryPair) {
+                    index += 2
+                } else {
+                    kept += item
+                    index++
+                }
+            }
+            return kept
+        }
     }
 }

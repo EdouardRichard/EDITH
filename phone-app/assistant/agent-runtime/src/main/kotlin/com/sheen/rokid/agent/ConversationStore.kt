@@ -96,22 +96,22 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
      * batch carries an output with the same call id, and an output with no call in the batch is dropped for the same
      * reason. Text items are never dropped by this filter, so a truncated turn still records what was said.
      *
+     * The plugin must apply [withoutIncompleteToolRounds] to a turn **before** it appends the closing reply: a turn
+     * that ended on a dangling call then ends on the assistant opener text, which the closing step replaces. If the
+     * reply were appended first, the opener and the reply would be two adjacent assistant texts — the one shape
+     * `ContextBudgeter` refuses, which would make every later turn of that session fail until the app restarted.
+     *
      * The items are stored as they are, including [ModelHistoryItem.ToolOutput.images]: the store keeps image
      * references (never bytes) and the frame renderer writes them back into the tool-round JSON.
      */
     @Synchronized
     fun appendTranscript(items: List<ModelHistoryItem>) {
         if (items.isEmpty()) return
-        val callIds = items.filterIsInstance<ModelHistoryItem.ToolCall>().mapTo(mutableSetOf()) { it.callId }
-        val outputIds = items.filterIsInstance<ModelHistoryItem.ToolOutput>().mapTo(mutableSetOf()) { it.callId }
-        val completeRounds = callIds intersect outputIds
-        for (item in items) {
+        for (item in withoutIncompleteToolRounds(items)) {
             when (item) {
                 is ModelHistoryItem.Text -> add(item, SegmentOrigin.TRANSCRIPT, roleOf(item.role))
-                is ModelHistoryItem.ToolCall ->
-                    if (item.callId in completeRounds) add(item, SegmentOrigin.TOOL_ROUND, null)
-                is ModelHistoryItem.ToolOutput ->
-                    if (item.callId in completeRounds) add(item, SegmentOrigin.TOOL_ROUND, null)
+                is ModelHistoryItem.ToolCall, is ModelHistoryItem.ToolOutput ->
+                    add(item, SegmentOrigin.TOOL_ROUND, null)
             }
         }
     }
@@ -383,5 +383,26 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
 
     companion object {
         const val MAX_ITEMS = 200
+
+        /**
+         * [items] without the tool items that do not form a complete round **within [items]**.
+         *
+         * A call is kept only when the same batch also carries an output with its call id; an output with no opening
+         * call in the batch is dropped for the same reason (it cannot round-trip). Text items are never dropped.
+         * [appendTranscript] uses this on its own batch, and the production plugin also applies it to a turn *before*
+         * closing the turn with the reply — see [appendTranscript]'s KDoc for why the order is load-bearing.
+         */
+        fun withoutIncompleteToolRounds(items: List<ModelHistoryItem>): List<ModelHistoryItem> {
+            val callIds = items.filterIsInstance<ModelHistoryItem.ToolCall>().mapTo(mutableSetOf()) { it.callId }
+            val outputIds = items.filterIsInstance<ModelHistoryItem.ToolOutput>().mapTo(mutableSetOf()) { it.callId }
+            val completeRounds = callIds intersect outputIds
+            return items.filter { item ->
+                when (item) {
+                    is ModelHistoryItem.Text -> true
+                    is ModelHistoryItem.ToolCall -> item.callId in completeRounds
+                    is ModelHistoryItem.ToolOutput -> item.callId in completeRounds
+                }
+            }
+        }
     }
 }

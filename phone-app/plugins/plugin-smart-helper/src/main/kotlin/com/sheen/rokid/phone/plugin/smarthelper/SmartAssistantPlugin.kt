@@ -2105,17 +2105,27 @@ class SmartAssistantPlugin(
      * the store itself as `AgentRequest.history`), so only the tail past the stored items is new: appending the whole
      * list would duplicate the session on every turn.
      *
+     * Two kinds of item are filtered out of that tail before it is stored, because neither is conversation:
+     *
+     * - **Incomplete tool rounds** ([ConversationStore.withoutIncompleteToolRounds]): a `STEP_LIMIT`/cancel can leave
+     *   a call with no output. Filtering happens **before** [closeStoreTurnWithReply] so a turn that ended on a
+     *   dangling call ends on the loop's assistant opener instead, and the reply replaces it. Appending the reply
+     *   first and letting the store drop the call afterwards would leave two adjacent assistant texts — the shape
+     *   `ContextBudgeter` refuses, which is how one step-limited turn used to make every later turn fail.
+     * - **Retry scaffolding** ([AgentLoop.withoutRetryScaffolding]): the retry instruction and its assistant
+     *   placeholder are loop-internal (ruling R16), not wearer/assistant speech.
+     *
      * The assistant half is written from [reply] rather than copied verbatim. When a tool round precedes the final
      * answer the loop does not append that text to its transcript at all (the run ends on the last `ToolOutput`), and
      * when it does close a turn the appended text is a wire placeholder for an empty/failed model reply. [reply] is
      * the sentence the wearer actually received (notification bodies + closing text, or the stable failure hint), so
-     * the trailing assistant text is **replaced**, not kept beside it — two assistant texts in a row are a shape
-     * `ContextBudgeter` rejects.
+     * the trailing assistant text is **replaced**, not kept beside it.
      *
      * Falls back to the pre-0.25 `appendUser`/`appendAssistant` pair when the run never produced a transcript (a
-     * transport failure makes the plugin's catch build an empty `AgentRun`) or when the transcript does not continue
-     * the store it was built from. Losing the turn's tool round is worse than falling back, but losing the turn
-     * itself would be worse still.
+     * transport failure makes the plugin's catch build an empty `AgentRun`), when the transcript does not continue
+     * the store it was built from (the asynchronous compressor may have changed the store mid-run), or when the
+     * filters leave nothing to attribute. Losing the turn's tool round is worse than falling back, but losing the
+     * turn itself would be worse still.
      */
     private fun recordStoreTurn(
         store: ConversationStore,
@@ -2130,17 +2140,22 @@ class SmartAssistantPlugin(
         } else {
             emptyList()
         }
-        if (turn.isEmpty()) {
+        val conversation = AgentLoop.withoutRetryScaffolding(
+            ConversationStore.withoutIncompleteToolRounds(turn),
+        )
+        if (conversation.isEmpty()) {
             store.appendUser(userText)
             store.appendAssistant(reply)
             return
         }
-        store.appendTranscript(closeStoreTurnWithReply(turn, reply))
+        store.appendTranscript(closeStoreTurnWithReply(conversation, reply))
     }
 
     /**
-     * The turn as the store should keep it: the run's items with [reply] as the closing assistant text.
+     * The turn as the store should keep it: the filtered run items with [reply] as the closing assistant text.
      *
+     * The caller has already dropped incomplete tool rounds and retry scaffolding, so a turn that ended early ends on
+     * the loop's assistant opener (replaced here) or on its last complete `ToolOutput` (where the reply is appended).
      * The loop's own last assistant text is either the same closing text (a plain answer) or a wire placeholder
      * (`(no reply)` / a partial reply the wearer never got); in both cases [reply] is the authoritative record of the
      * assistant half. A trailing `ToolOutput` has no text to replace, so the reply is simply appended.
