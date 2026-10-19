@@ -31,9 +31,9 @@ import com.sheen.rokid.output.HintWireCodec
  * 0.24 S2 Task 9: the production panel host (D158).
  *
  * A foreground service with a low-importance notification owns the CXR listener and a `TYPE_APPLICATION_OVERLAY`
- * window, so the panel can appear over another app and while the glasses screen is off. The trampoline Activity only
- * starts this service; the service survives the Activity, and a panel close hides the window without ending the
- * session.
+ * window, so the panel can appear over another app and while the glasses screen is off. The transparent
+ * [GlassesActivity] scene host starts this service and stays resumed (the CUSTOM_APP session needs the glasses app in
+ * front); the service survives a panel close, and a panel close hides the window without ending the session.
  *
  * The overlay geometry is the official panel's bottom box: 480×380 at `BOTTOM|START`, translucent, not touchable and
  * focusable (S1 proved the side keys arrive at a focusable `TYPE_APPLICATION_OVERLAY`). The screen wake lock is the
@@ -143,6 +143,9 @@ class GlassesOverlayService : Service() {
         RokidBridgeEndpoint.instance.setDisconnectionListener(null)
         RokidBridgeEndpoint.instance.setListener(null)
         if (this::host.isInitialized) host.destroy()
+        // Safety net (Task 21 fix): the scene host exists only for this CXR session. `onCxrDisconnected` already ends
+        // it, but a service destroyed by any other path must not leave a resumed transparent Activity behind.
+        GlassesActivity.finishSceneHost()
         instanceForTest = null
         runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
         Log.i(TAG, "SERVICE onDestroy")
@@ -283,6 +286,9 @@ class GlassesOverlayService : Service() {
         }
         Log.i(TAG, "CXR_DISCONNECTED overlay=${overlayRoot != null}")
         hidePanel()
+        // The CXR session is over: end the transparent scene host too, so it cannot outlive the session it exists for
+        // and the next `appStart` starts a fresh scene (Task 21 fix).
+        GlassesActivity.finishSceneHost()
         Log.i(TAG, "CXR_DISCONNECTED service_stop_requested=true")
         stopSelf()
     }
@@ -633,7 +639,7 @@ class GlassesOverlayService : Service() {
         private const val WAKE_LOCK_TIMEOUT_MS = 10 * 60 * 1000L
 
         /**
-         * Test-only: the live service, so the trampoline test can prove that launching the default Activity started the
+         * Test-only: the live service, so the scene-host test can prove that launching the default Activity started the
          * service (the alternative would have been to infer it from a log line). Cleared in [onDestroy].
          */
         @Volatile

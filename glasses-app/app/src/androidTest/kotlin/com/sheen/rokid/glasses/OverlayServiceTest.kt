@@ -7,6 +7,7 @@ import android.content.Intent
 import android.content.ServiceConnection
 import android.graphics.PixelFormat
 import android.os.IBinder
+import android.os.PowerManager
 import android.provider.Settings
 import android.view.Gravity
 import android.view.KeyEvent
@@ -40,7 +41,8 @@ import java.util.concurrent.TimeUnit
 
 /**
  * 0.24 S2 Task 9: the production default is a foreground service that draws the panel as a
- * `TYPE_APPLICATION_OVERLAY` window; the Activity is only the CXR trampoline.
+ * `TYPE_APPLICATION_OVERLAY` window; the Activity is the CXR scene host (Task 21 fix: it stays RESUMED but
+ * transparent and non-interactive, it never draws the panel).
  *
  * The assertions read the **service's own window**, not a log line: the overlay is really added to the
  * `WindowManager` with the pinned geometry/flags, `UI_READY` really goes out only after a session identity exists,
@@ -809,16 +811,24 @@ class OverlayServiceTest {
             uiEvents().count { it is HintCommand.UiClosed })
     }
 
-    // ---------------------------------------------------------------- the production default is the trampoline
+    // ------------------------------------------- the production default: a transparent CXR scene host, not a trampoline
 
+    /**
+     * 0.24 S5 Task 21 owner fix (decision A): the default no-extra Activity must **stay RESUMED** as the CXR scene.
+     *
+     * The Task 9 design finished the Activity after starting the service. Measured on the device, the launcher then
+     * resumes, CXR reports `onGlassAppResume=false` and terminates the CUSTOM_APP session with `GLASSES_APP_EXIT`;
+     * the 5 s grace expires before the delayed `appStart` can bring anything up, so the production panel path never
+     * obtains a live session. The scene host now starts the same foreground service but does not finish; it is
+     * transparent and non-interactive so the service's 480×380 focusable overlay remains the only visible surface.
+     */
     @Test
-    fun theDefaultActivityStartsTheForegroundServiceInsteadOfHostingThePanel() {
+    fun theDefaultActivityKeepsTheTransparentCxrSceneAliveAndStartsTheService() {
         // Prove the default Activity is the only thing that starts the service: stop any prior instance first.
         context.stopService(serviceIntent)
-        waitUntil("no service before the trampoline launch") { GlassesOverlayService.instanceForTest == null }
+        waitUntil("no service before the scene launch") { GlassesOverlayService.instanceForTest == null }
 
-        // Task 9 review I5: launch the real no-extra path through ActivityScenario and prove it reaches DESTROYED.
-        // The service-start assertion is unchanged; the destroyed state adds "and the Activity is not hosting a panel".
+        val display = holdDisplayOn()
         val intent = Intent(context, GlassesActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         val scenario = ActivityScenario.launch<GlassesActivity>(intent)
         try {
@@ -826,16 +836,104 @@ class OverlayServiceTest {
                 GlassesOverlayService.instanceForTest != null
             }
             val started = requireNotNull(GlassesOverlayService.instanceForTest)
-            assertEquals("the trampoline Activity must finish after starting the service",
-                Lifecycle.State.DESTROYED, scenario.state)
+            assertEquals(
+                "the production Activity must stay RESUMED as the CXR scene: finishing it lets the launcher resume " +
+                    "and CXR terminates the session with GLASSES_APP_EXIT",
+                Lifecycle.State.RESUMED, scenario.state)
             assertFalse("the default path must not draw the panel inside the Activity; the service starts hidden",
                 onMain { started.overlayShownForProbe() })
+
+            var sceneHost = false
+            var panelHost = true
+            var flags = 0
+            var format = 0
+            var backgroundTransparent = false
+            var contentWidth = -1
+            var contentHeight = -1
+            scenario.onActivity { activity ->
+                sceneHost = activity.isSceneHostForProbe()
+                panelHost = activity.isPanelHostForProbe()
+                flags = activity.sceneHostWindowFlagsForProbe()
+                format = activity.sceneHostWindowFormatForProbe()
+                backgroundTransparent = activity.sceneHostBackgroundTransparentForProbe()
+                contentWidth = activity.sceneHostContentWidthForProbe()
+                contentHeight = activity.sceneHostContentHeightForProbe()
+            }
+            assertTrue("the production path must enter the transparent scene host", sceneHost)
+            assertFalse("the scene host must never build the debug Activity panel", panelHost)
+            assertTrue("the scene host must not take key focus from the service's focusable overlay " +
+                "(flags=$flags)", flags and WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE != 0)
+            assertTrue("the scene host must not take touches (flags=$flags)",
+                flags and WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE != 0)
+            assertEquals("the scene window must be translucent, or it composites as opaque black over the launcher",
+                PixelFormat.TRANSLUCENT, format)
+            assertTrue("the scene window background must be transparent", backgroundTransparent)
+            assertEquals("the scene host keeps only a 1x1 transparent content view", 1, contentWidth)
+            assertEquals(1, contentHeight)
+            assertTrue("the scene host must be registered with the service's scene-finish hook",
+                GlassesActivity.sceneHostPresentForTest())
         } finally {
             runCatching { scenario.close() }
+            runCatching { display.release() }
+        }
+    }
+
+    /**
+     * 0.24 S5 Task 21 owner fix (decision A): the transparent scene host may not outlive the CXR session.
+     *
+     * `GlassesOverlayService.onCxrDisconnected` is the production scene-end path (the bridge's own `onDisconnected`);
+     * it already hides the panel and stops the service, and must also finish the Activity it was started from, so the
+     * next `appStart` starts a fresh scene instead of reusing a dead one.
+     */
+    @Test
+    fun aCxrDisconnectFinishesTheTransparentSceneHostActivity() {
+        context.stopService(serviceIntent)
+        waitUntil("no service before the scene launch") { GlassesOverlayService.instanceForTest == null }
+
+        val display = holdDisplayOn()
+        val intent = Intent(context, GlassesActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        val scenario = ActivityScenario.launch<GlassesActivity>(intent)
+        try {
+            waitUntil("the scene host and its service") { GlassesOverlayService.instanceForTest != null }
+            assertEquals("precondition: the production Activity is the RESUMED scene host",
+                Lifecycle.State.RESUMED, scenario.state)
+            val service = requireNotNull(GlassesOverlayService.instanceForTest)
+
+            instrumentation.runOnMainSync { service.onCxrDisconnectedForProbe() }
+
+            waitUntil("a CXR disconnect finishes the transparent scene host") {
+                scenario.state == Lifecycle.State.DESTROYED
+            }
+            waitUntil("the scene-finish hook drops the dead Activity") {
+                !GlassesActivity.sceneHostPresentForTest()
+            }
+        } finally {
+            runCatching { scenario.close() }
+            runCatching { display.release() }
         }
     }
 
     // ---------------------------------------------------------------- helpers
+
+    /**
+     * Holds the glasses display on for the duration of a scene-host test.
+     *
+     * This is a test precondition, not a product claim: this ROM's 5 s screen timeout would otherwise put the display
+     * to sleep a couple of seconds after launch, which pauses/stops the (correctly transparent) Activity and makes
+     * `ActivityScenario` report `CREATED`. A sleeping display is a separate acceptance concern (the panel's own wake
+     * lock covers the wake path); the production Activity itself must never hold the screen on.
+     */
+    private fun holdDisplayOn(): PowerManager.WakeLock {
+        val powerManager = context.getSystemService(Context.POWER_SERVICE) as PowerManager
+        val lock = powerManager.newWakeLock(
+            PowerManager.SCREEN_BRIGHT_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "edith:test-scene-host",
+        )
+        lock.setReferenceCounted(false)
+        lock.acquire(TEST_DISPLAY_HOLD_MILLIS)
+        waitUntil("the glasses display to wake for the scene-host test") { powerManager.isInteractive }
+        return lock
+    }
 
     private fun startAndBind(): GlassesOverlayService {
         context.stopService(serviceIntent)
@@ -887,5 +985,10 @@ class OverlayServiceTest {
             Thread.sleep(50)
         }
         assertTrue("timed out waiting for $what", condition())
+    }
+
+    private companion object {
+        /** Long enough for one scene-host test, short enough that a broken release cannot pin the panel forever. */
+        const val TEST_DISPLAY_HOLD_MILLIS = 30_000L
     }
 }
