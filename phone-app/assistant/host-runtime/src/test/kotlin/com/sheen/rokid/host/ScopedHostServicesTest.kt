@@ -242,6 +242,34 @@ class ScopedHostServicesTest {
         assertEquals(1, begins)
     }
 
+    @Test fun `a granted actions channel forwards precheck and a revoked scope never reaches the classifier`() {
+        val seen = mutableListOf<Pair<String, String>>()
+        val provider = object : ActionExecutor {
+            override fun descriptors() = emptyList<ActionDescriptor>()
+            override fun execute(name: String, argsJson: String) = ActionResult(ActionOutcome.Done, "")
+            override fun cancel() = Unit
+            override fun precheck(name: String, argsJson: String): ActionPrecheck {
+                seen += name to argsJson
+                return ActionPrecheck(PrecheckDecision.RequireConfirmation, "终端命令：会删除数据", "IRREVERSIBLE")
+            }
+        }
+        val scope = scope()
+        val services = ScopedHostServices(scope, setOf(Capability.Actions),
+            mapOf(Capability.Actions to provider), FakeTaskScope())
+        val actions = services.actions()
+
+        // 0.25 Task 11: `ConfirmingActions` asks the scoped executor before every call. Without this override the
+        // interface default `Allow` answered here, so the production shell classifier never ran.
+        val precheck = actions.precheck("shell", "{\"command\":\"pm clear com.x\"}")
+        assertEquals(PrecheckDecision.RequireConfirmation, precheck.decision)
+        assertEquals("IRREVERSIBLE", precheck.reason)
+        assertEquals(listOf("shell" to "{\"command\":\"pm clear com.x\"}"), seen)
+
+        scope.revoke()
+        assertFailsWith<ContractError.Cancelled> { actions.precheck("shell", "{\"command\":\"dumpsys window\"}") }
+        assertEquals(1, seen.size)
+    }
+
     @Test fun `a plugin without the Confirmation capability is refused`() {
         val services = ScopedHostServices(scope(), emptySet(), emptyMap(), FakeTaskScope())
         assertFailsWith<ContractError.CapabilityMissing> { services.confirmation() }

@@ -124,6 +124,11 @@ class ScopedHostServices(
     private fun scopedActions(provider: ActionExecutor) = object : ActionExecutor {
         override fun descriptors() = scope.active { provider.descriptors() }
         override fun execute(name: String, argsJson: String) = scope.active { provider.execute(name, argsJson) }
+        // 0.25 Task 11 (R49): the plugin asks the *scoped* executor before every call, so the call-level
+        // classifier has to be forwarded here too. Without this override the interface default `Allow` runs
+        // and the production shell classifier never sees a command.
+        override fun precheck(name: String, argsJson: String): ActionPrecheck =
+            scope.active { provider.precheck(name, argsJson) }
         override fun cancel() = scope.active { provider.cancel() }
         // 0.25 Task 10 (R42): `cancel` is turn-scoped, so the wrapper that forwards it must forward the
         // next turn's re-arm as well. Without this override the interface's default no-op runs here and
