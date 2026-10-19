@@ -91,16 +91,20 @@ class ToolRegistry(
             return ToolResult.error(call.id, TOOL_THREW)
         }
         // R57: the observation fingerprint rides through verbatim, on every outcome — a refused write that left the
-        // screen unchanged is exactly the evidence the poll/global detectors need.
+        // screen unchanged is exactly the evidence the poll/global detectors need. R98: so does the per-call
+        // state-changing declaration, which is what tells a write that returns an observation apart from a read.
         return when (result.outcome) {
-            ActionOutcome.Done -> ToolResult(call.id, ok = true, payload = result.detail, fingerprint = result.fingerprint)
+            ActionOutcome.Done -> ToolResult(
+                call.id, ok = true, payload = result.detail,
+                fingerprint = result.fingerprint, stateChanging = result.stateChanging,
+            )
             ActionOutcome.Refused -> ToolResult(
                 call.id, ok = false, payload = "${ActionOutcome.Refused.name}: ${result.detail}",
-                fingerprint = result.fingerprint,
+                fingerprint = result.fingerprint, stateChanging = result.stateChanging,
             )
             ActionOutcome.Failed -> ToolResult(
                 call.id, ok = false, payload = "${ActionOutcome.Failed.name}: ${result.detail}",
-                fingerprint = result.fingerprint,
+                fingerprint = result.fingerprint, stateChanging = result.stateChanging,
             )
         }
     }
@@ -118,6 +122,20 @@ class ToolRegistry(
         // merge: an executor that declared a tool must stop when the turn ends even if another declaration was the one
         // the model saw.
         executors.forEach { executor -> runCatching { executor.cancel() } }
+    }
+
+    /**
+     * 0.25 Task 12 fix (R97): re-arms every executor after a **confirmed** tool timeout, so the rest of the same agent
+     * turn can still act.
+     *
+     * [ActionExecutor.cancel] is turn-scoped on the host side — the device kernel refuses every later call until
+     * `beginTurn` — so the stop a timeout issues would otherwise leave the executor cancelled for the whole rest of the
+     * turn. The loop calls this only when the timed-out call really stopped ([AgentLoop]'s `ACTION_TIMEOUT` path); a
+     * STOP/cancel, a teardown and an `ACTION_TIMEOUT_UNCERTAIN` never re-arm. Like [cancel], every executor is attempted
+     * and the first failure is swallowed: one executor that cannot re-arm must not leave the others cancelled.
+     */
+    fun beginTurn() {
+        executors.forEach { executor -> runCatching { executor.beginTurn() } }
     }
 
     private fun argumentsParse(argsJson: String): Boolean =

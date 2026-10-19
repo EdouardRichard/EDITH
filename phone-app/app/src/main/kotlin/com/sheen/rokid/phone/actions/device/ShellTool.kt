@@ -86,6 +86,7 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
                         recoverable = false,
                     ),
                 ),
+                stateChanging = true,
             )
         }
         val target = shell ?: return channelFailure(SHELL_NOT_BOUND)
@@ -132,7 +133,7 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
                 )
             }
         }.toString()
-        return ActionResult(outcome, detail)
+        return ActionResult(outcome, detail, stateChanging = true)
     }
 
     private fun channelFailure(code: String): ActionResult = ActionResult(
@@ -144,9 +145,12 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
             accepted = false,
             error = ToolFailure(code, "the privileged shell channel is not usable", recoverable = true),
         ),
+        stateChanging = true,
     )
 
-    private fun refused(code: String) = ActionResult(ActionOutcome.Refused, code)
+    // R98: every `shell` call is a write, whatever its outcome — the declaration describes the call class, not
+    // whether the command got to run.
+    private fun refused(code: String) = ActionResult(ActionOutcome.Refused, code, stateChanging = true)
 
     companion object {
         const val NAME = "shell"

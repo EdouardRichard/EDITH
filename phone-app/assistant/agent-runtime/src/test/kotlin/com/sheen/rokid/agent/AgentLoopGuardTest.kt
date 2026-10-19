@@ -11,6 +11,7 @@ import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.testsupport.FakeClock
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
 import kotlin.concurrent.thread
 import kotlin.test.Test
@@ -127,6 +128,52 @@ class AgentLoopGuardTest {
         assertEquals(2, executor.calls.size)
         assertEquals(5, run.spentObservations)
         assertFalse(run.steps[2].executed)
+    }
+
+    // ---------------------------------------------------------------- state-changing progress (R98)
+
+    @Test
+    fun `repeated ineffective device act fingerprints trip the no-progress guard`() {
+        // `device` declares observation=true for every call, but an `act` still *changes state*. The guard must see it:
+        // different arguments keep the same-tool detectors (generic/poll) out of the way, so only the guard can end this.
+        val executor = executor(descriptor("device", observation = true))
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, "screen", fingerprint = "same-screen", stateChanging = true)
+        }
+        val gateway = ScriptedGateway(
+            List(4) { reply(calls = listOf(call("c$it", "device", """{"action":"act","kind":"tap","ref":"#n$it"}"""))) } +
+                reply(text = "done"),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.NO_PROGRESS, run.outcome)
+        assertEquals("NO_PROGRESS", run.safeCode)
+        assertEquals(3, run.steps.size)
+        assertEquals(3, gateway.requests.size)
+    }
+
+    @Test
+    fun `read-only observations never feed the no-progress guard`() {
+        // R62's read-only exclusion survives R98: only a state-changing call feeds the guard. Observations stay the poll
+        // detector's read path (see the LOOP_POLL test above). A guard of limit 1 would trip on the first observation if
+        // this seam leaked reads into it.
+        val executor = executor(descriptor("device", observation = true))
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, "screen", fingerprint = "same-screen", stateChanging = false)
+        }
+        val gateway = ScriptedGateway(
+            List(4) {
+                reply(calls = listOf(call("c$it", "device", """{"action":"observe","filter":"all","since":$it}""")))
+            } + reply(text = "done"),
+        )
+        val guard = ProgressGuard(limit = 1)
+
+        val run = loop(gateway, ToolRegistry(listOf(executor)), guard = guard).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(4, run.steps.size)
+        assertFalse(guard.tripped, "an observation is not a state-changing call")
     }
 
     // ---------------------------------------------------------------- ping_pong
@@ -378,7 +425,30 @@ class AgentLoopGuardTest {
         assertEquals(1, run.steps.size)
         assertEquals(1, gateway.requests.size, "no model request after an uncertain write")
         assertTrue(run.steps.single().result.startsWith("ACTION_TIMEOUT_UNCERTAIN"))
+        assertEquals(0, executor.beginTurns.get(), "an uncertain stop must never re-arm the executors")
         executor.release()
+    }
+
+    @Test
+    fun `a confirmed timeout re-arms the executors so a later call in the same turn can act`() {
+        // The host executor's `cancel` is turn-scoped (DeviceKernel), so the timeout's stop request leaves it
+        // cancelled until a `beginTurn`. Without the re-arm, the very next call in the same run is CANCELLED.
+        val executor = TurnScopedExecutor(descriptor("slow", timeoutMillis = 50L), descriptor("quick"))
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "slow"), call("c2", "quick"))),
+                reply(text = "done"),
+            ),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(2, run.steps.size)
+        assertTrue(run.steps[0].result.startsWith("ACTION_TIMEOUT"), run.steps[0].result)
+        assertEquals("ok", run.steps[1].result, "the next call must run against a re-armed executor")
+        assertEquals(2, executor.calls.size, "the second call reached the executor")
+        assertEquals(1, executor.beginTurns.get(), "the timeout recovery path re-arms exactly once")
     }
 
     // ---------------------------------------------------------------- observation budget (R61)
@@ -507,6 +577,7 @@ class AgentLoopGuardTest {
         assertTrue(finished.await(10, TimeUnit.SECONDS), "cancel must reach the blocked tool")
         assertEquals(AgentOutcome.CANCELLED, run?.outcome)
         assertEquals(1, executor.cancels.get(), "the registry cancels the executor exactly once")
+        assertEquals(0, executor.beginTurns.get(), "a STOP/cancel must never re-arm the executors")
         assertTrue(run!!.steps.isEmpty(), "the cancelled call never becomes a step")
         assertTrue(outputs(run!!).isEmpty(), "no unfinished tool output is appended")
         assertTrue(gateway.requests.size == 1)
@@ -553,6 +624,7 @@ class AgentLoopGuardTest {
     /** A tool that ignores both `cancel()` and interrupts: the only honest answer is ACTION_TIMEOUT_UNCERTAIN. */
     private class StuckExecutor(private val descriptor: ActionDescriptor) : ActionExecutor {
         val started = AtomicInteger()
+        val beginTurns = AtomicInteger()
         private val release = CountDownLatch(1)
 
         override fun descriptors(): List<ActionDescriptor> = listOf(descriptor)
@@ -571,13 +643,62 @@ class AgentLoopGuardTest {
 
         override fun cancel() = Unit
 
+        override fun beginTurn() {
+            beginTurns.incrementAndGet()
+        }
+
         fun release() = release.countDown()
+    }
+
+    /**
+     * A turn-scoped executor like the device kernel: [cancel] refuses every later call until [beginTurn].
+     *
+     * The `slow` tool overruns its descriptor timeout (the loop's cancel then interrupts it); the `quick` tool proves
+     * whether the same turn was re-armed before the next call.
+     */
+    private class TurnScopedExecutor(
+        private val slow: ActionDescriptor,
+        private val quick: ActionDescriptor,
+    ) : ActionExecutor {
+        val beginTurns = AtomicInteger()
+        val calls = mutableListOf<String>()
+        private val cancelled = AtomicBoolean(false)
+        @Volatile
+        private var worker: Thread? = null
+
+        override fun descriptors(): List<ActionDescriptor> = listOf(slow, quick)
+
+        override fun execute(name: String, argsJson: String): ActionResult {
+            calls += name
+            if (cancelled.get()) return ActionResult(ActionOutcome.Failed, "CANCELLED")
+            if (name == slow.name) {
+                worker = Thread.currentThread()
+                try {
+                    Thread.sleep(5_000L)
+                } catch (_: InterruptedException) {
+                    // The timeout's cancel interrupts the call; its late answer is discarded by the loop.
+                }
+                return ActionResult(ActionOutcome.Done, "late")
+            }
+            return ActionResult(ActionOutcome.Done, "quick")
+        }
+
+        override fun cancel() {
+            cancelled.set(true)
+            worker?.interrupt()
+        }
+
+        override fun beginTurn() {
+            beginTurns.incrementAndGet()
+            cancelled.set(false)
+        }
     }
 
     /** A tool that blocks until released by the test: a cancelled call never returns, so it stays unfinished. */
     private class BlockingExecutor(private val descriptor: ActionDescriptor) : ActionExecutor {
         val started = CountDownLatch(1)
         val cancels = AtomicInteger()
+        val beginTurns = AtomicInteger()
         private val stop = CountDownLatch(1)
 
         override fun descriptors(): List<ActionDescriptor> = listOf(descriptor)
@@ -596,6 +717,10 @@ class AgentLoopGuardTest {
         override fun cancel() {
             // Deliberately does not release the call: this is the "unfinished at cancellation" case R61 names.
             cancels.incrementAndGet()
+        }
+
+        override fun beginTurn() {
+            beginTurns.incrementAndGet()
         }
 
         fun release() = stop.countDown()

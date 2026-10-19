@@ -82,6 +82,15 @@ class DialToolTest {
         assertTrue(executor.calls.isEmpty())
     }
 
+    // ---- R98: the state-changing declaration ----
+
+    @Test
+    fun `dial results declare a state change`() {
+        assertTrue(DialTool(FakeExecutor()) { true }.execute("""{"number":"10086"}""").stateChanging)
+        // The declaration describes the call class, not whether CALL_PHONE allowed it to run.
+        assertTrue(DialTool(FakeExecutor()) { false }.execute("""{"number":"10086"}""").stateChanging)
+    }
+
     private fun body(result: ActionResult): JsonObject =
         json.parseToJsonElement(result.detail).jsonObject
 

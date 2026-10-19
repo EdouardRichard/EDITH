@@ -35,6 +35,15 @@ data class ToolResult(
     val ok: Boolean,
     val payload: String,
     val fingerprint: String? = null,
+    /**
+     * 0.25 Task 12 fix (R98): the executor's per-call declaration that this call **changed state**, projected verbatim
+     * from `plugin-api`'s `ActionResult.stateChanging`.
+     *
+     * It is what lets the loop tell `device.act` (state-changing, `observation = true` because it returns a fingerprint)
+     * from `device.observe` (read-only) without a name table. `ProgressGuard` is fed only a state-changing result that
+     * also carries a [fingerprint]; `false` — the default, and every plugin tool — keeps the R62 read-only exclusion.
+     */
+    val stateChanging: Boolean = false,
 ) {
     companion object {
         /** A failed step whose payload is a stable machine-readable code rather than an exception message. */

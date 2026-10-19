@@ -223,6 +223,19 @@ class ShellToolTest {
             tool.precheck("device", """{"action":"observe"}""").decision)
     }
 
+    // ---- R98: the state-changing declaration ----
+
+    @Test
+    fun `shell results declare a state change`() {
+        val done = ShellTool(FakeShell(ShellResult("echo hi", 0, "hi\n", "", false)))
+            .execute("""{"command":"echo hi"}""")
+        assertTrue(done.stateChanging)
+
+        // The declaration describes the call class, not whether the command got to run.
+        val refused = ShellTool(null).execute("""{"command":"echo hi"}""")
+        assertTrue("a shell call is a write even when its channel is unavailable", refused.stateChanging)
+    }
+
     private fun body(result: ActionResult): JsonObject =
         json.parseToJsonElement(result.detail).jsonObject
 

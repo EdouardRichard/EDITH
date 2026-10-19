@@ -107,6 +107,19 @@ data class ActionResult(
     val outcome: ActionOutcome,
     val detail: String,
     val fingerprint: String? = null,
+    /**
+     * 0.25 Task 12 fix (R98): whether this call **changes state** — a write, not a read-only observation.
+     *
+     * A descriptor cannot answer this for a multi-action tool: `device` declares [ActionDescriptor.observation] once
+     * because every one of its calls returns a post-call fingerprint, so "not an observation" would misclassify
+     * `device.act` as a read. The tool therefore declares it per **call**. The agent loop feeds its `ProgressGuard` only
+     * a state-changing result that also carries a [fingerprint], which keeps R62's read-only exclusion while letting a
+     * write that returns an observation be recognised as a write.
+     *
+     * `false` — the default, and what `device.observe`/`screenshot`/`wait`/`status` and the plugin's own tools return —
+     * means this call only reads.
+     */
+    val stateChanging: Boolean = false,
 )
 
 /**
@@ -155,6 +168,11 @@ interface ActionExecutor {
      * cancelled for the rest of the process. The default is a no-op so every existing executor and
      * every hand-built test executor keeps compiling and behaving exactly as before; an executor
      * that owns turn-scoped state (the device kernel) overrides it to re-arm.
+     *
+     * 0.25 Task 12 fix (R97): a **confirmed** tool timeout is the one mid-turn re-arm. The loop cancels
+     * the executors to stop the overrunning call and calls `beginTurn` again once that call has really
+     * stopped, so the same turn can still act. A STOP/cancel, a teardown and an uncertain timeout never
+     * re-arm — they must stay cancelled.
      */
     fun beginTurn() = Unit
 

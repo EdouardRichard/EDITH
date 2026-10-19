@@ -725,13 +725,22 @@ class AgentLoop(
                     history += ModelHistoryItem.ToolOutput(call.id, execution.result.payload)
                     return finish(AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps)
                 }
+                // R97: the stop a timeout issued is turn-scoped on the host side (DeviceKernel.cancel refuses every call
+                // until beginTurn). The call really stopped, so re-arm the executors here, once the timeout result exists,
+                // and the rest of this same turn can still act. An uncertain stop ended the run above; a STOP, a cancel
+                // and a teardown must stay cancelled, so those paths never reach this re-arm.
+                if (execution.timedOut && !cancelled) {
+                    registry.beginTurn()
+                }
                 val result = execution.result
                 val write = descriptor?.let { !it.observation } ?: false
-                // R57/R62: the detectors see only a fingerprint that exists **after** this call ran; the guard is fed
-                // only by a fingerprint-bearing write (a non-observation tool). The payload is never used as a
-                // fingerprint — a payload that carries timing or a counter could never trip the guard.
+                // R57/R62/R98: the detectors see only a fingerprint that exists **after** this call ran. The guard is
+                // fed by a fingerprint-bearing **state-changing** call — the tool's per-call declaration, not
+                // `!observation` (`device` declares observation=true for act too, and an act is still a write). A read
+                // never feeds it and the payload is never used as a fingerprint (a payload with timing or a counter
+                // could never trip the guard).
                 val after = detectors.afterCall(execution.executed, write, result.fingerprint)
-                if (execution.executed && write && result.fingerprint != null) {
+                if (execution.executed && result.stateChanging && result.fingerprint != null) {
                     guard.observeAfterAction(result.fingerprint)
                 }
                 // R56: the error streak is fed by every attempt with a stable code (a policy refusal counts, a

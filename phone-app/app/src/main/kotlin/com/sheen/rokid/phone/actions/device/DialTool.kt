@@ -42,7 +42,7 @@ class DialTool(
             return refused(DIAL_FAILED)
         }
         return when (result.outcome) {
-            ActionOutcome.Done -> ActionResult(ActionOutcome.Done, acceptedOnly())
+            ActionOutcome.Done -> ActionResult(ActionOutcome.Done, acceptedOnly(), stateChanging = true)
             ActionOutcome.Refused -> refused(result.detail.ifBlank { ARGUMENTS_INVALID })
             ActionOutcome.Failed -> ActionResult(
                 ActionOutcome.Failed,
@@ -53,6 +53,7 @@ class DialTool(
                     accepted = false,
                     error = ToolFailure(DIAL_FAILED, "the dial intent could not be launched", recoverable = true),
                 ),
+                stateChanging = true,
             )
         }
     }
@@ -66,6 +67,8 @@ class DialTool(
         applied = null,
     )
 
+    // R98: every `dial` call is a write, whatever its outcome — the declaration describes the call class, not whether
+    // CALL_PHONE let the intent run.
     private fun refused(code: String): ActionResult = ActionResult(
         ActionOutcome.Refused,
         toolEnvelope(
@@ -75,6 +78,7 @@ class DialTool(
             accepted = false,
             error = ToolFailure(code, messageFor(code), recoverable = code != ARGUMENTS_INVALID),
         ),
+        stateChanging = true,
     )
 
     private fun messageFor(code: String): String = when (code) {

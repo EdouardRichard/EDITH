@@ -203,6 +203,7 @@ class OpenTool(
                 recoverable = true,
             ),
         ),
+        stateChanging = true,
     )
 
     // ── shell helpers ────────────────────────────────────────────────────────
@@ -237,9 +238,12 @@ class OpenTool(
     private fun runSafely(target: PrivilegedShell, command: String): ShellResult? =
         runCatching { target.run(command) }.getOrNull()
 
+    // R98: every `open` call is a write, whatever its outcome — launching an app, a page or a URL changes the
+    // foreground state; the declaration describes the call class, not whether the launch got to run.
     private fun done(data: kotlinx.serialization.json.JsonObject): ActionResult = ActionResult(
         ActionOutcome.Done,
         toolEnvelope(tool = NAME, ok = true, channel = CHANNEL, accepted = true, data = data),
+        stateChanging = true,
     )
 
     private fun failure(
@@ -256,6 +260,7 @@ class OpenTool(
             accepted = false,
             error = ToolFailure(code, message, recoverable),
         ),
+        stateChanging = true,
     )
 
     private fun channelUnavailable(): ActionResult = failure(

@@ -291,6 +291,26 @@ class ToolRegistryTest {
         assertEquals("fp-1", refused.fingerprint, "a refused write still reports the screen it left behind")
     }
 
+    @Test fun `the state changing declaration rides through every outcome`() {
+        val executor = executorOf("device")
+        val registry = ToolRegistry(listOf(executor))
+
+        // Default: no declaration — reads and every plugin tool keep the pre-R98 behaviour.
+        assertFalse(registry.execute(ToolCall("c0", "device", "{}")).stateChanging)
+
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "screen", stateChanging = true) }
+        assertTrue(registry.execute(ToolCall("c1", "device", "{}")).stateChanging)
+
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Refused, "NODE_STALE", stateChanging = true) }
+        assertTrue(
+            registry.execute(ToolCall("c2", "device", "{}")).stateChanging,
+            "a refused write is still a state-changing call",
+        )
+
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", stateChanging = true) }
+        assertTrue(registry.execute(ToolCall("c3", "device", "{}")).stateChanging)
+    }
+
     @Test fun `cancel reaches every executor once including a duplicate that lost the merge`() {
         val survivor = executorOf("shared", risk = RiskLevel.L1)
         val loser = executorOf("shared", risk = RiskLevel.L0)
@@ -302,5 +322,31 @@ class ToolRegistryTest {
         assertEquals(1, survivor.cancellations)
         assertEquals(1, loser.cancellations, "an executor that declared a tool must stop even if it lost the merge")
         assertEquals(1, distinct.cancellations)
+    }
+
+    @Test fun `beginTurn reaches every executor once including a duplicate that lost the merge`() {
+        // R97: the same host executor set `cancel` reaches must be re-armed after a confirmed tool timeout.
+        val survivor = executorOf("shared", risk = RiskLevel.L1)
+        val loser = executorOf("shared", risk = RiskLevel.L0)
+        val distinct = executorOf("other")
+        val registry = ToolRegistry(listOf(survivor, loser, distinct))
+
+        registry.beginTurn()
+
+        assertEquals(1, survivor.begins)
+        assertEquals(1, loser.begins, "an executor that declared a tool must re-arm even if it lost the merge")
+        assertEquals(1, distinct.begins)
+    }
+
+    @Test fun `a throwing beginTurn does not stop the other executors from re-arming`() {
+        val throwing = executorOf("throwing")
+        throwing.beginTurnFailure = IllegalStateException("boom")
+        val healthy = executorOf("healthy")
+        val registry = ToolRegistry(listOf(throwing, healthy))
+
+        registry.beginTurn()
+
+        assertEquals(1, throwing.begins, "every executor is attempted before the first failure is swallowed")
+        assertEquals(1, healthy.begins)
     }
 }

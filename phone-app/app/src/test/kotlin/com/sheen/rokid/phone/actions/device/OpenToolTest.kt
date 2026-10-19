@@ -256,6 +256,19 @@ class OpenToolTest {
         assertEquals("CHANNEL_UNAVAILABLE", errorCode(result))
     }
 
+    // ---- R98: the state-changing declaration ----
+
+    @Test
+    fun `open results declare a state change`() {
+        val pipeline = ShellPipeline()
+        val done = OpenTool(pipeline.shell, knownMusic()).execute("""{"target":"com.example.music"}""")
+        assertTrue(done.stateChanging)
+
+        // The declaration describes the call class, not whether the channel was available.
+        val refused = OpenTool(null, FakeCatalog()).execute("""{"target":"com.example.music"}""")
+        assertTrue("open is a write even when its channel is unavailable", refused.stateChanging)
+    }
+
     // ---- helpers ----
 
     private fun body(result: ActionResult): JsonObject =

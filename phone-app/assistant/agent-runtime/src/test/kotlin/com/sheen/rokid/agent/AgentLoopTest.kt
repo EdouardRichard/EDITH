@@ -751,8 +751,11 @@ class AgentLoopTest {
         // R62 (Task 12): the guard is fed the **observation fingerprint** of a write, never the payload. The three
         // calls have different arguments on purpose: same-tool+args repeats are `generic_repeat`'s job now, so a test
         // that kept identical payloads would pass for the wrong detector (and not prove the guard is fed at all).
+        // R98: the fake declares the call state-changing, as the tool layer does for a real write.
         val executor = executorOf("lookup")
-        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "same-screen", fingerprint = "same-screen") }
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, "same-screen", fingerprint = "same-screen", stateChanging = true)
+        }
         val gateway = ScriptedGateway(
             List(4) { reply(calls = listOf(call("c$it", "lookup", """{"step":$it}"""))) },
         )
@@ -770,7 +773,12 @@ class AgentLoopTest {
         var attempt = 0
         executor.outcome = { _, _ ->
             attempt++
-            ActionResult(ActionOutcome.Done, "payload", fingerprint = if (attempt == 3) "changed" else "same")
+            ActionResult(
+                ActionOutcome.Done,
+                "payload",
+                fingerprint = if (attempt == 3) "changed" else "same",
+                stateChanging = true,
+            )
         }
         val gateway = ScriptedGateway(
             listOf(
@@ -804,7 +812,9 @@ class AgentLoopTest {
         guard.observeAfterAction("stale-screen")
         guard.observeAfterAction("stale-screen")
         val executor = executorOf("lookup")
-        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "payload", fingerprint = "fresh-screen") }
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, "payload", fingerprint = "fresh-screen", stateChanging = true)
+        }
         val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "done")))
 
         val run = newLoop(gateway, registry = ToolRegistry(listOf(executor)), guard = guard).run(request())
@@ -821,7 +831,9 @@ class AgentLoopTest {
         // Without a per-run reset this first observation is the third consecutive identical fingerprint and the run
         // ends NO_PROGRESS before it gets anywhere.
         val executor = executorOf("lookup")
-        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "payload", fingerprint = "same-screen") }
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, "payload", fingerprint = "same-screen", stateChanging = true)
+        }
         val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "done")))
 
         val run = newLoop(gateway, registry = ToolRegistry(listOf(executor)), guard = guard).run(request())

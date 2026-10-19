@@ -212,7 +212,12 @@ class DeviceTool(
             key = args.stringArg("key"),
             timeoutMillis = timeout,
         )
-        return result(envelope, project(envelope, lastFilter), fingerprintAfter(envelope))
+        return result(
+            envelope,
+            project(envelope, lastFilter),
+            fingerprintAfter(envelope),
+            stateChanging = true,
+        )
     }
 
     /**
@@ -242,19 +247,39 @@ class DeviceTool(
                 timeoutMillis = remaining,
             )
             if (!scrolled.ok && scrolled.error?.code != DeviceErrorCodes.ACCEPTED_NO_EFFECT) {
-                return result(scrolled.copy(action = ACTION_ACT), project(scrolled, lastFilter), fingerprintAfter(scrolled))
+                return result(
+                    scrolled.copy(action = ACTION_ACT),
+                    project(scrolled, lastFilter),
+                    fingerprintAfter(scrolled),
+                    stateChanging = true,
+                )
             }
             val waited = operations.waitFor(text, null, false, remaining)
             last = waited
             if (waited.ok) {
-                return result(waited.copy(action = ACTION_ACT), project(waited, lastFilter), fingerprintAfter(waited))
+                return result(
+                    waited.copy(action = ACTION_ACT),
+                    project(waited, lastFilter),
+                    fingerprintAfter(waited),
+                    stateChanging = true,
+                )
             }
             if (waited.error?.code != DeviceErrorCodes.VERIFY_TIMEOUT) {
-                return result(waited.copy(action = ACTION_ACT), project(waited, lastFilter), fingerprintAfter(waited))
+                return result(
+                    waited.copy(action = ACTION_ACT),
+                    project(waited, lastFilter),
+                    fingerprintAfter(waited),
+                    stateChanging = true,
+                )
             }
         } while (clock() - started < timeoutMillis)
         val envelope = last ?: operations.waitFor(text, null, false, 1L)
-        return result(envelope.copy(action = ACTION_ACT), project(envelope, lastFilter), fingerprintAfter(envelope))
+        return result(
+            envelope.copy(action = ACTION_ACT),
+            project(envelope, lastFilter),
+            fingerprintAfter(envelope),
+            stateChanging = true,
+        )
     }
 
     private fun screenshot(): ActionResult {
@@ -308,13 +333,25 @@ class DeviceTool(
         }
     }
 
-    private fun result(envelope: DeviceEnvelope, data: JsonObject, fingerprint: String? = null): ActionResult {
+    /**
+     * One device call's result.
+     *
+     * R98: [stateChanging] is `true` for `act` (a write, including `scroll_to_text`) and `false` for the read-only
+     * actions. The `device` descriptor declares `observation = true` for all of them, so this per-call flag is the only
+     * way the loop can tell the write that returns a post-call observation from the read that does.
+     */
+    private fun result(
+        envelope: DeviceEnvelope,
+        data: JsonObject,
+        fingerprint: String? = null,
+        stateChanging: Boolean = false,
+    ): ActionResult {
         val outcome = when {
             envelope.ok -> ActionOutcome.Done
             envelope.error?.recoverable == true -> ActionOutcome.Refused
             else -> ActionOutcome.Failed
         }
-        return ActionResult(outcome, renderEnvelope(envelope, data), fingerprint)
+        return ActionResult(outcome, renderEnvelope(envelope, data), fingerprint, stateChanging)
     }
 
     /**
@@ -498,8 +535,9 @@ class DeviceTool(
             reversible = false,
             scope = "app.ui",
             // Task 12 (R57/R61): every `device` call comes back with an observation (the kernel's post-action
-            // snapshot), so the loop counts it against the observation budget and fingerprints it. It is deliberately
-            // *not* a ProgressGuard input: the poll/global detectors own the repeated-observation case.
+            // snapshot), so the loop counts it against the observation budget and fingerprints it. R98: the descriptor
+            // cannot distinguish `act` from `observe`, so each result declares `stateChanging` per call — the loop feeds
+            // ProgressGuard from an act (when it has a fingerprint) and never from a read.
             observation = true,
         )
     }

@@ -473,6 +473,21 @@ class DeviceToolTest {
     }
 
     @Test
+    fun `act is state changing while the read-only device actions are not`() {
+        // R98: `device` declares observation=true for all its calls, so the descriptor cannot tell a write from a read.
+        // The per-call result does: only `act` (including scroll_to_text) feeds the loop's ProgressGuard.
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        val tool = tool(operations)
+
+        assertFalse(tool.execute("""{"action":"observe"}""").stateChanging)
+        assertFalse(tool.execute("""{"action":"status"}""").stateChanging)
+        assertFalse(tool.execute("""{"action":"screenshot"}""").stateChanging)
+        assertFalse(tool.execute("""{"action":"wait","idle":true}""").stateChanging)
+        assertTrue(tool.execute("""{"action":"act","kind":"tap","ref":"#n1"}""").stateChanging)
+        assertTrue(tool.execute("""{"action":"act","kind":"scroll_to_text","text":"A"}""").stateChanging)
+    }
+
+    @Test
     fun `wait status and screenshot carry no observation fingerprint`() {
         val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
         val tool = tool(operations)

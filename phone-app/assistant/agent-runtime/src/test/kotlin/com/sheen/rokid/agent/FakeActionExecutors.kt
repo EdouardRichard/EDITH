@@ -17,6 +17,8 @@ internal class RecordingActionExecutor(
     var outcome: (String, String) -> ActionResult = { _, _ -> ActionResult(ActionOutcome.Done, "done") }
     var failure: RuntimeException? = null
     var cancellations = 0
+    var begins = 0
+    var beginTurnFailure: RuntimeException? = null
 
     override fun descriptors(): List<ActionDescriptor> = actions
 
@@ -28,6 +30,11 @@ internal class RecordingActionExecutor(
 
     override fun cancel() {
         cancellations++
+    }
+
+    override fun beginTurn() {
+        begins++
+        beginTurnFailure?.let { throw it }
     }
 }
 
