@@ -23,7 +23,8 @@ import kotlinx.serialization.json.put
  *  - ambiguity is `Refused` with `error.code = APP_AMBIGUOUS` and
  *    `data.candidates = [{"label":...,"packageName":...}]` — never a `Done`, and never parsed out of
  *    a `CODE:payload` detail string (R20);
- *  - an unknown name is `APP_NOT_FOUND`;
+ *  - an unknown name is `APP_NOT_FOUND`; a package-shaped token counts as a package only when the
+ *    catalog knows it, otherwise it is resolved like a label and an unknown one is `APP_NOT_FOUND`;
  *  - a package launch resolves its launcher component first
  *    (`cmd package resolve-activity --brief -c android.intent.category.LAUNCHER <pkg>`), then
  *    `am start -W -n <component>`; no component falls back to the launcher intent;
@@ -117,12 +118,18 @@ class OpenTool(
     // ── app launch ───────────────────────────────────────────────────────────
 
     private fun launchApp(target: String, relaunch: Boolean): ActionResult {
-        val resolved = when {
-            PACKAGE_NAME.matches(target) -> {
-                val label = catalog.visibleApps().firstOrNull { it.packageName == target }?.label ?: target
-                LaunchTarget(target, label)
-            }
-            else -> when (val resolution = resolver.resolve(target)) {
+        // A package-shaped token is a package only when the catalog actually knows that package
+        // (R43 fix): "youtube" is a label, so it must fall through to name resolution, and an
+        // uninstalled "com.nope" must be APP_NOT_FOUND instead of a launch attempt.
+        val known = if (PACKAGE_NAME.matches(target)) {
+            catalog.visibleApps().firstOrNull { it.packageName == target }
+        } else {
+            null
+        }
+        val resolved = if (known != null) {
+            LaunchTarget(known.packageName, known.label)
+        } else {
+            when (val resolution = resolver.resolve(target)) {
                 is LaunchResolution.Found -> LaunchTarget(
                     resolution.target.packageName,
                     resolution.target.label,

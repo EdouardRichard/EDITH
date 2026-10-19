@@ -253,13 +253,17 @@ class DeviceTool(
     }
 
     private fun project(envelope: DeviceEnvelope, filter: ScreenFilter): JsonObject {
+        // R32: the kernel writes a one-line `diagnostic=...` in `data` when a write succeeded but the
+        // result could not be observed. There is no screen for that envelope, so keep the line and do
+        // not project a stale observation as if it were the write's result.
+        val kernelDiagnostic = envelope.data?.takeIf { it.isNotBlank() }
         val observation = operations.latestObservation
-        return if (observation != null) {
+        return if (observation != null && kernelDiagnostic == null) {
             projector.project(observation, filter)
         } else {
             buildJsonObject {
                 put("screen", JsonNull)
-                put("diagnostic", envelope.error?.code ?: "no observation")
+                put("diagnostic", kernelDiagnostic ?: envelope.error?.code ?: "no observation")
             }
         }
     }
@@ -370,6 +374,13 @@ class DeviceTool(
         /**
          * The model-facing schema (spec §4.7): one action selector plus the union of the per-action
          * parameters. Deliberately no `via`, `point`, `region` or `annotate` (D84, R44).
+         *
+         * Spec §4.7 also lists `observe.window` / `observe.since_rev` and
+         * `act.from` / `act.to` / `act.duration_ms`. They are deliberately omitted in 0.25 (R64):
+         * the frozen kernel API ([DeviceKernel.observe] / [DeviceKernel.act]) has no such
+         * parameters, and `from`/`to` would be model-supplied coordinates, which D84 forbids.
+         * Advertising them would add arguments the tool silently ignores; they can only arrive
+         * together with the kernel capability, not as schema alone.
          */
         val DESCRIPTOR: ActionDescriptor = ActionDescriptor(
             name = NAME,

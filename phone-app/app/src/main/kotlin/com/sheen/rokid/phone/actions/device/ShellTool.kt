@@ -24,9 +24,11 @@ import kotlinx.serialization.json.put
  * rather than silently ignored.
  *
  * **The timeout is not faked.** [PrivilegedShell] has no timeout API, so `timeout_ms` is carried as
- * a semantic argument and the shell's own facts (`SHELL_NOT_BOUND`, `SHELL_REPLY_TOO_LARGE`,
- * `SHELL_FAILED`) survive into the envelope; the tool never invents `ACTION_TIMEOUT`. Command
- * classification and confirmation are Task 11 and are deliberately absent here.
+ * a semantic argument and the shell's own facts survive into the envelope (R65): a reply the carrier
+ * cut short is `SHELL_REPLY_TOO_LARGE`, a carrier failure that truncated nothing is `SHELL_FAILED`,
+ * an unparseable reply is `SHELL_FAILED`, and an unreachable channel is `SHELL_NOT_BOUND`; the tool
+ * never invents `ACTION_TIMEOUT`. Command classification and confirmation are Task 11 and are
+ * deliberately absent here.
  *
  * Outcome mapping: a completed zero-exit command is `Done`; a completed non-zero exit is `Failed`
  * (it ran and failed, with its exit code and output kept); a channel failure is `Refused` (the
@@ -75,12 +77,14 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
         val (stdout, stdoutCut) = truncateUtf8(result.stdout, maxBytes.toInt())
         val (stderr, stderrCut) = truncateUtf8(result.stderr, maxBytes.toInt())
         val truncated = result.truncated || stdoutCut || stderrCut
-        val failureCode = result.failure?.let { failure ->
-            when (failure) {
-                ShellFailure.NOT_BOUND -> SHELL_NOT_BOUND
-                ShellFailure.CARRIER -> SHELL_REPLY_TOO_LARGE
-                ShellFailure.PARSE -> SHELL_FAILED
-            }
+        val failureCode = when {
+            // R65: only a reply the carrier actually cut is the too-large answer. A carrier failure
+            // that truncated nothing means the call did not cross, which is a plain shell failure.
+            result.truncated -> SHELL_REPLY_TOO_LARGE
+            result.failure == ShellFailure.NOT_BOUND -> SHELL_NOT_BOUND
+            result.failure == ShellFailure.CARRIER -> SHELL_FAILED
+            result.failure == ShellFailure.PARSE -> SHELL_FAILED
+            else -> null
         }
         val ok = failureCode == null && result.exitCode == 0
         val outcome = when {
@@ -162,9 +166,9 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
  * The kernel-side adapter from the app's [PrivilegedShell] to the pure-JVM `ShellPort`.
  *
  * The kernel's shell-key path and Task 11's shell classification use this adapter; it keeps the
- * adapter's channel codes (`NOT_BOUND`→`SHELL_NOT_BOUND`, `CARRIER`→`SHELL_REPLY_TOO_LARGE`,
- * `PARSE`→`SHELL_FAILED`) and cuts each stream to [ShellPort.run]'s `maxBytes` with the same
- * UTF-8-boundary rule the `shell` tool uses.
+ * R65 channel codes (`NOT_BOUND`→`SHELL_NOT_BOUND`, `CARRIER` without truncation→`SHELL_FAILED`,
+ * `PARSE`→`SHELL_FAILED`, a truncated reply→`SHELL_REPLY_TOO_LARGE`) and cuts each stream to
+ * [ShellPort.run]'s `maxBytes` with the same UTF-8-boundary rule the `shell` tool uses.
  */
 class PrivilegedShellPort(private val shell: PrivilegedShell) : ShellPort {
 
@@ -180,11 +184,12 @@ class PrivilegedShellPort(private val shell: PrivilegedShell) : ShellPort {
                 failure = SHELL_FAILED,
             )
         }
-        val failure = when (result.failure) {
-            ShellFailure.NOT_BOUND -> "SHELL_NOT_BOUND"
-            ShellFailure.CARRIER -> "SHELL_REPLY_TOO_LARGE"
-            ShellFailure.PARSE -> "SHELL_FAILED"
-            null -> null
+        val failure = when {
+            result.truncated -> "SHELL_REPLY_TOO_LARGE"
+            result.failure == ShellFailure.NOT_BOUND -> "SHELL_NOT_BOUND"
+            result.failure == ShellFailure.CARRIER -> "SHELL_FAILED"
+            result.failure == ShellFailure.PARSE -> "SHELL_FAILED"
+            else -> null
         }
         val (stdout, stdoutCut) = truncateUtf8(result.stdout, maxBytes)
         val (stderr, stderrCut) = truncateUtf8(result.stderr, maxBytes)

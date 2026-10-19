@@ -62,9 +62,11 @@ class ShellToolTest {
 
     @Test
     fun `channel failures keep their own codes`() {
+        // R65: only a reply cut by the carrier is SHELL_REPLY_TOO_LARGE; a carrier failure that did
+        // not truncate anything is SHELL_FAILED, as is an unparseable reply.
         val cases = listOf(
             ShellFailure.NOT_BOUND to "SHELL_NOT_BOUND",
-            ShellFailure.CARRIER to "SHELL_REPLY_TOO_LARGE",
+            ShellFailure.CARRIER to "SHELL_FAILED",
             ShellFailure.PARSE to "SHELL_FAILED",
         )
         cases.forEach { (failure, expected) ->
@@ -75,6 +77,20 @@ class ShellToolTest {
             assertEquals("$failure must refuse", ActionOutcome.Refused, result.outcome)
             assertEquals(expected, body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
         }
+    }
+
+    @Test
+    fun `a reply the carrier cut short is SHELL_REPLY_TOO_LARGE`() {
+        val shell = FakeShell(ShellResult("x", 0, "a prefix", "", truncated = true))
+
+        val result = ShellTool(shell).execute("""{"command":"x"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        val body = body(result)
+        assertEquals("SHELL_REPLY_TOO_LARGE", body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals(false, body["ok"]!!.jsonPrimitive.boolean)
+        assertTrue(body["truncated"]!!.jsonPrimitive.boolean)
+        assertEquals("a prefix", body["stdout"]!!.jsonPrimitive.content)
     }
 
     @Test
@@ -112,7 +128,7 @@ class ShellToolTest {
         val result = ShellTool(shell).execute("""{"command":"slow","timeout_ms":1}""")
 
         val code = body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content
-        assertEquals("SHELL_REPLY_TOO_LARGE", code)
+        assertEquals("SHELL_FAILED", code)
         assertFalse("the shell has no timeout API; the tool must not claim ACTION_TIMEOUT",
             result.detail.contains("ACTION_TIMEOUT"))
     }
@@ -141,6 +157,15 @@ class ShellToolTest {
         shell.result = ShellResult("cmd", -1, "", "marker", false, failure = ShellFailure.NOT_BOUND)
         val down = port.run("cmd", 1_000, 64)
         assertEquals("SHELL_NOT_BOUND", down.failure)
+
+        shell.result = ShellResult("cmd", -1, "", "carrier refused", false, failure = ShellFailure.CARRIER)
+        val carrier = port.run("cmd", 1_000, 64)
+        assertEquals("SHELL_FAILED", carrier.failure)
+
+        shell.result = ShellResult("cmd", 0, "a prefix", "", truncated = true)
+        val cutShort = port.run("cmd", 1_000, 64)
+        assertEquals("SHELL_REPLY_TOO_LARGE", cutShort.failure)
+        assertTrue(cutShort.truncated)
     }
 
     private fun body(result: ActionResult): JsonObject =

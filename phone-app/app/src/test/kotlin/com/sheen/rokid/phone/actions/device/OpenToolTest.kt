@@ -98,6 +98,37 @@ class OpenToolTest {
     }
 
     @Test
+    fun `an ascii label resolves through the catalog instead of being treated as a package`() {
+        val pipeline = ShellPipeline()
+        val catalog = FakeCatalog(
+            listOf(AppEntry("com.google.android.youtube", "youtube", "android.intent.action.MAIN")),
+        )
+
+        val result = OpenTool(pipeline.shell, catalog).execute("""{"target":"youtube"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(
+            "cmd package resolve-activity --brief -c android.intent.category.LAUNCHER com.google.android.youtube",
+            pipeline.shell.commands[0],
+        )
+        assertEquals(
+            "am start -W -n com.google.android.youtube/.MainActivity",
+            pipeline.shell.commands[1],
+        )
+    }
+
+    @Test
+    fun `a package-shaped target the catalog does not know is APP_NOT_FOUND and never reaches the shell`() {
+        val pipeline = ShellPipeline()
+
+        val result = OpenTool(pipeline.shell, FakeCatalog()).execute("""{"target":"com.nope"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("APP_NOT_FOUND", errorCode(result))
+        assertTrue("an uninstalled package must not be launched", pipeline.shell.commands.isEmpty())
+    }
+
+    @Test
     fun `a non-http scheme is INVALID_URL and never reaches the shell`() {
         val shell = FakeShell()
 
@@ -113,7 +144,7 @@ class OpenToolTest {
     @Test
     fun `a package target resolves the launcher component then starts it`() {
         val pipeline = ShellPipeline()
-        val result = OpenTool(pipeline.shell, FakeCatalog()).execute("""{"target":"com.example.music"}""")
+        val result = OpenTool(pipeline.shell, knownMusic()).execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals(
@@ -132,7 +163,7 @@ class OpenToolTest {
             ShellResult(command, -1, "", "SHELL_NOT_BOUND", false, failure = ShellFailure.NOT_BOUND)
         }
 
-        val result = OpenTool(shell, FakeCatalog()).execute("""{"target":"com.example.music"}""")
+        val result = OpenTool(shell, knownMusic()).execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("CHANNEL_UNAVAILABLE", errorCode(result))
@@ -142,15 +173,15 @@ class OpenToolTest {
     fun `a resolve exit other than zero is CHANNEL_UNAVAILABLE`() {
         val shell = FakeShell { command -> ShellResult(command, 1, "", "boom") }
 
-        val result = OpenTool(shell, FakeCatalog()).execute("""{"target":"com.example.music"}""")
+        val result = OpenTool(shell, knownMusic()).execute("""{"target":"com.example.music"}""")
 
         assertEquals("CHANNEL_UNAVAILABLE", errorCode(result))
     }
 
     @Test
     fun `no resolved component falls back to a launcher intent`() {
-        val pipeline = ShellPipeline(resolveComponent = null)
-        val result = OpenTool(pipeline.shell, FakeCatalog()).execute("""{"target":"com.example.music"}""")
+        val pipeline = ShellPipeline(component = { null })
+        val result = OpenTool(pipeline.shell, knownMusic()).execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals(
@@ -163,7 +194,7 @@ class OpenToolTest {
     fun `a launch without Status ok is a Failed STATE_UNCHANGED`() {
         val pipeline = ShellPipeline(statusOk = false)
 
-        val result = OpenTool(pipeline.shell, FakeCatalog()).execute("""{"target":"com.example.music"}""")
+        val result = OpenTool(pipeline.shell, knownMusic()).execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Failed, result.outcome)
         assertEquals("STATE_UNCHANGED", errorCode(result))
@@ -174,7 +205,7 @@ class OpenToolTest {
     fun `relaunch false with the target already in front does not start it again`() {
         val shell = FakeShell { command -> ShellResult(command, 0, "Status: ok\n", "") }
 
-        val result = OpenTool(shell, FakeCatalog(), foreground = { "com.example.music" })
+        val result = OpenTool(shell, knownMusic(), foreground = { "com.example.music" })
             .execute("""{"target":"com.example.music","relaunch":false}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
@@ -186,7 +217,7 @@ class OpenToolTest {
     fun `relaunch true starts the app even when it is already in front`() {
         val pipeline = ShellPipeline()
 
-        val result = OpenTool(pipeline.shell, FakeCatalog(), foreground = { "com.example.music" })
+        val result = OpenTool(pipeline.shell, knownMusic(), foreground = { "com.example.music" })
             .execute("""{"target":"com.example.music","relaunch":true}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
@@ -233,6 +264,14 @@ class OpenToolTest {
     private fun errorCode(result: ActionResult): String =
         body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content
 
+    /**
+     * `com.example.music` has to be a catalog entry now: a package-shaped target is a package only
+     * when the catalog actually knows it, and this fake catalog is the catalog under test.
+     */
+    private fun knownMusic() = FakeCatalog(
+        listOf(AppEntry("com.example.music", "Music", "android.intent.action.MAIN")),
+    )
+
     private class FakeCatalog(
         private val apps: List<AppEntry> = emptyList(),
     ) : AppCatalog {
@@ -251,22 +290,25 @@ class OpenToolTest {
     }
 
     /**
-     * The resolve-activity/am-start pair a package launch needs, with the component and Status the
-     * test chose. Every command is recorded by [shell].
+     * The resolve-activity/am-start pair a package launch needs. [component] derives the launcher
+     * component from the package in the command by default; `{ null }` scripts an empty resolve
+     * reply, which exercises the launcher-intent fallback. Every command is recorded by [shell].
      */
     private class ShellPipeline(
-        private val resolveComponent: String? = "com.example.music/.MainActivity",
+        private val component: (String) -> String? = { pkg -> "$pkg/.MainActivity" },
         private val statusOk: Boolean = true,
     ) {
         val shell = FakeShell { command ->
             when {
-                command.startsWith("cmd package resolve-activity") ->
+                command.startsWith("cmd package resolve-activity") -> {
+                    val pkg = command.substringAfterLast(' ')
                     ShellResult(
                         command,
                         0,
-                        "priority=0 preferredOrder=0\n${resolveComponent ?: ""}\n",
+                        "priority=0 preferredOrder=0\n${component(pkg) ?: ""}\n",
                         "",
                     )
+                }
                 command.startsWith("am start -W") ->
                     ShellResult(
                         command,

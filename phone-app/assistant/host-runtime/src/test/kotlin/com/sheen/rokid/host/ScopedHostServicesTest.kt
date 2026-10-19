@@ -216,6 +216,32 @@ class ScopedHostServicesTest {
         assertEquals(1, seen.size)
     }
 
+    @Test fun `a granted actions channel forwards beginTurn so a later turn re-arms the provider`() {
+        var begins = 0
+        var cancels = 0
+        val provider = object : ActionExecutor {
+            override fun descriptors() = emptyList<ActionDescriptor>()
+            override fun execute(name: String, argsJson: String) = ActionResult(ActionOutcome.Done, "")
+            override fun cancel() { cancels++ }
+            override fun beginTurn() { begins++ }
+        }
+        val scope = scope()
+        val services = ScopedHostServices(scope, setOf(Capability.Actions),
+            mapOf(Capability.Actions to provider), FakeTaskScope())
+        val actions = services.actions()
+
+        // Teardown cancels the turn-scoped executor through the wrapper; the next turn must re-arm it
+        // through the same wrapper, or the interface default no-op leaves it cancelled for the process.
+        actions.cancel()
+        assertEquals(1, cancels)
+        actions.beginTurn()
+        assertEquals(1, begins)
+
+        scope.revoke()
+        assertFailsWith<ContractError.Cancelled> { actions.beginTurn() }
+        assertEquals(1, begins)
+    }
+
     @Test fun `a plugin without the Confirmation capability is refused`() {
         val services = ScopedHostServices(scope(), emptySet(), emptyMap(), FakeTaskScope())
         assertFailsWith<ContractError.CapabilityMissing> { services.confirmation() }

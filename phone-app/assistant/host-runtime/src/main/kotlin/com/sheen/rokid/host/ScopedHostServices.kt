@@ -125,6 +125,10 @@ class ScopedHostServices(
         override fun descriptors() = scope.active { provider.descriptors() }
         override fun execute(name: String, argsJson: String) = scope.active { provider.execute(name, argsJson) }
         override fun cancel() = scope.active { provider.cancel() }
+        // 0.25 Task 10 (R42): `cancel` is turn-scoped, so the wrapper that forwards it must forward the
+        // next turn's re-arm as well. Without this override the interface's default no-op runs here and
+        // the production kernel (behind ToolCatalog) stays cancelled for the rest of the process.
+        override fun beginTurn() = scope.active { provider.beginTurn() }
     }
     private fun scopedContext(provider: ContextSignals) = object : ContextSignals {
         override fun snapshot() = scope.active { provider.snapshot() }

@@ -318,6 +318,52 @@ class DeviceToolTest {
         )
     }
 
+    @Test
+    fun `an unobserved shell write keeps the kernel diagnostic instead of a bare error code`() {
+        val operations = FakeDeviceOperations(observation = null)
+        operations.actEnvelope = DeviceEnvelope.success(
+            action = "act",
+            channel = "shell",
+            accepted = true,
+            applied = null,
+            verified = null,
+            timing = Timing(0, 0, 0),
+            data = "diagnostic=shell_accepted_unobserved; the accessibility service is not bound",
+        )
+
+        val result = tool(operations).execute("""{"action":"act","kind":"tap","ref":"#n1"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val data = body(result)["data"]!!.jsonObject
+        assertEquals(JsonNull, data["screen"])
+        assertEquals(
+            "diagnostic=shell_accepted_unobserved; the accessibility service is not bound",
+            data["diagnostic"]!!.jsonPrimitive.content,
+        )
+    }
+
+    @Test
+    fun `a stale observation is not shown in place of an unobserved write diagnostic`() {
+        val operations = FakeDeviceOperations(observation())
+        operations.actEnvelope = DeviceEnvelope.success(
+            action = "act",
+            channel = "shell",
+            accepted = true,
+            applied = null,
+            verified = null,
+            timing = Timing(0, 0, 0),
+            data = "diagnostic=shell_accepted_unobserved; the screen observation failed: VERIFY_TIMEOUT",
+        )
+
+        val result = tool(operations).execute("""{"action":"act","kind":"tap","ref":"#n1"}""")
+
+        val data = body(result)["data"]!!.jsonObject
+        assertEquals(JsonNull, data["screen"])
+        assertTrue(
+            data["diagnostic"]!!.jsonPrimitive.content.startsWith("diagnostic=shell_accepted_unobserved"),
+        )
+    }
+
     // - turn life cycle (R42) -
 
     @Test
