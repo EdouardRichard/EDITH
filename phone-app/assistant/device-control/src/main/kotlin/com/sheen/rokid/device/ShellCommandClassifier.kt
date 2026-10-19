@@ -161,8 +161,21 @@ object ShellCommandClassifier {
                     character == '"' -> { doubleQuoted = false; index++ }
                     character == '\\' &&
                         command.getOrNull(index + 1)?.let { it in DOUBLE_QUOTE_ESCAPES } == true -> {
+                        // A backslash-escaped `$` or backtick is literal text in the shell, so it stays unexpanded.
                         current.append(command[index + 1])
                         index += 2
+                    }
+                    // Double quotes do **not** suppress expansion: `"$(...)"`, `` "`...`" `` and `"$VAR"` all run
+                    // before the command does. Allowing them would let a quoted substitution execute unconfirmed.
+                    character == '`' -> {
+                        syntax = syntax ?: OBFUSCATED
+                        current.append(character)
+                        index++
+                    }
+                    character == '$' && looksLikeExpansion(command, index) -> {
+                        syntax = syntax ?: OBFUSCATED
+                        current.append(character)
+                        index++
                     }
                     else -> { current.append(character); index++ }
                 }

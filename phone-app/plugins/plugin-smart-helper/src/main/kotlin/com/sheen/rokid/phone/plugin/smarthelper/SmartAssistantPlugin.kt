@@ -298,10 +298,21 @@ internal class ConfirmingActions(
             return ActionResult(ActionOutcome.Refused, CONFIRMATION_UNAVAILABLE)
         }
         if (outcome.approved) return host.execute(name, argsJson)
-        val code = if (outcome.source == ConfirmationSource.TIMEOUT) CONFIRMATION_TIMEOUT else CONFIRMATION_DENIED
-        diagnostics("P3_CONFIRM request=$requestId outcome=${if (code == CONFIRMATION_TIMEOUT) "timeout" else "denied"} " +
+        val code = when (outcome.source) {
+            ConfirmationSource.TIMEOUT -> CONFIRMATION_TIMEOUT
+            // No channel, or the host could not present the question: nobody was asked, so this is not a denial.
+            ConfirmationSource.UNAVAILABLE -> CONFIRMATION_UNAVAILABLE
+            else -> CONFIRMATION_DENIED
+        }
+        diagnostics("P3_CONFIRM request=$requestId outcome=${outcomeName(code)} " +
             "source=${outcome.source.name.lowercase()}")
         return ActionResult(ActionOutcome.Refused, code)
+    }
+
+    private fun outcomeName(code: String): String = when (code) {
+        CONFIRMATION_TIMEOUT -> "timeout"
+        CONFIRMATION_UNAVAILABLE -> "unavailable"
+        else -> "denied"
     }
 
     internal companion object {

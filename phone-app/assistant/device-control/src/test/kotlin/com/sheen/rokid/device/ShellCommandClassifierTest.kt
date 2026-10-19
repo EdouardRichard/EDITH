@@ -116,6 +116,34 @@ class ShellCommandClassifierTest {
     }
 
     @Test
+    fun `command substitution and variables inside double quotes require confirmation`() {
+        // The production shell runs `sh -c`: double quotes do **not** stop `$(...)`, backticks or `$VAR` from being
+        // expanded before the command runs, so allowing them would execute text this classifier never saw.
+        val commands = listOf(
+            "dumpsys \"\$(rm -rf /sdcard/x)\"",
+            "echo \"\$(pm clear com.x)\"",
+            "echo \"`id`\"",
+            "A=\"\$(reboot)\" dumpsys",
+            "echo \"\$HOME\"",
+        )
+
+        commands.forEach(::assertRequiresConfirmation)
+    }
+
+    @Test
+    fun `escaped and single quoted dollar signs stay literal and allowed`() {
+        // In the shell a backslash-escaped `$` inside double quotes and every `$` inside single quotes are literal
+        // text, not expansion; a fix for the quoted bypass must not turn these into false positives.
+        listOf(
+            "echo \"\\\$HOME\"",
+            "echo '\$HOME'",
+        ).forEach { command ->
+            assertEquals(PrecheckDecision.Allow, ShellCommandClassifier.classify(command).decision,
+                "a literal dollar must not be treated as expansion: `$command`")
+        }
+    }
+
+    @Test
     fun `shell syntax that hides a second command requires confirmation`() {
         val commands = listOf(
             "ls & pm clear com.x",

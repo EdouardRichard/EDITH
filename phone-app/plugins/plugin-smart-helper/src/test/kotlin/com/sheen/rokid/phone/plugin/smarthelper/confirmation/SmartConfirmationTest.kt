@@ -149,14 +149,23 @@ class SmartConfirmationTest {
         assertEquals(1, channel.cancelled, "the host's question must be withdrawn too")
     }
 
-    @Test fun `a missing or failing channel is a denial rather than a silent approval`() {
+    @Test fun `a failing channel is unavailable rather than a silent approval`() {
         val channel = FakeChannel()
         channel.failure = RuntimeException("no display")
         val subject = confirmation(channel)
         val ask = ask(subject)
 
-        assertEquals(ConfirmationOutcome(false, ConfirmationSource.CANCEL), ask.join())
+        assertEquals(ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE), ask.join())
         assertFalse(subject.onConfirmationResult(tap("c1", true)), "a settled question takes no second answer")
+    }
+
+    @Test fun `the plugin without a host channel answers unavailable`() {
+        // R52: "no channel" and "the wearer cancelled" are different answers; only the latter is a denial.
+        val subject = SmartConfirmation(channel = null, gate = ConfirmationGate(clock, scheduler))
+
+        assertEquals(ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE),
+            subject.request("c1", "卸载探针 App"))
+        assertEquals(0, subject.pendingCount, "an unasked question must not stay armed")
     }
 
     @Test fun `a channel attached at activation can present a question the plugin was built without`() {

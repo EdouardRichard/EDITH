@@ -1,7 +1,10 @@
 package com.sheen.rokid.agent
 
-/** Who answered a confirmation. `NONE` is "no answer was ever consumed". */
-enum class ConfirmationSource { PHONE, VOICE, TIMEOUT, CANCEL, NONE }
+/**
+ * Who answered a confirmation. `NONE` is "no answer was ever consumed"; `UNAVAILABLE` is "there was nobody able to
+ * ask" (no host channel, or the host could not present the question), which is not a denial by the wearer.
+ */
+enum class ConfirmationSource { PHONE, VOICE, TIMEOUT, CANCEL, NONE, UNAVAILABLE }
 
 /** One settled confirmation: whether the action may run, and which channel settled it. */
 data class ConfirmationOutcome(val approved: Boolean, val source: ConfirmationSource)

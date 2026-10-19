@@ -50,11 +50,11 @@ internal class SmartConfirmation(
     /**
      * 0.25 Task 11 (R52): whether a host channel is attached right now.
      *
-     * [request] answers `CANCEL` for two different situations - the host cannot present a question at all, and the
-     * wearer's STOP/急停 withdrew a live one. The caller that has to tell "unavailable" from "denied" asks this
-     * **before** requesting: false means there is nobody to ask. The answer can change while a question is in flight
-     * (deactivation detaches the channel and cancels the pending question), which is why this is a read-only property
-     * rather than a promise.
+     * [request] answers `CANCEL` for a live question withdrawn by the wearer's STOP/急停, but a question nobody could
+     * present is `UNAVAILABLE` instead. The caller that has to tell "unavailable" from "denied" asks this **before**
+     * requesting: false means there is nobody to ask. The answer can change while a question is in flight (deactivation
+     * detaches the channel and cancels the pending question), which is why this is a read-only property rather than a
+     * promise; [request] itself reports `UNAVAILABLE` whenever presentation finds no channel.
      */
     val canAsk: Boolean get() = channel != null
 
@@ -101,9 +101,10 @@ internal class SmartConfirmation(
         val target = channel
         val presented = target?.let { runCatching { it.present(requestId, summary, timeoutMillis) } }
         if (presented == null || presented.isFailure) {
-            // No channel, or a host that could not show the question: deny, and never a silent approval.
+            // No channel, or a host that could not show the question: nobody was asked, so report UNAVAILABLE rather
+            // than a denial - and never a silent approval.
             log("P3_CONFIRM request=$requestId outcome=unavailable source=none")
-            entry.outcome.set(ConfirmationOutcome(false, ConfirmationSource.CANCEL))
+            entry.outcome.set(ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE))
             finish(requestId)
             return entry.outcome.get()!!
         }

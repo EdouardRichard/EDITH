@@ -146,6 +146,21 @@ class ConfirmationGuardTest {
     }
 
     @Test
+    fun `a presentation failure refuses as unavailable rather than denied`() {
+        // No channel and a `present` that could not display the question are both "there was nobody to ask", which
+        // R52 maps to CONFIRMATION_UNAVAILABLE; only a question the wearer actually saw and denied is DENIED.
+        val actions = FakeActions(ActionPrecheck(PrecheckDecision.RequireConfirmation, summary = "危险"))
+        val confirmation = FakeConfirmation(ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE))
+
+        val result = wrapper(actions, confirmation).execute("shell", args)
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("CONFIRMATION_UNAVAILABLE", result.detail)
+        assertTrue(actions.executed.isEmpty(), "an unpresentable question must never run the command")
+        assertEquals(1, confirmation.requested.size, "the policy asked; presenting is what failed")
+    }
+
+    @Test
     fun `a broken channel refuses as unavailable instead of throwing into the loop`() {
         val actions = FakeActions(ActionPrecheck(PrecheckDecision.RequireConfirmation, summary = "危险"))
         val confirmation = FakeConfirmation().apply { failure = IllegalStateException("host gone") }
