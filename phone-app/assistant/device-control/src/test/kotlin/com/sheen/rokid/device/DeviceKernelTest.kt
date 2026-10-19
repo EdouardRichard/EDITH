@@ -38,7 +38,7 @@ class DeviceKernelTest {
     }
 
     private fun newKernel(shell: ShellPort? = null): DeviceKernel =
-        DeviceKernel(accessibility, shell).also { kernels += it }
+        DeviceKernel(accessibility, shell, settlePolicy = NO_SETTLE).also { kernels += it }
 
     // ── observe ─────────────────────────────────────────────────────────────
 
@@ -507,5 +507,263 @@ class DeviceKernelTest {
         assertNull(envelope.applied)
         assertEquals(0L, kernel.generation, "waiting is not a write")
         assertTrue(kernel.revision >= 2, "idle needs at least two observations")
+    }
+
+    // ── cancellation gaps and input validation ─────────────────────────────
+
+    @Test
+    fun `a cancel during a planner lookup prevents the planned gesture`() {
+        accessibility.screen = testObservation(
+            listOf(testNode(text = "Wi-Fi", bounds = Bounds(0, 0, 100, 100))),
+        )
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        accessibility.onObserve = {
+            entered.countDown()
+            // The planner lookup is a platform read that may ignore interrupts. Once cancel()
+            // returns, the caller has been told CANCELLED, so no later write may run.
+            awaitIgnoringInterrupts(release)
+        }
+        var envelope: DeviceEnvelope? = null
+
+        val worker = thread { envelope = kernel.act(ActKind.TAP, text = "Wi-Fi", timeoutMillis = 30_000) }
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "the planner lookup must reach the port")
+        kernel.cancel()
+        worker.join(5_000)
+        assertFalse(worker.isAlive, "cancel must release the waiting caller")
+        assertEquals(DeviceErrorCodes.CANCELLED, envelope?.error?.code)
+
+        // Resume the old operation after the next turn is armed: its per-operation token must keep
+        // it dead even though the turn-level flag has been cleared again.
+        kernel.beginTurn()
+        release.countDown()
+        accessibility.onObserve = null
+        assertTrue(kernel.observe().ok, "the worker must be free again")
+        assertTrue(
+            accessibility.calls.none { it.startsWith("gesture") || it.startsWith("node:") },
+            "a cancelled action must not reach the platform: ${accessibility.calls}",
+        )
+        assertEquals(0L, kernel.generation)
+    }
+
+    @Test
+    fun `a timeout during a planner lookup cannot dispatch the gesture afterwards`() {
+        accessibility.screen = testObservation(
+            listOf(testNode(text = "Wi-Fi", bounds = Bounds(0, 0, 100, 100))),
+        )
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        accessibility.onObserve = {
+            entered.countDown()
+            awaitIgnoringInterrupts(release)
+        }
+        var envelope: DeviceEnvelope? = null
+
+        val worker = thread { envelope = kernel.act(ActKind.TAP, text = "Wi-Fi", timeoutMillis = 250) }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        worker.join(5_000)
+        assertFalse(worker.isAlive)
+        assertEquals(DeviceErrorCodes.ACTION_TIMEOUT, envelope?.error?.code)
+
+        release.countDown()
+        accessibility.onObserve = null
+        assertTrue(kernel.observe().ok, "the worker must be free again")
+        assertTrue(
+            accessibility.calls.none { it.startsWith("gesture") || it.startsWith("node:") },
+            "a timed-out action must not reach the platform: ${accessibility.calls}",
+        )
+        assertEquals(0L, kernel.generation)
+    }
+
+    @Test
+    fun `a timeout during the shell ready probe cannot run the key event afterwards`() {
+        val shell = FakeShellPort()
+        val shellKernel = newKernel(shell)
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        accessibility.onIsInteractive = {
+            entered.countDown()
+            awaitIgnoringInterrupts(release)
+        }
+        var envelope: DeviceEnvelope? = null
+
+        val worker = thread { envelope = shellKernel.act(ActKind.PRESS_KEY, key = "HOME", timeoutMillis = 250) }
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "the ready probe must reach the port")
+        worker.join(5_000)
+        assertFalse(worker.isAlive)
+        assertEquals(DeviceErrorCodes.ACTION_TIMEOUT, envelope?.error?.code)
+
+        release.countDown()
+        accessibility.onIsInteractive = null
+        assertTrue(shellKernel.observe().ok, "the worker must be free again")
+        assertTrue(shell.calls.isEmpty(), "a timed-out key event must not reach the shell: ${shell.calls}")
+        assertEquals(0L, shellKernel.generation)
+    }
+
+    @Test
+    fun `an interrupted caller cancels the operation it was waiting for`() {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        accessibility.onIsInteractive = {
+            entered.countDown()
+            awaitIgnoringInterrupts(release)
+        }
+        var envelope: DeviceEnvelope? = null
+
+        val caller = thread { envelope = kernel.act(ActKind.TAP, ref = Ref("#n0"), timeoutMillis = 30_000) }
+        assertTrue(entered.await(5, TimeUnit.SECONDS))
+        caller.interrupt()
+        caller.join(5_000)
+        assertFalse(caller.isAlive)
+        assertEquals(DeviceErrorCodes.CANCELLED, envelope?.error?.code)
+
+        release.countDown()
+        accessibility.onIsInteractive = null
+        assertTrue(kernel.observe().ok, "the worker must be free again")
+        assertTrue(
+            accessibility.nodeActions().isEmpty(),
+            "the interrupted caller's write must not run: ${accessibility.calls}",
+        )
+        assertEquals(0L, kernel.generation)
+    }
+
+    @Test
+    fun `a key with shell metacharacters is rejected before the shell runs`() {
+        val shell = FakeShellPort()
+        val shellKernel = newKernel(shell)
+        val hostile = listOf("HOME; \$0", "HOME && reboot", "KEYCODE_HOME;input tap 1 1", "\$(reboot)", "HOME\nHOME")
+
+        hostile.forEach { key ->
+            val envelope = shellKernel.act(ActKind.PRESS_KEY, key = key)
+            assertFalse(envelope.ok, "a hostile key must be refused: $key")
+            assertEquals(DeviceErrorCodes.INVALID_ARGUMENTS, envelope.error?.code, "key: $key")
+        }
+
+        assertTrue(shell.calls.isEmpty(), "no hostile key may reach the shell: ${shell.calls}")
+        assertEquals(0L, shellKernel.generation)
+    }
+
+    @Test
+    fun `a type value containing the argument separator is refused before the device is touched`() {
+        val envelope = kernel.act(ActKind.TYPE, ref = Ref("#n1"), value = "hello\u0000text=evil")
+
+        assertFalse(envelope.ok)
+        assertEquals(DeviceErrorCodes.INVALID_ARGUMENTS, envelope.error?.code)
+        assertEquals(0L, kernel.generation)
+        assertTrue(accessibility.calls.isEmpty(), "a malformed text argument must not reach the port: ${accessibility.calls}")
+    }
+
+    // ── readiness gate before the planner ──────────────────────────────────
+
+    @Test
+    fun `a screen-off device refuses text and swipe targets before reading the screen`() {
+        accessibility.interactive = false
+
+        val textTarget = kernel.act(ActKind.TAP, text = "Wi-Fi")
+        val swipe = kernel.act(ActKind.SWIPE, direction = "up")
+
+        assertEquals(DeviceErrorCodes.DEVICE_SCREEN_OFF, textTarget.error?.code)
+        assertEquals(DeviceErrorCodes.DEVICE_SCREEN_OFF, swipe.error?.code)
+        assertTrue(accessibility.calls.isEmpty(), "no screen read may happen before the gate: ${accessibility.calls}")
+        assertEquals(0L, kernel.generation)
+    }
+
+    @Test
+    fun `a locked device refuses text and swipe targets before reading the screen`() {
+        accessibility.keyguardLocked = true
+
+        val textTarget = kernel.act(ActKind.TAP, text = "Wi-Fi")
+        val swipe = kernel.act(ActKind.SWIPE, direction = "up")
+
+        assertEquals(DeviceErrorCodes.DEVICE_LOCKED, textTarget.error?.code)
+        assertEquals(DeviceErrorCodes.DEVICE_LOCKED, swipe.error?.code)
+        assertTrue(accessibility.calls.isEmpty(), "no screen read may happen before the gate: ${accessibility.calls}")
+        assertEquals(0L, kernel.generation)
+    }
+
+    @Test
+    fun `an unbound channel refuses reads before the port is called`() {
+        accessibility.bound = false
+
+        val observed = kernel.observe()
+        val acted = kernel.act(ActKind.TAP, ref = Ref("#n0"))
+
+        assertEquals(DeviceErrorCodes.CHANNEL_UNAVAILABLE, observed.error?.code)
+        assertEquals(DeviceErrorCodes.CHANNEL_UNAVAILABLE, acted.error?.code)
+        assertTrue(accessibility.calls.isEmpty(), "an unbound channel must be gated before the port: ${accessibility.calls}")
+    }
+
+    @Test
+    fun `a successful shell key is not turned into a failure when accessibility is unbound`() {
+        val shell = FakeShellPort()
+        val shellKernel = newKernel(shell)
+        accessibility.bound = false
+
+        val envelope = shellKernel.act(ActKind.PRESS_KEY, key = "HOME")
+
+        assertTrue(envelope.ok, "a successful write must not be failed by the unavailable observer")
+        assertTrue(envelope.accepted)
+        assertNull(envelope.applied)
+        assertNull(envelope.verified)
+        assertNull(envelope.error)
+        assertEquals("shell", envelope.channel)
+        assertEquals(1, shell.calls.size, "the shell write itself must still run: ${shell.calls}")
+        assertTrue(accessibility.calls.isEmpty(), "no observation may be attempted while unbound: ${accessibility.calls}")
+        assertTrue(envelope.data?.contains("diagnostic") == true, "the envelope must say the write was not observed: ${envelope.data}")
+    }
+
+    @Test
+    fun `a refused gesture reports a gesture failure instead of a non-clickable node`() {
+        assertTrue(kernel.observe().ok)
+        accessibility.gestureResult = false
+
+        val envelope = kernel.act(ActKind.SWIPE, direction = "up")
+
+        assertFalse(envelope.ok)
+        assertFalse(envelope.accepted)
+        assertEquals(DeviceErrorCodes.GESTURE_FAILED, envelope.error?.code)
+    }
+
+    @Test
+    fun `a wait with a huge timeout does not overflow its deadline`() {
+        accessibility.screen = testObservation(listOf(testNode(text = "Loading")))
+        var polls = 0
+        accessibility.onObserve = {
+            polls += 1
+            if (polls == 2) accessibility.screen = testObservation(listOf(testNode(text = "Done")))
+        }
+
+        val envelope = kernel.waitFor(text = "Done", foreground = null, idle = false, timeoutMillis = Long.MAX_VALUE)
+
+        assertTrue(envelope.ok)
+        assertEquals("expected", envelope.verified?.kind)
+        assertEquals("Done", kernel.latestObservation?.nodes?.single()?.text)
+    }
+
+    /** Simulates a platform call that cannot be interrupted, so the post-boundary check is the guard. */
+    private fun awaitIgnoringInterrupts(latch: CountDownLatch) {
+        while (true) {
+            try {
+                if (latch.await(10, TimeUnit.MILLISECONDS)) return
+            } catch (_: InterruptedException) {
+                // Keep waiting: the port call does not honour interruption.
+            }
+        }
+    }
+
+    private companion object {
+        /**
+         * These tests are not about settle, so their kernels use a zero change wait: the act still
+         * observes once (and `applied` still compares that look), but does not spend the production
+         * budgets. [DeviceKernelSettleTest] owns the settle behaviour.
+         */
+        val NO_SETTLE = SettlePolicy(
+            tapChangeWaitMillis = 0L,
+            scrollChangeWaitMillis = 0L,
+            typeChangeWaitMillis = 0L,
+            keyChangeWaitMillis = 0L,
+            heldStillMillis = 0L,
+            pollIntervalMillis = 5L,
+        )
     }
 }

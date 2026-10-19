@@ -25,14 +25,17 @@ data class Timing(val actMs: Long, val observeMs: Long, val totalMs: Long)
  * after an independent observation differs from the pre-action snapshot, `applied = false` means an
  * observation was compared and nothing changed, and `applied = null` means there was no baseline to
  * compare against (or the operation was not a write). A refused action is never `applied = true`;
- * its refusal is the error. **`verified`** is set only together with `applied = true` and names the
- * post-condition the kernel checked.
+ * its refusal is the error. **`verified`** names the post-condition the kernel checked: for an
+ * `act` it is set only together with `applied = true` (`screen_change`), while [DeviceKernel.waitFor]
+ * reports `expected`/`idle` with `applied = null` because a wait applies nothing.
  *
  * **`data` is deliberately null in this task.** The kernel does not render the observation:
  * `observe`/`act`/`wait` return the envelope plus [DeviceKernel.latestObservation], and Task 10
  * projects the rendered/diff JSON (spec §4.6 `data.screen`) into it. Keeping rendering out of the
  * kernel is what lets Task 10 choose full-vs-diff without the kernel owning a second copy of the
- * budget rules.
+ * budget rules. The one exception is a successful shell write that the accessibility channel could
+ * not observe: `data` carries a one-line `diagnostic=...` instead of screen data, and Task 10 must
+ * keep that diagnostic visible rather than dropping it.
  *
  * **`images` never carries bytes.** A screenshot becomes an [ImageRef] whose `artifactId` is
  * resolved by the artifact store; this task reports the placeholder `pending` (see

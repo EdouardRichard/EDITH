@@ -73,17 +73,24 @@ internal class FakeAccessibilityPort : AccessibilityPort {
     @Volatile var onObserve: (() -> Unit)? = null
     @Volatile var onNodeAction: ((Ref, String) -> Unit)? = null
     @Volatile var onGesture: ((Gesture) -> Unit)? = null
+    @Volatile var onIsInteractive: (() -> Unit)? = null
 
     private val activeWrites = AtomicInteger()
     val maxConcurrentWrites = AtomicInteger()
 
     override fun isBound(): Boolean = bound
 
-    override fun isInteractive(): Boolean = interactive
+    override fun isInteractive(): Boolean {
+        onIsInteractive?.invoke()
+        return interactive
+    }
 
     override fun isKeyguardLocked(): Boolean = keyguardLocked
 
     override fun observe(filter: ScreenFilter): Observation {
+        // A real adapter cannot read an unbound service; throwing here means a kernel that forgets
+        // its channel gate fails the test instead of silently getting a screen from the fake.
+        check(bound) { "the accessibility service is not bound" }
         filters += filter
         calls += "observe:${filter.name}"
         onObserve?.invoke()

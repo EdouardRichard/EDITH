@@ -16,9 +16,17 @@ data class DeviceError(val code: String, val message: String, val recoverable: B
  * adapters and tools of Tasks 9–11.
  *
  * Produced by [DeviceKernel] today: [CHANNEL_UNAVAILABLE], [DEVICE_SCREEN_OFF], [DEVICE_LOCKED],
- * [NODE_NOT_CLICKABLE] (coarse refusal from the port), [ACCEPTED_NO_EFFECT], [INVALID_ARGUMENTS],
- * [UNSUPPORTED], [VERIFY_TIMEOUT], [ACTION_TIMEOUT], [CANCELLED], [SHELL_FAILED] and any
- * [ShellOutcome.failure] code the shell adapter supplies.
+ * [NODE_NOT_CLICKABLE] (coarse refusal from the port), [GESTURE_FAILED], [ACCEPTED_NO_EFFECT],
+ * [INVALID_ARGUMENTS], [UNSUPPORTED], [VERIFY_TIMEOUT], [ACTION_TIMEOUT], [CANCELLED],
+ * [SHELL_FAILED] and any [ShellOutcome.failure] code the shell adapter supplies.
+ *
+ * Four of those are outside spec §7's table, which has no cell for them: [UNSUPPORTED] is
+ * spec §4.7's "the platform has no such capability" (kept apart from [CHANNEL_UNAVAILABLE] on
+ * purpose); [GESTURE_FAILED] is the gesture refusal letter, because the port's `Boolean` cannot
+ * tell a refused gesture from a stale node and [NODE_NOT_CLICKABLE] would be a lie; [SHELL_FAILED]
+ * is a non-zero shell exit that came without an adapter `failure` code (when the adapter supplies
+ * one, that code is reported verbatim instead); [CANCELLED] is spec §4.3/§4.8's turn-cancellation
+ * outcome.
  *
  * Produced later and therefore declared now so every layer spells them the same way:
  * [DEVICE_LOCKED_SECURE] (screen state the kernel cannot distinguish through the current port),
@@ -46,6 +54,7 @@ object DeviceErrorCodes {
     const val SCROLL_AT_BOUNDARY = "SCROLL_AT_BOUNDARY"
     const val INVALID_ARGUMENTS = "INVALID_ARGUMENTS"
     const val UNSUPPORTED = "UNSUPPORTED"
+    const val GESTURE_FAILED = "GESTURE_FAILED"
 
     // Verification / timing layer.
     const val VERIFY_TIMEOUT = "VERIFY_TIMEOUT"

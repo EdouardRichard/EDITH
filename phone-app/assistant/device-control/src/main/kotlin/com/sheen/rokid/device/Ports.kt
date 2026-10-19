@@ -49,10 +49,16 @@ data class Gesture(val strokes: List<Stroke>)
  * The accessibility channel, as the kernel needs it.
  *
  * The Android implementation lives in `phone-app/app` (Task 9); this module only ever sees this
- * interface, so it stays a pure JVM library. Implementations are called from the kernel's single
- * worker thread. The kernel bounds each operation with a timeout and interrupts the worker on
- * cancellation, but it cannot force a stuck implementation to return: the adapter owns making
- * platform calls interruptible/bounded.
+ * interface, so it stays a pure JVM library.
+ *
+ * **Threading.** The kernel calls [observe], [performNodeAction], [dispatchGesture], [screenshot]
+ * and [foreground] from its single worker thread, one call at a time. The channel probes
+ * ([isBound], [isInteractive], [isKeyguardLocked]) are also called from the caller's thread by
+ * [DeviceKernel.ensureReady] and [DeviceKernel.health], so implementations must tolerate a probe
+ * racing the worker (keep the probes lock-free or synchronize the state they read). The kernel
+ * bounds each operation with a timeout and interrupts the worker on cancellation, but it cannot
+ * force a stuck implementation to return: the adapter owns making platform calls
+ * interruptible/bounded.
  *
  * [observe] returns a producer snapshot; [Observation.revision] is ignored on input because the
  * kernel stamps its own revision. The filter is the producer's collection hint.
@@ -122,8 +128,9 @@ interface ShellPort {
  * centre, because two platform clicks are not a double tap). Arguments travel in the same string,
  * because the port keeps a single `(ref, action)` signature: `key=value` pairs separated from the
  * action and from each other by [ARGUMENT_SEPARATOR]. Only [SET_TEXT] carries one today
- * (`text=<text>`); the value is passed through verbatim (it may contain `=`). Text cannot contain
- * [ARGUMENT_SEPARATOR] on Android, so the encoding is unambiguous.
+ * (`text=<text>`); the value is passed through verbatim (it may contain `=`), but it must not
+ * contain [ARGUMENT_SEPARATOR]: there is no escaping in this wire format, so [encode] refuses such
+ * a value (the kernel reports [DeviceErrorCodes.INVALID_ARGUMENTS] and never calls the port).
  */
 object DeviceActions {
 
@@ -137,8 +144,21 @@ object DeviceActions {
     /** Separates the action name from each `key=value` argument in the port's action string. */
     const val ARGUMENT_SEPARATOR = '\u0000'
 
-    /** Builds the port action string: `action` when there are no arguments. */
-    fun encode(action: String, arguments: Map<String, String>): String {
+    /**
+     * Builds the port action string, or returns null when [action] or an argument cannot be encoded
+     * unambiguously: a [ARGUMENT_SEPARATOR] anywhere, or an argument key that is empty or contains
+     * `=` (which [decode] would mis-split). A value may contain `=`; it may not contain the
+     * separator.
+     */
+    fun encode(action: String, arguments: Map<String, String>): String? {
+        if (action.isEmpty() || action.contains(ARGUMENT_SEPARATOR)) return null
+        val invalid = arguments.any { (key, value) ->
+            key.isEmpty() ||
+                key.contains(ARGUMENT_SEPARATOR) ||
+                key.indexOf('=') >= 0 ||
+                value.contains(ARGUMENT_SEPARATOR)
+        }
+        if (invalid) return null
         if (arguments.isEmpty()) return action
         return buildString {
             append(action)
@@ -148,7 +168,7 @@ object DeviceActions {
         }
     }
 
-    /** Splits a port action string into its action token and its arguments. */
+    /** Splits a port action string produced by [encode] into its action token and its arguments. */
     fun decode(portAction: String): Pair<String, Map<String, String>> {
         val parts = portAction.split(ARGUMENT_SEPARATOR)
         val arguments = LinkedHashMap<String, String>()

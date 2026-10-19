@@ -219,6 +219,27 @@ class ActionPlannerTest {
         assertEquals("KEYCODE_HOME", shellKey(planner.plan(ActKind.PRESS_KEY, null, null, null, null, "home")))
     }
 
+    @Test
+    fun `keys with shell metacharacters are unsupported`() {
+        val hostile = listOf("HOME; \$0", "HOME && reboot", "KEYCODE_HOME;input tap 1 1", "\$(reboot)", "HOME\nHOME")
+
+        hostile.forEach { key ->
+            assertEquals(
+                PlannedAction.Unsupported,
+                planner.plan(ActKind.PRESS_KEY, null, null, null, null, key),
+                "a key is interpolated into a shell command, so metacharacters must be refused: $key",
+            )
+        }
+    }
+
+    @Test
+    fun `typing a value containing the separator is unsupported`() {
+        assertEquals(
+            PlannedAction.Unsupported,
+            planner.plan(ActKind.TYPE, Ref("#n1"), null, "a\u0000b", null, null),
+        )
+    }
+
     // ── unsupported inputs ──────────────────────────────────────────────────
 
     @Test

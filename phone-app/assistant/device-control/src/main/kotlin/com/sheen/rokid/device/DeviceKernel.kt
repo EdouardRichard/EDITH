@@ -11,7 +11,6 @@ import java.util.concurrent.RejectedExecutionException
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.TimeoutException
 import java.util.concurrent.atomic.AtomicBoolean
-
 /**
  * The device-control kernel: the one owner of device state, channel access and serialization
  * (spec §4.1/§4.3).
@@ -33,19 +32,28 @@ import java.util.concurrent.atomic.AtomicBoolean
  *
  * **Timeouts and cancellation.** A timed-out operation is interrupted; the envelope says
  * [DeviceErrorCodes.ACTION_TIMEOUT], because an interrupted platform call may still have taken
- * effect (the message says so). [cancel] also interrupts the in-flight operation and refuses every
- * later operation of the turn; [beginTurn] re-arms the kernel for the next turn. The worker task is
- * interrupted but the kernel cannot force a wedged port call to return — the adapter owns making
- * platform calls bounded.
+ * effect (the message says so). [cancel] also refuses every later operation of the turn;
+ * [beginTurn] re-arms the kernel for the next turn. Every operation additionally owns a
+ * cancellation token: a timeout, a caller interrupt or [cancel] sets it, and the worker checks it
+ * after planning/ready probing and immediately before each port write, so an operation whose
+ * caller already saw ACTION_TIMEOUT/CANCELLED cannot still send a tap, scroll or shell key. The
+ * worker task is interrupted but the kernel cannot force a wedged port call to return — the
+ * adapter owns making platform calls bounded.
  *
- * **What an action reports.** [act] performs the planned action and then *always* observes again
- * (success or refusal), so `accepted` is the platform's answer while `applied` is only true when
- * that independent observation differs from the snapshot taken before the action. A refused action
- * is never `applied = true`; an accepted action that changes nothing is
- * [DeviceErrorCodes.ACCEPTED_NO_EFFECT]; without a baseline observation `applied` stays null.
- * The baseline is the last snapshot this kernel observed — the e2e flow observes right before it
- * acts, so an unrelated change between that observation and the action can still be misread as
- * `applied` (spec §4.5's known fingerprint limitation).
+ * **What an action reports.** [act] performs the planned action and then observes again (success
+ * or refusal), so `accepted` is the platform's answer while `applied` is only true when that
+ * independent observation differs from the snapshot taken before the action. The observation is a
+ * bounded settle (spec §4.4): the kernel polls until the screen leaves the pre-action shape or the
+ * per-kind change wait expires, and taps/scrolls/keys additionally wait for two agreeing captures,
+ * so an animated or network-backed screen is not misreported as [DeviceErrorCodes.ACCEPTED_NO_EFFECT].
+ * A refused action is never `applied = true`; an accepted action that changes nothing is
+ * [DeviceErrorCodes.ACCEPTED_NO_EFFECT]; without a baseline observation there is nothing to compare
+ * against, so one look is the whole settle and `applied` stays null. A successful shell write is
+ * not turned into a failure when the accessibility channel cannot observe: the envelope succeeds
+ * with `applied = null` and a `diagnostic=...` line in `data` (R32). The baseline is the last
+ * snapshot this kernel observed — the e2e flow observes right before it acts, so an unrelated
+ * change between that observation and the action can still be misread as `applied` (spec §4.5's
+ * known fingerprint limitation).
  *
  * **Rendering.** The kernel deliberately does not render. [DeviceEnvelope.data] stays null and
  * [latestObservation] carries the snapshot; Task 10 projects the §4.6 `data.screen` (full/diff) and
@@ -59,6 +67,7 @@ class DeviceKernel(
     private val shell: ShellPort?,
     private val clock: () -> Long = { System.nanoTime() / 1_000_000L },
     val registry: RefRegistry = RefRegistry(),
+    private val settlePolicy: SettlePolicy = SettlePolicy(),
 ) : AutoCloseable {
 
     private val planner = ActionPlanner(accessibility, shell)
@@ -70,11 +79,18 @@ class DeviceKernel(
     private val cancelled = AtomicBoolean(false)
 
     /**
-     * Futures submitted and not yet returned. The worker is single-threaded, so at most one runs and
-     * the rest are queued; [cancel] must interrupt the running one *and* drop the queued ones, and
-     * tracking only the newest future would miss the running write.
+     * Futures submitted and not yet returned, each with the operation's own cancellation token.
+     * The worker is single-threaded, so at most one runs and the rest are queued; [cancel] must
+     * interrupt the running one *and* drop the queued ones, and tracking only the newest future
+     * would miss the running write.
+     *
+     * The token is needed in addition to the turn-level [cancelled] flag: a timed-out operation is
+     * cancelled without ending the turn, and [beginTurn] clears the turn flag while an old
+     * operation may still be unwinding inside an uninterruptible port call. The token keeps that
+     * operation dead, so it can never execute a write after the caller was told CANCELLED or
+     * ACTION_TIMEOUT.
      */
-    private val outstanding = LinkedHashSet<Future<*>>()
+    private val outstanding = LinkedHashMap<Future<*>, OperationToken>()
 
     @Volatile
     private var revisionCounter = 0L
@@ -155,16 +171,19 @@ class DeviceKernel(
      * null because a read applies nothing). [data] is left for Task 10 to render.
      */
     fun observe(filter: ScreenFilter = ScreenFilter.INTERACTIVE): DeviceEnvelope =
-        runSerial(ACTION_OBSERVE, CHANNEL_ACCESSIBILITY, DEFAULT_OPERATION_TIMEOUT_MILLIS) {
+        runSerial(ACTION_OBSERVE, CHANNEL_ACCESSIBILITY, DEFAULT_OPERATION_TIMEOUT_MILLIS) { token ->
             val started = clock()
-            if (cancelled.get()) {
+            if (isCancelled(token)) {
                 return@runSerial cancelledEnvelope(ACTION_OBSERVE, CHANNEL_ACCESSIBILITY, started)
             }
             ensureReady(ReadyKind.OBSERVE)?.let {
                 return@runSerial rejected(ACTION_OBSERVE, CHANNEL_ACCESSIBILITY, it, started)
             }
+            if (isCancelled(token)) {
+                return@runSerial cancelledEnvelope(ACTION_OBSERVE, CHANNEL_ACCESSIBILITY, started)
+            }
             val readStarted = clock()
-            val result = observeLocked(filter)
+            val result = observeLocked(filter, token)
             val observeMs = elapsed(readStarted)
             when (result) {
                 is ObserveResult.Ok -> DeviceEnvelope.success(
@@ -187,15 +206,17 @@ class DeviceKernel(
     /**
      * Executes one semantic action and then observes the screen.
      *
-     * Planning happens before the ready gate so a shell-only action (a key event) does not need a
-     * bound accessibility service: the gate is [ReadyKind.SHELL] for shell-only kinds and
-     * [ReadyKind.ACT] otherwise. `WAIT` is not a platform action; it runs as [waitFor] over an idle
-     * screen and reports `action = "wait"`.
+     * The ready gate runs before planning: the gate is [ReadyKind.SHELL] for shell-only kinds and
+     * [ReadyKind.ACT] otherwise, so a shell-only action (a key event) does not need a bound
+     * accessibility service while a text or swipe target never reads the screen on a device that
+     * is off or locked. `WAIT` is not a platform action; it runs as [waitFor] over an idle screen
+     * and reports `action = "wait"`.
      *
      * On success the envelope carries `accepted`, the observed `applied` and — when the screen
-     * changed — `verified = screen_change`. Every refused platform action still returns the new
-     * observation (through [latestObservation]); an unsupported request is
-     * [DeviceErrorCodes.INVALID_ARGUMENTS] and touches nothing.
+     * changed — `verified = screen_change`. The observation is the bounded settle of spec §4.4
+     * (per-kind change wait, held-still for taps/scrolls/keys, first change for a type). Every
+     * refused platform action still returns the new observation (through [latestObservation]); an
+     * unsupported request is [DeviceErrorCodes.INVALID_ARGUMENTS] and touches nothing.
      */
     fun act(
         kind: ActKind,
@@ -213,13 +234,13 @@ class DeviceKernel(
         } else {
             timeoutMillis
         }
-        return runSerial(action, channel, budget) {
+        return runSerial(action, channel, budget) { token ->
             val started = clock()
-            if (cancelled.get()) return@runSerial cancelledEnvelope(action, channel, started)
+            if (isCancelled(token)) return@runSerial cancelledEnvelope(action, channel, started)
             if (kind == ActKind.WAIT) {
-                waitLocked(action, channel, started, text = null, foreground = null, idle = true, timeoutMillis)
+                waitLocked(action, channel, started, text = null, foreground = null, idle = true, timeoutMillis, token)
             } else {
-                actLocked(kind, ref, text, value, direction, key, channel, started, timeoutMillis)
+                actLocked(kind, ref, text, value, direction, key, channel, started, timeoutMillis, token)
             }
         }
     }
@@ -233,19 +254,22 @@ class DeviceKernel(
      * [DeviceErrorCodes.UNSUPPORTED], which is distinct from [DeviceErrorCodes.CHANNEL_UNAVAILABLE].
      */
     fun screenshot(): DeviceEnvelope =
-        runSerial(ACTION_SCREENSHOT, CHANNEL_ACCESSIBILITY, DEFAULT_OPERATION_TIMEOUT_MILLIS) {
+        runSerial(ACTION_SCREENSHOT, CHANNEL_ACCESSIBILITY, DEFAULT_OPERATION_TIMEOUT_MILLIS) { token ->
             val started = clock()
-            if (cancelled.get()) {
+            if (isCancelled(token)) {
                 return@runSerial cancelledEnvelope(ACTION_SCREENSHOT, CHANNEL_ACCESSIBILITY, started)
             }
             ensureReady(ReadyKind.SCREENSHOT)?.let {
                 return@runSerial rejected(ACTION_SCREENSHOT, CHANNEL_ACCESSIBILITY, it, started)
             }
+            if (isCancelled(token)) {
+                return@runSerial cancelledEnvelope(ACTION_SCREENSHOT, CHANNEL_ACCESSIBILITY, started)
+            }
             val readStarted = clock()
             val shot = try {
                 accessibility.screenshot()
             } catch (t: Throwable) {
-                return@runSerial if (cancelled.get()) {
+                return@runSerial if (isCancelled(token)) {
                     cancelledEnvelope(ACTION_SCREENSHOT, CHANNEL_ACCESSIBILITY, started)
                 } else {
                     DeviceEnvelope.failure(
@@ -257,7 +281,7 @@ class DeviceKernel(
                 }
             }
             val readMs = elapsed(readStarted)
-            if (cancelled.get()) {
+            if (isCancelled(token)) {
                 return@runSerial cancelledEnvelope(ACTION_SCREENSHOT, CHANNEL_ACCESSIBILITY, started)
             }
             if (shot == null) {
@@ -296,12 +320,12 @@ class DeviceKernel(
      */
     fun waitFor(text: String?, foreground: String?, idle: Boolean, timeoutMillis: Long): DeviceEnvelope {
         val budget = timeoutMillis.coerceAtMost(Long.MAX_VALUE - WAIT_GRACE_MILLIS) + WAIT_GRACE_MILLIS
-        return runSerial(ACTION_WAIT, CHANNEL_ACCESSIBILITY, budget) {
+        return runSerial(ACTION_WAIT, CHANNEL_ACCESSIBILITY, budget) { token ->
             val started = clock()
-            if (cancelled.get()) {
+            if (isCancelled(token)) {
                 return@runSerial cancelledEnvelope(ACTION_WAIT, CHANNEL_ACCESSIBILITY, started)
             }
-            waitLocked(ACTION_WAIT, CHANNEL_ACCESSIBILITY, started, text, foreground, idle, timeoutMillis)
+            waitLocked(ACTION_WAIT, CHANNEL_ACCESSIBILITY, started, text, foreground, idle, timeoutMillis, token)
         }
     }
 
@@ -312,16 +336,16 @@ class DeviceKernel(
      * `interactive=false` when the screen is off, which is exactly when the model needs it.
      */
     fun status(): DeviceEnvelope =
-        runSerial(ACTION_STATUS, CHANNEL_ACCESSIBILITY, DEFAULT_OPERATION_TIMEOUT_MILLIS) {
+        runSerial(ACTION_STATUS, CHANNEL_ACCESSIBILITY, DEFAULT_OPERATION_TIMEOUT_MILLIS) { token ->
             val started = clock()
-            if (cancelled.get()) {
+            if (isCancelled(token)) {
                 return@runSerial cancelledEnvelope(ACTION_STATUS, CHANNEL_ACCESSIBILITY, started)
             }
             val readStarted = clock()
             val foreground = try {
                 accessibility.foreground()
             } catch (t: Throwable) {
-                return@runSerial if (cancelled.get()) {
+                return@runSerial if (isCancelled(token)) {
                     cancelledEnvelope(ACTION_STATUS, CHANNEL_ACCESSIBILITY, started)
                 } else {
                     DeviceEnvelope.failure(
@@ -333,6 +357,9 @@ class DeviceKernel(
                 }
             }
             val readMs = elapsed(readStarted)
+            if (isCancelled(token)) {
+                return@runSerial cancelledEnvelope(ACTION_STATUS, CHANNEL_ACCESSIBILITY, started)
+            }
             val health = health()
             val data = buildString {
                 append("foreground=").append(foreground.packageName ?: "?").append('/').append(foreground.activity ?: "?")
@@ -365,7 +392,7 @@ class DeviceKernel(
      * dropped, and every later operation returns [DeviceErrorCodes.CANCELLED] until [beginTurn].
      */
     fun cancel() {
-        cancelled.set(true)
+        markTurnCancelled()
         cancelOutstanding()
     }
 
@@ -376,15 +403,29 @@ class DeviceKernel(
 
     /** Stops the worker; a closed kernel reports [DeviceErrorCodes.CANCELLED] for every operation. */
     override fun close() {
-        cancelled.set(true)
+        markTurnCancelled()
         cancelOutstanding()
         writer.shutdownNow()
         runCatching { writer.awaitTermination(CLOSE_GRACE_MILLIS, TimeUnit.MILLISECONDS) }
     }
 
+    /**
+     * Sets the turn-level flag under the submission lock, so a concurrent [runSerial] either
+     * submits (and is seen by [cancelOutstanding]) or observes the flag and refuses; there is no
+     * window in which an operation is accepted after cancel returned.
+     */
+    private fun markTurnCancelled() {
+        synchronized(submissionLock) {
+            cancelled.set(true)
+        }
+    }
+
     private fun cancelOutstanding() {
         val pending = synchronized(submissionLock) { outstanding.toList() }
-        pending.forEach { it.cancel(true) }
+        pending.forEach { (future, token) ->
+            token.cancel()
+            future.cancel(true)
+        }
     }
 
     // ── serialization ───────────────────────────────────────────────────────
@@ -395,12 +436,16 @@ class DeviceKernel(
      * The timeout covers queueing plus execution, so a wedged channel fails fast instead of
      * accumulating work. The caller's wall time is written into [Timing.totalMs] so queueing is
      * visible in the envelope.
+     *
+     * A timeout, a caller interrupt and [cancel] all cancel the operation's own token before they
+     * release the caller, so the worker cannot execute a write after the caller already saw
+     * ACTION_TIMEOUT/CANCELLED even when the interrupted port call keeps running.
      */
     private fun runSerial(
         action: String,
         channel: String,
         timeoutMillis: Long,
-        block: () -> DeviceEnvelope,
+        block: (OperationToken) -> DeviceEnvelope,
     ): DeviceEnvelope {
         val callerStarted = clock()
         if (cancelled.get()) return cancelledEnvelope(action, channel, callerStarted)
@@ -412,9 +457,13 @@ class DeviceKernel(
                 callerStarted,
             )
         }
+        val token = OperationToken()
         val future = try {
             synchronized(submissionLock) {
-                writer.submit(Callable { block() }).also { outstanding += it }
+                // Re-check under the same lock [markTurnCancelled] uses, so a cancel that lands
+                // between the fast-path check above and this submission still wins.
+                if (cancelled.get()) return cancelledEnvelope(action, channel, callerStarted)
+                writer.submit(Callable { block(token) }).also { outstanding[it] = token }
             }
         } catch (e: RejectedExecutionException) {
             return cancelledEnvelope(action, channel, callerStarted)
@@ -424,6 +473,7 @@ class DeviceKernel(
             val wall = elapsed(callerStarted)
             envelope.copy(timing = envelope.timing.copy(totalMs = maxOf(envelope.timing.totalMs, wall)))
         } catch (e: TimeoutException) {
+            token.cancel()
             future.cancel(true)
             DeviceEnvelope.failure(
                 action = action,
@@ -436,8 +486,10 @@ class DeviceKernel(
                 timing = timing(callerStarted),
             )
         } catch (e: CancellationException) {
+            token.cancel()
             cancelledEnvelope(action, channel, callerStarted)
         } catch (e: ExecutionException) {
+            token.cancel()
             DeviceEnvelope.failure(
                 action = action,
                 channel = channel,
@@ -449,11 +501,14 @@ class DeviceKernel(
                 timing = timing(callerStarted),
             )
         } catch (e: InterruptedException) {
+            // The caller stopped waiting; the work it was waiting for must stop too.
+            token.cancel()
+            future.cancel(true)
             Thread.currentThread().interrupt()
             cancelledEnvelope(action, channel, callerStarted)
         } finally {
             synchronized(submissionLock) {
-                outstanding -= future
+                outstanding.remove(future)
             }
         }
     }
@@ -468,22 +523,26 @@ class DeviceKernel(
     /**
      * Reads and caches one observation. Must run on the worker (the only writer of [revisionCounter],
      * [latestSnapshot] and [latestFilter]).
+     *
+     * Publishing happens after [RefRegistry.assign], so a caller that sees the new
+     * [latestObservation] can always resolve its refs.
      */
-    private fun observeLocked(filter: ScreenFilter): ObserveResult {
+    private fun observeLocked(filter: ScreenFilter, token: OperationToken): ObserveResult {
+        if (isCancelled(token)) return ObserveResult.Failed(cancelledError())
         val observation = try {
             accessibility.observe(filter)
         } catch (t: Throwable) {
             return ObserveResult.Failed(
-                if (cancelled.get()) cancelledError() else channelError("the observation failed", t),
+                if (isCancelled(token)) cancelledError() else channelError("the observation failed", t),
             )
         }
-        if (cancelled.get()) return ObserveResult.Failed(cancelledError())
+        if (isCancelled(token)) return ObserveResult.Failed(cancelledError())
         val next = revisionCounter + 1
         revisionCounter = next
         val stamped = observation.copy(revision = next)
+        runCatching { registry.assign(stamped) }
         latestSnapshot = stamped
         latestFilter = filter
-        runCatching { registry.assign(stamped) }
         return ObserveResult.Ok(stamped)
     }
 
@@ -513,12 +572,18 @@ class DeviceKernel(
         channel: String,
         started: Long,
         timeoutMillis: Long,
+        token: OperationToken,
     ): DeviceEnvelope {
-        val plan = planner.plan(kind, ref, text, value, direction, key)
+        // The readiness gate runs before planning. A text target and a screen swipe both make the
+        // planner read the screen, so a screen-off or locked device must be refused before that
+        // read; a shell-only key needs no accessibility binding, which is why its gate is SHELL.
         val readyKind = if (kind.isShellKeyAction) ReadyKind.SHELL else ReadyKind.ACT
         ensureReady(readyKind)?.let {
             return rejected(ACTION_ACT, channel, it, started)
         }
+        if (isCancelled(token)) return cancelledEnvelope(ACTION_ACT, channel, started)
+        val plan = planner.plan(kind, ref, text, value, direction, key)
+        if (isCancelled(token)) return cancelledEnvelope(ACTION_ACT, channel, started)
         if (plan is PlannedAction.Unsupported) {
             return rejected(
                 ACTION_ACT,
@@ -536,104 +601,155 @@ class DeviceKernel(
         // screen change.
         val before = latestSnapshot
         val autoFilter = latestFilter
+        // Last boundary before the write: planning may have blocked on a lookup and ensureReady on
+        // a channel probe, so a cancel/timeout up to here must still leave the platform untouched.
+        if (isCancelled(token)) return cancelledEnvelope(ACTION_ACT, channel, started)
         generationCounter += 1
         val actStarted = clock()
-        val execution = execute(plan, timeoutMillis, started)
+        val execution = execute(plan, token, timeoutMillis, started)
         val actMs = elapsed(actStarted)
-        if (execution.cancelled) return cancelledEnvelope(ACTION_ACT, channel, started)
+        if (execution.cancelled || isCancelled(token)) return cancelledEnvelope(ACTION_ACT, channel, started)
         val observeStarted = clock()
-        val observed = observeLocked(autoFilter)
-        val observeMs = elapsed(observeStarted)
-        return when (observed) {
-            is ObserveResult.Failed -> DeviceEnvelope.failure(
+        // A shell write does not need the accessibility service. Reporting a successful write as a
+        // failure because the observer is missing would be a lie about the write, so the envelope
+        // succeeds with `applied = null` and a diagnostic instead (R32).
+        if (execution.accepted && channel == CHANNEL_SHELL && !bound()) {
+            return DeviceEnvelope.success(
                 action = ACTION_ACT,
                 channel = channel,
-                error = execution.error ?: observed.error,
+                accepted = true,
+                applied = null,
+                verified = null,
+                data = unobservedShellDiagnostic("the accessibility service is not bound"),
+                timing = timing(started, actMs = actMs, observeMs = elapsed(observeStarted)),
+            )
+        }
+        val settled = settleLocked(kind, before, autoFilter, execution.accepted, token)
+        val observeMs = elapsed(observeStarted)
+        if (settled is SettleResult.Failed) {
+            if (execution.accepted && channel == CHANNEL_SHELL) {
+                return DeviceEnvelope.success(
+                    action = ACTION_ACT,
+                    channel = channel,
+                    accepted = true,
+                    applied = null,
+                    verified = null,
+                    data = unobservedShellDiagnostic("the screen observation failed: ${settled.error.code}"),
+                    timing = timing(started, actMs = actMs, observeMs = observeMs),
+                )
+            }
+            if (isCancelled(token)) return cancelledEnvelope(ACTION_ACT, channel, started)
+            return DeviceEnvelope.failure(
+                action = ACTION_ACT,
+                channel = channel,
+                error = execution.error ?: settled.error,
                 accepted = execution.accepted,
                 applied = null,
                 timing = timing(started, actMs = actMs, observeMs = observeMs),
             )
-            is ObserveResult.Ok -> {
-                val applied = when {
-                    before == null -> null
-                    !execution.accepted -> false
-                    else -> !sameScreen(before, observed.observation)
-                }
-                val verified = if (applied == true) {
-                    Verified(VERIFIED_SCREEN_CHANGE, observed.observation.revision)
-                } else {
-                    null
-                }
-                val error = execution.error ?: if (applied == false && execution.accepted) {
-                    DeviceError(
-                        DeviceErrorCodes.ACCEPTED_NO_EFFECT,
-                        "the platform accepted the action but the screen did not change",
-                        recoverable = true,
+        }
+        if (settled is SettleResult.Cancelled) return cancelledEnvelope(ACTION_ACT, channel, started)
+        val observation = (settled as SettleResult.Observed).observation
+        val applied = when {
+            before == null -> null
+            !execution.accepted -> false
+            else -> !sameScreen(before, observation)
+        }
+        val verified = if (applied == true) {
+            Verified(VERIFIED_SCREEN_CHANGE, observation.revision)
+        } else {
+            null
+        }
+        val error = execution.error ?: if (applied == false && execution.accepted) {
+            DeviceError(
+                DeviceErrorCodes.ACCEPTED_NO_EFFECT,
+                "the platform accepted the action but the screen did not change",
+                recoverable = true,
+            )
+        } else {
+            null
+        }
+        return if (error == null) {
+            DeviceEnvelope.success(
+                action = ACTION_ACT,
+                channel = channel,
+                accepted = execution.accepted,
+                applied = applied,
+                verified = verified,
+                timing = timing(started, actMs = actMs, observeMs = observeMs),
+            )
+        } else {
+            DeviceEnvelope.failure(
+                action = ACTION_ACT,
+                channel = channel,
+                error = error,
+                accepted = execution.accepted,
+                applied = applied,
+                timing = timing(started, actMs = actMs, observeMs = observeMs),
+            )
+        }
+    }
+
+    private fun execute(plan: PlannedAction, token: OperationToken, timeoutMillis: Long, started: Long): Execution =
+        when (plan) {
+            is PlannedAction.Node -> {
+                val encoded = DeviceActions.encode(plan.action, plan.arguments)
+                if (encoded == null) {
+                    Execution(
+                        accepted = false,
+                        error = DeviceError(
+                            DeviceErrorCodes.INVALID_ARGUMENTS,
+                            "the action arguments cannot be encoded safely",
+                            recoverable = false,
+                        ),
                     )
                 } else {
-                    null
-                }
-                if (error == null) {
-                    DeviceEnvelope.success(
-                        action = ACTION_ACT,
-                        channel = channel,
-                        accepted = execution.accepted,
-                        applied = applied,
-                        verified = verified,
-                        timing = timing(started, actMs = actMs, observeMs = observeMs),
-                    )
-                } else {
-                    DeviceEnvelope.failure(
-                        action = ACTION_ACT,
-                        channel = channel,
-                        error = error,
-                        accepted = execution.accepted,
-                        applied = applied,
-                        timing = timing(started, actMs = actMs, observeMs = observeMs),
-                    )
+                    invokePort(token, "the accessibility node action failed") {
+                        accessibility.performNodeAction(plan.ref, encoded)
+                    }.refusedAs {
+                        DeviceError(
+                            DeviceErrorCodes.NODE_NOT_CLICKABLE,
+                            "the platform refused ${plan.action} on ${plan.ref.value}",
+                            recoverable = true,
+                        )
+                    }
                 }
             }
-        }
-    }
-
-    private fun execute(plan: PlannedAction, timeoutMillis: Long, started: Long): Execution = when (plan) {
-        is PlannedAction.Node -> invokePort("the accessibility node action failed") {
-            accessibility.performNodeAction(plan.ref, DeviceActions.encode(plan.action, plan.arguments))
-        }.refusedAs {
-            DeviceError(
-                DeviceErrorCodes.NODE_NOT_CLICKABLE,
-                "the platform refused ${plan.action} on ${plan.ref.value}",
-                recoverable = true,
+            is PlannedAction.GestureAction -> invokePort(token, "the accessibility gesture failed") {
+                accessibility.dispatchGesture(plan.gesture)
+            }.refusedAs {
+                DeviceError(
+                    DeviceErrorCodes.GESTURE_FAILED,
+                    "the platform refused the gesture",
+                    recoverable = true,
+                )
+            }
+            is PlannedAction.ShellKey -> runShellKey(plan.key, token, timeoutMillis, started)
+            PlannedAction.Unsupported -> Execution(
+                accepted = false,
+                error = DeviceError(
+                    DeviceErrorCodes.INVALID_ARGUMENTS,
+                    "the request has no target, or no channel this kernel has can express it",
+                    recoverable = false,
+                ),
             )
         }
-        is PlannedAction.GestureAction -> invokePort("the accessibility gesture failed") {
-            accessibility.dispatchGesture(plan.gesture)
-        }.refusedAs {
-            DeviceError(
-                DeviceErrorCodes.NODE_NOT_CLICKABLE,
-                "the platform refused the gesture",
-                recoverable = true,
-            )
-        }
-        is PlannedAction.ShellKey -> runShellKey(plan.key, timeoutMillis, started)
-        PlannedAction.Unsupported -> Execution(
-            accepted = false,
-            error = DeviceError(
-                DeviceErrorCodes.INVALID_ARGUMENTS,
-                "the request has no target, or no channel this kernel has can express it",
-                recoverable = false,
-            ),
-        )
-    }
 
-    private fun invokePort(what: String, call: () -> Boolean): Execution = try {
-        val accepted = call()
-        if (cancelled.get()) Execution(accepted = accepted, cancelled = true) else Execution(accepted = accepted)
-    } catch (t: Throwable) {
-        if (cancelled.get()) {
-            Execution(accepted = false, cancelled = true)
-        } else {
-            Execution(accepted = false, error = channelError(what, t))
+    /**
+     * Runs one accessibility write. The pre-call cancellation check is what keeps an operation that
+     * was timed out or cancelled during planning/ready probing from reaching the platform.
+     */
+    private fun invokePort(token: OperationToken, what: String, call: () -> Boolean): Execution {
+        if (isCancelled(token)) return Execution(accepted = false, cancelled = true)
+        return try {
+            val accepted = call()
+            if (isCancelled(token)) Execution(accepted = accepted, cancelled = true) else Execution(accepted = accepted)
+        } catch (t: Throwable) {
+            if (isCancelled(token)) {
+                Execution(accepted = false, cancelled = true)
+            } else {
+                Execution(accepted = false, error = channelError(what, t))
+            }
         }
     }
 
@@ -641,7 +757,20 @@ class DeviceKernel(
     private fun Execution.refusedAs(refusal: () -> DeviceError): Execution =
         if (error == null && !accepted) copy(error = refusal()) else this
 
-    private fun runShellKey(key: String, timeoutMillis: Long, started: Long): Execution {
+    private fun runShellKey(key: String, token: OperationToken, timeoutMillis: Long, started: Long): Execution {
+        // Defence in depth: the planner already refuses hostile keys, but the key is interpolated
+        // into a shell command here, so the last line before the port repeats the check.
+        if (!DeviceKeyCodes.isSafeNormalized(key)) {
+            return Execution(
+                accepted = false,
+                error = DeviceError(
+                    DeviceErrorCodes.INVALID_ARGUMENTS,
+                    "the key is not a safe key event code",
+                    recoverable = false,
+                ),
+            )
+        }
+        if (isCancelled(token)) return Execution(accepted = false, cancelled = true)
         val port = shell ?: return Execution(
             accepted = false,
             error = DeviceError(
@@ -654,13 +783,13 @@ class DeviceKernel(
         val outcome = try {
             port.run("$SHELL_INPUT_KEYEVENT $key", remaining, SHELL_MAX_BYTES)
         } catch (t: Throwable) {
-            return if (cancelled.get()) {
+            return if (isCancelled(token)) {
                 Execution(accepted = false, cancelled = true)
             } else {
                 Execution(accepted = false, error = channelError("the shell command failed", t))
             }
         }
-        if (cancelled.get()) return Execution(accepted = false, cancelled = true)
+        if (isCancelled(token)) return Execution(accepted = false, cancelled = true)
         val failure = outcome.failure?.takeIf { it.isNotBlank() }
         val detail = shellDetail(outcome.stderr)
         val error = when {
@@ -675,6 +804,117 @@ class DeviceKernel(
         return Execution(accepted = error == null, error = error)
     }
 
+    private fun unobservedShellDiagnostic(reason: String): String =
+        "diagnostic=shell_accepted_unobserved; $reason"
+
+    // ── settle ──────────────────────────────────────────────────────────────
+
+    private sealed interface SettleResult {
+        data class Observed(val observation: Observation) : SettleResult
+        data class Failed(val error: DeviceError) : SettleResult
+        data object Cancelled : SettleResult
+    }
+
+    /**
+     * Observes the screen after a write and waits for it to settle (spec §4.4).
+     *
+     * A refused write has no effect to wait for, and without a pre-action baseline there is
+     * nothing to compare against, so both cases take exactly one look. Otherwise the kernel polls
+     * the accessibility tree until it leaves the baseline's shape or the per-kind change wait
+     * expires; a change then needs [SettlePolicy.requiresHeldStill] to see two agreeing captures
+     * (bounded by [SettlePolicy.heldStillMillis]) so a list caught mid-update is not returned as
+     * settled. `type` reads at the first change instead, because its effect is confined to the
+     * field it acted on. Every wait is difference-based and bounded; cancellation is checked before
+     * each look and each sleep.
+     */
+    private fun settleLocked(
+        kind: ActKind,
+        before: Observation?,
+        filter: ScreenFilter,
+        accepted: Boolean,
+        token: OperationToken,
+    ): SettleResult {
+        if (!accepted || before == null) return observeOnce(filter, token)
+        val changeWait = settlePolicy.changeWaitMillis(kind)
+        if (changeWait <= 0L) return observeOnce(filter, token)
+        val changeStarted = clock()
+        var last: Observation
+        while (true) {
+            if (isCancelled(token)) return SettleResult.Cancelled
+            when (val result = observeLocked(filter, token)) {
+                is ObserveResult.Failed -> return settleFailure(result.error, token)
+                is ObserveResult.Ok -> last = result.observation
+            }
+            if (!sameScreen(before, last)) {
+                return if (settlePolicy.requiresHeldStill(kind)) {
+                    holdStill(last, filter, token)
+                } else {
+                    SettleResult.Observed(last)
+                }
+            }
+            if (elapsed(changeStarted) >= changeWait) return SettleResult.Observed(last)
+            if (!awaitNextPoll(token)) return SettleResult.Cancelled
+        }
+    }
+
+    /** Waits for a capture that agrees with [firstChanged], bounded by the held-still budget. */
+    private fun holdStill(firstChanged: Observation, filter: ScreenFilter, token: OperationToken): SettleResult {
+        val heldStill = settlePolicy.heldStillMillis
+        if (heldStill <= 0L) return SettleResult.Observed(firstChanged)
+        val stillStarted = clock()
+        var previous = firstChanged
+        while (true) {
+            if (elapsed(stillStarted) >= heldStill) return SettleResult.Observed(previous)
+            if (!awaitNextPoll(token)) return SettleResult.Cancelled
+            when (val result = observeLocked(filter, token)) {
+                is ObserveResult.Failed -> return settleFailure(result.error, token)
+                is ObserveResult.Ok -> {
+                    val current = result.observation
+                    if (sameScreen(previous, current)) return SettleResult.Observed(current)
+                    previous = current
+                }
+            }
+        }
+    }
+
+    private fun observeOnce(filter: ScreenFilter, token: OperationToken): SettleResult =
+        when (val result = observeLocked(filter, token)) {
+            is ObserveResult.Failed -> settleFailure(result.error, token)
+            is ObserveResult.Ok -> SettleResult.Observed(result.observation)
+        }
+
+    private fun settleFailure(error: DeviceError, token: OperationToken): SettleResult =
+        if (error.code == DeviceErrorCodes.CANCELLED || isCancelled(token)) {
+            SettleResult.Cancelled
+        } else {
+            SettleResult.Failed(error)
+        }
+
+    /** Sleeps one bounded poll interval; false when the operation was cancelled. */
+    private fun awaitNextPoll(token: OperationToken): Boolean {
+        if (isCancelled(token)) return false
+        return try {
+            Thread.sleep(settlePolicy.pollIntervalMillis.coerceAtLeast(1L))
+            !isCancelled(token)
+        } catch (e: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+    }
+
+    private fun isCancelled(token: OperationToken): Boolean = cancelled.get() || token.isCancelled
+
+    /** One operation's cancellation flag; independent of the turn-level flag (see [outstanding]). */
+    private class OperationToken {
+        private val cancelled = AtomicBoolean(false)
+
+        val isCancelled: Boolean get() = cancelled.get()
+
+        fun cancel() {
+            cancelled.set(true)
+        }
+    }
+
     // ── wait ────────────────────────────────────────────────────────────────
 
     private fun waitLocked(
@@ -685,6 +925,7 @@ class DeviceKernel(
         foreground: String?,
         idle: Boolean,
         timeoutMillis: Long,
+        token: OperationToken,
     ): DeviceEnvelope {
         val query = text?.trim()?.takeIf { it.isNotEmpty() }
         val foregroundQuery = foreground?.trim()?.takeIf { it.isNotEmpty() }
@@ -709,23 +950,26 @@ class DeviceKernel(
             )
         }
         ensureReady(ReadyKind.OBSERVE)?.let { return rejected(action, channel, it, started) }
-        val deadline = started + timeoutMillis
         var observeMs = 0L
         var previous: Observation? = null
         var stableSince = started
         while (true) {
-            if (cancelled.get()) return cancelledEnvelope(action, channel, started)
+            if (isCancelled(token)) return cancelledEnvelope(action, channel, started)
             val observeStarted = clock()
-            val result = observeLocked(ScreenFilter.ALL)
+            val result = observeLocked(ScreenFilter.ALL, token)
             observeMs += elapsed(observeStarted)
             val current = when (result) {
                 is ObserveResult.Failed ->
-                    return DeviceEnvelope.failure(
-                        action = action,
-                        channel = channel,
-                        error = result.error,
-                        timing = timing(started, observeMs = observeMs),
-                    )
+                    return if (isCancelled(token)) {
+                        cancelledEnvelope(action, channel, started)
+                    } else {
+                        DeviceEnvelope.failure(
+                            action = action,
+                            channel = channel,
+                            error = result.error,
+                            timing = timing(started, observeMs = observeMs),
+                        )
+                    }
                 is ObserveResult.Ok -> result.observation
             }
             val last = previous
@@ -756,7 +1000,8 @@ class DeviceKernel(
             }
             if (!unchangedSinceLast) stableSince = clock()
             previous = current
-            if (clock() >= deadline) {
+            // A difference-based deadline cannot overflow when the caller passes a huge timeout.
+            if (elapsed(started) >= timeoutMillis) {
                 return DeviceEnvelope.failure(
                     action = action,
                     channel = channel,

@@ -68,7 +68,8 @@ internal val ActKind.isShellKeyAction: Boolean
  * - `TAP`/`LONG_PRESS`/`DOUBLE_TAP`: a ref → node action (`click`/`long_click`/`double_click`);
  *   otherwise a text → gesture at the matched node; otherwise unsupported.
  * - `TYPE`: a ref plus `value` (falling back to `text`) → `set_text` with a `text` argument. Typing
- *   has no gesture form, so a ref is required.
+ *   has no gesture form, so a ref is required; a payload containing [DeviceActions.ARGUMENT_SEPARATOR]
+ *   is unsupported because the port's wire format cannot escape it.
  * - `SCROLL`/`SCROLL_TO_TEXT`: a ref → `scroll_forward`/`scroll_backward`; otherwise a screen
  *   swipe. `SCROLL_TO_TEXT` is **one** scroll step: the caller repeats it with
  *   [DeviceKernel.waitFor] until the text appears, because multi-step loops belong to the tool layer
@@ -76,8 +77,10 @@ internal val ActKind.isShellKeyAction: Boolean
  * - `SWIPE`: always a screen-level gesture from the observed screen area (`up`/`down`/`left`/
  *   `right`); a ref is ignored because a swipe is a screen gesture.
  * - `PRESS_KEY`/`HOME`/`BACK`/`RECENTS`/`NOTIFICATIONS`: `input keyevent` through the shell. Keys
- *   normalize to `KEYCODE_*` (numbers pass through). These are the only global navigation routes
- *   this version has: [AccessibilityPort] exposes no global-action method.
+ *   normalize to `KEYCODE_*` (numbers pass through); anything outside `[A-Za-z0-9_]+` and numeric
+ *   keycodes is unsupported, because the key is interpolated into a shell command and a model
+ *   must not be able to inject shell syntax (`HOME; ...`). These are the only global navigation
+ *   routes this version has: [AccessibilityPort] exposes no global-action method.
  * - `WAIT` is not planned; the kernel runs it as a wait operation.
  *
  * Every mismatch returns [PlannedAction.Unsupported] instead of throwing: the kernel owns the error
@@ -120,6 +123,7 @@ class ActionPlanner(
     private fun type(ref: Ref?, text: String?, value: String?): PlannedAction {
         if (ref == null) return PlannedAction.Unsupported
         val payload = (value ?: text)?.takeIf { it.isNotEmpty() } ?: return PlannedAction.Unsupported
+        if (payload.contains(DeviceActions.ARGUMENT_SEPARATOR)) return PlannedAction.Unsupported
         return PlannedAction.Node(ref, DeviceActions.SET_TEXT, mapOf(ARGUMENT_TEXT to payload))
     }
 
@@ -269,13 +273,7 @@ class ActionPlanner(
             ActKind.NOTIFICATIONS -> "NOTIFICATION"
             else -> return PlannedAction.Unsupported
         }
-        return PlannedAction.ShellKey(normalizeKey(raw))
-    }
-
-    private fun normalizeKey(raw: String): String {
-        if (raw.all { it.isDigit() }) return raw
-        val upper = raw.uppercase()
-        return if (upper.startsWith(KEYCODE_PREFIX)) upper else KEYCODE_PREFIX + upper
+        return PlannedAction.ShellKey(DeviceKeyCodes.normalize(raw) ?: return PlannedAction.Unsupported)
     }
 
     private fun Bounds.hasArea(): Boolean = right > left && bottom > top
@@ -284,7 +282,6 @@ class ActionPlanner(
 
     private companion object {
         const val ARGUMENT_TEXT = "text"
-        const val KEYCODE_PREFIX = "KEYCODE_"
 
         /** Short enough that the platform reads it as a tap. */
         const val TAP_DURATION_MILLIS = 50L
@@ -297,4 +294,34 @@ class ActionPlanner(
 
         const val SWIPE_DURATION_MILLIS = 300L
     }
+}
+
+/**
+ * Validation and normalization for `input keyevent` arguments.
+ *
+ * The key ends up inside a shell command string, so a model-supplied key must be unable to add
+ * shell syntax. Two forms are accepted: a numeric keycode (`26`) or a token of ASCII letters,
+ * digits and underscores (`home`, `KEYCODE_HOME`); the token is upper-cased and prefixed with
+ * `KEYCODE_` when it does not already carry it. Embedded whitespace and every shell metacharacter
+ * (`;`, `$`, `&`, `|`, quotes, newlines, `../`, ...) is refused before the command is built;
+ * leading/trailing whitespace is trimmed first.
+ */
+internal object DeviceKeyCodes {
+
+    private val SAFE_KEY = Regex("[A-Za-z0-9_]+")
+    private const val KEYCODE_PREFIX = "KEYCODE_"
+
+    /** Returns the normalized key event code, or null when [raw] is not a safe key. */
+    fun normalize(raw: String): String? {
+        val text = raw.trim()
+        if (text.isEmpty()) return null
+        if (text.all { it.isDigit() }) return text
+        if (!SAFE_KEY.matches(text)) return null
+        val upper = text.uppercase()
+        return if (upper.startsWith(KEYCODE_PREFIX)) upper else KEYCODE_PREFIX + upper
+    }
+
+    /** Whether an already-normalized key (the only form [DeviceKernel] receives) is safe. */
+    fun isSafeNormalized(key: String): Boolean =
+        key.isNotEmpty() && (key.all { it.isDigit() } || SAFE_KEY.matches(key))
 }
