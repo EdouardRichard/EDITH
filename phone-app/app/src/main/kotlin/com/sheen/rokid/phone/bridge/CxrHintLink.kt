@@ -152,6 +152,16 @@ class CxrHintLink(
     var onStopRequest: ((sessionId: String, generation: Long) -> Unit)? = null
 
     /**
+     * 0.25 Task 11 (R51): the wearer's ring decision on a confirmation question.
+     *
+     * The event is an ENTER/BACK press while the phone had announced `CONFIRM_STATE`, so it is validated against the
+     * same established session/generation as [Stop]/[Pin] **before** it is delivered: a key press queued from a
+     * previous session must not answer the current question. The validated [HintIdentity] travels with the event so
+     * the composition can re-check it at delivery time. Runs on the vendor callback thread; a throw is contained here.
+     */
+    var onConfirmationDecision: ((identity: HintIdentity, requestId: String, approved: Boolean) -> Unit)? = null
+
+    /**
      * The wearer pinned the panel for [route] (0.24 spec §5.4).
      *
      * PIN is one-way and route-scoped; it is validated against the established session **and** generation before it
@@ -279,6 +289,20 @@ class CxrHintLink(
         }
         return runCatching { outbound(HintWireCodec.encode(build(identity.sessionId, identity.generation))) }
             .getOrDefault(false)
+    }
+
+    /**
+     * 0.25 Task 11 (R51): tells the glasses whether a confirmation question is up.
+     *
+     * Same identity rule as every other conversation command: sent only for the session this link introduced, and a
+     * refusal (no session yet, link down) is the honest `false` rather than an invented identity. A repeat is
+     * idempotent on the wire - [HintCommand.ConfirmState] is a level.
+     */
+    fun confirmationState(requestId: String, active: Boolean): Boolean {
+        if (requestId.isBlank()) return false
+        return sendConversation("a confirmation state") { session, generation ->
+            HintCommand.ConfirmState(session, generation, requestId, active)
+        }
     }
 
     override fun state(route: AssistantRoute, turnId: String, status: Int, sequence: Long): Boolean =
@@ -1028,6 +1052,20 @@ class CxrHintLink(
                 callback = onPanelShown
             }
             deliver("PANEL_SHOWN") { callback?.invoke(identity, command.route) }
+            return true
+        }
+        if (command is HintCommand.ConfirmDecision) {
+            val identity = HintIdentity(command.sessionId, command.generation)
+            var callback: ((HintIdentity, String, Boolean) -> Unit)? = null
+            synchronized(handshakeGate) {
+                if (!isEstablishedLocked(command.sessionId, command.generation, "CONFIRM_DECISION")) return false
+                callback = onConfirmationDecision
+            }
+            // The request id is the plugin's own UUID (a question address), not command text; the decision is a
+            // boolean. Neither can carry user content.
+            diagnostics("confirm decision accepted: session=${command.sessionId} " +
+                "request=${command.requestId} approved=${command.approved}")
+            deliver("CONFIRM_DECISION") { callback?.invoke(identity, command.requestId, command.approved) }
             return true
         }
         return rokidDevice.onCommand(json)

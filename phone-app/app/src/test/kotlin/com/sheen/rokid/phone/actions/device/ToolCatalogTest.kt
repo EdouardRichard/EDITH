@@ -18,6 +18,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.skill.LoadSkillTool
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoad
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoadReason
 import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.PrecheckDecision
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.int
@@ -190,6 +191,23 @@ class ToolCatalogTest {
         assertEquals(1, operations.cancels)
         assertEquals(1, operations.begins)
         assertEquals(1, operations.closes)
+    }
+
+    @Test
+    fun `precheck classifies only shell and leaves every other tool without a question`() {
+        val catalog = catalog()
+
+        assertEquals(PrecheckDecision.RequireConfirmation,
+            catalog.precheck("shell", """{"command":"pm clear com.x"}""").decision)
+        assertEquals(PrecheckDecision.Allow,
+            catalog.precheck("shell", """{"command":"dumpsys window"}""").decision)
+        assertEquals(PrecheckDecision.Reject,
+            catalog.precheck("shell", """{"command":"ls\u0000x"}""").decision)
+
+        listOf("device", "open", "dial", "notify_user", "load_skill", "teleport").forEach { name ->
+            assertEquals("$name is not command-classified", PrecheckDecision.Allow,
+                catalog.precheck(name, "{}").decision)
+        }
     }
 
     // - helpers -

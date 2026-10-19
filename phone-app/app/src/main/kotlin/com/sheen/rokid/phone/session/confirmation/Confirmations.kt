@@ -20,6 +20,19 @@ fun interface SummaryDisplayer {
     fun show(text: String, ttlMillis: Long): Boolean
 }
 
+/**
+ * 0.25 Task 11 (R51): how the presenter tells the glasses whether a confirmation question is up.
+ *
+ * A separate narrow port rather than the link itself so the presenter stays a plain JVM object and a glasses build
+ * that cannot receive the command is a `false`, never an exception. The link supplies the established session and
+ * generation; `false` also covers "no session introduced yet", which is the honest answer rather than an invented
+ * identity.
+ */
+fun interface ConfirmationGlasses {
+    /** Returns `false` when the glasses could not be told; a broken link is a degradation, never a failed answer. */
+    fun show(requestId: String, active: Boolean): Boolean
+}
+
 /** The phone-side question: a card on the session page and, when notifications are allowed, the same two actions. */
 interface ConfirmationUi {
     fun show(requestId: String, summary: String)
@@ -46,6 +59,12 @@ class ConfirmationPresenter(
     private val clock: MonotonicClock,
     private val scheduler: DeadlineScheduler,
     private val envelopeFor: (String) -> EventEnvelope,
+    /**
+     * 0.25 Task 11 (R51): the glasses' key channel. Optional by default so a host without a glasses link (and every
+     * test that predates the dual channel) keeps its exact behaviour; a question that cannot be announced there is
+     * still fully answerable on the phone.
+     */
+    private val glasses: ConfirmationGlasses = ConfirmationGlasses { _, _ -> false },
 ) : ConfirmationChannel {
 
     private class Pending(val requestId: String, val summary: String, val envelope: EventEnvelope) {
@@ -86,6 +105,9 @@ class ConfirmationPresenter(
         // displayed anywhere is still settled by the gate's timeout (as a denial).
         runCatching { this.summary.show(text, timeoutMillis + SUMMARY_MARGIN_MILLIS) }
         runCatching { ui.show(requestId, text) }
+        // 0.25 Task 11 (R51): after the question is up, the glasses' ENTER/BACK answer it. A send that fails (no
+        // session introduced, link down) is a degradation only: the phone and the window still settle the question.
+        tellGlasses(requestId, active = true)
 
         val timer = scheduler.at(clock.nowNanos() + timeoutMillis * 1_000_000L) { withdraw(requestId) }
         synchronized(lock) { pending[requestId]?.timer = timer }
@@ -100,15 +122,26 @@ class ConfirmationPresenter(
         val live = synchronized(lock) { pending.remove(requestId) } ?: return false
         live.timer?.cancel()
         runCatching { ui.hide(requestId) }
+        tellGlasses(requestId, active = false)
         deliver(ConfirmationResult(live.envelope, requestId, approved))
         return true
     }
+
+    /**
+     * 0.25 Task 11 (R51): the glasses' ENTER/BACK answer.
+     *
+     * Deliberately the **same** path as [answer] - one remove from `pending`, one `ConfirmationResult`, one delivery -
+     * so which screen wins a race cannot change what the plugin is told. A second answer for the same id settles
+     * nothing and sends the glasses no second state.
+     */
+    fun answerFromGlasses(requestId: String, approved: Boolean): Boolean = answer(requestId, approved)
 
     /** Takes a question off both screens without answering it: used by the timer, by 急停 and by session teardown. */
     private fun withdraw(requestId: String) {
         val live = synchronized(lock) { pending.remove(requestId) } ?: return
         live.timer?.cancel()
         runCatching { ui.hide(requestId) }
+        tellGlasses(requestId, active = false)
     }
 
     /** Withdraws every open question; called when the session ends so a later tap cannot answer a dead turn. */
@@ -120,6 +153,11 @@ class ConfirmationPresenter(
         val collapsed = summary.replace('\n', ' ').replace('\r', ' ').trim()
         return if (collapsed.length <= MAX_SUMMARY_CHARS) collapsed
         else collapsed.take(MAX_SUMMARY_CHARS - 1) + "…"
+    }
+
+    /** One glasses state change; a refused/failed send is recorded as a degradation, never as a failed question. */
+    private fun tellGlasses(requestId: String, active: Boolean) {
+        runCatching { glasses.show(requestId, active) }
     }
 
     companion object {

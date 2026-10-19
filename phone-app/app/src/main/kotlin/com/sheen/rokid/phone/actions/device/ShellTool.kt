@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.actions.device
 
+import com.sheen.rokid.device.ShellCommandClassifier
 import com.sheen.rokid.device.ShellOutcome
 import com.sheen.rokid.device.ShellPort
 import com.sheen.rokid.phone.actions.shizuku.PrivilegedShell
@@ -8,7 +9,9 @@ import com.sheen.rokid.phone.actions.shizuku.ShellResult
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionPrecheck
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.PrecheckDecision
 import com.sheen.rokid.plugin.RiskLevel
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonObject
@@ -42,6 +45,23 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
 
     /** The tool's own call shape (one argument object); [ActionExecutor.execute] adds the name. */
     fun execute(argsJson: String): ActionResult = execute(NAME, argsJson)
+
+    /**
+     * 0.25 Task 11 (R49/R50): classifies **this call** before anything reaches the shell.
+     *
+     * The classifier is a pure table in `device-control`; this method only extracts the `command` member and hands it
+     * over. A missing/mistyped `command` is [PrecheckDecision.Reject] (there is no shell call to make), while an
+     * unknown but well-formed command is `RequireConfirmation` - the classifier decides that, never this tool.
+     */
+    fun classify(argsJson: String): ActionPrecheck {
+        val command = parseObject(argsJson)?.stringArg("command")
+            ?: return ActionPrecheck(PrecheckDecision.Reject, reason = INVALID_ARGUMENTS)
+        return ShellCommandClassifier.classify(command)
+    }
+
+    /** Only `shell` is command-classified; any other name is not this executor's call shape. */
+    override fun precheck(name: String, argsJson: String): ActionPrecheck =
+        if (name == NAME) classify(argsJson) else ActionPrecheck(PrecheckDecision.Allow)
 
     override fun execute(name: String, argsJson: String): ActionResult {
         if (name != NAME) return ActionResult(ActionOutcome.Refused, UNKNOWN_ACTION)

@@ -3,7 +3,9 @@ package com.sheen.rokid.phone.actions.device
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionPrecheck
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.PrecheckDecision
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -58,6 +60,18 @@ class ToolCatalog(
         DialTool.NAME ->
             if (callAvailable()) dial.execute(name, argsJson) else callRefused()
         else -> ActionResult(ActionOutcome.Refused, UNKNOWN_ACTION)
+    }
+
+    /**
+     * 0.25 Task 11 (R49): only the raw-command tool has a call-level risk; every other tool answers the additive
+     * default so `device`/`open`/`dial` never gain a confirmation they are not supposed to have (R-03).
+     *
+     * Kept independent of [execute]'s channel probes on purpose: classifying a command is a pure string decision and
+     * must not depend on whether Shizuku happens to be up this second.
+     */
+    override fun precheck(name: String, argsJson: String): ActionPrecheck = when (name) {
+        ShellTool.NAME -> shell.classify(argsJson)
+        else -> ActionPrecheck(PrecheckDecision.Allow)
     }
 
     override fun cancel() {

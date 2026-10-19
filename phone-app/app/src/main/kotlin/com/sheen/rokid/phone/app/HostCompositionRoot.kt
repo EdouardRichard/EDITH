@@ -18,6 +18,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.actions.INTENT_CHANNEL
 import com.sheen.rokid.phone.actions.SHIZUKU_CHANNEL
 import com.sheen.rokid.phone.session.confirmation.SummaryDisplayer
+import com.sheen.rokid.phone.session.confirmation.ConfirmationGlasses
 import com.sheen.rokid.phone.model.ScriptedModelWire
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillDirectoryView
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
@@ -1118,6 +1119,38 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
+     * 0.25 Task 11 (R51): one ENTER/BACK decision from the glasses.
+     *
+     * The link validated the pair against the identity it introduced; this checks it again against the host's current
+     * one at delivery time, exactly like [panelShownArrived], so a press queued from a previous session answers
+     * nothing. The presenter is the authority on whether that question is still live: its [ConfirmationPresenter]
+     * answer path removes one pending entry and delivers one `ConfirmationResult`, which is also what makes a phone
+     * tap and a glasses press settle the question at most once in total.
+     */
+    internal fun onConfirmationDecisionFromLink(identity: HintIdentity, requestId: String, approved: Boolean) {
+        dispatchHostEvent {
+            if (closed) return@dispatchHostEvent
+            if (requestId.isBlank()) {
+                P3Log.line("P3_CONFIRM_HOST source=glasses result=ignored reason=MISSING_REQUEST")
+                return@dispatchHostEvent
+            }
+            if (!identityIsCurrent(identity)) {
+                P3Log.line(
+                    "P3_CONFIRM_HOST source=glasses result=stale session=${identity.sessionId} " +
+                        "request=$requestId",
+                )
+                return@dispatchHostEvent
+            }
+            val settled = confirmationPresenter?.answerFromGlasses(requestId, approved) ?: false
+            // Same shape as the phone's line: the request id (a UUID) and the result, never the summary.
+            P3Log.line(
+                "P3_CONFIRM_HOST answer=${if (approved) "allow" else "deny"} request=$requestId " +
+                    "settled=$settled source=glasses",
+            )
+        }
+    }
+
+    /**
      * One diagnostic `IGlassesEventListener` fact, recorded off the vendor thread.
      *
      * 0.24 S5 Task 20: the screen-on/off and app-paused/resumed callbacks are **diagnostics only** - they are recorded
@@ -2014,6 +2047,11 @@ class HostCompositionRoot internal constructor(
                         now,
                     )
                 },
+                // 0.25 Task 11 (R51): the presenter announces the question to the glasses through the same link that
+                // carries hints; a link with no established session answers false, which only degrades to phone-only.
+                glasses = ConfirmationGlasses { requestId, active ->
+                    hintLink.confirmationState(requestId, active)
+                },
             )
             // P5 (spec §S1/S5): construct the speech player only when the user switch is on AND the engine is ready.
             // The player is passed to the environment so OutputArbiter can use it; null means no speech capability.
@@ -2199,6 +2237,11 @@ class HostCompositionRoot internal constructor(
             // is read from the host at call time by `requestStop` (not captured here).
             hintLink.onStopRequest = { sessionId, generation ->
                 rootHolder[0]?.requestStop(sessionId, generation) ?: false
+            }
+            // 0.25 Task 11 (R51): the glasses' ENTER/BACK decision. The validated identity travels with it so the
+            // composition re-checks it against the current session at delivery time.
+            hintLink.onConfirmationDecision = { identity, requestId, approved ->
+                rootHolder[0]?.onConfirmationDecisionFromLink(identity, requestId, approved)
             }
             // 0.24 S2 Task 11: the resident handshake and panel lifecycle. Each link callback runs on the vendor
             // callback thread, so the root methods below marshal it (Task 12's timer consumes `onPanelShown`), and

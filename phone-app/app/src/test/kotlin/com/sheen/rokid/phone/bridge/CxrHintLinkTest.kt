@@ -1524,4 +1524,60 @@ class CxrHintLinkTest {
             link.sessionEnded()
         }
     }
+
+    // ---------------------------------------------------------------- 0.25 Task 11: the glasses decision channel
+
+    @Test
+    fun aConfirmationDecisionFromTheEstablishedSessionReachesTheHost() {
+        val sent = mutableListOf<String>()
+        val link = CxrHintLink(FakeClock(), FakeScheduler(), sendJson = { json -> sent += json; true }, maxRetries = 0)
+        val decisions = mutableListOf<Triple<HintIdentity, String, Boolean>>()
+        link.onConfirmationDecision = { identity, requestId, approved ->
+            decisions += Triple(identity, requestId, approved)
+        }
+        link.sessionEstablished("s-1", 3)
+
+        assertTrue(link.onInbound(HintWireCodec.encode(HintCommand.ConfirmDecision("s-1", 3, "c-1", true))))
+
+        assertEquals(listOf(Triple(HintIdentity("s-1", 3), "c-1", true)), decisions)
+    }
+
+    @Test
+    fun aConfirmationDecisionFromAnotherSessionOrGenerationIsRefused() {
+        val sent = mutableListOf<String>()
+        val link = CxrHintLink(FakeClock(), FakeScheduler(), sendJson = { json -> sent += json; true }, maxRetries = 0)
+        val decisions = mutableListOf<Triple<HintIdentity, String, Boolean>>()
+        link.onConfirmationDecision = { identity, requestId, approved ->
+            decisions += Triple(identity, requestId, approved)
+        }
+        link.sessionEstablished("s-1", 3)
+
+        assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.ConfirmDecision("s-other", 3, "c-1", true))))
+        assertFalse(link.onInbound(HintWireCodec.encode(HintCommand.ConfirmDecision("s-1", 4, "c-1", true))))
+
+        assertTrue("a stale session's key press cannot answer the current question", decisions.isEmpty())
+    }
+
+    @Test
+    fun aConfirmationStateCarriesTheEstablishedIdentityAndIsRefusedBeforeASession() {
+        val sent = mutableListOf<String>()
+        val link = CxrHintLink(FakeClock(), FakeScheduler(), sendJson = { json -> sent += json; true }, maxRetries = 0)
+        assertFalse("a state with no session introduced has nobody to be true for",
+            link.confirmationState("c-1", true))
+        assertTrue(sent.isEmpty())
+
+        link.sessionEstablished("s-1", 7)
+        sent.clear()
+
+        assertTrue(link.confirmationState("c-1", true))
+        assertEquals(
+            HintCommand.ConfirmState("s-1", 7, "c-1", true),
+            sent.mapNotNull(HintWireCodec::decode).filterIsInstance<HintCommand.ConfirmState>().single(),
+        )
+
+        assertTrue(link.confirmationState("c-1", false))
+        val inactive = sent.mapNotNull(HintWireCodec::decode).filterIsInstance<HintCommand.ConfirmState>().last()
+        assertEquals("c-1", inactive.requestId)
+        assertFalse("the withdrawal names the same question", inactive.active)
+    }
 }

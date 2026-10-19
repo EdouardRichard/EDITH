@@ -5,6 +5,7 @@ import com.sheen.rokid.phone.actions.shizuku.ShellFailure
 import com.sheen.rokid.phone.actions.shizuku.ShellResult
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.PrecheckDecision
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -166,6 +167,60 @@ class ShellToolTest {
         val cutShort = port.run("cmd", 1_000, 64)
         assertEquals("SHELL_REPLY_TOO_LARGE", cutShort.failure)
         assertTrue(cutShort.truncated)
+    }
+
+    // ---- R49/R50: the precheck seam ----
+
+    @Test
+    fun `classify allows a read only command without touching the shell`() {
+        val shell = FakeShell()
+
+        val precheck = ShellTool(shell).classify("""{"command":"dumpsys window"}""")
+
+        assertEquals(PrecheckDecision.Allow, precheck.decision)
+        assertTrue("classifying is not executing", shell.commands.isEmpty())
+    }
+
+    @Test
+    fun `classify requires confirmation for an irreversible command without touching the shell`() {
+        val shell = FakeShell()
+
+        val precheck = ShellTool(shell).classify("""{"command":"pm clear com.x"}""")
+
+        assertEquals(PrecheckDecision.RequireConfirmation, precheck.decision)
+        assertTrue("the wearer needs a summary to decide", !precheck.summary.isNullOrBlank())
+        assertTrue("the reason is a category, never the command body",
+            !precheck.reason.isNullOrBlank() && !precheck.reason!!.contains("pm clear"))
+        assertTrue("classifying must never run the command", shell.commands.isEmpty())
+    }
+
+    @Test
+    fun `classify rejects a malformed or blank command argument`() {
+        val tool = ShellTool(FakeShell())
+
+        listOf(
+            """{"timeout_ms":1}""",
+            """{"command":""}""",
+            """{"command":"   "}""",
+            """{"command":123}""",
+            """{"command":"ls\u0000/sdcard"}""",
+            "not json",
+            "",
+        ).forEach { args ->
+            assertEquals("args: $args", PrecheckDecision.Reject, tool.classify(args).decision)
+        }
+    }
+
+    @Test
+    fun `precheck classifies the shell tool and defaults every other name to allow`() {
+        val tool = ShellTool(null)
+
+        assertEquals(PrecheckDecision.RequireConfirmation,
+            tool.precheck("shell", """{"command":"rm -rf /sdcard/x"}""").decision)
+        assertEquals(PrecheckDecision.Allow,
+            tool.precheck("shell", """{"command":"ls /sdcard"}""").decision)
+        assertEquals(PrecheckDecision.Allow,
+            tool.precheck("device", """{"action":"observe"}""").decision)
     }
 
     private fun body(result: ActionResult): JsonObject =

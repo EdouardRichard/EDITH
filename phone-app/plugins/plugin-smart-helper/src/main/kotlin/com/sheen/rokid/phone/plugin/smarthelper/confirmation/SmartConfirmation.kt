@@ -47,6 +47,17 @@ internal class SmartConfirmation(
         this.channel = channel
     }
 
+    /**
+     * 0.25 Task 11 (R52): whether a host channel is attached right now.
+     *
+     * [request] answers `CANCEL` for two different situations - the host cannot present a question at all, and the
+     * wearer's STOP/急停 withdrew a live one. The caller that has to tell "unavailable" from "denied" asks this
+     * **before** requesting: false means there is nobody to ask. The answer can change while a question is in flight
+     * (deactivation detaches the channel and cancels the pending question), which is why this is a read-only property
+     * rather than a promise.
+     */
+    val canAsk: Boolean get() = channel != null
+
     /** One live question; [outcome] is set exactly once, by whichever resolver gets there first. */
     private class Pending(val requestId: String, val latch: CountDownLatch = CountDownLatch(1)) {
         val outcome = AtomicReference<ConfirmationOutcome?>(null)

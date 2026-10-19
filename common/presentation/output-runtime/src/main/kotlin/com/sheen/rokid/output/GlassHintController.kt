@@ -81,7 +81,10 @@ class GlassHintController(
             is HintCommand.Said, is HintCommand.Busy, is HintCommand.Stop,
             is HintCommand.State, is HintCommand.Idle, is HintCommand.Asr, is HintCommand.Answer,
             is HintCommand.Tool, is HintCommand.Close, is HintCommand.Pin, is HintCommand.PanelOpen,
-            is HintCommand.PanelShown, is HintCommand.UiReady, is HintCommand.UiClosed -> Unit
+            is HintCommand.PanelShown, is HintCommand.UiReady, is HintCommand.UiClosed,
+            // 0.25 Task 11: the confirmation level and decision belong to the panel's key state, not to the one-hint
+            // render/expiry machine.
+            is HintCommand.ConfirmState, is HintCommand.ConfirmDecision -> Unit
         }
     }
 

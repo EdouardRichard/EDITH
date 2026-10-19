@@ -238,6 +238,18 @@ class GlassesPanelController(
     /** Whether a deadline is already armed for the current busy spell; a repeat of the level must not push it back. */
     private var busyDeadlineArmed = false
 
+    /**
+     * 0.25 Task 11 (R51): the confirmation question the ring's keys currently answer, or null outside confirm mode.
+     *
+     * One id only, because the plugin asks one question at a time. It is **not** the panel's pin or the selected
+     * route: confirmation is a modal key state layered over the ordinary panel, and leaving it restores that panel's
+     * own decisions untouched.
+     */
+    private var confirmationRequestId: String? = null
+
+    /** Read-only view of [confirmationRequestId] for the Activity and the JVM tests. */
+    val confirmingRequestId: String? get() = confirmationRequestId
+
     /** False between [onStop] and [onStart]; mirror of the Activity's resumed flag for the retry/deadline decision. */
     private var running = false
 
@@ -291,6 +303,10 @@ class GlassesPanelController(
             // arrived.
             is HintCommand.Hello -> onHello(command)
 
+            // 0.25 Task 11: the phone says whether a confirmation question is up. It changes the ring's key map, not
+            // the conversation.
+            is HintCommand.ConfirmState -> onConfirmState(command)
+
             else -> hints.accept(command)
         }
         return true
@@ -308,12 +324,77 @@ class GlassesPanelController(
      * focus mid-press is not a wearer decision) and keeps the page gestures for its scroll view; both are window glue,
      * not panel state.
      */
-    fun onKey(keyCode: Int, action: Int): Boolean = when {
-        keyCode == KEYCODE_ENTER && action == ACTION_DOWN -> true
-        keyCode == KEYCODE_BACK && action == ACTION_DOWN -> true
-        keyCode == KEYCODE_ENTER && action == ACTION_UP -> onEnter()
-        keyCode == KEYCODE_BACK && action == ACTION_UP -> onBack()
-        else -> false
+    fun onKey(keyCode: Int, action: Int): Boolean {
+        // 0.25 Task 11 (R51): confirmation is a modal key state. ENTER allows and BACK denies, both on ACTION_UP with
+        // their ACTION_DOWN consumed; neither may fall through to the pin or the STOP/exit matrix, and direction keys
+        // stay the host's so the wearer can still page while deciding.
+        if (confirmationRequestId != null) {
+            return when {
+                (keyCode == KEYCODE_ENTER || keyCode == KEYCODE_BACK) && action == ACTION_DOWN -> true
+                keyCode == KEYCODE_ENTER && action == ACTION_UP -> answerConfirmation(approved = true)
+                keyCode == KEYCODE_BACK && action == ACTION_UP -> answerConfirmation(approved = false)
+                else -> false
+            }
+        }
+        return when {
+            keyCode == KEYCODE_ENTER && action == ACTION_DOWN -> true
+            keyCode == KEYCODE_BACK && action == ACTION_DOWN -> true
+            keyCode == KEYCODE_ENTER && action == ACTION_UP -> onEnter()
+            keyCode == KEYCODE_BACK && action == ACTION_UP -> onBack()
+            else -> false
+        }
+    }
+
+    /**
+     * One `CONFIRM_STATE` level (0.25 Task 11, R51).
+     *
+     * The session/generation gate is the hint controller's, so a queued state from a previous session cannot map the
+     * ring's keys to a question the wearer can no longer see. `active=true` enters the mode and renders (the summary
+     * itself arrived as a normal hint); a repeat is the same statement. `active=false` only leaves the mode when it
+     * names the question that is actually live - a late withdrawal for an older question must not disarm a newer one.
+     */
+    private fun onConfirmState(command: HintCommand.ConfirmState) {
+        if (!hints.isCurrent(command.sessionId, command.generation)) {
+            diagnostics("confirm refused: session or generation mismatch")
+            return
+        }
+        if (command.requestId.isBlank()) {
+            diagnostics("confirm refused: blank request id")
+            return
+        }
+        if (command.active) {
+            confirmationRequestId = command.requestId
+            diagnostics("confirm active request=${command.requestId}")
+            applyAndRender()
+        } else if (confirmationRequestId == command.requestId) {
+            confirmationRequestId = null
+            diagnostics("confirm inactive request=${command.requestId}")
+            applyAndRender()
+        }
+    }
+
+    /**
+     * Sends one decision for the live question and leaves confirm mode immediately, whatever the send answers.
+     *
+     * The send result is diagnostic only: the keys must not stay mapped to a question that the phone's own 120 s
+     * window will settle anyway, and a decision that could not be sent is the phone's timeout-as-denial, not a second
+     * chance to press a key under a different meaning.
+     */
+    private fun answerConfirmation(approved: Boolean): Boolean {
+        val requestId = confirmationRequestId ?: return true
+        confirmationRequestId = null
+        val identity = hints.currentIdentity()
+        val sent = if (identity == null) {
+            diagnostics("confirm decision deferred: no session identity")
+            false
+        } else {
+            runCatching {
+                send(HintCommand.ConfirmDecision(identity.first, identity.second, requestId, approved))
+            }.getOrDefault(false)
+        }
+        diagnostics("P5_GLASS_CONFIRM action=${if (approved) "allow" else "deny"} sent=$sent " +
+            "request=$requestId")
+        return true
     }
 
     /** The Activity is visible again: re-apply the level and arm the local busy bound. */
@@ -337,6 +418,8 @@ class GlassesPanelController(
      */
     fun disconnect() {
         running = false
+        // 0.25 Task 11: a destroyed screen cannot answer a question either; the phone's window settles it.
+        confirmationRequestId = null
         hints.disconnect()
     }
 
@@ -381,6 +464,9 @@ class GlassesPanelController(
         liveEntryId = null
         contentRevision = 0L
         busyDeadlineArmed = false
+        // 0.25 Task 11: a confirmation question belongs to the window that showed it; the next window starts with the
+        // ordinary ring semantics and learns about a still-live question only from a new CONFIRM_STATE.
+        confirmationRequestId = null
         applyAndRender()
     }
 
@@ -425,6 +511,8 @@ class GlassesPanelController(
             resetOfficialState(resetSequence = true)
             finalAnswerEntries.clear()
             liveEntryId = null
+            // 0.25 Task 11: the keys must not keep answering the previous session's question.
+            confirmationRequestId = null
         }
         hints.accept(command)
         // The Activity rebuilds on every HELLO, so it stays here: a repeated HELLO is also a chance for the view to

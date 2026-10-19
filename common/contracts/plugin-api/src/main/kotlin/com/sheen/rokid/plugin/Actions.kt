@@ -77,10 +77,43 @@ data class ActionDescriptor(
 
 data class ActionResult(val outcome: ActionOutcome, val detail: String)
 
+/**
+ * 0.25 Task 11 (R49): what an action executor thinks should happen to one call **before** it runs.
+ *
+ * The declaration is deliberately separate from [ActionDescriptor.requiresConfirmation]: that flag is static (the
+ * `shell` descriptor is one tool), while one call's risk depends on its arguments (`dumpsys window` vs `pm clear`).
+ * [Allow] means "no human confirmation is needed", never "the action is safe"; [Reject] means the arguments are not a
+ * well-formed call and must not reach the executor at all.
+ */
+enum class PrecheckDecision { Allow, RequireConfirmation, Reject }
+
+/**
+ * The answer of [ActionExecutor.precheck].
+ *
+ * [summary] is the human-readable question a [RequireConfirmation] decision shows the wearer (it must never carry raw
+ * user content); [reason] is a machine-readable category that may reach the audit trail, which is why neither is the
+ * action's arguments.
+ */
+data class ActionPrecheck(
+    val decision: PrecheckDecision,
+    val summary: String? = null,
+    val reason: String? = null,
+)
+
 interface ActionExecutor {
     fun descriptors(): List<ActionDescriptor>
     fun execute(name: String, argsJson: String): ActionResult
     fun cancel()
+
+    /**
+     * 0.25 Task 11 (R49): classifies **one call** before it executes.
+     *
+     * The host's action catalog overrides this to classify a raw `shell` command; every other executor keeps the
+     * default so the seam is additive and no existing tool gains a confirmation it never had. A wrapper that gates
+     * execution must call this first and must never execute a [PrecheckDecision.Reject] call.
+     */
+    fun precheck(name: String, argsJson: String): ActionPrecheck =
+        ActionPrecheck(PrecheckDecision.Allow)
 
     /**
      * 0.25 Task 10 (R42): called at the start of every new assistant turn.

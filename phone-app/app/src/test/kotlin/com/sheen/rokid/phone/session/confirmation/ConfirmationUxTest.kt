@@ -1,0 +1,209 @@
+package com.sheen.rokid.phone.session.confirmation
+
+import com.sheen.rokid.contracts.ConfirmationResult
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.testsupport.FakeClock
+import com.sheen.rokid.testsupport.ManualScheduler
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * R51: one question, two screens, exactly one settlement.
+ *
+ * The phone card and the glasses keys are two input channels for the same question. This test pins the properties that
+ * make that safe:
+ * - the glasses are told when the question appears and when it goes away, so their keys are never mapped to a stale
+ *   question;
+ * - `answerFromGlasses` is the *same* path as the phone's tap, so which channel wins the race never changes the
+ *   `ConfirmationResult` the plugin receives;
+ * - a timeout takes the question down on both channels and delivers **nothing** - the plugin's gate owns "silence is a
+ *   denial", and the presenter must not turn its own timer into an approval;
+ * - the window is the caller's (the plugin's 120 s), not a second number invented here.
+ */
+class ConfirmationUxTest {
+
+    private class FakeSummary : SummaryDisplayer {
+        val shown = mutableListOf<Pair<String, Long>>()
+        override fun show(text: String, ttlMillis: Long): Boolean {
+            shown += text to ttlMillis
+            return true
+        }
+    }
+
+    private class FakeUi : ConfirmationUi {
+        val shown = mutableListOf<Pair<String, String>>()
+        val hidden = mutableListOf<String>()
+        override fun show(requestId: String, summary: String) { shown += requestId to summary }
+        override fun hide(requestId: String) { hidden += requestId }
+    }
+
+    private class FakeGlasses : ConfirmationGlasses {
+        val states = mutableListOf<Pair<String, Boolean>>()
+        var accepts = true
+        override fun show(requestId: String, active: Boolean): Boolean {
+            states += requestId to active
+            return accepts
+        }
+    }
+
+    private class Rig {
+        val clock = FakeClock()
+        val scheduler = ManualScheduler(clock)
+        val summary = FakeSummary()
+        val ui = FakeUi()
+        val glasses = FakeGlasses()
+        val delivered = mutableListOf<ConfirmationResult>()
+        val presenter = ConfirmationPresenter(
+            summary = summary,
+            ui = ui,
+            glasses = glasses,
+            deliver = { delivered += it },
+            clock = clock,
+            scheduler = scheduler,
+            envelopeFor = { requestId ->
+                EventEnvelope(SessionId("s"), Generation(1), requestId, 0, 1)
+            },
+        )
+    }
+
+    @Test
+    fun `present puts the question on the phone and activates the glasses channel`() {
+        val rig = Rig()
+
+        rig.presenter.present("c1", "卸载 App：edith.phone.a11yprobe", 120_000L)
+
+        assertEquals(1, rig.ui.shown.size)
+        assertEquals(1, rig.summary.shown.size)
+        assertEquals("present must tell the glasses which question the keys now answer",
+            listOf("c1" to true), rig.glasses.states)
+        assertEquals(1, rig.presenter.pendingCount)
+        assertTrue("presenting is not answering", rig.delivered.isEmpty())
+    }
+
+    @Test
+    fun `answering from the glasses settles once and delivers the same result`() {
+        val rig = Rig()
+        rig.presenter.present("c1", "卸载 App", 120_000L)
+
+        assertTrue(rig.presenter.answerFromGlasses("c1", approved = true))
+
+        val result = rig.delivered.single()
+        assertEquals("c1", result.requestId)
+        assertTrue(result.approved)
+        assertEquals(SessionId("s"), result.envelope.sessionId)
+        assertEquals(Generation(1), result.envelope.generation)
+        assertEquals(listOf("c1"), rig.ui.hidden)
+        assertEquals("the glasses must be told the question is over",
+            listOf("c1" to true, "c1" to false), rig.glasses.states)
+        assertEquals(0, rig.presenter.pendingCount)
+
+        assertFalse("a settled question accepts no second answer",
+            rig.presenter.answerFromGlasses("c1", approved = false))
+        assertFalse("and the phone's tap for the same question loses too",
+            rig.presenter.answer("c1", approved = false))
+        assertEquals("only one ConfirmationResult may ever be delivered", 1, rig.delivered.size)
+        assertEquals("the glasses see exactly one deactivation", 2, rig.glasses.states.size)
+    }
+
+    @Test
+    fun `a phone tap and a glasses key race and the second one settles nothing`() {
+        val rig = Rig()
+        rig.presenter.present("c1", "卸载 App", 120_000L)
+
+        assertTrue(rig.presenter.answer("c1", approved = false))
+        assertFalse(rig.presenter.answerFromGlasses("c1", approved = true))
+
+        val result = rig.delivered.single()
+        assertEquals("the first decision wins, whichever screen made it", false, result.approved)
+        assertEquals(listOf("c1" to true, "c1" to false), rig.glasses.states)
+    }
+
+    @Test
+    fun `a timeout withdraws the question on both channels and delivers no approval`() {
+        val rig = Rig()
+        rig.presenter.present("c1", "卸载 App", 120_000L)
+
+        rig.clock.advance(120_000_000_000L - 1)
+        rig.scheduler.runDue()
+        assertEquals("the question must survive until the window closes", 1, rig.presenter.pendingCount)
+        assertEquals(listOf("c1" to true), rig.glasses.states)
+
+        rig.clock.advance(1)
+        rig.scheduler.runDue()
+
+        assertEquals(listOf("c1"), rig.ui.hidden)
+        assertEquals("the glasses must leave confirm mode when the window closes",
+            listOf("c1" to true, "c1" to false), rig.glasses.states)
+        assertTrue("the presenter's timeout is a withdrawal, never an approval", rig.delivered.isEmpty())
+        assertEquals(0, rig.presenter.pendingCount)
+        assertFalse("a key pressed after the timeout answers nothing",
+            rig.presenter.answerFromGlasses("c1", approved = true))
+    }
+
+    @Test
+    fun `the window is the caller's so the presenter owns no fixed 120 seconds`() {
+        // The plugin passes SmartConfirmation.DEFAULT_TIMEOUT_MILLIS (120 s); the presenter must arm exactly what it is
+        // given. A short window here would survive a hardcoded 120 s.
+        val rig = Rig()
+        rig.presenter.present("c1", "卸载 App", 5_000L)
+
+        rig.clock.advance(5_000_000_000L - 1)
+        rig.scheduler.runDue()
+        assertEquals(1, rig.presenter.pendingCount)
+
+        rig.clock.advance(1)
+        rig.scheduler.runDue()
+        assertEquals(0, rig.presenter.pendingCount)
+        assertEquals(listOf("c1" to true, "c1" to false), rig.glasses.states)
+        assertTrue(rig.delivered.isEmpty())
+    }
+
+    @Test
+    fun `the phone notification window still matches the plugins one hundred twenty seconds`() {
+        assertEquals(120_000L, ConfirmationNotifier.WINDOW_MILLIS)
+    }
+
+    @Test
+    fun `withdraw all takes every open question off the glasses`() {
+        val rig = Rig()
+        rig.presenter.present("c1", "动作一", 120_000L)
+        rig.presenter.present("c2", "动作二", 120_000L)
+
+        rig.presenter.withdrawAll()
+
+        assertEquals(listOf("c1", "c2"), rig.ui.hidden)
+        assertEquals(
+            listOf("c1" to true, "c2" to true, "c1" to false, "c2" to false),
+            rig.glasses.states,
+        )
+        assertTrue(rig.delivered.isEmpty())
+        assertEquals(0, rig.presenter.pendingCount)
+    }
+
+    @Test
+    fun `a duplicate present for a live id does not activate the glasses twice`() {
+        val rig = Rig()
+        rig.presenter.present("c1", "第一个动作", 120_000L)
+
+        rig.presenter.present("c1", "第二个动作", 120_000L)
+
+        assertEquals("the duplicate never displaces the live question", listOf("c1" to "第一个动作"), rig.ui.shown)
+        assertEquals("and it must not send a second activation", listOf("c1" to true), rig.glasses.states)
+    }
+
+    @Test
+    fun `a glasses send failure never stops the phone from asking`() {
+        val rig = Rig()
+        rig.glasses.accepts = false
+
+        rig.presenter.present("c1", "卸载 App", 120_000L)
+
+        assertEquals("the phone is the fallback screen, not a second failure", 1, rig.ui.shown.size)
+        assertTrue("the question is still answerable on the phone", rig.presenter.answer("c1", approved = true))
+        assertEquals(1, rig.delivered.size)
+    }
+}

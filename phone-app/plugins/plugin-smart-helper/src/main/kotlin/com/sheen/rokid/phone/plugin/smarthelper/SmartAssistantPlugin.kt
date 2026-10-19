@@ -29,6 +29,8 @@ import com.sheen.rokid.agent.AgentRun
 import com.sheen.rokid.agent.AuditEntry
 import com.sheen.rokid.agent.BoundedAuditLog
 import com.sheen.rokid.agent.ConfirmationGate
+import com.sheen.rokid.agent.ConfirmationPort
+import com.sheen.rokid.agent.ConfirmationSource
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.GatewayTurn
 import com.sheen.rokid.agent.MemoryRetrieval
@@ -68,6 +70,11 @@ import com.sheen.rokid.contracts.WakeDetected
 import com.sheen.rokid.output.HintReadingBudget
 import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionPrecheck
+import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.ConfigSchema
 import com.sheen.rokid.plugin.ConfiguredPlugin
@@ -84,6 +91,7 @@ import com.sheen.rokid.plugin.PluginConfiguration
 import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
 import com.sheen.rokid.plugin.PluginLifecycle
+import com.sheen.rokid.plugin.PrecheckDecision
 import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.plugin.ToolSpec
 import com.sheen.rokid.plugin.actions
@@ -226,6 +234,86 @@ private const val BLANK_UTTERANCE_HINT = "没有听清内容，请再说一次�
  * failed — that belongs in the log line, as a code.
  */
 private const val DEPENDENCY_HINT = "本地模型还没准备好，暂时不能用。"
+
+/**
+ * 0.25 Task 11 (R52): command-level confirmation between the agent loop and the host's tools.
+ *
+ * `shell` is **one** descriptor, so its static risk cannot say whether *this* call is a `dumpsys` or a `pm clear`. The
+ * wrapper therefore asks the host's own [ActionExecutor.precheck] before every call:
+ * - [PrecheckDecision.Allow] - execute once, unchanged;
+ * - [PrecheckDecision.Reject] - refuse with `SHELL_COMMAND_REJECTED`, executing nothing;
+ * - [PrecheckDecision.RequireConfirmation] - ask through the plugin's existing [ConfirmationPort] and execute only after
+ *   a live approval. A denial, a timeout, a cancelled question (STOP/急停) and a missing/broken channel each refuse
+ *   without running the command.
+ *
+ * It never invents a question for a tool whose precheck says Allow, which is what keeps `device`/`open`/`dial`
+ * unconfirmed (R-03); the plugin's own `notify_user`/`load_skill` are not wrapped here at all. The request id is a
+ * UUID because it addresses one question, not a command, and the summary is the precheck's category text - never the
+ * raw command (the same no-command-text rule as the audit trail).
+ */
+internal class ConfirmingActions(
+    private val host: ActionExecutor,
+    private val confirmation: ConfirmationPort,
+    private val canAsk: () -> Boolean,
+    private val newRequestId: () -> String = { UUID.randomUUID().toString() },
+    private val diagnostics: (String) -> Unit = { P3Log.line(it) },
+) : ActionExecutor {
+
+    override fun descriptors(): List<ActionDescriptor> = host.descriptors()
+
+    override fun cancel() = host.cancel()
+
+    override fun beginTurn() = host.beginTurn()
+
+    /** The wrapper adds no classification of its own: the host is the only side that knows a command's risk. */
+    override fun precheck(name: String, argsJson: String): ActionPrecheck = host.precheck(name, argsJson)
+
+    override fun execute(name: String, argsJson: String): ActionResult {
+        val precheck = runCatching { host.precheck(name, argsJson) }.getOrElse {
+            // A precheck that cannot answer is not an approval. Refuse rather than fall through to executing.
+            diagnostics("P3_CONFIRM action=$name outcome=unavailable reason=PRECHECK_FAILED")
+            return ActionResult(ActionOutcome.Refused, SHELL_COMMAND_REJECTED)
+        }
+        return when (precheck.decision) {
+            PrecheckDecision.Allow -> host.execute(name, argsJson)
+            PrecheckDecision.Reject -> {
+                diagnostics("P3_CONFIRM action=$name outcome=rejected reason=${precheck.reason ?: "UNSPECIFIED"}")
+                ActionResult(ActionOutcome.Refused, SHELL_COMMAND_REJECTED)
+            }
+            PrecheckDecision.RequireConfirmation -> confirmThenRun(name, argsJson, precheck)
+        }
+    }
+
+    private fun confirmThenRun(name: String, argsJson: String, precheck: ActionPrecheck): ActionResult {
+        // No channel means there is nobody to ask. This is separate from STOP: there the question existed and was
+        // withdrawn, so the honest answer is a denial, not "unavailable".
+        if (!runCatching(canAsk).getOrDefault(false)) {
+            diagnostics("P3_CONFIRM action=$name outcome=unavailable reason=NO_CHANNEL")
+            return ActionResult(ActionOutcome.Refused, CONFIRMATION_UNAVAILABLE)
+        }
+        val requestId = newRequestId()
+        val summary = precheck.summary?.takeIf { it.isNotBlank() } ?: DEFAULT_SUMMARY
+        val outcome = runCatching { confirmation.request(requestId, summary) }.getOrElse {
+            diagnostics("P3_CONFIRM request=$requestId outcome=unavailable reason=CHANNEL_FAILED")
+            return ActionResult(ActionOutcome.Refused, CONFIRMATION_UNAVAILABLE)
+        }
+        if (outcome.approved) return host.execute(name, argsJson)
+        val code = if (outcome.source == ConfirmationSource.TIMEOUT) CONFIRMATION_TIMEOUT else CONFIRMATION_DENIED
+        diagnostics("P3_CONFIRM request=$requestId outcome=${if (code == CONFIRMATION_TIMEOUT) "timeout" else "denied"} " +
+            "source=${outcome.source.name.lowercase()}")
+        return ActionResult(ActionOutcome.Refused, code)
+    }
+
+    internal companion object {
+        const val CONFIRMATION_DENIED = "CONFIRMATION_DENIED"
+        const val CONFIRMATION_TIMEOUT = "CONFIRMATION_TIMEOUT"
+        const val CONFIRMATION_UNAVAILABLE = "CONFIRMATION_UNAVAILABLE"
+        const val SHELL_COMMAND_REJECTED = "SHELL_COMMAND_REJECTED"
+
+        /** Only used if a host ever returns RequireConfirmation without a summary; still category text, never a command. */
+        private const val DEFAULT_SUMMARY = "终端命令：无法确认是否安全"
+    }
+}
 
 /**
  * The smart assistant plugin: the passive loop from wake to a hint on the glasses.
@@ -2184,7 +2272,13 @@ class SmartAssistantPlugin(
     private fun registryFor(context: PluginContext, owned: SmartTurn, ledger: NotifyLedger): ToolRegistry =
         ToolRegistry(
             listOf(
-                context.services.actions(),
+                // 0.25 Task 11 (R52): every host action passes the precheck gate first. `notify_user`/`load_skill` are
+                // added beside the wrapper, not inside it, so they never grow a command-level confirmation.
+                ConfirmingActions(
+                    host = context.services.actions(),
+                    confirmation = confirmation,
+                    canAsk = { confirmation.canAsk },
+                ),
                 // B7: `notify_user` is the model's only channel to the wearer (spec §6.1). It rides the action
                 // registry rather than a new tool port, and `NotifyUserTool`'s KDoc records what that choice costs.
                 NotifyUserTool { channel, text -> onNotify(owned, ledger, channel, text) },

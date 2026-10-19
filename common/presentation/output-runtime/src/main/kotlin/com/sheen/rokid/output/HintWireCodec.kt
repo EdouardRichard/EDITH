@@ -132,6 +132,27 @@ sealed interface HintCommand {
 
     /** Glasses -> phone: the panel for [route] is hidden; the resident service is still alive. */
     data class UiClosed(val sessionId: String, val generation: Long, val route: AssistantRoute) : HintCommand
+
+    /**
+     * 0.25 Task 11 (R51): whether a confirmation question is up, travelling **phone -> glasses**.
+     *
+     * A **level, not an event**, like [Busy]: there is no sequence, because two statements with the same [active]
+     * value are the same statement and the later one simply wins. A repeat is therefore idempotent. [requestId] is
+     * the confirmation's own address (the plugin's UUID, not a hint or tool id); the glasses echo it back in the
+     * [ConfirmDecision] so a late key press cannot answer a different question.
+     */
+    data class ConfirmState(val sessionId: String, val generation: Long, val requestId: String,
+        val active: Boolean) : HintCommand
+
+    /**
+     * 0.25 Task 11 (R51): the wearer's ring decision on a confirmation, travelling **glasses -> phone**.
+     *
+     * An event: no sequence and no ACK, because it settles a question that [ConfirmState] already addressed. A repeat
+     * is idempotent - the phone's presenter settles at most once - and the phone validates the session/generation
+     * before delivering it, exactly like [Stop]/[Pin].
+     */
+    data class ConfirmDecision(val sessionId: String, val generation: Long, val requestId: String,
+        val approved: Boolean) : HintCommand
 }
 
 object HintWireCodec {
@@ -320,6 +341,21 @@ object HintWireCodec {
                 fields["generation"] = command.generation
                 fields["route"] = command.route.name
             }
+            is HintCommand.ConfirmState -> {
+                fields["command"] = "CONFIRM_STATE"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["requestId"] = command.requestId
+                // The flat reader carries strings and integers only, so a boolean travels as 1/0 (as BUSY does).
+                fields["active"] = if (command.active) 1 else 0
+            }
+            is HintCommand.ConfirmDecision -> {
+                fields["command"] = "CONFIRM_DECISION"
+                fields["sessionId"] = command.sessionId
+                fields["generation"] = command.generation
+                fields["requestId"] = command.requestId
+                fields["approved"] = if (command.approved) 1 else 0
+            }
         }
         val json = buildString {
             append('{')
@@ -488,6 +524,24 @@ object HintWireCodec {
                 sessionId = fields.id("sessionId") ?: return null,
                 generation = fields.long("generation") ?: return null,
                 route = fields.requiredRoute() ?: return null)
+            "CONFIRM_STATE" -> HintCommand.ConfirmState(
+                sessionId = fields.id("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                requestId = fields.id("requestId") ?: return null,
+                active = when (fields.rawNumber("active")) {
+                    "1" -> true
+                    "0" -> false
+                    else -> return null
+                })
+            "CONFIRM_DECISION" -> HintCommand.ConfirmDecision(
+                sessionId = fields.id("sessionId") ?: return null,
+                generation = fields.long("generation") ?: return null,
+                requestId = fields.id("requestId") ?: return null,
+                approved = when (fields.rawNumber("approved")) {
+                    "1" -> true
+                    "0" -> false
+                    else -> return null
+                })
             else -> null
         }
     }
@@ -553,6 +607,14 @@ object HintWireCodec {
             is HintCommand.PanelShown -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
             is HintCommand.UiReady -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
             is HintCommand.UiClosed -> require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+            is HintCommand.ConfirmState -> {
+                require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+                require(command.requestId.isNotBlank()) { "REQUEST_ID_REQUIRED" }
+            }
+            is HintCommand.ConfirmDecision -> {
+                require(command.sessionId.isNotBlank()) { "SESSION_ID_REQUIRED" }
+                require(command.requestId.isNotBlank()) { "REQUEST_ID_REQUIRED" }
+            }
         }
     }
 
