@@ -26,9 +26,11 @@ class ControlledModelClient(
     private val transport = http.newBuilder().followRedirects(false).followSslRedirects(false)
         .retryOnConnectionFailure(false).authenticator(Authenticator.NONE).proxyAuthenticator(Authenticator.NONE).build()
     private val executor = Executors.newCachedThreadPool { runnable -> Thread(runnable, "edith-model-http").apply { isDaemon = true } }
-    private val deepSeekAdapter = DeepSeekResponsesAdapter()
     // Mutable media source: starts as no-op, can be replaced after construction when the audio bridge is ready.
     @Volatile private var activeMediaSource: MediaSource = mediaSource ?: NoOpMediaSource
+    // Both adapters resolve media at encode time, so a late `setMediaSource` (0.25: images as well as audio)
+    // reaches them.
+    private val deepSeekAdapter get() = DeepSeekResponsesAdapter(activeMediaSource)
     private val openAiAdapter get() = OpenAiChatCompletionsAdapter(activeMediaSource)
     fun setMediaSource(source: MediaSource) { activeMediaSource = source }
     private object NoOpMediaSource : MediaSource { override fun resolveAudio(ref: String) = null }

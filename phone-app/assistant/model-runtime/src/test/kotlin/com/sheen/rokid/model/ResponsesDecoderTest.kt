@@ -246,9 +246,9 @@ class ResponsesDecoderTest {
         assertTrue(messages.all { it.keys == setOf("role", "content") })
     }
 
-    @Test fun `adapter declares and encodes text only rejecting mismatched request and media`() {
+    @Test fun `adapter declares text and image input rejecting mismatched request and media`() {
         val adapter = DeepSeekResponsesAdapter()
-        assertEquals(setOf(InputModality.TEXT), adapter.support.inputs)
+        assertEquals(setOf(InputModality.TEXT, InputModality.IMAGE), adapter.support.inputs)
         assertEquals(setOf(OutputModality.TEXT), adapter.support.outputs)
         for (request in listOf(requestFixture(listOf(InputPart.Image("synthetic"))),
             requestFixture(listOf(InputPart.Audio("synthetic"))), requestFixture(output = OutputModality.AUDIO),
