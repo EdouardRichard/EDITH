@@ -41,7 +41,12 @@ class OutputArbiter private constructor(
     }
     private data class Item(val hint: Assistance, val revision: Long, val sequence: Long,
         var output: CancellationHandle? = null, var deadline: CancellationHandle? = null,
-        var speechHandle: CancellationHandle? = null, var speechSettled: Boolean = false)
+        var speechHandle: CancellationHandle? = null, var speechSettled: Boolean = false,
+        /**
+         * 0.25 Task 20 / R114: the display budget expired while this item's utterance was still in flight, so the
+         * hint is being held on screen until the speech terminal state (or the bounded grace) arrives.
+         */
+        var expiryHeldForSpeech: Boolean = false)
     private val policy = HintPolicy()
     private val queue = mutableListOf<Item>()
     private var displayed: Item? = null
@@ -109,13 +114,14 @@ class OutputArbiter private constructor(
      * 0.24 S3 (spec §5.5): a playback state reported by [SpeechPlayer].
      *
      * `STARTED` only drives the host's own playback gate and is not forwarded. A terminal state is forwarded **once**
-     * and only while the hint is still the displayed one: a replaced/cleared/expired item's cancellation must not be
-     * read as "the answer's speech finished" (Task 14's stale-hint rule). The callback can arrive on any thread, so it
-     * is marshalled onto the arbiter's serial executor before it touches the item or the host.
+     * and only while the hint is still the displayed one: a replaced/cleared item's cancellation must not be read as
+     * "the answer's speech finished" (Task 14's stale-hint rule). The callback can arrive on any thread, so it is
+     * marshalled onto the arbiter's serial executor before it touches the item or the host.
      *
-     * 0.24 S3 Task 14 fix (C1 review minor): the terminal callback also re-checks the hint's deadline, exactly like the
-     * display callback. A player can report its end after `expiresAtNanos` but before the queued `expire` task runs;
-     * forwarding that would name a hint that is already gone.
+     * 0.25 Task 20 / R116 (the user's long-TTS defect): a hint whose display budget already expired while its
+     * utterance was still playing is deliberately **still displayed** (see [expire]), so its terminal state must be
+     * forwarded rather than dropped as "already expired". The screen is cleared only after the event is reported -
+     * the cycle needs `SpeechFinished` before the hint/next display is gone.
      */
     private fun onSpeechState(item: Item, state: SpeechPlayback) {
         val result = when (state) {
@@ -127,21 +133,75 @@ class OutputArbiter private constructor(
             if (item.speechSettled) return@execute
             item.speechSettled = true
             if (displayed !== item) return@execute
-            if (item.hint.expiresAtNanos <= nowNanos()) { expire(item); return@execute }
             onSpeech(item.hint, result)
+            if (item.expiryHeldForSpeech) {
+                // R116 order: forward the terminal FIRST, then finish the hint the display budget already gave up on.
+                remove(item, OutputStatus.Expired)
+                next()
+            }
         }
     }
 
+    /**
+     * 0.25 Task 20 / R114 (the user's "TTS not finished before the turn ends" defect): a **natural** display expiry
+     * must not cut an in-flight utterance.
+     *
+     * The old implementation sent every expiry through [remove], and [remove] cancelled the speech handle first
+     * ("先停播再撤屏"). A long answer's TTS therefore stopped at its display budget without ever reporting
+     * `SpeechFinished`, and the cycle's longer wait could not recover an utterance the host itself had cancelled.
+     *
+     * Expiry now only defers: it neither cancels the playback nor clears the screen nor reports `Expired`, and it
+     * re-arms the arbiter's own [scheduler] at [SPEECH_EXPIRY_GRACE_MILLIS] after the original deadline. The hint is
+     * finished by its terminal state ([onSpeechState]) or, when the player never reports one, by the grace task
+     * ([expireAtGrace]) - so the screen is never unbounded, and no caller thread is blocked.
+     *
+     * Interrupts are different and keep stop-before-clear: [remove] from a replacement, turn/hint cancellation or
+     * [clear] still stops the playback first. A hint without an in-flight utterance (no speech request, no player, or
+     * playback already finished) still leaves at its display deadline exactly as before.
+     */
     private fun expire(item: Item) {
+        if (displayed === item && item.speechHandle != null && !item.speechSettled) {
+            holdExpiry(item)
+            return
+        }
         if (displayed === item || item in queue) { remove(item, OutputStatus.Expired); next() }
     }
+
+    private fun holdExpiry(item: Item) {
+        // A second deadline report (a late display callback also calls expire) must not move the bound later: the
+        // grace is measured from the ORIGINAL display deadline only.
+        if (item.expiryHeldForSpeech) return
+        item.expiryHeldForSpeech = true
+        val graceAtNanos = saturatingAdd(item.hint.expiresAtNanos, SPEECH_EXPIRY_GRACE_NANOS)
+        if (graceAtNanos <= nowNanos()) { remove(item, OutputStatus.Expired); next(); return }
+        item.deadline?.cancel()
+        item.deadline = try {
+            scheduler!!.at(graceAtNanos) { command { expireAtGrace(item) } }
+        } catch (_: Exception) {
+            // Without a scheduler to re-arm there would be no bound at all: fall back to the old stop+clear.
+            remove(item, OutputStatus.Expired)
+            next()
+            return
+        }
+    }
+
+    private fun expireAtGrace(item: Item) {
+        if (displayed !== item && item !in queue) return
+        remove(item, OutputStatus.Expired)
+        next()
+    }
+
+    private fun saturatingAdd(base: Long, delta: Long): Long =
+        if (base > Long.MAX_VALUE - delta) Long.MAX_VALUE else base + delta
 
     private fun remove(item: Item, state: OutputStatus) {
         val wasDisplayed = displayed === item
         if (wasDisplayed) displayed = null else queue.remove(item)
         item.deadline?.cancel()
-        // Stop speech BEFORE clearing the screen (spec §S3: "先停播再撤屏").
-        item.speechHandle?.let { runCatching { it.cancel() } }
+        // Stop speech BEFORE clearing the screen (spec §S3: "先停播再撤屏"). This is the **interrupt** path; a
+        // naturally finished utterance (R114/R116) must not be cancelled after its terminal state, so only playback
+        // that is still in flight is stopped here.
+        if (!item.speechSettled) item.speechHandle?.let { runCatching { it.cancel() } }
         item.output?.let { runCatching { it.cancel() } }
         if (wasDisplayed) runCatching { device!!.clear(item.hint.sessionId, item.hint.generation) }
         status(item, state)
@@ -179,5 +239,19 @@ class OutputArbiter private constructor(
         displayed?.takeIf { it.hint.sourceTurnId == turnId && it.hint.hintId == hintId }
             ?.let { remove(it, OutputStatus.Rejected) }
         next()
+    }
+
+    companion object {
+        /**
+         * 0.25 Task 20 / R114: how long a hint whose display budget expired while its utterance was still playing may
+         * stay on screen waiting for `SpeechFinished`.
+         *
+         * Measured from the **original** display deadline, not from when the arbiter noticed it, so repeated display
+         * callbacks cannot extend the hold. It matches the cycle's own speech liveness bound
+         * (`OfficialConversation.SPEECH_LIVENESS_MILLIS`, 120 s), so the two cannot disagree about when a silent
+         * player is lost. When the bound is reached the old stop-then-clear path runs: the screen is never unbounded.
+         */
+        const val SPEECH_EXPIRY_GRACE_MILLIS = 120_000L
+        private const val SPEECH_EXPIRY_GRACE_NANOS = SPEECH_EXPIRY_GRACE_MILLIS * 1_000_000L
     }
 }
