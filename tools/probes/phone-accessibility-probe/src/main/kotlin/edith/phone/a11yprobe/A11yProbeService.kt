@@ -32,6 +32,15 @@ data class NodeInTree(val node: AccessibilityNodeInfo, val path: List<Int>)
 data class CoordinateTap(val dispatched: Boolean, val hit: NodeInTree?)
 
 /**
+ * The two halves of one injected tap, kept apart (coordinate arm).
+ *
+ * `accepted` is whether the platform took the gesture; `completed` is whether its completion callback arrived. A
+ * gesture can be accepted and never reported, and calling that "clicked" would claim a landing the probe never saw -
+ * the same discipline as [CoordinateTap]'s `dispatched`, with the missing half named.
+ */
+data class GestureOutcome(val accepted: Boolean, val completed: Boolean)
+
+/**
  * P3.0 T3b: the two cross-app UI mechanisms, measured on the same target.
  *
  * Node mode uses the accessibility tree (`findAccessibilityNodeInfosByText` + `ACTION_CLICK`), which is what a semantic
@@ -287,6 +296,48 @@ class A11yProbeService : AccessibilityService() {
         runCatching { latch.await(GESTURE_READ_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS) }
         return CoordinateTap(dispatched = completed.get(), hit = hit.get())
     }
+
+    /**
+     * Dispatch one **coordinate** tap at an arbitrary screen point (the coordinate arm of click-now).
+     *
+     * Deliberately not `tapCenterAndReadPoint`: that one answers "what did I hit" for A1's mis-tap metric, while this
+     * one answers "did the platform take and complete the touch" for a point the caller already validated. Both report
+     * the two halves separately, because an accepted gesture with no completion callback is not a landing.
+     */
+    fun tapAt(x: Int, y: Int): GestureOutcome {
+        val completed = AtomicReference(false)
+        val latch = CountDownLatch(1)
+        val callback = object : GestureResultCallback() {
+            override fun onCompleted(gestureDescription: GestureDescription?) {
+                completed.set(true)
+                latch.countDown()
+            }
+
+            override fun onCancelled(gestureDescription: GestureDescription?) {
+                latch.countDown()
+            }
+        }
+        val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
+        val gesture = GestureDescription.Builder()
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, TAP_MILLIS))
+            .build()
+        val accepted = runCatching { dispatchGesture(gesture, callback, Handler(Looper.getMainLooper())) }
+            .getOrDefault(false)
+        if (!accepted) return GestureOutcome(accepted = false, completed = false)
+        runCatching { latch.await(GESTURE_READ_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS) }
+        return GestureOutcome(accepted = true, completed = completed.get())
+    }
+
+    /**
+     * The active window root's bounds in screen pixels, or null when no window can be read (the coordinate arm).
+     *
+     * This is the accessibility tree's own answer to "how big is the window this point must miss", read **at dispatch
+     * time** so the verdict carries the bounds the decision actually used rather than a figure from another run.
+     */
+    fun activeRootBounds(): Rect? = runCatching {
+        val root = rootInActiveWindow ?: return@runCatching null
+        Rect().also { root.getBoundsInScreen(it) }
+    }.getOrNull()
 
     /** Every non-blank text/contentDescription currently visible, in tree order. Used for marker and label matching. */
     fun visibleLabels(): List<String> {

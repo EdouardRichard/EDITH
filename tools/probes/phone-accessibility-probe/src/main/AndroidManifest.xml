@@ -61,8 +61,10 @@
 
         <!--
           Click-now: the unattended "click whichever of these labels is on screen" action, for dialogs that only the
-          accessibility tree can see (the MIUI install confirmation). Exported and reachable only by an explicit
-          `am start` carrying the action plus `confirm=true`, like A1 above, because it taps on someone else's window.
+          accessibility tree can see (the MIUI install confirmation), and its coordinate arm ("tap this screen point,
+          optionally only if it is outside the marker window") used for the confirmation-dialog outside-tap check.
+          Exported and reachable only by an explicit `am start` carrying the action plus `confirm=true`, like A1 above,
+          because it taps on someone else's window.
 
           `Theme.Translucent.NoTitleBar` is deliberate: this activity is started *before* the dialog exists, so its own
           window must not paint over the screen the dialog is coming up on. `excludeFromRecents` keeps the run out of the
