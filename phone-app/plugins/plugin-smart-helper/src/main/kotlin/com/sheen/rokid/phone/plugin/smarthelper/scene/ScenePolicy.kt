@@ -26,10 +26,17 @@ internal class ScenePolicy(private val cooldownNanos: Long) {
 
     /** True when a turn may open at [nowNanos]; false while the previous admitted turn is still inside the cooldown. */
     @Synchronized
-    fun admit(nowNanos: Long, turnId: String): Boolean {
+    fun admits(nowNanos: Long): Boolean {
         val last = lastAdmittedNanos ?: return true
         return nowNanos - last >= cooldownNanos
     }
+
+    /**
+     * The caller-facing form of [admits]: [turnId] is accepted for the caller's benefit and deliberately not part of
+     * the decision (the policy is time-based, not per-turn).
+     */
+    @Synchronized
+    fun admit(nowNanos: Long, turnId: String): Boolean = admits(nowNanos)
 
     /** Records the moment the admitted turn actually opened. */
     @Synchronized

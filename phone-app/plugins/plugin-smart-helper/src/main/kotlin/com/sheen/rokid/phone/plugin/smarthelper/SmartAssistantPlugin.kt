@@ -1170,9 +1170,35 @@ class SmartAssistantPlugin(
      * Starts — or, for Task 11's idempotent re-announcement, refreshes — the official 10 s listening window. It never
      * opens a turn: the wake already did, and a delayed/duplicated `PANEL_SHOWN` from the same panel must not create a
      * second one.
+     *
+     * 0.24 S5 final review Important #1: a turn can exist without a cycle window. `Help` is the non-wake entry point -
+     * it resets the cycle and opens its own turn immediately - so a panel that reports its first layout afterwards
+     * belongs to that turn, not to an orphan wake, and the cycle's turn-less defensive close must not end it. Every
+     * wake path is still announced to the cycle by `onWake`, and a refused wake has no turn at all, so this guard
+     * cannot hide the orphan case it exists for.
      */
     fun onPanelShown(route: AssistantRoute) {
+        val liveTurn = synchronized(gate) { turn != null }
+        if (liveTurn && !conversationCycle.hasTurn(route)) return
         conversationCycle.onPanelShown(route)
+    }
+
+    /**
+     * Whether the scene would admit a wake **right now** (0.24 S5 final review Important #1).
+     *
+     * The composition asks this before requesting the resident panel. `openTurn` refuses a wake during the scene
+     * cooldown, and such a wake opens no turn - a panel opened for it would have no turn behind it and no
+     * conversation timer, which is the blank overlay that only BACK could close.
+     *
+     * Only the scene gate is mirrored: when a turn is already waiting for its transcript, the panel belongs to that
+     * turn and its original wake is what opened it, so a repeated request is the link's idempotent no-op and must not
+     * be suppressed here.
+     *
+     * @return false before activation (no plugin context, so no turn can open) or while the previous admitted wake
+     *   is inside the cooldown.
+     */
+    fun canOpenWake(): Boolean = synchronized(gate) {
+        context != null && scene.admits(clock.nowNanos())
     }
 
     /**

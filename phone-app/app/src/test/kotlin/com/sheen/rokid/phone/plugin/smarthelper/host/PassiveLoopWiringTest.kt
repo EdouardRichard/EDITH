@@ -1278,6 +1278,158 @@ private class NoStorageAccess : StorageAccess {
         }
     }
 
+    // ---------------------------------------------------------------- 0.24 S5 final review Important #1: orphan wake panel
+
+    /**
+     * The production wake decision (`HostCompositionRoot.emitWake`) with a real smart plugin and a real `CxrHintLink`,
+     * so a `PANEL_OPEN` that leaves the phone is observed on the composition's own outbound path.
+     *
+     * A live clock mapping is published before every test, so an unguarded `requestPanelOpen` really would send:
+     * "no `PANEL_OPEN`" therefore means the decision refused it, not that the link was not ready.
+     */
+    private inner class WakePanelRig : AutoCloseable {
+        val clock = FakeClock(1_000_000_000L)
+        val scheduler = ManualScheduler(clock)
+        val sent = CopyOnWriteArrayList<String>()
+        var chimes = 0
+        var appStarts = 0
+        val display = RecordingConversationDisplay()
+        private val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
+        private val wiring = SmartWiring(
+            SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
+                profileId = "p-1", cooldownMillis = 5_000L),
+            FixedProfiles(profile("p-1")), clock, scheduler,
+            isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false })
+        private val link = CxrHintLink(
+            clock, scheduler,
+            sendJson = { json -> sent += json; true },
+            startGlassesApp = { onResult -> appStarts++; onResult(true); true },
+        )
+        val root: HostCompositionRoot
+
+        init {
+            val environment = CxrHostEnvironment(
+                clock = clock, input = RecordingInputPort(), liveOutput = { LiveDisplay() }, scheduler = scheduler,
+                providers = mapOf(
+                    Capability.Model to InertModel(),
+                    Capability.Asr to StubAsrSession(),
+                    Capability.Actions to NoActions(),
+                    Capability.Confirmation to NoConfirmations(),
+                    Capability.WakeWord to wiring.wakeWords,
+                    Capability.Context to EmptyContextSignals(),
+                    Capability.StorageAccess to NoStorageAccess(),
+                    Capability.SystemOne to ReadySystemOne(),
+                    Capability.Embedding to ReadyEmbedding(),
+                    Capability.ConversationDisplay to display,
+                ),
+                storageFor = { StubStorage() })
+            root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
+                environment, hintLink = link, smartWiring = wiring,
+                rokidConnectionFactory = { FakeTransportConnection(null) })
+            rootHolder[0] = root
+            root.registerPlugin(wiring.plugin)
+            root.attachCxrActivity(Any())
+        }
+
+        /** 开始 + the transport's live-session signal, then the clock exchange that makes a display real. */
+        fun startEstablished() {
+            root.start("smart-assistant")
+            root.onSceneReady()
+            val ping = sent.mapNotNull { HintWireCodec.decode(it) as? HintCommand.Ping }.last()
+            clock.nowNanos = ping.p0 + 10_000_000
+            assertTrue("the clock exchange must be answered", link.onInbound(HintWireCodec.encode(
+                HintCommand.Pong(ping.syncId, ping.p0, ping.p0 + 1_005_000_000, ping.p0 + 1_005_000_000))))
+            settle()
+        }
+
+        /** One detector emission through the production composition decision. */
+        fun emitWake(word: String = "伊迪丝") {
+            root.emitWake(root.host, word, 1.0) { chimes++ }
+        }
+
+        fun advance(millis: Long) {
+            clock.advance(millis * 1_000_000L)
+            scheduler.runDue()
+        }
+
+        /** Delivery runs on the host's executor; a command result is the barrier that proves the drain. */
+        fun settle() { root.host.currentState }
+
+        fun panelOpens(): List<HintCommand.PanelOpen> =
+            sent.mapNotNull { HintWireCodec.decode(it) as? HintCommand.PanelOpen }
+
+        fun closePanelThroughLink() { assertTrue(link.close(AssistantRoute.WAKE)) }
+
+        override fun close() = root.close()
+    }
+
+    @Test
+    fun aWakeWithoutALiveIdentityDoesNotRequestThePanel() {
+        WakePanelRig().use { rig ->
+            rig.startEstablished()
+            // Activation race: the link is established and live, but no plugin owns the host identity (paused).
+            rig.root.pause()
+            rig.sent.clear()
+            val appStartsBefore = rig.appStarts
+
+            rig.emitWake()
+            rig.settle()
+
+            assertEquals("no chime for a wake no live session can hear", 0, rig.chimes)
+            assertTrue("an inactive plugin must not open the overlay: ${rig.sent}", rig.panelOpens().isEmpty())
+            assertEquals("and the scene must not be started for it", appStartsBefore, rig.appStarts)
+        }
+    }
+
+    @Test
+    fun anAcceptedWakeStillRequestsThePanel() {
+        WakePanelRig().use { rig ->
+            rig.startEstablished()
+            rig.sent.clear()
+
+            rig.emitWake()
+            rig.settle()
+
+            assertEquals(1, rig.chimes)
+            val opens = rig.panelOpens()
+            assertEquals("the accepted wake must still open the resident panel", 1, opens.size)
+            assertEquals(AssistantRoute.WAKE, opens.single().route)
+            assertEquals("a live mapping sends PANEL_OPEN without starting the scene", 0, rig.appStarts)
+        }
+    }
+
+    @Test
+    fun aWakeTheSceneCooldownRefusesDoesNotRequestThePanel() {
+        WakePanelRig().use { rig ->
+            rig.startEstablished()
+
+            // An admitted wake opens the panel and starts the 5 s scene cooldown.
+            rig.emitWake()
+            rig.settle()
+            assertEquals(1, rig.panelOpens().size)
+
+            // The panel never comes up, so the cycle's bounded acquisition wait ends the turn at 3 s while the
+            // cooldown still runs. Clear the link's open attempt so an unguarded request would be a visible new
+            // PANEL_OPEN - exactly the orphan overlay the final review found.
+            rig.advance(3_000)
+            rig.closePanelThroughLink()
+            rig.sent.clear()
+            val appStartsBefore = rig.appStarts
+
+            rig.emitWake()
+            rig.settle()
+
+            assertTrue("a refused wake must not open the overlay: ${rig.sent}", rig.panelOpens().isEmpty())
+            assertEquals("and must not start the scene", appStartsBefore, rig.appStarts)
+
+            // The gate is the cooldown, not a permanent block: once it expires the next wake opens again.
+            rig.advance(2_000)
+            rig.emitWake()
+            rig.settle()
+            assertEquals("a wake after the cooldown must open again", 1, rig.panelOpens().size)
+        }
+    }
+
     @Test
     fun noWakeMeansNoModelRequestIsMade() {
         withRig { rig ->

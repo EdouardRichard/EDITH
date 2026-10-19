@@ -1193,6 +1193,35 @@ class HostCompositionRoot internal constructor(
     internal fun requestPanelOpen(route: AssistantRoute): Boolean = hintLink?.requestPanelOpen(route) ?: false
 
     /**
+     * One wake detector emission, as `create` delivers it (0.24 S5 final review Important #1).
+     *
+     * The chime, the panel request and the host event used to be three statements in the detector's lambda. The panel
+     * request is now a decision of this composition - it has both halves the decision needs, the host's live identity
+     * and the smart plugin's own scene admission - so it lives here rather than in a lambda a test cannot drive.
+     *
+     * @param chime the wearer-facing acknowledgement, played only for a wake that has a live identity.
+     */
+    internal fun emitWake(host: HostRuntime, word: String, confidence: Double, chime: () -> Unit = {}) {
+        val identity = runCatching { host.currentIdentity() }.getOrNull()
+        if (identity != null) {
+            chime()
+            // 0.24 S5 final review Important #1: a live identity is necessary but not sufficient. The plugin can still
+            // refuse the wake (scene cooldown), and no turn is then installed, so the panel would have nothing to
+            // close it. Ask the plugin's own admission before asking for the window.
+            if (pluginAdmitsWake()) requestPanelOpen(AssistantRoute.WAKE)
+        }
+        emitWakeDetected(host, clock, word, confidence)
+    }
+
+    /**
+     * The plugin half of the wake-panel decision (0.24 S5 final review Important #1).
+     *
+     * A composition built without the smart wiring (a harness) has no scene policy to ask and keeps the identity-only
+     * behaviour; production always has it. False means the wake will be refused, so no panel may be requested for it.
+     */
+    private fun pluginAdmitsWake(): Boolean = smartWiring?.plugin?.canOpenWake() ?: true
+
+    /**
      * 0.23 P5 (spec §5.3.2, U11): the wearer's double-click on the glasses, raised as `UserAction.Stop`.
      *
      * The caller passes the session/generation the STOP was validated against (not just "a stop happened"), and the
@@ -1804,21 +1833,23 @@ class HostCompositionRoot internal constructor(
                 // - and a wake that arrives after the session ended is dropped by `onEvent` instead of opening a turn
                 // under a generation that no longer exists.
                 wakeEmit = { word, confidence -> hostHolder[0]?.let { host ->
-                    // 0.23 P5 (D135): a short chime, governed by the same 「语音朗读」 switch, then the wake event.
-                    // No Assistance, no conversation entry and no TTS phrase: the wearer hears that they were heard,
-                    // and nothing claims to be an answer. A wake with no live identity is not a session the wearer
-                    // can be hearing - do not chime for it.
                     val root = rootHolder[0]
-                    if (root != null && host.currentIdentity() != null) {
-                        val outcome = wakeChime.playOutcome(
-                            clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
-                        P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
+                    if (root != null) {
+                        // 0.23 P5 (D135): a short chime, governed by the same 「语音朗读」 switch, then the wake
+                        // event. No Assistance, no conversation entry and no TTS phrase: the wearer hears that they
+                        // were heard, and nothing claims to be an answer. 0.24 S5 final review Important #1: the
+                        // composition owns the chime and the resident-panel decision together, so a wake the plugin
+                        // will refuse cannot open an overlay with no turn behind it.
+                        root.emitWake(host, word, confidence) {
+                            val outcome = wakeChime.playOutcome(
+                                clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
+                            P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
+                        }
+                    } else {
+                        // The composition does not exist yet (the chain is built before it): no panel can be asked
+                        // for, but the detector's evidence still has to reach the host.
+                        emitWakeDetected(host, clock, word, confidence)
                     }
-                    // 0.24 S2 Task 11: a wake opens the resident panel. The link decides whether the service is
-                    // already there or whether the scene must be started first; Task 12 starts the 10 s timer only
-                    // after the resulting `PANEL_SHOWN`.
-                    root?.requestPanelOpen(com.sheen.rokid.contracts.AssistantRoute.WAKE)
-                    emitWakeDetected(host, clock, word, confidence)
                 } },
                 // Task 4 (P3.2): the same per-emission identity resolution for the acoustic gate, so a label that
                 // arrives after the session ended is dropped by `onEvent` instead of opening anything under a

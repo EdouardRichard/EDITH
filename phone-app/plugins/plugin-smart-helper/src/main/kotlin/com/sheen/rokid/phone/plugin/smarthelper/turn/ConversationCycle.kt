@@ -101,6 +101,15 @@ internal class ConversationCycle(
         var pinnedCloseExpiry: CancellationHandle? = null
 
         /**
+         * 0.24 S5 final review Important #1: the bounded close for a `PANEL_SHOWN` that has **no turn** behind it.
+         *
+         * A wake can ask for the overlay and then open no turn (the scene cooldown refused it, or the plugin was not
+         * active yet). The listening window needs a turn and is never armed in that state, so without this bound the
+         * blank 480x380 panel would stay up until BACK. It is its own deadline family because no turn can own it.
+         */
+        var noTurnCloseExpiry: CancellationHandle? = null
+
+        /**
          * Invalidates every already-scheduled callback for its own timer family. A cancelled [CancellationHandle] is
          * not guaranteed to prevent an already-queued task from running, so each callback checks the epoch it was
          * armed under before touching the state. The families are independent because cancelling the listening window
@@ -111,6 +120,7 @@ internal class ConversationCycle(
         var continueOffEpoch = 0L
         var pinnedCloseEpoch = 0L
         var speechWaitEpoch = 0L
+        var noTurnCloseEpoch = 0L
 
         var answerDone = false
         var speechPending = false
@@ -178,7 +188,17 @@ internal class ConversationCycle(
     fun onPanelShown(route: AssistantRoute) {
         synchronized(lock) {
             val current = state(route)
-            val turnId = current.turnId ?: return
+            val turnId = current.turnId
+            if (turnId == null) {
+                // 0.24 S5 final review Important #1: no turn means no listening window. `PANEL_SHOWN` here is a wake
+                // that was refused (or lost the activation race) and still asked for the overlay - or a delayed
+                // report from a turn that is already gone. The official idle panel is the one legitimate no-turn
+                // state: it stays until its pinned close or the wearer closes it.
+                if (!current.idle) armNoTurnCloseLocked(route, current)
+                return
+            }
+            // A real turn owns the panel again, so the defensive close has nothing left to end.
+            cancelNoTurnCloseLocked(current)
             if (current.idle) return
             // The panel is up, so the acquisition wait is over whatever level this round has already reached. This must
             // happen before the listening-only guard below: an early usable ASR publishes status 2 before the panel's
@@ -444,6 +464,15 @@ internal class ConversationCycle(
 
     fun isPinned(route: AssistantRoute): Boolean = synchronized(lock) { state(route).pinned }
 
+    /**
+     * True when [route] currently owns a conversation turn (0.24 S5 final review Important #1).
+     *
+     * The plugin asks this before handing [onPanelShown] an event: a turn the cycle does not own (the non-wake `Help`
+     * path resets the cycle and runs immediately) still owns the panel it opened, so the turn-less defensive close
+     * must not treat it as an orphan.
+     */
+    fun hasTurn(route: AssistantRoute): Boolean = synchronized(lock) { state(route).turnId != null }
+
     // ---------------------------------------------------------------- deadlines
 
     private fun armPanelWaitLocked(route: AssistantRoute, current: RouteState) {
@@ -468,6 +497,20 @@ internal class ConversationCycle(
         current.continueOffExpiry = scheduler.at(
             deadlineAfter(CONTINUE_OFF_CLOSE_MILLIS),
         ) { onContinueOffTimeout(route, epoch) }
+    }
+
+    /**
+     * 0.24 S5 final review Important #1: the bound on a panel that was shown with no turn behind it.
+     *
+     * Deliberately not the listening window: that one requires a turn and would never be armed here. It is bounded
+     * short because the state it repairs is already a defect - the overlay is up but nothing behind it can close it.
+     */
+    private fun armNoTurnCloseLocked(route: AssistantRoute, current: RouteState) {
+        cancelNoTurnCloseLocked(current)
+        val epoch = current.noTurnCloseEpoch
+        current.noTurnCloseExpiry = scheduler.at(
+            deadlineAfter(NO_TURN_PANEL_CLOSE_MILLIS),
+        ) { onNoTurnCloseTimeout(route, epoch) }
     }
 
     private fun armPinnedCloseLocked(route: AssistantRoute, current: RouteState) {
@@ -529,12 +572,19 @@ internal class ConversationCycle(
         current.speechWaitEpoch++
     }
 
+    private fun cancelNoTurnCloseLocked(current: RouteState) {
+        current.noTurnCloseExpiry?.cancel()
+        current.noTurnCloseExpiry = null
+        current.noTurnCloseEpoch++
+    }
+
     private fun cancelAllTimersLocked(current: RouteState) {
         cancelListenLocked(current)
         cancelPanelWaitLocked(current)
         cancelContinueOffLocked(current)
         cancelPinnedCloseLocked(current)
         cancelSpeechWaitLocked(current)
+        cancelNoTurnCloseLocked(current)
     }
 
     private fun deadlineAfter(millis: Long): Long {
@@ -597,6 +647,24 @@ internal class ConversationCycle(
             closeLocked(route, current)
         }
         cancelledTurn?.let { cancelTurn(route, it) }
+    }
+
+    /**
+     * 0.24 S5 final review Important #1: no turn appeared behind the panel inside the bound.
+     *
+     * A turn that arrived in the meantime cancelled this deadline and owns the panel, so the re-check under the lock
+     * is what keeps the close from tearing down a real conversation. The official idle panel also stays: it is a
+     * legitimate visible panel, not an orphan wake.
+     */
+    private fun onNoTurnCloseTimeout(route: AssistantRoute, epoch: Long) {
+        synchronized(lock) {
+            val current = state(route)
+            if (current.noTurnCloseEpoch != epoch) return
+            current.noTurnCloseExpiry = null
+            if (current.turnId != null || current.idle) return
+            log("P3_CONV close route=${route.name} reason=no_turn_panel")
+            closeLocked(route, current)
+        }
     }
 
     private fun onPinnedCloseTimeout(route: AssistantRoute, epoch: Long) {
@@ -680,5 +748,14 @@ internal class ConversationCycle(
          * `P3_CONV panel_not_shown`; it does not become the wearer's 10 s silence.
          */
         const val PANEL_WAIT_MILLIS = 3_000L
+
+        /**
+         * 0.24 S5 final review Important #1: how long a panel shown **without a turn** may stay up.
+         *
+         * Separate from [PANEL_WAIT_MILLIS] on purpose: that one measures the panel's acquisition for a hidden-panel
+         * turn and closes the turn, while this one repairs the state where no turn exists at all. Both are short, but
+         * they are different facts and must not share a deadline family.
+         */
+        const val NO_TURN_PANEL_CLOSE_MILLIS = 3_000L
     }
 }

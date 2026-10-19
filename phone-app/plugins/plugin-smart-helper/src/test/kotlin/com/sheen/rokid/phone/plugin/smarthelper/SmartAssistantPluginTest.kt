@@ -1305,6 +1305,26 @@ class SmartAssistantPluginTest {
         assertTrue(rig.model.requests.isEmpty())
     }
 
+    @Test fun `a panel shown while help runs is not closed as an orphan wake`() {
+        val (rig, display) = cycleRig()
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+        rig.plugin.handle(TranscriptEvent(rig.transcript("问题")))
+        rig.plugin.handle(rig.wakeEvent())
+        // `Help` is the non-wake entry point: it replaces the waiting wake turn and resets the conversation cycle, so
+        // the cycle has no window while a real turn runs. The panel requested by the wake can report its first layout
+        // after that - it belongs to the Help turn and must not be closed by the turn-less defensive bound.
+        rig.plugin.handle(UserAction(rig.envelope(), UserAction.Action.Help))
+        assertEquals(1, rig.model.requests.size)
+
+        rig.plugin.onPanelShown(AssistantRoute.WAKE)
+        rig.tick(3_000)
+
+        assertTrue(
+            display.closes.isEmpty(),
+            "a running turn owns the panel; the defensive close is for turn-less panels: ${display.closes}",
+        )
+    }
+
     @Test fun `S3 a panel that never comes up closes the listening round after three seconds`() {
         val (rig, display) = cycleRig()
 

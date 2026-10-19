@@ -162,14 +162,94 @@ class ConversationCycleTest {
     }
 
     @Test
-    fun `a panel shown with no wake does nothing`() {
+    fun `a panel shown with no turn arms a bounded close instead of the ten second window`() {
         val rig = rig()
         rig.cycle.onPanelShown(AssistantRoute.WAKE)
-        rig.advance(60_000)
 
-        assertEquals(emptyList(), rig.display.calls)
-        assertEquals(0, rig.scheduler.pending())
+        // 0.24 S5 final review I1: a wake can ask for the overlay and then be refused (scene cooldown) or lose the
+        // activation race, so `PANEL_SHOWN` can arrive with no turn behind it. The 10 s window needs a turn and would
+        // never be armed; without a separate bound the blank 480x380 panel would stay up until BACK.
+        assertEquals(1, rig.scheduler.pending(), "the defensive close is the only deadline")
+        assertEquals(emptyList(), rig.display.statuses, "no turn means no listening level")
+
+        rig.advance(2_999)
+        assertEquals(0, rig.display.closed, "2_999 ms is still inside the defensive close")
+        rig.advance(1)
+        assertEquals(1, rig.display.closed, "3_000 ms with no turn closes the orphan panel")
+        assertTrue(
+            rig.logs.any { it.contains("P3_CONV close route=WAKE reason=no_turn_panel") },
+            "the orphan close is named evidence: ${rig.logs}",
+        )
+        assertEquals(0, rig.scheduler.pending(), "the defensive close is the only deadline and it is spent")
+        rig.advance(60_000)
+        assertEquals(1, rig.display.closed, "no 10 s window may be armed for a panel with no turn")
         assertEquals(emptyList(), rig.continuations)
+    }
+
+    @Test
+    fun `a turn arriving cancels the defensive no turn close`() {
+        val rig = rig()
+        rig.cycle.onPanelShown(AssistantRoute.WAKE)
+        rig.advance(1_000)
+
+        // The accepted wake's event reaches the cycle after the panel's first layout: it owns the panel now, and the
+        // orphan bound has nothing left to close.
+        rig.panelVisible = true
+        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
+
+        assertEquals(listOf(OfficialStatus.LISTENING.wire), rig.display.statuses)
+        assertEquals(1, rig.scheduler.pending(), "the turn's 10 s window replaces the defensive close")
+
+        rig.advance(1_999)
+        assertEquals(0, rig.display.closed, "the cancelled no-turn close must not fire at its old 3 s deadline")
+        rig.advance(8_000)
+        assertEquals(0, rig.display.closed, "9_999 ms after the wake is still inside the real window")
+        rig.advance(1)
+        assertEquals(1, rig.display.closed, "the turn's own 10 s window is what closes the panel")
+        assertEquals(listOf(AssistantRoute.WAKE to "turn-1"), rig.cancelled)
+    }
+
+    @Test
+    fun `closing the route releases the defensive no turn close`() {
+        val rig = rig()
+        rig.cycle.onPanelShown(AssistantRoute.WAKE)
+        assertEquals(1, rig.scheduler.pending())
+
+        rig.cycle.onClose(AssistantRoute.WAKE)
+
+        assertEquals(0, rig.scheduler.pending(), "UI_CLOSED releases the bound it made unnecessary")
+        rig.advance(60_000)
+        assertEquals(0, rig.display.closed, "the panel is already hidden; onClose must not send a CLOSE")
+    }
+
+    @Test
+    fun `a session reset releases the defensive no turn close`() {
+        val rig = rig()
+        rig.cycle.onPanelShown(AssistantRoute.WAKE)
+        assertEquals(1, rig.scheduler.pending())
+
+        rig.cycle.reset()
+
+        assertEquals(0, rig.scheduler.pending(), "a session end releases the bound with everything else")
+        rig.advance(60_000)
+        assertEquals(0, rig.display.closed)
+    }
+
+    @Test
+    fun `an idle panel with no turn is not closed by the defensive bound`() {
+        val rig = rig(panelVisible = true)
+        rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
+        rig.cycle.onStop(AssistantRoute.WAKE)
+        assertEquals(1, rig.display.idled)
+        assertEquals(0, rig.scheduler.pending())
+
+        // Official STOP keeps the panel and drops the turn; a duplicate/late `PANEL_SHOWN` for that retained dialog is
+        // legitimate and must not be treated as an orphan wake.
+        rig.cycle.onPanelShown(AssistantRoute.WAKE)
+
+        assertEquals(0, rig.scheduler.pending(), "the idle panel arms nothing")
+        rig.advance(60_000)
+        assertEquals(0, rig.display.closed, "the official idle panel is a legitimate visible panel")
     }
 
     @Test
