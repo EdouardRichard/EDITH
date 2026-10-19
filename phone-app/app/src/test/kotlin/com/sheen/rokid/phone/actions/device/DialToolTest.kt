@@ -1,9 +1,13 @@
 package com.sheen.rokid.phone.actions.device
 
+import com.sheen.rokid.agent.PolicyDecision
+import com.sheen.rokid.agent.ToolDescriptor
+import com.sheen.rokid.agent.WhitelistActionPolicy
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.RiskLevel
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -80,6 +84,36 @@ class DialToolTest {
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("ARGUMENTS_INVALID", errorCode(result))
         assertTrue(executor.calls.isEmpty())
+    }
+
+    // ---- R129: dial never asks, including under the default L1 ceiling ----
+
+    @Test
+    fun `dial is L1 so the default ceiling allows it without confirmation`() {
+        assertEquals(
+            "R129: the user ruled that dial never asks; an L2 descriptor is refused or questioned by the default policy",
+            RiskLevel.L1,
+            DialTool.DESCRIPTOR.risk,
+        )
+        assertEquals(false, DialTool.DESCRIPTOR.requiresConfirmation)
+        val descriptor = ToolDescriptor(
+            name = DialTool.DESCRIPTOR.name,
+            description = DialTool.DESCRIPTOR.title,
+            parametersJson = DialTool.DESCRIPTOR.parametersJson,
+            risk = DialTool.DESCRIPTOR.risk,
+            requiresConfirmation = DialTool.DESCRIPTOR.requiresConfirmation,
+            idempotent = DialTool.DESCRIPTOR.idempotent,
+            reversible = DialTool.DESCRIPTOR.reversible,
+            scope = DialTool.DESCRIPTOR.scope,
+        )
+
+        val decision = WhitelistActionPolicy(maxLevel = RiskLevel.L1, whitelist = emptyList()).decide(descriptor)
+
+        assertEquals(
+            "the default L1 ceiling must allow dial, never question or refuse it",
+            PolicyDecision.Allow,
+            decision,
+        )
     }
 
     // ---- R98: the state-changing declaration ----

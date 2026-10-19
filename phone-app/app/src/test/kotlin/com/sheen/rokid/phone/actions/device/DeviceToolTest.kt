@@ -272,6 +272,55 @@ class DeviceToolTest {
         assertFalse(result.detail.contains("base64", ignoreCase = true))
     }
 
+    @Test
+    fun `screenshot preserves the kernel artifact diagnostic instead of a generic line`() {
+        // R131: the kernel writes `diagnostic=screenshot_artifact_pending; reason=...` when the bytes were captured but
+        // the store failed. Replacing it with "screenshot is an artifact reference" makes a broken store look like a
+        // normal pending artifact, which is the failure the wearer would never learn about.
+        val operations = FakeDeviceOperations(observation())
+        operations.screenshotEnvelope = DeviceEnvelope.success(
+            action = "screenshot",
+            channel = "accessibility",
+            accepted = true,
+            applied = null,
+            verified = null,
+            timing = Timing(0, 0, 0),
+            data = "diagnostic=screenshot_artifact_pending; reason=artifact store unavailable",
+            images = listOf(ImageRef("pending", "image/jpeg", 768, 1664, "")),
+        )
+
+        val result = tool(operations).execute("""{"action":"screenshot"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val diagnostic = body(result)["data"]!!.jsonObject["diagnostic"]!!.jsonPrimitive.content
+        assertTrue(
+            "the kernel diagnostic must survive the projection, was `$diagnostic`",
+            diagnostic.contains("screenshot_artifact_pending"),
+        )
+        assertTrue(
+            "the store's reason must survive too: `$diagnostic`",
+            diagnostic.contains("artifact store unavailable"),
+        )
+        assertEquals("pending", body(result)["images"]!!.jsonArray[0].jsonObject["artifactId"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `a failed screenshot keeps the kernel error code as its diagnostic`() {
+        val operations = FakeDeviceOperations(observation())
+        operations.screenshotEnvelope = failure("screenshot", "UNSUPPORTED", recoverable = false)
+
+        val result = tool(operations).execute("""{"action":"screenshot"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        val body = body(result)
+        assertEquals(
+            "a failed screenshot must name the kernel's error code, not a generic sentence",
+            "UNSUPPORTED",
+            body["data"]!!.jsonObject["diagnostic"]!!.jsonPrimitive.content,
+        )
+        assertEquals("UNSUPPORTED", body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+    }
+
     // - wait -
 
     @Test

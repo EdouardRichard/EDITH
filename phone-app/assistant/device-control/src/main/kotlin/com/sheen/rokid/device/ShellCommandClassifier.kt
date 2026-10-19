@@ -18,7 +18,10 @@ import com.sheen.rokid.plugin.PrecheckDecision
  *    command substitution (`$(...)`, backticks), variable expansion, encoded payloads, subshells, background execution
  *    and redirections are all "cannot be read" and are therefore confirmed - never allowed. An unknown command is
  *    confirmed too, not rejected: the model may have produced a legitimate tool this table does not know, and a human
- *    is the right decider.
+ *    is the right decider. The **only** redirections stripped before the scan are the ones that cannot change what
+ *    runs - a `/dev/null` target (`2>/dev/null`, `>/dev/null`, `1>`/`2</dev/null` with an optional space) and the two
+ *    fd duplications `2>&1`/`1>&2` (R130). Everything else (`>file`, `>>`, `<file`, a non-`/dev/null` target) still
+ *    forces a question, and stripping never launders the base command: `pm clear x >/dev/null` remains irreversible.
  * 2. **The reason is a category, never the command.** Shell text can contain user data (`content delete --uri …`), so
  *    the reason carried to the audit trail and the summary shown to the wearer name a class of risk, not the words.
  *
@@ -89,6 +92,22 @@ object ShellCommandClassifier {
 
     private val WHITESPACE = Regex("\\s+")
 
+    /**
+     * R130: the two harmless redirection shapes, matched at the position where the token starts.
+     *
+     * A `/dev/null` target discards the output (or supplies an immediate EOF), and `2>&1`/`1>&2` only duplicate a
+     * descriptor, so neither can change the command's words. The negative lookahead keeps a look-alike target
+     * (`/dev/nullx`, `/dev/null/foo`) from being treated as the safe one. `\s*` accepts `> /dev/null`, which the shell
+     * reads the same way.
+     */
+    private val SAFE_DEV_NULL_REDIRECTION = Regex("""[12]?[<>]\s*/dev/null(?![\w/.\-:])""")
+
+    /** R130: `2>&1` / `1>&2` only; anything after the target digit must not extend it into another word. */
+    private val SAFE_FD_DUPLICATION = Regex("""[12]>&[12](?![\w])""")
+
+    /** Characters that end a word, so a leading fd digit there is a descriptor and not part of an argument. */
+    private const val WORD_BOUNDARIES = " \t\r\n;|&("
+
     /** One pass over the raw string: the segments, and the first structural feature that cannot be read safely. */
     private class Scanned(val segments: List<String>, val syntaxReason: String?)
 
@@ -96,7 +115,10 @@ object ShellCommandClassifier {
         if (command.isBlank() || command.contains('\u0000') || command.length > MAX_COMMAND_CHARS) {
             return ActionPrecheck(PrecheckDecision.Reject, reason = INVALID_ARGUMENTS)
         }
-        val scanned = scan(command)
+        // R130: remove harmless `/dev/null` / fd-duplication redirects first - they cannot change what runs, and
+        // leaving them in the scan made every `dumpsys ... 2>/dev/null` ask the wearer. The remaining text is classified
+        // by the same table, so the removal cannot wash a dangerous command clean.
+        val scanned = scan(stripSafeRedirections(command))
         // Structure that can hide or build a second command is a confirmation, never an allow. This is checked first:
         // `ls > f` must not pass merely because `ls` is readable.
         scanned.syntaxReason?.let { return required(it) }
@@ -125,6 +147,85 @@ object ShellCommandClassifier {
         else -> "终端命令：无法确认是否安全"
     }
 
+    // ---------------------------------------------------------------- harmless redirections (R130)
+
+    /**
+     * Deletes the harmless redirections from [command] before [scan], leaving every other character untouched.
+     *
+     * The scan is quote- and escape-aware, so this pass is too: a `>` inside quotes is an argument, not a redirection,
+     * and a backslash-escaped one is literal text. That is what keeps `echo "2>/dev/null"` an ordinary `echo`.
+     *
+     * Deleting a token cannot hide another command: the surrounding words and separators are copied verbatim, so
+     * `pm clear x >/dev/null` is still the irreversible `pm clear x`. Only the redirection's own bytes disappear.
+     */
+    private fun stripSafeRedirections(command: String): String {
+        val stripped = StringBuilder(command.length)
+        var singleQuoted = false
+        var doubleQuoted = false
+        var index = 0
+        while (index < command.length) {
+            val character = command[index]
+            when {
+                singleQuoted -> {
+                    stripped.append(character)
+                    if (character == '\'') singleQuoted = false
+                    index++
+                }
+                doubleQuoted -> when {
+                    character == '"' -> { doubleQuoted = false; stripped.append(character); index++ }
+                    character == '\\' && index + 1 < command.length -> {
+                        stripped.append(character).append(command[index + 1])
+                        index += 2
+                    }
+                    else -> { stripped.append(character); index++ }
+                }
+                character == '\'' -> { singleQuoted = true; stripped.append(character); index++ }
+                character == '"' -> { doubleQuoted = true; stripped.append(character); index++ }
+                // An escaped character is literal text in the shell; keep the pair and let `scan` read it the same way.
+                character == '\\' && index + 1 < command.length -> {
+                    stripped.append(character).append(command[index + 1])
+                    index += 2
+                }
+                character == '>' || character == '<' || character == '1' || character == '2' -> {
+                    val length = safeRedirectionLength(command, index)
+                    if (length == 0) {
+                        stripped.append(character)
+                        index++
+                    } else {
+                        index += length
+                    }
+                }
+                else -> { stripped.append(character); index++ }
+            }
+        }
+        return stripped.toString()
+    }
+
+    /**
+     * Length of a harmless redirection starting at [index], or `0` when the character there starts something else.
+     *
+     * A redirection with an explicit descriptor (`2>/dev/null`) is only a redirection when the digit starts a word: in
+     * `echo x2>/dev/null` the `2` belongs to the argument `x2` and only the bare `>/dev/null` may be removed. The
+     * command text itself is never executed; this only feeds classification.
+     */
+    private fun safeRedirectionLength(command: String, index: Int): Int {
+        val character = command[index]
+        val fdPrefixed = character == '1' || character == '2'
+        if (fdPrefixed) {
+            val before = command.getOrNull(index - 1)
+            if (before != null && !before.isWhitespace() && before !in WORD_BOUNDARIES) return 0
+        }
+        if (character == '>' || character == '<' || fdPrefixed) {
+            val devNull = SAFE_DEV_NULL_REDIRECTION.find(command, index)
+            if (devNull != null && devNull.range.first == index) return devNull.value.length
+        }
+        if (character == '>' || fdPrefixed) {
+            val duplication = SAFE_FD_DUPLICATION.find(command, index)
+            if (duplication != null && duplication.range.first == index) return duplication.value.length
+        }
+        return 0
+    }
+
     // ---------------------------------------------------------------- scanner
 
     /**
@@ -133,7 +234,8 @@ object ShellCommandClassifier {
      * Quotes are removed from the resulting segment text (the shell removes them too), which is what lets `'rm' -rf /`
      * be classified as `rm` rather than as an unknown token. Structure that this classifier cannot reason about is
      * recorded in [Scanned.syntaxReason] instead of being ignored: a redirection, a background `&`, a subshell, a
-     * brace group, a backtick, `$(...)`, `${...}`, or a `$VAR` expansion.
+     * brace group, a backtick, `$(...)`, `${...}`, or a `$VAR` expansion. The harmless `/dev/null` and fd-duplication
+     * redirects have already been stripped by [stripSafeRedirections] (R130), so only unreadable ones reach here.
      */
     private fun scan(command: String): Scanned {
         val segments = mutableListOf<String>()

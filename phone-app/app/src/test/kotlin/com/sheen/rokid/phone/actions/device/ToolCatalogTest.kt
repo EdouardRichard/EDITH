@@ -171,10 +171,11 @@ class ToolCatalogTest {
     }
 
     @Test
-    fun `dial is L2 without confirmation and never audits the number`() {
+    fun `dial is L1 without confirmation and never audits the number`() {
         val dial = descriptor("dial")
 
-        assertEquals(com.sheen.rokid.plugin.RiskLevel.L2, dial.risk)
+        // R129: the user ruled that dial never asks, so the tool is L1 and the default L1 ceiling allows it outright.
+        assertEquals(com.sheen.rokid.plugin.RiskLevel.L1, dial.risk)
         assertFalse(dial.requiresConfirmation)
         assertEquals(null, dial.auditTargetArgument)
     }

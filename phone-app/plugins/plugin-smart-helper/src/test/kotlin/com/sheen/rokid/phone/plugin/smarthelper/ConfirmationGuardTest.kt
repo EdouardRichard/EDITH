@@ -1,13 +1,17 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 
+import com.sheen.rokid.agent.ConfirmationGate
 import com.sheen.rokid.agent.ConfirmationOutcome
 import com.sheen.rokid.agent.ConfirmationPort
 import com.sheen.rokid.agent.ConfirmationSource
+import com.sheen.rokid.phone.plugin.smarthelper.confirmation.SmartConfirmation
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionPrecheck
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.ConfirmationChannel
 import com.sheen.rokid.plugin.PrecheckDecision
 import com.sheen.rokid.plugin.RiskLevel
 import java.util.UUID
@@ -196,6 +200,37 @@ class ConfirmationGuardTest {
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("CONFIRMATION_DENIED", result.detail)
         assertTrue(actions.executed.isEmpty(), "a cancelled question must not execute the command")
+    }
+
+    @Test
+    fun `a real question cancelled while it waits refuses the tool as denied`() {
+        // The R128 seam at the layer that runs the tool: the plugin's own `SmartConfirmation.cancelAll()` settles the
+        // wait as CANCEL, so the wrapper refuses the command instead of executing the approval that arrives later.
+        val actions = FakeActions(ActionPrecheck(PrecheckDecision.RequireConfirmation, summary = "危险"))
+        val clock = SmartFakeClock()
+        val gate = ConfirmationGate(clock, SmartFakeScheduler(clock), timeoutNanos = 120_000_000_000L)
+        lateinit var confirmation: SmartConfirmation
+        val channel = object : ConfirmationChannel {
+            override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle {
+                // STOP lands while the question is on screen.
+                confirmation.cancelAll()
+                return object : CancellationHandle { override fun cancel() = Unit }
+            }
+        }
+        confirmation = SmartConfirmation(channel = channel, gate = gate)
+        val subject = ConfirmingActions(
+            host = actions,
+            confirmation = confirmation,
+            canAsk = { true },
+            diagnostics = { },
+        )
+
+        val result = subject.execute("shell", args)
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("CONFIRMATION_DENIED", result.detail)
+        assertTrue(actions.executed.isEmpty(), "a cancelled question must never run the command")
+        assertEquals(0, confirmation.pendingCount, "the cancelled question must not stay armed")
     }
 
     @Test

@@ -524,6 +524,15 @@ class SmartAssistantPlugin(
     internal fun auditTrail(): List<AuditEntry> = audit.entries()
 
     /**
+     * R128: test-only observation of whether a confirmation question is still live.
+     *
+     * The STOP/teardown tests need to prove the question was **settled**, not merely that the host's card was
+     * withdrawn: a stale `pending` slot would make the next question answer `BUSY` and still let a queued Allow
+     * through. `SmartConfirmation.pendingCount` is already 0-or-1 by construction and hands out no state.
+     */
+    internal fun pendingConfirmationCountForTest(): Int = confirmation.pendingCount
+
+    /**
      * Test-only observation of the **session's** effective history allowance (spec §4.3).
      *
      * It is the allowance the compressor is handed at the end of a turn: history's own share of the injected budget
@@ -3407,6 +3416,11 @@ class SmartAssistantPlugin(
                 detach()
             }
         }
+        // R128: a STOP must withdraw the live question here, before teardown and before the loop can see a late Allow.
+        // Without this the turn was cancelled but `SmartConfirmation.pending` stayed armed, the phone's card stayed up,
+        // and a tap that arrived afterwards settled the gate as approved - reaching `host.execute` after the wearer had
+        // stopped the assistant (the R52 bypass). A foreign Stop is not this session's stop and cancels nothing.
+        if (accepted) confirmation.cancelAll()
         teardown(stopped)
         // 0.23 P5 (D145): an already-displayed proactive hint is output too. The official `stopTalk` stops the speech
         // and leaves the panel idle without closing it; `cancelOutputTurn` is the host path that both stops speech and
@@ -3475,6 +3489,10 @@ class SmartAssistantPlugin(
      */
     private fun teardown(owned: SmartTurn?, cancelOutput: Boolean = true) {
         if (owned == null) return
+        // R128: a question belongs to the turn that asked it. Every teardown - STOP, a panel close, a replaced turn, a
+        // session end - withdraws the host's card and settles the wait as cancelled, so no later Allow can execute an
+        // action whose turn is already gone. `cancelAll` is idempotent, and `deactivate` calling it first is harmless.
+        confirmation.cancelAll()
         // 0.24 S3: the listening deadline is the conversation cycle's, not the turn's. Teardown here cancels the loop,
         // the assembler and the pending output; the cycle closes its own window when the conversation ends.
         runCatching { owned.loop?.cancel() }

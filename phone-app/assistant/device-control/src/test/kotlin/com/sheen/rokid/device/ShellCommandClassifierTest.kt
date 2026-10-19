@@ -155,6 +155,47 @@ class ShellCommandClassifierTest {
     }
 
     @Test
+    fun `harmless dev null redirections are stripped before classification`() {
+        // R130: `2>/dev/null` is the idiom every diagnostic command uses. Treating it as unreadable shell syntax made
+        // `dumpsys window 2>/dev/null` ask the wearer for 120 s on every round, while still not letting the redirect
+        // launder a dangerous command.
+        listOf(
+            "dumpsys window 2>/dev/null",
+            "dumpsys window >/dev/null",
+            "dumpsys window 1>/dev/null",
+            "dumpsys window > /dev/null",
+            "dumpsys window 2>&1",
+            "dumpsys window 1>&2",
+            "dumpsys window >/dev/null 2>&1",
+        ).forEach { command ->
+            assertEquals(
+                PrecheckDecision.Allow,
+                ShellCommandClassifier.classify(command).decision,
+                "a redirect to /dev/null (or an fd duplication) must not force confirmation: `$command`",
+            )
+        }
+
+        // The redirect is removed, then the remaining command is classified by the normal table: it cannot wash a
+        // dangerous command clean.
+        val clear = ShellCommandClassifier.classify("pm clear com.x >/dev/null")
+        assertEquals(PrecheckDecision.RequireConfirmation, clear.decision)
+        assertEquals("IRREVERSIBLE", clear.reason, "the base command, not the redirect, must decide")
+        assertRequiresConfirmation("rm -rf /sdcard/x 2>/dev/null")
+
+        // Every other redirect target is still unreadable shell syntax.
+        listOf(
+            "echo x >/sdcard/x",
+            "echo x > /sdcard/x",
+            "dumpsys window >>/dev/null",
+            "dumpsys window >/dev/nullx",
+        ).forEach { command ->
+            val result = ShellCommandClassifier.classify(command)
+            assertEquals(PrecheckDecision.RequireConfirmation, result.decision, "expected RequireConfirmation for `$command`")
+            assertEquals("SHELL_SYNTAX", result.reason, "an unsafe redirect is a syntax category: `$command`")
+        }
+    }
+
+    @Test
     fun `an empty blank NUL or overlong command is rejected as invalid arguments`() {
         val overlong = "ls " + "a".repeat(ShellCommandClassifier.MAX_COMMAND_CHARS)
 

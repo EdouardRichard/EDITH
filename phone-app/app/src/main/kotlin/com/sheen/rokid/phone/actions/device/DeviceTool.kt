@@ -289,14 +289,19 @@ class DeviceTool(
 
     private fun screenshot(): ActionResult {
         val envelope = operations.screenshot()
+        val kernelDiagnostic = envelope.data?.takeIf { it.isNotBlank() }
         val data = if (envelope.ok) {
             buildJsonObject {
-                put("diagnostic", "screenshot is an artifact reference; bytes are not inlined")
+                // R131: the kernel's `diagnostic=screenshot_artifact_pending; reason=…` is the only honest record that
+                // the capture worked and the store did not. A generic sentence here would overwrite the failure reason
+                // and make a broken artifact store indistinguishable from a normal pending reference.
+                put("diagnostic", kernelDiagnostic ?: "screenshot is an artifact reference; bytes are not inlined")
             }
         } else {
             buildJsonObject {
                 put("screen", JsonNull)
-                put("diagnostic", envelope.error?.code ?: "the screenshot failed")
+                // On failure the error code is the reason; never replace it with a sentence the kernel did not say.
+                put("diagnostic", envelope.error?.code ?: kernelDiagnostic ?: "the screenshot failed")
             }
         }
         return result(envelope, data)

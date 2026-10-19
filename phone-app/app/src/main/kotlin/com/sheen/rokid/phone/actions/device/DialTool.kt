@@ -14,6 +14,13 @@ import com.sheen.rokid.plugin.RiskLevel
  * growing a parallel rule set. A missing permission is refused before the executor is reached, so
  * the tool's own gate and the executor's answer cannot disagree for long.
  *
+ * **R129 risk ruling: `dial` is L1, not L2.** The user explicitly ruled that dialing never asks:
+ * placing a call is an immediate, explicit action with no payment, and the wearer can end it from the
+ * same phone. The default ceiling (`maxLevel = L1`) therefore treats it as the accepted class the
+ * policy allows outright (see `WhitelistActionPolicy` step 3) instead of demanding an L2 grant or
+ * asking a 120 s question. A wearer who lowers the ceiling to L0 still gets a `Refuse` — a refusal,
+ * never a question. The number's privacy is why `auditTargetArgument` stays null, not the risk level.
+ *
  * The result is `accepted_only` — an intent hand-off has no screen to observe, so `applied` is null
  * and there is no confirmation (R-03). **There is deliberately no `ACTION_DIAL` fallback**: a dialer
  * screen would be a different action and would make a refused call look accepted.
@@ -101,7 +108,8 @@ class DialTool(
             title = "拨打电话",
             parametersJson = """{"type":"object","properties":{"number":{"type":"string"}},""" +
                 """"required":["number"],"additionalProperties":false}""",
-            risk = RiskLevel.L2,
+            // R129: L1 - the user's ruling is that dial never asks; see the class KDoc.
+            risk = RiskLevel.L1,
             requiresConfirmation = false,
             idempotent = false,
             reversible = false,
