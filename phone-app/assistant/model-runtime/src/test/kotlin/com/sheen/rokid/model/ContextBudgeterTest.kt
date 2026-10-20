@@ -9,7 +9,7 @@ class ContextBudgeterTest {
     private fun smallProfile(budget: Int = 220) = profileFixture().copy(inputBudgetTokens = budget)
     private fun required() = requestFixture(listOf(InputPart.Text("q".repeat(60)))).copy(instructions = "i".repeat(40))
 
-    @Test fun `old complete history removed while hundred byte required text stays intact`() {
+    @Test fun `old complete history removed while required text stays intact`() {
         val request = required().copy(history = listOf(ModelHistoryItem.Text(MessageRole.USER, "u".repeat(100)),
             ModelHistoryItem.Text(MessageRole.ASSISTANT, "a".repeat(100))))
         val result = budgeter.prepare(smallProfile(), request)
@@ -28,7 +28,9 @@ class ContextBudgeterTest {
             listOf(ModelHistoryItem.Text(MessageRole.USER, "u".repeat(50)),
                 ModelHistoryItem.Text(MessageRole.ASSISTANT, "a".repeat(50)))
         }
-        val result = budgeter.prepare(smallProfile(365), required().copy(history = history))
+        // Token units: the base request is 121 and each 50-character pair is 90. Removing one pair leaves 301, so a
+        // 300 budget forces the second pair out as well; the byte-era 365 would have stopped after one removal.
+        val result = budgeter.prepare(smallProfile(300), required().copy(history = history))
         assertEquals(listOf("history:0", "history:1"), result.removedIds)
         assertEquals(history.takeLast(2), result.request.history)
     }
@@ -57,15 +59,34 @@ class ContextBudgeterTest {
             ModelHistoryItem.ToolOutput("call_1", "o".repeat(200)),
         )
         val request = requestFixture(input = emptyList(), history = history).copy(instructions = "i".repeat(40))
-        assertFailsWith<ContractError.ConfigurationRejected> { budgeter.prepare(smallProfile(300), request) }
+        // Token units price this request at 258: 250 is under it but still over the 74 the budget refuses to leave
+        // behind once the only user turn is gone, so the request reaches the "nothing left to send" rejection.
+        assertFailsWith<ContractError.ConfigurationRejected> { budgeter.prepare(smallProfile(250), request) }
     }
 
-    @Test fun `utf8 bytes and framing count conservatively even for empty optional context`() {
+    @Test fun `a Chinese text is priced by TokenMeter not by UTF-8 bytes`() {
+        // Each "你好" is six UTF-8 bytes but two token units (one per CJK code point), so the old byte estimator
+        // priced this request at 32 + (6 + 32) + (6 + 32) = 108. TokenMeter prices it at
+        // 32 + (2 + 32) + (2 + 32) = 100. The bound is the old byte count itself: it can only pass once the request
+        // text is priced by TokenMeter.
+        val profile = profileFixture().copy(
+            inputBudgetTokens = 150,
+            usableWindowTokens = 1_000,
+            maxOutputTokens = 100,
+            safetyTokens = 50,
+        )
+        val request = requestFixture(listOf(InputPart.Text("你好"))).copy(instructions = "你好")
+        val prepared = budgeter.prepare(profile, request)
+        assertEquals(100, prepared.estimatedInputTokens)
+        assertTrue(prepared.estimatedInputTokens < 108, "the byte count (108) must no longer be the estimate")
+    }
+
+    @Test fun `token units and framing are counted even for empty optional context`() {
         val result = budgeter.prepare(profileFixture(), requestFixture(listOf(InputPart.Text("\u4e2d"))).copy(instructions = "i"))
-        assertEquals(100, result.estimatedInputTokens) // 1 + 3 bytes + 32 request + 2 * 32 message framing.
+        assertEquals(98, result.estimatedInputTokens) // 1 + 1 tokens + 32 request + 2 * 32 message framing.
         assertTrue(result.estimated)
         assertFailsWith<ContractError.ContextWindowExceeded> {
-            budgeter.prepare(smallProfile(99), result.request)
+            budgeter.prepare(smallProfile(97), result.request)
         }
     }
 

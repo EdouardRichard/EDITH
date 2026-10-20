@@ -14,12 +14,13 @@ import kotlin.test.assertFailsWith
 import kotlin.test.assertTrue
 
 /**
- * 0.25 Task 1: images are part of the request, so the one byte-based window budget must charge for them.
+ * 0.25 Task 1: images are part of the request, so the one window budget must charge for them.
  *
- * The unit is the existing `estimateText` one (UTF-8 bytes, the profile's `inputBudgetTokens` is used as a byte cap), and
- * one image costs [ImageBudget.UNITS_PER_IMAGE] in that same unit — the deliberate coarse approximation the 0.25 spec
- * chose instead of inventing a token formula. The constant lives in core-contracts (Task 13 / R68) so `TurnTrimmer` and
- * `ContextBudgeter` cannot drift apart. Text-only requests must keep their exact previous cost.
+ * The unit is the budgeter's text unit — now token units from `TokenMeter` (0.3 design §5.2), with the profile's
+ * `inputBudgetTokens` interpreted as a token cap — and one image costs [ImageBudget.UNITS_PER_IMAGE] in that same unit:
+ * the deliberate coarse approximation the 0.25 spec chose instead of inventing a token formula. The constant lives in
+ * core-contracts (Task 13 / R68) so `TurnTrimmer` and `ContextBudgeter` cannot drift apart. Text prices changed with
+ * the unit switch (CJK is one unit per code point, ASCII one per four); the image delta did not.
  */
 class ContextBudgeterImageTest {
 
@@ -33,7 +34,7 @@ class ContextBudgeterImageTest {
     private fun cost(request: ModelRequest, profile: ModelProfile = profileFixture()) =
         budgeter.prepare(profile, request).estimatedInputTokens
 
-    @Test fun `one image costs one thousand twenty four byte units`() {
+    @Test fun `one image costs one thousand twenty four token units`() {
         assertEquals(1024L, ImageBudget.UNITS_PER_IMAGE)
     }
 
@@ -84,9 +85,9 @@ class ContextBudgeterImageTest {
         assertEquals(cost(textOnly, roomy) + 3 * 1024, result.estimatedInputTokens)
     }
 
-    @Test fun `a text only request keeps its exact previous cost`() {
+    @Test fun `a text only request is priced in token units`() {
         val result = budgeter.prepare(profileFixture(), request(listOf(InputPart.Text("\u4e2d"))).copy(instructions = "i"))
-        assertEquals(100, result.estimatedInputTokens)
+        assertEquals(98, result.estimatedInputTokens) // 1 + 1 tokens + 32 request + 2 * 32 message framing.
     }
 
     @Test fun `an input image over the limit is rejected rather than truncated`() {
