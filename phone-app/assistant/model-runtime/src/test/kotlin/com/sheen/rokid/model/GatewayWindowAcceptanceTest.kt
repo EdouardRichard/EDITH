@@ -1,6 +1,7 @@
 package com.sheen.rokid.model
 
 import com.sheen.rokid.agent.CONTEXT_OVERFLOW
+import com.sheen.rokid.agent.ContextPolicy
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.GatewayTurn
 import com.sheen.rokid.agent.ModelClientGateway
@@ -125,18 +126,12 @@ class GatewayWindowAcceptanceTest {
     private fun tightProfile() = profile.copy(inputBudgetTokens = 200, maxOutputTokens = 128, safetyTokens = 128)
 
     /**
-     * The trim window the gateway uses at send time, recomputed here because `ModelClientGateway.windowTokens` is
-     * `internal` to `agent-runtime`: the same `minOf(...)` bound minus the deliberate 32-unit margin. The comparison
-     * in the production-shape test is a "nothing was cut" check, so sharing the send-time `prepare` limit itself would
-     * be circular; the formula above it is `ContextBudgeter`'s own.
+     * The trim window the gateway uses at send time: the session `ContextPolicy.hardLimit`
+     * (`hardInputLimit - hardMargin`), recomputed here through the real policy so a budget change cannot leave this
+     * helper behind. The comparison in the production-shape test is a "nothing was cut" check, so sharing the send-time
+     * `prepare` limit itself would be circular; the formula above it is `ContextBudgeter`'s own.
      */
-    private fun limitWindowTokens(chosen: ModelProfile): Int = maxOf(
-        0,
-        minOf(
-            chosen.inputBudgetTokens,
-            chosen.usableWindowTokens - chosen.maxOutputTokens - chosen.safetyTokens,
-        ) - 32,
-    )
+    private fun limitWindowTokens(chosen: ModelProfile): Int = ContextPolicy.from(chosen).hardLimit
 
     private fun turn(frame: RequestFrame?, chosen: ModelProfile = profile) =
         GatewayTurn("turn-7", chosen.id, "You are Edith.", emptyList(), emptyList(), 1_000_000_000L, frame = frame)
@@ -184,7 +179,7 @@ class GatewayWindowAcceptanceTest {
         // Token-exact for the trimmer and for the send-time budgeter:
         //
         //   ContextBudgeter limit = minOf(93_000, 100_000 - 6_000 - 1_000) = **93_000 token units**
-        //   gateway trim window   = 93_000 - FIXED_OVERHEAD(32)            = **92_968 token units**
+        //   gateway trim window   = policy hardLimit (93_000 - 9_300 margin) = **83_700 token units**
         //   TurnTrimmer.total()   = 32 + (1 + 32) + (700 + 32) + (22_500 + 32) + (2 + 32) = **23_363 token units**
         //
         // The frame is comfortably inside the window, so cut ① does not fire and the whole transcript is sent. The
@@ -201,7 +196,7 @@ class GatewayWindowAcceptanceTest {
         )
 
         // The trimmer's own verdict at the window: nothing is cut, so the assertion below cannot drift from it.
-        assertEquals(frame, TurnTrimmer().trim(frame, 92_968).kept, "92_968 is the gateway window: nothing is cut")
+        assertEquals(frame, TurnTrimmer().trim(frame, 83_700).kept, "83_700 is the gateway window: nothing is cut")
         assertEquals(frame, TurnTrimmer().trim(frame, 23_363).kept, "23_363 is the frame's exact token price")
         assertEquals(
             1,
@@ -228,14 +223,13 @@ class GatewayWindowAcceptanceTest {
      * survive** the trim. The other acceptance tests trim at or near a 93 000-unit window and cut nothing; this one
      * makes cut ① fire and then hands the result to the real send-time [ContextBudgeter].
      *
-     * `tightProfile()` pins `minOf(200, 100_000 - 128 - 128)` = **200**, so the trim window is `200 - 32` = **168 token
-     * units**:
+     * `tightProfile()` pins `minOf(200, 100_000 - 128 - 128)` = **200**, so the trim window is the policy's
+     * `hardLimit = 200 - floor(200 × 0.10)` = **180 token units**:
      *
      * ```
      * ContextBudgeter limit = minOf(200, 100_000 - 128 - 128)                 = **200 token units**
-     * gateway trim window   = 200 - FIXED_OVERHEAD(32)                        = **168 token units**
-     * frame total           = 32 + (10 + 32) + (1 + 32) + (1 + 32) + (5 + 32) = **177**  > 168  ⇒ ① fires
-     * kept total            = 32 + (10 + 32) + (5 + 32)                      = **111**  ≤ 168
+     * gateway trim window   = policy.hardLimit (200 - 20 hard margin)         = **180 token units**
+     * frame total           = 32 + (10 + 32) + (1 + 32) + (10 + 32) + (5 + 32) = **186** > 180 ⇒ ① fires     * kept total            = 32 + (10 + 32) + (5 + 32)                       = **111** ≤ 180
      * ```
      *
      * The old turn is deliberately **two** segments (`USER` + `ASSISTANT`) so that the input sits inside cut ①'s slice:
@@ -247,13 +241,13 @@ class GatewayWindowAcceptanceTest {
             systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "i".repeat(40))),
             conversationFlow = listOf(
                 Segment(SegmentOrigin.TRANSCRIPT, true, "u", SegmentRole.USER),
-                Segment(SegmentOrigin.TRANSCRIPT, true, "a1", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "a".repeat(40), SegmentRole.ASSISTANT),
                 Segment(SegmentOrigin.USER_INPUT, true, "现在几点了"),
             ),
             tools = emptyList(),
         )
         // The window really is the tight one: the untrimmed frame does not fit, and one whole old turn is what gives way.
-        assertEquals(1, TurnTrimmer().trim(frame, 168).droppedTurns, "the whole old turn is dropped")
+        assertEquals(1, TurnTrimmer().trim(frame, 180).droppedTurns, "the whole old turn is dropped")
 
         val tightClient = RecordingModelClient()
         val tightGateway = gateway(recording = tightClient, chosen = tightProfile())

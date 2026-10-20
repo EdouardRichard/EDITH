@@ -155,6 +155,9 @@ private const val DEFAULT_MAX_LEVEL = "L1"
 private const val HINT_LIFETIME_MILLIS = 5_000L
 private const val DEFAULT_HINT_GRACE_MILLIS = 5_000L
 
+/** The `catalogHash`/`deviceHash` value that says "the source was absent", never an invented digest. */
+private const val SKILL_HASH_NONE = "none"
+
 /**
  * 0.24 S3 Task 14 fix round (I2): how long a promised closing fallback may take to reach the display.
  *
@@ -583,13 +586,13 @@ class SmartAssistantPlugin(
      *
      * The production manager derives a [ContextPolicy] from the session's `ModelProfile` at activation, and the
      * compressor is handed `policy.softLimit`. A test reads this to prove the profile-driven policy reached the
-     * session's compressor — not that a hard-coded number did. When the profile is missing there is no policy, and
-     * this accessor fails rather than inventing a budget: production fails closed the same way (no manager is built,
-     * and the host's gateway refuses the turn with `PROFILE_MISSING`).
+     * session's compressor — not that a hard-coded number did. When no policy can be derived there is no manager, and
+     * this accessor fails rather than inventing a budget: production refuses every turn the same way, with the
+     * distinct `PROFILE_MISSING`/`PROFILE_INVALID`/`PROFILE_TOO_SMALL` code the gateway reports.
      */
     internal fun historyBudgetTokensForTest(): Int =
         checkNotNull(activeContextForTurn) {
-            "no session context policy: the configured model profile is missing"
+            "no session context policy: the configured model profile is missing or invalid"
         }.compressionBudgetTokens()
 
     private data class Config(
@@ -669,6 +672,31 @@ class SmartAssistantPlugin(
      * live session.
      */
     @Volatile private var activePromptPlans: Map<ContextRoute, PromptPlan>? = null
+
+    /**
+     * 0.3 Phase 1 final-fix wave (spec §4.4/§5.1): the SKILL catalog the session pinned at activation.
+     *
+     * The catalog is part of the cacheable system slot, so it must be stable for as long as the session lives: a
+     * directory edit mid-session is reported (`P3_SKILL catalog_changed`) but never rewrites `instructions`. `""`
+     * means the library was empty or unreadable at activation; [deactivate] drops it with the rest of the session.
+     */
+    @Volatile private var pinnedSkillCatalog: String = ""
+
+    /** Deterministic hex digest of [pinnedSkillCatalog], or [SKILL_HASH_NONE] when nothing was pinned. */
+    @Volatile private var pinnedSkillCatalogHash: String = SKILL_HASH_NONE
+
+    /** Whether this session already reported a detectable catalog change, so a change is named once, not per turn. */
+    @Volatile private var skillCatalogChangeLogged: Boolean = false
+
+    /**
+     * 0.3 Phase 1 final-fix wave (spec §5.2): the session's fail-closed policy code, or `null` when the policy built.
+     *
+     * A missing profile is still the gateway's `PROFILE_MISSING`; this keeps the distinct `PROFILE_INVALID` /
+     * `PROFILE_TOO_SMALL` that a swallowed `ContextPolicy.from` used to erase, and every model turn of the session
+     * refuses with it. The send-time trim window itself is derived from the live profile at each turn
+     * ([turnHardLimit]) so a profile change is not silently frozen into an activation-time number.
+     */
+    @Volatile private var activeContextFailure: String? = null
 
     /**
      * Phase 5: the session's per-route stores, or `null` when the wiring supplied none. Session state like
@@ -993,6 +1021,17 @@ class SmartAssistantPlugin(
         activePromptPlans?.get(route) ?: promptCatalog(route, null)
 
     /**
+     * 0.3 final-fix wave (spec §6.2): the token-unit window a turn's frame is trimmed to, `ContextPolicy.hardLimit`.
+     *
+     * Derived from the profile the turn will actually send under, so a profile change is not frozen into an
+     * activation-time number; a profile that cannot produce a policy answers [Int.MAX_VALUE] and the gateway's own
+     * fail-closed code refuses the turn before it trims anything.
+     */
+    private fun turnHardLimit(profile: ModelProfile?): Int =
+        profile?.let { runCatching { ContextPolicy.from(it, contextTuning).hardLimit }.getOrNull() }
+            ?: Int.MAX_VALUE
+
+    /**
      * Deterministic SHA-256 of the session's static [DeviceProfile] (spec §4.2.1 rule 4), or `"none"` when the host
      * supplied no profile.
      *
@@ -1026,19 +1065,26 @@ class SmartAssistantPlugin(
         val payload = facts.joinToString("\u0000") { fact ->
             if (fact == null) "~" else "${fact.length}:$fact"
         }
+        return sha256Hex(payload)
+    }
+
+    /** Deterministic SHA-256 hex of [text]; the only digest shape this file logs (never the text itself). */
+    private fun sha256Hex(text: String): String {
         val digest = java.security.MessageDigest.getInstance("SHA-256")
-            .digest(payload.toByteArray(Charsets.UTF_8))
+            .digest(text.toByteArray(Charsets.UTF_8))
         return digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
     }
 
     /**
      * The one prompt-provenance line of a session (spec §4.1): version, ordered-section hash, deterministic device
-     * hash and static size. Counts and hex only - no prompt text, no device value, no model text ever rides on it.
+     * hash, the pinned SKILL catalog hash and static size. Counts and hex only - no prompt text, no device value, no
+     * model text ever rides on it.
      */
     private fun logPromptPlan(plan: PromptPlan, deviceHash: String) {
         P3Log.line(
             "P3_PROMPT version=${PromptCatalog.VERSION} hash=${plan.hash} " +
-                "deviceHash=$deviceHash staticChars=${plan.systemText.length}",
+                "deviceHash=$deviceHash catalogHash=$pinnedSkillCatalogHash " +
+                "staticChars=${plan.systemText.length}",
         )
     }
 
@@ -1095,13 +1141,24 @@ class SmartAssistantPlugin(
         )
         // B1/B3/B6: the session's transcript and compressor (see the field comments for why they are built here).
         //
-        // 0.3 Task 11: the budget is the session profile's `ContextPolicy`, never a constant. A missing profile, or a
-        // profile whose limits cannot produce `0 < softLimit <= hardLimit <= hardInputLimit`, leaves no policy and
-        // therefore no manager: the turn then fails closed through the gateway's `PROFILE_MISSING` refusal instead of
-        // running against an invented budget.
-        val contextPolicy = config?.profileId
+        // 0.3 Task 11: the budget is the session profile's `ContextPolicy`, never a constant. The final-fix wave makes
+        // the failure explicit rather than swallowed: `PROFILE_INVALID`/`PROFILE_TOO_SMALL` is kept as the session's
+        // fail-closed code and handed to every turn, which refuses before the transport. A missing profile stays the
+        // gateway's `PROFILE_MISSING` (the lookup itself answers nothing). No path invents a budget.
+        val sessionProfile = config?.profileId
             ?.let { profileId -> runCatching { profileLookup(profileId) }.getOrNull() }
-            ?.let { profile -> runCatching { ContextPolicy.from(profile, contextTuning) }.getOrNull() }
+        val policyFailure = sessionProfile?.let { profile -> ContextPolicy.failureCode(profile, contextTuning) }
+        val contextPolicy = if (sessionProfile != null && policyFailure == null) {
+            // `failureCode` just ran the same derivation, so this cannot throw for a profile it accepted; the
+            // `runCatching` keeps a future contract change from taking activation down without a fail-closed code.
+            runCatching { ContextPolicy.from(sessionProfile, contextTuning) }.getOrNull()
+        } else {
+            null
+        }
+        val contextFailure = policyFailure
+            ?: if (sessionProfile != null && contextPolicy == null) ContextPolicy.PROFILE_INVALID else null
+        activeContextFailure = contextFailure
+        if (contextFailure != null) P3Log.line("P3_CONTEXT policy=$contextFailure")
         // 0.3 Task 12 (§4.2.1): the static device profile is read once per session. The provider is the host's, resolved
         // here unless a test injected one; a host that cannot answer yields `null` and the catalog omits the device
         // section. No default model/locale/version is invented to fill the gap.
@@ -1113,8 +1170,6 @@ class SmartAssistantPlugin(
             promptCatalog(route, sessionDeviceProfile)
         }
         activePromptPlans = sessionPlans
-        // Once per activation, counts/hashes only (spec §4.1): which prompt ran and on which device, never the prose.
-        logPromptPlan(sessionPlans.getValue(ContextRoute.WAKE), deviceProfileHash(sessionDeviceProfile))
         val contextManager = contextForTurn ?: contextPolicy?.let { policy ->
             ContextManager(
                 memory = memoryRetrieval,
@@ -1166,6 +1221,24 @@ class SmartAssistantPlugin(
         libraryGovernor = governor
         skillManager = runCatching { context.services.storageAccess() }.getOrNull()
             ?.let { SkillManager(StorageAccessSkillDirectory(it), governor = governor) }
+        // 0.3 final-fix wave (spec §4.4/§5.1): the catalog is part of the cacheable system slot, so it is read **once**
+        // here and pinned for the whole session; a later request must not rebuild it. `beginTurn()` first creates the
+        // governor's entries (the catalog only lists known entries) and opens the session's first observation, which
+        // the first real turn joins. A broken library contributes no catalog rather than failing activation (§3.7).
+        val pinnedCatalog = synchronized(skillLock) {
+            skillManager?.let { manager ->
+                runCatching {
+                    manager.beginTurn()
+                    manager.catalog()
+                }.getOrElse { "" }
+            }.orEmpty()
+        }
+        pinnedSkillCatalog = pinnedCatalog
+        pinnedSkillCatalogHash = if (pinnedCatalog.isBlank()) SKILL_HASH_NONE else sha256Hex(pinnedCatalog)
+        skillCatalogChangeLogged = false
+        // Once per activation, counts/hashes only (spec §4.1): which prompt ran, on which device, with which pinned
+        // SKILL catalog - never the prose, a device value or a SKILL name/body.
+        logPromptPlan(sessionPlans.getValue(ContextRoute.WAKE), deviceProfileHash(sessionDeviceProfile))
         // P3.3: the same rule for the confirmation channel. A host that cannot ask the user leaves this null, and the
         // loop then refuses every flagged action (`CONFIRMATION_UNAVAILABLE`) instead of acting unasked.
         confirmation.attach(runCatching { context.services.confirmation() }.getOrNull())
@@ -1201,6 +1274,12 @@ class SmartAssistantPlugin(
             activeCompressor = null
             // The pinned plans belong to the session that loaded them; a later activation loads its own (spec §4.1).
             activePromptPlans = null
+            // The pinned catalog, its provenance and the session's policy are session state for the same reason: a
+            // later activation must build them from the library/profile it is actually given.
+            pinnedSkillCatalog = ""
+            pinnedSkillCatalogHash = SKILL_HASH_NONE
+            skillCatalogChangeLogged = false
+            activeContextFailure = null
             // Phase 5: the injected stores are the same session state, so both ends of the handover empty them.
             activeStores?.values?.forEach { it.clear() }
             activeStores = null
@@ -2164,6 +2243,9 @@ class SmartAssistantPlugin(
         // request must be rendered by the same renderer from the transcript it continues. Only the store path gets one;
         // the legacy path keeps its frame-less behaviour byte for byte.
         val frameFor = store?.let { frameBuilderFor(it, ContextRoute.WAKE, text, prompt, toolSpecsOf(registry)) }
+        // 0.3 final-fix wave (spec §5.2): one profile read feeds the request timeout, the per-turn output cap and the
+        // trim window; the session's fail-closed policy code (if any) refuses the turn before the transport.
+        val turnProfile = runCatching { profileLookup(configured.profileId) }.getOrNull()
         val run = try {
             val built = buildLoop(configured, registry, gateway)
             loop = built
@@ -2186,9 +2268,14 @@ class SmartAssistantPlugin(
                     deadlineNanos = owned.deadlineNanos,
                     // D49: the profile's timeout caps **one model request**; the turn's own budget is the number above,
                     // and it no longer pays for the time a person spends deciding.
-                    requestTimeoutNanos = modelRequestTimeoutNanos(
-                        config?.let { profileLookup(it.profileId) }?.timeoutMillis,
-                    ),
+                    requestTimeoutNanos = modelRequestTimeoutNanos(turnProfile?.timeoutMillis),
+                    // 0.3 final-fix wave (spec §5.2): the profile's own output cap is this turn's cap, declared
+                    // explicitly; the adapter's fallback is only for a caller that supplies none.
+                    maxOutputTokens = turnProfile?.maxOutputTokens,
+                    // The session policy's hard limit is the frame trim window; its failure code (if any) refuses
+                    // every model turn of this session before the transport.
+                    limitTokens = turnHardLimit(turnProfile),
+                    contextFailure = activeContextFailure,
                     // `buildPrompt` ends its history on this turn's user message while the loop appends the utterance
                     // itself, so the last item is dropped: passing it whole would ask the model the same thing twice.
                     //
@@ -2735,10 +2822,16 @@ class SmartAssistantPlugin(
         )
     }
 
-    /** Reads the catalog and the pulled bodies under one acquisition of [skillLock]. */
+    /**
+     * Reads the session-pinned catalog and the pulled bodies under one acquisition of [skillLock].
+     *
+     * The catalog half is the string [activate] pinned: rebuilding it here would let a directory edit rewrite the
+     * cacheable system slot mid-session (0.3 design §4.4/§5.1). The pull half is turn state and is still cleared at
+     * each turn boundary, so the two halves still belong to one moment of one turn.
+     */
     private fun skillSnapshot(): SkillSnapshot = synchronized(skillLock) {
         SkillSnapshot(
-            catalog = runCatching { skillManager?.catalog() }.getOrNull().orEmpty(),
+            catalog = pinnedSkillCatalog,
             bodies = loadedSkillBodies.values.toList(),
         )
     }
@@ -2906,6 +2999,7 @@ class SmartAssistantPlugin(
         // one-observation-per-turn). So it owns its own generation and gives it back at its own end.
         if (!owner && skillTurnOwner != 0L) {
             runCatching { skillManager?.beginTurn() }
+            detectSkillCatalogChange()
             return 0L
         }
         val generation = ++skillTurnGeneration
@@ -2914,7 +3008,26 @@ class SmartAssistantPlugin(
         // end is made harmless by the generation check, not by this clear.
         loadedSkillBodies.clear()
         runCatching { skillManager?.beginTurn() }
+        // 0.3 final-fix wave: the change is detected at the **turn** boundary, never per request, and it is reported
+        // (`P3_SKILL catalog_changed`, hashes only) without rewriting the pinned system text. Spec §4.4 allows either
+        // "takes effect next session" or an explicit signal with one accepted cache invalidation; this session chose
+        // the former, so the trace is the whole observable effect.
+        detectSkillCatalogChange()
         generation
+    }
+
+    /**
+     * Names a detectable SKILL-catalog change once per session, under [skillLock] (the governor is not thread-safe).
+     *
+     * The comparison read is the only per-turn directory read this fix adds; the catalog **text used by requests**
+     * stays the activation pin. A broken or revoked library is a no-op, exactly like the activation read.
+     */
+    private fun detectSkillCatalogChange() {
+        val manager = skillManager ?: return
+        val current = runCatching { manager.catalog() }.getOrNull() ?: return
+        if (skillCatalogChangeLogged || current == pinnedSkillCatalog) return
+        skillCatalogChangeLogged = true
+        P3Log.line("P3_SKILL catalog_changed pinned=$pinnedSkillCatalogHash current=${sha256Hex(current)}")
     }
 
     /**
@@ -3094,6 +3207,7 @@ class SmartAssistantPlugin(
                 return
             }
         }
+        val proactiveProfile = runCatching { profileLookup(configured.profileId) }.getOrNull()
         val gateway = ModelClientGateway(
             client = runCatching { current.services.model() }.getOrElse { failure ->
                 P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")
@@ -3142,6 +3256,11 @@ class SmartAssistantPlugin(
                 tools = listOf(ProactiveHintSpec.PROPOSE_HINT),
                 deadlineNanos = SmartTurn.saturatingAdd(started, ProactiveHintSpec.PROACTIVE_DEADLINE_MILLIS * 1_000_000L),
                 frame = frame,
+                // 0.3 final-fix wave (spec §5.2): the proactive route is one turn like any other, so the profile's
+                // per-turn output cap and the session policy's trim window/fail-closed code apply here too.
+                maxOutputTokens = proactiveProfile?.maxOutputTokens,
+                limitTokens = turnHardLimit(proactiveProfile),
+                contextFailure = activeContextFailure,
             ))
         } catch (failure: Throwable) {
             // `D53`① (2026-10-11): this is no longer "the upload gate said no" - there is no such gate any more. It is
@@ -3161,7 +3280,9 @@ class SmartAssistantPlugin(
         when {
             reply.terminal == ModelEnd.CANCELLED -> silence(hint, "CANCELLED", elapsed)
             reply.terminal == ModelEnd.DEADLINE -> silence(hint, "DEADLINE", elapsed)
-            reply.terminal != ModelEnd.COMPLETED -> silence(hint, "FAILED", elapsed)
+            // 0.3 final-fix wave: a fail-closed policy refusal (PROFILE_*/PROMPT_EXCEEDS_BUDGET) is a distinct
+            // machine-readable reason, not a generic transport failure. The code is shape-bounded by the gateway.
+            reply.terminal != ModelEnd.COMPLETED -> silence(hint, reply.safeCode ?: "FAILED", elapsed)
             else -> {
                 val call = reply.toolCalls.firstOrNull { it.name == ProactiveHintSpec.PROPOSE_HINT.name }
                 val text = call?.let { parseHint(it.argsJson) }

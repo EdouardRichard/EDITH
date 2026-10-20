@@ -47,6 +47,26 @@ data class AgentRequest(
      */
     val requestTimeoutNanos: Long = 0L,
     /**
+     * 0.3 design §5.2: this turn's output cap, carried verbatim into every [GatewayTurn] of the run.
+     *
+     * `null` — the default — keeps every pre-0.3 caller unchanged: the adapter then sends the profile's
+     * `maxOutputTokens`. The wiring that owns the profile passes that same value explicitly so the per-turn decision is
+     * inspectable and cannot silently drift from the profile it was derived from.
+     */
+    val maxOutputTokens: Int? = null,
+    /**
+     * 0.3 design §5.2/§6.2: the token-unit bound every [RequestFrame] of this run is trimmed to, from the session's
+     * `ContextPolicy.hardLimit`. [Int.MAX_VALUE] — the default — means "no override" and keeps the gateway's own
+     * profile-derived window, so a pre-0.3 caller is unaffected.
+     */
+    val limitTokens: Int = Int.MAX_VALUE,
+    /**
+     * 0.3 final-fix wave (spec §5.2): the session's fail-closed policy code (`PROFILE_INVALID`/`PROFILE_TOO_SMALL`),
+     * or `null` when the policy was built. A non-null code makes every model turn of the run refuse with that code
+     * before the transport instead of silently running on a profile whose budget could not be derived.
+     */
+    val contextFailure: String? = null,
+    /**
      * The transcript this turn continues, oldest first (spec §4.2: the plugin owns a session's conversation, not a
      * turn's). Empty — the default — reproduces the previous behaviour exactly: the utterance opens the history on
      * its own, which is what every caller before the session work relied on.
@@ -580,6 +600,11 @@ class AgentLoop(
                     // 0.25 Task 27 (R143): the gateway's trim safety net restores this question if cut ① evicts the
                     // current turn's USER transcript; the continuation cue alone would otherwise be the whole input.
                     userUtterance = request.utterance,
+                    // 0.3 final-fix wave (spec §5.2): the session policy's per-turn decisions ride every model turn,
+                    // not only the opening one - a tool round must not lose the cap or fall back to another window.
+                    limitTokens = request.limitTokens,
+                    maxOutputTokens = request.maxOutputTokens,
+                    contextFailure = request.contextFailure,
                 ),
             )
             metricModelNanos += (clock.nowNanos() - modelStartedNanos).coerceAtLeast(0L)

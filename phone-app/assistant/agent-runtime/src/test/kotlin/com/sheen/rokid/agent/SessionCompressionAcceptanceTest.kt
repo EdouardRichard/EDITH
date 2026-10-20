@@ -56,7 +56,7 @@ class SessionCompressionAcceptanceTest {
         safetyTokens = 128,
     )
 
-    /** input 预算 200 ⇒ 只装得下系统帧 + 本轮发言（网关窗口 = 200 - 32 的既留余量 = 168 token 单位）。 */
+    /** input 预算 200 ⇒ `hardInputLimit = min(200, 4096 - 128 - 128) = 200`，网关窗口 = `200 - 20(hardMargin) = 180`。 */
     private fun tightProfile() = profileFixture().copy(inputBudgetTokens = 200, maxOutputTokens = 128)
 
     private fun frame(vararg flow: Segment) =
@@ -110,11 +110,11 @@ class SessionCompressionAcceptanceTest {
     }
 
     @Test fun `AC-5 the request is still sendable when only the input fits`() {
-        // token 单位下这一组旧回合要真的装不下：62(旧×30) + 42(sys) + 37(input) + 32(固定) = 173 > 168(窗口)，
-        // 裁掉后才 111 ≤ 168 —— 旧回合用「旧回合」三个字在 token 口径下只需 35，会装进窗口，反而留下一个
+        // token 单位下这一组旧回合要真的装不下：72(旧×40) + 42(sys) + 37(input) + 32(固定) = 183 > 180(hardLimit)，
+        // 裁掉后才 111 ≤ 180 —— 旧回合用「旧回合」三个字在 token 口径下只需 35，会装进窗口，反而留下一个
         // 没有回答的 lone user 组（网关按设计拒收），所以把旧回合放大以保持"只有本轮装得下"这个判据。
         val f = frame(
-            Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(30), SegmentRole.USER),
+            Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(40), SegmentRole.USER),
             Segment(SegmentOrigin.USER_INPUT, true, "现在几点了"),
         )
         val sent = send(f, tightProfile())
@@ -180,8 +180,8 @@ class SessionCompressionAcceptanceTest {
     // ------------------------------------------------------------------ 0.3 §5.2 token-unit window
 
     @Test fun `the token priced window keeps a CJK memory the byte window used to evict`() {
-        // The trimmer and the send-time budgeter now charge the same unit: the window is `200 - 32 = 168` token units.
-        // Token price of this frame = 32 + (10 + 32) + (20 + 32) + (5 + 32) = **163** ≤ 168 ⇒ nothing is cut and the
+        // The trimmer and the send-time budgeter now charge the same unit: the window is `200 - 20 = 180` token units.
+        // Token price of this frame = 32 + (10 + 32) + (20 + 32) + (5 + 32) = **163** ≤ 180 ⇒ nothing is cut and the
         // memory rides ahead of the input. The byte-era trimmer priced the same frame at 243 and evicted the memory
         // (cut ②), so this acceptance case stays RED until the trimmer counts tokens.
         val memory = "记".repeat(20)
@@ -198,10 +198,11 @@ class SessionCompressionAcceptanceTest {
     }
 
     @Test fun `an over limit frame still reports compression owed`() {
-        // 200 CJK characters price at 306 token units (32 + (10 + 32) + (200 + 32)), over the 168-unit window. There
-        // is no turn to give up (cut ①) and no memory (cut ②), so the trimmer can only report cut ③ as owed — and it
-        // must still keep the current input. This pins the fail-closed verdict after the unit switch.
-        val utterance = "现".repeat(200)
+        // 80 CJK characters price at 186 token units (32 + (10 + 32) + (80 + 32)), over the 180-unit hard limit but
+        // still inside the 200-unit hard input, so the turn is sendable and only cut ③ is owed. At 200 characters the
+        // fixed prompt alone would exceed the hard input and the gateway would refuse with PROMPT_EXCEEDS_BUDGET
+        // (the turn is not merely over the trim window), so this fixture deliberately stays below that boundary.
+        val utterance = "现".repeat(80)
         val f = frame(Segment(SegmentOrigin.USER_INPUT, true, utterance))
         val client = FakeModelClient { request, listener ->
             listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))

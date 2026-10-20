@@ -27,7 +27,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-private const val PROFILE_MISSING = "PROFILE_MISSING"
 private const val NO_USER_TURN = "NO_USER_TURN"
 private const val NO_TERMINAL = "NO_TERMINAL"
 private const val DEADLINE = "DEADLINE"
@@ -114,49 +113,87 @@ class ModelClientGateway(
 
     companion object {
         /**
-         * The token-unit budget a frame is trimmed to: the same `minOf(...)` bound `ContextBudgeter` enforces at send
-         * time (`minOf(inputBudgetTokens, usableWindow - maxOutput - safety)`), minus a deliberate 32-unit margin.
+         * The token-unit budget a frame is trimmed to (0.3 design §6.2): the session `ContextPolicy.hardLimit`,
+         * `hardInputLimit - hardMargin`. Before the final-fix wave this was a second, ad-hoc formula
+         * (`minOf(inputBudget, usable - maxOutput - safety) - FIXED_OVERHEAD`), which left the policy's hard margin
+         * dead: the trimmer ran closer to the send-time bound than the policy said it should.
          *
-         * Both stages price text with [TokenMeter] (0.3 design §5.2), charge the same
-         * [com.sheen.rokid.contracts.ImageBudget.UNITS_PER_IMAGE] per image (R68), and add the same fixed
-         * [FIXED_OVERHEAD], so they share one formula. Their totals are still not identical by construction because
-         * each renders the frame differently:
-         *
-         * - [frameToTranscript] folds context segments into one head/input message, which removes each folded
-         *   segment's own +32 per-message overhead, so that merged message prices at or below the trimmer's
-         *   per-segment measure (the `\n\n` separators it adds are at most one token unit each).
-         * - A `TOOL_ROUND` moves the other way: `ContextBudgeter` charges one +32 per rendered wire item, while the
-         *   trimmer charged one +32 for the whole segment. A round with several call/output entries can therefore
-         *   price more than the 32-unit margin above the trimmer's total.
-         *
-         * The subtraction is therefore a deliberately stricter bound, not a guarantee that the rendered request
-         * fits. The real gate is the send-time `ContextBudgeter.prepare`: when it throws
+         * Both stages still price text with [TokenMeter] and charge the same
+         * [com.sheen.rokid.contracts.ImageBudget.UNITS_PER_IMAGE] per image (R68), and a `TOOL_ROUND` is itemised into
+         * one wire item per call/output while the trimmer charged one +32 for the whole segment. The real gate remains
+         * the send-time `ContextBudgeter.prepare`: when it throws
          * [ContractError.ContextWindowExceeded], the gateway's bounded AGGRESSIVE/HARD recovery re-trims and resends
-         * the same turn, and exhausting both recoveries is reported as `CONTEXT_OVERFLOW`. The acceptance test's
-         * discriminating assertion is that `prepare` call itself, never a claim that the two totals are identical.
+         * the same turn, and exhausting both recoveries is reported as `CONTEXT_OVERFLOW`.
          */
-        internal fun windowTokens(profile: ModelProfile): Int =
-            minOf(
-                profile.inputBudgetTokens,
-                profile.usableWindowTokens - profile.maxOutputTokens - profile.safetyTokens,
-            ) - FIXED_OVERHEAD
+        internal fun windowTokens(profile: ModelProfile): Int = ContextPolicy.from(profile).hardLimit
     }
+
+    /**
+     * One fail-closed turn: a typed safe code and no transport call. Used for a missing profile, a policy that cannot
+     * be derived, and a fixed prompt that cannot fit — three different conditions that must not read as one.
+     */
+    private fun refusal(code: String): GatewayReply =
+        GatewayReply(emptyList(), "", ModelEnd.FAILED, code)
 
     override fun turn(request: GatewayTurn): GatewayReply {
         val profile = profileLookup(request.profileId)
-            ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, PROFILE_MISSING)
+            ?: return refusal(ContextPolicy.PROFILE_MISSING)
+        // The plugin derived the same policy at activation. If it failed there, every turn of the session must fail
+        // with that exact code; otherwise the gateway classifies the profile itself (invalid vs too small).
+        request.contextFailure?.let { return refusal(it) }
+        ContextPolicy.failureCode(profile)?.let { return refusal(it) }
+        val policy = ContextPolicy.from(profile)
         // Phase 5: an assembled RequestFrame is trimmed below and mapped to the request's shape; without one, the
         // pre-Phase-5 `split(history)` path is kept verbatim, including its "a transport exception escapes" contract.
         val frame = request.frame
         if (frame == null) {
             val transcript = split(request.history)
-                ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN)
+                ?: return refusal(NO_USER_TURN)
+            // The fixed prompt alone (system slot + this turn's input) can already exceed the hard input; no history
+            // trim can rescue that request, so it is refused with its own code instead of burning the overflow
+            // recoveries. Measured before `sendTurn`, so the transport is never called.
+            if (fixedPromptTokens(request.instructions, transcript.input) > policy.hardInputLimit) {
+                return refusal(ContextPolicy.PROMPT_EXCEEDS_BUDGET)
+            }
             return sendTurn(request, modelRequest(request, profile, request.instructions, transcript))
         }
-        // The window is the same expression `ContextBudgeter` bounds the send with, minus the deliberate
-        // 32-unit margin (see [windowTokens]). A caller-supplied `limitTokens` (test seam) wins.
-        val limit = if (request.limitTokens == Int.MAX_VALUE) windowTokens(profile) else request.limitTokens
+        // Same fail-closed check for the frame path, against the untrimmed system slot + dynamic tail + current
+        // input. A frame with no USER_INPUT is left to `frameToTranscript` (it answers NO_USER_TURN).
+        val fixed = fixedPromptTokens(frame)
+        if (fixed != null && fixed > policy.hardInputLimit) {
+            return refusal(ContextPolicy.PROMPT_EXCEEDS_BUDGET)
+        }
+        // The trim window is the policy's hard limit; a caller-supplied `limitTokens` (the plugin's session policy,
+        // or a test seam) wins.
+        val limit = if (request.limitTokens == Int.MAX_VALUE) policy.hardLimit else request.limitTokens
         return turnWithOverflowRecovery(request, profile, frame, limit)
+    }
+
+    /**
+     * The fixed, untrimmable prompt cost: the `+32` accounting overhead once, the system slot as one message, and the
+     * request input — which on the frame path already folds the request-scoped dynamic tail and the wearer's turn.
+     * Token units, the same unit [TokenMeter] and the trimmer use.
+     */
+    private fun fixedPromptTokens(instructions: String, input: List<InputPart>): Int {
+        var total = FIXED_OVERHEAD + tokenUnitsPlusOverhead(instructions)
+        input.forEach { part ->
+            if (part is InputPart.Text) total += tokenUnitsPlusOverhead(part.text)
+        }
+        return total
+    }
+
+    /**
+     * The frame path's fixed prompt cost before trimming: system slot + the request-scoped tail + the one
+     * `USER_INPUT`, each at the trimmer's own per-segment price. `null` when the frame carries no `USER_INPUT`
+     * (`frameToTranscript` owns that verdict).
+     */
+    private fun fixedPromptTokens(frame: RequestFrame): Int? {
+        val flow = frame.conversationFlow
+        val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
+        if (inputIndex < 0) return null
+        val dynamic = RequestLayout.dynamicTail(flow).sumOf { tokenUnitsPlusOverhead(it.text) }
+        return FIXED_OVERHEAD + tokenUnitsPlusOverhead(frame.systemText) + dynamic +
+            tokenUnitsPlusOverhead(flow[inputIndex].text)
     }
 
     /**

@@ -36,6 +36,46 @@ data class ContextPolicy(
     val toolResultRetention: Int,
 ) {
     companion object {
+        /** The profile lookup answered nothing: there is no configured model to derive a budget from. */
+        const val PROFILE_MISSING = "PROFILE_MISSING"
+
+        /** The profile or the policy tuning is itself invalid, so no budget may be derived from it. */
+        const val PROFILE_INVALID = "PROFILE_INVALID"
+
+        /** The profile's window is too small to produce `0 < softLimit <= hardLimit`. */
+        const val PROFILE_TOO_SMALL = "PROFILE_TOO_SMALL"
+
+        /** The fixed prompt (instructions + request-scoped tail + this turn's input) cannot fit the hard input. */
+        const val PROMPT_EXCEEDS_BUDGET = "PROMPT_EXCEEDS_BUDGET"
+
+        /**
+         * The distinct fail-closed code for [profile]/[tuning], or `null` when [from] would succeed.
+         *
+         * The classification is structural, never a parse of the exception text:
+         * - invalid surface values or tuning (a non-positive window/safety/output, arithmetic already rejected by
+         *   `ModelProfile`, a threshold outside `(0,1)`, fewer than one kept turn) → [PROFILE_INVALID];
+         * - a valid surface whose derived limits cannot satisfy the policy invariant → [PROFILE_TOO_SMALL].
+         *
+         * A caller that must refuse a turn uses this instead of `runCatching { ... }.getOrNull()`, because the latter
+         * erases *why* the policy does not exist and forces the generic `PROFILE_MISSING` onto a configured profile.
+         */
+        fun failureCode(profile: ModelProfile, tuning: ContextTuning = ContextTuning()): String? {
+            val invalidNumbers = profile.usableWindowTokens <= 0 ||
+                profile.inputBudgetTokens <= 0 ||
+                profile.maxOutputTokens <= 0 ||
+                profile.safetyTokens <= 0 ||
+                profile.inputBudgetTokens.toLong() + profile.maxOutputTokens + profile.safetyTokens >
+                profile.usableWindowTokens.toLong()
+            val invalidTuning = tuning.compressionThreshold <= 0.0 ||
+                tuning.compressionThreshold >= 1.0 ||
+                tuning.keepRecentTurns < 1
+            if (invalidNumbers || invalidTuning) return PROFILE_INVALID
+            return runCatching { from(profile, tuning) }.fold(
+                onSuccess = { null },
+                onFailure = { PROFILE_TOO_SMALL },
+            )
+        }
+
         fun from(profile: ModelProfile, tuning: ContextTuning = ContextTuning()): ContextPolicy {
             require(tuning.compressionThreshold > 0.0 && tuning.compressionThreshold < 1.0) {
                 "compressionThreshold must be in (0, 1): ${tuning.compressionThreshold}"

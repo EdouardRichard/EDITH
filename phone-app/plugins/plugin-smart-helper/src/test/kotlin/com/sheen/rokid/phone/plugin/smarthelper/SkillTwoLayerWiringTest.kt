@@ -15,19 +15,17 @@ import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelStreamEvent
-import com.sheen.rokid.plugin.StorageAccess
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.skill.LoadSkillTool
 import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicLong
-import java.util.concurrent.atomic.AtomicReference
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 /**
@@ -221,6 +219,50 @@ class SkillTwoLayerWiringTest {
             marker in secondTurnFirst,
             "the body is turn-scoped and must be gone from the next turn's first request: $secondTurnFirst",
         )
+    }
+
+    @Test
+    fun `a skill library mutation does not rewrite the session prompt and is reported once`() {
+        // 0.3 review fix (spec §4.4/§5.1): the SKILL catalog is part of the cacheable system slot, so it is pinned at
+        // activation. A directory edit mid-session must leave `instructions` byte-identical (the pinned catalog), and
+        // the detectable change must be named for the trace: `P3_SKILL catalog_changed`, hashes only.
+        val storage = MutableSmartFakeSkills(
+            mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", "正文-a")),
+        )
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.StorageAccess to storage))
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("第一问", turnId = "asr-1")
+            val first = rig.model.requests.single().instructions
+            val promptLine = lines.single { it.startsWith("P3_PROMPT ") }
+            val pinnedHash = promptLine.substringAfter("catalogHash=").substringBefore(' ')
+
+            // The user installs a second SKILL while the session is live.
+            storage.files["/sdcard/EDITH/skills/b.md"] = smartSkillDoc("beta", "正文-b")
+            rig.tick(4_000)
+            rig.wakeAndFinal("第二问", turnId = "asr-2")
+
+            val second = rig.model.requests.last().instructions
+            assertEquals(first, second, "a live session's system slot must not be rewritten by a library edit")
+            assertFalse("- beta: d-beta" in second, "the pinned catalog must not grow mid-session: $second")
+            assertTrue(
+                lines.any { it.startsWith("P3_SKILL catalog_changed ") },
+                "a detectable catalog change must be named, not silent: $lines",
+            )
+            assertEquals(
+                pinnedHash,
+                promptLine.substringAfter("catalogHash=").substringBefore(' '),
+                "the provenance line must keep the session's pinned catalog hash",
+            )
+            assertNotEquals("none", pinnedHash, "the session had a catalog installed at activation")
+        } finally {
+            P3Log.sink = previous
+        }
     }
 
     @Test
@@ -603,20 +645,16 @@ class SkillTwoLayerWiringTest {
     /**
      * Review finding (Important), concurrency half: `LibraryGovernor` documents "not thread-safe" and the SKILL state
      * is one map and one turn flag read and written from the plugin's **two-thread** production pool. This drives two
-     * turns through the real boundary and pins the interleaving with latches: a blocking directory holds a request
-     * inside its catalog build while a second owner turn begins.
+     * turns through the real boundary and reads the request's SKILL view concurrently with a second owner begin.
      *
-     * The pairing half (0.3 Task 12 review fix): the catalog and the pulled bodies are the two halves of one request's
-     * SKILL view, and `beginSkillTurn` clears the bodies under the same `skillLock`. Reading them in separate critical
-     * sections would let that begin land **between** them — a newer catalog paired with the previous turn's bodies.
-     * The latch handshake is those halves' proof: while the request holds the lock for its catalog build, the second
-     * owner's `beginSkillTurn` may not complete (it would have to clear the bodies), and when it is finally released
-     * the request's own view still carries the body it pulled. The old version of this test captured the body *before*
-     * the handover — which accepted the split instead of pinning the pair.
+     * 0.3 final-fix wave: the catalog half is now **session-pinned** — a request no longer rebuilds it — so the two
+     * halves cannot be split by a catalog build at all. What must still hold under the interleaving is that every
+     * view pairs the same pinned catalog with a bodies list that is either turn A's pull or the next turn's empty set,
+     * never a body inside the system slot, and that both threads finish without a torn structure.
      */
     @Test
     fun `a concurrent owner begin cannot split a request's catalog from its pulled bodies`() {
-        val storage = BlockingSkillStorage(
+        val storage = SmartFakeSkills(
             mapOf(
                 "/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", "正文-a"),
                 "/sdcard/EDITH/skills/b.md" to smartSkillDoc("beta", "正文-b"),
@@ -626,74 +664,76 @@ class SkillTwoLayerWiringTest {
             it.activate(overrides = mapOf(Capability.StorageAccess to storage))
         }
         val failures = ConcurrentLinkedQueue<Throwable>()
-        val view = AtomicReference<Pair<List<Segment>, List<Segment>>?>(null)
-        val secondStarted = CountDownLatch(1)
-        val secondDone = CountDownLatch(1)
+        val views = ConcurrentLinkedQueue<Pair<List<Segment>, List<Segment>>>()
+        val start = CountDownLatch(1)
+        val done = CountDownLatch(2)
         val secondGeneration = AtomicLong(0L)
 
-        // Turn A owns the turn and has pulled alpha; its request is the continuation that must carry the body.
+        // Turn A owns the turn and has pulled alpha; its requests are the continuations that must carry the body.
         val first = rig.plugin.beginSkillTurnForTest(owner = true)
         rig.plugin.loadSkillToolForTest().execute(LoadSkillTool.NAME, """{"name":"alpha"}""")
 
-        // The request's catalog build blocks inside the directory listing: i.e. while it holds the SKILL lock.
-        storage.blockNextList.set(true)
         val request = Thread {
+            start.await()
             try {
-                view.set(rig.plugin.requestSkillSegmentsForTest(ContextRoute.WAKE))
-            } catch (failure: Throwable) {
-                failures += failure
-            }
-        }
-        request.start()
-        assertTrue(storage.entered.await(2, TimeUnit.SECONDS), "the request must reach its catalog build")
-
-        val second = Thread {
-            secondStarted.countDown()
-            try {
-                secondGeneration.set(rig.plugin.beginSkillTurnForTest(owner = true))
+                repeat(64) { views += rig.plugin.requestSkillSegmentsForTest(ContextRoute.WAKE) }
             } catch (failure: Throwable) {
                 failures += failure
             } finally {
-                secondDone.countDown()
+                done.countDown()
             }
         }
+        val second = Thread {
+            start.await()
+            try {
+                secondGeneration.set(rig.plugin.beginSkillTurnForTest(owner = true))
+                rig.plugin.endSkillTurnForTest(secondGeneration.get())
+            } catch (failure: Throwable) {
+                failures += failure
+            } finally {
+                done.countDown()
+            }
+        }
+        request.start()
         second.start()
-        assertTrue(secondStarted.await(2, TimeUnit.SECONDS), "the second owner turn must start")
-        assertFalse(
-            secondDone.await(500, TimeUnit.MILLISECONDS),
-            "a concurrent owner begin cut into one request's SKILL view: the catalog and the pulled bodies were read " +
-                "in separate critical sections, so the begin could clear the bodies between them",
-        )
-
-        storage.release()
+        start.countDown()
+        assertTrue(done.await(5, TimeUnit.SECONDS), "both threads must finish; a deadlock is a failure")
         request.join(5_000)
         second.join(5_000)
 
         assertFalse(request.isAlive || second.isAlive, "both must finish; a torn structure or a deadlock is a failure")
         assertTrue(failures.isEmpty(), "concurrent SKILL turn work threw: ${failures.take(3)}")
+        assertTrue(views.isNotEmpty(), "the request thread must have built at least one SKILL view")
 
-        val (system, bodies) = assertNotNull(view.get(), "the request's SKILL view must have been built")
-        assertTrue(
-            system.any { it.origin == SegmentOrigin.SKILL && "- alpha: d-alpha" in it.text },
-            "the request's catalog half must be intact: $system",
-        )
-        assertTrue(
-            bodies.any { it.origin == SegmentOrigin.SKILL_BODY && "正文-a" in it.text },
-            "the request's pulled body must come from the same snapshot as its catalog: $bodies",
-        )
+        // Every view pairs the same pinned catalog with either turn A's pull or the next turn's empty set, and a body
+        // never appears in the system slot. That is the concurrency invariant the pin preserves.
+        views.forEach { (system, bodies) ->
+            assertTrue(
+                system.any { it.origin == SegmentOrigin.SKILL && "- alpha: d-alpha" in it.text },
+                "every request's catalog half must stay the pinned catalog: $system",
+            )
+            assertFalse(system.any { "正文-a" in it.text }, "a body leaked into the system slot: $system")
+            assertTrue(
+                bodies.all { it.origin == SegmentOrigin.SKILL_BODY && "正文-a" in it.text },
+                "a body half may only be turn A's pull: $bodies",
+            )
+        }
 
-        // The begin that was held out is the next turn's; a turn starts with no pulled bodies, so the pair moved
-        // together instead of being split.
+        // The second begin is the next turn's; a turn starts with no pulled bodies and the catalog did not move.
         val afterHandover = rig.plugin.requestSkillSegmentsForTest(ContextRoute.WAKE)
         assertTrue(
             afterHandover.second.isEmpty(),
             "the next turn must start with no pulled bodies: ${afterHandover.second}",
         )
-        rig.plugin.endSkillTurnForTest(secondGeneration.get())
+        assertTrue(
+            afterHandover.first.any { it.origin == SegmentOrigin.SKILL && "- alpha: d-alpha" in it.text },
+            "the pinned catalog must survive the handover: ${afterHandover.first}",
+        )
         // Turn A's end is stale now: the second owner already replaced it, so this must be a no-op.
         rig.plugin.endSkillTurnForTest(first)
 
-        // The shared state must be intact: both entries still governed and a fresh turn still opens cleanly.
+        // The shared state must be intact: the entries are still governed (activation pinned them) and a fresh turn
+        // still opens cleanly with the same catalog.
         val governor = assertNotNull(rig.plugin.skillGovernor(), "activation must build the session's library governor")
         assertTrue(
             governor.entry("alpha") != null && governor.entry("beta") != null,
@@ -709,26 +749,3 @@ class SkillTwoLayerWiringTest {
     }
 }
 
-/**
- * A `StorageAccess` that can hold one `listFiles` call on a latch, so a test can pin the exact interleaving of two
- * turns instead of racing them. The block is armed explicitly and fires once.
- */
-private class BlockingSkillStorage(files: Map<String, String?>) : StorageAccess {
-    private val delegate = SmartFakeSkills(files)
-    val blockNextList = AtomicBoolean(false)
-    val entered = CountDownLatch(1)
-    private val release = CountDownLatch(1)
-
-    fun release() = release.countDown()
-
-    override fun listFiles(dirPath: String, suffix: String): List<String> {
-        if (blockNextList.compareAndSet(true, false)) {
-            entered.countDown()
-            release.await(5, TimeUnit.SECONDS)
-        }
-        return delegate.listFiles(dirPath, suffix)
-    }
-
-    override fun readFile(path: String): String? = delegate.readFile(path)
-    override fun deleteFile(path: String): Boolean = delegate.deleteFile(path)
-}

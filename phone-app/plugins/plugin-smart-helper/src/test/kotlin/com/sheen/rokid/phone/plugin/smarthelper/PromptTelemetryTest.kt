@@ -60,8 +60,10 @@ class PromptTelemetryTest {
         val line = promptLine(lines)
         val plan = PromptCatalog.plan(ContextRoute.WAKE, profile)
         assertTrue(
-            Regex("""^P3_PROMPT version=0\.3\.0 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} staticChars=\d+$""")
-                .matches(line),
+            Regex(
+                """^P3_PROMPT version=0\.3\.0 hash=[0-9a-f]{64} deviceHash=(?:[0-9a-f]{64}|none) """ +
+                    """catalogHash=(?:[0-9a-f]{64}|none) staticChars=\d+$""",
+            ).matches(line),
             "the line must carry exactly the pinned plan's identity and sizes: $line",
         )
         assertTrue("hash=${plan.hash}" in line, "the hash must fingerprint the rendered plan: $line")
@@ -75,6 +77,36 @@ class PromptTelemetryTest {
         assertFalse(line.contains("FixtureCorp"), "a device value leaked into the log: $line")
         assertFalse(line.contains("你是一名"), "prompt prose leaked into the log: $line")
         assertFalse(line.contains("【设备画像】"), "prompt prose leaked into the log: $line")
+    }
+
+    @Test
+    fun `P3_PROMPT carries the pinned skill catalog hash when a library is installed`() {
+        // 0.3 review fix: the SKILL catalog is session-pinned, so its provenance must be on the same one line as the
+        // prompt plan's. Only the digest and the path-free counts may appear - never a SKILL name or body.
+        val lines = withLines {
+            SmartTestRig().activate(
+                overrides = mapOf(
+                    Capability.Storage to SmartFakeStorage(),
+                    Capability.DeviceState to SmartFakeDeviceState(profile),
+                    Capability.StorageAccess to
+                        SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", "正文标记"))),
+                ),
+            )
+        }
+
+        val line = promptLine(lines)
+        val catalogHash = line.substringAfter("catalogHash=").substringBefore(' ')
+        assertEquals(64, catalogHash.length, "an installed catalog must be fingerprinted: $line")
+        assertNotEquals("none", catalogHash, "a catalog was installed: $line")
+        assertFalse("alpha" in line, "a SKILL name leaked into the provenance line: $line")
+        assertFalse(line.contains("正文标记"), "a SKILL body leaked into the provenance line: $line")
+    }
+
+    @Test
+    fun `no skill library is announced as catalogHash none instead of inventing one`() {
+        val lines = withLines { activateWithDeviceProfile() }
+
+        assertTrue("catalogHash=none" in promptLine(lines), "no grant is a stable 'none': ${promptLine(lines)}")
     }
 
     @Test

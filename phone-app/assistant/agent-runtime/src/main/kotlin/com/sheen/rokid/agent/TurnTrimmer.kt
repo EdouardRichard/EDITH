@@ -167,8 +167,9 @@ val TrimReport.counts: TrimCounts
  *
  * The rendered request is not necessarily the exact sum of those per-segment prices: the gateway folds the leading
  * context into one message and renders a `TOOL_ROUND` as one or more wire items, so the send-time total can differ
- * from [total] by the cost of that rendering. The gateway therefore trims to `limit - 32`, a deliberate safety margin
- * that keeps the trimmer stricter than the check it must satisfy; the acceptance tests' discriminating assertion is
+ * from [total] by the cost of that rendering. The gateway therefore trims to the session `ContextPolicy.hardLimit`,
+ * which reserves the policy's own hard margin (`hardInputLimit - hardMargin`) below the send-time bound — a deliberate
+ * stricter bound, not a guarantee that the two totals are identical. The acceptance tests' discriminating assertion is
  * the send-time `prepare` call itself, never a claim that the two totals are identical.
  *
  * A `SUMMARY` segment is **not a turn**: it never participates in turn eviction. But it does count toward [total] —
@@ -615,7 +616,7 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
  * The fixed `+32` `ContextBudgeter` adds once on top of the per-message costs
  * (`Math.addExact(32L, message(request.instructions))`), in token units like every other term. It is a
  * structural part of the shared formula: `TurnTrimmer.total` adds it once and `ContextBudgeter.prepare`
- * adds it once. (`ModelClientGateway.windowTokens` subtracts one more 32 as a deliberate safety margin.)
+ * adds it once. (`ContextPolicy.hardLimit` is the trim window; it already reserves the policy's hard margin.)
  */
 internal const val FIXED_OVERHEAD = 32
 

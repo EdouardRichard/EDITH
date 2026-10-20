@@ -7,6 +7,7 @@ import com.sheen.rokid.plugin.SecretHandle
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -186,5 +187,44 @@ class ContextPolicyTest {
         assertFailsWith<IllegalArgumentException> {
             ContextPolicy.from(profile(usable = 1_000, input = 100, output = 900, safety = 100))
         }
+    }
+
+    // ── distinct fail-closed codes (final-fix wave) ───────────────────────────────────────────────
+
+    @Test
+    fun `a valid profile has no failure code`() {
+        assertNull(ContextPolicy.failureCode(smallProfile()))
+    }
+
+    @Test
+    fun `a profile too small for the policy invariant is PROFILE_TOO_SMALL`() {
+        // 1 + 1 + 1 = 3 <= 100, so the profile is consistent; the derived hard input is 1 and the 0.75 soft limit
+        // rounds to zero. Before the final-fix wave this was swallowed and surfaced as `PROFILE_MISSING`.
+        assertEquals(
+            ContextPolicy.PROFILE_TOO_SMALL,
+            ContextPolicy.failureCode(profile(usable = 100, input = 1, output = 1, safety = 1)),
+        )
+    }
+
+    @Test
+    fun `a threshold that rounds the soft limit down to zero is PROFILE_TOO_SMALL`() {
+        assertEquals(
+            ContextPolicy.PROFILE_TOO_SMALL,
+            ContextPolicy.failureCode(smallProfile(), ContextTuning(compressionThreshold = 0.0001)),
+        )
+    }
+
+    @Test
+    fun `invalid tuning is PROFILE_INVALID`() {
+        // The profile surface is valid; the configuration that shapes it is not. The two must not share a code:
+        // `PROFILE_INVALID` says "fix the configuration", `PROFILE_TOO_SMALL` says "this model cannot hold a turn".
+        assertEquals(
+            ContextPolicy.PROFILE_INVALID,
+            ContextPolicy.failureCode(smallProfile(), ContextTuning(compressionThreshold = 1.0)),
+        )
+        assertEquals(
+            ContextPolicy.PROFILE_INVALID,
+            ContextPolicy.failureCode(smallProfile(), ContextTuning(keepRecentTurns = 0)),
+        )
     }
 }

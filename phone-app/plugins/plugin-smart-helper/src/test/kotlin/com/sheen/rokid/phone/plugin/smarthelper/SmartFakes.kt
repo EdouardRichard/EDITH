@@ -480,6 +480,20 @@ internal class SmartFakeSkills(
     override fun deleteFile(path: String): Boolean = false
 }
 
+/**
+ * A mutable SKILL library for the session-pin tests: the same on-disk shape as [SmartFakeSkills], with a `files` map a
+ * test can edit **after** activation to model the user adding or editing a SKILL while the session is live.
+ */
+internal class MutableSmartFakeSkills(initial: Map<String, String?> = emptyMap()) : StorageAccess {
+    val files = LinkedHashMap(initial)
+
+    override fun listFiles(dirPath: String, suffix: String): List<String> = files.keys.toList()
+
+    override fun readFile(path: String): String? = files[path]
+
+    override fun deleteFile(path: String): Boolean = files.remove(path) != null
+}
+
 /** One SKILL `.md` file with valid front matter, as the user would write it. */
 internal fun smartSkillDoc(
     name: String,

@@ -536,17 +536,25 @@ class StoreSessionWiringTest {
         }
     }
 
+    /** The fixed utterance the tiny-window helpers measure against. */
+    private val tinyInput = "现在几点"
+
     /**
-     * A profile whose frame window (32 bytes) fits nothing at all: the system slot alone overruns it, so the trimmer
-     * reports `compressionOwed = true` on every turn. Whether a **whole turn was dropped** is then the only variable,
-     * which is exactly the conjunction the ③ gate is.
+     * A profile whose **send-time hard limit** (`hardInputLimit - hardMargin`) is below the fixed prompt, so the
+     * trimmer reports `compressionOwed = true` on every turn, while the fixed prompt itself still fits the hard input
+     * (otherwise the gateway refuses with `PROMPT_EXCEEDS_BUDGET` before any trim). Whether a **whole turn was dropped**
+     * is then the only variable, which is exactly the conjunction the ③ gate is.
      */
-    private fun tinyWindowProfile(): ModelProfile = smartProfile().copy(
-        usableWindowTokens = 1_000,
-        inputBudgetTokens = 64,
-        maxOutputTokens = 100,
-        safetyTokens = 100,
-    )
+    private fun tinyWindowProfile(): ModelProfile {
+        val system = PromptCatalog.plan(ContextRoute.WAKE, null).systemText
+        val fixedPrompt = 32 + measure(system) + measure(tinyInput)
+        return smartProfile().copy(
+            usableWindowTokens = fixedPrompt + 10 + 1_000 + 100,
+            inputBudgetTokens = fixedPrompt + 10,
+            maxOutputTokens = 1_000,
+            safetyTokens = 100,
+        )
+    }
 
     @Test
     fun `the store gate opens only when a turn was dropped and compression is still owed`() {
@@ -600,20 +608,24 @@ class StoreSessionWiringTest {
     private fun measure(text: String) = TokenMeter.estimate(text) + 32
 
     /**
-     * A profile whose window fits the system slot, the surviving pending user turn and this turn's input — with 8
-     * token units to spare — so cut ① evicts the older whole turn and stops there. The system slot is composed exactly
-     * as `buildFrame` composes it.
+     * A profile whose window fits the system slot, the surviving pending user turn and this turn's input — with a
+     * small margin — so cut ① evicts the older whole turn and stops there. The window is derived through
+     * `ContextPolicy.hardLimit` (`hardInputLimit - hardMargin`), not the old raw profile remainder: the hard limit must
+     * clear the survivors, because otherwise cut ① would drop the pending user turn too and the frame would become a
+     * sendable empty-history request. The system slot is composed exactly as `buildFrame` composes it.
      */
     private fun windowSizedFor(vararg survivors: String): ModelProfile {
         // 0.3 Task 12: the system slot is the session's profile-less WAKE catalog plan (this rig supplies no device
         // provider and no SKILL directory).
         val system = PromptCatalog.plan(ContextRoute.WAKE, null).systemText
         val total = 32 + measure(system) + survivors.sumOf { measure(it) }
-        val window = total + 8
-        val inputBudget = window + 32
+        val desiredHardLimit = total + 8
+        // `hardLimit = hardInput - max(1, floor(hardInput * 0.10))`; find the first hard input that keeps the survivors.
+        var hardInput = desiredHardLimit
+        while (hardInput - maxOf(1, kotlin.math.floor(hardInput * 0.10).toInt()) < desiredHardLimit) hardInput++
         return smartProfile().copy(
-            usableWindowTokens = inputBudget + 1_000 + 100,
-            inputBudgetTokens = inputBudget,
+            usableWindowTokens = hardInput + 1_000 + 100,
+            inputBudgetTokens = hardInput,
             maxOutputTokens = 1_000,
             safetyTokens = 100,
         )

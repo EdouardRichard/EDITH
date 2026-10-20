@@ -67,7 +67,7 @@ class ModelClientGatewayTest {
         tools: List<ToolSpec> = emptyList(),
         deadlineNanos: Long = 1_000_000_000L,
         // Phase 5 seams, both appended with defaults so every existing positional call site keeps its meaning:
-        // `Int.MAX_VALUE` is the "no override" sentinel the gateway reads as "trim to `windowTokens(profile)`, and
+        // `Int.MAX_VALUE` is the "no override" sentinel the gateway reads as "trim to the policy's hard limit", and
         // `frame = null` is exactly today's `split(history)` behaviour. `frame` is the last parameter.
         limitTokens: Int = Int.MAX_VALUE,
         frame: RequestFrame? = null,
@@ -119,6 +119,53 @@ class ModelClientGatewayTest {
         assertEquals("", reply.text)
         assertTrue(reply.toolCalls.isEmpty())
         assertTrue(client.requests.isEmpty(), "a missing profile must be refused before any transport call")
+    }
+
+    @Test fun `a profile too small for a policy fails closed as PROFILE_TOO_SMALL`() {
+        // Before the final-fix wave `ContextPolicy.from` was swallowed with `getOrNull()`, the session had no manager
+        // and the turn was reported as `PROFILE_MISSING` even though the profile existed. The code must name the real
+        // condition and still refuse before the transport.
+        val tooSmall = profile.copy(inputBudgetTokens = 1, maxOutputTokens = 1, safetyTokens = 1)
+        lookup = { tooSmall }
+        val client = FakeModelClient()
+
+        val reply = gateway(client).turn(turn())
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals(ContextPolicy.PROFILE_TOO_SMALL, reply.safeCode)
+        assertTrue(client.requests.isEmpty(), "an unusable profile must be refused before any transport call")
+    }
+
+    @Test fun `an activation policy failure is reported with its own code`() {
+        // The plugin computes the policy while activating and hands the typed failure to every turn; the gateway must
+        // relay that code instead of re-deriving a generic one.
+        val client = FakeModelClient()
+
+        val reply = gateway(client).turn(turn().copy(contextFailure = ContextPolicy.PROFILE_INVALID))
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals(ContextPolicy.PROFILE_INVALID, reply.safeCode)
+        assertTrue(client.requests.isEmpty(), "a fail-closed session must never reach the transport")
+    }
+
+    @Test fun `a fixed prompt that cannot fit the hard input is PROMPT_EXCEEDS_BUDGET`() {
+        // The whole static prompt + this turn's input alone exceed the profile's hard input, so no history trim can
+        // make the request sendable. The turn must be refused with the dedicated code rather than going out and
+        // burning the overflow recoveries on an impossible shape.
+        val small = profile.copy(inputBudgetTokens = 100, maxOutputTokens = 1, safetyTokens = 1)
+        lookup = { small }
+        val frame = RequestFrame(
+            listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "i".repeat(400))),
+            listOf(Segment(SegmentOrigin.USER_INPUT, true, "你好")),
+            emptyList(),
+        )
+        val client = FakeModelClient()
+
+        val reply = gateway(client).turn(turn(profileId = small.id, frame = frame))
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals(ContextPolicy.PROMPT_EXCEEDS_BUDGET, reply.safeCode)
+        assertTrue(client.requests.isEmpty(), "the impossible prompt must never reach the transport")
     }
 
     // ------------------------------------------------------------ 2. the input/history split
@@ -1088,17 +1135,14 @@ class ModelClientGatewayTest {
         assertFalse(counts.toString().contains("旧"), "no trimmed body either: $counts")
     }
 
-    @Test fun `the trim window is the send time limit minus a deliberate safety margin`() {
-        // I-4: `TurnTrimmer.total()` and `ContextBudgeter.prepare` count the same token unit and the same fixed
-        // 32, against the same `minOf(inputBudgetTokens, usable - maxOutput - safety)` limit. The totals are still
-        // not identical by construction: folding leading context into one message drops the folded segments' +32,
-        // but a `TOOL_ROUND` is itemised into one wire item per call/output and the budgeter charges each one its
-        // own +32, so with several items the rendered request can price above the trimmer's total — beyond the
-        // 32-unit margin. The subtraction is a deliberate stricter bound, not an absorption guarantee; the real
-        // gate is the send-time `ContextBudgeter.prepare`, and its `ContextWindowExceeded` triggers the gateway's
-        // AGGRESSIVE/HARD recovery. It is not a correction of a unit disagreement. The fixture profile's window is
-        // `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, so the trimmer is handed 59_968.
-        assertEquals(59_968, ModelClientGateway.windowTokens(profile))
+    @Test fun `the trim window is the policy hard limit`() {
+        // 0.3 final-fix wave: `ContextPolicy.hardLimit`/`hardMargin` are live at send time. The frame path trims to
+        // `hardLimit = hardInputLimit - hardMargin` (a deliberate 10% reserve), not to the bare profile remainder
+        // minus a second 32-unit margin. The fixture profile's hard input is
+        // `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, the margin `floor(60_000 × 0.10)` = 6_000, so the
+        // trimmer is handed **54_000**.
+        assertEquals(54_000, ModelClientGateway.windowTokens(profile))
+        assertEquals(ContextPolicy.from(profile).hardLimit, ModelClientGateway.windowTokens(profile))
     }
 
     @Test fun `the frame path sends one instructions message for the whole system slot`() {

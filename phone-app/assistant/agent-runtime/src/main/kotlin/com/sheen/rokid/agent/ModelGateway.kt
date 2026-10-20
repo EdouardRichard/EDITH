@@ -44,9 +44,10 @@ data class GatewayTurn(
     val tools: List<ToolSpec>,
     val deadlineNanos: Long,
     /**
-     * Test seam only: the token-unit limit the frame is trimmed to. [Int.MAX_VALUE] (the default) means
-     * "no override" — the gateway trims to `ModelClientGateway.windowTokens(profile)`, which is the send-time
-     * `ContextBudgeter` bound minus a deliberate 32-unit margin. Ignored when [frame] is null.
+     * Test seam / session wiring: the token-unit limit the frame is trimmed to. [Int.MAX_VALUE] (the default) means
+     * "no override" — the gateway trims to `ContextPolicy.hardLimit`, the send-time policy's own hard bound (0.3
+     * Phase 1 final-fix wave). The production plugin passes its session policy's `hardLimit`. Ignored when [frame] is
+     * null.
      */
     val limitTokens: Int = Int.MAX_VALUE,
     /**
@@ -79,6 +80,14 @@ data class GatewayTurn(
      * (a short answer, a compression summary, a proactive hint) and wins over the profile at encode time.
      */
     val maxOutputTokens: Int? = null,
+    /**
+     * 0.3 final-fix wave (spec §5.2): the session's fail-closed policy code, or `null` when a policy exists.
+     *
+     * The gateway itself classifies an invalid/too-small profile; this field carries the **activation-time** failure
+     * (the plugin derives the same policy while activating) so a turn of that session refuses with the same code and
+     * never reaches the transport. A non-null value wins over re-derivation.
+     */
+    val contextFailure: String? = null,
 )
 
 /**
