@@ -52,10 +52,11 @@ private val toolRoundJson = Json { isLenient = true }
  * stateless [ModelRequest], accumulates the stream into a [GatewayReply], and owns the turn's wall-clock bound.
  *
  * **The request input is the in-flight user turn, not history.** `ModelRequest.input` is rendered last on the wire, so
- * a transcript that ends on the pending `Text(USER)` lifts that turn into `input`. When the transcript has already
- * moved past that turn (a tool round appended after it), the whole transcript stays `ModelRequest.history` and the
- * request carries an empty `input`: a history-only request, which `plugin-api` admits and `ContextBudgeter` validates.
- * That keeps the tool output last on the wire instead of re-asserting the user message after it.
+ * a transcript that ends on the pending `Text(USER)` lifts that turn into `input`, prefixed by the request-scoped
+ * dynamic tail (perception, memory evidence, a skill body, runtime state, a retry instruction). When the transcript has
+ * already moved past that turn (a tool round appended after it), the whole transcript stays `ModelRequest.history` and
+ * the request carries an empty `input`: a history-only request, which `plugin-api` admits and `ContextBudgeter`
+ * validates. That keeps the tool output last on the wire instead of re-asserting the user message after it.
  *
  * **A turn has one verdict.** Only a [ModelStreamEvent.Terminal] ends the turn; a tool-call delta whose terminal never
  * arrived is not a call, and an empty turn left by one is `INCOMPLETE`/`TOOL_CALL_DELIVERY_INCOMPLETE` rather than a
@@ -343,28 +344,49 @@ class ModelClientGateway(
     /**
      * Maps a (already trimmed) frame's conversation flow onto the request's `input`/`history` shape.
      *
-     * The in-flight user turn is the frame's one `USER_INPUT` segment and becomes `input` — never history. A
-     * conversation-flow segment's `role` is metadata ([Segment.role]), never inferred from text.
+     * The in-flight user turn is the frame's one `USER_INPUT` segment and is the **last** text carried by `input` —
+     * never history. A conversation-flow segment's `role` is metadata ([Segment.role]), never inferred from text.
      *
-     * ## The summary and the memory form the head of the history — as one user message
+     * ## The prefix is system + tools + history; the request-scoped context is the input tail
      *
-     * A `SUMMARY`, every `MEMORY_EVIDENCE` and every `PERCEPTION` segment is not a conversation turn: it is lifted
-     * out of the flow and folded into the **one leading user message**, ahead of the oldest surviving transcript
-     * text. Attribution is `origin == SUMMARY` throughout — never a text prefix — and a summary body is rendered
-     * with [SummaryBoundary] here unless it already carries the boundary (the store hands over the bounded text).
+     * `history` is the transcript, verbatim: its first item is the oldest surviving transcript text, tool rounds keep
+     * their structured call/output items, and a summary is folded into that first user turn. Nothing request-scoped is
+     * ever folded in: `PERCEPTION`, `MEMORY_EVIDENCE`, `SKILL_BODY`, `RUNTIME_STATE` and `RETRY` ride the request
+     * `input` ahead of the wearer's turn, in flow order (0.3 design §5.1/§5.3, [RequestLayout.dynamicTail]). A
+     * perception tick, newly retrieved memory, a `load_skill` pull or a retry therefore rewrites only the tail, never
+     * the system slot or the history, so the provider's prefix cache stays warm; the one accepted prefix rewrite is a
+     * compression point replacing the summary (§6.5).
      *
-     * This is the owner-approved shape (2026-10-16). The previous order (transcript → memory → `USER_INPUT`) made
-     * the history end on a lone `Text(USER, memory)` group immediately before the request `input`, a shape
-     * `ContextBudgeter` rejects **by design** (whole-group eviction depends on it), so every later turn would fail
-     * `ConfigurationRejected` until an app restart — the 2026-10-14 incident.
+     * ## The summary is the one head context
+     *
+     * A `SUMMARY` is not a conversation turn: it is lifted out of the flow and folded into the history's **first
+     * user text**, ahead of the oldest surviving transcript text. Attribution is `origin == SUMMARY` throughout —
+     * never a text prefix — and a summary body is rendered with [SummaryBoundary] here unless it already carries the
+     * boundary (the store hands over the bounded text).
      *
      * The leading context cannot be a **standalone** user message: `ContextBudgeter` requires the history to open
-     * with a user text and then alternate, so a leading user message followed by the transcript's own first user
-     * turn is two consecutive user texts and is rejected. Folding the context **into** that first user turn keeps
-     * one leading user message, keeps the alternation, and leaves every transcript role untouched. When the flow
-     * carries no transcript user turn to ride (an empty store — the first turn of a session that already has
-     * memory), the context is folded into the request `input` instead, because a history holding only the context
-     * would be a lone user group and unsendable.
+     * with a user text and then alternate, so a leading user message followed by the transcript's own first user turn
+     * is two consecutive user texts and is rejected. Folding the summary **into** that first user turn keeps one
+     * leading user message, keeps the alternation, and leaves every transcript role untouched. When the flow carries
+     * no transcript user turn to ride (an empty store — the first turn of a session that already has a summary), the
+     * summary is folded into the request `input` instead, because a history holding only the summary would be a lone
+     * user group and unsendable.
+     *
+     * `RUNTIME_STATE` (Task 12, R59) and `RETRY` were the first tail riders: as history turns they would open a
+     * **new** group ending on a bare user text, which `ContextBudgeter` rejects by design (`groups.last().size == 1`)
+     * — the loop's designed retry would be refused before it was ever sent. They now share the dynamic tail with
+     * memory, perception and a pulled skill body, in flow order: the surviving transcript's last group stays closed,
+     * and the request-scoped context is the first thing the model reads in the message it is answering.
+     *
+     * Folding a context segment into the head/input message removes that segment's own +32 per-message overhead, so
+     * the merged message prices at or below the trimmer's per-segment total for the pieces it merges (the `\n\n`
+     * separators the join introduces are at most one token unit each). That is only the price-lowering direction: a
+     * `TOOL_ROUND` renders as one wire item per call/output entry, and `ContextBudgeter` charges each item its own +32
+     * while the trimmer charged one +32 for the whole segment, so with several entries the rendered request can price
+     * more than the 32-unit window margin above the trimmer's total. Nothing here claims the rendered request is priced
+     * identically to the per-segment total, and the margin is not the guarantee that the request fits: the real gate
+     * is the send-time `ContextBudgeter.prepare`, whose `ContextWindowExceeded` is answered by the gateway's bounded
+     * AGGRESSIVE/HARD recovery.
      *
      * Returns `null` — the caller answers `NO_USER_TURN` — when the mapping could not produce a request
      * `ContextBudgeter` would send: no `USER_INPUT` segment at all, a non-empty history whose first text is not
@@ -377,60 +399,36 @@ class ModelClientGateway(
      * carries the wearer's question (Task 26). `TurnTrimmer` cut ① removes whole turns from the oldest end and the
      * current turn is a turn too: under a tight window it can evict the current `USER` transcript and leave the cue as
      * the model's **only** input. When no `Text(USER)` survives in the built history and [fallbackUtterance] is
-     * non-blank, the request input is rebuilt from that utterance instead of the cue. The request-scoped metadata that
-     * normally rides ahead of the input (`RUNTIME_STATE`/`RETRY`, or the folded context when the history is empty) is
-     * kept, so the first turn — whose input already is the utterance — is rendered identically as before. When a
-     * `USER` text does survive, the input is left untouched: restoring it there would reintroduce the duplicate Task 26
-     * removed. A blank fallback changes nothing; the gateway never invents a question.
-     *
-     * ## A `RETRY` is folded into the request `input`, never a history turn
-     *
-     * A retry instruction is the loop talking to the model, not the wearer speaking. As a history turn it would open
-     * a **new** group ending on a bare user text, which `ContextBudgeter` rejects by design (`groups.last().size == 1`)
-     * — the loop's designed retry would be refused before it was ever sent. It therefore rides **ahead of the request
-     * `input`**, in flow order, exactly as a summary and the memory ride ahead of the history's first user turn: the
-     * surviving transcript's last group stays closed, and the loop's nudge is the first thing the model reads in the
-     * message it is answering. The frame's one `USER_INPUT` is still the request `input` — it is not replaced.
-     *
-     * A `RUNTIME_STATE` segment (Task 12, R59) rides the same way: it is request metadata, not a conversation turn, so
-     * it precedes the retry text and the input inside the one message. Putting it in history would create the same lone
-     * user group a retry would; putting it after the input would make the wearer's turn stop being last.
-     *
-     * Folding a context segment into the head/input message removes that segment's own +32 per-message overhead, so
-     * the merged message prices at or below the trimmer's per-segment total for the pieces it merges (the `\n\n`
-     * separators the join introduces are at most one token unit each). That is only the price-lowering direction: a
-     * `TOOL_ROUND` renders as one wire item per call/output entry, and `ContextBudgeter` charges each item its own +32
-     * while the trimmer charged one +32 for the whole segment, so with several entries the rendered request can price
-     * more than the 32-unit window margin above the trimmer's total. Nothing here claims the folded request is priced
-     * identically to the per-segment total, and the margin is not the guarantee that the request fits: the real gate
-     * is the send-time `ContextBudgeter.prepare`, whose `ContextWindowExceeded` is answered by the gateway's bounded
-     * AGGRESSIVE/HARD recovery.
+     * non-blank, the request input is rebuilt from that utterance instead of the cue. The request-scoped dynamic tail
+     * that normally rides ahead of the input is kept, so the first turn — whose input already is the utterance — is
+     * rendered identically as before. When a `USER` text does survive, the input is left untouched: restoring it there
+     * would reintroduce the duplicate Task 26 removed. A blank fallback changes nothing; the gateway never invents a
+     * question.
      */
     private fun frameToTranscript(frame: RequestFrame, fallbackUtterance: String?): Transcript? {
         val flow = frame.conversationFlow
         val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
         if (inputIndex < 0) return null
         val inputText = flow[inputIndex].text
-        // Loop-internal continuations are not conversation turns; see the KDoc above. A runtime state (Task 12) rides
-        // ahead of them: it is where the device is, then what the model must do next, then the wearer's turn.
-        val runtimeText = flow.take(inputIndex)
-            .filter { it.origin == SegmentOrigin.RUNTIME_STATE }
-            .joinToString("\n\n") { it.text }
-        val retryText = flow.take(inputIndex)
-            .filter { it.origin == SegmentOrigin.RETRY }
-            .joinToString("\n\n") { it.text }
-        val leadingInput = listOf(runtimeText, retryText).filter { it.isNotEmpty() }
-        val requestInput =
-            if (leadingInput.isEmpty()) inputText else "${leadingInput.joinToString("\n\n")}\n\n$inputText"
-        val leading = mutableListOf<String>()
+        // The request-scoped context is the request tail (0.3 design §5.1/§5.3): `dynamicTail` selects exactly
+        // PERCEPTION/MEMORY_EVIDENCE/SKILL_BODY/RUNTIME_STATE/RETRY before the input and keeps their frame order.
+        val dynamicTexts = RequestLayout.dynamicTail(flow)
+            .map { it.text }
+            .filter { it.isNotBlank() }
+        val dynamicText = dynamicTexts.joinToString("\n\n")
+        val requestInput = if (dynamicText.isEmpty()) inputText else "$dynamicText\n\n$inputText"
+        val summaries = mutableListOf<String>()
         val history = mutableListOf<ModelHistoryItem>()
         for (segment in flow.take(inputIndex)) {
             when (segment.origin) {
-                SegmentOrigin.SUMMARY -> leading += boundedSummary(segment.text)
-                // Task 10 moves SKILL_BODY to the request-input dynamic tail; until then it rides the head path like memory.
-                SegmentOrigin.MEMORY_EVIDENCE, SegmentOrigin.PERCEPTION, SegmentOrigin.SKILL_BODY ->
-                    leading += segment.text
-                SegmentOrigin.RETRY, SegmentOrigin.RUNTIME_STATE -> Unit
+                SegmentOrigin.SUMMARY -> summaries += boundedSummary(segment.text)
+                // Request-scoped context: it is already in `dynamicTexts` above and must never enter the cacheable
+                // history — not even as part of the head user message.
+                SegmentOrigin.MEMORY_EVIDENCE,
+                SegmentOrigin.PERCEPTION,
+                SegmentOrigin.SKILL_BODY,
+                SegmentOrigin.RETRY,
+                SegmentOrigin.RUNTIME_STATE -> Unit
                 SegmentOrigin.TOOL_ROUND -> {
                     // A tool round is not conversation-flow text: the endpoint is stateless, so the model's own call
                     // must be echoed back as a call item beside its result or the exchange does not round-trip (and two
@@ -446,22 +444,28 @@ class ModelClientGateway(
                 else -> history += ModelHistoryItem.Text(roleOf(segment), segment.text)
             }
         }
+        val summaryText = summaries.joinToString("\n\n")
+        // A summary with no transcript user turn to ride goes into the input; `restoreCurrentUtterance` must then
+        // keep that summary prefix too.
+        var summaryInInput = false
         val transcript = when {
-            leading.isEmpty() ->
+            summaries.isEmpty() ->
                 if (history.isEmpty() || opensWithUser(history)) {
                     Transcript(listOf(InputPart.Text(requestInput)), history)
                 } else {
                     null
                 }
             else -> {
-                val context = leading.joinToString("\n\n")
                 val head = history.firstOrNull()
                 when {
                     head is ModelHistoryItem.Text && head.role == MessageRole.USER -> {
-                        history[0] = ModelHistoryItem.Text(MessageRole.USER, "$context\n\n${head.text}")
+                        history[0] = ModelHistoryItem.Text(MessageRole.USER, "$summaryText\n\n${head.text}")
                         Transcript(listOf(InputPart.Text(requestInput)), history)
                     }
-                    history.isEmpty() -> Transcript(listOf(InputPart.Text("$context\n\n$requestInput")), history)
+                    history.isEmpty() -> {
+                        summaryInInput = true
+                        Transcript(listOf(InputPart.Text("$summaryText\n\n$requestInput")), history)
+                    }
                     else -> null
                 }
             }
@@ -471,17 +475,22 @@ class ModelClientGateway(
         // design** (`groups.last().size == 1` — whole-group eviction depends on it). Handing it to the transport would
         // make every later turn fail with `ConfigurationRejected` until a restart (the 2026-10-14 incident).
         if (history.isNotEmpty() && !lastGroupIsClosed(history)) return null
-        return restoreCurrentUtterance(transcript, leading + leadingInput, fallbackUtterance)
+        val prefix = buildList {
+            if (summaryInInput) add(summaryText)
+            addAll(dynamicTexts)
+        }
+        return restoreCurrentUtterance(transcript, prefix, fallbackUtterance)
     }
 
     /**
      * R143's safety net: when the trimmed history carries no `USER` text, the current input is rebuilt on
      * [fallbackUtterance] (the wearer's question) rather than on the frame's fixed cue.
      *
-     * Only the frame's own `USER_INPUT` is interchangeable here. The leading texts — the folded summary/memory context,
-     * runtime state, a retry instruction — are not the wearer's conversation turn and stay ahead of it, exactly as
-     * [frameToTranscript] had arranged them. That is also why the opening turn is unchanged: its input already is the
-     * utterance, so the rebuilt string is identical.
+     * Only the frame's own `USER_INPUT` is interchangeable here. The request-scoped tail — perception, memory
+     * evidence, a skill body, runtime state, a retry instruction, and a summary that had no transcript user head to
+     * ride — is not the wearer's conversation turn and stays ahead of it ([prefix]), exactly as [frameToTranscript]
+     * had arranged it. That is also why the opening turn is unchanged: its input already is the utterance, so the
+     * rebuilt string is identical.
      *
      * A history that still carries a `USER` text keeps its input: the question is already there once, and replacing the
      * input would be the duplicate Task 26 removed. A null or blank fallback never invents content.

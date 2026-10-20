@@ -8,6 +8,7 @@ import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.ToolSpec
@@ -27,6 +28,7 @@ import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 /**
@@ -88,6 +90,21 @@ class ModelClientGatewayTest {
      */
     private fun terminalClient(requestId: String = "turn-7") =
         scripted(ModelStreamEvent.Terminal(requestId, ModelEnd.COMPLETED, null, null))
+
+    /** A frame whose system slot is one instruction segment; the dynamic-tail tests only care about the flow. */
+    private fun frame(vararg flow: Segment) =
+        RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow.toList(), emptyList())
+
+    /** Runs one real gateway turn over [frame] and answers the request it actually sent. */
+    private fun captureRequest(frame: RequestFrame, limitTokens: Int = 1_000_000): ModelRequest {
+        val client = terminalClient()
+        gateway(client).turn(turn(frame = frame, limitTokens = limitTokens))
+        return client.requests.single()
+    }
+
+    /** The text the adapter will render in the request tail (audio parts excluded: these frames carry none). */
+    private fun inputText(request: ModelRequest): String =
+        request.input.filterIsInstance<InputPart.Text>().joinToString("\n") { it.text }
 
     // ------------------------------------------------------------ 1. profile lookup
 
@@ -635,6 +652,162 @@ class ModelClientGatewayTest {
         assertEquals(1, input.split(SummaryBoundary.CLOSE).size - 1, "no second boundary: $input")
     }
 
+    // ------------------------------------------------------------ 7c. the dynamic tail (0.3 Task 10)
+
+    @Test fun `memory and perception do not rewrite the first history message`() {
+        // 0.3 design §5.1/§5.3: memory evidence and perception are request-scoped tail context. They must not be folded
+        // into `history[0]` (that would rewrite the cacheable prefix on every perception tick) and must instead ride
+        // the request input ahead of the wearer's utterance.
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "memory: likes tea"),
+                Segment(SegmentOrigin.PERCEPTION, false, "foreground=com.android.settings"),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        assertEquals("old question", (request.history.first() as ModelHistoryItem.Text).text)
+        assertTrue(
+            request.history.none { it is ModelHistoryItem.Text && "memory: likes tea" in it.text },
+            "memory must never enter the history: ${request.history}",
+        )
+        assertTrue(
+            request.history.none { it is ModelHistoryItem.Text && "foreground=" in it.text },
+            "perception must never enter the history: ${request.history}",
+        )
+        val input = inputText(request)
+        assertTrue("memory: likes tea" in input && "foreground=com.android.settings" in input && "now" in input, input)
+    }
+
+    @Test fun `skill body is not in the system slot or history`() {
+        // Task 9's SKILL_BODY is dynamic, request-scoped content: a `load_skill` pull changes only the request tail, so
+        // the system slot and every history item remain byte-identical. The transcript head is deliberate — without
+        // it the old head-folding path would already place the body in the input (the empty-history branch), so the
+        // test would pin nothing.
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.SKILL_BODY, true, "skill body"),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        assertFalse("skill body" in request.instructions, request.instructions)
+        assertTrue(request.history.isEmpty() || request.history.none { it is ModelHistoryItem.Text && "skill body" in it.text })
+        assertTrue(request.input.filterIsInstance<InputPart.Text>().any { "skill body" in it.text })
+    }
+
+    @Test fun `summary remains the only head context`() {
+        // The summary is the one accepted prefix rewrite (§5.1): it stays folded into the head user turn while the
+        // dynamic origins move to the tail.
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.SUMMARY, false, "summary"),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        assertTrue((request.history.first() as ModelHistoryItem.Text).text.contains("summary"))
+    }
+
+    @Test fun `the dynamic tail reaches the request input in flow order before the utterance`() {
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "memory text"),
+                Segment(SegmentOrigin.PERCEPTION, false, "perception text"),
+                Segment(SegmentOrigin.SKILL_BODY, true, "skill body text"),
+                Segment(SegmentOrigin.RUNTIME_STATE, false, "runtime text"),
+                Segment(SegmentOrigin.RETRY, true, "retry text"),
+                Segment(SegmentOrigin.USER_INPUT, true, "the utterance"),
+            ),
+        )
+
+        val input = request.input.filterIsInstance<InputPart.Text>().single().text
+        val positions = listOf(
+            "memory text",
+            "perception text",
+            "skill body text",
+            "runtime text",
+            "retry text",
+            "the utterance",
+        ).map { marker -> input.indexOf(marker) }
+        assertTrue(positions.all { it >= 0 }, "every dynamic block and the utterance must be in the input: $input")
+        assertEquals(positions.sorted(), positions, "the dynamic tail must keep the frame's flow order: $input")
+        assertTrue(input.endsWith("the utterance"), "the wearer's turn stays last: $input")
+        assertEquals("old question", (request.history.first() as ModelHistoryItem.Text).text)
+    }
+
+    @Test fun `summary is the only dynamic text folded into the head`() {
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.SUMMARY, false, "the summary"),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "memory text"),
+                Segment(SegmentOrigin.PERCEPTION, false, "perception text"),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        val head = request.history.first() as ModelHistoryItem.Text
+        assertTrue(head.text.contains("the summary"), head.text)
+        assertTrue(head.text.endsWith("old question"), "the summary rides the oldest surviving user turn: ${head.text}")
+        assertFalse("memory text" in head.text, "memory is tail context, not head context: ${head.text}")
+        assertFalse("perception text" in head.text, "perception is tail context, not head context: ${head.text}")
+        val input = inputText(request)
+        assertTrue("memory text" in input && "perception text" in input, input)
+    }
+
+    @Test fun `a summary with no transcript user head goes into the request input`() {
+        // The empty-history behaviour is preserved: a history holding only the summary would be a lone user group the
+        // send-time budgeter rejects, so the summary rides the input instead.
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.SUMMARY, false, "orphan summary"),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        assertTrue(request.history.isEmpty(), "a summary alone cannot be history: ${request.history}")
+        val input = request.input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(input.contains("orphan summary"), input)
+        assertTrue(input.endsWith("now"), "the wearer's turn stays last: $input")
+    }
+
+    @Test fun `the cacheable prefix excludes the dynamic tail while the input carries it`() {
+        fun requestFor(memory: String, perception: String, skillBody: String): ModelRequest = captureRequest(
+            frame(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.MEMORY_EVIDENCE, false, memory),
+                Segment(SegmentOrigin.PERCEPTION, false, perception),
+                Segment(SegmentOrigin.SKILL_BODY, true, skillBody),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        val first = requestFor(memory = "memory A", perception = "perception A", skillBody = "skill A")
+        val second = requestFor(memory = "memory B", perception = "perception B", skillBody = "skill B")
+
+        assertEquals(
+            PrefixHash.of(first.instructions, first.tools, first.history),
+            PrefixHash.of(second.instructions, second.tools, second.history),
+            "a change in the dynamic tail must not change the cacheable prefix",
+        )
+        assertNotEquals(
+            inputText(first),
+            inputText(second),
+            "the changed dynamic tail must still reach the request input",
+        )
+    }
+
     @Test fun `a frame's tool round reaches the wire as a tool call and its output`() {
         // Phase 5: `AgentLoop.frameFor` rebuilds every request of a run from one renderer, so a tool-round continuation
         // arrives as `TOOL_ROUND` segments. The wire shape for those is not text: the endpoint is stateless and the
@@ -687,11 +860,12 @@ class ModelClientGatewayTest {
         assertEquals(listOf("把音量调小一点"), client.requests.single().input.filterIsInstance<InputPart.Text>().map { it.text })
     }
 
-    @Test fun `the compacted leading context survives while cut one can still cut an older turn`() {
+    @Test fun `the compacted memory survives in the tail while cut one can still cut an older turn`() {
         // I-3: this test previously ordered the frame `[memory, oldTurn, input]`, which production never assembles
         // (`TurnRunner`: store snapshot → perception → memory → `USER_INPUT`). In the real order the memory sits
         // **after** the last turn group, i.e. inside the ① slice of the group that precedes it — so the guard only
-        // passed because the order was inverted. Rewritten against the real order and the merged shape.
+        // passed because the order was inverted. Rewritten against the real order; 0.3 Task 10 additionally moved the
+        // surviving memory out of the head user message and into the request input tail.
         //
         // Limit arithmetic (`TurnTrimmer.total()`, `measure = TokenMeter.estimate + 32`, plus the fixed 32): the limit
         // below is exactly the frame **without** the older turn — 32 + 33(sys) + 132(kept user) + 132(kept assistant)
@@ -721,14 +895,16 @@ class ModelClientGatewayTest {
         assertTrue(counts.droppedOrigins.isEmpty(), "② never had to touch the memory")
         val sent = client.requests.single()
         val head = sent.history.first() as ModelHistoryItem.Text
-        assertEquals(MessageRole.USER, head.role, "the leading context is one user message")
-        assertTrue(head.text.contains(memory.text), "the compacted leading context is still on the wire")
-        assertTrue(head.text.contains(keptUser.text), "and it rides the head user turn")
+        assertEquals(MessageRole.USER, head.role, "the history opens on the surviving user turn")
+        assertEquals(keptUser.text, head.text, "the head is the transcript's own text: no dynamic context is folded in")
+        assertEquals(ModelHistoryItem.Text(MessageRole.ASSISTANT, keptAssistant.text), sent.history[1])
+        val sentInput = sent.input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(sentInput.contains(memory.text), "the compacted memory is still on the wire, in the request tail")
+        assertTrue(sentInput.endsWith("现在几点"), "the wearer's turn stays last: $sentInput")
         assertFalse(
             sent.history.any { it is ModelHistoryItem.Text && it.text.contains(oldUser.text) },
             "the older turn is gone",
         )
-        assertEquals(listOf("现在几点"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
     }
 
     @Test fun `a memory segment after the last turn leaves inside that turn's cut one slice`() {

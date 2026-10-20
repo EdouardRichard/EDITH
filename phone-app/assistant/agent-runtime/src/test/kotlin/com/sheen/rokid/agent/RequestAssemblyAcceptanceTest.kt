@@ -99,6 +99,7 @@ class RequestAssemblyAcceptanceTest {
             SegmentOrigin.TOOL_ROUND,
             SegmentOrigin.RETRY,
             SegmentOrigin.RUNTIME_STATE,
+            SegmentOrigin.SKILL_BODY,
         )
         for (origin in nonSystemOrigins) {
             assertFailsWith<IllegalArgumentException>(

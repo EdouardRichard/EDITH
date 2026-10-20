@@ -312,9 +312,10 @@ class GatewayWindowAcceptanceTest {
         }
     }
 
-    @Test fun `the merged leading context is accepted where the trailing memory order is rejected`() {
-        // The owner-approved design change (2026-10-16), proven against the real budgeter: the old order — transcript
-        // then a `MEMORY_EVIDENCE` user turn then the input — ends the history on a lone user group, which
+    @Test fun `a tail placed memory is accepted where the trailing memory history order is rejected`() {
+        // 0.3 design §5.1/§5.3 moves `MEMORY_EVIDENCE` out of the history head and into the dynamic tail. The shape is
+        // still accepted by the real budgeter; the old order — transcript then a `MEMORY_EVIDENCE` user turn then the
+        // input — is still the counterexample, because it ends the history on a lone user group which
         // `ContextBudgeter` rejects **by design** (whole-group eviction depends on it). Every later turn would fail
         // `ConfigurationRejected` until an app restart (the 2026-10-14 incident).
         //
@@ -339,15 +340,17 @@ class GatewayWindowAcceptanceTest {
         try {
             budgeter.prepare(profile, sent)
         } catch (rejected: ContractError) {
-            fail("the merged leading context must be a sendable shape: ${rejected.message}")
+            fail("the tail placed memory must be a sendable shape: ${rejected.message}")
         }
-        // …and it really is the merged order: memory folded into the head user message, not a second user turn.
+        // …and it really is the new layout: the history head is the transcript's own user turn, the memory rides the
+        // request input ahead of the wearer's turn.
         val head = sent.history.first() as ModelHistoryItem.Text
         assertEquals(MessageRole.USER, head.role)
-        assertTrue(head.text.contains(memory), head.text)
-        assertTrue(head.text.endsWith("第一轮问"), head.text)
+        assertEquals("第一轮问", head.text, "the head must not be rewritten by request-scoped memory")
         assertEquals(ModelHistoryItem.Text(MessageRole.ASSISTANT, "第一轮答"), sent.history[1])
-        assertEquals(listOf("现在呢"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+        val input = sent.input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(input.startsWith(memory), "the memory is the input's dynamic prefix: $input")
+        assertTrue(input.endsWith("现在呢"), "the wearer's turn stays last: $input")
 
         // Counterexample: the order the plan used to specify. Built by hand, because that is exactly what the old
         // mapping produced — history ends on `Text(USER, memory)`, one user group with no reply.
@@ -473,14 +476,17 @@ class GatewayWindowAcceptanceTest {
         } catch (rejected: ContractError) {
             fail("the production shaped store backed frame must be sendable: ${rejected.message}")
         }
-        // …and it is the production shape, not merely accepted: summary + memory are folded into the one leading user
-        // message, ahead of the oldest surviving turn; the current utterance is the request input; the tool round came
-        // back structured (a plain-text round would hand the endpoint an assistant message where it expects the call
-        // it produced).
+        // …and it is the production shape, not merely accepted: the summary is folded into the one leading user
+        // message, ahead of the oldest surviving turn; the memory rides the request input ahead of the current
+        // utterance; the tool round came back structured (a plain-text round would hand the endpoint an assistant
+        // message where it expects the call it produced).
         val head = sent.history.first() as ModelHistoryItem.Text
         assertEquals(MessageRole.USER, head.role)
         assertTrue(head.text.contains(SummaryBoundary.render(summaryBody)), head.text)
-        assertTrue(head.text.contains("<reference_context>"), head.text)
+        assertFalse(
+            head.text.contains("<reference_context>"),
+            "memory is request-scoped tail context, not head context: ${head.text}",
+        )
         assertTrue(head.text.endsWith("旧问题"), head.text)
         assertEquals(
             listOf(
@@ -495,9 +501,11 @@ class GatewayWindowAcceptanceTest {
             ),
             sent.history.drop(1),
         )
-        assertEquals(listOf("现在呢"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+        val input = sent.input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(input.startsWith(memory.text), "the memory is the input's dynamic prefix: $input")
+        assertTrue(input.endsWith("现在呢"), "the wearer's turn stays last: $input")
         // The tool round survives `frameToTranscript` as **one** leading user group: the property whole-group eviction
-        // depends on, and the reason the memory cannot be a standalone user message.
+        // depends on, and the reason no request-scoped block can be emitted as its own user message.
         assertEquals(1, sent.history.count { it is ModelHistoryItem.Text && it.role == MessageRole.USER })
     }
 
