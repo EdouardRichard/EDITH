@@ -255,7 +255,8 @@ class OpenToolTest {
             listOf(AppEntry("com.google.android.youtube", "youtube", "android.intent.action.MAIN")),
         )
 
-        val result = OpenTool(pipeline.shell, catalog).execute("""{"target":"youtube"}""")
+        val result = launchedOpen(pipeline.shell, catalog, "com.google.android.youtube")
+            .execute("""{"target":"youtube"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals(
@@ -307,7 +308,8 @@ class OpenToolTest {
             }
         }
 
-        val result = OpenTool(shell, FakeCatalog()).execute("""{"target":"com.android.fileexplorer"}""")
+        val result = launchedOpen(shell, FakeCatalog(), "com.android.fileexplorer")
+            .execute("""{"target":"com.android.fileexplorer"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals(
@@ -376,7 +378,8 @@ class OpenToolTest {
     @Test
     fun `a package target resolves the launcher component then starts it`() {
         val pipeline = ShellPipeline()
-        val result = OpenTool(pipeline.shell, knownMusic()).execute("""{"target":"com.example.music"}""")
+        val result = launchedOpen(pipeline.shell, knownMusic(), "com.example.music")
+            .execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals(
@@ -386,6 +389,117 @@ class OpenToolTest {
         assertEquals(
             "am start -W -n com.example.music/.MainActivity",
             pipeline.shell.commands[1],
+        )
+    }
+
+    @Test
+    fun `a verified launch reports the foreground, activity, root package and wait`() {
+        val pipeline = ShellPipeline()
+        val waits = mutableListOf<Pair<String, Long>>()
+        val result = launchedOpen(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            target = "com.example.music",
+            activity = "com.example.music/.MainActivity",
+            waitForForeground = { pkg, timeoutMillis ->
+                waits += pkg to timeoutMillis
+                true
+            },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val data = body(result)["data"]!!.jsonObject
+        assertEquals("com.example.music", data["resolvedPackage"]!!.jsonPrimitive.content)
+        assertEquals(
+            "com.example.music",
+            data["foreground"]!!.jsonObject["package"]!!.jsonPrimitive.content,
+        )
+        assertEquals(
+            "com.example.music/.MainActivity",
+            data["foreground"]!!.jsonObject["activity"]!!.jsonPrimitive.content,
+        )
+        assertEquals("com.example.music", data["rootPackage"]!!.jsonPrimitive.content)
+        assertTrue("foreground and the a11y root both name the target", data["verified"]!!.jsonPrimitive.boolean)
+        assertEquals(
+            "the existing target key stays beside the verification fields",
+            "com.example.music",
+            data["target"]!!.jsonPrimitive.content,
+        )
+        assertEquals(
+            "the post-launch wait polls for the resolved package for the full 2 s budget",
+            listOf("com.example.music" to 2_000L),
+            waits,
+        )
+    }
+
+    @Test
+    fun `a launch whose foreground matches but a11y root does not is STATE_UNCHANGED`() {
+        val pipeline = ShellPipeline()
+        val result = launchedOpen(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            target = "com.example.music",
+            activity = "com.example.music/.MainActivity",
+            root = "com.android.launcher",
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        assertEquals("STATE_UNCHANGED", errorCode(result))
+        val body = body(result)
+        assertTrue(
+            "a launch that did not reach the target is recoverable",
+            body["error"]!!.jsonObject["recoverable"]!!.jsonPrimitive.boolean,
+        )
+        val data = body["data"]!!.jsonObject
+        assertFalse("the a11y root disagrees with the target", data["verified"]!!.jsonPrimitive.boolean)
+        assertEquals(
+            "com.example.music",
+            data["foreground"]!!.jsonObject["package"]!!.jsonPrimitive.content,
+        )
+        assertEquals("com.android.launcher", data["rootPackage"]!!.jsonPrimitive.content)
+        assertEquals("com.example.music", data["resolvedPackage"]!!.jsonPrimitive.content)
+        assertEquals(
+            "the failed launch keeps the existing target data",
+            "com.example.music",
+            data["target"]!!.jsonPrimitive.content,
+        )
+    }
+
+    @Test
+    fun `a launch that never reaches the target is STATE_UNCHANGED despite Status ok`() {
+        val pipeline = ShellPipeline()
+        val waits = mutableListOf<Pair<String, Long>>()
+        val result = OpenTool(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            foreground = { "com.android.launcher" },
+            foregroundActivity = { "com.android.launcher/.Launcher" },
+            rootPackage = { "com.android.launcher" },
+            waitForForeground = { pkg, timeoutMillis ->
+                waits += pkg to timeoutMillis
+                false
+            },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        assertEquals("STATE_UNCHANGED", errorCode(result))
+        val data = body(result)["data"]!!.jsonObject
+        assertFalse("am start's Status: ok alone is not success", data["verified"]!!.jsonPrimitive.boolean)
+        assertEquals(
+            "the observed foreground is reported, not the target",
+            "com.android.launcher",
+            data["foreground"]!!.jsonObject["package"]!!.jsonPrimitive.content,
+        )
+        assertEquals("com.android.launcher", data["rootPackage"]!!.jsonPrimitive.content)
+        assertEquals("com.example.music", data["resolvedPackage"]!!.jsonPrimitive.content)
+        assertEquals(
+            "the wait was tried against the resolved package",
+            listOf("com.example.music" to 2_000L),
+            waits,
+        )
+        assertTrue(
+            "the shell did start the activity; the verification is what failed",
+            pipeline.shell.commands.any { it.startsWith("am start -W") },
         )
     }
 
@@ -413,7 +527,8 @@ class OpenToolTest {
     @Test
     fun `no resolved component falls back to a launcher intent`() {
         val pipeline = ShellPipeline(component = { null })
-        val result = OpenTool(pipeline.shell, knownMusic()).execute("""{"target":"com.example.music"}""")
+        val result = launchedOpen(pipeline.shell, knownMusic(), "com.example.music")
+            .execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals(
@@ -449,7 +564,8 @@ class OpenToolTest {
     fun `relaunch true starts the app even when it is already in front`() {
         val pipeline = ShellPipeline()
 
-        val result = OpenTool(pipeline.shell, knownMusic(), foreground = { "com.example.music" })
+        // `relaunch=true` must start the app even though the same package is already reported in front.
+        val result = foregroundOpen(pipeline.shell, knownMusic(), "com.example.music")
             .execute("""{"target":"com.example.music","relaunch":true}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
@@ -460,7 +576,7 @@ class OpenToolTest {
     fun `an http URL is single-quote escaped before becoming a shell command`() {
         val shell = FakeShell { command -> ShellResult(command, 0, "Status: ok\n", "") }
 
-        val result = OpenTool(shell, FakeCatalog())
+        val result = foregroundOpen(shell, FakeCatalog(), "com.android.browser")
             .execute("""{"target":"https://example.com/a'b"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
@@ -468,16 +584,58 @@ class OpenToolTest {
             "am start -W -a android.intent.action.VIEW -d 'https://example.com/a'\\''b'",
             shell.commands.single(),
         )
+        val data = body(result)["data"]!!.jsonObject
+        assertTrue(data["verified"]!!.jsonPrimitive.boolean)
+        assertEquals(
+            "a URL has no known target package, so resolvedPackage is the observed foreground",
+            "com.android.browser",
+            data["resolvedPackage"]!!.jsonPrimitive.content,
+        )
+    }
+
+    @Test
+    fun `an unverified URL launch is STATE_UNCHANGED with the observed foreground`() {
+        val shell = FakeShell { command -> ShellResult(command, 0, "Status: ok\n", "") }
+        val waits = mutableListOf<Pair<String, Long>>()
+        val result = OpenTool(
+            shell = shell,
+            catalog = FakeCatalog(),
+            foreground = { "com.android.chrome" },
+            foregroundActivity = { "com.android.chrome/.Main" },
+            rootPackage = { "com.android.launcher" },
+            waitForForeground = { pkg, timeoutMillis ->
+                waits += pkg to timeoutMillis
+                true
+            },
+        ).execute("""{"target":"https://example.com"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        assertEquals("STATE_UNCHANGED", errorCode(result))
+        val data = body(result)["data"]!!.jsonObject
+        assertFalse("the a11y root is not the URL's foreground app", data["verified"]!!.jsonPrimitive.boolean)
+        assertEquals(
+            "no target package is known; the resolved package is the observed foreground",
+            "com.android.chrome",
+            data["resolvedPackage"]!!.jsonPrimitive.content,
+        )
+        assertEquals(
+            "com.android.chrome",
+            data["foreground"]!!.jsonObject["package"]!!.jsonPrimitive.content,
+        )
+        assertEquals("com.android.launcher", data["rootPackage"]!!.jsonPrimitive.content)
+        assertTrue("a URL launch must not poll for an invented target package", waits.isEmpty())
     }
 
     @Test
     fun `a settings page maps to its android settings action`() {
         val shell = FakeShell { command -> ShellResult(command, 0, "Status: ok\n", "") }
 
-        val result = OpenTool(shell, FakeCatalog()).execute("""{"target":"wifi"}""")
+        val result = foregroundOpen(shell, FakeCatalog(), "com.android.settings")
+            .execute("""{"target":"wifi"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals("am start -W -a android.settings.WIFI_SETTINGS", shell.commands.single())
+        assertTrue(body(result)["data"]!!.jsonObject["verified"]!!.jsonPrimitive.boolean)
     }
 
     @Test
@@ -493,7 +651,8 @@ class OpenToolTest {
     @Test
     fun `open results declare a state change`() {
         val pipeline = ShellPipeline()
-        val done = OpenTool(pipeline.shell, knownMusic()).execute("""{"target":"com.example.music"}""")
+        val done = launchedOpen(pipeline.shell, knownMusic(), "com.example.music")
+            .execute("""{"target":"com.example.music"}""")
         assertTrue(done.stateChanging)
 
         // The declaration describes the call class, not whether the channel was available.
@@ -521,6 +680,52 @@ class OpenToolTest {
      */
     private fun knownMusic() = FakeCatalog(
         listOf(AppEntry("com.example.music", "Music", "android.intent.action.MAIN")),
+    )
+
+    /**
+     * An `open` whose foreground only names [target] once the shell has actually run `am start`.
+     *
+     * That is the real ordering a launch tests: before the command the app is not in front (so the documented
+     * `alreadyForeground` shortcut does not swallow the launch), after it the package is what the post-launch
+     * verification observes. The wait answers immediately so a JVM test never sleeps for the production 2 s budget;
+     * tests that need a mismatch override [root] or inject their own [waitForForeground].
+     */
+    private fun launchedOpen(
+        shell: FakeShell,
+        catalog: AppCatalog,
+        target: String,
+        activity: String? = null,
+        root: String? = target,
+        waitForForeground: (String, Long) -> Boolean = { _, _ -> true },
+    ): OpenTool = OpenTool(
+        shell = shell,
+        catalog = catalog,
+        foreground = {
+            target.takeIf { shell.commands.any { command -> command.startsWith("am start -W") } }
+        },
+        foregroundActivity = { activity },
+        rootPackage = { root },
+        waitForForeground = waitForForeground,
+    )
+
+    /**
+     * An `open` with a fixed foreground, for URL/settings launches where no target package exists:
+     * the launch verifies that observed foreground against the accessibility root.
+     */
+    private fun foregroundOpen(
+        shell: PrivilegedShell,
+        catalog: AppCatalog,
+        foreground: String?,
+        activity: String? = null,
+        root: String? = foreground,
+        waitForForeground: (String, Long) -> Boolean = { _, _ -> true },
+    ): OpenTool = OpenTool(
+        shell = shell,
+        catalog = catalog,
+        foreground = { foreground },
+        foregroundActivity = { activity },
+        rootPackage = { root },
+        waitForForeground = waitForForeground,
     )
 
     private class FakeCatalog(

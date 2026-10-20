@@ -2191,6 +2191,8 @@ class HostCompositionRoot internal constructor(
                 // has no foreground to report - that is `null`, not a failed status call. Every other call above still
                 // requires the live service, so this fallback cannot make an unbound channel look usable.
                 override fun foreground() = EdithAccessibilityService.port()?.foreground() ?: Foreground(null, null)
+                // 0.3 Phase 2 Task 8: same unbound style - no live service means no root package to report.
+                override fun rootPackage() = EdithAccessibilityService.port()?.rootPackage()
             }
             val deviceKernel = DeviceKernel(
                 accessibility = accessibilityPort,
@@ -2266,6 +2268,10 @@ class HostCompositionRoot internal constructor(
                     shell = shizukuShell,
                     catalog = appCatalog,
                     foreground = { EdithAccessibilityService.port()?.foreground()?.packageName },
+                    // 0.3 Phase 2 Task 8: `am start -W`'s own `Status: ok` is not success; the tool verifies the
+                    // resolved package is both the foreground app and the accessibility root.
+                    foregroundActivity = { EdithAccessibilityService.port()?.foreground()?.activity },
+                    rootPackage = { EdithAccessibilityService.port()?.rootPackage() },
                 ),
                 // The number validation/permission check/ACTION_CALL hand-off stay in the one executor that owns them.
                 dial = DialTool(actions, callAvailable),

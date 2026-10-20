@@ -33,7 +33,11 @@ import kotlinx.serialization.json.put
  *  - a package launch resolves its launcher component first
  *    (`cmd package resolve-activity --brief -c android.intent.category.LAUNCHER <pkg>`), then
  *    `am start -W -n <component>`; no component falls back to the launcher intent;
- *  - `relaunch=false` with the target already in front does not start it again.
+ *  - `relaunch=false` with the target already in front does not start it again;
+ *  - `am start`'s `Status: ok` alone is **not** success (0.3 Phase 2 Task 8): after the shell accepts a launch, the
+ *    resolved package must be the foreground app **and** the accessibility root, or the call is a recoverable
+ *    `STATE_UNCHANGED` carrying the observed values. A URL/settings page knows no target package, so its observed
+ *    foreground app must equal the accessibility root instead.
  *
  * A URL is restricted to `http(s)` and single-quote-escaped before it enters the command, so a URL
  * containing a quote or a shell metacharacter stays one literal argument. The settings-page table is
@@ -45,6 +49,26 @@ class OpenTool(
     private val shell: PrivilegedShell?,
     catalog: AppCatalog,
     private val foreground: () -> String? = { null },
+    /** The foreground activity class, reported beside [foreground] for the model's post-launch view. */
+    private val foregroundActivity: () -> String? = { null },
+    /** The accessibility root's package - the second witness a package launch must reach. */
+    private val rootPackage: () -> String? = { null },
+    /**
+     * Waits until [foreground] names [pkg], polling every 100 ms up to the caller's budget (2 s in production).
+     *
+     * A launch is asynchronous: `am start -W` returning is not the same as the new activity owning the foreground. The
+     * default poll, and the injected tests' fake, only synchronize the observation; [launchEnvelope] still requires the
+     * poll to have reached the package **and** the observed foreground + accessibility root to agree. Tests inject this
+     * so no JVM test sleeps for two seconds.
+     */
+    private val waitForForeground: (String, Long) -> Boolean = { pkg, timeoutMillis ->
+        var remaining = timeoutMillis
+        while (foreground() != pkg && remaining > 0L) {
+            Thread.sleep(FOREGROUND_POLL_MILLIS)
+            remaining -= FOREGROUND_POLL_MILLIS
+        }
+        foreground() == pkg
+    },
 ) : ActionExecutor {
 
     private val resolver = AppLaunchResolver(catalog)
@@ -235,6 +259,7 @@ class OpenTool(
                 put("target", pkg)
                 put("component", component?.let { kotlinx.serialization.json.JsonPrimitive(it) } ?: JsonNull)
             },
+            expectedPackage = pkg,
         )
         return started
     }
@@ -272,16 +297,27 @@ class OpenTool(
 
     // ── shell helpers ────────────────────────────────────────────────────────
 
-    /** One URL/settings launch, with the shell's own `Status: ok` as the success post-condition. */
+    /** One URL/settings launch: the shell's `Status: ok` starts the verification, it does not end it. */
     private fun launch(command: String): ActionResult {
         val target = shell ?: return channelUnavailable()
         return launchEnvelope(target, command)
     }
 
+    /**
+     * Runs one launch command and verifies what is actually in front afterwards (0.3 Phase 2 Task 8).
+     *
+     * The shell's `Status: ok` is only the precondition. For a package launch ([expectedPackage] set) the tool waits for
+     * that package and then requires the **foreground** and the **accessibility root** to both name it; for a
+     * URL/settings launch no target package is known, so the observed foreground must be non-null and equal the root
+     * package. A mismatch is a recoverable `STATE_UNCHANGED` whose `data` carries the same fields a success would:
+     * `resolvedPackage`, `foreground` (`package`/`activity`), `rootPackage` and `verified`. The caller's [data] keys
+     * (`target`/`component`) stay on both outcomes.
+     */
     private fun launchEnvelope(
         target: PrivilegedShell,
         command: String,
         data: kotlinx.serialization.json.JsonObject = buildJsonObject { },
+        expectedPackage: String? = null,
     ): ActionResult {
         val result = runSafely(target, command) ?: return channelUnavailable()
         if (result.failure != null) return channelUnavailable()
@@ -291,9 +327,42 @@ class OpenTool(
         if (!result.stdout.contains(STATUS_OK)) {
             return failure(STATE_UNCHANGED, "the launch produced no success status", recoverable = true, outcome = ActionOutcome.Failed)
         }
+        val reachedForeground = expectedPackage == null ||
+            waitForForeground(expectedPackage, FOREGROUND_TIMEOUT_MILLIS)
+        val observedForeground = foreground()
+        val observedActivity = foregroundActivity()
+        val observedRoot = rootPackage()
+        val resolvedPackage = expectedPackage ?: observedForeground
+        val verified = if (expectedPackage != null) {
+            reachedForeground && observedForeground == expectedPackage && observedRoot == expectedPackage
+        } else {
+            observedForeground != null && observedForeground == observedRoot
+        }
+        val launchData = buildJsonObject {
+            data.forEach { (key, value) -> put(key, value) }
+            put("resolvedPackage", resolvedPackage)
+            put(
+                "foreground",
+                buildJsonObject {
+                    put("package", observedForeground)
+                    put("activity", observedActivity)
+                },
+            )
+            put("rootPackage", observedRoot)
+            put("verified", verified)
+        }
+        if (!verified) {
+            return failure(
+                code = STATE_UNCHANGED,
+                message = "the launch command succeeded but the request is not verified in front",
+                recoverable = true,
+                outcome = ActionOutcome.Failed,
+                data = launchData,
+            )
+        }
         return done(
             buildJsonObject {
-                data.forEach { (key, value) -> put(key, value) }
+                launchData.forEach { (key, value) -> put(key, value) }
                 put("launched", true)
             },
         )
@@ -329,6 +398,7 @@ class OpenTool(
         message: String,
         recoverable: Boolean,
         outcome: ActionOutcome = ActionOutcome.Refused,
+        data: kotlinx.serialization.json.JsonObject? = null,
     ): ActionResult = ActionResult(
         outcome,
         toolEnvelope(
@@ -336,6 +406,7 @@ class OpenTool(
             ok = false,
             channel = CHANNEL,
             accepted = false,
+            data = data,
             error = ToolFailure(code, message, recoverable),
         ),
         stateChanging = true,
@@ -388,6 +459,12 @@ class OpenTool(
         private const val PACKAGE_LIST_COMMAND = "pm list packages"
 
         private const val STATUS_OK = "Status: ok"
+
+        /** How long a launch may take to put its package in front before the observation is treated as a failure. */
+        private const val FOREGROUND_TIMEOUT_MILLIS = 2_000L
+
+        /** The default `waitForForeground` poll interval. */
+        private const val FOREGROUND_POLL_MILLIS = 100L
         private const val APP_AMBIGUOUS = "APP_AMBIGUOUS"
         private const val APP_NOT_FOUND = "APP_NOT_FOUND"
         private const val STATE_UNCHANGED = "STATE_UNCHANGED"

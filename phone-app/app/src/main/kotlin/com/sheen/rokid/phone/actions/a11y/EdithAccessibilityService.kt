@@ -128,6 +128,15 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
     }
 
     /**
+     * The active window's root package — the second witness `open` verifies a launch against.
+     *
+     * Only the package string is read; no node content. A failed or missing root answers `null` (an
+     * honest "cannot tell"), never the last event's package.
+     */
+    override fun rootPackage(): String? =
+        runCatching { rootInActiveWindow?.packageName?.toString() }.getOrNull()
+
+    /**
      * Takes one JPEG screenshot through the platform's `takeScreenshot` (API 30+).
      *
      * The encoded bytes are returned to the caller only; the service never writes the payload to
