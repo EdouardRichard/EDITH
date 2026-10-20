@@ -120,11 +120,15 @@ class StoreSessionWiringTest {
         )
     }
 
+    /** A manager with a plan and the fixture profile's policy; the store path never writes its transcript. */
+    private fun manager(): ContextManager =
+        ContextManager(policy = smartContextPolicy(), promptPlan = smartPromptPlan("SYSTEM"))
+
     @Test
     fun `with no injected stores the plugin keeps the legacy transcript`() {
         // Regression: with no store the Phase B behaviour is unchanged — the `ContextManager` transcript is what the
         // session records into, and no frame is assembled.
-        val contexts = ContextManager()
+        val contexts = manager()
         val rig = SmartTestRig(contextForTurn = contexts)
         rig.activate(overrides = mapOf(Capability.Storage to SmartFakeStorage()))
         rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
@@ -216,26 +220,48 @@ class StoreSessionWiringTest {
 
         assertEquals(2, rig.model.requests.size, "the tool round must make a second model request")
         val first = rig.model.requests[0]
-        assertEquals(listOf("香菜"), first.input.filterIsInstance<InputPart.Text>().map { it.text })
+        // 0.3 Task 10 (spec §5.1): memory rides the request **input** ahead of the wearer's turn; it is no longer
+        // folded into the first history message. The input is one joined text — the dynamic tail, then the utterance.
+        val firstInput = first.input.filterIsInstance<InputPart.Text>().map { it.text }
+        assertEquals(1, firstInput.size, "the request carries one input message: ${first.input}")
+        assertTrue(
+            firstInput.single().contains("reference_context") && firstInput.single().contains("我不吃香菜"),
+            "the retrieved memory must ride the input tail: ${firstInput.single()}",
+        )
+        assertTrue(
+            firstInput.single().endsWith("香菜"),
+            "the wearer's utterance must stay last in the input: ${firstInput.single()}",
+        )
         assertTrue(
             first.history.none { it is ModelHistoryItem.ToolOutput },
             "the opening request is issued before any tool has run: ${first.history}",
         )
-        val firstHead = first.history.firstOrNull()
-        assertTrue(
-            firstHead is ModelHistoryItem.Text && firstHead.role == MessageRole.USER &&
-                firstHead.text.contains("reference_context") && firstHead.text.contains("旧问题"),
-            "the opening request must carry the session and the memory too: ${first.history}",
+        // The cacheable history is the transcript verbatim: it opens on the oldest surviving user turn, and the
+        // request-scoped memory must never be folded into it (that is what would rewrite the prefix every turn).
+        val firstHead = first.history.first() as ModelHistoryItem.Text
+        assertEquals("旧问题", firstHead.text, "history[0] must be the oldest transcript user turn: ${first.history}")
+        assertFalse(
+            firstHead.text.contains("reference_context"),
+            "memory must not be folded into history[0] any more: ${first.history}",
+        )
+        assertEquals(
+            listOf("旧问题", "旧回答"),
+            first.history.filterIsInstance<ModelHistoryItem.Text>().map { it.text },
+            "the opening request must carry the session transcript",
         )
 
         val second = rig.model.requests[1]
         // 0.25 Task 26 (R140): the transcript already carries this turn's utterance, so the frame's one `USER_INPUT`
-        // is the fixed loop-internal cue — not the question again. The gateway maps everything before it into the
-        // history, so the continuation still carries the utterance exactly once, and the tool output stays last.
-        assertEquals(
-            listOf(CONTINUE_AFTER_TOOL),
-            second.input.filterIsInstance<InputPart.Text>().map { it.text },
-            "the continuation must not repeat this turn's utterance as the request input: ${second.input}",
+        // is the fixed loop-internal cue — not the question again. The memory tail rides ahead of that cue.
+        val secondInput = second.input.filterIsInstance<InputPart.Text>().map { it.text }
+        assertEquals(1, secondInput.size, "the continuation carries one input message: ${second.input}")
+        assertTrue(
+            secondInput.single().contains("reference_context") && secondInput.single().contains("我不吃香菜"),
+            "request 2 must still carry the retrieved memory on the input tail: ${secondInput.single()}",
+        )
+        assertTrue(
+            secondInput.single().endsWith(CONTINUE_AFTER_TOOL),
+            "the continuation's input must be the fixed cue after the dynamic tail: ${secondInput.single()}",
         )
         assertEquals(
             1,
@@ -248,14 +274,12 @@ class StoreSessionWiringTest {
             second.history.lastOrNull() is ModelHistoryItem.ToolOutput,
             "the tool output must stay last in the transcript: ${second.history}",
         )
-        val head = second.history.firstOrNull()
-        assertTrue(
-            head is ModelHistoryItem.Text && head.role == MessageRole.USER && head.text.contains("reference_context"),
-            "request 2 must still carry the retrieved memory: ${second.history}",
+        val head = second.history.first() as ModelHistoryItem.Text
+        assertEquals("旧问题", head.text, "request 2's history must open on the transcript, not on memory: ${second.history}")
+        assertFalse(
+            head.text.contains("reference_context"),
+            "request 2 must not fold the memory into history[0] either: ${second.history}",
         )
-        val headText = (head as ModelHistoryItem.Text).text
-        assertTrue(headText.contains("旧问题"), "request 2 must still carry the earlier session turn: $headText")
-        assertTrue(headText.contains("我不吃香菜"), "request 2 must carry the memory content: $headText")
         assertTrue(
             second.history.filterIsInstance<ModelHistoryItem.Text>().map { it.text }.any { it == "旧回答" },
             "request 2 must still carry the earlier assistant turn: ${second.history}",
@@ -456,14 +480,14 @@ class StoreSessionWiringTest {
      * already carries this turn's two halves when `compressStore` is entered, then ③ (memory write), ④ (transcript
      * record) and ⑤ (compression) ran in that order.
      */
-    private class OrderWatchingStoreCompressor(private val memory: MemoryLog) : ContextCompressor() {
+    private class OrderWatchingStoreCompressor(private val memory: MemoryLog) :
+        ContextCompressor(historyBudgetTokens = 3, summaryMaxTokens = 64) {
         val memoryAtCompression = mutableListOf<List<String>>()
         val storeAtCompression = mutableListOf<List<String>>()
         var calls = 0
 
         override fun compressStore(
             store: ConversationStore,
-            shareTokens: Int,
             compressionOwed: Boolean,
         ): CompressionReport {
             calls++
@@ -496,12 +520,11 @@ class StoreSessionWiringTest {
     // ------------------------------------------------------------ the ③ gate, both directions
 
     /** Records the caller's half of the ③ gate — what the plugin decided, not what compression then did. */
-    private class GateWatchingCompressor : ContextCompressor() {
+    private class GateWatchingCompressor : ContextCompressor(historyBudgetTokens = 3, summaryMaxTokens = 64) {
         val owedAtEntry = mutableListOf<Boolean>()
 
         override fun compressStore(
             store: ConversationStore,
-            shareTokens: Int,
             compressionOwed: Boolean,
         ): CompressionReport {
             owedAtEntry += compressionOwed

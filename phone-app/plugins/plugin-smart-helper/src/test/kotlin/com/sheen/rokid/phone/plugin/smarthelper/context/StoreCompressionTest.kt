@@ -70,9 +70,16 @@ class StoreCompressionTest {
 
     private fun compressor(
         memory: MemoryModule? = null,
-        summarize: ((String) -> String?)? = null,
+        summarize: ((String, Int) -> String?)? = null,
         tasks: TaskScope? = null,
-    ) = ContextCompressor(memory = memory, summarizer = summarize, scope = tasks)
+        shareTokens: Int = 3,
+    ) = ContextCompressor(
+        historyBudgetTokens = shareTokens,
+        summaryMaxTokens = SUMMARY_MAX_TOKENS,
+        memory = memory,
+        summarizer = summarize,
+        scope = tasks,
+    )
 
     /** Two finished turns plus a pending user turn: the store's shape at a turn's end. */
     private fun threeTurnStore(): ConversationStore = ConversationStore().also {
@@ -93,7 +100,8 @@ class StoreCompressionTest {
         store.appendAssistant("二")
         val asked = mutableListOf<String>()
 
-        val report = compressor(summarize = { asked += it; "不该调用" }).compressStore(store, shareTokens = 10_000, compressionOwed = true)
+        val report = compressor(summarize = { _, _ -> asked += "不该出现"; "不该调用" }, shareTokens = 10_000)
+            .compressStore(store, compressionOwed = true)
 
         assertEquals(2, store.size())
         assertEquals(0, report.truncated)
@@ -106,7 +114,7 @@ class StoreCompressionTest {
     fun `an over-share store drops whole turns and keeps the last one`() {
         val store = threeTurnStore()
 
-        val report = compressor().compressStore(store, shareTokens = 3, compressionOwed = true)
+        val report = compressor().compressStore(store, compressionOwed = true)
 
         assertTrue(report.droppedTurns > 0)
         // §4.4's first anchor: the most recent user turn must stay.
@@ -135,7 +143,7 @@ class StoreCompressionTest {
         }
         val before = store.texts()
 
-        val report = compressor(memory = memory).compressStore(store, shareTokens = 3, compressionOwed = true)
+        val report = compressor(memory = memory).compressStore(store, compressionOwed = true)
 
         assertEquals(listOf("u3", "a3", "u4"), store.texts())
         assertEquals(2, report.droppedTurns)
@@ -164,7 +172,7 @@ class StoreCompressionTest {
         val store = threeTurnStore()
         val before = store.texts()
 
-        compressor(memory = memory).compressStore(store, shareTokens = 3, compressionOwed = true)
+        compressor(memory = memory).compressStore(store, compressionOwed = true)
 
         val left = before.toMutableList()
         store.texts().forEach { left.remove(it) }
@@ -179,7 +187,7 @@ class StoreCompressionTest {
         val tasks = CapturingTasks()
         val body = "（此前对话已摘要）"
 
-        compressor(summarize = { body }, tasks = tasks).compressStore(store, shareTokens = 3, compressionOwed = true)
+        compressor(summarize = { _, _ -> body }, tasks = tasks).compressStore(store, compressionOwed = true)
         tasks.runAll()
 
         // The summary lands at the **head** (index 0) — `ConversationStore.appendSummary` inserts it there so it is
@@ -205,7 +213,8 @@ class StoreCompressionTest {
         val store = threeTurnStore()
         val tasks = CapturingTasks()
 
-        compressor(memory = memory, summarize = { "（摘要）" }, tasks = tasks).compressStore(store, shareTokens = 3, compressionOwed = true)
+        compressor(memory = memory, summarize = { _, _ -> "（摘要）" }, tasks = tasks)
+            .compressStore(store, compressionOwed = true)
         tasks.runAll()
 
         val stored = memory.entries().map { it.text }
@@ -217,7 +226,7 @@ class StoreCompressionTest {
     fun `no summarizer degrades to pure truncation with no error`() {
         val store = threeTurnStore()
 
-        val report = compressor().compressStore(store, shareTokens = 3, compressionOwed = true)
+        val report = compressor().compressStore(store, compressionOwed = true)
 
         assertEquals(false, report.summaryStarted)
         assertEquals("NO_SUMMARIZER", report.summaryReason)
@@ -230,7 +239,7 @@ class StoreCompressionTest {
         val store = threeTurnStore()
         val tasks = CapturingTasks()
 
-        compressor(summarize = { error("cloud down") }, tasks = tasks).compressStore(store, shareTokens = 3, compressionOwed = true)
+        compressor(summarize = { _, _ -> error("cloud down") }, tasks = tasks).compressStore(store, compressionOwed = true)
         val afterCompression = store.size()
         val compacted = store.history()
         tasks.runAll()
@@ -239,7 +248,7 @@ class StoreCompressionTest {
 
         val emptyTasks = CapturingTasks()
         val store2 = threeTurnStore()
-        compressor(summarize = { null }, tasks = emptyTasks).compressStore(store2, shareTokens = 3, compressionOwed = true)
+        compressor(summarize = { _, _ -> null }, tasks = emptyTasks).compressStore(store2, compressionOwed = true)
         val afterSecondCompression = store2.size()
         emptyTasks.runAll()
         assertEquals(afterSecondCompression, store2.size(), "an empty answer must add no placeholder")
@@ -252,8 +261,8 @@ class StoreCompressionTest {
         val tasks = CapturingTasks()
         val asked = mutableListOf<String>()
 
-        val report = compressor(summarize = { asked += it; "（摘要）" }, tasks = tasks)
-            .compressStore(store, shareTokens = 3, compressionOwed = true)
+        val report = compressor(summarize = { text, _ -> asked += text; "（摘要）" }, tasks = tasks)
+            .compressStore(store, compressionOwed = true)
 
         assertEquals(true, report.summaryStarted)
         assertEquals(emptyList(), asked, "the summary must not have run on the caller's thread")
@@ -269,7 +278,7 @@ class StoreCompressionTest {
         store.appendUser("u1")
         store.appendAssistant("a1")
 
-        compressor().compressStore(store, shareTokens = 0, compressionOwed = true)
+        compressor(shareTokens = 0).compressStore(store, compressionOwed = true)
 
         assertTrue(store.size() > 0, "a compressed store must still say something")
         // The anchored region is the last user turn and everything it opened, so this turn stays whole.
@@ -291,8 +300,8 @@ class StoreCompressionTest {
         store.appendUser("只有本轮一句")
         val asked = mutableListOf<String>()
 
-        val report = compressor(summarize = { asked += it; "不该调用" })
-            .compressStore(store, shareTokens = 1, compressionOwed = true)
+        val report = compressor(summarize = { _, _ -> "不该调用" }, shareTokens = 1)
+            .compressStore(store, compressionOwed = true)
 
         assertTrue(report.truncated == 0 && report.droppedTurns == 0)
         assertTrue(estimateTokens("只有本轮一句") > 1, "the fixture must really be over its share")
@@ -312,11 +321,16 @@ class StoreCompressionTest {
         val store = threeTurnStore()
         val asked = mutableListOf<String>()
 
-        val report = compressor(summarize = { asked += it; "不该调用" })
-            .compressStore(store, shareTokens = 3, compressionOwed = false)
+        val report = compressor(summarize = { _, _ -> "不该调用" })
+            .compressStore(store, compressionOwed = false)
 
         assertTrue(report.droppedTurns > 0, "the fixture must really have dropped a turn")
         assertEquals(emptyList(), asked, "compressionOwed == false: no summary may be requested")
         assertEquals(false, report.summaryStarted)
+    }
+
+    private companion object {
+        /** The policy's summary cap as this fixture models it; the production value comes from `ContextPolicy`. */
+        const val SUMMARY_MAX_TOKENS = 64
     }
 }

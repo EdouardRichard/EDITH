@@ -31,6 +31,8 @@ import com.sheen.rokid.agent.BoundedAuditLog
 import com.sheen.rokid.agent.ConfirmationGate
 import com.sheen.rokid.agent.ConfirmationPort
 import com.sheen.rokid.agent.ConfirmationSource
+import com.sheen.rokid.agent.ContextPolicy
+import com.sheen.rokid.agent.ContextTuning
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.GatewayTurn
 import com.sheen.rokid.agent.MemoryRetrieval
@@ -110,7 +112,6 @@ import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.context.ModelSummarizer
 import com.sheen.rokid.phone.plugin.smarthelper.context.PromptAssembly
-import com.sheen.rokid.phone.plugin.smarthelper.context.TokenBudget
 import com.sheen.rokid.phone.plugin.smarthelper.context.estimatedLength
 import com.sheen.rokid.phone.plugin.smarthelper.library.LibraryGovernor
 import com.sheen.rokid.phone.plugin.smarthelper.memory.LegacyRawMemoryEvidenceRenderer
@@ -134,6 +135,9 @@ import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoadReason
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillManager
 import com.sheen.rokid.phone.plugin.smarthelper.skill.StorageAccessSkillDirectory
 import com.sheen.rokid.phone.plugin.smarthelper.turn.ConversationCycle
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptKind
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptSection
 import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -394,12 +398,13 @@ class SmartAssistantPlugin(
     /** The compressor, consulted **after** the turn's memory write (spec §4.9). `null` means never compress. */
     private val compressor: ContextCompressor? = null,
     /**
-     * The session's token split (spec §4.3). A seam rather than a constant because the over-budget path
-     * (`historyTokens > historyBudget`, spec §4.4) is otherwise unreachable in a test: at the spec's own 1638-token
-     * allowance it takes roughly 200 turns at the wake cooldown. The **default is the spec's split**, and a test that
-     * injects a smaller one is exercising the real production compressor against a real budget, not a fake.
+     * 0.3 design §5.2/§6.3: the ratio tuning `ContextPolicy.from` applies to the session's `ModelProfile`.
+     *
+     * Production passes the default. The seam exists because compression has to be reachable in a JVM test without
+     * shrinking the profile's frame window: lowering only [ContextTuning.compressionThreshold] makes the history
+     * allowance small while the model still receives the profile's full window.
      */
-    private val budget: TokenBudget = TokenBudget(),
+    private val contextTuning: ContextTuning = ContextTuning(),
     /**
      * edith-0.2 Phase B (B11): the intervention gate — "should the model step in right now?" (spec §4.7).
      *
@@ -552,17 +557,18 @@ class SmartAssistantPlugin(
     internal fun pendingConfirmationCountForTest(): Int = confirmation.pendingCount
 
     /**
-     * Test-only observation of the **session's** effective history allowance (spec §4.3).
+     * Test-only observation of the **session's** effective history/compression allowance (0.3 design §5.2/§6.3).
      *
-     * It is the allowance the compressor is handed at the end of a turn: history's own share of the injected budget
-     * plus the SKILL and memory budget a session with no SKILL directory and no memories leaves unused. A test reads
-     * this to prove the injected `budget` reached the compressor the session actually uses, rather than comparing
-     * against a hard-coded copy of the split (which a plugin that ignored the injection would still satisfy).
+     * The production manager derives a [ContextPolicy] from the session's `ModelProfile` at activation, and the
+     * compressor is handed `policy.softLimit`. A test reads this to prove the profile-driven policy reached the
+     * session's compressor — not that a hard-coded number did. When the profile is missing there is no policy, and
+     * this accessor fails rather than inventing a budget: production fails closed the same way (no manager is built,
+     * and the host's gateway refuses the turn with `PROFILE_MISSING`).
      */
-    internal fun historyBudgetTokensForTest(): Int {
-        val categories = budget.categories()
-        return categories.history + categories.skill + categories.memory
-    }
+    internal fun historyBudgetTokensForTest(): Int =
+        checkNotNull(activeContextForTurn) {
+            "no session context policy: the configured model profile is missing"
+        }.compressionBudgetTokens()
 
     private data class Config(
         val profileId: String,
@@ -942,6 +948,28 @@ class SmartAssistantPlugin(
 
     // ---------------------------------------------------------------- lifecycle
 
+    /**
+     * Task 11's transitional prompt plan: the plugin's existing base/system instructions, wrapped as a one-section
+     * [PromptPlan] so `ContextManager` only ever reads planned system text.
+     *
+     * This is a **seam, not the 0.3 prompt design**: Task 12 replaces it with `PromptCatalog.plan(route, profile)` and
+     * the device/dynamic sections. Until then the text is byte-identical to what the manager read directly before the
+     * migration, which is what keeps production prompt behaviour unchanged for this task.
+     */
+    private fun legacyPromptPlan(route: ContextRoute): PromptPlan {
+        val text = when (route) {
+            ContextRoute.WAKE -> SmartPrompts.instructions()
+            ContextRoute.PROACTIVE -> SmartPrompts.proactiveInstructions()
+        }
+        val sections = listOf(PromptSection("legacy-system", PromptKind.STATIC, text))
+        return PromptPlan(
+            version = LEGACY_PROMPT_VERSION,
+            sections = sections,
+            systemText = text,
+            hash = PromptPlan.hashOf(sections),
+        )
+    }
+
     override fun activate(context: PluginContext) {
         deactivate(DeactivationReason.Switched)
         synchronized(gate) {
@@ -994,7 +1022,25 @@ class SmartAssistantPlugin(
             write = { kind, text, source -> memory.remember(text, kind, source) },
         )
         // B1/B3/B6: the session's transcript and compressor (see the field comments for why they are built here).
-        activeContextForTurn = contextForTurn ?: ContextManager(memory = memoryRetrieval, budget = budget)
+        //
+        // 0.3 Task 11: the budget is the session profile's `ContextPolicy`, never a constant. A missing profile, or a
+        // profile whose limits cannot produce `0 < softLimit <= hardLimit <= hardInputLimit`, leaves no policy and
+        // therefore no manager: the turn then fails closed through the gateway's `PROFILE_MISSING` refusal instead of
+        // running against an invented budget.
+        val contextPolicy = config?.profileId
+            ?.let { profileId -> runCatching { profileLookup(profileId) }.getOrNull() }
+            ?.let { profile -> runCatching { ContextPolicy.from(profile, contextTuning) }.getOrNull() }
+        val contextManager = contextForTurn ?: contextPolicy?.let { policy ->
+            ContextManager(
+                memory = memoryRetrieval,
+                policy = policy,
+                // Task 12 replaces this transitional lambda with `PromptCatalog.plan(route, profile)`. Until then the
+                // plan carries the same base/system instructions the manager used to read directly, so production
+                // prompt bytes are unchanged.
+                promptPlan = { route -> legacyPromptPlan(route) },
+            )
+        }
+        activeContextForTurn = contextManager
         // Phase 5: the injected per-route stores are session state too. A store left over from the previous session
         // would be replayed under the new session's envelope - the same leak `lastFinalTranscript` is cleared for - so
         // activation empties them; `deactivate` clears them at the other end of the handover.
@@ -1017,13 +1063,19 @@ class SmartAssistantPlugin(
                 deadlineNanos = { clock.nowNanos() + SUMMARY_DEADLINE_MILLIS * 1_000_000L },
             )
         }
-        activeCompressor = compressor ?: ContextCompressor(
-            memory = memory,
-            summarizer = summarizer,
-            // The plugin's task pool: `compressIfNeeded` runs inside the turn, and an inline summary would hold the
-            // caller's thread for a cloud round trip (the same defect the gate had before review C2).
-            scope = context.services.tasks,
-        )
+        activeCompressor = compressor ?: contextManager?.let { manager ->
+            ContextCompressor(
+                // Both allowances are the session policy's (0.3 design §6.3/§6.4): the end-of-turn compression
+                // threshold and the summary output cap. No six-way token split exists any more.
+                historyBudgetTokens = manager.compressionBudgetTokens(),
+                summaryMaxTokens = manager.summaryMaxTokens(),
+                memory = memory,
+                summarizer = summarizer,
+                // The plugin's task pool: `compressIfNeeded` runs inside the turn, and an inline summary would hold the
+                // caller's thread for a cloud round trip (the same defect the gate had before review C2).
+                scope = context.services.tasks,
+            )
+        }
         // B4: the SKILL library. A host that granted no directory leaves this null and the prompt is simply the
         // system instructions - "no SKILLs installed" is a normal state (spec §3.7), not a degraded one.
         val governor = LibraryGovernor()
@@ -2229,13 +2281,13 @@ class SmartAssistantPlugin(
             // for an over-budget frame whose flow holds no turn to give (an empty store, or memory as the only thing
             // trimmed), and a summary started there would be invented content.
             val owed = trim != null && trim.droppedTurns > 0 && trim.compressionOwed
-            activeCompressor?.compressStore(store, contexts.historyBudgetTokens(), owed)
+            activeCompressor?.compressStore(store, owed)
             return
         }
         val context = contexts.context(route)
         context.appendUser(userText)
         contexts.appendAssistantMessage(route, reply)
-        activeCompressor?.compressIfNeeded(context, contexts.historyBudgetTokens())
+        activeCompressor?.compressIfNeeded(context)
     }
 
     /**
@@ -3592,6 +3644,12 @@ class SmartAssistantPlugin(
     }
 
     private companion object {
+        /**
+         * Task 11's transitional `PromptPlan` version. It names the plan shape, not a prompt release: Task 12 replaces
+         * the transitional plan (and this constant) with `PromptCatalog`'s own `0.3.0` manifest version.
+         */
+        const val LEGACY_PROMPT_VERSION = "0.3.0"
+
         val SystemMonotonicClock = object : MonotonicClock {
             override fun nowNanos(): Long = System.nanoTime()
         }

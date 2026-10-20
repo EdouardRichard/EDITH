@@ -43,9 +43,9 @@ class ProactiveContextWiringTest {
     }
 
     /** Counts what the session consulted, so "both routes compress" is observable without a real budget overflow. */
-    private class CountingCompressor : ContextCompressor() {
+    private class CountingCompressor : ContextCompressor(historyBudgetTokens = 3, summaryMaxTokens = 64) {
         val calls = mutableListOf<Int>()
-        override fun compressIfNeeded(ctx: ConversationContext, budgetTokens: Int): CompressionReport {
+        override fun compressIfNeeded(ctx: ConversationContext): CompressionReport {
             calls += ctx.route.ordinal
             return CompressionReport(truncated = 0, summaryStarted = false, summaryReason = null)
         }
@@ -53,7 +53,8 @@ class ProactiveContextWiringTest {
 
     private class Fixture {
         val contexts = ContextManager(
-            baseInstructions = { route ->
+            policy = com.sheen.rokid.phone.plugin.smarthelper.smartContextPolicy(),
+            promptPlan = com.sheen.rokid.phone.plugin.smarthelper.smartPromptPlan { route ->
                 if (route == ContextRoute.PROACTIVE) "注入:主动" else "注入:唤醒"
             },
         )

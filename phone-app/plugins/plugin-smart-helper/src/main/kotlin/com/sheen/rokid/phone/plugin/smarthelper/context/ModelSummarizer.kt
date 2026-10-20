@@ -50,7 +50,7 @@ class ModelSummarizer(
     private val deadlineNanos: () -> Long,
 ) : Summarizer {
 
-    override fun summarize(transcript: String): String? {
+    override fun summarize(transcript: String, maxOutputTokens: Int): String? {
         val text = transcript.trim()
         if (text.isEmpty()) return null
         val startedNanos = clock.nowNanos()
@@ -73,6 +73,9 @@ class ModelSummarizer(
                     // `ModelRequest` requires `input` or `history` to be non-empty, and the transcript is the history.
                     tools = emptyList(),
                     deadlineNanos = deadlineNanos(),
+                    // 0.3 design §5.2/§6.4: the summary declares its own output cap rather than inheriting the
+                    // profile's window reservation, so the next turn keeps the room the summary did not spend.
+                    maxOutputTokens = maxOutputTokens,
                 ),
             )
             val summary = reply.text

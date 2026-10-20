@@ -19,7 +19,11 @@ import com.sheen.rokid.phone.plugin.smarthelper.memory.MemorySource
  * It blocks, and it is called on the task scope for exactly that reason.
  */
 fun interface Summarizer {
-    fun summarize(transcript: String): String?
+    /**
+     * @param maxOutputTokens the policy's summary allowance (0.3 design §6.4): the production implementation forwards
+     *   it as the request's own output cap, so a summary can never spend the window the next turn needs.
+     */
+    fun summarize(transcript: String, maxOutputTokens: Int): String?
 }
 
 /**
@@ -97,6 +101,14 @@ data class CompressionReport(
  * invented, and if a future version adds such a message the anchor must be added with it.
  */
 open class ContextCompressor(
+    /**
+     * The history allowance both entry points measure against (0.3 design §6.3), derived from the session policy's
+     * `softLimit`. It used to be a per-call parameter carrying the plugin's own six-way token split; with the policy
+     * it is fixed for the session and is therefore constructor state.
+     */
+    private val historyBudgetTokens: Int,
+    /** The policy's summary output allowance (0.3 design §6.4), passed on to every summarizer call. */
+    private val summaryMaxTokens: Int,
     private val memory: MemoryModule? = null,
     private val summarizer: Summarizer? = null,
     /**
@@ -107,9 +119,19 @@ open class ContextCompressor(
     private val log: (String) -> Unit = { P3Log.line(it) },
 ) {
 
+    init {
+        require(historyBudgetTokens >= 0) {
+            "historyBudgetTokens must not be negative, was $historyBudgetTokens"
+        }
+        require(summaryMaxTokens > 0) {
+            "summaryMaxTokens must be positive, was $summaryMaxTokens"
+        }
+    }
+
     /**
-     * The `ConversationContext` entry point: **signature and behaviour unchanged**, so the ordering test that
-     * overrides it still sees the same call, and `CompressionTest` still passes line for line.
+     * The `ConversationContext` entry point: **behaviour unchanged**, and it now measures against the session
+     * policy's allowance ([historyBudgetTokens]) instead of an arbitrary per-call number, so `CompressionTest` still
+     * passes line for line.
      *
      * Its eviction is message-at-a-time and is deliberately **not** the store path's whole-turn eviction: it drops
      * the oldest message, one at a time, until the transcript fits or the keepline is reached, then writes exactly
@@ -118,16 +140,16 @@ open class ContextCompressor(
      *
      * `open` so a test can observe *when* compression ran relative to the memory write (spec §4.9's ordering).
      */
-    open fun compressIfNeeded(ctx: ConversationContext, budgetTokens: Int): CompressionReport {
+    open fun compressIfNeeded(ctx: ConversationContext): CompressionReport {
         val messages = ctx.history()
         if (messages.isEmpty()) return CompressionReport(0, false, null)
         val total = messages.sumOf { estimateTokens(it.estimatedText()) }
-        if (total <= budgetTokens) return CompressionReport(0, false, null)
+        if (total <= historyBudgetTokens) return CompressionReport(0, false, null)
 
         val keepline = keeplineIndex(messages)
         var dropped = 0
         var remaining = total
-        while (dropped < keepline && remaining > budgetTokens) {
+        while (dropped < keepline && remaining > historyBudgetTokens) {
             remaining -= estimateTokens(messages[dropped].estimatedText())
             dropped++
         }
@@ -145,7 +167,7 @@ open class ContextCompressor(
         discarded.forEach { message ->
             runCatching { memory?.remember(message.estimatedText(), MemoryKind.FACT, MemorySource.AUTO) }
         }
-        log("P3_CONTEXT compress truncated=$dropped budget=$budgetTokens")
+        log("P3_CONTEXT compress truncated=$dropped budget=$historyBudgetTokens")
         // How many turns those leading messages came from. On this path a half turn can be the answer, which is why
         // the report counts the two units separately.
         val droppedTurns = turnStartIndices(messages).count { it < dropped }
@@ -165,17 +187,16 @@ open class ContextCompressor(
     }
 
     /**
-     * Cut ③ over the production session owner. Drops the oldest **whole turns** until the store fits [shareTokens]
-     * or only the anchored region is left, writes what it dropped to memory, and — only when a whole turn actually
-     * went — starts the summary. Returns the standard report.
+     * Cut ③ over the production session owner. Drops the oldest **whole turns** until the store fits
+     * [historyBudgetTokens] or only the anchored region is left, writes what it dropped to memory, and — only when a
+     * whole turn actually went — starts the summary. Returns the standard report.
      *
      * [compressionOwed] is the caller's half of the ③ gate: this method applies `droppedTurns > 0 && compressionOwed`
      * in full, so a caller that has not established that cut ① happened must say so and gets no summary. It is a
      * required parameter rather than a default for exactly that reason — a default would put the half-gated call
      * back on the one public entry point the wiring uses.
      *
-     * There is no window share to consult here: [shareTokens] is the store's own allowance, and the caller passes the
-     * share it measured.
+     * The allowance is the policy-derived [historyBudgetTokens], the same one [compressIfNeeded] uses.
      *
      * **It does not free space in the current request** (P5-R4; see the class KDoc). Call it at the turn's tail.
      *
@@ -185,13 +206,12 @@ open class ContextCompressor(
      */
     open fun compressStore(
         store: ConversationStore,
-        shareTokens: Int,
         compressionOwed: Boolean,
     ): CompressionReport {
         val messages = store.history()
         if (messages.isEmpty()) return CompressionReport(0, false, null)
         val total = messages.sumOf { estimateTokens(it.estimatedText()) }
-        if (total <= shareTokens) return CompressionReport(0, false, null)
+        if (total <= historyBudgetTokens) return CompressionReport(0, false, null)
 
         // A turn starts at a user message and runs to the next one; spans[i] is everything turn i owns. The last
         // turn is the anchored region and is never offered for eviction, so `droppable == 0` when it is the only
@@ -204,7 +224,7 @@ open class ContextCompressor(
 
         var droppedTurns = 0
         var remaining = total
-        while (droppedTurns < droppable && remaining > shareTokens) {
+        while (droppedTurns < droppable && remaining > historyBudgetTokens) {
             remaining -= messages.slice(spans[droppedTurns]).sumOf { estimateTokens(it.estimatedText()) }
             droppedTurns++
         }
@@ -230,7 +250,7 @@ open class ContextCompressor(
             log("P3_CONTEXT compress swept=${removed - discarded.size}")
         }
         val truncated = maxOf(removed, discarded.size)
-        log("P3_CONTEXT compress truncated=$truncated budget=$shareTokens")
+        log("P3_CONTEXT compress truncated=$truncated budget=$historyBudgetTokens")
 
         if (!compressionOwed) {
             // The caller's half of the gate: nothing was owed, so the compaction stands and no summary is started.
@@ -259,7 +279,7 @@ open class ContextCompressor(
      * boundary on it at all.
      */
     private fun applySummary(summarizer: Summarizer, text: String, append: (String) -> Unit) {
-        val summary = runCatching { summarizer.summarize(text) }.getOrNull()
+        val summary = runCatching { summarizer.summarize(text, summaryMaxTokens) }.getOrNull()
         if (summary.isNullOrBlank()) {
             log("P3_CONTEXT summary=none")
             return

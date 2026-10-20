@@ -17,7 +17,6 @@ import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.context.ConversationContext
 import com.sheen.rokid.phone.plugin.smarthelper.context.ModelSummarizer
-import com.sheen.rokid.phone.plugin.smarthelper.context.TokenBudget
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
@@ -104,12 +103,15 @@ class ModelSummarizerTest {
         val summarizer = newSummarizer()
         model.onRequest = answers("（此前对话摘要）")
 
-        val summary = summarizer.summarize("用户问了几点。助手回答了时间。")
+        val summary = summarizer.summarize("用户问了几点。助手回答了时间。", SUMMARY_MAX_TOKENS)
 
         assertEquals("（此前对话摘要）", summary)
         val request = model.requests.single()
         assertEquals("profile-x", request.profileId)
         assertEquals(9L, request.profileRevision)
+        // 0.3 design §5.2/§6.4: the summary's own output cap is the policy-derived allowance, not the profile's
+        // window reservation.
+        assertEquals(SUMMARY_MAX_TOKENS, request.maxOutputTokens, "the summary must declare its own output cap")
         // The gateway lifts a one-item transcript into `input` (that is what makes it last on the wire), so the
         // transcript is asserted where it actually travels rather than where a hand-built history would have put it.
         assertEquals(
@@ -128,15 +130,15 @@ class ModelSummarizerTest {
         // only moves when the test says so turns this case into an infinite loop rather than a `null`.
         model.onRequest = { _, _ -> /* no terminal at all: the transport never answered */ }
         clock.autoAdvanceNanos = 1_000_000_000L
-        assertNull(silent.summarize("要摘要的对话"), "a stream with no verdict is not a summary")
+        assertNull(silent.summarize("要摘要的对话", SUMMARY_MAX_TOKENS), "a stream with no verdict is not a summary")
 
         val empty = newSummarizer()
         model.onRequest = answers("   ")
-        assertNull(empty.summarize("要摘要的对话"), "a blank answer is not a summary")
+        assertNull(empty.summarize("要摘要的对话", SUMMARY_MAX_TOKENS), "a blank answer is not a summary")
 
         val throwing = newSummarizer()
         model.onRequest = { _, _ -> throw IllegalStateException("cloud down") }
-        assertNull(throwing.summarize("要摘要的对话"), "a failing transport must degrade, not escape")
+        assertNull(throwing.summarize("要摘要的对话", SUMMARY_MAX_TOKENS), "a failing transport must degrade, not escape")
     }
 
     @Test
@@ -151,8 +153,8 @@ class ModelSummarizerTest {
         val context: ConversationContext
         try {
             context = overflowing()
-            ContextCompressor(summarizer = summarizer, scope = tasks)
-                .compressIfNeeded(context, budgetTokens = 3)
+            ContextCompressor(historyBudgetTokens = 3, summaryMaxTokens = SUMMARY_MAX_TOKENS, summarizer = summarizer, scope = tasks)
+                .compressIfNeeded(context)
             tasks.joinAll()
         } finally {
             P3Log.sink = previous
@@ -184,8 +186,8 @@ class ModelSummarizerTest {
 
         // `compressIfNeeded` must return while the summary is still blocked inside the transport: that is the property
         // "the wearer's turn does not pay for a cloud round trip".
-        val report = ContextCompressor(summarizer = summarizer, scope = tasks)
-            .compressIfNeeded(context, budgetTokens = 3)
+        val report = ContextCompressor(historyBudgetTokens = 3, summaryMaxTokens = SUMMARY_MAX_TOKENS, summarizer = summarizer, scope = tasks)
+            .compressIfNeeded(context)
         assertEquals(true, report.summaryStarted)
         val beforeRunning = context.size()
 
@@ -206,8 +208,10 @@ class ModelSummarizerTest {
         // this proves the **production** object (not a constructor-injected fake) is the one that ran. A small history
         // allowance is injected so a handful of turns reach the compression the module-level tests above cover.
         val contexts = ContextManager(
-            budget = TokenBudget(total = 60),
-            baseInstructions = { "测试用指令" },
+            policy = smartContextPolicy(
+                smartProfile(inputBudgetTokens = 60, usableWindowTokens = 10_000, maxOutputTokens = 1, safetyTokens = 1),
+            ),
+            promptPlan = smartPromptPlan("测试用指令"),
         )
         val rig = SmartTestRig(contextForTurn = contexts)
         rig.activate(overrides = mapOf(Capability.Embedding to ScriptedEmbeddings()))
@@ -270,7 +274,7 @@ class ModelSummarizerTest {
         var previous = P3Log.sink
         P3Log.sink = { successLines += it }
         try {
-            assertEquals(marker, succeeded.summarize("要摘要的对话"))
+            assertEquals(marker, succeeded.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
         } finally {
             P3Log.sink = previous
         }
@@ -286,7 +290,7 @@ class ModelSummarizerTest {
         previous = P3Log.sink
         P3Log.sink = { blankLines += it }
         try {
-            assertNull(blank.summarize("要摘要的对话"))
+            assertNull(blank.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
         } finally {
             P3Log.sink = previous
         }
@@ -300,7 +304,7 @@ class ModelSummarizerTest {
         previous = P3Log.sink
         P3Log.sink = { unconfiguredLines += it }
         try {
-            assertNull(unconfigured.summarize("要摘要的对话"))
+            assertNull(unconfigured.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
         } finally {
             P3Log.sink = previous
         }
@@ -315,7 +319,7 @@ class ModelSummarizerTest {
         previous = P3Log.sink
         P3Log.sink = { refusedLines += it }
         try {
-            assertNull(refused.summarize("要摘要的对话"))
+            assertNull(refused.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
         } finally {
             P3Log.sink = previous
         }
@@ -324,6 +328,9 @@ class ModelSummarizerTest {
     }
 
     private companion object {
+        /** The summary output cap the fixture hands the summarizer; the production value comes from `ContextPolicy`. */
+        const val SUMMARY_MAX_TOKENS = 64
+
         /** The request bound the fixture hands the summarizer; unrelated to the plugin's own constant. */
         const val SUMMARY_DEADLINE_NANOS = 8_000_000_000L
 

@@ -1,9 +1,14 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
-import com.sheen.rokid.phone.plugin.smarthelper.context.TokenBudget
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextCompressor
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptKind
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptSection
+
+import com.sheen.rokid.agent.ContextPolicy
+import com.sheen.rokid.agent.ContextTuning
 
 import com.sheen.rokid.contracts.Assistance
 import com.sheen.rokid.contracts.AssistantRoute
@@ -398,11 +403,15 @@ internal class OffThreadTasks : TaskScope {
     fun joinAll(millis: Long = 5_000) { workers.toList().forEach { it.join(millis) } }
 }
 
-/** Minimal but valid `ModelProfile` fixture; the plugin only reads `id`, `revision` and `timeoutMillis`. */
+/** Minimal but valid `ModelProfile` fixture; the plugin reads its window limits, `id`, `revision` and `timeoutMillis`. */
 internal fun smartProfile(
     id: String = "smart-profile",
     revision: Long = 3,
     timeoutMillis: Long = 10_000,
+    usableWindowTokens: Int = 4_000,
+    inputBudgetTokens: Int = 2_000,
+    maxOutputTokens: Int = 1_000,
+    safetyTokens: Int = 100,
 ) = ModelProfile(
     id = id,
     revision = revision,
@@ -412,15 +421,42 @@ internal fun smartProfile(
     protocolId = "fake",
     model = "fake-model",
     secret = object : SecretHandle { override val id = "fake-secret" },
-    usableWindowTokens = 4_000,
-    inputBudgetTokens = 2_000,
-    maxOutputTokens = 1_000,
-    safetyTokens = 100,
+    usableWindowTokens = usableWindowTokens,
+    inputBudgetTokens = inputBudgetTokens,
+    maxOutputTokens = maxOutputTokens,
+    safetyTokens = safetyTokens,
     timeoutMillis = timeoutMillis,
     inputs = setOf(InputModality.TEXT),
     outputs = setOf(OutputModality.TEXT),
     verifications = emptyList(),
 )
+
+/** The policy a session with [profile] and [tuning] gets, exactly as the plugin derives it in `activate`. */
+internal fun smartContextPolicy(
+    profile: ModelProfile = smartProfile(),
+    tuning: ContextTuning = ContextTuning(),
+): ContextPolicy = ContextPolicy.from(profile, tuning)
+
+/**
+ * A one-section prompt plan for a test manager. 0.3 Task 11's `ContextManager` reads its instructions from a plan,
+ * and Task 12 will supply the catalog; a test that is not about prompt content uses this deterministic stand-in.
+ */
+internal fun smartPromptPlan(
+    systemText: (ContextRoute) -> String = { route ->
+        when (route) {
+            ContextRoute.WAKE -> "WAKE SYSTEM"
+            ContextRoute.PROACTIVE -> "PROACTIVE SYSTEM"
+        }
+    },
+): (ContextRoute) -> PromptPlan = { route ->
+    val text = systemText(route)
+    val sections = listOf(PromptSection("test-system", PromptKind.STATIC, text))
+    PromptPlan("0.3.0", sections, text, PromptPlan.hashOf(sections))
+}
+
+/** The same plan for every route, for a test that only needs one instruction text. */
+internal fun smartPromptPlan(systemText: String): (ContextRoute) -> PromptPlan =
+    smartPromptPlan { systemText }
 
 /**
  * A host `StorageAccess` grant backed by an in-memory SKILL library (Phase 6): one `.md` file per map entry.
@@ -506,10 +542,11 @@ internal class SmartTestRig(
     /** edith-0.2 Phase B (B11): the intervention gate, `null` for the pre-B11 behaviour. */
     interventionGate: com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate? = null,
     /**
-     * edith-0.2 Phase B (B3): the session's token split. Defaults to the spec's own, so only a test that wants the
-     * production over-budget path reachable in a few turns injects a smaller one.
+     * 0.3 design §5.2/§6.3: the tuning the plugin derives its `ContextPolicy` with. The default is production's;
+     * a test that needs the history allowance small without shrinking the profile's frame window lowers
+     * `compressionThreshold` here.
      */
-    budget: com.sheen.rokid.phone.plugin.smarthelper.context.TokenBudget = com.sheen.rokid.phone.plugin.smarthelper.context.TokenBudget(),
+    contextTuning: ContextTuning = ContextTuning(),
     /**
      * Phase 5: the per-route session stores the production wiring injects. `null` — the default — is the legacy shape
      * every pre-Phase-5 test uses, so those tests keep both old paths untouched.
@@ -565,7 +602,7 @@ internal class SmartTestRig(
             contextForTurn = contextForTurn,
             compressor = compressor,
             interventionGate = interventionGate,
-            budget = budget,
+            contextTuning = contextTuning,
             conversationStores = conversationStores,
             isPanelVisible = { panelVisible },
             continueDialogue = { continueDialogue },

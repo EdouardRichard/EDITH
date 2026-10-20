@@ -1,16 +1,21 @@
 package com.sheen.rokid.phone.plugin.smarthelper.context
 
+import com.sheen.rokid.agent.ContextPolicy
 import com.sheen.rokid.agent.MemoryRetrieval
 import com.sheen.rokid.agent.Segment
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelHistoryItem
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
 
 /**
  * What [ContextManager.buildPrompt] hands the loop: the request's pieces, already assembled and measured.
  *
  * [history] ends on this turn's user message and is **not** written back — the caller records the turn's own
  * messages when the turn ends, so appending here would double them on the next one.
+ *
+ * [historyBudgetTokens] is the **remaining** history allowance for this request (0.3 design §5.2):
+ * `policy.hardInputLimit - measured(instructions) - measured(memory) - measured(input)`. It is request-scoped
+ * because the system text, the retrieved memory and the input are measured facts, not fixed shares.
  */
 data class PromptAssembly(
     val route: ContextRoute,
@@ -18,14 +23,14 @@ data class PromptAssembly(
     val history: List<ModelHistoryItem>,
     val memorySegments: List<Segment>,
     val estimatedTokens: Int,
-    /** The history allowance this assembly was measured against (spec §4.3). */
+    /** The history allowance this assembly was measured against (0.3 design §5.2). */
     val historyBudgetTokens: Int,
-    /** Whether the history has outgrown that allowance, which is the compression trigger (spec §4.4). */
+    /** Whether the history has outgrown that allowance, which is the compression trigger (0.3 design §6.3). */
     val overHistoryBudget: Boolean,
 )
 
 /**
- * The two conversation routes and the prompt each one builds (spec §4.2/§4.3).
+ * The two conversation routes and the prompt each one builds (0.3 design §5.1/§5.2).
  *
  * Two [ConversationContext]s, never merged: C3 makes the wake path and the proactive path independent histories
  * that share only the SKILL library, the memory store and the local model services.
@@ -35,6 +40,11 @@ data class PromptAssembly(
  * `systemSlot`. Keeping the old whole-library section here as well would put every SKILL into the model twice
  * (`systemSlot` already takes `prompt.instructions`), which is why the `skills` parameter and this manager's
  * `assembleInstructions`/`skillSection` were deleted rather than left unused.
+ *
+ * **The system text is a [PromptPlan], and the budget is a [ContextPolicy].** Task 11 replaced the plugin's own
+ * six-way token split with the policy derived from the session's `ModelProfile`: the plan supplies the instructions,
+ * and the policy supplies the hard input limit every measurement is taken out of. A missing profile is not papered
+ * over with a default here — the plugin fails closed and does not build a manager at all.
  *
  * **It holds no `SystemOneService`**, although spec §4.2's constructor sketch does. Under D60 Laya participates in
  * neither compression, SKILL selection nor memory writing — spec §4.7 says so in its first paragraph — so injecting
@@ -47,17 +57,14 @@ class ContextManager(
      * retrieval; a `null` manager injects nothing rather than failing, so a host without memory still answers.
      */
     private val memory: MemoryRetrieval? = null,
-    private val budget: TokenBudget = TokenBudget(),
+    /** The session's limits, derived from the configured `ModelProfile` by `ContextPolicy.from` (0.3 design §5.2). */
+    private val policy: ContextPolicy,
     /**
-     * The route's own system prompt. A seam rather than a constant because the two routes ask the model for
-     * different jobs: the wake path answers a request, the proactive path decides whether to speak unprompted.
+     * The route's own [PromptPlan]. A seam rather than a constant because the two routes ask the model for different
+     * jobs: the wake path answers a request, the proactive path decides whether to speak unprompted. Task 12 replaces
+     * the plugin's transitional plan with `PromptCatalog.plan(route, profile)`.
      */
-    private val baseInstructions: (ContextRoute) -> String = { route ->
-        when (route) {
-            ContextRoute.WAKE -> SmartPrompts.instructions()
-            ContextRoute.PROACTIVE -> SmartPrompts.proactiveInstructions()
-        }
-    },
+    private val promptPlan: (ContextRoute) -> PromptPlan,
 ) {
 
     private val contexts: Map<ContextRoute, ConversationContext> =
@@ -66,31 +73,29 @@ class ContextManager(
     fun context(route: ContextRoute): ConversationContext = contexts.getValue(route)
 
     /**
-     * Assembles one request: the route's base instructions, the transcript this turn continues, and the memory for
+     * Assembles one request: the route's planned instructions, the transcript this turn continues, and the memory for
      * the utterance. Nothing here decides what SKILLs the model sees — that is the frame's `SKILL` segments.
+     *
+     * The history allowance is what the policy's hard input limit leaves after the measured instructions, memory and
+     * this turn's input (0.3 design §5.2). The clamp at zero is deliberate: a request whose fixed pieces alone exceed
+     * the hard input has **no** history allowance, which marks the assembly over budget rather than inventing room.
      */
     fun buildPrompt(
         route: ContextRoute,
         userInput: String,
     ): PromptAssembly {
         val context = context(route)
-        val instructions = baseInstructions(route)
+        val instructions = promptPlan(route).systemText
         val history = context.history() + ModelHistoryItem.Text(MessageRole.USER, userInput)
         val memoryParts = runCatching { memory?.retrieve(userInput, MEMORY_LIMIT) }.getOrNull().orEmpty()
 
+        val instructionTokens = estimateTokens(instructions)
         val historyTokens = history.sumOf { estimateTokens(it.estimatedText()) }
-        // Phase 6: this assembly carries no SKILL text, so the SKILL category is unused and its allowance flows to
-        // history exactly as an unused category always has (spec §4.3). The catalog's own small cost rides the frame
-        // and is not part of this estimate; it is bounded by the governor's cap, not by the token split.
-        val historyBudget = historyBudgetWithLeftovers(
-            categories = budget.categories(),
-            skillsUsed = 0,
-            memoryUsed = memoryParts.sumOf { estimateTokens(it.text) },
-        )
-        val estimated = estimateTokens(instructions) +
-            historyTokens +
-            memoryParts.sumOf { estimateTokens(it.text) }
-        // `userInput` is already inside `history`; it is not counted twice.
+        val memoryTokens = memoryParts.sumOf { estimateTokens(it.text) }
+        // `userInput` is already inside `history`; it is subtracted once here, never counted twice.
+        val historyBudget = (policy.hardInputLimit - instructionTokens - memoryTokens - estimateTokens(userInput))
+            .coerceAtLeast(0)
+        val estimated = instructionTokens + historyTokens + memoryTokens
 
         return PromptAssembly(
             route = route,
@@ -112,8 +117,17 @@ class ContextManager(
     fun tokenCount(route: ContextRoute): Int =
         context(route).history().sumOf { estimateTokens(it.estimatedText()) }
 
-    /** The allowance a compression measures a route's history against (spec §4.3/§4.4). */
-    fun historyBudgetTokens(): Int = budget.historyBudgetTokens()
+    /**
+     * The allowance a compression measures a route's history against (0.3 design §6.3).
+     *
+     * It is the policy's `softLimit` — the end-of-turn threshold — rather than the request-scoped remaining budget
+     * above: the compressor runs at the turn's tail, where there is no in-flight request whose fixed pieces could be
+     * measured. `ContextCompressor` receives this value when the plugin builds it.
+     */
+    fun compressionBudgetTokens(): Int = policy.softLimit
+
+    /** The policy's summary output allowance (0.3 design §6.4), handed to the compressor with [compressionBudgetTokens]. */
+    fun summaryMaxTokens(): Int = policy.summaryMaxTokens
 
     private companion object {
         /** Spec §5.7: the top-5 related memories are injected. */
