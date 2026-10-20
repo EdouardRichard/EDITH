@@ -33,6 +33,7 @@ import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
 import com.sheen.rokid.phone.storage.AndroidSpeakerProfileStore
 import com.sheen.rokid.phone.context.NotificationCategoryService
+import com.sheen.rokid.phone.context.androidDeviceStateProvider
 import com.sheen.rokid.phone.bridge.CxrHintLink
 import com.sheen.rokid.phone.bridge.HintIdentity
 import com.sheen.rokid.phone.bridge.UiState
@@ -2201,6 +2202,28 @@ class HostCompositionRoot internal constructor(
             // a switch that is on but whose engine failed to create still produces no SpeechFinished. Set before the
             // host is built/activated so the value the plugin reads is the one the arbiter will honour.
             speechPlayerHolder.set(speechPlayer)
+            // 0.3 Phase 1 Task 2: the static device profile / per-request state channel. Built here rather than beside
+            // the context sources because its capability set is a live read of gates assembled above (the Shizuku
+            // shell exists, the speech player has been decided); answering from a half-built composition would let the
+            // profile name a capability the host cannot answer. Facts are read lazily on each profile()/state() call.
+            // The wake-word source is the same registry the plugin declares its words to (`Capability.WakeWord`), so
+            // the prompt and the detector describe one word set, not two copies of the settings.
+            val deviceState = androidDeviceStateProvider(
+                context = context,
+                capabilities = {
+                    buildSet {
+                        if (EdithAccessibilityService.connected()) add("a11y")
+                        if (shizukuShell.ready()) add("shizuku")
+                        if (speechPlayer != null) add("tts")
+                        if (notificationCategory.isConnected) add("notification_access")
+                        if (foregroundApp.isGranted) add("usage_access")
+                        if (calendar.isGranted) add("calendar")
+                        // `media_session`/`clipboard` are not wired in Phase 1: there is no source to read, so the
+                        // capability is omitted instead of advertised and then refused. Add them with their providers.
+                    }
+                },
+                wakeWords = { smartWiring.wakeWords.current() },
+            )
             // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
             // assistant tab reads it. It has to be created here because the provider map is built before the root.
             val conversationLog = ConversationLog()
@@ -2235,6 +2258,10 @@ class HostCompositionRoot internal constructor(
                     // provider is the composition's own signals object, so the values a plugin reads and the events
                     // the host delivers describe one source, not two.
                     put(Capability.Context, contextSignals)
+                    // 0.3 Phase 1 Task 2: the device profile/state channel. The provider is a pure local read (no
+                    // permission, model or transport needed at assembly), so it joins the advertised set; the host can
+                    // now grant the smart plugin's `Capability.DeviceState` when Task 12 declares it.
+                    put(Capability.DeviceState, deviceState)
                     // edith-0.2 Phase B (B4): the user's SKILL directory. `StorageAccessServiceImpl` is pure
                     // `java.io.File` work with no Android dependency and no permission to request at assembly time,
                     // so this capability is answerable whenever the composition exists - the advertised set and the
