@@ -64,6 +64,11 @@ data class RangeInfo(
  * deliberately not part of a node's ref identity: a slider whose [RangeInfo.current] moved, or a
  * container whose collection size changed, is still the same node for [RefRegistry]. [drawingOrder]
  * is the platform's z-order hint, `0` when the producer has none.
+ *
+ * [visibleToUser] is the platform's own visibility answer (edith-0.3 Phase 2). It defaults to
+ * `true` so every pre-0.3 producer keeps behaving unchanged, and a perception snapshot drops
+ * nodes the platform marked invisible. It is not part of the ref identity either: hiding a node
+ * does not make its ref address a different node while the node is still in the tree.
  */
 data class DeviceNode(
     val role: String,
@@ -81,6 +86,7 @@ data class DeviceNode(
     val drawingOrder: Int = 0,
     val windowId: Int,
     val depth: Int,
+    val visibleToUser: Boolean = true,
 )
 
 /**

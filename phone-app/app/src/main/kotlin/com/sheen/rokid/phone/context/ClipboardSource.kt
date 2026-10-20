@@ -17,30 +17,41 @@ internal sealed interface ClipboardRead {
 }
 
 /**
- * The (current) clipboard text and its honest absences, over an injectable platform read.
+ * The (current) clipboard text and its honest absences, over an injectable platform read (Task 4) and an injectable
+ * foreground predicate (Task 6, R7).
  *
- * The class is the JVM-testable seam: production passes a lambda over [ClipboardManager], and a test drives the mapping
- * without Android. No permission is added and no read is attempted outside what the window state allows - a refused
- * read is `background_restricted`, not an empty clipboard.
+ * The class is the JVM-testable seam: production passes a lambda over [ClipboardManager] and a lambda over the host's
+ * foreground fact, and a test drives both without Android. No permission is added and no read is attempted outside what
+ * the window state allows.
  *
- * [read] catches the platform's refusal (`SecurityException`/`IllegalStateException`) and any unexpected failure, so a
- * dead binder or an OEM refusing the call degrades to an unavailability instead of crashing the perception read.
+ * **R7 — background honesty.** [foreground] answers whether this host is currently in front. When it returns `false`
+ * the platform read is **not attempted at all** and the answer is `background_restricted`: on Android 10+ a background
+ * read can hand back `null`, and reporting that as [REASON_EMPTY] would silently claim "the clipboard is empty" when the
+ * host never looked. `true` or `null` (the feature was not supplied, or the window state is unknown) keeps the old
+ * "try the read" behavior. A throwing predicate is treated as `null`, so a broken window probe degrades to an attempt
+ * instead of a crash. A refused read (`SecurityException`/`IllegalStateException`, or any unexpected platform failure)
+ * is `background_restricted` - the platform refused this read - and only `null`/blank content is `empty`.
  */
-internal class ClipboardSource(read: () -> CharSequence?) {
+internal class ClipboardSource(
+    read: () -> CharSequence?,
+    foreground: () -> Boolean? = { null },
+) {
 
-    // Stored under a distinct name: the class's own `read()` would otherwise shadow the lambda at every call site and
-    // turn the function into an infinite recursion (found by the RED/GREEN compile).
+    // Stored under distinct names: the class's own `read()` would otherwise shadow the lambda at every call site and
+    // turn the function into an infinite recursion (found by the RED/GREEN compile of Task 4).
     private val readClipboard = read
+    private val foregroundState = foreground
 
     fun read(): ClipboardRead {
+        // A known-background host never touches the platform clipboard (R7).
+        if (runCatching { foregroundState() }.getOrNull() == false) {
+            return ClipboardRead.Unavailable(REASON_BACKGROUND_RESTRICTED)
+        }
         val value = try {
             readClipboard()
-        } catch (_: SecurityException) {
-            return ClipboardRead.Unavailable(REASON_BACKGROUND_RESTRICTED)
-        } catch (_: IllegalStateException) {
-            return ClipboardRead.Unavailable(REASON_BACKGROUND_RESTRICTED)
         } catch (_: Throwable) {
-            return ClipboardRead.Unavailable(REASON_READ_FAILED)
+            // A refused or failed read is never "there is no text": the platform did not answer.
+            return ClipboardRead.Unavailable(REASON_BACKGROUND_RESTRICTED)
         }
         if (value == null || value.isBlank()) return ClipboardRead.Unavailable(REASON_EMPTY)
         return ClipboardRead.Text(value.toString())
@@ -50,30 +61,28 @@ internal class ClipboardSource(read: () -> CharSequence?) {
         /** Background clipboard access is restricted by the platform; a read from there is expected to fail. */
         const val REASON_BACKGROUND_RESTRICTED = "background_restricted"
 
-        /** There is no text on the clipboard (never used for a refused read). */
+        /** There is no text on the clipboard (never used for a refused or skipped read). */
         const val REASON_EMPTY = "empty"
-
-        /** The platform produced an error this source does not model; reported honestly instead of as "empty". */
-        const val REASON_READ_FAILED = "read_failed"
 
         /**
          * The platform half: the current primary clip's first item text, read through `ClipboardManager` only.
          *
          * The manager and the clip are resolved on each read (the clipboard changes underneath the app), and the
          * read is left unchanged so the platform's own background restriction applies. Null means "no text on the
-         * clipboard"; a refused read is thrown by the platform and mapped by [ClipboardSource.read].
+         * clipboard"; a refused read is thrown by the platform and mapped by [ClipboardSource.read]. [foreground] is
+         * optional and defaults to "unknown", keeping every existing construction source-compatible.
          */
-        fun android(context: Context): ClipboardSource {
+        fun android(context: Context, foreground: () -> Boolean? = { null }): ClipboardSource {
             val application = context.applicationContext ?: context
             val read: () -> CharSequence? = {
                 // A missing clipboard service is not "the clipboard is empty": it is a read that never happened, and
-                // `read()` reports it as `read_failed` instead of fabricating an empty clip.
+                // `read()` reports it as a refusal instead of fabricating an empty clip.
                 val manager = application.getSystemService(Context.CLIPBOARD_SERVICE) as? ClipboardManager
                     ?: throw UnsupportedOperationException("clipboard service unavailable")
                 val clip = manager.primaryClip
                 if (clip == null || clip.itemCount == 0) null else clip.getItemAt(0).text
             }
-            return ClipboardSource(read)
+            return ClipboardSource(read, foreground)
         }
     }
 }

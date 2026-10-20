@@ -77,19 +77,38 @@ internal class CalendarSource(
          *
          * `Instances` rather than `Events` so an occurrence inside today is what counts, not the series' start. A
          * provider that refuses (no permission) or throws leaves the snapshot unavailable, which is the same honest
-         * answer as a missing permission.
+         * answer as a missing permission. A provider that answers **no cursor at all** is a failure, not an empty day
+         * (R8): [titlesFrom] throws, so [snapshot] reports `available=false` instead of inventing a free day.
          */
         private fun titlesToday(context: Context, nowMillis: Long): List<String> {
             val builder = CalendarContract.Instances.CONTENT_URI.buildUpon()
             ContentUris.appendId(builder, nowMillis)
             ContentUris.appendId(builder, nowMillis + TimeUnit.DAYS.toMillis(1) - 1)
-            val cursor = context.contentResolver.query(builder.build(),
-                arrayOf(CalendarContract.Instances.TITLE), null, null,
-                CalendarContract.Instances.BEGIN + " ASC") ?: return emptyList()
-            return cursor.use { rows ->
+            return titlesFrom(
+                context.contentResolver.query(
+                    builder.build(),
+                    arrayOf(CalendarContract.Instances.TITLE),
+                    null,
+                    null,
+                    CalendarContract.Instances.BEGIN + " ASC",
+                ),
+            )
+        }
+
+        /**
+         * Reads today's titles from an already-issued cursor.
+         *
+         * A null cursor means the content provider failed (dead provider, refused binder, revoked grant); throwing is
+         * what lets [snapshot] keep "unavailable" apart from a granted day with no events (R8). Extracted from
+         * [titlesToday] so this rule is JVM-testable without an Android `ContentResolver`.
+         */
+        internal fun titlesFrom(cursor: android.database.Cursor?): List<String> {
+            val rows = cursor
+                ?: throw IllegalStateException("calendar provider returned no cursor")
+            return rows.use { cursorRows ->
                 buildList {
-                    while (rows.moveToNext() && size < MAX_TITLES) {
-                        rows.getString(0)?.let { add(it) }
+                    while (cursorRows.moveToNext() && size < MAX_TITLES) {
+                        cursorRows.getString(0)?.let { add(it) }
                     }
                 }
             }

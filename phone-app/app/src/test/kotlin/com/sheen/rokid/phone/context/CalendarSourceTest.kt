@@ -63,6 +63,16 @@ class CalendarSourceTest {
     }
 
     @Test
+    fun aNullProviderCursorFailsTheSnapshotInsteadOfReadingAsAnEmptyDay() {
+        // R8: the platform's ContentResolver.query can answer null (dead provider / refused binder). That is a
+        // provider failure, not "granted with no events", so the read throws and the snapshot stays unavailable.
+        val source = CalendarSource(granted = { true }, today = { CalendarSource.titlesFrom(null) })
+
+        assertEquals(CalendarSnapshot(available = false, titles = emptyList()), source.snapshot())
+        assertTrue("the flat map still omits a failed provider", source.values().isEmpty())
+    }
+
+    @Test
     fun atMostFiveTitlesAreCarried() {
         val source = CalendarSource(granted = { true },
             today = { listOf("一", "二", "三", "四", "五", "六", "七") })

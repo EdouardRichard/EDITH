@@ -667,6 +667,7 @@ private class AndroidAccessibilityPlatform(
             tooltipText = tooltipText?.toString(),
             drawingOrder = drawingOrder,
             actionIds = actionList.map { it.id },
+            visibleToUser = isVisibleToUser,
             collection = collectionInfo?.let {
                 PlatformCollectionInfo(
                     rowCount = it.rowCount,

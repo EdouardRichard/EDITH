@@ -118,6 +118,7 @@ class AccessibilityAdapterTest {
         actionIds: List<Int> = emptyList(),
         collection: PlatformCollectionInfo? = null,
         range: PlatformRangeInfo? = null,
+        visibleToUser: Boolean = true,
     ): PlatformNode = PlatformNode(
         nodeId = nodeId,
         windowId = windowId,
@@ -143,6 +144,7 @@ class AccessibilityAdapterTest {
         actionIds = actionIds,
         collection = collection,
         range = range,
+        visibleToUser = visibleToUser,
     )
 
     private fun adapter(platform: FakePlatform, registry: RefRegistry = RefRegistry()) =
@@ -295,6 +297,25 @@ class AccessibilityAdapterTest {
         assertEquals(0, bare.drawingOrder)
         assertNull(bare.collection)
         assertNull(bare.range)
+    }
+
+    @Test
+    fun observeCarriesThePlatformIsVisibleToUserFlagOnEveryNode() {
+        val platform = FakePlatform().apply {
+            windows = listOf(
+                window(
+                    nodes = listOf(
+                        node(nodeId = 0, text = "可见"),
+                        node(nodeId = 1, depth = 1, text = "不可见", visibleToUser = false),
+                    ),
+                ),
+            )
+        }
+
+        val nodes = adapter(platform).observe(DeviceScreenFilter.ALL).nodes
+
+        assertEquals(listOf(true, false), nodes.map { it.visibleToUser })
+        assertTrue("the additive default keeps pre-0.3 producers visible", node().visibleToUser)
     }
 
     @Test
