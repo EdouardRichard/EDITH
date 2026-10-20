@@ -233,7 +233,9 @@ class ModelClientGateway(
                 ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN, overflowRecoveries = recoveries)
             val modelRequest = modelRequest(request, profile, frame.systemText, transcript)
             val reply = try {
-                sendTurn(request, modelRequest)
+                // The metric describes the kept frame, never the untrimmed assembly: a HARD recovery can drop the
+                // request-scoped tail, and a `P3_CACHE` line that still counted it would claim bytes no longer sent.
+                sendTurn(request, modelRequest, report.kept)
             } catch (rejected: ContractError.ContextWindowExceeded) {
                 // The one local rejection this path may answer with a cheaper request: the send-time budget refused
                 // the shape the trimmer produced. A plain `ConfigurationRejected` is a different refusal and still
@@ -307,11 +309,16 @@ class ModelClientGateway(
      *
      * Every request reports its own count-only `P3_CACHE` line when the reply carried usage — the wake run's tool
      * rounds, the proactive `turn`, and each deterministic overflow re-send alike. The line is per request, never a
-     * sum: [AgentLoop] no longer reports a run-total duplicate (0.3 Phase 2 Task 11).
+     * sum: [AgentLoop] no longer reports a run-total duplicate (0.3 Phase 2 Task 11). [sentFrame] is the frame that was
+     * actually put on the wire (the trimmer's kept frame); the untrimmed [GatewayTurn.frame] is never used for sizes.
      */
-    private fun sendTurn(request: GatewayTurn, modelRequest: ModelRequest): GatewayReply {
+    private fun sendTurn(
+        request: GatewayTurn,
+        modelRequest: ModelRequest,
+        sentFrame: RequestFrame? = request.frame,
+    ): GatewayReply {
         val reply = sendTurnOnce(request, modelRequest)
-        emitCacheMetric(request, reply)
+        emitCacheMetric(request, reply, sentFrame)
         return reply
     }
 
@@ -320,14 +327,14 @@ class ModelClientGateway(
      *
      * Counts only, fixed field order: `cached`/`miss` from the provider's own cache members (an unreported counter is
      * `-`, a reported zero stays `0`), `inputTokens`/`outputTokens`, and the request's shape as two character counts —
-     * the system slot and the sum of the dynamic-tail segment texts. The legacy no-frame path sends `instructions`
-     * directly, so it reports that length and a zero tail. No text ever rides the line.
+     * the sent frame's system slot and the sum of its dynamic-tail segment texts. The legacy no-frame path sends
+     * `instructions` directly, so it reports that length and a zero tail. No text ever rides the line.
      */
-    private fun emitCacheMetric(request: GatewayTurn, reply: GatewayReply) {
+    private fun emitCacheMetric(request: GatewayTurn, reply: GatewayReply, sentFrame: RequestFrame?) {
         val usage = reply.usage ?: return
         // `systemText` joins the system segments with newlines; for one segment it is exactly its text.
-        val systemChars = request.frame?.systemText?.length ?: request.instructions.length
-        val dynamicChars = request.frame?.conversationFlow
+        val systemChars = sentFrame?.systemText?.length ?: request.instructions.length
+        val dynamicChars = sentFrame?.conversationFlow
             ?.let { flow -> RequestLayout.dynamicTail(flow).sumOf { it.text.length } }
             ?: 0
         val line = buildString {

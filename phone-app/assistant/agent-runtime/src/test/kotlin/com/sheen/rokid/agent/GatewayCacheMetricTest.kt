@@ -1,5 +1,6 @@
 package com.sheen.rokid.agent
 
+import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
@@ -25,8 +26,9 @@ import kotlin.test.assertTrue
  *
  * The line is asserted on its exact field list and order because later phases read it. Three states are pinned
  * separately: no accounting at all omits the line, an unreported counter is `-` (never a fabricated zero), and a
- * reported zero is `0`. The sizes are the request's own: the system text length and the sum of the dynamic-tail text
- * lengths ([RequestLayout.dynamicTail]); the legacy no-frame path reports its instructions length and 0.
+ * reported zero is `0`. The sizes are those of the frame **actually sent**: the system text length and the sum of the
+ * dynamic-tail text lengths ([RequestLayout.dynamicTail]) of the kept frame, so an overflow recovery's HARD cut cannot
+ * report a tail it dropped; the legacy no-frame path reports its instructions length and 0.
  */
 class GatewayCacheMetricTest {
 
@@ -228,6 +230,35 @@ class GatewayCacheMetricTest {
                 "P3_CACHE cached=6 miss=4 inputTokens=10 outputTokens=5 systemChars=3 dynamicChars=0",
             ),
             lines,
+        )
+    }
+
+    @Test
+    fun `a hard recovery reports the kept frame's sizes, not the untrimmed assembly`() {
+        // R70 recovery ② (HARD) can drop request-scoped tail segments (here the memory/perception tail). `P3_CACHE`
+        // describes the model request that was actually sent, so the sizes come from the kept frame; measuring the
+        // assembled `request.frame` would claim a tail that never went on the wire.
+        val lines = mutableListOf<String>()
+        var calls = 0
+        val client = FakeModelClient { request, listener ->
+            calls++
+            if (calls <= 2) throw ContractError.ContextWindowExceeded("does not fit")
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, ModelUsage(10, 5), null))
+        }
+        val frame = frame(
+            system = "sys",
+            Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "memory-evidence"),
+            Segment(SegmentOrigin.PERCEPTION, false, "perception-block"),
+            Segment(SegmentOrigin.USER_INPUT, true, "now"),
+        )
+
+        val reply = gateway(client, lines).turn(turn(frame))
+
+        assertEquals(2, reply.overflowRecoveries)
+        assertEquals(
+            listOf("P3_CACHE cached=- miss=- inputTokens=10 outputTokens=5 systemChars=3 dynamicChars=0"),
+            lines,
+            "the HARD cut dropped the whole dynamic tail, so the sent request reports zero dynamic chars",
         )
     }
 

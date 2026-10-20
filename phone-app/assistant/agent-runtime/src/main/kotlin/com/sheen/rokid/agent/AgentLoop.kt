@@ -151,6 +151,22 @@ data class AgentRequest(
      * nothing — never a fabricated block.
      */
     val perception: (() -> String?)? = null,
+    /**
+     * 0.3 Phase 2 Task 11 review fix (controller ruling R12): an optional observer of this run's **assembled** request
+     * frames.
+     *
+     * Called once per model request of the run, after the loop has folded [runtimeState] and [perception] into the
+     * frame and before the gateway is asked to send it. A request that assembles no frame — the legacy history path, or
+     * a caller whose frame builder returned nothing — never calls it. This is the only seam that sees the whole frame:
+     * the caller's builder runs **before** the loop adds those request-scoped segments, so a provenance line emitted
+     * there would under-count the tail it claims to describe.
+     *
+     * Observability only: the callback receives a frame it must not mutate (the loop has already fixed the shape), and
+     * a throwing callback is swallowed so a logger can never fail a delivered turn. The callback is not called for the
+     * gateway's own overflow re-sends — those re-send one already-assembled request (they report `P3_CACHE` only) — and
+     * it *is* called for a request the gateway then refuses before sending, because the assembly did happen.
+     */
+    val onRequestBuilt: ((RequestFrame) -> Unit)? = null,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -590,6 +606,11 @@ class AgentLoop(
                 openingTurn -> request.frame
                 else -> null
             }?.let { withRuntimeState(it, request, spentSteps) }?.let { withPerception(it, request) }
+            // 0.3 Phase 2 Task 11 review fix (R12): one request-level telemetry observation per assembled request.
+            // It runs **after** the loop's RUNTIME_STATE and PERCEPTION segments are folded in and **before** the
+            // gateway can send (or refuse) the request, so the callback describes the frame this request really is.
+            // Observability is never a verdict: a throwing hook must not turn an assembled request into a failed run.
+            frameForTurn?.let { frame -> runCatching { request.onRequestBuilt?.invoke(frame) } }
             openingTurn = false
             // R78: count this request's images before it is sent. Distinct artifact ids, so a picture carried by two
             // requests of the same run is one image, not two.

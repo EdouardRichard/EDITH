@@ -1134,26 +1134,33 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * 0.3 Phase 2 Task 11 (spec §4.1/§5.3): the per-request prompt-provenance line, replacing the activation-once line.
+     * 0.3 Phase 2 Task 11 (spec §4.1/§5.3; review fix R12): the per-**assembled-request** prompt-provenance line.
      *
      * Counts and hashes only — the catalog version, the session-pinned plan's ordered-section hash, the device-profile
-     * digest, the pinned SKILL catalog hash, the route, and the request frame's system and dynamic-tail character
-     * counts. One line is emitted for **each model request** by the frame builder (wake tool rounds included) and by the
-     * proactive request assembly; no prompt prose, device value, SKILL name or user text ever rides it.
+     * digest, the pinned SKILL catalog hash, the route, and the assembled request frame's system and dynamic-tail
+     * character counts. One line is emitted for each assembled request: the wake route passes it to `AgentLoop` as
+     * `AgentRequest.onRequestBuilt`, which calls it after folding the loop's own segments in and before the gateway
+     * sends (a tool round is a second assembled request), and the proactive request assembly calls it directly because
+     * that route has no loop. A gateway overflow re-send reuses one assembled request and reports only `P3_CACHE`; a
+     * request the gateway refuses before sending still has this line, because the assembly did happen. No prompt prose,
+     * device value, SKILL name or user text ever rides it.
      *
-     * `dynamicChars` is the frame's [RequestLayout.dynamicTail] length **at frame build time**. The agent loop folds its
-     * own `RUNTIME_STATE` and `PERCEPTION` segments in after the wake builder returns, so those loop-owned segments are
-     * deliberately excluded: this line describes the frame the plugin assembled, while the gateway's `P3_CACHE` line
-     * describes the exact request that was sent.
+     * `dynamicChars` is the assembled frame's [RequestLayout.dynamicTail] length with the loop-owned `RUNTIME_STATE`
+     * excluded: memory evidence, a pulled `SKILL_BODY`, a `RETRY` instruction and the `PERCEPTION` block are counted,
+     * while the loop's own per-request state line is not (it is request scaffolding, not plugin-owned prompt context).
+     * The gateway's `P3_CACHE` line describes the exact kept frame that was sent, after any trim.
      */
     private fun logPromptRequest(route: ContextRoute, frame: RequestFrame) {
+        val dynamicChars = RequestLayout.dynamicTail(frame.conversationFlow)
+            .filter { it.origin != SegmentOrigin.RUNTIME_STATE }
+            .sumOf { it.text.length }
         P3Log.line(
             "P3_PROMPT version=${PromptCatalog.VERSION} " +
                 "hash=${activePromptPlans?.get(route)?.hash ?: PROMPT_HASH_NONE} " +
                 "deviceHash=$activeDeviceHash catalogHash=$pinnedSkillCatalogHash " +
                 "route=${route.name} " +
                 "staticChars=${frame.systemText.length} " +
-                "dynamicChars=${RequestLayout.dynamicTail(frame.conversationFlow).sumOf { it.text.length }}",
+                "dynamicChars=$dynamicChars",
         )
     }
 
@@ -2466,6 +2473,11 @@ class SmartAssistantPlugin(
                     perception = perception?.let { provider ->
                         { perceptionBlockFor(provider, initialSnapshot, perceptionRequests, profileAcceptsImages) }
                     },
+                    // 0.3 Phase 2 Task 11 (review fix R12): the loop calls this once per **assembled** request, after
+                    // folding its RUNTIME_STATE/PERCEPTION segments in and before the gateway sends (or refuses), so
+                    // the `P3_PROMPT` line describes the exact frame this request is. The legacy no-store path has no
+                    // frame and therefore emits no prompt line.
+                    onRequestBuilt = { frame -> logPromptRequest(ContextRoute.WAKE, frame) },
                 ),
             )
         } catch (failure: Throwable) {
@@ -2832,8 +2844,9 @@ class SmartAssistantPlugin(
      * a turn boundary that cleared the bodies between two separate reads would split the pair.
      *
      * 0.3 Phase 2 Task 11: this factory builds the proactive request's frame; the caller (`runProactive`) emits the
-     * per-request `P3_PROMPT` line from the returned frame immediately before `gateway.turn`, so the frame describes
-     * exactly the request that is sent. The wake path's equivalent is the `frameBuilderFor` lambda.
+     * per-assembled-request `P3_PROMPT` line from the returned frame immediately before `gateway.turn`. The wake
+     * route's equivalent is `AgentRequest.onRequestBuilt`, not its frame builder: the wake frame is assembled further
+     * by `AgentLoop` (which folds the loop-owned segments in), so only the loop's hook sees the complete frame.
      *
      * @param store the route's session store, whose [ConversationStore.snapshot] opens the flow.
      * @param prompt the session assembly. `null` means no manager was built (a host without a profile); the system
@@ -2938,10 +2951,9 @@ class SmartAssistantPlugin(
                 },
                 tools = tools,
             )
-            // 0.3 Phase 2 Task 11: one prompt-provenance line per model request (a tool round is the second request).
-            // The loop's RUNTIME_STATE/PERCEPTION segments are folded in after this lambda returns, so they are not
-            // counted here; P3_CACHE at the gateway reports the shape that was actually sent.
-            logPromptRequest(route, frame)
+            // No `P3_PROMPT` here: the builder runs **before** `AgentLoop` folds its RUNTIME_STATE/PERCEPTION
+            // segments in, so a line emitted from this lambda would under-count the tail. The loop's
+            // `AgentRequest.onRequestBuilt` hook emits the one line per assembled request instead (review fix R12).
             frame
         }
     }
@@ -3473,9 +3485,13 @@ class SmartAssistantPlugin(
         val frame = activeStores?.get(ContextRoute.PROACTIVE)?.let {
             buildFrame(it, ContextRoute.PROACTIVE, message, prompt, listOf(ProactiveHintSpec.PROPOSE_HINT))
         }
-        // 0.3 Phase 2 Task 11: this route has no AgentLoop, so the per-request prompt line is emitted here, before the
-        // one model request it makes. A no-frame legacy request (a host wiring without stores) has no frame to
-        // describe and stays silent; production always injects the per-route stores.
+        // 0.3 Phase 2 Task 11: this route has no AgentLoop, so the per-assembled-request prompt line is emitted here,
+        // before the one model request it makes. The perception-derived context of this route is folded into the
+        // request's USER_INPUT (the proactive `message`), not into a `PERCEPTION` tail segment, so it is neither part
+        // of `staticChars` nor of `dynamicChars` — its contribution is 0 by construction. The counted dynamic tail is
+        // whatever the assembly put there (memory evidence, a pulled SKILL body). A no-frame legacy request (a host
+        // wiring without stores) has no frame to describe and stays silent; production always injects the per-route
+        // stores.
         frame?.let { logPromptRequest(ContextRoute.PROACTIVE, it) }
         val reply = try {
             // 0.25 Task 12 (R58/R59): this route deliberately has **no** `AgentLoop` and no `AgentRequest` — it is one

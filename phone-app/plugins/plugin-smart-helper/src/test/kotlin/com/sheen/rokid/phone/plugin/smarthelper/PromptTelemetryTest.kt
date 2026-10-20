@@ -1,15 +1,22 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 
+import com.sheen.rokid.agent.MemoryRetrieval
+import com.sheen.rokid.agent.Segment
+import com.sheen.rokid.agent.SegmentOrigin
 import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.profileFixture
+import com.sheen.rokid.phone.plugin.smarthelper.skill.LoadSkillTool
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.DeviceProfile
+import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelEnd
+import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -18,21 +25,28 @@ import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 /**
- * 0.3 Phase 2 Task 11 (spec §4.1/§4.2.1/§5.3): `P3_PROMPT` is a **per request** provenance line.
+ * 0.3 Phase 2 Task 11 (spec §4.1/§4.2.1/§5.3; review fix R12): `P3_PROMPT` is a **per assembled request**
+ * provenance line.
  *
  * It is how a device log can prove which prompt ran without ever printing it: the catalog version, the pinned plan's
  * ordered-section hash, the deterministic device-profile hash, the pinned SKILL catalog hash, the route, and the
- * system/tail sizes of the frame that request carried. It is emitted for both production frame paths — the wake
- * builder (one line per model request, so a tool round is two lines) and the proactive request assembly — and no longer
- * once per activation: the plan is still pinned for the session, but the line describes each rendered request.
+ * system/tail sizes of the assembled request. It is emitted for both production frame paths — the wake route through
+ * `AgentRequest.onRequestBuilt`, called by `AgentLoop` after its `RUNTIME_STATE`/`PERCEPTION` segments are folded in
+ * and before the gateway sends (a tool round is a second assembled request), and the proactive request assembly (which
+ * has no `AgentLoop`) — and no longer once per activation. A gateway overflow re-send reuses an already-assembled
+ * request and reports only `P3_CACHE`; a request the gateway refuses before sending still has its `P3_PROMPT`, because
+ * the assembly really happened.
  *
- * `dynamicChars` is the frame's [com.sheen.rokid.agent.RequestLayout.dynamicTail] length at build time. The loop-owned
- * `RUNTIME_STATE` (and `PERCEPTION`) segments are folded in by `AgentLoop` **after** the wake builder returns, so they
- * are deliberately excluded; the line stays counts/hashes only, with no prompt, device or user text.
+ * `dynamicChars` is the assembled frame's [com.sheen.rokid.agent.RequestLayout.dynamicTail] length **excluding** the
+ * loop-owned `RUNTIME_STATE` segment: memory evidence, a pulled SKILL body, a retry instruction and the `PERCEPTION`
+ * block all count. The line stays counts/hashes only, with no prompt, device or user text.
  */
 class PromptTelemetryTest {
 
     private val profile = profileFixture(model = "M2012K11AC")
+
+    /** The one memory line every request of the [tailsRig] assembly retrieves; its length is a known tail term. */
+    private val memoryText = "memory: 用户喜欢乌龙茶"
 
     /** The production activation path: the device provider arrives through `services.deviceState()`. */
     private fun activateWithDeviceProfile(rig: SmartTestRig = SmartTestRig()): SmartTestRig {
@@ -57,12 +71,12 @@ class PromptTelemetryTest {
         return rig
     }
 
-    /** One request that answers normally, i.e. the per-request line the wake path emits before the gateway call. */
+    /** One request that answers normally: the single assembled request the wake path reports. */
     private fun answerOnce(rig: SmartTestRig) {
         rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
     }
 
-    /** A tool round: the model notifies once, then answers — two model requests in one turn. */
+    /** A tool round: the model notifies once, then answers — two assembled requests in one turn. */
     private fun notifyThenAnswer(rig: SmartTestRig, answer: String = "好。") {
         var calls = 0
         rig.model.onRequest = { request, listener ->
@@ -107,13 +121,70 @@ class PromptTelemetryTest {
         return withLines { rig.wakeAndFinal(utterance) }
     }
 
+    /** One fixed retrieval: every wake assembly gets this evidence, so the tail's memory term is a known length. */
+    private class FixedMemory(private val parts: List<Segment>) : MemoryRetrieval {
+        override fun retrieve(query: String, limit: Int): List<Segment> = parts
+    }
+
+    /**
+     * A store-backed wake rig with all three plugin-owned tails available: memory (through the session assembly), a
+     * SKILL library whose body the model can pull, and the host perception port. The store is what gives every request
+     * an assembled frame.
+     */
+    private fun tailsRig(skillBody: String): SmartTestRig {
+        val rig = SmartTestRig(
+            contextForTurn = ContextManager(
+                memory = FixedMemory(
+                    listOf(Segment(SegmentOrigin.MEMORY_EVIDENCE, trusted = false, text = memoryText)),
+                ),
+                policy = smartContextPolicy(),
+                promptPlan = smartPromptPlan("WAKE SYSTEM"),
+            ),
+            conversationStores = smartStores(),
+        )
+        // A wide window so the gateway's trimmer never drops the tail these tests measure: with the default small
+        // fixture the production system prompt plus all three tails would exceed the hard limit, and a legitimate cut
+        // (or `restoreCurrentUtterance`) would make the sizes depend on the trimmer instead of on this fix.
+        rig.profile = smartProfile(
+            usableWindowTokens = 32_000,
+            inputBudgetTokens = 16_000,
+            maxOutputTokens = 2_000,
+            safetyTokens = 1_000,
+        )
+        rig.activate(
+            overrides = mapOf(
+                Capability.Storage to SmartFakeStorage(),
+                Capability.DeviceState to SmartFakeDeviceState(profile),
+                Capability.Perception to SmartFakePerception(),
+                Capability.StorageAccess to SmartFakeSkills(
+                    mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", skillBody)),
+                ),
+            ),
+        )
+        return rig
+    }
+
+    /**
+     * The request-scoped tail the model actually received, decoded from the wire input: the gateway renders the
+     * dynamic segments ahead of the user input, joined with a blank line. The trailing user input is known to the
+     * test, so the decode is exact and no production constant is duplicated.
+     */
+    private fun dynamicPartsOf(request: ModelRequest, userInput: String): List<String> {
+        val input = request.input.filterIsInstance<InputPart.Text>().joinToString("\n\n") { it.text }
+        assertTrue(input.endsWith("\n\n$userInput"), "the dynamic tail must precede the user input: $input")
+        return input.removeSuffix("\n\n$userInput").split("\n\n")
+    }
+
+    /** One rendered perception block's own character count, from its count-only `P3_PERCEPTION` line. */
+    private fun perceptionChars(line: String): Int = field(line, "screenChars").toInt()
+
     @Test
     fun `activation no longer emits a prompt line`() {
         val lines = withLines { activateWithDeviceProfile() }
 
         assertTrue(
             promptLines(lines).isEmpty(),
-            "P3_PROMPT is per request now; activation must not claim a request that never happened: $lines",
+            "P3_PROMPT is per assembled request now; activation must not claim a request that never happened: $lines",
         )
     }
 
@@ -138,7 +209,8 @@ class PromptTelemetryTest {
             field(line, "staticChars"),
             "staticChars must be the frame's own system length: $line",
         )
-        // No memory, skill body or retry in this request: the dynamic tail is empty (loop-owned segments come later).
+        // No memory, skill body, retry or perception in this request: the assembled dynamic tail is empty (the
+        // loop-owned RUNTIME_STATE is excluded by contract, and this rig produces none anyway).
         assertEquals("0", field(line, "dynamicChars"), line)
         assertEquals("none", field(line, "catalogHash"), "no library was installed: $line")
         // No prompt prose, no device values, no user/model text: the whole line is ASCII counts and hex.
@@ -151,7 +223,7 @@ class PromptTelemetryTest {
     }
 
     @Test
-    fun `a wake tool round emits one prompt line per model request`() {
+    fun `a wake tool round emits one prompt line per assembled request`() {
         val rig = wakeRig()
         notifyThenAnswer(rig)
 
@@ -159,7 +231,7 @@ class PromptTelemetryTest {
 
         assertEquals(2, rig.model.requests.size, "the notify round-trip must make a second model request")
         val prompt = promptLines(lines)
-        assertEquals(2, prompt.size, "one line per model request, not one per turn or activation: $lines")
+        assertEquals(2, prompt.size, "one line per assembled request, not one per turn or activation: $lines")
         prompt.forEach { line ->
             assertTrue("route=WAKE" in line, line)
             assertTrue(Regex("""staticChars=\d+ dynamicChars=\d+$""").containsMatchIn(line), line)
@@ -226,6 +298,10 @@ class PromptTelemetryTest {
     fun `a proactive request logs route=PROACTIVE with the proactive plan`() {
         // The proactive route has no AgentLoop: it assembles its frame and calls the gateway directly, so its line is
         // emitted by that request assembly. The plan is the PROACTIVE one, never the wake plan.
+        //
+        // The perception-derived context of this route is folded into the request's USER_INPUT (the proactive
+        // `message`), not into a PERCEPTION tail segment, so it is neither static nor dynamic by construction and
+        // `dynamicChars` is 0 here. Memory and a pulled SKILL body would still be counted, and this route pulls none.
         val rig = SmartTestRig(conversationStores = smartStores())
         rig.activate(
             overrides = mapOf(
@@ -250,6 +326,13 @@ class PromptTelemetryTest {
 
         val line = promptLine(lines)
         val plan = PromptCatalog.plan(ContextRoute.PROACTIVE, profile)
+        assertTrue(
+            Regex(
+                """^P3_PROMPT version=0\.3\.0 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
+                    """catalogHash=(?:[0-9a-f]{64}|none) route=PROACTIVE staticChars=\d+ dynamicChars=0$""",
+            ).matches(line),
+            "the proactive line must carry exactly the same pinned field list as the wake line: $line",
+        )
         assertTrue("route=PROACTIVE" in line, "the proactive request must name its own route: $line")
         assertEquals(plan.hash, field(line, "hash"), "the proactive request must use the proactive plan: $line")
         assertEquals(64, field(line, "deviceHash").length, "a supplied profile hashes to a SHA-256 digest: $line")
@@ -277,5 +360,113 @@ class PromptTelemetryTest {
         assertEquals(first, second, "the same profile must fingerprint the same")
         assertNotEquals(first, other, "a different device profile must fingerprint differently")
         assertNotEquals("none", first, "a supplied profile must not read as absent")
+    }
+
+    @Test
+    fun `the line counts memory, skill body and perception but never the loop-owned runtime state`() {
+        // Review Important (R12): the line is emitted after AgentLoop folds RUNTIME_STATE and PERCEPTION in, so the
+        // memory evidence, the pulled SKILL body and the PERCEPTION block are counted, while the loop-owned state is
+        // excluded.
+        val skillMarker = "skill-body-marker-9042"
+        val rig = tailsRig(skillMarker)
+        rig.actions.runtimeStateLine = "foreground=com.android.settings"
+        var skillBodyChars = 0
+        var calls = 0
+        rig.model.onRequest = { request, listener ->
+            calls++
+            if (calls == 1) {
+                listener(
+                    smartToolCall(
+                        "c1", LoadSkillTool.NAME, """{"name":"alpha"}""",
+                        requestId = request.requestId,
+                    ),
+                )
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                // The pulled body is live now; it is the exact SKILL_BODY tail the second request carries.
+                skillBodyChars = rig.plugin.requestSkillSegmentsForTest(ContextRoute.WAKE).second
+                    .sumOf { it.text.length }
+                streamText(request, listener, "好。")
+            }
+        }
+
+        val lines = withLines { rig.wakeAndFinal("现在几点了") }
+
+        assertEquals(2, rig.model.requests.size, "the load_skill round-trip makes a second assembled request")
+        val prompts = promptLines(lines)
+        assertEquals(2, prompts.size, "exactly one P3_PROMPT per assembled request: $lines")
+        val perceptions = lines.filter { it.startsWith("P3_PERCEPTION ") }
+        assertEquals(2, perceptions.size, "each request rendered its own block: $lines")
+
+        val first = dynamicPartsOf(rig.model.requests[0], "现在几点了")
+        val second = dynamicPartsOf(rig.model.requests[1], CONTINUE_AFTER_TOOL)
+
+        // Request 1: memory + the loop's runtime state + perception. The line must count memory and perception and
+        // skip RUNTIME_STATE, even though the runtime state really is on the wire.
+        assertTrue(first.any { it.startsWith("steps=") }, "the loop folded its state in: $first")
+        assertTrue(memoryText in first, "the memory evidence rides the tail: $first")
+        assertTrue(first.any { it.length == perceptionChars(perceptions[0]) }, "the perception block rides: $first")
+        assertFalse(first.any { skillMarker in it }, "the body was never pulled before request 1: $first")
+        assertEquals(
+            first.filterNot { it.startsWith("steps=") }.sumOf { it.length },
+            field(prompts[0], "dynamicChars").toInt(),
+            "the line must sum memory + perception and exclude RUNTIME_STATE: $first",
+        )
+
+        // Request 2: the pulled SKILL body joins. No retry in this flow; an unchanged runtime state is deduplicated.
+        assertTrue(memoryText in second, "memory is re-added to every request of the turn: $second")
+        assertTrue(second.any { skillMarker in it }, "the pulled body rides the tail: $second")
+        assertTrue(second.any { it.length == perceptionChars(perceptions[1]) }, "perception rides again: $second")
+        assertTrue(second.none { it.startsWith("steps=") }, "an unchanged state is deduplicated: $second")
+        assertEquals(
+            second.sumOf { it.length },
+            field(prompts[1], "dynamicChars").toInt(),
+            "the line must sum memory + SKILL body + perception: $second",
+        )
+        assertEquals(
+            memoryText.length + skillBodyChars + perceptionChars(perceptions[1]),
+            field(prompts[1], "dynamicChars").toInt(),
+            "the named tails add up to the reported count exactly",
+        )
+    }
+
+    @Test
+    fun `a retry instruction is counted and a request without perception still logs`() {
+        // Review Important (R12): a retry re-assembles the frame with the loop's RETRY segment, so the line is
+        // emitted again and counts it. This rig has no perception provider at all, and the request still logs.
+        val rig = wakeRig()
+        rig.actions.runtimeStateLine = "foreground=com.android.settings"
+        var calls = 0
+        rig.model.onRequest = { request, listener ->
+            calls++
+            if (calls == 1) {
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(request, listener, "好。")
+            }
+        }
+
+        val lines = withLines { rig.wakeAndFinal("现在几点了") }
+
+        assertEquals(2, rig.model.requests.size, "the empty first reply must be retried")
+        val prompts = promptLines(lines)
+        assertEquals(2, prompts.size, "one line per assembled request: $lines")
+
+        val first = dynamicPartsOf(rig.model.requests[0], "现在几点了")
+        val second = dynamicPartsOf(rig.model.requests[1], CONTINUE_AFTER_TOOL)
+        assertTrue(first.any { it.startsWith("steps=") }, "request 1 carried the loop state: $first")
+        assertEquals(
+            0,
+            field(prompts[0], "dynamicChars").toInt(),
+            "a request without perception still logs, and the loop-owned state is excluded: $first",
+        )
+        val retry = second.singleOrNull()
+            ?: error("the retry instruction must be the second request's only dynamic tail: $second")
+        assertTrue(retry.isNotBlank(), "the loop appended a retry instruction")
+        assertEquals(
+            retry.length,
+            field(prompts[1], "dynamicChars").toInt(),
+            "the retry instruction is part of the assembled tail: $retry",
+        )
     }
 }

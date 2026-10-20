@@ -31,6 +31,7 @@ class AgentLoopPerceptionTest {
         perception: (() -> String?)? = null,
         runtimeState: (() -> TurnRuntimeState?)? = null,
         frameFor: ((List<ModelHistoryItem>) -> RequestFrame)? = minimalFrame("打开设置"),
+        onRequestBuilt: ((RequestFrame) -> Unit)? = null,
     ) = AgentRequest(
         turnId = "turn-perception",
         utterance = "打开设置",
@@ -40,6 +41,7 @@ class AgentLoopPerceptionTest {
         frameFor = frameFor,
         runtimeState = runtimeState,
         perception = perception,
+        onRequestBuilt = onRequestBuilt,
     )
 
     private fun loop(
@@ -209,5 +211,71 @@ class AgentLoopPerceptionTest {
         assertEquals(0, gateway.requests.single().frame?.conversationFlow?.count {
             it.origin == SegmentOrigin.PERCEPTION
         } ?: 0)
+    }
+
+    // ---------------------------------------------------------------- the assembled-request hook (Task 11 R12)
+
+    @Test
+    fun `the request hook sees the frame after the loop folded perception in`() {
+        // The hook is the fix's whole point: the plugin's builder runs before the loop adds its request-scoped
+        // segments, so only this seam can describe the tail the model really received.
+        val gateway = ScriptedGateway(listOf(reply(text = "好。")))
+        val frames = mutableListOf<RequestFrame>()
+
+        loop(gateway).run(
+            request(
+                perception = { "感知：前台=com.android.settings" },
+                onRequestBuilt = { frames += it },
+            ),
+        )
+
+        val sent = gateway.requests.single().frame!!
+        assertEquals(listOf(sent), frames, "one hook call per assembled request, carrying the frame that was sent")
+        assertEquals(
+            1,
+            frames.single().conversationFlow.count { it.origin == SegmentOrigin.PERCEPTION },
+            "the hook must see the folded perception segment, not the builder's pre-fold frame: ${frames.single()}",
+        )
+    }
+
+    @Test
+    fun `the request hook runs once per request of a retry`() {
+        // A retry is a second assembled request, and its frame is rebuilt from the transcript the retry continues.
+        // An unchanged perception block is deduplicated, exactly as the sent frame shows.
+        val gateway = ScriptedGateway(listOf(reply(), reply(text = "好。")))
+        val frames = mutableListOf<RequestFrame>()
+
+        loop(gateway).run(
+            request(
+                perception = { "感知：前台=com.android.settings" },
+                onRequestBuilt = { frames += it },
+            ),
+        )
+
+        assertEquals(2, gateway.requests.size)
+        assertEquals(2, frames.size, "one hook call per assembled request: $frames")
+        assertEquals(1, frames[0].conversationFlow.count { it.origin == SegmentOrigin.PERCEPTION })
+        assertEquals(0, frames[1].conversationFlow.count { it.origin == SegmentOrigin.PERCEPTION })
+    }
+
+    @Test
+    fun `the request hook is not called when the run assembles no frame`() {
+        val gateway = ScriptedGateway(listOf(reply(text = "好。")))
+        var calls = 0
+
+        loop(gateway).run(request(frameFor = null, onRequestBuilt = { calls++ }))
+
+        assertEquals(0, calls, "the legacy history path has no frame to describe")
+    }
+
+    @Test
+    fun `a throwing request hook cannot fail the run`() {
+        // Observability is never a verdict: a logger that throws must not turn a delivered answer into a failure.
+        val gateway = ScriptedGateway(listOf(reply(text = "好。")))
+
+        val run = loop(gateway).run(request(onRequestBuilt = { error("logger exploded") }))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals("好。", run.finalText)
     }
 }
