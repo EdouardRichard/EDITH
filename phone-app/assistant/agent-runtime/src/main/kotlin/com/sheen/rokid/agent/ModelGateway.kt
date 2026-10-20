@@ -44,11 +44,11 @@ data class GatewayTurn(
     val tools: List<ToolSpec>,
     val deadlineNanos: Long,
     /**
-     * Test seam only: the byte limit the frame is trimmed to. [Int.MAX_VALUE] (the default) means
-     * "no override" — the gateway trims to `ModelClientGateway.windowBytes(profile)`, which is the send-time
-     * `ContextBudgeter` bound minus a deliberate 32-byte margin. Ignored when [frame] is null.
+     * Test seam only: the token-unit limit the frame is trimmed to. [Int.MAX_VALUE] (the default) means
+     * "no override" — the gateway trims to `ModelClientGateway.windowTokens(profile)`, which is the send-time
+     * `ContextBudgeter` bound minus a deliberate 32-unit margin. Ignored when [frame] is null.
      */
-    val limitBytes: Int = Int.MAX_VALUE,
+    val limitTokens: Int = Int.MAX_VALUE,
     /**
      * Phase 5: 已装配的请求形状。非 null 时网关从它派生 [ModelRequest] 并先裁到窗口内；
      * null（默认）时完全保持 Phase 3 之前的 `split(history)` 行为 ⇒ 既有调用点一行不改。

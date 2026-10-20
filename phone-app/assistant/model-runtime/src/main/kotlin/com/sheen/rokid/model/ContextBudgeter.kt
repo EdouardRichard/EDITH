@@ -114,9 +114,9 @@ class ContextBudgeter {
     }
 
     /**
-     * The token-unit estimate for one text, shared with the trimmer and the plugin through [TokenMeter] (0.3 design
-     * §5.2). The previous implementation counted UTF-8 bytes, which over-priced CJK up to threefold and made the
-     * profile's `inputBudgetTokens` name untrue; the unit is now the same one the profile fields speak.
+     * The token-unit estimate for one text, in the same unit the profile fields speak and the same one `TurnTrimmer`
+     * charges through [TokenMeter] (0.3 design §5.2). The previous implementation counted UTF-8 bytes, which
+     * over-priced CJK up to threefold and made the profile's `inputBudgetTokens` name untrue.
      */
     fun estimateText(text: String): Long = TokenMeter.estimate(text).toLong()
 }

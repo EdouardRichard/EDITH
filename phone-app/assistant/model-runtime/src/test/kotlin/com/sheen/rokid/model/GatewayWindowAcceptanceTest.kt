@@ -50,15 +50,13 @@ import kotlin.test.fail
  *
  * ## What the discriminating assertion is (I-4)
  *
- * The gate is the `budgeter.prepare(...)` call itself, not the shape of the wire. `TurnTrimmer.total` and
- * [ContextBudgeter.prepare] now price text in **different units for one task**: the budgeter uses `TokenMeter` token
- * units (0.3 design §5.2), while the trimmer is deliberately left byte-based here — Task 7 reprices it. That direction
- * is safe, not a hole: for the same message, a UTF-8 byte count is never smaller than its `TokenMeter` estimate (ASCII
- * is ≤ one unit per byte, every non-ASCII code point is one unit for at least two bytes), both stages add the same fixed
- * 32 and the same per-message 32, and both charge the same [com.sheen.rokid.contracts.ImageBudget.UNITS_PER_IMAGE] per
- * image. A frame trimmed to the byte window is therefore still accepted by the token budget, with slack; these tests pin
- * that acceptance (and, below, the token unit's own fail-closed boundary) until Task 7 makes the units match exactly.
- * The gateway's `- 32` in its window is still a deliberate safety margin, not a correction.
+ * The gate is the `budgeter.prepare(...)` call itself, not the shape of the wire. [TurnTrimmer] and
+ * [ContextBudgeter.prepare] both price text with `TokenMeter` token units (0.3 design §5.2), both add the same fixed 32
+ * and the same per-message 32, and both charge the same
+ * [com.sheen.rokid.contracts.ImageBudget.UNITS_PER_IMAGE] per image. The gateway's `- 32` in its window is still a
+ * deliberate safety margin, not a unit correction: the wire rendering can fold leading context and itemise a tool
+ * round, so a request's price is not necessarily the trimmer's per-segment total. These tests pin the send-time
+ * acceptance and, where a boundary is meaningful, the exact token price of a fixture.
  *
  * The margin itself is pinned next to the code it lives in, by `ModelClientGatewayTest`'s
  * `the trim window is the send time limit minus a deliberate safety margin`.
@@ -86,8 +84,8 @@ class GatewayWindowAcceptanceTest {
 
     /**
      * A [ModelClient] that answers the provider's overflow verdict for its first [overflows] requests and completes the
-     * turn afterwards, recording every request. This is how an overflow the byte budget cannot see (the provider counts
-     * tokens, not bytes) reaches the gateway's recovery path.
+     * turn afterwards, recording every request. This is how an overflow the local estimate cannot see (the provider
+     * counts its own tokens, this project only estimates) reaches the gateway's recovery path.
      */
     private class OverflowFirstModelClient(private val overflows: Int) : ModelClient {
         val requests = mutableListOf<ModelRequest>()
@@ -127,13 +125,12 @@ class GatewayWindowAcceptanceTest {
     private fun tightProfile() = profile.copy(inputBudgetTokens = 200, maxOutputTokens = 128, safetyTokens = 128)
 
     /**
-     * The trim window the gateway uses at send time, recomputed here because `ModelClientGateway.windowBytes` is
-     * `internal` to `agent-runtime`: the same `minOf(...)` bound minus the deliberate 32-unit margin. It stays a **byte**
-     * window until Task 7 reprices the trimmer; the budgeter it hands the request to already counts token units. The
-     * comparison in the production-shape test is a "nothing was cut" check, so sharing the send-time `prepare` limit
-     * itself would be circular; the formula above it is `ContextBudgeter`'s own.
+     * The trim window the gateway uses at send time, recomputed here because `ModelClientGateway.windowTokens` is
+     * `internal` to `agent-runtime`: the same `minOf(...)` bound minus the deliberate 32-unit margin. The comparison
+     * in the production-shape test is a "nothing was cut" check, so sharing the send-time `prepare` limit itself would
+     * be circular; the formula above it is `ContextBudgeter`'s own.
      */
-    private fun limitWindowBytes(chosen: ModelProfile): Int = maxOf(
+    private fun limitWindowTokens(chosen: ModelProfile): Int = maxOf(
         0,
         minOf(
             chosen.inputBudgetTokens,
@@ -184,16 +181,15 @@ class GatewayWindowAcceptanceTest {
     )
 
     @Test fun `a frame at the trim window is accepted by the send time budgeter`() {
-        // Byte-exact for the trimmer, which Task 7 will reprice; the send-time gate below is already token-based:
+        // Token-exact for the trimmer and for the send-time budgeter:
         //
         //   ContextBudgeter limit = minOf(93_000, 100_000 - 6_000 - 1_000) = **93_000 token units**
-        //   gateway byte window   = 93_000 - FIXED_OVERHEAD(32)            = **92_968 bytes**
-        //   TurnTrimmer.total()   = 32 + (3 + 32) + (2_800 + 32) + (90_000 + 32) + (5 + 32) = **92_968 bytes**
+        //   gateway trim window   = 93_000 - FIXED_OVERHEAD(32)            = **92_968 token units**
+        //   TurnTrimmer.total()   = 32 + (1 + 32) + (700 + 32) + (22_500 + 32) + (2 + 32) = **23_363 token units**
         //
-        // The frame sits exactly on the trim window, so cut ① does not fire and the whole transcript is sent. Its token
-        // price is far lower (ASCII is one unit per four characters), so the send-time check accepts it with slack —
-        // the safe direction of running the byte trimmer ahead of the token budgeter for one task. The discriminating
-        // assertion is that `prepare` accepts it.
+        // The frame is comfortably inside the window, so cut ① does not fire and the whole transcript is sent. The
+        // exact price is pinned by the boundary pair below: at 23_363 nothing is cut, one unit less evicts the whole
+        // oldest turn. The discriminating acceptance assertion remains the send-time `prepare` call.
         val frame = RequestFrame(
             systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")),
             conversationFlow = listOf(
@@ -205,7 +201,13 @@ class GatewayWindowAcceptanceTest {
         )
 
         // The trimmer's own verdict at the window: nothing is cut, so the assertion below cannot drift from it.
-        assertEquals(frame, TurnTrimmer().trim(frame, 92_968).kept, "92_968 is the exact window: nothing is cut")
+        assertEquals(frame, TurnTrimmer().trim(frame, 92_968).kept, "92_968 is the gateway window: nothing is cut")
+        assertEquals(frame, TurnTrimmer().trim(frame, 23_363).kept, "23_363 is the frame's exact token price")
+        assertEquals(
+            1,
+            TurnTrimmer().trim(frame, 23_362).droppedTurns,
+            "one unit under the exact price must evict the oldest whole turn",
+        )
 
         gateway().turn(turn(frame))
 
@@ -226,20 +228,19 @@ class GatewayWindowAcceptanceTest {
      * survive** the trim. The other acceptance tests trim at or near a 93 000-unit window and cut nothing; this one
      * makes cut ① fire and then hands the result to the real send-time [ContextBudgeter].
      *
-     * `tightProfile()` pins `minOf(200, 100_000 - 128 - 128)` = **200**, so the byte-only trim window (Task 7 will
-     * reprice it) is `200 - 32` = **168 bytes**:
+     * `tightProfile()` pins `minOf(200, 100_000 - 128 - 128)` = **200**, so the trim window is `200 - 32` = **168 token
+     * units**:
      *
      * ```
-     * ContextBudgeter limit = minOf(200, 100_000 - 128 - 128)                    = **200 token units**
-     * gateway byte window   = 200 - FIXED_OVERHEAD(32)                           = **168 bytes**
-     * frame total           = 32 + (40 + 32) + (1 + 32) + (2 + 32) + (15 + 32)   = **218**  > 168  ⇒ ① fires
-     * kept total            = 32 + (40 + 32) + (15 + 32)                         = **151**  ≤ 168
-     * kept token price      = 32 + (10 + 32) + (5 + 32)                          = **111**  ≤ 200
+     * ContextBudgeter limit = minOf(200, 100_000 - 128 - 128)                 = **200 token units**
+     * gateway trim window   = 200 - FIXED_OVERHEAD(32)                        = **168 token units**
+     * frame total           = 32 + (10 + 32) + (1 + 32) + (1 + 32) + (5 + 32) = **177**  > 168  ⇒ ① fires
+     * kept total            = 32 + (10 + 32) + (5 + 32)                      = **111**  ≤ 168
      * ```
      *
      * The old turn is deliberately **two** segments (`USER` + `ASSISTANT`) so that the input sits inside cut ①'s slice:
      * with a one-segment turn the slice would stop before the input and the eviction filter would never be consulted.
-     * `prepare` re-measures the kept request in token units, so the acceptance is exact at the new unit.
+     * `prepare` re-measures the kept request in the same token units, so the acceptance is exact.
      */
     @Test fun `a frame trimmed to a window that fits only the current turn input is accepted`() {
         val frame = RequestFrame(
@@ -273,15 +274,15 @@ class GatewayWindowAcceptanceTest {
 
     /**
      * The unit switch at the gateway boundary: a Chinese-only input whose UTF-8 size exceeded the tight profile's
-     * budget is now priced by `TokenMeter` and accepted.
+     * budget is priced by `TokenMeter` and accepted.
      *
-     * The frame has no evictable transcript turn, so the still-byte-based trimmer (Task 7) leaves the oversized input
-     * in the kept frame and the real send-time budgeter is the only price check left — exactly the situation this task
-     * changes. At `tightProfile()`'s 200-unit limit the request prices at **166 token units**
-     * (32 + (10 + 32) + (60 + 32)); the byte estimator charged **316** (32 + (40 + 32) + (180 + 32)) and rejected the
-     * shape. The exact value proves the text went through `TokenMeter`, not that the assertion merely got looser.
+     * The frame has no evictable transcript turn, so the trimmer leaves the input in the kept frame (its own token
+     * total, 166, is inside the 168-unit window) and the real send-time budgeter accepts the same price: **166 token
+     * units** (32 + (10 + 32) + (60 + 32)). The byte estimator charged **316** (32 + (40 + 32) + (180 + 32)) and
+     * rejected the shape. The exact value proves the text went through `TokenMeter`, not that the assertion merely got
+     * looser.
      */
-    @Test fun `a Chinese input the byte budget used to reject is accepted at its token price`() {
+    @Test fun `a Chinese input the byte estimator used to reject is accepted at its token price`() {
         val frame = RequestFrame(
             systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "i".repeat(40))),
             conversationFlow = listOf(Segment(SegmentOrigin.USER_INPUT, true, "现在几点了".repeat(12))),
@@ -418,10 +419,10 @@ class GatewayWindowAcceptanceTest {
      * rendered at insert time and the tool round is stored as `ToolCall`/`ToolOutput` (not as a plain text round).
      *
      * The window for the "nothing was trimmed" check below is written out here rather than calling the gateway's
-     * `windowBytes`: that function is `internal` to `agent-runtime`, and this module is on the other side of the
+     * `windowTokens`: that function is `internal` to `agent-runtime`, and this module is on the other side of the
      * boundary. It is the same formula with the same deliberate 32-unit margin, floored at 0 so a small profile cannot
-     * produce a negative limit. (It is still a byte window until Task 7 reprices the trimmer; the budgeter below is
-     * already token-based, which only adds slack to this acceptance.)
+     * produce a negative limit. Both stages now count the same token unit, so this comparison prices the same frame
+     * the trimmer did.
      */
     @Test fun `the production shaped store backed frame is accepted by the send time budgeter`() {
         val summaryBody = "上一段对话已被压缩为摘要。"
@@ -460,7 +461,7 @@ class GatewayWindowAcceptanceTest {
         // The head really is the compressed summary, and cut ① has nothing to drop at this profile's window - so the
         // shape below is the untrimmed production frame, not a trimmer artefact.
         assertTrue(store.headIsSummary(), "the store head must be the summary this shape is about")
-        val window = limitWindowBytes(profile)
+        val window = limitWindowTokens(profile)
         assertEquals(frame, TurnTrimmer().trim(frame, window).kept)
 
         gateway().turn(turn(frame))
@@ -529,7 +530,8 @@ class GatewayWindowAcceptanceTest {
             tools = emptyList(),
         )
 
-        // The provider reports an overflow the byte budget cannot see **twice**; the third attempt is the hard truncate.
+        // The provider reports an overflow the local estimate cannot see **twice**; the third attempt is the hard
+        // truncate.
         val overflowClient = OverflowFirstModelClient(overflows = 2)
         gateway(recording = overflowClient).turn(turn(frame))
 
@@ -564,7 +566,7 @@ class GatewayWindowAcceptanceTest {
 
 /**
  * The plugin's `toSegment` rule, mirrored here because `plugins-smart` is downstream of `model-runtime` and its own
- * private copy is not visible from this module (`SmartAssistantPlugin.kt:2336`). Kept byte-identical in intent: roles
+ * private copy is not visible from this module (`SmartAssistantPlugin.kt:2336`). Kept identical in intent: roles
  * ride along for text, and a tool item becomes a `TOOL_ROUND` segment whose text is the frame vocabulary's JSON entry,
  * so the gateway restores the round as **structured** items rather than as assistant texts.
  */

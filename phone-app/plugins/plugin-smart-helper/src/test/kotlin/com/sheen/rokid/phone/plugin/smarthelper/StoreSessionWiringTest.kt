@@ -7,6 +7,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryKind
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.SegmentOrigin
 import com.sheen.rokid.agent.SummaryBoundary
+import com.sheen.rokid.agent.TokenMeter
 import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
 import com.sheen.rokid.contracts.TranscriptEvent
@@ -568,13 +569,13 @@ class StoreSessionWiringTest {
 
     // ------------------------------------------------------------ the lone one-item user group
 
-    /** `TurnTrimmer.total`'s own byte unit (`UTF-8 bytes + 32`), so the window below is exact. */
-    private fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+    /** `TurnTrimmer.total`'s own token unit (`TokenMeter.estimate + 32`), so the window below is exact. */
+    private fun measure(text: String) = TokenMeter.estimate(text) + 32
 
     /**
      * A profile whose window fits the system slot, the surviving pending user turn and this turn's input — with 8
-     * bytes to spare — so cut ① evicts the older whole turn and stops there. The system slot is composed exactly as
-     * `buildFrame` composes it.
+     * token units to spare — so cut ① evicts the older whole turn and stops there. The system slot is composed exactly
+     * as `buildFrame` composes it.
      */
     private fun windowSizedFor(vararg survivors: String): ModelProfile {
         val system = SmartPrompts.instructions() + "\n" + SmartPrompts.MEMORY_POLICY

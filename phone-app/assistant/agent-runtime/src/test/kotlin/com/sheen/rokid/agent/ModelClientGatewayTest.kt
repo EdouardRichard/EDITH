@@ -65,9 +65,9 @@ class ModelClientGatewayTest {
         tools: List<ToolSpec> = emptyList(),
         deadlineNanos: Long = 1_000_000_000L,
         // Phase 5 seams, both appended with defaults so every existing positional call site keeps its meaning:
-        // `Int.MAX_VALUE` is the "no override" sentinel the gateway reads as "trim to `windowBytes(profile)`, and
+        // `Int.MAX_VALUE` is the "no override" sentinel the gateway reads as "trim to `windowTokens(profile)`, and
         // `frame = null` is exactly today's `split(history)` behaviour. `frame` is the last parameter.
-        limitBytes: Int = Int.MAX_VALUE,
+        limitTokens: Int = Int.MAX_VALUE,
         frame: RequestFrame? = null,
         // 0.24 S4 Task 16: the streaming observer, appended so every positional call site keeps its meaning.
         onTextDelta: ((String) -> Unit)? = null,
@@ -75,7 +75,7 @@ class ModelClientGatewayTest {
         // pre-Task-27 construction and keeps every existing call site unchanged.
         userUtterance: String? = null,
     ) = GatewayTurn(
-        turnId, profileId, instructions, history, tools, deadlineNanos, limitBytes, frame, onTextDelta, userUtterance,
+        turnId, profileId, instructions, history, tools, deadlineNanos, limitTokens, frame, onTextDelta, userUtterance,
     )
 
     private fun scripted(vararg events: ModelStreamEvent) =
@@ -552,7 +552,7 @@ class ModelClientGatewayTest {
         }
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 200))
+        gateway(client).turn(turn(frame = frame, limitTokens = 200))
 
         val sent = client.requests.single()
         assertEquals(listOf("本轮到底几点了"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
@@ -569,7 +569,7 @@ class ModelClientGatewayTest {
         )
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+        gateway(client).turn(turn(frame = frame, limitTokens = 1_000_000))
 
         val sent = client.requests.single()
         assertEquals(0, sent.history.size, "runtime state is not a conversation turn")
@@ -599,7 +599,7 @@ class ModelClientGatewayTest {
         )
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+        gateway(client).turn(turn(frame = frame, limitTokens = 1_000_000))
 
         val sent = client.requests.single()
         val head = sent.history.first() as ModelHistoryItem.Text
@@ -625,7 +625,7 @@ class ModelClientGatewayTest {
         )
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+        gateway(client).turn(turn(frame = frame, limitTokens = 1_000_000))
 
         // The flow has no transcript user turn to carry the context, so it rides the request input itself (a
         // history holding only the leading context is a lone user group, which the budgeter rejects).
@@ -665,7 +665,7 @@ class ModelClientGatewayTest {
         )
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+        gateway(client).turn(turn(frame = frame, limitTokens = 1_000_000))
 
         val sent = client.requests.single()
         assertEquals(
@@ -693,8 +693,9 @@ class ModelClientGatewayTest {
         // **after** the last turn group, i.e. inside the ① slice of the group that precedes it — so the guard only
         // passed because the order was inverted. Rewritten against the real order and the merged shape.
         //
-        // Limit arithmetic (`TurnTrimmer.total()`, `measure = utf8 bytes + 32`, plus the fixed 32): the limit below
-        // is exactly the frame **without** the older turn, so cut ① must take that one whole group and stop.
+        // Limit arithmetic (`TurnTrimmer.total()`, `measure = TokenMeter.estimate + 32`, plus the fixed 32): the limit
+        // below is exactly the frame **without** the older turn — 32 + 33(sys) + 132(kept user) + 132(kept assistant)
+        // + 232(memory) + 36(input) = **597** token units — so cut ① must take that one whole group and stop.
         val memory = Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "记".repeat(200))
         val oldUser = Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(300), SegmentRole.USER)
         val oldAssistant = Segment(SegmentOrigin.TRANSCRIPT, true, "答".repeat(300), SegmentRole.ASSISTANT)
@@ -707,13 +708,13 @@ class ModelClientGatewayTest {
             listOf(oldUser, oldAssistant, keptUser, keptAssistant, memory, input),
             emptyList(),
         )
-        fun bytes(segment: Segment) = segment.text.toByteArray(Charsets.UTF_8).size + 32
+        fun tokens(segment: Segment) = TokenMeter.estimate(segment.text) + 32
         val withoutTheOlderTurn =
-            FIXED_OVERHEAD + bytes(system) + bytes(keptUser) + bytes(keptAssistant) + bytes(memory) + bytes(input)
+            FIXED_OVERHEAD + tokens(system) + tokens(keptUser) + tokens(keptAssistant) + tokens(memory) + tokens(input)
         val client = terminalClient()
         val gateway = gateway(client)
 
-        gateway.turn(turn(frame = frame, limitBytes = withoutTheOlderTurn))
+        gateway.turn(turn(frame = frame, limitTokens = withoutTheOlderTurn))
 
         val counts = requireNotNull(gateway.lastTrim)
         assertEquals(1, counts.droppedTurns, "① cut exactly the older whole turn")
@@ -750,12 +751,12 @@ class ModelClientGatewayTest {
             listOf(oldUser, oldAssistant, keptUser, keptAssistant, memory, input),
             emptyList(),
         )
-        fun bytes(segment: Segment) = segment.text.toByteArray(Charsets.UTF_8).size + 32
-        val onlySystemAndInput = FIXED_OVERHEAD + bytes(system) + bytes(input)
+        fun tokens(segment: Segment) = TokenMeter.estimate(segment.text) + 32
+        val onlySystemAndInput = FIXED_OVERHEAD + tokens(system) + tokens(input)
         val client = terminalClient()
         val gateway = gateway(client)
 
-        gateway.turn(turn(frame = frame, limitBytes = onlySystemAndInput))
+        gateway.turn(turn(frame = frame, limitTokens = onlySystemAndInput))
 
         val counts = requireNotNull(gateway.lastTrim)
         assertEquals(2, counts.droppedTurns, "both groups go: the tighter window cannot fit the newer turn either")
@@ -782,13 +783,14 @@ class ModelClientGatewayTest {
         )
         val system = Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")
         val frame = RequestFrame(listOf(system), flow, emptyList())
-        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
-        // Exactly the frame without the current turn's transcript: ① has to drop that one group and then stops.
+        fun measure(text: String) = TokenMeter.estimate(text) + 32
+        // Exactly the frame without the current turn's transcript — 32 + 33(sys) + 40(cue) = **105** token units:
+        // ① has to drop that one group and then stops.
         val limit = FIXED_OVERHEAD + measure(system.text) + measure(cue)
         val client = terminalClient()
         val gateway = gateway(client)
 
-        gateway.turn(turn(frame = frame, limitBytes = limit, userUtterance = utterance))
+        gateway.turn(turn(frame = frame, limitTokens = limit, userUtterance = utterance))
 
         assertEquals(
             1,
@@ -822,11 +824,11 @@ class ModelClientGatewayTest {
         )
         val system = Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")
         val frame = RequestFrame(listOf(system), flow, emptyList())
-        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+        fun measure(text: String) = TokenMeter.estimate(text) + 32
         val limit = FIXED_OVERHEAD + measure(system.text) + measure(state) + measure(cue)
         val client = terminalClient()
 
-        gateway(client).turn(turn(frame = frame, limitBytes = limit, userUtterance = utterance))
+        gateway(client).turn(turn(frame = frame, limitTokens = limit, userUtterance = utterance))
 
         val input = client.requests.single().input.filterIsInstance<InputPart.Text>().single().text
         assertTrue(input.startsWith(state), "the runtime state must stay ahead of the restored question: $input")
@@ -869,13 +871,14 @@ class ModelClientGatewayTest {
             Segment(SegmentOrigin.USER_INPUT, true, input),
         )
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
-        // The window fits the system slot, the pending user turn and the input — and none of the older turn: cut ①
-        // takes exactly that whole group and stops, so the surviving history is the lone user half.
-        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+        // The window fits the system slot, the pending user turn and the input — 32 + 33(sys) + 40(pending)
+        // + 35(input) = **140** token units — and none of the older turn: cut ① takes exactly that whole group and
+        // stops, so the surviving history is the lone user half.
+        fun measure(text: String) = TokenMeter.estimate(text) + 32
         val limit = FIXED_OVERHEAD + measure("sys") + measure(pending) + measure(input)
         val gateway = gateway(client)
 
-        val reply = gateway.turn(turn(frame = frame, limitBytes = limit))
+        val reply = gateway.turn(turn(frame = frame, limitTokens = limit))
 
         assertEquals(1, requireNotNull(gateway.lastTrim).droppedTurns, "cut ① took exactly the older whole turn")
         assertEquals(ModelEnd.FAILED, reply.terminal)
@@ -900,7 +903,7 @@ class ModelClientGatewayTest {
         )
         val gateway = gateway(client)
 
-        gateway.turn(turn(frame = frame, limitBytes = 100))
+        gateway.turn(turn(frame = frame, limitTokens = 100))
 
         val counts: TrimCounts = requireNotNull(gateway.lastTrim)
         assertEquals(1, counts.droppedTurns)
@@ -910,18 +913,21 @@ class ModelClientGatewayTest {
     }
 
     @Test fun `the trim window is the send time limit minus a deliberate safety margin`() {
-        // I-4: `TurnTrimmer.total()` and `ContextBudgeter.prepare` compute **structurally identical** totals against
-        // the same `minOf(inputBudgetTokens, usable - maxOutput - safety)` limit, so parity is exact with one shared
-        // number; the `- FIXED_OVERHEAD` is a deliberate 32-byte **safety margin** (the trimmer is stricter than the
-        // check it must satisfy), not a correction of a 32-byte disagreement. The fixture profile's window is
-        // `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, so the trimmer is handed 59_968.
-        assertEquals(59_968, ModelClientGateway.windowBytes(profile))
+        // I-4: `TurnTrimmer.total()` and `ContextBudgeter.prepare` now count the same token unit and the same fixed
+        // 32, against the same `minOf(inputBudgetTokens, usable - maxOutput - safety)` limit. They are still not
+        // identical by construction (the gateway folds leading context and itemises tool rounds when it renders the
+        // wire request), which is exactly why the `- FIXED_OVERHEAD` is a deliberate 32-unit **safety margin**: the
+        // trimmer is stricter than the check it must satisfy. It is not a correction of a unit disagreement. The
+        // fixture profile's window is `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, so the trimmer is handed
+        // 59_968.
+        assertEquals(59_968, ModelClientGateway.windowTokens(profile))
     }
 
     @Test fun `the frame path sends one instructions message for the whole system slot`() {
         // `frameToTranscript` must take `instructions` from the frame's whole system slot, not map each system segment
         // to its own message: the trimmer measures that slot as ONE message, so n system segments mapped as n messages
-        // would undercount by 32 bytes per extra segment and the send-time check could reject the trimmed request.
+        // would undercount by 32 token units per extra segment and the send-time check could reject the trimmed
+        // request.
         val client = terminalClient()
         val system = listOf(
             Segment(SegmentOrigin.INSTRUCTIONS, true, "base instructions"),
@@ -930,7 +936,7 @@ class ModelClientGatewayTest {
         )
         val frame = RequestFrame(system, listOf(Segment(SegmentOrigin.USER_INPUT, true, "在吗")), emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 5_000))
+        gateway(client).turn(turn(frame = frame, limitTokens = 5_000))
 
         val sent = client.requests.single()
         assertEquals(

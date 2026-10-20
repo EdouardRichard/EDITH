@@ -75,7 +75,7 @@ class ModelClientGateway(
     private val stop: () -> Boolean = { false },
     /**
      * P5 (spec §A2): optional audio parts appended to the request input after the transcript. Null reproduces the
-     * pre-P5 text-only behaviour byte for byte. A lambda rather than a value so the segment is resolved at request
+     * pre-P5 text-only behaviour exactly. A lambda rather than a value so the segment is resolved at request
      * time, not at gateway construction time.
      */
     private val audioParts: (() -> List<InputPart>)? = null,
@@ -113,20 +113,19 @@ class ModelClientGateway(
 
     companion object {
         /**
-         * The byte budget a frame is trimmed to, in the same unit and against the same bound `ContextBudgeter`
-         * enforces at send time (`minOf(inputBudgetTokens, usableWindow - maxOutput - safety)`).
+         * The token-unit budget a frame is trimmed to: the same `minOf(...)` bound `ContextBudgeter` enforces at send
+         * time (`minOf(inputBudgetTokens, usableWindow - maxOutput - safety)`), minus a deliberate 32-unit margin.
          *
-         * The `- [FIXED_OVERHEAD]` is a **deliberate 32-byte safety margin**, not a correction.
-         * [TurnTrimmer.total] and `ContextBudgeter.prepare` (`ContextBudgeter.kt:55-65`) compute structurally
-         * identical totals against the same `minOf(...)` limit — the same per-item `bytes + 32`, the same fixed 32,
-         * and `instructions == frame.systemText` — so with one shared limit they would already agree exactly. They
-         * also charge the same `ImageBudget.UNITS_PER_IMAGE` per image (R68), so an image-bearing request keeps that
-         * identity. Taking one more 32 off makes the trimmer 32 bytes **stricter** than the check it must satisfy,
-         * which is the safe direction; the cost is that a frame within 32 bytes of fitting is trimmed one message
-         * earlier than strictly necessary. Nothing here claims the subtraction is what prevents a rejection: the
-         * acceptance test's discriminating assertion is the send-time `prepare` call itself.
+         * Both stages now price text with [TokenMeter] (0.3 design §5.2) and charge the same
+         * [com.sheen.rokid.contracts.ImageBudget.UNITS_PER_IMAGE] per image (R68), and both add the same fixed
+         * [FIXED_OVERHEAD]. The totals are still not **identical by construction**: [frameToTranscript] folds the
+         * leading context into one message and renders a `TOOL_ROUND` as one or more wire items, so the send-time
+         * request can price slightly below or above the trimmer's per-segment total. Taking one more 32 off keeps the
+         * trimmer **stricter** than the check it must satisfy, in the safe direction, and absorbs that rendering
+         * difference. Nothing here claims the subtraction is what prevents a rejection: the acceptance test's
+         * discriminating assertion is the send-time `prepare` call itself.
          */
-        internal fun windowBytes(profile: ModelProfile): Int =
+        internal fun windowTokens(profile: ModelProfile): Int =
             minOf(
                 profile.inputBudgetTokens,
                 profile.usableWindowTokens - profile.maxOutputTokens - profile.safetyTokens,
@@ -145,8 +144,8 @@ class ModelClientGateway(
             return sendTurn(request, modelRequest(request, profile, request.instructions, transcript))
         }
         // The window is the same expression `ContextBudgeter` bounds the send with, minus the deliberate
-        // 32-byte margin (see [windowBytes]). A caller-supplied `limitBytes` (test seam) wins.
-        val limit = if (request.limitBytes == Int.MAX_VALUE) windowBytes(profile) else request.limitBytes
+        // 32-unit margin (see [windowTokens]). A caller-supplied `limitTokens` (test seam) wins.
+        val limit = if (request.limitTokens == Int.MAX_VALUE) windowTokens(profile) else request.limitTokens
         return turnWithOverflowRecovery(request, profile, frame, limit)
     }
 
@@ -368,7 +367,7 @@ class ModelClientGateway(
      * the model's **only** input. When no `Text(USER)` survives in the built history and [fallbackUtterance] is
      * non-blank, the request input is rebuilt from that utterance instead of the cue. The request-scoped metadata that
      * normally rides ahead of the input (`RUNTIME_STATE`/`RETRY`, or the folded context when the history is empty) is
-     * kept, so the first turn — whose input already is the utterance — is rendered byte for byte as before. When a
+     * kept, so the first turn — whose input already is the utterance — is rendered identically as before. When a
      * `USER` text does survive, the input is left untouched: restoring it there would reintroduce the duplicate Task 26
      * removed. A blank fallback changes nothing; the gateway never invents a question.
      *
@@ -385,11 +384,12 @@ class ModelClientGateway(
      * it precedes the retry text and the input inside the one message. Putting it in history would create the same lone
      * user group a retry would; putting it after the input would make the wearer's turn stop being last.
      *
-     * Folding several context segments into one message removes one 32-byte per-message overhead per folded segment and
-     * adds 2 bytes per join, so it is cheaper whenever more than one segment is folded. With a **single** context
-     * segment it is 2 bytes **more** expensive than the trimmer's measurement of that one segment (no overhead is
-     * removed), which the gateway's deliberate 32-byte window margin absorbs; the trimmer's verdict therefore stays
-     * the conservative one either way and no fold can push a request over the limit.
+     * Folding several context segments into one message removes one 32-unit per-message overhead per folded segment
+     * and adds the `\n\n` separators the join introduces (two ASCII characters, at most one token unit). With a
+     * **single** context segment nothing is saved but the separators, so the folded request prices at up to one token
+     * unit more than the trimmer's measurement of that segment; the gateway's deliberate 32-unit window margin
+     * absorbs that, and the trimmer's verdict stays the conservative one either way. Nothing here claims the folded
+     * request is priced identically to the per-segment total — only that it stays inside the margin.
      */
     private fun frameToTranscript(frame: RequestFrame, fallbackUtterance: String?): Transcript? {
         val flow = frame.conversationFlow
@@ -464,7 +464,7 @@ class ModelClientGateway(
      * Only the frame's own `USER_INPUT` is interchangeable here. The leading texts — the folded summary/memory context,
      * runtime state, a retry instruction — are not the wearer's conversation turn and stay ahead of it, exactly as
      * [frameToTranscript] had arranged them. That is also why the opening turn is unchanged: its input already is the
-     * utterance, so the rebuilt string is byte-identical.
+     * utterance, so the rebuilt string is identical.
      *
      * A history that still carries a `USER` text keeps its input: the question is already there once, and replacing the
      * input would be the duplicate Task 26 removed. A null or blank fallback never invents content.

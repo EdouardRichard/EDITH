@@ -112,8 +112,8 @@ val TrimReport.counts: TrimCounts
     )
 
 /**
- * Trims a [RequestFrame] down to a byte budget in the fixed order (H2 + H3 + R69). A pure function: it never mutates
- * its input, never touches a store, and calls nothing asynchronous.
+ * Trims a [RequestFrame] down to a token-unit budget in the fixed order (H2 + H3 + R69). A pure function: it never
+ * mutates its input, never touches a store, and calls nothing asynchronous.
  *
  * ⓪ [TrimOrder.TYPE_AWARE] runs first, unconditionally — a stale observation or an expired image is cheaper as a
  * header/summary no matter how much room the frame has. Then ① [TrimOrder.OLDEST_TURNS] (whole old turns) and
@@ -145,7 +145,7 @@ val TrimReport.counts: TrimCounts
  * [RequestFrame]'s `require`). So if anything survives, it is the input — the input survives because
  * it is never offered for eviction, not because it "happens to" survive.
  *
- * This is **not** the same as "the input always fits": when `USER_INPUT` alone exceeds `limitBytes`
+ * This is **not** the same as "the input always fits": when `USER_INPUT` alone exceeds `limitTokens`
  * the kept frame still carries it and [TrimReport.compressionOwed] is `true`. Refusing an oversized
  * input stays `ContextBudgeter`'s existing `ConfigurationRejected` rule — out of scope here, and this
  * class never emits an oversized input into a send path that would bypass that rule.
@@ -157,24 +157,28 @@ val TrimReport.counts: TrimCounts
  * [total] strictly falls, so the loop cannot spin and an empty candidate slice is unreachable — there
  * is deliberately no empty-slice guard (one existed and was dead code).
  *
- * ## Byte accounting — the same unit and the same total as `ContextBudgeter`
+ * ## Token accounting — the same unit and the same per-message formula as `ContextBudgeter`
  *
- * [measure] is the arithmetic `ContextBudgeter` uses for one message (UTF-8 bytes + 32, see
- * `ContextBudgeter.kt`'s `message(text)`), plus one [ImageBudget.UNITS_PER_IMAGE] per image the adapter will put on the
- * wire (R68). The two stages therefore price an image identically, and an image-bearing frame cannot be trimmed to a
- * request the send-time budgeter then rejects. [total] adds the same fixed [FIXED_OVERHEAD] that `ContextBudgeter.kt`
- * adds once (`Math.addExact(32L, message(instructions))`). The two totals are **structurally identical** against the
- * same `minOf(...)` limit, and a frame whose `total()` is at or under that limit is accepted by the send-time check.
- * (The gateway still trims to `limit - 32` as a deliberate safety margin; that is stricter, never the other way round.)
+ * [measure] prices one message the way `ContextBudgeter.message(text)` does — [TokenMeter.estimate] token units plus
+ * the same 32-unit per-message overhead — plus one [ImageBudget.UNITS_PER_IMAGE] per image the adapter will put on the
+ * wire (R68). The two stages therefore price a text and an image identically, and an image-bearing frame cannot be
+ * trimmed to a request the send-time budgeter then rejects. [total] adds the same fixed [FIXED_OVERHEAD] that
+ * `ContextBudgeter.kt` adds once (`Math.addExact(32L, message(instructions))`).
+ *
+ * The rendered request is not necessarily the exact sum of those per-segment prices: the gateway folds the leading
+ * context into one message and renders a `TOOL_ROUND` as one or more wire items, so the send-time total can differ
+ * from [total] by the cost of that rendering. The gateway therefore trims to `limit - 32`, a deliberate safety margin
+ * that keeps the trimmer stricter than the check it must satisfy; the acceptance tests' discriminating assertion is
+ * the send-time `prepare` call itself, never a claim that the two totals are identical.
  *
  * A `SUMMARY` segment is **not a turn**: it never participates in turn eviction. But it does count toward [total] —
  * it gets no exemption from the budget check.
  *
- * @param measure the per-segment byte cost. Defaults to [defaultSegmentMeasure], which includes image units.
+ * @param measure the per-segment token-unit cost. Defaults to [defaultSegmentMeasure], which includes image units.
  */
 class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasure) {
 
-    fun trim(frame: RequestFrame, limitBytes: Int, mode: TrimMode = TrimMode.STANDARD): TrimReport {
+    fun trim(frame: RequestFrame, limitTokens: Int, mode: TrimMode = TrimMode.STANDARD): TrimReport {
         val prepared = when (mode) {
             TrimMode.STANDARD -> frame.conversationFlow
             TrimMode.AGGRESSIVE -> dropOlderToolRounds(frame.conversationFlow)
@@ -197,7 +201,7 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
 
         // ① 旧整回合：一组 = 一条 role=USER 的 TRANSCRIPT（或它引发的 TOOL_ROUND 段）到下一个
         // USER 之前。整组淘汰 ⇒ 永远不发"半个回合"。从最旧一组开始，只在还超预算时才落。
-        while (total() > limitBytes) {
+        while (total() > limitTokens) {
             val start = flow.indexOfFirst { isTurnStart(it) }
             if (start < 0) break
             val next = flow.subList(start + 1, flow.size).indexOfFirst { isTurnStart(it) }
@@ -216,7 +220,7 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
         // `flow.size`，把记忆段一起带走并记在 droppedTurns 上（见 `TrimOrder` 的 KDoc）。它保留下来是为了
         // 没有任何回合组可让的请求（`[memory, USER_INPUT]`），以及为后续阶段保留"按相关性单独让出记忆"的能力。
         var index = flow.lastIndex
-        while (total() > limitBytes && index >= 0) {
+        while (total() > limitTokens && index >= 0) {
             if (flow[index].origin == SegmentOrigin.MEMORY_EVIDENCE) {
                 droppedOrigins += flow.removeAt(index).origin
             }
@@ -227,7 +231,7 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
             kept = frame.copy(conversationFlow = flow.toList()),
             droppedTurns = droppedTurns,
             droppedOrigins = droppedOrigins.toList(),
-            compressionOwed = total() > limitBytes,
+            compressionOwed = total() > limitTokens,
             elidedUiTrees = typeAware.elidedUiTrees,
             elidedImages = typeAware.elidedImages,
             elidedToolResults = typeAware.elidedToolResults,
@@ -609,17 +613,16 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
 
 /**
  * The fixed `+32` `ContextBudgeter` adds once on top of the per-message costs
- * (`Math.addExact(32L, message(request.instructions))`). It is part of the **shared** formula, not a
- * correction: `TurnTrimmer.total` and `ContextBudgeter.prepare` count the same terms, so including it
- * here is what makes the two agree exactly. (`ModelClientGateway.windowBytes` subtracts one more 32 as
- * a deliberate margin.)
+ * (`Math.addExact(32L, message(request.instructions))`), in token units like every other term. It is a
+ * structural part of the shared formula: `TurnTrimmer.total` adds it once and `ContextBudgeter.prepare`
+ * adds it once. (`ModelClientGateway.windowTokens` subtracts one more 32 as a deliberate safety margin.)
  */
 internal const val FIXED_OVERHEAD = 32
 
 /**
- * 与 `ContextBudgeter` 同口径：UTF-8 字节 + 每条 32 的记账开销（`ContextBudgeter.message()` 用同一算式）。
+ * 与 `ContextBudgeter.message()` 同口径：TokenMeter token 单位 + 每条 32 的记账开销。
  */
-internal fun utf8BytesPlusOverhead(text: String): Int = text.toByteArray(Charsets.UTF_8).size + 32
+internal fun tokenUnitsPlusOverhead(text: String): Int = TokenMeter.estimate(text) + 32
 
 /**
  * The default per-segment price: the text cost above plus one [ImageBudget.UNITS_PER_IMAGE] for every image the
@@ -627,7 +630,7 @@ internal fun utf8BytesPlusOverhead(text: String): Int = text.toByteArray(Charset
  * [Segment.images] reference. R68: `ContextBudgeter` charges the same per image, so the two stages cannot disagree.
  */
 internal fun defaultSegmentMeasure(segment: Segment): Int {
-    var cost = utf8BytesPlusOverhead(segment.text)
+    var cost = tokenUnitsPlusOverhead(segment.text)
     cost += imageUnits(segment.images.size)
     if (segment.origin == SegmentOrigin.TOOL_ROUND) cost += imageUnits(toolRoundImageCount(segment.text))
     return cost

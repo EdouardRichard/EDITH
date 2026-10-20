@@ -110,7 +110,7 @@ class TurnTrimmerTypeAwareTest {
         val rounds = (1..5).map { toolOutput(screenObservation(it, "#n1 button Wi-Fi", "#n2 text hi"), callId = "c$it") }
         val f = frame(userTurn("u"), assistant("a"), *rounds.toTypedArray(), user("now"))
 
-        val report = TurnTrimmer().trim(f, limitBytes = 1_000_000)
+        val report = TurnTrimmer().trim(f, limitTokens = 1_000_000)
 
         assertEquals(4, report.elidedUiTrees, "the four non-last observations are the type-aware cut")
         val keptOutputs = report.kept.conversationFlow
@@ -138,7 +138,7 @@ class TurnTrimmerTypeAwareTest {
         val rounds = (1..5).map { toolOutput("shot $it", images = listOf(it), callId = "c$it") }
         val f = frame(userTurn("u"), assistant("a"), *rounds.toTypedArray(), user("now"))
 
-        val report = TurnTrimmer().trim(f, limitBytes = 1_000_000)
+        val report = TurnTrimmer().trim(f, limitTokens = 1_000_000)
 
         assertEquals(2, report.elidedImages)
         val kept = report.kept.conversationFlow.filter { it.origin == SegmentOrigin.TOOL_ROUND }
@@ -165,7 +165,7 @@ class TurnTrimmerTypeAwareTest {
             user("now"),
         )
 
-        val report = TurnTrimmer().trim(f, limitBytes = 1_000_000)
+        val report = TurnTrimmer().trim(f, limitTokens = 1_000_000)
 
         val outputs = report.kept.conversationFlow.filter { it.origin == SegmentOrigin.TOOL_ROUND }
         assertEquals(long, outputText(outputs.last()), "the newest tool result is exempt from the type-aware cut")
@@ -183,7 +183,7 @@ class TurnTrimmerTypeAwareTest {
             user("now"),
         )
 
-        val report = TurnTrimmer().trim(f, limitBytes = 1_000_000)
+        val report = TurnTrimmer().trim(f, limitTokens = 1_000_000)
 
         assertEquals(1, report.elidedToolResults)
         val outputs = report.kept.conversationFlow.filter { it.origin == SegmentOrigin.TOOL_ROUND }
@@ -203,13 +203,15 @@ class TurnTrimmerTypeAwareTest {
             user("now"),
         )
         val expected = FIXED_OVERHEAD +
-            utf8BytesPlusOverhead(withImages.systemText) +
+            tokenUnitsPlusOverhead(withImages.systemText) +
             withImages.conversationFlow.sumOf { segment ->
-                utf8BytesPlusOverhead(segment.text) +
+                tokenUnitsPlusOverhead(segment.text) +
                     (segment.images.size * ImageBudget.UNITS_PER_IMAGE).toInt()
             }
 
-        assertEquals(expected, 32 + 35 + 33 + 35 + 2 * 1024, "text cost unchanged, images priced at 1024 each")
+        // Token-unit price: 32(fixed) + (1 + 32)(sys "sys") + (1 + 32)("p") + (2 × 1024)(two images) + (1 + 32)("now")
+        // = **2179**; the limit below is that exact price, so the image units are really part of the total.
+        assertEquals(expected, 32 + 33 + 33 + 2 * 1024 + 33, "text cost in token units, images priced at 1024 units each")
         assertEquals(false, TurnTrimmer().trim(withImages, expected).compressionOwed)
         assertEquals(
             true,
@@ -227,9 +229,10 @@ class TurnTrimmerTypeAwareTest {
             runtime(),
             user("now"),
         )
-        // Total = 32 + sys(35) + u1(34) + a1(34) + the tree (now a short header) + runtime(58) + now(35); the limit is
-        // below the whole frame so cut ① has to remove the turn, but the runtime line is request metadata and stays.
-        val report = TurnTrimmer().trim(f, limitBytes = 220)
+        // Token-unit total = 32(fixed) + 33(sys) + 33(u1) + 33(a1) + 106(the observation JSON: 74 tokens + 32)
+        // + 39(runtime: 7 tokens + 32) + 33(now) = **309**. The limit is below that, so cut ① removes the turn
+        // (66 units) and leaves 243 > 220; the runtime line is request metadata and stays regardless.
+        val report = TurnTrimmer().trim(f, limitTokens = 220)
 
         assertEquals(1, report.droppedTurns)
         assertTrue(
@@ -237,6 +240,22 @@ class TurnTrimmerTypeAwareTest {
             "runtime state must survive turn eviction: ${report.kept.conversationFlow}",
         )
         assertEquals(SegmentOrigin.USER_INPUT, report.kept.conversationFlow.last().origin)
+    }
+
+    @Test
+    fun `a CJK only transcript is trimmed against token units, not byte size`() {
+        val cjk = "你好".repeat(100)
+        val f = frame(userTurn(cjk), assistant("好的"), user("现在"))
+        // Token price: 32 + (1 + 32) + (200 + 32) + (2 + 32) + (2 + 32) = **365**, inside 400.
+        // Byte price:  32 +    35 +   (600 + 32) +   (6 + 32) +   (6 + 32) = **775**, over 400.
+        // A byte-priced trimmer therefore evicts the whole turn here and reports droppedTurns = 1; the token-priced
+        // one keeps it. This is the discriminating assertion for the unit migration.
+        val report = TurnTrimmer().trim(f, limitTokens = 400)
+
+        assertEquals(0, report.droppedTurns)
+        assertTrue(report.kept.conversationFlow.any { it.text == cjk }, "the CJK turn fits in token units")
+        assertTrue(report.kept.conversationFlow.any { it.origin == SegmentOrigin.USER_INPUT })
+        assertEquals(false, report.compressionOwed)
     }
 
     @Test
@@ -250,7 +269,7 @@ class TurnTrimmerTypeAwareTest {
             user("now"),
         )
 
-        val counts = TurnTrimmer().trim(f, limitBytes = 1_000_000).counts
+        val counts = TurnTrimmer().trim(f, limitTokens = 1_000_000).counts
 
         assertEquals(1, counts.elidedUiTrees)
         assertEquals(1, counts.elidedImages, "four images: the newest three stay whole")

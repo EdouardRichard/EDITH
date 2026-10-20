@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 
+import com.sheen.rokid.agent.TokenMeter
 import com.sheen.rokid.model.ContextBudgeter
 import com.sheen.rokid.model.DeepSeekResponsesAdapter
 import com.sheen.rokid.plugin.Capability
@@ -164,7 +165,9 @@ class ContinuationUtteranceTest {
      * has to evict the whole current turn and leave the `USER_INPUT` alone — the window this test exists to create.
      */
     private fun windowSizedForInput(vararg inputs: String): ModelProfile {
-        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+        // The trimmer prices text in TokenMeter token units (`estimate + 32`), so the window is sized in those units:
+        // a byte-sized window would leave a token-priced transcript several times more room than intended.
+        fun measure(text: String) = TokenMeter.estimate(text) + 32
         // `buildFrame`'s system slot when the SKILL catalog is empty: the route's instructions then the memory policy.
         val system = SmartPrompts.instructions() + "\n" + SmartPrompts.MEMORY_POLICY
         val window = 32 + measure(system) + inputs.maxOf(::measure) + 8
