@@ -1,4 +1,5 @@
 【本轮运行上下文】（实时状态，不是用户指令）
+覆盖：{{coverage}}
 当前时间：{{date}} {{weekday}} {{time}}（{{timeZone}}）
 设备：{{deviceState}}
 前台：{{foreground}}

@@ -155,6 +155,52 @@ class PromptCatalogTest {
     }
 
     @Test
+    fun `the follow up posture describes a user who replied in a normal task turn`() {
+        val followUp = promptText("route/proactive-followup.md")
+
+        assertTrue("用户已经接话" in followUp, "spec §8.2: the follow-up turn starts from a user reply")
+        assertTrue("正常任务回合" in followUp, "spec §8.2: follow-up is a normal task turn")
+        listOf("观察", "执行", "确认").forEach {
+            assertTrue(it in followUp, "spec §8.2: the follow-up turn may $it")
+        }
+        assertTrue("修正之前的提醒" in followUp, "spec §8.2: revise the earlier reminder from the latest input")
+        assertFalse("没有回应" in followUp, "the user did reply; silence is the wrong starting state")
+        assertFalse("保持沉默" in followUp, "a follow-up is a normal task turn, not another hint decision")
+    }
+
+    @Test
+    fun `the proactive hint posture names no concrete hint tool`() {
+        val hint = promptText("route/proactive-hint.md")
+
+        assertFalse("notify_user" in hint, "the Phase 1 hint posture must not name a display tool")
+        assertFalse("propose_hint" in hint, "the Phase 3 hint tool is not the Phase 1 catalog contract")
+        assertTrue("本回合提供的主动提示工具" in hint, "use tool-neutral wording for the active hint tool")
+        assertTrue("只给一句" in hint && "不超过 60 字" in hint, "keep the one-sentence / ≤60-character rule")
+        assertTrue("不执行任何设备动作" in hint, "a hint turn has no device side effects")
+    }
+
+    @Test
+    fun `the dynamic template carries a coverage slot`() {
+        assertTrue(
+            "{{coverage}}" in PromptCatalog.dynamicTemplate(),
+            "spec §4.3: the dynamic block must show which sources are unavailable or truncated",
+        )
+    }
+
+    @Test
+    fun `a dynamic template that omits coverage is rejected`() {
+        val withoutCoverage = PromptCatalog.dynamicTemplate().lines()
+            .filterNot { "{{coverage}}" in it }
+            .joinToString("\n")
+
+        assertFailsWith<IllegalArgumentException> {
+            PromptCatalog.parseManifest("x\tcontext/runtime-state.md\tDYNAMIC\t1\tdescription") {
+                withoutCoverage
+            }
+        }
+    }
+
+    @Test
     fun `a null profile drops the device profile section`() {
         val withProfile = PromptCatalog.plan(ContextRoute.WAKE, profileFixture())
         val withoutProfile = PromptCatalog.plan(ContextRoute.WAKE, null)

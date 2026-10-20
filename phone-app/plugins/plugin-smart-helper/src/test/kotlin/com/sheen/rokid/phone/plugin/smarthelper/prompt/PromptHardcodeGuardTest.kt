@@ -123,6 +123,7 @@ class PromptHardcodeGuardTest {
             "foreground",
             "media",
             "perception",
+            "coverage",
             "notifications",
             "calendar",
             "acoustic",

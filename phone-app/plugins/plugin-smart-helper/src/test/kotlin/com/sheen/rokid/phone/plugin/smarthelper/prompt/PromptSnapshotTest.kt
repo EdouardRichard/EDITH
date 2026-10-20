@@ -35,6 +35,6 @@ class PromptSnapshotTest {
         // Captured from the first failing run after `prompts/*` and `PromptCatalog` were authored.
         // Fill these explicitly on any prompt edit; never regenerate them silently.
         const val WAKE_GOLDEN_HASH = "7c0ed456907ed2a8e14ae6fd51ed0e0adc6667dc084d1da287a8fc127a0a86f6"
-        const val PROACTIVE_GOLDEN_HASH = "7a5f8342b1d1a873e14be7be042a867abc3afe9861faf151a9ae0c74f8480ff2"
+        const val PROACTIVE_GOLDEN_HASH = "ae76dc48ee7c147b2406ccfd556d6bda6aa30a92fd65cdb136c9f610bcb96371"
     }
 }

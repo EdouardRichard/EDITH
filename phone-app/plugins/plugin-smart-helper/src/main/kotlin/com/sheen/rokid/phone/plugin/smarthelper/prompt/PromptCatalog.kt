@@ -104,6 +104,7 @@ object PromptCatalog {
         "foreground",
         "media",
         "perception",
+        "coverage",
         "notifications",
         "calendar",
         "acoustic",
