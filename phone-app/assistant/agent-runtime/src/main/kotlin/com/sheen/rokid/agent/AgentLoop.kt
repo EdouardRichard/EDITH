@@ -1141,10 +1141,12 @@ class AgentLoop(
         val block = runCatching { request.perception?.invoke() }.getOrNull()?.takeIf { it.isNotBlank() } ?: return frame
         val hash = sha256Hex(block)
         if (hash == lastPerceptionHash) return frame
-        lastPerceptionHash = hash
         val flow = frame.conversationFlow
         val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
+        // A block that could not be placed was not sent, so it must not be remembered as sent (review minor). The
+        // branch is defensive: `RequestFrame` requires exactly one USER_INPUT, so `inputIndex` is always >= 0 today.
         if (inputIndex < 0) return frame
+        lastPerceptionHash = hash
         return frame.copy(
             conversationFlow = flow.take(inputIndex) +
                 Segment(SegmentOrigin.PERCEPTION, trusted = false, text = block) +

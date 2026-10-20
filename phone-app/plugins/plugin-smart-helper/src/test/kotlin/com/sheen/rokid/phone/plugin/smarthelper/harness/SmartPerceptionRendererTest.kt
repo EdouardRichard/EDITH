@@ -122,6 +122,11 @@ class SmartPerceptionRendererTest {
         brightness: Int? = 50,
         volumePercent: Int? = 40,
         imeVisible: Boolean? = false,
+        foregroundPackage: String? = null,
+        foregroundActivity: String? = null,
+        panelVisible: Boolean? = true,
+        glassesConnected: Boolean? = true,
+        glassesWearing: Boolean? = true,
     ) = DeviceState(
         capturedAtEpochMillis = 1_000_000L,
         timeZone = "Asia/Shanghai",
@@ -136,6 +141,11 @@ class SmartPerceptionRendererTest {
         brightness = brightness,
         volumePercent = volumePercent,
         imeVisible = imeVisible,
+        foregroundPackage = foregroundPackage,
+        foregroundActivity = foregroundActivity,
+        panelVisible = panelVisible,
+        glassesConnected = glassesConnected,
+        glassesWearing = glassesWearing,
     )
 
     @Test
@@ -158,6 +168,10 @@ class SmartPerceptionRendererTest {
         assertTrue("brightness=50" in text, text)
         assertTrue("volume=40%" in text, text)
         assertTrue("ime=false" in text, text)
+        // 0.3 Phase 2 Task 9 review I1: the glasses/panel facts were dropped from the device line.
+        assertTrue("panel=visible" in text, text)
+        assertTrue("glasses=connected" in text, text)
+        assertTrue("wearing=yes" in text, text)
         assertTrue("com.miui.player/.PlayerActivity" in text, text)
         assertTrue("PLAYING" in text && "稻香" in text && "周杰伦" in text && "魔杰座" in text, text)
         assertTrue("progress=01:04/03:43" in text, text)
@@ -176,6 +190,153 @@ class SmartPerceptionRendererTest {
             "screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok vision=ok glasses=ok device=ok" in text,
             text,
         )
+    }
+
+    @Test
+    fun `the panel and glasses facts are appended only when the host knows them`() {
+        val known = SmartPerceptionRenderer.render(
+            snapshot(),
+            state(panelVisible = false, glassesConnected = false, glassesWearing = false),
+            PerceptionPolicy(),
+            full = true,
+        )
+        assertTrue("panel=hidden" in known, known)
+        assertTrue("glasses=disconnected" in known, known)
+        assertTrue("wearing=no" in known, known)
+
+        // A null fact is absent, never a guessed false: the coverage line's own glasses token is unrelated.
+        val unknown = SmartPerceptionRenderer.render(
+            snapshot(),
+            state(panelVisible = null, glassesConnected = null, glassesWearing = null),
+            PerceptionPolicy(),
+            full = true,
+        )
+        listOf("panel=visible", "panel=hidden", "glasses=connected", "glasses=disconnected", "wearing=")
+            .forEach { token -> assertFalse(token in unknown, "omitted fact '$token' must not be rendered: $unknown") }
+    }
+
+    @Test
+    fun `the foreground pair never mixes a snapshot package with a live activity`() {
+        // The snapshot is the request's observation; mixing its package with the live state's activity would fabricate
+        // a package/activity pair that has never coexisted (review I2).
+        val conflicting = SmartPerceptionRenderer.render(
+            snapshot(foregroundPackage = "com.snapshot.player", foregroundActivity = null),
+            state(foregroundPackage = "com.live.player", foregroundActivity = ".LiveActivity"),
+            PerceptionPolicy(),
+            full = true,
+        )
+        assertTrue("前台：com.snapshot.player" in conflicting, conflicting)
+        assertFalse("com.live.player" in conflicting, conflicting)
+        assertFalse("/.LiveActivity" in conflicting, conflicting)
+
+        // Only when the snapshot names no package at all does the live pair supply both halves together.
+        val fallback = SmartPerceptionRenderer.render(
+            snapshot(foregroundPackage = null, foregroundActivity = null),
+            state(foregroundPackage = "com.live.player", foregroundActivity = ".LiveActivity"),
+            PerceptionPolicy(),
+            full = true,
+        )
+        assertTrue("前台：com.live.player/.LiveActivity" in fallback, fallback)
+    }
+
+    @Test
+    fun `a value over the policy cap carries the shared truncation marker`() {
+        val capPolicy = PerceptionPolicy(elementLimit = 5) // max(500, 5 * 120) = 600 code points
+        val longPackage = "p".repeat(601)
+        val long = snapshot(
+            elements = emptyList(),
+            notifications = listOf(NotificationItem(packageName = longPackage, postedAtEpochMillis = 1L)),
+            media = null,
+            calendarTitles = emptyList(),
+            acoustic = null,
+            clipboardText = null,
+            coverage = coverage(screen = "empty", notifications = "ok"),
+        )
+
+        val text = SmartPerceptionRenderer.render(long, state(), capPolicy, full = true)
+
+        assertTrue("… truncated" in text, "a deliberate cap must leave the shared marker: $text")
+        assertFalse(longPackage in text, "the over-cap value must not be rendered whole: $text")
+    }
+
+    @Test
+    fun `the policy cap boundary is exact and the telemetry reports the local clip`() {
+        val capPolicy = PerceptionPolicy(elementLimit = 5) // max(500, 5 * 120) = 600 code points
+        fun block(packageLength: Int) = snapshot(
+            elements = emptyList(),
+            notifications = listOf(
+                NotificationItem(packageName = "p".repeat(packageLength), postedAtEpochMillis = 1L),
+            ),
+            media = null,
+            calendarTitles = emptyList(),
+            acoustic = null,
+            clipboardText = null,
+            coverage = coverage(screen = "empty", notifications = "ok"),
+        )
+
+        // Exactly at the cap: whole, no marker, telemetry keeps the snapshot's own truncated flag.
+        val atCap = SmartPerceptionRenderer.renderDetailed(block(600), state(), capPolicy, full = true)
+        assertFalse(atCap.truncated, "600 code points is not over the 600 code point cap")
+        assertFalse("… truncated" in atCap.text, atCap.text)
+        assertTrue(
+            "truncated=false" in SmartPerceptionRenderer.telemetry(block(600), atCap.text, atCap.truncated, atCap.coverage),
+            "an unclipped render keeps truncated=false",
+        )
+
+        // One code point over: the renderer itself truncates, says so, and the value still ends at the cap.
+        val overCap = SmartPerceptionRenderer.renderDetailed(block(601), state(), capPolicy, full = true)
+        assertTrue(overCap.truncated, "a locally clipped value must set the telemetry flag")
+        assertTrue("… truncated" in overCap.text, overCap.text)
+        assertFalse("p".repeat(601) in overCap.text, "the 601st code point must be the marker's budget, not content")
+        val telemetry = SmartPerceptionRenderer.telemetry(block(601), overCap.text, overCap.truncated, overCap.coverage)
+        assertTrue("truncated=true" in telemetry, telemetry)
+    }
+
+    @Test
+    fun `a clipped screen marks the screen coverage and never splits a surrogate pair`() {
+        val capPolicy = PerceptionPolicy(elementLimit = 5) // 600 code points
+        val emoji = "\uD83D\uDE00" // one code point, two UTF-16 units
+        val longScreen = snapshot(
+            elements = listOf(
+                PerceptionElement(ref = "#n1", role = "text", text = emoji.repeat(700), centerX = 1, centerY = 2),
+            ),
+            notifications = emptyList(),
+            media = null,
+            calendarTitles = emptyList(),
+            acoustic = null,
+            clipboardText = null,
+            coverage = coverage(screen = "ok", notifications = "empty"),
+        )
+
+        val rendered = SmartPerceptionRenderer.renderDetailed(longScreen, state(), capPolicy, full = true)
+
+        assertTrue(rendered.truncated, "the screen text was cut, so the snapshot is locally bounded")
+        assertEquals("truncated", rendered.coverage.screen, "the local coverage token must name the cut")
+        assertTrue("screen=truncated" in rendered.text, rendered.text)
+        assertTrue("… truncated" in rendered.text, rendered.text)
+        val telemetry = SmartPerceptionRenderer.telemetry(
+            longScreen,
+            rendered.text,
+            rendered.truncated,
+            rendered.coverage,
+        )
+        assertTrue("truncated=true" in telemetry, telemetry)
+        assertTrue("screen=truncated" in telemetry, telemetry)
+        // The cap counts code points: a cut between the two halves of an emoji would leave a lone surrogate.
+        var index = 0
+        while (index < rendered.text.length) {
+            val character = rendered.text[index]
+            if (Character.isHighSurrogate(character)) {
+                assertTrue(
+                    index + 1 < rendered.text.length && Character.isLowSurrogate(rendered.text[index + 1]),
+                    "the truncated text ends on a lone high surrogate at $index",
+                )
+                index += 2
+            } else {
+                assertFalse(Character.isLowSurrogate(character), "the truncated text carries a lone low surrogate at $index")
+                index += 1
+            }
+        }
     }
 
     @Test

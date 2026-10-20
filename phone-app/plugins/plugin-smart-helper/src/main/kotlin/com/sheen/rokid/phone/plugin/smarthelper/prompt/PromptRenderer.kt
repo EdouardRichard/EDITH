@@ -81,11 +81,11 @@ object PromptRenderer {
     }
 
     /**
-     * Removes control/separator characters that could rewrite the prompt layout and caps the result
-     * at [maxValueCodePoints] code points. Bidi overrides are removed too: they are not ISO
-     * controls but they can visually reorder surrounding prompt text.
+     * Removes the characters that could rewrite the prompt layout: ISO controls, bidi overrides and the Unicode
+     * line/paragraph separators. Shared with the perception renderer, which must count the same characters before it
+     * applies its own deliberate truncation (0.3 Phase 2 Task 9 review I3).
      */
-    private fun sanitize(value: String, maxValueCodePoints: Int): String {
+    internal fun stripControlCharacters(value: String): String {
         val cleaned = StringBuilder(value.length)
         var index = 0
         while (index < value.length) {
@@ -93,8 +93,17 @@ object PromptRenderer {
             if (!isControl(codePoint)) cleaned.appendCodePoint(codePoint)
             index += Character.charCount(codePoint)
         }
+        return cleaned.toString()
+    }
 
-        if (cleaned.length <= maxValueCodePoints) return cleaned.toString()
+    /**
+     * Strips the unsafe characters and caps the result at [maxValueCodePoints] code points. Bidi overrides are removed
+     * too: they are not ISO controls but they can visually reorder surrounding prompt text.
+     */
+    private fun sanitize(value: String, maxValueCodePoints: Int): String {
+        val cleaned = stripControlCharacters(value)
+
+        if (cleaned.length <= maxValueCodePoints) return cleaned
 
         var codePoints = 0
         var end = 0

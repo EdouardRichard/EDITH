@@ -5,6 +5,7 @@ import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.testsupport.FakeClock
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -180,6 +181,21 @@ class AgentLoopPerceptionTest {
 
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals("好。", run.finalText)
+    }
+
+    @Test
+    fun `a frame without a user input cannot exist so the no-insertion guard is unreachable`() {
+        // Review minor: the dedupe hash used to be assigned before the `inputIndex < 0` guard. Moving it after the
+        // guard is still correct defensively, but no behavioural test can reach that branch: every RequestFrame must
+        // carry exactly one USER_INPUT and end on it, so `indexOfLast` is always >= 0.
+        val failure = assertFailsWith<IllegalArgumentException> {
+            RequestFrame(
+                systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = "sys")),
+                conversationFlow = emptyList(),
+                tools = emptyList(),
+            )
+        }
+        assertTrue("USER_INPUT" in failure.message.orEmpty(), "the invariant is named: ${failure.message}")
     }
 
     @Test

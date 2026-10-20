@@ -737,6 +737,23 @@ class SmartAssistantPlugin(
     @Volatile private var activeDeviceStateProvider: DeviceStateProvider? = null
 
     /**
+     * 0.3 Phase 2 Task 9 review minor: the **owner ticket** of the perception turn, so a superseded turn's `finally`
+     * cannot close the newer turn's provider boundary.
+     *
+     * `beginTurn()`/`endTurn()` are host-side turn boundaries with no turn identity of their own: if turn A is
+     * superseded while it is inside the model request and turn B opens afterwards, A's late `endTurn()` would clear the
+     * snapshot and refs `B` just installed. The plugin therefore hands each opened boundary a process-wide monotonic
+     * ticket and closes the provider only when that ticket is still the current owner. [perceptionTurnGeneration] is
+     * never reset, so a stale ticket can never match a later session's boundary; deactivation only drops the owner.
+     *
+     * [perceptionTurnLock] serialises the begin/end pairs themselves, which also makes the visible order of two
+     * concurrent turns' boundaries match the ticket order.
+     */
+    private val perceptionTurnLock = Any()
+    private var perceptionTurnGeneration: Long = 0L
+    private var perceptionTurnOwner: Long = 0L
+
+    /**
      * P3.4: what a finished turn is allowed to write. Same lifetime and the same namespace as [memoryRetrieval]; `null`
      * means "no session", and a turn then writes nothing.
      */
@@ -1347,6 +1364,9 @@ class SmartAssistantPlugin(
         // A parked trigger describes a session that is ending; running it later would act on a stale world under a
         // session that never observed it.
         parkedProactive = null
+        // Task 9 review minor: the perception boundary belongs to the session. Clearing the owner (not the generation)
+        // makes an unwinding turn's late `endTurn()` a no-op, while a stale ticket can never be handed out again.
+        synchronized(perceptionTurnLock) { perceptionTurnOwner = 0L }
     }
 
     private fun configuredWakeWords(): List<String> =
@@ -2199,17 +2219,64 @@ class SmartAssistantPlugin(
         // when a turn ends (`Stop`, a replaced turn, a session end); without the matching begin the next turn would
         // keep getting CANCELLED from the device kernel for the rest of the process.
         runCatching { current.services.actions().beginTurn() }
-        // edith-0.3 Phase 2 Task 9: the perception turn opens immediately after the action turn, and closes in the
-        // `finally` below so **every** exit — success, an early refusal, a detached turn, a thrown transport failure or
-        // a cancellation — pairs its `beginTurn()` with an `endTurn()`. The host's provider owns the refs and the open
-        // capture window; a turn left open would let stale refs survive into the next one.
+        // edith-0.3 Phase 2 Task 9: the perception turn opens immediately after the action turn, and the `finally`
+        // below closes it so every exit that still owns the boundary — success, an early refusal, a thrown transport
+        // failure or a cancellation — pairs its `beginTurn()` with an `endTurn()`. The host's provider owns the refs
+        // and the open capture window; a turn left open would let stale refs survive into the next one. A superseded
+        // turn deliberately does **not** call `endTurn()`: its ticket is stale and the close would clear the newer
+        // turn's snapshot/refs (review minor).
         val perception = activePerception
-        val initialSnapshot = perception?.let { provider -> runCatching { provider.beginTurn() }.getOrNull() }
+        val perceptionTurn = perception?.let { provider -> beginPerceptionTurn(provider) }
         val perceptionRequests = AtomicInteger(0)
         try {
-            runTurnBody(owned, text, current, configured, perception, initialSnapshot, perceptionRequests)
+            runTurnBody(
+                owned,
+                text,
+                current,
+                configured,
+                perception,
+                perceptionTurn?.initialSnapshot,
+                perceptionRequests,
+            )
         } finally {
-            if (perception != null) runCatching { perception.endTurn() }
+            // A superseded turn still unwinds through here after the newer turn has opened its boundary; the ticket
+            // check keeps its late close from clearing the newer turn's snapshot/refs (review minor).
+            if (perception != null && perceptionTurn != null) endPerceptionTurn(perception, perceptionTurn.ticket)
+        }
+    }
+
+    /** One opened perception boundary: its owner [ticket] and the snapshot `beginTurn()` took (or `null` on failure). */
+    private class PerceptionTurnBoundary(val ticket: Long, val initialSnapshot: PerceptionSnapshot?)
+
+    /**
+     * Opens the host's perception boundary and takes ownership of it, serialised under [perceptionTurnLock].
+     *
+     * The ticket is allocated **before** `beginTurn()` runs and the whole pair is under the lock, so two turns cannot
+     * interleave their begin/end calls: the newer turn's begin always lands after the older turn's close (when the older
+     * one got there first), and the ticket order matches the order the host saw. A throwing `beginTurn()` still owns a
+     * ticket: its `finally` closes the boundary attempt, and the request path falls back to an explicit full read.
+     */
+    private fun beginPerceptionTurn(provider: PerceptionProvider): PerceptionTurnBoundary =
+        synchronized(perceptionTurnLock) {
+            perceptionTurnGeneration += 1L
+            perceptionTurnOwner = perceptionTurnGeneration
+            PerceptionTurnBoundary(
+                ticket = perceptionTurnGeneration,
+                initialSnapshot = runCatching { provider.beginTurn() }.getOrNull(),
+            )
+        }
+
+    /**
+     * Closes the perception boundary only when [ticket] is still the owner; a superseded/cancelled turn is a no-op.
+     *
+     * The close runs under the same lock as [beginPerceptionTurn], so a newer begin cannot install a snapshot between
+     * the owner check and the older `endTurn()`.
+     */
+    private fun endPerceptionTurn(provider: PerceptionProvider, ticket: Long) {
+        synchronized(perceptionTurnLock) {
+            if (perceptionTurnOwner != ticket) return
+            perceptionTurnOwner = 0L
+            runCatching { provider.endTurn() }
         }
     }
 
@@ -2476,9 +2543,18 @@ class SmartAssistantPlugin(
             }.getOrNull()
         } ?: return null
         val device = runCatching { activeDeviceStateProvider?.state() }.getOrNull()
-        val block = SmartPerceptionRenderer.render(snapshot, device, perceptionPolicy, full)
-        P3Log.line(SmartPerceptionRenderer.telemetry(snapshot, block))
-        return block
+        // `renderDetailed` is the block plus the local-clip flags; reducing it to a String here would hide a value
+        // the policy cap deliberately truncated (review I3), so the telemetry call gets the same result.
+        val rendered = SmartPerceptionRenderer.renderDetailed(snapshot, device, perceptionPolicy, full)
+        P3Log.line(
+            SmartPerceptionRenderer.telemetry(
+                snapshot,
+                rendered.text,
+                rendered.truncated,
+                rendered.coverage,
+            ),
+        )
+        return rendered.text
     }
 
     /**

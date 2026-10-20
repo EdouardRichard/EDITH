@@ -8,6 +8,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRenderer
 import com.sheen.rokid.plugin.DeviceState
 import com.sheen.rokid.plugin.MediaState
 import com.sheen.rokid.plugin.NotificationItem
+import com.sheen.rokid.plugin.PerceptionCoverage
 import com.sheen.rokid.plugin.PerceptionSnapshot
 
 /**
@@ -33,6 +34,12 @@ object SmartPerceptionRenderer {
 
     /** What an ambient block says for a source it deliberately did not ask the host to re-read. */
     private const val NOT_REQUESTED = "not_requested"
+
+    /** The coverage token that means "the read itself was bounded"; same vocabulary as the shared coverage renderer. */
+    private const val SCREEN_TRUNCATED = "truncated"
+
+    /** The one shared marker a bounded text ends with; the compact renderer defines it, this renderer reuses it. */
+    private val TRUNCATION_MARKER = CompactSnapshotRenderer.TRUNCATION_MARKER
 
     private const val UNAVAILABLE = "unavailable"
     private const val NO_SESSION = "unavailable(no_session)"
@@ -62,39 +69,110 @@ object SmartPerceptionRenderer {
     private const val LINE_SEPARATOR = " | "
 
     /**
-     * Renders the block for [snapshot] against the current [deviceState] and session [policy].
+     * The block plus the two facts its telemetry must report honestly: the coverage that was actually rendered and
+     * whether this render itself bounded a value (review I3).
      *
-     * A missing [deviceState] leaves the date/weekday/time/timeZone slots empty rather than inventing a clock; a null
-     * device field is omitted from the device line. Missing sources keep the snapshot's own coverage token, so
-     * "nothing there" (`empty`) and "the host cannot see it" (`unavailable(...)`) stay different statements.
+     * [coverage] is [PerceptionSnapshot.coverage] unless the screen text had to be cut by the value cap, in which case
+     * its `screen` token is `truncated`. [truncated] is the snapshot's own flag OR a local clip of any slot. A caller
+     * that logs [telemetry] must use this result: reducing the block to a [String] loses the local-clip fact.
+     */
+    data class RenderedPerception(
+        val text: String,
+        val coverage: PerceptionCoverage,
+        val truncated: Boolean,
+    )
+
+    /**
+     * Renders the block for [snapshot] against the current [deviceState] and session [policy]; the text-only form of
+     * [renderDetailed]. A caller that also logs the block's telemetry uses [renderDetailed], because a local cap clip
+     * is not visible in the text alone.
      */
     fun render(
         snapshot: PerceptionSnapshot,
         deviceState: DeviceState?,
         policy: PerceptionPolicy,
         full: Boolean,
-    ): String {
+    ): String = renderDetailed(snapshot, deviceState, policy, full).text
+
+    /**
+     * Renders the block for [snapshot] against the current [deviceState] and session [policy], with the honest flags
+     * the count-only telemetry needs.
+     *
+     * A missing [deviceState] leaves the date/weekday/time/timeZone slots empty rather than inventing a clock; a null
+     * device field is omitted from the device line. Missing sources keep the snapshot's own coverage token, so
+     * "nothing there" (`empty`) and "the host cannot see it" (`unavailable(...)`) stay different statements.
+     *
+     * **Bounded values say so (review I3).** Every slot is measured after the same control-character stripping the
+     * prompt renderer applies. A slot over the policy cap is cut deliberately to the cap minus the shared
+     * [CompactSnapshotRenderer.TRUNCATION_MARKER] and ends with that marker, so the model never receives a prefix that
+     * looks complete. A cut screen also flips the rendered coverage's `screen=` token to `truncated`, and any cut sets
+     * [RenderedPerception.truncated] for the telemetry.
+     */
+    fun renderDetailed(
+        snapshot: PerceptionSnapshot,
+        deviceState: DeviceState?,
+        policy: PerceptionPolicy,
+        full: Boolean,
+    ): RenderedPerception {
+        val maxValueCodePoints = maxOf(DEFAULT_VALUE_CODE_POINTS, policy.elementLimit * CODE_POINTS_PER_ELEMENT)
+        var truncated = snapshot.truncated
+
+        val rawScreen = if (full) screenText(snapshot) else NOT_REQUESTED
+        var screenClipped = false
+        val screen = cappedValue(rawScreen, maxValueCodePoints) { screenClipped = true }
+        if (screenClipped) truncated = true
+
+        // The local coverage string must not keep saying `ok` for a screen the cap just cut short.
+        val coverage = if (screenClipped) snapshot.coverage.copy(screen = SCREEN_TRUNCATED) else snapshot.coverage
+
+        fun cappedSlot(raw: String): String = cappedValue(raw, maxValueCodePoints) { truncated = true }
+
         val values = linkedMapOf(
-            "coverage" to PerceptionCoverageRenderer.render(snapshot.coverage),
-            "date" to deviceState?.localDate.orEmpty(),
-            "weekday" to deviceState?.weekday.orEmpty(),
-            "time" to deviceState?.localTime.orEmpty(),
-            "timeZone" to deviceState?.timeZone.orEmpty(),
-            "deviceState" to deviceLine(deviceState),
-            "foreground" to foregroundLine(snapshot, deviceState),
-            "media" to mediaLine(snapshot.media ?: deviceState?.media),
-            "perception" to if (full) screenText(snapshot) else NOT_REQUESTED,
-            "notifications" to if (full) notificationsText(snapshot, policy) else NOT_REQUESTED,
-            "calendar" to if (full) calendarText(snapshot, policy) else NOT_REQUESTED,
-            "acoustic" to if (full) acousticText(snapshot) else NOT_REQUESTED,
-            "clipboard" to if (full) clipboardText(snapshot) else NOT_REQUESTED,
+            "coverage" to cappedSlot(PerceptionCoverageRenderer.render(coverage)),
+            "date" to cappedSlot(deviceState?.localDate.orEmpty()),
+            "weekday" to cappedSlot(deviceState?.weekday.orEmpty()),
+            "time" to cappedSlot(deviceState?.localTime.orEmpty()),
+            "timeZone" to cappedSlot(deviceState?.timeZone.orEmpty()),
+            "deviceState" to cappedSlot(deviceLine(deviceState)),
+            "foreground" to cappedSlot(foregroundLine(snapshot, deviceState)),
+            "media" to cappedSlot(mediaLine(snapshot.media ?: deviceState?.media)),
+            "perception" to screen,
+            "notifications" to cappedSlot(if (full) notificationsText(snapshot, policy) else NOT_REQUESTED),
+            "calendar" to cappedSlot(if (full) calendarText(snapshot, policy) else NOT_REQUESTED),
+            "acoustic" to cappedSlot(if (full) acousticText(snapshot) else NOT_REQUESTED),
+            "clipboard" to cappedSlot(if (full) clipboardText(snapshot) else NOT_REQUESTED),
         )
-        return PromptRenderer.render(
+        val text = PromptRenderer.render(
             template = PromptCatalog.perceptionTemplate(),
             values = values,
             allowedSlots = SLOTS,
-            maxValueCodePoints = maxOf(DEFAULT_VALUE_CODE_POINTS, policy.elementLimit * CODE_POINTS_PER_ELEMENT),
+            maxValueCodePoints = maxValueCodePoints,
         )
+        return RenderedPerception(text, coverage, truncated)
+    }
+
+    /**
+     * One value, sanitised exactly as [PromptRenderer] will sanitise it, then bounded deliberately by this renderer.
+     *
+     * A value at or under [maxCodePoints] is returned whole (control characters stripped). A longer one is cut to
+     * `maxCodePoints - marker`, always on a code-point boundary, and the shared marker is appended: the result is
+     * exactly the cap and the model can tell a complete value from a bounded one. [onClip] fires only when a cut
+     * actually happened.
+     */
+    private fun cappedValue(raw: String, maxCodePoints: Int, onClip: () -> Unit): String {
+        val clean = PromptRenderer.stripControlCharacters(raw)
+        if (clean.codePointCount(0, clean.length) <= maxCodePoints) return clean
+        onClip()
+        val markerCodePoints = TRUNCATION_MARKER.codePointCount(0, TRUNCATION_MARKER.length)
+        if (maxCodePoints <= markerCodePoints) return truncateToCodePoints(TRUNCATION_MARKER, maxCodePoints)
+        return truncateToCodePoints(clean, maxCodePoints - markerCodePoints) + TRUNCATION_MARKER
+    }
+
+    /** The longest prefix of [value] whose code-point count is at most [maxCodePoints]; never splits a surrogate. */
+    private fun truncateToCodePoints(value: String, maxCodePoints: Int): String {
+        if (maxCodePoints <= 0) return ""
+        if (value.codePointCount(0, value.length) <= maxCodePoints) return value
+        return value.substring(0, value.offsetByCodePoints(0, maxCodePoints))
     }
 
     /**
@@ -103,8 +181,17 @@ object SmartPerceptionRenderer {
      * It never carries a title, text, package, activity, calendar title or clipboard value — only the fields named in
      * the shape, all of which are numbers, booleans, an ASCII token or the coverage vocabulary. `images=0` because
      * Phase 2 Task 9 attaches no image; Task 10's screenshot path owns the count.
+     *
+     * [truncated] and [coverage] default to the snapshot's own values so a direct call keeps the pre-fix shape; a
+     * caller that rendered through [renderDetailed] passes its local-clip result, which is what makes a cap cut visible
+     * as `truncated=true` even when the snapshot itself was complete (review I3).
      */
-    fun telemetry(snapshot: PerceptionSnapshot, renderedText: String): String = buildString {
+    fun telemetry(
+        snapshot: PerceptionSnapshot,
+        renderedText: String,
+        truncated: Boolean = snapshot.truncated,
+        coverage: PerceptionCoverage = snapshot.coverage,
+    ): String = buildString {
         append("P3_PERCEPTION snap=")
         append(snapshot.snapshotId.take(8).replace(UNSAFE_SNAPSHOT_CHARS, "").ifBlank { "-" })
         append(" elements=").append(snapshot.elements.size)
@@ -112,8 +199,8 @@ object SmartPerceptionRenderer {
         append(" calendar=").append(snapshot.calendarTitles.size)
         append(" images=0")
         append(" screenChars=").append(renderedText.length)
-        append(" truncated=").append(snapshot.truncated)
-        append(" coverage=").append(PerceptionCoverageRenderer.render(snapshot.coverage))
+        append(" truncated=").append(truncated)
+        append(" coverage=").append(PerceptionCoverageRenderer.render(coverage))
     }
 
     // ---------------------------------------------------------------- slot values
@@ -161,12 +248,23 @@ object SmartPerceptionRenderer {
     private fun clipboardText(snapshot: PerceptionSnapshot): String =
         snapshot.clipboardText?.takeIf { it.isNotBlank() } ?: snapshot.coverage.clipboard
 
-    /** `package/activity`, falling back to the device state's own foreground facts, or an honest `unavailable`. */
+    /**
+     * `package/activity`, or an honest `unavailable`.
+     *
+     * The snapshot's own pair is used **as a pair** whenever it names a package: its activity stays null when the
+     * snapshot did not see one, rather than being borrowed from the live [DeviceState]. Mixing the two sources would
+     * fabricate a `package/activity` combination that never existed (review I2). The live state is the fallback only
+     * when the snapshot has no package at all, and then both halves come from that one state read.
+     */
     private fun foregroundLine(snapshot: PerceptionSnapshot, deviceState: DeviceState?): String {
-        val packageName = snapshot.foregroundPackage ?: deviceState?.foregroundPackage
-        if (packageName.isNullOrBlank()) return UNAVAILABLE
-        val activity = snapshot.foregroundActivity ?: deviceState?.foregroundActivity
-        return if (activity.isNullOrBlank()) packageName else "$packageName/$activity"
+        val snapshotPackage = snapshot.foregroundPackage?.takeIf { it.isNotBlank() }
+        if (snapshotPackage != null) {
+            val snapshotActivity = snapshot.foregroundActivity?.takeIf { it.isNotBlank() }
+            return if (snapshotActivity == null) snapshotPackage else "$snapshotPackage/$snapshotActivity"
+        }
+        val statePackage = deviceState?.foregroundPackage?.takeIf { it.isNotBlank() } ?: return UNAVAILABLE
+        val stateActivity = deviceState.foregroundActivity?.takeIf { it.isNotBlank() }
+        return if (stateActivity == null) statePackage else "$statePackage/$stateActivity"
     }
 
     /** Media state and metadata; only the fields the platform reported, or `unavailable(no_session)`. */
@@ -197,11 +295,19 @@ object SmartPerceptionRenderer {
             deviceState.brightness?.let { add("brightness=$it") }
             deviceState.volumePercent?.let { add("volume=$it%") }
             deviceState.imeVisible?.let { add("ime=$it") }
+            // 0.3 Phase 2 Task 9 review I1: the glasses and panel facts existed on DeviceState but were never rendered.
+            deviceState.panelVisible?.let { add("panel=${visibleHidden(it)}") }
+            deviceState.glassesConnected?.let { add("glasses=${connectedDisconnected(it)}") }
+            deviceState.glassesWearing?.let { add("wearing=${yesNo(it)}") }
         }
         return parts.joinToString(" ")
     }
 
     private fun yesNo(value: Boolean): String = if (value) "yes" else "no"
+
+    private fun visibleHidden(value: Boolean): String = if (value) "visible" else "hidden"
+
+    private fun connectedDisconnected(value: Boolean): String = if (value) "connected" else "disconnected"
 
     /** A media position/duration as `mm:ss`, or `h:mm:ss` once it reaches an hour. Negative values clamp to zero. */
     private fun formatMillis(millis: Long): String {

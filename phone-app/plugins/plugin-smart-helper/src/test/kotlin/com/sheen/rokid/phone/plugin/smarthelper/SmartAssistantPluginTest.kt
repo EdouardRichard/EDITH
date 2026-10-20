@@ -31,13 +31,22 @@ import com.sheen.rokid.plugin.DeactivationReason
 import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.OutputSubmission
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
 import com.sheen.rokid.plugin.PerceptionSource
+import com.sheen.rokid.plugin.TaskScope
 import com.sheen.rokid.plugin.PluginConfiguration
 import com.sheen.rokid.plugin.PluginLifecycle
 import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.output.HintReadingBudget
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.*
 
 /**
@@ -215,6 +224,192 @@ class SmartAssistantPluginTest {
             assertTrue(lines.none { it.startsWith("P3_PERCEPTION ") }, "no provider, no telemetry: $lines")
         } finally {
             P3Log.sink = previous
+        }
+    }
+
+    @Test fun `a beginTurn that throws falls back to an explicit full snapshot`() {
+        val perception = SmartFakePerception(initialFailure = IllegalStateException("synthetic-begin-failure"))
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertEquals(1, perception.beginTurns, "the failed opening is still one beginTurn attempt")
+            assertEquals(
+                listOf(PerceptionSource.entries.toSet()),
+                perception.requestedSources,
+                "a failed beginTurn must be recovered by one explicit full snapshot read",
+            )
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue(input.startsWith("【本轮运行上下文】"), "the fallback snapshot still renders the block: $input")
+            assertTrue("#n12 button \"搜索\"" in input, input)
+            assertEquals(1, lines.count { it.startsWith("P3_PERCEPTION ") }, "one line for the fallback block: $lines")
+            assertEquals(1, perception.endTurns, "the failed opening is still closed by the finally")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `an ambient snapshot that throws injects no block and no telemetry`() {
+        val perception = SmartFakePerception(ambientFailure = IllegalStateException("synthetic-ambient-failure"))
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            var turn = 0
+            rig.model.onRequest = { request, listener ->
+                turn += 1
+                if (turn == 1) {
+                    listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.INCOMPLETE, null, null))
+                } else {
+                    streamText(request, listener, "好。")
+                }
+            }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertEquals(2, rig.model.requests.size, "the empty turn is retried")
+            assertEquals(
+                listOf(setOf(PerceptionSource.DEVICE, PerceptionSource.MEDIA)),
+                perception.requestedSources,
+                "only the retry asks the provider for the ambient snapshot",
+            )
+            val second = rig.model.requests[1].input.filterIsInstance<InputPart.Text>().single().text
+            assertFalse("【本轮运行上下文】" in second, "a throwing ambient read contributes no block: $second")
+            assertEquals(
+                1,
+                lines.count { it.startsWith("P3_PERCEPTION ") },
+                "only the first request's block is rendered and logged: $lines",
+            )
+            assertEquals(1, perception.endTurns)
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `a superseded turn cannot close the newer turn's perception boundary`() {
+        val perception = TicketProbePerception()
+        val tasks = JoinableTasks()
+        val firstRequestStarted = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val secondRequestStarted = CountDownLatch(1)
+        val releaseSecond = CountDownLatch(1)
+        val rig = SmartTestRig(cooldownNanos = 0L)
+        val previous = P3Log.sink
+        P3Log.sink = { }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception), tasks = tasks)
+            var request = 0
+            rig.model.onRequest = { modelRequest, listener ->
+                when (++request) {
+                    1 -> {
+                        firstRequestStarted.countDown()
+                        releaseFirst.await(5, TimeUnit.SECONDS)
+                        streamText(modelRequest, listener, "第一个答案。")
+                    }
+                    2 -> {
+                        secondRequestStarted.countDown()
+                        releaseSecond.await(5, TimeUnit.SECONDS)
+                        streamText(modelRequest, listener, "第二个答案。")
+                    }
+                    else -> streamText(modelRequest, listener, "好。")
+                }
+            }
+
+            rig.plugin.handle(rig.wakeEvent())
+            rig.plugin.handle(TranscriptEvent(rig.transcript("第一个问题", turnId = "asr-a")))
+            assertTrue(perception.firstBegin.await(5, TimeUnit.SECONDS), "turn A opens its perception turn")
+            assertTrue(firstRequestStarted.await(5, TimeUnit.SECONDS), "turn A is inside its model request")
+
+            // A newer wake replaces A while A is still blocked, and opens its own perception boundary.
+            rig.clock.advance(1_000_000L)
+            rig.plugin.handle(rig.wakeEvent())
+            rig.plugin.handle(TranscriptEvent(rig.transcript("第二个问题", turnId = "asr-b")))
+            assertTrue(perception.secondBegin.await(5, TimeUnit.SECONDS), "turn B opens its perception turn")
+            assertTrue(secondRequestStarted.await(5, TimeUnit.SECONDS), "turn B is inside its model request")
+
+            // A now unwinds on its own worker. Its finally must not close B's still-open boundary.
+            releaseFirst.countDown()
+            tasks.join(0)
+            assertEquals(
+                0,
+                perception.endTurns.get(),
+                "a superseded turn must not call endTurn: it would clear the newer turn's snapshot/refs",
+            )
+            assertTrue(perception.liveSnapshot != null, "turn B's snapshot/refs survive turn A's finally")
+
+            releaseSecond.countDown()
+            tasks.join(1)
+            assertEquals(1, perception.endTurns.get(), "only the live turn closes the provider")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    /**
+     * The host port for the superseded-turn test: it models the one thing the real provider owns — a live snapshot/ref
+     * set that `beginTurn` installs and `endTurn` clears — and lets the test see that set from outside.
+     */
+    private class TicketProbePerception : PerceptionProvider {
+        val firstBegin = CountDownLatch(1)
+        val secondBegin = CountDownLatch(1)
+        val endTurns = AtomicInteger(0)
+        private val begins = AtomicInteger(0)
+
+        @Volatile
+        var liveSnapshot: PerceptionSnapshot? = null
+            private set
+
+        override fun beginTurn(): PerceptionSnapshot {
+            val number = begins.incrementAndGet()
+            val snapshot = smartPerceptionSnapshot(snapshotId = "snap-$number")
+            liveSnapshot = snapshot
+            if (number == 1) firstBegin.countDown() else secondBegin.countDown()
+            return snapshot
+        }
+
+        override fun snapshot(
+            include: Set<PerceptionSource>,
+            filter: PerceptionFilter,
+            limit: Int?,
+        ): PerceptionSnapshot =
+            checkNotNull(liveSnapshot) { "snapshot requested after the perception turn closed" }
+
+        override fun afterAction(): PerceptionSnapshot =
+            snapshot(emptySet(), PerceptionFilter.ALL, null)
+
+        override fun screenshot(): PerceptionScreenshotResult =
+            PerceptionScreenshotResult.Unavailable("test")
+
+        override fun endTurn() {
+            endTurns.incrementAndGet()
+            liveSnapshot = null
+        }
+    }
+
+    /** A task scope whose workers the test can join one at a time, in launch order. */
+    private class JoinableTasks : TaskScope {
+        private val workers = mutableListOf<Thread>()
+
+        override fun launch(block: () -> Unit): CancellationHandle {
+            val worker = Thread(block, "perception-turn-worker-${workers.size + 1}")
+            worker.isDaemon = true
+            synchronized(workers) { workers += worker }
+            worker.start()
+            return object : CancellationHandle { override fun cancel() = Unit }
+        }
+
+        override fun cancelAll() = Unit
+
+        fun join(index: Int, millis: Long = 5_000L) {
+            synchronized(workers) { workers[index] }.join(millis)
         }
     }
 

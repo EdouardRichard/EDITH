@@ -97,6 +97,23 @@ class PromptRendererTest {
     }
 
     @Test
+    fun `the cap boundary is exact and a negative cap is rejected`() {
+        fun renderCap(value: String) = PromptRenderer.render(
+            "{{x}}",
+            mapOf("x" to value),
+            setOf("x"),
+            maxValueCodePoints = 600,
+        )
+
+        assertEquals("#".repeat(599), renderCap("#".repeat(599)))
+        assertEquals("#".repeat(600), renderCap("#".repeat(600)), "a value exactly at the cap is not cut")
+        assertEquals("#".repeat(600), renderCap("#".repeat(601)), "one code point over is cut to the cap exactly")
+        assertFailsWith<IllegalArgumentException> {
+            PromptRenderer.render("{{x}}", mapOf("x" to "v"), setOf("x"), maxValueCodePoints = -1)
+        }
+    }
+
+    @Test
     fun `the cap override never splits a surrogate pair`() {
         val out = PromptRenderer.render(
             "{{x}}",
