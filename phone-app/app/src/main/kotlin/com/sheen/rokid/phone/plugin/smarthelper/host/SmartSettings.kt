@@ -71,6 +71,18 @@ data class SmartSettings(
      * default (on); once the user turns it off, no path may turn it back on automatically.
      */
     val continueDialogue: Boolean = true,
+    /**
+     * 0.3 Phase 2 Task 10: the 「感知截图」 switch, persisted globally and **on by default**.
+     *
+     * It is the host's live vision gate: when off, the perception provider answers `PerceptionScreenshotResult.Disabled`
+     * and the device tool refuses `screenshot` with `VISION_DISABLED` before touching the kernel. The field is only
+     * the persisted half - the composition owns a live `VisionGate` that mirrors it and is updated on save, so the
+     * switch takes effect without an App restart.
+     *
+     * A blob written before this key exists takes the default (on), because the phase ships with vision on. Once the
+     * user turns it off, no path may turn it back on automatically (`D53`② same-shape rule).
+     */
+    val visionEnabled: Boolean = true,
 ) {
     /**
      * The plugin's own cooldown parameter.
@@ -187,6 +199,7 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
             put("proactiveEnabled", settings.proactiveEnabled)
             put("speechEnabled", settings.speechEnabled)
             put("continueDialogue", settings.continueDialogue)
+            put("visionEnabled", settings.visionEnabled)
         })
     }
 
@@ -218,6 +231,10 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
                 // blob must continue conversations; only the user's explicit off is stored as false.
                 continueDialogue = json["continueDialogue"]?.jsonPrimitive?.booleanOrNull
                     ?: SmartSettings().continueDialogue,
+                // Absent in a blob written before Phase 2 Task 10: takes the default (on). The switch ships on, and an
+                // explicit off is the user's act - it must never be inferred from an older blob.
+                visionEnabled = json["visionEnabled"]?.jsonPrimitive?.booleanOrNull
+                    ?: SmartSettings().visionEnabled,
             )
         }.getOrNull()
     }

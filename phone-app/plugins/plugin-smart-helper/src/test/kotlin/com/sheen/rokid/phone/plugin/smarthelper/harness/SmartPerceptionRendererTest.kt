@@ -340,6 +340,81 @@ class SmartPerceptionRendererTest {
     }
 
     @Test
+    fun `a non-image profile names the missing capability instead of reporting vision ok`() {
+        // The host gate is on (the snapshot says `vision=ok`), but the selected profile declares no IMAGE input, so the
+        // images cannot reach the model. Saying `ok` would be the silent text guess spec §7.7 forbids.
+        val rendered = SmartPerceptionRenderer.renderDetailed(
+            snapshot(coverage = coverage(vision = "ok")),
+            state(),
+            PerceptionPolicy(),
+            full = true,
+            visionSupported = false,
+        )
+
+        assertEquals("unavailable(no_image_profile)", rendered.coverage.vision)
+        assertTrue("vision=unavailable(no_image_profile)" in rendered.text, rendered.text)
+        val telemetry = SmartPerceptionRenderer.telemetry(
+            snapshot(coverage = coverage(vision = "ok")),
+            rendered.text,
+            rendered.truncated,
+            rendered.coverage,
+        )
+        assertTrue(
+            "coverage=screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok " +
+                "vision=unavailable(no_image_profile) glasses=ok device=ok" in telemetry,
+            telemetry,
+        )
+    }
+
+    @Test
+    fun `a disabled host gate keeps saying disabled even for an image-capable profile`() {
+        val rendered = SmartPerceptionRenderer.renderDetailed(
+            snapshot(coverage = coverage(vision = "disabled")),
+            state(),
+            PerceptionPolicy(),
+            full = true,
+            visionSupported = true,
+        )
+
+        assertEquals("disabled", rendered.coverage.vision,
+            "the host's off switch wins over the profile capability")
+        assertTrue("vision=disabled" in rendered.text, rendered.text)
+        assertTrue(
+            "vision=disabled" in SmartPerceptionRenderer.telemetry(
+                snapshot(coverage = coverage(vision = "disabled")),
+                rendered.text,
+                rendered.truncated,
+                rendered.coverage,
+            ),
+            "the telemetry coverage must agree with the rendered block",
+        )
+    }
+
+    @Test
+    fun `an image-capable profile with the gate on keeps vision ok and no profile leaves the host token alone`() {
+        val ok = SmartPerceptionRenderer.renderDetailed(
+            snapshot(coverage = coverage(vision = "ok")),
+            state(),
+            PerceptionPolicy(),
+            full = true,
+            visionSupported = true,
+        )
+        assertEquals("ok", ok.coverage.vision)
+        assertTrue("vision=ok" in ok.text, ok.text)
+
+        // No profile is not evidence that images are unsupported: the host's own token stays the answer.
+        val unknown = SmartPerceptionRenderer.renderDetailed(
+            snapshot(coverage = coverage(vision = "ok")),
+            state(),
+            PerceptionPolicy(),
+            full = true,
+            visionSupported = null,
+        )
+        assertEquals("ok", unknown.coverage.vision)
+        assertTrue("vision=ok" in unknown.text, unknown.text)
+    }
+
+    @Test
     fun `the telemetry is count-only and carries no content`() {
         val text = SmartPerceptionRenderer.render(snapshot(), state(), PerceptionPolicy(), full = true)
 

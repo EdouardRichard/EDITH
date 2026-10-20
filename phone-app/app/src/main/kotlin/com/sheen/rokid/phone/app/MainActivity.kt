@@ -252,13 +252,19 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     ((expiresAtMillis - System.currentTimeMillis()) / 1000).coerceAtLeast(0L)
 
 /**
- * The minimal settings entry point (Task 14b): the three things the user can set, plus the inline errors.
+ * The minimal settings entry point (Task 14b): the values the user can set, plus the inline errors.
  *
  * Everything that can be validated lives in [SmartSettingsForm] (JVM-tested); this function only holds the text
  * fields and prints the errors, so the untested part is wiring. Two facts the copy must state truthfully
  * (Task 14b-fix item 4): the composition is a process-lifetime singleton and reads the settings **once** in
  * `HostCompositionRoot.create`, so only a full App restart re-reads them - restarting a session does not; and `L1`
  * is the ceiling the phase ships with while `L3`/`L4` are an explicit user choice.
+ *
+ * edith-0.3 Phase 2 Task 10 adds the one exception: 「感知截图」 is a **live** gate applied by a successful save, so
+ * its copy says "immediately" while everything else keeps the restart sentence. The risk paragraph next to it is the
+ * user's plain-language notice that screen/notification content (possibly passwords, OTPs, card numbers) travels to
+ * the configured model service, that logs/evidence only carry counts and ids, and that turning it off stops images
+ * only - screen text still travels.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun SmartSettingsSection(loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit) {
@@ -269,7 +275,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     val levels = listOf("L0", "L1", "L2", "L3", "L4")
 
     Text("唤醒与权限设置", style = MaterialTheme.typography.titleLarge)
-    Text("设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；默认上限为 L1，如需 L3/L4 请在此明确选择。",
+    Text("唤醒词、权限上限、白名单、主动辅助等设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；感知截图开关保存后立即生效。默认上限为 L1，如需 L3/L4 请在此明确选择。",
         style = MaterialTheme.typography.bodyMedium)
     // Task 14b-fix item 5: an edit invalidates whatever the last save reported, so the stale error text cannot
     // outlive the input it was about.
@@ -321,9 +327,29 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
             draft = draft.copy(continueDialogue = it); errors = emptyList(); saved = false
         })
     }
+    // 0.3 Phase 2 Task 10: the perception-screenshot switch. Unlike the fields above it is a **live** gate: a
+    // successful save applies it to the composition immediately (no App restart). Turning it off stops screenshot
+    // images from being captured/sent, but screen text keeps travelling with the request - the copy says both.
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("感知截图（图片随请求发送）")
+            Text(
+                "关闭后不再截取并随请求发送屏幕图片；保存后立即生效。它不停止屏幕文字、通知等文字内容的发送。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Switch(checked = draft.visionEnabled, onCheckedChange = {
+            draft = draft.copy(visionEnabled = it); errors = emptyList(); saved = false
+        })
+    }
+    Text(
+        "风险提示：开启后，屏幕与通知中的内容（可能包含密码、验证码、银行卡号等敏感信息）会随请求发送到你配置的模型服务；" +
+            "本机日志与证据只记录计数和标识，不记录这些内容。关闭此开关只会停止发送截图图片，不会停止发送屏幕文字。",
+        style = MaterialTheme.typography.bodySmall,
+    )
     errors.forEach { Text(it, color = MaterialTheme.colorScheme.error) }
     if (saved) {
-        if (errors.isEmpty()) Text("已保存，将于下次重启 App 后生效")
+        if (errors.isEmpty()) Text("已保存：感知截图开关立即生效；其余设置将在下次重启 App 后生效")
         else Text("可用字段已保存，被拒绝的输入请按上述提示修改")
     }
     Button(onClick = {

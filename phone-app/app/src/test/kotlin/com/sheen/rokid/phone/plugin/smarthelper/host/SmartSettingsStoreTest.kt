@@ -288,6 +288,47 @@ class SmartSettingsStoreTest {
         assertEquals(5000L, reloaded.cooldownMillis)
     }
 
+    // ---- 0.3 Phase 2 Task 10: the vision switch -------------------------------------------------
+
+    @Test
+    fun visionIsOnByDefaultInAFreshStoreAndInAFreshSettingsValue() {
+        assertEquals(true, SmartSettings().visionEnabled)
+        assertEquals(true, SmartSettingsStore(TestBlobs()).load().visionEnabled)
+    }
+
+    @Test
+    fun anExplicitlyDisabledVisionSwitchSurvivesASaveAndLoadInBothDirections() {
+        val blobs = TestBlobs()
+        SmartSettingsStore(blobs).save(SmartSettings(visionEnabled = false))
+
+        assertEquals(
+            "an explicit off must persist; no other field may re-enable it",
+            false,
+            SmartSettingsStore(blobs).load().visionEnabled,
+        )
+
+        SmartSettingsStore(blobs).save(SmartSettings(visionEnabled = true))
+        assertEquals(true, SmartSettingsStore(blobs).load().visionEnabled)
+    }
+
+    @Test
+    fun aBlobWrittenBeforeTheVisionKeyExistedLoadsItAsOn() {
+        // The key is new in Phase 2 Task 10: the default is on, and turning it off must be the user's explicit act.
+        val blobs = TestBlobs()
+        writeJson(blobs, SmartSettingsStore.BLOB_ID, buildJsonObject {
+            put("version", 1)
+            put("wakeWords", buildJsonArray { add("伊迪丝") })
+            put("maxLevel", "L1")
+            put("whitelist", buildJsonArray {})
+            put("cooldownMillis", 3000L)
+        })
+
+        val loaded = SmartSettingsStore(blobs).load()
+
+        assertEquals(true, loaded.visionEnabled)
+        assertEquals("the rest of the old blob must still load", "L1", loaded.maxLevel)
+    }
+
     @Test
     fun anUnreadableProfileRepositoryDoesNotStopTheSettingsFromResolving() {
         // The composition reads the settings while it assembles the plugin. The profile repository can genuinely

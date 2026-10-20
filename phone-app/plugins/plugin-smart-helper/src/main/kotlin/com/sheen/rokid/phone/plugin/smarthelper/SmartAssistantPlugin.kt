@@ -90,6 +90,7 @@ import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
+import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.OutputSink
@@ -2379,6 +2380,10 @@ class SmartAssistantPlugin(
         // 0.3 final-fix wave (spec §5.2): one profile read feeds the request timeout, the per-turn output cap and the
         // trim window; the session's fail-closed policy code (if any) refuses the turn before the transport.
         val turnProfile = runCatching { profileLookup(configured.profileId) }.getOrNull()
+        // Phase 2 Task 10: the profile's own image capability. `null` (no profile) is **not** evidence that images are
+        // unsupported, so only a real profile that omits `IMAGE` turns the rendered coverage into
+        // `unavailable(no_image_profile)`. The host's gate-off token (`disabled`) always wins over this.
+        val profileAcceptsImages = turnProfile?.let { InputModality.IMAGE in it.inputs }
         val run = try {
             val built = buildLoop(configured, registry, gateway)
             loop = built
@@ -2438,7 +2443,7 @@ class SmartAssistantPlugin(
                     // re-read when that failed), later requests ask only for the ambient device/media state. The
                     // renderer never logs content; the one `P3_PERCEPTION` line is counts plus coverage tokens.
                     perception = perception?.let { provider ->
-                        { perceptionBlockFor(provider, initialSnapshot, perceptionRequests) }
+                        { perceptionBlockFor(provider, initialSnapshot, perceptionRequests, profileAcceptsImages) }
                     },
                 ),
             )
@@ -2526,11 +2531,17 @@ class SmartAssistantPlugin(
      *
      * Exactly one count-only `P3_PERCEPTION` line is emitted per rendered block; the block itself is never logged.
      * Returns `null` when no snapshot could be read, which the loop treats as "no perception segment".
+     *
+     * [visionSupported] is the resolved profile's `IMAGE` capability (Task 10): `false` downgrades an `ok` coverage
+     * token to `unavailable(no_image_profile)`; `null` leaves the host's own token alone. The same
+     * [SmartPerceptionRenderer.RenderedPerception.coverage] feeds both the block and the telemetry, so the logged
+     * `coverage=` can never disagree with what the model was told.
      */
     private fun perceptionBlockFor(
         provider: PerceptionProvider,
         initialSnapshot: PerceptionSnapshot?,
         requests: AtomicInteger,
+        visionSupported: Boolean?,
     ): String? {
         val full = requests.getAndIncrement() == 0
         val snapshot = if (full) {
@@ -2545,7 +2556,13 @@ class SmartAssistantPlugin(
         val device = runCatching { activeDeviceStateProvider?.state() }.getOrNull()
         // `renderDetailed` is the block plus the local-clip flags; reducing it to a String here would hide a value
         // the policy cap deliberately truncated (review I3), so the telemetry call gets the same result.
-        val rendered = SmartPerceptionRenderer.renderDetailed(snapshot, device, perceptionPolicy, full)
+        val rendered = SmartPerceptionRenderer.renderDetailed(
+            snapshot,
+            device,
+            perceptionPolicy,
+            full,
+            visionSupported = visionSupported,
+        )
         P3Log.line(
             SmartPerceptionRenderer.telemetry(
                 snapshot,

@@ -26,8 +26,28 @@ class SmartSettingsFormTest {
         proactiveSensitivity: String = "LOW",
         proactiveEnabled: Boolean = true,
         continueDialogue: Boolean = true,
+        visionEnabled: Boolean = true,
     ) = SmartSettings(wakeWords, maxLevel, whitelist, profileId, cooldownMillis,
-        proactiveCooldownMillis, proactiveSensitivity, proactiveEnabled, continueDialogue = continueDialogue)
+        proactiveCooldownMillis, proactiveSensitivity, proactiveEnabled, continueDialogue = continueDialogue,
+        visionEnabled = visionEnabled)
+
+    // ---- 0.3 Phase 2 Task 10: the perception-screenshot switch ---------------------------------------
+
+    @Test
+    fun theVisionSwitchRoundTripsThroughTheFormInBothDirections() {
+        val base = settings(visionEnabled = true)
+
+        val draft = SmartSettingsForm.fromSettings(base)
+        assertTrue("the screen must show the stored switch", draft.visionEnabled)
+
+        val off = SmartSettingsForm.toSettings(draft.copy(visionEnabled = false), base)
+        assertTrue("a valid switch reports no errors: ${off.errors}", off.errors.isEmpty())
+        assertFalse("turning the switch off must be stored", off.settings.visionEnabled)
+
+        val storedOff = settings(visionEnabled = false)
+        val untouched = SmartSettingsForm.toSettings(SmartSettingsForm.fromSettings(storedOff), storedOff)
+        assertFalse("loading and saving an untouched off switch must not re-enable it", untouched.settings.visionEnabled)
+    }
 
     // ---- 0.24 S3: the continual-dialogue switch -----------------------------------------------------
 

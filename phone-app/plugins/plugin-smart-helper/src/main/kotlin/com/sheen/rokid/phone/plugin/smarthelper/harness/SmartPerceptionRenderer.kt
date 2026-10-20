@@ -45,6 +45,15 @@ object SmartPerceptionRenderer {
     private const val NO_SESSION = "unavailable(no_session)"
     private const val UNKNOWN_MEDIA_STATE = "UNKNOWN"
 
+    /** The host's own vision token: the gate is on and the policy asked for vision. */
+    private const val VISION_OK = "ok"
+
+    /**
+     * edith-0.3 Phase 2 Task 10: the profile the turn is running on declares no `IMAGE` input, so a screenshot could
+     * be captured but never travel with the request. This is an honest capability gap, not a transient unavailability.
+     */
+    private const val NO_IMAGE_PROFILE = "unavailable(no_image_profile)"
+
     /** The thirteen slots the perception template may use; memory/skill/loop are deliberately absent. */
     private val SLOTS: Set<String> = linkedSetOf(
         "coverage",
@@ -86,13 +95,18 @@ object SmartPerceptionRenderer {
      * Renders the block for [snapshot] against the current [deviceState] and session [policy]; the text-only form of
      * [renderDetailed]. A caller that also logs the block's telemetry uses [renderDetailed], because a local cap clip
      * is not visible in the text alone.
+     *
+     * [visionSupported] is edith-0.3 Phase 2 Task 10's profile check: `false` means the selected profile declares no
+     * `IMAGE` input, so an `ok` host token is rendered as `unavailable(no_image_profile)`; `true`/`null` leave the
+     * host's token (`ok` when the gate is on, `disabled` when it is off) untouched.
      */
     fun render(
         snapshot: PerceptionSnapshot,
         deviceState: DeviceState?,
         policy: PerceptionPolicy,
         full: Boolean,
-    ): String = renderDetailed(snapshot, deviceState, policy, full).text
+        visionSupported: Boolean? = null,
+    ): String = renderDetailed(snapshot, deviceState, policy, full, visionSupported).text
 
     /**
      * Renders the block for [snapshot] against the current [deviceState] and session [policy], with the honest flags
@@ -107,12 +121,19 @@ object SmartPerceptionRenderer {
      * [CompactSnapshotRenderer.TRUNCATION_MARKER] and ends with that marker, so the model never receives a prefix that
      * looks complete. A cut screen also flips the rendered coverage's `screen=` token to `truncated`, and any cut sets
      * [RenderedPerception.truncated] for the telemetry.
+     *
+     * **Vision completeness (Task 10).** [visionSupported] is the caller's profile fact: `false` means the turn's
+     * profile declares no `IMAGE` input, and an `ok` host coverage token is then reported as
+     * `unavailable(no_image_profile)` in both the block and [RenderedPerception.coverage]. `true` and `null` keep the
+     * host's own token, so a gate that is off still reads `disabled` and a missing profile is not treated as evidence
+     * that images are unsupported.
      */
     fun renderDetailed(
         snapshot: PerceptionSnapshot,
         deviceState: DeviceState?,
         policy: PerceptionPolicy,
         full: Boolean,
+        visionSupported: Boolean? = null,
     ): RenderedPerception {
         val maxValueCodePoints = maxOf(DEFAULT_VALUE_CODE_POINTS, policy.elementLimit * CODE_POINTS_PER_ELEMENT)
         var truncated = snapshot.truncated
@@ -122,8 +143,19 @@ object SmartPerceptionRenderer {
         val screen = cappedValue(rawScreen, maxValueCodePoints) { screenClipped = true }
         if (screenClipped) truncated = true
 
-        // The local coverage string must not keep saying `ok` for a screen the cap just cut short.
-        val coverage = if (screenClipped) snapshot.coverage.copy(screen = SCREEN_TRUNCATED) else snapshot.coverage
+        // The local coverage string must not keep saying `ok` for a screen the cap just cut short, and it must not keep
+        // saying `ok` for a screenshot the selected profile could never carry (Task 10). `disabled` stays `disabled`:
+        // the host's own gate is off, which is a stronger fact than the profile's missing IMAGE input.
+        val coverage = when {
+            screenClipped -> snapshot.coverage.copy(screen = SCREEN_TRUNCATED)
+            else -> snapshot.coverage
+        }.let { base ->
+            if (visionSupported == false && base.vision == VISION_OK) {
+                base.copy(vision = NO_IMAGE_PROFILE)
+            } else {
+                base
+            }
+        }
 
         fun cappedSlot(raw: String): String = cappedValue(raw, maxValueCodePoints) { truncated = true }
 

@@ -28,6 +28,7 @@ import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ConfigSchema
 import com.sheen.rokid.plugin.DeactivationReason
+import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelStreamEvent
@@ -134,6 +135,51 @@ class SmartAssistantPluginTest {
             assertTrue("elements=1" in telemetry.single(), telemetry.single())
             assertTrue("images=0" in telemetry.single(), telemetry.single())
             assertFalse("搜索" in telemetry.single(), "the telemetry must not carry screen text: ${telemetry.single()}")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `a text-only profile says vision is unavailable instead of reporting the host gate as ok`() {
+        // Phase 2 Task 10: the host's snapshot token says the capture path is on (`vision=ok`), but the selected
+        // profile declares no IMAGE input. The rendered coverage must name that gap, and the telemetry must agree.
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue("vision=unavailable(no_image_profile)" in input, input)
+            val telemetry = lines.single { it.startsWith("P3_PERCEPTION ") }
+            assertTrue("vision=unavailable(no_image_profile)" in telemetry, telemetry)
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `an image-capable profile keeps vision ok`() {
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        rig.profile = smartProfile().copy(inputs = setOf(InputModality.TEXT, InputModality.IMAGE))
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue("vision=ok" in input, input)
+            val telemetry = lines.single { it.startsWith("P3_PERCEPTION ") }
+            assertTrue("vision=ok" in telemetry, telemetry)
         } finally {
             P3Log.sink = previous
         }

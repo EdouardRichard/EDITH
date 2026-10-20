@@ -22,6 +22,7 @@ import com.sheen.rokid.phone.session.confirmation.ConfirmationGlasses
 import com.sheen.rokid.phone.model.ScriptedModelWire
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillDirectoryView
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
+import com.sheen.rokid.phone.plugin.smarthelper.host.VisionGate
 import com.sheen.rokid.phone.actions.ExecutionChannelStatus
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.StorageAccessSkillView
 import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticRegistration
@@ -264,6 +265,14 @@ class HostCompositionRoot internal constructor(
      * the next load read one blob.
      */
     private val smartSettingsStore: SmartSettingsStore? = null,
+    /**
+     * edith-0.3 Phase 2 Task 10: the **live** 「感知截图」 switch.
+     *
+     * [create] builds it from the persisted [SmartSettings.visionEnabled] and hands the same instance to the perception
+     * provider and the `device` tool, so a save on the settings screen takes effect on their very next call. A
+     * hand-built composition (tests, harnesses) keeps the default on, which is the shipped setting.
+     */
+    private val visionGate: VisionGate = VisionGate(true),
     /**
      * `D53`② (2026-10-11): the **persisted, global** 「主动辅助」 switch - it replaced P3.2's session-scoped one.
      *
@@ -691,9 +700,20 @@ class HostCompositionRoot internal constructor(
     fun storedSettings(): SmartSettings =
         requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }.load(profiles)
 
-    /** Persists one settings edit; the next App start's composition picks it up (this one never re-reads). */
+    /**
+     * Persists one settings edit; the next App start's composition picks it up (this one never re-reads).
+     *
+     * edith-0.3 Phase 2 Task 10: the 「感知截图」 switch is the exception to "next App start" - it is a live privacy
+     * control, so a successful save also applies it to [visionGate] immediately. A save that turns vision **off** is
+     * applied before the blob write and stays applied if the write fails: persistence is the durability half, while a
+     * failed save must never leave capture enabled after the user asked for off. A save that turns vision on applies
+     * only after the blob accepted it, so a failed write cannot arm capture.
+     */
     fun saveSmartSettings(settings: SmartSettings) {
-        requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }.save(settings)
+        val store = requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }
+        if (!settings.visionEnabled) visionGate.set(false)
+        store.save(settings)
+        visionGate.set(settings.visionEnabled)
     }
 
     /**
@@ -1904,9 +1924,14 @@ class HostCompositionRoot internal constructor(
             // corrupt blob leaves a configure-able, arm-able app rather than an un-activatable plugin.
             //
             // Task 14b: this is also the store the settings screen writes through, so a save and the next load read
-            // the same blob. The composition's own settings stay the ones read here; the screen's copy is explicit
-            // that only a full App restart re-reads them (this root is a process-lifetime singleton).
+            // the same blob. The composition's own settings stay the ones read here; the screen's copy says that only
+            // a full App restart re-reads them (this root is a process-lifetime singleton), with the single exception
+            // of the live vision gate built just below.
             val smartSettings = smartSettingsStore.load(profiles)
+            // Phase 2 Task 10: one live gate for the perception provider and the device tool, seeded from the stored
+            // switch. A save updates this same instance through `saveSmartSettings`; the old `{ true }` hardcodes on
+            // both consumers are gone, so the switch really is the only source of truth.
+            val visionGate = VisionGate(smartSettings.visionEnabled)
             // Task 14b: the self-audio seam. P3.1 emits no audio at all, so the gate stays open and this wiring
             // changes nothing today; it is what P3.2 hands to the speech output path. See `PlaybackGate`.
             //
@@ -2232,9 +2257,9 @@ class HostCompositionRoot internal constructor(
                 acoustic = acoustic,
                 glasses = glassesState,
                 policy = { perceptionPolicy },
-                // Task 10 replaces this with the user's live switch; until then the existing screenshot behavior is
-                // unchanged and this lambda is the one place the preference will be read.
-                visionEnabled = { true },
+                // Phase 2 Task 10: the live switch, not an assembly-time copy. The provider answers `Disabled` and the
+                // injected capture is not called while it is off.
+                visionEnabled = { visionGate.enabled },
                 screenshot = {
                     val envelope = deviceKernel.screenshot()
                     val image = envelope.images.firstOrNull()
@@ -2254,7 +2279,7 @@ class HostCompositionRoot internal constructor(
                 deviceState = deviceState,
                 registry = deviceKernel.registry,
                 foreground = foreground,
-                visionEnabled = { true },
+                visionEnabled = { visionGate.enabled },
                 refTtlMillis = { perceptionPolicy.refTtlMillis },
             )
             val callAvailable: () -> Boolean = {
@@ -2478,6 +2503,7 @@ class HostCompositionRoot internal constructor(
                 dispatchHostEvent = { task -> scheduler.at(clock.nowNanos(), task) },
                 smartWiring = smartWiring,
                 smartSettingsStore = smartSettingsStore,
+                visionGate = visionGate,
                 proactiveArming = proactiveArming,
                 playbackGate = playbackGate)
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
