@@ -8,6 +8,20 @@ package com.sheen.rokid.device
  */
 data class Ref(val value: String)
 
+/**
+ * One observed screen, as recorded by [RefRegistry.beginSnapshot].
+ *
+ * [snapshotId] identifies the observation a ref belongs to; [issuedAtEpochMillis] and the foreground
+ * facts are the action-time gate used by [RefRegistry.resolveForAction]. The foreground values are
+ * nullable because the producer cannot always determine the app or activity in front.
+ */
+data class RefSnapshot(
+    val snapshotId: String,
+    val issuedAtEpochMillis: Long,
+    val foregroundPackage: String?,
+    val foregroundActivity: String?,
+)
+
 /** The outcome of resolving a [Ref] against an observation. */
 sealed interface RefResult {
 
@@ -18,9 +32,12 @@ sealed interface RefResult {
      * The ref cannot address a node any more; the caller must re-observe.
      *
      * [reason] is diagnostic text meant for logs and error envelopes, not for the model's action
-     * parameters.
+     * parameters. [code] is the machine-readable reason the caller maps to an error envelope:
+     * `STALE_REF` for an unknown or rebind-exhausted ref, `REF_EXPIRED` for an expired snapshot,
+     * `FOREGROUND_CHANGED` when the app in front is no longer the observed one, and
+     * `CROSS_SNAPSHOT` when the ref was not assigned in the current snapshot.
      */
-    data class Stale(val reason: String) : RefResult
+    data class Stale(val reason: String, val code: String = "STALE_REF") : RefResult
 }
 
 /**
@@ -42,10 +59,22 @@ sealed interface RefResult {
  * with a truncation-specific reason and does not spend the rebind budget, because absence there
  * proves nothing.
  *
+ * **Snapshots (Phase 2).** [beginSnapshot] records the id, issue time and foreground facts of the
+ * screen that is about to be assigned; [assign] stamps the current snapshot id onto every binding it
+ * assigns or reuses, so a surviving node keeps its ref and is re-stamped. [resolveForAction] is the
+ * action-time gate: it returns `REF_EXPIRED` when the snapshot is older than the caller's TTL
+ * (comparison is strict `>`; a non-positive TTL expires every snapshot immediately),
+ * `FOREGROUND_CHANGED` when the package or activity in front differs from the snapshot, and
+ * `CROSS_SNAPSHOT` when the ref's binding was not assigned in the current snapshot. A ref whose node
+ * is absent from the current observation is therefore stale as `CROSS_SNAPSHOT`, never silently
+ * pointed at a new node. [beginSnapshot] never clears the identity maps; [resolve] never consults
+ * this metadata, so pre-Phase-2 callers behave unchanged.
+ *
  * **Lifecycle.** Every distinct identity ever assigned keeps one map entry for the lifetime of the
  * registry, so a long-lived registry grows with the app's UI history. A kernel should own one
- * registry per task/session and [reset] it between them (or create a fresh one). Ref numbers stay
- * monotonic across a reset, so a retained old ref can never silently address a node minted later.
+ * registry per task/session and [reset] it between them (or create a fresh one). [reset] clears the
+ * identity maps and the snapshot metadata. Ref numbers stay monotonic across a reset, so a retained
+ * old ref can never silently address a node minted later.
  *
  * **Keys.** [assign] returns one entry per node keyed by the structural path also used by
  * [ObservationDiff] (`0`, `0/1`, ...). That is the key callers use to associate a diff entry with
@@ -60,31 +89,66 @@ class RefRegistry {
         val rebindKey: String,
         var ref: Ref,
         var rebinds: Int = 0,
+        /** The snapshot this binding was last assigned in; null until an [assign] under a snapshot. */
+        var snapshotId: String? = null,
     )
 
     private val byIdentity = HashMap<String, Ref>()
     private val byReference = HashMap<String, Binding>()
     private var issued = 0
+    private var current: RefSnapshot? = null
+
+    /**
+     * Records the metadata of the observation the caller is about to [assign].
+     *
+     * Only metadata is recorded: the identity maps are left untouched, and a ref becomes actionable
+     * for the new snapshot only when [assign] stamps it.
+     */
+    @Synchronized
+    fun beginSnapshot(
+        snapshotId: String,
+        issuedAtEpochMillis: Long,
+        foregroundPackage: String?,
+        foregroundActivity: String?,
+    ) {
+        current = RefSnapshot(
+            snapshotId = snapshotId,
+            issuedAtEpochMillis = issuedAtEpochMillis,
+            foregroundPackage = foregroundPackage,
+            foregroundActivity = foregroundActivity,
+        )
+    }
+
+    /** The snapshot most recently recorded by [beginSnapshot], or null before the first one. */
+    @Synchronized
+    fun currentSnapshot(): RefSnapshot? = current
 
     /**
      * Assigns or reuses a ref for every node in [observation].
      *
      * The returned map is keyed by the node's structural path and preserves the observation's node
      * order. Nodes hidden from a render filter still get refs; the registry does not know about
-     * filters.
+     * filters. Every assigned or reused binding is stamped with the current snapshot id (null when
+     * [beginSnapshot] has not been called), which is what makes it actionable for that snapshot.
      */
     @Synchronized
     fun assign(observation: Observation): Map<String, Ref> {
+        val snapshotId = current?.snapshotId
         val paths = NodeStructure.paths(observation.nodes)
         val refs = LinkedHashMap<String, Ref>(observation.nodes.size)
         observation.nodes.forEachIndexed { index, node ->
-            refs[paths[index]] = refFor(node, paths[index])
+            val ref = refFor(node, paths[index])
+            // A node that survived from an earlier snapshot keeps its binding and is re-stamped
+            // here; this is the only place that stamps, so resolve() cannot resurrect a ref.
+            byReference.getValue(ref.value).snapshotId = snapshotId
+            refs[paths[index]] = ref
         }
         return refs
     }
 
     /**
-     * Forgets every issued ref, e.g. at the task/session boundary of a long-lived registry.
+     * Forgets every issued ref and the snapshot metadata, e.g. at the task/session boundary of a
+     * long-lived registry.
      *
      * Ref numbers keep increasing, so a ref retained from before the reset goes [RefResult.Stale]
      * as unknown instead of silently addressing a node minted afterwards.
@@ -93,6 +157,7 @@ class RefRegistry {
     fun reset() {
         byIdentity.clear()
         byReference.clear()
+        current = null
     }
 
     /**
@@ -102,6 +167,9 @@ class RefRegistry {
      * per ref), then [RefResult.Stale]. When the ref's node was replaced by a node that already has
      * another ref, that canonical ref is returned; the caller never receives two different live
      * refs for what is now one node.
+     *
+     * This is the pre-Phase-2 resolution path: it deliberately ignores snapshot ids, TTL and the
+     * foreground. Use [resolveForAction] before dispatching an action.
      */
     @Synchronized
     fun resolve(observation: Observation, ref: Ref): RefResult {
@@ -142,6 +210,61 @@ class RefRegistry {
         binding.ref = rebound
         binding.rebinds += 1
         return RefResult.Ok(rebound)
+    }
+
+    /**
+     * Resolves [ref] for an action about to be dispatched, refusing refs that no longer belong to
+     * the screen the model saw.
+     *
+     * Checks, in order: a current snapshot exists ([RefSnapshot]); the snapshot is not older than
+     * [ttlMillis] (strict `>`; `ttlMillis <= 0` expires every snapshot immediately); the foreground
+     * package and activity still match the snapshot; the ref was assigned in the current snapshot
+     * (otherwise `CROSS_SNAPSHOT`). Only then does it delegate to [resolve]. Unknown and
+     * rebind-exhausted refs are `STALE_REF`; the reason strings are diagnostic.
+     */
+    @Synchronized
+    fun resolveForAction(
+        observation: Observation,
+        ref: Ref,
+        nowEpochMillis: Long,
+        foregroundPackage: String?,
+        foregroundActivity: String?,
+        ttlMillis: Long,
+    ): RefResult {
+        val snapshot = current
+            ?: return RefResult.Stale("no current snapshot")
+        if (ttlMillis <= 0L || nowEpochMillis - snapshot.issuedAtEpochMillis > ttlMillis) {
+            return RefResult.Stale(
+                "ref ${ref.value} expired: snapshot ${snapshot.snapshotId} was issued " +
+                    "${nowEpochMillis - snapshot.issuedAtEpochMillis} ms ago " +
+                    "(ttl ${ttlMillis} ms)",
+                "REF_EXPIRED",
+            )
+        }
+        if (snapshot.foregroundPackage != foregroundPackage ||
+            snapshot.foregroundActivity != foregroundActivity
+        ) {
+            return RefResult.Stale(
+                "foreground changed since snapshot ${snapshot.snapshotId}: was " +
+                    "${snapshot.foregroundPackage}/${snapshot.foregroundActivity}, now " +
+                    "$foregroundPackage/$foregroundActivity",
+                "FOREGROUND_CHANGED",
+            )
+        }
+        val binding = byReference[ref.value]
+            ?: return RefResult.Stale(
+                "unknown ref ${ref.value}: it was not issued by this registry",
+            )
+        if (binding.snapshotId != snapshot.snapshotId) {
+            return RefResult.Stale(
+                "ref ${ref.value} was not assigned in snapshot ${snapshot.snapshotId}",
+                "CROSS_SNAPSHOT",
+            )
+        }
+        return when (val resolved = resolve(observation, ref)) {
+            is RefResult.Ok -> resolved
+            is RefResult.Stale -> RefResult.Stale(resolved.reason)
+        }
     }
 
     private fun refFor(node: DeviceNode, path: String): Ref {
