@@ -742,6 +742,60 @@ class DeviceToolTest {
     }
 
     @Test
+    fun `observe with perception refreshes the cached observation before projecting`() {
+        // 0.3 Phase 2 final review C1: `snapshot()` is cache-only, so a `device.observe` that only called it would serve
+        // the turn's opening screen after a manual change. An explicit observe must read first and project the fresh
+        // snapshot; `snapshot` then provides the caller's include/filter/limit projection from the fresh cache.
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(
+                snapshotId = "snap-cached",
+                elements = listOf(perceptionElement(ref = "#n1", text = "缓存的旧屏幕")),
+            ),
+            refreshedSnapshot = perceptionSnapshot(
+                snapshotId = "snap-fresh",
+                elements = listOf(perceptionElement(ref = "#n2", text = "手动切换后的新屏幕")),
+            ),
+        )
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"observe"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(1, perception.refreshCalls)
+        val screen = body(result).screen()
+        assertEquals("snap-fresh", screen["snap"]!!.jsonPrimitive.content)
+        assertTrue(
+            "the explicit observe must answer from the refreshed observation: ${screen["text"]}",
+            screen["text"]!!.jsonPrimitive.content.contains("手动切换后的新屏幕"),
+        )
+        assertFalse(screen["text"]!!.jsonPrimitive.content.contains("缓存的旧屏幕"))
+        assertEquals("the caller's projection still applies after the refresh", PerceptionFilter.INTERACTIVE, perception.lastFilter)
+    }
+
+    @Test
+    fun `perception-backed results are flagged non-persistent while pre-perception results are not`() {
+        // 0.3 Phase 2 final review C2: screen/notification/clipboard/calendar content rides the ActionResult detail for
+        // the current model request only. The plugin-api flag is what lets AgentLoop keep it out of the stored transcript.
+        val perception = FakePerception(perceptionSnapshot())
+        val device = tool(FakeDeviceOperations(observation()), perception = perception)
+
+        assertTrue("observe carries perception content", device.execute("""{"action":"observe"}""").nonPersistent)
+        assertTrue("status carries notification/media content", device.execute("""{"action":"status"}""").nonPersistent)
+        assertTrue(
+            "act returns the post-action compact snapshot",
+            device.execute("""{"action":"act","kind":"home"}""").nonPersistent,
+        )
+        assertFalse(
+            "the pre-perception projection path is still persistable",
+            tool(FakeDeviceOperations(observation())).execute("""{"action":"observe"}""").nonPersistent,
+        )
+        assertFalse(
+            "a screenshot result carries an image reference, not perception text",
+            device.execute("""{"action":"screenshot"}""").nonPersistent,
+        )
+    }
+
+    @Test
     fun `observe passes include and limit to the provider and returns the requested sources`() {
         val operations = FakeDeviceOperations(observation())
         val perception = FakePerception(
@@ -810,6 +864,10 @@ class DeviceToolTest {
         actionRegistry.assign(observation)
         val perception = FakePerception(
             snapshot = perceptionSnapshot(
+                snapshotId = "snap-old-cache",
+                elements = listOf(perceptionElement(ref = "#n0", text = "旧缓存")),
+            ),
+            refreshedSnapshot = perceptionSnapshot(
                 snapshotId = "snap-fresh",
                 elements = listOf(perceptionElement(ref = "#n9", text = "A")),
             ),
@@ -828,11 +886,13 @@ class DeviceToolTest {
         val body = body(result)
         assertEquals("STALE_REF", body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
         assertTrue(
-            "a stale ref must be answered with a fresh compact snapshot: ${body["data"]}",
+            "a stale ref must be answered with a freshly observed compact snapshot: ${body["data"]}",
             body["data"]!!.jsonObject["snapshot"]!!.jsonPrimitive.content.contains("#n9"),
         )
         assertTrue("the action must not be dispatched", operations.actCalls.isEmpty())
-        assertEquals("the fresh snapshot comes from a new provider snapshot", 1, perception.afterActions)
+        assertTrue("the stale answer carries fresh perception content", result.nonPersistent)
+        assertEquals("the stale answer is a real read, not the cached turn snapshot", 1L, perception.refreshCalls.toLong())
+        assertEquals("afterAction is reserved for post-act only", 0L, perception.afterActions.toLong())
     }
 
     @Test
@@ -1445,14 +1505,26 @@ class DeviceToolTest {
     private class FakePerception(
         var snapshot: PerceptionSnapshot,
         var afterActionSnapshot: PerceptionSnapshot? = null,
+        /**
+         * What a real `refresh()` would observe; when set the fake also updates its cache, exactly like
+         * `AndroidPerceptionProvider.refresh()` (the cached projection follows the fresh read).
+         */
+        var refreshedSnapshot: PerceptionSnapshot? = null,
     ) : PerceptionProvider {
         var afterActions = 0
+        var refreshCalls = 0
         var snapshotCalls = 0
         var lastInclude: Set<PerceptionSource>? = null
         var lastFilter: PerceptionFilter? = null
         var lastLimit: Int? = null
 
         override fun beginTurn(): PerceptionSnapshot = snapshot
+
+        override fun refresh(): PerceptionSnapshot {
+            refreshCalls++
+            refreshedSnapshot?.let { snapshot = it }
+            return snapshot
+        }
 
         override fun snapshot(
             include: Set<PerceptionSource>,

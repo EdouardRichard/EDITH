@@ -640,13 +640,39 @@ class TurnTrimmer(
      * The head+tail form of one dynamic-tail segment, or `null` when the segment is already short enough to keep whole.
      *
      * The cap pair is a policy starting point, not a model constant. The marker is fixed text, never the segment's
-     * content, so the kept request says exactly where the middle went.
+     * content, so the kept request says exactly where the middle went. Both cuts are code-point safe: a cap that lands
+     * inside a surrogate pair drops the orphan half instead of emitting an unpaired surrogate into the request.
      */
     private fun truncateDynamicText(text: String): String? {
-        val head = text.take(hardDynamicHeadChars)
-        val tail = text.takeLast(hardDynamicTailChars)
+        val head = text.takeCodePointSafe(hardDynamicHeadChars)
+        val tail = text.takeLastCodePointSafe(hardDynamicTailChars)
         if (text.length <= head.length + tail.length + HARD_TRUNCATED_MARKER.length) return null
         return head + HARD_TRUNCATED_MARKER + tail
+    }
+
+    /** `take(count)` without splitting a surrogate pair; an orphan high surrogate is dropped. */
+    private fun String.takeCodePointSafe(count: Int): String {
+        if (count <= 0) return ""
+        if (count >= length) return this
+        val end = if (Character.isHighSurrogate(this[count - 1]) && Character.isLowSurrogate(this[count])) {
+            count - 1
+        } else {
+            count
+        }
+        return substring(0, end)
+    }
+
+    /** `takeLast(count)` without splitting a surrogate pair; an orphan low surrogate is dropped. */
+    private fun String.takeLastCodePointSafe(count: Int): String {
+        if (count <= 0) return ""
+        if (count >= length) return this
+        val start = length - count
+        val from = if (Character.isLowSurrogate(this[start]) && Character.isHighSurrogate(this[start - 1])) {
+            start + 1
+        } else {
+            start
+        }
+        return substring(from)
     }
 
     // ── shared helpers ───────────────────────────────────────────────────────────────────────────

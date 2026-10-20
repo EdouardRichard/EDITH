@@ -144,6 +144,49 @@ class TurnTrimmerHardTest {
         assertEquals(listOf(SegmentOrigin.MEMORY_EVIDENCE), report.truncatedOrigins)
     }
 
+    @Test
+    fun `a character cut never splits a surrogate pair`() {
+        // Final review minor: `String.take(n)` / `takeLast(n)` count UTF-16 units, so a cut could keep half of an emoji
+        // (an unpaired surrogate). The head cut lands on a high surrogate and the tail cut on a low surrogate here; both
+        // must drop the orphan half and keep the rest of the text well-formed.
+        val emoji = "\uD83D\uDE00"
+        val headSplit = "x".repeat(399) + emoji + "y".repeat(800)
+        val tailSplit = "x".repeat(800) + emoji + "q".repeat(99)
+        val f = frame(
+            userTurn("u"),
+            perception(headSplit),
+            perception(tailSplit),
+            user("now"),
+        )
+
+        val report = TurnTrimmer().trim(f, limitTokens = 1_000_000, mode = TrimMode.HARD)
+
+        val kept = dynamic(report).filter { it.origin == SegmentOrigin.PERCEPTION }
+        assertEquals(2, kept.size)
+        assertEquals("x".repeat(399), kept[0].text.substringBefore(marker), "the cut drops the orphan high surrogate")
+        assertEquals("q".repeat(99), kept[1].text.substringAfter(marker), "the cut drops the orphan low surrogate")
+        kept.forEach { segment ->
+            assertFalse(hasUnpairedSurrogate(segment.text), "a truncated segment must stay well-formed: ${segment.text}")
+        }
+    }
+
+    /** True when [text] contains a high surrogate without a low one (or a lone low surrogate), i.e. half an emoji. */
+    private fun hasUnpairedSurrogate(text: String): Boolean {
+        var index = 0
+        while (index < text.length) {
+            val char = text[index]
+            when {
+                Character.isHighSurrogate(char) -> {
+                    if (index + 1 >= text.length || !Character.isLowSurrogate(text[index + 1])) return true
+                    index += 2
+                }
+                Character.isLowSurrogate(char) -> return true
+                else -> index += 1
+            }
+        }
+        return false
+    }
+
     // ── cleanup: only when the truncated frame is still over budget ──────────────────────────────────
 
     @Test

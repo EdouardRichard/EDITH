@@ -15,6 +15,7 @@ import com.sheen.rokid.phone.context.GlassesStateSource
 import com.sheen.rokid.phone.context.MediaSessionSource
 import com.sheen.rokid.phone.context.NotificationContent
 import com.sheen.rokid.phone.context.NotificationContentSource
+import com.sheen.rokid.phone.context.NotificationRead
 import com.sheen.rokid.plugin.DeviceStateProvider
 import com.sheen.rokid.plugin.PerceptionFilter
 import com.sheen.rokid.plugin.PerceptionProvider
@@ -32,6 +33,10 @@ import java.util.UUID
  *   It then reads the foreground, opens a new registry snapshot and **re-assigns** the observation under it - the
  *   adapter may already have assigned the same observation under the previous snapshot, and only an assign under the
  *   new snapshot makes the refs actionable. Finally it builds and caches the snapshot.
+ * - [refresh] performs the same real read and new-snapshot sequence as [beginTurn] **without** starting a turn: it is
+ *   the explicit `device.observe` read (final review C1). The cached [snapshot] cannot serve that call, because a manual
+ *   screen change after the turn's opening read would be reported as the old screen and re-stamped refs would pass
+ *   TTL/foreground. [refresh] is guarded exactly like [beginTurn] (a failed read degrades only the screen).
  * - [afterAction] takes the kernel's post-action observation ([latestObservation], falling back to a fresh [observe]),
  *   reads the foreground, opens a **new** snapshot and re-assigns. That new snapshot id is what makes a ref from
  *   before the action fail [RefRegistry.resolveForAction] as `CROSS_SNAPSHOT` when its node is gone, while a surviving
@@ -87,29 +92,29 @@ internal class AndroidPerceptionProvider(
     private var cached: CachedTurn? = null
 
     @Synchronized
-    override fun beginTurn(): PerceptionSnapshot {
-        val observation = observeAll()
-        val foregroundFacts = foregroundOrNull()
-        val now = safeClock()
-        val snapshotId = UUID.randomUUID().toString()
-        val refs = beginAndAssign(observation, snapshotId, now, foregroundFacts)
-        val snapshot = build(
-            snapshotId = snapshotId,
-            capturedAtEpochMillis = now,
-            observation = observation,
-            refs = refs,
-            foregroundFacts = foregroundFacts,
-            include = ALL_SOURCES,
-            filter = PerceptionFilter.ALL,
-            limit = null,
-        )
-        cached = CachedTurn(snapshotId, now, observation, refs, foregroundFacts)
-        return snapshot
-    }
+    override fun beginTurn(): PerceptionSnapshot = openFreshSnapshot()
+
+    /**
+     * 0.3 Phase 2 final review (C1): the explicit-read half of [beginTurn].
+     *
+     * Same order and the same guards as the turn opening (observe -> foreground -> new snapshot id -> beginSnapshot ->
+     * assign -> build/cache), but no turn state is reset: it is a read of the device, not a lifecycle event. The new
+     * snapshot id is what makes a ref the caller held before this read a cross-snapshot ref (stale when its node moved)
+     * instead of letting it be re-stamped by a cache-only rebuild.
+     */
+    @Synchronized
+    override fun refresh(): PerceptionSnapshot = openFreshSnapshot()
 
     @Synchronized
     override fun afterAction(): PerceptionSnapshot {
         val observation = latestObservationOrNull() ?: observeAll()
+        return openSnapshot(observation)
+    }
+
+    private fun openFreshSnapshot(): PerceptionSnapshot = openSnapshot(observeAll())
+
+    /** Opens a new snapshot over [observation] and caches the result; the one fresh-build body for begin/refresh/action. */
+    private fun openSnapshot(observation: Observation?): PerceptionSnapshot {
         val foregroundFacts = foregroundOrNull()
         val now = safeClock()
         val snapshotId = UUID.randomUUID().toString()
@@ -200,7 +205,7 @@ internal class AndroidPerceptionProvider(
         val profile = runCatching { deviceState.profile() }.getOrNull()
         val state = runCatching { deviceState.state() }.getOrNull()
         val notificationsConnected = notifications.isConnected()
-        val recent = readNotifications(effectivePolicy, notificationsConnected)
+        val notificationRead = readNotifications(effectivePolicy, notificationsConnected)
         val mediaState = runCatching { media.current() }.getOrNull()
         val calendarGranted = calendar.isGranted
         val calendarSnapshot = runCatching { calendar.snapshot() }
@@ -223,8 +228,9 @@ internal class AndroidPerceptionProvider(
             observation = observation,
             refs = refs,
             foreground = foregroundFacts,
-            notifications = recent,
+            notifications = notificationRead.items,
             notificationsConnected = notificationsConnected,
+            notificationsAvailable = notificationRead.available,
             media = mediaState,
             calendar = calendarSnapshot,
             calendarGranted = calendarGranted,
@@ -243,16 +249,17 @@ internal class AndroidPerceptionProvider(
 
     /**
      * Reads one item past the policy cap so the builder can tell "there are exactly N" from "the cap cut the list".
-     * A missing listener grant is not read at all.
+     * A missing listener grant is not read at all. Final review I3: the read also carries whether the producer answered,
+     * so a failed binder is `unavailable(provider)` rather than `empty`.
      */
     private fun readNotifications(
         effectivePolicy: PerceptionPolicy,
         connected: Boolean,
-    ): List<NotificationContent> {
-        if (!connected) return emptyList()
+    ): NotificationRead {
+        if (!connected) return NotificationRead(emptyList(), available = false)
         val cap = effectivePolicy.notificationLimit
         val probe = if (cap == Int.MAX_VALUE) Int.MAX_VALUE else cap + 1
-        return runCatching { notifications.recent(probe) }.getOrDefault(emptyList())
+        return notifications.read(probe)
     }
 
     /**

@@ -144,6 +144,17 @@ data class ActionResult(
      * that produces no image pays nothing extra on the wire.
      */
     val images: List<ImageRef> = emptyList(),
+    /**
+     * edith-0.3 Phase 2 final review (C2): this result's [detail] carries **perception content** (screen text,
+     * notifications, clipboard, calendar, ...), which may live only in the current model request and must never be
+     * persisted to a `ConversationStore` or an `AgentRun.transcript` (spec §7.8).
+     *
+     * The agent loop still feeds the full detail back to the model for this run; at `finish` it replaces the stored
+     * form of a marked tool output with a safe marker and drops its images. `device.observe`/`status`/`act` set it when a
+     * perception provider is attached. `false` — the default, and every pre-Phase-2 action — keeps every existing
+     * construction and every non-perception tool byte-for-byte unchanged.
+     */
+    val nonPersistent: Boolean = false,
 )
 
 /**

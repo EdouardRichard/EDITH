@@ -60,6 +60,8 @@ internal object PerceptionSnapshotBuilder {
      * @param refs `RefRegistry.assign(observation)`'s path-keyed map, in node order; empty when [observation] is null.
      * @param notifications the notifications read with one item past the policy cap, so a cut is observable.
      * @param notificationsConnected whether the notification listener grant is live.
+     * @param notificationsAvailable final review I3: whether the producer actually answered. `false` with a live grant
+     *   is `unavailable(provider)`, never `empty`; a missing grant keeps its own `unavailable(no_access)` reason.
      * @param calendar the permission/provider/content answer; [calendarGranted] keeps no-permission apart from a
      *   provider failure.
      * @param deviceState the per-request device facts (only the IME fact feeds coverage here).
@@ -77,6 +79,7 @@ internal object PerceptionSnapshotBuilder {
         foreground: Foreground?,
         notifications: List<NotificationContent>,
         notificationsConnected: Boolean,
+        notificationsAvailable: Boolean = true,
         media: MediaState?,
         calendar: CalendarSnapshot,
         calendarGranted: Boolean,
@@ -131,6 +134,7 @@ internal object PerceptionSnapshotBuilder {
             },
             notifications = when {
                 !notificationsConnected -> NOTIFICATIONS_UNAVAILABLE
+                !notificationsAvailable -> NOTIFICATIONS_PROVIDER_UNAVAILABLE
                 notificationsVisible.isEmpty() -> EMPTY
                 notificationCut -> TRUNCATED
                 else -> OK
@@ -316,6 +320,9 @@ internal object PerceptionSnapshotBuilder {
     private const val TRUNCATED = "truncated"
     private const val SCREEN_UNAVAILABLE = "unavailable(no_accessibility)"
     private const val NOTIFICATIONS_UNAVAILABLE = "unavailable(no_access)"
+
+    /** Final review I3: the listener grant is live but the producer failed; a failed read is not an empty result. */
+    private const val NOTIFICATIONS_PROVIDER_UNAVAILABLE = "unavailable(provider)"
     private const val MEDIA_UNAVAILABLE = "unavailable(no_session)"
     private const val CALENDAR_NO_PERMISSION = "unavailable(no_permission)"
     private const val CALENDAR_UNAVAILABLE = "unavailable(provider)"

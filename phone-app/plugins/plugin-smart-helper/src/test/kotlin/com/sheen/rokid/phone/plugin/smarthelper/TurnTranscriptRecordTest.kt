@@ -279,6 +279,46 @@ class TurnTranscriptRecordTest {
     }
 
     @Test
+    fun `a non-persistent perception tool result never reaches the conversation store`() {
+        // 0.3 Phase 2 final review C2: the production store path is the one that persists. The model sees the content
+        // during the run, but the stored transcript must hold only the safe marker.
+        val sentinel = "SYNTHETIC-SCREEN-CONTENT-4471"
+        val stores = stores()
+        val rig = rig(stores)
+        rig.actions.descriptors += smartAction("device")
+        rig.actions.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, sentinel, nonPersistent = true)
+        }
+        var request = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            request++
+            if (request == 1) {
+                listener(smartToolCall("c1", "device", """{"action":"observe"}""", requestId = modelRequest.requestId))
+                listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(modelRequest, listener, "看完了。")
+            }
+        }
+
+        rig.wakeAndFinal("屏幕上有什么")
+
+        assertEquals(2, rig.model.requests.size, "the tool round must issue a continuation request")
+        val continuation = rig.model.requests[1]
+        val sent = continuation.history.filterIsInstance<ModelHistoryItem.ToolOutput>()
+            .single { it.callId == "c1" }
+        assertTrue(
+            sent.output.contains(sentinel),
+            "the model must see the perception content during the run: ${sent.output}",
+        )
+        val stored = stores.getValue(ContextRoute.WAKE).history()
+        assertTrue(
+            stored.none { it.containsContent(sentinel) },
+            "perception content must not be persisted into ConversationStore: $stored",
+        )
+        assertEquals(1, stored.count { it is ModelHistoryItem.ToolOutput }, "the stored call/output pair stays attributable")
+    }
+
+    @Test
     fun `the next turn's request carries the previous turn's tool round`() {
         val stores = stores()
         val rig = rig(stores)
@@ -456,5 +496,12 @@ class TurnTranscriptRecordTest {
             stores.getValue(ContextRoute.WAKE).history(),
             "the retry instruction and its placeholder are loop-internal, not wearer/assistant speech",
         )
+    }
+
+    /** Whether a stored item carries [value]; the store path must keep perception content out of all three shapes. */
+    private fun ModelHistoryItem.containsContent(value: String): Boolean = when (this) {
+        is ModelHistoryItem.Text -> text.contains(value)
+        is ModelHistoryItem.ToolCall -> argsJson.contains(value)
+        is ModelHistoryItem.ToolOutput -> output.contains(value)
     }
 }

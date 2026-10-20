@@ -260,6 +260,10 @@ class DeviceTool(
             } else {
                 null
             }
+            // Final review C1: an explicit observe is a real read. `snapshot()` is the turn's cache-only projection, so
+            // after a manual screen change it would answer the stale opening screen (and re-stamp its refs as current).
+            // Refresh first, then project the caller's include/filter/limit from the new snapshot.
+            provider.refresh()
             val snapshot = provider.snapshot(include, filter.toPerceptionFilter(), limit)
             // A read through the perception port already answered: there is no kernel envelope to project, but every
             // `device` call keeps the same model-facing envelope shape.
@@ -273,6 +277,9 @@ class DeviceTool(
                     timing = Timing(0, 0, 0),
                 ),
                 observationData(snapshot, include),
+                // Final review C2: the detail carries the compact screen (and any requested source content). It is model
+                // context for this run only; the agent loop redacts it from the stored transcript.
+                nonPersistent = true,
             )
         }
     }
@@ -308,12 +315,17 @@ class DeviceTool(
      * something to resolve against; if it still cannot observe, the gate is skipped and the kernel's own readiness /
      * ref checks decide. A [RefResult.Stale] is answered with `STALE_REF` plus a fresh compact snapshot and the action
      * is **not** dispatched; [RefResult.Ok] returns the (possibly re-bound) ref the kernel should act on.
+     *
+     * The fresh snapshot is a real [PerceptionProvider.refresh] read (final review C1), not `afterAction()` and not the
+     * cached `snapshot()`: the stale ref may have gone stale because the user changed the screen by hand, and a
+     * cache-only answer would re-serve the old screen and re-stamp its refs as current. `afterAction` stays the
+     * post-act read, where the action itself produced the observation.
      */
     private fun staleRefAnswer(stale: RefResult.Stale): ActionResult {
         val provider = checkNotNull(perception) {
             "STALE_REF is only reachable when the perception provider owns the ref gate"
         }
-        val snapshot = provider.afterAction()
+        val snapshot = provider.refresh()
         val data = buildJsonObject {
             put("snapshot", CompactSnapshotRenderer.render(snapshot))
             put("coverage", PerceptionCoverageRenderer.render(snapshot.coverage))
@@ -329,7 +341,7 @@ class DeviceTool(
                 recoverable = true,
             ),
         )
-        return ActionResult(ActionOutcome.Refused, detail)
+        return ActionResult(ActionOutcome.Refused, detail, nonPersistent = true)
     }
 
     /** The [RefResult.Ok] resolution when this call is gated, or null when the gate does not apply/cannot decide. */
@@ -368,6 +380,8 @@ class DeviceTool(
             data,
             fingerprintAfter(envelope, revisionBefore),
             stateChanging = true,
+            // The decorated data carries the forced post-action compact snapshot (or the stale answer's fresh one).
+            nonPersistent = perception != null,
         )
     }
 
@@ -520,7 +534,8 @@ class DeviceTool(
             val include = parseStatusInclude(args) ?: return refused(INVALID_ARGUMENTS)
             statusData(envelope, provider.snapshot(include, PerceptionFilter.ALL, null), include)
         }
-        return result(envelope, data)
+        // Final review C2: with a provider the status detail may carry notification/media/device content.
+        return result(envelope, data, nonPersistent = provider != null)
     }
 
     /**
@@ -768,12 +783,16 @@ class DeviceTool(
      * R98: [stateChanging] is `true` for `act` (a write, including `scroll_to_text`) and `false` for the read-only
      * actions. The `device` descriptor declares `observation = true` for all of them, so this per-call flag is the only
      * way the loop can tell the write that returns a post-call observation from the read that does.
+     *
+     * Final review C2: [nonPersistent] marks a detail that carries perception content. The loop still shows it to the
+     * model for this run; its stored transcript keeps only a safe marker. Every pre-Phase-2 path leaves it `false`.
      */
     private fun result(
         envelope: DeviceEnvelope,
         data: JsonObject,
         fingerprint: String? = null,
         stateChanging: Boolean = false,
+        nonPersistent: Boolean = false,
     ): ActionResult {
         val outcome = when {
             envelope.ok -> ActionOutcome.Done
@@ -784,7 +803,14 @@ class DeviceTool(
         // JSON. A screenshot answers a real stored `ImageRef` (or the `pending` placeholder with its diagnostic), and
         // this projection is what lets the agent loop carry it to the model request. Every other action's envelope
         // carries an empty list, so their results keep the old shape.
-        return ActionResult(outcome, renderEnvelope(envelope, data), fingerprint, stateChanging, images = envelope.images)
+        return ActionResult(
+            outcome,
+            renderEnvelope(envelope, data),
+            fingerprint,
+            stateChanging,
+            images = envelope.images,
+            nonPersistent = nonPersistent,
+        )
     }
 
     /**

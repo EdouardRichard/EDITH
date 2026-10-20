@@ -54,6 +54,15 @@ data class ToolResult(
      * tool round byte-for-byte unchanged; an image is never invented from the payload.
      */
     val images: List<ImageRef> = emptyList(),
+    /**
+     * edith-0.3 Phase 2 final review (C2): the executor's declaration that [payload] carries perception content which
+     * may live only in the current model request (projected from `plugin-api`'s `ActionResult.nonPersistent`).
+     *
+     * The loop feeds the full payload to the model for this run, but at `finish` the persisted form of a marked tool
+     * output becomes a safe marker with no images, so it cannot reach a `ConversationStore` or an `AgentRun.transcript`.
+     * `false` — the default — keeps every pre-Phase-2 result and every non-perception tool byte-for-byte unchanged.
+     */
+    val nonPersistent: Boolean = false,
 ) {
     companion object {
         /** A failed step whose payload is a stable machine-readable code rather than an exception message. */

@@ -11,6 +11,7 @@ import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelInfo
 import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.TaskScope
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextCompressor
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
@@ -120,6 +121,41 @@ class ModelSummarizerTest {
             "the transcript to summarise has to be what the request carries",
         )
         assertTrue(request.tools.isEmpty(), "a summary must never be able to execute anything: ${request.tools}")
+    }
+
+    @Test
+    fun `a summary request reports its own P3_CACHE line when usage is reported`() {
+        // Final review I4: `P3_CACHE` is the gateway's per-request line, so it must cover the summary request too. A
+        // summary has no assembled RequestFrame and never goes through AgentLoop.onRequestBuilt, so it has no
+        // P3_PROMPT line - that asymmetry is documented in CONTRACTS.md §P3_PROMPT.
+        val summarizer = newSummarizer()
+        model.onRequest = { request, listener ->
+            listener(ModelStreamEvent.TextDelta(request.requestId, "（此前对话摘要）"))
+            listener(
+                ModelStreamEvent.Terminal(
+                    request.requestId,
+                    com.sheen.rokid.plugin.ModelEnd.COMPLETED,
+                    ModelUsage(inputTokens = 41, outputTokens = 3),
+                    null,
+                ),
+            )
+        }
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            assertEquals("（此前对话摘要）", summarizer.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
+        } finally {
+            P3Log.sink = previous
+        }
+
+        val cache = lines.single { it.startsWith("P3_CACHE ") }
+        assertTrue(cache.contains("inputTokens=41"), "the summary's usage must reach P3_CACHE: $cache")
+        assertTrue(cache.contains("outputTokens=3"), "the summary's usage must reach P3_CACHE: $cache")
+        assertTrue(
+            lines.none { it.startsWith("P3_PROMPT ") },
+            "a summary has no assembled RequestFrame, so it emits no P3_PROMPT line: $lines",
+        )
     }
 
     @Test

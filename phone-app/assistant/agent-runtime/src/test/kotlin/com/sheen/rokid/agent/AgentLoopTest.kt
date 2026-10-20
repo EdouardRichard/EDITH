@@ -3,6 +3,7 @@ package com.sheen.rokid.agent
 import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
@@ -162,6 +163,39 @@ class AgentLoopTest {
         assertEquals(AgentOutcome.INSUFFICIENT, run.outcome)
         assertEquals("EMPTY_TURN", run.safeCode)
         assertEquals(2, gateway.requests.size)
+    }
+
+    @Test fun `a non-persistent tool result reaches the model but never the stored transcript`() {
+        // 0.3 Phase 2 final review C2: perception content may live only in the in-run model request. The stored
+        // transcript (what a ConversationStore persists) keeps the call/output pair attributable but must not carry the
+        // content or its image reference.
+        val sentinel = "SYNTHETIC-PERCEPTION-CONTENT-9182"
+        val image = ImageRef("artifact-perception-1", "image/png", 768, 1664, "sha-perception-1")
+        val executor = executorOf("device").apply {
+            outcome = { _, _ ->
+                ActionResult(ActionOutcome.Done, sentinel, nonPersistent = true, images = listOf(image))
+            }
+        }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "device"))),
+                reply(text = "看完了。"),
+            ),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val inRun = gateway.requests[1].history.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertTrue(inRun.output.contains(sentinel), "the model must see the content during the run: ${inRun.output}")
+        assertEquals(listOf(image), inRun.images, "the in-run request keeps the image reference")
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertFalse(
+            stored.output.contains(sentinel),
+            "the stored transcript must not carry perception content: ${stored.output}",
+        )
+        assertTrue(stored.output.isNotBlank(), "a safe marker keeps the call/output pair attributable")
+        assertEquals(emptyList(), stored.images, "the stored transcript carries no image reference")
     }
 
     @Test fun `a productive tool turn resets the empty counter`() {

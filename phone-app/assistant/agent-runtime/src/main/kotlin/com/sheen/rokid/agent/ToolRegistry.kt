@@ -99,14 +99,17 @@ class ToolRegistry(
             ActionOutcome.Done -> ToolResult(
                 call.id, ok = true, payload = result.detail,
                 fingerprint = result.fingerprint, stateChanging = result.stateChanging, images = result.images,
+                nonPersistent = result.nonPersistent,
             )
             ActionOutcome.Refused -> ToolResult(
                 call.id, ok = false, payload = "${ActionOutcome.Refused.name}: ${result.detail}",
                 fingerprint = result.fingerprint, stateChanging = result.stateChanging, images = result.images,
+                nonPersistent = result.nonPersistent,
             )
             ActionOutcome.Failed -> ToolResult(
                 call.id, ok = false, payload = "${ActionOutcome.Failed.name}: ${result.detail}",
                 fingerprint = result.fingerprint, stateChanging = result.stateChanging, images = result.images,
+                nonPersistent = result.nonPersistent,
             )
         }
     }

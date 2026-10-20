@@ -1,6 +1,7 @@
 package com.sheen.rokid.agent
 
 import com.sheen.rokid.contracts.ToolPhase
+import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
@@ -230,6 +231,11 @@ data class AgentRun(
      * from [`finalText`] would get a different conversation than the one the model saw. A caller that stores the
      * conversation (rather than continuing it) additionally applies [withoutRetryScaffolding]: a retry nudge is
      * loop-internal and must not be persisted as the wearer's speech (0.25 review ruling R16).
+     *
+     * **Perception content is redacted here** (0.3 Phase 2 final review C2): a tool output the executor marked
+     * `nonPersistent` (screen/notification/clipboard/calendar content, `device.observe`/`status`/`act`) is replaced by a
+     * safe marker with no images. The model saw the full payload in this run; this list is the only shape a
+     * `ConversationStore` may persist (spec §7.8), so the content cannot outlive the request.
      */
     val transcript: List<ModelHistoryItem> = emptyList(),
     /**
@@ -286,6 +292,11 @@ private const val STEP_LIMIT = "STEP_LIMIT"
 private const val EMPTY_TURN_TEXT = "(empty turn)"
 private const val TOOL_CALL_TEXT = "(tool call)"
 private const val CLOSED_TURN_TEXT = "(no reply)"
+/**
+ * Final review C2: the safe marker that replaces a non-persistent tool output in the **stored** transcript. It names
+ * why the body is gone without carrying any of it; the model already saw the full payload in this run.
+ */
+private const val NON_PERSISTENT_TOOL_OUTPUT = "(perception content not persisted)"
 private const val RETRY_INSTRUCTION =
     "The previous turn produced no tool call and no text. Call a tool, or state the final answer."
 private const val AUDIT_POLICY = "policy"
@@ -453,6 +464,13 @@ class AgentLoop(
     /** Task 9: the hash of the perception block last injected, so an unchanged block is sent only once per run. */
     private var lastPerceptionHash: String? = null
 
+    /**
+     * Final review C2: the call ids whose tool result carried perception content. The in-run [history] keeps their full
+     * payloads (the model must see them), but [finish] replaces their stored form with [NON_PERSISTENT_TOOL_OUTPUT].
+     * Per-run state, reset on entry like the other accumulators.
+     */
+    private val nonPersistentCallIds = LinkedHashSet<String>()
+
     /** R58: the last text that was nudged, so an identical plan cannot be nudged again in place. */
     private var lastNudgedText: String? = null
     private var nudges = 0
@@ -536,6 +554,7 @@ class AgentLoop(
         planNudgeCap = 0
         lastRuntimeStateHash = null
         lastPerceptionHash = null
+        nonPersistentCallIds.clear()
         lastNudgedText = null
         nudges = 0
         lastWriteUnverified = false
@@ -753,7 +772,7 @@ class AgentLoop(
                         is LoopDecision.Warn -> {
                             val warning = loopWarningPayload(decision.pattern)
                             steps += AgentStep(steps.size + 1, call.name, warning, executed = false)
-                            history += ModelHistoryItem.ToolOutput(call.id, warning)
+                            appendToolOutput(history, call.id, warning)
                             // A skipped observation still spends the observation budget (D3 §1.8), and a cancel or an
                             // expired deadline still ends the run. Nothing else about a skipped call is recorded: no
                             // fingerprint, no guard feed, no global no-progress count, no error streak.
@@ -771,7 +790,7 @@ class AgentLoop(
                         is LoopDecision.Critical -> {
                             val code = decision.pattern.safeCode
                             steps += AgentStep(steps.size + 1, call.name, code, executed = false)
-                            history += ModelHistoryItem.ToolOutput(call.id, code)
+                            appendToolOutput(history, call.id, code)
                             return finish(AgentOutcome.NO_PROGRESS, code, null, steps, history, "", spentSteps)
                         }
                         LoopDecision.Allow -> Unit
@@ -892,8 +911,12 @@ class AgentLoop(
                 // previous one may still be in flight.
                 if (execution.uncertain) {
                     steps += AgentStep(steps.size + 1, call.name, execution.result.payload, executed = true)
-                    history += ModelHistoryItem.ToolOutput(
-                        call.id, execution.result.payload, execution.result.images,
+                    appendToolOutput(
+                        history,
+                        call.id,
+                        execution.result.payload,
+                        execution.result.images,
+                        nonPersistent = execution.result.nonPersistent,
                     )
                     return finish(AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps)
                 }
@@ -940,8 +963,9 @@ class AgentLoop(
                 steps += AgentStep(steps.size + 1, call.name, stepResult, executed = true)
                 // 0.25 Task 24 (R133): the executor's images ride on the tool output exactly as the payload does. An
                 // empty list keeps the pre-0.25 item shape, and the plugin's TOOL_ROUND segment is the one channel that
-                // carries these references to the next model request.
-                history += ModelHistoryItem.ToolOutput(call.id, historyPayload, result.images)
+                // carries these references to the next model request. Final review C2: a non-persistent (perception)
+                // result is still shown to the model here; [finish] keeps it out of the stored transcript.
+                appendToolOutput(history, call.id, historyPayload, result.images, nonPersistent = result.nonPersistent)
                 if (execution.executed && result.ok) successfulToolExecutions++
                 if (guard.tripped) return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps)
                 if (errorsSeen.repeatTerminated) {
@@ -1230,6 +1254,41 @@ class AgentLoop(
     }
 
     /**
+     * Appends one `ToolOutput` and remembers a non-persistent result's call id (final review C2).
+     *
+     * Every ToolOutput append path goes through this helper, so no branch can forget to mark a perception-bearing output;
+     * the in-run history keeps the full payload and only the stored transcript is redacted at [finish].
+     */
+    private fun appendToolOutput(
+        history: MutableList<ModelHistoryItem>,
+        callId: String,
+        output: String,
+        images: List<ImageRef> = emptyList(),
+        nonPersistent: Boolean = false,
+    ) {
+        if (nonPersistent) nonPersistentCallIds += callId
+        history += ModelHistoryItem.ToolOutput(callId, output, images)
+    }
+
+    /**
+     * The transcript a caller may persist: the run's history with every non-persistent tool output replaced by a safe
+     * marker and stripped of its images (final review C2; spec §7.8).
+     *
+     * The in-run history is never touched - the model saw the content - and the replacement keeps the call id, so the
+     * stored call/output pair stays attributable and a later turn still sees that the tool ran.
+     */
+    private fun transcriptForStorage(history: List<ModelHistoryItem>): List<ModelHistoryItem> {
+        if (nonPersistentCallIds.isEmpty()) return history.toList()
+        return history.map { item ->
+            if (item is ModelHistoryItem.ToolOutput && item.callId in nonPersistentCallIds) {
+                item.copy(output = NON_PERSISTENT_TOOL_OUTPUT, images = emptyList())
+            } else {
+                item
+            }
+        }
+    }
+
+    /**
      * Returns a run and records the transcript it leaves behind, closing a still-pending user turn first: a transcript
      * that ended on `Text(USER)` is the one shape `ContextBudgeter` refuses, so the loop never returns one. The steps
      * are handed over as a copy, so the run never hands out the loop's own mutable list.
@@ -1247,7 +1306,7 @@ class AgentLoop(
         if (last is ModelHistoryItem.Text && last.role == MessageRole.USER) {
             history += ModelHistoryItem.Text(MessageRole.ASSISTANT, closingText.ifBlank { CLOSED_TURN_TEXT })
         }
-        lastTranscript = history.toList()
+        lastTranscript = transcriptForStorage(history)
         val metrics = AgentMetrics(
             calls = metricCalls,
             toolCalls = steps.size,

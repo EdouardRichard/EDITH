@@ -75,6 +75,19 @@ internal class NotificationContentRing(private val capacity: Int = NOTIFICATION_
 }
 
 /**
+ * One notification read: the captured content plus whether the producer actually answered (edith-0.3 Phase 2, final
+ * review I3).
+ *
+ * An empty [items] with `available = true` is "there are no notifications"; an empty list with `available = false` is
+ * "the host could not read the source" and must be reported as `unavailable(...)`, never as `empty` (spec §7.1/§7.2:
+ * a failed read is not an empty result).
+ */
+internal data class NotificationRead(
+    val items: List<NotificationContent>,
+    val available: Boolean,
+)
+
+/**
  * The injectable facade over the listener's captured notification content (edith-0.3 Phase 2, Task 3).
  *
  * The service is the only producer: it maps each post with [NotificationContentMapper] and keeps the last
@@ -100,12 +113,24 @@ internal class NotificationContentSource(
      * A non-positive limit and a missing grant are both an empty answer; the producer is not called in either case. A
      * producer that throws degrades to empty, and one that ignores the limit cannot widen it.
      */
-    fun recent(limit: Int): List<NotificationContent> {
-        if (limit <= 0 || !isConnected()) return emptyList()
+    fun recent(limit: Int): List<NotificationContent> = read(limit).items
+
+    /**
+     * Final review I3: the same bounded read as [recent], plus whether the source actually answered.
+     *
+     * `available = false` covers both a missing listener grant and a throwing producer; the caller still checks
+     * [isConnected] first so the two keep distinct coverage reasons (`no_access` vs `provider`). A non-positive limit
+     * is an available empty answer and never calls the producer.
+     */
+    fun read(limit: Int): NotificationRead {
+        if (limit <= 0) return NotificationRead(emptyList(), available = true)
+        if (!isConnected()) return NotificationRead(emptyList(), available = false)
         val bounded = limit.coerceAtMost(NOTIFICATION_CONTENT_LIMIT)
         return runCatching { recent.invoke(bounded) }
-            .getOrDefault(emptyList())
-            .take(bounded)
+            .fold(
+                onSuccess = { NotificationRead(it.take(bounded), available = true) },
+                onFailure = { NotificationRead(emptyList(), available = false) },
+            )
     }
 
     /** The opaque category/channel string of the last categorised notification, or `null` when unavailable. */

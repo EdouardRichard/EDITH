@@ -104,6 +104,22 @@ sealed interface PerceptionScreenshotResult {
 interface PerceptionProvider {
     fun beginTurn(): PerceptionSnapshot
     fun snapshot(include: Set<PerceptionSource>, filter: PerceptionFilter, limit: Int?): PerceptionSnapshot
+
+    /**
+     * 0.3 Phase 2 final review (C1): a **real** read of the device, for a caller that explicitly asked to perceive now
+     * (`device.observe`, and the fresh snapshot a `STALE_REF` answer returns).
+     *
+     * [snapshot] is deliberately cache-only: the turn's opening read and the post-action read are the turn's captures,
+     * and rebuilding them from a stale cache after the user changed the screen by hand would serve the old screen as if
+     * it were current. [refresh] re-observes the screen, opens a new snapshot with a new id, re-assigns its refs and
+     * caches it, so the answer is a real read and any ref minted before it is bound to an older snapshot.
+     *
+     * The default keeps every provider written before this method compiling, but does **not** refresh: a provider that
+     * cannot observe on demand answers its current snapshot (the pre-fix behaviour). The Android host overrides it.
+     */
+    fun refresh(): PerceptionSnapshot =
+        snapshot(setOf(PerceptionSource.SCREEN), PerceptionFilter.ALL, null)
+
     fun afterAction(): PerceptionSnapshot
     fun screenshot(): PerceptionScreenshotResult
     fun endTurn()

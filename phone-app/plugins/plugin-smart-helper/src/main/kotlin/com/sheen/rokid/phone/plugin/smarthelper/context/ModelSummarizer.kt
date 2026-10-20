@@ -35,6 +35,11 @@ import com.sheen.rokid.phone.plugin.smarthelper.audit.safeFailureCode
  * `ModelRequest`, owns the deadline and accumulates the stream; re-implementing that here would be a second answer
  * to "what does one request look like" and the first thing to drift. This class therefore supplies exactly the two
  * things only the plugin knows: the **profile** (its configured id) and the **transcript** to condense.
+ *
+ * **Telemetry (0.3 Phase 2 final review I4).** The gateway is built with [P3Log.line], so a summary request reports its
+ * own count-only `P3_CACHE` line whenever the provider returns usage. A summary has no assembled `RequestFrame` and
+ * does not run through `AgentLoop.onRequestBuilt`, so it emits **no** `P3_PROMPT` line; that is the documented
+ * asymmetry, not a missing line.
  */
 class ModelSummarizer(
     private val client: ModelClient,
@@ -63,6 +68,9 @@ class ModelSummarizer(
                 clock = clock,
                 scheduler = scheduler,
                 envelopeFor = envelopeFor,
+                // Final review I4: the summary is a model request too, so its cache accounting is reported. Without this
+                // sink the `P3_CACHE` "every request with usage" contract silently skipped the asynchronous summary.
+                metricLine = P3Log::line,
             ).turn(
                 GatewayTurn(
                     turnId = REQUEST_ID_PREFIX + clock.nowNanos(),

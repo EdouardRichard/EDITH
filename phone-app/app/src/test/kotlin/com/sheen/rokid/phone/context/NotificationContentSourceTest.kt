@@ -194,6 +194,38 @@ class NotificationContentSourceTest {
     }
 
     @Test
+    fun `read tells a failed producer apart from an empty notification list`() {
+        // Final review I3: a producer failure must become `unavailable(provider)`, not `empty`. The read result carries
+        // the availability fact so the builder can report it instead of guessing from an empty list.
+        val throwing = NotificationContentSource(
+            connected = { true },
+            recent = { error("dead binder") },
+            category = { null },
+        )
+        val failed = throwing.read(3)
+        assertFalse("a failed producer is not available", failed.available)
+        assertTrue(failed.items.isEmpty())
+
+        val disconnected = NotificationContentSource(
+            connected = { false },
+            recent = { error("must not be called without the grant") },
+            category = { null },
+        )
+        val noAccess = disconnected.read(3)
+        assertFalse("no listener grant is not an available read", noAccess.available)
+        assertTrue(noAccess.items.isEmpty())
+
+        val empty = NotificationContentSource(
+            connected = { true },
+            recent = { emptyList() },
+            category = { null },
+        )
+        val emptyRead = empty.read(3)
+        assertTrue("a working producer with nothing to report is available", emptyRead.available)
+        assertTrue(emptyRead.items.isEmpty())
+    }
+
+    @Test
     fun `without the listener grant there is no content and no category`() {
         var calls = 0
         val source = NotificationContentSource(

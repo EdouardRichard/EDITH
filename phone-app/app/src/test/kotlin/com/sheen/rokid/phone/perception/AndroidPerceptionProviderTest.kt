@@ -157,6 +157,7 @@ class AndroidPerceptionProviderTest {
         var clipboardReads = 0
         var clipboardValue: CharSequence? = null
         var notificationsConnected = true
+        var notificationsThrow = false
         var notifications = listOf<NotificationContent>()
         var calendarGranted = true
         var calendarTitles = listOf<String>()
@@ -185,7 +186,9 @@ class AndroidPerceptionProviderTest {
             registry = registry,
             notifications = NotificationContentSource(
                 connected = { notificationsConnected },
-                recent = { limit -> notifications.take(limit) },
+                recent = { limit ->
+                    if (notificationsThrow) error("notification binder died") else notifications.take(limit)
+                },
                 category = { null },
             ),
             calendar = CalendarSource(
@@ -276,6 +279,31 @@ class AndroidPerceptionProviderTest {
     }
 
     @Test
+    fun refreshObservesTheScreenAndOpensANewSnapshotWhileSnapshotStaysCached() {
+        // 0.3 Phase 2 final review C1: an explicit `device.observe` is a real read, not the cached turn snapshot. `refresh`
+        // mirrors `beginTurn`'s load-bearing order (observe -> foreground -> beginSnapshot -> assign -> build) without
+        // starting a turn; `snapshot` keeps its cache-only contract.
+        val harness = Harness()
+        val first = harness.provider.beginTurn()
+        harness.provider.snapshot(setOf(PerceptionSource.SCREEN), PerceptionFilter.ALL, null)
+        assertEquals("snapshot must never observe", 1L, harness.observeCalls.toLong())
+
+        harness.observationResult = observation(listOf(node(text = "手动切屏后的新内容")))
+        val refreshed = harness.provider.refresh()
+
+        assertEquals(2, harness.observeCalls)
+        assertEquals(listOf(ScreenFilter.ALL, ScreenFilter.ALL), harness.observeFilters)
+        assertNotEquals(first.snapshotId, refreshed.snapshotId)
+        assertEquals(listOf("手动切屏后的新内容"), refreshed.elements.map { it.text })
+        assertEquals(refreshed.snapshotId, harness.registry.currentSnapshot()?.snapshotId)
+
+        val projected = harness.provider.snapshot(setOf(PerceptionSource.SCREEN), PerceptionFilter.ALL, null)
+        assertEquals("snapshot after refresh stays cache-only", 2L, harness.observeCalls.toLong())
+        assertEquals(refreshed.snapshotId, projected.snapshotId)
+        assertEquals(listOf("手动切屏后的新内容"), projected.elements.map { it.text })
+    }
+
+    @Test
     fun anUnknownForegroundKeepsTheSnapshotButMarksTheDevicePartial() {
         val harness = Harness()
         harness.foregroundValue = null
@@ -330,6 +358,32 @@ class AndroidPerceptionProviderTest {
         assertEquals("unavailable(provider)", snapshot.coverage.calendar)
         assertEquals("ok", snapshot.coverage.screen)
         assertEquals("ok", snapshot.coverage.device)
+    }
+
+    @Test
+    fun aThrowingNotificationProducerReportsUnavailableProviderNotEmpty() {
+        // Final review I3: a binder failure is not "no notifications". The coverage token must say the source could not
+        // answer, while a genuinely empty list stays `empty`.
+        val harness = Harness()
+        harness.notifications = listOf(notification("合成消息"))
+        harness.notificationsThrow = true
+
+        val snapshot = harness.provider.beginTurn()
+
+        assertEquals("unavailable(provider)", snapshot.coverage.notifications)
+        assertTrue(snapshot.notifications.isEmpty())
+        assertEquals("only the notification source degrades", "ok", snapshot.coverage.screen)
+    }
+
+    @Test
+    fun aDisconnectedNotificationListenerStillReportsNoAccess() {
+        val harness = Harness()
+        harness.notificationsConnected = false
+
+        val snapshot = harness.provider.beginTurn()
+
+        assertEquals("unavailable(no_access)", snapshot.coverage.notifications)
+        assertTrue(snapshot.notifications.isEmpty())
     }
 
     // ── afterAction ─────────────────────────────────────────────────────────
