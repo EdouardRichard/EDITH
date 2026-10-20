@@ -63,6 +63,31 @@ class ScreenProjectorTest {
     }
 
     @Test
+    fun `the foreground activity comes from the injected lambda`() {
+        // edith-0.3 Phase 2 Task 7: the observation model has no activity class, so the screen projection asks the
+        // same foreground fact the perception provider uses. A throwing lambda degrades to null, never a crash.
+        val activity = ScreenProjector(
+            ObservationRenderer(registry),
+            registry,
+            foregroundActivity = { ".SettingsActivity" },
+        )
+        val thrown = ScreenProjector(
+            ObservationRenderer(RefRegistry()),
+            RefRegistry(),
+            foregroundActivity = { error("foreground unavailable") },
+        )
+
+        assertEquals(
+            ".SettingsActivity",
+            activity.project(observation(rev = 1), ScreenFilter.ALL).screen()["activity"]!!.jsonPrimitive.content,
+        )
+        assertEquals(
+            JsonNull,
+            thrown.project(observation(rev = 1), ScreenFilter.ALL).screen()["activity"],
+        )
+    }
+
+    @Test
     fun `no application window maps app to null`() {
         val screen = projector().project(observation(windows = emptyList()), ScreenFilter.ALL).screen()
 

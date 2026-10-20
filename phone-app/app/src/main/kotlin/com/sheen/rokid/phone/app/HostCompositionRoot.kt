@@ -33,7 +33,10 @@ import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
 import com.sheen.rokid.phone.storage.AndroidSpeakerProfileStore
 import com.sheen.rokid.phone.context.NotificationCategoryService
+import com.sheen.rokid.phone.context.NotificationContentSource
 import com.sheen.rokid.phone.context.androidDeviceStateProvider
+import com.sheen.rokid.phone.perception.AndroidPerceptionProvider
+import com.sheen.rokid.agent.PerceptionPolicy
 import com.sheen.rokid.phone.bridge.CxrHintLink
 import com.sheen.rokid.phone.bridge.HintIdentity
 import com.sheen.rokid.phone.bridge.UiState
@@ -463,8 +466,8 @@ class HostCompositionRoot internal constructor(
         Capability.ConversationDisplay -> "DISPLAY_MISSING"
         // edith-0.3 Phase 1: the device profile/state channel; the Android provider is wired by Task 2.
         Capability.DeviceState -> "DEVICE_STATE_PROVIDER_MISSING"
-        // edith-0.3 Phase 2: the perception port. Nothing is wired yet, so the panel reports the missing provider
-        // instead of hiding the row; the plugin still treats absence as "no perception block", never a failed turn.
+        // edith-0.3 Phase 2 Task 7 wires the perception port; this row remains for a composition built without one
+        // (tests/harnesses). The plugin still treats absence as "no perception block", never a failed turn.
         Capability.Perception -> "PERCEPTION_PROVIDER_MISSING"
     }
     private val mutableState =
@@ -1939,6 +1942,9 @@ class HostCompositionRoot internal constructor(
                 connected = NotificationCategoryService::isConnected,
                 latest = NotificationCategoryService::latest,
             )
+            // 0.3 Phase 2 Task 3: the same listener's in-memory content. Task 7 hands it to the perception provider;
+            // it is never logged or persisted, and a missing grant answers an honest `unavailable`.
+            val notificationContent = NotificationContentSource()
             // 0.3 Phase 2 Task 2: the media fact. `getActiveSessions` is gated on the app's notification-listener
             // grant, so the component the user already enabled for the category signal is the one named here; no new
             // permission is requested or needed. The source answers `null` (never a fake state) while the grant is
@@ -1950,9 +1956,16 @@ class HostCompositionRoot internal constructor(
             val calendar = CalendarSource.android(context)
             // 0.3 Phase 2 Task 4: the remaining perception sources. Each reads its fact at frame time through a late
             // lambda, because the objects that own those facts (the host for the acoustic label, the composition for
-            // the wearing/panel state) do not exist yet when this block runs. Task 7 hands these instances to
-            // `AndroidPerceptionProvider`; the provider registration itself is deliberately left to that task.
-            val clipboard = ClipboardSource.android(context)
+            // the wearing/panel state) do not exist yet when this block runs.
+            //
+            // Task 7: one foreground lambda is shared by the perception provider, the device tool's ref gate and the
+            // screen projector, so those three cannot disagree about the app in front. R7: the clipboard source gets a
+            // foreground predicate, so a known-background host never attempts a read the platform would refuse.
+            val foreground = { EdithAccessibilityService.port()?.foreground() }
+            val clipboard = ClipboardSource.android(
+                context,
+                foreground = { runCatching { foreground()?.packageName }.getOrNull()?.let { it == context.packageName } },
+            )
             val acoustic = AcousticSource { hostHolder[0]?.lastAcousticLabel() }
             val glassesState = GlassesStateSource(
                 connected = { hintLink.isEstablished() },
@@ -2110,6 +2123,47 @@ class HostCompositionRoot internal constructor(
             val rootProbe = RootProbe.onDevice()
             // T2.7: one package catalog for the app-name resolution and the label fallback of `open`/`list`.
             val appCatalog = PackageManagerAppCatalog(context)
+            // 0.3 Phase 1 Task 2: the static device profile / per-request state channel. Built here, before the
+            // execution layer, because Phase 2 Task 7's perception provider and `device` tool both read it. Its
+            // capability set is a live read of gates assembled above (the Shizuku shell exists, the speech player has
+            // been decided); answering from a half-built composition would let the profile name a capability the host
+            // cannot answer. Facts are read lazily on each profile()/state() call.
+            // The wake-word source is the same registry the plugin declares its words to (`Capability.WakeWord`), so
+            // the prompt and the detector describe one word set, not two copies of the settings.
+            //
+            // 0.3 Phase 2 Task 2 completes the perception facts. Each lambda reads the object that owns the fact at
+            // frame time: the accessibility port for the foreground app and the IME window list, the media-session
+            // source, and the composition/link for the panel and both glasses facts. The composition itself is reached
+            // through `rootHolder` because the provider map is assembled before the root exists; a fact asked for
+            // before then is honestly `null` rather than a fabricated default.
+            //
+            // Task 7 moves this construction above `DeviceKernel`/`DeviceTool`; the speech player is built later, so
+            // the capability set reads the holder that `create` fills before the host exists.
+            val deviceState = androidDeviceStateProvider(
+                context = context,
+                capabilities = {
+                    buildSet {
+                        if (EdithAccessibilityService.connected()) add("a11y")
+                        if (shizukuShell.ready()) add("shizuku")
+                        if (speechPlayerHolder.get() != null) add("tts")
+                        if (notificationCategory.isConnected) add("notification_access")
+                        if (foregroundApp.isGranted) add("usage_access")
+                        if (calendar.isGranted) add("calendar")
+                        // The media session is readable only through that same notification-listener grant
+                        // (`MediaSessionManager.getActiveSessions` throws without it), so the capability follows the
+                        // grant instead of being advertised and then refused. Clipboard readability is foreground-
+                        // bound (R7), so it stays a coverage fact rather than a capability here.
+                        if (notificationCategory.isConnected) add("media_session")
+                    }
+                },
+                wakeWords = { smartWiring.wakeWords.current() },
+                foreground = { foreground() },
+                imeVisible = { EdithAccessibilityService.imeVisibleNow() },
+                media = { mediaSession.current() },
+                panelVisible = { rootHolder[0]?.isPanelVisible() },
+                glassesConnected = { hintLink.isEstablished() },
+                glassesWearing = { rootHolder[0]?.glassesWearing() },
+            )
             // ---- 0.25 Task 10: the six-tool surface (spec §4.7) -------------------------------------------------------
             // `ToolCatalog` is the single `Capability.Actions` provider: four host tools whose channels are probed at
             // read time (device/shell/open/dial). The old 21-tool `ExecutionRouter` is deliberately no longer wired -
@@ -2144,8 +2198,58 @@ class HostCompositionRoot internal constructor(
                 // `ArtifactMediaSource` resolves, instead of the `pending` placeholder.
                 artifactStore = artifactStore,
             )
-            val screenProjector = ScreenProjector(ObservationRenderer(deviceKernel.registry), deviceKernel.registry)
-            val deviceTool = DeviceTool(DeviceKernelOperations(deviceKernel), screenProjector)
+            val screenProjector = ScreenProjector(
+                ObservationRenderer(deviceKernel.registry),
+                deviceKernel.registry,
+                foregroundActivity = { runCatching { foreground()?.activity }.getOrNull() },
+            )
+            // ---- edith-0.3 Phase 2 Task 7: perception wiring ------------------------------------------------
+            // `observe` is the kernel-backed whole-screen read: a failed envelope is thrown (the provider turns that
+            // into `screen=unavailable`), and a failed read never silently answers a pre-turn cache. The same
+            // `foreground` lambda feeds the provider, the tool and the projector, so their foreground facts agree.
+            val perceptionPolicy = PerceptionPolicy()
+            val observe = { filter: DeviceScreenFilter ->
+                val envelope = deviceKernel.observe(filter)
+                if (!envelope.ok) throw IllegalStateException(envelope.error?.code ?: "OBSERVE_FAILED")
+                deviceKernel.latestObservation ?: throw IllegalStateException("OBSERVE_NO_OBSERVATION")
+            }
+            val perception = AndroidPerceptionProvider(
+                observe = observe,
+                foreground = foreground,
+                registry = deviceKernel.registry,
+                notifications = notificationContent,
+                calendar = calendar,
+                media = mediaSession,
+                deviceState = deviceState,
+                clipboard = clipboard,
+                acoustic = acoustic,
+                glasses = glassesState,
+                policy = { perceptionPolicy },
+                // Task 10 replaces this with the user's live switch; until then the existing screenshot behavior is
+                // unchanged and this lambda is the one place the preference will be read.
+                visionEnabled = { true },
+                screenshot = {
+                    val envelope = deviceKernel.screenshot()
+                    val image = envelope.images.firstOrNull()
+                    if (image == null) {
+                        PerceptionScreenshotResult.Unavailable(envelope.error?.code ?: "SCREENSHOT_FAILED")
+                    } else {
+                        PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+                    }
+                },
+                latestObservation = { deviceKernel.latestObservation },
+                clock = { System.currentTimeMillis() },
+            )
+            val deviceTool = DeviceTool(
+                DeviceKernelOperations(deviceKernel),
+                screenProjector,
+                perception = perception,
+                deviceState = deviceState,
+                registry = deviceKernel.registry,
+                foreground = foreground,
+                visionEnabled = { true },
+                refTtlMillis = { perceptionPolicy.refTtlMillis },
+            )
             val callAvailable: () -> Boolean = {
                 context.checkSelfPermission(android.Manifest.permission.CALL_PHONE) ==
                     android.content.pm.PackageManager.PERMISSION_GRANTED
@@ -2249,43 +2353,6 @@ class HostCompositionRoot internal constructor(
             // a switch that is on but whose engine failed to create still produces no SpeechFinished. Set before the
             // host is built/activated so the value the plugin reads is the one the arbiter will honour.
             speechPlayerHolder.set(speechPlayer)
-            // 0.3 Phase 1 Task 2: the static device profile / per-request state channel. Built here rather than beside
-            // the context sources because its capability set is a live read of gates assembled above (the Shizuku
-            // shell exists, the speech player has been decided); answering from a half-built composition would let the
-            // profile name a capability the host cannot answer. Facts are read lazily on each profile()/state() call.
-            // The wake-word source is the same registry the plugin declares its words to (`Capability.WakeWord`), so
-            // the prompt and the detector describe one word set, not two copies of the settings.
-            //
-            // 0.3 Phase 2 Task 2 completes the perception facts. Each lambda reads the object that owns the fact at
-            // frame time: the accessibility port for the foreground app and the IME window list, the media-session
-            // source, and the composition/link for the panel and both glasses facts. The composition itself is reached
-            // through `rootHolder` because the provider map is assembled before the root exists; a fact asked for
-            // before then is honestly `null` rather than a fabricated default.
-            val deviceState = androidDeviceStateProvider(
-                context = context,
-                capabilities = {
-                    buildSet {
-                        if (EdithAccessibilityService.connected()) add("a11y")
-                        if (shizukuShell.ready()) add("shizuku")
-                        if (speechPlayer != null) add("tts")
-                        if (notificationCategory.isConnected) add("notification_access")
-                        if (foregroundApp.isGranted) add("usage_access")
-                        if (calendar.isGranted) add("calendar")
-                        // The media session is readable only through that same notification-listener grant
-                        // (`MediaSessionManager.getActiveSessions` throws without it), so the capability follows the
-                        // grant instead of being advertised and then refused. `clipboard` is still not wired in this
-                        // task, so it stays out of the set.
-                        if (notificationCategory.isConnected) add("media_session")
-                    }
-                },
-                wakeWords = { smartWiring.wakeWords.current() },
-                foreground = { EdithAccessibilityService.port()?.foreground() },
-                imeVisible = { EdithAccessibilityService.imeVisibleNow() },
-                media = { mediaSession.current() },
-                panelVisible = { rootHolder[0]?.isPanelVisible() },
-                glassesConnected = { hintLink.isEstablished() },
-                glassesWearing = { rootHolder[0]?.glassesWearing() },
-            )
             // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
             // assistant tab reads it. It has to be created here because the provider map is built before the root.
             val conversationLog = ConversationLog()
@@ -2324,6 +2391,11 @@ class HostCompositionRoot internal constructor(
                     // permission, model or transport needed at assembly), so it joins the advertised set; the host can
                     // now grant the smart plugin's `Capability.DeviceState` when Task 12 declares it.
                     put(Capability.DeviceState, deviceState)
+                    // edith-0.3 Phase 2 Task 7: the perception port. The provider is the same instance the `device`
+                    // tool decorates its results from, and its registry is the kernel's own, so a snapshot's refs are
+                    // exactly the refs the kernel/`performNodeAction` resolves (R36). Plugins that do not declare
+                    // `Capability.Perception` are unaffected (Task 9 declares it).
+                    put(Capability.Perception, perception)
                     // edith-0.2 Phase B (B4): the user's SKILL directory. `StorageAccessServiceImpl` is pure
                     // `java.io.File` work with no Android dependency and no permission to request at assembly time,
                     // so this capability is answerable whenever the composition exists - the advertised set and the

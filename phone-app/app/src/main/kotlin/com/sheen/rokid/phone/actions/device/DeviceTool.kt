@@ -3,18 +3,36 @@ package com.sheen.rokid.phone.actions.device
 import com.sheen.rokid.device.ActKind
 import com.sheen.rokid.device.Bounds
 import com.sheen.rokid.device.DeviceEnvelope
+import com.sheen.rokid.device.DeviceError
 import com.sheen.rokid.device.DeviceErrorCodes
 import com.sheen.rokid.device.DeviceKernel
+import com.sheen.rokid.device.Foreground
 import com.sheen.rokid.device.Observation
 import com.sheen.rokid.device.Ref
+import com.sheen.rokid.device.RefRegistry
+import com.sheen.rokid.device.RefResult
 import com.sheen.rokid.device.ScreenFilter
+import com.sheen.rokid.device.Timing
+import com.sheen.rokid.phone.perception.CompactSnapshotRenderer
+import com.sheen.rokid.phone.perception.PerceptionCoverageRenderer
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.DeviceState
+import com.sheen.rokid.plugin.DeviceStateProvider
+import com.sheen.rokid.plugin.MediaState
+import com.sheen.rokid.plugin.NotificationItem
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.RiskLevel
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
@@ -127,6 +145,30 @@ class DeviceTool(
     private val operations: DeviceOperations,
     private val projector: ScreenProjector,
     private val clock: () -> Long = { System.nanoTime() / 1_000_000L },
+    /**
+     * edith-0.3 Phase 2 Task 7: the host's perception port, or null for every pre-Phase-2 composition.
+     *
+     * With a provider the tool's screens are the compact [PerceptionSnapshot] (see [CompactSnapshotRenderer]), an action
+     * is gated by the turn's ref binding ([RefRegistry.resolveForAction]) and followed by a forced post-action read,
+     * and `status` reports coverage/device facts instead of a screen tree. With null it keeps the pre-Phase-2
+     * projection path byte-for-byte, which is what keeps every older caller and test unchanged.
+     */
+    private val perception: PerceptionProvider? = null,
+    /** The device-state channel `status`/`observe(include=["device"])` read; null keeps those fields absent. */
+    private val deviceState: DeviceStateProvider? = null,
+    /**
+     * The registry the provider binds refs into (the kernel's own, R36). Required for the act-time ref gate: when it
+     * is null the tool cannot prove the ref still belongs to the current screen, so the kernel makes that decision.
+     */
+    private val registry: RefRegistry? = null,
+    /** The app in front, read at act time; the same lambda the provider and composition use. */
+    private val foreground: () -> Foreground? = { null },
+    /** Epoch millis for the ref TTL check; injectable so the TTL boundary is testable without sleeping. */
+    private val nowMillis: () -> Long = { System.currentTimeMillis() },
+    /** The turn's ref TTL policy; the composition passes `PerceptionPolicy.refTtlMillis`. */
+    private val refTtlMillis: () -> Long = { 20_000L },
+    /** edith-0.3 Phase 2: the vision switch. Off answers `VISION_DISABLED` without capturing anything. */
+    private val visionEnabled: () -> Boolean = { true },
 ) : ActionExecutor {
 
     /** The filter the last observe used; the kernel's auto-observation inherits it. */
@@ -172,6 +214,18 @@ class DeviceTool(
     /** The tool's own call shape (one argument object); [ActionExecutor.execute] adds the name. */
     fun execute(argsJson: String): ActionResult = execute(NAME, argsJson)
 
+    /**
+     * edith-0.3 Phase 2 Task 7: true only when this call is `device.status`.
+     *
+     * [ToolCatalog] uses this answer to keep `status` outside the unlock gate and the accessibility refusal: a locked
+     * phone with a dead accessibility service is exactly the state `status` exists to report, so gating it would hide
+     * the diagnosis behind the thing it is meant to diagnose. The parse mirrors [execute]'s own rule (an object with an
+     * `action` token, trimmed/lower-cased), so a status call with extra members - e.g. the `include` this task adds -
+     * is still exempt; a malformed or non-status call is not.
+     */
+    fun isStatus(argsJson: String): Boolean =
+        parseObject(argsJson)?.stringArg("action")?.trim()?.lowercase() == ACTION_STATUS
+
     override fun execute(name: String, argsJson: String): ActionResult {
         if (name != NAME) return refused(UNKNOWN_ACTION)
         val args = parseObject(argsJson) ?: return refused(INVALID_ARGUMENTS)
@@ -181,7 +235,7 @@ class DeviceTool(
             ACTION_ACT -> act(args)
             ACTION_SCREENSHOT -> screenshot()
             ACTION_WAIT -> wait(args)
-            ACTION_STATUS -> status()
+            ACTION_STATUS -> status(args)
             else -> refused(INVALID_ARGUMENTS)
         }
     }
@@ -194,9 +248,34 @@ class DeviceTool(
             else -> return refused(INVALID_ARGUMENTS)
         }
         lastFilter = filter
-        val revisionBefore = operations.revision
-        val envelope = operations.observe(filter)
-        return result(envelope, project(envelope, filter), fingerprintAfter(envelope, revisionBefore))
+        val provider = perception
+        return if (provider == null) {
+            val revisionBefore = operations.revision
+            val envelope = operations.observe(filter)
+            result(envelope, project(envelope, filter), fingerprintAfter(envelope, revisionBefore))
+        } else {
+            val include = parseInclude(args, DEFAULT_OBSERVE_INCLUDE, OBSERVE_SOURCES)
+                ?: return refused(INVALID_ARGUMENTS)
+            val limit = if (args.containsKey(LIMIT_KEY)) {
+                parseLimit(args) ?: return refused(INVALID_ARGUMENTS)
+            } else {
+                null
+            }
+            val snapshot = provider.snapshot(include, filter.toPerceptionFilter(), limit)
+            // A read through the perception port already answered: there is no kernel envelope to project, but every
+            // `device` call keeps the same model-facing envelope shape.
+            result(
+                DeviceEnvelope.success(
+                    action = ACTION_OBSERVE,
+                    channel = CHANNEL_ACCESSIBILITY,
+                    accepted = true,
+                    applied = null,
+                    verified = null,
+                    timing = Timing(0, 0, 0),
+                ),
+                observationData(snapshot, include),
+            )
+        }
     }
 
     private fun act(args: JsonObject): ActionResult {
@@ -206,22 +285,128 @@ class DeviceTool(
         if (timeout <= 0L) return refused(INVALID_ARGUMENTS)
         if (kind == ActKind.SCROLL_TO_TEXT) return scrollToText(args, timeout)
         val ref = args.stringArg("ref")?.trim()?.takeIf { it.isNotEmpty() }?.let(::normalizedRef)
+        val resolution = ref?.let(::resolveForAction)
+        if (resolution is RefResult.Stale) return staleRefAnswer(resolution)
+        val resolvedRef = (resolution as? RefResult.Ok)?.ref ?: ref
         val revisionBefore = operations.revision
         val envelope = operations.act(
             kind = kind,
-            ref = ref,
+            ref = resolvedRef,
             text = args.stringArg("text"),
             value = args.stringArg("value"),
             direction = args.stringArg("direction"),
             key = args.stringArg("key"),
             timeoutMillis = timeout,
         )
+        val data = decorateActData(project(envelope, lastFilter), envelope)
         return result(
             envelope,
-            project(envelope, lastFilter),
+            data,
             fingerprintAfter(envelope, revisionBefore),
             stateChanging = true,
         )
+    }
+
+    /**
+     * Task 7's action-time ref gate, in the brief's exact order.
+     *
+     * Before anything reaches the kernel, the latest observation is resolved through the registry bound by the turn
+     * (ref identity, foreground, TTL and snapshot id). When the kernel has not observed yet, one `observe(ALL)` is made so the gate has
+     * something to resolve against; if it still cannot observe, the gate is skipped and the kernel's own readiness /
+     * ref checks decide. A [RefResult.Stale] is answered with `STALE_REF` plus a fresh compact snapshot and the action
+     * is **not** dispatched; [RefResult.Ok] returns the (possibly re-bound) ref the kernel should act on.
+     */
+    private fun staleRefAnswer(stale: RefResult.Stale): ActionResult {
+        val snapshot = perception!!.afterAction()
+        val data = buildJsonObject {
+            put("snapshot", CompactSnapshotRenderer.render(snapshot))
+            put("coverage", PerceptionCoverageRenderer.render(snapshot.coverage))
+        }
+        val detail = toolEnvelope(
+            tool = NAME,
+            ok = false,
+            channel = CHANNEL_ACCESSIBILITY,
+            data = data,
+            error = ToolFailure(
+                code = STALE_REF,
+                message = stale.reason,
+                recoverable = true,
+            ),
+        )
+        return ActionResult(ActionOutcome.Refused, detail)
+    }
+
+    /** The [RefResult.Ok] resolution when this call is gated, or null when the gate does not apply/cannot decide. */
+    private fun resolveForAction(ref: Ref): RefResult? {
+        if (perception == null) return null
+        val actionRegistry = registry ?: return null
+        var observation = operations.latestObservation
+        if (observation == null) {
+            operations.observe(ScreenFilter.ALL)
+            observation = operations.latestObservation
+        }
+        if (observation == null) return null
+        val currentForeground = runCatching { foreground() }.getOrNull()
+        return actionRegistry.resolveForAction(
+            observation = observation,
+            ref = ref,
+            nowEpochMillis = nowMillis(),
+            foregroundPackage = currentForeground?.packageName,
+            foregroundActivity = currentForeground?.activity,
+            ttlMillis = refTtlMillis(),
+        )
+    }
+
+    /**
+     * Task 7: a forced post-action perception read.
+     *
+     * `perception.afterAction()` opens a new snapshot under a new id, so a ref from before the action that no longer
+     * names a node is stale for the next call (R5). The compact text replaces the projector's full/diff text so the
+     * model sees the same bounded shape as `observe`; the existing envelope (ok/error/applied) is untouched.
+     */
+    private fun decorateActData(data: JsonObject, envelope: DeviceEnvelope): JsonObject {
+        val provider = perception ?: return data
+        val snapshot = provider.afterAction()
+        val coverage = PerceptionCoverageRenderer.render(snapshot.coverage)
+        val foreground = foregroundString(snapshot)
+        val compact = CompactSnapshotRenderer.render(snapshot)
+        val changed = envelope.applied == true
+        return buildJsonObject {
+            data.forEach { (key, value) -> if (key != SCREEN_KEY) put(key, value) }
+            put(SNAP_KEY, snapshot.snapshotId)
+            put(COVERAGE_KEY, coverage)
+            put(FOREGROUND_KEY, foreground)
+            put(CHANGED_KEY, changed)
+            (data[SCREEN_KEY] as? JsonObject)?.let { screen ->
+                put(
+                    SCREEN_KEY,
+                    buildJsonObject {
+                        screen.forEach { (key, value) -> put(key, value) }
+                        put(SNAP_KEY, snapshot.snapshotId)
+                        put(COVERAGE_KEY, coverage)
+                        put(FOREGROUND_KEY, foreground)
+                        put(TRUNCATED_KEY, snapshot.truncated)
+                        put(TEXT_KEY, compact)
+                        // The projector's full/diff lines carry `bounds=`, which is evidence-only and must not face the
+                        // model (spec §7.3). The compact text above is the complete post-action screen, so the change
+                        // mode is full again rather than a diff whose line format would reintroduce bounds.
+                        put(
+                            CHANGES_KEY,
+                            buildJsonObject {
+                                put("mode", "full")
+                                put("added", buildJsonArray { })
+                                put("updated", buildJsonArray { })
+                                put("removed", buildJsonArray { })
+                            },
+                        )
+                    },
+                )
+            }
+            if (!changed && (envelope.applied == false ||
+                    envelope.error?.code == DeviceErrorCodes.ACCEPTED_NO_EFFECT)) {
+                put(NOTE_KEY, OBSERVE_FIRST_NOTE)
+            }
+        }
     }
 
     /**
@@ -296,6 +481,9 @@ class DeviceTool(
     }
 
     private fun screenshot(): ActionResult {
+        // Task 7: the vision switch is checked before the kernel, so a disabled vision never captures, stores or
+        // advertises an image. The refusal names the switch, which is more actionable than a channel error.
+        if (!runCatching { visionEnabled() }.getOrDefault(false)) return refused(VISION_DISABLED)
         val envelope = operations.screenshot()
         val kernelDiagnostic = envelope.data?.takeIf { it.isNotBlank() }
         val data = if (envelope.ok) {
@@ -326,13 +514,210 @@ class DeviceTool(
         return result(envelope, project(envelope, lastFilter))
     }
 
-    private fun status(): ActionResult {
+    private fun status(args: JsonObject): ActionResult {
         val envelope = operations.status()
-        val data = buildJsonObject {
-            // R41: keep the kernel's key=value diagnostic line verbatim, just inside a JSON object.
-            put("status", envelope.data ?: envelope.error?.code ?: "")
+        val provider = perception
+        val data = if (provider == null) {
+            buildJsonObject {
+                // R41: keep the kernel's key=value diagnostic line verbatim, just inside a JSON object.
+                put(STATUS_KEY, envelope.data ?: envelope.error?.code ?: "")
+            }
+        } else {
+            val include = parseInclude(args, DEFAULT_STATUS_INCLUDE, STATUS_SOURCES)
+                ?: return refused(INVALID_ARGUMENTS)
+            statusData(envelope, provider.snapshot(include, PerceptionFilter.ALL, null), include)
         }
         return result(envelope, data)
+    }
+
+    /**
+     * Task 7's `status`: device state + coverage, never the screen tree.
+     *
+     * `status` is the cheap "where am I" question; repeating the screen would make it an `observe` with the wrong name
+     * and could cost the model the whole element budget for facts it already has. The kernel's one-line diagnostic is
+     * kept verbatim (it is what reports `locked=`/`accessibility=`), and the requested notification/media content is
+     * added beside it. All content stays in the model-facing result only - this class never logs a value.
+     */
+    private fun statusData(
+        envelope: DeviceEnvelope,
+        snapshot: PerceptionSnapshot,
+        include: Set<PerceptionSource>,
+    ): JsonObject {
+        val state = deviceStateOrNull()
+        return buildJsonObject {
+            put(STATUS_KEY, envelope.data ?: envelope.error?.code ?: "")
+            put(COVERAGE_KEY, PerceptionCoverageRenderer.render(snapshot.coverage))
+            put(DEVICE_KEY, state?.let(::renderDeviceState))
+            put(
+                FOREGROUND_KEY,
+                foregroundString(snapshot) ?: state?.let {
+                    it.foregroundPackage?.let { packageName ->
+                        "$packageName/${it.foregroundActivity ?: UNKNOWN_ACTIVITY}"
+                    }
+                },
+            )
+            put(MEDIA_KEY, mediaJson(snapshot.media ?: state?.media))
+            put(PANEL_KEY, state?.panelVisible)
+            put(GLASSES_KEY, glassesJson(state))
+            if (PerceptionSource.NOTIFICATIONS in include) {
+                put(NOTIFICATIONS_KEY, notificationsJson(snapshot.notifications))
+            }
+        }
+    }
+
+    /** One `observe` result: the compact screen object plus every non-screen source the caller asked for. */
+    private fun observationData(snapshot: PerceptionSnapshot, include: Set<PerceptionSource>): JsonObject =
+        buildJsonObject {
+            put(
+                SCREEN_KEY,
+                buildJsonObject {
+                    put(SNAP_KEY, snapshot.snapshotId)
+                    put(COVERAGE_KEY, PerceptionCoverageRenderer.render(snapshot.coverage))
+                    put(FOREGROUND_KEY, foregroundString(snapshot))
+                    put(TRUNCATED_KEY, snapshot.truncated)
+                    put(TEXT_KEY, CompactSnapshotRenderer.render(snapshot))
+                },
+            )
+            if (PerceptionSource.NOTIFICATIONS in include) {
+                put(NOTIFICATIONS_KEY, notificationsJson(snapshot.notifications))
+            }
+            if (PerceptionSource.MEDIA in include) {
+                put(MEDIA_KEY, mediaJson(snapshot.media))
+            }
+            if (PerceptionSource.CALENDAR in include) {
+                put(
+                    CALENDAR_KEY,
+                    buildJsonArray { snapshot.calendarTitles.forEach { add(JsonPrimitive(it)) } },
+                )
+            }
+            if (PerceptionSource.ACOUSTIC in include) {
+                put(ACOUSTIC_KEY, snapshot.acoustic)
+            }
+            if (PerceptionSource.CLIPBOARD in include) {
+                put(CLIPBOARD_KEY, snapshot.clipboardText)
+            }
+            if (PerceptionSource.GLASSES in include) {
+                put(GLASSES_KEY, glassesJson(deviceStateOrNull()))
+            }
+            if (PerceptionSource.DEVICE in include) {
+                put(DEVICE_KEY, deviceStateOrNull()?.let(::renderDeviceState))
+            }
+        }
+
+    private fun foregroundString(snapshot: PerceptionSnapshot): String? =
+        snapshot.foregroundPackage?.let { packageName ->
+            "$packageName/${snapshot.foregroundActivity ?: UNKNOWN_ACTIVITY}"
+        }
+
+    private fun deviceStateOrNull(): DeviceState? =
+        deviceState?.let { runCatching { it.state() }.getOrNull() }
+
+    /**
+     * The compact device line (spec §7.3's `device:` row): every non-null fact, joined into one line.
+     * A fact the platform did not report is omitted - the coverage line already says whether the source is complete.
+     */
+    private fun renderDeviceState(state: DeviceState): String = buildString {
+        append("time=").append(state.localTime)
+        append(" date=").append(state.localDate)
+        append(" weekday=").append(state.weekday)
+        append(" tz=").append(state.timeZone)
+        state.batteryPercent?.let { append(" battery=").append(it).append('%') }
+        state.charging?.let { append(" charging=").append(it) }
+        state.network?.let { append(" network=").append(it) }
+        state.screenOn?.let { append(" screen=").append(if (it) "on" else "off") }
+        state.locked?.let { append(" locked=").append(it) }
+        state.brightness?.let { append(" brightness=").append(it) }
+        state.volumePercent?.let { append(" volume=").append(it).append('%') }
+        state.imeVisible?.let { append(" ime=").append(it) }
+        state.foregroundPackage?.let { append(" foreground=").append(it) }
+    }
+
+    /** The media fact as structured JSON; absent metadata stays `null`, never a fabricated value. */
+    private fun mediaJson(media: MediaState?): JsonElement =
+        if (media == null) {
+            JsonNull
+        } else {
+            buildJsonObject {
+                put("state", media.state)
+                put("title", media.title)
+                put("artist", media.artist)
+                put("album", media.album)
+                put("positionMs", media.positionMs)
+                put("durationMs", media.durationMs)
+            }
+        }
+
+    /**
+     * The notification content (spec §7.2): title/text/subText/bigText/category/posted time/ongoing/action labels.
+     * This is model context only; the tool never logs it and the provider keeps it in memory only.
+     */
+    private fun notificationsJson(notifications: List<NotificationItem>): JsonArray = buildJsonArray {
+        notifications.forEach { item ->
+            add(
+                buildJsonObject {
+                    put("package", item.packageName)
+                    put("app", item.appLabel)
+                    put("title", item.title)
+                    put("text", item.text)
+                    put("subText", item.subText)
+                    put("bigText", item.bigText)
+                    put("category", item.category)
+                    put("postedAt", item.postedAtEpochMillis)
+                    put("ongoing", item.ongoing)
+                    put(
+                        "actions",
+                        buildJsonArray { item.actionLabels.forEach { add(JsonPrimitive(it)) } },
+                    )
+                },
+            )
+        }
+    }
+
+    /** Glasses facts as structured JSON; a host that cannot tell leaves the field `null`. */
+    private fun glassesJson(state: DeviceState?): JsonObject = buildJsonObject {
+        put("connected", state?.glassesConnected)
+        put("wearing", state?.glassesWearing)
+        put("panel", state?.panelVisible)
+    }
+
+    /**
+     * Parses the optional `include` array.
+     *
+     * `all` expands to every source the action accepts. A malformed array, an unknown token, or a token the action does
+     * not serve is invalid arguments: silently ignoring it would answer a different question than the model asked.
+     */
+    private fun parseInclude(
+        args: JsonObject,
+        default: Set<PerceptionSource>,
+        allowed: Set<PerceptionSource>,
+    ): Set<PerceptionSource>? {
+        val raw = args["include"] ?: return default
+        val array = raw as? JsonArray ?: return null
+        if (array.isEmpty()) return default
+        val included = mutableSetOf<PerceptionSource>()
+        array.forEach { element ->
+            val token = (element as? JsonPrimitive)
+                ?.takeIf { it.isString }
+                ?.content
+                ?.trim()
+                ?.lowercase()
+                ?: return null
+            if (token == INCLUDE_ALL) {
+                included += allowed
+            } else {
+                val source = SOURCE_BY_TOKEN[token] ?: return null
+                if (source !in allowed) return null
+                included += source
+            }
+        }
+        return included
+    }
+
+    /** The optional element cap; a non-positive/non-integer value is invalid rather than a silent default. */
+    private fun parseLimit(args: JsonObject): Int? {
+        val raw = args.longArg("limit") ?: return null
+        if (raw <= 0L) return null
+        return raw.coerceAtMost(Int.MAX_VALUE.toLong()).toInt()
     }
 
     private fun project(envelope: DeviceEnvelope, filter: ScreenFilter): JsonObject {
@@ -517,6 +902,65 @@ class DeviceTool(
 
         private const val INVALID_ARGUMENTS = "INVALID_ARGUMENTS"
         private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
+
+        /** The channel a perception-backed read/act is reported under (the kernel's own accessibility channel). */
+        private const val CHANNEL_ACCESSIBILITY = "accessibility"
+
+        /** edith-0.3 Phase 2 Task 7: the two tool-level refusals the model can branch on. */
+        private const val STALE_REF = "STALE_REF"
+        private const val VISION_DISABLED = "VISION_DISABLED"
+
+        /** The one-line nudge when an accepted write provably changed nothing (spec §7.6). */
+        private const val OBSERVE_FIRST_NOTE = "动作未改变画面；先观察再决定"
+
+        /** The activity placeholder when only the package is known; the model can still tell it is unresolved. */
+        private const val UNKNOWN_ACTIVITY = "?"
+
+        // Model-facing keys shared by observe/act/status. Kept private and spelled once so the three shapes cannot drift.
+        private const val SCREEN_KEY = "screen"
+        private const val CHANGES_KEY = "changes"
+        private const val SNAP_KEY = "snap"
+        private const val COVERAGE_KEY = "coverage"
+        private const val FOREGROUND_KEY = "foreground"
+        private const val TRUNCATED_KEY = "truncated"
+        private const val TEXT_KEY = "text"
+        private const val CHANGED_KEY = "changed"
+        private const val NOTE_KEY = "note"
+        private const val STATUS_KEY = "status"
+        private const val DEVICE_KEY = "device"
+        private const val MEDIA_KEY = "media"
+        private const val PANEL_KEY = "panel"
+        private const val GLASSES_KEY = "glasses"
+        private const val NOTIFICATIONS_KEY = "notifications"
+        private const val CALENDAR_KEY = "calendar"
+        private const val ACOUSTIC_KEY = "acoustic"
+        private const val CLIPBOARD_KEY = "clipboard"
+        private const val LIMIT_KEY = "limit"
+        private const val INCLUDE_ALL = "all"
+
+        private val OBSERVE_SOURCES: Set<PerceptionSource> = PerceptionSource.entries.toSet()
+
+        /** `status` is the ambient question; the screen tree is explicitly not one of its sources. */
+        private val STATUS_SOURCES: Set<PerceptionSource> = setOf(
+            PerceptionSource.DEVICE,
+            PerceptionSource.NOTIFICATIONS,
+            PerceptionSource.MEDIA,
+        )
+
+        private val DEFAULT_OBSERVE_INCLUDE: Set<PerceptionSource> = setOf(PerceptionSource.SCREEN)
+        private val DEFAULT_STATUS_INCLUDE: Set<PerceptionSource> = setOf(PerceptionSource.DEVICE)
+
+        private val SOURCE_BY_TOKEN: Map<String, PerceptionSource> = mapOf(
+            "screen" to PerceptionSource.SCREEN,
+            "notifications" to PerceptionSource.NOTIFICATIONS,
+            "media" to PerceptionSource.MEDIA,
+            "calendar" to PerceptionSource.CALENDAR,
+            "acoustic" to PerceptionSource.ACOUSTIC,
+            "clipboard" to PerceptionSource.CLIPBOARD,
+            "glasses" to PerceptionSource.GLASSES,
+            "device" to PerceptionSource.DEVICE,
+        )
+
         private val BARE_REF = Regex("n\\d+")
 
         private val KIND_BY_TOKEN: Map<String, ActKind> = mapOf(
@@ -551,6 +995,8 @@ class DeviceTool(
             parametersJson = """{"type":"object","properties":{""" +
                 """"action":{"type":"string","enum":["observe","act","screenshot","wait","status"]},""" +
                 """"filter":{"type":"string","enum":["interactive","text","all"]},""" +
+                """"include":{"type":"array","items":{"type":"string","enum":["screen","notifications","media","calendar","acoustic","clipboard","glasses","device","all"]}},""" +
+                """"limit":{"type":"integer","minimum":1},""" +
                 """"kind":{"type":"string","enum":["tap","long_press","double_tap","swipe","scroll",""" +
                 """"scroll_to_text","type","press_key","home","back","recents","notifications"]},""" +
                 """"ref":{"type":"string"},"text":{"type":"string"},"value":{"type":"string"},""" +
@@ -569,4 +1015,11 @@ class DeviceTool(
             observation = true,
         )
     }
+}
+
+/** The compact snapshot's filter vocabulary mirrors the kernel's render filter exactly. */
+private fun ScreenFilter.toPerceptionFilter(): PerceptionFilter = when (this) {
+    ScreenFilter.INTERACTIVE -> PerceptionFilter.INTERACTIVE
+    ScreenFilter.TEXT -> PerceptionFilter.TEXT
+    ScreenFilter.ALL -> PerceptionFilter.ALL
 }

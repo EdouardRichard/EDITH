@@ -49,6 +49,12 @@ import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
 import com.sheen.rokid.plugin.PluginLifecycle
+import com.sheen.rokid.plugin.PerceptionCoverage
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.SpeakerWindow
 import com.sheen.rokid.plugin.StorageHandle
 import com.sheen.rokid.transport.CxrAuthorizationOutcome
@@ -141,6 +147,39 @@ class CxrHostServicesTest {
         override fun cancel() = Unit
     }
 
+    /** edith-0.3 Phase 2 Task 7: the Android perception provider's stand-in for the environment's answerability check. */
+    private class StubPerception : PerceptionProvider {
+        private fun snapshot(): PerceptionSnapshot = PerceptionSnapshot(
+            snapshotId = "snap",
+            capturedAtEpochMillis = 0L,
+            coverage = PerceptionCoverage(
+                screen = "ok",
+                notifications = "ok",
+                media = "ok",
+                calendar = "ok",
+                acoustic = "ok",
+                clipboard = "ok",
+                vision = "ok",
+                glasses = "ok",
+                device = "ok",
+            ),
+        )
+
+        override fun beginTurn(): PerceptionSnapshot = snapshot()
+
+        override fun snapshot(
+            include: Set<PerceptionSource>,
+            filter: PerceptionFilter,
+            limit: Int?,
+        ): PerceptionSnapshot = snapshot()
+
+        override fun afterAction(): PerceptionSnapshot = snapshot()
+
+        override fun screenshot(): PerceptionScreenshotResult = PerceptionScreenshotResult.Disabled
+
+        override fun endTurn() = Unit
+    }
+
     private class StubStorage(val pluginId: String) : StorageHandle {
         private val values = mutableMapOf<String, ByteArray>()
         override fun read(key: String): ByteArray? = values[key]
@@ -152,7 +191,8 @@ class CxrHostServicesTest {
     private fun scope(pluginId: String) = ResourceScope(pluginId, SessionId("s-1"), Generation(1))
 
     private fun environment(displayLive: Boolean, storage: Boolean = true, input: InputPort = RecordingInput(),
-        asr: AsrSession? = null, actions: ActionExecutor? = null, wakeWords: com.sheen.rokid.plugin.WakeWordRegistry? = StubWakeWords()) =
+        asr: AsrSession? = null, actions: ActionExecutor? = null, wakeWords: com.sheen.rokid.plugin.WakeWordRegistry? = StubWakeWords(),
+        perception: PerceptionProvider? = null) =
         CxrHostEnvironment(
             clock = FakeClock(),
             input = input,
@@ -163,21 +203,23 @@ class CxrHostServicesTest {
                 asr?.let { put(Capability.Asr, it) }
                 actions?.let { put(Capability.Actions, it) }
                 wakeWords?.let { put(Capability.WakeWord, it) }
+                perception?.let { put(Capability.Perception, it) }
             },
             storageFor = if (storage) { { id -> StubStorage(id) } } else null,
         )
 
     @Test
     fun everyAdvertisedCapabilityIsAnswerableAndNothingElseIs() {
-        val env = environment(displayLive = true, asr = StubAsr(), actions = StubActions())
+        val env = environment(displayLive = true, asr = StubAsr(), actions = StubActions(), perception = StubPerception())
         val advertised = env.availableCapabilities
 
         // Task 11 ruling: with the engine chain wired the Asr provider is advertised; Audio stays out because there is
         // no AudioSubscription provider (transcripts arrive through AsrSession). Task 12 adds the action provider, so
         // Actions joins the set - and must therefore be answerable below. Task 14a adds the wake-word provider, which
-        // is what finally lets `smart-assistant` (which declares WakeWord) pass the host's capability gate.
+        // is what finally lets `smart-assistant` (which declares WakeWord) pass the host's capability gate. Phase 2
+        // Task 7 adds the perception port; a registered provider is advertised and answerable like every other.
         assertEquals(setOf(Capability.Model, Capability.Storage, Capability.TextOutput, Capability.Asr,
-            Capability.Actions, Capability.WakeWord), advertised)
+            Capability.Actions, Capability.WakeWord, Capability.Perception), advertised)
         val services = env.services(scope("smart-assistant"), advertised)
         advertised.forEach { capability ->
             assertNull("$capability is advertised, so it must be answerable",
@@ -198,6 +240,15 @@ class CxrHostServicesTest {
         assertFalse(Capability.WakeWord in env.availableCapabilities)
         assertNotNull(runCatching { env.services(scope("smart-assistant"), setOf(Capability.WakeWord))
             .require(Capability.WakeWord) }.exceptionOrNull())
+    }
+
+    @Test
+    fun perceptionIsRefusedRatherThanAdvertisedWhenTheCompositionSuppliesNoProvider() {
+        val env = environment(displayLive = true)
+
+        assertFalse(Capability.Perception in env.availableCapabilities)
+        assertNotNull(runCatching { env.services(scope("smart-assistant"), setOf(Capability.Perception))
+            .require(Capability.Perception) }.exceptionOrNull())
     }
 
     @Test
@@ -473,7 +524,8 @@ class CxrHostServicesTest {
         val environment = CxrHostEnvironment(clock = clock, input = chain.input, liveOutput = { StubDevice() },
             scheduler = scheduler,
             providers = mapOf(Capability.Model to StubModel(), Capability.Asr to chain.asrSession,
-                Capability.Actions to StubActions(), Capability.WakeWord to StubWakeWords()),
+                Capability.Actions to StubActions(), Capability.WakeWord to StubWakeWords(),
+                Capability.Perception to StubPerception()),
             storageFor = { id -> StubStorage(id) })
     }
 
@@ -482,7 +534,7 @@ class CxrHostServicesTest {
         val rig = AudioWiringRig()
         try {
             assertEquals(setOf(Capability.Model, Capability.Storage, Capability.TextOutput, Capability.Asr,
-                Capability.Actions, Capability.WakeWord), rig.environment.availableCapabilities)
+                Capability.Actions, Capability.WakeWord, Capability.Perception), rig.environment.availableCapabilities)
             assertTrue("the input port must be the polled audio loop, not the refusing placeholder",
                 rig.environment.input === rig.chain.input)
 

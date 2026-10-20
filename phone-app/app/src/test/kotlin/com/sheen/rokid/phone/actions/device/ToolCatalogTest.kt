@@ -147,7 +147,7 @@ class ToolCatalogTest {
             schema["properties"]!!.jsonObject["action"]!!.jsonObject["enum"]!!.jsonArray
                 .map { it.jsonPrimitive.content },
         )
-        listOf("filter", "kind", "ref", "text", "value", "direction", "key", "timeout_ms")
+        listOf("filter", "kind", "ref", "text", "value", "direction", "key", "timeout_ms", "include", "limit")
             .forEach { parameter ->
                 assertTrue("device schema must carry $parameter", properties.containsKey(parameter))
             }
@@ -312,6 +312,68 @@ class ToolCatalogTest {
         assertEquals("the gate must run even while a11y is down", listOf(true), calls)
     }
 
+    // - Task 7: status is exempt from the unlock and accessibility gates -
+
+    @Test
+    fun `device status bypasses the unlock gate and the accessibility refusal`() {
+        val calls = mutableListOf<Boolean>()
+        val gate = com.sheen.rokid.phone.lock.UnlockGate { requireAccessibility ->
+            calls += requireAccessibility
+            com.sheen.rokid.phone.lock.UnlockOutcome.FAILED
+        }
+        val operations = RecordingDeviceOperations(
+            statusEnvelope = DeviceEnvelope.success(
+                action = "status",
+                channel = "accessibility",
+                accepted = true,
+                applied = null,
+                verified = null,
+                timing = Timing(0, 0, 0),
+                data = "foreground=?/? interactive=false locked=true accessibility=false shell=false",
+            ),
+        )
+        val catalog = catalog(probes = Probes(a11y = false), deviceOperations = operations, unlock = gate)
+
+        val result = catalog.execute("device", """{"action":"status"}""")
+
+        assertEquals("status must be able to report a locked phone with a11y off", ActionOutcome.Done, result.outcome)
+        assertTrue("status must not ask for an unlock", calls.isEmpty())
+        assertEquals(1, operations.statusCalls)
+        assertTrue(
+            "the diagnostic line must survive",
+            result.detail.contains("locked=true accessibility=false"),
+        )
+    }
+
+    @Test
+    fun `every other device action still passes the unlock gate and the a11y check`() {
+        val calls = mutableListOf<Boolean>()
+        val gate = com.sheen.rokid.phone.lock.UnlockGate { requireAccessibility ->
+            calls += requireAccessibility
+            com.sheen.rokid.phone.lock.UnlockOutcome.FAILED
+        }
+        val catalog = catalog(probes = Probes(a11y = false), unlock = gate)
+
+        assertEquals(ActionOutcome.Refused, catalog.execute("device", """{"action":"observe"}""").outcome)
+        assertEquals(ActionOutcome.Refused, catalog.execute("device", """{"action":"act","kind":"tap"}""").outcome)
+        assertEquals("observe and act ask for an unlock with accessibility", listOf(true, true), calls)
+
+        calls.clear()
+        val unlocked = catalog(
+            probes = Probes(a11y = false),
+            unlock = com.sheen.rokid.phone.lock.UnlockGate {
+                calls += it
+                com.sheen.rokid.phone.lock.UnlockOutcome.ALREADY_UNLOCKED
+            },
+        )
+        assertEquals(
+            "an unlocked but a11y-down device still refuses observe",
+            "CHANNEL_UNAVAILABLE",
+            unlocked.execute("device", """{"action":"observe"}""").detail,
+        )
+        assertEquals(listOf(true), calls)
+    }
+
     // - helpers -
 
     private fun catalog(
@@ -368,6 +430,8 @@ class ToolCatalogTest {
         private val observation: Observation? = null,
         override val revision: Long? = null,
         override val generation: Long? = null,
+        private val statusEnvelope: DeviceEnvelope =
+            DeviceEnvelope.success("status", "accessibility", true, null, null, Timing(0, 0, 0)),
     ) : DeviceOperations {
         override val latestObservation: Observation?
             get() = observation
@@ -375,6 +439,7 @@ class ToolCatalogTest {
         var cancels = 0
         var begins = 0
         var closes = 0
+        var statusCalls = 0
 
         override fun observe(filter: ScreenFilter): DeviceEnvelope {
             observeEnvelopes += DeviceEnvelope.success("observe", "accessibility", true, null, null, Timing(0, 0, 0))
@@ -397,8 +462,10 @@ class ToolCatalogTest {
         override fun waitFor(text: String?, foreground: String?, idle: Boolean, timeoutMillis: Long): DeviceEnvelope =
             DeviceEnvelope.success("wait", "accessibility", true, null, null, Timing(0, 0, 0))
 
-        override fun status(): DeviceEnvelope =
-            DeviceEnvelope.success("status", "accessibility", true, null, null, Timing(0, 0, 0))
+        override fun status(): DeviceEnvelope {
+            statusCalls++
+            return statusEnvelope
+        }
 
         override fun cancel() { cancels++ }
 

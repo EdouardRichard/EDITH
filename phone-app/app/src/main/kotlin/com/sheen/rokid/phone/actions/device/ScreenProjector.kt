@@ -41,13 +41,25 @@ class ScreenProjector(
     private val registry: RefRegistry,
     private val renderFull: (Observation, ScreenFilter) -> String,
     private val renderChanged: (Observation, Collection<String>) -> String,
+    /**
+     * edith-0.3 Phase 2 Task 7: the foreground activity the observation model cannot carry.
+     *
+     * The value is read per projection from the same accessibility/foreground fact the perception provider and the
+     * `device` tool use, so `screen.activity` and the compact snapshot's foreground cannot disagree. A throwing
+     * lambda degrades to `null` (unknown) instead of taking the whole screen projection down.
+     */
+    private val foregroundActivity: () -> String? = { null },
 ) {
 
     /**
      * The production shape: the renderer must have been built with the kernel's shared [registry],
      * or the refs in the diff lines would be unresolved by the kernel (R36).
      */
-    constructor(renderer: ObservationRenderer, registry: RefRegistry) : this(
+    constructor(
+        renderer: ObservationRenderer,
+        registry: RefRegistry,
+        foregroundActivity: () -> String? = { null },
+    ) : this(
         registry = registry,
         renderFull = { observation, filter ->
             renderer.render(
@@ -58,6 +70,7 @@ class ScreenProjector(
             )
         },
         renderChanged = { observation, paths -> renderer.renderNodes(observation, paths) },
+        foregroundActivity = foregroundActivity,
     )
 
     private var previous: Observation? = null
@@ -118,9 +131,10 @@ class ScreenProjector(
         return buildJsonObject {
             put("rev", observation.revision)
             if (app == null) put("app", JsonNull) else put("app", app)
-            // The observation model has no activity class (AccessibilityPort.foreground does), so the
-            // honest answer here is always null; Task 10's brief fixes that shape (R41).
-            put("activity", JsonNull)
+            // The observation model has no activity class; the injected foreground fact supplies it, and an unknown
+            // activity stays null rather than being guessed (R41/Task 7).
+            val activity = runCatching { foregroundActivity() }.getOrNull()?.takeIf { it.isNotBlank() }
+            if (activity == null) put("activity", JsonNull) else put("activity", activity)
             put("ime", observation.windows.any { it.type == IME_WINDOW_TYPE })
             put("truncated", observation.truncated)
             put("changes", changes)

@@ -69,10 +69,17 @@ class ToolCatalog(
         P3Log.line(ToolArgsShape.describe(name, argsJson))
         return when (name) {
         DeviceTool.NAME ->
-            // The gate comes **before** the a11y probe: a locked phone can be exactly the reason the accessibility
-            // service is unbound, so probing first would refuse the call without ever trying to unlock and reconnect.
-            gated(unlock.ensureUnlocked(requireAccessibility = true)) {
-                if (a11yAvailable()) device.execute(name, argsJson) else channelRefused()
+            // edith-0.3 Phase 2 Task 7: `status` is the one device call that must run while the phone is locked and
+            // the accessibility service is down - it is the diagnostic that reports `locked=true` / `accessibility=false`,
+            // and a gate would hide the condition behind the question "can you unlock?". Every other action keeps both
+            // checks. The gate comes **before** the a11y probe: a locked phone can be exactly the reason the service
+            // is unbound, so probing first would refuse the call without ever trying to unlock and reconnect.
+            if (device.isStatus(argsJson)) {
+                device.execute(name, argsJson)
+            } else {
+                gated(unlock.ensureUnlocked(requireAccessibility = true)) {
+                    if (a11yAvailable()) device.execute(name, argsJson) else channelRefused()
+                }
             }
         ShellTool.NAME ->
             if (shellAvailable()) shell.execute(name, argsJson) else channelRefused()
