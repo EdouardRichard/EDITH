@@ -6,6 +6,7 @@ import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.InputModality
+import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelClient
 import com.sheen.rokid.plugin.ModelEnd
@@ -111,9 +112,9 @@ class ContextOverflowTest {
         }.toString(),
     )
 
-    private fun frame(): RequestFrame = RequestFrame(
+    private fun frame(perception: String? = null, memory: String? = null): RequestFrame = RequestFrame(
         systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")),
-        conversationFlow = listOf(
+        conversationFlow = listOfNotNull(
             Segment(SegmentOrigin.TRANSCRIPT, true, "old-question", SegmentRole.USER),
             Segment(SegmentOrigin.TRANSCRIPT, true, "old-answer", SegmentRole.ASSISTANT),
             toolCall("c1"),
@@ -122,6 +123,8 @@ class ContextOverflowTest {
             Segment(SegmentOrigin.TRANSCRIPT, true, "(tool call)", SegmentRole.ASSISTANT),
             toolCall("c2"),
             toolOutput("c2", screenTree("current")),
+            perception?.let { Segment(SegmentOrigin.PERCEPTION, false, it) },
+            memory?.let { Segment(SegmentOrigin.MEMORY_EVIDENCE, false, it) },
             Segment(SegmentOrigin.USER_INPUT, true, "now"),
         ),
         tools = emptyList(),
@@ -216,13 +219,17 @@ class ContextOverflowTest {
     // ── recovery 2: hard truncation, then the stable error ─────────────────────────────────────────
 
     @Test
-    fun `a second overflow hard truncates to the latest turn and the current input`() {
+    fun `a second overflow hard truncates to the latest turn and keeps a marked dynamic tail`() {
+        // 0.3 Phase 2 Task 12 (spec §6.6): recovery ② may not silently drop the request-scoped tail. A huge perception
+        // block and a huge memory evidence segment are kept as head + marker + tail, still ahead of the current input.
+        val perception = "perception-start-" + "p".repeat(2_000) + "-perception-end"
+        val memory = "memory-start-" + "m".repeat(2_000) + "-memory-end"
         val client = ScriptedOverflowClient(
             mutableListOf(Fault.LOCAL_REJECT, Fault.LOCAL_REJECT, Fault.COMPLETED),
         )
         val gateway = gateway(client)
 
-        val reply = gateway.turn(turn())
+        val reply = gateway.turn(turn(frame(perception = perception, memory = memory)))
 
         assertEquals(ModelEnd.COMPLETED, reply.terminal)
         assertEquals(3, client.requests.size)
@@ -230,7 +237,15 @@ class ContextOverflowTest {
         assertEquals("recent-question", texts(hardened).first(), "hard truncation starts at the latest user turn")
         assertTrue(texts(hardened).none { it == "old-question" }, "the earlier turn is gone: ${texts(hardened)}")
         assertEquals(listOf("c2"), callIds(hardened), "the latest tool round survives with the latest turn")
-        assertEquals(listOf("now"), hardened.input.filterIsInstance<com.sheen.rokid.plugin.InputPart.Text>().map { it.text })
+        val inputText = hardened.input.filterIsInstance<InputPart.Text>().joinToString("") { it.text }
+        assertTrue(inputText.endsWith("now"), "the current input still ends the request input: $inputText")
+        assertEquals(2, inputText.split("[truncated]").size - 1, "both dynamic segments carry the marker: $inputText")
+        assertTrue(inputText.contains(perception.take(400)), "the perception head survives")
+        assertTrue(inputText.contains(perception.takeLast(100)), "the perception tail survives")
+        assertTrue(inputText.contains(memory.take(400)), "the memory head survives")
+        assertTrue(inputText.contains(memory.takeLast(100)), "the memory tail survives")
+        assertTrue(!inputText.contains(perception), "the whole perception block is not sent")
+        assertTrue(!inputText.contains(memory), "the whole memory evidence is not sent")
         assertEquals(2, gateway.overflowRecoveries)
         assertEquals(0, gateway.overflowFailures)
     }

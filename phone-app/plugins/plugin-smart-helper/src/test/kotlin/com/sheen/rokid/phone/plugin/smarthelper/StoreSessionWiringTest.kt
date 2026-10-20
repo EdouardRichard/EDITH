@@ -576,8 +576,10 @@ class StoreSessionWiringTest {
             "cut ① dropped a whole turn and the frame is still over budget, so ③ is owed",
         )
         assertTrue(
-            lines.contains("P3_CONTEXT trim route=WAKE droppedTurns=1 compressionOwed=true"),
-            "the trim counts must be logged as two numbers: $lines",
+            lines.contains(
+                "P3_CONTEXT trim route=WAKE droppedTurns=1 compressionOwed=true truncated=- dropped=-",
+            ),
+            "the trim counts and origin lists must be logged: $lines",
         )
     }
 
@@ -597,8 +599,10 @@ class StoreSessionWiringTest {
             "no turn was dropped, so the caller's half of the ③ gate must be false",
         )
         assertTrue(
-            lines.contains("P3_CONTEXT trim route=WAKE droppedTurns=0 compressionOwed=true"),
-            "the two counts must be logged even when cut ① did nothing: $lines",
+            lines.contains(
+                "P3_CONTEXT trim route=WAKE droppedTurns=0 compressionOwed=true truncated=- dropped=-",
+            ),
+            "the counts and origin lists must be logged even when cut ① did nothing: $lines",
         )
     }
 

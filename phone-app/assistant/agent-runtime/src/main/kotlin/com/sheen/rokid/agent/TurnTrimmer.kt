@@ -58,7 +58,10 @@ object TrimOrder {
  * assistant texts the removal brings together are merged, so the result is still a shape `ContextBudgeter` sends.
  * [HARD] is overflow recovery ②: only the newest whole turn and the current input remain (plus request-scoped
  * `RUNTIME_STATE`/`RETRY` metadata and the untouched system slot), and within that turn only the newest tool round,
- * its assistant opener and the closing assistant text survive.
+ * its assistant opener and the closing assistant text survive. The request-scoped dynamic tail
+ * (`PERCEPTION`/`MEMORY_EVIDENCE`/`SKILL_BODY`/`RUNTIME_STATE`) is kept, shortened to head + marker + tail; only a
+ * frame that is still over budget after that gives a whole origin up, in the fixed order `SKILL_BODY` →
+ * `MEMORY_EVIDENCE` → `PERCEPTION`, and every removal is recorded (Task 12, spec §6.6).
  */
 enum class TrimMode { STANDARD, AGGRESSIVE, HARD }
 
@@ -73,6 +76,10 @@ enum class TrimMode { STANDARD, AGGRESSIVE, HARD }
  * @param elidedUiTrees how many old UI-tree tool results ⓪ replaced with a header (Task 13).
  * @param elidedImages how many historical images ⓪ degraded to a text summary (Task 13; newest K = 3 stay whole).
  * @param elidedToolResults how many long non-last tool results ⓪ truncated to head+tail (Task 13).
+ * @param truncatedOrigins the origins of HARD-recovery dynamic segments that survived **truncated** (Task 12): the
+ *   segment is still in [kept], with `head + "\n...[truncated]...\n" + tail`. A segment that was truncated and then
+ *   given up by the still-over-budget cleanup is reported in [droppedOrigins] instead, so the two lists never name the
+ *   same segment. Empty for STANDARD/AGGRESSIVE.
  */
 data class TrimReport(
     val kept: RequestFrame,
@@ -82,6 +89,7 @@ data class TrimReport(
     val elidedUiTrees: Int = 0,
     val elidedImages: Int = 0,
     val elidedToolResults: Int = 0,
+    val truncatedOrigins: List<SegmentOrigin> = emptyList(),
 )
 
 /**
@@ -98,6 +106,7 @@ data class TrimCounts(
     val elidedUiTrees: Int = 0,
     val elidedImages: Int = 0,
     val elidedToolResults: Int = 0,
+    val truncatedOrigins: List<SegmentOrigin> = emptyList(),
 )
 
 /** The counts-only view of this report: safe to log, `toString()`, or hand to a probe. */
@@ -109,6 +118,7 @@ val TrimReport.counts: TrimCounts
         elidedUiTrees,
         elidedImages,
         elidedToolResults,
+        truncatedOrigins,
     )
 
 /**
@@ -176,14 +186,22 @@ val TrimReport.counts: TrimCounts
  * it gets no exemption from the budget check.
  *
  * @param measure the per-segment token-unit cost. Defaults to [defaultSegmentMeasure], which includes image units.
+ * @param hardDynamicHeadChars how much of a HARD-kept dynamic tail segment's head survives (Task 12). 400 is a policy
+ *   starting point, not a model constant: the caller may tune it.
+ * @param hardDynamicTailChars the tail counterpart of [hardDynamicHeadChars]; 100 is likewise a tunable starting point.
  */
-class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasure) {
+class TurnTrimmer(
+    private val measure: (Segment) -> Int = ::defaultSegmentMeasure,
+    private val hardDynamicHeadChars: Int = 400,
+    private val hardDynamicTailChars: Int = 100,
+) {
 
     fun trim(frame: RequestFrame, limitTokens: Int, mode: TrimMode = TrimMode.STANDARD): TrimReport {
+        val hard = if (mode == TrimMode.HARD) hardTruncate(frame.conversationFlow) else null
         val prepared = when (mode) {
             TrimMode.STANDARD -> frame.conversationFlow
             TrimMode.AGGRESSIVE -> dropOlderToolRounds(frame.conversationFlow)
-            TrimMode.HARD -> hardTruncate(frame.conversationFlow)
+            TrimMode.HARD -> hard!!.flow
         }
         val hardDroppedTurns = if (mode == TrimMode.HARD) {
             val lastTurn = frame.conversationFlow.indexOfLast { isTurnStart(it) }
@@ -195,10 +213,40 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
         val flow = typeAware.flow.toMutableList()
         var droppedTurns = hardDroppedTurns
         val droppedOrigins = mutableListOf<SegmentOrigin>()
+        // Task 12: indexes into `flow` of the HARD dynamic segments that were shortened. `applyTypeAware` maps the list
+        // one-to-one in order (it never reorders or resizes), so [HardTruncation.truncatedIndexes] stay valid here; every
+        // removal below goes through `removeSegmentAt`, which keeps them pointing at the same segments.
+        val truncatedIndexes = hard?.truncatedIndexes?.toMutableSet() ?: mutableSetOf()
 
         fun total(): Int = FIXED_OVERHEAD +
             measure(Segment(SegmentOrigin.INSTRUCTIONS, true, frame.systemText)) +
             flow.sumOf(measure)
+
+        /** Removes one segment and shifts the truncated-index bookkeeping. */
+        fun removeSegmentAt(index: Int): Segment {
+            val removed = flow.removeAt(index)
+            truncatedIndexes.remove(index)
+            val shifted = truncatedIndexes.filter { it > index }
+            if (shifted.isNotEmpty()) {
+                truncatedIndexes.removeAll(shifted.toSet())
+                shifted.forEach { truncatedIndexes += it - 1 }
+            }
+            return removed
+        }
+
+        // HARD only (Task 12, spec §6.6): truncation is not enough, so give up whole dynamic origins in the declared
+        // order — SKILL_BODY, then MEMORY_EVIDENCE, then PERCEPTION — one segment at a time, the oldest/first first.
+        // The loop never touches USER_INPUT/RUNTIME_STATE/RETRY/the newest turn: those origins are not in its order, and
+        // it stops the moment the frame fits. Every removal is recorded in `droppedOrigins`.
+        if (mode == TrimMode.HARD) {
+            for (origin in HARD_CLEANUP_ORDER) {
+                while (total() > limitTokens) {
+                    val index = flow.indexOfFirst { it.origin == origin }
+                    if (index < 0) break
+                    droppedOrigins += removeSegmentAt(index).origin
+                }
+            }
+        }
 
         // ① 旧整回合：一组 = 一条 role=USER 的 TRANSCRIPT（或它引发的 TOOL_ROUND 段）到下一个
         // USER 之前。整组淘汰 ⇒ 永远不发"半个回合"。从最旧一组开始，只在还超预算时才落。
@@ -212,7 +260,7 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
             // ⇒ isEvictable 必为真。故不存在（也不需要）空集分支。每轮至少删掉 flow[start]，
             // flow 单调变短、total() 单调变小 ⇒ 循环必终止，① 不会空转。
             val slice = (start until stop).filter { isEvictable(flow[it]) }
-            slice.sortedDescending().forEach { flow.removeAt(it) }
+            slice.sortedDescending().forEach { removeSegmentAt(it) }
             droppedTurns++
         }
 
@@ -223,10 +271,15 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
         var index = flow.lastIndex
         while (total() > limitTokens && index >= 0) {
             if (flow[index].origin == SegmentOrigin.MEMORY_EVIDENCE) {
-                droppedOrigins += flow.removeAt(index).origin
+                droppedOrigins += removeSegmentAt(index).origin
             }
             index--
         }
+
+        // Task 12: a segment that was truncated and then given up is reported as dropped, not truncated.
+        val truncatedOrigins = flow.indices
+            .filter { it in truncatedIndexes }
+            .map { flow[it].origin }
 
         return TrimReport(
             kept = frame.copy(conversationFlow = flow.toList()),
@@ -236,6 +289,7 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
             elidedUiTrees = typeAware.elidedUiTrees,
             elidedImages = typeAware.elidedImages,
             elidedToolResults = typeAware.elidedToolResults,
+            truncatedOrigins = truncatedOrigins,
         )
     }
 
@@ -512,52 +566,87 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
      * assistant text(s) that follow it (the turn's closing answer). The older rounds of the same turn are exactly the
      * "compression was not enough" cost this cut exists to remove; keeping them let a multi-round turn end
      * `CONTEXT_OVERFLOW` at a size this truncation already fits. A newest turn with no tool round keeps its text only.
-     * Request-scoped `RUNTIME_STATE`/`RETRY` metadata and `USER_INPUT` always survive in flow order; a stored
-     * `SUMMARY`/`MEMORY_EVIDENCE`/`PERCEPTION` is exactly the "old context" this hard cut removes. With no turn group
-     * at all, only the metadata and the current input remain.
+     * Request-scoped `RUNTIME_STATE`/`RETRY` metadata and `USER_INPUT` always survive in flow order.
+     *
+     * ## The dynamic tail is kept, shortened (Task 12, spec §6.6)
+     *
+     * A request-scoped tail segment (`PERCEPTION`/`MEMORY_EVIDENCE`/`SKILL_BODY`/`RUNTIME_STATE`) is **not** dropped
+     * whole: it survives as `head + "\n...[truncated]...\n" + tail` (the cap is the constructor's
+     * [hardDynamicHeadChars]/[hardDynamicTailChars] policy pair; an already-shorter segment is unchanged), and its
+     * index is returned in [HardTruncation.truncatedIndexes] so the report can name the origin. A stored `SUMMARY` is
+     * still exactly the "old context" this hard cut removes, and it is not in the dynamic tail. If the shortened frame
+     * is still over budget, `trim` cleans whole dynamic origins in the declared order (SKILL_BODY → MEMORY_EVIDENCE →
+     * PERCEPTION, recorded in `droppedOrigins`); this function only truncates, it does not measure.
+     *
+     * The returned indexes address the returned list; `trim` keeps them in sync while it removes segments.
      */
-    private fun hardTruncate(flow: List<Segment>): List<Segment> {
+    private fun hardTruncate(flow: List<Segment>): HardTruncation {
         val lastTurn = flow.indexOfLast { isTurnStart(it) }
         val kept = if (lastTurn < 0) flow else flow.subList(lastTurn, flow.size)
         val lastTool = kept.indexOfLast { it.origin == SegmentOrigin.TOOL_ROUND }
-        if (lastTool < 0) {
-            return kept.filter {
+        val survivors = if (lastTool < 0) {
+            kept.filter {
                 it.origin == SegmentOrigin.TRANSCRIPT ||
                     it.origin == SegmentOrigin.USER_INPUT ||
-                    it.origin == SegmentOrigin.RUNTIME_STATE ||
-                    it.origin == SegmentOrigin.RETRY
+                    it.origin == SegmentOrigin.RETRY ||
+                    it.origin in HARD_DYNAMIC_ORIGINS
             }
-        }
-        var newestRunStart = lastTool
-        while (newestRunStart > 0 && kept[newestRunStart - 1].origin == SegmentOrigin.TOOL_ROUND) {
-            newestRunStart--
-        }
-        // The assistant text immediately before the newest run. Every production round is opened by one (AgentLoop
-        // appends a placeholder when the model sent no text); if a frame has none, the run is kept as it is and the
-        // send-time budgeter remains the judge of the orphaned-call shape.
-        val opener = (newestRunStart - 1 downTo 0).firstOrNull { index -> isAssistantTranscript(kept[index]) }
-        // The turn's own opening user text: the history must open on a user item and the turn must not be a lone half.
-        val turnUser = (0 until newestRunStart).firstOrNull { index ->
-            kept[index].origin == SegmentOrigin.TRANSCRIPT && kept[index].role == SegmentRole.USER
-        }
-        val keep = mutableSetOf<Int>()
-        // Request-scoped metadata and the current input are never evicted, wherever the turn put them.
-        kept.forEachIndexed { index, segment ->
-            if (segment.origin == SegmentOrigin.USER_INPUT ||
-                segment.origin == SegmentOrigin.RUNTIME_STATE ||
-                segment.origin == SegmentOrigin.RETRY
-            ) {
-                keep += index
+        } else {
+            var newestRunStart = lastTool
+            while (newestRunStart > 0 && kept[newestRunStart - 1].origin == SegmentOrigin.TOOL_ROUND) {
+                newestRunStart--
             }
+            // The assistant text immediately before the newest run. Every production round is opened by one (AgentLoop
+            // appends a placeholder when the model sent no text); if a frame has none, the run is kept as it is and the
+            // send-time budgeter remains the judge of the orphaned-call shape.
+            val opener = (newestRunStart - 1 downTo 0).firstOrNull { index -> isAssistantTranscript(kept[index]) }
+            // The turn's own opening user text: the history must open on a user item and the turn must not be a lone half.
+            val turnUser = (0 until newestRunStart).firstOrNull { index ->
+                kept[index].origin == SegmentOrigin.TRANSCRIPT && kept[index].role == SegmentRole.USER
+            }
+            val keep = mutableSetOf<Int>()
+            // Request-scoped metadata, the dynamic tail and the current input are never evicted, wherever the turn put them.
+            kept.forEachIndexed { index, segment ->
+                if (segment.origin == SegmentOrigin.USER_INPUT ||
+                    segment.origin == SegmentOrigin.RETRY ||
+                    segment.origin in HARD_DYNAMIC_ORIGINS
+                ) {
+                    keep += index
+                }
+            }
+            turnUser?.let(keep::add)
+            opener?.let(keep::add)
+            (newestRunStart..lastTool).forEach(keep::add)
+            // Everything the assistant said after its last tool round is the turn's closing answer, kept in flow order.
+            for (index in (lastTool + 1) until kept.size) {
+                if (kept[index].origin == SegmentOrigin.TRANSCRIPT) keep += index
+            }
+            kept.filterIndexed { index, _ -> index in keep }
         }
-        turnUser?.let(keep::add)
-        opener?.let(keep::add)
-        (newestRunStart..lastTool).forEach(keep::add)
-        // Everything the assistant said after its last tool round is the turn's closing answer, kept in flow order.
-        for (index in (lastTool + 1) until kept.size) {
-            if (kept[index].origin == SegmentOrigin.TRANSCRIPT) keep += index
+        val truncatedIndexes = mutableSetOf<Int>()
+        val shortened = survivors.mapIndexed { index, segment ->
+            if (segment.origin !in HARD_DYNAMIC_ORIGINS) return@mapIndexed segment
+            val text = truncateDynamicText(segment.text) ?: return@mapIndexed segment
+            truncatedIndexes += index
+            segment.copy(text = text)
         }
-        return kept.filterIndexed { index, _ -> index in keep }
+        return HardTruncation(shortened, truncatedIndexes)
+    }
+
+    /** The shortened HARD survivors plus the indexes (into [flow]) of the dynamic segments that were shortened. */
+    private data class HardTruncation(val flow: List<Segment>, val truncatedIndexes: Set<Int>)
+
+    /**
+     * The head+tail form of one dynamic-tail segment, or `null` when the segment is already short enough to keep whole.
+     *
+     * The cap pair is a policy starting point, not a model constant. The marker is fixed text, never the segment's
+     * content, so the kept request says exactly where the middle went.
+     */
+    private fun truncateDynamicText(text: String): String? {
+        val head = text.take(hardDynamicHeadChars)
+        val tail = text.takeLast(hardDynamicTailChars)
+        if (text.length <= head.length + tail.length + HARD_TRUNCATED_MARKER.length) return null
+        return head + HARD_TRUNCATED_MARKER + tail
     }
 
     // ── shared helpers ───────────────────────────────────────────────────────────────────────────
@@ -607,6 +696,34 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
 
         /** A screen header keeps its visible refs, bounded so the header cannot become the new cost. */
         const val MAX_ELIDED_REFS: Int = 24
+
+        /**
+         * Task 12: the exact marker between a HARD-kept dynamic segment's head and tail. It is fixed text — never a
+         * character count — so the kept request states that a middle was removed without pricing it.
+         */
+        const val HARD_TRUNCATED_MARKER: String = "\n...[truncated]...\n"
+
+        /**
+         * Task 12: request-scoped context keeps its origin when the HARD cut shortens it. `RUNTIME_STATE` is here as
+         * well because it is request metadata, not a turn, and it uses the same cap as the rest of the tail.
+         */
+        private val HARD_DYNAMIC_ORIGINS = setOf(
+            SegmentOrigin.PERCEPTION,
+            SegmentOrigin.MEMORY_EVIDENCE,
+            SegmentOrigin.SKILL_BODY,
+            SegmentOrigin.RUNTIME_STATE,
+        )
+
+        /**
+         * Task 12: the fixed order a still-over-budget HARD frame gives whole dynamic origins up in. It is a declared
+         * order, not flow order, and each origin is removed one segment at a time (oldest/first first). `USER_INPUT`,
+         * `RUNTIME_STATE`, `RETRY` and the newest turn are deliberately absent: the cleanup may never pick them.
+         */
+        private val HARD_CLEANUP_ORDER = listOf(
+            SegmentOrigin.SKILL_BODY,
+            SegmentOrigin.MEMORY_EVIDENCE,
+            SegmentOrigin.PERCEPTION,
+        )
 
         private val REF_PATTERN = Regex("#n\\d+")
     }

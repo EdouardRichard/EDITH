@@ -2654,10 +2654,16 @@ class SmartAssistantPlugin(
         // A turn with no manager has no transcript to write: the counts below belong to a turn that was actually
         // recorded, so the early return comes first rather than logging a trim for a route this session never owns.
         val contexts = activeContextForTurn ?: return
-        // The two counts the frame path is allowed to log (Task 4's `lastTrim`): how many whole turns cut ① dropped
-        // and whether cut ③ is still owed. Nothing else from the report is printed, and the report has no text at all.
+        // The counts (and, since Task 12, the origin names) the frame path is allowed to log: how many whole turns
+        // cut ① dropped, whether cut ③ is still owed, which request-scoped segments HARD shortened, and which whole
+        // origins it gave up. Origin names only — never a segment's text; `-` means "none".
         trim?.let {
-            P3Log.line("P3_CONTEXT trim route=$route droppedTurns=${it.droppedTurns} compressionOwed=${it.compressionOwed}")
+            val truncated = it.truncatedOrigins.joinToString(",") { origin -> origin.name }.ifEmpty { "-" }
+            val dropped = it.droppedOrigins.joinToString(",") { origin -> origin.name }.ifEmpty { "-" }
+            P3Log.line(
+                "P3_CONTEXT trim route=$route droppedTurns=${it.droppedTurns} compressionOwed=${it.compressionOwed} " +
+                    "truncated=$truncated dropped=$dropped",
+            )
         }
         // §4.2/§6.2: a turn that reached a terminal state **always says something** ([submitOutcome]), so the
         // transcript records the same words the wearer got rather than only the user half. Recording the user half

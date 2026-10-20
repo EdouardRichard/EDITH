@@ -28,7 +28,7 @@ import kotlin.test.assertTrue
  * separately: no accounting at all omits the line, an unreported counter is `-` (never a fabricated zero), and a
  * reported zero is `0`. The sizes are those of the frame **actually sent**: the system text length and the sum of the
  * dynamic-tail text lengths ([RequestLayout.dynamicTail]) of the kept frame, so an overflow recovery's HARD cut cannot
- * report a tail it dropped; the legacy no-frame path reports its instructions length and 0.
+ * report the untrimmed tail it shortened (Task 12); the legacy no-frame path reports its instructions length and 0.
  */
 class GatewayCacheMetricTest {
 
@@ -235,9 +235,9 @@ class GatewayCacheMetricTest {
 
     @Test
     fun `a hard recovery reports the kept frame's sizes, not the untrimmed assembly`() {
-        // R70 recovery ② (HARD) can drop request-scoped tail segments (here the memory/perception tail). `P3_CACHE`
-        // describes the model request that was actually sent, so the sizes come from the kept frame; measuring the
-        // assembled `request.frame` would claim a tail that never went on the wire.
+        // R70 recovery ② (HARD) shortens request-scoped tail segments (Task 12: head + marker + tail, never a silent
+        // drop). `P3_CACHE` describes the model request that was actually sent, so the sizes come from the kept frame;
+        // measuring the assembled `request.frame` would claim the full tail that never went on the wire.
         val lines = mutableListOf<String>()
         var calls = 0
         val client = FakeModelClient { request, listener ->
@@ -247,8 +247,8 @@ class GatewayCacheMetricTest {
         }
         val frame = frame(
             system = "sys",
-            Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "memory-evidence"),
-            Segment(SegmentOrigin.PERCEPTION, false, "perception-block"),
+            Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "memory-evidence".repeat(100)),
+            Segment(SegmentOrigin.PERCEPTION, false, "perception-block".repeat(100)),
             Segment(SegmentOrigin.USER_INPUT, true, "now"),
         )
 
@@ -256,9 +256,9 @@ class GatewayCacheMetricTest {
 
         assertEquals(2, reply.overflowRecoveries)
         assertEquals(
-            listOf("P3_CACHE cached=- miss=- inputTokens=10 outputTokens=5 systemChars=3 dynamicChars=0"),
+            listOf("P3_CACHE cached=- miss=- inputTokens=10 outputTokens=5 systemChars=3 dynamicChars=1038"),
             lines,
-            "the HARD cut dropped the whole dynamic tail, so the sent request reports zero dynamic chars",
+            "the sent request reports the shortened tail (2 × 519 chars), not the assembled 3,100-char one",
         )
     }
 
