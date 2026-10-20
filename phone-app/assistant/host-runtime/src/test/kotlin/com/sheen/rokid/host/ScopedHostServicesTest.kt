@@ -86,6 +86,48 @@ class ScopedHostServicesTest {
         assertEquals("M2012K11AC", services.deviceState().profile().model)
     }
 
+    // edith-0.3 Phase 2 Task 1: perception is additive. The host forwards the provider untouched, exactly as it does
+    // the other stateless read ports, and granting it must not disturb the device-state channel beside it.
+    @Test fun `a granted perception channel forwards the provider and device state still forwards`() {
+        val perception = object : PerceptionProvider {
+            override fun beginTurn() = fakeSnapshot()
+            override fun snapshot(include: Set<PerceptionSource>, filter: PerceptionFilter, limit: Int?) = fakeSnapshot()
+            override fun afterAction() = fakeSnapshot()
+            override fun screenshot(): PerceptionScreenshotResult = PerceptionScreenshotResult.Unavailable("test double")
+            override fun endTurn() = Unit
+        }
+        val device = object : DeviceStateProvider {
+            override fun profile() = DeviceProfile(
+                manufacturer = "Xiaomi", model = "M2012K11AC", deviceName = null, androidRelease = "13",
+                apiLevel = 33, screenWidthPx = 1080, screenHeightPx = 2400, densityDpi = 440,
+                glassesModel = null, glassesFirmware = null, glassesWidthPx = null, glassesHeightPx = null,
+                appVersion = "0.3", locale = "zh-CN", timeZone = "Asia/Shanghai", wakeWords = listOf("EDITH"),
+                capabilities = setOf("a11y"),
+            )
+            override fun state() = DeviceState(
+                capturedAtEpochMillis = 0, timeZone = "Asia/Shanghai", localDate = "2026-10-20",
+                weekday = "星期一", localTime = "18:23",
+            )
+        }
+        val services = ScopedHostServices(
+            scope(), setOf(Capability.Perception, Capability.DeviceState),
+            mapOf(Capability.Perception to perception, Capability.DeviceState to device), FakeTaskScope(),
+        )
+
+        assertSame(perception, services.perception())
+        assertSame(device, services.deviceState())
+    }
+
+    private fun fakeSnapshot() = PerceptionSnapshot(
+        snapshotId = "snap",
+        capturedAtEpochMillis = 0,
+        coverage = PerceptionCoverage(
+            screen = "unavailable", notifications = "unavailable", media = "unavailable",
+            calendar = "unavailable", acoustic = "unavailable", clipboard = "unavailable",
+            vision = "disabled", glasses = "unavailable", device = "available",
+        ),
+    )
+
     @Test fun `capability injection rejects missing and wrong provider types`() {
         assertFailsWith<ContractError.CapabilityMissing> {
             ScopedHostServices(scope(), setOf(Capability.Model), emptyMap(), FakeTaskScope())

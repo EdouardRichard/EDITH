@@ -62,3 +62,12 @@ fun HostServices.storageAccess(): StorageAccess = require(Capability.StorageAcce
  */
 fun HostServices.conversationDisplay(): ConversationDisplay =
     require(Capability.ConversationDisplay) as ConversationDisplay
+
+/**
+ * The per-turn perception port (edith-0.3 Phase 2, spec §3.2, §7.1–§7.4).
+ *
+ * **Optional by design**: a host with no perception layer never grants the capability, so a caller asks for it the
+ * way the plugin asks for a confirmation channel — `runCatching { services.perception() }.getOrNull()` — and omits
+ * the perception block instead of failing the turn. The host owns the turn boundary; see [PerceptionProvider].
+ */
+fun HostServices.perception(): PerceptionProvider = require(Capability.Perception) as PerceptionProvider

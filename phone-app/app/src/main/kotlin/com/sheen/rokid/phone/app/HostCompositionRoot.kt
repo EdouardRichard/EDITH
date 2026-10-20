@@ -458,6 +458,9 @@ class HostCompositionRoot internal constructor(
         Capability.ConversationDisplay -> "DISPLAY_MISSING"
         // edith-0.3 Phase 1: the device profile/state channel; the Android provider is wired by Task 2.
         Capability.DeviceState -> "DEVICE_STATE_PROVIDER_MISSING"
+        // edith-0.3 Phase 2: the perception port. Nothing is wired yet, so the panel reports the missing provider
+        // instead of hiding the row; the plugin still treats absence as "no perception block", never a failed turn.
+        Capability.Perception -> "PERCEPTION_PROVIDER_MISSING"
     }
     private val mutableState =
         MutableStateFlow(

@@ -50,6 +50,11 @@ class ScopedHostServices(
                 // model services — a stateless read-only port with no subscription to fence and no cancellation
                 // surface. The grant itself is still checked by `require`, so an ungranted scope cannot reach it.
                 Capability.DeviceState -> provider as? com.sheen.rokid.plugin.DeviceStateProvider ?: wrong(capability)
+                // edith-0.3 Phase 2 Task 1: the perception port. Unwrapped for the same reason as the device-state
+                // port above — the host implementation owns the turn boundary and there is no subscription to fence.
+                // The grant itself is still checked by `require`, so an ungranted scope cannot reach it; granting
+                // this capability changes nothing for a caller that never asks for it.
+                Capability.Perception -> provider as? PerceptionProvider ?: wrong(capability)
                 // edith-0.2 Phase C: the conversation view. Unwrapped for the same reason as the two above — four
                 // statements with no subscription and nothing to cancel. The scope's own grant check still applies, so
                 // a plugin that was not granted this capability cannot reach it.

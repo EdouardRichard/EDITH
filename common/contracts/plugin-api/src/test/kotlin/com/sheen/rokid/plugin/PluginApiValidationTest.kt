@@ -26,12 +26,13 @@ class PluginApiValidationTest {
         // The guard is that a new capability may only be **appended**: reordering or inserting would renumber every
         // existing entry for a plugin that compared ordinals. P3.3 (spec §17.6) appended `Confirmation`, edith-0.2
         // Phase A appended `SystemOne` and `Embedding`, edith-0.2 Phase B appended `StorageAccess`, edith-0.2
-        // Phase C appended `ConversationDisplay`, and edith-0.3 Phase 1 appended `DeviceState`.
+        // Phase C appended `ConversationDisplay`, edith-0.3 Phase 1 appended `DeviceState`, and edith-0.3 Phase 2
+        // appended `Perception`.
         assertEquals(
             listOf(
                 "Audio", "Asr", "Speaker", "Model", "Storage", "TextOutput", "SpeechOutput",
                 "Actions", "Context", "WakeWord", "Confirmation", "SystemOne", "Embedding", "StorageAccess",
-                "ConversationDisplay", "DeviceState",
+                "ConversationDisplay", "DeviceState", "Perception",
             ),
             Capability.entries.map { it.name },
         )
