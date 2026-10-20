@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.perception
+package com.sheen.rokid.output
 
 import com.sheen.rokid.plugin.PerceptionElement
 import com.sheen.rokid.plugin.PerceptionSnapshot
@@ -27,7 +27,7 @@ import com.sheen.rokid.plugin.PerceptionSnapshot
  * is flattened onto its element's line (control characters become spaces, quotes/backslashes are escaped); a
  * multi-line platform string can never fabricate extra element lines.
  */
-internal object CompactSnapshotRenderer {
+object CompactSnapshotRenderer {
 
     /** The one marker a bounded text ends with; downstream renderers reuse the same word. */
     const val TRUNCATION_MARKER = "… truncated"

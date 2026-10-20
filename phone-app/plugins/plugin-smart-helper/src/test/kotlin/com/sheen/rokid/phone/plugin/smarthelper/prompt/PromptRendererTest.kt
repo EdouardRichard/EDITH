@@ -85,6 +85,31 @@ class PromptRendererTest {
     }
 
     @Test
+    fun `render accepts an explicit code point cap`() {
+        val out = PromptRenderer.render(
+            "{{x}}",
+            mapOf("x" to "#".repeat(1_200)),
+            setOf("x"),
+            maxValueCodePoints = 1_000,
+        )
+
+        assertEquals(1_000, out.length)
+    }
+
+    @Test
+    fun `the cap override never splits a surrogate pair`() {
+        val out = PromptRenderer.render(
+            "{{x}}",
+            mapOf("x" to "\uD83D\uDE00".repeat(600)),
+            setOf("x"),
+            maxValueCodePoints = 501,
+        )
+
+        assertEquals(501, out.codePointCount(0, out.length), "an odd cap must still end on a whole code point")
+        assertEquals(1_002, out.length, "the cap counts code points, not UTF-16 units")
+    }
+
+    @Test
     fun `plan hash is stable for identical sections and changes with text`() {
         val first = listOf(PromptSection("a", PromptKind.STATIC, "A"))
         val second = listOf(PromptSection("a", PromptKind.STATIC, "A"))

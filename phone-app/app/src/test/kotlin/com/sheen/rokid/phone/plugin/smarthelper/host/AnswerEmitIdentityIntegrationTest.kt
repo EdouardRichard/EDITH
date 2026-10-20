@@ -341,6 +341,9 @@ class AnswerEmitIdentityIntegrationTest {
                     // composition answers it with its Android provider, so a composition-shaped rig must answer it too
                     // or the host refuses activation.
                     Capability.DeviceState to SyntheticDeviceState(),
+                    // 0.3 Phase 2 Task 9: the per-turn perception port the request tail renders from. The tests here
+                    // are about emission identity, so it answers an all-unavailable snapshot.
+                    Capability.Perception to PassiveLoopWiringTest.InertPerception(),
                     Capability.ConversationDisplay to display,
                 ),
                 storageFor = { StubStorage() },

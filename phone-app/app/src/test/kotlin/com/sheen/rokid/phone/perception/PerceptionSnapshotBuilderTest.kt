@@ -8,6 +8,8 @@ import com.sheen.rokid.device.Observation
 import com.sheen.rokid.device.ObservationWindow
 import com.sheen.rokid.device.Ref
 import com.sheen.rokid.device.RefRegistry
+import com.sheen.rokid.output.CompactSnapshotRenderer
+import com.sheen.rokid.output.PerceptionCoverageRenderer
 import com.sheen.rokid.phone.context.CalendarSnapshot
 import com.sheen.rokid.phone.context.ClipboardRead
 import com.sheen.rokid.phone.context.GlassesPerception

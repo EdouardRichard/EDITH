@@ -43,6 +43,13 @@ import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.OutputSink
 import com.sheen.rokid.plugin.OutputSubmission
+import com.sheen.rokid.plugin.PerceptionCoverage
+import com.sheen.rokid.plugin.PerceptionElement
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.plugin.SecretHandle
 import com.sheen.rokid.plugin.StorageAccess
@@ -815,4 +822,95 @@ internal class SmartFakeDeviceState(
     }
 
     override fun state(): DeviceState = state
+}
+
+/** An all-`ok` coverage fixture; a test that is about an unavailable source overrides the one token it needs. */
+internal fun smartPerceptionCoverage(
+    screen: String = "ok",
+    notifications: String = "ok",
+    media: String = "ok",
+    calendar: String = "ok",
+    acoustic: String = "ok",
+    clipboard: String = "ok",
+    vision: String = "ok",
+    glasses: String = "ok",
+    device: String = "ok",
+) = PerceptionCoverage(
+    screen = screen,
+    notifications = notifications,
+    media = media,
+    calendar = calendar,
+    acoustic = acoustic,
+    clipboard = clipboard,
+    vision = vision,
+    glasses = glasses,
+    device = device,
+)
+
+/** One synthetic turn snapshot: one compact screen element and nothing sensitive. */
+internal fun smartPerceptionSnapshot(
+    snapshotId: String = "snap-0042",
+    elements: List<PerceptionElement> = listOf(
+        PerceptionElement(
+            ref = "#n12",
+            role = "button",
+            text = "搜索",
+            centerX = 540,
+            centerY = 320,
+            clickable = true,
+        ),
+    ),
+    coverage: PerceptionCoverage = smartPerceptionCoverage(),
+) = PerceptionSnapshot(
+    snapshotId = snapshotId,
+    capturedAtEpochMillis = 1_000_000L,
+    foregroundPackage = "com.miui.player",
+    foregroundActivity = ".PlayerActivity",
+    elements = elements,
+    coverage = coverage,
+)
+
+/**
+ * edith-0.3 Phase 2 Task 9: the host's perception port, answerable from a fixture and recording its turn boundary.
+ *
+ * The counters are how a test proves the plugin closed the turn on **every** exit path, including the early-return
+ * and failure paths; [requestedSources] proves the first request took the full snapshot and a later one asked only
+ * for the ambient device/media subset.
+ */
+internal class SmartFakePerception(
+    private val initial: PerceptionSnapshot = smartPerceptionSnapshot(),
+    private val ambient: PerceptionSnapshot = initial,
+    private val initialFailure: RuntimeException? = null,
+    private val ambientFailure: RuntimeException? = null,
+) : PerceptionProvider {
+    var beginTurns: Int = 0
+        private set
+    var endTurns: Int = 0
+        private set
+    val requestedSources = mutableListOf<Set<PerceptionSource>>()
+
+    override fun beginTurn(): PerceptionSnapshot {
+        beginTurns += 1
+        initialFailure?.let { throw it }
+        return initial
+    }
+
+    override fun snapshot(
+        include: Set<PerceptionSource>,
+        filter: PerceptionFilter,
+        limit: Int?,
+    ): PerceptionSnapshot {
+        requestedSources += include
+        ambientFailure?.let { throw it }
+        return ambient
+    }
+
+    override fun afterAction(): PerceptionSnapshot = ambient
+
+    override fun screenshot(): PerceptionScreenshotResult =
+        PerceptionScreenshotResult.Unavailable("test")
+
+    override fun endTurn() {
+        endTurns += 1
+    }
 }

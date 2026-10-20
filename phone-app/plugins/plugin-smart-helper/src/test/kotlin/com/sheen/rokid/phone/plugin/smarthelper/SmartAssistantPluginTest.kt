@@ -33,6 +33,7 @@ import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.OutputSubmission
+import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.PluginConfiguration
 import com.sheen.rokid.plugin.PluginLifecycle
 import com.sheen.rokid.plugin.RiskLevel
@@ -83,6 +84,10 @@ class SmartAssistantPluginTest {
                 // declaring it and the optional access degraded to "no port" in silence. This list is the gate that
                 // now makes that omission fail here instead of on the wearer's face.
                 Capability.ConversationDisplay,
+                // 0.3 Phase 2 Task 9: the host's per-turn perception port. The block is optional (a host without the
+                // provider still activates), but declaring the capability is what makes `services.perception()`
+                // reachable at all.
+                Capability.Perception,
                 // 0.3 Phase 1 Task 12: the static device profile that the session pins into its prompt plan. The host
                 // only hands over a capability the descriptor declares, so declaring it is what makes the prompt's
                 // device section reachable at all.
@@ -95,6 +100,122 @@ class SmartAssistantPluginTest {
         assertFalse(rig.plugin.active)
         rig.plugin.deactivate(DeactivationReason.Stopped)
         assertFalse(rig.plugin.active)
+    }
+
+    @Test fun `a perception provider opens and closes the turn and its block rides before the utterance`() {
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertEquals(1, perception.beginTurns, "the turn must open the provider exactly once")
+            assertEquals(1, perception.endTurns, "the turn must close the provider on its success path")
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue(input.startsWith("【本轮运行上下文】"), "the perception block is the request tail head: $input")
+            assertTrue(input.contains("#n12 button \"搜索\""), input)
+            assertTrue(input.endsWith("现在几点了"), "the wearer's utterance stays last: $input")
+            val telemetry = lines.filter { it.startsWith("P3_PERCEPTION ") }
+            assertEquals(1, telemetry.size, "one count-only line per rendered block: $lines")
+            assertTrue("elements=1" in telemetry.single(), telemetry.single())
+            assertTrue("images=0" in telemetry.single(), telemetry.single())
+            assertFalse("搜索" in telemetry.single(), "the telemetry must not carry screen text: ${telemetry.single()}")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `the first request carries the full snapshot and a continuation only the ambient sources`() {
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            var turn = 0
+            rig.model.onRequest = { request, listener ->
+                turn += 1
+                if (turn == 1) {
+                    listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.INCOMPLETE, null, null))
+                } else {
+                    streamText(request, listener, "好。")
+                }
+            }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertEquals(2, rig.model.requests.size, "an empty turn is retried, so there are two model requests")
+            assertEquals(
+                listOf(setOf(PerceptionSource.DEVICE, PerceptionSource.MEDIA)),
+                perception.requestedSources,
+                "request 1 uses the beginTurn snapshot; the retry asks only for ambient device/media",
+            )
+            val first = rig.model.requests[0].input.filterIsInstance<InputPart.Text>().single().text
+            val second = rig.model.requests[1].input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue("#n12" in first, "the opening request carries the full compact screen: $first")
+            assertFalse("#n12" in second, "a continuation must not repeat the whole snapshot: $second")
+            assertTrue("not_requested" in second, "the suppressed sources say so honestly: $second")
+            assertEquals(2, lines.count { it.startsWith("P3_PERCEPTION ") }, "one line per rendered block: $lines")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `an early-refused turn still closes the perception turn`() {
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(
+                overrides = mapOf(
+                    Capability.Perception to perception,
+                    // A hard dependency that is missing refuses the turn **after** the turn has opened, which is the
+                    // early-return path the `finally` exists for.
+                    Capability.SystemOne to SmartFakeSystemOne(available = false),
+                ),
+            )
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertTrue(lines.any { it.startsWith("P3_DEPENDENCY reason=") }, "the dependency refuses the turn: $lines")
+            assertEquals(1, perception.beginTurns)
+            assertEquals(1, perception.endTurns, "an early return must still close the perception turn")
+            assertTrue(rig.model.requests.isEmpty(), "a refused turn never reaches the transport")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `a host without a perception provider still activates and runs a turn`() {
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            // The descriptor declares Perception, but this host grants no provider: absence must be "no block".
+            rig.activate()
+            assertTrue(rig.plugin.active)
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertEquals(1, rig.model.requests.size)
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertFalse("【本轮运行上下文】" in input, "a missing provider injects nothing: $input")
+            assertTrue(input.endsWith("现在几点了"), input)
+            assertTrue(lines.none { it.startsWith("P3_PERCEPTION ") }, "no provider, no telemetry: $lines")
+        } finally {
+            P3Log.sink = previous
+        }
     }
 
     @Test fun `activate declares the configured wake words and builds nothing else`() {

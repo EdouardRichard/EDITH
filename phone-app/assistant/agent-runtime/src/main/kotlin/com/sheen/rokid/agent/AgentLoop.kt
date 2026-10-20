@@ -140,6 +140,17 @@ data class AgentRequest(
      * or a tool result; it lives only in the assembled request and is folded into the request input by the gateway.
      */
     val runtimeState: (() -> TurnRuntimeState?)? = null,
+    /**
+     * edith-0.3 Phase 2 Task 9: the host's perception block to fold into each request as one untrusted `PERCEPTION`
+     * segment immediately before `USER_INPUT`.
+     *
+     * `null` — the default — injects nothing. The provider is called once per model request and a result identical to
+     * the previous request's is skipped, so a steady screen does not pay the same bytes on every tool round. The block
+     * never enters the transcript, a `ConversationStore` or a tool result; it lives only in the assembled request and
+     * is folded into the request input by the gateway. A provider that returns `null` or blank, or throws, contributes
+     * nothing — never a fabricated block.
+     */
+    val perception: (() -> String?)? = null,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -422,6 +433,9 @@ class AgentLoop(
     /** R59: the hash of the runtime state last injected, so an unchanged state is sent only once. */
     private var lastRuntimeStateHash: String? = null
 
+    /** Task 9: the hash of the perception block last injected, so an unchanged block is sent only once per run. */
+    private var lastPerceptionHash: String? = null
+
     /** R58: the last text that was nudged, so an identical plan cannot be nudged again in place. */
     private var lastNudgedText: String? = null
     private var nudges = 0
@@ -504,6 +518,7 @@ class AgentLoop(
         spentObservations = 0
         planNudgeCap = 0
         lastRuntimeStateHash = null
+        lastPerceptionHash = null
         lastNudgedText = null
         nudges = 0
         lastWriteUnverified = false
@@ -573,7 +588,7 @@ class AgentLoop(
                 request.frameFor != null -> request.frameFor(frameTranscript(history, utteranceIndex))
                 openingTurn -> request.frame
                 else -> null
-            }?.let { withRuntimeState(it, request, spentSteps) }
+            }?.let { withRuntimeState(it, request, spentSteps) }?.let { withPerception(it, request) }
             openingTurn = false
             // R78: count this request's images before it is sent. Distinct artifact ids, so a picture carried by two
             // requests of the same run is one image, not two.
@@ -1109,6 +1124,30 @@ class AgentLoop(
         return frame.copy(
             conversationFlow = flow.take(inputIndex) +
                 Segment(SegmentOrigin.RUNTIME_STATE, trusted = false, text = composed.text) +
+                flow.drop(inputIndex),
+        )
+    }
+
+    /**
+     * Folds the current [AgentRequest.perception] block into [frame] as one untrusted `PERCEPTION` segment immediately
+     * before the frame's `USER_INPUT`, unless it is byte-identical to the block the previous request carried.
+     *
+     * The provider is invoked once per model request. A `null`, blank or throwing provider contributes nothing, and an
+     * unchanged block is skipped: both keep a steady screen from spending the same bytes on every tool round. The
+     * segment is request metadata, never appended to `history`, so it cannot reach [AgentRun.transcript], a
+     * `ConversationStore` or a tool result.
+     */
+    private fun withPerception(frame: RequestFrame, request: AgentRequest): RequestFrame {
+        val block = runCatching { request.perception?.invoke() }.getOrNull()?.takeIf { it.isNotBlank() } ?: return frame
+        val hash = sha256Hex(block)
+        if (hash == lastPerceptionHash) return frame
+        lastPerceptionHash = hash
+        val flow = frame.conversationFlow
+        val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
+        if (inputIndex < 0) return frame
+        return frame.copy(
+            conversationFlow = flow.take(inputIndex) +
+                Segment(SegmentOrigin.PERCEPTION, trusted = false, text = block) +
                 flow.drop(inputIndex),
         )
     }

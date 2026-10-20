@@ -1,4 +1,4 @@
-package com.sheen.rokid.phone.perception
+package com.sheen.rokid.output
 
 import com.sheen.rokid.plugin.PerceptionCoverage
 
@@ -13,7 +13,7 @@ import com.sheen.rokid.plugin.PerceptionCoverage
  *
  * This is pure and content-free: a coverage line carries no screen text, title, clipboard value or bounds.
  */
-internal object PerceptionCoverageRenderer {
+object PerceptionCoverageRenderer {
 
     /** The exact, stable token line for [coverage]. */
     fun render(coverage: PerceptionCoverage): String = buildString {

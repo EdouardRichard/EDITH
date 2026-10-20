@@ -71,6 +71,12 @@ import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.PerceptionCoverage
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.PluginConfiguration
 import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
@@ -225,6 +231,40 @@ class PassiveLoopWiringTest {
             weekday = "星期一",
             localTime = "00:00",
         )
+    }
+
+    /**
+     * edith-0.3 Phase 2 Task 9: the smart plugin declares the host's per-turn perception port, so a composition-shaped
+     * rig must answer `Capability.Perception` or the host refuses activation with `CAPABILITY_MISSING`. This provider
+     * returns an all-unavailable snapshot: these tests are about wiring, so it contributes no screen text, no
+     * notification body and no device fact.
+     */
+    internal class InertPerception : PerceptionProvider {
+        private val snapshot = PerceptionSnapshot(
+            snapshotId = "snap-test",
+            capturedAtEpochMillis = 0L,
+            coverage = PerceptionCoverage(
+                screen = "unavailable(no_accessibility)",
+                notifications = "unavailable(no_access)",
+                media = "unavailable(no_session)",
+                calendar = "empty",
+                acoustic = "unavailable(no_event)",
+                clipboard = "unavailable(background_restricted)",
+                vision = "disabled",
+                glasses = "unavailable(no_state)",
+                device = "partial",
+            ),
+        )
+
+        override fun beginTurn(): PerceptionSnapshot = snapshot
+        override fun snapshot(
+            include: Set<PerceptionSource>,
+            filter: PerceptionFilter,
+            limit: Int?,
+        ): PerceptionSnapshot = snapshot
+        override fun afterAction(): PerceptionSnapshot = snapshot
+        override fun screenshot(): PerceptionScreenshotResult = PerceptionScreenshotResult.Unavailable("test")
+        override fun endTurn() = Unit
     }
 
     /**
@@ -455,6 +495,7 @@ private class NoStorageAccess : StorageAccess {
                     Capability.SystemOne to ReadySystemOne(),
                     Capability.Embedding to ReadyEmbedding(),
                     Capability.DeviceState to SyntheticDeviceState(),
+                    Capability.Perception to InertPerception(),
                     Capability.ConversationDisplay to NoConversationDisplay(),
                 ),
                 storageFor = { StubStorage() })
@@ -858,6 +899,7 @@ private class NoStorageAccess : StorageAccess {
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
                 Capability.DeviceState to SyntheticDeviceState(),
+                Capability.Perception to InertPerception(),
                 Capability.ConversationDisplay to NoConversationDisplay(),
             ),
             storageFor = { StubStorage() })
@@ -928,7 +970,9 @@ private class NoStorageAccess : StorageAccess {
                 // it and this rig answers it - the two halves of the contract this test exists to keep equal.
                 Capability.ConversationDisplay,
                 // 0.3 Phase 1 Task 12: the static device profile the session pins into its prompt plan.
-                Capability.DeviceState), advertised)
+                Capability.DeviceState,
+                // 0.3 Phase 2 Task 9: the per-turn perception port the request tail renders from.
+                Capability.Perception), advertised)
             val services = rig.environment.services(ResourceScope("smart-assistant", session, Generation(1)), advertised)
             advertised.forEach { capability ->
                 assertNull("$capability is advertised, so it must be answerable",
@@ -1095,6 +1139,7 @@ private class NoStorageAccess : StorageAccess {
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
                 Capability.DeviceState to SyntheticDeviceState(),
+                Capability.Perception to InertPerception(),
                 Capability.ConversationDisplay to NoConversationDisplay(),
             ),
             storageFor = { StubStorage() })
@@ -1282,6 +1327,7 @@ private class NoStorageAccess : StorageAccess {
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
                 Capability.DeviceState to SyntheticDeviceState(),
+                Capability.Perception to InertPerception(),
                 Capability.ConversationDisplay to display,
             ),
             storageFor = { StubStorage() })
@@ -1385,6 +1431,7 @@ private class NoStorageAccess : StorageAccess {
                     Capability.SystemOne to ReadySystemOne(),
                     Capability.Embedding to ReadyEmbedding(),
                     Capability.DeviceState to SyntheticDeviceState(),
+                Capability.Perception to InertPerception(),
                 Capability.ConversationDisplay to display,
                 ),
                 storageFor = { StubStorage() })

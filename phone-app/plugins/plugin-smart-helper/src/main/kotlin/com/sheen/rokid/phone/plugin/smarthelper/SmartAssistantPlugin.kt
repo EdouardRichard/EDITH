@@ -37,6 +37,7 @@ import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.GatewayTurn
 import com.sheen.rokid.agent.MemoryRetrieval
 import com.sheen.rokid.agent.ModelClientGateway
+import com.sheen.rokid.agent.PerceptionPolicy
 import com.sheen.rokid.agent.ProgressGuard
 import com.sheen.rokid.agent.RequestFrame
 import com.sheen.rokid.agent.Segment
@@ -93,6 +94,10 @@ import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.OutputSink
 import com.sheen.rokid.plugin.OutputSubmission
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.PluginConfiguration
 import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
@@ -105,6 +110,7 @@ import com.sheen.rokid.plugin.confirmation
 import com.sheen.rokid.plugin.context
 import com.sheen.rokid.plugin.embedding
 import com.sheen.rokid.plugin.model
+import com.sheen.rokid.plugin.perception
 import com.sheen.rokid.plugin.storage
 import com.sheen.rokid.plugin.storageAccess
 import com.sheen.rokid.plugin.systemOne
@@ -116,6 +122,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.context.ModelSummarizer
 import com.sheen.rokid.phone.plugin.smarthelper.context.PromptAssembly
 import com.sheen.rokid.phone.plugin.smarthelper.context.estimatedLength
+import com.sheen.rokid.phone.plugin.smarthelper.harness.SmartPerceptionRenderer
 import com.sheen.rokid.phone.plugin.smarthelper.library.LibraryGovernor
 import com.sheen.rokid.phone.plugin.smarthelper.memory.LegacyRawMemoryEvidenceRenderer
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryExtraction
@@ -141,6 +148,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.turn.ConversationCycle
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
@@ -487,6 +495,12 @@ class SmartAssistantPlugin(
      * the pre-fix test rigs behaving as before.
      */
     private val speechAvailable: () -> Boolean = { true },
+    /**
+     * edith-0.3 Phase 2 Task 9: the bounds the perception block renders under (element cap, notification cap, title
+     * cap). The production default is the host's Phase 2 policy; the constructor seam exists so a test can pin a cap
+     * without changing the provider's snapshot.
+     */
+    private val perceptionPolicy: PerceptionPolicy = PerceptionPolicy(),
 ) : PluginLifecycle, ConfiguredPlugin {
 
     init {
@@ -533,6 +547,10 @@ class SmartAssistantPlugin(
             // happened on the device: the spoken answer was fine while the phone's 助手 page stayed empty and not one
             // `SAID` or `BUSY` reached the glasses.
             Capability.ConversationDisplay,
+            // 0.3 Phase 2 Task 9: the host's per-turn perception port. Declaring it is what makes
+            // `services.perception()` reachable; the port is optional, so a host that provides none leaves the turn
+            // without a perception block instead of failing it.
+            Capability.Perception,
             // 0.3 Phase 1 Task 12 (spec §4.2.1): the host's static device profile, rendered once into the session's
             // prompt plan. Declaring it is what makes `services.deviceState()` reachable inside `activate`; a host
             // without the provider still activates (the device section is omitted), never a default profile.
@@ -703,6 +721,20 @@ class SmartAssistantPlugin(
      * [activeContextForTurn]: [activate] adopts the injected map **and empties it**, [deactivate] empties and drops it.
      */
     @Volatile private var activeStores: Map<ContextRoute, ConversationStore>? = null
+
+    /**
+     * edith-0.3 Phase 2 Task 9: the host's perception port, resolved once per activation. `null` — a host without the
+     * capability — means "no perception block", never a failed activation or turn; [deactivate] drops it with the rest
+     * of the session state so a closed turn can never be reopened under a later session.
+     */
+    @Volatile private var activePerception: PerceptionProvider? = null
+
+    /**
+     * Task 9: the per-request device-state source (date/time/battery/foreground/media), same lifetime as
+     * [activePerception]. Read per request, guarded: the provider can be absent or throw, and the renderer then leaves
+     * the affected slots empty instead of inventing a clock or a battery value.
+     */
+    @Volatile private var activeDeviceStateProvider: DeviceStateProvider? = null
 
     /**
      * P3.4: what a finished turn is allowed to write. Same lifetime and the same namespace as [memoryRetrieval]; `null`
@@ -1163,6 +1195,10 @@ class SmartAssistantPlugin(
         // here unless a test injected one; a host that cannot answer yields `null` and the catalog omits the device
         // section. No default model/locale/version is invented to fill the gap.
         val deviceProvider = deviceState ?: runCatching { context.services.deviceState() }.getOrNull()
+        // 0.3 Phase 2 Task 9: the per-turn perception port and the per-request device-state source. Both optional: a
+        // host that grants neither still activates, and the turn then simply carries no perception block.
+        activeDeviceStateProvider = deviceProvider
+        activePerception = runCatching { context.services.perception() }.getOrNull()
         val sessionDeviceProfile = runCatching { deviceProvider?.profile() }.getOrNull()
         // §4.1/§4.4: the session pins its plans. Both routes are loaded **now** and never re-planned, so a catalog
         // change (or a different device read) cannot rewrite a live session or invalidate its prefix cache mid-stream.
@@ -1272,6 +1308,9 @@ class SmartAssistantPlugin(
             // behind would be the previous session's words under the new session's envelope.
             activeContextForTurn = null
             activeCompressor = null
+            // Task 9: the perception port and its device-state source belong to the session that resolved them.
+            activePerception = null
+            activeDeviceStateProvider = null
             // The pinned plans belong to the session that loaded them; a later activation loads its own (spec §4.1).
             activePromptPlans = null
             // The pinned catalog, its provenance and the session's policy are session state for the same reason: a
@@ -2160,6 +2199,33 @@ class SmartAssistantPlugin(
         // when a turn ends (`Stop`, a replaced turn, a session end); without the matching begin the next turn would
         // keep getting CANCELLED from the device kernel for the rest of the process.
         runCatching { current.services.actions().beginTurn() }
+        // edith-0.3 Phase 2 Task 9: the perception turn opens immediately after the action turn, and closes in the
+        // `finally` below so **every** exit — success, an early refusal, a detached turn, a thrown transport failure or
+        // a cancellation — pairs its `beginTurn()` with an `endTurn()`. The host's provider owns the refs and the open
+        // capture window; a turn left open would let stale refs survive into the next one.
+        val perception = activePerception
+        val initialSnapshot = perception?.let { provider -> runCatching { provider.beginTurn() }.getOrNull() }
+        val perceptionRequests = AtomicInteger(0)
+        try {
+            runTurnBody(owned, text, current, configured, perception, initialSnapshot, perceptionRequests)
+        } finally {
+            if (perception != null) runCatching { perception.endTurn() }
+        }
+    }
+
+    /**
+     * The blocking half of [runTurn], separated only so the perception turn's `try/finally` encloses all of it. Its
+     * early returns end this body; the caller's `finally` still closes the provider.
+     */
+    private fun runTurnBody(
+        owned: SmartTurn,
+        text: String,
+        current: PluginContext,
+        configured: Config,
+        perception: PerceptionProvider?,
+        initialSnapshot: PerceptionSnapshot?,
+        perceptionRequests: AtomicInteger,
+    ) {
         // B9 (spec §1.3 C2): a hard dependency that is missing refuses the turn *here*, before the loop is built and
         // before the listening window has anything to wait for. A refusal is a per-turn judgement, not a latch: the
         // models are resident and their state can change between turns, so a slow load that finishes later serves
@@ -2300,6 +2366,13 @@ class SmartAssistantPlugin(
                     // 0.25 Task 12 (R59): one short state line from the scoped executor, folded into the request by
                     // the loop. It is never written to the store: the loop keeps it out of the transcript.
                     runtimeState = { runtimeStateForTurn() },
+                    // 0.3 Phase 2 Task 9: the perception block for **this** request. The lambda is called once per
+                    // model request of the run; request 0 uses the snapshot `beginTurn()` already took (or a full
+                    // re-read when that failed), later requests ask only for the ambient device/media state. The
+                    // renderer never logs content; the one `P3_PERCEPTION` line is counts plus coverage tokens.
+                    perception = perception?.let { provider ->
+                        { perceptionBlockFor(provider, initialSnapshot, perceptionRequests) }
+                    },
                 ),
             )
         } catch (failure: Throwable) {
@@ -2373,6 +2446,39 @@ class SmartAssistantPlugin(
         // emitted while the run is still `Running`).
         settleAnswerAfterRun(fallbackExpected = ledger.calls == 0 && !ledger.suppressed)
         releaseParkedProactive()
+    }
+
+    /**
+     * edith-0.3 Phase 2 Task 9: one model request's perception block, built at the moment the loop is about to send it.
+     *
+     * Request 0 uses the snapshot `beginTurn()` already took (spec §7.5's "完整感知快照"), falling back to one explicit
+     * full read when that failed; every later request asks only for [AMBIENT_PERCEPTION_SOURCES], because a tool round
+     * must not repeat the whole snapshot. Both calls are guarded: a provider that throws contributes no block rather
+     * than failing the turn. The device state is read per call for the same reason — it carries the current clock,
+     * battery and foreground.
+     *
+     * Exactly one count-only `P3_PERCEPTION` line is emitted per rendered block; the block itself is never logged.
+     * Returns `null` when no snapshot could be read, which the loop treats as "no perception segment".
+     */
+    private fun perceptionBlockFor(
+        provider: PerceptionProvider,
+        initialSnapshot: PerceptionSnapshot?,
+        requests: AtomicInteger,
+    ): String? {
+        val full = requests.getAndIncrement() == 0
+        val snapshot = if (full) {
+            initialSnapshot ?: runCatching {
+                provider.snapshot(PerceptionSource.entries.toSet(), PerceptionFilter.ALL, null)
+            }.getOrNull()
+        } else {
+            runCatching {
+                provider.snapshot(AMBIENT_PERCEPTION_SOURCES, PerceptionFilter.ALL, null)
+            }.getOrNull()
+        } ?: return null
+        val device = runCatching { activeDeviceStateProvider?.state() }.getOrNull()
+        val block = SmartPerceptionRenderer.render(snapshot, device, perceptionPolicy, full)
+        P3Log.line(SmartPerceptionRenderer.telemetry(snapshot, block))
+        return block
     }
 
     /**
@@ -3913,6 +4019,13 @@ class SmartAssistantPlugin(
     }
 
     private companion object {
+        /**
+         * 0.3 Phase 2 Task 9: the sources a continuation's ambient perception block asks for. A tool round already
+         * carries its own observation result, so the request tail only refreshes what changes without one.
+         */
+        val AMBIENT_PERCEPTION_SOURCES: Set<PerceptionSource> =
+            setOf(PerceptionSource.DEVICE, PerceptionSource.MEDIA)
+
         /**
          * 0.3 design §4.2.1 rule 4: the `deviceHash` value for a host that supplied no device profile. It is a stable
          * word, not a hash, so a reader can tell "no profile" from "a profile whose digest happens to look like this".

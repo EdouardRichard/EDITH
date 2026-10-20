@@ -201,6 +201,23 @@ class PromptCatalogTest {
     }
 
     @Test
+    fun `the perception template is the thirteen-slot request tail`() {
+        val template = PromptCatalog.perceptionTemplate()
+
+        // The slots the perception block renders (0.3 Phase 2 Task 9). Memory/skill/loop stay dedicated tail segments,
+        // so the perception template must not carry them.
+        listOf("coverage", "perception", "notifications", "media").forEach { slot ->
+            assertTrue("{{$slot}}" in template, "the perception template must carry {{$slot}}")
+        }
+        listOf("memoryEvidence", "skillBodies", "loopState").forEach { slot ->
+            assertFalse("{{$slot}}" in template, "the perception template must not carry {{$slot}}")
+        }
+        assertEquals(13, template.lines().size, "the perception template has exactly thirteen lines")
+        assertEquals(13, Regex("""\{\{[A-Za-z_][A-Za-z0-9_]*\}\}""").findAll(template).count())
+        assertFalse(template.trimEnd().endsWith("记忆："), "the memory header belongs to the full template, not this one")
+    }
+
+    @Test
     fun `a null profile drops the device profile section`() {
         val withProfile = PromptCatalog.plan(ContextRoute.WAKE, profileFixture())
         val withoutProfile = PromptCatalog.plan(ContextRoute.WAKE, null)

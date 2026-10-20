@@ -12,8 +12,8 @@ import com.sheen.rokid.device.RefRegistry
 import com.sheen.rokid.device.RefResult
 import com.sheen.rokid.device.ScreenFilter
 import com.sheen.rokid.device.Timing
-import com.sheen.rokid.phone.perception.CompactSnapshotRenderer
-import com.sheen.rokid.phone.perception.PerceptionCoverageRenderer
+import com.sheen.rokid.output.CompactSnapshotRenderer
+import com.sheen.rokid.output.PerceptionCoverageRenderer
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome

@@ -167,6 +167,16 @@ object PromptCatalog {
      */
     fun dynamicTemplate(): String = resourceTexts.getValue(RUNTIME_STATE_FILE)
 
+    /**
+     * The perception block of `context/runtime-state.md` (0.3 Phase 2 Task 9): the template up to, but excluding, the
+     * `记忆：` header.
+     *
+     * Memory evidence, SKILL bodies and the loop state keep their own dedicated tail segments (they are not perception
+     * sources), so the perception block renders exactly the thirteen slots above that header. The full template stays
+     * intact for a future unification; this accessor is the one the perception renderer uses today.
+     */
+    fun perceptionTemplate(): String = dynamicTemplate().substringBefore("\n记忆：")
+
     /** The validated manifest, in authored order. Internal so tests can prove every entry loads. */
     internal fun manifest(): List<PromptManifestEntry> = manifestEntries
 

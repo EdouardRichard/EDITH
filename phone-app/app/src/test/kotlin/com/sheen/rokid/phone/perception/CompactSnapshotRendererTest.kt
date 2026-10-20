@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.perception
 
+import com.sheen.rokid.output.CompactSnapshotRenderer
 import com.sheen.rokid.plugin.PerceptionCoverage
 import com.sheen.rokid.plugin.PerceptionElement
 import com.sheen.rokid.plugin.PerceptionSnapshot

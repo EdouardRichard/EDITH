@@ -26,17 +26,29 @@ object PromptRenderer {
     /**
      * Renders [template] with [values], permitting only names in [allowedSlots].
      *
+     * [maxValueCodePoints] is the per-value cap. The default preserves every pre-existing caller byte for byte; a
+     * caller whose slot legitimately carries a larger model-facing block (the perception tail, 0.3 Phase 2 Task 9)
+     * passes its own policy-derived bound instead of growing the default.
+     *
      * @throws IllegalArgumentException if any value names a slot outside [allowedSlots], if a
      * placeholder has no supplied value, if a placeholder names a slot outside [allowedSlots], or
      * if the template contains a placeholder that is not a strict `{{name}}` token.
      */
-    fun render(template: String, values: Map<String, String>, allowedSlots: Set<String>): String {
+    fun render(
+        template: String,
+        values: Map<String, String>,
+        allowedSlots: Set<String>,
+        maxValueCodePoints: Int = MAX_VALUE_CODE_POINTS,
+    ): String {
+        require(maxValueCodePoints >= 0) {
+            "maxValueCodePoints must not be negative, was $maxValueCodePoints"
+        }
         val disallowed = values.keys - allowedSlots
         require(disallowed.isEmpty()) {
             "values supplied for slots that are not allowed: ${disallowed.sorted().joinToString(", ")}"
         }
 
-        val sanitized = values.mapValues { (_, value) -> sanitize(value) }
+        val sanitized = values.mapValues { (_, value) -> sanitize(value, maxValueCodePoints) }
         val output = StringBuilder(template.length)
         var cursor = 0
 
@@ -70,10 +82,10 @@ object PromptRenderer {
 
     /**
      * Removes control/separator characters that could rewrite the prompt layout and caps the result
-     * at [MAX_VALUE_CODE_POINTS] code points. Bidi overrides are removed too: they are not ISO
+     * at [maxValueCodePoints] code points. Bidi overrides are removed too: they are not ISO
      * controls but they can visually reorder surrounding prompt text.
      */
-    private fun sanitize(value: String): String {
+    private fun sanitize(value: String, maxValueCodePoints: Int): String {
         val cleaned = StringBuilder(value.length)
         var index = 0
         while (index < value.length) {
@@ -82,11 +94,11 @@ object PromptRenderer {
             index += Character.charCount(codePoint)
         }
 
-        if (cleaned.length <= MAX_VALUE_CODE_POINTS) return cleaned.toString()
+        if (cleaned.length <= maxValueCodePoints) return cleaned.toString()
 
         var codePoints = 0
         var end = 0
-        while (end < cleaned.length && codePoints < MAX_VALUE_CODE_POINTS) {
+        while (end < cleaned.length && codePoints < maxValueCodePoints) {
             end += Character.charCount(cleaned.codePointAt(end))
             codePoints++
         }
