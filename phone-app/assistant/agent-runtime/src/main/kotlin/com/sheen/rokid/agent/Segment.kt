@@ -3,7 +3,7 @@ package com.sheen.rokid.agent
 import com.sheen.rokid.plugin.ImageRef
 
 /**
- * The eleven origins a request segment can have (spec §3.2 + Task 12's RUNTIME_STATE).
+ * The twelve origins a request segment can have (spec §3.2 + Task 12's RUNTIME_STATE + Task 9's SKILL_BODY).
  *
  * Each segment carries its origin as structured metadata — never inferred from rendered text.
  * Attribution is supplied when the fragment is produced, not reverse-engineered later.
@@ -34,6 +34,12 @@ enum class SegmentOrigin {
      * the request input, it is never written to a `ConversationStore`, and `TurnTrimmer` protects it from eviction.
      */
     RUNTIME_STATE,
+    /**
+     * A trusted skill body pulled into this turn's conversation flow. It is dynamic, request-scoped content: it may
+     * only appear before `USER_INPUT` (the request tail), never in the system slot, so the cacheable prefix stays
+     * stable when a skill is loaded or its text changes.
+     */
+    SKILL_BODY,
 }
 
 /** 会话流里一条消息的说话人。归属是元数据，**永不**由文本推断。 */

@@ -55,7 +55,7 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
                         }
                         SegmentOrigin.SUMMARY -> add(message("user", segment.text))
                         SegmentOrigin.MEMORY_EVIDENCE -> add(message("user", segment.text))
-                        SegmentOrigin.PERCEPTION -> add(message("user", segment.text))
+                        SegmentOrigin.PERCEPTION, SegmentOrigin.SKILL_BODY -> add(message("user", segment.text))
                         SegmentOrigin.USER_INPUT -> add(message("user", segment.text))
                         SegmentOrigin.TOOL_ROUND -> {
                             // Parse tool round JSON: array of {type, callId, name, argsJson, output}

@@ -427,7 +427,9 @@ class ModelClientGateway(
         for (segment in flow.take(inputIndex)) {
             when (segment.origin) {
                 SegmentOrigin.SUMMARY -> leading += boundedSummary(segment.text)
-                SegmentOrigin.MEMORY_EVIDENCE, SegmentOrigin.PERCEPTION -> leading += segment.text
+                // Task 10 moves SKILL_BODY to the request-input dynamic tail; until then it rides the head path like memory.
+                SegmentOrigin.MEMORY_EVIDENCE, SegmentOrigin.PERCEPTION, SegmentOrigin.SKILL_BODY ->
+                    leading += segment.text
                 SegmentOrigin.RETRY, SegmentOrigin.RUNTIME_STATE -> Unit
                 SegmentOrigin.TOOL_ROUND -> {
                     // A tool round is not conversation-flow text: the endpoint is stateless, so the model's own call

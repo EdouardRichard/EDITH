@@ -8,14 +8,14 @@ import kotlin.test.assertTrue
 
 class SegmentTest {
 
-    @Test fun `SegmentOrigin has exactly 11 values and each named value exists`() {
+    @Test fun `SegmentOrigin has exactly 12 values and each named value exists`() {
         val values = SegmentOrigin.values()
-        assertEquals(11, values.size)
+        assertEquals(12, values.size)
 
         val expected = setOf(
             "INSTRUCTIONS", "SKILL", "MEMORY_POLICY", "MEMORY_EVIDENCE",
             "PERCEPTION", "SUMMARY", "TRANSCRIPT", "USER_INPUT",
-            "TOOL_ROUND", "RETRY", "RUNTIME_STATE"
+            "TOOL_ROUND", "RETRY", "RUNTIME_STATE", "SKILL_BODY"
         )
         val actual = values.map { it.name }.toSet()
         assertEquals(expected, actual)

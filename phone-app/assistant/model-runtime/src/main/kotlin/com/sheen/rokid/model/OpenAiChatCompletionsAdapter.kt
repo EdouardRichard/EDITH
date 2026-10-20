@@ -75,7 +75,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
                             put("role", "user")
                             put("content", segment.text)
                         })
-                        SegmentOrigin.PERCEPTION -> add(buildJsonObject {
+                        SegmentOrigin.PERCEPTION, SegmentOrigin.SKILL_BODY -> add(buildJsonObject {
                             put("role", "user")
                             put("content", segment.text)
                         })
