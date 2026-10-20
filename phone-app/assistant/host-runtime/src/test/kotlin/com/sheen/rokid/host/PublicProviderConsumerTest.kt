@@ -194,6 +194,12 @@ class PublicProviderConsumerTest {
                 override fun snapshot() = ContextSnapshot(0L, emptyMap())
                 override fun listen(listener: (ContextSnapshot) -> Unit): CancellationHandle = FakeCancellation()
             },
+            // edith-0.3 Phase 2 (Task 9, f42b7b79): the smart plugin now declares `Capability.Perception`, and
+            // `HostRuntime.activate` refuses a plugin whose declared capabilities are not all advertised. This rig
+            // answers every other declared capability the way the App's composition does, so it must answer this
+            // one too. The provider is deliberately inert - every source reports `unavailable(no_provider)` - so
+            // this test stays about capability hand-over, not about perception content.
+            Capability.Perception to InertPerception(),
             // 0.3 Phase 1 Task 12: the smart plugin now declares the static device profile channel, so a rig that
             // activates it must answer it the way the App's composition does (its Android provider is wired at
             // startup). The facts are synthetic and empty: this test is about capability hand-over, not prompt content.
@@ -288,5 +294,34 @@ class PublicProviderConsumerTest {
         fun envelope(g: Generation) = EventEnvelope(SessionId("s"), g, "e-${eventSequence++}", clock.nowNanos, clock.nowNanos)
         fun request(g: Generation) = ModelRequest(envelope(g), "r", "t", "dummy", 3, "dummy instructions",
             listOf(InputPart.Text("dummy")), emptyList(), OutputModality.TEXT, 11_000_000_000)
+
+        /** The empty, all-unavailable perception read: no screen, notification, media, acoustic or device content. */
+        private class InertPerception : PerceptionProvider {
+            private val snapshot = PerceptionSnapshot(
+                snapshotId = "",
+                capturedAtEpochMillis = 0L,
+                coverage = PerceptionCoverage(
+                    screen = "unavailable(no_provider)",
+                    notifications = "unavailable(no_provider)",
+                    media = "unavailable(no_provider)",
+                    calendar = "unavailable(no_provider)",
+                    acoustic = "unavailable(no_provider)",
+                    clipboard = "unavailable(no_provider)",
+                    vision = "unavailable(no_provider)",
+                    glasses = "unavailable(no_provider)",
+                    device = "unavailable(no_provider)",
+                ),
+            )
+
+            override fun beginTurn() = snapshot
+            override fun snapshot(
+                include: Set<PerceptionSource>,
+                filter: PerceptionFilter,
+                limit: Int?,
+            ) = snapshot
+            override fun afterAction() = snapshot
+            override fun screenshot() = PerceptionScreenshotResult.Disabled
+            override fun endTurn() = Unit
+        }
     }
 }
