@@ -119,4 +119,14 @@ class DeepSeekResponsesAdapterFrameTest {
         val bytes2 = adapter.encode(profile, f)
         assertContentEquals(bytes1, bytes2)
     }
+
+    @Test
+    fun `a request level output cap overrides the profile cap`() {
+        // 0.3 design §5.2: the turn policy's cap is the wire value; the profile's is only the window reservation.
+        val request = requestFixture().copy(maxOutputTokens = 512)
+        val body = Json.parseToJsonElement(
+            String(adapter.encode(profile, ContextBudgeter().prepare(profile, request)), Charsets.UTF_8),
+        ).jsonObject
+        assertEquals(512, body["max_output_tokens"]!!.jsonPrimitive.int)
+    }
 }

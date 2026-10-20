@@ -140,6 +140,12 @@ data class ModelRequest(
     val deadlineNanos: Long,
     /** Empty means a text-only request: the P2 body shape is preserved byte for byte. */
     val tools: List<ToolSpec> = emptyList(),
+    /**
+     * 0.3 design §5.2: this turn's output cap, overriding the profile's window-reservation value at the adapter.
+     * `null` — the default — means "use `ModelProfile.maxOutputTokens`". It is a per-turn declaration (a short answer,
+     * a compression summary, a proactive hint), never a zero-budget request.
+     */
+    val maxOutputTokens: Int? = null,
 ) {
     init {
         require(listOf(requestId, turnId, profileId, instructions).all { it.isNotBlank() })
@@ -154,8 +160,27 @@ data class ModelRequest(
 
 enum class ModelEnd { COMPLETED, INCOMPLETE, FAILED, CANCELLED, DEADLINE }
 
-data class ModelUsage(val inputTokens: Long?, val outputTokens: Long?) {
-    init { require(inputTokens == null || inputTokens >= 0); require(outputTokens == null || outputTokens >= 0) }
+/**
+ * One model turn's provider-reported accounting. Counts only — no body text ever rides on this type.
+ *
+ * [cachedInputTokens] and [cacheMissInputTokens] are the provider's cache telemetry (0.3 design §5.3), added
+ * additively in 0.3: `null` means the provider did not report that count, which is **not** the same as a zero and is
+ * never fabricated. Only an explicit provider member may fill the miss count; a protocol that has no cache notion
+ * leaves both null.
+ */
+data class ModelUsage(
+    val inputTokens: Long?,
+    val outputTokens: Long?,
+    /** Input tokens served from the provider's prompt cache, when it reports them. Null = unreported. */
+    val cachedInputTokens: Long? = null,
+    /** Input tokens the provider reports as a cache miss, when it reports them. Null = unreported, never derived. */
+    val cacheMissInputTokens: Long? = null,
+) {
+    init {
+        require(inputTokens == null || inputTokens >= 0); require(outputTokens == null || outputTokens >= 0)
+        require(cachedInputTokens == null || cachedInputTokens >= 0)
+        require(cacheMissInputTokens == null || cacheMissInputTokens >= 0)
+    }
 }
 
 sealed interface ModelStreamEvent {

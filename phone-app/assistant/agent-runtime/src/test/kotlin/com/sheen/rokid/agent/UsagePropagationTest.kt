@@ -167,4 +167,52 @@ class UsagePropagationTest {
         assertEquals(ModelEnd.INCOMPLETE, reply.terminal)
         assertEquals(ModelUsage(9, 3), reply.usage)
     }
+
+    // ------------------------------------------------------------ per-turn output cap
+
+    /** A client that settles the turn at once; these tests only read the request the gateway assembled. */
+    private fun capturingClient() = FakeModelClient { request, listener ->
+        listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+    }
+
+    private fun frame() = RequestFrame(
+        systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "You are Edith.")),
+        conversationFlow = listOf(Segment(SegmentOrigin.USER_INPUT, true, "把音量调小一点")),
+        tools = emptyList(),
+    )
+
+    @Test fun `the gateway carries the turn output cap into the model request`() {
+        // The legacy `split(history)` path is still used by frame-less turns (e.g. the compression summary request),
+        // so the per-turn cap must reach the wire there too — it is the adapter that falls back to the profile cap.
+        val client = capturingClient()
+
+        gateway(client).turn(turn().copy(maxOutputTokens = 512))
+
+        assertEquals(512, client.requests.single().maxOutputTokens)
+    }
+
+    @Test fun `the frame path carries the turn output cap into the model request`() {
+        val client = capturingClient()
+
+        gateway(client).turn(turn().copy(frame = frame(), maxOutputTokens = 512))
+
+        assertEquals(512, client.requests.single().maxOutputTokens)
+    }
+
+    // ------------------------------------------------------------ cache usage
+
+    @Test fun `cache usage from the decoder terminal survives into the reply`() {
+        // Cache counts are part of the same provider accounting the decoder reports on the terminal; the gateway must
+        // hand the object through intact rather than rebuild it from the two legacy counters.
+        val usage = ModelUsage(inputTokens = 100, outputTokens = 20, cachedInputTokens = 64, cacheMissInputTokens = 36)
+        val client = FakeModelClient { request, listener ->
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, usage, null))
+        }
+
+        val reply = gateway(client).turn(turn())
+
+        assertEquals(64L, reply.usage?.cachedInputTokens)
+        assertEquals(36L, reply.usage?.cacheMissInputTokens)
+        assertEquals(ModelUsage(100, 20, 64, 36), reply.usage)
+    }
 }

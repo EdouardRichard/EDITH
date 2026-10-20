@@ -249,6 +249,9 @@ class ModelClientGateway(
             output = OutputModality.TEXT,
             deadlineNanos = request.deadlineNanos,
             tools = request.tools,
+            // 0.3 design §5.2: the turn policy's cap travels beside the shape it applies to; the adapter falls back to
+            // the profile's window-reservation value when this is null (pre-0.3 callers).
+            maxOutputTokens = request.maxOutputTokens,
         )
     }
 

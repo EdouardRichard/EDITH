@@ -185,4 +185,18 @@ class OpenAiChatCompletionsAdapterFrameTest {
         val decoded = java.util.Base64.getDecoder().decode(inputAudio["data"]!!.jsonPrimitive.content)
         assertEquals("RIFF", String(decoded.sliceArray(0..3), Charsets.US_ASCII))
     }
+
+    @Test
+    fun `a request level output cap overrides the profile cap`() {
+        // 0.3 design §5.2: the turn policy's cap is the wire value; the profile's is only the window reservation.
+        val request = requestFixture().copy(
+            profileId = profile.id,
+            profileRevision = profile.revision,
+            maxOutputTokens = 512,
+        )
+        val body = Json.parseToJsonElement(
+            String(adapter.encode(profile, ContextBudgeter().prepare(profile, request)), Charsets.UTF_8),
+        ).jsonObject
+        assertEquals(512, body["max_tokens"]!!.jsonPrimitive.int)
+    }
 }

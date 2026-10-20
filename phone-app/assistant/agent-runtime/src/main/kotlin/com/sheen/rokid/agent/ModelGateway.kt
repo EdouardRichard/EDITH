@@ -71,6 +71,14 @@ data class GatewayTurn(
      * duplicate Task 26 removed). `null` — the default — keeps every pre-Task-27 construction and caller unaltered.
      */
     val userUtterance: String? = null,
+    /**
+     * 0.3 design §5.2: this turn's output cap, forwarded verbatim into `ModelRequest.maxOutputTokens`.
+     *
+     * `null` — the default — keeps every pre-0.3 caller unaltered: the adapter then sends the profile's
+     * `maxOutputTokens`, which is only the window-reservation value. A non-null cap is the turn policy's decision
+     * (a short answer, a compression summary, a proactive hint) and wins over the profile at encode time.
+     */
+    val maxOutputTokens: Int? = null,
 )
 
 /**

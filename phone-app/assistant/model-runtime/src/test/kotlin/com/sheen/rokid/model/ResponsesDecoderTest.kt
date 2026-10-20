@@ -62,9 +62,11 @@ class ResponsesDecoderTest {
 
     @Test fun `created first nested identity supports text without response id at every byte split`() {
         val bytes = fixture("text-completed")
+        // The fixture reports `input_tokens_details.cached_tokens = 0`: an explicit provider zero, which is a real
+        // count, not the absence that stays null (0.3 design §5.3).
         val expected = listOf(ModelStreamEvent.TextDelta("q", "\u63d0\u793a"),
             ModelStreamEvent.TextDelta("q", "\ud83d\ude00"),
-            ModelStreamEvent.Terminal("q", ModelEnd.COMPLETED, ModelUsage(12, 4), null))
+            ModelStreamEvent.Terminal("q", ModelEnd.COMPLETED, ModelUsage(12, 4, cachedInputTokens = 0), null))
         assertEquals(expected, decode(bytes))
         for (split in 0..bytes.size) assertEquals(expected, decode(bytes, split), "byte split $split")
         val sse = SseDecoder()
@@ -457,5 +459,31 @@ class ResponsesDecoderTest {
         assertEquals(listOf("A"), texts(decoder.accept(delta("5", response = ""))))
         assertTrue(decoder.accept(done("8")).isEmpty())
         assertEquals(ModelEnd.COMPLETED, ends(decoder.accept(terminal(sequence = "19"))).single().end)
+    }
+
+    // ------------------------------------------------------------ 0.3 cache telemetry (design §5.3)
+
+    @Test fun `usage exposes openai cached tokens from input token details`() {
+        val events = ResponsesDecoder("q").accept(terminal(response =
+            """{"id":"r","status":"completed","usage":{"input_tokens":100,"output_tokens":20,"input_tokens_details":{"cached_tokens":64}}}"""))
+        assertEquals(ModelUsage(100, 20, cachedInputTokens = 64), ends(events).single().usage)
+        assertNull(ends(events).single().usage?.cacheMissInputTokens)
+    }
+
+    @Test fun `usage exposes deepseek prompt cache hit and miss tokens`() {
+        val events = ResponsesDecoder("q").accept(terminal(response =
+            """{"id":"r","status":"completed","usage":{"input_tokens":100,"output_tokens":20,"prompt_cache_hit_tokens":64,"prompt_cache_miss_tokens":36}}"""))
+        assertEquals(ModelUsage(100, 20, cachedInputTokens = 64, cacheMissInputTokens = 36), ends(events).single().usage)
+    }
+
+    @Test fun `usage leaves cache fields null when the provider omits them`() {
+        // A missing count is absent, not zero: a run that never reported a cache hit must not read as a miss either.
+        val events = ResponsesDecoder("q").accept(terminal(response =
+            """{"id":"r","status":"completed","usage":{"input_tokens":100,"output_tokens":20}}"""))
+        val usage = ends(events).single().usage
+        assertEquals(100L, usage?.inputTokens)
+        assertEquals(20L, usage?.outputTokens)
+        assertNull(usage?.cachedInputTokens)
+        assertNull(usage?.cacheMissInputTokens)
     }
 }

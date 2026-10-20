@@ -115,7 +115,9 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             put("model", profile.model)
             put("instructions", budgeted.request.instructions)
             put("stream", true)
-            put("max_output_tokens", profile.maxOutputTokens)
+            // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
+            // when the request declares no cap of its own (every pre-0.3 caller).
+            put("max_output_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
             if (tools.isNotEmpty()) {
                 // Measured, not guessed (T4 + the T5 ten-step run). Without `reasoning.effort = "none"` the turn comes
                 // back `incomplete/max_output_tokens`: the deliberation is charged against the output budget and the

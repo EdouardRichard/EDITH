@@ -248,9 +248,7 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
         val expected = type.removePrefix("response.")
         val status = string(response, "status")
         if (status != null && status != expected) invalid("STATUS_CONFLICT")
-        val usage = objectValue(response["usage"])?.let {
-            ModelUsage(number(it["input_tokens"]), number(it["output_tokens"]))
-        }
+        val usage = objectValue(response["usage"])?.let(::usage)
         val end = when (expected) {
             "completed" -> ModelEnd.COMPLETED
             "incomplete" -> ModelEnd.INCOMPLETE
@@ -282,6 +280,24 @@ class ResponsesDecoder(requestId: String, maxResponseBytes: Int = 1048576) {
         val error = response["error"] as? JsonObject ?: return false
         fun field(name: String): String? = (error[name] as? JsonPrimitive)?.contentOrNull
         return isProviderContextOverflow(field("code"), field("type"), field("message"))
+    }
+
+    /**
+     * 0.3 design §5.3: the provider's cache telemetry, read from whichever member the protocol reports.
+     *
+     * The Responses schema nests the hit count under `input_tokens_details.cached_tokens`; DeepSeek reports
+     * `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` at the usage top level. Every member is optional and an
+     * absent one stays `null` — no count is fabricated, and the miss count is only ever read from its own member.
+     */
+    private fun usage(usage: JsonObject): ModelUsage {
+        val details = objectValue(usage["input_tokens_details"])
+        return ModelUsage(
+            inputTokens = number(usage["input_tokens"]),
+            outputTokens = number(usage["output_tokens"]),
+            cachedInputTokens = number(details?.get("cached_tokens"))
+                ?: number(usage["prompt_cache_hit_tokens"]),
+            cacheMissInputTokens = number(usage["prompt_cache_miss_tokens"]),
+        )
     }
 
     /** Mirrors the text path's `text.keys.all { it in delivered }`: every observed call must have its done sentinel. */

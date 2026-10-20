@@ -44,12 +44,7 @@ class ChatCompletionsDecoder(private val requestId: String) {
                 }
                 val finishReason = obj["finish_reason"]?.jsonPrimitive?.contentOrNull
                 if (finishReason != null) {
-                    val usage = (root["usage"] as? JsonObject)?.let {
-                        ModelUsage(
-                            it["prompt_tokens"]?.jsonPrimitive?.longOrNull,
-                            it["completion_tokens"]?.jsonPrimitive?.longOrNull,
-                        )
-                    }
+                    val usage = usage(root)
                     val end = when (finishReason) {
                         "stop" -> ModelEnd.COMPLETED
                         "length" -> ModelEnd.INCOMPLETE
@@ -71,6 +66,25 @@ class ChatCompletionsDecoder(private val requestId: String) {
         // If we received content but no finish_reason/[DONE], treat as completed (some providers omit it)
         return if (receivedContent) terminal(ModelEnd.COMPLETED, null, null)
         else terminal(ModelEnd.INCOMPLETE, null, "EOF_INCOMPLETE")
+    }
+
+    /**
+     * 0.3 design §5.3: the provider's cache telemetry, read from whichever member the protocol reports.
+     *
+     * OpenAI nests the hit count under `prompt_tokens_details.cached_tokens`; DeepSeek reports
+     * `prompt_cache_hit_tokens`/`prompt_cache_miss_tokens` at the usage top level. Every member is optional and an
+     * absent one stays `null` — no count is fabricated, and the miss count is only ever read from its own member.
+     */
+    private fun usage(root: JsonObject): ModelUsage? {
+        val usage = root["usage"] as? JsonObject ?: return null
+        val details = usage["prompt_tokens_details"] as? JsonObject
+        return ModelUsage(
+            inputTokens = usage["prompt_tokens"]?.jsonPrimitive?.longOrNull,
+            outputTokens = usage["completion_tokens"]?.jsonPrimitive?.longOrNull,
+            cachedInputTokens = details?.get("cached_tokens")?.jsonPrimitive?.longOrNull
+                ?: usage["prompt_cache_hit_tokens"]?.jsonPrimitive?.longOrNull,
+            cacheMissInputTokens = usage["prompt_cache_miss_tokens"]?.jsonPrimitive?.longOrNull,
+        )
     }
 
     private fun terminal(end: ModelEnd, usage: ModelUsage?, code: String?): List<ModelStreamEvent> {
