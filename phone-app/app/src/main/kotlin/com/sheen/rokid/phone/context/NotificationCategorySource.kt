@@ -4,11 +4,11 @@ import com.sheen.rokid.phone.context.NotificationCategoryService
 /**
  * The notification **category** as one context signal, published under [KEY] (P3.2 Stage B, Task 12).
  *
- * Spec §8.2 keeps the notification layer to the category by default, and the shape of this type is that rule: its only
- * input is one opaque platform string. There is no `Notification`, no `StatusBarNotification` and no `Bundle` to read
- * a title or a body from - so "the assistant never sees notification content" is a property of the type rather than a
- * promise about its implementation. The listener service that feeds it maps `Notification.category` and nothing else
- * (`NotificationCategoryService`).
+ * D179 supersedes the old category-only rule for perception, but it does not widen this type: its only input is one
+ * opaque platform string. There is no `Notification`, no `StatusBarNotification` and no `Bundle` here to read a title or
+ * a body from, so the value this source publishes can only ever be the category. Notification **content** is a separate
+ * source ([NotificationContentSource]); keeping it separate is what preserves the single-string contract of
+ * `notification.category` while the perception pipeline gets the content D179 allows it to see.
  *
  * Degradation follows Task 11's rule: not connected, or no category, contributes **no key** - never a placeholder.
  */

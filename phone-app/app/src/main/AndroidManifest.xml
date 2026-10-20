@@ -96,9 +96,10 @@
             <meta-data android:name="android.accessibilityservice"
                 android:resource="@xml/edith_accessibility_config" />
         </service>
-        <!-- P3.2 Stage B (Task 12): notification access is the user's grant, made in Settings. The service only ever
-             reads a notification's category/channel id (see NotificationCategoryService); the permission it binds
-             with is declared by the platform, not by us. -->
+        <!-- P3.2 Stage B (Task 12): notification access is the user's grant, made in Settings. The service reads the
+             opaque category/channel id and, since 0.3 Phase 2 Task 3 (D179), notification content in memory only (see
+             NotificationCategoryService/NotificationContentSource); the permission it binds with is declared by the
+             platform, not by us. -->
         <service android:name=".context.NotificationCategoryService" android:exported="false"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter>
