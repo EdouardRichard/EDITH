@@ -49,7 +49,7 @@ class MetricLogTest {
         metricLine = { lines += it })
 
     @Test
-    fun `one run emits one metric line with exactly the count fields`() {
+    fun `one run emits the metric line and a separate P3_CACHE line with exactly the count fields`() {
         val lines = mutableListOf<String>()
         val clock = FakeMetricClock()
         val executor = RecordingActionExecutor(listOf(actionDescriptor("lookup", observation = true)))

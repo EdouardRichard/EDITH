@@ -127,6 +127,25 @@ class CacheMetricTest {
     }
 
     @Test
+    fun `a reported zero cache count prints zero instead of a dash`() {
+        val lines = mutableListOf<String>()
+        val clock = FakeClock()
+        val gateway = CacheGateway(clock, listOf(
+            GatewayReply(
+                emptyList(), "answer", ModelEnd.COMPLETED, null,
+                ModelUsage(inputTokens = 100, outputTokens = 20, cachedInputTokens = 0, cacheMissInputTokens = 0),
+            ),
+        ))
+
+        loop(gateway, clock, lines).run(request())
+
+        // `-` is reserved for "the provider did not report this"; a reported zero is a measurement and must stay `0`.
+        assertEquals("P3_CACHE cached=0 miss=0 inputTokens=100 outputTokens=20", lines.last())
+        assertFalse(lines.last().contains("cached=-"), lines.last())
+        assertFalse(lines.last().contains("miss=-"), lines.last())
+    }
+
+    @Test
     fun `usage without cache counters prints dashes instead of a fabricated zero`() {
         val lines = mutableListOf<String>()
         val clock = FakeClock()
