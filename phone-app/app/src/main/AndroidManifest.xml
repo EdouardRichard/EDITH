@@ -2,6 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 0.3 Phase 1 (§4.2.1): `AndroidDeviceStateProvider.network()` reads `ConnectivityManager.activeNetwork` /
+         `getNetworkCapabilities()` for the `{{network}}` device fact. Those calls throw `SecurityException` without this
+         permission and the per-fact `runCatching` would silently turn every read into `null`. It is a normal install-time
+         permission: no runtime prompt, no user grant. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!--
       edith-0.2 Phase B (B4): the SKILL library lives at /sdcard/EDITH/skills (spec §3.5), which is outside the app's
       own directories, so reading it needs shared-storage access. On API 33 the legacy READ_EXTERNAL_STORAGE does not
