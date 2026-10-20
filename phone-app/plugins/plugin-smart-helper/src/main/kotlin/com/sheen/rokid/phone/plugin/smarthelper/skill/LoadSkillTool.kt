@@ -27,8 +27,9 @@ import kotlinx.serialization.json.jsonObject
  *   which trips on three identical consecutive fingerprints; a constant receipt would make two pulls of the same
  *   SKILL look like `NO_PROGRESS` and end the run. `loaded:<n>` advances on every successful pull, and
  *   `SKILL_DORMANT loaded:<n>` additionally says the entry was reached by name while not in the catalog (D-4's second
- *   gate). The body itself travels only through [onLoaded], which the plugin routes into the system slot (D-2), so it
- *   never appears in a receipt, a log line or the descriptor.
+ *   gate). The body itself travels only through [onLoaded], which the plugin keeps for the current turn and renders as
+ *   request-tail `SKILL_BODY` content (0.3 Task 12; it no longer rides the system slot), so it never appears in a
+ *   receipt, a log line or the descriptor.
  * - **A refusal is a step the model can correct, never an exception into the loop.** Every parse failure — non-JSON,
  *   a JSON non-object, a missing/blank/non-string `name` — is `ActionOutcome.Refused` with a stable code. A name that
  *   is not pullable is refused too, and the two reasons stay distinguishable: an unknown name is [NOT_FOUND] (the

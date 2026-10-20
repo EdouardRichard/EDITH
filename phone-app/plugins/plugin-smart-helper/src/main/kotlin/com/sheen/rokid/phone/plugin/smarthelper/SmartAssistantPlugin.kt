@@ -738,8 +738,10 @@ class SmartAssistantPlugin(
      * body's lifetime is one turn, and letting it accumulate across turns would move the unbounded growth this phase
      * removes into the conversation itself.
      *
-     * Guarded by [skillLock]; [systemSlot] reads the catalog and this map in one critical section so a request cannot
-     * pair a newer catalog with an older pulled set.
+     * Guarded by [skillLock]. It is only read through [skillSnapshot], which copies it and the SKILL catalog in **one**
+     * critical section: the catalog and the pulled bodies are the two halves of one request's SKILL view, and
+     * [beginSkillTurn] clears the bodies under the same lock. Two separate snapshots could pair a newer catalog with
+     * the previous turn's pulled set (0.3 Task 12 review fix).
      */
     private val loadedSkillBodies = LinkedHashMap<String, Skill>()
 
@@ -2516,6 +2518,9 @@ class SmartAssistantPlugin(
      * places would give two renderers that drift. Both are request-scoped tail content, so a pull or a new retrieval
      * never rewrites the cacheable prefix.
      *
+     * The system slot's catalog and the tail's pulled bodies are read as **one** snapshot ([requestSkillSegments]);
+     * a turn boundary that cleared the bodies between two separate reads would split the pair.
+     *
      * @param store the route's session store, whose [ConversationStore.snapshot] opens the flow.
      * @param prompt the session assembly. `null` means no manager was built (a host without a profile); the system
      *   slot still carries the pinned plan, and the flow simply carries no memory.
@@ -2527,15 +2532,19 @@ class SmartAssistantPlugin(
         prompt: PromptAssembly?,
         tools: List<ToolSpec>,
     ): RequestFrame {
+        // Both SKILL layers come from one snapshot (`requestSkillSegments`): the catalog (system) and the pulled
+        // bodies (tail) belong to the same moment of the turn, and `beginSkillTurn` clears the bodies under the same
+        // lock, so two separate reads could pair a newer catalog with the previous turn's bodies.
+        val skills = requestSkillSegments(route)
         val flow = buildList {
             addAll(store.snapshot())
             // 0.3 design §5.1: request-scoped context rides the tail, in this order, ahead of the one USER_INPUT.
             addAll(prompt?.memorySegments.orEmpty())
-            addAll(skillBodySegments())
+            addAll(skills.bodies)
             add(Segment(SegmentOrigin.USER_INPUT, trusted = true, text = userInput))
         }
         return RequestFrame(
-            systemSegments = systemSlot(route),
+            systemSegments = skills.system,
             conversationFlow = flow,
             tools = tools,
         )
@@ -2583,8 +2592,12 @@ class SmartAssistantPlugin(
         val pinnedCount = store.history().size
         return { transcript ->
             val retryIndex = retryIndexIn(transcript, pinnedCount)
+            // One snapshot per request (0.3 Task 12 review fix): the catalog in the system slot and the pulled bodies
+            // in the tail are read together, because `beginSkillTurn` clears the bodies under the same lock. A begin
+            // that landed between two separate reads would pair a newer catalog with the previous turn's bodies.
+            val skills = requestSkillSegments(route)
             RequestFrame(
-                systemSegments = systemSlot(route),
+                systemSegments = skills.system,
                 conversationFlow = buildList {
                     transcript.forEachIndexed { index, item ->
                         add(
@@ -2600,7 +2613,7 @@ class SmartAssistantPlugin(
                     addAll(prompt?.memorySegments.orEmpty())
                     // The SKILL bodies are re-read every request: a `load_skill` pull earlier in this turn must be
                     // visible to the continuation request without rewriting the system slot.
-                    addAll(skillBodySegments())
+                    addAll(skills.bodies)
                     add(
                         Segment(
                             SegmentOrigin.USER_INPUT,
@@ -2661,26 +2674,38 @@ class SmartAssistantPlugin(
     }
 
     /**
+     * The two SKILL layers of one request, copied in **one** critical section of [skillLock].
+     *
+     * 0.3 Task 12 review fix (Important 2): the catalog is the system half and the pulled bodies are the tail half, but
+     * they are one view of one turn. [beginSkillTurn] clears the bodies under the same lock, so reading the two in
+     * separate critical sections could produce a catalog from turn N+1 paired with the bodies of turn N. This snapshot
+     * is what [requestSkillSegments] hands to both halves of a request.
+     *
+     * The catalog is built here because it mutates the session's `SkillManager` governor, which documents that it is
+     * not thread-safe (spec §3.7/design D-1) — the same reason every other manager call runs under this lock.
+     */
+    private class SkillSnapshot(val catalog: String, val bodies: List<Skill>)
+
+    /** One request's two SKILL layers, both derived from a single [SkillSnapshot]. */
+    private class RequestSkillSegments(val system: List<Segment>, val bodies: List<Segment>)
+
+    /**
      * The system slot both frame paths share: exactly two stable things (0.3 design §4.4, §5.1).
      *
      * - the route's **session-pinned** `PromptPlan.systemText` as `INSTRUCTIONS`. The plan already contains the core
      *   sections, the route posture and the rendered device profile, including the memory policy
      *   (`core/50-memory-policy.md`), which is why the old separate `MEMORY_POLICY` segment is gone: keeping it would
      *   state the rule twice.
-     * - **one** SKILL **catalog** segment, when the library is non-empty. A pulled body is request-scoped
-     *   `SKILL_BODY` flow content (see [skillBodySegments]), never system text: a pull must not rewrite the cacheable
-     *   prefix.
+     * - **one** SKILL **catalog** segment, when the library is non-empty. The catalog is [SkillSnapshot.catalog], taken
+     *   together with the pulled bodies; a pulled body is request-scoped `SKILL_BODY` flow content
+     *   ([RequestSkillSegments.bodies]), never system text: a pull must not rewrite the cacheable prefix.
      *
      * A library that throws contributes no catalog segment rather than failing the request (spec §3.7).
      */
-    private fun systemSlot(route: ContextRoute): List<Segment> = buildList {
+    private fun systemSlot(route: ContextRoute, skills: SkillSnapshot): List<Segment> = buildList {
         add(Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = promptPlan(route).systemText))
-        // The catalog mutates the session's governor (not thread-safe), so it is read under the SKILL lock.
-        val catalog = synchronized(skillLock) {
-            runCatching { skillManager?.catalog() }.getOrNull().orEmpty()
-        }
-        if (catalog.isNotBlank()) {
-            add(Segment(SegmentOrigin.SKILL, trusted = true, text = catalog))
+        if (skills.catalog.isNotBlank()) {
+            add(Segment(SegmentOrigin.SKILL, trusted = true, text = skills.catalog))
         }
     }
 
@@ -2689,12 +2714,33 @@ class SmartAssistantPlugin(
      *
      * They are the dynamic half of the two-layer SKILL design (0.3 design §4.4/§5.1): request-scoped content that
      * changes only the tail, before `USER_INPUT`, so the system prompt and the cacheable history stay stable when a
-     * skill is loaded. The body travels whole, never summarised (D-2).
+     * skill is loaded. The body travels whole, never summarised (D-2). The list is the [SkillSnapshot.bodies] copy, so
+     * it belongs to the same snapshot as the catalog in the system slot.
      */
-    private fun skillBodySegments(): List<Segment> = synchronized(skillLock) {
-        loadedSkillBodies.values.map { skill ->
-            Segment(SegmentOrigin.SKILL_BODY, trusted = true, text = bodySegmentText(skill))
-        }
+    private fun skillBodySegments(skills: SkillSnapshot): List<Segment> = skills.bodies.map { skill ->
+        Segment(SegmentOrigin.SKILL_BODY, trusted = true, text = bodySegmentText(skill))
+    }
+
+    /**
+     * Both SKILL layers of one request, read as one snapshot (0.3 Task 12 review fix, Important 2).
+     *
+     * A frame builder calls this **once** and uses both halves; the pairing is the contract, not an implementation
+     * detail: a concurrent [beginSkillTurn] may run wholly before or wholly after this call, never between its halves.
+     */
+    private fun requestSkillSegments(route: ContextRoute): RequestSkillSegments {
+        val skills = skillSnapshot()
+        return RequestSkillSegments(
+            system = systemSlot(route, skills),
+            bodies = skillBodySegments(skills),
+        )
+    }
+
+    /** Reads the catalog and the pulled bodies under one acquisition of [skillLock]. */
+    private fun skillSnapshot(): SkillSnapshot = synchronized(skillLock) {
+        SkillSnapshot(
+            catalog = runCatching { skillManager?.catalog() }.getOrNull().orEmpty(),
+            bodies = loadedSkillBodies.values.toList(),
+        )
     }
 
     /**
@@ -2924,11 +2970,18 @@ class SmartAssistantPlugin(
      */
     internal fun loadSkillToolForTest(): LoadSkillTool = loadSkillTool
 
-    /** Test-only: the system slot the next request for [route] would carry, built by the production [systemSlot]. */
-    internal fun systemSlotForTest(route: ContextRoute): List<Segment> = systemSlot(route)
-
-    /** Test-only: the pulled bodies the next request for a turn would carry, built by [skillBodySegments]. */
-    internal fun skillBodySegmentsForTest(): List<Segment> = skillBodySegments()
+    /**
+     * Test-only: both SKILL layers of the request the plugin would build for [route], read through the same
+     * [requestSkillSegments] the frame builders call.
+     *
+     * The pair is deliberate: a test that needs to prove the catalog and the pulled bodies belong to one moment must
+     * read them together, because either half on its own can be observed after a turn boundary has legitimately cleared
+     * the other (0.3 Task 12 review fix).
+     */
+    internal fun requestSkillSegmentsForTest(route: ContextRoute): Pair<List<Segment>, List<Segment>> {
+        val skills = requestSkillSegments(route)
+        return skills.system to skills.bodies
+    }
 
     /** The gate's input, assembled from the same signals the request carries (spec §4.7). */    private fun gateState(trigger: ProactiveTrigger): ProactiveGateState {
         val values = currentContextValues()

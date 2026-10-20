@@ -10,12 +10,17 @@ import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptKind
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptSection
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.profileFixture
+import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
 import com.sheen.rokid.phone.plugin.smarthelper.skill.LoadSkillTool
 import com.sheen.rokid.phone.plugin.smarthelper.smartSkillDoc
 import com.sheen.rokid.phone.plugin.smarthelper.smartStores
 import com.sheen.rokid.phone.plugin.smarthelper.streamText
 
+import com.sheen.rokid.contracts.AcousticEvent
+import com.sheen.rokid.contracts.AcousticLabel
+import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.DeviceProfile
 import com.sheen.rokid.plugin.EmbedResult
 import com.sheen.rokid.plugin.EmbeddingService
 import com.sheen.rokid.plugin.InputPart
@@ -39,6 +44,13 @@ import kotlin.test.assertTrue
  * 0.3 Task 12 moved the system text from that hand-written prose to `PromptCatalog.plan(route, deviceProfile)`. The
  * system prompt is therefore a **session-pinned** value that contains the live device profile, and a `load_skill` pull
  * is request-scoped tail content ([SegmentOrigin.SKILL_BODY]) instead of system text.
+ *
+ * Two request shapes live here. The transcript/memory tests use the legacy no-store shape (`SmartTestRig()`), where the
+ * model reads `AgentRequest.instructions`/`history`; they are about the session transcript, not the system slot. The
+ * plan-once/device-once/system-slot tests use the **store-backed production shape** (`conversationStores`, exactly as
+ * `SmartWiring` builds them), where every request is a `RequestFrame` and `ModelRequest.instructions` is the plugin's
+ * own `systemSlot` — the path production actually runs. 0.3 review fix (Important 1): the original version of those
+ * tests ran on the legacy path, so they proved nothing about the slot production builds.
  */
 class SessionContextWiringTest {
 
@@ -72,6 +84,32 @@ class SessionContextWiringTest {
             ),
         )
         rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+        return rig
+    }
+
+    /**
+     * The **production request shape** (0.3 review fix, Important 1): one `ConversationStore` per route exactly as
+     * `SmartWiring` builds them, and the device profile resolved through `services.deviceState()` inside `activate`.
+     *
+     * On this path every request is a `RequestFrame`, so `ModelRequest.instructions` is the plugin's own
+     * [com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin] `systemSlot` — the slot production actually
+     * sends — rather than the legacy no-store `AgentRequest.instructions` seam.
+     */
+    private fun storeBackedRig(
+        device: SmartFakeDeviceState = SmartFakeDeviceState(deviceProfile),
+        promptCatalog: ((ContextRoute, DeviceProfile?) -> PromptPlan)? = null,
+    ): SmartTestRig {
+        val rig = SmartTestRig(
+            conversationStores = smartStores(),
+            promptCatalog = promptCatalog,
+        )
+        rig.activate(
+            overrides = mapOf(
+                Capability.Storage to SmartFakeStorage(),
+                Capability.Embedding to ScriptedEmbeddings(),
+                Capability.DeviceState to device,
+            ),
+        )
         return rig
     }
 
@@ -144,49 +182,121 @@ class SessionContextWiringTest {
     }
 
     @Test
-    fun `the session system prompt contains the device profile and is stable across turns`() {
-        val rig = activatedRig(ScriptedEmbeddings())
+    fun `a store-backed session reads both plans and the device once and keeps the profile in its system slot`() {
+        // 0.3 review fix (Important 1): this used `SmartTestRig()` without stores, so it asserted the legacy
+        // `AgentRequest.instructions` path rather than `systemSlot`/`buildFrame`. Production `SmartWiring` always injects
+        // the per-route stores, so the production shape is the one this test must run on.
+        val device = SmartFakeDeviceState(deviceProfile)
+        val planned = mutableListOf<ContextRoute>()
+        val rig = storeBackedRig(
+            device = device,
+            promptCatalog = { route, profile ->
+                planned += route
+                PromptCatalog.plan(route, profile)
+            },
+        )
+        rig.model.onRequest = { request, listener ->
+            if (request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }) {
+                listener(
+                    smartToolCall(
+                        ProactiveHintSpec.PROPOSE_HINT.name,
+                        """{"text":"主动提示"}""",
+                        request.requestId,
+                    ),
+                )
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(request, listener, "好。")
+            }
+        }
+
+        assertEquals(
+            listOf(ContextRoute.WAKE, ContextRoute.PROACTIVE),
+            planned,
+            "activation must load exactly one plan per route, both at once",
+        )
+        assertEquals(1, device.profileReads, "the session must read the device profile once at activation")
 
         rig.wakeAndFinal("第一问", turnId = "asr-1")
         rig.tick(4_000)
         rig.wakeAndFinal("第二问", turnId = "asr-2")
 
-        val first = rig.model.requests.first { it.instructions.isNotBlank() }.instructions
-        val second = rig.model.requests.last { it.instructions.isNotBlank() }.instructions
-        assertTrue("M2012K11AC" in first, "the device profile never reached the system prompt: $first")
-        assertEquals(first, second, "the system prompt must be pinned for the whole session")
-        assertEquals(PromptCatalog.plan(ContextRoute.WAKE, deviceProfile).systemText, first)
+        assertEquals(2, planned.size, "a turn must never re-load a prompt plan")
+        assertEquals(1, device.profileReads, "a turn must never re-read the device profile")
+
+        val systemSlots = rig.model.requests.map { it.instructions }
+        assertEquals(2, systemSlots.size, "each wake turn must reach the model once")
+        systemSlots.forEachIndexed { index, slot ->
+            assertTrue(
+                "M2012K11AC" in slot,
+                "request $index's system slot must carry the session's device profile: $slot",
+            )
+        }
+        assertEquals(systemSlots[0], systemSlots[1], "the system slot must be pinned for the whole session")
+        assertEquals(
+            PromptCatalog.plan(ContextRoute.WAKE, deviceProfile).systemText,
+            systemSlots[0],
+            "the store-backed system slot is the pinned catalog plan, not the legacy instructions string",
+        )
     }
 
     @Test
     fun `a catalog change after activation does not rewrite a live session`() {
+        // 0.3 review fix (Important 1): store-backed production shape again. Both routes are exercised so a per-turn
+        // re-plan cannot hide behind the route that did not run.
         var revision = "first"
         val plans = mutableListOf<PromptPlan>()
-        val rig = SmartTestRig(
+        val device = SmartFakeDeviceState(deviceProfile)
+        val rig = storeBackedRig(
+            device = device,
             promptCatalog = { route, _ ->
                 val text = "$revision:${route.name}"
                 val sections = listOf(PromptSection("test-system", PromptKind.STATIC, text))
                 PromptPlan(PromptCatalog.VERSION, sections, text, PromptPlan.hashOf(sections)).also { plans += it }
             },
         )
-        rig.activate()
-        rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+        rig.model.onRequest = { request, listener ->
+            if (request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }) {
+                listener(
+                    smartToolCall(
+                        ProactiveHintSpec.PROPOSE_HINT.name,
+                        """{"text":"主动提示"}""",
+                        request.requestId,
+                    ),
+                )
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(request, listener, "好。")
+            }
+        }
 
-        rig.wakeAndFinal("第一问", turnId = "asr-1")
         assertEquals(
             listOf("first:WAKE", "first:PROACTIVE"),
             plans.map { it.systemText },
             "activation loads exactly one plan per route, in route order",
         )
 
+        rig.wakeAndFinal("第一问", turnId = "asr-1")
+        assertEquals("first:WAKE", rig.model.requests.single().instructions)
+
         // The catalog is replaced after activation. A live session must keep the plan it pinned: re-planning now would
         // rewrite the system prompt (and invalidate the prefix cache) mid-session.
         revision = "second"
         rig.tick(4_000)
         rig.wakeAndFinal("第二问", turnId = "asr-2")
+        assertEquals(2, rig.model.requests.size)
+        assertEquals("first:WAKE", rig.model.requests.last().instructions)
+
+        // The proactive route must keep its pinned plan too, not just the wake route.
+        rig.plugin.handle(AcousticEvent(rig.envelope(), AcousticLabel.Speech))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了", turnId = "asr-p1")))
+        val proactive = rig.model.requests.single { request ->
+            request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }
+        }
+        assertEquals("first:PROACTIVE", proactive.instructions)
 
         assertEquals(2, plans.size, "a live session must never re-load a prompt plan")
-        assertEquals("first:WAKE", rig.model.requests.last().instructions)
+        assertEquals(1, device.profileReads, "a live session must never re-read the device profile")
     }
 
     @Test
