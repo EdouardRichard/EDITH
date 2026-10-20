@@ -1,7 +1,7 @@
 package com.sheen.rokid.phone.plugin.smarthelper.proactive
 import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig
 import com.sheen.rokid.phone.plugin.smarthelper.streamText
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
 import com.sheen.rokid.phone.plugin.smarthelper.smartAction
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.smartToolCall
@@ -216,7 +216,7 @@ class SmartProactiveTurnTest {
 
     @Test
     fun `a hint longer than the display bound is silence rather than a clipped screen`() {
-        val tooLong = rigWithProposal("字".repeat(SmartPrompts.PROACTIVE_HINT_MAX_CHARS + 1))
+        val tooLong = rigWithProposal("字".repeat(ProactiveHintSpec.PROACTIVE_HINT_MAX_CHARS + 1))
 
         withLines { lines ->
             arm(tooLong)
@@ -229,7 +229,7 @@ class SmartProactiveTurnTest {
 
     @Test
     fun `a hint at the display bound is still delivered`() {
-        val atBound = rigWithProposal("字".repeat(SmartPrompts.PROACTIVE_HINT_MAX_CHARS))
+        val atBound = rigWithProposal("字".repeat(ProactiveHintSpec.PROACTIVE_HINT_MAX_CHARS))
 
         arm(atBound)
         atBound.plugin.handle(TranscriptEvent(atBound.transcript("现在几点了")))

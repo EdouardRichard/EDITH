@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemorySource
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
+import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryKind
 
@@ -93,7 +94,7 @@ class StoreSessionWiringTest {
         val stores = stores()
         val rig = rig(stores)
         rig.model.onRequest = { request, listener ->
-            if (request.tools.any { it.name == SmartPrompts.PROPOSE_HINT.name }) {
+            if (request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }) {
                 listener(smartToolCall("c1", "propose_hint", """{"text":"主动提示"}""", requestId = request.requestId))
                 listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
             } else {
@@ -296,7 +297,10 @@ class StoreSessionWiringTest {
             acceptableWireHistory(second.history),
             "the continuation must stay a shape the send-time budgeter accepts: ${second.history}",
         )
-        assertTrue(second.instructions.contains(SmartPrompts.MEMORY_POLICY), "the fixed memory policy rides along")
+        assertTrue(
+            second.instructions.contains("记忆策略"),
+            "the catalog plan's memory-policy section rides along: ${second.instructions}",
+        )
         // Important 2: the count line must report the store's own session, not the manager the store path never writes
         // (which holds only this utterance, so the line used to read `history=1` however many turns the store held).
         assertTrue(
@@ -601,7 +605,9 @@ class StoreSessionWiringTest {
      * as `buildFrame` composes it.
      */
     private fun windowSizedFor(vararg survivors: String): ModelProfile {
-        val system = SmartPrompts.instructions() + "\n" + SmartPrompts.MEMORY_POLICY
+        // 0.3 Task 12: the system slot is the session's profile-less WAKE catalog plan (this rig supplies no device
+        // provider and no SKILL directory).
+        val system = PromptCatalog.plan(ContextRoute.WAKE, null).systemText
         val total = 32 + measure(system) + survivors.sumOf { measure(it) }
         val window = total + 8
         val inputBudget = window + 32

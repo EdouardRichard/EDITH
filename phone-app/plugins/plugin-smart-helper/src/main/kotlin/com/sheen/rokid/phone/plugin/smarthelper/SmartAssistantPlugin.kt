@@ -9,7 +9,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.audit.safeFailureCode
 import com.sheen.rokid.phone.plugin.smarthelper.turn.SmartTurnPhase
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveSkip
 import com.sheen.rokid.phone.plugin.smarthelper.turn.SmartTurn
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
 import com.sheen.rokid.phone.plugin.smarthelper.output.decideChannel
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.admitByFeatures
 import com.sheen.rokid.phone.plugin.smarthelper.output.NotifyChannel
@@ -48,6 +48,9 @@ import com.sheen.rokid.agent.TurnRuntimeState
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.plugin.ConversationDisplay
 import com.sheen.rokid.plugin.conversationDisplay
+import com.sheen.rokid.plugin.DeviceProfile
+import com.sheen.rokid.plugin.DeviceStateProvider
+import com.sheen.rokid.plugin.deviceState
 import com.sheen.rokid.agent.WhitelistActionPolicy
 import com.sheen.rokid.agent.WhitelistEntry
 import com.sheen.rokid.contracts.AcousticEvent
@@ -135,9 +138,8 @@ import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoadReason
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillManager
 import com.sheen.rokid.phone.plugin.smarthelper.skill.StorageAccessSkillDirectory
 import com.sheen.rokid.phone.plugin.smarthelper.turn.ConversationCycle
-import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptKind
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
-import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptSection
 import java.util.UUID
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -374,9 +376,9 @@ internal class ConfirmingActions(
  * - **nothing is replayed across sessions** — the remembered final transcript belongs to the session that produced it,
  *   so `Help` after a re-activation runs this session's utterance or nothing at all.
  *
- * The descriptor declares exactly `WakeWord, Asr, Model, Actions, TextOutput, Context`. `Capability.Context` is what
- * P3.2's proactive path runs on: the host produces the perception signals, so a plugin that did not declare it could
- * never be armed.
+ * The descriptor is the host's grant list, not a wish: every capability in it is one this plugin actually calls
+ * (`Context` drives the proactive path, `DeviceState` supplies the static device profile the prompt plan renders, and
+ * so on). A declaration without a real call site would make the host answer a channel nothing reads.
  */
 class SmartAssistantPlugin(
     private val clock: MonotonicClock = SystemMonotonicClock,
@@ -405,6 +407,22 @@ class SmartAssistantPlugin(
      * allowance small while the model still receives the profile's full window.
      */
     private val contextTuning: ContextTuning = ContextTuning(),
+    /**
+     * 0.3 Phase 1 Task 12 (spec §4.2.1): the session's **static** device facts, read once at activation.
+     *
+     * Production passes nothing and [activate] resolves the host's `services.deviceState()`; this constructor parameter
+     * is the test seam. A host that cannot provide the provider leaves this `null`, and the catalog then omits the
+     * device section entirely - it must never be filled with a made-up model, locale or version.
+     */
+    private val deviceState: DeviceStateProvider? = null,
+    /**
+     * 0.3 Phase 1 Task 12 (spec §4.1): the prompt-catalog seam.
+     *
+     * The default is the shipped `PromptCatalog`; the lambda exists so a test can observe **when** a plan is loaded
+     * (once per activation, never per request) and prove that a catalog change cannot rewrite a live session.
+     */
+    private val promptCatalog: (ContextRoute, DeviceProfile?) -> PromptPlan =
+        { route, profile -> PromptCatalog.plan(route, profile) },
     /**
      * edith-0.2 Phase B (B11): the intervention gate — "should the model step in right now?" (spec §4.7).
      *
@@ -512,6 +530,10 @@ class SmartAssistantPlugin(
             // happened on the device: the spoken answer was fine while the phone's 助手 page stayed empty and not one
             // `SAID` or `BUSY` reached the glasses.
             Capability.ConversationDisplay,
+            // 0.3 Phase 1 Task 12 (spec §4.2.1): the host's static device profile, rendered once into the session's
+            // prompt plan. Declaring it is what makes `services.deviceState()` reachable inside `activate`; a host
+            // without the provider still activates (the device section is omitted), never a default profile.
+            Capability.DeviceState,
         ),
         ConfigSchema(CONFIG_SCHEMA_VERSION),
     )
@@ -639,6 +661,14 @@ class SmartAssistantPlugin(
      */
     @Volatile private var activeContextForTurn: ContextManager? = null
     @Volatile private var activeCompressor: ContextCompressor? = null
+
+    /**
+     * 0.3 Phase 1 Task 12 (spec §4.1/§4.4): the plans [activate] pinned for the two routes, or `null` outside a
+     * session. Built once per activation and read by every subsequent request; [deactivate] drops them with the rest
+     * of the session state. A catalog version change therefore takes effect on the **next** activation, never inside a
+     * live session.
+     */
+    @Volatile private var activePromptPlans: Map<ContextRoute, PromptPlan>? = null
 
     /**
      * Phase 5: the session's per-route stores, or `null` when the wiring supplied none. Session state like
@@ -949,24 +979,64 @@ class SmartAssistantPlugin(
     // ---------------------------------------------------------------- lifecycle
 
     /**
-     * Task 11's transitional prompt plan: the plugin's existing base/system instructions, wrapped as a one-section
-     * [PromptPlan] so `ContextManager` only ever reads planned system text.
+     * The session's pinned prompt plan for [route] (0.3 design §4.1/§4.4).
      *
-     * This is a **seam, not the 0.3 prompt design**: Task 12 replaces it with `PromptCatalog.plan(route, profile)` and
-     * the device/dynamic sections. Until then the text is byte-identical to what the manager read directly before the
-     * migration, which is what keeps production prompt behaviour unchanged for this task.
+     * [activate] loads both routes' plans exactly once. Every later request reads this map, so a catalog edit, a
+     * device profile change or a version bump can never rewrite a live session: only a new activation picks them up.
+     *
+     * A call before activation (a direct test seam, never a production request path) falls back to the profile-less
+     * catalog plan. It is a plan, not an invented device: the device section is simply absent.
      */
-    private fun legacyPromptPlan(route: ContextRoute): PromptPlan {
-        val text = when (route) {
-            ContextRoute.WAKE -> SmartPrompts.instructions()
-            ContextRoute.PROACTIVE -> SmartPrompts.proactiveInstructions()
+    private fun promptPlan(route: ContextRoute): PromptPlan =
+        activePromptPlans?.get(route) ?: promptCatalog(route, null)
+
+    /**
+     * Deterministic SHA-256 of the session's static [DeviceProfile] (spec §4.2.1 rule 4), or `"none"` when the host
+     * supplied no profile.
+     *
+     * It is the provenance half of `P3_PROMPT`: `hash` proves which prompt prose ran, `deviceHash` proves the
+     * `SESSION_STATIC` section really followed the device. Only the digest is logged - never a field value. Nulls are
+     * encoded distinctly from empty strings, and the capability set is sorted first, so the digest is stable for one
+     * profile and changes for a different one.
+     */
+    private fun deviceProfileHash(profile: DeviceProfile?): String {
+        if (profile == null) return DEVICE_HASH_NONE
+        val facts: List<String?> = listOf(
+            profile.manufacturer,
+            profile.model,
+            profile.deviceName,
+            profile.androidRelease,
+            profile.apiLevel.toString(),
+            profile.screenWidthPx.toString(),
+            profile.screenHeightPx.toString(),
+            profile.densityDpi.toString(),
+            profile.glassesModel,
+            profile.glassesFirmware,
+            profile.glassesWidthPx?.toString(),
+            profile.glassesHeightPx?.toString(),
+            profile.appVersion,
+            profile.locale,
+            profile.timeZone,
+            profile.wakeWords.joinToString("\u001f"),
+            profile.capabilities.sorted().joinToString("\u001f"),
+        )
+        // Length-prefixed, so concatenation cannot make two different profiles share one payload.
+        val payload = facts.joinToString("\u0000") { fact ->
+            if (fact == null) "~" else "${fact.length}:$fact"
         }
-        val sections = listOf(PromptSection("legacy-system", PromptKind.STATIC, text))
-        return PromptPlan(
-            version = LEGACY_PROMPT_VERSION,
-            sections = sections,
-            systemText = text,
-            hash = PromptPlan.hashOf(sections),
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(payload.toByteArray(Charsets.UTF_8))
+        return digest.joinToString("") { "%02x".format(it.toInt() and 0xff) }
+    }
+
+    /**
+     * The one prompt-provenance line of a session (spec §4.1): version, ordered-section hash, deterministic device
+     * hash and static size. Counts and hex only - no prompt text, no device value, no model text ever rides on it.
+     */
+    private fun logPromptPlan(plan: PromptPlan, deviceHash: String) {
+        P3Log.line(
+            "P3_PROMPT version=${PromptCatalog.VERSION} hash=${plan.hash} " +
+                "deviceHash=$deviceHash staticChars=${plan.systemText.length}",
         )
     }
 
@@ -1030,14 +1100,26 @@ class SmartAssistantPlugin(
         val contextPolicy = config?.profileId
             ?.let { profileId -> runCatching { profileLookup(profileId) }.getOrNull() }
             ?.let { profile -> runCatching { ContextPolicy.from(profile, contextTuning) }.getOrNull() }
+        // 0.3 Task 12 (§4.2.1): the static device profile is read once per session. The provider is the host's, resolved
+        // here unless a test injected one; a host that cannot answer yields `null` and the catalog omits the device
+        // section. No default model/locale/version is invented to fill the gap.
+        val deviceProvider = deviceState ?: runCatching { context.services.deviceState() }.getOrNull()
+        val sessionDeviceProfile = runCatching { deviceProvider?.profile() }.getOrNull()
+        // §4.1/§4.4: the session pins its plans. Both routes are loaded **now** and never re-planned, so a catalog
+        // change (or a different device read) cannot rewrite a live session or invalidate its prefix cache mid-stream.
+        val sessionPlans = ContextRoute.entries.associateWith { route ->
+            promptCatalog(route, sessionDeviceProfile)
+        }
+        activePromptPlans = sessionPlans
+        // Once per activation, counts/hashes only (spec §4.1): which prompt ran and on which device, never the prose.
+        logPromptPlan(sessionPlans.getValue(ContextRoute.WAKE), deviceProfileHash(sessionDeviceProfile))
         val contextManager = contextForTurn ?: contextPolicy?.let { policy ->
             ContextManager(
                 memory = memoryRetrieval,
                 policy = policy,
-                // Task 12 replaces this transitional lambda with `PromptCatalog.plan(route, profile)`. Until then the
-                // plan carries the same base/system instructions the manager used to read directly, so production
-                // prompt bytes are unchanged.
-                promptPlan = { route -> legacyPromptPlan(route) },
+                // The manager's instructions are the same session-pinned plan every request's system slot uses, so
+                // the legacy no-store path and the frame path cannot disagree about the system text.
+                promptPlan = { route -> sessionPlans.getValue(route) },
             )
         }
         activeContextForTurn = contextManager
@@ -1115,6 +1197,8 @@ class SmartAssistantPlugin(
             // behind would be the previous session's words under the new session's envelope.
             activeContextForTurn = null
             activeCompressor = null
+            // The pinned plans belong to the session that loaded them; a later activation loads its own (spec §4.1).
+            activePromptPlans = null
             // Phase 5: the injected stores are the same session state, so both ends of the handover empty them.
             activeStores?.values?.forEach { it.clear() }
             activeStores = null
@@ -2025,9 +2109,9 @@ class SmartAssistantPlugin(
         // `null` when the wiring supplied no manager, which is every test that is about the passive loop; the request
         // then falls back to the pre-Phase-B shape and the gateway retrieves memory itself.
         //
-        // SKILL is deliberately not part of this assembly since Phase 6: the managed text would double-inject what
-        // `systemSlot` already carries, so the manager is de-skilled and the catalog/bodies ride the frame's SKILL
-        // segments (design D-1).
+        // SKILL is deliberately not part of this assembly since Phase 6: the managed text would double-inject what the
+        // system slot already carries, so the manager is de-skilled. The catalog rides the system slot's SKILL segment
+        // and the pulled bodies ride the request tail as `SKILL_BODY` (design D-1/D-2; 0.3 Task 12).
         //
         // Phase 6 (obligation 1): the turn's **single** governor observation opens here, before the turn's first
         // request is assembled and never from inside the per-request builder — the observation unit is the turn
@@ -2095,7 +2179,7 @@ class SmartAssistantPlugin(
                 AgentRequest(
                     turnId = owned.turnId,
                     utterance = text,
-                    instructions = prompt?.instructions ?: SmartPrompts.instructions(),
+                    instructions = prompt?.instructions ?: promptPlan(ContextRoute.WAKE).systemText,
                     profileId = configured.profileId,
                     deadlineNanos = owned.deadlineNanos,
                     // D49: the profile's timeout caps **one model request**; the turn's own budget is the number above,
@@ -2423,16 +2507,18 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * Phase 5's request shape for one turn: the system slot (instructions + the fixed memory policy), the route's
-     * snapshot, the memory the assembly retrieved, and this turn's utterance **last**.
+     * Phase 5's request shape for one turn: the system slot (the session-pinned plan plus the SKILL catalog), the
+     * route's snapshot, the memory the assembly retrieved, the bodies pulled this turn, and this turn's utterance
+     * **last** (0.3 design §5.1).
      *
-     * The plugin's job stops at "segments and their attribution": the memory is *not* folded into the first user
-     * message here. That is `ModelClientGateway.frameToTranscript`'s single job, and doing it in two places would give
-     * two renderers that drift.
+     * The plugin's job stops at "segments and their attribution": neither the memory nor a SKILL body is folded into
+     * the first user message here. That is `ModelClientGateway.frameToTranscript`'s single job, and doing it in two
+     * places would give two renderers that drift. Both are request-scoped tail content, so a pull or a new retrieval
+     * never rewrites the cacheable prefix.
      *
      * @param store the route's session store, whose [ConversationStore.snapshot] opens the flow.
-     * @param prompt the session assembly, or `null` when it could not be built — the instructions then fall back to
-     *   the route's own prompt and the flow carries no memory, which is the shape a host without a manager produces.
+     * @param prompt the session assembly. `null` means no manager was built (a host without a profile); the system
+     *   slot still carries the pinned plan, and the flow simply carries no memory.
      */
     private fun buildFrame(
         store: ConversationStore,
@@ -2443,11 +2529,13 @@ class SmartAssistantPlugin(
     ): RequestFrame {
         val flow = buildList {
             addAll(store.snapshot())
+            // 0.3 design §5.1: request-scoped context rides the tail, in this order, ahead of the one USER_INPUT.
             addAll(prompt?.memorySegments.orEmpty())
+            addAll(skillBodySegments())
             add(Segment(SegmentOrigin.USER_INPUT, trusted = true, text = userInput))
         }
         return RequestFrame(
-            systemSegments = systemSlot(route, prompt),
+            systemSegments = systemSlot(route),
             conversationFlow = flow,
             tools = tools,
         )
@@ -2496,7 +2584,7 @@ class SmartAssistantPlugin(
         return { transcript ->
             val retryIndex = retryIndexIn(transcript, pinnedCount)
             RequestFrame(
-                systemSegments = systemSlot(route, prompt),
+                systemSegments = systemSlot(route),
                 conversationFlow = buildList {
                     transcript.forEachIndexed { index, item ->
                         add(
@@ -2510,6 +2598,9 @@ class SmartAssistantPlugin(
                         )
                     }
                     addAll(prompt?.memorySegments.orEmpty())
+                    // The SKILL bodies are re-read every request: a `load_skill` pull earlier in this turn must be
+                    // visible to the continuation request without rewriting the system slot.
+                    addAll(skillBodySegments())
                     add(
                         Segment(
                             SegmentOrigin.USER_INPUT,
@@ -2570,44 +2661,45 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * The system slot both frame paths share: the route's instructions, the SKILL layer, and the fixed memory policy.
+     * The system slot both frame paths share: exactly two stable things (0.3 design §4.4, §5.1).
      *
-     * Phase 6 (design D-1/D-2, obligations 4 and 5): the SKILL layer is **one catalog segment** (only when the catalog
-     * is non-blank — never a heading with nothing under it) followed by **one segment per body pulled this turn**, in
-     * pull order. `systemSlot` is called per request, which is what makes a pull visible on the next request of the
-     * same turn; the governor's observation unit stays the turn because [beginSkillTurn]/[endSkillTurn] own that
-     * boundary. A library that throws contributes no segment rather than failing the request (spec §3.7).
+     * - the route's **session-pinned** `PromptPlan.systemText` as `INSTRUCTIONS`. The plan already contains the core
+     *   sections, the route posture and the rendered device profile, including the memory policy
+     *   (`core/50-memory-policy.md`), which is why the old separate `MEMORY_POLICY` segment is gone: keeping it would
+     *   state the rule twice.
+     * - **one** SKILL **catalog** segment, when the library is non-empty. A pulled body is request-scoped
+     *   `SKILL_BODY` flow content (see [skillBodySegments]), never system text: a pull must not rewrite the cacheable
+     *   prefix.
+     *
+     * A library that throws contributes no catalog segment rather than failing the request (spec §3.7).
      */
-    private fun systemSlot(route: ContextRoute, prompt: PromptAssembly?): List<Segment> = buildList {
-        add(
-            Segment(
-                SegmentOrigin.INSTRUCTIONS,
-                trusted = true,
-                text = prompt?.instructions ?: when (route) {
-                    ContextRoute.WAKE -> SmartPrompts.instructions()
-                    ContextRoute.PROACTIVE -> SmartPrompts.proactiveInstructions()
-                },
-            ),
-        )
-        // The catalog and the pulled bodies are read in **one** critical section: the catalog mutates the session's
-        // governor (not thread-safe) and both halves must describe the same turn, so an ending turn on the other pool
-        // thread cannot clear the bodies between the two reads.
-        val (catalog, bodies) = synchronized(skillLock) {
-            val text = runCatching { skillManager?.catalog() }.getOrNull().orEmpty()
-            text to loadedSkillBodies.values.toList()
+    private fun systemSlot(route: ContextRoute): List<Segment> = buildList {
+        add(Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = promptPlan(route).systemText))
+        // The catalog mutates the session's governor (not thread-safe), so it is read under the SKILL lock.
+        val catalog = synchronized(skillLock) {
+            runCatching { skillManager?.catalog() }.getOrNull().orEmpty()
         }
         if (catalog.isNotBlank()) {
             add(Segment(SegmentOrigin.SKILL, trusted = true, text = catalog))
         }
-        bodies.forEach { skill ->
-            add(Segment(SegmentOrigin.SKILL, trusted = true, text = bodySegmentText(skill)))
-        }
-        add(Segment(SegmentOrigin.MEMORY_POLICY, trusted = true, text = SmartPrompts.MEMORY_POLICY))
     }
 
     /**
-     * One pulled body as its own `SKILL` segment. The heading names the entry so the model can tell which body this is
-     * when it pulled more than one this turn; the body follows verbatim (D-2: the body travels whole, never summarised).
+     * The bodies pulled with `load_skill` this turn, in pull order, as `SKILL_BODY` segments for the request tail.
+     *
+     * They are the dynamic half of the two-layer SKILL design (0.3 design §4.4/§5.1): request-scoped content that
+     * changes only the tail, before `USER_INPUT`, so the system prompt and the cacheable history stay stable when a
+     * skill is loaded. The body travels whole, never summarised (D-2).
+     */
+    private fun skillBodySegments(): List<Segment> = synchronized(skillLock) {
+        loadedSkillBodies.values.map { skill ->
+            Segment(SegmentOrigin.SKILL_BODY, trusted = true, text = bodySegmentText(skill))
+        }
+    }
+
+    /**
+     * One pulled body as its own `SKILL_BODY` segment. The heading names the entry so the model can tell which body
+     * this is when it pulled more than one this turn; the body follows verbatim.
      */
     private fun bodySegmentText(skill: Skill): String = "## SKILL 正文: ${skill.name}\n${skill.body}"
 
@@ -2833,7 +2925,10 @@ class SmartAssistantPlugin(
     internal fun loadSkillToolForTest(): LoadSkillTool = loadSkillTool
 
     /** Test-only: the system slot the next request for [route] would carry, built by the production [systemSlot]. */
-    internal fun systemSlotForTest(route: ContextRoute): List<Segment> = systemSlot(route, null)
+    internal fun systemSlotForTest(route: ContextRoute): List<Segment> = systemSlot(route)
+
+    /** Test-only: the pulled bodies the next request for a turn would carry, built by [skillBodySegments]. */
+    internal fun skillBodySegmentsForTest(): List<Segment> = skillBodySegments()
 
     /** The gate's input, assembled from the same signals the request carries (spec §4.7). */    private fun gateState(trigger: ProactiveTrigger): ProactiveGateState {
         val values = currentContextValues()
@@ -2961,11 +3056,11 @@ class SmartAssistantPlugin(
             stop = { hint.cancelled },
         )
         // B1/B3/B6 / spec §4.2: the proactive route consumes the **session's own** assembly exactly as the wake route
-        // does — its transcript comes from `buildPrompt` under `ContextRoute.PROACTIVE` (the SKILL layer arrives
-        // through the shared `systemSlot`, not through this assembly). Before this, the route hand-built
-        // `SmartPrompts.proactiveInstructions()` plus one history item, so the manager's PROACTIVE context was
-        // constructed and never read: "two independent conversations" held for the wake route only. `null` is the
-        // pre-Phase-B shape a test without a manager gets.
+        // does — its transcript comes from `buildPrompt` under `ContextRoute.PROACTIVE` (the SKILL catalog arrives
+        // through the shared `systemSlot` and the pulled bodies through the frame's `SKILL_BODY` tail, not through this
+        // assembly). Before this, the route hand-built a proactive prose plus one history item, so the manager's
+        // PROACTIVE context was constructed and never read: "two independent conversations" held for the wake route
+        // only. `null` is the pre-Phase-B shape a test without a manager gets.
         val prompt = activeContextForTurn?.let { contexts ->
             runCatching { contexts.buildPrompt(ContextRoute.PROACTIVE, trigger.transcript) }.getOrNull()
         }
@@ -2974,7 +3069,7 @@ class SmartAssistantPlugin(
         // the trigger: the trigger is what the transcript records (see `recordProactiveTurn`), while the message is
         // what this request asks the model about.
         val frame = activeStores?.get(ContextRoute.PROACTIVE)?.let {
-            buildFrame(it, ContextRoute.PROACTIVE, message, prompt, listOf(SmartPrompts.PROPOSE_HINT))
+            buildFrame(it, ContextRoute.PROACTIVE, message, prompt, listOf(ProactiveHintSpec.PROPOSE_HINT))
         }
         val reply = try {
             // 0.25 Task 12 (R58/R59): this route deliberately has **no** `AgentLoop` and no `AgentRequest` — it is one
@@ -2984,15 +3079,15 @@ class SmartAssistantPlugin(
             gateway.turn(GatewayTurn(
                 turnId = hint.turnId,
                 profileId = configured.profileId,
-                instructions = prompt?.instructions ?: SmartPrompts.proactiveInstructions(),
+                instructions = prompt?.instructions ?: promptPlan(ContextRoute.PROACTIVE).systemText,
                 // The gateway lifts a trailing USER turn into `input`, which is what puts the utterance and the
                 // perception last on the wire - the same shape the passive path uses. The assembly's history ends on
                 // this turn's trigger, so that last item is dropped and the full message below becomes the input:
                 // passing it whole would put the observation to the model twice.
                 history = (prompt?.history?.dropLast(1).orEmpty() +
                     ModelHistoryItem.Text(MessageRole.USER, message)),
-                tools = listOf(SmartPrompts.PROPOSE_HINT),
-                deadlineNanos = SmartTurn.saturatingAdd(started, SmartPrompts.PROACTIVE_DEADLINE_MILLIS * 1_000_000L),
+                tools = listOf(ProactiveHintSpec.PROPOSE_HINT),
+                deadlineNanos = SmartTurn.saturatingAdd(started, ProactiveHintSpec.PROACTIVE_DEADLINE_MILLIS * 1_000_000L),
                 frame = frame,
             ))
         } catch (failure: Throwable) {
@@ -3015,12 +3110,12 @@ class SmartAssistantPlugin(
             reply.terminal == ModelEnd.DEADLINE -> silence(hint, "DEADLINE", elapsed)
             reply.terminal != ModelEnd.COMPLETED -> silence(hint, "FAILED", elapsed)
             else -> {
-                val call = reply.toolCalls.firstOrNull { it.name == SmartPrompts.PROPOSE_HINT.name }
+                val call = reply.toolCalls.firstOrNull { it.name == ProactiveHintSpec.PROPOSE_HINT.name }
                 val text = call?.let { parseHint(it.argsJson) }
                 when {
                     call == null -> silence(hint, "NO_CALL", elapsed)
                     text == null -> silence(hint, "UNPARSABLE", elapsed)
-                    text.codePointCount(0, text.length) > SmartPrompts.PROACTIVE_HINT_MAX_CHARS ->
+                    text.codePointCount(0, text.length) > ProactiveHintSpec.PROACTIVE_HINT_MAX_CHARS ->
                         silence(hint, "TOO_LONG", elapsed)
                     else -> {
                         filter.noteRequest(clock.nowNanos())
@@ -3144,7 +3239,7 @@ class SmartAssistantPlugin(
             if (proactiveHint !== hint || hint.cancelled) return
             // The visible window starts here, not at the trigger: a reply that used most of the request deadline must
             // still give the wearer a full window (a review finding).
-            val expiry = SmartTurn.saturatingAdd(now, SmartPrompts.PROACTIVE_HINT_TTL_MILLIS * 1_000_000L)
+            val expiry = SmartTurn.saturatingAdd(now, ProactiveHintSpec.PROACTIVE_HINT_TTL_MILLIS * 1_000_000L)
             hint.expiryNanos = expiry
             hint.submitting = true
             hint.pendingAck = false
@@ -3645,10 +3740,11 @@ class SmartAssistantPlugin(
 
     private companion object {
         /**
-         * Task 11's transitional `PromptPlan` version. It names the plan shape, not a prompt release: Task 12 replaces
-         * the transitional plan (and this constant) with `PromptCatalog`'s own `0.3.0` manifest version.
+         * 0.3 design §4.2.1 rule 4: the `deviceHash` value for a host that supplied no device profile. It is a stable
+         * word, not a hash, so a reader can tell "no profile" from "a profile whose digest happens to look like this".
+         * An absent provider must never be filled with an invented profile.
          */
-        const val LEGACY_PROMPT_VERSION = "0.3.0"
+        const val DEVICE_HASH_NONE = "none"
 
         val SystemMonotonicClock = object : MonotonicClock {
             override fun nowNanos(): Long = System.nanoTime()

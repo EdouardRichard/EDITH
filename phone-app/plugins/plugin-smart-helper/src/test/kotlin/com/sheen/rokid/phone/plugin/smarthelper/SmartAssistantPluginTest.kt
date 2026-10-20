@@ -4,7 +4,8 @@ import com.sheen.rokid.phone.plugin.smarthelper.scene.ScenePolicy
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryExtraction
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
 import com.sheen.rokid.phone.plugin.smarthelper.memory.score
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 
 import com.sheen.rokid.contracts.AcousticEvent
@@ -81,7 +82,11 @@ class SmartAssistantPluginTest {
                 // empty and no `SAID`/`BUSY` ever reached the glasses, because the plugin consumed the port without
                 // declaring it and the optional access degraded to "no port" in silence. This list is the gate that
                 // now makes that omission fail here instead of on the wearer's face.
-                Capability.ConversationDisplay),
+                Capability.ConversationDisplay,
+                // 0.3 Phase 1 Task 12: the static device profile that the session pins into its prompt plan. The host
+                // only hands over a capability the descriptor declares, so declaring it is what makes the prompt's
+                // device section reachable at all.
+                Capability.DeviceState),
             plugin.descriptor.capabilities,
         )
         // P3.2 Task 8: `Context` is no longer absent. It is what the proactive path runs on - the host delivers
@@ -120,7 +125,11 @@ class SmartAssistantPluginTest {
         assertEquals("smart-profile", request.profileId)
         assertEquals(3, request.profileRevision)
         assertEquals(listOf(InputPart.Text("记录一下")), request.input)
-        assertEquals(SmartPrompts.instructions(), request.instructions)
+        assertEquals(
+            PromptCatalog.plan(ContextRoute.WAKE, null).systemText,
+            request.instructions,
+            "the session's profile-less catalog plan is the system text (the rig grants no device provider)",
+        )
         assertEquals(OutputModality.TEXT, request.output)
     }
 

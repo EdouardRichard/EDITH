@@ -33,6 +33,9 @@ import com.sheen.rokid.plugin.ConfirmationChannel
 import com.sheen.rokid.plugin.ContextSignals
 import com.sheen.rokid.plugin.ContextSnapshot
 import com.sheen.rokid.plugin.ConversationDisplay
+import com.sheen.rokid.plugin.DeviceProfile
+import com.sheen.rokid.plugin.DeviceState
+import com.sheen.rokid.plugin.DeviceStateProvider
 import com.sheen.rokid.plugin.EmbedResult
 import com.sheen.rokid.plugin.EmbeddingService
 import com.sheen.rokid.plugin.HintDevice
@@ -334,6 +337,10 @@ class AnswerEmitIdentityIntegrationTest {
                     Capability.StorageAccess to NoStorageAccess(),
                     Capability.SystemOne to ReadySystemOne(),
                     Capability.Embedding to ReadyEmbedding(),
+                    // 0.3 Phase 1 Task 12: the smart plugin declares the static device profile channel; the App's
+                    // composition answers it with its Android provider, so a composition-shaped rig must answer it too
+                    // or the host refuses activation.
+                    Capability.DeviceState to SyntheticDeviceState(),
                     Capability.ConversationDisplay to display,
                 ),
                 storageFor = { StubStorage() },
@@ -617,4 +624,40 @@ class AnswerEmitIdentityIntegrationTest {
             rig.close()
         }
     }
+}
+
+/**
+ * 0.3 Phase 1 Task 12: the static device profile channel a composition-shaped rig must answer.
+ *
+ * The facts are synthetic and empty: this file is about the answer's emit identity, not about prompt content, and an
+ * absent profile is a legal state the prompt omits rather than invents.
+ */
+private class SyntheticDeviceState : DeviceStateProvider {
+    override fun profile() = DeviceProfile(
+        manufacturer = "",
+        model = "",
+        deviceName = null,
+        androidRelease = "",
+        apiLevel = 0,
+        screenWidthPx = 0,
+        screenHeightPx = 0,
+        densityDpi = 0,
+        glassesModel = null,
+        glassesFirmware = null,
+        glassesWidthPx = null,
+        glassesHeightPx = null,
+        appVersion = "",
+        locale = "",
+        timeZone = "",
+        wakeWords = emptyList(),
+        capabilities = emptySet(),
+    )
+
+    override fun state() = DeviceState(
+        capturedAtEpochMillis = 0L,
+        timeZone = "UTC",
+        localDate = "2026-10-20",
+        weekday = "星期一",
+        localTime = "00:00",
+    )
 }

@@ -61,8 +61,9 @@ class ContextManager(
     private val policy: ContextPolicy,
     /**
      * The route's own [PromptPlan]. A seam rather than a constant because the two routes ask the model for different
-     * jobs: the wake path answers a request, the proactive path decides whether to speak unprompted. Task 12 replaces
-     * the plugin's transitional plan with `PromptCatalog.plan(route, profile)`.
+     * jobs: the wake path answers a request, the proactive path decides whether to speak unprompted. Production passes
+     * the session's **pinned** plans (`PromptCatalog.plan(route, deviceProfile)` loaded once in `activate`), so the
+     * system text cannot change under a live conversation.
      */
     private val promptPlan: (ContextRoute) -> PromptPlan,
 ) {

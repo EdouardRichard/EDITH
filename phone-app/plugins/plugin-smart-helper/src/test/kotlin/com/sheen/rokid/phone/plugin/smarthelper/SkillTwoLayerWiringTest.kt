@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
 import com.sheen.rokid.phone.plugin.smarthelper.library.LibraryGovernor
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillDirectory
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
@@ -11,6 +11,7 @@ import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelStreamEvent
@@ -93,6 +94,10 @@ class SkillTwoLayerWiringTest {
         }
     }
 
+    /** The one request input as text: 0.3 Task 12 puts the pulled body in this request-scoped tail. */
+    private fun inputText(request: com.sheen.rokid.plugin.ModelRequest): String =
+        request.input.filterIsInstance<InputPart.Text>().joinToString("\n\n") { it.text }
+
     private fun <T> withLines(block: (MutableList<String>) -> T): T {
         val lines = mutableListOf<String>()
         val previous = P3Log.sink
@@ -118,22 +123,31 @@ class SkillTwoLayerWiringTest {
         rig.wakeAndFinal("帮我回微信")
 
         assertEquals(2, rig.model.requests.size, "the load_skill round-trip must make a second model request")
-        val first = rig.model.requests[0].instructions
-        assertTrue(first.contains("## SKILL 目录"), "the first request must advertise the catalog: $first")
+        val first = rig.model.requests[0]
+        assertTrue(first.instructions.contains("## SKILL 目录"), "the first request must advertise the catalog")
         assertTrue(
-            first.contains("- reply-wechat-message: d-reply-wechat-message"),
-            "the catalog carries name and description: $first",
+            first.instructions.contains("- reply-wechat-message: d-reply-wechat-message"),
+            "the catalog carries name and description: ${first.instructions}",
         )
         assertFalse(
-            marker in first,
-            "the body must NOT reach the first request — the catalog is the whole point of the second layer: $first",
+            marker in first.instructions,
+            "the body must NOT reach the first request — the catalog is the whole point of the second layer",
         )
+        assertFalse(marker in inputText(first), "the body was never pulled yet")
 
-        val second = rig.model.requests[1].instructions
-        assertTrue(marker in second, "the pulled body must reach the next request of the same turn: $second")
+        // 0.3 Task 12: the pulled body is request-scoped tail content (SKILL_BODY), never system text.
+        val second = rig.model.requests[1]
+        assertFalse(
+            marker in second.instructions,
+            "a pulled body must never be folded into the system slot: ${second.instructions}",
+        )
         assertTrue(
-            second.contains("## SKILL 正文: reply-wechat-message"),
-            "the body travels in its own SKILL segment under a heading that names it: $second",
+            marker in inputText(second),
+            "the pulled body must reach the next request of the same turn, in its input tail: ${inputText(second)}",
+        )
+        assertTrue(
+            inputText(second).contains("## SKILL 正文: reply-wechat-message"),
+            "the body travels under a heading that names it: ${inputText(second)}",
         )
     }
 
@@ -185,8 +199,13 @@ class SkillTwoLayerWiringTest {
         rig.wakeAndFinal("第二回合")
 
         assertEquals(3, rig.model.requests.size, "turn 1 makes two requests, turn 2 makes one")
-        assertTrue(marker in rig.model.requests[1].instructions, "turn 1's second request carries the pulled body")
+        assertTrue(marker in inputText(rig.model.requests[1]), "turn 1's second request carries the pulled body")
+        assertFalse(
+            marker in rig.model.requests[1].instructions,
+            "the body is request-tail content, not system text",
+        )
         val secondTurnFirst = rig.model.requests[2].instructions
+        assertFalse(marker in inputText(rig.model.requests[2]), "the body is turn-scoped and left with turn 1")
         assertTrue(
             secondTurnFirst.contains("- alpha: d-alpha"),
             "the next turn's first request must advertise the catalog again: $secondTurnFirst",
@@ -223,11 +242,14 @@ class SkillTwoLayerWiringTest {
     }
 
     @Test
-    fun `two system slot builds in one turn with the same loaded set are byte-identical`() {
+    fun `two system slot builds in one turn advertise the same catalog and never a pulled body`() {
         // Design D-7 (the AC-3 range): with the same turn and the same loaded set, two builds of the SKILL segment are
         // byte-identical. The catalog is recomputed per request (D-1), so this pins that recomputation against a library
         // that did not change and a pull set that did not change; a per-build counter, timestamp or unstable sort order
         // would show up as a difference here.
+        //
+        // 0.3 Task 12 adds the placement half: a **pulled body** is request-scoped `SKILL_BODY` flow content, so it
+        // must never appear in the system slot at all — only the catalog does.
         val marker = "正文标记-9701"
         val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", marker))))
         val generation = rig.plugin.beginSkillTurnForTest(owner = true)
@@ -236,15 +258,21 @@ class SkillTwoLayerWiringTest {
             val first = rig.plugin.systemSlotForTest(ContextRoute.WAKE).filter { it.origin == SegmentOrigin.SKILL }
             val second = rig.plugin.systemSlotForTest(ContextRoute.WAKE).filter { it.origin == SegmentOrigin.SKILL }
 
-            assertTrue(first.isNotEmpty(), "the slot must carry the catalog and the pulled body: $first")
+            assertTrue(first.isNotEmpty(), "the slot must carry the catalog: $first")
             assertTrue(
                 first.any { it.text.startsWith("## SKILL 目录") },
-                "the catalog is one of the two SKILL layers this test compares: $first",
+                "the catalog is the system-slot half of the two-layer design: $first",
             )
-            assertTrue(first.any { marker in it.text }, "the loaded body is part of the compared segments: $first")
+            assertFalse(first.any { marker in it.text }, "the pulled body must not be in the system slot: $first")
             assertEquals(
                 first.map { it.text }, second.map { it.text },
-                "design D-7: two builds in one turn with the same loaded set must be byte-identical",
+                "design D-7: two builds in one turn with the same library must be byte-identical",
+            )
+            // The body is still the turn's to hand to the request tail, under its own origin.
+            val bodies = rig.plugin.skillBodySegmentsForTest()
+            assertTrue(
+                bodies.any { it.origin == SegmentOrigin.SKILL_BODY && marker in it.text },
+                "the pulled body must survive in the request tail: $bodies",
             )
         } finally {
             rig.plugin.endSkillTurnForTest(generation)
@@ -258,10 +286,10 @@ class SkillTwoLayerWiringTest {
         // error this test exists to catch.
         val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", "正文"))))
         rig.model.onRequest = { request, listener ->
-            if (request.tools.any { it.name == SmartPrompts.PROPOSE_HINT.name }) {
+            if (request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }) {
                 listener(
                     smartToolCall(
-                        "p1", SmartPrompts.PROPOSE_HINT.name, """{"text":"主动提示"}""",
+                        "p1", ProactiveHintSpec.PROPOSE_HINT.name, """{"text":"主动提示"}""",
                         requestId = request.requestId,
                     ),
                 )
@@ -393,9 +421,12 @@ class SkillTwoLayerWiringTest {
 
         rig.wakeAndFinal("帮我回微信")
 
-        val second = rig.model.requests[1].instructions
-        assertTrue(marker in second, "an enabled SKILL's body must still reach the model: $second")
-        assertTrue(second.contains("## SKILL 正文: reply-wechat-message"), second)
+        // 0.3 Task 12: the body still reaches the model, but as request-scoped `SKILL_BODY` input rather than system
+        // text, so the cacheable prefix does not change when a skill is pulled.
+        val second = rig.model.requests[1]
+        assertFalse(marker in second.instructions, "the body is tail content, not system text")
+        assertTrue(marker in inputText(second), "an enabled SKILL's body must still reach the model: ${inputText(second)}")
+        assertTrue(inputText(second).contains("## SKILL 正文: reply-wechat-message"), inputText(second))
     }
 
     // ------------------------------------------------------------ the turn-end count line (design D-10)
@@ -463,7 +494,7 @@ class SkillTwoLayerWiringTest {
         rig.model.onRequest = { request, listener ->
             listener(
                 smartToolCall(
-                    "p1", SmartPrompts.PROPOSE_HINT.name, """{"text":"主动提示"}""",
+                    "p1", ProactiveHintSpec.PROPOSE_HINT.name, """{"text":"主动提示"}""",
                     requestId = request.requestId,
                 ),
             )
@@ -472,12 +503,14 @@ class SkillTwoLayerWiringTest {
         rig.plugin.handle(AcousticEvent(rig.envelope(), AcousticLabel.Speech))
         rig.plugin.handle(TranscriptEvent(rig.transcript("这个页面怎么一直转圈", turnId = "asr-p1")))
 
-        val sent = rig.model.requests.single().instructions
+        val request = rig.model.requests.single()
+        val sent = inputText(request)
         assertTrue(
             secondMarker in sent,
             "turn 1's late end must not clear the body turn 2 pulled: $sent",
         )
         assertFalse(firstMarker in sent, "turn 2 began with no pulled bodies: $sent")
+        assertFalse(secondMarker in request.instructions, "the body still travels in the request tail, not system")
         rig.plugin.endSkillTurnForTest(second)
     }
 
@@ -499,24 +532,30 @@ class SkillTwoLayerWiringTest {
         assertEquals(0L, proactive, "a proactive turn beside a live wake turn must join it, not take ownership")
         rig.plugin.endSkillTurnForTest(proactive)
 
-        val slot = rig.plugin.systemSlotForTest(ContextRoute.WAKE)
+        val bodies = rig.plugin.skillBodySegmentsForTest()
         assertTrue(
-            slot.any { it.origin == SegmentOrigin.SKILL && marker in it.text },
-            "the wake turn's pulled body must survive the proactive turn's end: $slot",
+            bodies.any { it.origin == SegmentOrigin.SKILL_BODY && marker in it.text },
+            "the wake turn's pulled body must survive the proactive turn's end: $bodies",
+        )
+        val slot = rig.plugin.systemSlotForTest(ContextRoute.WAKE)
+        assertFalse(
+            slot.any { marker in it.text },
+            "a pulled body is request-tail content and must never enter the system slot: $slot",
         )
         rig.plugin.endSkillTurnForTest(wake)
     }
 
     /**
-     * Design D-1/D-2 fixes **where** the body travels: it belongs to the system slot's `SKILL` origin, never to
-     * `INSTRUCTIONS`. The flattened `instructions` string cannot tell the two apart, so the old assertions would pass
-     * even if the body were moved back into the instruction segment. This asserts on the segments themselves.
+     * 0.3 Task 12 fixes **where** the body travels: it belongs to the request's dynamic tail as a `SKILL_BODY`
+     * segment, never to the system slot and never to `INSTRUCTIONS`. The flattened `instructions` string cannot tell
+     * those apart, so the assertions read both the request input (the tail) and the segments themselves.
      */
     @Test
-    fun `a pulled body travels in a SKILL segment and never in INSTRUCTIONS`() {
+    fun `a pulled body travels in the request tail and never in the system slot`() {
         val marker = "正文标记-8104"
         val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", marker))))
         val slots = mutableListOf<List<Segment>>()
+        val bodies = mutableListOf<List<Segment>>()
         var calls = 0
         rig.model.onRequest = { request, listener ->
             calls += 1
@@ -524,9 +563,10 @@ class SkillTwoLayerWiringTest {
                 listener(smartToolCall("c1", LoadSkillTool.NAME, """{"name":"alpha"}""", requestId = request.requestId))
                 listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
             } else {
-                // The production producer for the slot this very request carries (the gateway flattens it into
-                // `instructions`, so the segments are only observable through the plugin).
+                // The production producers for the request this very turn carries (the gateway flattens them into
+                // `instructions`/`input`, so the segments are only observable through the plugin, mid-turn).
                 slots += rig.plugin.systemSlotForTest(ContextRoute.WAKE)
+                bodies += rig.plugin.skillBodySegmentsForTest()
                 streamText(request, listener, "好。")
             }
         }
@@ -534,26 +574,30 @@ class SkillTwoLayerWiringTest {
         rig.wakeAndFinal("帮我回微信")
 
         val slot = slots.single()
-        assertTrue(
-            slot.filter { it.origin == SegmentOrigin.SKILL }.any { marker in it.text },
-            "the pulled body must travel in a SKILL segment: $slot",
-        )
         assertFalse(
-            slot.filter { it.origin == SegmentOrigin.INSTRUCTIONS }.any { marker in it.text },
-            "the body must not be folded into INSTRUCTIONS; its origin is the whole point: $slot",
+            slot.any { marker in it.text },
+            "the pulled body must never travel in the system slot: $slot",
         )
+        assertTrue(
+            bodies.single().any {
+                it.origin == SegmentOrigin.SKILL_BODY && marker in it.text
+            },
+            "the pulled body's origin is SKILL_BODY in the request tail",
+        )
+        assertTrue(marker in inputText(rig.model.requests[1]), "the body must reach the model's input tail")
     }
 
     /**
      * Review finding (Important), concurrency half: `LibraryGovernor` documents "not thread-safe" and the SKILL state
-     * was one map and one turn flag read and written from the plugin's **two-thread** production pool. This drives two
+     * is one map and one turn flag read and written from the plugin's **two-thread** production pool. This drives two
      * turns through the real boundary and pins the interleaving with latches: a blocking directory holds turn A inside
-     * its catalog build while turn B begins and ends.
+     * its catalog build (the one SKILL-lock acquisition `systemSlot` still performs) while turn B begins and ends.
      *
-     * The latch handshake is deliberate — a bare race would only catch the corruption sometimes. Pre-fix, B's end is
-     * free to run while A is mid-request, clearing the body A is about to read; the catalog build and the body snapshot
-     * are also two separate lock acquisitions. Post-fix the one SKILL lock serialises B behind A, so A's request keeps
-     * its body and no shared structure is mutated by two threads.
+     * The latch handshake is deliberate — a bare race would only catch the corruption sometimes; the 500 ms wait bounds
+     * the test rather than asserting on timing. A new owner turn legitimately clears the previous turn's pulled bodies
+     * (that is the turn-scoped lifetime), so the body half is captured **before** the handover: it pins that the pull
+     * itself is recorded under `SKILL_BODY`, which is the shape the frame builder reads later in the turn. The stale
+     * **end** that must not clear a newer turn's bodies is covered by its own test above.
      */
     @Test
     fun `concurrent begin catalog and end do not throw or corrupt the turn state`() {
@@ -568,12 +612,14 @@ class SkillTwoLayerWiringTest {
         }
         val failures = ConcurrentLinkedQueue<Throwable>()
         val firstSlot = AtomicReference<List<Segment>>(emptyList())
+        val firstBodies = AtomicReference<List<Segment>>(emptyList())
         val secondDone = CountDownLatch(1)
 
         val first = Thread {
             try {
                 val generation = rig.plugin.beginSkillTurnForTest(owner = true)
                 rig.plugin.loadSkillToolForTest().execute(LoadSkillTool.NAME, """{"name":"alpha"}""")
+                firstBodies.set(rig.plugin.skillBodySegmentsForTest())
                 // The next directory listing is the catalog build of this turn's request, and it blocks there.
                 storage.blockNextList.set(true)
                 firstSlot.set(rig.plugin.systemSlotForTest(ContextRoute.WAKE))
@@ -595,8 +641,6 @@ class SkillTwoLayerWiringTest {
             secondDone.countDown()
         }
         second.start()
-        // Not an assertion on timing: pre-fix the second turn finishes here and clears the first turn's body; post-fix
-        // it waits on the SKILL lock, and the wait only bounds the test.
         secondDone.await(500, TimeUnit.MILLISECONDS)
         storage.release()
         first.join(5_000)
@@ -605,8 +649,12 @@ class SkillTwoLayerWiringTest {
         assertFalse(first.isAlive || second.isAlive, "both turns must finish; a torn structure or a deadlock is a failure")
         assertTrue(failures.isEmpty(), "concurrent SKILL turn work threw: ${failures.take(3)}")
         assertTrue(
-            firstSlot.get().any { it.origin == SegmentOrigin.SKILL && "正文-a" in it.text },
-            "the overlapping turn's end must not clear the body this request is still building: ${firstSlot.get()}",
+            firstBodies.get().any { it.origin == SegmentOrigin.SKILL_BODY && "正文-a" in it.text },
+            "the pull behind the blocked catalog build must be a SKILL_BODY tail segment: ${firstBodies.get()}",
+        )
+        assertTrue(
+            firstSlot.get().any { it.origin == SegmentOrigin.SKILL && "- alpha: d-alpha" in it.text },
+            "the overlapping turn's catalog build must finish intact: ${firstSlot.get()}",
         )
 
         // The shared state must be intact: both entries still governed, the catalog still non-empty, and a fresh turn

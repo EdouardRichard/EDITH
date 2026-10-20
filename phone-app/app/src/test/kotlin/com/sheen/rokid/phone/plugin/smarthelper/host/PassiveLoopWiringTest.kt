@@ -58,6 +58,9 @@ import com.sheen.rokid.plugin.CapabilityVerification
 import com.sheen.rokid.plugin.ConfigSchema
 import com.sheen.rokid.plugin.ConfiguredPlugin
 import com.sheen.rokid.plugin.ContextSignals
+import com.sheen.rokid.plugin.DeviceProfile
+import com.sheen.rokid.plugin.DeviceState
+import com.sheen.rokid.plugin.DeviceStateProvider
 import com.sheen.rokid.plugin.ContextSnapshot
 import com.sheen.rokid.plugin.DeactivationReason
 import com.sheen.rokid.plugin.HintDevice
@@ -186,6 +189,42 @@ class PassiveLoopWiringTest {
         override fun snapshot() = ContextSnapshot(0L, emptyMap())
         override fun listen(listener: (ContextSnapshot) -> Unit): CancellationHandle =
             object : CancellationHandle { override fun cancel() = Unit }
+    }
+
+    /**
+     * 0.3 Phase 1 Task 12: the smart plugin declares the static device profile channel, so every composition-shaped
+     * rig that activates it must answer `Capability.DeviceState` exactly as the App's composition does. The facts are
+     * deliberately empty (a profile with no model/version), so this rig contributes no device literal to any prompt and
+     * these tests stay about wiring rather than prompt content.
+     */
+    private class SyntheticDeviceState : DeviceStateProvider {
+        override fun profile() = DeviceProfile(
+            manufacturer = "",
+            model = "",
+            deviceName = null,
+            androidRelease = "",
+            apiLevel = 0,
+            screenWidthPx = 0,
+            screenHeightPx = 0,
+            densityDpi = 0,
+            glassesModel = null,
+            glassesFirmware = null,
+            glassesWidthPx = null,
+            glassesHeightPx = null,
+            appVersion = "",
+            locale = "",
+            timeZone = "",
+            wakeWords = emptyList(),
+            capabilities = emptySet(),
+        )
+
+        override fun state() = DeviceState(
+            capturedAtEpochMillis = 0L,
+            timeZone = "UTC",
+            localDate = "2026-10-20",
+            weekday = "星期一",
+            localTime = "00:00",
+        )
     }
 
     /**
@@ -415,6 +454,7 @@ private class NoStorageAccess : StorageAccess {
                     Capability.StorageAccess to NoStorageAccess(),
                     Capability.SystemOne to ReadySystemOne(),
                     Capability.Embedding to ReadyEmbedding(),
+                    Capability.DeviceState to SyntheticDeviceState(),
                     Capability.ConversationDisplay to NoConversationDisplay(),
                 ),
                 storageFor = { StubStorage() })
@@ -817,6 +857,7 @@ private class NoStorageAccess : StorageAccess {
                 Capability.StorageAccess to NoStorageAccess(),
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
+                Capability.DeviceState to SyntheticDeviceState(),
                 Capability.ConversationDisplay to NoConversationDisplay(),
             ),
             storageFor = { StubStorage() })
@@ -885,7 +926,9 @@ private class NoStorageAccess : StorageAccess {
                 Capability.StorageAccess, Capability.SystemOne, Capability.Embedding,
                 // edith-0.2 Phase C: the smart plugin declares the conversation port, so the composition advertises
                 // it and this rig answers it - the two halves of the contract this test exists to keep equal.
-                Capability.ConversationDisplay), advertised)
+                Capability.ConversationDisplay,
+                // 0.3 Phase 1 Task 12: the static device profile the session pins into its prompt plan.
+                Capability.DeviceState), advertised)
             val services = rig.environment.services(ResourceScope("smart-assistant", session, Generation(1)), advertised)
             advertised.forEach { capability ->
                 assertNull("$capability is advertised, so it must be answerable",
@@ -1051,6 +1094,7 @@ private class NoStorageAccess : StorageAccess {
                 Capability.StorageAccess to NoStorageAccess(),
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
+                Capability.DeviceState to SyntheticDeviceState(),
                 Capability.ConversationDisplay to NoConversationDisplay(),
             ),
             storageFor = { StubStorage() })
@@ -1237,6 +1281,7 @@ private class NoStorageAccess : StorageAccess {
                 Capability.StorageAccess to NoStorageAccess(),
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
+                Capability.DeviceState to SyntheticDeviceState(),
                 Capability.ConversationDisplay to display,
             ),
             storageFor = { StubStorage() })
@@ -1339,7 +1384,8 @@ private class NoStorageAccess : StorageAccess {
                     Capability.StorageAccess to NoStorageAccess(),
                     Capability.SystemOne to ReadySystemOne(),
                     Capability.Embedding to ReadyEmbedding(),
-                    Capability.ConversationDisplay to display,
+                    Capability.DeviceState to SyntheticDeviceState(),
+                Capability.ConversationDisplay to display,
                 ),
                 storageFor = { StubStorage() })
             root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),

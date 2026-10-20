@@ -1,26 +1,44 @@
 package com.sheen.rokid.phone.plugin.smarthelper.context
-import com.sheen.rokid.phone.plugin.smarthelper.memory.VectorIndex
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+
+import com.sheen.rokid.phone.plugin.smarthelper.CONTINUE_AFTER_TOOL
+import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeDeviceState
+import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeSkills
+import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeStorage
+import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptKind
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptSection
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.profileFixture
+import com.sheen.rokid.phone.plugin.smarthelper.skill.LoadSkillTool
+import com.sheen.rokid.phone.plugin.smarthelper.smartSkillDoc
+import com.sheen.rokid.phone.plugin.smarthelper.smartStores
+import com.sheen.rokid.phone.plugin.smarthelper.streamText
 
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.EmbedResult
 import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.InputPart
+import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelInfo
-import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeStorage
-import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig
-import com.sheen.rokid.phone.plugin.smarthelper.streamText
+import com.sheen.rokid.plugin.ModelStreamEvent
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
  * edith-0.2 Phase B (B1/B6/B7): the session's own prompt assembly, read out of the request the model received.
  *
- * `ContextManager` was built, tested and **never called**: `runTurn` sent `SmartPrompts.instructions()`, passed no
- * history at all (review finding I1), and let the gateway retrieve memory on its own. So "two independent
+ * `ContextManager` was built, tested and **never called**: `runTurn` sent the hand-written `SmartPrompts` prose,
+ * passed no history at all (review finding I1), and let the gateway retrieve memory on its own. So "two independent
  * conversations" and "the assistant remembers this session" were properties of a class nothing ran. These tests
  * activate the plugin the way the composition does and read `ModelRequest.history` / `.context` / `.instructions`.
+ *
+ * 0.3 Task 12 moved the system text from that hand-written prose to `PromptCatalog.plan(route, deviceProfile)`. The
+ * system prompt is therefore a **session-pinned** value that contains the live device profile, and a `load_skill` pull
+ * is request-scoped tail content ([SegmentOrigin.SKILL_BODY]) instead of system text.
  */
 class SessionContextWiringTest {
 
@@ -41,12 +59,16 @@ class SessionContextWiringTest {
         override val dimensions = DIM
     }
 
+    /** The session's synthetic device profile; the model is the value the system prompt must carry. */
+    private val deviceProfile = profileFixture(model = "M2012K11AC")
+
     private fun activatedRig(embeddings: EmbeddingService): SmartTestRig {
         val rig = SmartTestRig()
         rig.activate(
             overrides = mapOf(
                 Capability.Storage to SmartFakeStorage(),
                 Capability.Embedding to embeddings,
+                Capability.DeviceState to SmartFakeDeviceState(deviceProfile),
             ),
         )
         rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
@@ -120,6 +142,106 @@ class SessionContextWiringTest {
         // Phase 3: context field removed from ModelRequest; memory assembly moved to TurnRunner.
         // Memory retrieval is verified via the embedding call count above.
     }
+
+    @Test
+    fun `the session system prompt contains the device profile and is stable across turns`() {
+        val rig = activatedRig(ScriptedEmbeddings())
+
+        rig.wakeAndFinal("第一问", turnId = "asr-1")
+        rig.tick(4_000)
+        rig.wakeAndFinal("第二问", turnId = "asr-2")
+
+        val first = rig.model.requests.first { it.instructions.isNotBlank() }.instructions
+        val second = rig.model.requests.last { it.instructions.isNotBlank() }.instructions
+        assertTrue("M2012K11AC" in first, "the device profile never reached the system prompt: $first")
+        assertEquals(first, second, "the system prompt must be pinned for the whole session")
+        assertEquals(PromptCatalog.plan(ContextRoute.WAKE, deviceProfile).systemText, first)
+    }
+
+    @Test
+    fun `a catalog change after activation does not rewrite a live session`() {
+        var revision = "first"
+        val plans = mutableListOf<PromptPlan>()
+        val rig = SmartTestRig(
+            promptCatalog = { route, _ ->
+                val text = "$revision:${route.name}"
+                val sections = listOf(PromptSection("test-system", PromptKind.STATIC, text))
+                PromptPlan(PromptCatalog.VERSION, sections, text, PromptPlan.hashOf(sections)).also { plans += it }
+            },
+        )
+        rig.activate()
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+        rig.wakeAndFinal("第一问", turnId = "asr-1")
+        assertEquals(
+            listOf("first:WAKE", "first:PROACTIVE"),
+            plans.map { it.systemText },
+            "activation loads exactly one plan per route, in route order",
+        )
+
+        // The catalog is replaced after activation. A live session must keep the plan it pinned: re-planning now would
+        // rewrite the system prompt (and invalidate the prefix cache) mid-session.
+        revision = "second"
+        rig.tick(4_000)
+        rig.wakeAndFinal("第二问", turnId = "asr-2")
+
+        assertEquals(2, plans.size, "a live session must never re-load a prompt plan")
+        assertEquals("first:WAKE", rig.model.requests.last().instructions)
+    }
+
+    @Test
+    fun `pulled skill bodies are not in the system slot`() {
+        val marker = "正文标记-1201"
+        val rig = SmartTestRig(conversationStores = smartStores())
+        rig.activate(
+            overrides = mapOf(
+                Capability.Storage to SmartFakeStorage(),
+                Capability.Embedding to ScriptedEmbeddings(),
+                Capability.DeviceState to SmartFakeDeviceState(deviceProfile),
+                Capability.StorageAccess to SmartFakeSkills(
+                    mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", marker)),
+                ),
+            ),
+        )
+        var calls = 0
+        rig.model.onRequest = { request, listener ->
+            calls += 1
+            if (calls == 1) {
+                listener(smartToolCall(LoadSkillTool.NAME, """{"name":"alpha"}""", request.requestId))
+                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(request, listener, "好。")
+            }
+        }
+
+        rig.wakeAndFinal("帮我看看")
+
+        assertEquals(2, rig.model.requests.size, "the load_skill round-trip must make a second request")
+        val (first, second) = rig.model.requests
+        val sessionPlan = PromptCatalog.plan(ContextRoute.WAKE, deviceProfile)
+        assertTrue(first.instructions.startsWith(sessionPlan.systemText), "the catalog plan is the system text")
+        assertTrue(first.instructions.contains("- alpha: d-alpha"), "the catalog must advertise the entry")
+        assertFalse(marker in first.instructions, "the body must not be in the first request's system slot")
+        assertFalse(marker in second.instructions, "a pulled body never becomes system text")
+        assertFalse(
+            "本轮技能正文" in second.instructions,
+            "the SKILL body placeholder belongs to the dynamic tail, not the system slot",
+        )
+
+        val secondInput = second.input.filterIsInstance<InputPart.Text>().joinToString("\n\n") { it.text }
+        assertTrue(marker in secondInput, "the pulled body must ride the request input: $secondInput")
+        assertTrue("## SKILL 正文: alpha" in secondInput, "the body travels under its own heading: $secondInput")
+        assertTrue(secondInput.endsWith(CONTINUE_AFTER_TOOL), "USER_INPUT stays last: $secondInput")
+    }
+
+    private fun smartToolCall(name: String, argsJson: String, requestId: String): ModelStreamEvent =
+        ModelStreamEvent.ToolCallTerminal(
+            requestId = requestId,
+            itemId = "c1",
+            callId = "c1",
+            name = name,
+            argsJson = argsJson,
+        )
 
     private companion object {
         /** The index is 256-dim in production; a narrower vector is rejected by `VectorIndex`. */

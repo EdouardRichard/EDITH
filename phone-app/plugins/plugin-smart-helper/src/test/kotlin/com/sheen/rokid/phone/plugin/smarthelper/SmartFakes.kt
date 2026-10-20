@@ -3,6 +3,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextCompressor
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptKind
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptSection
@@ -26,6 +27,9 @@ import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ConversationDisplay
 import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.DeviceProfile
+import com.sheen.rokid.plugin.DeviceState
+import com.sheen.rokid.plugin.DeviceStateProvider
 import com.sheen.rokid.plugin.EmbedResult
 import com.sheen.rokid.plugin.EmbeddingService
 import com.sheen.rokid.plugin.HostServices
@@ -438,8 +442,9 @@ internal fun smartContextPolicy(
 ): ContextPolicy = ContextPolicy.from(profile, tuning)
 
 /**
- * A one-section prompt plan for a test manager. 0.3 Task 11's `ContextManager` reads its instructions from a plan,
- * and Task 12 will supply the catalog; a test that is not about prompt content uses this deterministic stand-in.
+ * A one-section prompt plan for a test manager. 0.3 Task 11's `ContextManager` reads its instructions from a plan, and
+ * Task 12 supplies the real `PromptCatalog` in production; a test that is not about prompt content uses this
+ * deterministic stand-in.
  */
 internal fun smartPromptPlan(
     systemText: (ContextRoute) -> String = { route ->
@@ -573,6 +578,16 @@ internal class SmartTestRig(
      * interleaving test needs a second wake inside the first round's 1 s close, so it opts out explicitly.
      */
     val cooldownNanos: Long = 3_000_000_000L,
+    /**
+     * 0.3 Phase 1 Task 12: the prompt-catalog seam. `null` uses the production `PromptCatalog.plan`; a test that pins
+     * "a catalog change never rewrites a live session" supplies its own observable planner instead.
+     */
+    promptCatalog: ((ContextRoute, DeviceProfile?) -> PromptPlan)? = null,
+    /**
+     * 0.3 Phase 1 Task 12: an injected `DeviceStateProvider`. `null` keeps the production resolution
+     * (`services.deviceState()` inside `activate`) under test.
+     */
+    deviceState: DeviceStateProvider? = null,
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -607,6 +622,8 @@ internal class SmartTestRig(
             isPanelVisible = { panelVisible },
             continueDialogue = { continueDialogue },
             speechAvailable = { speechAvailable },
+            promptCatalog = promptCatalog ?: { route, profile -> PromptCatalog.plan(route, profile) },
+            deviceState = deviceState,
         )
     }
 
@@ -757,4 +774,31 @@ internal class SmartFakeEmbedding(private val available: Boolean = true) : Embed
     override val isAvailable: Boolean get() = available
     override val modelInfo: ModelInfo? get() = null
     override val dimensions: Int get() = 256
+}
+
+/**
+ * 0.3 Phase 1 Task 12: the host's device profile/state channel, answerable from a fixture.
+ *
+ * [profileReads] lets a test prove the session reads the device **once** at activation instead of per turn: the plan
+ * is pinned, so a second `profile()` call for a live session would be a second snapshot the spec does not allow.
+ */
+internal class SmartFakeDeviceState(
+    private val profile: DeviceProfile,
+    private val state: DeviceState = DeviceState(
+        capturedAtEpochMillis = 0L,
+        timeZone = "UTC",
+        localDate = "2026-10-20",
+        weekday = "星期一",
+        localTime = "00:00",
+    ),
+) : DeviceStateProvider {
+    var profileReads: Int = 0
+        private set
+
+    override fun profile(): DeviceProfile {
+        profileReads += 1
+        return profile
+    }
+
+    override fun state(): DeviceState = state
 }

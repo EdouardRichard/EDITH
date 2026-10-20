@@ -12,7 +12,8 @@ import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -168,8 +169,9 @@ class ContinuationUtteranceTest {
         // The trimmer prices text in TokenMeter token units (`estimate + 32`), so the window is sized in those units:
         // a byte-sized window would leave a token-priced transcript several times more room than intended.
         fun measure(text: String) = TokenMeter.estimate(text) + 32
-        // `buildFrame`'s system slot when the SKILL catalog is empty: the route's instructions then the memory policy.
-        val system = SmartPrompts.instructions() + "\n" + SmartPrompts.MEMORY_POLICY
+        // `buildFrame`'s system slot when the SKILL catalog is empty: 0.3 Task 12's session-pinned catalog plan.
+        // This rig supplies no device provider, so the plan is the profile-less WAKE plan.
+        val system = PromptCatalog.plan(ContextRoute.WAKE, null).systemText
         val window = 32 + measure(system) + inputs.maxOf(::measure) + 8
         val inputBudget = window + 32
         return wireProfile.copy(

@@ -3,8 +3,8 @@ package com.sheen.rokid.phone.plugin.smarthelper.scene
 /**
  * The scene policy: the one gate that stops the passive loop from answering a wake it should not answer yet.
  *
- * Spec §4.3 keeps the knowledge / privacy / dilemma behaviour in `SmartPrompts`, and this class keeps the *timing*
- * half: a wake that arrives within [cooldownNanos] of the previous admitted wake is refused. Without it, one utterance
+ * Spec §4.3 keeps the knowledge / privacy / dilemma behaviour in the versioned prompt catalog, and this class keeps
+ * the *timing* half: a wake that arrives within [cooldownNanos] of the previous admitted wake is refused. Without it, one utterance
  * that happens to contain the wake word several times would open several turns for the same thing, and the glasses
  * would be handed several hints for one request.
  *

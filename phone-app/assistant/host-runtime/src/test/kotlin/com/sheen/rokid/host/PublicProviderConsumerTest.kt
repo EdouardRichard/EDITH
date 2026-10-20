@@ -194,6 +194,38 @@ class PublicProviderConsumerTest {
                 override fun snapshot() = ContextSnapshot(0L, emptyMap())
                 override fun listen(listener: (ContextSnapshot) -> Unit): CancellationHandle = FakeCancellation()
             },
+            // 0.3 Phase 1 Task 12: the smart plugin now declares the static device profile channel, so a rig that
+            // activates it must answer it the way the App's composition does (its Android provider is wired at
+            // startup). The facts are synthetic and empty: this test is about capability hand-over, not prompt content.
+            Capability.DeviceState to object : DeviceStateProvider {
+                override fun profile() = DeviceProfile(
+                    manufacturer = "Synthetic",
+                    model = "Synthetic",
+                    deviceName = null,
+                    androidRelease = "0",
+                    apiLevel = 0,
+                    screenWidthPx = 0,
+                    screenHeightPx = 0,
+                    densityDpi = 0,
+                    glassesModel = null,
+                    glassesFirmware = null,
+                    glassesWidthPx = null,
+                    glassesHeightPx = null,
+                    appVersion = "0",
+                    locale = "zh-CN",
+                    timeZone = "Asia/Shanghai",
+                    wakeWords = emptyList(),
+                    capabilities = emptySet(),
+                )
+
+                override fun state() = DeviceState(
+                    capturedAtEpochMillis = 0L,
+                    timeZone = "Asia/Shanghai",
+                    localDate = "2026-10-20",
+                    weekday = "星期一",
+                    localTime = "00:00",
+                )
+            },
             Capability.Actions to object : ActionExecutor {
                 override fun descriptors() = emptyList<ActionDescriptor>()
                 override fun execute(name: String, argsJson: String) = ActionResult(ActionOutcome.Done, "done")
