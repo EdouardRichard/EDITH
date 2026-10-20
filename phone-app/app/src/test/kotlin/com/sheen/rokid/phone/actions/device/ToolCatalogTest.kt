@@ -261,12 +261,65 @@ class ToolCatalogTest {
         }
     }
 
+    @Test
+    fun `device open and dial are gated by unlock but shell is not`() {
+        val calls = mutableListOf<Boolean>()
+        val gate = com.sheen.rokid.phone.lock.UnlockGate { requireAccessibility ->
+            calls += requireAccessibility
+            com.sheen.rokid.phone.lock.UnlockOutcome.FAILED
+        }
+        val catalog = catalog(unlock = gate)
+
+        assertEquals(ActionOutcome.Refused, catalog.execute("device", "{}").outcome)
+        assertEquals(ActionOutcome.Refused, catalog.execute("open", "{}").outcome)
+        assertEquals(ActionOutcome.Refused, catalog.execute("dial", "{}").outcome)
+        assertEquals("device needs accessibility; open/dial do not", listOf(true, false, false), calls)
+
+        calls.clear()
+        catalog.execute("shell", "{}")
+        assertTrue("the raw shell is never blocked by the lock-screen gate", calls.isEmpty())
+    }
+
+    @Test
+    fun `execute emits a privacy safe arg shape before delegating`() {
+        val lines = mutableListOf<String>()
+        val previous = com.sheen.rokid.phone.platform.P3Log.sink
+        com.sheen.rokid.phone.platform.P3Log.sink = { lines += it }
+        try {
+            catalog().execute("shell", """{"command":"id hunter2"}""")
+        } finally {
+            com.sheen.rokid.phone.platform.P3Log.sink = previous
+        }
+
+        assertTrue("M1 must log one shape line: $lines", lines.any {
+            it == "P3_TOOLARG tool=shell commandClass=identity chars=10 hasStdin=false timeoutMs=30000"
+        })
+        assertFalse("the command must never reach the log", lines.any { it.contains("hunter2") })
+    }
+
+    @Test
+    fun `device unlock gate runs before the a11y probe so a locked phone can wake it`() {
+        val calls = mutableListOf<Boolean>()
+        val gate = com.sheen.rokid.phone.lock.UnlockGate { requireAccessibility ->
+            calls += requireAccessibility
+            com.sheen.rokid.phone.lock.UnlockOutcome.FAILED
+        }
+        val catalog = catalog(probes = Probes(a11y = false), unlock = gate)
+
+        val result = catalog.execute("device", "{}")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("the gate must run even while a11y is down", listOf(true), calls)
+    }
+
     // - helpers -
 
     private fun catalog(
         probes: Probes = Probes(),
         deviceOperations: RecordingDeviceOperations = RecordingDeviceOperations(),
         dialExecutor: RecordingExecutor = RecordingExecutor(),
+        unlock: com.sheen.rokid.phone.lock.UnlockGate =
+            com.sheen.rokid.phone.lock.UnlockGate { com.sheen.rokid.phone.lock.UnlockOutcome.ALREADY_UNLOCKED },
     ): ToolCatalog {
         val registry = RefRegistry()
         val device = DeviceTool(
@@ -281,6 +334,7 @@ class ToolCatalogTest {
             a11yAvailable = { probes.a11y },
             shellAvailable = { probes.shell },
             callAvailable = { probes.call },
+            unlock = unlock,
         )
     }
 

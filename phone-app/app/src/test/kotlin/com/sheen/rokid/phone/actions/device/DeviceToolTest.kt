@@ -150,7 +150,24 @@ class DeviceToolTest {
         assertEquals(JsonNull, screen["activity"])
     }
 
+    @Test
+    fun `the schema tells the model to use a media key after opening a player`() {
+        val descriptor = tool(FakeDeviceOperations(observation())).descriptors().single()
+
+        assertTrue(descriptor.parametersJson.contains("MEDIA_PLAY_PAUSE"))
+        assertTrue(descriptor.parametersJson.contains("播放"))
+    }
+
     // - act -
+
+    @Test
+    fun `act accepts a ref without the hash prefix`() {
+        val operations = FakeDeviceOperations(observation())
+        val result = tool(operations).execute("""{"action":"act","kind":"tap","ref":"n1"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(Ref("#n1"), operations.actCalls.single().ref)
+    }
 
     @Test
     fun `act passes kind ref value direction key and timeout through to the kernel`() {

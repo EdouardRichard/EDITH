@@ -9,6 +9,7 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ServiceInfo
+import android.graphics.Color
 import android.graphics.PixelFormat
 import android.os.Binder
 import android.os.Build
@@ -23,6 +24,8 @@ import android.view.View
 import android.view.WindowManager
 import android.widget.FrameLayout
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.glasses.accessibility.GlassesAccessibilityService
+import com.sheen.rokid.glasses.accessibility.PanelWindowPolicy
 import com.sheen.rokid.glasses.bridge.RokidBridgeEndpoint
 import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
@@ -67,6 +70,14 @@ class GlassesOverlayService : Service() {
 
     private var overlayRoot: FrameLayout? = null
     private var overlayParams: WindowManager.LayoutParams? = null
+    /**
+     * The manager that actually added [overlayRoot]. With the accessibility service this is the service's own
+     * `WindowManager` (a `TYPE_ACCESSIBILITY_OVERLAY` cannot be added with this application context's token); the
+     * fallback is [windowManager]. Removal must use the same manager.
+     */
+    private var overlayWindowManager: WindowManager? = null
+    /** The full-screen opaque backdrop that hides the vendor HUD; non-null only in accessibility-overlay mode. */
+    private var backdropRoot: FrameLayout? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
     /** The timeout the current acquire call was given; read by [wakeLockTimeoutAppliedForProbe]. */
@@ -123,6 +134,16 @@ class GlassesOverlayService : Service() {
         RokidBridgeEndpoint.instance.setListener { json -> acceptCommand(json) }
         // Task 20: the CXR-S bridge reports the link's own death. It arrives on the bridge thread; the handler posts.
         RokidBridgeEndpoint.instance.setDisconnectionListener { onCxrDisconnected() }
+        // A panel drawn through the accessibility overlay disappears with that service. Hide our state as well, so a
+        // later PANEL_OPEN re-adds it instead of reporting an already-visible window that no longer exists.
+        GlassesAccessibilityService.onLost = {
+            mainHandler.post {
+                if (overlayRoot != null) {
+                    Log.i(TAG, "A11Y_LOST hide_panel=true")
+                    hidePanel()
+                }
+            }
+        }
         instanceForTest = this
         // No identity before a HELLO, so this records the deferral instead of fabricating a session.
         maybeSendUiReady()
@@ -138,6 +159,7 @@ class GlassesOverlayService : Service() {
     override fun onBind(intent: Intent?): IBinder = binder
 
     override fun onDestroy() {
+        GlassesAccessibilityService.onLost = null
         runCatching { hidePanel() }
         releaseWakeLock()
         RokidBridgeEndpoint.instance.setDisconnectionListener(null)
@@ -170,6 +192,14 @@ class GlassesOverlayService : Service() {
         }
         visibleRoute = route
         acquireWakeLock()
+        val accessibilityManager = GlassesAccessibilityService.windowManagerOrNull()
+        val useAccessibilityOverlay = accessibilityManager != null
+        val panelWindowManager = accessibilityManager ?: windowManager
+        // The panel is the key target while visible; the transparent scene must not compete for focus.
+        if (useAccessibilityOverlay) GlassesActivity.setSceneFocusable(false)
+        if (PanelWindowPolicy.needsBackdrop(useAccessibilityOverlay)) {
+            addBackdrop(panelWindowManager)
+        }
         val root = OverlayRoot(this).apply {
             isFocusable = true
             isFocusableInTouchMode = true
@@ -182,7 +212,7 @@ class GlassesOverlayService : Service() {
         val params = WindowManager.LayoutParams(
             WIDTH_PX,
             HEIGHT_PX,
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            PanelWindowPolicy.type(useAccessibilityOverlay),
             WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS or
                 WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
                 WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
@@ -195,20 +225,25 @@ class GlassesOverlayService : Service() {
             setTitle(WINDOW_TITLE)
         }
         try {
-            windowManager.addView(root, params)
+            panelWindowManager.addView(root, params)
         } catch (t: Throwable) {
             Log.e(TAG, "OVERLAY add_failed=${t.javaClass.simpleName}:${t.message}")
+            removeBackdrop(panelWindowManager)
+            if (useAccessibilityOverlay) GlassesActivity.setSceneFocusable(true)
             visibleRoute = null
             releaseWakeLock()
             return
         }
         overlayRoot = root
         overlayParams = params
+        overlayWindowManager = panelWindowManager
         root.requestFocus()
         host.installSideTouch(root)
         host.onStart()
-        Log.i(TAG, "OVERLAY added type=TYPE_APPLICATION_OVERLAY gravity=BOTTOM|START size=${WIDTH_PX}x${HEIGHT_PX} " +
-            "format=TRANSLUCENT flags=NOT_TOUCHABLE|LAYOUT_NO_LIMITS|LAYOUT_IN_SCREEN|KEEP_SCREEN_ON focusable=true")
+        Log.i(TAG, "OVERLAY added type=${typeName(params.type)} accessibility=$useAccessibilityOverlay " +
+            "gravity=BOTTOM|START size=${WIDTH_PX}x${HEIGHT_PX} " +
+            "format=TRANSLUCENT flags=NOT_TOUCHABLE|LAYOUT_NO_LIMITS|LAYOUT_IN_SCREEN|KEEP_SCREEN_ON focusable=true " +
+            "backdrop=${backdropRoot != null}")
         root.viewTreeObserver.addOnGlobalLayoutListener(object : android.view.ViewTreeObserver.OnGlobalLayoutListener {
             override fun onGlobalLayout() {
                 if (overlayRoot !== root || !root.isAttachedToWindow || root.width == 0) return
@@ -236,7 +271,13 @@ class GlassesOverlayService : Service() {
             return
         }
         val root = overlayRoot
+        val manager = overlayWindowManager ?: windowManager
+        val wasAccessibilityOverlay = overlayParams?.type == WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY ||
+            backdropRoot != null
         if (root == null) {
+            overlayWindowManager = null
+            removeBackdrop(manager)
+            if (wasAccessibilityOverlay) GlassesActivity.setSceneFocusable(true)
             pendingPanelShownRoute = null
             visibleRoute = null
             // No window to remove, but the hidden cache is still a cache: a valid CLOSE must clear it.
@@ -246,19 +287,74 @@ class GlassesOverlayService : Service() {
         }
         overlayRoot = null
         overlayParams = null
+        overlayWindowManager = null
         val route = visibleRoute ?: host.selectedRoute()
         visibleRoute = null
         pendingPanelShownRoute = null
-        runCatching { windowManager.removeView(root) }
+        runCatching { manager.removeView(root) }
             .onFailure { Log.w(TAG, "OVERLAY remove_failed=${it.javaClass.simpleName}:${it.message}") }
         runCatching { root.removeAllViews() }
             .onFailure { Log.w(TAG, "OVERLAY detach_failed=${it.javaClass.simpleName}:${it.message}") }
+        removeBackdrop(manager)
+        // Keep a focused window after the accessibility panel goes away; otherwise the top RESUMED transparent scene
+        // has no focus target and this ROM raises an ANR and force-finishes it.
+        if (wasAccessibilityOverlay) GlassesActivity.setSceneFocusable(true)
         host.onStop()
         releaseWakeLock()
         // Task 9: a closed panel leaves no conversation behind. The session identity is kept (see resetForClose).
         host.resetForClose()
         sendUiClosed(route)
         Log.i(TAG, "PANEL_HIDDEN route=${route.name} conversation_cleared=true")
+    }
+
+    /**
+     * Adds the full-screen opaque layer that hides the vendor home HUD.
+     *
+     * Only meaningful for `TYPE_ACCESSIBILITY_OVERLAY`: the vendor HUD is a system window at 271000, above every
+     * `TYPE_APPLICATION_OVERLAY` (121000), so a panel-only app overlay cannot cover it. The backdrop and the panel are
+     * added through the same accessibility-service manager; the backdrop is NOT focusable, and the panel added after
+     * it remains the focused window that receives the side keys.
+     */
+    private fun addBackdrop(manager: WindowManager) {
+        if (backdropRoot != null) return
+        val view = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        val params = WindowManager.LayoutParams(
+            PanelWindowPolicy.CANVAS_WIDTH_PX,
+            PanelWindowPolicy.CANVAS_HEIGHT_PX,
+            WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY,
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCHABLE or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.OPAQUE,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            setTitle(BACKDROP_TITLE)
+        }
+        try {
+            manager.addView(view, params)
+            backdropRoot = view
+            Log.i(TAG, "BACKDROP added type=TYPE_ACCESSIBILITY_OVERLAY " +
+                "size=${PanelWindowPolicy.CANVAS_WIDTH_PX}x${PanelWindowPolicy.CANVAS_HEIGHT_PX} opaque")
+        } catch (t: Throwable) {
+            Log.e(TAG, "BACKDROP add_failed=${t.javaClass.simpleName}:${t.message}")
+        }
+    }
+
+    private fun removeBackdrop(manager: WindowManager) {
+        val view = backdropRoot ?: return
+        backdropRoot = null
+        runCatching { manager.removeView(view) }
+            .onFailure { Log.w(TAG, "BACKDROP remove_failed=${it.javaClass.simpleName}:${it.message}") }
+        Log.i(TAG, "BACKDROP removed")
+    }
+
+    private fun typeName(type: Int): String = when (type) {
+        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY -> "TYPE_ACCESSIBILITY_OVERLAY"
+        WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY -> "TYPE_APPLICATION_OVERLAY"
+        else -> "type=$type"
     }
 
     /** The overlay must be the focused window to receive the side keys, so its root owns the key path. */
@@ -532,6 +628,13 @@ class GlassesOverlayService : Service() {
 
     fun overlayParamsForProbe(): WindowManager.LayoutParams? = overlayParams
 
+    fun backdropShownForProbe(): Boolean = backdropRoot != null
+
+    fun overlayTypeForProbe(): Int? = overlayParams?.type
+
+    fun accessibilityOverlayForProbe(): Boolean = overlayParams?.type ==
+        WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+
     fun wakeLockHeldForProbe(): Boolean = wakeLock?.isHeld == true
 
     /**
@@ -630,6 +733,7 @@ class GlassesOverlayService : Service() {
         private const val CHANNEL_ID = "edith-overlay"
         private const val FOREGROUND_ID = 1
         private const val WINDOW_TITLE = "EDITH-PANEL"
+        private const val BACKDROP_TITLE = "EDITH-BACKDROP"
 
         /** The 480×640 canvas; the official panel occupies its bottom 380 px. */
         private const val WIDTH_PX = 480

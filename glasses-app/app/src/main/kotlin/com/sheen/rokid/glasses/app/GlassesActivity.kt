@@ -203,6 +203,19 @@ open class GlassesActivity : Activity() {
     }
 
     /**
+     * BACK belongs to the panel while it is visible; when the scene host holds focus (panel hidden) it must not finish
+     * the CXR scene. The old non-focusable scene never saw BACK; the accessibility-overlay close re-enables scene focus
+     * so the system always has a focused window, and this keeps that window from ending the session.
+     */
+    override fun onBackPressed() {
+        if (sceneHost) {
+            Log.i(TAG, "SCENE back ignored: the panel owns BACK while visible")
+            return
+        }
+        super.onBackPressed()
+    }
+
+    /**
      * Registers this Activity as the one the service's scene-end hook finishes. A duplicate launch replaces the
      * previous scene host (CXR may issue `appStart` again) so exactly one transparent scene instance stays alive.
      */
@@ -486,6 +499,28 @@ open class GlassesActivity : Activity() {
 
         /** True while a scene host is registered; the service's scene-end hook needs one to finish (test-only). */
         internal fun sceneHostPresentForTest(): Boolean = sceneHostRef?.get() != null
+
+        /**
+         * Gives the transparent scene host the focused-window role while an accessibility-overlay panel is hidden.
+         *
+         * Removing a focused `TYPE_ACCESSIBILITY_OVERLAY` panel otherwise left the top RESUMED scene with no focused
+         * window; this Android 12 build then raised `ANR in com.sheen.rokid.glasses: Application does not have a
+         * focused window` and force-finished the scene (ending the CXR session). The scene is normally NOT_FOCUSABLE so
+         * the launcher owns focus; this toggle is used only around an accessibility-overlay show/hide cycle. When the
+         * panel is visible the scene is non-focusable again, so the panel receives the side keys.
+         */
+        internal fun setSceneFocusable(focusable: Boolean) {
+            val activity = sceneHostRef?.get() ?: return
+            activity.runOnUiThread {
+                if (!activity.sceneHost || activity.isFinishing || activity.isDestroyed) return@runOnUiThread
+                if (focusable) {
+                    activity.window.clearFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+                } else {
+                    activity.window.addFlags(WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE)
+                }
+                Log.i(TAG, "SCENE focusable=$focusable")
+            }
+        }
 
         /**
          * Ends the transparent scene host. Called by [GlassesOverlayService] when the CXR link is gone (the scene's

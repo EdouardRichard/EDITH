@@ -88,7 +88,7 @@ class KeywordSpotterDeviceTest {
         }
         assertEquals(
             "the packaged keywords.txt must be our own two keyword lines",
-            listOf("y ī d í s ī @伊迪丝", "IY1 D IH0 TH @EDITH"),
+            listOf("y ī d í s ī @伊迪丝", "IY1 D AH0 TH @EDITH"),
             bundle.keywords,
         )
         println("P3_KWS_DEVICE case=assets files=${listing.sorted()} " +

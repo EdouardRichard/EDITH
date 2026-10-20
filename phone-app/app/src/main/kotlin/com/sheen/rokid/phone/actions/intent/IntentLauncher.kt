@@ -69,10 +69,11 @@ class ContextIntentLauncher(private val context: Context) : IntentLauncher {
 /**
  * The production [AppCatalog] over `PackageManager`.
  *
- * API 30+ package visibility is why the manifest declares `QUERY_ALL_PACKAGES`: without it
- * `getInstalledApplications` returns only the App's own packages, so every `open_app` would resolve to nothing and
- * refuse `APP_NOT_VISIBLE`. The alternative is an explicit `<queries>` allowlist, which cannot resolve an arbitrary
- * spoken app name - the whole point of the L0 action.
+ * API 30+ package visibility is why the manifest declares `QUERY_ALL_PACKAGES`. The K40 still returned **one**
+ * installed application (`getInstalledApplications(0)` = 1, `MATCH_ALL` = 1) while the launcher activity query returned
+ * 31, so the filter was the API choice, not the permission: **enumerate the launchable set with
+ * `queryIntentActivities`, not `getInstalledApplications`.** This is the same live set the shell's `open(list)` sees,
+ * and it is what makes a spoken app name resolvable at all (P1/T1/T4/P4).
  *
  * A failure to enumerate is an empty catalog (the resolver then refuses), never a throw: the package manager is
  * device state, and a device without a usable package manager must produce an honest refusal.
@@ -80,27 +81,24 @@ class ContextIntentLauncher(private val context: Context) : IntentLauncher {
 class PackageManagerAppCatalog(private val context: Context) : AppCatalog {
     override fun visibleApps(): List<AppEntry> = try {
         val manager = context.packageManager
-        if (manager == null) emptyList() else manager.getInstalledApplications(0).mapNotNull { info ->
-            // One unreadable package must not hide the rest of the catalog.
-            try {
-                val launchIntent = manager.getLaunchIntentForPackage(info.packageName)
-                // K40 device finding (2026-10-16): getLaunchIntentForPackage returns a non-null
-                // intent for launchable apps, but on MIUI the intent's action can be null even
-                // when the app has a valid launcher activity (confirmed via cmd package
-                // resolve-activity). Using the intent's existence as the launchability signal
-                // rather than its action field keeps these apps in the catalog. The action is
-                // still carried when present for backward compatibility with IntentActionExecutor.
-                if (launchIntent == null) return@mapNotNull null
-                AppEntry(
-                    packageName = info.packageName,
-                    label = info.loadLabel(manager).toString(),
-                    launchIntentAction = launchIntent.action ?: LAUNCH_MARKER,
-                )
-            } catch (unreadable: Exception) {
-                android.util.Log.i("EdithActions",
-                    "APP_SKIPPED: ${info.packageName} ${unreadable.javaClass.simpleName}")
-                null
-            }
+        if (manager == null) emptyList() else {
+            val launcherIntent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            manager.queryIntentActivities(launcherIntent, 0).mapNotNull { resolveInfo ->
+                // One unreadable package must not hide the rest of the catalog.
+                try {
+                    val packageName = resolveInfo.activityInfo?.packageName ?: return@mapNotNull null
+                    AppEntry(
+                        packageName = packageName,
+                        label = resolveInfo.loadLabel(manager)?.toString()?.takeIf { it.isNotBlank() } ?: packageName,
+                        // The resolver only needs "has a launch intent"; the launcher query already proved that.
+                        launchIntentAction = LAUNCH_MARKER,
+                    )
+                } catch (unreadable: Exception) {
+                    android.util.Log.i("EdithActions",
+                        "APP_SKIPPED: ${resolveInfo.activityInfo?.packageName} ${unreadable.javaClass.simpleName}")
+                    null
+                }
+            }.distinctBy { it.packageName }
         }
     } catch (unavailable: Exception) {
         android.util.Log.i("EdithActions",

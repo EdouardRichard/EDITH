@@ -205,7 +205,7 @@ class DeviceTool(
         val timeout = args.longArg("timeout_ms") ?: DEFAULT_TIMEOUT_MILLIS
         if (timeout <= 0L) return refused(INVALID_ARGUMENTS)
         if (kind == ActKind.SCROLL_TO_TEXT) return scrollToText(args, timeout)
-        val ref = args.stringArg("ref")?.trim()?.takeIf { it.isNotEmpty() }?.let(::Ref)
+        val ref = args.stringArg("ref")?.trim()?.takeIf { it.isNotEmpty() }?.let(::normalizedRef)
         val revisionBefore = operations.revision
         val envelope = operations.act(
             kind = kind,
@@ -233,6 +233,14 @@ class DeviceTool(
      * means "keep scrolling until the budget is spent", and the last envelope keeps the final
      * observation (`data.screen` is projected from it).
      */
+    /**
+     * A model sometimes sends the rendered ref as `n12` instead of `#n12`; the registry only knows the `#` form. Accept
+     * both for the exact `n<number>` shape (and leave any other value untouched so an invalid ref is still refused by
+     * the kernel rather than silently rewritten).
+     */
+    private fun normalizedRef(raw: String): Ref =
+        Ref(if (raw.startsWith("#")) raw else if (BARE_REF.matches(raw)) "#$raw" else raw)
+
     private fun scrollToText(args: JsonObject, timeoutMillis: Long): ActionResult {
         val text = args.stringArg("text")?.trim()?.takeIf { it.isNotEmpty() }
             ?: return refused(INVALID_ARGUMENTS)
@@ -509,6 +517,7 @@ class DeviceTool(
 
         private const val INVALID_ARGUMENTS = "INVALID_ARGUMENTS"
         private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
+        private val BARE_REF = Regex("n\\d+")
 
         private val KIND_BY_TOKEN: Map<String, ActKind> = mapOf(
             "tap" to ActKind.TAP,
@@ -545,7 +554,7 @@ class DeviceTool(
                 """"kind":{"type":"string","enum":["tap","long_press","double_tap","swipe","scroll",""" +
                 """"scroll_to_text","type","press_key","home","back","recents","notifications"]},""" +
                 """"ref":{"type":"string"},"text":{"type":"string"},"value":{"type":"string"},""" +
-                """"direction":{"type":"string"},"key":{"type":"string"},"foreground":{"type":"string"},""" +
+                """"direction":{"type":"string"},"key":{"type":"string","description":"press_key 的 Android keycode 名，如 MEDIA_PLAY_PAUSE / MEDIA_NEXT / MEDIA_PREVIOUS；打开播放器后用它在设备上开始播放。"},"foreground":{"type":"string"},""" +
                 """"idle":{"type":"boolean"},"timeout_ms":{"type":"integer","minimum":1}},""" +
                 """"required":["action"],"additionalProperties":false}""",
             risk = RiskLevel.L1,

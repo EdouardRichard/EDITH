@@ -21,6 +21,32 @@
             </intent-filter>
         </receiver>
         <!--
+          F-01 keyword-recall probe (2026-10-20): builds the real packed spotter, feeds a WAV from the host shell and
+          logs which keyword labels fired. Same export rule and the same reason as `DebugAudioInjector`: only
+          `adb shell am broadcast` drives it, so it must be exported and must never exist in a release build.
+        -->
+        <receiver
+            android:name=".debug.DebugKwsProbe"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_KWS" />
+            </intent-filter>
+        </receiver>
+        <!--
+          F-01 session-control instrument (2026-10-20): drives the composition's own start/stop so a second session
+          re-arm can be measured in one process (the 2x PCM rate hypothesis). Same export rule and the same reason as
+          the instruments above: shell-driven, debug-only, never in a release build.
+        -->
+        <receiver
+            android:name=".debug.DebugSessionControl"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_SESSION" />
+            </intent-filter>
+        </receiver>
+        <!--
           P3.2 Stage 0 hint-length instrument. Same reasoning as `DebugAudioInjector`: the only caller is an
           `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
           release build. It carries synthetic text only and logs counts only.
@@ -195,5 +221,64 @@
           source and the decision about how to expose that environment belong to the Laya line; leaving a receiver
           with no class behind it would only ship a debug build whose broadcast dies at run time.
         -->
+        <!--
+          2026-10-20 lock-screen probe: shell-started so it does not depend on the MIUI broadcast queue. Debug source
+          set only; it executes the production Shizuku shell and logs shape only (never stdout).
+        -->
+        <activity
+            android:name=".debug.ShizukuLockProbeActivity"
+            android:exported="true"
+            android:label="EDITH Shizuku lock probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <!-- Debug-only PIN writer; the user-facing path is the settings page. -->
+        <activity
+            android:name=".debug.LockPinProbeActivity"
+            android:exported="true"
+            android:label="EDITH lock PIN probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.LockUnlockProbeActivity"
+            android:exported="true"
+            android:label="EDITH lock unlock probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.LockToolProbeActivity"
+            android:exported="true"
+            android:label="EDITH lock tool probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.OpenListProbeActivity"
+            android:exported="true"
+            android:label="EDITH open list probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.OpenTargetProbeActivity"
+            android:exported="true"
+            android:label="EDITH open target probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.T6PageServerActivity"
+            android:exported="true"
+            android:label="EDITH T6 page server"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.T6SequenceProbeActivity"
+            android:exported="true"
+            android:label="EDITH T6 sequence probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.T6ClickProbeActivity"
+            android:exported="true"
+            android:label="EDITH T6 click probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
     </application>
 </manifest>

@@ -385,6 +385,37 @@ class AccessibilityAdapterTest {
     }
 
     @Test
+    fun aNonClickableLabelFallsBackToATapAtItsCentre() {
+        val registry = RefRegistry()
+        val platform = FakePlatform().apply {
+            windows = listOf(
+                window(
+                    nodes = listOf(
+                        node(
+                            nodeId = 65,
+                            className = "android.widget.TextView",
+                            text = "播放",
+                            clickable = false,
+                            bounds = Bounds(100, 100, 300, 200),
+                        ),
+                    ),
+                ),
+            )
+            clickResult = false
+        }
+        val adapter = adapter(platform, registry)
+        val ref = registry.assign(adapter.observe(DeviceScreenFilter.ALL)).values.single()
+
+        assertTrue(
+            "the model often targets a text child; tapping its centre must reach the clickable parent",
+            adapter.performNodeAction(ref, DeviceActions.CLICK),
+        )
+        assertEquals(listOf(65), platform.clicks)
+        assertEquals(1, platform.gestures.size)
+        assertEquals(listOf(Point(200, 150)), platform.gestures.single().strokes.single().points)
+    }
+
+    @Test
     fun clickReportsThePlatformRefusal() {
         val registry = RefRegistry()
         val platform = FakePlatform().apply {

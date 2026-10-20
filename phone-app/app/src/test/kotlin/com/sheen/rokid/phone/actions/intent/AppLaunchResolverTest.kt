@@ -28,7 +28,7 @@ class AppLaunchResolverTest {
 
     @Test
     fun exactMatchUniqueReturnsFound() {
-        val result = resolver(entry("Camera Pro", "com.pro"), entry("Camera", "com.camera"))
+        val result = resolver(entry("Camera", "com.camera"), entry("WeChat", "com.tencent.mm"))
             .resolve("camera")
 
         assertTrue("expected Found but was $result", result is LaunchResolution.Found)
@@ -111,14 +111,28 @@ class AppLaunchResolverTest {
     // ── Preserved behaviors adapted to new return type ──────────────────────
 
     @Test
-    fun anExactLabelMatchWinsOverASubstringMatch() {
+    fun anExactLabelMatchDoesNotHideANearbyCandidate() {
         val result = resolver(entry("Camera Pro", "com.pro"), entry("Camera", "com.camera"))
             .resolve("camera")
 
-        assertTrue(result is LaunchResolution.Found)
-        val found = result as LaunchResolution.Found
-        assertEquals("com.camera", found.target.packageName)
-        assertEquals("Camera", found.target.label)
+        assertTrue("expected Ambiguous but was $result", result is LaunchResolution.Ambiguous)
+        val ambiguous = result as LaunchResolution.Ambiguous
+        assertEquals(setOf("com.pro", "com.camera"), ambiguous.candidates.map { it.packageName }.toSet())
+    }
+
+    @Test
+    fun aGenericFileWordReturnsBothFileApps() {
+        val result = resolver(
+            entry("文件管理", "com.android.fileexplorer"),
+            entry("文件", "com.google.android.documentsui"),
+        ).resolve("文件")
+
+        assertTrue("P4 requires `文件` to be ambiguous, was $result", result is LaunchResolution.Ambiguous)
+        val ambiguous = result as LaunchResolution.Ambiguous
+        assertEquals(
+            setOf("com.android.fileexplorer", "com.google.android.documentsui"),
+            ambiguous.candidates.map { it.packageName }.toSet(),
+        )
     }
 
     @Test

@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.ui
 import com.sheen.rokid.phone.ui.profile.ProfileListScreen
 import com.sheen.rokid.phone.ui.profile.ProfileViewModel
+import com.sheen.rokid.phone.app.LockPinSection
 import com.sheen.rokid.phone.app.SmartSettingsSection
 
 import android.Manifest
@@ -101,7 +102,13 @@ internal fun PhoneScreen(
                     root = root,
                     plugins = plugins,
                     selected = selected,
-                    start = start,
+                    // The start click must hand the page back to the assistant: leaving the drawer over the
+                    // conversation made the corpus/model see "会话管理/已就绪" instead of the intended assistant page
+                    // (2026-10-20 actual-screen finding). A refused start still closes; the error is shown on the page.
+                    start = { pluginId ->
+                        start(pluginId)
+                        scope.launch { drawerState.close() }
+                    },
                     command = command,
                     onSelectPlugin = { viewModel.selectPlugin(it) },
                     onClose = { scope.launch { drawerState.close() } },
@@ -520,6 +527,13 @@ internal fun SettingsTab(
 
     HorizontalDivider()
     SmartSettingsSection(loadSettings, saveSettings)
+
+    HorizontalDivider()
+    LockPinSection(
+        loadPinConfigured = { root.lockPinConfigured },
+        savePin = { root.saveLockPin(it) },
+        clearPin = { root.clearLockPin() },
+    )
 
     HorizontalDivider()
     LocalModelStatus(state)

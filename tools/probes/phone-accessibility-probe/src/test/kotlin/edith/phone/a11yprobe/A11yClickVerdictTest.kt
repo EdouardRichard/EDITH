@@ -86,6 +86,17 @@ class A11yClickVerdictTest {
         assertNull("a dialog that never appeared matches nothing", firstCandidateIn(listOf("继续安装"), emptyList()))
     }
 
+    @Test
+    fun aCountdownSuffixMatchesItsExactLabelWithoutBecomingASubstringRule() {
+        assertEquals("允许", firstCandidateIn(listOf("允许"), listOf("拒绝", "急停", "允许 (91)")))
+        assertEquals("允许", firstCandidateIn(listOf("允许"), listOf("允许（9）")))
+        assertNull(
+            "the countdown exception must not turn 安装 into a match for 继续安装",
+            firstCandidateIn(listOf("安装"), listOf("继续安装")),
+        )
+        assertNull(firstCandidateIn(listOf("允许"), listOf("允许其他")))
+    }
+
     // ------------------------------------------------------------------ the poll evidence
 
     /**

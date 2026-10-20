@@ -22,6 +22,7 @@ import androidx.test.core.app.ActivityScenario
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.glasses.accessibility.GlassesAccessibilityService
 import com.sheen.rokid.glasses.app.GlassesActivity
 import com.sheen.rokid.glasses.app.GlassesOverlayService
 import com.sheen.rokid.glasses.display.PagOrbView
@@ -44,9 +45,10 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 /**
- * 0.24 S2 Task 9: the production default is a foreground service that draws the panel as a
- * `TYPE_APPLICATION_OVERLAY` window; the Activity is the CXR scene host (Task 21 fix: it stays RESUMED but
- * transparent and non-interactive, it never draws the panel).
+ * 0.24 S2 Task 9: the production default is a foreground service that draws the panel as an overlay; since
+ * 2026-10-20 it uses `TYPE_ACCESSIBILITY_OVERLAY` when the glasses accessibility service is bound (so the vendor HUD
+ * can be covered) and falls back to `TYPE_APPLICATION_OVERLAY` otherwise. The Activity is the CXR scene host (Task 21
+ * fix: it stays RESUMED but transparent and non-interactive, it never draws the panel).
  *
  * The assertions read the **service's own window**, not a log line: the overlay is really added to the
  * `WindowManager` with the pinned geometry/flags, `UI_READY` really goes out only after a session identity exists,
@@ -104,8 +106,11 @@ class OverlayServiceTest {
         // All three values are read from the platform (ActivityManager / NotificationManager), not from service fields.
         assertTrue("the overlay service must be running as a foreground service",
             onMain { service.serviceForegroundForProbe() })
-        assertTrue("the FOREGROUND_ID notification must be active",
-            onMain { service.activeForegroundNotificationForProbe() })
+        // startForeground posts asynchronously on this build; wait for the platform's active notification instead of
+        // racing the post.
+        waitUntil("the FOREGROUND_ID notification to become active") {
+            onMain { service.activeForegroundNotificationForProbe() }
+        }
         assertEquals("the resident notification must be low importance",
             NotificationManager.IMPORTANCE_LOW, onMain { service.foregroundChannelImportanceForProbe() })
 
@@ -130,8 +135,15 @@ class OverlayServiceTest {
 
         val params = onMain { service.overlayParamsForProbe() }
         requireNotNull(params) { "the service must expose the added window params" }
-        assertEquals("the panel is an application overlay",
-            WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY, params.type)
+        val accessibilityOverlay = GlassesAccessibilityService.isConnected()
+        assertEquals(
+            "the panel uses the accessibility overlay when the glasses a11y service is bound, otherwise the app overlay",
+            if (accessibilityOverlay) WindowManager.LayoutParams.TYPE_ACCESSIBILITY_OVERLAY
+            else WindowManager.LayoutParams.TYPE_APPLICATION_OVERLAY,
+            params.type,
+        )
+        assertEquals("only the accessibility overlay needs the HUD-hiding backdrop",
+            accessibilityOverlay, onMain { service.backdropShownForProbe() })
         assertEquals(480, params.width)
         assertEquals(380, params.height)
         assertEquals("bottom-start anchored", Gravity.BOTTOM or Gravity.START, params.gravity)
@@ -154,6 +166,8 @@ class OverlayServiceTest {
         waitUntil("UI_CLOSED after removal") { uiEvents().any { it is HintCommand.UiClosed } }
         waitUntil("the overlay window is removed") { !onMain { service.overlayShownForProbe() } }
         assertNull("hidePanel must drop the window reference", onMain { service.overlayViewForProbe() })
+        assertFalse("hidePanel must remove the accessibility backdrop too",
+            onMain { service.backdropShownForProbe() })
         assertFalse("hidePanel must release the wake lock", onMain { service.wakeLockHeldForProbe() })
         val closed = uiEvents().filterIsInstance<HintCommand.UiClosed>().single()
         assertEquals("UI_CLOSED carries the visible route", AssistantRoute.WAKE, closed.route)

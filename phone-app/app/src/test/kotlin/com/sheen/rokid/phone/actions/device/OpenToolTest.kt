@@ -120,6 +120,45 @@ class OpenToolTest {
     }
 
     @Test
+    fun `list reports the frozen catalog summary fields and a count-only log`() {
+        val shell = FakeShell { command ->
+            when (command) {
+                LAUNCHER_QUERY -> ShellResult(
+                    command,
+                    0,
+                    listOf(
+                        "com.android.settings/.Settings",
+                        "com.miui.player/com.miui.player.ui.MusicActivity",
+                        "com.android.camera/.Camera",
+                    ).joinToString("\n") + "\n",
+                    "",
+                )
+                else -> ShellResult(command, 1, "", "unexpected command: $command")
+            }
+        }
+        val catalog = FakeCatalog(listOf(AppEntry("com.android.settings", "设置", "android.intent.action.MAIN")))
+        val lines = mutableListOf<String>()
+        val previous = com.sheen.rokid.phone.platform.P3Log.sink
+        com.sheen.rokid.phone.platform.P3Log.sink = { lines += it }
+        val result = try {
+            OpenTool(shell, catalog).execute("""{"list":true}""")
+        } finally {
+            com.sheen.rokid.phone.platform.P3Log.sink = previous
+        }
+
+        val data = body(result)["data"]!!.jsonObject
+        assertEquals("launcher", data["catalogVia"]!!.jsonPrimitive.content)
+        assertEquals(3, data["catalogCount"]!!.jsonPrimitive.int)
+        assertTrue(data["hasPlayer"]!!.jsonPrimitive.boolean)
+        assertTrue(data["hasSettings"]!!.jsonPrimitive.boolean)
+        assertEquals(
+            listOf("P3_TOOLCATALOG via=launcher count=3 hasPlayer=true hasSettings=true truncated=false"),
+            lines,
+        )
+        assertFalse("the log must not contain app labels or package rows", lines.any { it.contains("com.miui.player") })
+    }
+
+    @Test
     fun `list falls back to every package when the launcher activity query is unusable`() {
         // R104: a failed/empty/unparseable query falls back to `pm list packages` (all packages), never to the -3 filter.
         val unusable = listOf(
@@ -317,6 +356,19 @@ class OpenToolTest {
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("INVALID_URL", errorCode(result))
         assertTrue(shell.commands.isEmpty())
+    }
+
+    @Test
+    fun `the descriptor states the supported target forms and excludes local files`() {
+        val descriptor = OpenTool(null, FakeCatalog()).descriptors().single()
+
+        assertTrue("the title must name the supported launch forms", descriptor.title.contains("http(s)"))
+        assertTrue("the schema must tell the model that app names/packages/settings pages are accepted",
+            descriptor.parametersJson.contains("应用名"))
+        assertTrue("the schema must explicitly exclude local files",
+            descriptor.parametersJson.contains("file://") && descriptor.parametersJson.contains("不支持"))
+        assertTrue("generic category words must be passed unchanged; the tool reports ambiguity",
+            descriptor.parametersJson.contains("类别词") && descriptor.parametersJson.contains("不要自行"))
     }
 
     // ---- launches ----

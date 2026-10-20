@@ -172,6 +172,13 @@ private const val FALLBACK_EMIT_WAIT_MILLIS = 1_000L
  * `ConversationCycle`; it starts at `PANEL_SHOWN` and never bounds this run.
  */
 private const val DEFAULT_TURN_BUDGET_MILLIS = 15_000L
+
+/**
+ * The agent turn is a multi-step UI task, not one model request. The profile timeout bounds each provider request;
+ * using it as the whole turn budget cut T7 (search → play → home) at 30 s while the corpus allows 180 s. Keep the
+ * provider cap untouched and give the agent a floor that matches the multi-step acceptance window.
+ */
+private const val MIN_AGENT_TURN_BUDGET_MILLIS = 180_000L
 private const val AUDIT_CAPACITY = 512
 
 /**
@@ -1831,7 +1838,10 @@ class SmartAssistantPlugin(
      */
     private fun turnBudgetNanos(): Long {
         val configuredMillis = config?.let { profileLookup(it.profileId) }?.timeoutMillis ?: 0L
-        return if (configuredMillis > 0L) configuredMillis * 1_000_000L else DEFAULT_TURN_BUDGET_MILLIS * 1_000_000L
+        // The profile timeout is the per-request cap; the agent loop is multi-step (T7: search → play → home). A floor
+        // keeps the provider cap from truncating the whole turn before the task can finish.
+        val turnMillis = maxOf(configuredMillis, MIN_AGENT_TURN_BUDGET_MILLIS)
+        return turnMillis * 1_000_000L
     }
 
     /**

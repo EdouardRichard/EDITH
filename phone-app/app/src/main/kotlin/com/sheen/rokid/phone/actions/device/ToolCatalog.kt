@@ -6,6 +6,9 @@ import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionPrecheck
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.PrecheckDecision
+import com.sheen.rokid.phone.lock.UnlockGate
+import com.sheen.rokid.phone.lock.UnlockOutcome
+import com.sheen.rokid.phone.platform.P3Log
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -39,6 +42,12 @@ class ToolCatalog(
     private val a11yAvailable: () -> Boolean,
     private val shellAvailable: () -> Boolean,
     private val callAvailable: () -> Boolean,
+    /**
+     * The lock-screen gate (2026-10-20). `device`/`open`/`dial` need an interactive, unlocked phone; `shell` does not,
+     * because Shizuku runs a command without a UI, so raw shell stays available on a locked phone. The default keeps
+     * every existing test and non-phone composition source-compatible.
+     */
+    private val unlock: UnlockGate = UnlockGate { UnlockOutcome.ALREADY_UNLOCKED },
 ) : ActionExecutor, AutoCloseable {
 
     override fun descriptors(): List<ActionDescriptor> = buildList {
@@ -54,17 +63,35 @@ class ToolCatalog(
         if (callAvailable()) add(dial.descriptors().single())
     }
 
-    override fun execute(name: String, argsJson: String): ActionResult = when (name) {
+    override fun execute(name: String, argsJson: String): ActionResult {
+        // M1: one shape line per call, before any channel/gate decision, so a refusal and a wrong model choice are
+        // distinguishable. ToolArgsShape never echoes the command, URL, package, ref, text or dialled number.
+        P3Log.line(ToolArgsShape.describe(name, argsJson))
+        return when (name) {
         DeviceTool.NAME ->
-            if (a11yAvailable()) device.execute(name, argsJson) else channelRefused()
+            // The gate comes **before** the a11y probe: a locked phone can be exactly the reason the accessibility
+            // service is unbound, so probing first would refuse the call without ever trying to unlock and reconnect.
+            gated(unlock.ensureUnlocked(requireAccessibility = true)) {
+                if (a11yAvailable()) device.execute(name, argsJson) else channelRefused()
+            }
         ShellTool.NAME ->
             if (shellAvailable()) shell.execute(name, argsJson) else channelRefused()
         OpenTool.NAME ->
-            if (shellAvailable()) open.execute(name, argsJson) else channelRefused()
+            if (!shellAvailable()) channelRefused()
+            else gated(unlock.ensureUnlocked(requireAccessibility = false)) { open.execute(name, argsJson) }
         DialTool.NAME ->
-            if (callAvailable()) dial.execute(name, argsJson) else callRefused()
-        else -> ActionResult(ActionOutcome.Refused, UNKNOWN_ACTION)
+            if (!callAvailable()) callRefused()
+            else gated(unlock.ensureUnlocked(requireAccessibility = false)) { dial.execute(name, argsJson) }
+            else -> ActionResult(ActionOutcome.Refused, UNKNOWN_ACTION)
+        }
     }
+
+    /**
+     * A refused unlock is reported as a refusal with a code the model can act on; the tool body is never entered, so a
+     * device action cannot run against a still-locked screen and get mislabeled as an accessibility failure.
+     */
+    private inline fun gated(outcome: UnlockOutcome, action: () -> ActionResult): ActionResult =
+        if (outcome.usable) action() else ActionResult(ActionOutcome.Refused, "LOCKED_UNLOCK_FAILED:${outcome.name}")
 
     /**
      * 0.25 Task 11 (R49): only the raw-command tool has a call-level risk; every other tool answers the additive

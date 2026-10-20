@@ -28,6 +28,11 @@ class CxrAudioAdapter : IAudioStreamCbk {
     private var events: Events? = null
     private var released = false
 
+    private var calls = 0L
+    private var bytes = 0L
+    private var duplicateChunks = 0L
+    private var previousChunk: ByteArray? = null
+
     /** What the host wants to hear about. Same shape as the transport's audio sink. */
     interface Events {
         fun received(data: ByteArray)
@@ -59,7 +64,27 @@ class CxrAudioAdapter : IAudioStreamCbk {
         // take the session down. The SDK's own sample guards the same way because bad ranges have been observed.
         val end = minOf(offset + length, buffer.size)
         if (end <= offset) return
-        sink.received(buffer.copyOfRange(offset, end))
+        val copy = buffer.copyOfRange(offset, end)
+        count(copy)
+        sink.received(copy)
+    }
+
+    /**
+     * Diagnostic counters for the F-01 wake investigation: how many callbacks arrive, how many bytes they carry,
+     * and whether consecutive callbacks repeat the same chunk. Counters only - never the audio, never a digest of
+     * the content. The summary lands every 250 callbacks (about 5 s at 20 ms) so a device run can be read at a
+     * glance: a 2x byte rate with a matching duplicate count means the same chunk is being delivered twice.
+     */
+    private fun count(chunk: ByteArray) {
+        val summary = synchronized(this) {
+            calls++
+            bytes += chunk.size
+            if (previousChunk?.contentEquals(chunk) == true) duplicateChunks++
+            previousChunk = chunk
+            if (calls % 250L != 0L) return
+            "P3_CXR_AUDIO callbacks=$calls bytes=$bytes dupConsecutive=$duplicateChunks lastLength=${chunk.size}"
+        }
+        Log.i("EdithCxrAudio", summary)
     }
 
     override fun onAudioError(errorCode: Int, errorInfo: String?) {

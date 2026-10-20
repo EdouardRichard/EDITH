@@ -54,6 +54,11 @@ internal fun KeywordAssetBundle.toRequest(): KeywordSpotterRequest = KeywordSpot
 internal class OwnedKeywordSpotterPort(private val spotter: KeywordSpotter) : KeywordSpotterPort {
     private var closed = false
 
+    private var frames = 0L
+    private var readyFrames = 0L
+    private var decodes = 0L
+    private var hits = 0L
+
     override fun createStream(keywords: String): KeywordStreamPort {
         check(!closed)
         return OwnedKeywordStream(spotter.createStream(keywords))
@@ -61,12 +66,20 @@ internal class OwnedKeywordSpotterPort(private val spotter: KeywordSpotter) : Ke
 
     override fun decode(stream: KeywordStreamPort) {
         check(!closed)
+        decodes++
         spotter.decode(native(stream))
     }
 
     override fun isReady(stream: KeywordStreamPort): Boolean {
         check(!closed)
-        return spotter.isReady(native(stream))
+        val ready = spotter.isReady(native(stream))
+        frames++
+        if (ready) readyFrames++
+        if (frames % 2000L == 0L) {
+            android.util.Log.i("EdithKws",
+                "P3_KWS frames=$frames ready=$readyFrames decoded=$decodes hits=$hits")
+        }
+        return ready
     }
 
     /** `null` when the native result carries no keyword — sherpa reports "nothing detected" as an empty string. */
@@ -74,6 +87,8 @@ internal class OwnedKeywordSpotterPort(private val spotter: KeywordSpotter) : Ke
         check(!closed)
         val hit = spotter.getResult(native(stream))
         if (hit.keyword.isEmpty()) return null
+        hits++
+        android.util.Log.i("EdithKws", "P3_KWS hit=${hit.keyword} tokens=${hit.tokens.size}")
         return KeywordHit(hit.keyword, hit.tokens.toList(), hit.timestamps)
     }
 

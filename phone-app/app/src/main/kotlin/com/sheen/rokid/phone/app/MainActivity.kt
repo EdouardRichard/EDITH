@@ -8,6 +8,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SmartSettingsForm
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionViewModel
+import com.sheen.rokid.phone.lock.LockPinValidator
 
 import android.Manifest
 import android.content.Intent
@@ -22,6 +23,7 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -32,6 +34,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.input.KeyboardType
+import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
@@ -337,6 +341,75 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
             saved = false
         }
     }) { Text("保存") }
+}
+
+/**
+ * 2026-10-20: the lock-screen PIN used when a device tool call arrives while the phone is locked.
+ *
+ * There is deliberately **no** on/off switch and no pocket switch: the owner's decision is that a device tool call
+ * unlocks, and EDITH does not add another gate. The copy states the two limits that remain structural: the PIN is stored
+ * encrypted on this phone and is only used for this unlock, and only a numeric PIN is supported (the unlock path sends
+ * key codes, so pattern and non-ASCII passwords cannot be typed and are refused rather than half-supported).
+ */
+@Composable
+internal fun LockPinSection(
+    loadPinConfigured: () -> Boolean,
+    savePin: (String) -> Boolean,
+    clearPin: () -> Unit,
+) {
+    var pin by remember { mutableStateOf("") }
+    var configured by remember { mutableStateOf(loadPinConfigured()) }
+    var error by remember { mutableStateOf<String?>(null) }
+    var notice by remember { mutableStateOf<String?>(null) }
+
+    Text("锁屏自动解锁", style = MaterialTheme.typography.titleLarge)
+    Text(
+        "工具调用需要手机处于解锁状态时会使用这里的 PIN。PIN 只保存在本机 Keystore（加密、不写日志、不上传）；" +
+            "仅支持 4-16 位数字 PIN，不支持图案或中文密码。",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    OutlinedTextField(
+        value = pin,
+        onValueChange = {
+            if (it.length <= LockPinValidator.MAX_LENGTH && it.all { c -> c in '0'..'9' }) {
+                pin = it
+                error = null
+                notice = null
+            }
+        },
+        label = { Text("锁屏 PIN（4-16 位数字）") },
+        visualTransformation = PasswordVisualTransformation(),
+        keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.NumberPassword),
+        modifier = Modifier.fillMaxWidth(),
+    )
+    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Button(onClick = {
+            val normalized = LockPinValidator.normalize(pin)
+            if (normalized == null) {
+                error = "请输入 4-16 位数字 PIN"
+            } else if (savePin(normalized)) {
+                configured = true
+                pin = ""
+                error = null
+                notice = "PIN 已保存"
+            } else {
+                error = "PIN 保存失败，请重试"
+            }
+        }) { Text(if (configured) "更新 PIN" else "保存 PIN") }
+        if (configured) {
+            OutlinedButton(onClick = {
+                clearPin()
+                configured = false
+                pin = ""
+                error = null
+                notice = "PIN 已清除"
+            }) { Text("清除 PIN") }
+        }
+    }
+    if (configured) Text("已配置：设备工具调用时会自动解锁", style = MaterialTheme.typography.bodySmall)
+    error?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+    notice?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
+    HorizontalDivider()
 }
 
 /**

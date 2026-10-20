@@ -123,7 +123,7 @@ data class KeywordHit(val keyword: String, val tokens: List<String>, val timesta
 /**
  * KWS wake-word engine over a [KeywordSpotterPort].
  *
- * **Honest status — wired to the API, model recall unmeasured.** `javap -p` on the pinned
+ * **Honest status — wired to the API, model recall measured 2026-10-20.** `javap -p` on the pinned
  * `audio-android/libs/sherpa-onnx-1.13.8.aar` (SHA-256 `633C2432…3BD96`) proves the native API exists:
  * `KeywordSpotter(AssetManager, KeywordSpotterConfig)`, `createStream(String): OnlineStream`,
  * `decode(OnlineStream)`, `reset(OnlineStream)`, `isReady(OnlineStream): Boolean`,
@@ -138,19 +138,45 @@ data class KeywordHit(val keyword: String, val tokens: List<String>, val timesta
  * assets when it is there and packages nothing when it is not (the app then reports `KWS_MODEL_MISSING`).
  * `tools/p2/engine-manifest.json` still declares only the ASR/VAD/speaker roles.
  *
- * **Unmeasured:** the model's own `test_wavs/` contains no audio for `伊迪丝`/`EDITH`, so their recall is not
- * verified here; its `en_*.wav` clips trigger `LIGHT_UP`/`LOVELY_CHILD` and are kept for a device check.
+ * **Phase diversity (F-01, measured 2026-10-20).** A single stream is not merely "one decoder": whether the
+ * model reports a keyword depends on **where the word falls relative to its chunk boundary**, because the
+ * pinned model decodes one 160 ms chunk at a time from a stream that has already been fed an arbitrary amount
+ * of audio. A device probe fed the same 8.9 s/9.5 s wake recordings through the real packaged assets with a
+ * quiet prefix in front: with one stream, the clips hit at a 0 ms prefix but were **deterministically missed**
+ * at 5 s (5/5 misses), and 8 of the 9 English alignment/prefix cases it was run on produced no hit. Four
+ * streams spaced 40 ms apart hit all 11 probe cases (9 English + 2 Chinese), but a later production run still
+ * missed one of twelve injections; **eight** streams, one per 20 ms phase, hit every one of the twelve probe
+ * cases (with 3-4 independent detections per clip) and all seven production injections of the same clips (six
+ * back-to-back plus one after a 60 s idle). The production count is eight. The streams share one native spotter
+ * (the model is loaded once); the cost is eight decoder states, not eight models.
  *
- * [accept] resets the stream **in place** after a hit, so a detection is reported once and the stream keeps
- * decoding; [reset] releases the current stream and the next [accept] recreates it (mirrors
- * `OwnedRecognizerPort`).
+ * [accept] feeds every due stream and resets a stream **in place** after its hit, so a detection is reported
+ * once per stream and the stream keeps decoding. [reset] releases all streams and restarts the stagger;
+ * without that, a release would create every stream on the same frame and collapse the diversity it exists for.
  */
 class KeywordSpotterWakeWordEngine(
     private val port: KeywordSpotterPort,
     private val keywords: String,
     private val sampleRateHz: Int = 16_000,
+    /**
+     * Streams fed in parallel. The default of one preserves the single-stream shape for unit harnesses; the
+     * production factory passes [PHASE_DIVERSITY_STREAMS].
+     */
+    private val streams: Int = 1,
+    /**
+     * Frames between consecutive stream starts. One 20 ms frame gives [PHASE_DIVERSITY_STREAMS] streams every one
+     * of the eight 20 ms phases the measured model is sensitive to; the production factory passes
+     * [PHASE_DIVERSITY_STRIDE_FRAMES].
+     */
+    private val streamStrideFrames: Int = 1,
 ) : WakeWordEngine {
-    private var stream: KeywordStreamPort? = null
+    init {
+        require(streams >= 1) { "at least one keyword stream is required" }
+        require(streamStrideFrames >= 1) { "stream stride must be at least one frame" }
+    }
+
+    private val live = arrayOfNulls<KeywordStreamPort>(streams)
+    private var frameIndex = 0L
     private var closed = false
 
     override fun accept(frame: PcmFrame): List<String> {
@@ -158,31 +184,55 @@ class KeywordSpotterWakeWordEngine(
         require(frame.sampleRateHz == sampleRateHz) {
             "keyword spotter is configured for $sampleRateHz Hz but received ${frame.sampleRateHz} Hz"
         }
-        val current = stream ?: port.createStream(keywords).also { stream = it }
-        current.acceptWaveform(frame.samples, sampleRateHz)
-        if (!port.isReady(current)) return emptyList()
-        port.decode(current)
-        val hit = port.result(current) ?: return emptyList()
-        // In place, before reporting: without it the stream still holds the detection and the same keyword
-        // would be re-reported on every ready frame.
-        port.reset(current)
-        return listOf(hit.keyword)
+        val hits = LinkedHashSet<String>()
+        val currentFrame = frameIndex++
+        for (index in 0 until streams) {
+            // Staggered start: stream `index` opens on frame `index * stride`, so its chunk boundaries are
+            // shifted against the first stream's by exactly that many frames.
+            if (currentFrame < index.toLong() * streamStrideFrames) continue
+            val current = live[index] ?: port.createStream(keywords).also { live[index] = it }
+            current.acceptWaveform(frame.samples, sampleRateHz)
+            if (!port.isReady(current)) continue
+            port.decode(current)
+            val hit = port.result(current) ?: continue
+            // In place, before reporting: without it the stream still holds the detection and the same keyword
+            // would be re-reported on every ready frame.
+            port.reset(current)
+            hits += hit.keyword
+        }
+        return hits.toList()
     }
 
     override fun reset() {
         check(!closed)
-        val previous = stream
-        stream = null
-        previous?.release()
+        releaseStreams()
+        // The next accept opens stream 0; streams 1.. are opened on the following `stride`-spaced frames.
+        frameIndex = 0L
     }
 
     override fun close() {
         if (closed) return
         closed = true
-        val previous = stream
-        stream = null
-        previous?.release()
+        releaseStreams()
         port.close()
+    }
+
+    private fun releaseStreams() {
+        for (index in live.indices) {
+            live[index]?.release()
+            live[index] = null
+        }
+    }
+
+    companion object {
+        /**
+         * Eight staggered streams cover every 20 ms phase of the measured model. Four hit all 11 probe cases but
+         * still missed one of twelve production injections; eight hit 12/12 in the probe. See the class note.
+         */
+        const val PHASE_DIVERSITY_STREAMS = 8
+
+        /** One 20 ms frame: eight streams at 0/20/…/140 ms cover all eight 20 ms phases. */
+        const val PHASE_DIVERSITY_STRIDE_FRAMES = 1
     }
 }
 
@@ -197,8 +247,9 @@ class KeywordSpotterWakeWordEngine(
  *   separate engine (see `WiredWakeDetector`).
  * - The stream is released **only after a sustained silence**: once a speech frame has been seen, a run of
  *   non-speech frames lasting [silenceReleaseNanos] calls [WakeWordEngine.reset] exactly once, and the next
- *   frame recreates the stream. A short pause inside one utterance therefore keeps the stream and its decoding
- *   context alive. Silence before any speech never releases, so an idle detector does not churn streams.
+ *   frames recreate the streams (the engine re-staggers them, so a release cannot collapse their phases into one).
+ *   A short pause inside one utterance therefore keeps the streams and their decoding context alive. Silence
+ *   before any speech never releases, so an idle detector does not churn streams.
  * - The same word is emitted at most once per [cooldownNanos] (anchored on the emission, not on the report);
  *   different words never block each other. An engine hit is emitted even on a frame the VAD calls silence:
  *   the emission rides the engine's return value, not the VAD's decision.

@@ -352,4 +352,61 @@ class WakeWordDetectorTest {
             assertEquals(0, fixture.port.creates)
         } finally { fixture.engine.close() }
     }
+
+    // ---- Phase diversity (F-01, 2026-10-20) ---------------------------------------------------------
+
+    /**
+     * The measured failure this pins: the native spotter's result depends on the **stream phase** - the same clip
+     * that fires when the stream starts at its beginning does not fire when the stream has been running for a
+     * different number of frames. A single stream therefore loses hits; staggered streams keep every phase.
+     *
+     * The fake answers only for the **second** stream, which a single-stream engine never creates.
+     */
+    @Test fun `keyword engine keeps a hit that only a later stream phase produces`() {
+        val port = FakeKeywordSpotterPort().apply {
+            hit = KeywordHit("edith", emptyList(), floatArrayOf())
+            hittingCreations = setOf(1)
+        }
+        val engine = KeywordSpotterWakeWordEngine(port, "edith",
+            streams = KeywordSpotterWakeWordEngine.PHASE_DIVERSITY_STREAMS,
+            streamStrideFrames = KeywordSpotterWakeWordEngine.PHASE_DIVERSITY_STRIDE_FRAMES)
+        try {
+            val hits = (0 until 8).flatMap { engine.accept(frame(it)) }
+            assertTrue("edith" in hits, "a later stream's hit must survive the stagger: $hits")
+        } finally { engine.close() }
+    }
+
+    /**
+     * The stagger is what gives the streams different phases: stream `j` is created `j * stride` frames after the
+     * reset, so its first accepted frame (and therefore its chunk boundary) is shifted by that many frames. A reset
+     * must re-stagger rather than create every stream on the same frame, or a later silence release would collapse
+     * the diversity it exists for.
+     */
+    @Test fun `keyword engine staggers streams by the configured stride and re-staggers after reset`() {
+        val port = FakeKeywordSpotterPort().apply { ready = true; hit = null }
+        val engine = KeywordSpotterWakeWordEngine(port, "edith", streams = 4, streamStrideFrames = 2)
+        try {
+            repeat(8) { engine.accept(frame(it)) }
+            assertEquals(4, port.streams.size)
+            assertEquals(listOf(8, 6, 4, 2), port.streams.map { it.accepts })
+            assertEquals(4, port.creates)
+
+            engine.reset()
+            assertEquals(listOf(1, 1, 1, 1), port.streams.map { it.releases })
+            repeat(8) { engine.accept(frame(it)) }
+            assertEquals(8, port.streams.size)
+            assertEquals(listOf(8, 6, 4, 2), port.streams.drop(4).map { it.accepts })
+        } finally { engine.close() }
+    }
+
+    @Test fun `keyword engine deduplicates the same word reported by several streams in one frame`() {
+        val port = FakeKeywordSpotterPort().apply {
+            hit = KeywordHit("edith", emptyList(), floatArrayOf())
+            hittingCreations = null
+        }
+        val engine = KeywordSpotterWakeWordEngine(port, "edith", streams = 4, streamStrideFrames = 2)
+        try {
+            assertEquals(listOf("edith"), engine.accept(frame(6)))
+        } finally { engine.close() }
+    }
 }

@@ -6,6 +6,7 @@ import com.sheen.rokid.phone.actions.intent.AppLaunchResolver
 import com.sheen.rokid.phone.actions.intent.LaunchResolution
 import com.sheen.rokid.phone.actions.shizuku.PrivilegedShell
 import com.sheen.rokid.phone.actions.shizuku.ShellResult
+import com.sheen.rokid.phone.platform.P3Log
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
@@ -95,14 +96,17 @@ class OpenTool(
             .orEmpty()
         val packages: List<String>
         val replyTruncated: Boolean
+        val catalogVia: String
         if (launcherPackages.isNotEmpty()) {
             packages = launcherPackages
             replyTruncated = launcherReply?.truncated == true
+            catalogVia = "launcher"
         } else {
             val all = runSafely(target, PACKAGE_LIST_COMMAND) ?: return channelUnavailable()
             if (all.failure != null || all.exitCode != 0) return channelUnavailable()
             packages = parsePackageLines(all.stdout)
             replyTruncated = all.truncated
+            catalogVia = "packages"
         }
         val labels = catalog.visibleApps().associate { entry -> entry.packageName to entry.label }
         val rows = packages.map { packageName ->
@@ -111,6 +115,17 @@ class OpenTool(
         }
         val truncated = replyTruncated || rows.size > MAX_LIST_ROWS
         val visible = rows.take(MAX_LIST_ROWS)
+        val hasPlayer = rows.any { row ->
+            PLAYER_PACKAGE.containsMatchIn(row.packageName) || PLAYER_LABEL.containsMatchIn(row.label)
+        }
+        val hasSettings = rows.any { row ->
+            row.packageName == SETTINGS_PACKAGE || row.label.contains("设置") ||
+                row.label.contains("settings", ignoreCase = true)
+        }
+        P3Log.line(
+            "P3_TOOLCATALOG via=$catalogVia count=${packages.size} hasPlayer=$hasPlayer " +
+                "hasSettings=$hasSettings truncated=$truncated",
+        )
         val data = buildJsonObject {
             put(
                 "apps",
@@ -127,6 +142,11 @@ class OpenTool(
             )
             put("text", visible.joinToString("\n") { "${it.label} (${it.packageName})" })
             put("truncated", truncated)
+            // P5/T4 frozen fields: a summary the controller can judge without reading the catalogue body.
+            put("catalogVia", catalogVia)
+            put("catalogCount", packages.size)
+            put("hasPlayer", hasPlayer)
+            put("hasSettings", hasSettings)
         }
         return done(data)
     }
@@ -377,6 +397,9 @@ class OpenTool(
         private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
 
         private val PACKAGE_NAME = Regex("[A-Za-z0-9._]+")
+        private val PLAYER_PACKAGE = Regex("(?i)player|music|video|media")
+        private val PLAYER_LABEL = Regex("(?i)音乐|播放器|视频|music|player|video")
+        private const val SETTINGS_PACKAGE = "com.android.settings"
 
         private val SCHEME = Regex("^([A-Za-z][A-Za-z0-9+.-]*):")
 
@@ -398,10 +421,11 @@ class OpenTool(
 
         val DESCRIPTOR: ActionDescriptor = ActionDescriptor(
             name = NAME,
-            title = "打开应用/页面",
+            title = "打开应用、http(s) 页面或设置页",
             parametersJson = """{"type":"object","properties":{""" +
-                """"target":{"type":"string"},"list":{"type":"boolean"},"relaunch":{"type":"boolean"}},""" +
-                """"additionalProperties":false}""",
+                """"target":{"type":"string","description":"应用名/包名、http(s) URL、或设置页别名（wifi/bluetooth/apps/display/sound/battery 等）。用户说类别词（如“文件”）时保持原词，不要自行扩成某个具体应用；歧义由工具返回候选。不支持 file://、content://、裸本地路径。"},""" +
+                """"list":{"type":"boolean","description":"true 时列出可启动应用，不执行打开。"},""" +
+                """"relaunch":{"type":"boolean"}},"additionalProperties":false}""",
             risk = RiskLevel.L1,
             requiresConfirmation = false,
             idempotent = true,

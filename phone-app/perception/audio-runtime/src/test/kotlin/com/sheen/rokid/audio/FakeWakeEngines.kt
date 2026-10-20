@@ -30,18 +30,28 @@ internal class RecordingWakeWordEngine : WakeWordEngine {
     var decodes = 0
     var resets = 0
     var closes = 0
+
+    /**
+     * When set, [result] answers a hit only for streams whose creation index is in the set. This models the
+     * measured phase dependence: the same audio produces a hit on one stream alignment and nothing on another.
+     */
+    var hittingCreations: Set<Int>? = null
+    private var nextCreation = 0
     override fun createStream(keywords: String): KeywordStreamPort {
         creates++
-        return FakeKeywordStream(keywords).also { streams += it }
+        return FakeKeywordStream(keywords, nextCreation++).also { streams += it }
     }
     override fun decode(stream: KeywordStreamPort) { decodes++ }
     override fun isReady(stream: KeywordStreamPort) = ready
-    override fun result(stream: KeywordStreamPort) = hit
+    override fun result(stream: KeywordStreamPort): KeywordHit? {
+        val allowed = hittingCreations ?: return hit
+        return hit?.takeIf { (stream as FakeKeywordStream).creation in allowed }
+    }
     override fun reset(stream: KeywordStreamPort) { resets++ }
     override fun close() { closes++ }
 }
 
-internal class FakeKeywordStream(val keywords: String) : KeywordStreamPort {
+internal class FakeKeywordStream(val keywords: String, val creation: Int = 0) : KeywordStreamPort {
     var accepts = 0
     var sampleRateHz = 0
     var lastSamples: FloatArray? = null

@@ -116,6 +116,15 @@ import com.sheen.rokid.phone.actions.device.PrivilegedShellPort
 import com.sheen.rokid.phone.actions.device.ScreenProjector
 import com.sheen.rokid.phone.actions.device.ShellTool
 import com.sheen.rokid.phone.actions.device.ToolCatalog
+import com.sheen.rokid.phone.lock.KeystoreLockPinStore
+import com.sheen.rokid.phone.lock.LockPinStore
+import com.sheen.rokid.phone.lock.LockPinValidator
+import com.sheen.rokid.phone.lock.LockShell
+import com.sheen.rokid.phone.lock.LockState
+import com.sheen.rokid.phone.lock.ScreenKeepAlive
+import com.sheen.rokid.phone.lock.UnlockCoordinator
+import com.sheen.rokid.phone.lock.UnlockGate
+import com.sheen.rokid.phone.lock.UnlockOutcome
 import com.sheen.rokid.device.AccessibilityPort
 import com.sheen.rokid.device.DeviceKernel
 import com.sheen.rokid.device.Gesture
@@ -267,6 +276,51 @@ class HostCompositionRoot internal constructor(
      */
     private val speechOn = MutableStateFlow(false)
     internal val speechEnabled: StateFlow<Boolean> = speechOn.asStateFlow()
+
+    /**
+     * The lock-screen PIN store. Production replaces the no-op in [create] with the Keystore-backed store; a test
+     * composition keeps the no-op, so no test can accidentally write a real credential.
+     */
+    internal var lockPinStore: LockPinStore = NoLockPinStore
+        private set
+
+    internal val lockPinConfigured: Boolean get() = lockPinStore.hasPin()
+
+    /**
+     * Debug-only seam (2026-10-20): the same production coordinator the tool catalog calls, exposed so a host-started
+     * Activity can measure the lock-screen path without arming a model turn. Production never reads it.
+     */
+    internal var unlockCoordinatorForProbe: UnlockGate? = null
+
+    internal fun ensureUnlockedForProbe(): UnlockOutcome =
+        unlockCoordinatorForProbe?.ensureUnlocked(requireAccessibility = true) ?: UnlockOutcome.FAILED
+
+    /** Debug-only seam: the production catalog, so an Activity can exercise the real gate + tool body. */
+    internal var toolCatalogForProbe: com.sheen.rokid.phone.actions.device.ToolCatalog? = null
+
+    internal fun executeToolForProbe(name: String, argsJson: String) =
+        toolCatalogForProbe?.execute(name, argsJson)
+
+    /**
+     * Validates and stores the PIN. The return value is the only place a UI learns whether the write succeeded; the
+     * PIN itself is never logged. An invalid value is refused before it reaches the Keystore.
+     */
+    internal fun saveLockPin(pin: String): Boolean {
+        val normalized = LockPinValidator.normalize(pin) ?: return false
+        return runCatching {
+            lockPinStore.save(normalized)
+            P3Log.line("P3_LOCKPIN configured=true")
+            true
+        }.getOrElse {
+            P3Log.line("P3_LOCKPIN configured=false reason=STORE_FAILED")
+            false
+        }
+    }
+
+    internal fun clearLockPin() {
+        runCatching { lockPinStore.clear() }
+        P3Log.line("P3_LOCKPIN configured=false")
+    }
 
     /**
      * P5 (spec §S5): the user's switch for 「语音朗读」. Writes through [smartSettingsStore] so the choice persists.
@@ -1973,6 +2027,36 @@ class HostCompositionRoot internal constructor(
                     // Through the holder: this shell is built inside `create`, before any composition instance exists.
                     rootHolder[0]?.refreshExecutionChannels()
                 })
+            // 2026-10-20: the lock-screen unlock gate. One coordinator owns the single-flight PIN attempt, the
+            // keyguard observation and the bounded screen wake lock; the tool catalog calls it before device/open/dial.
+            val lockPinStore = KeystoreLockPinStore(context)
+            val screenKeepAlive = ScreenKeepAlive(context)
+            val keyguard = context.getSystemService(android.app.KeyguardManager::class.java)
+            val unlockCoordinator = UnlockCoordinator(
+                lockState = object : LockState {
+                    override fun isLocked(): Boolean = keyguard?.isKeyguardLocked ?: true
+                    override fun isSecure(): Boolean = keyguard?.isDeviceSecure ?: false
+                },
+                shell = LockShell { command -> shizukuShell.run(command).exitCode == 0 },
+                pins = lockPinStore,
+                accessibilityReady = { EdithAccessibilityService.connected() },
+                keepAlive = { screenKeepAlive.acquire() },
+                nowMillis = { android.os.SystemClock.elapsedRealtime() },
+                sleepMillis = { millis ->
+                    try {
+                        Thread.sleep(millis)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                    }
+                },
+            )
+            // The one production gate the catalog and the debug probe share; the log line carries the outcome, never
+            // the PIN or a shell command.
+            val unlockGate = UnlockGate { requireAccessibility ->
+                unlockCoordinator.ensureUnlocked(requireAccessibility).also {
+                    P3Log.line("P3_UNLOCK requireA11y=$requireAccessibility outcome=${it.name}")
+                }
+            }
             val rootProbe = RootProbe.onDevice()
             // T2.7: one package catalog for the app-name resolution and the label fallback of `open`/`list`.
             val appCatalog = PackageManagerAppCatalog(context)
@@ -2029,6 +2113,7 @@ class HostCompositionRoot internal constructor(
                 a11yAvailable = { EdithAccessibilityService.connected() },
                 shellAvailable = { shizukuShell.ready() },
                 callAvailable = callAvailable,
+                unlock = unlockGate,
             )
             val confirmationUi = object : ConfirmationUi {
                 // Through the holder: this object is built inside `create`, where no composition instance exists yet,
@@ -2188,6 +2273,8 @@ class HostCompositionRoot internal constructor(
                 audio?.let { add(it) }
                 // 0.23 P5: the chime's ToneGenerator is a native resource; release it with the composition.
                 add(wakeChimeSink)
+                // The unlock wake lock must not outlive the composition.
+                add(screenKeepAlive)
             }, profileTester = tester, profileConsent = probeGate::grant,
                 namespaceFactory = namespaceFactory, speakerProfiles = AndroidSpeakerProfileStore(blobs),
                 // One CXR connection per composition, built on first use: the transport stays the only
@@ -2223,6 +2310,9 @@ class HostCompositionRoot internal constructor(
             // connection that has not been built yet.
             root.observerHolder = observerHolder
             root.armObserver(initialObserver)
+            root.lockPinStore = lockPinStore
+            root.unlockCoordinatorForProbe = unlockGate
+            root.toolCatalogForProbe = toolCatalog
             root.audioChain = audio
             // P5 (spec §S5): sync the UI state with what was loaded above.
             root.speechOn.value = speechEnabledNow
@@ -2558,7 +2648,15 @@ internal open class AudioChainEngines(
                 SpeakerPolicy(minVoicedMillis = 1, selfThreshold = null, otherThreshold = null)))
     }
 
-    /** The detector over the packaged KWS assets, or null when the assets or the spotter are unavailable. */
+    /**
+     * The detector over the packaged KWS assets, or null when the assets or the spotter are unavailable.
+     *
+     * The engine runs [KeywordSpotterWakeWordEngine.PHASE_DIVERSITY_STREAMS] staggered streams over one native
+     * spotter: measured 2026-10-20, a single stream missed 8 of the 9 English alignment/prefix cases it was run on,
+     * four streams hit all 11 probe cases but still missed one of twelve production injections, and eight streams
+     * hit 12/12 in the probe and 7/7 in production (F-01). The model is loaded once; only its per-stream decoder
+     * state is replicated.
+     */
     open fun wakeDetector(bundle: ValidatedModelBundle, vad: VadEngine,
         emit: (word: String, confidence: Double) -> Unit,
         suppressWhile: () -> Boolean): WakeWordDetector? {
@@ -2566,7 +2664,9 @@ internal open class AudioChainEngines(
         val timeSource = clock ?: return null
         val keywordAssets = KeywordAssetBundle.load(manager) ?: return null
         val port = SherpaKeywordSpotterFactory.create(keywordAssets, manager) ?: return null
-        return WakeWordDetector(vad, KeywordSpotterWakeWordEngine(port, keywordAssets.keywordsArgument),
+        return WakeWordDetector(vad, KeywordSpotterWakeWordEngine(port, keywordAssets.keywordsArgument,
+            streams = KeywordSpotterWakeWordEngine.PHASE_DIVERSITY_STREAMS,
+            streamStrideFrames = KeywordSpotterWakeWordEngine.PHASE_DIVERSITY_STRIDE_FRAMES),
             emit = emit, clock = timeSource, cooldownNanos = cooldownNanos, suppressWhile = suppressWhile)
     }
 }
@@ -3058,4 +3158,12 @@ internal fun activateBundle(
         onSuccess = { "ENGINE_IMPORTED: $it" },
         onFailure = { "ENGINE_IMPORT_FAILED: ${it.javaClass.name}: ${it.message}" }))
     return imported.getOrNull()?.let { store.active() }
+}
+
+/** A composition that was not wired for lock-screen unlock: the PIN is never configured. */
+private object NoLockPinStore : LockPinStore {
+    override fun hasPin(): Boolean = false
+    override fun read(): CharArray? = null
+    override fun save(pin: String) = Unit
+    override fun clear() = Unit
 }

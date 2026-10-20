@@ -37,8 +37,13 @@ fun scrollDecision(targetVisible: Boolean, fingerprinted: Boolean, scrollsDone: 
  */
 fun firstCandidateIn(candidates: List<String>, onScreen: List<String>): String? {
     val present = onScreen.filter { it.isNotBlank() }.toSet()
-    return candidates.firstOrNull { it in present }
+    // Confirmation cards (notably the owner's allow button) append a live countdown: “允许 (91)”, “允许（9）”.
+    // Match that exact suffix only; this must never become a general substring rule (安装 vs 继续安装).
+    val withoutCountdown = present.map { COUNTDOWN_SUFFIX.replace(it, "") }.toSet()
+    return candidates.firstOrNull { it in present || it in withoutCountdown }
 }
+
+private val COUNTDOWN_SUFFIX = Regex("""\s*[（(]\d+[)）]\s*$""")
 
 /**
  * Which mechanism dispatched one tap (A1, mis-tap rate).

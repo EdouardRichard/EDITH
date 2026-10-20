@@ -222,6 +222,7 @@ class AccessibilityAdapter(
     private var lastObservation: Observation? = null
     private var refToNodeIds: Map<String, Int> = emptyMap()
     private var nodeBoundsById: Map<Int, Bounds> = emptyMap()
+    private var nodeClickableById: Map<Int, Boolean> = emptyMap()
 
     /**
      * Collects the whole current screen and assigns refs into [registry] (R36).
@@ -275,7 +276,7 @@ class AccessibilityAdapter(
             val (token, arguments) = DeviceActions.decode(action)
             val nodeId = nodeIdFor(ref) ?: return false
             when (token) {
-                DeviceActions.CLICK -> platform.click(nodeId)
+                DeviceActions.CLICK -> platform.click(nodeId) || tapCentreForNonClickable(nodeId)
                 DeviceActions.LONG_CLICK -> platform.longClick(nodeId)
                 DeviceActions.SCROLL_FORWARD -> platform.scrollForward(nodeId)
                 DeviceActions.SCROLL_BACKWARD -> platform.scrollBackward(nodeId)
@@ -307,18 +308,34 @@ class AccessibilityAdapter(
     /** Delegates one synthetic gesture to the platform. */
     fun dispatchGesture(gesture: Gesture): Boolean = platform.dispatchGesture(gesture)
 
+    /**
+     * The model commonly targets the text label inside a row/button; the platform's ACTION_CLICK on that text node
+     * returns false even though tapping its centre hits the clickable parent. Only non-clickable nodes get this
+     * fallback, so a genuine clickable node whose ACTION_CLICK is refused is still reported as a refusal.
+     */
+    private fun tapCentreForNonClickable(nodeId: Int): Boolean {
+        if (nodeClickableById[nodeId] != false) return false
+        val bounds = nodeBoundsById[nodeId] ?: return false
+        return platform.dispatchGesture(
+            Gesture(listOf(Stroke(listOf(bounds.centre()), 0L, TAP_DURATION_MILLIS))),
+        )
+    }
+
     private fun bind(observation: Observation, platformNodes: List<PlatformNode>) {
         val refs = registry.assign(observation)
         val refToNodeIds = HashMap<String, Int>(refs.size)
         val nodeBounds = HashMap<Int, Bounds>(refs.size)
+        val nodeClickable = HashMap<Int, Boolean>(refs.size)
         refs.values.forEachIndexed { index, ref ->
             val node = platformNodes[index]
             refToNodeIds[ref.value] = node.nodeId
             nodeBounds[node.nodeId] = node.bounds
+            nodeClickable[node.nodeId] = node.clickable
         }
         lastObservation = observation
         this.refToNodeIds = refToNodeIds
         nodeBoundsById = nodeBounds
+        nodeClickableById = nodeClickable
     }
 
     private fun nodeIdFor(ref: Ref): Int? {
