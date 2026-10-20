@@ -1,6 +1,8 @@
 package com.sheen.rokid.phone.context
 
+import com.sheen.rokid.device.Foreground
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.MediaState
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -92,7 +94,7 @@ class AndroidDeviceStateProviderTest {
     }
 
     @Test
-    fun `state maps every readable device fact and leaves the unavailable ones null`() {
+    fun `state maps every readable device fact`() {
         val provider = AndroidDeviceStateProvider(FakeFacts(), clock = { fixedEpochMillis })
 
         val state = provider.state()
@@ -102,9 +104,63 @@ class AndroidDeviceStateProviderTest {
         assertEquals(false, state.locked)
         assertEquals(120, state.brightness)
         assertEquals(40, state.volumePercent)
-        assertNull("Phase 1 has no window-backed IME fact", state.imeVisible)
-        assertNull("Phase 1 leaves the foreground to the perception provider", state.foregroundPackage)
+        assertEquals(true, state.imeVisible)
+        assertEquals("com.example.app", state.foregroundPackage)
+        assertEquals(".MainActivity", state.foregroundActivity)
+        assertEquals(
+            MediaState(
+                state = "PLAYING",
+                title = "Synthetic",
+                artist = "Synthetic Artist",
+                album = "Synthetic Album",
+                positionMs = 42_000L,
+                durationMs = 180_000L,
+            ),
+            state.media,
+        )
+        assertEquals(true, state.panelVisible)
+        assertEquals(true, state.glassesConnected)
+        assertEquals(true, state.glassesWearing)
+    }
+
+    @Test
+    fun `state keeps a fact the platform cannot supply null instead of inventing one`() {
+        val provider = AndroidDeviceStateProvider(
+            FakeFacts(
+                batteryPercent = null,
+                charging = null,
+                network = null,
+                screenOn = null,
+                locked = null,
+                brightness = null,
+                volumePercent = null,
+                imeVisible = null,
+                foregroundPackage = null,
+                foregroundActivity = null,
+                media = null,
+                panelVisible = null,
+                glassesConnected = null,
+                glassesWearing = null,
+            ),
+            clock = { fixedEpochMillis },
+        )
+
+        val state = provider.state()
+
+        assertNull(state.batteryPercent)
+        assertNull(state.charging)
+        assertNull(state.network)
+        assertNull(state.screenOn)
+        assertNull(state.locked)
+        assertNull(state.brightness)
+        assertNull(state.volumePercent)
+        assertNull("no IME fact is not a hidden IME", state.imeVisible)
+        assertNull("no foreground fact is not a guessed app", state.foregroundPackage)
         assertNull(state.foregroundActivity)
+        assertNull("no media session is not a stopped or unknown one", state.media)
+        assertNull(state.panelVisible)
+        assertNull("an unestablished link is not a disconnection inferred here", state.glassesConnected)
+        assertNull("no wearing event is not 'not wearing'", state.glassesWearing)
     }
 
     // ------------------------------------------------------------- degradation
@@ -119,6 +175,12 @@ class AndroidDeviceStateProviderTest {
                 override fun network(): String? = error("connectivity service died")
                 override fun capabilities(): Set<String> = error("capability probe died")
                 override fun imeVisible(): Boolean? = error("ime probe died")
+                override fun foregroundPackage(): String? = error("accessibility service died")
+                override fun foregroundActivity(): String? = error("accessibility service died")
+                override fun media(): MediaState? = error("media session manager died")
+                override fun panelVisible(): Boolean? = error("glasses panel died")
+                override fun glassesConnected(): Boolean? = error("glasses link died")
+                override fun glassesWearing(): Boolean? = error("wearing probe died")
             },
             clock = { fixedEpochMillis },
             timeZone = { "Asia/Shanghai" },
@@ -135,6 +197,12 @@ class AndroidDeviceStateProviderTest {
         assertNull(state.charging)
         assertNull(state.network)
         assertNull(state.imeVisible)
+        assertNull(state.foregroundPackage)
+        assertNull(state.foregroundActivity)
+        assertNull("a dead media binder is no media fact", state.media)
+        assertNull(state.panelVisible)
+        assertNull(state.glassesConnected)
+        assertNull(state.glassesWearing)
         // The facts that still answer are still rendered, so one broken probe degrades one field, not the request.
         assertEquals("Xiaomi", profile.manufacturer)
         assertEquals("2026-10-20", state.localDate)
@@ -163,6 +231,36 @@ class AndroidDeviceStateProviderTest {
         assertEquals(0, profile.screenWidthPx)
         assertEquals("", profile.appVersion)
         assertEquals("the other facts are unaffected", "Xiaomi", profile.manufacturer)
+    }
+
+    // ------------------------------------------------------------------ factory
+
+    @Test
+    fun `the production factory reads the host lambdas into state`() {
+        val provider = androidDeviceStateProvider(
+            android.content.ContextWrapper(null),
+            capabilities = { setOf("a11y") },
+            wakeWords = { listOf("edith") },
+            foreground = { Foreground("com.example.app", ".MainActivity") },
+            imeVisible = { true },
+            media = { MediaState("PAUSED", "Synthetic") },
+            panelVisible = { true },
+            glassesConnected = { false },
+            glassesWearing = { true },
+        )
+
+        val state = provider.state()
+        val profile = provider.profile()
+
+        assertEquals("com.example.app", state.foregroundPackage)
+        assertEquals(".MainActivity", state.foregroundActivity)
+        assertEquals(true, state.imeVisible)
+        assertEquals(MediaState("PAUSED", "Synthetic"), state.media)
+        assertEquals(true, state.panelVisible)
+        assertEquals("an established link can be false, which is still a fact", false, state.glassesConnected)
+        assertEquals(true, state.glassesWearing)
+        assertEquals("the live capability lambda is forwarded, not replaced", setOf("a11y"), profile.capabilities)
+        assertEquals(listOf("edith"), profile.wakeWords)
     }
 
     // ------------------------------------------------------------------ wiring
@@ -202,9 +300,20 @@ private open class FakeFacts(
     locked: Boolean? = false,
     brightness: Int? = 120,
     volumePercent: Int? = 40,
-    imeVisible: Boolean? = null,
-    foregroundPackage: String? = null,
-    foregroundActivity: String? = null,
+    imeVisible: Boolean? = true,
+    foregroundPackage: String? = "com.example.app",
+    foregroundActivity: String? = ".MainActivity",
+    media: MediaState? = MediaState(
+        state = "PLAYING",
+        title = "Synthetic",
+        artist = "Synthetic Artist",
+        album = "Synthetic Album",
+        positionMs = 42_000L,
+        durationMs = 180_000L,
+    ),
+    panelVisible: Boolean? = true,
+    glassesConnected: Boolean? = true,
+    glassesWearing: Boolean? = true,
 ) : PlatformFacts {
 
     private val modelFact = model
@@ -222,6 +331,10 @@ private open class FakeFacts(
     private val imeVisibleFact = imeVisible
     private val foregroundPackageFact = foregroundPackage
     private val foregroundActivityFact = foregroundActivity
+    private val mediaFact = media
+    private val panelVisibleFact = panelVisible
+    private val glassesConnectedFact = glassesConnected
+    private val glassesWearingFact = glassesWearing
 
     override fun manufacturer(): String = "Xiaomi"
     override fun model(): String = modelFact
@@ -247,4 +360,8 @@ private open class FakeFacts(
     override fun imeVisible(): Boolean? = imeVisibleFact
     override fun foregroundPackage(): String? = foregroundPackageFact
     override fun foregroundActivity(): String? = foregroundActivityFact
+    override fun media(): MediaState? = mediaFact
+    override fun panelVisible(): Boolean? = panelVisibleFact
+    override fun glassesConnected(): Boolean? = glassesConnectedFact
+    override fun glassesWearing(): Boolean? = glassesWearingFact
 }

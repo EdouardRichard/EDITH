@@ -412,6 +412,22 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
         /** The channel's own answer to "am I usable right now". */
         fun connected(): Boolean = instance != null
 
+        /**
+         * Whether an input-method window is up (0.3 Phase 2, Task 2's IME fact), or `null` when it cannot be told.
+         *
+         * A service the user has switched off is `null`, not `false`: it never looked, and a `false` would be a fact
+         * this channel does not have. While connected, the platform's window list is the answer - a
+         * `TYPE_INPUT_METHOD` window present means the IME is up, and a readable list without one means it is down.
+         * Only the window **type** is read; no window content, title or node is touched.
+         */
+        fun imeVisibleNow(): Boolean? {
+            val service = instance ?: return null
+            return runCatching {
+                val windows = service.windows ?: return@runCatching null
+                windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+            }.getOrNull()
+        }
+
         /** The live UI port, or `null` while the user has the service switched off. */
         fun ui(): AccessibilityUi? = instance
 

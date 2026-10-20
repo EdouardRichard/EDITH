@@ -1580,4 +1580,19 @@ class CxrHintLinkTest {
         assertEquals("c-1", inactive.requestId)
         assertFalse("the withdrawal names the same question", inactive.active)
     }
+
+    // ------------------------------------------------------- 0.3 Phase 2 Task 2: the connected fact
+
+    @Test
+    fun theLinkReportsAnEstablishedSessionUntilItEnds() {
+        val link = CxrHintLink(FakeClock(), FakeScheduler(), sendJson = { _ -> true }, maxRetries = 0)
+
+        assertFalse("a link nobody introduced a session to is not connected", link.isEstablished())
+
+        link.sessionEstablished("s-1", 3)
+        assertTrue("an introduced session is the connected fact", link.isEstablished())
+
+        link.sessionEnded()
+        assertFalse("停止 ends the session the glasses were introduced to", link.isEstablished())
+    }
 }

@@ -10,10 +10,12 @@ import android.os.Build
 import android.os.PowerManager
 import android.provider.Settings
 import android.view.WindowManager
+import com.sheen.rokid.device.Foreground
 import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.plugin.DeviceProfile
 import com.sheen.rokid.plugin.DeviceState
 import com.sheen.rokid.plugin.DeviceStateProvider
+import com.sheen.rokid.plugin.MediaState
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
@@ -52,6 +54,10 @@ internal interface PlatformFacts {
     fun imeVisible(): Boolean?
     fun foregroundPackage(): String?
     fun foregroundActivity(): String?
+    fun media(): MediaState?
+    fun panelVisible(): Boolean?
+    fun glassesConnected(): Boolean?
+    fun glassesWearing(): Boolean?
 }
 
 /**
@@ -59,9 +65,9 @@ internal interface PlatformFacts {
  *
  * Three rules are the reason this class exists rather than reading Android inline at the call site:
  *
- * 1. **No invented facts.** A null platform fact stays null in [DeviceState]; the glasses fields stay null until
- *    the transport exposes handshake data. Missing values are omitted by the renderer, never replaced with
- *    `unknown` or a default (spec §4.2.1 rule 2).
+ * 1. **No invented facts.** A null platform fact stays null in [DeviceState]: an unreadable probe, an absent media
+ *    session and a wear sensor that has not reported yet are all `null`, never replaced with `unknown` or a default
+ *    (spec §4.2.1 rule 2).
  * 2. **One clock.** [profile] and [state] read time exclusively through the injected [clock]/[timeZone]. [state] does
  *    not call `System.currentTimeMillis()` a second time, so `capturedAtEpochMillis`, the local date and the local
  *    time all describe one instant - the request's.
@@ -129,6 +135,12 @@ internal class AndroidDeviceStateProvider(
             imeVisible = nullableFact { facts.imeVisible() },
             foregroundPackage = nullableFact { facts.foregroundPackage() },
             foregroundActivity = nullableFact { facts.foregroundActivity() },
+            // 0.3 Phase 2: the perception facts a plugin's device view needs. Each one is a live host read like every
+            // other fact here; a probe that cannot answer leaves the field null rather than guessing.
+            media = nullableFact { facts.media() },
+            panelVisible = nullableFact { facts.panelVisible() },
+            glassesConnected = nullableFact { facts.glassesConnected() },
+            glassesWearing = nullableFact { facts.glassesWearing() },
         )
     }
 
@@ -150,23 +162,49 @@ internal class AndroidDeviceStateProvider(
 }
 
 /**
- * The production provider: real Android platform facts plus the host's own capability probes.
+ * The production provider: real Android platform facts plus the host's own perception probes.
  *
- * The composition passes [capabilities] and [wakeWords] as lambdas because both are live reads of objects that only
- * the composition owns (channel readiness, the wake-word registry). They are evaluated on every `profile()` call, so
- * a capability that came up after assembly is reported by the next session and never cached into a stale list.
+ * The composition passes [capabilities], [wakeWords] and the six perception facts as lambdas because each is a live read
+ * of an object that only the composition owns (channel readiness, the wake-word registry, the accessibility port, the
+ * CXR link, the media-session manager). They are evaluated on every `profile()`/`state()` call, so a channel that came
+ * up after assembly is reported by the next request and never cached into a stale value.
+ *
+ * Every perception lambda defaults to `{ null }`: a provider assembled without one (the JVM assembly tests) reports
+ * that fact as unknown instead of pretending it read something. The production factory in `HostCompositionRoot` is the
+ * only caller that wires all six.
  *
  * @param capabilities platform capability names the host can answer right now (`a11y`, `shizuku`, ...).
  * @param wakeWords the host wake-word registry's current word list.
+ * @param foreground the accessibility port's current foreground app, or `null` while the service is off.
+ * @param imeVisible whether an input-method window is up, or `null` while that cannot be read.
+ * @param media the current media session, or `null` when there is none/notification access is missing.
+ * @param panelVisible whether the glasses panel is visible right now.
+ * @param glassesConnected whether the CXR session is established.
+ * @param glassesWearing the wear sensor's last fact, or `null` before any wearing event.
  */
 internal fun androidDeviceStateProvider(
     context: Context,
     capabilities: () -> Set<String> = { emptySet() },
     wakeWords: () -> List<String> = { emptyList() },
+    foreground: () -> Foreground? = { null },
+    imeVisible: () -> Boolean? = { null },
+    media: () -> MediaState? = { null },
+    panelVisible: () -> Boolean? = { null },
+    glassesConnected: () -> Boolean? = { null },
+    glassesWearing: () -> Boolean? = { null },
 ): DeviceStateProvider = AndroidDeviceStateProvider(
     // The application context outlives the activity and owns no window; a null base (JVM assembly tests) is kept as
     // given so construction itself never throws.
-    facts = AndroidPlatformFacts(context.applicationContext ?: context, capabilities),
+    facts = AndroidPlatformFacts(
+        context.applicationContext ?: context,
+        capabilities,
+        foregroundProbe = foreground,
+        imeProbe = imeVisible,
+        mediaProbe = media,
+        panelProbe = panelVisible,
+        connectedProbe = glassesConnected,
+        wearingProbe = glassesWearing,
+    ),
     wakeWords = wakeWords,
 )
 
@@ -177,13 +215,24 @@ internal fun androidDeviceStateProvider(
  * service throws. Nothing here reads a serial number, an IMEI or any other identifier: the profile is built from
  * manufacturer/model/release/screen values only.
  *
- * Phase 1 deliberately leaves `imeVisible`, `foregroundPackage` and `foregroundActivity` null: the window-backed IME
- * state and the foreground app belong to the Phase 2 perception provider, and guessing them here would put a made-up
- * fact into the prompt. The glasses fields stay null until the transport exposes its handshake.
+ * The perception facts (0.3 Phase 2, Task 2) are not Android calls of their own: the composition owns their live
+ * sources - the accessibility port for the foreground app and the IME window list, the CXR link for the glasses
+ * session and panel, the media-session source, and the host's wear sensor - because only the composition can see
+ * them. This class forwards those probes and keeps the "a probe that throws costs that one fact" rule, so a disabled
+ * accessibility service or a revoked notification-listener grant cannot take the whole state down.
  */
 internal class AndroidPlatformFacts(
     private val context: Context,
-    private val capabilities: () -> Set<String>,
+    // Deliberately not named `capabilities`: that would shadow the `capabilities()` override below, and the read would
+    // resolve to the function itself. The recursion was swallowed by `read`'s runCatching and the profile advertised an
+    // empty capability set - pinned now by `the production factory reads the host lambdas into state`.
+    private val capabilitiesProbe: () -> Set<String>,
+    private val foregroundProbe: () -> Foreground?,
+    private val imeProbe: () -> Boolean?,
+    private val mediaProbe: () -> MediaState?,
+    private val panelProbe: () -> Boolean?,
+    private val connectedProbe: () -> Boolean?,
+    private val wearingProbe: () -> Boolean?,
 ) : PlatformFacts {
 
     override fun manufacturer(): String = read { Build.MANUFACTURER }.orEmpty()
@@ -215,7 +264,7 @@ internal class AndroidPlatformFacts(
 
     override fun appVersion(): String = read { BuildConfig.VERSION_NAME }.orEmpty()
 
-    override fun capabilities(): Set<String> = read { capabilities() }.orEmpty()
+    override fun capabilities(): Set<String> = read { capabilitiesProbe() }.orEmpty()
 
     override fun batteryPercent(): Int? = read {
         batteryManager()?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
@@ -241,13 +290,25 @@ internal class AndroidPlatformFacts(
 
     override fun volumePercent(): Int? = read { musicVolumePercent() }
 
-    /** Phase 1: no window token is owned by the host, so the IME's visibility is not a fact it can report. */
-    override fun imeVisible(): Boolean? = null
+    /** The window list belongs to the accessibility channel; a service that is off answers `null` upstream. */
+    override fun imeVisible(): Boolean? = read { imeProbe() }
 
-    /** Phase 1: the foreground app is the perception provider's fact (Phase 2), not a profile guess. */
-    override fun foregroundPackage(): String? = null
+    /** The foreground app is the accessibility port's fact; a disconnected service answers `null` upstream. */
+    override fun foregroundPackage(): String? = read { foregroundProbe()?.packageName }
 
-    override fun foregroundActivity(): String? = null
+    override fun foregroundActivity(): String? = read { foregroundProbe()?.activity }
+
+    /** The media-session source answers only while notification access lets it read sessions. */
+    override fun media(): MediaState? = read { mediaProbe() }
+
+    /** The CXR link owns whether the resident panel is up. */
+    override fun panelVisible(): Boolean? = read { panelProbe() }
+
+    /** Whether a session has been introduced to the glasses (the CXR link's own established state). */
+    override fun glassesConnected(): Boolean? = read { connectedProbe() }
+
+    /** The wear sensor's last reported value; `null` until the glasses report one. */
+    override fun glassesWearing(): Boolean? = read { wearingProbe() }
 
     /**
      * The current window bounds on API 30+, the display metrics below it. `currentWindowMetrics` from a non-activity

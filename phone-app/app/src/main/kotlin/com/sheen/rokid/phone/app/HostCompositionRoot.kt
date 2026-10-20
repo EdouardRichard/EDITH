@@ -63,6 +63,7 @@ import com.sheen.rokid.phone.session.ToneWakeChimeSink
 import com.sheen.rokid.phone.session.WakeChime
 import com.sheen.rokid.phone.session.confirmation.AndroidNotificationSurface
 
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import com.sheen.rokid.audio.AcousticLabeler
@@ -138,6 +139,7 @@ import com.sheen.rokid.phone.actions.intent.IntentActionExecutor
 import com.sheen.rokid.phone.actions.intent.PackageManagerAppCatalog
 import com.sheen.rokid.phone.context.CalendarSource
 import com.sheen.rokid.phone.context.ForegroundAppSource
+import com.sheen.rokid.phone.context.MediaSessionSource
 import com.sheen.rokid.phone.context.NotificationCategorySource
 import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
 import com.sheen.rokid.phone.model.ProfileProbeGate
@@ -1120,6 +1122,19 @@ class HostCompositionRoot internal constructor(
     internal fun isPanelVisible(): Boolean = hintLink?.isPanelVisible() ?: false
 
     /**
+     * The last wear-sensor value the glasses reported, or `null` before any wearing event (0.3 Phase 2, Task 2).
+     *
+     * A tri-state on purpose: the host must not turn "no event yet" into "not wearing". Set by [onWearingChanged] and
+     * cleared when the link is lost or the session ends, because the fact belongs to the session that reported it.
+     * Read-only from the outside; written only on the host-event path.
+     */
+    @Volatile
+    private var wearingState: Boolean? = null
+
+    /** The device-state provider's wearing fact; `null` until the glasses report one. */
+    internal fun glassesWearing(): Boolean? = wearingState
+
+    /**
      * True when [identity] is the pair [HostRuntime] currently accepts events for.
      *
      * The link validated an inbound event against the identity it introduced; a queued event can outlive that
@@ -1263,6 +1278,9 @@ class HostCompositionRoot internal constructor(
     internal fun onWearingChanged(wearing: Boolean) {
         dispatchHostEvent {
             if (closed) return@dispatchHostEvent
+            // 0.3 Phase 2 Task 2: the wear sensor fact is recorded for the device state. `true` and `false` are both
+            // facts; a session that has reported none stays `null` until its first event.
+            wearingState = wearing
             P3Log.line("P3_CXR glasses_event=wearing=$wearing")
             if (wearing) return@dispatchHostEvent
             val identity = runCatching { host.currentIdentity() }.getOrNull()
@@ -1294,6 +1312,8 @@ class HostCompositionRoot internal constructor(
     private fun onCxrLinkInterrupted() {
         if (closed) return
         hintLink?.linkLost()
+        // 0.3 Phase 2 Task 2: a dead link's last wearing fact must not outlive the session it described.
+        wearingState = null
         linkReady = false
         linkBuilt = false
         retriedMappingSyncId = null
@@ -1695,6 +1715,8 @@ class HostCompositionRoot internal constructor(
             host.stop()
         } finally {
             hintLink?.sessionEnded()
+            // 0.3 Phase 2 Task 2: the wearing fact belongs to the session that reported it; 停止 is that session ending.
+            wearingState = null
         }
         activatedPlugin = null
         awaitingDisplayForActivation = false
@@ -1913,6 +1935,14 @@ class HostCompositionRoot internal constructor(
             val notificationCategory = NotificationCategorySource(
                 connected = NotificationCategoryService::isConnected,
                 latest = NotificationCategoryService::latest,
+            )
+            // 0.3 Phase 2 Task 2: the media fact. `getActiveSessions` is gated on the app's notification-listener
+            // grant, so the component the user already enabled for the category signal is the one named here; no new
+            // permission is requested or needed. The source answers `null` (never a fake state) while the grant is
+            // missing, the binder is dead, or no session reports a playback state.
+            val mediaSession = MediaSessionSource(
+                context,
+                ComponentName(context, NotificationCategoryService::class.java),
             )
             val calendar = CalendarSource.android(context)
             // edith-0.2 Phase B (B4): the SKILL directory grant. The implementation reads through `java.io.File`,
@@ -2211,6 +2241,12 @@ class HostCompositionRoot internal constructor(
             // profile name a capability the host cannot answer. Facts are read lazily on each profile()/state() call.
             // The wake-word source is the same registry the plugin declares its words to (`Capability.WakeWord`), so
             // the prompt and the detector describe one word set, not two copies of the settings.
+            //
+            // 0.3 Phase 2 Task 2 completes the perception facts. Each lambda reads the object that owns the fact at
+            // frame time: the accessibility port for the foreground app and the IME window list, the media-session
+            // source, and the composition/link for the panel and both glasses facts. The composition itself is reached
+            // through `rootHolder` because the provider map is assembled before the root exists; a fact asked for
+            // before then is honestly `null` rather than a fabricated default.
             val deviceState = androidDeviceStateProvider(
                 context = context,
                 capabilities = {
@@ -2221,11 +2257,20 @@ class HostCompositionRoot internal constructor(
                         if (notificationCategory.isConnected) add("notification_access")
                         if (foregroundApp.isGranted) add("usage_access")
                         if (calendar.isGranted) add("calendar")
-                        // `media_session`/`clipboard` are not wired in Phase 1: there is no source to read, so the
-                        // capability is omitted instead of advertised and then refused. Add them with their providers.
+                        // The media session is readable only through that same notification-listener grant
+                        // (`MediaSessionManager.getActiveSessions` throws without it), so the capability follows the
+                        // grant instead of being advertised and then refused. `clipboard` is still not wired in this
+                        // task, so it stays out of the set.
+                        if (notificationCategory.isConnected) add("media_session")
                     }
                 },
                 wakeWords = { smartWiring.wakeWords.current() },
+                foreground = { EdithAccessibilityService.port()?.foreground() },
+                imeVisible = { EdithAccessibilityService.imeVisibleNow() },
+                media = { mediaSession.current() },
+                panelVisible = { rootHolder[0]?.isPanelVisible() },
+                glassesConnected = { hintLink.isEstablished() },
+                glassesWearing = { rootHolder[0]?.glassesWearing() },
             )
             // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
             // assistant tab reads it. It has to be created here because the provider map is built before the root.
