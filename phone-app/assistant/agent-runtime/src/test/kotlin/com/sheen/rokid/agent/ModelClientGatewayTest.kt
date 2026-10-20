@@ -913,13 +913,15 @@ class ModelClientGatewayTest {
     }
 
     @Test fun `the trim window is the send time limit minus a deliberate safety margin`() {
-        // I-4: `TurnTrimmer.total()` and `ContextBudgeter.prepare` now count the same token unit and the same fixed
-        // 32, against the same `minOf(inputBudgetTokens, usable - maxOutput - safety)` limit. They are still not
-        // identical by construction (the gateway folds leading context and itemises tool rounds when it renders the
-        // wire request), which is exactly why the `- FIXED_OVERHEAD` is a deliberate 32-unit **safety margin**: the
-        // trimmer is stricter than the check it must satisfy. It is not a correction of a unit disagreement. The
-        // fixture profile's window is `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, so the trimmer is handed
-        // 59_968.
+        // I-4: `TurnTrimmer.total()` and `ContextBudgeter.prepare` count the same token unit and the same fixed
+        // 32, against the same `minOf(inputBudgetTokens, usable - maxOutput - safety)` limit. The totals are still
+        // not identical by construction: folding leading context into one message drops the folded segments' +32,
+        // but a `TOOL_ROUND` is itemised into one wire item per call/output and the budgeter charges each one its
+        // own +32, so with several items the rendered request can price above the trimmer's total — beyond the
+        // 32-unit margin. The subtraction is a deliberate stricter bound, not an absorption guarantee; the real
+        // gate is the send-time `ContextBudgeter.prepare`, and its `ContextWindowExceeded` triggers the gateway's
+        // AGGRESSIVE/HARD recovery. It is not a correction of a unit disagreement. The fixture profile's window is
+        // `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, so the trimmer is handed 59_968.
         assertEquals(59_968, ModelClientGateway.windowTokens(profile))
     }
 

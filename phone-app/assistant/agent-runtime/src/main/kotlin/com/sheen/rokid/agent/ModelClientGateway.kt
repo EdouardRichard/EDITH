@@ -116,14 +116,23 @@ class ModelClientGateway(
          * The token-unit budget a frame is trimmed to: the same `minOf(...)` bound `ContextBudgeter` enforces at send
          * time (`minOf(inputBudgetTokens, usableWindow - maxOutput - safety)`), minus a deliberate 32-unit margin.
          *
-         * Both stages now price text with [TokenMeter] (0.3 design §5.2) and charge the same
-         * [com.sheen.rokid.contracts.ImageBudget.UNITS_PER_IMAGE] per image (R68), and both add the same fixed
-         * [FIXED_OVERHEAD]. The totals are still not **identical by construction**: [frameToTranscript] folds the
-         * leading context into one message and renders a `TOOL_ROUND` as one or more wire items, so the send-time
-         * request can price slightly below or above the trimmer's per-segment total. Taking one more 32 off keeps the
-         * trimmer **stricter** than the check it must satisfy, in the safe direction, and absorbs that rendering
-         * difference. Nothing here claims the subtraction is what prevents a rejection: the acceptance test's
-         * discriminating assertion is the send-time `prepare` call itself.
+         * Both stages price text with [TokenMeter] (0.3 design §5.2), charge the same
+         * [com.sheen.rokid.contracts.ImageBudget.UNITS_PER_IMAGE] per image (R68), and add the same fixed
+         * [FIXED_OVERHEAD], so they share one formula. Their totals are still not identical by construction because
+         * each renders the frame differently:
+         *
+         * - [frameToTranscript] folds context segments into one head/input message, which removes each folded
+         *   segment's own +32 per-message overhead, so that merged message prices at or below the trimmer's
+         *   per-segment measure (the `\n\n` separators it adds are at most one token unit each).
+         * - A `TOOL_ROUND` moves the other way: `ContextBudgeter` charges one +32 per rendered wire item, while the
+         *   trimmer charged one +32 for the whole segment. A round with several call/output entries can therefore
+         *   price more than the 32-unit margin above the trimmer's total.
+         *
+         * The subtraction is therefore a deliberately stricter bound, not a guarantee that the rendered request
+         * fits. The real gate is the send-time `ContextBudgeter.prepare`: when it throws
+         * [ContractError.ContextWindowExceeded], the gateway's bounded AGGRESSIVE/HARD recovery re-trims and resends
+         * the same turn, and exhausting both recoveries is reported as `CONTEXT_OVERFLOW`. The acceptance test's
+         * discriminating assertion is that `prepare` call itself, never a claim that the two totals are identical.
          */
         internal fun windowTokens(profile: ModelProfile): Int =
             minOf(
@@ -384,12 +393,15 @@ class ModelClientGateway(
      * it precedes the retry text and the input inside the one message. Putting it in history would create the same lone
      * user group a retry would; putting it after the input would make the wearer's turn stop being last.
      *
-     * Folding several context segments into one message removes one 32-unit per-message overhead per folded segment
-     * and adds the `\n\n` separators the join introduces (two ASCII characters, at most one token unit). With a
-     * **single** context segment nothing is saved but the separators, so the folded request prices at up to one token
-     * unit more than the trimmer's measurement of that segment; the gateway's deliberate 32-unit window margin
-     * absorbs that, and the trimmer's verdict stays the conservative one either way. Nothing here claims the folded
-     * request is priced identically to the per-segment total — only that it stays inside the margin.
+     * Folding a context segment into the head/input message removes that segment's own +32 per-message overhead, so
+     * the merged message prices at or below the trimmer's per-segment total for the pieces it merges (the `\n\n`
+     * separators the join introduces are at most one token unit each). That is only the price-lowering direction: a
+     * `TOOL_ROUND` renders as one wire item per call/output entry, and `ContextBudgeter` charges each item its own +32
+     * while the trimmer charged one +32 for the whole segment, so with several entries the rendered request can price
+     * more than the 32-unit window margin above the trimmer's total. Nothing here claims the folded request is priced
+     * identically to the per-segment total, and the margin is not the guarantee that the request fits: the real gate
+     * is the send-time `ContextBudgeter.prepare`, whose `ContextWindowExceeded` is answered by the gateway's bounded
+     * AGGRESSIVE/HARD recovery.
      */
     private fun frameToTranscript(frame: RequestFrame, fallbackUtterance: String?): Transcript? {
         val flow = frame.conversationFlow

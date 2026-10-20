@@ -12,6 +12,7 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -230,8 +231,9 @@ class TurnTrimmerTypeAwareTest {
             user("now"),
         )
         // Token-unit total = 32(fixed) + 33(sys) + 33(u1) + 33(a1) + 106(the observation JSON: 74 tokens + 32)
-        // + 39(runtime: 7 tokens + 32) + 33(now) = **309**. The limit is below that, so cut ① removes the turn
-        // (66 units) and leaves 243 > 220; the runtime line is request metadata and stays regardless.
+        // + 39(runtime: 7 tokens + 32) + 33(now) = **309**. The limit is below that, so cut ① removes that whole
+        // turn group — u1, a1 and the tool round (33 + 33 + 106 = 172 units) — while `RUNTIME_STATE` is protected,
+        // leaving 32 + 33 + 39 + 33 = **137** ≤ 220. The runtime line is counted and stays regardless.
         val report = TurnTrimmer().trim(f, limitTokens = 220)
 
         assertEquals(1, report.droppedTurns)
@@ -240,6 +242,11 @@ class TurnTrimmerTypeAwareTest {
             "runtime state must survive turn eviction: ${report.kept.conversationFlow}",
         )
         assertEquals(SegmentOrigin.USER_INPUT, report.kept.conversationFlow.last().origin)
+        val keptTotal = FIXED_OVERHEAD +
+            tokenUnitsPlusOverhead(report.kept.systemText) +
+            report.kept.conversationFlow.sumOf { tokenUnitsPlusOverhead(it.text) }
+        assertEquals(137, keptTotal, "the kept frame: 32(fixed) + 33(sys) + 39(runtime) + 33(now)")
+        assertFalse(report.compressionOwed, "the kept frame fits the 220-unit limit")
     }
 
     @Test
