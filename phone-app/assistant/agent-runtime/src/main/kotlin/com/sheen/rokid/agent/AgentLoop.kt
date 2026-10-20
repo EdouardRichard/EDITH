@@ -201,7 +201,8 @@ data class AgentRun(
     /**
      * Task 6 (spec §4.8 / §4.13): the provider's token accounting for the run, summed over **every** model turn it
      * made — a tool round and a retry each cost a turn, so the run's total is their sum, not the last turn's counts.
-     * Each component is summed independently (a turn that reported only one counter leaves the other total intact).
+     * Each component — including the two cache counters — is summed independently (a turn that reported only one
+     * counter leaves the other totals intact), and a cache counter stays `null` until some turn reports it.
      *
      * `null` — the default — means no turn reported usage at all, which is different from a reported zero. Counts only:
      * no text, prompt or completion body reaches this field. It is the source Task 14's `P3_METRIC` reads; the existing
@@ -345,9 +346,11 @@ class AgentLoop(
      */
     private val maxObservations: Int = 24,
     /**
-     * 0.25 Task 14 (R78): where the run's one `P3_METRIC` line goes. `{}` (the default) emits nothing, keeping every
-     * pre-0.25 caller and test byte-for-byte; the production plugin passes its log sink. The loop still reports the
-     * same numbers in [AgentRun.metrics] for a caller that has its own consumer.
+     * 0.25 Task 14 (R78): where the run's count-only metric lines go. `{}` (the default) emits nothing, keeping every
+     * pre-0.25 caller and test byte-for-byte; the production plugin passes its log sink. The loop emits the
+     * long-standing `P3_METRIC` line and, when the provider reported accounting, the separate `P3_CACHE` line
+     * (0.3 Phase 1 Task 13). The loop still reports the same numbers in [AgentRun.metrics] for a caller that has its own
+     * consumer.
      *
      * Observability must never change the outcome, so a throwing sink is swallowed like the display callbacks are.
      */
@@ -1167,9 +1170,11 @@ class AgentLoop(
             nudges = nudges,
             overflows = metricOverflows,
         )
-        // 0.25 Task 14 (R78): exactly one count-only line per run. The sink is observability, never a verdict: a
-        // throwing logger must not turn a completed run into an exception.
+        // 0.25 Task 14 (R78) + 0.3 Phase 1 Task 13: exactly one count-only `P3_METRIC` line per run, then — only when
+        // the run reported accounting — the separate count-only `P3_CACHE` line. The sink is observability, never a
+        // verdict: a throwing logger must not turn a completed run into an exception.
         runCatching { metricLine(renderMetric(metrics)) }
+        renderCacheMetric()?.let { cacheLine -> runCatching { metricLine(cacheLine) } }
         return AgentRun(
             outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps, usage,
             spentObservations, planNudgeCap, metrics,
@@ -1202,6 +1207,28 @@ class AgentLoop(
     }
 
     /**
+     * 0.3 Phase 1 Task 13 (spec §5.3): the run's separate `P3_CACHE` line — counts only, fixed field order — or `null`
+     * when the run reported no accounting at all.
+     *
+     * An unreported counter is `-`, while a reported zero stays `0`: the provider saying nothing is not the same as it
+     * billing zero. The counts are the run's totals (see [accumulatedUsage]), so a tool round or a retry reports every
+     * model turn of the run rather than the last one.
+     */
+    private fun renderCacheMetric(): String? {
+        val total = usage ?: return null
+        return buildString {
+            append("P3_CACHE")
+            append(" cached=").append(countField(total.cachedInputTokens))
+            append(" miss=").append(countField(total.cacheMissInputTokens))
+            append(" inputTokens=").append(countField(total.inputTokens))
+            append(" outputTokens=").append(countField(total.outputTokens))
+        }
+    }
+
+    /** `-` for a count the provider did not report; a reported zero is printed as `0`, never fabricated. */
+    private fun countField(value: Long?): String = value?.toString() ?: "-"
+
+    /**
      * Adds the images one model request carries to the run's distinct-image count (R78): a request-flow segment's
      * `images` and a history tool output's `images`. Artifact ids key the set, so the same screenshot echoed by two
      * requests of one run counts once.
@@ -1214,9 +1241,10 @@ class AgentLoop(
     }
 
     /**
-     * Adds one turn's accounting to the run's total. A turn that reported nothing contributes nothing; the two
-     * counters are summed independently because [ModelUsage] admits one side being absent. The total stays `null`
-     * until the first turn reports something, so "no accounting" is never fabricated as a zero count.
+     * Adds one turn's accounting to the run's total. A turn that reported nothing contributes nothing; every counter is
+     * summed independently because [ModelUsage] admits a side being absent — including the two cache counters, which a
+     * multi-turn run must not lose. The total stays `null` until the first turn reports something, and a cache counter
+     * stays `null` until some turn reports it, so "no accounting" is never fabricated as a zero count.
      */
     private fun accumulatedUsage(total: ModelUsage?, turn: ModelUsage?): ModelUsage? {
         if (turn == null) return total
@@ -1224,6 +1252,8 @@ class AgentLoop(
         return ModelUsage(
             inputTokens = sumTokens(total.inputTokens, turn.inputTokens),
             outputTokens = sumTokens(total.outputTokens, turn.outputTokens),
+            cachedInputTokens = sumTokens(total.cachedInputTokens, turn.cachedInputTokens),
+            cacheMissInputTokens = sumTokens(total.cacheMissInputTokens, turn.cacheMissInputTokens),
         )
     }
 
