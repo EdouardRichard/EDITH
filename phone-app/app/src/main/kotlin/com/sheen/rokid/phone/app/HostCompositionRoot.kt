@@ -455,6 +455,8 @@ class HostCompositionRoot internal constructor(
         // edith-0.2 Phase C: the conversation view needs somewhere to be shown, so it is refused for the same reason
         // the text output is.
         Capability.ConversationDisplay -> "DISPLAY_MISSING"
+        // edith-0.3 Phase 1: the device profile/state channel; the Android provider is wired by Task 2.
+        Capability.DeviceState -> "DEVICE_STATE_PROVIDER_MISSING"
     }
     private val mutableState =
         MutableStateFlow(
