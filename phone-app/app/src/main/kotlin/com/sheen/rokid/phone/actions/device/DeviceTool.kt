@@ -277,9 +277,6 @@ class DeviceTool(
                     timing = Timing(0, 0, 0),
                 ),
                 observationData(snapshot, include),
-                // Final review C2: the detail carries the compact screen (and any requested source content). It is model
-                // context for this run only; the agent loop redacts it from the stored transcript.
-                nonPersistent = true,
             )
         }
     }
@@ -380,8 +377,6 @@ class DeviceTool(
             data,
             fingerprintAfter(envelope, revisionBefore),
             stateChanging = true,
-            // The decorated data carries the forced post-action compact snapshot (or the stale answer's fresh one).
-            nonPersistent = perception != null,
         )
     }
 
@@ -534,8 +529,9 @@ class DeviceTool(
             val include = parseStatusInclude(args) ?: return refused(INVALID_ARGUMENTS)
             statusData(envelope, provider.snapshot(include, PerceptionFilter.ALL, null), include)
         }
-        // Final review C2: with a provider the status detail may carry notification/media/device content.
-        return result(envelope, data, nonPersistent = provider != null)
+        // Final review C2 (re-review): [result] marks every device result non-persistent, including this one and the
+        // provider-less diagnostic-only branch above.
+        return result(envelope, data)
     }
 
     /**
@@ -784,15 +780,19 @@ class DeviceTool(
      * actions. The `device` descriptor declares `observation = true` for all of them, so this per-call flag is the only
      * way the loop can tell the write that returns a post-call observation from the read that does.
      *
-     * Final review C2: [nonPersistent] marks a detail that carries perception content. The loop still shows it to the
-     * model for this run; its stored transcript keeps only a safe marker. Every pre-Phase-2 path leaves it `false`.
+     * Final review C2 (re-review): **every** result produced by this projection is marked
+     * [ActionResult.nonPersistent]. The perception-backed actions carry the compact screen and the requested sources;
+     * the legacy projector path still renders raw kernel screen text into `observe`/`wait`/`act`; and `screenshot`
+     * carries artifact references. None of that may outlive the run, so the flag is set here rather than at each
+     * caller (which is how `wait` used to slip through). The loop still shows the full detail to the model for this
+     * run; only the stored transcript keeps the safe marker. It remains an additive contract with the default `false`
+     * for every other tool; argument-validation refusals are not produced here and carry no content.
      */
     private fun result(
         envelope: DeviceEnvelope,
         data: JsonObject,
         fingerprint: String? = null,
         stateChanging: Boolean = false,
-        nonPersistent: Boolean = false,
     ): ActionResult {
         val outcome = when {
             envelope.ok -> ActionOutcome.Done
@@ -809,7 +809,7 @@ class DeviceTool(
             fingerprint,
             stateChanging,
             images = envelope.images,
-            nonPersistent = nonPersistent,
+            nonPersistent = true,
         )
     }
 

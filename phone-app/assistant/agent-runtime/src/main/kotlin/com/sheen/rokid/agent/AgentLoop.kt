@@ -232,10 +232,11 @@ data class AgentRun(
      * conversation (rather than continuing it) additionally applies [withoutRetryScaffolding]: a retry nudge is
      * loop-internal and must not be persisted as the wearer's speech (0.25 review ruling R16).
      *
-     * **Perception content is redacted here** (0.3 Phase 2 final review C2): a tool output the executor marked
-     * `nonPersistent` (screen/notification/clipboard/calendar content, `device.observe`/`status`/`act`) is replaced by a
-     * safe marker with no images. The model saw the full payload in this run; this list is the only shape a
-     * `ConversationStore` may persist (spec §7.8), so the content cannot outlive the request.
+     * **Perception content is redacted here** (0.3 Phase 2 final review C2): a tool output **this run** marked
+     * `nonPersistent` (every `device.*` result, including `wait`/`screenshot` and the legacy no-provider projection) is
+     * replaced by a safe marker with no images. The model saw the full payload in this run; this list is the only shape
+     * a `ConversationStore` may persist (spec §7.8), so the content cannot outlive the request. An earlier turn's
+     * output with the same call id is left verbatim (C2 re-review).
      */
     val transcript: List<ModelHistoryItem> = emptyList(),
     /**
@@ -471,6 +472,14 @@ class AgentLoop(
      */
     private val nonPersistentCallIds = LinkedHashSet<String>()
 
+    /**
+     * Final review C2 (re-review): the index in the run's `history` where **this run's** items start (the caller's
+     * prefix plus the appended utterance). Only outputs at or after it are redacted by [transcriptForStorage]: a call
+     * id only has to be non-blank, so this run may reuse an earlier turn's id, and that earlier output is not this
+     * run's perception content. Set in [runInternal] once the history is built; a loop instance is single-use.
+     */
+    private var runHistoryStart = 0
+
     /** R58: the last text that was nudged, so an identical plan cannot be nudged again in place. */
     private var lastNudgedText: String? = null
     private var nudges = 0
@@ -555,6 +564,7 @@ class AgentLoop(
         lastRuntimeStateHash = null
         lastPerceptionHash = null
         nonPersistentCallIds.clear()
+        runHistoryStart = 0
         lastNudgedText = null
         nudges = 0
         lastWriteUnverified = false
@@ -582,6 +592,10 @@ class AgentLoop(
         // The user's turn opens the history: the loop has no other channel to hand the model what was asked. When the
         // caller supplies a session transcript, this turn's utterance is appended to it rather than replacing it.
         val history = (request.history + ModelHistoryItem.Text(MessageRole.USER, request.utterance)).toMutableList()
+        // Final review C2 (re-review): remember where this run's own items start. Redaction must never touch the
+        // caller-supplied prefix: a reused call id is legal, and rewriting an earlier turn's output would make the
+        // stored transcript stop being a prefix of the `ConversationStore`, so `recordStoreTurn` would drop this turn.
+        runHistoryStart = history.size
         // Where this turn's utterance sits in that transcript. It is the pending user turn until a tool round or a
         // retry appends after it, and a frame renders the pending user turn as its one `USER_INPUT` rather than as a
         // history entry (a history that ended on it would be the lone user group `ContextBudgeter` refuses) — so the
@@ -1271,16 +1285,20 @@ class AgentLoop(
     }
 
     /**
-     * The transcript a caller may persist: the run's history with every non-persistent tool output replaced by a safe
-     * marker and stripped of its images (final review C2; spec §7.8).
+     * The transcript a caller may persist: this run's history with every non-persistent tool output **of this run**
+     * replaced by a safe marker and stripped of its images (final review C2; spec §7.8).
      *
-     * The in-run history is never touched - the model saw the content - and the replacement keeps the call id, so the
-     * stored call/output pair stays attributable and a later turn still sees that the tool ran.
+     * Only items at or after [fromIndex] — where [runHistoryStart] placed this run's first item — are considered. Call
+     * ids are only required to be non-blank, so a run may reuse an earlier turn's id; redacting by id across the whole
+     * history would rewrite that earlier, persistent output and break the `ConversationStore` prefix check, which
+     * drops the current turn's tool round instead of storing it. The in-run history is never touched - the model saw
+     * the content - and the replacement keeps the call id, so the stored call/output pair stays attributable and a
+     * later turn still sees that the tool ran.
      */
-    private fun transcriptForStorage(history: List<ModelHistoryItem>): List<ModelHistoryItem> {
+    private fun transcriptForStorage(history: List<ModelHistoryItem>, fromIndex: Int): List<ModelHistoryItem> {
         if (nonPersistentCallIds.isEmpty()) return history.toList()
-        return history.map { item ->
-            if (item is ModelHistoryItem.ToolOutput && item.callId in nonPersistentCallIds) {
+        return history.mapIndexed { index, item ->
+            if (index >= fromIndex && item is ModelHistoryItem.ToolOutput && item.callId in nonPersistentCallIds) {
                 item.copy(output = NON_PERSISTENT_TOOL_OUTPUT, images = emptyList())
             } else {
                 item
@@ -1306,7 +1324,7 @@ class AgentLoop(
         if (last is ModelHistoryItem.Text && last.role == MessageRole.USER) {
             history += ModelHistoryItem.Text(MessageRole.ASSISTANT, closingText.ifBlank { CLOSED_TURN_TEXT })
         }
-        lastTranscript = transcriptForStorage(history)
+        lastTranscript = transcriptForStorage(history, runHistoryStart)
         val metrics = AgentMetrics(
             calls = metricCalls,
             toolCalls = steps.size,

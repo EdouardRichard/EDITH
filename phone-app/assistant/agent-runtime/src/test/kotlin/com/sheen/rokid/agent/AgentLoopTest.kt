@@ -29,6 +29,7 @@ class AgentLoopTest {
         requestTimeoutNanos: Long = 0L,
         onTextDelta: ((String) -> Unit)? = null,
         onToolStatus: ((String, ToolPhase) -> Unit)? = null,
+        history: List<ModelHistoryItem> = emptyList(),
     ) = AgentRequest(
         turnId = "turn-7",
         utterance = "把音量调小一点",
@@ -38,6 +39,7 @@ class AgentLoopTest {
         requestTimeoutNanos = requestTimeoutNanos,
         onTextDelta = onTextDelta,
         onToolStatus = onToolStatus,
+        history = history,
     )
 
     private fun newLoop(
@@ -196,6 +198,41 @@ class AgentLoopTest {
         )
         assertTrue(stored.output.isNotBlank(), "a safe marker keeps the call/output pair attributable")
         assertEquals(emptyList(), stored.images, "the stored transcript carries no image reference")
+    }
+
+    @Test fun `a reused call id redacts only this run's output and keeps an earlier turn verbatim`() {
+        // 0.3 Phase 2 final review C2 (re-review): a run may reuse a call id that a previous turn already used (ids only
+        // need to be non-blank). Redacting the whole history by id turned the earlier, persistent output into the marker
+        // too, which made the stored transcript stop being a prefix of the store and dropped the current tool round.
+        val earlier = ModelHistoryItem.ToolOutput("c1", "EARLIER-LEGACY-OUTPUT-5521")
+        val sentinel = "SYNTHETIC-PERCEPTION-CONTENT-7719"
+        val executor = executorOf("device").apply {
+            outcome = { _, _ -> ActionResult(ActionOutcome.Done, sentinel, nonPersistent = true) }
+        }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "device"))),
+                reply(text = "看完了。"),
+            ),
+        )
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "之前的屏幕"),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "稍等"),
+            ModelHistoryItem.ToolCall("c1", "device", """{"action":"observe"}""", "item-1"),
+            earlier,
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(history = history))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().filter { it.callId == "c1" }
+        assertEquals(2, stored.size, "both the earlier and the current output must stay attributable: ${run.transcript}")
+        assertEquals(earlier.output, stored[0].output, "an earlier turn's output must survive verbatim")
+        assertFalse(
+            stored[1].output.contains(sentinel),
+            "only this run's output is perception content: ${stored[1].output}",
+        )
+        assertTrue(stored[1].output.isNotBlank(), "the current call/output pair keeps a safe marker")
     }
 
     @Test fun `a productive tool turn resets the empty counter`() {

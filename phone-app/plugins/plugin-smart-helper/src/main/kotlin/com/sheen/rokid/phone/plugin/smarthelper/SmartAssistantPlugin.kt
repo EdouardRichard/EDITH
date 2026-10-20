@@ -2704,11 +2704,13 @@ class SmartAssistantPlugin(
     /**
      * Records the turn that just ended into the route's store (0.25 spec §5.1).
      *
-     * The run hands over its own transcript — this turn's user text, every tool call/output (image references
-     * included) and the loop's closing text — so the store keeps the whole multi-step turn instead of only its two
-     * text halves. The transcript is this turn **on top of** the history the request started from (the plugin passes
-     * the store itself as `AgentRequest.history`), so only the tail past the stored items is new: appending the whole
-     * list would duplicate the session on every turn.
+     * The run hands over its own transcript — this turn's user text, every tool call/output and the loop's closing
+     * text — so the store keeps the whole multi-step turn instead of only its two text halves. A `device` action
+     * output here is the loop's already-redacted form (`(perception content not persisted)`, no images), not the raw
+     * screen/notification content the model saw during the run (0.3 Phase 2 C2); every other tool's output — image
+     * references included — is stored as the model saw it. The transcript is this turn **on top of** the history the
+     * request started from (the plugin passes the store itself as `AgentRequest.history`), so only the tail past the
+     * stored items is new: appending the whole list would duplicate the session on every turn.
      *
      * Two kinds of item are filtered out of that tail before it is stored, because neither is conversation:
      *
@@ -2729,8 +2731,10 @@ class SmartAssistantPlugin(
      * Falls back to the pre-0.25 `appendUser`/`appendAssistant` pair when the run never produced a transcript (a
      * transport failure makes the plugin's catch build an empty `AgentRun`), when the transcript does not continue
      * the store it was built from (the asynchronous compressor may have changed the store mid-run), or when the
-     * filters leave nothing to attribute. Losing the turn's tool round is worse than falling back, but losing the
-     * turn itself would be worse still.
+     * filters leave nothing to attribute. The loop's C2 redaction is limited to this run's suffix for exactly this
+     * check: an earlier turn's output keeps its body even when this run reuses its call id, so a legal id reuse
+     * cannot make the prefix mismatch and drop the current round. Losing the turn's tool round is worse than falling
+     * back, but losing the turn itself would be worse still.
      */
     private fun recordStoreTurn(
         store: ConversationStore,

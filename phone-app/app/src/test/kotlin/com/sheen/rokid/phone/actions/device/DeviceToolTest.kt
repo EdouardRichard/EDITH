@@ -773,9 +773,11 @@ class DeviceToolTest {
     }
 
     @Test
-    fun `perception-backed results are flagged non-persistent while pre-perception results are not`() {
-        // 0.3 Phase 2 final review C2: screen/notification/clipboard/calendar content rides the ActionResult detail for
-        // the current model request only. The plugin-api flag is what lets AgentLoop keep it out of the stored transcript.
+    fun `every device result is flagged non-persistent including wait screenshot and legacy paths`() {
+        // 0.3 Phase 2 final review C2 (re-review): every DeviceTool result can carry screen text. The legacy projector
+        // path (`perception == null`) still renders the raw kernel observation into `wait`/`observe`, and the wait path
+        // used `result()`'s default, so a wait result was persisted as-is. The flag now covers the whole tool, not only
+        // the perception-backed branches; `screenshot` is included because its image references must not outlive the run.
         val perception = FakePerception(perceptionSnapshot())
         val device = tool(FakeDeviceOperations(observation()), perception = perception)
 
@@ -785,14 +787,36 @@ class DeviceToolTest {
             "act returns the post-action compact snapshot",
             device.execute("""{"action":"act","kind":"home"}""").nonPersistent,
         )
-        assertFalse(
-            "the pre-perception projection path is still persistable",
+        assertTrue(
+            "wait projects the kernel screen for the current run",
+            device.execute("""{"action":"wait","idle":true}""").nonPersistent,
+        )
+        assertTrue("a screenshot carries an artifact reference", device.execute("""{"action":"screenshot"}""").nonPersistent)
+        assertTrue(
+            "the pre-perception observe still projects raw screen text",
             tool(FakeDeviceOperations(observation())).execute("""{"action":"observe"}""").nonPersistent,
         )
-        assertFalse(
-            "a screenshot result carries an image reference, not perception text",
-            device.execute("""{"action":"screenshot"}""").nonPersistent,
+        assertTrue(
+            "the pre-perception wait is the same leak",
+            tool(FakeDeviceOperations(observation())).execute("""{"action":"wait","idle":true}""").nonPersistent,
         )
+    }
+
+    @Test
+    fun `wait with a provider keeps the sentinel for the run but is flagged non-persistent`() {
+        // Re-review C2: the wait path never set the flag, so AgentLoop stored this detail verbatim. The model still
+        // needs the observed screen in this run; the action result must now say the body may not be persisted.
+        val sentinel = "WAIT-SCREEN-SENTINEL-3f81"
+        val operations = FakeDeviceOperations(observation(nodes = listOf(node(sentinel))))
+        val result = tool(operations, perception = FakePerception(perceptionSnapshot()))
+            .execute("""{"action":"wait","idle":true}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertTrue(
+            "the in-run model request must still see the observed screen: ${result.detail}",
+            result.detail.contains(sentinel),
+        )
+        assertTrue("a wait result may not be persisted", result.nonPersistent)
     }
 
     @Test

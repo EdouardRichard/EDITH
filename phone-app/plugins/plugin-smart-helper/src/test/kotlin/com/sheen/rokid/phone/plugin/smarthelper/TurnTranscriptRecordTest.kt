@@ -319,6 +319,56 @@ class TurnTranscriptRecordTest {
     }
 
     @Test
+    fun `a reused call id keeps the store prefix and records this turn's tool round`() {
+        // C2 re-review: redaction keyed on the current run's call ids alone rewrote an **earlier** turn's persistent
+        // tool output when this run reused its id (ids only need to be non-blank). The stored transcript then stopped
+        // being a prefix of the store, so `recordStoreTurn` fell back to two text halves and dropped this run's round.
+        val stores = stores()
+        val rig = rig(stores)
+        stores.getValue(ContextRoute.WAKE).appendTranscript(
+            listOf(
+                ModelHistoryItem.Text(MessageRole.USER, "看一下屏幕"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "稍等"),
+                ModelHistoryItem.ToolCall("c1", "device", """{"action":"observe"}""", "item-1"),
+                ModelHistoryItem.ToolOutput("c1", "EARLIER-LEGACY-OUTPUT-5521"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "看到了"),
+            ),
+        )
+        val sentinel = "SYNTHETIC-SCREEN-CONTENT-8842"
+        rig.actions.descriptors += smartAction("device")
+        rig.actions.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, sentinel, nonPersistent = true)
+        }
+        var request = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            request++
+            if (request == 1) {
+                listener(smartToolCall("c1", "device", """{"action":"observe"}""", requestId = modelRequest.requestId))
+                listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(modelRequest, listener, "看完了。")
+            }
+        }
+
+        rig.wakeAndFinal("屏幕上有什么")
+
+        val history = stores.getValue(ContextRoute.WAKE).history()
+        val outputs = history.filterIsInstance<ModelHistoryItem.ToolOutput>()
+        assertEquals(2, outputs.size, "the earlier round and this run's round must both be stored: $history")
+        assertEquals("EARLIER-LEGACY-OUTPUT-5521", outputs[0].output, "an earlier turn must stay verbatim")
+        assertTrue(outputs[1].output.isNotBlank(), "this run's output keeps a safe marker")
+        assertTrue(
+            history.none { it.containsContent(sentinel) },
+            "this run's perception content must not be persisted: $history",
+        )
+        assertEquals(
+            2,
+            history.count { it is ModelHistoryItem.ToolCall },
+            "the reused call id must not drop this run's call from the store: $history",
+        )
+    }
+
+    @Test
     fun `the next turn's request carries the previous turn's tool round`() {
         val stores = stores()
         val rig = rig(stores)

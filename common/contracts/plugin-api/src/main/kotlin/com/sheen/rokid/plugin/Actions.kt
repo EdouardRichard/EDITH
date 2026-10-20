@@ -150,9 +150,11 @@ data class ActionResult(
      * persisted to a `ConversationStore` or an `AgentRun.transcript` (spec §7.8).
      *
      * The agent loop still feeds the full detail back to the model for this run; at `finish` it replaces the stored
-     * form of a marked tool output with a safe marker and drops its images. `device.observe`/`status`/`act` set it when a
-     * perception provider is attached. `false` — the default, and every pre-Phase-2 action — keeps every existing
-     * construction and every non-perception tool byte-for-byte unchanged.
+     * form of a marked tool output with a safe marker and drops its images. Every content-bearing `device` action
+     * result (`observe`/`act`/`screenshot`/`wait`/`status`) sets it: the perception-backed actions carry the compact
+     * screen, the legacy projector path still renders raw screen text into `observe`/`wait`/`act`, and `screenshot`
+     * carries artifact references (final-review C2 re-review; argument-validation refusals carry no content). `false` —
+     * the default — keeps every other tool's construction and output byte-for-byte unchanged.
      */
     val nonPersistent: Boolean = false,
 )
