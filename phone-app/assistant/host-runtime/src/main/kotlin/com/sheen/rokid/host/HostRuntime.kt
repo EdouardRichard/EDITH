@@ -55,7 +55,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
      * dropped: the dispatcher has capacity 32 and a full queue for a non-`TranscriptEvent` is a critical overflow
      * (`DiscontinuityEvent(OVERFLOW)` + `interrupt()`), so only label transitions may reach it.
      */
-    private var lastAcousticLabel: AcousticLabel? = null
+    @Volatile private var lastAcoustic: AcousticLabel? = null
     private val timer = Executors.newSingleThreadScheduledExecutor { task -> Thread(task, "edith-deadlines").also { it.isDaemon = true } }
     private val deadlineScheduler = object : DeadlineScheduler {
         override fun at(deadlineNanos: Long, task: () -> Unit): CancellationHandle {
@@ -98,6 +98,16 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
      * from being mistaken for a session that merely exists.
      */
     fun currentIdentity(): Pair<SessionId, Generation>? = if (closed) eventIdentity else command { eventIdentity }
+
+    /**
+     * The last acoustic label this host delivered in the current activation, as the label's stable name (for example
+     * `"Speech"`), or `null` when no label has arrived, the session is not armed, or the memory has been reset.
+     *
+     * Read-only and content-free: this is the transition label, never speech text or audio. It is public rather than
+     * `internal` because the perception composition lives in the app module and Kotlin `internal` is Gradle-module
+     * scoped; there is no other surface through which that composition can read the acoustic fact.
+     */
+    @Synchronized fun lastAcousticLabel(): String? = lastAcoustic?.name
 
     fun observeState(listener: (SessionState) -> Unit): CancellationHandle = command {
         val observation = StateObservation(listener)
@@ -226,7 +236,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
             active = plugin
             state = SessionState.Ready
             eventIdentity = session to generation
-            lastAcousticLabel = null
+            lastAcoustic = null
             plugin.activate(PluginContext(session, generation, plugin.descriptor.capabilities, services))
             if (scope !== resource || resource.isRevoked) throw ContractError.Cancelled()
             if (Capability.Audio in plugin.descriptor.capabilities) {
@@ -350,8 +360,8 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
         }
         if (capability != null && capability !in plugin.descriptor.capabilities) return
         if (event is AcousticEvent) {
-            if (event.label == lastAcousticLabel) return
-            lastAcousticLabel = event.label
+            if (event.label == lastAcoustic) return
+            lastAcoustic = event.label
         }
         runCatching { plugin.handle(event) }.onFailure { pause() }
     }
@@ -359,7 +369,7 @@ class HostRuntime(private val apiVersion: Int, private val environment: HostEnvi
     private fun teardown(reason: DeactivationReason) {
         transitioning = true
         try {
-        synchronized(eventGate) { eventIdentity = null; lastAcousticLabel = null; dispatcher.clear() }
+        synchronized(eventGate) { eventIdentity = null; lastAcoustic = null; dispatcher.clear() }
         val epoch = inputEpoch
         inputEpoch = null
         scope?.revoke()

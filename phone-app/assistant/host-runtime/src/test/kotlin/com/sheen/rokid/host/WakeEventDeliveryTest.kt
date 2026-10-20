@@ -165,6 +165,32 @@ class WakeEventDeliveryTest {
         )
     }
 
+    @Test fun `the last acoustic label is readable and follows label transitions`() {
+        // edith-0.3 Phase 2 Task 4: the perception path has to read the acoustic fact without waiting for another
+        // event. Before any transition there is no label (null), and after one the stable enum name is published.
+        val (host, _) = activated(Capability.Context)
+        assertNull(host.lastAcousticLabel(), "no event yet is not a label")
+
+        assertTrue(host.onEvent(acoustic(host, "a1", AcousticLabel.Speech)))
+        settle(host)
+        assertEquals("Speech", host.lastAcousticLabel())
+
+        assertTrue(host.onEvent(acoustic(host, "a2", AcousticLabel.Silence)))
+        settle(host)
+        assertEquals("Silence", host.lastAcousticLabel())
+    }
+
+    @Test fun `the last acoustic label is cleared when the session ends`() {
+        val (host, _) = activated(Capability.Context)
+        assertTrue(host.onEvent(acoustic(host, "a1", AcousticLabel.Noisy)))
+        settle(host)
+        assertEquals("Noisy", host.lastAcousticLabel())
+
+        host.stop()
+
+        assertNull(host.lastAcousticLabel(), "a stopped session has no acoustic fact")
+    }
+
     @Test fun `acoustic memory resets with a new session`() {
         val (host, plugin) = activated(Capability.Context)
         assertTrue(host.onEvent(acoustic(host, "a1", AcousticLabel.Speech)))

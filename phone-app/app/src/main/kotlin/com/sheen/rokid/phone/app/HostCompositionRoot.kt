@@ -137,8 +137,11 @@ import com.sheen.rokid.phone.actions.intent.AppLaunchResolver
 import com.sheen.rokid.phone.actions.intent.ContextIntentLauncher
 import com.sheen.rokid.phone.actions.intent.IntentActionExecutor
 import com.sheen.rokid.phone.actions.intent.PackageManagerAppCatalog
+import com.sheen.rokid.phone.context.AcousticSource
 import com.sheen.rokid.phone.context.CalendarSource
+import com.sheen.rokid.phone.context.ClipboardSource
 import com.sheen.rokid.phone.context.ForegroundAppSource
+import com.sheen.rokid.phone.context.GlassesStateSource
 import com.sheen.rokid.phone.context.MediaSessionSource
 import com.sheen.rokid.phone.context.NotificationCategorySource
 import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
@@ -1945,6 +1948,17 @@ class HostCompositionRoot internal constructor(
                 ComponentName(context, NotificationCategoryService::class.java),
             )
             val calendar = CalendarSource.android(context)
+            // 0.3 Phase 2 Task 4: the remaining perception sources. Each reads its fact at frame time through a late
+            // lambda, because the objects that own those facts (the host for the acoustic label, the composition for
+            // the wearing/panel state) do not exist yet when this block runs. Task 7 hands these instances to
+            // `AndroidPerceptionProvider`; the provider registration itself is deliberately left to that task.
+            val clipboard = ClipboardSource.android(context)
+            val acoustic = AcousticSource { hostHolder[0]?.lastAcousticLabel() }
+            val glassesState = GlassesStateSource(
+                connected = { hintLink.isEstablished() },
+                wearing = { rootHolder[0]?.glassesWearing() },
+                panelVisible = { rootHolder[0]?.isPanelVisible() },
+            )
             // edith-0.2 Phase B (B4): the SKILL directory grant. The implementation reads through `java.io.File`,
             // so it is stateless and cheap; the plugin points it at `/sdcard/EDITH/skills/` itself, which keeps the
             // on-device path in the module that owns the SKILL format (`StorageAccessSkillDirectory`).
