@@ -49,6 +49,43 @@ class ScopedHostServicesTest {
         }
     }
 
+    @Test fun `a granted device-state channel forwards the provider`() {
+        val provider = object : DeviceStateProvider {
+            override fun profile() = DeviceProfile(
+                manufacturer = "Xiaomi",
+                model = "M2012K11AC",
+                deviceName = null,
+                androidRelease = "13",
+                apiLevel = 33,
+                screenWidthPx = 1080,
+                screenHeightPx = 2400,
+                densityDpi = 440,
+                glassesModel = null,
+                glassesFirmware = null,
+                glassesWidthPx = null,
+                glassesHeightPx = null,
+                appVersion = "0.3",
+                locale = "zh-CN",
+                timeZone = "Asia/Shanghai",
+                wakeWords = listOf("EDITH"),
+                capabilities = setOf("a11y"),
+            )
+
+            override fun state() = DeviceState(
+                capturedAtEpochMillis = 0,
+                timeZone = "Asia/Shanghai",
+                localDate = "2026-10-20",
+                weekday = "星期一",
+                localTime = "18:23",
+            )
+        }
+        val services = ScopedHostServices(
+            scope(), setOf(Capability.DeviceState), mapOf(Capability.DeviceState to provider), FakeTaskScope(),
+        )
+        assertSame(provider, services.deviceState())
+        assertEquals("M2012K11AC", services.deviceState().profile().model)
+    }
+
     @Test fun `capability injection rejects missing and wrong provider types`() {
         assertFailsWith<ContractError.CapabilityMissing> {
             ScopedHostServices(scope(), setOf(Capability.Model), emptyMap(), FakeTaskScope())

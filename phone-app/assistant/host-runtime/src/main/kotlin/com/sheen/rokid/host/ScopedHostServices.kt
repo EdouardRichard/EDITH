@@ -46,6 +46,10 @@ class ScopedHostServices(
                 // cancellation surface, so a scoped wrapper would add a layer that conveys nothing. The grant itself
                 // is still checked: `require` refuses a capability this scope was not given.
                 Capability.StorageAccess -> provider as? com.sheen.rokid.plugin.StorageAccess ?: wrong(capability)
+                // edith-0.3 Phase 1 (spec §3.2): device profile/state. Unwrapped for the same reason as the local
+                // model services — a stateless read-only port with no subscription to fence and no cancellation
+                // surface. The grant itself is still checked by `require`, so an ungranted scope cannot reach it.
+                Capability.DeviceState -> provider as? com.sheen.rokid.plugin.DeviceStateProvider ?: wrong(capability)
                 // edith-0.2 Phase C: the conversation view. Unwrapped for the same reason as the two above — four
                 // statements with no subscription and nothing to cancel. The scope's own grant check still applies, so
                 // a plugin that was not granted this capability cannot reach it.

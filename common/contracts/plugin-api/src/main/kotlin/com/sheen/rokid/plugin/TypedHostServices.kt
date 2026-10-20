@@ -37,6 +37,15 @@ fun HostServices.systemOne(): SystemOneService = require(Capability.SystemOne) a
 fun HostServices.embedding(): EmbeddingService = require(Capability.Embedding) as EmbeddingService
 
 /**
+ * Platform device facts (spec §3.2, §4.2.1): the static profile and the per-request state.
+ *
+ * **Optional by design**: a host with no platform provider never grants it, so a caller asks for it the way the
+ * plugin asks for a confirmation channel - `runCatching { services.deviceState() }.getOrNull()` - and omits the
+ * device section from the prompt instead of failing the turn.
+ */
+fun HostServices.deviceState(): DeviceStateProvider = require(Capability.DeviceState) as DeviceStateProvider
+
+/**
  * The user's own SKILL directory, on shared storage (spec §3.5).
  *
  * Separate from [storage], which is the app-private key/value namespace: `Capability.StorageAccess` is the grant to
