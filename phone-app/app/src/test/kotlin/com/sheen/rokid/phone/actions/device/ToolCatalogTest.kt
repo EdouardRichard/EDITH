@@ -74,12 +74,15 @@ class ToolCatalogTest {
     }
 
     @Test
-    fun `each unavailable channel removes only its own tools`() {
+    fun `an unavailable a11y channel keeps device advertised for status while shell and call still gate`() {
         val probes = Probes(a11y = false)
 
+        // Task 7 review I2 (R11): `status` is the call that reports `accessibility=false`, so hiding the whole tool
+        // would hide the diagnosis behind the condition. The device tool stays advertised; every non-status action is
+        // still refused at execution time by the a11y check below.
         val a11yDown = catalog(probes).descriptors().map { it.name }
-        assertFalse(a11yDown.contains("device"))
-        assertEquals(listOf("shell", "open", "dial"), a11yDown)
+        assertTrue("device must stay advertised while a11y is down", a11yDown.contains("device"))
+        assertEquals(listOf("device", "shell", "open", "dial"), a11yDown)
 
         probes.a11y = true
         probes.shell = false
@@ -372,6 +375,41 @@ class ToolCatalogTest {
             unlocked.execute("device", """{"action":"observe"}""").detail,
         )
         assertEquals(listOf(true), calls)
+    }
+
+    @Test
+    fun `a blind phone advertises device and status reports accessibility false through the real kernel`() {
+        // Review I2 end to end: the production composition builds its accessibility port with a null service (the JVM
+        // test has no bound service). Before the fix `status` asked that port for the foreground, got the port's
+        // IllegalStateException, and the kernel turned it into CHANNEL_UNAVAILABLE - so the one call that exists to
+        // report `accessibility=false` could not run on the phone it describes.
+        val root = com.sheen.rokid.phone.app.HostCompositionRoot.create(android.content.ContextWrapper(null))
+        try {
+            val catalog = requireNotNull(root.toolCatalogForProbe) {
+                "the production composition must expose its catalog"
+            }
+            assertTrue(
+                "device must be in the model-visible surface on a blind phone",
+                catalog.descriptors().any { it.name == "device" },
+            )
+
+            val result = catalog.execute("device", """{"action":"status"}""")
+
+            assertEquals(
+                "status must complete on a phone with no accessibility service",
+                ActionOutcome.Done,
+                result.outcome,
+            )
+            val data = json.parseToJsonElement(result.detail).jsonObject["data"]!!.jsonObject
+            val status = data["status"]!!.jsonPrimitive.content
+            assertTrue("the diagnostic must report the blind channel: $status", status.contains("accessibility=false"))
+            assertFalse(
+                "status must not be answered with a channel failure: ${result.detail}",
+                result.detail.contains("CHANNEL_UNAVAILABLE"),
+            )
+        } finally {
+            root.close()
+        }
     }
 
     // - helpers -

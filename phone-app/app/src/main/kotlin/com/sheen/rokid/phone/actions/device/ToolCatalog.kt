@@ -27,8 +27,10 @@ import kotlinx.serialization.json.put
  * each channel on **every** `descriptors()`/`execute()` call, because a channel's answer changes
  * while the App runs (accessibility switched off, Shizuku binder dead, `CALL_PHONE` revoked). An
  * unavailable channel's tool is not advertised, and a call that arrives after its channel went down
- * is refused instead of being delegated. The plugin adds `notify_user`/`load_skill` beside this
- * catalog, which is what makes the model-visible surface exactly six (R40).
+ * is refused instead of being delegated. The one exception is `device`: it stays advertised because
+ * its `status` action must be answerable while the accessibility service is down, and the other
+ * actions are still refused at execution time. The plugin adds `notify_user`/`load_skill` beside
+ * this catalog, which is what makes the model-visible surface exactly six (R40).
  *
  * `cancel`/`beginTurn`/`close` are the turn lifecycle (R42): the kernel's cancellation is
  * turn-scoped, so a new turn re-arms it and the composition closes the catalog to stop the kernel's
@@ -51,7 +53,11 @@ class ToolCatalog(
 ) : ActionExecutor, AutoCloseable {
 
     override fun descriptors(): List<ActionDescriptor> = buildList {
-        if (a11yAvailable()) add(device.descriptors().single())
+        // Task 7 review I2 (R11): `device` stays advertised even while the accessibility channel is down. Its `status`
+        // action is the diagnosis that reports `accessibility=false`/`locked=true`; hiding the whole tool behind the
+        // condition it exists to report made that answer unreachable on a blind phone. Every non-status action is still
+        // refused by `execute`'s a11y check below, so the advertisement cannot run anything the channel cannot serve.
+        add(device.descriptors().single())
         if (shellAvailable()) {
             // Task 12 fix (R99): the shell descriptor keeps its machine cap and declares `mayAskHuman`; the plugin wraps
             // this executor in `ConfirmingActions`, which asks the wearer inside the same `execute` call, and the agent
@@ -123,8 +129,9 @@ class ToolCatalog(
     /**
      * Task 12 (R59): the one runtime-state line the plugin folds into its next model request, or `null`.
      *
-     * `null` while the accessibility channel is down: the device tool is not advertised then, so a state line about a
-     * screen this run cannot even observe would be noise. Every other tool in this catalog keeps the interface default.
+     * `null` while the accessibility channel is down: the device tool stays advertised for `status`, but it has no
+     * screen state to describe for a channel this run cannot observe, and such a line would be noise. Every other tool
+     * in this catalog keeps the interface default.
      */
     override fun runtimeState(): String? = if (a11yAvailable()) device.runtimeState() else null
 

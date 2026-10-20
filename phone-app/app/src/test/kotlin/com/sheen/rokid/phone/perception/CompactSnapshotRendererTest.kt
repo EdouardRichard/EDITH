@@ -121,17 +121,56 @@ class CompactSnapshotRendererTest {
     }
 
     @Test
-    fun `marks truncation once and only when the snapshot is truncated`() {
+    fun `marks truncation once and only when the screen itself was cut`() {
         val truncated = snapshot(
             elements = listOf(element(ref = "#n1", text = "A", centerX = 1, centerY = 1)),
             truncated = true,
+            screenCoverage = "truncated",
         )
 
         val text = CompactSnapshotRenderer.render(truncated)
 
-        assertTrue("a bounded snapshot must say so: $text", text.lines().last().contains("truncated"))
+        assertTrue("a bounded screen must say so: $text", text.lines().last().contains("truncated"))
         assertEquals(1, text.lines().count { it.contains("truncated") })
-        assertFalse(CompactSnapshotRenderer.render(snapshot(truncated = false)).contains("truncated"))
+        assertFalse(
+            CompactSnapshotRenderer.render(
+                snapshot(elements = listOf(element(ref = "#n1", text = "A")), truncated = false),
+            ).contains("truncated"),
+        )
+    }
+
+    @Test
+    fun `a notification-only cut does not mark a complete screen as truncated`() {
+        // Task 7 review I3: the snapshot-wide flag is also set when notifications are cut at the policy cap. A screen
+        // that was read in full must not end with the marker, and its coverage says `ok`.
+        val notificationCut = snapshot(
+            elements = listOf(element(ref = "#n1", text = "A", centerX = 1, centerY = 1)),
+            truncated = true,
+            screenCoverage = "ok",
+        )
+
+        val text = CompactSnapshotRenderer.render(notificationCut)
+
+        assertEquals("#n1 text \"A\" center=(1,1)", text)
+        assertFalse("a complete screen must not claim truncation: $text", text.contains(CompactSnapshotRenderer.TRUNCATION_MARKER))
+    }
+
+    @Test
+    fun `flattens unicode line and paragraph separators like the other line breaks`() {
+        // U+2028/U+2029 are line separators, not ISO control characters, so the control-character branch misses them.
+        val snapshot = snapshot(
+            elements = listOf(
+                element(ref = "#n1", text = "第一行\u2028第二行\u2029第三行", centerX = 1, centerY = 1),
+                element(ref = "#n2", text = "next", centerX = 2, centerY = 2),
+            ),
+        )
+
+        val lines = CompactSnapshotRenderer.render(snapshot).lines()
+
+        assertEquals("U+2028/U+2029 must not fabricate extra element lines", 2, lines.size)
+        assertTrue(lines[0].startsWith("#n1 "))
+        assertTrue(lines[0].contains("第一行 第二行 第三行"))
+        assertTrue(lines[1].startsWith("#n2 "))
     }
 
     @Test
@@ -144,11 +183,12 @@ class CompactSnapshotRendererTest {
     private fun snapshot(
         elements: List<PerceptionElement> = emptyList(),
         truncated: Boolean = false,
+        screenCoverage: String = "ok",
     ): PerceptionSnapshot = PerceptionSnapshot(
         snapshotId = "snap-1",
         capturedAtEpochMillis = 0L,
         elements = elements,
-        coverage = coverage(),
+        coverage = coverage(screenCoverage),
         truncated = truncated,
     )
 
@@ -174,8 +214,8 @@ class CompactSnapshotRendererTest {
         editable = editable,
     )
 
-    private fun coverage(): PerceptionCoverage = PerceptionCoverage(
-        screen = "ok",
+    private fun coverage(screen: String = "ok"): PerceptionCoverage = PerceptionCoverage(
+        screen = screen,
         notifications = "ok",
         media = "ok",
         calendar = "ok",

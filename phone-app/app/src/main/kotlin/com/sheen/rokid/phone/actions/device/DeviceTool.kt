@@ -3,7 +3,6 @@ package com.sheen.rokid.phone.actions.device
 import com.sheen.rokid.device.ActKind
 import com.sheen.rokid.device.Bounds
 import com.sheen.rokid.device.DeviceEnvelope
-import com.sheen.rokid.device.DeviceError
 import com.sheen.rokid.device.DeviceErrorCodes
 import com.sheen.rokid.device.DeviceKernel
 import com.sheen.rokid.device.Foreground
@@ -298,13 +297,7 @@ class DeviceTool(
             key = args.stringArg("key"),
             timeoutMillis = timeout,
         )
-        val data = decorateActData(project(envelope, lastFilter), envelope)
-        return result(
-            envelope,
-            data,
-            fingerprintAfter(envelope, revisionBefore),
-            stateChanging = true,
-        )
+        return actResult(envelope, revisionBefore)
     }
 
     /**
@@ -317,7 +310,10 @@ class DeviceTool(
      * is **not** dispatched; [RefResult.Ok] returns the (possibly re-bound) ref the kernel should act on.
      */
     private fun staleRefAnswer(stale: RefResult.Stale): ActionResult {
-        val snapshot = perception!!.afterAction()
+        val provider = checkNotNull(perception) {
+            "STALE_REF is only reachable when the perception provider owns the ref gate"
+        }
+        val snapshot = provider.afterAction()
         val data = buildJsonObject {
             put("snapshot", CompactSnapshotRenderer.render(snapshot))
             put("coverage", PerceptionCoverageRenderer.render(snapshot.coverage))
@@ -358,6 +354,24 @@ class DeviceTool(
     }
 
     /**
+     * One dispatched act's result, exactly like the plain action path: project the envelope, then replace the
+     * model-facing screen with the forced [PerceptionProvider.afterAction] read.
+     *
+     * Shared by [act] and [scrollToText] so every reachable act return gets the same post-processing (review C1: the
+     * scroll loop used to bypass it, leaking the projector's `bounds=` text and leaving the provider cache one screen
+     * behind). `changed` is derived from the envelope this call actually returns - never assumed from the dispatch.
+     */
+    private fun actResult(envelope: DeviceEnvelope, revisionBefore: Long?): ActionResult {
+        val data = decorateActData(project(envelope, lastFilter), envelope)
+        return result(
+            envelope,
+            data,
+            fingerprintAfter(envelope, revisionBefore),
+            stateChanging = true,
+        )
+    }
+
+    /**
      * Task 7: a forced post-action perception read.
      *
      * `perception.afterAction()` opens a new snapshot under a new id, so a ref from before the action that no longer
@@ -385,7 +399,7 @@ class DeviceTool(
                         put(SNAP_KEY, snapshot.snapshotId)
                         put(COVERAGE_KEY, coverage)
                         put(FOREGROUND_KEY, foreground)
-                        put(TRUNCATED_KEY, snapshot.truncated)
+                        put(TRUNCATED_KEY, CompactSnapshotRenderer.screenTruncated(snapshot))
                         put(TEXT_KEY, compact)
                         // The projector's full/diff lines carry `bounds=`, which is evidence-only and must not face the
                         // model (spec §7.3). The compact text above is the complete post-action screen, so the change
@@ -445,39 +459,19 @@ class DeviceTool(
                 timeoutMillis = remaining,
             )
             if (!scrolled.ok && scrolled.error?.code != DeviceErrorCodes.ACCEPTED_NO_EFFECT) {
-                return result(
-                    scrolled.copy(action = ACTION_ACT),
-                    project(scrolled, lastFilter),
-                    fingerprintAfter(scrolled, revisionBefore),
-                    stateChanging = true,
-                )
+                return actResult(scrolled.copy(action = ACTION_ACT), revisionBefore)
             }
             val waited = operations.waitFor(text, null, false, remaining)
             last = waited
             if (waited.ok) {
-                return result(
-                    waited.copy(action = ACTION_ACT),
-                    project(waited, lastFilter),
-                    fingerprintAfter(waited, revisionBefore),
-                    stateChanging = true,
-                )
+                return actResult(waited.copy(action = ACTION_ACT), revisionBefore)
             }
             if (waited.error?.code != DeviceErrorCodes.VERIFY_TIMEOUT) {
-                return result(
-                    waited.copy(action = ACTION_ACT),
-                    project(waited, lastFilter),
-                    fingerprintAfter(waited, revisionBefore),
-                    stateChanging = true,
-                )
+                return actResult(waited.copy(action = ACTION_ACT), revisionBefore)
             }
         } while (clock() - started < timeoutMillis)
         val envelope = last ?: operations.waitFor(text, null, false, 1L)
-        return result(
-            envelope.copy(action = ACTION_ACT),
-            project(envelope, lastFilter),
-            fingerprintAfter(envelope, revisionBefore),
-            stateChanging = true,
-        )
+        return actResult(envelope.copy(action = ACTION_ACT), revisionBefore)
     }
 
     private fun screenshot(): ActionResult {
@@ -523,8 +517,7 @@ class DeviceTool(
                 put(STATUS_KEY, envelope.data ?: envelope.error?.code ?: "")
             }
         } else {
-            val include = parseInclude(args, DEFAULT_STATUS_INCLUDE, STATUS_SOURCES)
-                ?: return refused(INVALID_ARGUMENTS)
+            val include = parseStatusInclude(args) ?: return refused(INVALID_ARGUMENTS)
             statusData(envelope, provider.snapshot(include, PerceptionFilter.ALL, null), include)
         }
         return result(envelope, data)
@@ -574,7 +567,9 @@ class DeviceTool(
                     put(SNAP_KEY, snapshot.snapshotId)
                     put(COVERAGE_KEY, PerceptionCoverageRenderer.render(snapshot.coverage))
                     put(FOREGROUND_KEY, foregroundString(snapshot))
-                    put(TRUNCATED_KEY, snapshot.truncated)
+                    // Review I3: the snapshot-wide flag also covers a notification cut; the screen flag must follow the
+                    // screen source only, or a complete screen claims to be truncated.
+                    put(TRUNCATED_KEY, CompactSnapshotRenderer.screenTruncated(snapshot))
                     put(TEXT_KEY, CompactSnapshotRenderer.render(snapshot))
                 },
             )
@@ -708,6 +703,37 @@ class DeviceTool(
                 val source = SOURCE_BY_TOKEN[token] ?: return null
                 if (source !in allowed) return null
                 included += source
+            }
+        }
+        return included
+    }
+
+    /**
+     * The `status` include, shared-schema aware (review minor 6).
+     *
+     * The one schema advertises every `observe` source, so a model may legally send `screen`/`calendar` for status.
+     * Those are known tokens `status` does not serve, and refusing them would answer INVALID_ARGUMENTS to a legal
+     * tool-call shape; they are ignored instead, while the answer itself still names exactly what was read. An unknown
+     * token stays invalid, so a typo is never silently answered with the default. `limit` is deliberately not parsed:
+     * status returns no element list, and the schema documents that it applies to `observe`.
+     */
+    private fun parseStatusInclude(args: JsonObject): Set<PerceptionSource>? {
+        val raw = args["include"] ?: return DEFAULT_STATUS_INCLUDE
+        val array = raw as? JsonArray ?: return null
+        if (array.isEmpty()) return DEFAULT_STATUS_INCLUDE
+        val included = mutableSetOf<PerceptionSource>()
+        array.forEach { element ->
+            val token = (element as? JsonPrimitive)
+                ?.takeIf { it.isString }
+                ?.content
+                ?.trim()
+                ?.lowercase()
+                ?: return null
+            if (token == INCLUDE_ALL) {
+                included += STATUS_SOURCES
+            } else {
+                val source = SOURCE_BY_TOKEN[token] ?: return null
+                if (source in STATUS_SOURCES) included += source
             }
         }
         return included
@@ -995,8 +1021,8 @@ class DeviceTool(
             parametersJson = """{"type":"object","properties":{""" +
                 """"action":{"type":"string","enum":["observe","act","screenshot","wait","status"]},""" +
                 """"filter":{"type":"string","enum":["interactive","text","all"]},""" +
-                """"include":{"type":"array","items":{"type":"string","enum":["screen","notifications","media","calendar","acoustic","clipboard","glasses","device","all"]}},""" +
-                """"limit":{"type":"integer","minimum":1},""" +
+                """"include":{"type":"array","description":"observe 可请求全部来源；status 只返回 device/notifications/media，其他合法来源会被忽略","items":{"type":"string","enum":["screen","notifications","media","calendar","acoustic","clipboard","glasses","device","all"]}},""" +
+                """"limit":{"type":"integer","minimum":1,"description":"observe 返回的元素上限；status 不使用该参数"},""" +
                 """"kind":{"type":"string","enum":["tap","long_press","double_tap","swipe","scroll",""" +
                 """"scroll_to_text","type","press_key","home","back","recents","notifications"]},""" +
                 """"ref":{"type":"string"},"text":{"type":"string"},"value":{"type":"string"},""" +

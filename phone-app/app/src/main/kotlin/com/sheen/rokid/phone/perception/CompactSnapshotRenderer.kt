@@ -20,20 +20,35 @@ import com.sheen.rokid.plugin.PerceptionSnapshot
  * **No systemui/status/nav noise.** That filtering is the provider's job ([PerceptionSnapshotBuilder]), and the renderer
  * renders exactly the elements it is given - a second filter here could disagree with the coverage line.
  *
- * **Bounded text stays honest.** A `truncated` snapshot ends with [TRUNCATION_MARKER], so the model can tell a complete
- * screen from one the host had to cut. Every platform text is flattened onto its element's line (control characters
- * become spaces, quotes/backslashes are escaped); a multi-line platform string can never fabricate extra element lines.
+ * **Bounded text stays honest.** A screen the host had to cut ends with [TRUNCATION_MARKER], so the model can tell a
+ * complete screen from one that was bounded. The marker follows the **screen** coverage, not
+ * [PerceptionSnapshot.truncated]: that snapshot-wide flag is also set when a different source (for example the
+ * notification list) was cut, and a complete screen must not claim to be truncated (review I3). Every platform text
+ * is flattened onto its element's line (control characters become spaces, quotes/backslashes are escaped); a
+ * multi-line platform string can never fabricate extra element lines.
  */
 internal object CompactSnapshotRenderer {
 
     /** The one marker a bounded text ends with; downstream renderers reuse the same word. */
     const val TRUNCATION_MARKER = "… truncated"
 
-    /** The complete text for [snapshot], or an empty string when it has no elements and is not truncated. */
+    /** The screen's coverage token that means "the read itself was bounded". */
+    private const val SCREEN_TRUNCATED = "truncated"
+
+    /**
+     * Whether the **screen** source was cut.
+     *
+     * The snapshot-wide [PerceptionSnapshot.truncated] is an "any source was bounded" flag (notifications included),
+     * so it cannot answer this question; the coverage line can. `observe`/`act` report this value as `screen.truncated`
+     * and this renderer appends the marker exactly when it is true.
+     */
+    fun screenTruncated(snapshot: PerceptionSnapshot): Boolean = snapshot.coverage.screen == SCREEN_TRUNCATED
+
+    /** The complete text for [snapshot], or an empty string when it has no elements and the screen is not truncated. */
     fun render(snapshot: PerceptionSnapshot): String {
         val lines = ArrayList<String>(snapshot.elements.size + 1)
         snapshot.elements.forEach { lines += line(it) }
-        if (snapshot.truncated) lines += TRUNCATION_MARKER
+        if (screenTruncated(snapshot)) lines += TRUNCATION_MARKER
         return lines.joinToString("\n")
     }
 
@@ -65,6 +80,9 @@ internal object CompactSnapshotRenderer {
                 character == '"' -> append("\\\"")
                 character == '\n' || character == '\r' || character == '\t' -> append(' ')
                 character.isISOControl() -> append(' ')
+                // U+2028/U+2029 are line/paragraph separators (category Zl/Zp), not ISO control characters, so the
+                // branch above misses them; a platform string carrying one would still wrap the model-facing line.
+                character == '\u2028' || character == '\u2029' -> append(' ')
                 else -> append(character)
             }
         }

@@ -132,6 +132,7 @@ import com.sheen.rokid.phone.lock.UnlockGate
 import com.sheen.rokid.phone.lock.UnlockOutcome
 import com.sheen.rokid.device.AccessibilityPort
 import com.sheen.rokid.device.DeviceKernel
+import com.sheen.rokid.device.Foreground
 import com.sheen.rokid.device.Gesture
 import com.sheen.rokid.device.ObservationRenderer
 import com.sheen.rokid.device.Ref
@@ -2170,10 +2171,11 @@ class HostCompositionRoot internal constructor(
             // the plugin adds `notify_user`/`load_skill` beside this catalog, which makes exactly six.
             //
             // The accessibility port is resolved per call through the service's companion: the user can switch the
-            // service off at any moment, and `a11yAvailable` is what stops `device` being advertised while it is. A
-            // call that somehow arrives while it is down fails on the kernel's own bound gate instead of dereferencing
-            // null. The delegate must share the service's registry (R36), so the refs rendered by ScreenProjector are
-            // the refs `performNodeAction` resolves.
+            // service off at any moment. Task 7 review I2 (R11): `device` stays advertised so its `status` action can
+            // report `accessibility=false`; every other device action and every other port call still requires the
+            // live service and fails on the kernel's own bound gate instead of dereferencing null. The delegate must
+            // share the service's registry (R36), so the refs rendered by ScreenProjector are the refs
+            // `performNodeAction` resolves.
             val accessibilityPort = object : AccessibilityPort {
                 private fun live(): AccessibilityPort = EdithAccessibilityService.port()
                     ?: throw IllegalStateException("the accessibility service is not connected")
@@ -2185,7 +2187,10 @@ class HostCompositionRoot internal constructor(
                 override fun performNodeAction(ref: Ref, action: String) = live().performNodeAction(ref, action)
                 override fun dispatchGesture(gesture: Gesture) = live().dispatchGesture(gesture)
                 override fun screenshot() = live().screenshot()
-                override fun foreground() = live().foreground()
+                // Task 7 review I2 (R11): the one port call `status` makes before it reads health. An unbound service
+                // has no foreground to report - that is `null`, not a failed status call. Every other call above still
+                // requires the live service, so this fallback cannot make an unbound channel look usable.
+                override fun foreground() = EdithAccessibilityService.port()?.foreground() ?: Foreground(null, null)
             }
             val deviceKernel = DeviceKernel(
                 accessibility = accessibilityPort,

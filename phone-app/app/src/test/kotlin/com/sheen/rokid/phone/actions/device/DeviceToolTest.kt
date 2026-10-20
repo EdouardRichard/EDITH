@@ -300,6 +300,115 @@ class DeviceToolTest {
         assertTrue(operations.actCalls.isEmpty())
     }
 
+    @Test
+    fun `scroll_to_text with perception runs one post-action read and returns a compact screen`() {
+        // Task 7 review C1: scroll_to_text dispatches a real kernel act, so it must run the same forced post-action
+        // read every other act runs. Before the fix it returned the projector's `bounds=` text and left the provider
+        // cache one screen behind.
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.waitEnvelopes.add(
+            DeviceEnvelope.success(
+                action = "wait",
+                channel = "accessibility",
+                accepted = true,
+                applied = true,
+                verified = null,
+                timing = Timing(0, 0, 0),
+            ),
+        )
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(
+                snapshotId = "snap-after-scroll",
+                elements = listOf(
+                    perceptionElement(
+                        ref = "#n4",
+                        role = "button",
+                        text = "目标",
+                        centerX = 11,
+                        centerY = 22,
+                        clickable = true,
+                        bounds = "0,0,22,44",
+                    ),
+                ),
+            ),
+        )
+
+        val result = tool(operations, perception = perception).execute(
+            """{"action":"act","kind":"scroll_to_text","text":"目标","timeout_ms":5000}""",
+        )
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("the forced post-action read must run exactly once", 1, perception.afterActions)
+        val data = body(result)["data"]!!.jsonObject
+        assertEquals("snap-after-scroll", data["snap"]!!.jsonPrimitive.content)
+        assertEquals(
+            "screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok vision=ok glasses=ok device=ok",
+            data["coverage"]!!.jsonPrimitive.content,
+        )
+        assertEquals("changed comes from the dispatched envelope", true, data["changed"]!!.jsonPrimitive.boolean)
+        val screen = data["screen"]!!.jsonObject
+        assertEquals("snap-after-scroll", screen["snap"]!!.jsonPrimitive.content)
+        assertTrue(
+            "the compact post-scroll screen replaces the projected bounds view: ${screen["text"]}",
+            screen["text"]!!.jsonPrimitive.content.contains("""#n4 button "目标" center=(11,22) [clickable]"""),
+        )
+        assertFalse("scroll_to_text must not leak projector bounds: ${result.detail}", result.detail.contains("bounds="))
+        assertEquals("full", screen["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
+    }
+
+    @Test
+    fun `scroll_to_text timeout with perception still runs the post-action read and keeps the failure`() {
+        var now = 0L
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.onWait = { now += 100 }
+        operations.waitEnvelope = failure("wait", "VERIFY_TIMEOUT", recoverable = true)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(
+                snapshotId = "snap-timeout",
+                elements = listOf(perceptionElement(ref = "#n1", text = "A")),
+            ),
+        )
+
+        val result = tool(operations, clock = { now }, perception = perception).execute(
+            """{"action":"act","kind":"scroll_to_text","text":"never","timeout_ms":50}""",
+        )
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("VERIFY_TIMEOUT", body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals(1, perception.afterActions)
+        val data = body(result)["data"]!!.jsonObject
+        assertEquals(false, data["changed"]!!.jsonPrimitive.boolean)
+        assertEquals("snap-timeout", data["snap"]!!.jsonPrimitive.content)
+        assertTrue("a failed scroll still carries the post-action coverage", data.containsKey("coverage"))
+        assertFalse("no bounds in the failed scroll either: ${result.detail}", result.detail.contains("bounds="))
+        assertEquals(1, operations.actCalls.size)
+    }
+
+    @Test
+    fun `an early scroll_to_text kernel failure still runs the post-action read`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.actEnvelope = failure("act", "CHANNEL_UNAVAILABLE", recoverable = true)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(
+                snapshotId = "snap-failed-scroll",
+                elements = listOf(perceptionElement(ref = "#n1", text = "A")),
+            ),
+        )
+
+        val result = tool(operations, perception = perception).execute(
+            """{"action":"act","kind":"scroll_to_text","text":"目标"}""",
+        )
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("CHANNEL_UNAVAILABLE", body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("a dispatched scroll always gets the forced read", 1, perception.afterActions)
+        assertEquals("snap-failed-scroll", body(result)["data"]!!.jsonObject["snap"]!!.jsonPrimitive.content)
+        assertFalse("no bounds after a failed scroll: ${result.detail}", result.detail.contains("bounds="))
+    }
+
     // - screenshot (R44) -
 
     @Test
@@ -607,6 +716,7 @@ class DeviceToolTest {
                     ),
                 ),
                 truncated = true,
+                screenCoverage = "truncated",
             ),
         )
 
@@ -616,7 +726,7 @@ class DeviceToolTest {
         val screen = body(result).screen()
         assertEquals("snap-7", screen["snap"]!!.jsonPrimitive.content)
         assertEquals(
-            "screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok vision=ok glasses=ok device=ok",
+            "screen=truncated notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok vision=ok glasses=ok device=ok",
             screen["coverage"]!!.jsonPrimitive.content,
         )
         assertEquals("com.example.app/.MainActivity", screen["foreground"]!!.jsonPrimitive.content)
@@ -783,6 +893,80 @@ class DeviceToolTest {
     }
 
     @Test
+    fun `observe truncation keys the screen flag off the screen coverage not the snapshot`() {
+        // Task 7 review I3: notifications cut at the policy cap set the snapshot-wide `truncated`, which used to mark a
+        // complete screen as truncated and append the marker. The screen flag must follow `coverage.screen`.
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(
+                elements = listOf(perceptionElement(ref = "#n1", text = "A")),
+                truncated = true,
+                screenCoverage = "ok",
+                notificationsCoverage = "truncated",
+            ),
+        )
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"observe"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val screen = body(result).screen()
+        assertFalse("a complete screen must stay untruncated: ${screen["coverage"]}", screen["truncated"]!!.jsonPrimitive.boolean)
+        assertFalse(
+            "a notification cut must not append a screen truncation marker: ${screen["text"]}",
+            screen["text"]!!.jsonPrimitive.content.contains("truncated"),
+        )
+        assertTrue(
+            "the notifications source must still report its own cut",
+            screen["coverage"]!!.jsonPrimitive.content.contains("notifications=truncated"),
+        )
+    }
+
+    @Test
+    fun `act truncation also keys the screen flag off the screen coverage`() {
+        val before = observation(rev = 1, nodes = listOf(node("A")))
+        val operations = FakeDeviceOperations(before)
+        operations.actEnvelope = DeviceEnvelope.success(
+            action = "act",
+            channel = "accessibility",
+            accepted = true,
+            applied = true,
+            verified = com.sheen.rokid.device.Verified("screen_change", 2L),
+            timing = Timing(0, 0, 0),
+        )
+        operations.actObservation = observation(rev = 2, nodes = listOf(node("B")))
+        val actionRegistry = RefRegistry()
+        actionRegistry.beginSnapshot("snap-before", 900L, "com.example.settings", null)
+        actionRegistry.assign(before)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(
+                snapshotId = "snap-after",
+                elements = listOf(perceptionElement(ref = "#n5", text = "B")),
+                truncated = true,
+                screenCoverage = "ok",
+                notificationsCoverage = "truncated",
+            ),
+        )
+
+        val result = tool(
+            operations,
+            perception = perception,
+            refRegistry = actionRegistry,
+            foreground = { Foreground("com.example.settings", null) },
+            nowMillis = { 1_000L },
+            refTtlMillis = { 20_000L },
+        ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val screen = body(result)["data"]!!.jsonObject["screen"]!!.jsonObject
+        assertFalse("act must apply the same screen-specific rule", screen["truncated"]!!.jsonPrimitive.boolean)
+        assertFalse(
+            "act's compact text must not append the marker for a notification cut",
+            screen["text"]!!.jsonPrimitive.content.contains("truncated"),
+        )
+    }
+
+    @Test
     fun `an act that changed nothing stays a refusal and tells the model to observe first`() {
         val before = observation(rev = 1, nodes = listOf(node("A")))
         val operations = FakeDeviceOperations(before)
@@ -865,6 +1049,125 @@ class DeviceToolTest {
         assertFalse("status must never repeat the screen tree", data.containsKey("screen"))
         assertFalse("status must never carry compact screen text", data.containsKey("text"))
         assertFalse("no screen refs in a status result", result.detail.contains("#n"))
+    }
+
+    @Test
+    fun `status default include asks only for device and omits notification content`() {
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(
+                notifications = listOf(
+                    NotificationItem(packageName = "com.android.mms", title = "信息", postedAtEpochMillis = 1L),
+                ),
+            ),
+        )
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"status"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("the ambient status question defaults to device facts", setOf(PerceptionSource.DEVICE), perception.lastInclude)
+        val data = body(result)["data"]!!.jsonObject
+        assertFalse("notification content must not be read unasked", data.containsKey("notifications"))
+        assertTrue("the device facts are always present", data.containsKey("device"))
+    }
+
+    @Test
+    fun `status ignores a shared-schema source it does not serve`() {
+        // Review minor 6: the one schema advertises every `observe` source, so a model may send `screen` for status.
+        // Refusing that would answer "invalid" to a legal tool-call shape; status ignores the sources it cannot serve.
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(
+                notifications = listOf(
+                    NotificationItem(packageName = "com.android.mms", title = "信息", postedAtEpochMillis = 1L),
+                ),
+            ),
+        )
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception).execute(
+            """{"action":"status","include":["screen","calendar","notifications"]}""",
+        )
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(setOf(PerceptionSource.NOTIFICATIONS), perception.lastInclude)
+        assertTrue(
+            "the notifications that were requested must still be returned",
+            body(result)["data"]!!.jsonObject.containsKey("notifications"),
+        )
+    }
+
+    @Test
+    fun `status still refuses an unknown include token`() {
+        val perception = FakePerception(perceptionSnapshot())
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"status","include":["telepathy"]}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("INVALID_ARGUMENTS", result.detail)
+        assertEquals("an invalid status include must not read the provider", 0, perception.snapshotCalls)
+    }
+
+    @Test
+    fun `observe refuses malformed include tokens and non-positive limits without a provider read`() {
+        val perception = FakePerception(perceptionSnapshot())
+        val device = tool(FakeDeviceOperations(observation()), perception = perception)
+
+        listOf(
+            """{"action":"observe","include":["screen","bogus"]}""",
+            """{"action":"observe","include":"screen"}""",
+            """{"action":"observe","include":["screen",1]}""",
+            """{"action":"observe","include":[] ,"limit":0}""",
+            """{"action":"observe","limit":-3}""",
+            """{"action":"observe","limit":"4"}""",
+        ).forEach { args ->
+            val result = device.execute(args)
+            assertEquals("$args must be INVALID_ARGUMENTS", ActionOutcome.Refused, result.outcome)
+            assertEquals("$args must be INVALID_ARGUMENTS", "INVALID_ARGUMENTS", result.detail)
+        }
+        assertEquals("no provider read may run for invalid arguments", 0, perception.snapshotCalls)
+    }
+
+    @Test
+    fun `act refreshes one observation when the turn has no latest one`() {
+        // Minor 4: the gate's "no latest observation yet" branch. One `observe(ALL)` must run, the tool must re-read
+        // the kernel's cache, and the resolved ref must be dispatched - not skipped.
+        val refreshed = observation(rev = 1, nodes = listOf(node("A")))
+        val operations = FakeDeviceOperations(observation = null)
+        operations.observeObservation = refreshed
+        val actionRegistry = RefRegistry()
+        actionRegistry.beginSnapshot("snap-gate", 0L, "com.example.settings", null)
+        actionRegistry.assign(refreshed)
+
+        val result = tool(
+            operations,
+            perception = FakePerception(perceptionSnapshot()),
+            refRegistry = actionRegistry,
+            foreground = { Foreground("com.example.settings", null) },
+            nowMillis = { 0L },
+            refTtlMillis = { 20_000L },
+        ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("the gate must refresh with one full observation", ScreenFilter.ALL, operations.observeFilter)
+        assertEquals(1, operations.calls.count { it == "observe:ALL" })
+        assertEquals(Ref("#n0"), operations.actCalls.single().ref)
+    }
+
+    @Test
+    fun `act skips the ref gate when one refresh observation still cannot be made`() {
+        // Minor 4: still unobservable after the refresh -> the kernel decides. The raw ref is passed through, never a
+        // refusal invented by the tool.
+        val operations = FakeDeviceOperations(observation = null)
+
+        val result = tool(
+            operations,
+            perception = FakePerception(perceptionSnapshot()),
+            refRegistry = RefRegistry(),
+        ).execute("""{"action":"act","kind":"tap","ref":"#n7"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("the fallback observation was attempted", 1, operations.calls.count { it == "observe:ALL" })
+        assertEquals("the kernel gets the model's ref unchanged", Ref("#n7"), operations.actCalls.single().ref)
     }
 
     @Test
@@ -1047,6 +1350,8 @@ class DeviceToolTest {
         acoustic: String? = null,
         clipboardText: String? = null,
         truncated: Boolean = false,
+        screenCoverage: String = "ok",
+        notificationsCoverage: String = "ok",
     ): PerceptionSnapshot = PerceptionSnapshot(
         snapshotId = snapshotId,
         capturedAtEpochMillis = 0L,
@@ -1059,8 +1364,8 @@ class DeviceToolTest {
         acoustic = acoustic,
         clipboardText = clipboardText,
         coverage = PerceptionCoverage(
-            screen = "ok",
-            notifications = "ok",
+            screen = screenCoverage,
+            notifications = notificationsCoverage,
             media = "ok",
             calendar = "ok",
             acoustic = "ok",
@@ -1142,6 +1447,7 @@ class DeviceToolTest {
         var afterActionSnapshot: PerceptionSnapshot? = null,
     ) : PerceptionProvider {
         var afterActions = 0
+        var snapshotCalls = 0
         var lastInclude: Set<PerceptionSource>? = null
         var lastFilter: PerceptionFilter? = null
         var lastLimit: Int? = null
@@ -1153,6 +1459,7 @@ class DeviceToolTest {
             filter: PerceptionFilter,
             limit: Int?,
         ): PerceptionSnapshot {
+            snapshotCalls++
             lastInclude = include
             lastFilter = filter
             lastLimit = limit
@@ -1252,6 +1559,8 @@ class DeviceToolTest {
         val actCalls = mutableListOf<ActCall>()
         val waitCalls = mutableListOf<WaitCall>()
         var observeFilter: ScreenFilter? = null
+        /** When set, `observe` leaves this observation as the kernel's new latest (the gate's refresh read). */
+        var observeObservation: Observation? = null
         /** When set, `act` leaves this observation as the kernel's new latest (the post-action read). */
         var actObservation: Observation? = null
         var observeEnvelope: DeviceEnvelope = DeviceEnvelope.success(
@@ -1294,6 +1603,7 @@ class DeviceToolTest {
             observeFilter = filter
             calls += "observe:${filter.name}"
             if (advanceRevisionOnObserve) revisionValue = revisionValue?.plus(1)
+            observeObservation?.let { observation = it }
             return observeEnvelope
         }
 

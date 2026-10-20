@@ -423,10 +423,31 @@ class PerceptionSnapshotBuilderTest {
 
         assertEquals(3, cut.notifications.size)
         assertEquals("truncated", cut.coverage.notifications)
+        assertEquals("the screen itself was complete", "ok", cut.coverage.screen)
         assertTrue(cut.truncated)
         assertEquals(3, fits.notifications.size)
         assertEquals("ok", fits.coverage.notifications)
         assertFalse(fits.truncated)
+    }
+
+    @Test
+    fun aNotificationOnlyCutLeavesTheCompactScreenTextComplete() {
+        // Task 7 review I3 end to end through the real builder: the snapshot-wide flag is true (notifications were
+        // cut), but the screen is intact, so the compact text must carry no truncation marker.
+        val cut = build(
+            observation = observation(listOf(node(text = "完整屏幕"))),
+            notifications = (0 until 4).map { notification("标题$it") },
+            policy = PerceptionPolicy(notificationLimit = 3),
+        )
+
+        assertTrue("the snapshot as a whole was bounded", cut.truncated)
+        assertEquals("ok", cut.coverage.screen)
+        val text = CompactSnapshotRenderer.render(cut)
+        assertTrue("the screen's own content is rendered", text.contains("完整屏幕"))
+        assertFalse(
+            "a notification cut must not append the screen marker: $text",
+            text.contains(CompactSnapshotRenderer.TRUNCATION_MARKER),
+        )
     }
 
     // ── Filters ─────────────────────────────────────────────────────────────
