@@ -79,6 +79,13 @@ class ModelClientGateway(
      * time, not at gateway construction time.
      */
     private val audioParts: (() -> List<InputPart>)? = null,
+    /**
+     * 0.3 Phase 2 Task 11 (spec §5.3): the count-only telemetry sink this gateway reports one `P3_CACHE` line to per
+     * model request. A lambda keeps `agent-runtime` free of Android/logging dependencies; the production plugin passes
+     * its `P3Log::line`, tests collect into a list. Defaulted so every pre-Task-11 construction is unchanged, and
+     * failures are the sink's problem: a throwing logger must never turn a delivered reply into a failed turn.
+     */
+    private val metricLine: (String) -> Unit = {},
 ) : ModelGateway {
 
     /**
@@ -297,8 +304,49 @@ class ModelClientGateway(
      * One model round trip: send the request, wait for the terminal (or the deadline/stop), and turn the accumulated
      * stream into a [GatewayReply]. Extracted verbatim from [turn] so overflow recovery can repeat it; a transport
      * failure is still not caught here.
+     *
+     * Every request reports its own count-only `P3_CACHE` line when the reply carried usage — the wake run's tool
+     * rounds, the proactive `turn`, and each deterministic overflow re-send alike. The line is per request, never a
+     * sum: [AgentLoop] no longer reports a run-total duplicate (0.3 Phase 2 Task 11).
      */
     private fun sendTurn(request: GatewayTurn, modelRequest: ModelRequest): GatewayReply {
+        val reply = sendTurnOnce(request, modelRequest)
+        emitCacheMetric(request, reply)
+        return reply
+    }
+
+    /**
+     * The single `P3_CACHE` line of one model request, or nothing when the provider reported no accounting.
+     *
+     * Counts only, fixed field order: `cached`/`miss` from the provider's own cache members (an unreported counter is
+     * `-`, a reported zero stays `0`), `inputTokens`/`outputTokens`, and the request's shape as two character counts —
+     * the system slot and the sum of the dynamic-tail segment texts. The legacy no-frame path sends `instructions`
+     * directly, so it reports that length and a zero tail. No text ever rides the line.
+     */
+    private fun emitCacheMetric(request: GatewayTurn, reply: GatewayReply) {
+        val usage = reply.usage ?: return
+        // `systemText` joins the system segments with newlines; for one segment it is exactly its text.
+        val systemChars = request.frame?.systemText?.length ?: request.instructions.length
+        val dynamicChars = request.frame?.conversationFlow
+            ?.let { flow -> RequestLayout.dynamicTail(flow).sumOf { it.text.length } }
+            ?: 0
+        val line = buildString {
+            append("P3_CACHE")
+            append(" cached=").append(countField(usage.cachedInputTokens))
+            append(" miss=").append(countField(usage.cacheMissInputTokens))
+            append(" inputTokens=").append(countField(usage.inputTokens))
+            append(" outputTokens=").append(countField(usage.outputTokens))
+            append(" systemChars=").append(systemChars)
+            append(" dynamicChars=").append(dynamicChars)
+        }
+        // Observability is never a verdict: a throwing sink must not turn a delivered reply into a failed turn.
+        runCatching { metricLine(line) }
+    }
+
+    /** `-` for a count the provider did not report; a reported zero is printed as `0`, never fabricated. */
+    private fun countField(value: Long?): String = value?.toString() ?: "-"
+
+    private fun sendTurnOnce(request: GatewayTurn, modelRequest: ModelRequest): GatewayReply {
         val accumulated = Accumulated()
         val wakeAtDeadline = scheduler.at(request.deadlineNanos) { accumulated.wake() }
         val caller = Thread.currentThread()

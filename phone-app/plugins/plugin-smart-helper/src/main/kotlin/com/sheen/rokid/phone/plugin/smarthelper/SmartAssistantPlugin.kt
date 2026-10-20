@@ -40,6 +40,7 @@ import com.sheen.rokid.agent.ModelClientGateway
 import com.sheen.rokid.agent.PerceptionPolicy
 import com.sheen.rokid.agent.ProgressGuard
 import com.sheen.rokid.agent.RequestFrame
+import com.sheen.rokid.agent.RequestLayout
 import com.sheen.rokid.agent.Segment
 import com.sheen.rokid.agent.SegmentOrigin
 import com.sheen.rokid.agent.SegmentRole
@@ -704,6 +705,13 @@ class SmartAssistantPlugin(
     /** Deterministic hex digest of [pinnedSkillCatalog], or [SKILL_HASH_NONE] when nothing was pinned. */
     @Volatile private var pinnedSkillCatalogHash: String = SKILL_HASH_NONE
 
+    /**
+     * 0.3 Phase 2 Task 11 (spec §4.2.1 rule 4): the digest of the [DeviceProfile] the session pinned at activation, or
+     * [DEVICE_HASH_NONE] when the host supplied none. Read per request by the `P3_PROMPT` line, so the digest describes
+     * the plan the frame actually rendered; it is cleared with the rest of the session state in [deactivate].
+     */
+    @Volatile private var activeDeviceHash: String = DEVICE_HASH_NONE
+
     /** Whether this session already reported a detectable catalog change, so a change is named once, not per turn. */
     @Volatile private var skillCatalogChangeLogged: Boolean = false
 
@@ -1126,15 +1134,26 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * The one prompt-provenance line of a session (spec §4.1): version, ordered-section hash, deterministic device
-     * hash, the pinned SKILL catalog hash and static size. Counts and hex only - no prompt text, no device value, no
-     * model text ever rides on it.
+     * 0.3 Phase 2 Task 11 (spec §4.1/§5.3): the per-request prompt-provenance line, replacing the activation-once line.
+     *
+     * Counts and hashes only — the catalog version, the session-pinned plan's ordered-section hash, the device-profile
+     * digest, the pinned SKILL catalog hash, the route, and the request frame's system and dynamic-tail character
+     * counts. One line is emitted for **each model request** by the frame builder (wake tool rounds included) and by the
+     * proactive request assembly; no prompt prose, device value, SKILL name or user text ever rides it.
+     *
+     * `dynamicChars` is the frame's [RequestLayout.dynamicTail] length **at frame build time**. The agent loop folds its
+     * own `RUNTIME_STATE` and `PERCEPTION` segments in after the wake builder returns, so those loop-owned segments are
+     * deliberately excluded: this line describes the frame the plugin assembled, while the gateway's `P3_CACHE` line
+     * describes the exact request that was sent.
      */
-    private fun logPromptPlan(plan: PromptPlan, deviceHash: String) {
+    private fun logPromptRequest(route: ContextRoute, frame: RequestFrame) {
         P3Log.line(
-            "P3_PROMPT version=${PromptCatalog.VERSION} hash=${plan.hash} " +
-                "deviceHash=$deviceHash catalogHash=$pinnedSkillCatalogHash " +
-                "staticChars=${plan.systemText.length}",
+            "P3_PROMPT version=${PromptCatalog.VERSION} " +
+                "hash=${activePromptPlans?.get(route)?.hash ?: PROMPT_HASH_NONE} " +
+                "deviceHash=$activeDeviceHash catalogHash=$pinnedSkillCatalogHash " +
+                "route=${route.name} " +
+                "staticChars=${frame.systemText.length} " +
+                "dynamicChars=${RequestLayout.dynamicTail(frame.conversationFlow).sumOf { it.text.length }}",
         )
     }
 
@@ -1290,9 +1309,10 @@ class SmartAssistantPlugin(
         pinnedSkillCatalog = pinnedCatalog
         pinnedSkillCatalogHash = if (pinnedCatalog.isBlank()) SKILL_HASH_NONE else sha256Hex(pinnedCatalog)
         skillCatalogChangeLogged = false
-        // Once per activation, counts/hashes only (spec §4.1): which prompt ran, on which device, with which pinned
-        // SKILL catalog - never the prose, a device value or a SKILL name/body.
-        logPromptPlan(sessionPlans.getValue(ContextRoute.WAKE), deviceProfileHash(sessionDeviceProfile))
+        // 0.3 Phase 2 Task 11: the device digest is pinned with the plans and read by every request's `P3_PROMPT`
+        // line. The line itself is no longer emitted here; a session has not made a model request at activation, and a
+        // per-request line must describe the frame that request actually rendered.
+        activeDeviceHash = deviceProfileHash(sessionDeviceProfile)
         // P3.3: the same rule for the confirmation channel. A host that cannot ask the user leaves this null, and the
         // loop then refuses every flagged action (`CONFIRMATION_UNAVAILABLE`) instead of acting unasked.
         confirmation.attach(runCatching { context.services.confirmation() }.getOrNull())
@@ -1335,6 +1355,7 @@ class SmartAssistantPlugin(
             // later activation must build them from the library/profile it is actually given.
             pinnedSkillCatalog = ""
             pinnedSkillCatalogHash = SKILL_HASH_NONE
+            activeDeviceHash = DEVICE_HASH_NONE
             skillCatalogChangeLogged = false
             activeContextFailure = null
             // Phase 5: the injected stores are the same session state, so both ends of the handover empty them.
@@ -2773,7 +2794,10 @@ class SmartAssistantPlugin(
         envelopeFor = { requestId, startNanos, endNanos ->
             EventEnvelope(context.sessionId, context.generation, requestId, startNanos, endNanos)
         },
+        // 0.3 Phase 2 Task 11: one `P3_CACHE` line per model request, including this run's tool rounds and overflow
+        // re-sends. The gateway owns the line so the proactive path reports the same shape.
         stop = { owned.closed },
+        metricLine = P3Log::line,
     )
 
     /**
@@ -2806,6 +2830,10 @@ class SmartAssistantPlugin(
      *
      * The system slot's catalog and the tail's pulled bodies are read as **one** snapshot ([requestSkillSegments]);
      * a turn boundary that cleared the bodies between two separate reads would split the pair.
+     *
+     * 0.3 Phase 2 Task 11: this factory builds the proactive request's frame; the caller (`runProactive`) emits the
+     * per-request `P3_PROMPT` line from the returned frame immediately before `gateway.turn`, so the frame describes
+     * exactly the request that is sent. The wake path's equivalent is the `frameBuilderFor` lambda.
      *
      * @param store the route's session store, whose [ConversationStore.snapshot] opens the flow.
      * @param prompt the session assembly. `null` means no manager was built (a host without a profile); the system
@@ -2882,7 +2910,7 @@ class SmartAssistantPlugin(
             // in the tail are read together, because `beginSkillTurn` clears the bodies under the same lock. A begin
             // that landed between two separate reads would pair a newer catalog with the previous turn's bodies.
             val skills = requestSkillSegments(route)
-            RequestFrame(
+            val frame = RequestFrame(
                 systemSegments = skills.system,
                 conversationFlow = buildList {
                     transcript.forEachIndexed { index, item ->
@@ -2910,6 +2938,11 @@ class SmartAssistantPlugin(
                 },
                 tools = tools,
             )
+            // 0.3 Phase 2 Task 11: one prompt-provenance line per model request (a tool round is the second request).
+            // The loop's RUNTIME_STATE/PERCEPTION segments are folded in after this lambda returns, so they are not
+            // counted here; P3_CACHE at the gateway reports the shape that was actually sent.
+            logPromptRequest(route, frame)
+            frame
         }
     }
 
@@ -3420,6 +3453,9 @@ class SmartAssistantPlugin(
                 EventEnvelope(current.sessionId, current.generation, requestId, startNanos, endNanos)
             },
             stop = { hint.cancelled },
+            // 0.3 Phase 2 Task 11: the proactive route calls the gateway directly, so wiring the same count-only sink
+            // here is what gives it the same per-request `P3_CACHE` line as the wake run.
+            metricLine = P3Log::line,
         )
         // B1/B3/B6 / spec §4.2: the proactive route consumes the **session's own** assembly exactly as the wake route
         // does — its transcript comes from `buildPrompt` under `ContextRoute.PROACTIVE` (the SKILL catalog arrives
@@ -3437,6 +3473,10 @@ class SmartAssistantPlugin(
         val frame = activeStores?.get(ContextRoute.PROACTIVE)?.let {
             buildFrame(it, ContextRoute.PROACTIVE, message, prompt, listOf(ProactiveHintSpec.PROPOSE_HINT))
         }
+        // 0.3 Phase 2 Task 11: this route has no AgentLoop, so the per-request prompt line is emitted here, before the
+        // one model request it makes. A no-frame legacy request (a host wiring without stores) has no frame to
+        // describe and stays silent; production always injects the per-route stores.
+        frame?.let { logPromptRequest(ContextRoute.PROACTIVE, it) }
         val reply = try {
             // 0.25 Task 12 (R58/R59): this route deliberately has **no** `AgentLoop` and no `AgentRequest` — it is one
             // proposal request with `propose_hint` as the only control channel. A plan nudge (which exists to push a
@@ -4125,6 +4165,13 @@ class SmartAssistantPlugin(
          * An absent provider must never be filled with an invented profile.
          */
         const val DEVICE_HASH_NONE = "none"
+
+        /**
+         * 0.3 Phase 2 Task 11: the `hash` value for a request whose route has no pinned plan (a direct test seam,
+         * never a production request path). A stable word, not a digest, so a reader can tell it apart from a real
+         * plan hash.
+         */
+        const val PROMPT_HASH_NONE = "none"
 
         val SystemMonotonicClock = object : MonotonicClock {
             override fun nowNanos(): Long = System.nanoTime()

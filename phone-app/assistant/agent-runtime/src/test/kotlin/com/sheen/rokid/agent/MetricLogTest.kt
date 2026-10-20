@@ -20,8 +20,9 @@ import kotlin.test.assertTrue
  * unread metric. The usage three-state rule (R21) is pinned separately: no accounting at all is `missing`, a reported
  * usage object with both counters absent is `unknown`, and a real zero is `0`.
  *
- * 0.3 Phase 1 Task 13 adds a **separate** `P3_CACHE` line when the run reported accounting; `P3_METRIC` keeps its
- * exact shape. This file still asserts that old shape, and filters for it rather than assuming it is the only line.
+ * 0.3 Phase 2 Task 11 moves provider cache accounting to `ModelClientGateway` (one `P3_CACHE` line per model request,
+ * asserted in `GatewayCacheMetricTest`); a finished run therefore emits exactly this one line. The shape below is the
+ * run-level contract and is unchanged.
  */
 class MetricLogTest {
 
@@ -49,7 +50,7 @@ class MetricLogTest {
         metricLine = { lines += it })
 
     @Test
-    fun `one run emits the metric line and a separate P3_CACHE line with exactly the count fields`() {
+    fun `one run emits exactly one P3_METRIC line with the count fields`() {
         val lines = mutableListOf<String>()
         val clock = FakeMetricClock()
         val executor = RecordingActionExecutor(listOf(actionDescriptor("lookup", observation = true)))
@@ -71,16 +72,14 @@ class MetricLogTest {
 
         loop(gateway, ToolRegistry(listOf(executor)), clock, lines).run(request(history = history))
 
-        assertEquals(2, lines.size, lines.toString())
+        assertEquals(1, lines.size, lines.toString())
         assertEquals(
             "P3_METRIC calls=2 toolCalls=1 modelMs=8 toolMs=3 observeMs=3 " +
                 "inputTokens=15 outputTokens=7 images=1 nudges=0 overflows=0",
-            lines.first(),
+            lines.single(),
         )
-        // The usage the run reported had no cache counters, so the separate line is present with both as `-`.
-        assertEquals("P3_CACHE cached=- miss=- inputTokens=15 outputTokens=7", lines.last())
-        // Both lines are counts only: no request/history/tool body, and no credential-shaped text.
-        assertFalse(lines.joinToString("\n").contains("MARKER"), lines.toString())
+        // The line is counts only: no request/history/tool body, and no credential-shaped text.
+        assertFalse(lines.single().contains("MARKER"), lines.toString())
     }
 
     @Test
@@ -143,8 +142,8 @@ class MetricLogTest {
             GatewayReply(emptyList(), "answer", ModelEnd.COMPLETED, null, usage),
         ))
         loop(gateway, clock = FakeMetricClock(), lines = lines).run(request())
-        // The `P3_METRIC` line only: the separate P3_CACHE line carries its own three-state rule in CacheMetricTest.
-        return lines.single { it.startsWith("P3_METRIC ") }
+        // The run's only line: per-request cache accounting moved to the gateway (`GatewayCacheMetricTest`).
+        return lines.single()
     }
 
     private fun tokenFields(line: String): String {
