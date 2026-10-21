@@ -13,11 +13,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * T1.5 — Tool surface wiring verification.
+ * T1.5 — the accessibility backend's five tools, and the **retired** router's availability gate.
  *
- * Verifies that the five new tools (read_screen, tap, long_press, scroll, input_text) are correctly registered
- * in the accessibility backend, that old tools (tap_text, type_text) are gone, and that availability gating
- * works correctly through the ExecutionRouter.
+ * Verifies that the five tools (read_screen, tap, long_press, scroll, input_text) are correctly registered in the
+ * accessibility backend and that old tools (tap_text, type_text) are gone. The two router tests below pin
+ * `ExecutionRouter`'s historical rule (an unavailable channel's tools are hidden) for the class that still exists for
+ * those tests; since edith-0.3 Phase 4A Task 4 production no longer uses that router. The production face is
+ * `com.sheen.rokid.phone.actions.ToolSurface`, which deliberately keeps a down channel's tools advertised and refuses
+ * the call instead (A3; see `ToolFaceWiringTest`/`ToolFaceCompositionTest`).
  */
 class ToolSurfaceWiringTest {
 
@@ -143,7 +146,7 @@ class ToolSurfaceWiringTest {
         assertFalse("type_text must be removed", names.contains("type_text"))
     }
 
-    // ── Test 3: Shizuku unavailable ⇒ read_screen still available ────────────
+    // ── Test 3: Shizuku unavailable ⇒ read_screen still available (router rule) ──
 
     @Test
     fun `read_screen is available when accessibility is up regardless of shizuku`() {
@@ -168,17 +171,20 @@ class ToolSurfaceWiringTest {
         assertFalse("clear_data must NOT be advertised (shizuku down)", names.contains("clear_data"))
     }
 
-    // ── Test 4: Accessibility unavailable ⇒ none of the 5 tools advertised ───
+    // ── Test 4: Accessibility unavailable ⇒ the retired router advertises none ──
 
     @Test
-    fun `accessibility unavailable means none of the five tools are advertised`() {
+    fun `the retired router hides a down channels tools, unlike the stable production surface`() {
+        // This is ExecutionRouter's rule (the class kept for its own tests). The production `ToolSurface` deliberately
+        // does the opposite: A3 keeps the tools advertised so the schema/cached prefix cannot change mid-session, and
+        // `execute` answers `ACTION_CHANNEL_UNAVAILABLE`. `ToolFaceWiringTest` pins that production behaviour.
         val ui = FakeUi()
         val a11yBackend = backend(ui, connected = false)
         val router = ExecutionRouter(listOf(a11yBackend))
 
         val names = router.descriptors().map { it.name }.toSet()
 
-        assertTrue("no tools should be advertised", names.isEmpty())
+        assertTrue("the retired router advertises nothing while the channel is down", names.isEmpty())
     }
 
     // ── Test 5: read_screen with default filter ──────────────────────────────

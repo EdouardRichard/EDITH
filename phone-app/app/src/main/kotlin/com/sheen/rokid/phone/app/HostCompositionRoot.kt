@@ -113,8 +113,21 @@ import com.sheen.rokid.storage.*
 import com.sheen.rokid.phone.storage.*
 import com.sheen.rokid.phone.actions.shizuku.RootProbe
 import com.sheen.rokid.phone.actions.shizuku.RootStatus
+import com.sheen.rokid.phone.actions.shizuku.ShizukuExecutionBackend
+import com.sheen.rokid.phone.actions.shizuku.ShizukuTargetState
 import com.sheen.rokid.phone.actions.shizuku.ShizukuUserServiceShell
+import com.sheen.rokid.phone.actions.AtomicActionExecutor
+import com.sheen.rokid.phone.actions.ToolSurface
+import com.sheen.rokid.phone.actions.a11y.AccessibilityExecutionBackend
+import com.sheen.rokid.phone.actions.a11y.AccessibilityUi
+import com.sheen.rokid.phone.actions.a11y.ScreenFilter as A11yScreenFilter
+import com.sheen.rokid.phone.actions.a11y.ScreenFingerprint
+import com.sheen.rokid.phone.actions.a11y.ScreenSnapshot
+import com.sheen.rokid.phone.actions.a11y.ScrollDirection
 import com.sheen.rokid.phone.actions.a11y.EdithAccessibilityService
+import com.sheen.rokid.phone.actions.intent.IntentAtomicExecutor
+import com.sheen.rokid.phone.actions.intent.LaunchAppExecutor
+import com.sheen.rokid.phone.actions.intent.SystemActionExecutor
 import com.sheen.rokid.phone.actions.device.DeviceKernelOperations
 import com.sheen.rokid.phone.actions.device.DeviceTool
 import com.sheen.rokid.phone.actions.device.DialTool
@@ -323,6 +336,13 @@ class HostCompositionRoot internal constructor(
 
     /** Debug-only seam: the production catalog, so an Activity can exercise the real gate + tool body. */
     internal var toolCatalogForProbe: com.sheen.rokid.phone.actions.device.ToolCatalog? = null
+
+    /**
+     * edith-0.3 Phase 4A Task 4: the one `Capability.Actions` provider the composition hands the host, exposed for the
+     * JVM gate only. Production never reads it; it lets `ToolFaceCompositionTest` assert the **wired** 22-name face
+     * rather than a hand-built look-alike.
+     */
+    internal var toolSurfaceForProbe: com.sheen.rokid.phone.actions.ToolSurface? = null
 
     /**
      * edith-0.3 Phase 2.2 Task 6: the production `open` tool, exposed only so the JVM gate can prove that the
@@ -2130,8 +2150,10 @@ class HostCompositionRoot internal constructor(
                 requestPanelOpen = { route -> rootHolder[0]?.requestPanelOpen(route) ?: false },
                 speechAvailable = { speechPlayerHolder.get() != null })
             // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
-            // One router is the single `Capability.Actions` provider, so the advertised tool set is exactly the set of
-            // channels that are up. Each channel is asked at read time, never cached.
+            // One `ToolSurface` is the single `Capability.Actions` provider (Phase 4A Task 4): the umbrella catalog's
+            // four verified tools plus the five atomic channel legs, 22 descriptors in all. The advertised set is fixed
+            // (A3): each channel is asked per call, never at read time, so a channel that goes down refuses rather than
+            // disappearing from the model's table.
             val shizukuShell = ShizukuUserServiceShell(context, BuildConfig.VERSION_CODE, BuildConfig.DEBUG,
                 // The bind is asynchronous, so the session's first probe can honestly read "not yet". This line is the
                 // moment the channel actually becomes usable - and it is what a device stage reads instead of guessing.
@@ -2214,10 +2236,11 @@ class HostCompositionRoot internal constructor(
                 glassesConnected = { hintLink.isEstablished() },
                 glassesWearing = { rootHolder[0]?.glassesWearing() },
             )
-            // ---- 0.25 Task 10: the six-tool surface (spec §4.7) -------------------------------------------------------
-            // `ToolCatalog` is the single `Capability.Actions` provider: four host tools whose channels are probed at
-            // read time (device/shell/open/dial). The old 21-tool `ExecutionRouter` is deliberately no longer wired -
-            // the plugin adds `notify_user`/`load_skill` beside this catalog, which makes exactly six.
+            // ---- 0.3 Phase 4A Task 4: the 22-host-tool surface (spec §4.1/§4.2) ---------------------------------------
+            // `ToolCatalog` is the umbrella half: four host tools (`device`/`shell`/`open`/`dial`) that stay advertised
+            // in every channel state (A3). The atomic legs built below it add the 18 fast-path tools, and the plugin
+            // adds `notify_user`/`load_skill` beside the surface - 24 model-visible tools in all. The old 21-tool
+            // `ExecutionRouter` remains retired from production.
             //
             // The accessibility port is resolved per call through the service's companion: the user can switch the
             // service off at any moment. Task 7 review I2 (R11): `device` stays advertised so its `status` action can
@@ -2363,6 +2386,79 @@ class HostCompositionRoot internal constructor(
                 observe = toolObservation,
                 capture = { perception.screenshot() },
             )
+            // ---- edith-0.3 Phase 4A Task 4 (A4): the 22-host-tool face ------------------------------------------
+            // `toolCatalog` is the umbrella half (the verified, structured path). The five atomic backends beside it are
+            // the fast path the model may choose instead: one leg per channel, each answering its own `available()` at
+            // call time. `ToolSurface` is the **one** `Capability.Actions` provider over both halves - 18 atomic
+            // descriptors plus the catalog's four = 22 - and it refuses a duplicate name at construction, which is why
+            // the intent leg filters `dial`: the catalog's `DialTool` is that name's only advertised owner.
+            //
+            // Advertising is stable (A3): a channel that is down keeps its tools advertised and its own `execute`
+            // answers the refusal, so the schema and the cached prompt prefix cannot change under the model mid-session.
+            //
+            // The atomic a11y backend needs the live `AccessibilityUi`, and the composition is assembled before the
+            // service connects, so the adapter resolves it per call exactly as `accessibilityPort` above does. A call
+            // that passes the backend's `connected` gate finds the live instance; an unbound one is the backend's own
+            // `ACTION_CHANNEL_UNAVAILABLE` refusal, never a stale or fabricated UI.
+            val accessibilityUi = object : AccessibilityUi {
+                private fun live(): AccessibilityUi = EdithAccessibilityService.ui()
+                    ?: throw IllegalStateException("the accessibility service is not connected")
+
+                override fun clickText(text: String): Boolean = live().clickText(text)
+                override fun setText(text: String): Boolean = live().setText(text)
+                override fun screenFingerprint(): String = live().screenFingerprint()
+                override fun snapshot(filter: A11yScreenFilter): ScreenSnapshot = live().snapshot(filter)
+                override fun clickByIndex(snapshotId: String, index: Int): Boolean = live().clickByIndex(snapshotId, index)
+                override fun longPressByIndex(snapshotId: String, index: Int): Boolean =
+                    live().longPressByIndex(snapshotId, index)
+                override fun scroll(direction: ScrollDirection): Boolean = live().scroll(direction)
+                override fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean =
+                    live().setTextByIndex(snapshotId, index, text)
+                override fun structuralFingerprint(): ScreenFingerprint = live().structuralFingerprint()
+            }
+            // `launch_app`/`list_apps` resolve spoken names against the same `appCatalog` instance the umbrella `open`
+            // tool uses. `open_app` (intent) resolves through its own executor's package catalog over the same package
+            // manager, so the three paths cannot disagree about what is installed.
+            val atomicLaunchResolver = AppLaunchResolver(appCatalog)
+            val atomicExecutors = listOf(
+                // accessibility: the semantic UI fast path (`read_screen`/`tap`/...)
+                AtomicActionExecutor(
+                    AccessibilityExecutionBackend(
+                        ui = accessibilityUi,
+                        connected = { EdithAccessibilityService.connected() },
+                    ),
+                ),
+                // intent: the L0/L1 open/alarm/note actions, without the `dial` advertisement the catalog owns
+                IntentAtomicExecutor(actions),
+                // Shizuku: the privileged four plus `set_brightness`; its own `available()` gates every call
+                AtomicActionExecutor(
+                    ShizukuExecutionBackend(
+                        shell = shizukuShell,
+                        state = ShizukuTargetState(shizukuShell),
+                        channelUp = { shizukuShell.ready() },
+                    ),
+                ),
+                // Shizuku: `launch_app`/`list_apps` (their own L0/L1 group, same binder)
+                AtomicActionExecutor(
+                    LaunchAppExecutor(
+                        resolver = atomicLaunchResolver,
+                        catalog = appCatalog,
+                        shell = shizukuShell,
+                        channelUp = { shizukuShell.ready() },
+                    ),
+                ),
+                // Shizuku: back/home/recents/notifications
+                AtomicActionExecutor(
+                    SystemActionExecutor(shell = shizukuShell, channelUp = { shizukuShell.ready() }),
+                ),
+            )
+            // The catalog is closed through the surface's `onClose` (after the atomic executors), so the composition's
+            // close path below adds the **surface** and not the catalog: one owner, one close.
+            val toolSurface = ToolSurface(
+                catalog = toolCatalog,
+                atomic = atomicExecutors,
+                onClose = { toolCatalog.close() },
+            )
             val confirmationUi = object : ConfirmationUi {
                 // Through the holder: this object is built inside `create`, where no composition instance exists yet,
                 // and the question is shown only after a session starts - by which time the holder is filled.
@@ -2465,9 +2561,10 @@ class HostCompositionRoot internal constructor(
                     audio?.let { put(Capability.Asr, it.asrSession) }
                     // Task 12: always answerable - the five L0/L1 actions need no engine, no transport and no
                     // permission at assembly time, so the advertised set and the answerable set stay equal.
-                    // 0.25 Task 10 (R40/R47): it is now the four-tool `ToolCatalog`, whose descriptors are gated on
-                    // live channel probes; the old 21-tool router is retired from production.
-                    put(Capability.Actions, toolCatalog)
+                    // 0.3 Phase 4A Task 4: it is the one `ToolSurface` - the 18 atomic tools plus the catalog's four
+                    // (22 host descriptors). A down channel keeps its tools and answers its own refusal (A3); the
+                    // plugin adds `notify_user`/`load_skill` beside it for 24. The old 21-tool router stays retired.
+                    put(Capability.Actions, toolSurface)
                     // P3.3: the confirmation channel is answerable whenever the composition has a screen to show the
                     // question on; a host that cannot ask must refuse the action, and this provider is what lets it ask.
                     put(Capability.Confirmation, confirmationPresenter)
@@ -2523,9 +2620,10 @@ class HostCompositionRoot internal constructor(
                     timer.shutdownNow(); pluginTasks.shutdownNow()
                     http.dispatcher.executorService.shutdown(); http.connectionPool.evictAll()
                 })
-                // 0.25 Task 10 (R42): closing the catalog closes the device kernel (its worker pool), so a closed
-                // composition cannot leave a device thread behind.
-                add(toolCatalog)
+                // 0.25 Task 10 (R42): closing the surface closes the device kernel (through the catalog's onClose) and
+                // any closeable atomic executor, so a closed composition cannot leave a device thread behind. The
+                // surface is added here **instead of** the catalog: one owner, so the catalog closes exactly once.
+                add(toolSurface)
                 // Closes the pipeline (and with it the native engines) with the composition that owns them.
                 audio?.let { add(it) }
                 // 0.23 P5: the chime's ToneGenerator is a native resource; release it with the composition.
@@ -2571,6 +2669,8 @@ class HostCompositionRoot internal constructor(
             root.lockPinStore = lockPinStore
             root.unlockCoordinatorForProbe = unlockGate
             root.toolCatalogForProbe = toolCatalog
+            // Phase 4A Task 4: the one `Capability.Actions` provider, for the JVM gate. Production never reads it.
+            root.toolSurfaceForProbe = toolSurface
             // Task 6: the JVM gate reads the same `open` instance the Actions capability serves, so it can prove the
             // observation source was really wired into `OpenTool(observe = ...)`.
             root.openToolForProbe = openTool

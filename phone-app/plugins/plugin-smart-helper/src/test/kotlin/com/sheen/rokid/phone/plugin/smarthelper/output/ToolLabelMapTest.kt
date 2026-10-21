@@ -7,15 +7,15 @@ import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
- * R48: the tool row labels the model's six-tool surface actually needs.
+ * R48: the user-facing labels for the umbrella half of the tool face.
  *
- * Since 0.25 Task 10 the host advertises four device tools (`device`/`shell`/`open`/`dial`) and the
- * plugin adds its own `notify_user`/`load_skill`; the old 21-tool router labels are retired, and the
+ * Since edith-0.3 Phase 4A Task 4 the production face is 22 host descriptors (the umbrella four this map covers plus 18
+ * atomic tools) and the plugin's `notify_user`/`load_skill`. The atomic 18 get their labels in Phase 4A Task 5; the
  * plugin's two answer/skill tools are not device actions and deliberately stay out of this table.
  */
 class ToolLabelMapTest {
 
-    /** The four host tools the ToolCatalog advertises, in descriptor order. */
+    /** The four umbrella tools `ToolCatalog` advertises, in descriptor order. */
     private val hostTools = listOf(
         "device" to "设备控制",
         "shell" to "终端命令",
@@ -26,7 +26,7 @@ class ToolLabelMapTest {
     @Test
     fun everyHostToolIsRegisteredWithItsUserFacingLabel() {
         assertEquals(hostTools.size, ToolLabelMap.entries.size,
-            "the map must cover exactly the four host tools")
+            "the map must cover exactly the four umbrella tools")
         hostTools.forEach { (action, label) ->
             assertTrue(ToolLabelMap.isRegistered(action), "$action must be registered")
             assertEquals(label, ToolLabelMap.labelFor(action), "$action label")
@@ -34,7 +34,9 @@ class ToolLabelMapTest {
     }
 
     @Test
-    fun theRetiredRouterActionsAreGone() {
+    fun theAtomicToolsHaveNoLabelEntryYet() {
+        // Phase 4A Task 4 wires the atomic 18 into the host face; Phase 4A Task 5 adds their labels. Until then the map
+        // must not claim them early, and a tool row falls back to the raw model name.
         listOf(
             "read_screen", "tap", "long_press", "scroll", "input_text", "open_app", "open_url",
             "open_settings", "set_alarm", "compose_note", "launch_app", "list_apps", "system_action",

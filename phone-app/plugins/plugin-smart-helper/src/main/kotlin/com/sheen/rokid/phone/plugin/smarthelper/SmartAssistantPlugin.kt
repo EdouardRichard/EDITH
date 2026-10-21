@@ -3595,23 +3595,33 @@ class SmartAssistantPlugin(
      *
      * `load_skill` is the plugin's **one** tool instance (see [loadSkillTool]); this method must never construct a new
      * one, or the counter receipt restarts and `ProgressGuard` mistakes a working pull for `NO_PROGRESS`.
+     *
+     * edith-0.3 Phase 4A Task 4 (A4): the host half is the 22-descriptor `ToolSurface` (18 atomic + 4 umbrella), so this
+     * registry is the 24-tool default face. Every build reports one **count-only** `P4_TOOLFACE` line: `tools` is the
+     * model-visible tool count after `ToolRegistry`'s duplicate merge, `duplicate` is how many declarations that merge
+     * absorbed (0 on the pinned Phase 4A face). No tool name, argument or content may reach the line (D117).
      */
-    private fun registryFor(context: PluginContext, owned: SmartTurn, ledger: NotifyLedger): ToolRegistry =
-        ToolRegistry(
-            listOf(
-                // 0.25 Task 11 (R52): every host action passes the precheck gate first. `notify_user`/`load_skill` are
-                // added beside the wrapper, not inside it, so they never grow a command-level confirmation.
-                ConfirmingActions(
-                    host = context.services.actions(),
-                    confirmation = confirmation,
-                    canAsk = { confirmation.canAsk },
-                ),
-                // B7: `notify_user` is the model's only channel to the wearer (spec §6.1). It rides the action
-                // registry rather than a new tool port, and `NotifyUserTool`'s KDoc records what that choice costs.
-                NotifyUserTool { channel, text -> onNotify(owned, ledger, channel, text) },
-                loadSkillTool,
+    private fun registryFor(context: PluginContext, owned: SmartTurn, ledger: NotifyLedger): ToolRegistry {
+        val executors = listOf(
+            // 0.25 Task 11 (R52): every host action passes the precheck gate first. `notify_user`/`load_skill` are
+            // added beside the wrapper, not inside it, so they never grow a command-level confirmation.
+            ConfirmingActions(
+                host = context.services.actions(),
+                confirmation = confirmation,
+                canAsk = { confirmation.canAsk },
             ),
+            // B7: `notify_user` is the model's only channel to the wearer (spec §6.1). It rides the action
+            // registry rather than a new tool port, and `NotifyUserTool`'s KDoc records what that choice costs.
+            NotifyUserTool { channel, text -> onNotify(owned, ledger, channel, text) },
+            loadSkillTool,
         )
+        val registry = ToolRegistry(executors)
+        val declaredNames = executors.flatMap { executor -> executor.descriptors() }.map { it.name }
+        P3Log.line(
+            "P4_TOOLFACE tools=${registry.descriptors().size} duplicate=${declaredNames.size - declaredNames.toSet().size}",
+        )
+        return registry
+    }
 
     /** The registry's tools in wire shape, which is what a [RequestFrame] carries. */
     private fun toolSpecsOf(registry: ToolRegistry): List<ToolSpec> =

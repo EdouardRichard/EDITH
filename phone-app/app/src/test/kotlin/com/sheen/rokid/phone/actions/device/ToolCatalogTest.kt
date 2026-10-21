@@ -47,8 +47,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * R40/R47: the production `Capability.Actions` provider is exactly the four host tools, with no fallback to the retired
- * 21.
+ * R40/R47: the umbrella half of the production tool face is exactly the four host tools, with no fallback to the retired
+ * 21-tool router. Since edith-0.3 Phase 4A Task 4 the one `Capability.Actions` provider is `ToolSurface`, which joins
+ * this catalog with the 18 atomic tools (22 host descriptors in all); this suite still pins the catalog **alone**.
  *
  * edith-0.3 Phase 4A Task 3 (A3): advertising is **stable**. A channel that goes down no longer removes its tool - the
  * schema and the cached prompt prefix must not change under the model mid-session - so `descriptors()` always answers
@@ -70,12 +71,17 @@ class ToolCatalogTest {
             "set_alarm", "compose_note", "launch_app", "list_apps", "system_action", "clear_data", "uninstall",
             "disable_app", "set_permission", "set_brightness",
         )
-        assertTrue("the old tool surface must not survive: ${retired.intersect(names.toSet())}",
-            retired.intersect(names.toSet()).isEmpty())
+        assertTrue(
+            "the catalog must not re-advertise the atomic names (ToolSurface adds them beside it): " +
+                "${retired.intersect(names.toSet())}",
+            retired.intersect(names.toSet()).isEmpty(),
+        )
     }
 
     @Test
-    fun `the plugins two tools make the model-visible surface exactly six`() {
+    fun `a catalog-only registry answers the umbrella four plus the plugin's two`() {
+        // The production face is 22 host descriptors plus these two (ToolFaceCompositionTest and
+        // SmartToolFaceRegistryTest pin that). This test keeps the catalog-alone seam honest, not the production count.
         val registry = ToolRegistry(
             listOf(
                 catalog(),
