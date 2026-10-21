@@ -20,10 +20,12 @@ import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.DeviceState
 import com.sheen.rokid.plugin.DeviceStateProvider
+import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.MediaState
 import com.sheen.rokid.plugin.NotificationItem
 import com.sheen.rokid.plugin.PerceptionFilter
 import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
 import com.sheen.rokid.plugin.PerceptionSnapshot
 import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.RiskLevel
@@ -265,6 +267,9 @@ class DeviceTool(
             // Refresh first, then project the caller's include/filter/limit from the new snapshot.
             provider.refresh()
             val snapshot = provider.snapshot(include, filter.toPerceptionFilter(), limit)
+            // 0.3 Phase 2.1 Task 3: only a screen read has something to look at; any other include returns a snapshot
+            // whose `vision` would be a capture the model never asked for.
+            val capture = if (PerceptionSource.SCREEN in include) captureVision() else null
             // A read through the perception port already answered: there is no kernel envelope to project, but every
             // `device` call keeps the same model-facing envelope shape.
             result(
@@ -276,7 +281,8 @@ class DeviceTool(
                     verified = null,
                     timing = Timing(0, 0, 0),
                 ),
-                observationData(snapshot, include),
+                withVision(observationData(snapshot, include), capture),
+                extraImages = capturedImage(capture),
             )
         }
     }
@@ -323,10 +329,16 @@ class DeviceTool(
             "STALE_REF is only reachable when the perception provider owns the ref gate"
         }
         val snapshot = provider.refresh()
-        val data = buildJsonObject {
-            put("snapshot", CompactSnapshotRenderer.render(snapshot))
-            put("coverage", PerceptionCoverageRenderer.render(snapshot.coverage))
-        }
+        // Task 3: the refreshed screen is exactly what the model needs to re-target, so the refusal carries its image
+        // and the same vision marker an observe would.
+        val capture = captureVision()
+        val data = withVision(
+            buildJsonObject {
+                put("snapshot", CompactSnapshotRenderer.render(snapshot))
+                put("coverage", PerceptionCoverageRenderer.render(snapshot.coverage))
+            },
+            capture,
+        )
         val detail = toolEnvelope(
             tool = NAME,
             ok = false,
@@ -338,7 +350,12 @@ class DeviceTool(
                 recoverable = true,
             ),
         )
-        return ActionResult(ActionOutcome.Refused, detail, nonPersistent = true)
+        return ActionResult(
+            ActionOutcome.Refused,
+            detail,
+            images = capturedImage(capture),
+            nonPersistent = true,
+        )
     }
 
     /** The [RefResult.Ok] resolution when this call is gated, or null when the gate does not apply/cannot decide. */
@@ -372,13 +389,45 @@ class DeviceTool(
      */
     private fun actResult(envelope: DeviceEnvelope, revisionBefore: Long?): ActionResult {
         val data = decorateActData(project(envelope, lastFilter), envelope)
+        // Task 3: the capture follows `afterAction()`, so the image is the screen the action produced. `scrollToText`
+        // reaches this through its single returned envelope, which is why the loop never captures per inner scroll.
+        val capture = captureVision()
         return result(
             envelope,
-            data,
+            withVision(data, capture),
             fingerprintAfter(envelope, revisionBefore),
             stateChanging = true,
+            extraImages = capturedImage(capture),
         )
     }
+
+    /**
+     * Task 3: the automatic vision capture, or `null` when this composition has no perception port.
+     *
+     * The user's switch and the profile's image capability are gates inside [PerceptionProvider.screenshot] (Task 2),
+     * so the tool does not duplicate them: [PerceptionScreenshotResult.Disabled] and
+     * [PerceptionScreenshotResult.Unavailable] are answers, never exceptions. The caller captures **after** the
+     * observation it decorates, so the image and the text describe the same screen.
+     */
+    private fun captureVision(): PerceptionScreenshotResult? = perception?.screenshot()
+
+    /** Task 3: adds the model-facing vision marker to [data]; `null` leaves the shape untouched. */
+    private fun withVision(data: JsonObject, capture: PerceptionScreenshotResult?): JsonObject {
+        val marker = when (capture) {
+            null -> return data
+            is PerceptionScreenshotResult.Image -> VISION_MARKER_OK
+            PerceptionScreenshotResult.Disabled -> VISION_MARKER_DISABLED
+            is PerceptionScreenshotResult.Unavailable -> "$VISION_MARKER_UNAVAILABLE(${capture.reason})"
+        }
+        return buildJsonObject {
+            data.forEach { (key, value) -> put(key, value) }
+            put(VISION_KEY, marker)
+        }
+    }
+
+    /** Task 3: the captured artifact, if the capture produced one; a disabled/unavailable capture adds no image. */
+    private fun capturedImage(capture: PerceptionScreenshotResult?): List<ImageRef> =
+        listOfNotNull((capture as? PerceptionScreenshotResult.Image)?.image)
 
     /**
      * Task 7: a forced post-action perception read.
@@ -793,6 +842,7 @@ class DeviceTool(
         data: JsonObject,
         fingerprint: String? = null,
         stateChanging: Boolean = false,
+        extraImages: List<ImageRef> = emptyList(),
     ): ActionResult {
         val outcome = when {
             envelope.ok -> ActionOutcome.Done
@@ -803,12 +853,15 @@ class DeviceTool(
         // JSON. A screenshot answers a real stored `ImageRef` (or the `pending` placeholder with its diagnostic), and
         // this projection is what lets the agent loop carry it to the model request. Every other action's envelope
         // carries an empty list, so their results keep the old shape.
+        // 0.3 Phase 2.1 Task 3: automatic vision appends its capture here rather than through the kernel envelope, so the
+        // JSON `images` and the model request stay one list. When no capture ran, `extraImages` is empty and the shape
+        // is exactly the 0.25 one.
         return ActionResult(
             outcome,
             renderEnvelope(envelope, data),
             fingerprint,
             stateChanging,
-            images = envelope.images,
+            images = envelope.images + extraImages,
             nonPersistent = true,
         )
     }
@@ -978,6 +1031,10 @@ class DeviceTool(
         private const val TEXT_KEY = "text"
         private const val CHANGED_KEY = "changed"
         private const val NOTE_KEY = "note"
+        private const val VISION_KEY = "vision"
+        private const val VISION_MARKER_OK = "ok"
+        private const val VISION_MARKER_DISABLED = "disabled"
+        private const val VISION_MARKER_UNAVAILABLE = "unavailable"
         private const val STATUS_KEY = "status"
         private const val DEVICE_KEY = "device"
         private const val MEDIA_KEY = "media"

@@ -976,6 +976,161 @@ class DeviceToolTest {
         assertEquals("full", screen["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
     }
 
+    // - Phase 2.1 Task 3: auto vision on observe/act -
+
+    private fun screenshotImage(id: String): PerceptionScreenshotResult.Image =
+        PerceptionScreenshotResult.Image(
+            image = ImageRef(id, "image/jpeg", 720, 1280, "sha-$id"),
+            mime = "image/jpeg",
+            width = 720,
+            height = 1280,
+        )
+
+    private fun visionOf(result: ActionResult): String =
+        body(result)["data"]!!.jsonObject["vision"]!!.jsonPrimitive.content
+
+    @Test
+    fun `observe attaches one screenshot and vision ok`() {
+        val perception = FakePerception(snapshot = perceptionSnapshot())
+        perception.screenshotResult = screenshotImage("img-1")
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"observe"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("the screen include asks for exactly one capture", 1, perception.screenshotCalls)
+        assertEquals("img-1", result.images.single().artifactId)
+        assertEquals("ok", visionOf(result))
+    }
+
+    @Test
+    fun `observe without screen include does not capture`() {
+        val perception = FakePerception(snapshot = perceptionSnapshot())
+        perception.screenshotResult = screenshotImage("img-notifications")
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"observe","include":["notifications"]}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(0, perception.screenshotCalls)
+        assertTrue(result.images.isEmpty())
+        assertFalse(
+            "a non-screen observe must not advertise vision it did not capture: ${body(result)["data"]}",
+            body(result)["data"]!!.jsonObject.containsKey("vision"),
+        )
+    }
+
+    @Test
+    fun `observe when vision disabled still succeeds without image`() {
+        val perception = FakePerception(snapshot = perceptionSnapshot())
+        perception.screenshotResult = PerceptionScreenshotResult.Disabled
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"observe"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(1, perception.screenshotCalls)
+        assertTrue(result.images.isEmpty())
+        assertEquals("disabled", visionOf(result))
+    }
+
+    @Test
+    fun `act attaches post action screenshot and vision ok`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(snapshotId = "snap-after-act"),
+        )
+        perception.screenshotResult = screenshotImage("img-act")
+
+        val result = tool(operations, perception = perception)
+            .execute("""{"action":"act","kind":"home"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertTrue("the post-action read must precede the capture", perception.afterActions >= 1)
+        assertEquals(1, perception.screenshotCalls)
+        assertEquals("img-act", result.images.single().artifactId)
+        assertEquals("ok", visionOf(result))
+    }
+
+    @Test
+    fun `stale ref answer returns fresh screenshot and stale code`() {
+        val observation = observation(rev = 1, nodes = listOf(node("A")))
+        val operations = FakeDeviceOperations(observation)
+        val actionRegistry = RefRegistry()
+        actionRegistry.beginSnapshot("snap-old", 500L, "com.example.settings", null)
+        actionRegistry.assign(observation)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(snapshotId = "snap-old-cache"),
+            refreshedSnapshot = perceptionSnapshot(
+                snapshotId = "snap-fresh",
+                elements = listOf(perceptionElement(ref = "#n9", text = "A")),
+            ),
+        )
+        perception.screenshotResult = screenshotImage("img-stale")
+
+        val result = tool(
+            operations,
+            perception = perception,
+            refRegistry = actionRegistry,
+            foreground = { Foreground("com.example.settings", null) },
+            nowMillis = { 1_000L },
+            refTtlMillis = { 0L },
+        ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("STALE_REF", body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("the refreshed screen is captured for the refusal", 1, perception.screenshotCalls)
+        assertEquals("img-stale", result.images.single().artifactId)
+        assertEquals("ok", visionOf(result))
+        assertTrue("the stale answer remains non-persistent", result.nonPersistent)
+        assertTrue("the action must not be dispatched", operations.actCalls.isEmpty())
+    }
+
+    @Test
+    fun `observe screenshot unavailable keeps result and carries reason`() {
+        val perception = FakePerception(snapshot = perceptionSnapshot())
+        perception.screenshotResult = PerceptionScreenshotResult.Unavailable("SCREENSHOT_FAILED")
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"observe"}""")
+
+        assertEquals("a failed capture does not fail the observation", ActionOutcome.Done, result.outcome)
+        assertTrue(result.images.isEmpty())
+        assertEquals("unavailable(SCREENSHOT_FAILED)", visionOf(result))
+    }
+
+    @Test
+    fun `scroll to text captures one screenshot for the final result`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.waitEnvelopes.add(failure("wait", "VERIFY_TIMEOUT", recoverable = true))
+        operations.waitEnvelopes.add(
+            DeviceEnvelope.success(
+                action = "wait",
+                channel = "accessibility",
+                accepted = true,
+                applied = true,
+                verified = null,
+                timing = Timing(0, 0, 0),
+            ),
+        )
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(snapshotId = "snap-after-scroll"),
+        )
+        perception.screenshotResult = screenshotImage("img-scroll")
+
+        val result = tool(operations, perception = perception).execute(
+            """{"action":"act","kind":"scroll_to_text","text":"目标","timeout_ms":5000}""",
+        )
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("two inner scroll rounds ran", 2, operations.actCalls.size)
+        assertEquals("only the one final actResult captures", 1, perception.screenshotCalls)
+        assertEquals("img-scroll", result.images.single().artifactId)
+        assertEquals("ok", visionOf(result))
+    }
+
     @Test
     fun `observe truncation keys the screen flag off the screen coverage not the snapshot`() {
         // Task 7 review I3: notifications cut at the policy cap set the snapshot-wide `truncated`, which used to mark a
@@ -1538,6 +1693,8 @@ class DeviceToolTest {
         var afterActions = 0
         var refreshCalls = 0
         var snapshotCalls = 0
+        var screenshotCalls = 0
+        var screenshotResult: PerceptionScreenshotResult = PerceptionScreenshotResult.Disabled
         var lastInclude: Set<PerceptionSource>? = null
         var lastFilter: PerceptionFilter? = null
         var lastLimit: Int? = null
@@ -1567,7 +1724,10 @@ class DeviceToolTest {
             return afterActionSnapshot ?: snapshot
         }
 
-        override fun screenshot(): PerceptionScreenshotResult = PerceptionScreenshotResult.Disabled
+        override fun screenshot(): PerceptionScreenshotResult {
+            screenshotCalls++
+            return screenshotResult
+        }
 
         override fun endTurn() = Unit
     }
