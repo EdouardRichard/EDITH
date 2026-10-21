@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.actions.a11y
 import com.sheen.rokid.phone.storage.unavailable
 import com.sheen.rokid.phone.actions.ExecutionBackend
 import com.sheen.rokid.phone.actions.ExecutionRouter
+import com.sheen.rokid.phone.actions.device.DeviceTool
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
@@ -306,18 +307,32 @@ class ToolSurfaceWiringTest {
             assertFalse("${d.name} reversible", d.reversible)
         }
 
-        // Risk levels
+        // Risk levels (A2: the atomic a11y writes are L1, same as the umbrella `device` tool)
         assertEquals(RiskLevel.L1, byName["read_screen"]?.risk)
-        assertEquals(RiskLevel.L2, byName["tap"]?.risk)
-        assertEquals(RiskLevel.L2, byName["long_press"]?.risk)
+        assertEquals(RiskLevel.L1, byName["tap"]?.risk)
+        assertEquals(RiskLevel.L1, byName["long_press"]?.risk)
         assertEquals(RiskLevel.L1, byName["scroll"]?.risk)
-        assertEquals(RiskLevel.L2, byName["input_text"]?.risk)
+        assertEquals(RiskLevel.L1, byName["input_text"]?.risk)
 
         // Idempotent: only scroll could be true, but spec says false for all except scroll
         assertFalse(byName["read_screen"]!!.idempotent)
         assertFalse(byName["tap"]!!.idempotent)
         assertFalse(byName["long_press"]!!.idempotent)
         assertFalse(byName["input_text"]!!.idempotent)
+    }
+
+    @Test
+    fun `tap long_press and input_text carry the same risk as the device tool`() {
+        val byName = backend(FakeUi()).descriptors().associateBy { it.name }
+        val deviceRisk = DeviceTool.DESCRIPTOR.risk
+
+        listOf("tap", "long_press", "input_text").forEach { name ->
+            assertEquals(
+                "$name must match the umbrella device tool's risk",
+                deviceRisk,
+                byName.getValue(name).risk,
+            )
+        }
     }
 
     @Test
