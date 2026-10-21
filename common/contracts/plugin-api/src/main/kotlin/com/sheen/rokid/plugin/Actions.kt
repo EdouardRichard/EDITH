@@ -87,6 +87,21 @@ data class ActionDescriptor(
      * human wait, because the turn deadline would still clamp it.
      */
     val mayAskHuman: Boolean = false,
+    /**
+     * edith-0.3 Phase 2.2 Task 3: whether one call of this action **touches the screen**, so its non-successful result
+     * should still carry a best-effort post-call observation for the model.
+     *
+     * This is deliberately **not** [observation]: that flag means the call returns a fingerprint for the loop's
+     * progress detectors (`open` changes the screen but declares `observation = false`), while this one means the host
+     * has a screen to observe after the call. Only `device`/`open`/`shell`/`dial` declare it `true` (Tasks 4-6); a pure
+     * plugin tool (`notify_user`, `load_skill`) keeps the default `false`, because inventing a screen observation for a
+     * tool that never looks at one would be a fabricated fact.
+     *
+     * `agent-runtime` reads it only for a **non-`Done`** result that carries no observation of its own: it asks the
+     * injected `ToolObservationSource` for one with a short deadline, and records `vision = unavailable` plus a reason
+     * (`no_source` / `observation_timeout`) when none can be had. A successful call's observation belongs to the tool.
+     */
+    val screenObservation: Boolean = false,
 ) {
     init {
         require(name.isNotBlank())

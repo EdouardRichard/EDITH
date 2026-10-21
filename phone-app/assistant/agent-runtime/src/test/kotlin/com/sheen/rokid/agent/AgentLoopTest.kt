@@ -10,8 +10,10 @@ import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
 import com.sheen.rokid.plugin.ToolOutcome
 import com.sheen.rokid.plugin.ToolSpec
+import com.sheen.rokid.plugin.ToolVision
 import com.sheen.rokid.testsupport.FakeClock
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -32,6 +34,7 @@ class AgentLoopTest {
         onTextDelta: ((String) -> Unit)? = null,
         onToolStatus: ((String, ToolPhase) -> Unit)? = null,
         history: List<ModelHistoryItem> = emptyList(),
+        observationSource: ToolObservationSource? = null,
     ) = AgentRequest(
         turnId = "turn-7",
         utterance = "把音量调小一点",
@@ -42,6 +45,7 @@ class AgentLoopTest {
         onTextDelta = onTextDelta,
         onToolStatus = onToolStatus,
         history = history,
+        observationSource = observationSource,
     )
 
     private fun newLoop(
@@ -1109,6 +1113,249 @@ class AgentLoopTest {
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals("done", run.finalText)
         assertEquals(2, run.steps.size)
+    }
+
+    // ---------------------------------------------------------------- failure observation (0.3 Phase 2.2 Task 3)
+
+    /**
+     * The envelope part of one model-facing tool output. The loop appends its stable `LOOP_HINT` **after** the envelope,
+     * so a test that pins the result contract compares the envelope alone; the hints have their own tests.
+     */
+    private fun envelopePart(output: ModelHistoryItem.ToolOutput): String =
+        output.output.substringBefore("\n\nLOOP_HINT:")
+
+    @Test fun `a policy refusal of a screen tool reports an unavailable observation when no source exists`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("device.set_volume", screenObservation = true)))
+        val policy = ScriptedPolicy(mapOf("device.set_volume" to PolicyDecision.Refuse))
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "那就不动")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor)), policy = policy).run(request())
+
+        assertTrue(executor.calls.isEmpty(), "a refused action never reaches the executor")
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(
+                    outcome = ToolOutcome.Failed,
+                    code = "REFUSED_BY_POLICY",
+                    accepted = false,
+                    applied = false,
+                ),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "no_source"),
+                data = "",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a failed screen tool gets the source observation with the short failure deadline`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val observation = ToolObservation(
+            foregroundPackage = "com.example.launcher",
+            screen = "Home",
+            vision = ToolVision.Ok,
+        )
+        val deadlines = mutableListOf<Long>()
+        val source = ToolObservationSource { deadlineMillis ->
+            deadlines += deadlineMillis
+            observation
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "看到了")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(listOf(250L), deadlines, "a failure observation gets its own short deadline")
+        assertEquals(
+            ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Failed), observation, "STATE_UNCHANGED"),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a pure tool failure never asks the observation source`() {
+        val executor = executorOf("notify_user")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "DELIVERY_FAILED") }
+        var observed = 0
+        val source = ToolObservationSource {
+            observed++
+            ToolObservation(screen = "Home")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "notify_user"))), reply(text = "知道了")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(0, observed, "a pure tool must keep observation=null instead of inventing a screen")
+        assertEquals(
+            ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Failed), null, "DELIVERY_FAILED"),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a throwing screen tool is uncertain and carries the best-effort observation`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("shell", screenObservation = true)))
+        executor.failure = IllegalStateException("boom")
+        val observation = ToolObservation(screen = "Home", vision = ToolVision.Ok)
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "shell"))), reply(text = "先不动")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(observationSource = { observation }),
+        )
+
+        assertEquals("TOOL_THREW", run.steps.single().result)
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(outcome = ToolOutcome.Uncertain, code = "TOOL_THREW", uncertain = true),
+                observation,
+                data = "",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a throwing screen tool without a source still reports an unavailable observation`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("shell", screenObservation = true)))
+        executor.failure = IllegalStateException("boom")
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "shell"))), reply(text = "先不动")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(outcome = ToolOutcome.Uncertain, code = "TOOL_THREW", uncertain = true),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "no_source"),
+                data = "",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `an observation source that returns null yields observation timeout`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "没看到")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(observationSource = ToolObservationSource { null }),
+        )
+
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(outcome = ToolOutcome.Failed),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "observation_timeout"),
+                data = "STATE_UNCHANGED",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a throwing observation source yields observation timeout and never fails the run`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "没看到")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(observationSource = ToolObservationSource { throw IllegalStateException("capture timed out") }),
+        )
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome, "an observation failure is never a run failure")
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(outcome = ToolOutcome.Failed),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "observation_timeout"),
+                data = "STATE_UNCHANGED",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a tool supplied observation is authoritative and is never replaced`() {
+        val toolObservation = ToolObservation(screen = "tool screen", vision = ToolVision.Ok)
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", observation = toolObservation)
+        }
+        var observed = 0
+        val source = ToolObservationSource {
+            observed++
+            ToolObservation(screen = "source screen", vision = ToolVision.Ok)
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "看到了")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(0, observed, "the loop must not overwrite an observation the tool already supplied")
+        assertEquals(
+            ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Failed), toolObservation, "STATE_UNCHANGED"),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a successful screen tool is not observed by the loop`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("device", screenObservation = true)))
+        var observed = 0
+        val source = ToolObservationSource {
+            observed++
+            ToolObservation(screen = "Home")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device"))), reply(text = "好了")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(0, observed, "a success observation belongs to the tool (Tasks 4-6), not the failure observer")
+        assertEquals(
+            ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Done), null, "done"),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a denied confirmation of a screen tool still gets a best-effort observation`() {
+        val executor = RecordingActionExecutor(
+            listOf(actionDescriptor("app.uninstall", requiresConfirmation = true, screenObservation = true)),
+        )
+        val observation = ToolObservation(screen = "Home", vision = ToolVision.Ok)
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "app.uninstall"))), reply(text = "那就不动")),
+        )
+
+        val run = newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("app.uninstall" to PolicyDecision.RequireConfirmation("卸载?"))),
+            confirmation = ScriptedConfirmation(ConfirmationOutcome(false, ConfirmationSource.PHONE)),
+        ).run(request(observationSource = { observation }))
+
+        assertTrue(executor.calls.isEmpty(), "a denied action must never execute")
+        assertEquals("CONFIRMATION_DENIED", run.steps.single().result)
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(
+                    outcome = ToolOutcome.Failed,
+                    code = "CONFIRMATION_DENIED",
+                    accepted = false,
+                    applied = false,
+                ),
+                observation,
+                data = "",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
     }
 
     // ------------------------------------------------- the confirmation wait is not the turn's budget (D49)

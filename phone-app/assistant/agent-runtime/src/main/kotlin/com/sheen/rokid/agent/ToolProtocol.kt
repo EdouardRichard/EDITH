@@ -98,7 +98,8 @@ data class ToolResult(
          * tool, unparsable arguments, or a policy/confirmation refusal.
          *
          * The action was never dispatched, so `accepted=false` and `applied=false` are facts, not guesses; no observation
-         * is fabricated. The code is the stable machine identity the loop's error detectors already key on — the old
+         * is fabricated here (the loop may add a best-effort screen observation for a `screenObservation` descriptor).
+         * The code is the stable machine identity the loop's error detectors already key on — the old
          * `"Failed: "`/`"Refused: "` prefix is deliberately gone. A **dispatched** call that threw is not this shape:
          * see [threw].
          */
@@ -118,7 +119,9 @@ data class ToolResult(
          * A **dispatched** call whose executor threw: the tool may have applied part of the call, so no tri-state fact
          * is known (`accepted`/`applied`/`changed` stay `null`) and the result is explicitly [ToolExecution.uncertain].
          *
-         * The stable code is `TOOL_THREW`; no observation is fabricated.
+         * The stable code is `TOOL_THREW`; no observation is fabricated. A screen tool's thrown result is enriched
+         * best-effort by `AgentLoop` after projection, which records an unavailable observation rather than a silent
+         * `null` when the source is missing or cannot answer in time.
          */
         fun threw(id: String): ToolResult = ToolResult(
             id = id,
@@ -175,6 +178,15 @@ data class ToolDescriptor(
      * out of the turn deadline instead of letting either cut a legal answer (D49).
      */
     val mayAskHuman: Boolean = false,
+    /**
+     * edith-0.3 Phase 2.2 Task 3: projected from [com.sheen.rokid.plugin.ActionDescriptor.screenObservation] — this
+     * tool touches the screen, so a failed call must come back with a best-effort observation (or an explicit
+     * `unavailable` one) instead of a silent `null`.
+     *
+     * It is separate from [observation]: the latter is the fingerprint/progress declaration. `false` — the default —
+     * keeps every pure tool out of the failure observer, preserving `observation = null` for it.
+     */
+    val screenObservation: Boolean = false,
 )
 
 /** A descriptor bound to the executor that declared it. */

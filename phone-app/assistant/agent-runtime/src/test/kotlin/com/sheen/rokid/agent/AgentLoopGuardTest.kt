@@ -8,7 +8,15 @@ import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolVision
 import com.sheen.rokid.testsupport.FakeClock
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.boolean
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -38,6 +46,7 @@ class AgentLoopGuardTest {
         runtimeState: (() -> TurnRuntimeState?)? = null,
         frameFor: ((List<ModelHistoryItem>) -> RequestFrame)? = null,
         deadlineNanos: Long = Long.MAX_VALUE,
+        observationSource: ToolObservationSource? = null,
     ) = AgentRequest(
         turnId = "turn-guard",
         utterance = "打开设置",
@@ -47,6 +56,7 @@ class AgentLoopGuardTest {
         frameFor = frameFor,
         allowPlanNudge = allowPlanNudge,
         runtimeState = runtimeState,
+        observationSource = observationSource,
     )
 
     private fun loop(
@@ -74,11 +84,13 @@ class AgentLoopGuardTest {
         observation: Boolean = false,
         timeoutMillis: Long = 30_000L,
         mayAskHuman: Boolean = false,
+        screenObservation: Boolean = false,
     ) = actionDescriptor(
         name,
         observation = observation,
         timeoutMillis = timeoutMillis,
         mayAskHuman = mayAskHuman,
+        screenObservation = screenObservation,
     )
 
     private fun executor(vararg descriptors: ActionDescriptor) = RecordingActionExecutor(descriptors.toList())
@@ -90,6 +102,12 @@ class AgentLoopGuardTest {
 
     private fun outputs(run: AgentRun): List<ModelHistoryItem.ToolOutput> =
         run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>()
+
+    /** The envelope of the run's single tool output, with the loop's trailing stable hint removed. */
+    private fun envelopeOf(run: AgentRun): JsonObject {
+        val payload = outputs(run).single().output.substringBefore("\n\nLOOP_HINT:")
+        return Json.parseToJsonElement(payload) as JsonObject
+    }
 
     private fun minimalFrame(userInput: String): (List<ModelHistoryItem>) -> RequestFrame = {
         RequestFrame(
@@ -541,6 +559,93 @@ class AgentLoopGuardTest {
         assertEquals("ok", run.steps[1].result, "the next call must run against a re-armed executor")
         assertEquals(2, executor.calls.size, "the second call reached the executor")
         assertEquals(1, executor.beginTurns.get(), "the timeout recovery path re-arms exactly once")
+    }
+
+    @Test
+    fun `a confirmed timeout carries the failure observation and stays non uncertain`() {
+        val executor = SleepingExecutor(
+            descriptor("slow", timeoutMillis = 50L, screenObservation = true),
+            sleepMillis = 5_000L,
+        )
+        val observation = ToolObservation(
+            foregroundPackage = "com.android.settings",
+            screen = "Settings",
+            vision = ToolVision.Ok,
+        )
+        val deadlines = mutableListOf<Long>()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "slow"))), reply(text = "先看看屏幕")),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(
+            request(observationSource = ToolObservationSource { deadlineMillis ->
+                deadlines += deadlineMillis
+                observation
+            }),
+        )
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(listOf(250L), deadlines, "a timeout observation gets its own short deadline")
+        val execution = envelopeOf(run).getValue("execution").jsonObject
+        assertEquals("timeout", execution.getValue("outcome").jsonPrimitive.content)
+        assertEquals("ACTION_TIMEOUT", execution.getValue("code").jsonPrimitive.content)
+        assertFalse(execution.getValue("uncertain").jsonPrimitive.boolean, "a confirmed stop is not uncertain")
+        assertTrue(execution.getValue("applied") is JsonNull, "a timed-out write's effect is unknown")
+        assertTrue(execution.getValue("changed") is JsonNull, "a timed-out write's change is unknown")
+        val observationJson = envelopeOf(run).getValue("observation").jsonObject
+        assertEquals("Settings", observationJson.getValue("screen").jsonPrimitive.content)
+        assertEquals("com.android.settings", observationJson.getValue("foregroundPackage").jsonPrimitive.content)
+        assertEquals("ok", observationJson.getValue("vision").jsonPrimitive.content)
+        executor.awaitWorkers(1_000)
+    }
+
+    @Test
+    fun `a confirmed timeout without a source still reports an unavailable observation`() {
+        val executor = SleepingExecutor(
+            descriptor("slow", timeoutMillis = 50L, screenObservation = true),
+            sleepMillis = 5_000L,
+        )
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "slow"))), reply(text = "先看看屏幕")),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val observation = envelopeOf(run).getValue("observation").jsonObject
+        assertEquals("unavailable", observation.getValue("vision").jsonPrimitive.content)
+        assertEquals("no_source", observation.getValue("visionReason").jsonPrimitive.content)
+        executor.awaitWorkers(1_000)
+    }
+
+    @Test
+    fun `an uncertain stop carries a best-effort observation and never a stable result`() {
+        val executor = StuckExecutor(descriptor("stuck", timeoutMillis = 50L, screenObservation = true))
+        val observation = ToolObservation(
+            foregroundPackage = "com.android.settings",
+            screen = "Settings",
+            vision = ToolVision.Ok,
+        )
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "stuck"), call("c2", "stuck-second")))),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(
+            request(observationSource = { observation }),
+        )
+
+        assertEquals(AgentOutcome.FAILED, run.outcome)
+        assertEquals("ACTION_TIMEOUT_UNCERTAIN", run.safeCode)
+        val execution = envelopeOf(run).getValue("execution").jsonObject
+        assertEquals("uncertain", execution.getValue("outcome").jsonPrimitive.content)
+        assertTrue(execution.getValue("uncertain").jsonPrimitive.boolean)
+        assertTrue(execution.getValue("accepted") is JsonNull, "a still-running call is not accepted or refused")
+        assertTrue(execution.getValue("applied") is JsonNull, "a mid-flight call may still apply")
+        assertTrue(execution.getValue("changed") is JsonNull, "a mid-flight frame is not a stable fact")
+        val observationJson = envelopeOf(run).getValue("observation").jsonObject
+        assertEquals("Settings", observationJson.getValue("screen").jsonPrimitive.content)
+        assertEquals("ok", observationJson.getValue("vision").jsonPrimitive.content)
+        executor.release()
     }
 
     // ---------------------------------------------------------------- human confirmation allowance (R99)

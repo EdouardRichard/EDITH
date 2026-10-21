@@ -299,6 +299,21 @@ class ToolRegistryTest {
         )
     }
 
+    @Test fun `a screen tool throw leaves the registry observation null for the loop to fill`() {
+        // ToolRegistry has no observation source by design: the runner owns that host seam. Its thrown result must not
+        // fabricate one, and Task 3's loop enrichment is what turns a screen tool's `TOOL_THREW` into an explicit
+        // unavailable observation. This pins the boundary so a later refactor does not invent a screen here.
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("device", screenObservation = true)))
+        executor.failure = IllegalStateException("boom")
+
+        val result = ToolRegistry(listOf(executor)).execute(ToolCall("call-10", "device", "{}"))
+
+        assertEquals(ToolOutcome.Uncertain, result.execution.outcome)
+        assertEquals("TOOL_THREW", result.execution.code)
+        assertTrue(result.execution.uncertain)
+        assertNull(result.observation, "the registry has no source; the loop enrichment attaches the observation")
+    }
+
     @Test fun `ok follows the explicit execution instead of contradicting it`() {
         // A migrated tool states its own execution facts. A legacy `Done` outcome must not report a success the
         // explicit execution denies: `ok` is derived from the execution the envelope and every consumer carry.
@@ -390,6 +405,17 @@ class ToolRegistryTest {
         val plain = ToolRegistry(listOf(executorOf("lookup"))).descriptors().single()
         assertFalse(plain.observation)
         assertEquals(30_000L, plain.timeoutMillis)
+    }
+
+    @Test fun `descriptors project the screen observation declaration additively`() {
+        // edith-0.3 Phase 2.2 Task 3: this is a screen-tool declaration, separate from `observation` (fingerprints).
+        val screen = RecordingActionExecutor(listOf(actionDescriptor("device", screenObservation = true)))
+        val descriptor = ToolRegistry(listOf(screen)).descriptors().single()
+
+        assertTrue(descriptor.screenObservation)
+
+        // Pure tools keep the default false, so the loop never invents a screen for notify_user/load_skill.
+        assertFalse(ToolRegistry(listOf(executorOf("notify_user"))).descriptors().single().screenObservation)
     }
 
     @Test fun `descriptors project the human confirmation allowance additively`() {

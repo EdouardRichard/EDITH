@@ -8,8 +8,10 @@ import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
 import com.sheen.rokid.plugin.ToolOutcome
 import com.sheen.rokid.plugin.ToolSpec
+import com.sheen.rokid.plugin.ToolVision
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -170,6 +172,17 @@ data class AgentRequest(
      * it *is* called for a request the gateway then refuses before sending, because the assembly did happen.
      */
     val onRequestBuilt: ((RequestFrame) -> Unit)? = null,
+    /**
+     * edith-0.3 Phase 2.2 Task 3: the host's source for a best-effort post-call observation, or `null` when this caller
+     * has none (every pre-Phase-2.2 caller, and the JVM tests that do not exercise screen tools).
+     *
+     * The loop reads it only after a **non-`Done`** result from a descriptor that declared `screenObservation = true`
+     * and that came back without an observation. It then calls [ToolObservationSource.observe] once with the short
+     * failure deadline; `null` or a throwing source becomes an explicit `vision = unavailable` observation
+     * (`no_source` / `observation_timeout`), never a silent `null`. A pure tool is never observed, and a successful
+     * screen tool's observation remains the tool's own (Tasks 4-6).
+     */
+    val observationSource: ToolObservationSource? = null,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -321,6 +334,17 @@ private const val ACTION_TIMEOUT_NOTE =
     "the action may or may not have taken effect; observe the screen before deciding."
 private const val ACTION_TIMEOUT_UNCERTAIN_NOTE =
     "the tool did not stop within the grace window; the run is stopping and the channel must be re-observed."
+/**
+ * edith-0.3 Phase 2.2 Task 3: the whole budget one best-effort **failure** observation may spend.
+ *
+ * The spec suggests 250 ms. The source is given the number and must return by then; the loop does not retry it, because
+ * a late observation of a failed call is worth less than the turn time it would cost. It is not a turn budget and a
+ * source that cannot answer within it is reported, never silently skipped.
+ */
+private const val FAILURE_OBSERVATION_DEADLINE_MILLIS = 250L
+/** The two honest reasons a screen tool's failure has no captured observation; they are wire values. */
+private const val OBSERVATION_NO_SOURCE = "no_source"
+private const val OBSERVATION_TIMEOUT = "observation_timeout"
 /** R58: the loop instruction that turns a plan-only answer back into a tool call. Never stored. */
 private const val PLAN_NUDGE_INSTRUCTION =
     "You described a plan but did not execute it. Observe first, then act: call the tool now instead of only promising it."
@@ -923,16 +947,21 @@ class AgentLoop(
                 if (execution.cancelled) {
                     return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
                 }
+                // edith-0.3 Phase 2.2 Task 3: every non-Done screen-tool result gets the same best-effort observation
+                // treatment, whether it came back from the executor (a throw or a tool's own failure), from a
+                // policy/confirmation refusal, or from the loop's own confirmed/uncertain timeout. The timeout results
+                // are built by `runTool` without a source, so this is the one place that can attach the fact.
+                val result = observedFailure(execution.result, descriptor, request.observationSource)
                 // R60: a call that did not stop within the grace window ends the run; no later write may run while the
                 // previous one may still be in flight.
                 if (execution.uncertain) {
-                    steps += AgentStep(steps.size + 1, call.name, stepResultOf(execution.result), executed = true)
+                    steps += AgentStep(steps.size + 1, call.name, stepResultOf(result), executed = true)
                     appendToolOutput(
                         history,
                         call.id,
-                        execution.result.payload,
-                        execution.result.images,
-                        nonPersistent = execution.result.nonPersistent,
+                        result.payload,
+                        result.images,
+                        nonPersistent = result.nonPersistent,
                     )
                     return finish(AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps)
                 }
@@ -943,7 +972,6 @@ class AgentLoop(
                 if (execution.timedOut && !cancelled) {
                     registry.beginTurn()
                 }
-                val result = execution.result
                 // R98/R100: the per-call state-changing declaration is the only write signal — `device` declares
                 // observation=true for act too, so `!descriptor.observation` would treat `notify_user` as a write and a
                 // real device act as a read. It feeds the detectors' progress reset, the error streak's reset and the
@@ -1011,6 +1039,46 @@ class AgentLoop(
     private fun notifyToolStatus(request: AgentRequest, action: String, phase: ToolPhase) {
         runCatching { request.onToolStatus?.invoke(action, phase) }
     }
+
+    // ---------------------------------------------------------------- failure observation (0.3 Phase 2.2 Task 3)
+
+    /**
+     * Attaches the best-effort post-call observation to one **non-`Done`** result.
+     *
+     * One rule serves every failure shape, which is why it lives here rather than in each branch:
+     * - a `Done` result is left alone — a successful screen tool's observation belongs to the tool (Tasks 4-6), and a
+     *   pure tool never had one to begin with;
+     * - a result that already carries an observation is authoritative and is never replaced by a second capture;
+     * - a pure tool (`screenObservation = false`) keeps `observation = null`, so no screen is invented for
+     *   `notify_user`/`load_skill`;
+     * - a screen tool's failure asks [AgentRequest.observationSource] **once**, with
+     *   [FAILURE_OBSERVATION_DEADLINE_MILLIS]. A missing source is `unavailable/no_source`; a source that returns `null`
+     *   or throws is `unavailable/observation_timeout`. None of these is a silent `null`, and a throwing source never
+     *   fails the run.
+     *
+     * The execution facts are untouched: a timeout stays a timeout, a throw stays `Uncertain`, and an unconfirmed
+     * refusal keeps its `accepted=false`/`applied=false`. The observation only says what the screen looked like when
+     * the loop learned the outcome; it is not evidence that the call was stable.
+     */
+    private fun observedFailure(
+        result: ToolResult,
+        descriptor: ToolDescriptor?,
+        source: ToolObservationSource?,
+    ): ToolResult {
+        if (result.execution.outcome == ToolOutcome.Done) return result
+        if (result.observation != null) return result
+        if (descriptor?.screenObservation != true) return result
+        val observation = if (source == null) {
+            unavailableObservation(OBSERVATION_NO_SOURCE)
+        } else {
+            runCatching { source.observe(FAILURE_OBSERVATION_DEADLINE_MILLIS) }
+                .getOrNull() ?: unavailableObservation(OBSERVATION_TIMEOUT)
+        }
+        return result.copy(observation = observation)
+    }
+
+    private fun unavailableObservation(reason: String): ToolObservation =
+        ToolObservation(vision = ToolVision.Unavailable, visionReason = reason)
 
     /**
      * The transcript a frame builder continues: the run's accumulated history, minus this turn's utterance while that

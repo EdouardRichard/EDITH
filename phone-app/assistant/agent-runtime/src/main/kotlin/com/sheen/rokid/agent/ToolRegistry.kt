@@ -165,6 +165,7 @@ private fun ActionDescriptor.toToolDescriptor() = ToolDescriptor(
     observation = observation,
     timeoutMillis = timeoutMillis,
     mayAskHuman = mayAskHuman,
+    screenObservation = screenObservation,
 )
 
 /** The pre-0.3 declaration projected onto the unified execution vocabulary; no facts beyond the outcome are invented. */

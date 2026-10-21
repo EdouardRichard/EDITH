@@ -3,6 +3,7 @@ package com.sheen.rokid.plugin
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 class ActionsContractTest {
@@ -74,6 +75,12 @@ class ActionsContractTest {
                 descriptor().copy(parametersJson = schema)
             }
         }
+    }
+
+    @Test fun `screen observation defaults off and is copyable`() {
+        // edith-0.3 Phase 2.2 Task 3: only device/open/shell/dial declare it (Tasks 4-6); every plugin tool keeps false.
+        assertFalse(descriptor().screenObservation)
+        assertTrue(descriptor().copy(screenObservation = true).screenObservation)
     }
 
     @Test fun `actions capability is addressable on a plugin descriptor`() {
