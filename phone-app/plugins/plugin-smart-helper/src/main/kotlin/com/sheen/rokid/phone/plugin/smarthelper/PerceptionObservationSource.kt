@@ -1,59 +1,163 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 
+import com.sheen.rokid.agent.ToolObservationCapture
 import com.sheen.rokid.agent.ToolObservationSource
 import com.sheen.rokid.output.PerceptionToolObservation
-import com.sheen.rokid.plugin.PerceptionFilter
 import com.sheen.rokid.plugin.PerceptionProvider
-import com.sheen.rokid.plugin.PerceptionSource
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
 import com.sheen.rokid.plugin.ToolObservation
 import com.sheen.rokid.plugin.ToolVision
+import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
+import java.util.concurrent.Callable
+import java.util.concurrent.CancellationException
+import java.util.concurrent.ExecutionException
+import java.util.concurrent.Executors
+import java.util.concurrent.RejectedExecutionException
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.TimeoutException
+import java.util.concurrent.atomic.AtomicBoolean
 
-/** The one source a failure observation reads: the compact screen, never the notification/calendar/... bulk. */
-private val FAILURE_OBSERVATION_SOURCES: Set<PerceptionSource> = setOf(PerceptionSource.SCREEN)
+/** The two stable reasons a failed loop-level capture reports; wire values the loop and acceptance already know. */
+private const val OBSERVATION_TIMEOUT = "observation_timeout"
+private const val PROVIDER_THREW = "provider_threw"
+/** The one worker a session's source owns. Daemon, so an interrupted platform read can never keep the process alive. */
+private const val OBSERVE_THREAD_NAME = "perception-observe"
+private const val NANOS_PER_MILLI = 1_000_000L
 
 /**
- * edith-0.3 Phase 2.2 Task 6: the plugin's loop-level [ToolObservationSource], backed by the session's existing
+ * edith-0.3 Phase 3 Task 3 (M4): the plugin's loop-level [ToolObservationSource], backed by the session's
  * [PerceptionProvider].
  *
  * The agent loop asks it only after a **non-`Done`** result from a descriptor that declared `screenObservation = true`
- * and that came back without an observation of its own (a policy/confirmation refusal, a confirmed or uncertain timeout,
- * a thrown tool). Tool-level failures (Tasks 4-6) already carry their own richer observation including a picture, so
- * this source is the fallback for the paths a tool cannot observe from inside.
+ * and that came back without an observation of its own. This is the fallback for the paths a tool cannot observe from
+ * inside (a policy/confirmation refusal, a confirmed or uncertain timeout, a thrown tool).
  *
- * It is deliberately **cache-only**: the turn boundary opened the provider at the start of the run and every host
- * action refreshes it, so `snapshot()` projects the current turn without a second expensive device read. The caller's
- * `deadlineMillis` is **advisory, not enforced**: the loop's failure budget is 250 ms, but this source runs the
- * provider's read on the calling thread and cannot preempt a slow platform read, so it is a **best-effort,
- * non-preemptible** observation and makes no compliance claim. Task 9 must measure the real cost on the K40 and record
- * the 250 ms budget as `NotMeasured` unless it actually measured it. The result carries the compact screen text,
- * foreground, coverage and the vision fact; it carries **no image**, because [ToolObservation] has no image member and
- * this channel has no `ImageRef`. A loop-level timeout/throw image is therefore `NotMeasured` (recorded by the device
- * evidence), not fabricated here: `vision` stays `NotRequested` for an observed screen and becomes
- * `Unavailable(reason)` when the screen source itself did not answer (for example `no_accessibility`).
+ * **Bounded by the deadline.** One task runs `provider.refresh()` then `provider.screenshot()` on a single-thread daemon
+ * executor, and the caller waits with `Future.get(deadlineMillis, MILLISECONDS)`. A platform read that overruns cannot
+ * hold the run: the caller returns an explicit `unavailable(observation_timeout)` and cancels the task. A provider
+ * throw becomes `unavailable(provider_threw)`, never a silent `null`. The loop's whole failure budget is 250 ms; the
+ * source gets that number and makes no claim about the read's wall time beyond the bound it enforces.
  *
- * A provider that throws (or a session without a port) yields `null`, which the loop records as an explicit
- * `unavailable/observation_timeout` or `unavailable/no_source` - never a silent null for a screen tool. The plugin never
- * invents a screen: the coverage token is the provider's own answer, and a blind snapshot reports `screen = null`.
+ * **At most one image.** The screenshot channel is the only image source: `Image` → the observation plus exactly that
+ * one [com.sheen.rokid.plugin.ImageRef]; `Disabled` → `vision = disabled`; `Unavailable(reason)` → `vision = unavailable`
+ * with the host's reason. The refreshed snapshot's screen text, foreground and coverage ride every answer (a blind
+ * screen still renders `screen = null`, never an invented one).
+ *
+ * **Observability.** Each attempt emits one count-only `P3_OBSERVE source=loop ms=<n> timeout=<bool> images=<n>
+ * reason=<stable|->` line: elapsed milliseconds, whether the deadline expired, the image count and the stable vision
+ * reason (`-` when the picture channel has none). No screen text, foreground package or reason payload is logged.
+ *
+ * **Lifecycle.** The plugin owns one source per session and calls [close] in `deactivate`; [close] shuts the executor
+ * down idempotently, and a capture attempted afterwards answers the timeout fact without starting another task.
  */
-internal fun perceptionToolObservationSource(provider: PerceptionProvider?): ToolObservationSource? =
-    provider?.let { port ->
-        ToolObservationSource { deadlineMillis ->
-            // `deadlineMillis` is received but not enforced: the cache-only read below cannot be preempted (see KDoc).
-            // It stays on the signature so a future bounded implementation can honour it without changing the loop.
-            // Only an Exception is a failed read. A non-Exception Throwable is not swallowed here for the same reason
-            // the loop does not swallow it: an Error is the run owner's problem, not an observation failure.
-            val snapshot = try {
-                port.snapshot(FAILURE_OBSERVATION_SOURCES, PerceptionFilter.ALL, null)
-            } catch (_: Exception) {
-                null
-            }
-            snapshot?.let { facts ->
-                val unavailableReason = PerceptionToolObservation.unavailableReason(facts.coverage.screen)
-                PerceptionToolObservation.render(
-                    facts,
-                    vision = if (unavailableReason != null) ToolVision.Unavailable else ToolVision.NotRequested,
-                    visionReason = unavailableReason,
-                )
-            }
+internal class PerceptionObservationSource(
+    private val provider: PerceptionProvider,
+    private val log: (String) -> Unit = { P3Log.line(it) },
+) : ToolObservationSource, AutoCloseable {
+
+    private val executor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, OBSERVE_THREAD_NAME).apply { isDaemon = true }
+    }
+    private val closed = AtomicBoolean(false)
+
+    /** The pre-M4 shape: the image-aware answer without its images. Existing callers keep this entry point. */
+    override fun observe(deadlineMillis: Long): ToolObservation =
+        observeWithImages(deadlineMillis).observation
+            ?: PerceptionToolObservation.unavailable(OBSERVATION_TIMEOUT)
+
+    override fun observeWithImages(deadlineMillis: Long): ToolObservationCapture {
+        val startedNanos = System.nanoTime()
+        // A closed session source cannot start another task; report the same explicit timeout fact the loop maps.
+        if (closed.get()) return unavailableCapture(startedNanos, timedOut = false)
+        val future = try {
+            executor.submit(Callable {
+                // Both reads are one attempt: refresh installs the current screen, screenshot observes the picture
+                // channel the host exposes for it. A throw anywhere in here is the provider's failure.
+                provider.refresh() to provider.screenshot()
+            })
+        } catch (_: RejectedExecutionException) {
+            // `close()` raced the submit: the task was never accepted, which is still an explicit timeout fact.
+            return unavailableCapture(startedNanos, timedOut = false)
+        }
+        return try {
+            val (snapshot, screenshot) = future.get(deadlineMillis.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
+            val capture = captureOf(snapshot, screenshot)
+            logObserve(
+                startedNanos,
+                timedOut = false,
+                images = capture.images.size,
+                reason = capture.observation?.visionReason,
+            )
+            capture
+        } catch (_: TimeoutException) {
+            future.cancel(true)
+            unavailableCapture(startedNanos, timedOut = true)
+        } catch (failure: ExecutionException) {
+            val cause = failure.cause
+            // An Error is the run owner's problem, not an observation failure; the loop keeps the same rule.
+            if (cause is Error) throw cause
+            logObserve(startedNanos, timedOut = false, images = 0, reason = PROVIDER_THREW)
+            ToolObservationCapture(PerceptionToolObservation.unavailable(PROVIDER_THREW))
+        } catch (_: InterruptedException) {
+            future.cancel(true)
+            // An interrupt is the caller's signal: restore it and still report the attempt's timeout fact.
+            Thread.currentThread().interrupt()
+            unavailableCapture(startedNanos, timedOut = false)
+        } catch (_: CancellationException) {
+            // A future cancelled elsewhere is still an attempt that produced no capture; never let it escape the loop.
+            unavailableCapture(startedNanos, timedOut = false)
         }
     }
+
+    override fun close() {
+        if (closed.compareAndSet(false, true)) executor.shutdownNow()
+    }
+
+    /** Unavailable/observation_timeout with no image, plus its one count-only line. */
+    private fun unavailableCapture(startedNanos: Long, timedOut: Boolean): ToolObservationCapture {
+        logObserve(startedNanos, timedOut = timedOut, images = 0, reason = OBSERVATION_TIMEOUT)
+        return ToolObservationCapture(PerceptionToolObservation.unavailable(OBSERVATION_TIMEOUT))
+    }
+
+    /**
+     * One honest projection: the refreshed snapshot always rides, the screenshot decides the vision fact and whether
+     * exactly one image is attached. Nothing here is invented — a host reason is passed through unchanged.
+     */
+    private fun captureOf(
+        snapshot: PerceptionSnapshot,
+        screenshot: PerceptionScreenshotResult,
+    ): ToolObservationCapture = when (screenshot) {
+        is PerceptionScreenshotResult.Image -> ToolObservationCapture(
+            PerceptionToolObservation.render(snapshot, vision = ToolVision.Ok),
+            images = listOf(screenshot.image),
+        )
+        PerceptionScreenshotResult.Disabled -> ToolObservationCapture(
+            PerceptionToolObservation.render(snapshot, vision = ToolVision.Disabled),
+        )
+        is PerceptionScreenshotResult.Unavailable -> ToolObservationCapture(
+            PerceptionToolObservation.render(
+                snapshot,
+                vision = ToolVision.Unavailable,
+                visionReason = screenshot.reason,
+            ),
+        )
+    }
+
+    /** The one count-only line: no screen text, no package, no image bytes — only the attempt's counts and stable facts. */
+    private fun logObserve(startedNanos: Long, timedOut: Boolean, images: Int, reason: String?) {
+        val elapsedMillis = ((System.nanoTime() - startedNanos) / NANOS_PER_MILLI).coerceAtLeast(0L)
+        log("P3_OBSERVE source=loop ms=$elapsedMillis timeout=$timedOut images=$images reason=${reason ?: "-"}")
+    }
+}
+
+/**
+ * The session's observation source, or `null` when the host granted no perception port — the loop then reports its own
+ * explicit `no_source` rather than this plugin inventing one.
+ *
+ * [log] is a test seam only; production uses [P3Log].
+ */
+internal fun perceptionToolObservationSource(
+    provider: PerceptionProvider?,
+    log: (String) -> Unit = { P3Log.line(it) },
+): PerceptionObservationSource? = provider?.let { PerceptionObservationSource(it, log) }

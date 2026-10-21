@@ -44,6 +44,7 @@ import com.sheen.rokid.agent.RequestLayout
 import com.sheen.rokid.agent.Segment
 import com.sheen.rokid.agent.SegmentOrigin
 import com.sheen.rokid.agent.SegmentRole
+import com.sheen.rokid.agent.ToolObservationSource
 import com.sheen.rokid.agent.ToolRegistry
 import com.sheen.rokid.agent.TrimCounts
 import com.sheen.rokid.agent.TurnRuntimeState
@@ -772,6 +773,16 @@ class SmartAssistantPlugin(
     @Volatile private var activePerception: PerceptionProvider? = null
 
     /**
+     * edith-0.3 Phase 3 Task 3 (M4): the session's bounded failure-observation source, built with [activePerception]
+     * and closed in [deactivate].
+     *
+     * One source per session (not per turn): it owns one daemon executor, and a per-turn source would either leak a
+     * thread or pay a fresh thread for every failed screen call. `null` when the host granted no perception port; the
+     * loop then reports its own explicit `no_source`, exactly as before this source existed.
+     */
+    @Volatile private var activeObservationSource: PerceptionObservationSource? = null
+
+    /**
      * Task 9: the per-request device-state source (date/time/battery/foreground/media), same lifetime as
      * [activePerception]. Read per request, guarded: the provider can be absent or throw, and the renderer then leaves
      * the affected slots empty instead of inventing a clock or a battery value.
@@ -823,6 +834,14 @@ class SmartAssistantPlugin(
      * reading it; no production caller has any reason to reach for it. Same shape as [auditTrail].
      */
     internal fun skillGovernor(): LibraryGovernor? = libraryGovernor
+
+    /**
+     * Test-only observation of the session's bounded failure-observation source.
+     *
+     * The source is production state the plugin owns, so a JVM test can only pin "one per session, closed on
+     * deactivate" by reading it; no production caller has any reason to reach for it. Same shape as [skillGovernor].
+     */
+    internal fun observationSourceForTest(): ToolObservationSource? = activeObservationSource
 
     /**
      * The one monitor guarding every read and mutation of the SKILL turn state: the generation/owner below, the pulled
@@ -1289,6 +1308,9 @@ class SmartAssistantPlugin(
         // host that grants neither still activates, and the turn then simply carries no perception block.
         activeDeviceStateProvider = deviceProvider
         activePerception = runCatching { context.services.perception() }.getOrNull()
+        // M4: one bounded observation source per session, sharing the provider's lifetime. `activate` begins with
+        // `deactivate`, so any previous source is already closed; assigning here cannot strand a worker.
+        activeObservationSource = activePerception?.let { PerceptionObservationSource(it) }
         val sessionDeviceProfile = runCatching { deviceProvider?.profile() }.getOrNull()
         // §4.1/§4.4; 0.3 Phase 3 §5.1: the session pins one plan for **every** prompt route, the not-yet-driven
         // follow-up included. All are loaded **now** and never re-planned, so a catalog change (or a different device
@@ -1403,6 +1425,10 @@ class SmartAssistantPlugin(
             activeCompressor = null
             // Task 9: the perception port and its device-state source belong to the session that resolved them.
             activePerception = null
+            // M4: the bounded observation worker ends with the session too; `close` is idempotent and a later
+            // activation builds its own source/provider pair.
+            activeObservationSource?.close()
+            activeObservationSource = null
             activeDeviceStateProvider = null
             // The pinned plans belong to the session that loaded them; a later activation loads its own (spec §4.1).
             activePromptPlans = null
@@ -2521,12 +2547,12 @@ class SmartAssistantPlugin(
                     perception = perception?.let { provider ->
                         { perceptionBlockFor(provider, initialSnapshot, perceptionRequests, profileAcceptsImages) }
                     },
-                    // edith-0.3 Phase 2.2 Task 6: the loop's best-effort failure-observation source, backed by the same
-                    // per-turn perception port. Without this the loop's `screenObservation` enrichment would be dead
-                    // code on the device: every screen-tool failure that could not observe itself would report
-                    // `no_source`. The source is cache-only and carries no image channel (see its KDoc); a null
-                    // provider (a host that grants no perception) leaves the loop's explicit `no_source` mapping.
-                    observationSource = perceptionToolObservationSource(perception),
+                    // edith-0.3 Phase 2.2 Task 6 / Phase 3 Task 3 (M4): the loop's bounded failure-observation source,
+                    // held for the whole session and closed by `deactivate`. Without it the loop's
+                    // `screenObservation` enrichment would be dead code on the device: every screen-tool failure that
+                    // could not observe itself would report `no_source`. A null provider (a host that grants no
+                    // perception) leaves the loop's explicit `no_source` mapping.
+                    observationSource = activeObservationSource,
                     // 0.3 Phase 2 Task 11 (review fix R12): the loop calls this once per **assembled** request, after
                     // folding its RUNTIME_STATE/PERCEPTION segments in and before the gateway sends (or refuses), so
                     // the `P3_PROMPT` line describes the exact frame this request is. The legacy no-store path has no

@@ -177,9 +177,10 @@ data class AgentRequest(
      * has none (every pre-Phase-2.2 caller, and the JVM tests that do not exercise screen tools).
      *
      * The loop reads it only after a **non-`Done`** result from a descriptor that declared `screenObservation = true`
-     * and that came back without an observation. It then calls [ToolObservationSource.observe] once with the short
-     * failure deadline; `null` or a throwing source becomes an explicit `vision = unavailable` observation
-     * (`no_source` / `observation_timeout`), never a silent `null`. A pure tool is never observed, and a successful
+     * and that came back without an observation. It then calls [ToolObservationSource.observeWithImages] once with the
+     * short failure deadline; `null` or a throwing source becomes an explicit `vision = unavailable` observation
+     * (`no_source` / `observation_timeout`), never a silent `null`. A capture that carries images appends them to the
+     * failed result and withdraws that result from persistence (M4). A pure tool is never observed, and a successful
      * screen tool's observation remains the tool's own (Tasks 4-6).
      */
     val observationSource: ToolObservationSource? = null,
@@ -1064,11 +1065,17 @@ class AgentLoop(
      * - a result that already carries an observation is authoritative and is never replaced by a second capture;
      * - a pure tool (`screenObservation = false`) keeps `observation = null`, so no screen is invented for
      *   `notify_user`/`load_skill`;
-     * - a screen tool's failure asks [AgentRequest.observationSource] **once**, with
-     *   [FAILURE_OBSERVATION_DEADLINE_MILLIS]. A missing source is `unavailable/no_source`; a source that returns `null`
-     *   or throws an [Exception] is `unavailable/observation_timeout`. None of these is a silent `null`, a throwing
-     *   source never fails the run, and an [InterruptedException] is restored before the timeout fact is recorded. A
-     *   non-[Exception] `Throwable` is deliberately not swallowed.
+     * - a screen tool's failure asks [AgentRequest.observationSource] **once**, through
+     *   [ToolObservationSource.observeWithImages], with [FAILURE_OBSERVATION_DEADLINE_MILLIS]. A missing source is
+     *   `unavailable/no_source`; a source that returns `null`/no observation or throws an [Exception] is
+     *   `unavailable/observation_timeout`. None of these is a silent `null`, a throwing source never fails the run, and
+     *   an [InterruptedException] is restored before the timeout fact is recorded. A non-[Exception] `Throwable` is
+     *   deliberately not swallowed.
+     *
+     * **M4 (images).** A capture may carry at most one picture the source really took. When it does, the returned copy
+     * appends it to the result's existing images; the transcript redaction below then drops it from the stored form
+     * (`AgentRun.transcript`), while the model sees it in this run's request. A capture without images keeps the
+     * previous copy shape exactly.
      *
      * A `null` observation therefore means one of two honest things: the tool does not observe the screen (pure tool),
      * or no capture was attempted. The detector-`Warn` skip path is the second case: the call was never executed, its
@@ -1093,24 +1100,36 @@ class AgentLoop(
         if (result.execution.outcome == ToolOutcome.Done) return result
         if (result.observation != null) return result
         if (descriptor?.screenObservation != true) return result
-        val observation = if (source == null) {
-            unavailableObservation(OBSERVATION_NO_SOURCE)
+        // M4: one image-aware call. A source that cannot answer (missing, timed-out, throwing) still yields the same
+        // explicit unavailable observation it did before; images are additive and never replace what the tool returned.
+        val capture = if (source == null) {
+            null
         } else {
             try {
-                source.observe(FAILURE_OBSERVATION_DEADLINE_MILLIS) ?: unavailableObservation(OBSERVATION_TIMEOUT)
+                source.observeWithImages(FAILURE_OBSERVATION_DEADLINE_MILLIS)
             } catch (_: InterruptedException) {
                 // An interrupt is the caller's signal, not an observation failure: restore it for the run's owner and
                 // still record the attempt's timeout fact.
                 Thread.currentThread().interrupt()
-                unavailableObservation(OBSERVATION_TIMEOUT)
+                null
             } catch (_: Exception) {
                 // A throwing source is a failed attempt, never a run failure; an Error is deliberately not swallowed.
-                unavailableObservation(OBSERVATION_TIMEOUT)
+                null
             }
         }
-        // Task 8: this copy now carries observation content, which may live only in the current model request. The
-        // in-run history keeps it; `finish` replaces the stored form and drops its images (C2).
-        return result.copy(observation = observation, nonPersistent = true)
+        val captured = capture?.observation
+        val observation = when {
+            source == null -> unavailableObservation(OBSERVATION_NO_SOURCE)
+            captured != null -> captured
+            else -> unavailableObservation(OBSERVATION_TIMEOUT)
+        }
+        // Task 8 / M4: this copy now carries observation (and possibly image) content, which may live only in the
+        // current model request. The in-run history keeps it; `finish` replaces the stored form and drops its images.
+        return result.copy(
+            observation = observation,
+            images = result.images + capture?.images.orEmpty(),
+            nonPersistent = true,
+        )
     }
 
     private fun unavailableObservation(reason: String): ToolObservation =

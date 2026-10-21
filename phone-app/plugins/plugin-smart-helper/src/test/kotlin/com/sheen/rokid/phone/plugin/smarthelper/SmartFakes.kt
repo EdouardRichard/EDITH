@@ -887,6 +887,11 @@ internal class SmartFakePerception(
     private val ambient: PerceptionSnapshot = initial,
     private val initialFailure: RuntimeException? = null,
     private val ambientFailure: RuntimeException? = null,
+    /**
+     * edith-0.3 Phase 3 Task 3 (M4): the picture the failure-observation source receives. The default is the honest
+     * "no picture here" answer every pre-M4 fixture implied; a test that pins the image channel supplies an `Image`.
+     */
+    private val screenshotResult: PerceptionScreenshotResult = PerceptionScreenshotResult.Unavailable("test"),
 ) : PerceptionProvider {
     var beginTurns: Int = 0
         private set
@@ -912,8 +917,7 @@ internal class SmartFakePerception(
 
     override fun afterAction(): PerceptionSnapshot = ambient
 
-    override fun screenshot(): PerceptionScreenshotResult =
-        PerceptionScreenshotResult.Unavailable("test")
+    override fun screenshot(): PerceptionScreenshotResult = screenshotResult
 
     override fun endTurn() {
         endTurns += 1

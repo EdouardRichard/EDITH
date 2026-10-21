@@ -4,6 +4,7 @@ import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
@@ -733,6 +734,85 @@ class AgentLoopGuardTest {
         assertEquals(0, beginTurnsWhenObserved.get(), "an uncertain stop must never re-arm the executors")
         assertEquals(0, executor.beginTurns.get(), "the re-arm stays off on the uncertain path")
         executor.release()
+    }
+
+    // ---------------------------------------------------------------- bounded failure capture (M4)
+
+    @Test
+    fun `a bounded failure capture returns observation timeout and the loop still completes`() {
+        val executor = executor(descriptor("open", screenObservation = true))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "看到了")),
+        )
+        val deadlines = mutableListOf<Long>()
+        // `observe` is booby-trapped: the loop must take the image-aware capture path, not the pre-M4 one.
+        val source = object : ToolObservationSource {
+            override fun observe(deadlineMillis: Long): ToolObservation? =
+                error("the loop must use observeWithImages, not observe")
+
+            override fun observeWithImages(deadlineMillis: Long): ToolObservationCapture {
+                deadlines += deadlineMillis
+                // A source that uses its whole budget answers an explicit timeout fact, never a silent null.
+                Thread.sleep(deadlineMillis)
+                return ToolObservationCapture(
+                    ToolObservation(vision = ToolVision.Unavailable, visionReason = "observation_timeout"),
+                )
+            }
+        }
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome, "a bounded capture never fails the run")
+        assertEquals(listOf(250L), deadlines, "the failure observation's whole budget is 250 ms")
+        val observation = envelopeInRequest(gateway).getValue("observation").jsonObject
+        assertEquals("unavailable", observation.getValue("vision").jsonPrimitive.content)
+        assertEquals("observation_timeout", observation.getValue("visionReason").jsonPrimitive.content)
+        assertEquals(
+            emptyList(),
+            gateway.requests.last().history.filterIsInstance<ModelHistoryItem.ToolOutput>().single().images,
+            "a timed-out capture must not carry an image",
+        )
+        assertEquals(emptyList(), outputs(run).single().images)
+    }
+
+    @Test
+    fun `a failure capture image rides the next model request and never the stored transcript`() {
+        val image = ImageRef("artifact-shot-1", "image/jpeg", 768, 1664, "sha-256-shot-1")
+        val executor = executor(descriptor("open", screenObservation = true))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "看到了")),
+        )
+        val capture = ToolObservationCapture(
+            ToolObservation(
+                foregroundPackage = "com.android.settings",
+                screen = "Settings",
+                vision = ToolVision.Ok,
+            ),
+            images = listOf(image),
+        )
+        val source = object : ToolObservationSource {
+            override fun observe(deadlineMillis: Long): ToolObservation? =
+                error("the loop must use observeWithImages, not observe")
+
+            override fun observeWithImages(deadlineMillis: Long): ToolObservationCapture = capture
+        }
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val sent = gateway.requests.last().history
+            .filterIsInstance<ModelHistoryItem.ToolOutput>()
+            .single()
+        assertEquals(listOf(image), sent.images, "the capture's image must reach the next request: $sent")
+        assertTrue(sent.output.contains("\"screen\":\"Settings\""), sent.output)
+        assertEquals(1, run.metrics.images, "the capture image is produced by this run and counted")
+
+        // The same privacy rule as every observation: the model saw it in this run; the stored transcript may not.
+        val stored = outputs(run).single()
+        assertEquals("(perception content not persisted)", stored.output)
+        assertEquals(emptyList(), stored.images, "a failure-capture image may never be stored")
     }
 
     // ---------------------------------------------------------------- human confirmation allowance (R99)

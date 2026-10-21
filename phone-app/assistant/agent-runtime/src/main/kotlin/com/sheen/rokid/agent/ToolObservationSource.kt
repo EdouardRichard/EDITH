@@ -1,11 +1,12 @@
 package com.sheen.rokid.agent
 
+import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.ToolObservation
 import com.sheen.rokid.plugin.ToolVision
 
 /**
- * edith-0.3 Phase 2.2 Task 3: the host-neutral source of a **best-effort post-call observation**, used when a screen
- * tool's failure/timeout/throw/refusal left no observation of its own.
+ * edith-0.3 Phase 2.2 Task 3 / Phase 3 Task 3 (M4): the host-neutral source of a **best-effort post-call observation**,
+ * used when a screen tool's failure/timeout/throw/refusal left no observation of its own.
  *
  * The agent loop calls this only for a non-`Done` result whose descriptor declared `screenObservation = true`. A pure
  * tool never reaches it, so its result keeps `observation = null` instead of a fabricated screen.
@@ -19,10 +20,26 @@ import com.sheen.rokid.plugin.ToolVision
  * swallowed. The source must never return an observation containing invented facts, and it must not carry user content
  * into logs.
  *
- * This loop-level channel carries no image payload (`ToolObservation` has no image member; images belong to the tool's
- * own `ActionResult`). A failure capture therefore reports what it actually saw — normally [ToolVision.NotRequested] or
- * [ToolVision.Unavailable] — and must not claim [ToolVision.Ok] with no picture behind it.
+ * **M4 (images).** [observeWithImages] is the image-aware form the loop now calls. A source that can capture a picture
+ * returns at most **one** [ImageRef] beside its observation; the loop appends it to the failed result's images and marks
+ * that result non-persistent, exactly as it does any observation. A source that predates M4 keeps the default: the
+ * pre-M4 [observe] answer plus no image, so every existing caller compiles and behaves unchanged.
  */
+data class ToolObservationCapture(
+    val observation: ToolObservation?,
+    val images: List<ImageRef> = emptyList(),
+)
+
 fun interface ToolObservationSource {
     fun observe(deadlineMillis: Long): ToolObservation?
+
+    /**
+     * The image-aware form of [observe], defaulting to the pre-M4 answer plus no image.
+     *
+     * A source that returns a capture with [ToolObservationCapture.images] must have really produced those images (a
+     * screenshot it took, or one its host returned); a fabricated or borrowed reference would claim a picture the loop
+     * never saw. `null` — and a capture whose observation is `null` — keeps the loop's explicit timeout mapping.
+     */
+    fun observeWithImages(deadlineMillis: Long): ToolObservationCapture? =
+        observe(deadlineMillis)?.let { ToolObservationCapture(it) }
 }
