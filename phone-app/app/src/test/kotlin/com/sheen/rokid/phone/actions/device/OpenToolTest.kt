@@ -9,6 +9,10 @@ import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
+import com.sheen.rokid.plugin.ToolVision
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
@@ -18,6 +22,8 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -64,6 +70,16 @@ class OpenToolTest {
             listOf(LAUNCHER_QUERY),
             shell.commands,
         )
+        // Task 5: list is a read, not a screen operation - execution facts only, never an invented observation/image.
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertNull("a list applies nothing", execution.applied)
+        assertNull(execution.verified)
+        assertNull("a list changes no screen", execution.changed)
+        assertNull("list is not a screen operation", result.observation)
+        assertTrue("list attaches no image", result.images.isEmpty())
+        assertFalse("execution facts alone are persistent", result.nonPersistent)
     }
 
     @Test
@@ -206,17 +222,43 @@ class OpenToolTest {
     }
 
     @Test
-    fun `list without a shell channel is CHANNEL_UNAVAILABLE`() {
-        val result = OpenTool(null, FakeCatalog()).execute("""{"list":true}""")
+    fun `list without a shell channel is CHANNEL_UNAVAILABLE with facts only`() {
+        var captureCalls = 0
+        var observeCalls = 0
+        val result = OpenTool(
+            shell = null,
+            catalog = FakeCatalog(),
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Disabled
+            },
+            observe = {
+                observeCalls++
+                openObservation()
+            },
+        ).execute("""{"list":true}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("CHANNEL_UNAVAILABLE", errorCode(result))
+        assertEquals("list is not a screen operation, even when its channel is down", 0, captureCalls)
+        assertEquals("list must not ask for an observation", 0, observeCalls)
+        assertNull(result.observation)
+        assertTrue(result.images.isEmpty())
+        assertFalse(result.nonPersistent)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("CHANNEL_UNAVAILABLE", execution.code)
+        assertEquals(true, execution.recoverable)
+        assertEquals(false, execution.accepted)
+        assertNull("a list applies nothing", execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
     }
 
     // ---- resolution ----
 
     @Test
-    fun `an ambiguous name refuses with structured candidates`() {
+    fun `an ambiguous name refuses with structured candidates and the observed screen`() {
         val catalog = FakeCatalog(
             listOf(
                 AppEntry("com.example.music1", "音乐", "android.intent.action.MAIN"),
@@ -224,10 +266,24 @@ class OpenToolTest {
             ),
         )
         val shell = FakeShell { command -> ShellResult(command, 0, "Status: ok\n", "") }
+        val image = openImage("artifact-ambiguous")
+        var captureCalls = 0
+        var observeCalls = 0
 
-        val result = OpenTool(shell, catalog).execute("""{"target":"音乐"}""")
+        val result = OpenTool(
+            shell = shell,
+            catalog = catalog,
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+            observe = {
+                observeCalls++
+                openObservation()
+            },
+        ).execute("""{"target":"音乐"}""")
 
-        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("ambiguity stays a refusal", ActionOutcome.Refused, result.outcome)
         val body = body(result)
         assertEquals("APP_AMBIGUOUS", body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
         assertTrue(body["error"]!!.jsonObject["recoverable"]!!.jsonPrimitive.boolean)
@@ -238,16 +294,41 @@ class OpenToolTest {
         assertEquals("音乐", candidates[1].jsonObject["label"]!!.jsonPrimitive.content)
         assertEquals("com.example.music2", candidates[1].jsonObject["packageName"]!!.jsonPrimitive.content)
         assertTrue("ambiguity must not launch anything", shell.commands.isEmpty())
+
+        assertRefusalExecution(executionOf(result), "APP_AMBIGUOUS", recoverable = true)
+        val observation = observationOf(result)
+        assertEquals("com.android.launcher", observation.foregroundPackage)
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertNull(observation.visionReason)
+        assertEquals("the model can still see the screen that caused the ambiguity", 1, captureCalls)
+        assertEquals(1, observeCalls)
+        assertEquals(listOf(image), result.images)
+        assertTrue("observation and image content stay request-scoped (C2)", result.nonPersistent)
     }
 
     @Test
-    fun `an unknown name is APP_NOT_FOUND`() {
+    fun `an unknown name is APP_NOT_FOUND and still observes the screen`() {
         val pipeline = ShellPipeline()
-        val result = OpenTool(pipeline.shell, FakeCatalog()).execute("""{"target":"不存在的应用"}""")
+        val image = openImage("artifact-not-found")
+        var captureCalls = 0
+        val result = OpenTool(
+            shell = pipeline.shell,
+            catalog = FakeCatalog(),
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+            observe = { openObservation() },
+        ).execute("""{"target":"不存在的应用"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("APP_NOT_FOUND", errorCode(result))
         assertTrue(pipeline.shell.commands.isEmpty())
+        assertRefusalExecution(executionOf(result), "APP_NOT_FOUND", recoverable = true)
+        assertEquals(1, captureCalls)
+        assertEquals(listOf(image), result.images)
+        assertEquals(ToolVision.Ok, observationOf(result).vision)
+        assertTrue(result.nonPersistent)
     }
 
     @Test
@@ -354,12 +435,26 @@ class OpenToolTest {
     @Test
     fun `a non-http scheme is INVALID_URL and never reaches the shell`() {
         val shell = FakeShell()
-
-        val result = OpenTool(shell, FakeCatalog()).execute("""{"target":"ftp://example.com/x"}""")
+        val image = openImage("artifact-invalid-url")
+        var captureCalls = 0
+        val result = OpenTool(
+            shell = shell,
+            catalog = FakeCatalog(),
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+            observe = { openObservation() },
+        ).execute("""{"target":"ftp://example.com/x"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("INVALID_URL", errorCode(result))
         assertTrue(shell.commands.isEmpty())
+        assertRefusalExecution(executionOf(result), "INVALID_URL", recoverable = false)
+        assertEquals(1, captureCalls)
+        assertEquals(listOf(image), result.images)
+        assertEquals(ToolVision.Ok, observationOf(result).vision)
+        assertTrue(result.nonPersistent)
     }
 
     @Test
@@ -373,6 +468,10 @@ class OpenToolTest {
             descriptor.parametersJson.contains("file://") && descriptor.parametersJson.contains("不支持"))
         assertTrue("generic category words must be passed unchanged; the tool reports ambiguity",
             descriptor.parametersJson.contains("类别词") && descriptor.parametersJson.contains("不要自行"))
+        assertTrue(
+            "open touches the screen, so its results must declare a screen observation",
+            descriptor.screenObservation,
+        )
     }
 
     // ---- launches ----
@@ -435,7 +534,7 @@ class OpenToolTest {
     }
 
     @Test
-    fun `verified launch attaches one screenshot and vision ok`() {
+    fun `verified launch attaches one screenshot and a done observation`() {
         val pipeline = ShellPipeline()
         val image = ImageRef(
             artifactId = "artifact-open-vision",
@@ -453,6 +552,7 @@ class OpenToolTest {
                 captureCalls++
                 PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
             },
+            observe = { openObservation() },
         ).execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
@@ -462,11 +562,28 @@ class OpenToolTest {
         val data = body(result)["data"]!!.jsonObject
         assertEquals("a verified launch marks vision ok", "ok", data["vision"]!!.jsonPrimitive.content)
         assertTrue("the verified launch shape stays intact", data["verified"]!!.jsonPrimitive.boolean)
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertEquals(true, execution.applied)
+        assertEquals(true, execution.verified)
+        assertEquals("a verified launch is the screen change", true, execution.changed)
+        assertFalse(execution.uncertain)
+        assertFalse(execution.partial)
+
+        val observation = observationOf(result)
+        assertEquals("snap-open", observation.snapshotId)
+        assertEquals("com.android.launcher", observation.foregroundPackage)
+        assertTrue(observation.screen!!.contains("桌面"))
+        assertEquals("an attached image is the only reason vision says ok", ToolVision.Ok, observation.vision)
+        assertNull(observation.visionReason)
     }
 
     @Test
-    fun `unverified launch does not capture`() {
+    fun `an unverified launch observes the current screen and attaches one image`() {
         val pipeline = ShellPipeline()
+        val image = openImage("artifact-state-unchanged")
         var captureCalls = 0
         val result = OpenTool(
             shell = pipeline.shell,
@@ -477,46 +594,79 @@ class OpenToolTest {
             waitForForeground = { _, _ -> false },
             capture = {
                 captureCalls++
-                PerceptionScreenshotResult.Disabled
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
             },
+            observe = { openObservation() },
         ).execute("""{"target":"com.example.music"}""")
 
-        assertEquals(ActionOutcome.Failed, result.outcome)
+        assertEquals("T7: the outcome stays a failure", ActionOutcome.Failed, result.outcome)
         assertEquals("STATE_UNCHANGED", errorCode(result))
-        assertEquals("a launch that is not verified in front must not capture", 0, captureCalls)
-        assertTrue("no image may be attached to an unverified launch", result.images.isEmpty())
-        assertFalse(
-            "an unverified answer has no vision marker",
-            body(result)["data"]!!.jsonObject.containsKey("vision"),
-        )
+        assertEquals("T7: a failed launch must show the model the screen it left behind", 1, captureCalls)
+        assertEquals("one image at most", listOf(image), result.images)
+        assertTrue(result.nonPersistent)
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Failed, execution.outcome)
+        assertEquals("STATE_UNCHANGED", execution.code)
+        assertEquals(true, execution.recoverable)
+        assertEquals("the launch command was accepted", true, execution.accepted)
+        assertNull("the evidence does not prove the launch applied", execution.applied)
+        assertEquals("the foreground/root check is the independent evidence", false, execution.verified)
+        assertNull("a failed verification claims no screen change", execution.changed)
+
+        val observation = observationOf(result)
+        assertEquals("the observation is the failed launch's screen", "com.android.launcher", observation.foregroundPackage)
+        assertEquals(ToolVision.Ok, observation.vision)
+
+        val data = body(result)["data"]!!.jsonObject
+        assertEquals("the failure data keeps its existing shape", false, data["verified"]!!.jsonPrimitive.boolean)
+        assertFalse("failure data gains no vision marker", data.containsKey("vision"))
     }
 
     @Test
-    fun `already foreground does not capture`() {
+    fun `already foreground observes the screen without relaunching`() {
         val shell = FakeShell { command -> ShellResult(command, 0, "Status: ok\n", "") }
+        val image = openImage("artifact-already-foreground")
         var captureCalls = 0
+        var observeCalls = 0
         val result = OpenTool(
             shell = shell,
             catalog = knownMusic(),
             foreground = { "com.example.music" },
             capture = {
                 captureCalls++
-                PerceptionScreenshotResult.Disabled
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+            observe = {
+                observeCalls++
+                openObservation()
             },
         ).execute("""{"target":"com.example.music","relaunch":false}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertTrue("already-foreground must not launch", shell.commands.isEmpty())
-        assertEquals("nothing was brought to front, so there is nothing to capture", 0, captureCalls)
-        assertTrue("alreadyForeground attaches no image", result.images.isEmpty())
-        assertFalse(
-            "the alreadyForeground answer has no vision marker",
-            body(result)["data"]!!.jsonObject.containsKey("vision"),
-        )
+        assertEquals("already-foreground still observes", 1, captureCalls)
+        assertEquals(1, observeCalls)
+        assertEquals("one image at most", listOf(image), result.images)
+        assertTrue(result.nonPersistent)
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertEquals("nothing was launched, so nothing applied", false, execution.applied)
+        assertNull("there is no post-condition to verify", execution.verified)
+        assertEquals("the screen was already the target: nothing changed", false, execution.changed)
+
+        val observation = observationOf(result)
+        assertEquals("com.android.launcher", observation.foregroundPackage)
+        assertEquals(ToolVision.Ok, observation.vision)
+        val data = body(result)["data"]!!.jsonObject
+        assertTrue("the alreadyForeground shape stays intact", data["alreadyForeground"]!!.jsonPrimitive.boolean)
+        assertFalse("the alreadyForeground data gains no vision marker", data.containsKey("vision"))
     }
 
     @Test
-    fun `disabled capture still returns done`() {
+    fun `disabled capture still returns done with a disabled observation`() {
         val pipeline = ShellPipeline()
         var captureCalls = 0
         val result = launchedOpen(
@@ -527,17 +677,22 @@ class OpenToolTest {
                 captureCalls++
                 PerceptionScreenshotResult.Disabled
             },
+            observe = { openObservation() },
         ).execute("""{"target":"com.example.music"}""")
 
         assertEquals("a disabled capture never fails the launch", ActionOutcome.Done, result.outcome)
         assertEquals(1, captureCalls)
         assertEquals("disabled", body(result)["data"]!!.jsonObject["vision"]!!.jsonPrimitive.content)
         assertTrue("a disabled capture attaches no image", result.images.isEmpty())
-        assertFalse("no image means no non-persistent marker", result.nonPersistent)
+        assertTrue("the observation still exists, so its content is non-persistent", result.nonPersistent)
+        val observation = observationOf(result)
+        assertEquals("no attached image may claim vision ok", ToolVision.Disabled, observation.vision)
+        assertNull(observation.visionReason)
+        assertEquals("com.android.launcher", observation.foregroundPackage)
     }
 
     @Test
-    fun `an unavailable capture still returns done`() {
+    fun `an unavailable capture still returns done with its reason on the observation`() {
         val pipeline = ShellPipeline()
         var captureCalls = 0
         val result = launchedOpen(
@@ -548,6 +703,7 @@ class OpenToolTest {
                 captureCalls++
                 PerceptionScreenshotResult.Unavailable("no_image_profile")
             },
+            observe = { openObservation() },
         ).execute("""{"target":"com.example.music"}""")
 
         assertEquals("an unavailable capture never fails the launch", ActionOutcome.Done, result.outcome)
@@ -559,7 +715,10 @@ class OpenToolTest {
             data["vision"]!!.jsonPrimitive.content,
         )
         assertTrue("an unavailable capture attaches no image", result.images.isEmpty())
-        assertFalse("no image means no non-persistent marker", result.nonPersistent)
+        assertTrue("the observation still exists, so its content is non-persistent", result.nonPersistent)
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("no_image_profile", observation.visionReason)
     }
 
     @Test
@@ -574,6 +733,7 @@ class OpenToolTest {
                 captureCalls++
                 throw IllegalStateException("the capture port blew up")
             },
+            observe = { openObservation() },
         ).execute("""{"target":"com.example.music"}""")
 
         assertEquals("a throwing capture must not turn a verified launch into a thrown tool", ActionOutcome.Done, result.outcome)
@@ -585,7 +745,10 @@ class OpenToolTest {
             data["vision"]!!.jsonPrimitive.content,
         )
         assertTrue("a failed capture attaches no image", result.images.isEmpty())
-        assertFalse("no image means no non-persistent marker", result.nonPersistent)
+        assertTrue(result.nonPersistent)
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("SCREENSHOT_FAILED", observation.visionReason)
     }
 
     @Test
@@ -606,6 +769,7 @@ class OpenToolTest {
                 captureCalls++
                 PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
             },
+            observe = { openObservation() },
         ).execute("""{"target":"https://example.com"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
@@ -616,17 +780,31 @@ class OpenToolTest {
             "ok",
             body(result)["data"]!!.jsonObject["vision"]!!.jsonPrimitive.content,
         )
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertEquals(true, execution.applied)
+        assertEquals(true, execution.verified)
+        assertEquals(true, execution.changed)
+        assertEquals(ToolVision.Ok, observationOf(result).vision)
     }
 
     @Test
     fun `a launch whose foreground matches but a11y root does not is STATE_UNCHANGED`() {
         val pipeline = ShellPipeline()
+        val image = openImage("artifact-root-mismatch")
+        var captureCalls = 0
         val result = launchedOpen(
             shell = pipeline.shell,
             catalog = knownMusic(),
             target = "com.example.music",
             activity = "com.example.music/.MainActivity",
             root = "com.android.launcher",
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+            observe = { openObservation() },
         ).execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Failed, result.outcome)
@@ -649,6 +827,20 @@ class OpenToolTest {
             "com.example.music",
             data["target"]!!.jsonPrimitive.content,
         )
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Failed, execution.outcome)
+        assertEquals("STATE_UNCHANGED", execution.code)
+        assertEquals(true, execution.recoverable)
+        assertEquals(true, execution.accepted)
+        assertNull("the root mismatch does not prove the launch failed to apply", execution.applied)
+        assertEquals(false, execution.verified)
+        assertNull(execution.changed)
+
+        assertEquals("T7: the failure shows the screen it actually left", 1, captureCalls)
+        assertEquals("one image at most", listOf(image), result.images)
+        assertEquals(ToolVision.Ok, observationOf(result).vision)
+        assertTrue(result.nonPersistent)
     }
 
     @Test
@@ -687,6 +879,13 @@ class OpenToolTest {
             "the shell did start the activity; the verification is what failed",
             pipeline.shell.commands.any { it.startsWith("am start -W") },
         )
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Failed, execution.outcome)
+        assertEquals("STATE_UNCHANGED", execution.code)
+        assertEquals(true, execution.accepted)
+        assertNull(execution.applied)
+        assertEquals(false, execution.verified)
+        assertNull(execution.changed)
     }
 
     @Test
@@ -724,14 +923,36 @@ class OpenToolTest {
     }
 
     @Test
-    fun `a launch without Status ok is a Failed STATE_UNCHANGED`() {
+    fun `a launch without Status ok is a Failed STATE_UNCHANGED and captures`() {
         val pipeline = ShellPipeline(statusOk = false)
+        val image = openImage("artifact-no-status")
+        var captureCalls = 0
 
-        val result = OpenTool(pipeline.shell, knownMusic()).execute("""{"target":"com.example.music"}""")
+        val result = launchedOpen(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            target = "com.example.music",
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+            observe = { openObservation() },
+        ).execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Failed, result.outcome)
         assertEquals("STATE_UNCHANGED", errorCode(result))
         assertFalse(result.detail.contains("Status: ok"))
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Failed, execution.outcome)
+        assertEquals("STATE_UNCHANGED", execution.code)
+        assertEquals(true, execution.accepted)
+        assertEquals("the command explicitly did not start the activity", false, execution.applied)
+        assertEquals(false, execution.verified)
+        assertNull(execution.changed)
+        assertEquals(1, captureCalls)
+        assertEquals(listOf(image), result.images)
+        assertEquals(ToolVision.Ok, observationOf(result).vision)
+        assertTrue(result.nonPersistent)
     }
 
     @Test
@@ -825,11 +1046,172 @@ class OpenToolTest {
     }
 
     @Test
-    fun `open without a shell channel is CHANNEL_UNAVAILABLE`() {
-        val result = OpenTool(null, FakeCatalog()).execute("""{"target":"com.example.music"}""")
+    fun `open without a shell channel is CHANNEL_UNAVAILABLE with the observed screen`() {
+        val image = openImage("artifact-channel")
+        var captureCalls = 0
+        val result = OpenTool(
+            shell = null,
+            catalog = FakeCatalog(),
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+            observe = { openObservation() },
+        ).execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("CHANNEL_UNAVAILABLE", errorCode(result))
+        assertRefusalExecution(executionOf(result), "CHANNEL_UNAVAILABLE", recoverable = true)
+        assertEquals(1, captureCalls)
+        assertEquals(listOf(image), result.images)
+        assertEquals(ToolVision.Ok, observationOf(result).vision)
+        assertTrue(result.nonPersistent)
+    }
+
+    // ---- Task 5: execution facts and observations on the remaining paths ----
+
+    @Test
+    fun `invalid arguments observe text only and never capture`() {
+        var captureCalls = 0
+        var observeCalls = 0
+        val result = OpenTool(
+            shell = FakeShell(),
+            catalog = FakeCatalog(),
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Disabled
+            },
+            observe = {
+                observeCalls++
+                openObservation()
+            },
+        ).execute("""{"target":"   "}""")
+
+        assertEquals("an argument refusal stays a refusal", ActionOutcome.Refused, result.outcome)
+        assertEquals("INVALID_ARGUMENTS", errorCode(result))
+        assertEquals("no picture is attempted for a pure validation refusal", 0, captureCalls)
+        assertEquals("the refusal still answers with the current screen as text", 1, observeCalls)
+        assertTrue(result.images.isEmpty())
+        assertTrue("observation text is still perception content (C2)", result.nonPersistent)
+        val observation = observationOf(result)
+        assertEquals("com.android.launcher", observation.foregroundPackage)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("not_attempted", observation.visionReason)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("INVALID_ARGUMENTS", execution.code)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        assertEquals("this refusal is not retryable", false, execution.recoverable)
+    }
+
+    @Test
+    fun `an unknown action reports execution facts but no observation or image`() {
+        var captureCalls = 0
+        var observeCalls = 0
+        val result = OpenTool(
+            shell = null,
+            catalog = FakeCatalog(),
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Disabled
+            },
+            observe = {
+                observeCalls++
+                openObservation()
+            },
+        ).execute("shell", "{}")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("UNKNOWN_ACTION", result.detail)
+        assertEquals("UNKNOWN_ACTION is not a screen operation", 0, captureCalls)
+        assertEquals(0, observeCalls)
+        assertNull("an unknown action invents no screen", result.observation)
+        assertTrue(result.images.isEmpty())
+        assertFalse(result.nonPersistent)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("UNKNOWN_ACTION", execution.code)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+    }
+
+    @Test
+    fun `a screen attempt without an observation source reports unavailable no source`() {
+        val result = OpenTool(
+            shell = FakeShell { command -> ShellResult(command, 0, "Status: ok\n", "") },
+            catalog = knownMusic(),
+            foreground = { "com.example.music" },
+            // No observe source: the production wiring arrives in Task 6.
+        ).execute("""{"target":"com.example.music","relaunch":false}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val observation = observationOf(result)
+        assertEquals("a missing source is never a silent null", ToolVision.Unavailable, observation.vision)
+        assertEquals("no_source", observation.visionReason)
+        assertNull(observation.foregroundPackage)
+        assertNull(observation.screen)
+        assertTrue("no source and a disabled capture attach no image", result.images.isEmpty())
+        assertTrue("an attempted observation is non-persistent", result.nonPersistent)
+    }
+
+    @Test
+    fun `vision is not ok when no image is attached even if the source claims it`() {
+        val result = OpenTool(
+            shell = null,
+            catalog = FakeCatalog(),
+            capture = { PerceptionScreenshotResult.Disabled },
+            observe = { openObservation(vision = ToolVision.Ok) },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertTrue("no image was attached", result.images.isEmpty())
+        assertEquals(
+            "vision=ok requires a resolvable attached image, not a source claim",
+            ToolVision.Disabled,
+            observationOf(result).vision,
+        )
+    }
+
+    @Test
+    fun `a launch command that exits non-zero is STATE_UNCHANGED with its screen`() {
+        val shell = FakeShell { command ->
+            when {
+                command.startsWith("cmd package resolve-activity") ->
+                    ShellResult(command, 0, "com.example.music/.MainActivity\n", "")
+                command.startsWith("am start -W") -> ShellResult(command, 7, "", "Error: boom")
+                else -> ShellResult(command, 0, "", "")
+            }
+        }
+        val image = openImage("artifact-exit-code")
+        var captureCalls = 0
+        val result = OpenTool(
+            shell = shell,
+            catalog = knownMusic(),
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+            observe = { openObservation() },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        assertEquals("STATE_UNCHANGED", errorCode(result))
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Failed, execution.outcome)
+        assertEquals("STATE_UNCHANGED", execution.code)
+        assertEquals(true, execution.accepted)
+        assertEquals("the command explicitly failed", false, execution.applied)
+        assertEquals(false, execution.verified)
+        assertNull(execution.changed)
+        assertEquals(1, captureCalls)
+        assertEquals(listOf(image), result.images)
+        assertEquals(ToolVision.Ok, observationOf(result).vision)
+        assertTrue(result.nonPersistent)
     }
 
     // ---- R98: the state-changing declaration ----
@@ -860,6 +1242,57 @@ class OpenToolTest {
     private fun errorCode(result: ActionResult): String =
         body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content
 
+    /** 0.3 Phase 2.2 Task 5: every `open` result must carry structured execution facts. */
+    private fun executionOf(result: ActionResult): ToolExecution {
+        assertNotNull("the open result must carry structured execution facts", result.execution)
+        return result.execution!!
+    }
+
+    /** 0.3 Phase 2.2 Task 5: a screen attempt must carry an observation, not a silent null. */
+    private fun observationOf(result: ActionResult): ToolObservation {
+        assertNotNull("the open result must carry a post-call observation", result.observation)
+        return result.observation!!
+    }
+
+    /** The observation facts a production source would return before the tool attaches its own picture. */
+    private fun openObservation(vision: ToolVision = ToolVision.NotRequested): ToolObservation = ToolObservation(
+        snapshotId = "snap-open",
+        capturedAtEpochMillis = 1_700_000_000_000L,
+        foregroundPackage = "com.android.launcher",
+        foregroundActivity = "com.android.launcher/.Launcher",
+        rootPackage = "com.android.launcher",
+        coverage = "screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok " +
+            "vision=ok glasses=ok device=ok",
+        screen = "#n1 button \"桌面\"",
+        truncated = false,
+        vision = vision,
+    )
+
+    /** One captured artifact; every image-bearing result must attach exactly this one. */
+    private fun openImage(artifactId: String = "artifact-open-observation"): ImageRef = ImageRef(
+        artifactId = artifactId,
+        mime = "image/jpeg",
+        width = 720,
+        height = 1600,
+        sha256 = "sha256-$artifactId",
+    )
+
+    /**
+     * The execution facts a tool-level refusal reports: the action was never dispatched, so nothing was accepted or
+     * applied, and nothing can be claimed as verified or changed.
+     */
+    private fun assertRefusalExecution(execution: ToolExecution, code: String, recoverable: Boolean) {
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals(code, execution.code)
+        assertEquals(recoverable, execution.recoverable)
+        assertEquals("the call never reached its action", false, execution.accepted)
+        assertEquals("nothing was applied", false, execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        assertFalse(execution.uncertain)
+        assertFalse(execution.partial)
+    }
+
     /**
      * `com.example.music` has to be a catalog entry now: a package-shaped target is a package only
      * when the catalog actually knows it, and this fake catalog is the catalog under test.
@@ -884,6 +1317,7 @@ class OpenToolTest {
         root: String? = target,
         waitForForeground: (String, Long) -> Boolean = { _, _ -> true },
         capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
+        observe: () -> ToolObservation? = { null },
     ): OpenTool = OpenTool(
         shell = shell,
         catalog = catalog,
@@ -894,6 +1328,7 @@ class OpenToolTest {
         rootPackage = { root },
         waitForForeground = waitForForeground,
         capture = capture,
+        observe = observe,
     )
 
     /**
@@ -908,6 +1343,7 @@ class OpenToolTest {
         root: String? = foreground,
         waitForForeground: (String, Long) -> Boolean = { _, _ -> true },
         capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
+        observe: () -> ToolObservation? = { null },
     ): OpenTool = OpenTool(
         shell = shell,
         catalog = catalog,
@@ -916,6 +1352,7 @@ class OpenToolTest {
         rootPackage = { root },
         waitForForeground = waitForForeground,
         capture = capture,
+        observe = observe,
     )
 
     private class FakeCatalog(

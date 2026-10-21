@@ -14,6 +14,10 @@ import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.PerceptionScreenshotResult
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
+import com.sheen.rokid.plugin.ToolVision
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
@@ -72,17 +76,28 @@ class OpenTool(
         foreground() == pkg
     },
     /**
-     * 0.3 Phase 2.1 Task 4: the automatic capture for a **verified** launch, or `Disabled` when this composition has no
-     * perception port.
+     * 0.3 Phase 2.1 Task 4 / Phase 2.2 Task 5: the automatic capture beside a post-call observation, or `Disabled`
+     * when this composition has no perception port.
      *
-     * Only the `verified = true` success of [launchEnvelope] captures. An ambiguous name, an unknown app, an unusable
-     * shell, the `alreadyForeground` shortcut and a `STATE_UNCHANGED` mismatch all answer without a new screen to show.
-     * The user's vision switch and the selected profile's `IMAGE` capability are gates inside
-     * [com.sheen.rokid.plugin.PerceptionProvider.screenshot] (Task 2), so this tool does not duplicate them: `Disabled`
-     * and `Unavailable` are answers that attach no image and never fail the launch. A capture that throws is mapped to
-     * `Unavailable("SCREENSHOT_FAILED")` here (Task 4 fix), so a broken port cannot turn the launch into `TOOL_THREW`.
+     * Task 5 asks every screen path for one best-effort picture: a verified success, `alreadyForeground`, an ambiguous
+     * name, an unknown app, an unusable shell, an invalid URL and a `STATE_UNCHANGED` failure all attach at most one
+     * image. `list` and an unknown action are not screen operations and never capture; a pure argument-validation
+     * refusal observes text only. The user's vision switch and the selected profile's `IMAGE` capability are gates
+     * inside [com.sheen.rokid.plugin.PerceptionProvider.screenshot] (Task 2), so this tool does not duplicate them:
+     * `Disabled` and `Unavailable` are answers that attach no image and never fail the launch. A capture that throws is
+     * mapped to `Unavailable("SCREENSHOT_FAILED")` here (Task 4 fix), so a broken port cannot turn the launch into
+     * `TOOL_THREW`.
      */
     private val capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
+    /**
+     * edith-0.3 Phase 2.2 Task 5: the testable post-call observation source, or `null` until Task 6 wires the
+     * production perception port in.
+     *
+     * The tool calls it after determining an outcome on every screen path, and attaches the answer beside the
+     * execution facts. A missing (or throwing) source is not a silent `null`: the result carries
+     * `ToolObservation(vision = unavailable, visionReason = "no_source")`.
+     */
+    private val observe: () -> ToolObservation? = { null },
 ) : ActionExecutor {
 
     private val resolver = AppLaunchResolver(catalog)
@@ -96,7 +111,7 @@ class OpenTool(
     fun execute(argsJson: String): ActionResult = execute(NAME, argsJson)
 
     override fun execute(name: String, argsJson: String): ActionResult {
-        if (name != NAME) return ActionResult(ActionOutcome.Refused, UNKNOWN_ACTION)
+        if (name != NAME) return unknownAction()
         val args = parseObject(argsJson) ?: return invalidArguments()
         if (args.booleanArg("list") == true) return listApps()
         if (shell == null) return channelUnavailable()
@@ -122,7 +137,7 @@ class OpenTool(
     // ── list ─────────────────────────────────────────────────────────────────
 
     private fun listApps(): ActionResult {
-        val target = shell ?: return channelUnavailable()
+        val target = shell ?: return listChannelUnavailable()
         // R104 (user report 2026-10-20): the wearer asked for the file manager / gallery / camera / settings / music,
         // and `pm list packages -3` hid every one of them (K40: 20 third-party packages vs 346 installed). The launcher
         // activity query is the **launchable** set - 31 components on the K40, system apps included. A failed, empty or
@@ -140,8 +155,8 @@ class OpenTool(
             replyTruncated = launcherReply?.truncated == true
             catalogVia = "launcher"
         } else {
-            val all = runSafely(target, PACKAGE_LIST_COMMAND) ?: return channelUnavailable()
-            if (all.failure != null || all.exitCode != 0) return channelUnavailable()
+            val all = runSafely(target, PACKAGE_LIST_COMMAND) ?: return listChannelUnavailable()
+            if (all.failure != null || all.exitCode != 0) return listChannelUnavailable()
             packages = parsePackageLines(all.stdout)
             replyTruncated = all.truncated
             catalogVia = "packages"
@@ -186,7 +201,8 @@ class OpenTool(
             put("hasPlayer", hasPlayer)
             put("hasSettings", hasSettings)
         }
-        return done(data)
+        // Task 5: `list` is a read, not a screen operation - execution facts only, no observation and no image.
+        return done(data, execution = listDoneExecution())
     }
 
     /**
@@ -245,12 +261,18 @@ class OpenTool(
             }
         }
         if (!relaunch && foreground() == resolved.packageName) {
+            // edith-0.3 Phase 2.2 Task 5: `alreadyForeground` stays Done, but the model still needs to see the screen
+            // it is already on - one best-effort observation and at most one picture.
+            val attempt = screenAttempt()
             return done(
                 buildJsonObject {
                     put("target", resolved.packageName)
                     put("alreadyForeground", true)
                     put("message", "already foreground")
                 },
+                images = attempt.images,
+                observation = attempt.observation,
+                execution = alreadyForegroundExecution(),
             )
         }
         val pkg = resolved.packageName
@@ -278,35 +300,25 @@ class OpenTool(
         return started
     }
 
-    private fun ambiguous(candidates: List<AppLaunchResolver.LaunchTarget>): ActionResult = ActionResult(
-        ActionOutcome.Refused,
-        toolEnvelope(
-            tool = NAME,
-            ok = false,
-            channel = CHANNEL,
-            accepted = false,
-            data = buildJsonObject {
-                put(
-                    "candidates",
-                    buildJsonArray {
-                        candidates.forEach { candidate ->
-                            add(
-                                buildJsonObject {
-                                    put("label", candidate.label)
-                                    put("packageName", candidate.packageName)
-                                },
-                            )
-                        }
-                    },
-                )
-            },
-            error = ToolFailure(
-                code = APP_AMBIGUOUS,
-                message = "multiple apps match the target; pick one of data.candidates",
-                recoverable = true,
-            ),
-        ),
-        stateChanging = true,
+    private fun ambiguous(candidates: List<AppLaunchResolver.LaunchTarget>): ActionResult = failure(
+        code = APP_AMBIGUOUS,
+        message = "multiple apps match the target; pick one of data.candidates",
+        recoverable = true,
+        data = buildJsonObject {
+            put(
+                "candidates",
+                buildJsonArray {
+                    candidates.forEach { candidate ->
+                        add(
+                            buildJsonObject {
+                                put("label", candidate.label)
+                                put("packageName", candidate.packageName)
+                            },
+                        )
+                    }
+                },
+            )
+        },
     )
 
     // ── shell helpers ────────────────────────────────────────────────────────
@@ -327,9 +339,9 @@ class OpenTool(
      * `resolvedPackage`, `foreground` (`package`/`activity`), `rootPackage` and `verified`. The caller's [data] keys
      * (`target`/`component`) stay on both outcomes.
      *
-     * 0.3 Phase 2.1 Task 4: only the verified success captures an automatic vision image, after the observation above;
-     * the done data gains `vision=ok|disabled|unavailable(<reason>)` and a produced image goes to
-     * [ActionResult.images]. Nothing below the verification captures.
+     * 0.3 Phase 2.2 Task 5: every outcome observes the screen and attaches at most one best-effort picture. Only a
+     * verified success keeps the `vision=ok|disabled|unavailable(<reason>)` marker in `data` (the Phase 2.1 shape);
+     * every other path carries the fact as `observation.vision` and a produced image in [ActionResult.images].
      */
     private fun launchEnvelope(
         target: PrivilegedShell,
@@ -340,10 +352,22 @@ class OpenTool(
         val result = runSafely(target, command) ?: return channelUnavailable()
         if (result.failure != null) return channelUnavailable()
         if (result.exitCode != 0) {
-            return failure(STATE_UNCHANGED, "the launch command exited ${result.exitCode}", recoverable = true, outcome = ActionOutcome.Failed)
+            return failure(
+                STATE_UNCHANGED,
+                "the launch command exited ${result.exitCode}",
+                recoverable = true,
+                outcome = ActionOutcome.Failed,
+                applied = false,
+            )
         }
         if (!result.stdout.contains(STATUS_OK)) {
-            return failure(STATE_UNCHANGED, "the launch produced no success status", recoverable = true, outcome = ActionOutcome.Failed)
+            return failure(
+                STATE_UNCHANGED,
+                "the launch produced no success status",
+                recoverable = true,
+                outcome = ActionOutcome.Failed,
+                applied = false,
+            )
         }
         val reachedForeground = expectedPackage == null ||
             waitForForeground(expectedPackage, FOREGROUND_TIMEOUT_MILLIS)
@@ -370,27 +394,33 @@ class OpenTool(
             put("verified", verified)
         }
         if (!verified) {
+            // Task 5 / T7: a verification mismatch keeps its Failed/STATE_UNCHANGED outcome and its data shape, but it
+            // now observes the screen it actually left behind (and attaches one best-effort picture). `applied` stays
+            // null: the mismatch proves the request is not in front, not that the command never applied.
             return failure(
                 code = STATE_UNCHANGED,
                 message = "the launch command succeeded but the request is not verified in front",
                 recoverable = true,
                 outcome = ActionOutcome.Failed,
                 data = launchData,
+                applied = null,
             )
         }
-        // 0.3 Phase 2.1 Task 4: only a verified success has a new screen worth showing. The capture runs after the
-        // verification read, so the image and the foreground/root facts describe the same screen. A capture port that
+        // 0.3 Phase 2.2 Task 5: a verified success observes and captures after the verification read, so the
+        // observation text, the image and the foreground/root facts describe the same screen. A capture port that
         // throws is still just "no image" (Task 4 fix): the verified launch succeeded, so it must not turn the tool
         // result into TOOL_THREW.
-        val captured = runCatching { capture() }
-            .getOrElse { PerceptionScreenshotResult.Unavailable(SCREENSHOT_FAILED) }
+        val attempt = screenAttempt()
+        val captured = attempt.captured
         return done(
             buildJsonObject {
                 launchData.forEach { (key, value) -> put(key, value) }
                 put("launched", true)
                 put(VISION_KEY, visionMarker(captured))
             },
-            images = capturedImage(captured),
+            images = attempt.images,
+            observation = attempt.observation,
+            execution = verifiedExecution(),
         )
     }
 
@@ -433,34 +463,87 @@ class OpenTool(
     private fun done(
         data: kotlinx.serialization.json.JsonObject,
         images: List<ImageRef> = emptyList(),
+        observation: ToolObservation? = null,
+        execution: ToolExecution = ToolExecution(outcome = ToolOutcome.Done),
     ): ActionResult = ActionResult(
         ActionOutcome.Done,
         toolEnvelope(tool = NAME, ok = true, channel = CHANNEL, accepted = true, data = data),
         stateChanging = true,
         images = images,
-        // C2: an attached image may live only in this run's model request. A launch result without one carries no
-        // perception content, so its existing persistent shape is unchanged.
-        nonPersistent = images.isNotEmpty(),
+        // C2: observation text and an attached image may live only in this run's model request. A launch result
+        // without either keeps its existing persistent shape; Task 8 still owns the loop-copy nonPersistent audit.
+        nonPersistent = observation != null || images.isNotEmpty(),
+        execution = execution,
+        observation = observation,
     )
 
+    /**
+     * edith-0.3 Phase 2.2 Task 5: one refusal or failure of a screen operation.
+     *
+     * The outcome and the model-facing `error` shape are exactly what they were before Task 5; this helper only adds
+     * the structured facts. [captureImage] and [attachObservation] encode the task's image boundary: the launch
+     * paths observe and attach at most one picture, a pure argument refusal observes text only, and `list` does
+     * neither. Nothing here can change the outcome or fail the call.
+     */
     private fun failure(
         code: String,
         message: String,
         recoverable: Boolean,
         outcome: ActionOutcome = ActionOutcome.Refused,
         data: kotlinx.serialization.json.JsonObject? = null,
-    ): ActionResult = ActionResult(
-        outcome,
-        toolEnvelope(
-            tool = NAME,
-            ok = false,
-            channel = CHANNEL,
-            accepted = false,
-            data = data,
-            error = ToolFailure(code, message, recoverable),
-        ),
-        stateChanging = true,
-    )
+        applied: Boolean? = false,
+        captureImage: Boolean = true,
+        attachObservation: Boolean = true,
+    ): ActionResult {
+        val observation: ToolObservation?
+        val images: List<ImageRef>
+        when {
+            !attachObservation -> {
+                observation = null
+                images = emptyList()
+            }
+            captureImage -> {
+                val attempt = screenAttempt()
+                observation = attempt.observation
+                images = attempt.images
+            }
+            else -> {
+                observation = textObservation()
+                images = emptyList()
+            }
+        }
+        val failed = outcome == ActionOutcome.Failed
+        return ActionResult(
+            outcome,
+            toolEnvelope(
+                tool = NAME,
+                ok = false,
+                channel = CHANNEL,
+                // The legacy detail envelope keeps its pre-Task-5 shape (`accepted=false` on a failure); the new
+                // structured `execution` below is where Task 5's honest facts live until Task 8 removes the duplication.
+                accepted = false,
+                data = data,
+                error = ToolFailure(code, message, recoverable),
+            ),
+            stateChanging = true,
+            images = images,
+            nonPersistent = observation != null || images.isNotEmpty(),
+            execution = ToolExecution(
+                outcome = if (failed) ToolOutcome.Failed else ToolOutcome.Refused,
+                code = code,
+                message = message,
+                recoverable = recoverable,
+                // A Failed/STATE_UNCHANGED launch was accepted by the shell and then failed its verification; a refusal
+                // never dispatched the action at all.
+                accepted = failed,
+                applied = applied,
+                // `verified=false` is the evidence that failed the launch; a refusal checked no post-condition.
+                verified = if (failed) false else null,
+                changed = null,
+            ),
+            observation = observation,
+        )
+    }
 
     private fun appNotFound(): ActionResult = failure(
         code = APP_NOT_FOUND,
@@ -474,10 +557,120 @@ class OpenTool(
         recoverable = true,
     )
 
+    /** Task 5: `list` is not a screen operation, so even its channel failure invents no observation or image. */
+    private fun listChannelUnavailable(): ActionResult = failure(
+        code = CHANNEL_UNAVAILABLE,
+        message = "the privileged shell is not usable",
+        recoverable = true,
+        applied = null,
+        captureImage = false,
+        attachObservation = false,
+    )
+
     private fun invalidArguments(): ActionResult = failure(
         code = INVALID_ARGUMENTS,
         message = "open needs list=true or a target",
         recoverable = false,
+        captureImage = false,
+    )
+
+    /**
+     * edith-0.3 Phase 2.2 Task 5: an unknown action is not an `open` call at all.
+     *
+     * Its model-facing detail stays the bare `UNKNOWN_ACTION` code (the pre-Task-5 shape), but it carries the same
+     * structured refusal facts a validation refusal does. It is not a screen operation, so it invents no observation
+     * and attaches no image.
+     */
+    private fun unknownAction(): ActionResult = ActionResult(
+        ActionOutcome.Refused,
+        UNKNOWN_ACTION,
+        execution = ToolExecution(
+            outcome = ToolOutcome.Refused,
+            code = UNKNOWN_ACTION,
+            accepted = false,
+            applied = false,
+            verified = null,
+            changed = null,
+        ),
+    )
+
+    /**
+     * edith-0.3 Phase 2.2 Task 5: one screen attempt's observation, picture and raw capture result.
+     *
+     * [captured] is never null: [screenAttempt] always takes exactly one picture (or records how the capture port
+     * answered), which is what keeps every result to **at most one image**.
+     */
+    private data class ObservationAttempt(
+        val observation: ToolObservation,
+        val images: List<ImageRef>,
+        val captured: PerceptionScreenshotResult,
+    )
+
+    /**
+     * The one post-call observation + picture builder for a screen attempt.
+     *
+     * The observation facts come from the injected [observe] source (Task 6 wires the production perception port);
+     * the picture comes from [capture] and is the only reason `vision = ok` is reported. A missing or throwing source
+     * is not a silent null: the result still carries an observation whose vision is `unavailable/no_source`. A capture
+     * port that throws is mapped to `unavailable/SCREENSHOT_FAILED`, exactly as Task 4 fixed for the verified path.
+     */
+    private fun screenAttempt(): ObservationAttempt {
+        val captured = runCatching { capture() }
+            .getOrElse { PerceptionScreenshotResult.Unavailable(SCREENSHOT_FAILED) }
+        val observed = runCatching { observe() }.getOrNull()
+        val sourceMissing = observed == null
+        val base = observed ?: ToolObservation(
+            vision = ToolVision.Unavailable,
+            visionReason = VISION_NO_SOURCE,
+        )
+        val image = (captured as? PerceptionScreenshotResult.Image)?.image
+        val observation = base.copy(
+            vision = when {
+                image != null -> ToolVision.Ok
+                sourceMissing -> ToolVision.Unavailable
+                captured == PerceptionScreenshotResult.Disabled -> ToolVision.Disabled
+                captured is PerceptionScreenshotResult.Unavailable -> ToolVision.Unavailable
+                else -> ToolVision.Unavailable
+            },
+            visionReason = when {
+                image != null -> null
+                sourceMissing -> VISION_NO_SOURCE
+                captured is PerceptionScreenshotResult.Unavailable -> captured.reason
+                else -> null
+            },
+        )
+        return ObservationAttempt(observation, capturedImage(captured), captured)
+    }
+
+    /** Task 5: the observation text a pure argument refusal can afford - no picture is attempted. */
+    private fun textObservation(): ToolObservation {
+        val observed = runCatching { observe() }.getOrNull()
+            ?: return ToolObservation(vision = ToolVision.Unavailable, visionReason = VISION_NO_SOURCE)
+        return observed.copy(vision = ToolVision.Unavailable, visionReason = VISION_NOT_ATTEMPTED)
+    }
+
+    /** Task 5: a `list` read reports its own facts - nothing was applied, verified or changed. */
+    private fun listDoneExecution(): ToolExecution = ToolExecution(
+        outcome = ToolOutcome.Done,
+        accepted = true,
+    )
+
+    /** Task 5: `alreadyForeground` did not launch, so the call applied nothing and the screen did not change. */
+    private fun alreadyForegroundExecution(): ToolExecution = ToolExecution(
+        outcome = ToolOutcome.Done,
+        accepted = true,
+        applied = false,
+        verified = null,
+        changed = false,
+    )
+
+    /** Task 5: a verified launch is the only `open` path with evidence for all four facts. */
+    private fun verifiedExecution(): ToolExecution = ToolExecution(
+        outcome = ToolOutcome.Done,
+        accepted = true,
+        applied = true,
+        verified = true,
+        changed = true,
     )
 
     private fun isHttpUrl(url: String): Boolean = try {
@@ -529,6 +722,10 @@ class OpenTool(
         private const val VISION_MARKER_DISABLED = "disabled"
         private const val VISION_MARKER_UNAVAILABLE = "unavailable"
 
+        /** Task 5: why a screen attempt has no picture, in the same vocabulary `AgentLoop` uses. */
+        private const val VISION_NO_SOURCE = "no_source"
+        private const val VISION_NOT_ATTEMPTED = "not_attempted"
+
         /** Task 4 fix: a capture port that throws becomes this `unavailable` reason, not a thrown tool. */
         private const val SCREENSHOT_FAILED = "SCREENSHOT_FAILED"
 
@@ -567,6 +764,7 @@ class OpenTool(
             idempotent = true,
             reversible = false,
             scope = "device",
+            screenObservation = true,
         )
     }
 }
