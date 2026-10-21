@@ -961,6 +961,31 @@ class ConversationCycleTest {
     }
 
     @Test
+    fun `a proactive follow-up window and a wake window expire independently`() {
+        val rig = rig(panelVisible = true)
+        // P3-13: PROACTIVE and WAKE are two independent sessions. The cycle keeps one state per route, so a follow-up
+        // window that started earlier must close on its own deadline without touching a younger wake round.
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "followup-1")
+        rig.advance(OfficialConversation.LISTEN_TIMEOUT_MILLIS - 1_000)
+        rig.cycle.onWake(AssistantRoute.WAKE, "wake-1")
+
+        rig.advance(1_000)
+        assertEquals(
+            listOf(AssistantRoute.PROACTIVE),
+            rig.display.calls.filterIsInstance<RecordingDisplay.Call.Close>().map { it.route },
+        )
+        assertEquals(listOf(AssistantRoute.PROACTIVE to "followup-1"), rig.cancelled)
+        assertEquals(1, rig.display.closed, "the younger wake window must still be open")
+
+        rig.advance(OfficialConversation.LISTEN_TIMEOUT_MILLIS - 1_000)
+        assertEquals(2, rig.display.closed)
+        assertEquals(
+            listOf(AssistantRoute.PROACTIVE to "followup-1", AssistantRoute.WAKE to "wake-1"),
+            rig.cancelled,
+        )
+    }
+
+    @Test
     fun `status updates after stop are ignored`() {
         val rig = rig(panelVisible = true)
         rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
