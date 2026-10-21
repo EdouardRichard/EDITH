@@ -27,24 +27,27 @@ internal data class PromptManifestEntry(
  * Layout produced by [plan], from spec §4.2 and the Phase 3 brief:
  * 1. the core sections in filename order (00-identity … 50-memory-policy);
  * 2. the route posture (`route/wake.md`, `route/proactive-hint.md` or `route/proactive-followup.md`);
- * 3. `context/device-profile.md`, rendered from the live [DeviceProfile], only when a profile exists;
- * 4. any `PINNED` sections (none in Phase 1).
+ * 3. `context/device-profile.md`, rendered from the live [DeviceProfile], only when a profile exists.
  *
  * The per-request block ([dynamicTemplate]) is deliberately **not** part of a plan: dynamic values
- * in the system prompt would break the cache boundary in spec §4.4.
+ * in the system prompt would break the cache boundary in spec §4.4. The `loop/`, `pinned/` and
+ * `summarizer.md` resources are independent fixed prompts loaded by [loop], [pinned] and
+ * [summarizer]; they never enter a system plan (a `PINNED` gate question is its own model call, and
+ * a loop instruction is a synthetic turn), so their prose cannot invalidate the cache prefix.
  */
 object PromptCatalog {
 
     /** Catalog semver; a session pins the plan it loaded, it never mixes versions (spec §4.1). */
-    const val VERSION: String = "0.3.0"
+    const val VERSION: String = "0.4.0"
 
     private const val PROMPTS_DIR = "prompts/"
     private const val MANIFEST_FILE = "manifest.tsv"
     private const val DEVICE_PROFILE_FILE = "context/device-profile.md"
     private const val RUNTIME_STATE_FILE = "context/runtime-state.md"
+    private const val SUMMARIZER_FILE = "summarizer.md"
 
     /** The only directories a manifest file may live in. */
-    private val RESOURCE_FOLDERS = setOf("core", "route", "context")
+    private val RESOURCE_FOLDERS = setOf("core", "route", "context", "loop", "pinned")
 
     /**
      * Every prompt route's posture resource (0.3 Phase 3 spec §5.1). The follow-up route is a separate posture from
@@ -157,10 +160,6 @@ object PromptCatalog {
             }
         }
 
-        entries.filter { it.kind == PromptKind.PINNED }
-            .sortedBy { it.file }
-            .forEach { sections += PromptSection(it.id, it.kind, sectionText(it)) }
-
         val systemText = sections.joinToString("\n\n") { it.text }
         return PromptPlan(VERSION, sections, systemText, PromptPlan.hashOf(sections))
     }
@@ -170,6 +169,30 @@ object PromptCatalog {
      * (spec §4.3). It is not part of any [PromptPlan].
      */
     fun dynamicTemplate(): String = resourceTexts.getValue(RUNTIME_STATE_FILE)
+
+    /**
+     * One externally constrained fixed prompt (`pinned/<key>.md`), such as Laya's fine-tuned gate question.
+     *
+     * PINNED content is not a system section: it belongs to its own call and is deliberately excluded from [plan]
+     * because rewriting it or paying for it on every request would invalidate its calibration or the cache prefix.
+     */
+    fun pinned(key: String): String = manifestResource("pinned/$key.md")
+
+    /**
+     * One loop-owned instruction (`loop/<key>.md`): retry, plan nudge or timeout guidance.
+     *
+     * These are injected as their own synthetic turn by the runtime, never as part of the system plan, so the
+     * cacheable prefix does not change when a loop branch runs.
+     */
+    fun loop(key: String): String = manifestResource("loop/$key.md")
+
+    /**
+     * The instruction for the asynchronous conversation summarizer.
+     *
+     * A summary is an independent request with no tools and no assembled [PromptPlan], so this text is not a
+     * system section either.
+     */
+    fun summarizer(): String = manifestResource(SUMMARIZER_FILE)
 
     /**
      * The perception block of `context/runtime-state.md` (0.3 Phase 2 Task 9): the template up to, but excluding, the
@@ -190,7 +213,8 @@ object PromptCatalog {
      * loudly instead of shipping a session with a silently missing section.
      *
      * Validation rules: five tab-separated columns, legal [PromptKind], unique id and file, a file
-     * under `core/`, `route/` or `context/`, and content that respects its kind's slot contract
+     * under `core/`, `route/`, `context/`, `loop/` or `pinned/` (or the root `summarizer.md`), and
+     * content that respects its kind's slot contract
      * (`STATIC` has no placeholders, `SESSION_STATIC` uses exactly the device-profile slots,
      * `DYNAMIC` uses exactly the runtime slots). Internal with an injectable loader so the rejection
      * paths are testable without shipping a broken resource.
@@ -218,8 +242,8 @@ object PromptCatalog {
             require(file.isNotBlank()) { "manifest '$id' has a blank file" }
             require(files.add(file)) { "duplicate manifest file '$file'" }
             require(file.endsWith(".md")) { "manifest '$id' file '$file' must be Markdown" }
-            require(file.substringBefore('/') in RESOURCE_FOLDERS) {
-                "manifest '$id' file '$file' must live under one of $RESOURCE_FOLDERS"
+            require(file == SUMMARIZER_FILE || file.substringBefore('/') in RESOURCE_FOLDERS) {
+                "manifest '$id' file '$file' must live under one of $RESOURCE_FOLDERS or be $SUMMARIZER_FILE"
             }
             val kind = PromptKind.entries.firstOrNull { it.name == kindName }
                 ?: throw IllegalArgumentException("manifest '$id' has unknown kind '$kindName'")
@@ -277,6 +301,15 @@ object PromptCatalog {
     }
 
     private fun sectionText(entry: PromptManifestEntry): String = resourceTexts.getValue(entry.file)
+
+    /**
+     * Loads a resource through the validated manifest so an accessor cannot read a file the catalog did not accept
+     * (wrong folder, blank version, duplicate id). A missing key fails loudly with the path the caller asked for.
+     */
+    private fun manifestResource(file: String): String {
+        require(file in resourceTexts) { "'$file' is not a validated prompt resource in the manifest" }
+        return resourceTexts.getValue(file)
+    }
 
     /**
      * Renders `context/device-profile.md` line by line against [profile].

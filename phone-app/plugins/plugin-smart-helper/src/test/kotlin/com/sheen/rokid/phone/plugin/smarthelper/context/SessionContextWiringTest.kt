@@ -305,6 +305,14 @@ class SessionContextWiringTest {
     fun `pulled skill bodies are not in the system slot`() {
         val marker = "正文标记-1201"
         val rig = SmartTestRig(conversationStores = smartStores())
+        // 0.3 Phase 4A Task 6: the 24-tool system prompt is larger than the six-tool one, so this content assertion
+        // needs a window that fits both the prompt and the pulled body; trimming is not what this test measures.
+        rig.profile = com.sheen.rokid.phone.plugin.smarthelper.smartProfile(
+            usableWindowTokens = 32_000,
+            inputBudgetTokens = 16_000,
+            maxOutputTokens = 2_000,
+            safetyTokens = 1_000,
+        )
         rig.activate(
             overrides = mapOf(
                 Capability.Storage to SmartFakeStorage(),

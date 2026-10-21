@@ -47,12 +47,24 @@ class StoreSessionWiringTest {
     private fun stores(): Map<ContextRoute, ConversationStore> =
         ContextRoute.entries.associateWith { ConversationStore() }
 
-    /** An activated production-shaped rig whose two route stores are `stores`. */
+    /**
+     * An activated production-shaped rig whose two route stores are `stores`.
+     *
+     * The wide window keeps the 24-tool system prompt (0.3 Phase 4A Task 6) out of these content assertions: a
+     * 4k-token fixture that just fitted the old six-tool prompt would otherwise let the trimmer drop the memory or a
+     * tool round the test is about. Tests that need a budget edge override `rig.profile` explicitly.
+     */
     private fun rig(
         stores: Map<ContextRoute, ConversationStore> = stores(),
         compressor: ContextCompressor? = null,
         overrides: Map<Capability, Any> = mapOf(Capability.Storage to SmartFakeStorage()),
     ): SmartTestRig = SmartTestRig(conversationStores = stores, compressor = compressor).also {
+        it.profile = smartProfile(
+            usableWindowTokens = 32_000,
+            inputBudgetTokens = 16_000,
+            maxOutputTokens = 2_000,
+            safetyTokens = 1_000,
+        )
         it.activate(overrides = overrides)
         it.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
     }

@@ -60,9 +60,26 @@ class PromptTelemetryTest {
         return rig
     }
 
-    /** The production store-backed shape: production always injects one `ConversationStore` per route. */
-    private fun wakeRig(deviceProfile: DeviceProfile? = profile): SmartTestRig {
+    /**
+     * The production store-backed shape: production always injects one `ConversationStore` per route.
+     *
+     * [wideWindow] keeps the gateway's trimmer out of a test that measures the dynamic tail: since Phase 4A Task 6 the
+     * 24-tool system prompt no longer fits the default small fixture together with a retry segment, and a legitimate
+     * trim would make the measured `dynamicChars` depend on the trimmer instead of on the loop's segment.
+     */
+    private fun wakeRig(
+        deviceProfile: DeviceProfile? = profile,
+        wideWindow: Boolean = false,
+    ): SmartTestRig {
         val rig = SmartTestRig(conversationStores = smartStores())
+        if (wideWindow) {
+            rig.profile = smartProfile(
+                usableWindowTokens = 32_000,
+                inputBudgetTokens = 16_000,
+                maxOutputTokens = 2_000,
+                safetyTokens = 1_000,
+            )
+        }
         rig.activate(
             overrides = buildMap {
                 put(Capability.Storage, SmartFakeStorage())
@@ -199,7 +216,7 @@ class PromptTelemetryTest {
         val plan = PromptCatalog.plan(PromptRoute.WAKE, profile)
         assertTrue(
             Regex(
-                """^P3_PROMPT version=0\.3\.0 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
+                """^P3_PROMPT version=0\.4\.0 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
                     """catalogHash=(?:[0-9a-f]{64}|none) route=WAKE staticChars=\d+ dynamicChars=\d+$""",
             ).matches(line),
             "the line must carry exactly the pinned plan's identity, route and sizes: $line",
@@ -331,7 +348,7 @@ class PromptTelemetryTest {
         val plan = PromptCatalog.plan(PromptRoute.PROACTIVE_HINT, profile)
         assertTrue(
             Regex(
-                """^P3_PROMPT version=0\.3\.0 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
+                """^P3_PROMPT version=0\.4\.0 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
                     """catalogHash=(?:[0-9a-f]{64}|none) route=PROACTIVE_HINT staticChars=\d+ dynamicChars=0$""",
             ).matches(line),
             "the proactive line must carry exactly the same pinned field list as the wake line: $line",
@@ -437,7 +454,9 @@ class PromptTelemetryTest {
     fun `a retry instruction is counted and a request without perception still logs`() {
         // Review Important (R12): a retry re-assembles the frame with the loop's RETRY segment, so the line is
         // emitted again and counts it. This rig has no perception provider at all, and the request still logs.
-        val rig = wakeRig()
+        // The wide window is the same seam `tailsRig` uses: the 24-tool system prompt must not make the trimmer decide
+        // what this count measures.
+        val rig = wakeRig(wideWindow = true)
         rig.actions.runtimeStateLine = "foreground=com.android.settings"
         var calls = 0
         rig.model.onRequest = { request, listener ->

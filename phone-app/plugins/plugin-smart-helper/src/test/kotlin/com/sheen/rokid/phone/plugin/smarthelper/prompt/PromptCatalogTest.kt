@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.plugin.smarthelper.prompt
 
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.INTERVENTION_PROPOSITION
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -17,7 +18,9 @@ import kotlin.test.assertTrue
  * - the section order is core 00→50, the route posture, then the rendered device profile;
  * - the dynamic runtime template stays out of `systemText`;
  * - the same route + profile is deterministic (same text, same hash);
- * - each of the three routes selects exactly its own posture, and the manifest must list all three.
+ * - each of the three routes selects exactly its own posture, and the manifest must list all three;
+ * - the loop/pinned/summarizer resources load through their accessors and never enter a system plan;
+ * - `core/20-tools.md` describes exactly the 24-tool default face (0.3 Phase 4A).
  */
 class PromptCatalogTest {
 
@@ -93,7 +96,54 @@ class PromptCatalogTest {
         assertEquals(PromptKind.STATIC, kindOf["route/proactive-followup.md"])
         assertEquals(PromptKind.SESSION_STATIC, kindOf["context/device-profile.md"])
         assertEquals(PromptKind.DYNAMIC, kindOf["context/runtime-state.md"])
-        assertEquals(11, entries.size, "the Phase 1 catalog has exactly eleven resources")
+        listOf("loop/retry.md", "loop/plan-nudge.md", "loop/timeout.md", "summarizer.md").forEach {
+            assertEquals(PromptKind.STATIC, kindOf[it], "$it must be a static fragment")
+        }
+        assertEquals(PromptKind.PINNED, kindOf["pinned/proactive-gate.md"], "the gate question is recalibrated, not edited")
+        assertEquals(16, entries.size, "the Phase 4A catalog has exactly sixteen resources")
+    }
+
+    @Test
+    fun `the loop pinned and summarizer accessors load their authored resources`() {
+        assertEquals(promptText("loop/retry.md"), PromptCatalog.loop("retry"))
+        assertEquals(promptText("loop/plan-nudge.md"), PromptCatalog.loop("plan-nudge"))
+        assertEquals(promptText("loop/timeout.md"), PromptCatalog.loop("timeout"))
+        assertEquals(promptText("pinned/proactive-gate.md"), PromptCatalog.pinned("proactive-gate"))
+        assertEquals(promptText("summarizer.md"), PromptCatalog.summarizer())
+    }
+
+    @Test
+    fun `the pinned proactive gate is the production fine tune question verbatim`() {
+        // The fine-tune spec (§3.3) pins one exact string; a paraphrase would make the deployed gate a question
+        // the model was never calibrated on. Compare both the production constant and the literal so the resource
+        // cannot drift from either source.
+        val pinned = PromptCatalog.pinned("proactive-gate")
+
+        assertEquals(INTERVENTION_PROPOSITION, pinned)
+        assertEquals("此刻是否存在一个需要大模型介入的缺口", pinned)
+    }
+
+    @Test
+    fun `the system plan never includes a pinned resource`() {
+        val pinned = PromptCatalog.pinned("proactive-gate")
+        val plan = PromptCatalog.plan(PromptRoute.WAKE, profileFixture())
+
+        assertTrue(
+            PromptCatalog.manifest().any { it.file == "pinned/proactive-gate.md" && it.kind == PromptKind.PINNED },
+            "the pinned resource must be in the manifest for this test to prove its exclusion",
+        )
+        assertFalse(plan.sections.any { it.kind == PromptKind.PINNED }, "PINNED content is not a system section")
+        assertFalse(pinned in plan.systemText, "the gate question belongs to its own call, not the system prompt")
+    }
+
+    @Test
+    fun `the tools prompt names the twenty four tool face and no route only tool`() {
+        val tools = promptText("core/20-tools.md")
+
+        DEFAULT_TOOL_NAMES.forEach { name ->
+            assertTrue(mentions(tools, name), "core/20-tools.md must name the advertised tool '$name'")
+        }
+        assertFalse(mentions(tools, "propose_hint"), "propose_hint is advertised only on the hint turn, not in core")
     }
 
     @Test
@@ -327,5 +377,21 @@ class PromptCatalogTest {
         assertTrue("修正之前的提醒" in followUp, "spec §8.2: revise the earlier reminder from the latest input")
         assertFalse("没有回应" in followUp, "the user did reply; silence is the wrong starting state")
         assertFalse("保持沉默" in followUp, "a follow-up is a normal task turn, not another hint decision")
+    }
+
+    private companion object {
+        /** The 24-tool default face of 0.3 Phase 4A; the same set `ToolFaceFixture` reads from production. */
+        val DEFAULT_TOOL_NAMES: Set<String> = linkedSetOf(
+            "read_screen", "tap", "long_press", "scroll", "input_text",
+            "open_app", "open_url", "open_settings", "set_alarm", "compose_note",
+            "clear_data", "uninstall", "disable_app", "set_permission", "set_brightness",
+            "launch_app", "list_apps", "system_action",
+            "device", "shell", "open", "dial",
+            "notify_user", "load_skill",
+        )
+
+        /** A tool name as a whole token, so `open` is not satisfied by `open_app`. */
+        fun mentions(text: String, name: String): Boolean =
+            Regex("(?<![A-Za-z0-9_])${Regex.escape(name)}(?![A-Za-z0-9_])").containsMatchIn(text)
     }
 }

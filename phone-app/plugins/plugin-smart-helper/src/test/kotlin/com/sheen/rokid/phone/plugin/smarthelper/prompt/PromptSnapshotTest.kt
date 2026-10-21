@@ -12,9 +12,10 @@ import kotlin.test.assertNotEquals
  * constants in the same commit, which makes an accidental prompt change show up as a failing test
  * instead of a silent cache-behaviour change.
  *
- * The `0.3.0` values below were captured from the first run after the resources were authored, and updated once in
- * the Phase 1 final-fix wave for the prose corrections (`400 个码点` and the tools/wake "report before acting"
- * reconciliation). Any further edit must update them explicitly.
+ * The values below were captured from the first run after the resources were authored, updated once in the Phase 1
+ * final-fix wave for the prose corrections (`400 个码点` and the tools/wake "report before acting" reconciliation), and
+ * re-captured for the Phase 4A Task 6 24-tool rewrite and its catalog version `0.4.0`. Any further edit must update them
+ * explicitly.
  */
 class PromptSnapshotTest {
 
@@ -33,9 +34,10 @@ class PromptSnapshotTest {
     }
 
     private companion object {
-        // Captured from the first failing run after `prompts/*` and `PromptCatalog` were authored.
+        // Captured from the first failing run after `prompts/*` and `PromptCatalog` were authored, then
+        // re-captured explicitly in Phase 4A Task 6 for the 24-tool `core/20-tools.md` rewrite.
         // Fill these explicitly on any prompt edit; never regenerate them silently.
-        const val WAKE_GOLDEN_HASH = "fb54847cdbeca6d7701e0ce6a546f9df0f3013b6c49831c59f11516af74c60b5"
-        const val PROACTIVE_GOLDEN_HASH = "0ff3f2bb0fa572312b25264a2dd9e8314665b1db679b34f0e55d5d6fe8e590ba"
+        const val WAKE_GOLDEN_HASH = "ed245aa207d757aaf69a8f2d899843f8b4ed435544d702d844b20e34b2ff1be0"
+        const val PROACTIVE_GOLDEN_HASH = "7ffca0e3c3cdcd33be784658abfe98970548c6e5c8fad8fbaa8ac319f2e90793"
     }
 }
