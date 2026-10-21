@@ -159,8 +159,24 @@ class AccessibilityExecutionBackend(
 
     override fun descriptors(): List<ActionDescriptor> = DESCRIPTORS
 
-    /** Tracks the latest snapshot for index-based actions. Set by read_screen, consumed by tap/long_press/input_text. */
+    /**
+     * Tracks the latest snapshot for index-based actions. Set by read_screen, consumed by tap/long_press/input_text;
+     * cleared by scroll and by the turn boundary, because the descriptor contract is one snapshot per turn.
+     */
     private var currentSnapshot: ScreenSnapshot? = null
+
+    /**
+     * edith-0.3 Phase 4A close fix: ends the turn that owns [currentSnapshot].
+     *
+     * The five descriptors promise that an index comes from "本回合上一次 read_screen". The snapshot used to be
+     * process-scoped - only a successful scroll cleared it - so a later assistant turn could act on a screen the model
+     * had not read in that turn. The production path is `ToolSurface.beginTurn()` -> the atomic adapter's turn seam ->
+     * this method, called by the plugin at the start of every turn. It is deliberately **not** on [ExecutionBackend]:
+     * the legacy probe contract does not widen, and a backend without turn state pays nothing.
+     */
+    internal fun beginTurn() {
+        currentSnapshot = null
+    }
 
     override fun execute(name: String, argsJson: String): ActionResult {
         if (!available()) return refused(ACTION_CHANNEL_UNAVAILABLE)

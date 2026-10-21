@@ -2420,13 +2420,18 @@ class HostCompositionRoot internal constructor(
             // tool uses. `open_app` (intent) resolves through its own executor's package catalog over the same package
             // manager, so the three paths cannot disagree about what is installed.
             val atomicLaunchResolver = AppLaunchResolver(appCatalog)
+            // The a11y backend owns turn-scoped state (its `read_screen` snapshot), so its adapter is the one given
+            // the turn-boundary seam: `ToolSurface.beginTurn()` then clears that snapshot at the start of every turn
+            // and the index tools can only use a snapshot read in the current turn. The other legs own no turn state.
+            val accessibilityBackend = AccessibilityExecutionBackend(
+                ui = accessibilityUi,
+                connected = { EdithAccessibilityService.connected() },
+            )
             val atomicExecutors = listOf(
                 // accessibility: the semantic UI fast path (`read_screen`/`tap`/...)
                 AtomicActionExecutor(
-                    AccessibilityExecutionBackend(
-                        ui = accessibilityUi,
-                        connected = { EdithAccessibilityService.connected() },
-                    ),
+                    backend = accessibilityBackend,
+                    onTurnBoundary = accessibilityBackend::beginTurn,
                 ),
                 // intent: the L0/L1 open/alarm/note actions, without the `dial` advertisement the catalog owns
                 IntentAtomicExecutor(actions),

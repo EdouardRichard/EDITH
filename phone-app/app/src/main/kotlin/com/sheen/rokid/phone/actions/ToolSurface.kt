@@ -83,7 +83,14 @@ class ToolSurface(
             ActionPrecheck(PrecheckDecision.Allow)
         }
 
-    /** Turn-scoped lifecycle is broadcast: the catalog re-arms/cancels the device kernel, the atomics their own state. */
+    /**
+     * Turn-scoped lifecycle is broadcast: the catalog re-arms/cancels the device kernel, the atomics their own state.
+     *
+     * Phase 4A close fix: "their own state" is load-bearing for the accessibility leg - its `read_screen` snapshot is
+     * valid for one turn only, and [AtomicActionExecutor] forwards this boundary to the backend's turn seam so an
+     * index from the previous turn is refused as `ARGUMENTS_INVALID` instead of acting on a stale screen. The plugin
+     * calls this at the start of every assistant turn.
+     */
     override fun beginTurn() {
         atomic.forEach { it.beginTurn() }
         catalog.beginTurn()

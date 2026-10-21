@@ -109,7 +109,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = SET_BRIGHTNESS,
         title = "调整屏幕亮度",
-        description = "把系统屏幕亮度设为 value（0-255 的整数，越界或非整数返回 ARGUMENTS_INVALID），写入后回读确认。只在用户明确要求调整亮度时使用，读取当前亮度不要用它。写入成功但回读不一致返回 STATE_UNCHANGED；通道掉线返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
+        description = "把系统屏幕亮度设为 value（0-255 的整数，越界或非整数返回 ARGUMENTS_INVALID），写入后回读确认。只在用户明确要求调整亮度时使用，读取当前亮度不要用它。L2 动作：按当前权限策略可能需要确认，也可能被拒绝。写入成功但回读不一致返回 STATE_UNCHANGED；通道掉线返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"value":{"type":"integer","minimum":0,"maximum":255}},""" +
             """"required":["value"],"additionalProperties":false}""",
         risk = RiskLevel.L2,

@@ -9,6 +9,7 @@ import com.sheen.rokid.device.RefRegistry
 import com.sheen.rokid.device.ScreenFilter as DeviceScreenFilter
 import com.sheen.rokid.phone.actions.a11y.AccessibilityExecutionBackend
 import com.sheen.rokid.phone.actions.a11y.AccessibilityUi
+import com.sheen.rokid.phone.actions.a11y.ScreenElement
 import com.sheen.rokid.phone.actions.a11y.ScreenFingerprint
 import com.sheen.rokid.phone.actions.a11y.ScreenFilter
 import com.sheen.rokid.phone.actions.a11y.ScreenSnapshot
@@ -96,6 +97,7 @@ class ToolFaceWiringTest {
         a11y: () -> Boolean = { true },
         shizuku: () -> Boolean = { true },
         call: () -> Boolean = { true },
+        ui: AccessibilityUi = NeverAskedUi,
     ): HostFace {
         val launcher = RecordingLauncher()
         val shell = RecordingShell()
@@ -121,8 +123,10 @@ class ToolFaceWiringTest {
             callAvailable = call,
         )
         val atomicIntent = IntentAtomicExecutor(intent)
+        // The production wiring passes the turn seam only to the leg that owns turn-scoped state (the a11y snapshot).
+        val accessibilityBackend = AccessibilityExecutionBackend(ui, a11y)
         val atomic = listOf(
-            AtomicActionExecutor(AccessibilityExecutionBackend(NeverAskedUi, a11y)),
+            AtomicActionExecutor(accessibilityBackend, onTurnBoundary = accessibilityBackend::beginTurn),
             atomicIntent,
             AtomicActionExecutor(ShizukuExecutionBackend(shell, NeverAskedState, shizuku)),
             AtomicActionExecutor(LaunchAppExecutor(AppLaunchResolver(appCatalog), appCatalog, shell, shizuku)),
@@ -280,6 +284,47 @@ class ToolFaceWiringTest {
         )
     }
 
+    // ── turn boundary ────────────────────────────────────────────────────────────────────────────────────────
+
+    /**
+     * edith-0.3 Phase 4A close fix: A5's index tools say "index 必须来自本回合上一次 read_screen".
+     *
+     * The plugin calls `services.actions().beginTurn()` at the start of every turn; that reaches the production
+     * [ToolSurface], which must therefore clear the atomic accessibility backend's snapshot. Without the turn
+     * boundary being forwarded through the adapter, turn 2 could reuse turn 1's snapshot and act on a screen the
+     * model never read this turn - which this test reproduces as a successful `tap`/`long_press`/`input_text`
+     * instead of the promised `ARGUMENTS_INVALID`.
+     */
+    @Test
+    fun `a new turn invalidates the previous turns read screen snapshot`() {
+        val ui = SnapshotUi()
+        val surface = hostFace(ui = ui).surface
+
+        // Turn 1: the model reads the screen once, establishing the index snapshot.
+        assertEquals(ActionOutcome.Done, surface.execute("read_screen", "{}").outcome)
+        assertEquals(1, ui.snapshotReads.size)
+
+        // The production turn boundary, exactly the call the plugin makes at the start of every assistant turn.
+        surface.beginTurn()
+
+        // Turn 2: no `read_screen` yet, so every index action must refuse rather than reuse turn 1's snapshot.
+        listOf(
+            "tap" to """{"index":0}""",
+            "long_press" to """{"index":0}""",
+            "input_text" to """{"index":0,"text":"hello"}""",
+        ).forEach { (name, args) ->
+            val result = surface.execute(name, args)
+            assertEquals("$name must refuse an index from the previous turn", ActionOutcome.Refused, result.outcome)
+            assertEquals("$name must not reuse the previous turn's snapshot", "ARGUMENTS_INVALID", result.detail)
+        }
+        assertTrue("no index action may reach the UI without a read_screen this turn", ui.mutations.isEmpty())
+
+        // The boundary ends one turn's snapshot, it does not disable the tools: a fresh read in this turn re-arms them.
+        assertEquals(ActionOutcome.Done, surface.execute("read_screen", "{}").outcome)
+        assertEquals(ActionOutcome.Done, surface.execute("tap", """{"index":0}""").outcome)
+        assertEquals(listOf("tap snap-turn-1:0"), ui.mutations)
+    }
+
     // ── adapter contract ─────────────────────────────────────────────────────────────────────────────────────
 
     @Test
@@ -351,6 +396,65 @@ class ToolFaceWiringTest {
         override fun permissionGranted(pkg: String, permission: String): Boolean = fail()
         override fun disabled(pkg: String): Boolean = fail()
         override fun setting(name: String): String? = fail()
+    }
+
+    /**
+     * Serves one fixed snapshot and records every mutation: a mutation landing here is the proof that the snapshot
+     * was reused, because the backend only reaches the UI after finding a `currentSnapshot` to act on.
+     */
+    private class SnapshotUi : AccessibilityUi {
+        val snapshotReads = mutableListOf<ScreenFilter>()
+        val mutations = mutableListOf<String>()
+        private var fingerprintCalls = 0
+        private val snapshot = ScreenSnapshot(
+            snapshotId = "snap-turn-1",
+            elements = listOf(
+                ScreenElement(
+                    index = 0,
+                    text = "WLAN",
+                    isHintText = false,
+                    clickable = true,
+                    editable = true,
+                    scrollable = false,
+                    checked = false,
+                    boundsDigest = "digest-0",
+                ),
+            ),
+            truncated = false,
+            fingerprint = ScreenFingerprint(hash = "fp", nodeCount = 1, clickableCount = 1, truncated = false),
+        )
+
+        override fun clickText(text: String): Boolean = error("the turn-boundary test never asks the UI by text")
+        override fun setText(text: String): Boolean = error("the turn-boundary test never asks the UI by text")
+        override fun snapshot(filter: ScreenFilter): ScreenSnapshot {
+            snapshotReads += filter
+            return snapshot
+        }
+
+        override fun screenFingerprint(): String {
+            fingerprintCalls++
+            return if (fingerprintCalls == 1) "screen-a" else "screen-b"
+        }
+
+        override fun clickByIndex(snapshotId: String, index: Int): Boolean {
+            mutations += "tap $snapshotId:$index"
+            return true
+        }
+
+        override fun longPressByIndex(snapshotId: String, index: Int): Boolean {
+            mutations += "long_press $snapshotId:$index"
+            return true
+        }
+
+        override fun scroll(direction: ScrollDirection): Boolean =
+            error("the turn-boundary test never scrolls")
+
+        override fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean {
+            mutations += "input_text $snapshotId:$index"
+            return true
+        }
+
+        override fun structuralFingerprint(): ScreenFingerprint = error("not used by the turn-boundary test")
     }
 
     /** A legacy backend that owns a resource: only a `Closeable` backend has anything to forward the close to. */
