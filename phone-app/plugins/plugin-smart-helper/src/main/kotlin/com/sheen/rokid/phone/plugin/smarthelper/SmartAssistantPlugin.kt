@@ -106,6 +106,8 @@ import com.sheen.rokid.plugin.PluginDescriptor
 import com.sheen.rokid.plugin.PluginLifecycle
 import com.sheen.rokid.plugin.PrecheckDecision
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
 import com.sheen.rokid.plugin.ToolSpec
 import com.sheen.rokid.plugin.actions
 import com.sheen.rokid.plugin.confirmation
@@ -311,13 +313,13 @@ internal class ConfirmingActions(
         val precheck = runCatching { host.precheck(name, argsJson) }.getOrElse {
             // A precheck that cannot answer is not an approval. Refuse rather than fall through to executing.
             diagnostics("P3_CONFIRM action=$name outcome=unavailable reason=PRECHECK_FAILED")
-            return ActionResult(ActionOutcome.Refused, SHELL_COMMAND_REJECTED)
+            return refusal(SHELL_COMMAND_REJECTED, recoverable = true)
         }
         return when (precheck.decision) {
             PrecheckDecision.Allow -> host.execute(name, argsJson)
             PrecheckDecision.Reject -> {
                 diagnostics("P3_CONFIRM action=$name outcome=rejected reason=${precheck.reason ?: "UNSPECIFIED"}")
-                ActionResult(ActionOutcome.Refused, SHELL_COMMAND_REJECTED)
+                refusal(SHELL_COMMAND_REJECTED, recoverable = false)
             }
             PrecheckDecision.RequireConfirmation -> confirmThenRun(name, argsJson, precheck)
         }
@@ -328,13 +330,13 @@ internal class ConfirmingActions(
         // withdrawn, so the honest answer is a denial, not "unavailable".
         if (!runCatching(canAsk).getOrDefault(false)) {
             diagnostics("P3_CONFIRM action=$name outcome=unavailable reason=NO_CHANNEL")
-            return ActionResult(ActionOutcome.Refused, CONFIRMATION_UNAVAILABLE)
+            return refusal(CONFIRMATION_UNAVAILABLE, recoverable = true)
         }
         val requestId = newRequestId()
         val summary = precheck.summary?.takeIf { it.isNotBlank() } ?: DEFAULT_SUMMARY
         val outcome = runCatching { confirmation.request(requestId, summary) }.getOrElse {
             diagnostics("P3_CONFIRM request=$requestId outcome=unavailable reason=CHANNEL_FAILED")
-            return ActionResult(ActionOutcome.Refused, CONFIRMATION_UNAVAILABLE)
+            return refusal(CONFIRMATION_UNAVAILABLE, recoverable = true)
         }
         if (outcome.approved) return host.execute(name, argsJson)
         val code = when (outcome.source) {
@@ -345,8 +347,34 @@ internal class ConfirmingActions(
         }
         diagnostics("P3_CONFIRM request=$requestId outcome=${outcomeName(code)} " +
             "source=${outcome.source.name.lowercase()}")
-        return ActionResult(ActionOutcome.Refused, code)
+        // The wearer denied/let the question expire: retrying the same call cannot help. A missing channel can come back.
+        return refusal(code, recoverable = code == CONFIRMATION_UNAVAILABLE)
     }
+
+    /**
+     * edith-0.3 Phase 2.2 Task 6 review: the structured facts of a refusal this wrapper itself synthesizes.
+     *
+     * The host action never ran, so `accepted = false` / `applied = false` are facts, not guesses; `verified` and
+     * `changed` were never checked and stay `null`. Without this the code lived only in `detail` and the projected
+     * execution reported `code`/`accepted`/`applied` as `null` - "refused, nothing ran" then read as "unknown".
+     *
+     * [recoverable] is false when retrying the same call cannot help (a command that is not a command, or the wearer's
+     * own denial/expiry) and true when the channel that refused can come back (a failed precheck read, no confirmation
+     * channel). It is the same convention the tools use for their own refusals.
+     */
+    private fun refusal(code: String, recoverable: Boolean): ActionResult = ActionResult(
+        ActionOutcome.Refused,
+        code,
+        execution = ToolExecution(
+            outcome = ToolOutcome.Refused,
+            code = code,
+            recoverable = recoverable,
+            accepted = false,
+            applied = false,
+            verified = null,
+            changed = null,
+        ),
+    )
 
     private fun outcomeName(code: String): String = when (code) {
         CONFIRMATION_TIMEOUT -> "timeout"

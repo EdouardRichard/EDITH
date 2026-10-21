@@ -660,6 +660,11 @@ class OpenTool(
                 },
                 visionReason = when {
                     image != null -> null
+                    captured == PerceptionScreenshotResult.Disabled -> null
+                    // Task 6 review: when the source itself reports the screen unavailable (`no_accessibility`), that
+                    // reason explains the missing observation; prefer it over the capture's image-only reason, exactly
+                    // as `ToolCatalog.screenAttempt` does for shell/dial.
+                    observed.vision == ToolVision.Unavailable && observed.visionReason != null -> observed.visionReason
                     captured is PerceptionScreenshotResult.Unavailable -> captured.reason
                     else -> null
                 },

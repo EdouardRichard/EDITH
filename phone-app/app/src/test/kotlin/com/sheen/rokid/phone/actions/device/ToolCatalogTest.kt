@@ -663,6 +663,34 @@ class ToolCatalogTest {
     }
 
     @Test
+    fun `a dial blocked by the lock gate is refused with the screen one image and refused facts`() {
+        val gate = com.sheen.rokid.phone.lock.UnlockGate { com.sheen.rokid.phone.lock.UnlockOutcome.FAILED }
+        var captureCalls = 0
+        val catalog = catalog(
+            unlock = gate,
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("dial", """{"number":"10086"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertTrue("the gate's own code must survive: ${result.detail}",
+            result.detail.startsWith("LOCKED_UNLOCK_FAILED"))
+        assertEquals("a locked phone still shows the model what is on screen", 1, captureCalls)
+        assertEquals(ToolVision.Ok, requireNotNull(result.observation).vision)
+        assertEquals(1, result.images.size)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("LOCKED_UNLOCK_FAILED:FAILED", execution.code)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertEquals("an unlock can succeed on the next attempt", true, execution.recoverable)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+    }
+
+    @Test
     fun `dial invalid arguments observe as text only and never capture`() {
         val executor = RecordingExecutor()
         var captureCalls = 0
@@ -740,6 +768,46 @@ class ToolCatalogTest {
     }
 
     @Test
+    fun `a throwing capture with a live source reports SCREENSHOT_FAILED and keeps the source facts`() {
+        val catalog = catalog(
+            shell = ShellTool(FakeShell { command -> ShellResult(command, 0, "", "") }),
+            observe = { screenFacts() },
+            capture = { throw IllegalStateException("capture gone") },
+        )
+
+        val result = catalog.execute("shell", """{"command":"id"}""")
+
+        assertEquals("the command's own outcome is untouched", ActionOutcome.Done, result.outcome)
+        val observation = requireNotNull(result.observation)
+        assertEquals("com.example.launcher", observation.foregroundPackage)
+        assertEquals("#n1 button \"OK\"", observation.screen)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("a throwing capture is an unavailable reason, never a TOOL_THREW", "SCREENSHOT_FAILED",
+            observation.visionReason)
+        assertTrue(result.images.isEmpty())
+        assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `the final vision follows the final image list and at most one image is kept`() {
+        // Future-proofing: today's shell/dial return no images of their own, but if one ever does, the catalog must not
+        // pair its picture with the capture's `disabled` marker, and the result still carries at most one image. The
+        // enrichment step is fed a synthetic result because the current tools have no image channel.
+        val catalog = catalog(
+            observe = { screenFacts() },
+            capture = { PerceptionScreenshotResult.Disabled },
+        )
+        val synthetic = ActionResult(ActionOutcome.Done, "done", images = listOf(IMAGE, SECOND_IMAGE))
+
+        val result = catalog.enrichScreenResult("dial", synthetic)
+
+        assertEquals("one result, one image", listOf(IMAGE), result.images)
+        val observation = requireNotNull(result.observation)
+        assertEquals("a picture is really attached, so vision is ok", ToolVision.Ok, observation.vision)
+        assertNull("an attached picture needs no unavailable reason", observation.visionReason)
+    }
+
+    @Test
     fun `a throwing observation or capture source never fails the shell result`() {
         val catalog = catalog(
             shell = ShellTool(FakeShell { command -> ShellResult(command, 0, "", "") }),
@@ -811,7 +879,11 @@ class ToolCatalogTest {
                 "open must carry the host observation source's answer"
             }
             assertEquals(ToolVision.Unavailable, openObservation.vision)
-            assertTrue("open must say why vision is unavailable", !openObservation.visionReason.isNullOrBlank())
+            // The exact reason is the discriminator: `OpenTool`'s own no-source fallback answers `no_source` too, so a
+            // blank-reason assertion would still pass if `OpenTool(observe = ...)` were dropped. Only the composition's
+            // source answers `no_accessibility` here.
+            assertEquals("no_accessibility", openObservation.visionReason)
+            assertNull("a blind phone has no fabricated screen", openObservation.screen)
             assertTrue("a blind composition attaches no image", openResult.images.isEmpty())
 
             val shellResult = requireNotNull(root.toolCatalogForProbe).execute("shell", """{"command":"id"}""")
@@ -878,6 +950,7 @@ class ToolCatalogTest {
 
     private companion object {
         val IMAGE = ImageRef("artifact-1", "image/png", 100, 50, "sha-1")
+        val SECOND_IMAGE = ImageRef("artifact-2", "image/png", 100, 50, "sha-2")
     }
 
     private fun descriptor(name: String): com.sheen.rokid.plugin.ActionDescriptor =

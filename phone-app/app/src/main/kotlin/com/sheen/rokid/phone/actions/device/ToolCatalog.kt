@@ -191,17 +191,35 @@ class ToolCatalog(
      * `nonPersistent` is raised whenever an observation or picture exists, because both are perception content that may
      * live only in the current model request (C2).
      */
-    private fun screenCall(tool: String, call: () -> ActionResult): ActionResult {
-        val result = call()
+    private fun screenCall(tool: String, call: () -> ActionResult): ActionResult =
+        enrichScreenResult(tool, call())
+
+    /**
+     * The enrichment half of [screenCall], split out so the JVM gate can feed a synthetic tool result.
+     *
+     * Today's `shell`/`dial` return no images of their own, so [ActionResult.images] is always empty in production. A
+     * future tool version may attach one; the final `vision` fact is therefore derived from the **final** image list
+     * (never from the capture's marker alone) and that list is coerced to at most one image, so a tool picture can never
+     * be paired with `vision = disabled/unavailable`.
+     */
+    internal fun enrichScreenResult(tool: String, result: ActionResult): ActionResult {
         val observed = if (isArgumentRefusal(tool, result)) {
             ObservationAttempt(textObservation(), emptyList())
         } else {
             screenAttempt(attachPicture = result.images.isEmpty())
         }
+        // Task 6 review: only the final image list may claim `vision = ok`; `take(1)` keeps one result to one image even
+        // if a future tool ever returns more than one.
+        val images = (result.images + observed.images).take(1)
+        val observation = if (images.isEmpty()) {
+            observed.observation
+        } else {
+            observed.observation.copy(vision = ToolVision.Ok, visionReason = null)
+        }
         return result.copy(
             execution = result.execution ?: executionFacts(tool, result),
-            observation = observed.observation,
-            images = result.images + observed.images,
+            observation = observation,
+            images = images,
             // Every `shell`/`dial` result now carries an observation, so it is perception content by definition (C2).
             nonPersistent = true,
         )

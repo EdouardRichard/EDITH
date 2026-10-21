@@ -6,10 +6,12 @@ import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.ToolVision
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
@@ -81,6 +83,25 @@ class PerceptionObservationSourceTest {
     @Test
     fun `a session without a perception port reports no source instead of inventing one`() {
         assertNull(perceptionToolObservationSource(null))
+    }
+
+    @Test
+    fun `the loop observation source asks only for the screen and takes the deadline as advisory`() {
+        val perception = SmartFakePerception()
+        val source = requireNotNull(perceptionToolObservationSource(perception))
+
+        // The loop's failure budget is 250 ms. This source is cache-only and cannot preempt the platform read, so the
+        // deadline is advisory here (Task 9 measures it; no compliance is claimed) - but the call must still receive
+        // the deadline and answer, and it must not widen the read beyond the compact screen.
+        assertNotNull(source.observe(250L))
+        // An already-expired budget still answers: non-enforcement is the documented residual, not an accident.
+        assertNotNull(source.observe(0L))
+
+        assertEquals(
+            listOf(setOf(PerceptionSource.SCREEN), setOf(PerceptionSource.SCREEN)),
+            perception.requestedSources,
+            "the loop fallback must never ask for the notification/calendar/... bulk",
+        )
     }
 
     @Test

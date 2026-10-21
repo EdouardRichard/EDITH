@@ -14,10 +14,12 @@ import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.ConfirmationChannel
 import com.sheen.rokid.plugin.PrecheckDecision
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolOutcome
 import java.util.UUID
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -38,6 +40,7 @@ class ConfirmationGuardTest {
         val executed = mutableListOf<Pair<String, String>>()
         var cancels = 0
         var begins = 0
+        var precheckFailure: RuntimeException? = null
 
         override fun descriptors(): List<ActionDescriptor> = listOf(DESCRIPTOR)
 
@@ -48,7 +51,10 @@ class ConfirmationGuardTest {
 
         override fun cancel() { cancels++ }
         override fun beginTurn() { begins++ }
-        override fun precheck(name: String, argsJson: String): ActionPrecheck = precheck
+        override fun precheck(name: String, argsJson: String): ActionPrecheck {
+            precheckFailure?.let { throw it }
+            return precheck
+        }
     }
 
     private class FakeConfirmation(
@@ -119,6 +125,7 @@ class ConfirmationGuardTest {
 
             assertEquals(ActionOutcome.Refused, result.outcome)
             assertEquals("CONFIRMATION_DENIED", result.detail)
+            assertRefusalFacts(result, "CONFIRMATION_DENIED", recoverable = false)
             assertTrue(actions.executed.isEmpty(), "a denial must never run the command (source=$source)")
             assertEquals(1, confirmation.requested.size)
         }
@@ -133,6 +140,7 @@ class ConfirmationGuardTest {
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("CONFIRMATION_TIMEOUT", result.detail)
+        assertRefusalFacts(result, "CONFIRMATION_TIMEOUT", recoverable = false)
         assertTrue(actions.executed.isEmpty(), "silence is not consent")
     }
 
@@ -145,6 +153,7 @@ class ConfirmationGuardTest {
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("CONFIRMATION_UNAVAILABLE", result.detail)
+        assertRefusalFacts(result, "CONFIRMATION_UNAVAILABLE", recoverable = true)
         assertTrue(actions.executed.isEmpty())
         assertTrue(confirmation.requested.isEmpty(), "a missing channel means there is nobody to ask")
     }
@@ -160,6 +169,7 @@ class ConfirmationGuardTest {
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("CONFIRMATION_UNAVAILABLE", result.detail)
+        assertRefusalFacts(result, "CONFIRMATION_UNAVAILABLE", recoverable = true)
         assertTrue(actions.executed.isEmpty(), "an unpresentable question must never run the command")
         assertEquals(1, confirmation.requested.size, "the policy asked; presenting is what failed")
     }
@@ -173,7 +183,23 @@ class ConfirmationGuardTest {
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("CONFIRMATION_UNAVAILABLE", result.detail)
+        assertRefusalFacts(result, "CONFIRMATION_UNAVAILABLE", recoverable = true)
         assertTrue(actions.executed.isEmpty())
+    }
+
+    @Test
+    fun `a precheck that cannot answer refuses with recoverable facts and never executes`() {
+        // A host that cannot classify the call is not an approval: it refuses rather than falling through to execute.
+        val actions = FakeActions().apply { precheckFailure = IllegalStateException("classifier gone") }
+        val confirmation = FakeConfirmation()
+
+        val result = wrapper(actions, confirmation).execute("shell", args)
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("SHELL_COMMAND_REJECTED", result.detail)
+        assertRefusalFacts(result, "SHELL_COMMAND_REJECTED", recoverable = true)
+        assertTrue(actions.executed.isEmpty())
+        assertTrue(confirmation.requested.isEmpty(), "an unanswerable precheck must not become a question")
     }
 
     @Test
@@ -185,6 +211,7 @@ class ConfirmationGuardTest {
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("SHELL_COMMAND_REJECTED", result.detail)
+        assertRefusalFacts(result, "SHELL_COMMAND_REJECTED", recoverable = false)
         assertTrue(actions.executed.isEmpty())
         assertTrue(confirmation.requested.isEmpty(), "a rejection is not a question")
     }
@@ -263,6 +290,24 @@ class ConfirmationGuardTest {
 
         assertEquals(1, actions.cancels)
         assertEquals(1, actions.begins)
+    }
+
+    /**
+     * edith-0.3 Phase 2.2 Task 6 review: a refusal this wrapper synthesizes must carry the structured facts the model
+     * reads.
+     *
+     * Without them the code lived only in `detail` and the projected execution reported
+     * `code`/`accepted`/`applied = null`, so "refused, nothing ran" was indistinguishable from "unknown".
+     */
+    private fun assertRefusalFacts(result: ActionResult, code: String, recoverable: Boolean) {
+        val facts = assertNotNull(result.execution, "a wrapper refusal must carry execution facts ($code)")
+        assertEquals(ToolOutcome.Refused, facts.outcome)
+        assertEquals(code, facts.code)
+        assertEquals(false, facts.accepted)
+        assertEquals(false, facts.applied)
+        assertNull(facts.verified)
+        assertNull(facts.changed)
+        assertEquals(recoverable, facts.recoverable)
     }
 
     private companion object {
