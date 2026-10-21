@@ -53,6 +53,42 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.nio.file.Files
 
+// - Auto vision (0.3 Phase 2.1 Task 3): cross-fake capture ordering -
+
+private const val EVENT_REFRESH = "perception.refresh"
+private const val EVENT_SNAPSHOT = "perception.snapshot"
+private const val EVENT_AFTER_ACTION = "perception.afterAction"
+private const val EVENT_CAPTURE = "perception.screenshot"
+private const val EVENT_KERNEL_ACT = "kernel.act"
+private const val EVENT_KERNEL_WAIT = "kernel.wait"
+private const val EVENT_KERNEL_OBSERVE = "kernel.observe"
+private const val EVENT_KERNEL_SCREENSHOT = "kernel.screenshot"
+private const val EVENT_KERNEL_STATUS = "kernel.status"
+private const val KERNEL_EVENT_PREFIX = "kernel."
+
+/**
+ * Ordered event log shared by `FakePerception` and `FakeDeviceOperations` (test-only).
+ *
+ * Counters prove *that* a read or a capture happened; only the shared order can prove the auto-vision invariant that
+ * the screenshot is taken **after** the observation it describes. Tests that assert order pass one instance to both
+ * fakes, so kernel dispatches, forced reads and captures land on one timeline.
+ */
+private class EventLog {
+    val entries = mutableListOf<String>()
+
+    fun record(event: String) {
+        entries += event
+    }
+
+    fun count(event: String): Int = entries.count { it == event }
+
+    fun indexOf(event: String): Int = entries.indexOf(event)
+
+    fun lastKernelIndex(): Int = entries.indexOfLast { it.startsWith(KERNEL_EVENT_PREFIX) }
+
+    override fun toString(): String = entries.joinToString(prefix = "[", postfix = "]")
+}
+
 /**
  * R41/R42/R44/R46: `device` tool behaviour over the kernel seam.
  *
@@ -978,6 +1014,22 @@ class DeviceToolTest {
 
     // - Phase 2.1 Task 3: auto vision on observe/act -
 
+    /*
+     * Auto vision ordering and scope.
+     *
+     * Authoritative contract: `ActionResult.images` and the top-level `data.vision` marker are the auto-vision
+     * result. The JSON body's `images` array is rendered from the **kernel envelope** only
+     * (`DeviceTool.renderEnvelope`), so an auto-captured image deliberately does not appear there; assert the
+     * former and do not "fix" the latter by changing rendering.
+     *
+     * Capture scope: argument validation runs before any perception call, so early `INVALID_ARGUMENTS` refusals
+     * never capture. A stale-ref refusal and a kernel-dispatched refusal do capture, each after its own fresh read
+     * (`refresh()` for stale, `afterAction()` for a dispatch). This matches the brief.
+     *
+     * Ordering evidence: counters alone cannot tell "captured after the read" from "captured before it", so these
+     * tests share one [EventLog] between the perception fake and the device-operations fake.
+     */
+
     private fun screenshotImage(id: String): PerceptionScreenshotResult.Image =
         PerceptionScreenshotResult.Image(
             image = ImageRef(id, "image/jpeg", 720, 1280, "sha-$id"),
@@ -989,18 +1041,40 @@ class DeviceToolTest {
     private fun visionOf(result: ActionResult): String =
         body(result)["data"]!!.jsonObject["vision"]!!.jsonPrimitive.content
 
+    /** Fails unless both events were logged and [before] happened first. */
+    private fun assertBefore(log: EventLog, before: String, after: String) {
+        val beforeIndex = log.indexOf(before)
+        val afterIndex = log.indexOf(after)
+        assertTrue(
+            "$before must happen before $after; ordered fake log: $log",
+            beforeIndex >= 0 && afterIndex >= 0 && beforeIndex < afterIndex,
+        )
+    }
+
+    /** A non-observe/act action must never attach an automatic image or advertise a vision marker. */
+    private fun assertNoAutoVision(action: String, result: ActionResult) {
+        assertTrue("$action must not attach an auto-captured image: ${result.images}", result.images.isEmpty())
+        assertFalse(
+            "$action must not carry a top-level vision marker: ${body(result)["data"]}",
+            body(result)["data"]!!.jsonObject.containsKey("vision"),
+        )
+    }
+
     @Test
     fun `observe attaches one screenshot and vision ok`() {
-        val perception = FakePerception(snapshot = perceptionSnapshot())
+        val log = EventLog()
+        val perception = FakePerception(snapshot = perceptionSnapshot(), events = log)
         perception.screenshotResult = screenshotImage("img-1")
 
-        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+        val result = tool(FakeDeviceOperations(observation(), events = log), perception = perception)
             .execute("""{"action":"observe"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals("the screen include asks for exactly one capture", 1, perception.screenshotCalls)
         assertEquals("img-1", result.images.single().artifactId)
         assertEquals("ok", visionOf(result))
+        assertBefore(log, EVENT_REFRESH, EVENT_CAPTURE)
+        assertBefore(log, EVENT_SNAPSHOT, EVENT_CAPTURE)
     }
 
     @Test
@@ -1036,10 +1110,12 @@ class DeviceToolTest {
 
     @Test
     fun `act attaches post action screenshot and vision ok`() {
-        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        val log = EventLog()
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))), events = log)
         val perception = FakePerception(
             snapshot = perceptionSnapshot(),
             afterActionSnapshot = perceptionSnapshot(snapshotId = "snap-after-act"),
+            events = log,
         )
         perception.screenshotResult = screenshotImage("img-act")
 
@@ -1047,25 +1123,35 @@ class DeviceToolTest {
             .execute("""{"action":"act","kind":"home"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        assertTrue("the post-action read must precede the capture", perception.afterActions >= 1)
+        assertEquals("the act forces exactly one post-action read", 1, perception.afterActions)
         assertEquals(1, perception.screenshotCalls)
         assertEquals("img-act", result.images.single().artifactId)
         assertEquals("ok", visionOf(result))
+        assertEquals(
+            "the capture must follow the dispatched act and its forced read; ordered fake log: $log",
+            listOf(EVENT_KERNEL_ACT, EVENT_AFTER_ACTION, EVENT_CAPTURE),
+            log.entries.filter { it == EVENT_KERNEL_ACT || it == EVENT_AFTER_ACTION || it == EVENT_CAPTURE },
+        )
     }
 
     @Test
     fun `stale ref answer returns fresh screenshot and stale code`() {
+        val log = EventLog()
         val observation = observation(rev = 1, nodes = listOf(node("A")))
-        val operations = FakeDeviceOperations(observation)
+        val operations = FakeDeviceOperations(observation, events = log)
         val actionRegistry = RefRegistry()
         actionRegistry.beginSnapshot("snap-old", 500L, "com.example.settings", null)
         actionRegistry.assign(observation)
         val perception = FakePerception(
-            snapshot = perceptionSnapshot(snapshotId = "snap-old-cache"),
+            snapshot = perceptionSnapshot(
+                snapshotId = "snap-old-cache",
+                elements = listOf(perceptionElement(ref = "#n0", text = "旧缓存")),
+            ),
             refreshedSnapshot = perceptionSnapshot(
                 snapshotId = "snap-fresh",
                 elements = listOf(perceptionElement(ref = "#n9", text = "A")),
             ),
+            events = log,
         )
         perception.screenshotResult = screenshotImage("img-stale")
 
@@ -1078,13 +1164,25 @@ class DeviceToolTest {
             refTtlMillis = { 0L },
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
 
+        val detail = body(result)
+        val data = detail["data"]!!.jsonObject
+        val snapshotText = data["snapshot"]!!.jsonPrimitive.content
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("STALE_REF", body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("STALE_REF", detail["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("the stale answer reads the screen once", 1, perception.refreshCalls)
+        assertEquals("afterAction is reserved for post-act only", 0, perception.afterActions)
+        // CompactSnapshotRenderer renders elements, not the snapshot id; `#n9` is the body-visible proof that the
+        // fresh `snap-fresh` read (not the cached `snap-old-cache`) produced this answer.
+        assertTrue("the refreshed screen must be in the body: $snapshotText", snapshotText.contains("#n9"))
+        assertFalse("the cached turn snapshot must not answer the stale ref: $snapshotText", snapshotText.contains("旧缓存"))
         assertEquals("the refreshed screen is captured for the refusal", 1, perception.screenshotCalls)
         assertEquals("img-stale", result.images.single().artifactId)
         assertEquals("ok", visionOf(result))
         assertTrue("the stale answer remains non-persistent", result.nonPersistent)
         assertTrue("the action must not be dispatched", operations.actCalls.isEmpty())
+        assertBefore(log, EVENT_REFRESH, EVENT_CAPTURE)
+        assertEquals("the stale answer captures exactly once", 1, log.count(EVENT_CAPTURE))
+        assertEquals("the stale answer never forces a post-act read", 0, log.count(EVENT_AFTER_ACTION))
     }
 
     @Test
@@ -1102,7 +1200,11 @@ class DeviceToolTest {
 
     @Test
     fun `scroll to text captures one screenshot for the final result`() {
-        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        val log = EventLog()
+        val operations = FakeDeviceOperations(
+            observation(rev = 1, nodes = listOf(node("A"))),
+            events = log,
+        )
         operations.waitEnvelopes.add(failure("wait", "VERIFY_TIMEOUT", recoverable = true))
         operations.waitEnvelopes.add(
             DeviceEnvelope.success(
@@ -1117,6 +1219,7 @@ class DeviceToolTest {
         val perception = FakePerception(
             snapshot = perceptionSnapshot(),
             afterActionSnapshot = perceptionSnapshot(snapshotId = "snap-after-scroll"),
+            events = log,
         )
         perception.screenshotResult = screenshotImage("img-scroll")
 
@@ -1129,6 +1232,37 @@ class DeviceToolTest {
         assertEquals("only the one final actResult captures", 1, perception.screenshotCalls)
         assertEquals("img-scroll", result.images.single().artifactId)
         assertEquals("ok", visionOf(result))
+        assertEquals("the whole scroll loop captures exactly once", 1, log.count(EVENT_CAPTURE))
+        assertEquals("the final envelope forces exactly one post-action read", 1, log.count(EVENT_AFTER_ACTION))
+        assertBefore(log, EVENT_AFTER_ACTION, EVENT_CAPTURE)
+        assertTrue(
+            "the single capture must follow the last dispatch/wait; ordered fake log: $log",
+            log.indexOf(EVENT_CAPTURE) > log.lastKernelIndex(),
+        )
+    }
+
+    @Test
+    fun `status wait and explicit screenshot never auto capture`() {
+        val log = EventLog()
+        val perception = FakePerception(snapshot = perceptionSnapshot(), events = log)
+        perception.screenshotResult = screenshotImage("img-must-not-be-used")
+        val operations = FakeDeviceOperations(observation(), events = log)
+        val device = tool(operations, perception = perception)
+
+        val status = device.execute("""{"action":"status"}""")
+        assertEquals("status never captures", 0, perception.screenshotCalls)
+        assertNoAutoVision("status", status)
+
+        val waited = device.execute("""{"action":"wait","idle":true}""")
+        assertEquals("wait never captures", 0, perception.screenshotCalls)
+        assertNoAutoVision("wait", waited)
+
+        val screenshot = device.execute("""{"action":"screenshot"}""")
+        assertEquals("the explicit screenshot does not route through auto vision", 0, perception.screenshotCalls)
+        assertEquals("the explicit action uses the kernel's own screenshot path", 1, operations.screenshotCalls)
+        assertNoAutoVision("screenshot", screenshot)
+
+        assertEquals("no auto capture ran for any of the three actions", 0, log.count(EVENT_CAPTURE))
     }
 
     @Test
@@ -1689,6 +1823,8 @@ class DeviceToolTest {
          * `AndroidPerceptionProvider.refresh()` (the cached projection follows the fresh read).
          */
         var refreshedSnapshot: PerceptionSnapshot? = null,
+        /** Shared with [FakeDeviceOperations] when a test asserts capture ordering; private otherwise. */
+        private val events: EventLog = EventLog(),
     ) : PerceptionProvider {
         var afterActions = 0
         var refreshCalls = 0
@@ -1702,6 +1838,7 @@ class DeviceToolTest {
         override fun beginTurn(): PerceptionSnapshot = snapshot
 
         override fun refresh(): PerceptionSnapshot {
+            events.record(EVENT_REFRESH)
             refreshCalls++
             refreshedSnapshot?.let { snapshot = it }
             return snapshot
@@ -1712,6 +1849,7 @@ class DeviceToolTest {
             filter: PerceptionFilter,
             limit: Int?,
         ): PerceptionSnapshot {
+            events.record(EVENT_SNAPSHOT)
             snapshotCalls++
             lastInclude = include
             lastFilter = filter
@@ -1720,11 +1858,13 @@ class DeviceToolTest {
         }
 
         override fun afterAction(): PerceptionSnapshot {
+            events.record(EVENT_AFTER_ACTION)
             afterActions++
             return afterActionSnapshot ?: snapshot
         }
 
         override fun screenshot(): PerceptionScreenshotResult {
+            events.record(EVENT_CAPTURE)
             screenshotCalls++
             return screenshotResult
         }
@@ -1810,6 +1950,8 @@ class DeviceToolTest {
 
     private class FakeDeviceOperations(
         var observation: Observation? = null,
+        /** Shared with [FakePerception] when a test asserts capture ordering; private otherwise. */
+        private val events: EventLog = EventLog(),
     ) : DeviceOperations {
         val calls = mutableListOf<String>()
         val actCalls = mutableListOf<ActCall>()
@@ -1856,6 +1998,7 @@ class DeviceToolTest {
             get() = generationValue
 
         override fun observe(filter: ScreenFilter): DeviceEnvelope {
+            events.record(EVENT_KERNEL_OBSERVE)
             observeFilter = filter
             calls += "observe:${filter.name}"
             if (advanceRevisionOnObserve) revisionValue = revisionValue?.plus(1)
@@ -1872,6 +2015,7 @@ class DeviceToolTest {
             key: String?,
             timeoutMillis: Long,
         ): DeviceEnvelope {
+            events.record(EVENT_KERNEL_ACT)
             calls += "act:${kind.name}"
             actCalls += ActCall(kind, ref, text, value, direction, key, timeoutMillis)
             if (advanceRevisionOnAct) revisionValue = revisionValue?.plus(1)
@@ -1880,6 +2024,7 @@ class DeviceToolTest {
         }
 
         override fun screenshot(): DeviceEnvelope {
+            events.record(EVENT_KERNEL_SCREENSHOT)
             screenshotCalls++
             return screenshotEnvelope
         }
@@ -1890,13 +2035,17 @@ class DeviceToolTest {
             idle: Boolean,
             timeoutMillis: Long,
         ): DeviceEnvelope {
+            events.record(EVENT_KERNEL_WAIT)
             calls += "wait:${text.orEmpty()}"
             waitCalls += WaitCall(text, foreground, idle, timeoutMillis)
             onWait?.invoke()
             return waitEnvelopes.removeFirstOrNull() ?: waitEnvelope
         }
 
-        override fun status(): DeviceEnvelope = statusEnvelope
+        override fun status(): DeviceEnvelope {
+            events.record(EVENT_KERNEL_STATUS)
+            return statusEnvelope
+        }
 
         override fun cancel() = Unit
 
