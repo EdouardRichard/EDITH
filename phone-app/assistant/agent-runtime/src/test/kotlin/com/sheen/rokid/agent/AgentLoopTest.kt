@@ -9,6 +9,8 @@ import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
 import com.sheen.rokid.plugin.ToolSpec
 import com.sheen.rokid.testsupport.FakeClock
 import java.util.concurrent.CountDownLatch
@@ -53,6 +55,25 @@ class AgentLoopTest {
         maxSteps: Int = 24,
         confirmation: ConfirmationPort? = null,
     ) = AgentLoop(gateway, registry, policy, guard, audit, clock, maxEmptyTurns, maxSteps, confirmation)
+
+    /**
+     * The exact envelope the loop feeds back for a tool result. The envelope shape itself is pinned in
+     * `ToolResultEnvelopeTest`/`ToolRegistryTest`; the loop tests only need the byte-identical string a result carries.
+     */
+    private fun envelope(execution: ToolExecution, data: String): String =
+        ToolResultEnvelope.encode(execution, observation = null, data = data)
+
+    private fun doneEnvelope(data: String): String = envelope(ToolExecution(outcome = ToolOutcome.Done), data)
+
+    private fun errorEnvelope(code: String): String = envelope(
+        ToolExecution(
+            outcome = ToolOutcome.Failed,
+            code = code,
+            accepted = false,
+            applied = false,
+        ),
+        data = "",
+    )
 
     // ---------------------------------------------------------------- turn state
 
@@ -360,7 +381,7 @@ class AgentLoopTest {
                 ModelHistoryItem.Text(MessageRole.USER, "把音量调小一点"),
                 ModelHistoryItem.Text(MessageRole.ASSISTANT, "(tool call)"),
                 ModelHistoryItem.ToolCall("call-1", "device.get_volume", "{}"),
-                ModelHistoryItem.ToolOutput("call-1", "volume=5"),
+                ModelHistoryItem.ToolOutput("call-1", doneEnvelope("volume=5")),
             ),
             second,
         )
@@ -476,8 +497,8 @@ class AgentLoopTest {
                 ModelHistoryItem.Text(MessageRole.ASSISTANT, "(tool call)"),
                 ModelHistoryItem.ToolCall("c1", "a", "{}"),
                 ModelHistoryItem.ToolCall("c2", "b", "{}"),
-                ModelHistoryItem.ToolOutput("c1", "payload-a"),
-                ModelHistoryItem.ToolOutput("c2", "payload-b"),
+                ModelHistoryItem.ToolOutput("c1", doneEnvelope("payload-a")),
+                ModelHistoryItem.ToolOutput("c2", doneEnvelope("payload-b")),
             ),
             gateway.requests[1].history,
         )
@@ -506,10 +527,10 @@ class AgentLoopTest {
                 ModelHistoryItem.Text(MessageRole.USER, "把音量调小一点"),
                 ModelHistoryItem.Text(MessageRole.ASSISTANT, "first"),
                 ModelHistoryItem.ToolCall("c1", "a", "{}"),
-                ModelHistoryItem.ToolOutput("c1", "payload-a"),
+                ModelHistoryItem.ToolOutput("c1", doneEnvelope("payload-a")),
                 ModelHistoryItem.Text(MessageRole.ASSISTANT, "second"),
                 ModelHistoryItem.ToolCall("c2", "b", "{}"),
-                ModelHistoryItem.ToolOutput("c2", "payload-b"),
+                ModelHistoryItem.ToolOutput("c2", doneEnvelope("payload-b")),
             ),
             gateway.requests[2].history,
         )
@@ -558,7 +579,7 @@ class AgentLoopTest {
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals(listOf(AgentStep(1, "nope", "UNKNOWN_TOOL")), run.steps)
         assertTrue(policy.seen.isEmpty(), "an unknown name must never reach the policy")
-        assertEquals(ModelHistoryItem.ToolOutput("c1", "UNKNOWN_TOOL"), gateway.requests[1].history.last())
+        assertEquals(ModelHistoryItem.ToolOutput("c1", errorEnvelope("UNKNOWN_TOOL")), gateway.requests[1].history.last())
         // An unresolved name was never executed, so the audit summary must not reuse the execution label asserted by
         // `an allowed tool call is one ok step...`; the outcome keeps the stable UNKNOWN_TOOL safe code.
         assertEquals(RecordedAuditEntry("turn-7", "nope", "UnknownTool", "UNKNOWN_TOOL"), audit.entries.single())
@@ -578,7 +599,7 @@ class AgentLoopTest {
         assertEquals(listOf(AgentStep(1, "device.set_volume", "REFUSED_BY_POLICY")), run.steps)
         assertTrue(executor.calls.isEmpty())
         assertEquals(RecordedAuditEntry("turn-7", "device.set_volume", "policy", "Refused"), audit.entries.single())
-        assertEquals(ModelHistoryItem.ToolOutput("c1", "REFUSED_BY_POLICY"), gateway.requests[1].history.last())
+        assertEquals(ModelHistoryItem.ToolOutput("c1", errorEnvelope("REFUSED_BY_POLICY")), gateway.requests[1].history.last())
     }
 
     @Test fun `a confirmation-gated action is refused as unavailable and the loop continues`() {
@@ -759,7 +780,7 @@ class AgentLoopTest {
         assertEquals(1, run.steps.size)
     }
 
-    @Test fun `only a successful terminal tool ends the run with its payload as the final text`() {
+    @Test fun `only a successful terminal tool ends the run with its tool detail as the final text`() {
         val executor = terminalExecutor("report_done")
         executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "最终答案") }
         val gateway = ScriptedGateway(listOf(reply(text = "thinking", calls = listOf(call("c1", "report_done")))))
@@ -811,7 +832,7 @@ class AgentLoopTest {
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals("answer", run.finalText)
         assertEquals(
-            listOf(AgentStep(1, "report_done", "Failed: missing field"), AgentStep(2, "report_done", "ok")),
+            listOf(AgentStep(1, "report_done", "Failed"), AgentStep(2, "report_done", "ok")),
             run.steps,
         )
     }

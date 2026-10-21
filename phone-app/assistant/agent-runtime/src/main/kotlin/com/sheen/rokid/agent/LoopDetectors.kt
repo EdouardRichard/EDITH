@@ -307,7 +307,7 @@ private val REFUSED_PREFIXES = listOf("Refused:", "Failed:")
 /**
  * Extracts the **identity** of a failed result without keeping its body (R56: D117 allows a hash, never the text).
  *
- * In order:
+ * This is the legacy-detail fallback used when a result carries no `ToolExecution.code`. In order:
  * 1. `Refused: CODE` / `Failed: CODE` — the token right after the prefix when it looks like a stable code;
  * 2. a bare all-caps token (`UNKNOWN_TOOL`, `REFUSED_BY_POLICY`);
  * 3. a leading `CODE:` (`ACTION_TIMEOUT: may or may not have taken effect`);
@@ -380,7 +380,9 @@ internal data class ErrorAssessment(
  * never counted and carry a "do not retry automatically" hint. `REFUSED_BY_POLICY` does count — it is deterministic and
  * the model must change course.
  *
- * Hints for known stable codes are injected once per code per run; the body of the payload is never retained.
+ * Hints for known stable codes are injected once per code per run; the body of the payload is never retained. The
+ * identity is the execution's own `code` when the tool named one; only an unmigrated result falls back to parsing its
+ * legacy detail ([stableCodeOf]).
  */
 internal class ErrorTracker(private val limit: Int = 3) {
     init {
@@ -399,7 +401,9 @@ internal class ErrorTracker(private val limit: Int = 3) {
             }
             return ErrorAssessment()
         }
-        val code = stableCodeOf(result.payload)
+        // edith-0.3 Phase 2.2: a migrated result states its stable code in the execution facts, so the body is never
+        // parsed. An unmigrated tool's legacy `data` is the fallback identity (the same parser the old payload used).
+        val code = result.execution.code ?: stableCodeOf(result.data)
         if (code == CONFIRMATION_DENIED || code == CONFIRMATION_TIMEOUT) {
             // The wearer answered (or the question expired): retrying is exactly the wrong response, and the result is
             // not evidence the tool is broken.

@@ -4,8 +4,14 @@ import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
+import com.sheen.rokid.plugin.ToolVision
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -154,7 +160,7 @@ class ToolRegistryTest {
 
         assertEquals("call-1", result.id)
         assertFalse(result.ok)
-        assertEquals("UNKNOWN_TOOL", result.payload)
+        assertErrorResult(result, "UNKNOWN_TOOL")
     }
 
     @Test fun `arguments the strict parser rejects but the lenient parser accepts are executed`() {
@@ -171,7 +177,10 @@ class ToolRegistryTest {
         val result = registry.execute(ToolCall(id = "call-2", name = "echo", argsJson = lenientOnly))
 
         assertTrue(result.ok)
-        assertEquals(lenientOnly, result.payload)
+        assertEquals(ToolOutcome.Done, result.execution.outcome)
+        assertNull(result.observation)
+        assertEquals(lenientOnly, result.data)
+        assertEquals(lenientOnly, payloadData(result), "the unparsed argument text is just the envelope's data")
         assertEquals(listOf("echo" to lenientOnly), executor.calls)
     }
 
@@ -189,7 +198,14 @@ class ToolRegistryTest {
         val result = registry.execute(ToolCall(id = "call-3", name = "echo", argsJson = rawNewline))
 
         assertTrue(result.ok)
-        assertEquals(rawNewline, result.payload)
+        assertEquals(ToolOutcome.Done, result.execution.outcome)
+        assertNull(result.observation)
+        assertEquals(rawNewline, result.data)
+        val encodedData = (Json.parseToJsonElement(result.payload) as JsonObject).getValue("data")
+        assertTrue(
+            encodedData is JsonObject,
+            "a literal newline inside a JSON string is still valid JSON, so data is embedded as an object",
+        )
         assertEquals(listOf("echo" to rawNewline), executor.calls)
     }
 
@@ -204,40 +220,61 @@ class ToolRegistryTest {
             val result = registry.execute(ToolCall(id = "call-4", name = "echo", argsJson = args))
 
             assertFalse(result.ok, "accepted arguments: <$args>")
-            assertEquals("ARGUMENTS_INVALID", result.payload, "arguments: <$args>")
+            assertErrorResult(result, "ARGUMENTS_INVALID", id = "call-4")
             assertTrue(executor.calls.isEmpty(), "executor ran for arguments: <$args>")
         }
     }
 
-    @Test fun `a Done outcome becomes a successful result carrying the detail`() {
+    @Test fun `a Done outcome becomes a done envelope whose data is the tool detail`() {
         val executor = executorOf("device.set_volume")
-        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "volume set to 3") }
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, """{"volume":3}""") }
         val registry = ToolRegistry(listOf(executor))
 
         val result = registry.execute(ToolCall("call-5", "device.set_volume", """{"level": 3}"""))
 
         assertEquals("call-5", result.id)
         assertTrue(result.ok)
-        assertEquals("volume set to 3", result.payload)
+        assertEquals(ToolOutcome.Done, result.execution.outcome)
+        assertNull(result.execution.code)
+        assertNull(result.observation, "a pure tool reports no observation instead of inventing one")
+        assertEquals("""{"volume":3}""", result.data)
+        assertEquals(
+            """{"execution":{"outcome":"done","code":null,"message":null,"recoverable":false,"accepted":null,""" +
+                """"applied":null,"verified":null,"changed":null,"uncertain":false,"partial":false},""" +
+                """"observation":null,"data":{"volume":3}}""",
+            result.payload,
+        )
     }
 
-    @Test fun `Refused and Failed outcomes become failed steps prefixed with the outcome name`() {
+    @Test fun `Refused and Failed outcomes become prefix free envelopes`() {
         listOf(
-            ActionOutcome.Refused to "user declined",
-            ActionOutcome.Failed to "device offline",
-        ).forEach { (outcome, detail) ->
+            ActionOutcome.Refused to ToolOutcome.Refused,
+            ActionOutcome.Failed to ToolOutcome.Failed,
+        ).forEach { (actionOutcome, toolOutcome) ->
+            val detail = "user declined"
             val executor = executorOf("device.set_volume")
-            executor.outcome = { _, _ -> ActionResult(outcome, detail) }
+            executor.outcome = { _, _ -> ActionResult(actionOutcome, detail) }
             val registry = ToolRegistry(listOf(executor))
 
             val result = registry.execute(ToolCall("call-6", "device.set_volume", "{}"))
 
-            assertFalse(result.ok, "outcome: $outcome")
-            assertEquals("${outcome.name}: $detail", result.payload)
+            assertFalse(result.ok, "outcome: $actionOutcome")
+            assertEquals(toolOutcome, result.execution.outcome)
+            assertNull(result.execution.code, "the registry must not fabricate a code from an unmigrated detail")
+            assertNull(result.observation)
+            assertEquals(detail, result.data)
+            assertEquals(
+                """{"execution":{"outcome":"${toolOutcome.name.lowercase()}","code":null,"message":null,""" +
+                    """"recoverable":false,"accepted":null,"applied":null,"verified":null,"changed":null,""" +
+                    """"uncertain":false,"partial":false},"observation":null,"data":"$detail"}""",
+                result.payload,
+            )
+            assertFalse(result.payload.contains("Refused: "), "no legacy prefix: ${result.payload}")
+            assertFalse(result.payload.contains("Failed: "), "no legacy prefix: ${result.payload}")
         }
     }
 
-    @Test fun `an executor that throws never propagates and becomes a TOOL_THREW step`() {
+    @Test fun `an executor that throws never propagates and becomes a TOOL_THREW envelope`() {
         val executor = executorOf("exploding.tool")
         executor.failure = IllegalStateException("boom")
         val registry = ToolRegistry(listOf(executor))
@@ -246,7 +283,51 @@ class ToolRegistryTest {
 
         assertEquals("call-7", result.id)
         assertFalse(result.ok)
-        assertEquals("TOOL_THREW", result.payload)
+        assertErrorResult(result, "TOOL_THREW")
+    }
+
+    @Test fun `an explicit execution and observation from the tool survive projection`() {
+        val execution = ToolExecution(
+            outcome = ToolOutcome.Done,
+            code = "OPEN_VERIFIED",
+            message = "opened",
+            accepted = true,
+            applied = true,
+            verified = true,
+            changed = true,
+        )
+        val observation = ToolObservation(
+            snapshotId = "snap-9",
+            foregroundPackage = "com.example",
+            screen = "Home",
+            vision = ToolVision.Ok,
+        )
+        val executor = executorOf("open")
+        executor.outcome = { _, _ ->
+            ActionResult(
+                ActionOutcome.Done,
+                """{"opened":true}""",
+                execution = execution,
+                observation = observation,
+            )
+        }
+        val registry = ToolRegistry(listOf(executor))
+
+        val result = registry.execute(ToolCall("call-9", "open", """{"target":"home"}"""))
+
+        assertTrue(result.ok)
+        assertEquals(execution, result.execution, "an explicit execution is the tool's fact, not the registry's guess")
+        assertEquals(observation, result.observation)
+        assertEquals("""{"opened":true}""", result.data)
+        assertFalse(result.data.contains("Home"), "observation fields must not be repeated in data")
+        assertEquals(
+            """{"execution":{"outcome":"done","code":"OPEN_VERIFIED","message":"opened","recoverable":false,""" +
+                """"accepted":true,"applied":true,"verified":true,"changed":true,"uncertain":false,"partial":false},""" +
+                """"observation":{"snapshotId":"snap-9","capturedAtEpochMillis":null,"foregroundPackage":"com.example",""" +
+                """"foregroundActivity":null,"rootPackage":null,"coverage":null,"screen":"Home","truncated":false,""" +
+                """"vision":"ok","visionReason":null},"data":{"opened":true}}""",
+            result.payload,
+        )
     }
 
     @Test fun `registration applies no risk gate and no confirmation filter`() {
@@ -377,5 +458,32 @@ class ToolRegistryTest {
 
         assertEquals(1, throwing.begins, "every executor is attempted before the first failure is swallowed")
         assertEquals(1, healthy.begins)
+    }
+
+    /** The `data` member of a result's envelope, decoded back to the tool detail string. */
+    private fun payloadData(result: ToolResult): String =
+        (Json.parseToJsonElement(result.payload) as JsonObject).getValue("data").jsonPrimitive.content
+
+    /**
+     * The framework-synthesized failure shape: the supplied stable code, `accepted=false`/`applied=false` (the
+     * pre-dispatch facts unknown tool/arguments establish), and no invented observation. `TOOL_THREW` still uses this
+     * shape in Task 2; Task 3 replaces it with the uncertain post-dispatch fact.
+     */
+    private fun assertErrorResult(result: ToolResult, code: String, id: String? = null) {
+        if (id != null) assertEquals(id, result.id)
+        assertFalse(result.ok)
+        assertEquals(ToolOutcome.Failed, result.execution.outcome)
+        assertEquals(code, result.execution.code)
+        assertEquals(false, result.execution.accepted)
+        assertEquals(false, result.execution.applied)
+        assertNull(result.observation)
+        assertEquals(
+            """{"execution":{"outcome":"failed","code":"$code","message":null,"recoverable":false,""" +
+                """"accepted":false,"applied":false,"verified":null,"changed":null,"uncertain":false,""" +
+                """"partial":false},"observation":null,"data":""}""",
+            result.payload,
+        )
+        assertFalse(result.payload.contains("Failed: "), "no legacy prefix: ${result.payload}")
+        assertFalse(result.payload.contains("Refused: "), "no legacy prefix: ${result.payload}")
     }
 }

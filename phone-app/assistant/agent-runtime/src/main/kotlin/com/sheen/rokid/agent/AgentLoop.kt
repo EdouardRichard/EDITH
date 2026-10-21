@@ -7,6 +7,8 @@ import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
 import com.sheen.rokid.plugin.ToolSpec
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -841,7 +843,7 @@ class AgentLoop(
                                     request.turnId, call.name, AUDIT_POLICY, AUDIT_REFUSED,
                                     scope = shape.scope, risk = shape.risk.name, decision = AUDIT_REFUSE,
                                 )
-                                ToolExecution(ToolResult.error(call.id, REFUSED_BY_POLICY), executed = false)
+                                ToolInvocation(ToolResult.error(call.id, REFUSED_BY_POLICY), executed = false)
                             }
                             is PolicyDecision.RequireConfirmation -> {
                                 // Waiting on a person is not the turn spending its own budget (D49): measure the call and
@@ -868,7 +870,7 @@ class AgentLoop(
                                             scope = shape.scope, risk = shape.risk.name,
                                             decision = AUDIT_REQUIRE_CONFIRMATION,
                                         )
-                                        ToolExecution(ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE), executed = false)
+                                        ToolInvocation(ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE), executed = false)
                                     }
                                     outcome.approved -> {
                                         val executed = runTool(
@@ -892,7 +894,7 @@ class AgentLoop(
                                             risk = shape.risk.name, decision = AUDIT_REQUIRE_CONFIRMATION,
                                             confirmationSource = outcome.source,
                                         )
-                                        ToolExecution(ToolResult.error(call.id, code), executed = false)
+                                        ToolInvocation(ToolResult.error(call.id, code), executed = false)
                                     }
                                 }
                             }
@@ -924,7 +926,7 @@ class AgentLoop(
                 // R60: a call that did not stop within the grace window ends the run; no later write may run while the
                 // previous one may still be in flight.
                 if (execution.uncertain) {
-                    steps += AgentStep(steps.size + 1, call.name, execution.result.payload, executed = true)
+                    steps += AgentStep(steps.size + 1, call.name, stepResultOf(execution.result), executed = true)
                     appendToolOutput(
                         history,
                         call.id,
@@ -968,7 +970,7 @@ class AgentLoop(
                 )
                 // The step keeps the raw stable code (`ok` on success, as before Task 12); the model-facing output
                 // additionally carries the one-time hints and the one-time global notice.
-                val stepResult = if (result.ok) "ok" else result.payload
+                val stepResult = stepResultOf(result)
                 val historyPayload = buildString {
                     append(result.payload)
                     errorsSeen.hint?.let { append("\n\n").append(it) }
@@ -992,7 +994,7 @@ class AgentLoop(
                     )
                 }
                 if (registered?.descriptor?.scope == SCOPE_TERMINAL && result.ok) {
-                    return finish(AgentOutcome.COMPLETED, null, result.payload, steps, history, "", spentSteps)
+                    return finish(AgentOutcome.COMPLETED, null, result.data, steps, history, "", spentSteps)
                 }
                 if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
                 if (spentObservations >= maxObservations) {
@@ -1025,7 +1027,7 @@ class AgentLoop(
      * One tool attempt's outcome, including the three states the old synchronous call could not express: cancelled,
      * timed out (confirmed stop) and uncertain (the tool did not stop).
      */
-    private class ToolExecution(
+    private class ToolInvocation(
         val result: ToolResult,
         val executed: Boolean,
         val timedOut: Boolean = false,
@@ -1051,7 +1053,7 @@ class AgentLoop(
      *
      * R99: [mayAskHuman] is the descriptor's declaration that the executor may spend D47's decision window inside
      * `execute`. Such a call is bounded by `timeoutMillis + HUMAN_CONFIRMATION_ALLOWANCE_NANOS` and **not** clamped by
-     * the turn deadline; whatever it spent beyond the machine cap is reported as [ToolExecution.deadlineShiftNanos] so
+     * the turn deadline; whatever it spent beyond the machine cap is reported as [ToolInvocation.deadlineShiftNanos] so
      * the caller can shift the turn deadline (D49). Every other call keeps `min(timeoutMillis, deadline - now)`.
      */
     private fun runTool(
@@ -1060,7 +1062,7 @@ class AgentLoop(
         turnDeadlineNanos: Long,
         toolExecutor: ExecutorService,
         mayAskHuman: Boolean = false,
-    ): ToolExecution {
+    ): ToolInvocation {
         val machineBudgetNanos = timeoutMillis.coerceAtLeast(1L) * 1_000_000L
         val timeoutNanos = if (mayAskHuman) {
             machineBudgetNanos + HUMAN_CONFIRMATION_ALLOWANCE_NANOS
@@ -1073,7 +1075,7 @@ class AgentLoop(
         while (true) {
             if (cancelled) {
                 awaitToolStop(future)
-                return ToolExecution(ToolResult.error(call.id, ACTION_TIMEOUT), executed = false, cancelled = true)
+                return ToolInvocation(ToolResult.error(call.id, ACTION_TIMEOUT), executed = false, cancelled = true)
             }
             val remaining = timeoutNanos - (System.nanoTime() - startedAt)
             if (remaining <= 0L) break
@@ -1082,7 +1084,7 @@ class AgentLoop(
                 // that does arrive is a real completed call: it is recorded like before Task 12, and the loop's own
                 // cancellation check right after the call ends the run.
                 val completed = future.get(minOf(remaining, TOOL_POLL_STEP_NANOS), TimeUnit.NANOSECONDS)
-                return ToolExecution(
+                return ToolInvocation(
                     completed,
                     executed = true,
                     deadlineShiftNanos = humanWaitShiftNanos(mayAskHuman, startedAt, machineBudgetNanos),
@@ -1090,27 +1092,42 @@ class AgentLoop(
             } catch (_: TimeoutException) {
                 // Keep waiting; the loop above re-checks cancellation and the remaining budget.
             } catch (_: ExecutionException) {
-                return ToolExecution(ToolResult.error(call.id, "TOOL_THREW"), executed = true)
+                return ToolInvocation(ToolResult.error(call.id, "TOOL_THREW"), executed = true)
             } catch (interrupted: InterruptedException) {
                 Thread.currentThread().interrupt()
                 runCatching { registry.cancel() }
                 awaitToolStop(future)
-                return ToolExecution(ToolResult.error(call.id, ACTION_TIMEOUT), executed = false, cancelled = true)
+                return ToolInvocation(ToolResult.error(call.id, ACTION_TIMEOUT), executed = false, cancelled = true)
             }
         }
         runCatching { registry.cancel() }
         val stopped = awaitToolStop(future)
         val humanShift = humanWaitShiftNanos(mayAskHuman, startedAt, machineBudgetNanos)
         return if (stopped) {
-            ToolExecution(
-                ToolResult(call.id, ok = false, payload = "$ACTION_TIMEOUT: $ACTION_TIMEOUT_NOTE"),
+            // The call really stopped: the caller may observe again and continue. `applied`/`changed` stay unknown
+            // (Task 3 fills the evidence it can get); the fixed note is the execution message, not tool `data`.
+            val execution = ToolExecution(
+                outcome = ToolOutcome.Timeout,
+                code = ACTION_TIMEOUT,
+                message = ACTION_TIMEOUT_NOTE,
+            )
+            ToolInvocation(
+                ToolResult(id = call.id, ok = false, execution = execution, observation = null),
                 executed = true,
                 timedOut = true,
                 deadlineShiftNanos = humanShift,
             )
         } else {
-            ToolExecution(
-                ToolResult(call.id, ok = false, payload = "$ACTION_TIMEOUT_UNCERTAIN: $ACTION_TIMEOUT_UNCERTAIN_NOTE"),
+            // The call did not stop within the grace window: it may still be running, so no tri-state field may be
+            // written as if it were known. The run ends before any later write.
+            val execution = ToolExecution(
+                outcome = ToolOutcome.Uncertain,
+                code = ACTION_TIMEOUT_UNCERTAIN,
+                message = ACTION_TIMEOUT_UNCERTAIN_NOTE,
+                uncertain = true,
+            )
+            ToolInvocation(
+                ToolResult(id = call.id, ok = false, execution = execution, observation = null),
                 executed = true,
                 uncertain = true,
             )
@@ -1416,7 +1433,17 @@ class AgentLoop(
         history += ModelHistoryItem.Text(MessageRole.USER, RETRY_INSTRUCTION)
     }
 
-    private fun outcomeOf(result: ToolResult) = if (result.ok) "ok" else result.payload
+    /**
+     * The short stable label one `AgentStep` (and one audit line) carries: `ok` for a success, otherwise the execution's
+     * stable code, or its outcome token when an unmigrated tool named no code.
+     *
+     * Never the tool detail and never the envelope: `AgentStep.result` reaches the plugin's `P3_TOOL` count-only log,
+     * and `data`/`observation` may carry content that is only allowed in the current model request (C2).
+     */
+    private fun stepResultOf(result: ToolResult): String =
+        if (result.ok) "ok" else result.execution.code ?: result.execution.outcome.name
+
+    private fun outcomeOf(result: ToolResult) = stepResultOf(result)
 
     /**
      * The one argument an audit line may carry (spec §17.5).

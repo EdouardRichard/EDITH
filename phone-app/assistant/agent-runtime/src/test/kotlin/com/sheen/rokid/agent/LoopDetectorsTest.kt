@@ -1,5 +1,7 @@
 package com.sheen.rokid.agent
 
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -287,31 +289,31 @@ class LoopDetectorsTest {
     fun `three identical errors terminate while a different code resets the streak`() {
         val tracker = ErrorTracker()
 
-        assertFalse(tracker.assess("device", ToolResult.error("c", "Refused: NODE_STALE now"), false).repeatTerminated)
-        assertFalse(tracker.assess("device", ToolResult.error("c", "Refused: NODE_STALE now"), false).repeatTerminated)
-        assertFalse(tracker.assess("device", ToolResult.error("c", "Refused: NODE_NOT_FOUND"), false).repeatTerminated)
-        assertFalse(tracker.assess("device", ToolResult.error("c", "Refused: NODE_NOT_FOUND"), false).repeatTerminated)
-        assertTrue(tracker.assess("device", ToolResult.error("c", "Refused: NODE_NOT_FOUND"), false).repeatTerminated)
+        assertFalse(tracker.assess("device", ToolResult.error("c", "NODE_STALE"), false).repeatTerminated)
+        assertFalse(tracker.assess("device", ToolResult.error("c", "NODE_STALE"), false).repeatTerminated)
+        assertFalse(tracker.assess("device", ToolResult.error("c", "NODE_NOT_FOUND"), false).repeatTerminated)
+        assertFalse(tracker.assess("device", ToolResult.error("c", "NODE_NOT_FOUND"), false).repeatTerminated)
+        assertTrue(tracker.assess("device", ToolResult.error("c", "NODE_NOT_FOUND"), false).repeatTerminated)
     }
 
     @Test
     fun `a successful write resets the error streak and a successful observation does not`() {
         val tracker = ErrorTracker()
-        tracker.assess("device", ToolResult.error("c", "Refused: NODE_STALE"), false)
-        tracker.assess("device", ToolResult.error("c", "Refused: NODE_STALE"), false)
+        tracker.assess("device", ToolResult.error("c", "NODE_STALE"), false)
+        tracker.assess("device", ToolResult.error("c", "NODE_STALE"), false)
 
         // An observation succeeding is not progress for the error streak: the third error still terminates.
-        tracker.assess("device", ToolResult("c", ok = true, payload = "screen"), writeSucceeded = false)
+        tracker.assess("device", successResult("c", "screen"), writeSucceeded = false)
         assertTrue(
-            tracker.assess("device", ToolResult.error("c", "Refused: NODE_STALE"), false).repeatTerminated,
+            tracker.assess("device", ToolResult.error("c", "NODE_STALE"), false).repeatTerminated,
             "a successful observation must not reset the streak",
         )
 
         // A successful write is progress: the next two errors are a fresh streak.
-        tracker.assess("device", ToolResult("c", ok = true, payload = "done"), writeSucceeded = true)
-        assertFalse(tracker.assess("device", ToolResult.error("c", "Refused: NODE_STALE"), false).repeatTerminated)
-        assertFalse(tracker.assess("device", ToolResult.error("c", "Refused: NODE_STALE"), false).repeatTerminated)
-        assertTrue(tracker.assess("device", ToolResult.error("c", "Refused: NODE_STALE"), false).repeatTerminated)
+        tracker.assess("device", successResult("c", "done"), writeSucceeded = true)
+        assertFalse(tracker.assess("device", ToolResult.error("c", "NODE_STALE"), false).repeatTerminated)
+        assertFalse(tracker.assess("device", ToolResult.error("c", "NODE_STALE"), false).repeatTerminated)
+        assertTrue(tracker.assess("device", ToolResult.error("c", "NODE_STALE"), false).repeatTerminated)
     }
 
     @Test
@@ -345,22 +347,40 @@ class LoopDetectorsTest {
     fun `a classification hint is injected once per stable code`() {
         val tracker = ErrorTracker()
 
-        val first = tracker.assess("device", ToolResult.error("c", "Refused: NODE_STALE"), false)
-        val second = tracker.assess("device", ToolResult.error("c", "Refused: NODE_STALE"), false)
+        val first = tracker.assess("device", ToolResult.error("c", "NODE_STALE"), false)
+        val second = tracker.assess("device", ToolResult.error("c", "NODE_STALE"), false)
 
         assertTrue(first.hint?.startsWith("LOOP_HINT:NODE_STALE") == true, "hint: ${first.hint}")
         assertNull(second.hint, "the same code is hinted once per run")
     }
 
+    @Test
+    fun `an explicit execution code wins over the legacy detail identity`() {
+        val tracker = ErrorTracker()
+        // A migrated tool names its code; the detail's prose must not become the identity (or leak into it).
+        val explicit = ToolResult(
+            id = "c",
+            ok = false,
+            execution = ToolExecution(outcome = ToolOutcome.Failed, code = "CHANNEL_UNAVAILABLE"),
+            observation = null,
+            data = "a different failure body",
+        )
+
+        val assessment = tracker.assess("device", explicit, false)
+
+        assertEquals("CHANNEL_UNAVAILABLE", assessment.stableCode)
+        assertTrue(assessment.hint?.startsWith("LOOP_HINT:CHANNEL_UNAVAILABLE") == true, "hint: ${assessment.hint}")
+    }
+
     // ---------------------------------------------------------------- production error identity (review R56)
 
     /**
-     * The exact payload the production path produces for a failed `device` call: `ToolRegistry` prefixes the outcome
-     * and `DeviceTool` renders the whole envelope (error code and timing included) as one JSON object. The timing values
-     * differ on every call; the failure is the same.
+     * The exact detail an unmigrated `device` call still returns: `DeviceTool` renders the whole envelope (error code
+     * and timing included) as one JSON object. The timing values differ on every call; the failure is the same.
+     * Until the tools carry an explicit `ToolExecution`, `ErrorTracker` falls back to this legacy detail identity.
      */
     private fun deviceFailure(totalMs: Long): String =
-        "Refused: " + """{"ok":false,"tool":"device","action":"act","channel":"accessibility","accepted":false,""" +
+        """{"ok":false,"tool":"device","action":"act","channel":"accessibility","accepted":false,""" +
             """"applied":null,"verified":null,"data":{"screen":null,"diagnostic":"accepted the action but could not """ +
             """observe"},"images":[],"timing":{"actMs":1,"observeMs":2,"totalMs":$totalMs},"error":{"code":"NODE_STALE",""" +
             """"message":"the node reference is stale","recoverable":true}}"""
@@ -370,16 +390,16 @@ class LoopDetectorsTest {
         val first = stableCodeOf(deviceFailure(totalMs = 7L))
         val second = stableCodeOf(deviceFailure(totalMs = 913L))
 
-        assertEquals("NODE_STALE", first, "the JSON error.code must win over the Refused: prefix token")
+        assertEquals("NODE_STALE", first, "the JSON error.code must win over the legacy detail")
         assertEquals(first, second, "identical failures with different timing must share one identity")
 
         // The per-code hint and the 3-in-a-row streak are both reachable only if the identity is stable.
         val tracker = ErrorTracker()
-        val hinted = tracker.assess("device", ToolResult.error("c1", deviceFailure(totalMs = 7L)), false)
+        val hinted = tracker.assess("device", legacyFailure("c1", deviceFailure(totalMs = 7L)), false)
         assertTrue(hinted.hint?.startsWith("LOOP_HINT:NODE_STALE") == true, "hint: ${hinted.hint}")
-        tracker.assess("device", ToolResult.error("c2", deviceFailure(totalMs = 8L)), false)
+        tracker.assess("device", legacyFailure("c2", deviceFailure(totalMs = 8L)), false)
         assertTrue(
-            tracker.assess("device", ToolResult.error("c3", deviceFailure(totalMs = 9L)), false).repeatTerminated,
+            tracker.assess("device", legacyFailure("c3", deviceFailure(totalMs = 9L)), false).repeatTerminated,
             "three NODE_STALE failures must terminate the run as a repeated error",
         )
     }
@@ -398,4 +418,21 @@ class LoopDetectorsTest {
         assertTrue(first.matches(Regex("[0-9a-f]{16}")), first)
         assertEquals(first, second, "the fallback hash must ignore timing and object key order")
     }
+
+    private fun successResult(id: String, data: String) = ToolResult(
+        id = id,
+        ok = true,
+        execution = ToolExecution(outcome = ToolOutcome.Done),
+        observation = null,
+        data = data,
+    )
+
+    /** An unmigrated tool result: no explicit execution code, only the legacy detail that the fallback parses. */
+    private fun legacyFailure(id: String, detail: String) = ToolResult(
+        id = id,
+        ok = false,
+        execution = ToolExecution(outcome = ToolOutcome.Failed),
+        observation = null,
+        data = detail,
+    )
 }

@@ -157,6 +157,23 @@ data class ActionResult(
      * the default — keeps every other tool's construction and output byte-for-byte unchanged.
      */
     val nonPersistent: Boolean = false,
+    /**
+     * edith-0.3 Phase 2.2: the structured execution facts of this call, or `null` for a tool that has not been migrated
+     * to the unified result contract yet.
+     *
+     * `null` is not "success": the host projects the plain [outcome] onto `ToolOutcome.Done/Refused/Failed` and the tool
+     * keeps its [detail] as the envelope's `data`. A migrated tool fills this with the facts the model actually needs
+     * (`accepted/applied/verified/changed` as tri-state, `uncertain`/`partial` flags) instead of encoding them in prose.
+     */
+    val execution: ToolExecution? = null,
+    /**
+     * edith-0.3 Phase 2.2: what the device looked like after this call, or `null` when the tool does not observe the
+     * screen (a pure tool such as `notify_user`) or did not attempt an observation.
+     *
+     * An observation is a device fact, never a restatement of [detail]; a tool that fills this must not repeat its
+     * fields in [detail]. An empty-but-attempted observation is a real observation (see [ToolObservation]).
+     */
+    val observation: ToolObservation? = null,
 )
 
 /**

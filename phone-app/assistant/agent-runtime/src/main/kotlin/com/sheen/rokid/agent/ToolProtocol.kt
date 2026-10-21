@@ -3,6 +3,9 @@ package com.sheen.rokid.agent
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
 
 /**
  * One tool invocation requested by the model for a single agent step.
@@ -26,6 +29,10 @@ data class ToolCall(val id: String, val name: String, val argsJson: String, val 
  * A `ok = false` result is *information*, never a run-ending verdict: an unknown tool, unparsable arguments, a refusal
  * and an executor failure all come back here so the model can correct itself.
  *
+ * edith-0.3 Phase 2.2: [payload] is no longer the tool's own string. It is the one model-facing envelope
+ * (`{execution, observation|null, data}`) produced by [ToolResultEnvelope.encode], and [execution]/[observation]/[data]
+ * are its authoritative parts. [payload] is derived, never stored separately, so the three can never drift apart.
+ *
  * [fingerprint] (Task 12, R57) is the executor's optional **post-call observation fingerprint**, projected verbatim from
  * `plugin-api`'s `ActionResult.fingerprint`. It is a hash of the screen/window content, never the payload and never a
  * timing value; the loop feeds it to the poll/global detectors and (for a write) to `ProgressGuard`. `null` means this
@@ -34,7 +41,24 @@ data class ToolCall(val id: String, val name: String, val argsJson: String, val 
 data class ToolResult(
     val id: String,
     val ok: Boolean,
-    val payload: String,
+    /**
+     * The structured execution facts of this call — the envelope's `execution` member.
+     *
+     * A result synthesized by the framework itself ([error]) always carries one; a migrated tool states the facts it
+     * knows and leaves unknown tri-state fields `null`. It is never derived from [data].
+     */
+    val execution: ToolExecution,
+    /**
+     * The post-call observation — the envelope's `observation` member — or `null` when this tool does not observe the
+     * screen / did not attempt one. Never invented to fill the key: "no observation" is itself the fact.
+     */
+    val observation: ToolObservation?,
+    /**
+     * The tool-specific detail, rendered as the envelope's `data` member and kept here so a consumer that needs the raw
+     * detail (a terminal tool's final answer) does not have to parse the envelope. It must not repeat the observation
+     * fields; observation content belongs in [observation].
+     */
+    val data: String = "",
     val fingerprint: String? = null,
     /**
      * 0.25 Task 12 fix (R98): the executor's per-call declaration that this call **changed state**, projected verbatim
@@ -55,8 +79,9 @@ data class ToolResult(
      */
     val images: List<ImageRef> = emptyList(),
     /**
-     * edith-0.3 Phase 2 final review (C2): the executor's declaration that [payload] carries perception content which
-     * may live only in the current model request (projected from `plugin-api`'s `ActionResult.nonPersistent`).
+     * edith-0.3 Phase 2 final review (C2): the executor's declaration that the tool-specific part of this result carries
+     * perception content which may live only in the current model request (projected from `plugin-api`'s
+     * `ActionResult.nonPersistent`).
      *
      * The loop feeds the full payload to the model for this run, but at `finish` the persisted form of a marked tool
      * output becomes a safe marker with no images, so it cannot reach a `ConversationStore` or an `AgentRun.transcript`.
@@ -64,9 +89,29 @@ data class ToolResult(
      */
     val nonPersistent: Boolean = false,
 ) {
+    /** The one model-facing result shape; see [ToolResultEnvelope]. */
+    val payload: String = ToolResultEnvelope.encode(execution, observation, data)
+
     companion object {
-        /** A failed step whose payload is a stable machine-readable code rather than an exception message. */
-        fun error(id: String, safeCode: String): ToolResult = ToolResult(id = id, ok = false, payload = safeCode)
+        /**
+         * A failed step the framework itself produced: an unknown tool, unparsable arguments, a thrown executor, or a
+         * policy/confirmation refusal.
+         *
+         * The action was never dispatched, so `accepted=false` and `applied=false` are facts, not guesses; no observation
+         * is fabricated. The code is the stable machine identity the loop's error detectors already key on — the old
+         * `"Failed: "`/`"Refused: "` prefix is deliberately gone.
+         */
+        fun error(id: String, safeCode: String): ToolResult = ToolResult(
+            id = id,
+            ok = false,
+            execution = ToolExecution(
+                outcome = ToolOutcome.Failed,
+                code = safeCode,
+                accepted = false,
+                applied = false,
+            ),
+            observation = null,
+        )
     }
 }
 

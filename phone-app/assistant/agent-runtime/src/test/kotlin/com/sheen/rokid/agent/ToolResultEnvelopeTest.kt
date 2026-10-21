@@ -10,6 +10,8 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertTrue
 
 /**
  * Pins the canonical model-facing tool result envelope: exactly `{execution, observation, data}`.
@@ -18,6 +20,12 @@ import kotlin.test.assertEquals
  * test, not the implementation: key order, every execution field, the tri-state nulls, and the lowercase wire tokens.
  */
 class ToolResultEnvelopeTest {
+
+    /** The exact literal every all-default `done` execution produces, up to the `data` member's value. */
+    private val donePrefix =
+        """{"execution":{"outcome":"done","code":null,"message":null,"recoverable":false,"accepted":null,""" +
+            """"applied":null,"verified":null,"changed":null,"uncertain":false,"partial":false},"observation":null,""" +
+            """"data":"""
 
     @Test
     fun `done result with observation and object data is encoded exactly`() {
@@ -164,6 +172,86 @@ class ToolResultEnvelopeTest {
             ),
             root.getValue("observation").jsonObject.keys.toList(),
         )
+    }
+
+    @Test
+    fun `valid json scalar data is embedded as that scalar not as a string`() {
+        // A scalar is valid JSON, so the strict parser must keep its type. The rule is pinned deliberately: object and
+        // array payloads are the normal tool output, but a bare `42`/`true`/`null` must not silently become text.
+        val cases = mapOf(
+            "42" to """${donePrefix}42}""",
+            "true" to """${donePrefix}true}""",
+            "null" to """${donePrefix}null}""",
+        )
+        cases.forEach { (data, expected) ->
+            val root = Json.parseToJsonElement(
+                ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Done), observation = null, data),
+            ).jsonObject
+            assertFalse(root.getValue("data").jsonPrimitive.isString, "data <$data> must stay a JSON scalar")
+            assertEquals(expected, ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Done), null, data))
+        }
+    }
+
+    @Test
+    fun `an empty observation is still a real observation with every field`() {
+        // An attempted capture with no screen/foreground text is not the same fact as "no observation": the object must
+        // exist and every field must appear, so the model never infers a field from absence.
+        val encoded = ToolResultEnvelope.encode(
+            execution = ToolExecution(outcome = ToolOutcome.Done),
+            observation = ToolObservation(),
+            data = "{}",
+        )
+
+        assertEquals(
+            """{"execution":{"outcome":"done","code":null,"message":null,"recoverable":false,"accepted":null,""" +
+                """"applied":null,"verified":null,"changed":null,"uncertain":false,"partial":false},""" +
+                """"observation":{"snapshotId":null,"capturedAtEpochMillis":null,"foregroundPackage":null,""" +
+                """"foregroundActivity":null,"rootPackage":null,"coverage":null,"screen":null,"truncated":false,""" +
+                """"vision":"not_requested","visionReason":null},"data":{}}""",
+            encoded,
+        )
+        val root = Json.parseToJsonElement(encoded).jsonObject
+        assertEquals(listOf("execution", "observation", "data"), root.keys.toList())
+        assertEquals(
+            listOf(
+                "snapshotId",
+                "capturedAtEpochMillis",
+                "foregroundPackage",
+                "foregroundActivity",
+                "rootPackage",
+                "coverage",
+                "screen",
+                "truncated",
+                "vision",
+                "visionReason",
+            ),
+            root.getValue("observation").jsonObject.keys.toList(),
+        )
+        assertEquals("not_requested", root.getValue("observation").jsonObject.getValue("vision").jsonPrimitive.content)
+    }
+
+    @Test
+    fun `quotes backslashes newlines and tabs are escaped in data and message`() {
+        val data = "line \"one\"\nline\\two\tend"
+        val message = "say \"no\"\nnow"
+        val encoded = ToolResultEnvelope.encode(
+            execution = ToolExecution(outcome = ToolOutcome.Failed, message = message),
+            observation = null,
+            data = data,
+        )
+
+        val root = Json.parseToJsonElement(encoded).jsonObject
+        assertEquals(data, root.getValue("data").jsonPrimitive.content, "the escaped string must round-trip exactly")
+        assertEquals(
+            message,
+            root.getValue("execution").jsonObject.getValue("message").jsonPrimitive.content,
+        )
+        assertFalse(encoded.contains('\n'), "a raw newline must never reach the wire: $encoded")
+        assertFalse(encoded.contains('\t'), "a raw tab must never reach the wire: $encoded")
+        assertTrue(encoded.contains("\\n"), "the newline must be escaped: $encoded")
+        assertTrue(encoded.contains("\\t"), "the tab must be escaped: $encoded")
+        assertTrue(encoded.contains("\\\""), "a quote must be escaped: $encoded")
+        assertTrue(encoded.contains("\\\\"), "a backslash must be escaped: $encoded")
     }
 
     @Test
