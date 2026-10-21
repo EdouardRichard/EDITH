@@ -214,4 +214,17 @@ class NotifyUserTest {
         assertTrue(!schema.contains("\"required\":[\"text\",\"channel\",\"final\"]"),
             "final must not be required: $schema")
     }
+
+    @Test
+    fun `the description states final has no tool-side effect in this version`() {
+        // execute() reads only text and channel. final is the model's own end-of-task declaration; the tool neither
+        // changes the notification nor ends the run because of it, so the prose must not sell it as doing so.
+        val description = tool.descriptors().single().description
+
+        assertTrue(description.contains("final"), "the description must document final: $description")
+        assertTrue(
+            description.contains("不改变通知行为"),
+            "final must not be described as changing the notification: $description",
+        )
+    }
 }

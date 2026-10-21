@@ -142,7 +142,7 @@ class NotifyUserTool(private val onNotify: (NotifyChannel, String) -> Unit) : Ac
         val DESCRIPTOR = ActionDescriptor(
             name = "notify_user",
             title = "向用户发送通知",
-            description = "把要对用户说的话交给系统输出：text 是要显示或播报的句子，channel 取 screen（只显示）、voice（只播报，本版会同时显示）、both（显示并播报）或 silent（不打扰用户，用于不必打断的完成汇报），final=true 表示这是本任务的收尾答复。需要让用户看到或听到回答时用它，收尾答复也应通过它给出；一个任务可以多次调用。参数不合法返回 NOTIFY_ARGUMENTS_INVALID。不要把工具调用过程、内部计划或屏幕原文塞进 text。",
+            description = "把要对用户说的话交给系统输出：text 是要显示或播报的句子，channel 取 screen（只显示）、voice（只播报，本版会同时显示）、both（显示并播报）或 silent（不打扰用户，用于不必打断的完成汇报）。final 只是模型自报本任务收尾的标记，本版不改变通知行为。需要让用户看到或听到回答时用它，收尾答复也应通过它给出；一个任务可以多次调用。参数不合法返回 NOTIFY_ARGUMENTS_INVALID。不要把工具调用过程、内部计划或屏幕原文塞进 text。",
             parametersJson = """{"type":"object","properties":{"text":{"type":"string","description":"要通知用户的内容"},"channel":{"type":"string","enum":["screen","voice","both","silent"],"description":"screen=仅眼镜显示，voice=仅语音播报，both=同时显示和播报，silent=不通知用户但阻止系统自动补发通知"},"final":{"type":"boolean","description":"true=模型声明任务结束（spec §3.7 决策5b）"}},"required":["text","channel"],"additionalProperties":false}""",
             risk = RiskLevel.L0,
             requiresConfirmation = false,

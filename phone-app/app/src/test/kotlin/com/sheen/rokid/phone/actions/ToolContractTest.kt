@@ -1,12 +1,22 @@
 package com.sheen.rokid.phone.actions
 
+import android.content.Intent
+import com.sheen.rokid.phone.actions.device.DialTool
+import com.sheen.rokid.phone.actions.intent.AppCatalog
+import com.sheen.rokid.phone.actions.intent.AppEntry
+import com.sheen.rokid.phone.actions.intent.AppLaunchResolver
+import com.sheen.rokid.phone.actions.intent.CallPermission
+import com.sheen.rokid.phone.actions.intent.IntentActionExecutor
+import com.sheen.rokid.phone.actions.intent.IntentLauncher
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.plugin.smarthelper.output.NotifyUserTool
 import com.sheen.rokid.phone.plugin.smarthelper.skill.LoadSkillTool
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoad
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoadReason
 import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionOutcome
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -74,9 +84,11 @@ class ToolContractTest {
     fun `every description says what a failed call means`() {
         val face = ToolFaceFixture.face()
 
-        FAILURE_BEHAVIOUR.forEach { (tool, marker) ->
+        FAILURE_BEHAVIOUR.forEach { (tool, markers) ->
             val description = face.getValue(tool).description
-            assertTrue("$tool must describe its failure behaviour ('$marker'): $description", description.contains(marker))
+            markers.forEach { marker ->
+                assertTrue("$tool must describe its failure behaviour ('$marker'): $description", description.contains(marker))
+            }
         }
     }
 
@@ -89,7 +101,7 @@ class ToolContractTest {
             umbrellas.forEach { umbrella ->
                 assertTrue(
                     "$atomic must tell the model when to use $umbrella instead: $description",
-                    description.contains("用 $umbrella"),
+                    saysToUse(description, umbrella),
                 )
             }
         }
@@ -107,7 +119,97 @@ class ToolContractTest {
         }
     }
 
+    @Test
+    fun `open_app and dial name the codes their production executors really return`() {
+        val face = ToolFaceFixture.face()
+        val executor = IntentActionExecutor(
+            AppLaunchResolver(FakeCatalog(listOf(
+                AppEntry("com.camera", "Camera", Intent.ACTION_MAIN),
+                AppEntry("com.scanner", "CamScanner", Intent.ACTION_MAIN),
+            ))),
+            FakeLauncher(accepts = false),
+            noteStorage = null,
+            callPermission = CallPermission { true },
+        )
+
+        fun refusedCode(name: String, argsJson: String): String {
+            val result = executor.execute(name, argsJson)
+            assertEquals("$name must refuse, never fail", ActionOutcome.Refused, result.outcome)
+            return result.detail
+        }
+
+        // Production has one code for "no match" and "several matches", and it resolves display labels only.
+        val notFound = refusedCode("open_app", """{"name":"地图"}""")
+        val ambiguous = refusedCode("open_app", """{"name":"cam"}""")
+        val packageName = refusedCode("open_app", """{"name":"com.camera"}""")
+        assertEquals("APP_NOT_VISIBLE", notFound)
+        assertEquals("both open_app outcomes share one honest code", notFound, ambiguous)
+        assertEquals("a package name is not a display label, so it matches nothing", notFound, packageName)
+        val openApp = face.getValue("open_app").description
+        assertTrue("open_app must name the code it really returns: $openApp", openApp.contains(notFound))
+        assertFalse("open_app never returns APP_NOT_FOUND: $openApp", openApp.contains("APP_NOT_FOUND"))
+        assertTrue("open_app's name is a display label, not a package name: $openApp", openApp.contains("不是包名"))
+
+        // A refused launch is passed through from the intent leg; DIAL_FAILED belongs to the post-dispatch shape.
+        val dial = DialTool(executor, callAvailable = { true })
+            .execute("dial", """{"number":"123456"}""")
+        assertEquals("a refused launch must stay Refused", ActionOutcome.Refused, dial.outcome)
+        assertEquals("LAUNCH_REFUSED", dial.execution?.code)
+        val dialDescription = face.getValue("dial").description
+        assertTrue("dial must name the refused-launch code: $dialDescription", dialDescription.contains("LAUNCH_REFUSED"))
+        assertTrue("dial must keep DIAL_FAILED for the uncertain shape: $dialDescription", dialDescription.contains("DIAL_FAILED"))
+    }
+
+    @Test
+    fun `index tools tie snapshot invalidation to scrolling rather than to time`() {
+        listOf("tap", "long_press", "input_text").forEach { name ->
+            val description = ToolFaceFixture.face().getValue(name).description
+            assertTrue(
+                "$name must say a scroll invalidates the snapshot it uses: $description",
+                description.contains("滚动后"),
+            )
+            assertFalse(
+                "$name must not imply the snapshot expires by time (only scroll clears it): $description",
+                description.contains("过期"),
+            )
+        }
+    }
+
+    @Test
+    fun `high risk tools state the policy condition instead of promising a confirmation`() {
+        listOf("clear_data", "uninstall", "disable_app", "set_permission").forEach { name ->
+            val description = ToolFaceFixture.face().getValue(name).description
+            assertFalse(
+                "$name must not promise a confirmation the default L1 ceiling refuses: $description",
+                description.contains("执行前用户会收到确认"),
+            )
+            assertTrue(
+                "$name must say the current policy may ask or refuse: $description",
+                description.contains("权限策略") && description.contains("可能需要确认"),
+            )
+        }
+    }
+
+    /** A catalog whose `visibleApps` is the list under test; the resolver remains the production one. */
+    private class FakeCatalog(private val apps: List<AppEntry>) : AppCatalog {
+        override fun visibleApps(): List<AppEntry> = apps
+    }
+
+    /** A launcher that never accepts, so every dispatch answers the production refusal. */
+    private class FakeLauncher(private val accepts: Boolean) : IntentLauncher {
+        override fun launch(action: String, data: String?, extras: Map<String, Any>): Boolean = accepts
+    }
+
     private companion object {
+        /**
+         * True only when the description **recommends** [tier]. A clause that only prohibits it ("不要用 shell …")
+         * must not satisfy the tier contract: that was the false positive this helper replaces.
+         */
+        fun saysToUse(description: String, tier: String): Boolean =
+            description.split('。', '；').any { clause ->
+                clause.contains("用 $tier") && !clause.contains("不要用 $tier")
+            }
+
         /** The exact default face after Phase 4A Task 4: 18 atomic + 4 umbrella + the plugin's 2 delivery tools. */
         val ATOMIC_TO_UMBRELLA: Map<String, List<String>> = linkedMapOf(
             "read_screen" to listOf("device"),
@@ -152,35 +254,35 @@ class ToolContractTest {
         )
 
         /**
-         * The one stable token each description must use to say what a failed call means. The tokens are the codes the
-         * executors already answer with (or, for `list_apps`, its only truncation fact), so the prose cannot invent a
-         * failure shape the tool does not produce.
+         * The stable tokens each description must use to say what a failed call means. They are the codes the executors
+         * already answer with (or, for `list_apps`, the wire marker of its only partial-result fact), so the prose cannot
+         * invent a failure shape the tool does not produce. A tool with more than one reachable failure names each.
          */
-        val FAILURE_BEHAVIOUR: Map<String, String> = linkedMapOf(
-            "read_screen" to "ACTION_CHANNEL_UNAVAILABLE",
-            "tap" to "NODE_NOT_CLICKABLE",
-            "long_press" to "NODE_NOT_CLICKABLE",
-            "scroll" to "NO_SCREEN_CHANGE",
-            "input_text" to "ARGUMENTS_INVALID",
-            "open_app" to "APP_NOT_FOUND",
-            "open_url" to "INVALID_URL",
-            "open_settings" to "INVALID_SETTINGS_PAGE",
-            "set_alarm" to "INVALID_TIME",
-            "compose_note" to "STORAGE_UNAVAILABLE",
-            "clear_data" to "STATE_UNCHANGED",
-            "uninstall" to "STATE_UNCHANGED",
-            "disable_app" to "STATE_UNCHANGED",
-            "set_permission" to "STATE_UNCHANGED",
-            "set_brightness" to "STATE_UNCHANGED",
-            "launch_app" to "APP_AMBIGUOUS",
-            "list_apps" to "截断",
-            "system_action" to "ACTION_CHANNEL_UNAVAILABLE",
-            "device" to "STALE_REF",
-            "shell" to "SHELL_NOT_BOUND",
-            "open" to "APP_AMBIGUOUS",
-            "dial" to "CALL_PERMISSION_MISSING",
-            "notify_user" to "NOTIFY_ARGUMENTS_INVALID",
-            "load_skill" to "SKILL_NOT_FOUND",
+        val FAILURE_BEHAVIOUR: Map<String, List<String>> = linkedMapOf(
+            "read_screen" to listOf("ACTION_CHANNEL_UNAVAILABLE"),
+            "tap" to listOf("NODE_NOT_CLICKABLE"),
+            "long_press" to listOf("NODE_NOT_CLICKABLE"),
+            "scroll" to listOf("NO_SCREEN_CHANGE"),
+            "input_text" to listOf("ARGUMENTS_INVALID"),
+            "open_app" to listOf("APP_NOT_VISIBLE"),
+            "open_url" to listOf("INVALID_URL"),
+            "open_settings" to listOf("INVALID_SETTINGS_PAGE"),
+            "set_alarm" to listOf("INVALID_TIME"),
+            "compose_note" to listOf("STORAGE_UNAVAILABLE"),
+            "clear_data" to listOf("STATE_UNCHANGED"),
+            "uninstall" to listOf("STATE_UNCHANGED"),
+            "disable_app" to listOf("STATE_UNCHANGED"),
+            "set_permission" to listOf("STATE_UNCHANGED"),
+            "set_brightness" to listOf("STATE_UNCHANGED"),
+            "launch_app" to listOf("APP_AMBIGUOUS"),
+            "list_apps" to listOf("truncated"),
+            "system_action" to listOf("ACTION_CHANNEL_UNAVAILABLE", "COMMAND_FAILED"),
+            "device" to listOf("STALE_REF"),
+            "shell" to listOf("SHELL_NOT_BOUND"),
+            "open" to listOf("APP_AMBIGUOUS"),
+            "dial" to listOf("CALL_PERMISSION_MISSING"),
+            "notify_user" to listOf("NOTIFY_ARGUMENTS_INVALID"),
+            "load_skill" to listOf("SKILL_NOT_FOUND"),
         )
     }
 }

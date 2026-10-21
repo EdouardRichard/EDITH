@@ -43,7 +43,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = TAP,
         title = "点击指定索引的元素",
-        description = "点击最近一次 read_screen 列表中的第 index 个元素（index 必须来自本回合上一次 read_screen；快照过期或越界返回 ARGUMENTS_INVALID）。只做一次点击、不需要引用或验证时用它；需要按 ref 操作、连续多步、或点完还要等待/校验界面时用 device 的 act（kind=tap）。界面不接受点击返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决定，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
+        description = "点击最近一次 read_screen 列表中的第 index 个元素（index 必须来自本回合上一次 read_screen；滚动后旧快照失效，失效或越界返回 ARGUMENTS_INVALID）。只做一次点击、不需要引用或验证时用它；需要按 ref 操作、连续多步、或点完还要等待/校验界面时用 device 的 act（kind=tap）。界面不接受点击返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决定，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"],"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -55,7 +55,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = LONG_PRESS,
         title = "长按指定索引的元素",
-        description = "长按最近一次 read_screen 列表中的第 index 个元素（index 来自本回合上一次 read_screen；越界或快照过期返回 ARGUMENTS_INVALID）。用于呼出上下文菜单、多选、拖动前抓取等长按手势；普通单击用 tap，需要 ref、连续多步或长按后还要验证时用 device 的 act（kind=long_press）。界面不接受返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决策，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
+        description = "长按最近一次 read_screen 列表中的第 index 个元素（index 来自本回合上一次 read_screen；滚动后旧快照失效，失效或越界返回 ARGUMENTS_INVALID）。用于呼出上下文菜单、多选、拖动前抓取等长按手势；普通单击用 tap，需要 ref、连续多步或长按后还要验证时用 device 的 act（kind=long_press）。界面不接受返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决策，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"],"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -79,7 +79,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = INPUT_TEXT,
         title = "在指定索引的输入框输入文字",
-        description = "在最近一次 read_screen 列表中的第 index 个可编辑元素输入 text（index 来自本回合上一次 read_screen；text 不能为空、不能含换行、最多 100 个字符，否则返回 ARGUMENTS_INVALID）。用于搜索词、名称、号码等短文本；需要按 ref 定位、输入长文本或输入后还要等待/校验时用 device 的 act（kind=type）。元素不可编辑返回 NODE_NOT_CLICKABLE，写入后屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
+        description = "在最近一次 read_screen 列表中的第 index 个可编辑元素输入 text（index 来自本回合上一次 read_screen，滚动后旧快照失效；text 不能为空、不能含换行、最多 100 个字符，否则返回 ARGUMENTS_INVALID）。用于搜索词、名称、号码等短文本；需要按 ref 定位、输入长文本或输入后还要等待/校验时用 device 的 act（kind=type）。元素不可编辑返回 NODE_NOT_CLICKABLE，写入后屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"index":{"type":"integer"},"text":{"type":"string"}},"required":["index","text"],"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,

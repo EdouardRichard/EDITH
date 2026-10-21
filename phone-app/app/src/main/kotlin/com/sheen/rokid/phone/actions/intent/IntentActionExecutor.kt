@@ -91,7 +91,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = OPEN_APP,
         title = "打开 App",
-        description = "按应用名称启动一个已安装的 App（name 为应用名或包名）。名称唯一匹配时直接打开；找不到匹配返回 APP_NOT_FOUND，匹配到多个时返回 APP_NOT_VISIBLE，且不会给出候选、也不会替你猜。只在名称明确、且不需要列应用、打开链接或设置页时用它；用户说的是类别词（如“音乐”“浏览器”）、可能有歧义或需要候选时用 open。启动器拒绝时返回 LAUNCH_REFUSED；未安装的 App 不会被假装打开。",
+        description = "按应用显示名启动一个设备上可见的 App（name 是显示名，不是包名）。名称唯一匹配时直接打开；找不到匹配、或匹配到多个时都返回 APP_NOT_VISIBLE，且不会给出候选、也不会替你猜。只在名称明确、且不需要列应用、打开链接或设置页时用它；用户说的是类别词（如“音乐”“浏览器”）、可能有歧义或需要候选时用 open。启动器拒绝时返回 LAUNCH_REFUSED；未安装的 App 不会被假装打开。",
         parametersJson = """{"type":"object","properties":{"name":{"type":"string","description":"App 名称"}},""" +
             """"required":["name"],"additionalProperties":false}""",
         risk = RiskLevel.L0,

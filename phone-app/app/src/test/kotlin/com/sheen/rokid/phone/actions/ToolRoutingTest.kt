@@ -50,7 +50,8 @@ class ToolRoutingTest {
         assertTrue("open must name the ambiguity refusal: $open", open.contains("APP_AMBIGUOUS"))
         assertTrue("open must name open_app as the exact-name tier: $open", open.contains("open_app"))
         assertFalse(
-            "open_app cannot return candidates; promising them would route the model into APP_NOT_FOUND: $openApp",
+            "open_app cannot return candidates; promising them would route the model into APP_AMBIGUOUS, " +
+                "which the atomic tier never emits: $openApp",
             openApp.contains("APP_AMBIGUOUS"),
         )
     }
@@ -59,7 +60,11 @@ class ToolRoutingTest {
     fun `a known exact app name may route to the atomic open_app`() {
         val openApp = face.getValue("open_app").description
 
-        assertTrue("open_app must say an unknown name is APP_NOT_FOUND: $openApp", openApp.contains("APP_NOT_FOUND"))
+        assertTrue(
+            "open_app must say an unmatched or ambiguous name is APP_NOT_VISIBLE: $openApp",
+            openApp.contains("APP_NOT_VISIBLE"),
+        )
+        assertFalse("open_app never returns APP_NOT_FOUND: $openApp", openApp.contains("APP_NOT_FOUND"))
         assertTrue("open_app must point at open for the ambiguous case: $openApp", openApp.contains("用 open"))
     }
 
@@ -86,10 +91,18 @@ class ToolRoutingTest {
     }
 
     @Test
-    fun `an irreversible action says the user is asked first`() {
+    fun `an irreversible action defers confirmation to the current permission policy`() {
         listOf("clear_data", "uninstall", "disable_app", "set_permission").forEach { name ->
             val description = face.getValue(name).description
-            assertTrue("$name must tell the model the wearer confirms the call: $description", description.contains("确认"))
+            assertTrue(
+                "$name must tell the model confirmation depends on the current policy: $description",
+                description.contains("权限策略"),
+            )
+            assertTrue("$name must still name the confirmation: $description", description.contains("确认"))
+            assertFalse(
+                "$name must not promise a question the current default (L1) ceiling refuses instead: $description",
+                description.contains("执行前用户会收到确认"),
+            )
         }
     }
 }
