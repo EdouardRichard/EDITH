@@ -2117,6 +2117,32 @@ class DeviceToolTest {
     }
 
     @Test
+    fun `a failed wait whose projection throws still reports its attached picture as vision ok`() {
+        // Review important: `vision` describes the picture channel, so an observation that fell back because the
+        // provider threw must not deny a picture the same result really attached. Both the refresh and the cache read
+        // throw here; the best-effort screenshot still succeeds, so the result is one image plus `vision=ok` with no
+        // reason. The mandated `unavailable(provider_threw)` stays for the no-picture case.
+        val operations = FakeDeviceOperations(observation())
+        operations.waitEnvelope = failure("wait", "VERIFY_TIMEOUT", recoverable = true)
+        val perception = FakePerception(perceptionSnapshot())
+        perception.refreshThrows = true
+        perception.snapshotThrows = true
+        perception.screenshotResult = screenshotImage("img-wait-broken-projection")
+
+        val result = tool(operations, perception = perception)
+            .execute("""{"action":"wait","text":"never"}""")
+
+        assertEquals("both the real read and the cache projection threw", 1, perception.refreshCalls)
+        assertEquals("the failed wait still attaches its best-effort picture", 1, result.images.size)
+        assertEquals(1, perception.screenshotCalls)
+        val observation = observationOf(result)
+        assertEquals("the attached usable image is the picture channel fact", ToolVision.Ok, observation.vision)
+        assertNull("a usable image needs no unavailable reason", observation.visionReason)
+        assertNull("nothing was read, so no screen may be claimed", observation.screen)
+        assertFalse("a screen that was not read cannot be truncated", observation.truncated)
+    }
+
+    @Test
     fun `invalid arguments carry execution facts and a text observation without an image`() {
         val perception = FakePerception(
             snapshot = perceptionSnapshot(elements = listOf(perceptionElement(ref = "#n1", text = "A"))),

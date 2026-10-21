@@ -545,7 +545,9 @@ class DeviceTool(
      *
      * edith-0.3 Phase 3 M2 adds the two facts that keep a broken or blind read from looking like a good one:
      *  - a provider that throws while projecting answers an **explicit** `unavailable(provider_threw)` observation
-     *    instead of `null` ("no observation" must mean "no perception port", not "the port failed quietly");
+     *    instead of `null` ("no observation" must mean "no perception port", not "the port failed quietly"), unless
+     *    this result already attached a usable picture: [ToolVision] describes the picture channel, so that fallback
+     *    reports `ok` rather than contradicting its own image ([projectionFallbackObservation]);
      *  - [wantsScreen] false, or a screen whose coverage is neither `ok` nor `truncated`, clears `screen` and
      *    `truncated` instead of rendering an unavailable read as an empty (or stale) screen.
      *
@@ -566,7 +568,7 @@ class DeviceTool(
             // Cache-only on purpose: the operation above already made this result's real read; this projects it.
             snapshot ?: provider.snapshot(OBSERVATION_SOURCES, lastFilter.toPerceptionFilter(), null)
         } catch (t: Throwable) {
-            return if (projectionFallback) providerThrewObservation() else null
+            return if (projectionFallback) projectionFallbackObservation(capture, captureResult) else null
         }
         val screenReadable = current.coverage.screen == SCREEN_COVERAGE_OK ||
             current.coverage.screen == SCREEN_COVERAGE_TRUNCATED
@@ -585,8 +587,32 @@ class DeviceTool(
                 visionReason = visionReasonOf(capture, visionRequested, shot),
             )
         } catch (t: Throwable) {
-            if (projectionFallback) providerThrewObservation() else null
+            if (projectionFallback) projectionFallbackObservation(capture, captureResult) else null
         }
+    }
+
+    /**
+     * M2 + review important: the fallback for a provider that threw while projecting, from the picture channel's side.
+     *
+     * The projection failed, so there is no screen to report (`screen = null`, `truncated = false`). What the result
+     * *does* know is whether it already attached the one capture it took: [ToolVision] says "whether the observation
+     * carries a picture the model can use", so an attached [PerceptionScreenshotResult.Image] must answer
+     * `ok` with no reason instead of `unavailable(provider_threw)` beside that same image - the contradiction the
+     * explicit screenshot path already reconciles. Every fallback without a picture keeps the mandated
+     * `unavailable(provider_threw)`.
+     */
+    private fun projectionFallbackObservation(
+        capture: Boolean,
+        captureResult: PerceptionScreenshotResult?,
+    ): ToolObservation = if (capture && captureResult is PerceptionScreenshotResult.Image) {
+        ToolObservation(
+            vision = ToolVision.Ok,
+            visionReason = null,
+            screen = null,
+            truncated = false,
+        )
+    } else {
+        providerThrewObservation()
     }
 
     /**
