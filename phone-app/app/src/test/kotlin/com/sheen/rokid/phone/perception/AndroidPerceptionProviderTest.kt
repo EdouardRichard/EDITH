@@ -150,6 +150,7 @@ class AndroidPerceptionProviderTest {
         var now = 1_000L
         var policyValue = PerceptionPolicy()
         var vision = true
+        var profileSupportsImage = true
         var screenshotCalls = 0
         var screenshotThrows = false
         var screenshotResult: PerceptionScreenshotResult =
@@ -215,6 +216,7 @@ class AndroidPerceptionProviderTest {
             ),
             policy = { policyValue },
             visionEnabled = { vision },
+            profileSupportsImage = { profileSupportsImage },
             screenshot = {
                 screenshotCalls++
                 if (screenshotThrows) error("capture died") else screenshotResult
@@ -580,6 +582,65 @@ class AndroidPerceptionProviderTest {
     @Test
     fun screenshotFailureIsAnUnavailableResultNeverAnException() {
         val harness = Harness()
+        harness.screenshotThrows = true
+
+        assertEquals(
+            PerceptionScreenshotResult.Unavailable("SCREENSHOT_FAILED"),
+            harness.provider.screenshot(),
+        )
+    }
+
+    // ── screenshot: profile-aware gate (Phase 2 Task 2) ─────────────────────
+
+    @Test
+    fun screenshotIsDisabledWhenUserVisionOff() {
+        // The user switch wins over the profile gate: a profile that does carry IMAGE still gets `Disabled`, and the
+        // injected capture is never asked for an image it would have to throw away.
+        val harness = Harness()
+        harness.vision = false
+        harness.profileSupportsImage = true
+
+        assertEquals(PerceptionScreenshotResult.Disabled, harness.provider.screenshot())
+        assertEquals(0, harness.screenshotCalls)
+    }
+
+    @Test
+    fun screenshotIsUnavailableWhenProfileHasNoImage() {
+        // The second gate: a profile without the IMAGE input must not attach an image, or the plugin's CapabilityGate
+        // rejects the whole request. This is an explicit absence, not a capture attempt.
+        val harness = Harness()
+        harness.vision = true
+        harness.profileSupportsImage = false
+
+        assertEquals(
+            PerceptionScreenshotResult.Unavailable("no_image_profile"),
+            harness.provider.screenshot(),
+        )
+        assertEquals(0, harness.screenshotCalls)
+    }
+
+    @Test
+    fun screenshotUsesCaptureWhenUserAndProfileAllowIt() {
+        val harness = Harness()
+        harness.vision = true
+        harness.profileSupportsImage = true
+        val image = PerceptionScreenshotResult.Image(
+            image = ImageRef("artifact-2", "image/jpeg", 10, 20, "sha256"),
+            mime = "image/jpeg",
+            width = 10,
+            height = 20,
+        )
+        harness.screenshotResult = image
+
+        assertSame(image, harness.provider.screenshot())
+        assertEquals(1, harness.screenshotCalls)
+    }
+
+    @Test
+    fun screenshotCaptureFailureIsUnavailableWithCode() {
+        val harness = Harness()
+        harness.vision = true
+        harness.profileSupportsImage = true
         harness.screenshotThrows = true
 
         assertEquals(

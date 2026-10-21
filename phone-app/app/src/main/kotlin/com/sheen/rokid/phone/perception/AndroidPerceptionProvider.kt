@@ -55,8 +55,11 @@ import java.util.UUID
  * @param observe the kernel-backed whole-screen read. Called with [ScreenFilter.ALL]; a throw means the channel is
  *   down and only the screen source degrades.
  * @param foreground the app in front, or null when the channel cannot tell. A throw is treated as unknown.
+ * @param profileSupportsImage whether the profile selected for this turn advertises the `IMAGE` input. A throw is
+ *   treated as "no image": an automatic capture must never attach an image the plugin's capability gate would reject.
  * @param screenshot the injected capture (Task 7 maps the kernel's `ImageRef` or failure code); only called when the
- *   vision gate is on, and a throw becomes `Unavailable("SCREENSHOT_FAILED")`.
+ *   user's vision switch **and** [profileSupportsImage] are both on, and a throw becomes
+ *   `Unavailable("SCREENSHOT_FAILED")`.
  * @param latestObservation the kernel's newest observation - the post-action read [afterAction] must use.
  */
 internal class AndroidPerceptionProvider(
@@ -72,6 +75,7 @@ internal class AndroidPerceptionProvider(
     private val glasses: GlassesStateSource,
     private val policy: () -> PerceptionPolicy,
     private val visionEnabled: () -> Boolean,
+    private val profileSupportsImage: () -> Boolean = { true },
     screenshot: () -> PerceptionScreenshotResult,
     private val latestObservation: () -> Observation?,
     private val clock: () -> Long,
@@ -168,12 +172,22 @@ internal class AndroidPerceptionProvider(
     }
 
     /**
-     * The screenshot fallback (spec §7.7): vision off is an explicit [PerceptionScreenshotResult.Disabled] and the
-     * injected capture is not called; a capture failure is an explicit `Unavailable`, never an exception.
+     * The screenshot fallback (spec §7.7, 0.3 auto-vision): two gates run in order and the injected capture is only
+     * called when both pass.
+     *
+     * 1. The user's vision switch off is an explicit [PerceptionScreenshotResult.Disabled] - the user said no, so the
+     *    profile is irrelevant.
+     * 2. A profile without the `IMAGE` input is an explicit `Unavailable("no_image_profile")`. Task 3's automatic
+     *    capture would otherwise attach an image the plugin's `CapabilityGate` rejects for the whole request.
+     *
+     * A capture failure stays an explicit `Unavailable`, never an exception; both gates fail closed on a throw.
      */
     override fun screenshot(): PerceptionScreenshotResult {
         if (!runCatching { visionEnabled() }.getOrDefault(false)) {
             return PerceptionScreenshotResult.Disabled
+        }
+        if (!runCatching { profileSupportsImage() }.getOrDefault(false)) {
+            return PerceptionScreenshotResult.Unavailable(NO_IMAGE_PROFILE)
         }
         return runCatching { capture() }
             .getOrElse { PerceptionScreenshotResult.Unavailable(SCREENSHOT_FAILED) }
@@ -299,5 +313,8 @@ internal class AndroidPerceptionProvider(
 
         /** The injected capture failed; reported as an explicit absence, never thrown at the plugin. */
         const val SCREENSHOT_FAILED = "SCREENSHOT_FAILED"
+
+        /** The selected profile has no `IMAGE` input; an attached image would fail the plugin's capability gate. */
+        const val NO_IMAGE_PROFILE = "no_image_profile"
     }
 }
