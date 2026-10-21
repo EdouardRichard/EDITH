@@ -86,7 +86,7 @@ class OpenTool(
      * inside [com.sheen.rokid.plugin.PerceptionProvider.screenshot] (Task 2), so this tool does not duplicate them:
      * `Disabled` and `Unavailable` are answers that attach no image and never fail the launch. A capture that throws is
      * mapped to `Unavailable("SCREENSHOT_FAILED")` here (Task 4 fix), so a broken port cannot turn the launch into
-     * `TOOL_THREW`.
+     * `TOOL_THREW`. This is a separate read from [observe]; the two are not one atomic snapshot.
      */
     private val capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
     /**
@@ -94,8 +94,13 @@ class OpenTool(
      * production perception port in.
      *
      * The tool calls it after determining an outcome on every screen path, and attaches the answer beside the
-     * execution facts. A missing (or throwing) source is not a silent `null`: the result carries
-     * `ToolObservation(vision = unavailable, visionReason = "no_source")`.
+     * execution facts. It is a separate read from [capture], so the tool cannot prove the two describe the same frame;
+     * Task 6 is responsible for making the production source cheap and consistent.
+     *
+     * A missing (or throwing) source is not a silent `null`. Without a picture the result carries
+     * `ToolObservation(vision = unavailable, visionReason = "no_source")`. With a picture the observation is built from
+     * the tool's own [foreground], [foregroundActivity] and [rootPackage] probes, `screen`/`coverage` stay `null` as
+     * the marker that no source answered, and `vision` is `ok` because the picture is attached.
      */
     private val observe: () -> ToolObservation? = { null },
 ) : ActionExecutor {
@@ -124,6 +129,7 @@ class OpenTool(
                     code = INVALID_URL,
                     message = "only http(s) URLs are accepted",
                     recoverable = false,
+                    applied = false,
                 )
             }
             return launch(command = "am start -W -a android.intent.action.VIEW -d '${singleQuote(target)}'")
@@ -304,6 +310,8 @@ class OpenTool(
         code = APP_AMBIGUOUS,
         message = "multiple apps match the target; pick one of data.candidates",
         recoverable = true,
+        // Ambiguity refuses before any launch is dispatched.
+        applied = false,
         data = buildJsonObject {
             put(
                 "candidates",
@@ -352,6 +360,7 @@ class OpenTool(
         val result = runSafely(target, command) ?: return channelUnavailable()
         if (result.failure != null) return channelUnavailable()
         if (result.exitCode != 0) {
+            // The only explicit failure fact: the shell itself reports the command did not run successfully.
             return failure(
                 STATE_UNCHANGED,
                 "the launch command exited ${result.exitCode}",
@@ -361,12 +370,15 @@ class OpenTool(
             )
         }
         if (!result.stdout.contains(STATUS_OK)) {
+            // Exit 0 without `Status: ok` is not proof that the launch failed: `am start -W` can answer
+            // `Status: timeout`, and the line can be truncated or localized. The command was accepted and ran, but
+            // whether it applied is unknown, so `applied` stays null (Task 5 fix).
             return failure(
                 STATE_UNCHANGED,
                 "the launch produced no success status",
                 recoverable = true,
                 outcome = ActionOutcome.Failed,
-                applied = false,
+                applied = null,
             )
         }
         val reachedForeground = expectedPackage == null ||
@@ -406,10 +418,11 @@ class OpenTool(
                 applied = null,
             )
         }
-        // 0.3 Phase 2.2 Task 5: a verified success observes and captures after the verification read, so the
-        // observation text, the image and the foreground/root facts describe the same screen. A capture port that
-        // throws is still just "no image" (Task 4 fix): the verified launch succeeded, so it must not turn the tool
-        // result into TOOL_THREW.
+        // 0.3 Phase 2.2 Task 5: a verified success observes and captures after the verification read. The observation
+        // source and the capture are two independent reads, so the tool cannot prove the observation text, the image
+        // and the foreground/root facts describe the same frame; Task 6's production source must make them consistent.
+        // A capture port that throws is still just "no image" (Task 4 fix): the verified launch succeeded, so it must
+        // not turn the tool result into TOOL_THREW.
         val attempt = screenAttempt()
         val captured = attempt.captured
         return done(
@@ -484,6 +497,9 @@ class OpenTool(
      * the structured facts. [captureImage] and [attachObservation] encode the task's image boundary: the launch
      * paths observe and attach at most one picture, a pure argument refusal observes text only, and `list` does
      * neither. Nothing here can change the outcome or fail the call.
+     *
+     * [applied] defaults to `null`: a failure without evidence must not claim the action did not apply. A caller that
+     * knows nothing was dispatched (a pure refusal, or a non-zero shell exit) passes `false` explicitly.
      */
     private fun failure(
         code: String,
@@ -491,7 +507,7 @@ class OpenTool(
         recoverable: Boolean,
         outcome: ActionOutcome = ActionOutcome.Refused,
         data: kotlinx.serialization.json.JsonObject? = null,
-        applied: Boolean? = false,
+        applied: Boolean? = null,
         captureImage: Boolean = true,
         attachObservation: Boolean = true,
     ): ActionResult {
@@ -549,15 +565,23 @@ class OpenTool(
         code = APP_NOT_FOUND,
         message = "no installed app matches the target",
         recoverable = true,
+        // Nothing was dispatched: the refusal happens before any launch command.
+        applied = false,
     )
 
     private fun channelUnavailable(): ActionResult = failure(
         code = CHANNEL_UNAVAILABLE,
         message = "the privileged shell is not usable",
         recoverable = true,
+        applied = false,
     )
 
-    /** Task 5: `list` is not a screen operation, so even its channel failure invents no observation or image. */
+    /**
+     * Task 5: `list` is not a screen operation, so even its channel failure invents no observation or image.
+     *
+     * `applied=null` is the read convention (nothing was applied, and the action is not applicable), not the launch
+     * refusal's `applied=false` - `list` never dispatches a launch at all.
+     */
     private fun listChannelUnavailable(): ActionResult = failure(
         code = CHANNEL_UNAVAILABLE,
         message = "the privileged shell is not usable",
@@ -571,6 +595,7 @@ class OpenTool(
         code = INVALID_ARGUMENTS,
         message = "open needs list=true or a target",
         recoverable = false,
+        applied = false,
         captureImage = false,
     )
 
@@ -609,38 +634,55 @@ class OpenTool(
     /**
      * The one post-call observation + picture builder for a screen attempt.
      *
-     * The observation facts come from the injected [observe] source (Task 6 wires the production perception port);
-     * the picture comes from [capture] and is the only reason `vision = ok` is reported. A missing or throwing source
-     * is not a silent null: the result still carries an observation whose vision is `unavailable/no_source`. A capture
-     * port that throws is mapped to `unavailable/SCREENSHOT_FAILED`, exactly as Task 4 fixed for the verified path.
+     * The observation facts normally come from the injected [observe] source (Task 6 wires the production perception
+     * port); the picture comes from [capture]. These are **two independent reads**, not one atomic snapshot: the tool
+     * cannot prove they describe the same frame, so Task 6's production source must be cheap and consistent.
+     *
+     * A missing or throwing source does not hide a usable picture. With an image attached, the observation is built
+     * from the tool's own [foreground], [foregroundActivity] and [rootPackage] probes with `screen = null` and
+     * `coverage = null`; those nulls are the marker that no observation source answered (a real source supplies the
+     * perception content), and `vision = ok` is reported because the picture is attached. Without an image the result
+     * says `unavailable/no_source`. A capture port that throws is mapped to `unavailable/SCREENSHOT_FAILED`, exactly
+     * as Task 4 fixed for the verified path.
      */
     private fun screenAttempt(): ObservationAttempt {
         val captured = runCatching { capture() }
             .getOrElse { PerceptionScreenshotResult.Unavailable(SCREENSHOT_FAILED) }
         val observed = runCatching { observe() }.getOrNull()
-        val sourceMissing = observed == null
-        val base = observed ?: ToolObservation(
-            vision = ToolVision.Unavailable,
-            visionReason = VISION_NO_SOURCE,
-        )
         val image = (captured as? PerceptionScreenshotResult.Image)?.image
-        val observation = base.copy(
-            vision = when {
-                image != null -> ToolVision.Ok
-                sourceMissing -> ToolVision.Unavailable
-                captured == PerceptionScreenshotResult.Disabled -> ToolVision.Disabled
-                captured is PerceptionScreenshotResult.Unavailable -> ToolVision.Unavailable
-                else -> ToolVision.Unavailable
-            },
-            visionReason = when {
-                image != null -> null
-                sourceMissing -> VISION_NO_SOURCE
-                captured is PerceptionScreenshotResult.Unavailable -> captured.reason
-                else -> null
-            },
-        )
+        val observation = when {
+            observed != null -> observed.copy(
+                vision = when {
+                    image != null -> ToolVision.Ok
+                    captured == PerceptionScreenshotResult.Disabled -> ToolVision.Disabled
+                    captured is PerceptionScreenshotResult.Unavailable -> ToolVision.Unavailable
+                    else -> ToolVision.Unavailable
+                },
+                visionReason = when {
+                    image != null -> null
+                    captured is PerceptionScreenshotResult.Unavailable -> captured.reason
+                    else -> null
+                },
+            )
+            image != null -> ToolObservation(
+                // No source answered, so no screen/coverage text may be invented. The tool's own probes are the
+                // honest facts it still has; `screen`/`coverage` stay null to say "no observation source".
+                foregroundPackage = probeForeground(),
+                foregroundActivity = probeForegroundActivity(),
+                rootPackage = probeRootPackage(),
+                vision = ToolVision.Ok,
+            )
+            else -> ToolObservation(vision = ToolVision.Unavailable, visionReason = VISION_NO_SOURCE)
+        }
         return ObservationAttempt(observation, capturedImage(captured), captured)
     }
+
+    /** A throwing foreground port must degrade the observation, never turn the tool result into `TOOL_THREW`. */
+    private fun probeForeground(): String? = runCatching { foreground() }.getOrNull()
+
+    private fun probeForegroundActivity(): String? = runCatching { foregroundActivity() }.getOrNull()
+
+    private fun probeRootPackage(): String? = runCatching { rootPackage() }.getOrNull()
 
     /** Task 5: the observation text a pure argument refusal can afford - no picture is attempted. */
     private fun textObservation(): ToolObservation {
@@ -649,7 +691,12 @@ class OpenTool(
         return observed.copy(vision = ToolVision.Unavailable, visionReason = VISION_NOT_ATTEMPTED)
     }
 
-    /** Task 5: a `list` read reports its own facts - nothing was applied, verified or changed. */
+    /**
+     * Task 5: a `list` read reports its own facts - nothing was applied, verified or changed.
+     *
+     * `applied=null` is the read/not-applicable convention (the same as the `DeviceTool` reads), not the launch
+     * refusal's `applied=false`: `list` never dispatches an action that could have applied.
+     */
     private fun listDoneExecution(): ToolExecution = ToolExecution(
         outcome = ToolOutcome.Done,
         accepted = true,

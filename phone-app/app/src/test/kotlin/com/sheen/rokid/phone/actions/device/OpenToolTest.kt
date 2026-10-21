@@ -55,8 +55,21 @@ class OpenToolTest {
         val catalog = FakeCatalog(
             listOf(AppEntry("com.example.app0", "音乐", "android.intent.action.MAIN")),
         )
+        var captureCalls = 0
+        var observeCalls = 0
 
-        val result = OpenTool(shell, catalog).execute("""{"list":true}""")
+        val result = OpenTool(
+            shell = shell,
+            catalog = catalog,
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Disabled
+            },
+            observe = {
+                observeCalls++
+                openObservation()
+            },
+        ).execute("""{"list":true}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         val data = body(result)["data"]!!.jsonObject
@@ -70,6 +83,8 @@ class OpenToolTest {
             listOf(LAUNCHER_QUERY),
             shell.commands,
         )
+        assertEquals("list success never asks for a picture", 0, captureCalls)
+        assertEquals("list success never asks for an observation", 0, observeCalls)
         // Task 5: list is a read, not a screen operation - execution facts only, never an invented observation/image.
         val execution = executionOf(result)
         assertEquals(ToolOutcome.Done, execution.outcome)
@@ -639,7 +654,14 @@ class OpenToolTest {
             },
             observe = {
                 observeCalls++
-                openObservation()
+                // `already foreground` means the tool's own read and the source must name the same app; a source
+                // claiming the launcher here would be a fixture, not a realistic post-call observation.
+                openObservation(
+                    foregroundPackage = "com.example.music",
+                    foregroundActivity = "com.example.music/.MainActivity",
+                    rootPackage = "com.example.music",
+                    screen = "#n1 button \"音乐\"",
+                )
             },
         ).execute("""{"target":"com.example.music","relaunch":false}""")
 
@@ -658,7 +680,9 @@ class OpenToolTest {
         assertEquals("the screen was already the target: nothing changed", false, execution.changed)
 
         val observation = observationOf(result)
-        assertEquals("com.android.launcher", observation.foregroundPackage)
+        assertEquals("the observed screen is the already-foreground app", "com.example.music", observation.foregroundPackage)
+        assertEquals("com.example.music/.MainActivity", observation.foregroundActivity)
+        assertEquals("com.example.music", observation.rootPackage)
         assertEquals(ToolVision.Ok, observation.vision)
         val data = body(result)["data"]!!.jsonObject
         assertTrue("the alreadyForeground shape stays intact", data["alreadyForeground"]!!.jsonPrimitive.boolean)
@@ -923,9 +947,11 @@ class OpenToolTest {
     }
 
     @Test
-    fun `a launch without Status ok is a Failed STATE_UNCHANGED and captures`() {
-        val pipeline = ShellPipeline(statusOk = false)
-        val image = openImage("artifact-no-status")
+    fun `an exit zero Status timeout is Failed STATE_UNCHANGED with unknown applied`() {
+        // Real `am start -W` answers exit 0 when it reports `Status: timeout`; the absence of `Status: ok` is not
+        // proof that nothing was applied (stdout may also be truncated or localized).
+        val pipeline = ShellPipeline(status = "Status: timeout\n")
+        val image = openImage("artifact-timeout")
         var captureCalls = 0
 
         val result = launchedOpen(
@@ -945,8 +971,8 @@ class OpenToolTest {
         val execution = executionOf(result)
         assertEquals(ToolOutcome.Failed, execution.outcome)
         assertEquals("STATE_UNCHANGED", execution.code)
-        assertEquals(true, execution.accepted)
-        assertEquals("the command explicitly did not start the activity", false, execution.applied)
+        assertEquals("the shell accepted and ran the command (exit 0)", true, execution.accepted)
+        assertNull("exit 0 without a success status does not prove the launch failed to apply", execution.applied)
         assertEquals(false, execution.verified)
         assertNull(execution.changed)
         assertEquals(1, captureCalls)
@@ -1160,6 +1186,89 @@ class OpenToolTest {
     }
 
     @Test
+    fun `a successful capture without an observation source reports the tool's own foreground facts`() {
+        val pipeline = ShellPipeline()
+        val image = openImage("artifact-no-source-facts")
+        var captureCalls = 0
+        val result = OpenTool(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            foreground = {
+                "com.example.music".takeIf { pipeline.shell.commands.any { it.startsWith("am start -W") } }
+            },
+            foregroundActivity = { "com.example.music/.MainActivity" },
+            rootPackage = { "com.example.music" },
+            waitForForeground = { _, _ -> true },
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+            // No observe source: Task 6 has not wired the production port yet.
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(1, captureCalls)
+        assertEquals("the picture survives a missing source", listOf(image), result.images)
+        val observation = observationOf(result)
+        assertEquals("a usable picture still reports ok when no source answered", ToolVision.Ok, observation.vision)
+        assertNull(observation.visionReason)
+        assertEquals(
+            "the tool's own foreground probe supplies the fact the absent source would have",
+            "com.example.music",
+            observation.foregroundPackage,
+        )
+        assertEquals("com.example.music/.MainActivity", observation.foregroundActivity)
+        assertEquals("com.example.music", observation.rootPackage)
+        assertNull("no source answered, so no screen facts are invented", observation.screen)
+        assertNull("no source answered, so no coverage facts are invented", observation.coverage)
+        assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `a throwing observation source is treated as missing and keeps the captured picture`() {
+        val pipeline = ShellPipeline()
+        val image = openImage("artifact-throwing-observe")
+        val result = launchedOpen(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            target = "com.example.music",
+            capture = {
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+            observe = { throw IllegalStateException("the observation port blew up") },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals("a throwing source must not turn the launch into a thrown tool", ActionOutcome.Done, result.outcome)
+        assertEquals(listOf(image), result.images)
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertNull(observation.visionReason)
+        assertEquals("com.example.music", observation.foregroundPackage)
+        assertEquals("com.example.music", observation.rootPackage)
+        assertNull("a throwing source leaves no screen facts", observation.screen)
+        assertNull("a throwing source leaves no coverage facts", observation.coverage)
+    }
+
+    @Test
+    fun `a throwing observation source without an image reports unavailable no source`() {
+        val result = launchedOpen(
+            shell = ShellPipeline().shell,
+            catalog = knownMusic(),
+            target = "com.example.music",
+            capture = { PerceptionScreenshotResult.Disabled },
+            observe = { throw IllegalStateException("the observation port blew up") },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertTrue("a failed observation attaches no image", result.images.isEmpty())
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("no_source", observation.visionReason)
+        assertNull("no image means no invented foreground fact", observation.foregroundPackage)
+        assertNull(observation.screen)
+    }
+
+    @Test
     fun `vision is not ok when no image is attached even if the source claims it`() {
         val result = OpenTool(
             shell = null,
@@ -1254,16 +1363,28 @@ class OpenToolTest {
         return result.observation!!
     }
 
-    /** The observation facts a production source would return before the tool attaches its own picture. */
-    private fun openObservation(vision: ToolVision = ToolVision.NotRequested): ToolObservation = ToolObservation(
+    /**
+     * The observation facts a source would return before the tool attaches its own picture.
+     *
+     * This fake stands in for an independent source read, so it does not have to agree with the tool's own
+     * `foreground()` probe: tests whose subject is the agreement pass the facts the tool itself observed. The default
+     * is the launcher home screen, which is what most pre-launch refusals leave in front.
+     */
+    private fun openObservation(
+        vision: ToolVision = ToolVision.NotRequested,
+        foregroundPackage: String = "com.android.launcher",
+        foregroundActivity: String? = "com.android.launcher/.Launcher",
+        rootPackage: String? = "com.android.launcher",
+        screen: String? = "#n1 button \"桌面\"",
+    ): ToolObservation = ToolObservation(
         snapshotId = "snap-open",
         capturedAtEpochMillis = 1_700_000_000_000L,
-        foregroundPackage = "com.android.launcher",
-        foregroundActivity = "com.android.launcher/.Launcher",
-        rootPackage = "com.android.launcher",
+        foregroundPackage = foregroundPackage,
+        foregroundActivity = foregroundActivity,
+        rootPackage = rootPackage,
         coverage = "screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok " +
             "vision=ok glasses=ok device=ok",
-        screen = "#n1 button \"桌面\"",
+        screen = screen,
         truncated = false,
         vision = vision,
     )
@@ -1379,7 +1500,8 @@ class OpenToolTest {
      */
     private class ShellPipeline(
         private val component: (String) -> String? = { pkg -> "$pkg/.MainActivity" },
-        private val statusOk: Boolean = true,
+        /** The `am start -W` status line; tests that script an exit-0 non-success pass `Status: timeout`. */
+        private val status: String = "Status: ok\n",
     ) {
         val shell = FakeShell { command ->
             when {
@@ -1396,8 +1518,7 @@ class OpenToolTest {
                     ShellResult(
                         command,
                         0,
-                        "Starting: Intent { act=android.intent.action.MAIN }\n" +
-                            (if (statusOk) "Status: ok\n" else "Error: Activity not started\n"),
+                        "Starting: Intent { act=android.intent.action.MAIN }\n$status",
                         "",
                     )
                 else -> ShellResult(command, 0, "", "")
