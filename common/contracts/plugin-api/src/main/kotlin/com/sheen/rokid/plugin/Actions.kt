@@ -97,9 +97,13 @@ data class ActionDescriptor(
      * plugin tool (`notify_user`, `load_skill`) keeps the default `false`, because inventing a screen observation for a
      * tool that never looks at one would be a fabricated fact.
      *
-     * `agent-runtime` reads it only for a **non-`Done`** result that carries no observation of its own: it asks the
-     * injected `ToolObservationSource` for one with a short deadline, and records `vision = unavailable` plus a reason
-     * (`no_source` / `observation_timeout`) when none can be had. A successful call's observation belongs to the tool.
+     * `agent-runtime` reads it only for a **non-`Done`** result that carries no observation of its own: it calls the
+     * injected `ToolObservationSource.observeWithImages(250)` **once**. A missing source is `unavailable(no_source)`;
+     * a source that returns null, throws or times out is `unavailable(observation_timeout)`; a real capture may add at
+     * most one failure image (the provider reports its own `provider_threw`/timeout reason). A successful call's
+     * observation belongs to the tool. The model-facing form is the single `{execution, observation|null, data}`
+     * envelope derived by `ToolResultEnvelope` in `agent-runtime`; this flag is not a second payload and this KDoc is
+     * not a wire contract.
      */
     val screenObservation: Boolean = false,
 ) {

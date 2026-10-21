@@ -815,6 +815,46 @@ class AgentLoopGuardTest {
         assertEquals(emptyList(), stored.images, "a failure-capture image may never be stored")
     }
 
+    @Test
+    fun `a thrown screen tool's capture image rides the next model request and never the stored transcript`() {
+        // M7 (spec §6.7): a `TOOL_THREW` screen tool is still a non-Done result, so the same `observeWithImages` capture
+        // path must attach the failure image. The image is visible to the model in this run and redacted from the store.
+        val image = ImageRef("artifact-throw-1", "image/jpeg", 768, 1664, "sha-256-throw-1")
+        val executor = executor(descriptor("open", screenObservation = true))
+        executor.failure = IllegalStateException("boom")
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "看到了")),
+        )
+        val capture = ToolObservationCapture(
+            ToolObservation(
+                foregroundPackage = "com.android.settings",
+                screen = "Settings",
+                vision = ToolVision.Ok,
+            ),
+            images = listOf(image),
+        )
+        val source = object : ToolObservationSource {
+            override fun observe(deadlineMillis: Long): ToolObservation? =
+                error("the loop must use observeWithImages, not observe")
+
+            override fun observeWithImages(deadlineMillis: Long): ToolObservationCapture = capture
+        }
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals("TOOL_THREW", run.steps.single().result)
+        val sent = gateway.requests.last().history
+            .filterIsInstance<ModelHistoryItem.ToolOutput>()
+            .single()
+        assertEquals(listOf(image), sent.images, "a thrown call's capture image must reach the next request: $sent")
+        assertTrue(sent.output.contains("\"screen\":\"Settings\""), sent.output)
+        assertEquals(1, run.metrics.images, "the capture image is produced by this run and counted")
+        val stored = outputs(run).single()
+        assertEquals("(perception content not persisted)", stored.output)
+        assertEquals(emptyList(), stored.images, "a thrown call's failure image may never be stored")
+    }
+
     // ---------------------------------------------------------------- human confirmation allowance (R99)
 
     @Test
