@@ -346,13 +346,15 @@ class DeviceToolTest {
         // read every other act runs. Before the fix it returned the projector's `bounds=` text and left the provider
         // cache one screen behind.
         val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        // Review important 3: a real DeviceKernel wait success reports applied=null (it applies nothing) and its own
+        // `expected` post-condition. The old fixture invented applied=true, which no kernel wait can produce.
         operations.waitEnvelopes.add(
             DeviceEnvelope.success(
                 action = "wait",
                 channel = "accessibility",
                 accepted = true,
-                applied = true,
-                verified = null,
+                applied = null,
+                verified = com.sheen.rokid.device.Verified("expected", 2L),
                 timing = Timing(0, 0, 0),
             ),
         )
@@ -387,7 +389,13 @@ class DeviceToolTest {
             "screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok vision=ok glasses=ok device=ok",
             data["coverage"]!!.jsonPrimitive.content,
         )
-        assertEquals("changed comes from the dispatched envelope", true, data["changed"]!!.jsonPrimitive.boolean)
+        // A wait success applies nothing, so the existing projection reports changed=false and the structured fact is
+        // unknown rather than a fabricated false/true pair.
+        assertEquals(
+            "the final wait envelope applies nothing, so data.changed stays false",
+            false,
+            data["changed"]!!.jsonPrimitive.boolean,
+        )
         val screen = data["screen"]!!.jsonObject
         assertEquals("snap-after-scroll", screen["snap"]!!.jsonPrimitive.content)
         assertTrue(
@@ -397,11 +405,13 @@ class DeviceToolTest {
         assertFalse("scroll_to_text must not leak projector bounds: ${result.detail}", result.detail.contains("bounds="))
         assertEquals("full", screen["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
 
-        // Task 4: the scroll is one write result with its own post-action observation and one picture.
+        // Task 4: the scroll is one write result with its own post-action observation and one picture. The facts come
+        // from the final wait envelope: applied/changed are unknown, the wait's own post-condition is verified.
         val execution = executionOf(result)
         assertEquals(ToolOutcome.Done, execution.outcome)
-        assertEquals(true, execution.applied)
-        assertEquals(true, execution.changed)
+        assertNull("a kernel wait success reports applied=null", execution.applied)
+        assertNull("without applied evidence there is no changed fact", execution.changed)
+        assertEquals(true, execution.verified)
         assertFalse(execution.partial)
         val observation = observationOf(result)
         assertEquals("snap-after-scroll", observation.snapshotId)
@@ -1127,6 +1137,8 @@ class DeviceToolTest {
         val observation = observationOf(result)
         assertEquals("no picture was wanted, so none is claimed", ToolVision.NotRequested, observation.vision)
         assertNull(observation.visionReason)
+        assertNull("a non-screen observe must not report a screen tree", observation.screen)
+        assertFalse("without a screen read nothing can be truncated", observation.truncated)
     }
 
     @Test
@@ -1286,8 +1298,8 @@ class DeviceToolTest {
                 action = "wait",
                 channel = "accessibility",
                 accepted = true,
-                applied = true,
-                verified = null,
+                applied = null,
+                verified = com.sheen.rokid.device.Verified("expected", 2L),
                 timing = Timing(0, 0, 0),
             ),
         )
@@ -1863,8 +1875,102 @@ class DeviceToolTest {
     }
 
     @Test
+    fun `an act timeout is uncertain and keeps its best-effort observation and image`() {
+        // Review critical 1: a timed-out write may still have been applied by the platform. The envelope's
+        // accepted=false only means the kernel never got the platform's answer, so no tri-state fact may be claimed and
+        // the best-effort observation/picture must survive.
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.actEnvelope = failure("act", DeviceErrorCodes.ACTION_TIMEOUT, recoverable = true)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(
+                snapshotId = "snap-timeout-act",
+                elements = listOf(perceptionElement(ref = "#n1", text = "A")),
+            ),
+        )
+        perception.screenshotResult = screenshotImage("img-timeout-act")
+
+        val result = tool(operations, perception = perception)
+            .execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
+
+        assertEquals("the legacy 3-state projection cannot express uncertainty", ActionOutcome.Refused, result.outcome)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Uncertain, execution.outcome)
+        assertEquals(DeviceErrorCodes.ACTION_TIMEOUT, execution.code)
+        assertTrue("a timeout is explicitly uncertain", execution.uncertain)
+        assertNull("the platform may have accepted the write", execution.accepted)
+        assertNull("the platform may have applied the write", execution.applied)
+        assertNull("there is no screen-change evidence", execution.changed)
+        assertNull(execution.verified)
+        assertFalse(execution.partial)
+
+        val observation = observationOf(result)
+        assertEquals("snap-timeout-act", observation.snapshotId)
+        assertTrue(observation.screen!!.contains("#n1"))
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals("the timed-out act keeps its best-effort picture", 1, result.images.size)
+        assertEquals(1, perception.screenshotCalls)
+    }
+
+    @Test
+    fun `a wait timeout is uncertain and keeps its best-effort observation and image`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.waitEnvelope = failure("wait", DeviceErrorCodes.ACTION_TIMEOUT, recoverable = true)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(elements = listOf(perceptionElement(ref = "#n1", text = "A"))),
+        )
+        perception.screenshotResult = screenshotImage("img-timeout-wait")
+
+        val result = tool(operations, perception = perception)
+            .execute("""{"action":"wait","text":"never"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Uncertain, execution.outcome)
+        assertEquals(DeviceErrorCodes.ACTION_TIMEOUT, execution.code)
+        assertTrue(execution.uncertain)
+        assertNull(execution.accepted)
+        assertNull(execution.applied)
+        assertNull(execution.changed)
+
+        val observation = observationOf(result)
+        assertTrue(observation.screen!!.contains("#n1"))
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals(1, result.images.size)
+        assertEquals("the timed-out wait still refreshes once for its observation", 1, perception.refreshCalls)
+        assertEquals(1, perception.screenshotCalls)
+    }
+
+    @Test
+    fun `an act cancellation is reported as cancelled and never claimed applied`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.actEnvelope = failure("act", DeviceErrorCodes.CANCELLED, recoverable = true)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(snapshotId = "snap-cancelled-act"),
+        )
+        perception.screenshotResult = screenshotImage("img-cancelled-act")
+
+        val result = tool(operations, perception = perception)
+            .execute("""{"action":"act","kind":"home"}""")
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Cancelled, execution.outcome)
+        assertEquals(DeviceErrorCodes.CANCELLED, execution.code)
+        assertFalse("a cancellation is its own outcome, not an uncertain one", execution.uncertain)
+        assertEquals("the kernel's accepted=false is copied verbatim", false, execution.accepted)
+        assertNull(execution.applied)
+        assertNull(execution.changed)
+        assertEquals("the post-action observation still rides along", "snap-cancelled-act", observationOf(result).snapshotId)
+        assertEquals(1, result.images.size)
+    }
+
+    @Test
     fun `status success reports a text observation with vision not requested and never captures`() {
-        val perception = FakePerception(snapshot = perceptionSnapshot())
+        // Review minor: status success reports no screen text, so it must not inherit the snapshot's screen truncation.
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(truncated = true, screenCoverage = "truncated"),
+        )
         perception.screenshotResult = screenshotImage("img-must-not-be-used")
 
         val result = tool(
@@ -1884,6 +1990,7 @@ class DeviceToolTest {
         assertEquals("com.example.app", observation.foregroundPackage)
         assertTrue(observation.coverage!!.contains("device=ok"))
         assertNull("status is not a screen read; the screen tree stays out of its observation", observation.screen)
+        assertFalse("a null screen cannot claim the snapshot's truncation", observation.truncated)
         assertEquals(ToolVision.NotRequested, observation.vision)
         assertNull(observation.visionReason)
         assertTrue(result.images.isEmpty())
@@ -1968,6 +2075,35 @@ class DeviceToolTest {
     }
 
     @Test
+    fun `a wait whose refresh throws falls back to the cached projection and still captures on failure`() {
+        // Review important 2: refresh() may throw even though the provider contract says it never does. The observation
+        // must fall back to the cache projection instead of vanishing, and a failed wait still takes its picture.
+        val operations = FakeDeviceOperations(observation())
+        operations.waitEnvelope = failure("wait", "VERIFY_TIMEOUT", recoverable = true)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(
+                snapshotId = "snap-cached-wait",
+                elements = listOf(perceptionElement(ref = "#n1", text = "A")),
+            ),
+        )
+        perception.refreshThrows = true
+        perception.screenshotResult = screenshotImage("img-wait-refresh-throw")
+
+        val result = tool(operations, perception = perception)
+            .execute("""{"action":"wait","text":"never"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("the real read was attempted and threw", 1, perception.refreshCalls)
+        assertEquals("the observation falls back to the cached projection", 1, perception.snapshotCalls)
+        val observation = observationOf(result)
+        assertEquals("snap-cached-wait", observation.snapshotId)
+        assertTrue(observation.screen!!.contains("#n1"))
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals("a failed wait still takes its best-effort picture", 1, result.images.size)
+        assertEquals(1, perception.screenshotCalls)
+    }
+
+    @Test
     fun `invalid arguments carry execution facts and a text observation without an image`() {
         val perception = FakePerception(
             snapshot = perceptionSnapshot(elements = listOf(perceptionElement(ref = "#n1", text = "A"))),
@@ -2030,6 +2166,41 @@ class DeviceToolTest {
         assertNull(observation.visionReason)
         assertEquals(1, result.images.size)
         assertEquals("the explicit screenshot is the only capture", 0, perception.screenshotCalls)
+    }
+
+    @Test
+    fun `a screenshot whose cached projection throws falls back to a real read`() {
+        // Review important 2: a throwing cache projection used to leave observation=null even though the tool had a
+        // provider and the screenshot had its own image. One real read answers the screen facts instead.
+        val operations = FakeDeviceOperations(observation())
+        operations.screenshotEnvelope = DeviceEnvelope.success(
+            action = "screenshot",
+            channel = "accessibility",
+            accepted = true,
+            applied = null,
+            verified = null,
+            timing = Timing(0, 0, 0),
+            images = listOf(ImageRef("artifact-shot", "image/jpeg", 768, 1664, "sha-shot")),
+        )
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(
+                snapshotId = "snap-refreshed-shot",
+                elements = listOf(perceptionElement(ref = "#n9", text = "B")),
+            ),
+        )
+        perception.snapshotThrows = true
+
+        val result = tool(operations, perception = perception).execute("""{"action":"screenshot"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("the cache projection threw", 1, perception.snapshotCalls)
+        assertEquals("the observation is rebuilt from one real read", 1, perception.refreshCalls)
+        val observation = observationOf(result)
+        assertEquals("snap-refreshed-shot", observation.snapshotId)
+        assertTrue(observation.screen!!.contains("#n9"))
+        assertEquals("the screenshot's own resolvable image is still vision ok", ToolVision.Ok, observation.vision)
+        assertEquals(1, result.images.size)
+        assertEquals("no second capture on the fallback", 0, perception.screenshotCalls)
     }
 
     @Test
@@ -2349,6 +2520,10 @@ class DeviceToolTest {
         var screenshotCalls = 0
         var screenshotResult: PerceptionScreenshotResult = PerceptionScreenshotResult.Disabled
         var screenshotThrows = false
+        /** A broken cache projection: `snapshot()` throws, exactly like a misbehaving provider. */
+        var snapshotThrows = false
+        /** A broken real read: `refresh()` throws instead of answering. */
+        var refreshThrows = false
         var lastInclude: Set<PerceptionSource>? = null
         var lastFilter: PerceptionFilter? = null
         var lastLimit: Int? = null
@@ -2358,6 +2533,7 @@ class DeviceToolTest {
         override fun refresh(): PerceptionSnapshot {
             events.record(EVENT_REFRESH)
             refreshCalls++
+            if (refreshThrows) error("refresh port died")
             refreshedSnapshot?.let { snapshot = it }
             return snapshot
         }
@@ -2369,6 +2545,7 @@ class DeviceToolTest {
         ): PerceptionSnapshot {
             events.record(EVENT_SNAPSHOT)
             snapshotCalls++
+            if (snapshotThrows) error("snapshot port died")
             lastInclude = include
             lastFilter = filter
             lastLimit = limit

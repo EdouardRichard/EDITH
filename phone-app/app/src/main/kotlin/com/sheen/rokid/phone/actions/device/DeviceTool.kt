@@ -144,7 +144,10 @@ class DeviceKernelOperations(private val kernel: DeviceKernel) : DeviceOperation
  *
  * **Outcome mapping.** `ok` from the kernel becomes [ActionOutcome.Done]; a failed envelope is
  * [ActionOutcome.Refused] when `error.recoverable` and [ActionOutcome.Failed] otherwise. The raw
- * code survives in the JSON `error` object either way.
+ * code survives in the JSON `error` object either way. That three-state legacy projection cannot
+ * express "the platform may still have applied it", so [ToolExecution] is the authoritative fact:
+ * a kernel `ACTION_TIMEOUT` is [ToolOutcome.Uncertain] with `uncertain=true` and every tri-state
+ * field unknown, and a kernel `CANCELLED` is [ToolOutcome.Cancelled].
  */
 class DeviceTool(
     private val operations: DeviceOperations,
@@ -276,13 +279,14 @@ class DeviceTool(
             val wantsScreen = PerceptionSource.SCREEN in include
             val capture = if (wantsScreen) captureVision() else null
             // 0.3 Phase 2.2 Task 4: the same snapshot and the same single capture are the structured observation, so
-            // the text, the picture and `vision` can never describe two different reads.
+            // the text, the picture and `vision` can never describe two different reads. A non-screen include has no
+            // screen to report: `screen=null`, never the compact renderer's empty string (fix review minor).
             val observation = observeForResult(
                 capture = wantsScreen,
                 visionRequested = wantsScreen,
                 snapshot = snapshot,
                 captureResult = capture,
-            )
+            )?.let { if (wantsScreen) it else it.copy(screen = null) }
             // A read through the perception port already answered: there is no kernel envelope to project, but every
             // `device` call keeps the same model-facing envelope shape.
             result(
@@ -546,14 +550,19 @@ class DeviceTool(
         else -> ToolVision.NotRequested
     }
 
-    /** Task 4: the stable reason that accompanies a non-[ToolVision.Ok] observation, or `null` when none is needed. */
+    /**
+     * Task 4: the stable reason that accompanies a non-[ToolVision.Ok] observation, or `null` when none is needed.
+     *
+     * A `capture` with a `null` shot is unreachable: [observeForResult] only builds an observation for a non-null
+     * provider, and [captureVision] answers for every such provider (a throw becomes `Unavailable(SCREENSHOT_FAILED)`),
+     * so there is no separate "capture was wanted but the port gave no answer" reason to report.
+     */
     private fun visionReasonOf(
         capture: Boolean,
         visionRequested: Boolean,
         shot: PerceptionScreenshotResult?,
     ): String? = when {
         capture && shot is PerceptionScreenshotResult.Unavailable -> shot.reason
-        capture && shot == null -> SCREENSHOT_FAILED
         capture -> null
         visionRequested -> VISION_NOT_ATTEMPTED
         else -> null
@@ -695,7 +704,7 @@ class DeviceTool(
         // artifact store as a successful screenshot with the `pending` placeholder (empty sha256), and naming that a
         // usable image would be the same lie `PerceptionScreenshotMapping` already refuses to tell. A failed action
         // reports `unavailable(<kernel code>)` and never fabricates a picture.
-        val observation = observeForResult(capture = false, visionRequested = false)?.let { base ->
+        val observation = observationForScreenshot()?.let { base ->
             val image = resolvableImage(envelope)
             when {
                 image != null -> base.copy(vision = ToolVision.Ok, visionReason = null)
@@ -709,6 +718,25 @@ class DeviceTool(
             }
         }
         return result(envelope, data, observation = observation)
+    }
+
+    /**
+     * Fix review important 2: the screenshot's observation, from the cached projection normally.
+     *
+     * A provider that throws from its cache projection must not silently drop the observation even though the call has
+     * a picture: one real [PerceptionProvider.refresh] is the fallback, and only a second throw leaves it `null`. This
+     * is deliberately screenshot-only - an argument refusal must never turn its cached read into a device read.
+     */
+    private fun observationForScreenshot(): ToolObservation? {
+        observeForResult(capture = false, visionRequested = false)?.let { return it }
+        val provider = perception ?: return null
+        val snapshot = runCatching { provider.refresh() }.getOrNull() ?: return null
+        return observeForResult(
+            capture = false,
+            visionRequested = false,
+            snapshot = snapshot,
+            captureResult = null,
+        )
     }
 
     /** The first image whose artifact the media source can resolve, or `null` for a failed/pending capture. */
@@ -727,13 +755,18 @@ class DeviceTool(
         // Task 4: a successful wait answers the current screen as *text* (`vision=not_requested`) and takes no picture;
         // a failed wait is a screen-tool failure and gets the current read plus one best-effort image. The kernel's wait
         // does not update the perception cache, so the observation is a real read instead of the turn's opening screen.
-        val snapshot = perception?.let { provider -> runCatching { provider.refresh() }.getOrNull() }
-        val capture = if (snapshot != null && !envelope.ok) captureVision() else null
-        val observation = snapshot?.let {
+        // Fix review important 2: a throwing refresh must not lose the observation - the helper falls back to the cache
+        // projection - and the failure's picture is best-effort even when that refresh threw.
+        val provider = perception
+        val snapshot = provider?.let { runCatching { it.refresh() }.getOrNull() }
+        val capture = if (provider != null && !envelope.ok) captureVision() else null
+        val observation = if (provider == null) {
+            null
+        } else {
             observeForResult(
                 capture = !envelope.ok,
                 visionRequested = !envelope.ok,
-                snapshot = it,
+                snapshot = snapshot,
                 captureResult = capture,
             )
         }
@@ -776,7 +809,10 @@ class DeviceTool(
                 visionRequested = !envelope.ok,
                 snapshot = it,
                 captureResult = capture,
-            )?.let { observation -> if (envelope.ok) observation.copy(screen = null) else observation }
+            )?.let { observation ->
+                // A status success reports no screen, so no `screen` fact and no screen truncation may survive.
+                if (envelope.ok) observation.copy(screen = null, truncated = false) else observation
+            }
         }
         // Final review C2 (re-review): [result] marks every device result non-persistent, including this one and the
         // provider-less diagnostic-only branch above.
@@ -1035,7 +1071,8 @@ class DeviceTool(
      * carries artifact references. None of that may outlive the run, so the flag is set here rather than at each
      * caller (which is how `wait` used to slip through). The loop still shows the full detail to the model for this
      * run; only the stored transcript keeps the safe marker. It remains an additive contract with the default `false`
-     * for every other tool; argument-validation refusals are not produced here and carry no content.
+     * for every other tool. Argument-validation refusals do not pass through this projection: [refused] builds them and
+     * sets `nonPersistent` itself whenever its observation text is present.
      */
     private fun result(
         envelope: DeviceEnvelope,
@@ -1082,25 +1119,35 @@ class DeviceTool(
      *
      * The tri-state fields keep the kernel's own honesty: [ToolExecution.accepted]/[ToolExecution.applied] are copied
      * verbatim, `verified` is `true` only when the kernel named the post-condition it checked, and `changed` is the
-     * write's applied evidence (a read or an unproven write leaves it `null`). `TOOL_THREW`, timeout and uncertain are
-     * loop-level facts and never fabricated here.
+     * write's applied evidence (a read or an unproven write leaves it `null`). `TOOL_THREW` is a loop-level fact and
+     * never fabricated here.
+     *
+     * **Timeout and cancellation (fix review critical 1).** A kernel `ACTION_TIMEOUT` means the caller stopped waiting
+     * while the platform call may still have been applied. It is therefore [ToolOutcome.Uncertain] with `uncertain=true`
+     * and `accepted`/`applied`/`verified`/`changed` all `null` - the envelope's `accepted=false` is "no answer was
+     * received", not "the platform refused". A kernel `CANCELLED` is [ToolOutcome.Cancelled] with its facts copied, so a
+     * dropped turn is never misreported as a refusal.
      */
     private fun executionOf(envelope: DeviceEnvelope, changed: Boolean?, partial: Boolean): ToolExecution {
+        val code = envelope.error?.code
+        val timedOut = code == DeviceErrorCodes.ACTION_TIMEOUT
         val outcome = when {
+            timedOut -> ToolOutcome.Uncertain
+            code == DeviceErrorCodes.CANCELLED -> ToolOutcome.Cancelled
             envelope.ok -> ToolOutcome.Done
             envelope.error?.recoverable == true -> ToolOutcome.Refused
             else -> ToolOutcome.Failed
         }
         return ToolExecution(
             outcome = outcome,
-            code = envelope.error?.code,
+            code = code,
             message = envelope.error?.message,
             recoverable = envelope.error?.recoverable == true,
-            accepted = envelope.accepted,
-            applied = envelope.applied,
-            verified = envelope.verified?.let { true },
-            changed = changed,
-            uncertain = false,
+            accepted = if (timedOut) null else envelope.accepted,
+            applied = if (timedOut) null else envelope.applied,
+            verified = if (timedOut) null else envelope.verified?.let { true },
+            changed = if (timedOut) null else changed,
+            uncertain = timedOut,
             partial = partial,
         )
     }
