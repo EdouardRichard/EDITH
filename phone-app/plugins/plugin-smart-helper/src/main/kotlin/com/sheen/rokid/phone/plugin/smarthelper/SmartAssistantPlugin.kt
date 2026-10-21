@@ -2473,6 +2473,12 @@ class SmartAssistantPlugin(
                     perception = perception?.let { provider ->
                         { perceptionBlockFor(provider, initialSnapshot, perceptionRequests, profileAcceptsImages) }
                     },
+                    // edith-0.3 Phase 2.2 Task 6: the loop's best-effort failure-observation source, backed by the same
+                    // per-turn perception port. Without this the loop's `screenObservation` enrichment would be dead
+                    // code on the device: every screen-tool failure that could not observe itself would report
+                    // `no_source`. The source is cache-only and carries no image channel (see its KDoc); a null
+                    // provider (a host that grants no perception) leaves the loop's explicit `no_source` mapping.
+                    observationSource = perceptionToolObservationSource(perception),
                     // 0.3 Phase 2 Task 11 (review fix R12): the loop calls this once per **assembled** request, after
                     // folding its RUNTIME_STATE/PERCEPTION segments in and before the gateway sends (or refuses), so
                     // the `P3_PROMPT` line describes the exact frame this request is. The legacy no-store path has no

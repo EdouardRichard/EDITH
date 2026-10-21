@@ -520,6 +520,8 @@ internal fun smartAction(
     requiresConfirmation: Boolean = false,
     scope: String = "app",
     title: String = "Action $name",
+    /** Task 6: a fake screen tool whose failures the loop should enrich from the host observation source. */
+    screenObservation: Boolean = false,
 ) = ActionDescriptor(
     name = name,
     title = title,
@@ -529,6 +531,7 @@ internal fun smartAction(
     idempotent = true,
     reversible = true,
     scope = scope,
+    screenObservation = screenObservation,
 )
 
 /** One text-delta-then-terminal stream, the shape a successful answer arrives in. */

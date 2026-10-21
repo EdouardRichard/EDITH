@@ -185,6 +185,10 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
             // R99: the plugin's confirming wrapper asks the wearer inside `execute` (D47's 120 s window). The loop must
             // add its human allowance to the machine cap instead of clamping the whole call by the turn deadline.
             mayAskHuman = true,
+            // edith-0.3 Phase 2.2 Task 6: a command can leave any screen behind, and `ToolCatalog` attaches the shared
+            // post-call observation. This is the screen-observation declaration, not the fingerprint seam (`observation`
+            // stays false), so `shell` does not start feeding the progress detectors.
+            screenObservation = true,
         )
     }
 }

@@ -101,6 +101,7 @@ import com.sheen.rokid.phone.inference.laya.LayaOfficialHost
 import com.sheen.rokid.phone.inference.litert.EmbeddingGemmaLiteRTEngine
 import com.sheen.rokid.model.*
 import com.sheen.rokid.output.ConversationLog
+import com.sheen.rokid.output.PerceptionToolObservation
 import com.sheen.rokid.output.TraceRecorder
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
@@ -176,6 +177,12 @@ private const val PROBE_IMAGE_BASE64 =
 private const val PROBE_IMAGE_WIDTH = 32
 private const val PROBE_IMAGE_HEIGHT = 32
 private val PROBE_IMAGE_PNG: ByteArray = Base64.getDecoder().decode(PROBE_IMAGE_BASE64)
+
+/**
+ * edith-0.3 Phase 2.2 Task 6: the reason a screen tool's production observation reports when the connected
+ * accessibility read itself fails (as opposed to the channel being off, which has its own reason).
+ */
+private const val TOOL_OBSERVATION_FAILED = "OBSERVE_FAILED"
 
 /**
  * Whether a STOP's validated identity still names the session the host is running.
@@ -316,6 +323,13 @@ class HostCompositionRoot internal constructor(
 
     /** Debug-only seam: the production catalog, so an Activity can exercise the real gate + tool body. */
     internal var toolCatalogForProbe: com.sheen.rokid.phone.actions.device.ToolCatalog? = null
+
+    /**
+     * edith-0.3 Phase 2.2 Task 6: the production `open` tool, exposed only so the JVM gate can prove that the
+     * composition wires the **same** `AndroidPerceptionProvider`-backed observation source into `OpenTool(observe = ...)`
+     * as into the catalog. Production never reads it; a composition built by hand leaves it `null`.
+     */
+    internal var openToolForProbe: com.sheen.rokid.phone.actions.device.OpenTool? = null
 
     internal fun executeToolForProbe(name: String, argsJson: String) =
         toolCatalogForProbe?.execute(name, argsJson)
@@ -2297,26 +2311,49 @@ class HostCompositionRoot internal constructor(
                 context.checkSelfPermission(android.Manifest.permission.CALL_PHONE) ==
                     android.content.pm.PackageManager.PERMISSION_GRANTED
             }
+            // ---- edith-0.3 Phase 2.2 Task 6: one host observation source for the screen tools -------------------
+            // `open`, `shell` and `dial` all describe "what the screen looks like after the call", so they share this
+            // one source instead of each growing its own read. It is a real post-call read (`refresh`), not the turn's
+            // opening cache: the whole point of a failed `open`'s observation is to show the screen the failure left
+            // behind. With the accessibility channel off there is nothing honest to read, so the source answers an
+            // explicit `unavailable/no_accessibility` observation - never an invented screen and never a silent null.
+            // It is non-throwing: a failed read degrades to `OBSERVE_FAILED` and the tool keeps its own outcome.
+            val toolObservation: () -> ToolObservation? = {
+                if (!EdithAccessibilityService.connected()) {
+                    PerceptionToolObservation.unavailable(PerceptionToolObservation.NO_ACCESSIBILITY)
+                } else {
+                    runCatching { PerceptionToolObservation.render(perception.refresh()) }
+                        .getOrElse { PerceptionToolObservation.unavailable(TOOL_OBSERVATION_FAILED) }
+                }
+            }
+            val openTool = OpenTool(
+                shell = shizukuShell,
+                catalog = appCatalog,
+                foreground = { EdithAccessibilityService.port()?.foreground()?.packageName },
+                // 0.3 Phase 2 Task 8: `am start -W`'s own `Status: ok` is not success; the tool verifies the
+                // resolved package is both the foreground app and the accessibility root.
+                foregroundActivity = { EdithAccessibilityService.port()?.foreground()?.activity },
+                rootPackage = { EdithAccessibilityService.port()?.rootPackage() },
+                // 0.3 Phase 2.1 Task 4: a verified open captures through the same provider gate as observe/act.
+                capture = { perception.screenshot() },
+                // 0.3 Phase 2.2 Task 6: the shared post-call observation, so an `open` failure tells the model what
+                // the phone is actually showing now.
+                observe = toolObservation,
+            )
             val toolCatalog = ToolCatalog(
                 device = deviceTool,
                 shell = ShellTool(shizukuShell),
-                open = OpenTool(
-                    shell = shizukuShell,
-                    catalog = appCatalog,
-                    foreground = { EdithAccessibilityService.port()?.foreground()?.packageName },
-                    // 0.3 Phase 2 Task 8: `am start -W`'s own `Status: ok` is not success; the tool verifies the
-                    // resolved package is both the foreground app and the accessibility root.
-                    foregroundActivity = { EdithAccessibilityService.port()?.foreground()?.activity },
-                    rootPackage = { EdithAccessibilityService.port()?.rootPackage() },
-                    // 0.3 Phase 2.1 Task 4: a verified open captures through the same provider gate as observe/act.
-                    capture = { perception.screenshot() },
-                ),
+                open = openTool,
                 // The number validation/permission check/ACTION_CALL hand-off stay in the one executor that owns them.
                 dial = DialTool(actions, callAvailable),
                 a11yAvailable = { EdithAccessibilityService.connected() },
                 shellAvailable = { shizukuShell.ready() },
                 callAvailable = callAvailable,
                 unlock = unlockGate,
+                // Task 6: the same source and the same capture gate as `open`; `shell`/`dial` differ only in their own
+                // outcome shapes, which the catalog leaves untouched.
+                observe = toolObservation,
+                capture = { perception.screenshot() },
             )
             val confirmationUi = object : ConfirmationUi {
                 // Through the holder: this object is built inside `create`, where no composition instance exists yet,
@@ -2526,6 +2563,9 @@ class HostCompositionRoot internal constructor(
             root.lockPinStore = lockPinStore
             root.unlockCoordinatorForProbe = unlockGate
             root.toolCatalogForProbe = toolCatalog
+            // Task 6: the JVM gate reads the same `open` instance the Actions capability serves, so it can prove the
+            // observation source was really wired into `OpenTool(observe = ...)`.
+            root.openToolForProbe = openTool
             root.audioChain = audio
             // P5 (spec §S5): sync the UI state with what was loaded above.
             root.speechOn.value = speechEnabledNow

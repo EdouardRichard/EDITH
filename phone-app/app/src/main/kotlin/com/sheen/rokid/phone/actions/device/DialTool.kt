@@ -21,8 +21,10 @@ import com.sheen.rokid.plugin.RiskLevel
  * asking a 120 s question. A wearer who lowers the ceiling to L0 still gets a `Refuse` — a refusal,
  * never a question. The number's privacy is why `auditTargetArgument` stays null, not the risk level.
  *
- * The result is `accepted_only` — an intent hand-off has no screen to observe, so `applied` is null
- * and there is no confirmation (R-03). **There is deliberately no `ACTION_DIAL` fallback**: a dialer
+ * The result is `accepted_only` — an intent hand-off has no verified screen ownership, so `applied` is null and there
+ * is no confirmation (R-03). Since edith-0.3 Phase 2.2 Task 6 the call **does** leave the phone on its call UI, so
+ * `ToolCatalog` attaches the shared post-call observation + one best-effort image around this result; the outcome and
+ * the envelope text stay exactly as they were. **There is deliberately no `ACTION_DIAL` fallback**: a dialer
  * screen would be a different action and would make a refused call look accepted.
  */
 class DialTool(
@@ -116,6 +118,9 @@ class DialTool(
             scope = "phone.number",
             // A phone number is personal data: no part of it ever reaches the audit trail (spec §17.5).
             auditTargetArgument = null,
+            // edith-0.3 Phase 2.2 Task 6: the call UI is the post-call screen, so `ToolCatalog` observes it. This is the
+            // screen-observation declaration, not the fingerprint seam (`observation` stays false).
+            screenObservation = true,
         )
     }
 }

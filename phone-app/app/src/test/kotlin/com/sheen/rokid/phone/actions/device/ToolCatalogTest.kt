@@ -13,12 +13,21 @@ import com.sheen.rokid.device.ScreenFilter
 import com.sheen.rokid.device.Timing
 import com.sheen.rokid.phone.actions.intent.AppCatalog
 import com.sheen.rokid.phone.actions.intent.AppEntry
+import com.sheen.rokid.phone.actions.shizuku.PrivilegedShell
+import com.sheen.rokid.phone.actions.shizuku.ShellResult
 import com.sheen.rokid.phone.plugin.smarthelper.output.NotifyUserTool
 import com.sheen.rokid.phone.plugin.smarthelper.skill.LoadSkillTool
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoad
 import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoadReason
 import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.ImageRef
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
 import com.sheen.rokid.plugin.PrecheckDecision
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
+import com.sheen.rokid.plugin.ToolVision
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.int
@@ -27,6 +36,7 @@ import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -412,6 +422,411 @@ class ToolCatalogTest {
         }
     }
 
+    // - edith-0.3 Phase 2.2 Task 6: shell/dial post-call observation -
+
+    @Test
+    fun `shell and dial declare screen observation while keeping the fingerprint seam off`() {
+        val descriptors = catalog().descriptors().associateBy { it.name }
+
+        listOf("device", "shell", "open", "dial").forEach { name ->
+            assertTrue("$name must declare a post-call observation", descriptors.getValue(name).screenObservation)
+        }
+        // Task 3's flag means "the host has a screen to observe after the call"; the fingerprint seam (`observation`)
+        // stays device-only so shell/dial do not start feeding the progress detectors.
+        listOf("shell", "open", "dial").forEach { name ->
+            assertFalse("$name must stay outside the fingerprint seam", descriptors.getValue(name).observation)
+        }
+    }
+
+    @Test
+    fun `a successful shell call carries the observation one image and done facts`() {
+        var captureCalls = 0
+        val catalog = catalog(
+            shell = ShellTool(FakeShell { command -> ShellResult(command, 0, "hi\n", "") }),
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("shell", """{"command":"echo hi"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("one best-effort picture", 1, captureCalls)
+        val observation = requireNotNull(result.observation) { "shell success must carry an observation" }
+        assertEquals("com.example.launcher", observation.foregroundPackage)
+        assertEquals("#n1 button \"OK\"", observation.screen)
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertNull("a picture needs no unavailable reason", observation.visionReason)
+        assertEquals(listOf(IMAGE), result.images)
+        val execution = requireNotNull(result.execution) { "shell must carry structured execution facts" }
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertNull("an exit code is not a target-state verdict, so applied stays unknown", execution.applied)
+        assertNull("a raw command is not verified against a target", execution.verified)
+        assertNull(execution.changed)
+        assertTrue("observation and picture content stay request-scoped", result.nonPersistent)
+    }
+
+    @Test
+    fun `a shell command that exits non zero reports failed facts with the screen and one image`() {
+        val catalog = catalog(
+            shell = ShellTool(FakeShell { command -> ShellResult(command, 2, "", "bad thing") }),
+            observe = { screenFacts() },
+            capture = { imageResult() },
+        )
+
+        val result = catalog.execute("shell", """{"command":"false"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        assertEquals(1, result.images.size)
+        assertEquals(ToolVision.Ok, requireNotNull(result.observation).vision)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Failed, execution.outcome)
+        assertEquals("the command ran", true, execution.accepted)
+        assertNull("a non-zero exit does not prove the side effects did not happen", execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `a shell reply that was cut is refused but known to have run`() {
+        val catalog = catalog(
+            shell = ShellTool(FakeShell { command -> ShellResult(command, 0, "prefix", "", truncated = true) }),
+            observe = { screenFacts() },
+            capture = { PerceptionScreenshotResult.Disabled },
+        )
+
+        val result = catalog.execute("shell", """{"command":"dumpsys window"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertTrue("the tool's own code is kept: ${result.detail}", result.detail.contains("SHELL_REPLY_TOO_LARGE"))
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("SHELL_REPLY_TOO_LARGE", execution.code)
+        assertEquals("a cut reply proves the command ran", true, execution.accepted)
+        assertNull("only the answer was cut; applying is unknown", execution.applied)
+        assertEquals(true, execution.recoverable)
+    }
+
+    @Test
+    fun `a shell channel refusal still observes the screen and captures one image`() {
+        var captureCalls = 0
+        val catalog = catalog(
+            probes = Probes(shell = false),
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("shell", """{"command":"id"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals(ToolCatalog.CHANNEL_UNAVAILABLE, result.detail)
+        assertEquals(1, captureCalls)
+        assertEquals(ToolVision.Ok, requireNotNull(result.observation).vision)
+        assertEquals(1, result.images.size)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals(ToolCatalog.CHANNEL_UNAVAILABLE, execution.code)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertEquals("the channel can come back", true, execution.recoverable)
+        assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `shell invalid arguments observe as text only and never capture`() {
+        var captureCalls = 0
+        val catalog = catalog(
+            shell = ShellTool(FakeShell { command -> ShellResult(command, 0, "", "") }),
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("shell", """{"command":""}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("the bare argument code is unchanged", "INVALID_ARGUMENTS", result.detail)
+        assertEquals("an argument refusal takes no picture", 0, captureCalls)
+        val observation = requireNotNull(result.observation) { "a refusal still observes the current screen" }
+        assertEquals("#n1 button \"OK\"", observation.screen)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("not_attempted", observation.visionReason)
+        assertTrue(result.images.isEmpty())
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("INVALID_ARGUMENTS", execution.code)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertEquals("a malformed call has no recoverable channel", false, execution.recoverable)
+        assertTrue("observation text stays request-scoped", result.nonPersistent)
+    }
+
+    @Test
+    fun `the unsupported stdin refusal is an argument refusal with a text-only observation`() {
+        var captureCalls = 0
+        val catalog = catalog(
+            shell = ShellTool(FakeShell { command -> ShellResult(command, 0, "", "") }),
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("shell", """{"command":"id","stdin":"x"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertTrue("the tool envelope is unchanged: ${result.detail}", result.detail.contains("UNSUPPORTED"))
+        assertEquals(0, captureCalls)
+        assertEquals("not_attempted", requireNotNull(result.observation).visionReason)
+        val execution = requireNotNull(result.execution)
+        assertEquals("UNSUPPORTED", execution.code)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertEquals(false, execution.recoverable)
+    }
+
+    @Test
+    fun `a successful dial carries the observation one image and accepted only facts`() {
+        val executor = RecordingExecutor()
+        var captureCalls = 0
+        val catalog = catalog(
+            dialExecutor = executor,
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("dial", """{"number":"10086"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(listOf("dial" to """{"number":"10086"}"""), executor.calls)
+        assertEquals(1, captureCalls)
+        assertEquals(ToolVision.Ok, requireNotNull(result.observation).vision)
+        assertEquals(1, result.images.size)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertNull("an intent hand-off is not verified as applied", execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `a failed dial reports failed facts with the screen and one image`() {
+        val executor = RecordingExecutor().apply {
+            outcome = ActionResult(ActionOutcome.Failed, "boom")
+        }
+        val catalog = catalog(
+            dialExecutor = executor,
+            observe = { screenFacts() },
+            capture = { imageResult() },
+        )
+
+        val result = catalog.execute("dial", """{"number":"10086"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        assertEquals(1, result.images.size)
+        assertEquals(ToolVision.Ok, requireNotNull(result.observation).vision)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Failed, execution.outcome)
+        assertEquals("DIAL_FAILED", execution.code)
+        assertEquals("the valid call reached the executor", true, execution.accepted)
+        assertEquals("the intent did not launch", false, execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `a dial permission refusal observes the screen and captures one image`() {
+        val executor = RecordingExecutor()
+        var captureCalls = 0
+        val catalog = catalog(
+            probes = Probes(call = false),
+            dialExecutor = executor,
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("dial", """{"number":"10086"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("CALL_PERMISSION_MISSING", result.detail)
+        assertTrue("the executor must not be reached", executor.calls.isEmpty())
+        assertEquals(1, captureCalls)
+        assertEquals(ToolVision.Ok, requireNotNull(result.observation).vision)
+        assertEquals(1, result.images.size)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("CALL_PERMISSION_MISSING", execution.code)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertEquals(true, execution.recoverable)
+    }
+
+    @Test
+    fun `dial invalid arguments observe as text only and never capture`() {
+        val executor = RecordingExecutor()
+        var captureCalls = 0
+        val catalog = catalog(
+            dialExecutor = executor,
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("dial", """{"number":"   "}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertTrue("the tool envelope is unchanged: ${result.detail}", result.detail.contains("ARGUMENTS_INVALID"))
+        assertTrue("an undialable number never reaches the executor", executor.calls.isEmpty())
+        assertEquals(0, captureCalls)
+        assertEquals("not_attempted", requireNotNull(result.observation).visionReason)
+        assertTrue(result.images.isEmpty())
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("ARGUMENTS_INVALID", execution.code)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertEquals(false, execution.recoverable)
+    }
+
+    @Test
+    fun `shell and dial without an observation source report unavailable no source`() {
+        val catalog = catalog(
+            shell = ShellTool(FakeShell { command -> ShellResult(command, 0, "", "") }),
+        )
+
+        val shell = catalog.execute("shell", """{"command":"id"}""")
+        val dial = catalog.execute("dial", """{"number":"10086"}""")
+
+        listOf("shell" to shell, "dial" to dial).forEach { (name, result) ->
+            val observation = requireNotNull(result.observation) { "$name must never silently drop its observation" }
+            assertEquals("$name reports the missing source", ToolVision.Unavailable, observation.vision)
+            assertEquals("no_source", observation.visionReason)
+            assertTrue("$name attaches no picture without a source", result.images.isEmpty())
+            assertTrue(result.nonPersistent)
+        }
+    }
+
+    @Test
+    fun `a disabled capture keeps the source facts with an honest disabled vision`() {
+        val catalog = catalog(
+            probes = Probes(call = false),
+            observe = { screenFacts().copy(vision = ToolVision.Ok) },
+            capture = { PerceptionScreenshotResult.Disabled },
+        )
+
+        val result = catalog.execute("dial", """{"number":"10086"}""")
+
+        val observation = requireNotNull(result.observation)
+        assertEquals("com.example.launcher", observation.foregroundPackage)
+        assertEquals("a source may not claim ok without an image", ToolVision.Disabled, observation.vision)
+        assertNull(observation.visionReason)
+        assertTrue(result.images.isEmpty())
+    }
+
+    @Test
+    fun `an unavailable capture reports its own vision reason`() {
+        val catalog = catalog(
+            probes = Probes(call = false),
+            observe = { screenFacts() },
+            capture = { PerceptionScreenshotResult.Unavailable("SCREENSHOT_FAILED") },
+        )
+
+        val result = catalog.execute("dial", """{"number":"10086"}""")
+
+        val observation = requireNotNull(result.observation)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("SCREENSHOT_FAILED", observation.visionReason)
+        assertTrue(result.images.isEmpty())
+    }
+
+    @Test
+    fun `a throwing observation or capture source never fails the shell result`() {
+        val catalog = catalog(
+            shell = ShellTool(FakeShell { command -> ShellResult(command, 0, "", "") }),
+            observe = { throw IllegalStateException("observer gone") },
+            capture = { throw IllegalStateException("capture gone") },
+        )
+
+        val result = catalog.execute("shell", """{"command":"id"}""")
+
+        assertEquals("the command's own outcome is untouched", ActionOutcome.Done, result.outcome)
+        val observation = requireNotNull(result.observation)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("no_source", observation.visionReason)
+        assertTrue(result.images.isEmpty())
+        assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `an unknown action keeps its bare refusal without an observation or a picture`() {
+        var captureCalls = 0
+        var observeCalls = 0
+        val catalog = catalog(
+            observe = { observeCalls++; screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("teleport", "{}")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals(ToolCatalog.UNKNOWN_ACTION, result.detail)
+        assertNull("an unknown name is not a screen operation", result.observation)
+        assertTrue(result.images.isEmpty())
+        assertEquals("no observation for an unknown name", 0, observeCalls)
+        assertEquals("no capture for an unknown name", 0, captureCalls)
+    }
+
+    @Test
+    fun `open keeps its own observation policy and is never enriched by the catalog`() {
+        var captureCalls = 0
+        var observeCalls = 0
+        val catalog = catalog(
+            observe = { observeCalls++; screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        // `list` through the shell-less fixture refuses at the channel; it is Task 5's non-screen path, not ours.
+        val result = catalog.execute("open", """{"list":true}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertTrue("the tool's own channel refusal is kept: ${result.detail}",
+            result.detail.contains("CHANNEL_UNAVAILABLE"))
+        assertNull("the catalog must not add an observation to open", result.observation)
+        assertTrue(result.images.isEmpty())
+        assertEquals(0, observeCalls)
+        assertEquals(0, captureCalls)
+    }
+
+    @Test
+    fun `the production composition backs open and shell with the perception observation source`() {
+        val root = com.sheen.rokid.phone.app.HostCompositionRoot.create(android.content.ContextWrapper(null))
+        try {
+            // a11y is down on the JVM composition: the source must answer an explicit unavailable observation, never a
+            // fabricated screen and never a silent null.
+            val open = requireNotNull(root.openToolForProbe) {
+                "the production composition must expose its open tool for the wiring check"
+            }
+            val openResult = open.execute("""{"target":"com.example.absent"}""")
+            val openObservation = requireNotNull(openResult.observation) {
+                "open must carry the host observation source's answer"
+            }
+            assertEquals(ToolVision.Unavailable, openObservation.vision)
+            assertTrue("open must say why vision is unavailable", !openObservation.visionReason.isNullOrBlank())
+            assertTrue("a blind composition attaches no image", openResult.images.isEmpty())
+
+            val shellResult = requireNotNull(root.toolCatalogForProbe).execute("shell", """{"command":"id"}""")
+            val shellObservation = requireNotNull(shellResult.observation) {
+                "shell must carry the host observation source's answer"
+            }
+            assertEquals(ToolVision.Unavailable, shellObservation.vision)
+            assertEquals("no_accessibility", shellObservation.visionReason)
+            assertNull("a blind phone has no fabricated screen", shellObservation.screen)
+            assertTrue("a blind composition attaches no image", shellResult.images.isEmpty())
+        } finally {
+            root.close()
+        }
+    }
+
     // - helpers -
 
     private fun catalog(
@@ -420,6 +835,9 @@ class ToolCatalogTest {
         dialExecutor: RecordingExecutor = RecordingExecutor(),
         unlock: com.sheen.rokid.phone.lock.UnlockGate =
             com.sheen.rokid.phone.lock.UnlockGate { com.sheen.rokid.phone.lock.UnlockOutcome.ALREADY_UNLOCKED },
+        shell: ShellTool = ShellTool(null),
+        observe: () -> ToolObservation? = { null },
+        capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
     ): ToolCatalog {
         val registry = RefRegistry()
         val device = DeviceTool(
@@ -428,14 +846,38 @@ class ToolCatalogTest {
         )
         return ToolCatalog(
             device = device,
-            shell = ShellTool(null),
+            shell = shell,
             open = OpenTool(null, EmptyCatalog),
             dial = DialTool(dialExecutor) { probes.call },
             a11yAvailable = { probes.a11y },
             shellAvailable = { probes.shell },
             callAvailable = { probes.call },
             unlock = unlock,
+            observe = observe,
+            capture = capture,
         )
+    }
+
+    /** The post-call facts a source would answer on a healthy phone. */
+    private fun screenFacts(): ToolObservation = ToolObservation(
+        snapshotId = "snap-1",
+        capturedAtEpochMillis = 1_000L,
+        foregroundPackage = "com.example.launcher",
+        foregroundActivity = ".Home",
+        coverage = "screen=ok vision=ok",
+        screen = "#n1 button \"OK\"",
+        vision = ToolVision.NotRequested,
+    )
+
+    private fun imageResult(): PerceptionScreenshotResult.Image =
+        PerceptionScreenshotResult.Image(IMAGE, "image/png", 100, 50)
+
+    private class FakeShell(private val answer: (String) -> ShellResult) : PrivilegedShell {
+        override fun run(command: String): ShellResult = answer(command)
+    }
+
+    private companion object {
+        val IMAGE = ImageRef("artifact-1", "image/png", 100, 50, "sha-1")
     }
 
     private fun descriptor(name: String): com.sheen.rokid.plugin.ActionDescriptor =
@@ -453,12 +895,13 @@ class ToolCatalogTest {
 
     private class RecordingExecutor : com.sheen.rokid.plugin.ActionExecutor {
         val calls = mutableListOf<Pair<String, String>>()
+        var outcome: ActionResult = ActionResult(ActionOutcome.Done, "done")
 
         override fun descriptors(): List<com.sheen.rokid.plugin.ActionDescriptor> = emptyList()
 
-        override fun execute(name: String, argsJson: String): com.sheen.rokid.plugin.ActionResult {
+        override fun execute(name: String, argsJson: String): ActionResult {
             calls += name to argsJson
-            return com.sheen.rokid.plugin.ActionResult(ActionOutcome.Done, "done")
+            return outcome
         }
 
         override fun cancel() = Unit
