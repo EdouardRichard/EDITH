@@ -415,6 +415,62 @@ class AgentLoopGuardTest {
             """"verified":null,"images":[],"timing":{"actMs":1,"observeMs":2,"totalMs":$totalMs},"data":null,""" +
             """"error":{"code":"NODE_STALE","message":"the node reference is stale","recoverable":true}}"""
 
+    // ---------------------------------------------------------------- prompt injection (A7)
+
+    @Test
+    fun `a custom plan nudge instruction and markers are the ones the model receives`() {
+        val executor = executorOf("lookup")
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "lookup"))),
+                reply(text = "自定义计划标记：先观察屏幕。"),
+                reply(text = "好。"),
+            ),
+        )
+        val loop = AgentLoop(
+            gateway,
+            ToolRegistry(listOf(executor)),
+            ScriptedPolicy(),
+            ProgressGuard(),
+            RecordingAuditSink(),
+            FakeClock(),
+            planNudgeInstruction = "资源纠偏指令",
+            planMarkers = listOf("自定义计划标记"),
+        )
+
+        val run = loop.run(request(allowPlanNudge = true))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(3, gateway.requests.size, "the injected marker must trigger exactly one nudge")
+        assertTrue(
+            gateway.requests[2].history.any { it is ModelHistoryItem.Text && it.text == "资源纠偏指令" },
+            "the model must receive the injected plan-nudge instruction: ${gateway.requests[2].history}",
+        )
+    }
+
+    @Test
+    fun `an explicitly empty plan marker set replaces the built-in list`() {
+        val executor = executorOf("lookup")
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = planText)),
+        )
+        val loop = AgentLoop(
+            gateway,
+            ToolRegistry(listOf(executor)),
+            ScriptedPolicy(),
+            ProgressGuard(),
+            RecordingAuditSink(),
+            FakeClock(),
+            planMarkers = emptyList(),
+        )
+
+        val run = loop.run(request(allowPlanNudge = true))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(planText, run.finalText)
+        assertEquals(2, gateway.requests.size, "the injected empty list must replace the built-in markers")
+    }
+
     // ---------------------------------------------------------------- plan nudge (R58)
 
     @Test
@@ -525,6 +581,29 @@ class AgentLoopGuardTest {
         // The executor's own command was cancelled, so its worker does not outlive the run.
         executor.awaitWorkers(1_000)
         assertTrue(executor.workers.none { it.isAlive }, "the tool worker must be stopped")
+    }
+
+    @Test
+    fun `a custom timeout instruction is the one the model receives`() {
+        val executor = SleepingExecutor(descriptor("slow", timeoutMillis = 50L), sleepMillis = 5_000L)
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "slow"))), reply(text = "先看看屏幕")),
+        )
+        val loop = AgentLoop(
+            gateway,
+            ToolRegistry(listOf(executor)),
+            ScriptedPolicy(),
+            ProgressGuard(),
+            RecordingAuditSink(),
+            FakeClock(),
+            timeoutInstruction = "资源超时指令",
+        )
+
+        val run = loop.run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertTrue(outputs(run).single().output.contains("资源超时指令"), outputs(run).single().output)
+        executor.awaitWorkers(1_000)
     }
 
     @Test

@@ -38,7 +38,7 @@ internal data class PromptManifestEntry(
 object PromptCatalog {
 
     /** Catalog semver; a session pins the plan it loaded, it never mixes versions (spec §4.1). */
-    const val VERSION: String = "0.4.0"
+    const val VERSION: String = "0.4.1"
 
     private const val PROMPTS_DIR = "prompts/"
     private const val MANIFEST_FILE = "manifest.tsv"
@@ -171,7 +171,8 @@ object PromptCatalog {
     fun dynamicTemplate(): String = resourceTexts.getValue(RUNTIME_STATE_FILE)
 
     /**
-     * One externally constrained fixed prompt (`pinned/<key>.md`), such as Laya's fine-tuned gate question.
+     * One externally constrained fixed prompt (`pinned/<key>.md`), such as Laya's fine-tuned gate question and its
+     * neutral options.
      *
      * PINNED content is not a system section: it belongs to its own call and is deliberately excluded from [plan]
      * because rewriting it or paying for it on every request would invalidate its calibration or the cache prefix.

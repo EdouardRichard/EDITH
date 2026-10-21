@@ -159,6 +159,26 @@ class AgentLoopTest {
         assertTrue(retry.text.isNotBlank())
     }
 
+    @Test fun `a custom retry instruction is the one the model receives`() {
+        // 0.3 Phase 4A A7: the retry prose is injected, and production passes `PromptCatalog.loop("retry")` here.
+        val gateway = ScriptedGateway(listOf(reply(text = ""), reply(text = "answer")))
+        val loop = AgentLoop(
+            gateway,
+            ToolRegistry(emptyList()),
+            ScriptedPolicy(),
+            ProgressGuard(),
+            RecordingAuditSink(),
+            FakeClock(),
+            retryInstruction = "资源重试指令",
+        )
+
+        val run = loop.run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val retried = gateway.requests[1].history
+        assertEquals("资源重试指令", assertIs<ModelHistoryItem.Text>(retried.last()).text)
+    }
+
     @Test fun `a retry never leaves the transcript on the pending user turn`() {
         val gateway = ScriptedGateway(listOf(reply(text = ""), reply(text = "answer")))
         val loop = newLoop(gateway)

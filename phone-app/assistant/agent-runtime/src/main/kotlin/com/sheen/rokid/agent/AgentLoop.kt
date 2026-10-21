@@ -448,6 +448,29 @@ class AgentLoop(
      * Observability must never change the outcome, so a throwing sink is swallowed like the display callbacks are.
      */
     private val metricLine: (String) -> Unit = {},
+    /**
+     * edith-0.3 Phase 4A A7: the retry prose fed back after an unproductive turn.
+     *
+     * The default is this module's own literal so every pre-A7 caller keeps its exact bytes; the production plugin
+     * passes `PromptCatalog.loop("retry")`. [withoutRetryScaffolding] still matches the loop-owned
+     * [RETRY_INSTRUCTION], because that is the value the default (and production's byte-identical resource) uses.
+     */
+    private val retryInstruction: String = RETRY_INSTRUCTION,
+    /**
+     * A7: the plan-nudge prose, defaulting to [PLAN_NUDGE_INSTRUCTION]. Production passes
+     * `PromptCatalog.loop("plan-nudge")`; the injected text is what the model receives.
+     */
+    private val planNudgeInstruction: String = PLAN_NUDGE_INSTRUCTION,
+    /**
+     * A7: the note attached to a **stopped** tool timeout, defaulting to [ACTION_TIMEOUT_NOTE]. Production passes
+     * `PromptCatalog.loop("timeout")`. `ACTION_TIMEOUT_UNCERTAIN_NOTE` stays a fixed terminal verdict, not this seam.
+     */
+    private val timeoutInstruction: String = ACTION_TIMEOUT_NOTE,
+    /**
+     * A7: the wording this run treats as a plan, defaulting to [PLAN_MARKERS]. Injection only: no catalog resource
+     * exists for matching constants, and passing an empty list explicitly disables plan detection.
+     */
+    private val planMarkers: List<String> = PLAN_MARKERS,
 ) {
     init {
         require(maxObservations >= 1) { "maxObservations must be at least 1, was $maxObservations" }
@@ -1240,7 +1263,7 @@ class AgentLoop(
             val execution = ToolExecution(
                 outcome = ToolOutcome.Timeout,
                 code = ACTION_TIMEOUT,
-                message = ACTION_TIMEOUT_NOTE,
+                message = timeoutInstruction,
             )
             ToolInvocation(
                 ToolResult(id = call.id, ok = false, execution = execution, observation = null),
@@ -1402,7 +1425,7 @@ class AgentLoop(
         if (spentObservations >= maxObservations) return false
         val lower = text.lowercase()
         if (PLAN_COMPLETION_MARKERS.any { text.contains(it) || lower.contains(it) }) return false
-        return PLAN_MARKERS.any { marker -> text.contains(marker) || lower.contains(marker) }
+        return planMarkers.any { marker -> text.contains(marker) || lower.contains(marker) }
     }
 
     /**
@@ -1412,7 +1435,7 @@ class AgentLoop(
      */
     private fun appendPlanNudge(history: MutableList<ModelHistoryItem>, text: String) {
         history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT })
-        history += ModelHistoryItem.Text(MessageRole.USER, PLAN_NUDGE_INSTRUCTION)
+        history += ModelHistoryItem.Text(MessageRole.USER, planNudgeInstruction)
     }
 
     /**
@@ -1638,7 +1661,7 @@ class AgentLoop(
      */
     private fun appendRetry(history: MutableList<ModelHistoryItem>, text: String) {
         history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT })
-        history += ModelHistoryItem.Text(MessageRole.USER, RETRY_INSTRUCTION)
+        history += ModelHistoryItem.Text(MessageRole.USER, retryInstruction)
     }
 
     /**

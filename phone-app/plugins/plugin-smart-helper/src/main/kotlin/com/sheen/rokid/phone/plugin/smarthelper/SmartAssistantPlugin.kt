@@ -139,6 +139,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGateState
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveHintRequest
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProposeHintTool
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.parseGateOptions
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
 import com.sheen.rokid.phone.plugin.smarthelper.memory.normalize
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryModule
@@ -1537,6 +1538,8 @@ class SmartAssistantPlugin(
                 client = client,
                 profileLookup = profileLookup,
                 profileId = config?.profileId ?: return@let null,
+                // 0.3 design §6.4 / Phase 4A A7: the structured six-part instruction is an authored resource.
+                prompt = PromptCatalog.summarizer(),
                 clock = clock,
                 scheduler = scheduler,
                 envelopeFor = { requestId, startNanos, endNanos ->
@@ -3905,6 +3908,10 @@ class SmartAssistantPlugin(
             confirmation = confirmation,
             // 0.25 Task 14 (R78): the run's one count-only metric line reaches the plugin's single P3 sink.
             metricLine = P3Log::line,
+            // 0.3 Phase 4A A7: all loop prose is the plugin catalog's authored resource, never the runtime's fallback.
+            retryInstruction = PromptCatalog.loop("retry"),
+            planNudgeInstruction = PromptCatalog.loop("plan-nudge"),
+            timeoutInstruction = PromptCatalog.loop("timeout"),
         )
 
     // ---------------------------------------------------------------- proactive turn (P3.2)
@@ -4027,8 +4034,18 @@ class SmartAssistantPlugin(
         return when (form) {
             // The operating point is named here rather than left to the constructor default, so the value the
             // production gate runs at is visible at the one place the gate is built.
-            GateForm.NOUL -> NoulGate(service, threshold = com.sheen.rokid.phone.plugin.smarthelper.proactive.NoulThreshold.VALUE)
-            GateForm.CHOICE -> ChoiceGate(service)
+            GateForm.NOUL -> NoulGate(
+                service,
+                threshold = com.sheen.rokid.phone.plugin.smarthelper.proactive.NoulThreshold.VALUE,
+                question = PromptCatalog.pinned("proactive-gate"),
+            )
+            // 0.3 Phase 4A A7: the calibrated question and its neutral options are frozen authored resources; a
+            // paraphrase here would be a question the fine-tune never saw.
+            GateForm.CHOICE -> ChoiceGate(
+                service,
+                question = PromptCatalog.pinned("proactive-gate"),
+                options = parseGateOptions(PromptCatalog.pinned("proactive-gate-options")),
+            )
         }
     }
 
@@ -4424,6 +4441,11 @@ class SmartAssistantPlugin(
                 // A hint turn may execute exactly one tool call: the terminal `propose_hint` *is* the answer.
                 maxSteps = 1,
                 metricLine = P3Log::line,
+                // 0.3 Phase 4A A7: the same catalog loop prose as the wake/follow-up loop. A hint turn usually only
+                // reaches the timeout branch, but no production loop may fall back to a compiled-in instruction.
+                retryInstruction = PromptCatalog.loop("retry"),
+                planNudgeInstruction = PromptCatalog.loop("plan-nudge"),
+                timeoutInstruction = PromptCatalog.loop("timeout"),
             )
             synchronized(gate) {
                 if (request.cancelled) return

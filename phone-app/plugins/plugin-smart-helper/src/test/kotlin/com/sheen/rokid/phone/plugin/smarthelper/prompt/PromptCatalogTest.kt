@@ -100,7 +100,12 @@ class PromptCatalogTest {
             assertEquals(PromptKind.STATIC, kindOf[it], "$it must be a static fragment")
         }
         assertEquals(PromptKind.PINNED, kindOf["pinned/proactive-gate.md"], "the gate question is recalibrated, not edited")
-        assertEquals(16, entries.size, "the Phase 4A catalog has exactly sixteen resources")
+        assertEquals(
+            PromptKind.PINNED,
+            kindOf["pinned/proactive-gate-options.md"],
+            "the gate options are frozen with the question they belong to",
+        )
+        assertEquals(17, entries.size, "the Phase 4A catalog has exactly seventeen resources")
     }
 
     @Test
@@ -109,6 +114,10 @@ class PromptCatalogTest {
         assertEquals(promptText("loop/plan-nudge.md"), PromptCatalog.loop("plan-nudge"))
         assertEquals(promptText("loop/timeout.md"), PromptCatalog.loop("timeout"))
         assertEquals(promptText("pinned/proactive-gate.md"), PromptCatalog.pinned("proactive-gate"))
+        assertEquals(
+            promptText("pinned/proactive-gate-options.md"),
+            PromptCatalog.pinned("proactive-gate-options"),
+        )
         assertEquals(promptText("summarizer.md"), PromptCatalog.summarizer())
     }
 
@@ -125,15 +134,22 @@ class PromptCatalogTest {
 
     @Test
     fun `the system plan never includes a pinned resource`() {
-        val pinned = PromptCatalog.pinned("proactive-gate")
+        val pinned = listOf(
+            PromptCatalog.pinned("proactive-gate"),
+            PromptCatalog.pinned("proactive-gate-options"),
+        )
         val plan = PromptCatalog.plan(PromptRoute.WAKE, profileFixture())
 
-        assertTrue(
-            PromptCatalog.manifest().any { it.file == "pinned/proactive-gate.md" && it.kind == PromptKind.PINNED },
-            "the pinned resource must be in the manifest for this test to prove its exclusion",
-        )
+        for (file in listOf("pinned/proactive-gate.md", "pinned/proactive-gate-options.md")) {
+            assertTrue(
+                PromptCatalog.manifest().any { it.file == file && it.kind == PromptKind.PINNED },
+                "the pinned resource '$file' must be in the manifest for this test to prove its exclusion",
+            )
+        }
         assertFalse(plan.sections.any { it.kind == PromptKind.PINNED }, "PINNED content is not a system section")
-        assertFalse(pinned in plan.systemText, "the gate question belongs to its own call, not the system prompt")
+        for (text in pinned) {
+            assertFalse(text in plan.systemText, "the gate question/options belong to its own call, not the system prompt")
+        }
     }
 
     @Test

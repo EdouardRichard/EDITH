@@ -574,6 +574,11 @@ internal class SmartTestRig(
     /** edith-0.2 Phase B (B11): the intervention gate, `null` for the pre-B11 behaviour. */
     interventionGate: com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate? = null,
     /**
+     * edith-0.3 Phase 4A A7: the production gate form, `null` — the default — for a plugin with no gate. When set, the
+     * plugin builds a real `NoulGate`/`ChoiceGate` from the host's `SystemOneService` (the resource wiring under test).
+     */
+    gateForm: com.sheen.rokid.phone.plugin.smarthelper.proactive.GateForm? = null,
+    /**
      * 0.3 design §5.2/§6.3: the tuning the plugin derives its `ContextPolicy` with. The default is production's;
      * a test that needs the history allowance small without shrinking the profile's frame window lowers
      * `compressionThreshold` here.
@@ -650,6 +655,7 @@ internal class SmartTestRig(
             contextForTurn = contextForTurn,
             compressor = compressor,
             interventionGate = interventionGate,
+            gateForm = gateForm,
             contextTuning = contextTuning,
             conversationStores = conversationStores,
             isPanelVisible = { panelVisible },

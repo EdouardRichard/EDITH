@@ -106,7 +106,7 @@ class DiagnosticTextPlugin(
             Triple(c, t, cfg)
         }
         val (c, t, cfg) = snapshot
-        val text = if (cfg.synthetic) SYNTHETIC_INPUT else t.text
+        val text = if (cfg.synthetic) DiagnosticPrompts.syntheticInput else t.text
         if (!hostTextAllowed(text)) return
         val profile = profileLookup(cfg.profile)?.takeIf { it.id == cfg.profile && it.revision == cfg.revision } ?: return
         val validUntil = plusMillis(t.endNanos, turnBudgetMillis)
@@ -121,7 +121,7 @@ class DiagnosticTextPlugin(
         }
         close(old)
         val request = ModelRequest(EventEnvelope(c.sessionId, c.generation, o.requestId, now, now), o.requestId,
-            t.turnId, cfg.profile, cfg.revision, INSTRUCTIONS, listOf(InputPart.Text(text)), emptyList(),
+            t.turnId, cfg.profile, cfg.revision, DiagnosticPrompts.instructions, listOf(InputPart.Text(text)), emptyList(),
             OutputModality.TEXT, deadline)
         try {
             synchronized(gate) { if (owner !== o || o.closed) return; mark(TraceMark.REQUEST_START, o) }
@@ -202,9 +202,5 @@ class DiagnosticTextPlugin(
         if (millis > Long.MAX_VALUE / 1_000_000) return Long.MAX_VALUE
         val nanos = millis * 1_000_000
         return if (base > Long.MAX_VALUE - nanos) Long.MAX_VALUE else base + nanos
-    }
-    companion object {
-        const val INSTRUCTIONS = "仅对当前测试问题给出一句简短中文建议。不要返回推理、工具调用或个人资料。"
-        const val SYNTHETIC_INPUT = "只回复测试通过"
     }
 }

@@ -16,6 +16,11 @@ import kotlin.test.assertNotEquals
  * final-fix wave for the prose corrections (`400 个码点` and the tools/wake "report before acting" reconciliation), and
  * re-captured for the Phase 4A Task 6 24-tool rewrite and its catalog version `0.4.0`. Any further edit must update them
  * explicitly.
+ *
+ * Phase 4A Task 7 (A7) is deliberately **not** a re-capture: the pinned gate options and the structured `summarizer.md`
+ * are independent fixed prompts outside every system plan, and [PromptPlan.hash] fingerprints only the ordered section
+ * texts (not the catalog version), so the plan bytes are unchanged. The catalog version moves to `0.4.1`, which
+ * `PromptTelemetryTest` pins.
  */
 class PromptSnapshotTest {
 

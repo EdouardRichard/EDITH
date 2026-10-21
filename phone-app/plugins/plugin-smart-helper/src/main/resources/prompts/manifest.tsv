@@ -13,4 +13,5 @@ loop.retry	loop/retry.md	STATIC	1	循环：空回合重试指令
 loop.plan-nudge	loop/plan-nudge.md	STATIC	1	循环：计划未执行纠偏指令
 loop.timeout	loop/timeout.md	STATIC	1	循环：工具超时后的观察指令
 pinned.proactive-gate	pinned/proactive-gate.md	PINNED	1	Laya 门问句（标定后冻结，不得改写字面）
-summarizer	summarizer.md	STATIC	1	异步摘要指令
+pinned.proactive-gate-options	pinned/proactive-gate-options.md	PINNED	1	Laya 门选项 A/B（标定后冻结，不得改写字面）
+summarizer	summarizer.md	STATIC	2	异步摘要指令（0.3 设计 §6.4 六段结构化模板）

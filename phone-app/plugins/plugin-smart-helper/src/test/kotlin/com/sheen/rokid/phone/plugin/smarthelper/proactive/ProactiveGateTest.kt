@@ -1,7 +1,9 @@
 package com.sheen.rokid.phone.plugin.smarthelper.proactive
 
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.plugin.FailureReason
 import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneCriterion
 import com.sheen.rokid.plugin.SystemOneQuestion
 import com.sheen.rokid.plugin.SystemOneQuestionType
 import com.sheen.rokid.plugin.SystemOneResult
@@ -290,6 +292,45 @@ class ProactiveGateTest {
         val gate = NoulGate(ScriptedSystemOne(ok(SystemOneAnswer.Noul(0.9, 0.5))), threshold = 0.6)
 
         assertEquals(231.0, gate.shouldIntervene(state()).latencyMs, 0.0001)
+    }
+
+    // ---------------------------------------------------------------- pinned resources (0.3 Phase 4A A7)
+
+    @Test
+    fun `the pinned gate resources are the production literals verbatim`() {
+        // The fine-tune spec pins one exact question *and* its two neutral options. Both are authored resources from
+        // A7 on, so the deployed bytes must equal the calibrated bytes field for field.
+        val question = PromptCatalog.pinned("proactive-gate")
+        val options = PromptCatalog.pinned("proactive-gate-options")
+
+        assertEquals(INTERVENTION_PROPOSITION, question)
+        // The frozen serialization: one option per line, `label<TAB>description`.
+        assertEquals(
+            "A\tyes — 存在一个需要大模型介入的缺口\n" +
+                "B\tno — 此刻不需要大模型介入",
+            options,
+        )
+        val parsed = parseGateOptions(options)
+        assertEquals(INTERVENTION_CRITERIA, parsed)
+        assertEquals("yes — 存在一个需要大模型介入的缺口", parsed.first().description)
+        assertEquals("no — 此刻不需要大模型介入", parsed.last().description)
+    }
+
+    @Test
+    fun `the gate constructors ask the injected question and options`() {
+        val noul = ScriptedSystemOne(ok(SystemOneAnswer.Noul(0.9, 0.5)))
+        NoulGate(noul, threshold = 0.6, question = "资源问句").shouldIntervene(state())
+        assertEquals("资源问句", noul.asked.single().instructions)
+
+        val choice = ScriptedSystemOne(ok(SystemOneAnswer.Choice("A", mapOf("A" to 0.9), 0.9)))
+        val options = listOf(
+            SystemOneCriterion("A", "注入的肯定项"),
+            SystemOneCriterion("B", "注入的否定项"),
+        )
+        assertTrue(ChoiceGate(choice, question = "资源问句", options = options).shouldIntervene(state()).intervene)
+        val asked = choice.asked.single()
+        assertEquals("资源问句", asked.instructions)
+        assertEquals(options, asked.criteria)
     }
 
     private fun ok(answer: SystemOneAnswer) = SystemOneResult.Success(answer, latencyMs = 231.0)

@@ -43,6 +43,9 @@ interface ProactiveGate {
  * The proposition both forms ask. **Pinned by the fine-tune spec** (`2026-10-13-laya-gate-finetune-design.md` §3.3),
  * not chosen here: a fine-tune trains on one exact string, so the trained string and the deployed string must be the
  * same one or the gain is unclaimable on the deployed question.
+ *
+ * Since 0.3 Phase 4A A7 the production bytes live in `prompts/pinned/proactive-gate.md`; this constant remains the
+ * constructor default so existing callers and tests keep the calibrated string.
  */
 const val INTERVENTION_PROPOSITION = "此刻是否存在一个需要大模型介入的缺口"
 
@@ -51,16 +54,47 @@ const val INTERVENTION_PROPOSITION = "此刻是否存在一个需要大模型介
  *
  * `介入`/`沉默` would be worse than neutral keys: an option label dominates the state in this model's prompt, so a
  * label that names the decision lets the label make it. `A`/`B` carry the meaning in the descriptions instead.
+ *
+ * A7 moves the production bytes to `prompts/pinned/proactive-gate-options.md`, parsed by [parseGateOptions]; this list
+ * stays the constructor default and the frozen reference the resource is compared against.
  */
 val INTERVENTION_CRITERIA = listOf(
     SystemOneCriterion("A", "yes — 存在一个需要大模型介入的缺口"),
     SystemOneCriterion("B", "no — 此刻不需要大模型介入"),
 )
 
+/**
+ * Parses the pinned gate-options resource (0.3 Phase 4A A7): one option per line, `label<TAB>description`.
+ *
+ * The format is deliberately a literal serialization of [SystemOneCriterion]: option labels are neutral keys, the
+ * description is what the model reads, and both are frozen by the fine-tune calibration, so a line's fields are kept
+ * verbatim (no trimming inside a field) and every malformed line fails loudly at construction time.
+ */
+internal fun parseGateOptions(text: String): List<SystemOneCriterion> {
+    val options = text.lines()
+        .map { line -> line.removeSuffix("\r") }
+        .filter { line -> line.isNotEmpty() }
+        .mapIndexed { index, line ->
+            val fields = line.split('\t')
+            require(fields.size == 2) {
+                "gate option ${index + 1} must be 'label<TAB>description', was '$line'"
+            }
+            require(fields[0].isNotBlank() && fields[1].isNotBlank()) {
+                "gate option ${index + 1} needs a non-blank label and description, was '$line'"
+            }
+            SystemOneCriterion(fields[0], fields[1])
+        }
+    require(options.size >= 2) { "the gate needs at least two options, found ${options.size}" }
+    require(options.map { it.label }.distinct().size == options.size) { "gate option labels must be unique" }
+    return options
+}
+
 /** The `noul` form: one Bernoulli question, and a threshold the caller calibrates. */
 class NoulGate(
     private val service: SystemOneService,
     private val threshold: Double = NoulThreshold.VALUE,
+    /** The calibrated proposition; production passes `PromptCatalog.pinned("proactive-gate")`. */
+    private val question: String = INTERVENTION_PROPOSITION,
 ) : ProactiveGate {
 
     override val form = GateForm.NOUL
@@ -69,7 +103,7 @@ class NoulGate(
         decide(
             service,
             state,
-            SystemOneQuestion(SystemOneQuestionType.NOUL, INTERVENTION_PROPOSITION),
+            SystemOneQuestion(SystemOneQuestionType.NOUL, question),
         ) { answer, latency ->
             when (answer) {
                 is SystemOneAnswer.Noul ->
@@ -81,21 +115,27 @@ class NoulGate(
 }
 
 /** The `choice` form: the same proposition with two named options. */
-class ChoiceGate(private val service: SystemOneService) : ProactiveGate {
+class ChoiceGate(
+    private val service: SystemOneService,
+    /** The calibrated proposition; production passes `PromptCatalog.pinned("proactive-gate")`. */
+    private val question: String = INTERVENTION_PROPOSITION,
+    /** The calibrated neutral options, parsed from `pinned/proactive-gate-options.md` in production. */
+    private val options: List<SystemOneCriterion> = INTERVENTION_CRITERIA,
+) : ProactiveGate {
     override val form = GateForm.CHOICE
 
     override fun shouldIntervene(state: ProactiveGateState): GateOutcome =
         decide(
             service,
             state,
-            SystemOneQuestion(SystemOneQuestionType.CHOICE, INTERVENTION_PROPOSITION, INTERVENTION_CRITERIA),
+            SystemOneQuestion(SystemOneQuestionType.CHOICE, question, options),
         ) { answer, latency ->
             when (answer) {
                 is SystemOneAnswer.Choice -> when (answer.choice) {
-                    INTERVENTION_CRITERIA.first().label ->
+                    options.first().label ->
                         GateOutcome(intervene = true, confidence = answer.confidence, latencyMs = latency)
 
-                    INTERVENTION_CRITERIA.last().label ->
+                    options.last().label ->
                         GateOutcome(intervene = false, confidence = answer.confidence, latencyMs = latency)
 
                     else -> GateOutcome(false, 0.0, latency, "UNKNOWN_LABEL")

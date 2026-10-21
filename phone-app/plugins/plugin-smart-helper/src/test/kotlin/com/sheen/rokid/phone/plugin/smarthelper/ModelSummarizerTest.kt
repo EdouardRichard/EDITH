@@ -18,6 +18,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.context.ConversationContext
 import com.sheen.rokid.phone.plugin.smarthelper.context.ModelSummarizer
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
@@ -74,6 +75,7 @@ class ModelSummarizerTest {
             client = model,
             profileLookup = { profile },
             profileId = "profile-x",
+            prompt = PromptCatalog.summarizer(),
             clock = clock,
             scheduler = SmartFakeScheduler(clock),
             envelopeFor = { requestId, startNanos, endNanos ->
@@ -121,6 +123,33 @@ class ModelSummarizerTest {
             "the transcript to summarise has to be what the request carries",
         )
         assertTrue(request.tools.isEmpty(), "a summary must never be able to execute anything: ${request.tools}")
+    }
+
+    @Test
+    fun `the summary request carries the six-part structured template`() {
+        // 0.3 design §6.4: the summarizer's instruction is a structured six-part template authored in
+        // `prompts/summarizer.md`, not the one-sentence compression instruction of the first migration.
+        val summarizer = newSummarizer()
+        model.onRequest = answers("（摘要）")
+
+        assertEquals("（摘要）", summarizer.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
+
+        val instructions = model.requests.single().instructions
+        assertEquals(PromptCatalog.summarizer(), instructions, "the request must carry the catalog's authored prompt")
+        listOf(
+            "当前目标与约束",
+            "已确认事实与偏好",
+            "已执行动作与结果",
+            "关键实体",
+            "未完成事项与下一步",
+            "禁止",
+        ).forEach { section ->
+            assertTrue(section in instructions, "design §6.4's six-part template must name 「$section」: $instructions")
+        }
+        assertTrue(
+            "编造" in instructions && "补充建议" in instructions && "提问" in instructions,
+            "the template must keep the no-invention/no-advice/no-question prohibition: $instructions",
+        )
     }
 
     @Test
@@ -273,6 +302,12 @@ class ModelSummarizerTest {
 
         val summaryRequests = rig.model.requests.count { it.tools.isEmpty() }
         assertTrue(summaryRequests > 0, "the production compressor never asked the summarizer: ${rig.model.requests.size} requests")
+        val summaryRequest = rig.model.requests.first { it.tools.isEmpty() }
+        assertEquals(
+            PromptCatalog.summarizer(),
+            summaryRequest.instructions,
+            "the activated plugin must pass the catalog's summarizer prompt, not a compiled-in copy",
+        )
         // "Lands in exactly one place" is one placeholder **per truncating compression**, and never more: a long
         // session compresses repeatedly, and a compression whose whole transcript is anchored (`truncated=0`) starts no
         // summary at all. The count is therefore bounded by the log lines rather than assumed equal to them — an
