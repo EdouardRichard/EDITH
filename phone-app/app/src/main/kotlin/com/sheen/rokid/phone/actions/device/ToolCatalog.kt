@@ -22,16 +22,16 @@ import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.longOrNull
 
 /**
- * R40/R47: the production `Capability.Actions` provider.
+ * R40/R47: the production `Capability.Actions` provider (since edith-0.3 Phase 4A it is joined with the atomic backends
+ * by `com.sheen.rokid.phone.actions.ToolSurface`).
  *
- * It advertises exactly the four host tools — `device`, `shell`, `open`, `dial` — and re-probes
- * each channel on **every** `descriptors()`/`execute()` call, because a channel's answer changes
- * while the App runs (accessibility switched off, Shizuku binder dead, `CALL_PHONE` revoked). An
- * unavailable channel's tool is not advertised, and a call that arrives after its channel went down
- * is refused instead of being delegated. The one exception is `device`: it stays advertised because
- * its `status` action must be answerable while the accessibility service is down, and the other
- * actions are still refused at execution time. The plugin adds `notify_user`/`load_skill` beside
- * this catalog, which is what makes the model-visible surface exactly six (R40).
+ * It advertises exactly the four host tools — `device`, `shell`, `open`, `dial` — in a fixed order on **every** read.
+ * Phase 4A Task 3 (A3) made that advertising **stable**: a channel's answer changes while the App runs (accessibility
+ * switched off, Shizuku binder dead, `CALL_PHONE` revoked), but hiding a down channel's tool would change the schema
+ * and the cached prompt prefix under the model mid-session, so the tool stays advertised and `execute` re-probes the
+ * channel on **every** call, refusing instead of delegating. `device` was always advertised this way because its
+ * `status` action must be answerable while the accessibility service is down. The plugin adds `notify_user`/`load_skill`
+ * beside this catalog, which is what made the pre-Phase-4 model-visible surface exactly six (R40).
  *
  * edith-0.3 Phase 2.2 Task 6: `shell`/`dial` results also carry a post-call observation, structured
  * execution facts and at most one best-effort image. This catalog owns that enrichment (the two tools
@@ -80,22 +80,19 @@ class ToolCatalog(
     private val capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
 ) : ActionExecutor, AutoCloseable {
 
-    override fun descriptors(): List<ActionDescriptor> = buildList {
-        // Task 7 review I2 (R11): `device` stays advertised even while the accessibility channel is down. Its `status`
-        // action is the diagnosis that reports `accessibility=false`/`locked=true`; hiding the whole tool behind the
-        // condition it exists to report made that answer unreachable on a blind phone. Every non-status action is still
-        // refused by `execute`'s a11y check below, so the advertisement cannot run anything the channel cannot serve.
-        add(device.descriptors().single())
-        if (shellAvailable()) {
-            // Task 12 fix (R99): the shell descriptor keeps its machine cap and declares `mayAskHuman`; the plugin wraps
-            // this executor in `ConfirmingActions`, which asks the wearer inside the same `execute` call, and the agent
-            // loop adds the human allowance plus shifts the measured wait out of the turn (D49). Inflating
-            // `timeoutMillis` here would be clamped by the turn deadline and cut a legal 120 s decision.
-            add(shell.descriptors().single())
-            add(open.descriptors().single())
-        }
-        if (callAvailable()) add(dial.descriptors().single())
-    }
+    override fun descriptors(): List<ActionDescriptor> = listOf(
+        // Task 7 review I2 (R11) made `device` stay advertised for its `status` diagnosis; A3 applies the same stable
+        // rule to all four: a down channel still advertises its tool and `execute` below answers the refusal. Hiding a
+        // tool would change the model-visible schema (and the cached prompt prefix) mid-session.
+        device.descriptors().single(),
+        // Task 12 fix (R99): the shell descriptor keeps its machine cap and declares `mayAskHuman`; the plugin wraps
+        // this executor in `ConfirmingActions`, which asks the wearer inside the same `execute` call, and the agent
+        // loop adds the human allowance plus shifts the measured wait out of the turn (D49). Inflating
+        // `timeoutMillis` here would be clamped by the turn deadline and cut a legal 120 s decision.
+        shell.descriptors().single(),
+        open.descriptors().single(),
+        dial.descriptors().single(),
+    )
 
     override fun execute(name: String, argsJson: String): ActionResult {
         // M1: one shape line per call, before any channel/gate decision, so a refusal and a wrong model choice are

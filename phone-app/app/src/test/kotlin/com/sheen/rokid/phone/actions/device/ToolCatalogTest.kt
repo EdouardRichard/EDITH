@@ -47,8 +47,12 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * R40/R47: the production `Capability.Actions` provider is exactly the four host tools, gated live,
- * with no fallback to the retired 21.
+ * R40/R47: the production `Capability.Actions` provider is exactly the four host tools, with no fallback to the retired
+ * 21.
+ *
+ * edith-0.3 Phase 4A Task 3 (A3): advertising is **stable**. A channel that goes down no longer removes its tool - the
+ * schema and the cached prompt prefix must not change under the model mid-session - so `descriptors()` always answers
+ * the same four names and `execute` is where the channel refusal is produced.
  */
 class ToolCatalogTest {
 
@@ -90,41 +94,34 @@ class ToolCatalogTest {
     }
 
     @Test
-    fun `an unavailable a11y channel keeps device advertised for status while shell and call still gate`() {
-        val probes = Probes(a11y = false)
-
-        // Task 7 review I2 (R11): `status` is the call that reports `accessibility=false`, so hiding the whole tool
-        // would hide the diagnosis behind the condition. The device tool stays advertised; every non-status action is
-        // still refused at execution time by the a11y check below.
-        val a11yDown = catalog(probes).descriptors().map { it.name }
-        assertTrue("device must stay advertised while a11y is down", a11yDown.contains("device"))
-        assertEquals(listOf("device", "shell", "open", "dial"), a11yDown)
-
-        probes.a11y = true
-        probes.shell = false
-        val shellDown = catalog(probes).descriptors().map { it.name }
-        assertFalse(shellDown.contains("shell"))
-        assertFalse(shellDown.contains("open"))
-        assertEquals(listOf("device", "dial"), shellDown)
-
-        probes.shell = true
-        probes.call = false
-        val callDown = catalog(probes).descriptors().map { it.name }
-        assertFalse(callDown.contains("dial"))
-        assertEquals(listOf("device", "shell", "open"), callDown)
-    }
-
-    @Test
-    fun `descriptors re-probe their channels on every read`() {
+    fun `the four host tools are advertised in every channel state and on every read`() {
         val probes = Probes()
         val catalog = catalog(probes)
-        assertTrue(catalog.descriptors().any { it.name == "shell" })
+        val expected = listOf("device", "shell", "open", "dial")
+
+        fun assertAdvertised(state: String) {
+            assertEquals(state, expected, catalog.descriptors().map { it.name })
+        }
+
+        assertAdvertised("all channels up")
+        assertAdvertised("a second read of the same catalog")
+
+        probes.a11y = false
+        assertAdvertised("accessibility down")
+        probes.a11y = true
 
         probes.shell = false
-        assertFalse(catalog.descriptors().any { it.name == "shell" })
-
+        assertAdvertised("Shizuku down")
         probes.shell = true
-        assertTrue(catalog.descriptors().any { it.name == "shell" })
+
+        probes.call = false
+        assertAdvertised("call permission revoked")
+        probes.call = true
+
+        probes.a11y = false
+        probes.shell = false
+        probes.call = false
+        assertAdvertised("every channel down")
     }
 
     @Test
