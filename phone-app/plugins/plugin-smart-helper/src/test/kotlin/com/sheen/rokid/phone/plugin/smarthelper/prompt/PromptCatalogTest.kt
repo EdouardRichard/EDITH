@@ -1,6 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.prompt
 
-import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
@@ -10,20 +9,30 @@ import kotlin.test.assertTrue
 
 /**
  * The prompt catalog is the single place that selects, orders and versions the system prompt
- * (spec §4.1, §4.6).
+ * (spec §4.1, §4.6; Phase 3 §5.1 splits the selection into [PromptRoute]).
  *
  * These tests pin the contract the rest of the harness builds on:
  * - the manifest is the catalog: every entry loads and every entry has a legal kind;
  * - a system plan never contains an unresolved slot or a DYNAMIC section;
  * - the section order is core 00→50, the route posture, then the rendered device profile;
  * - the dynamic runtime template stays out of `systemText`;
- * - the same route + profile is deterministic (same text, same hash).
+ * - the same route + profile is deterministic (same text, same hash);
+ * - each of the three routes selects exactly its own posture, and the manifest must list all three.
  */
 class PromptCatalogTest {
 
+    private val coreIds = listOf(
+        "core.identity",
+        "core.operating",
+        "core.tools",
+        "core.safety",
+        "core.output",
+        "core.memory-policy",
+    )
+
     @Test
     fun `every manifest entry loads and every system plan has no slots`() {
-        val plan = PromptCatalog.plan(ContextRoute.WAKE, profileFixture())
+        val plan = PromptCatalog.plan(PromptRoute.WAKE, profileFixture())
 
         assertTrue(plan.systemText.isNotBlank())
         assertFalse("{{" in plan.systemText, "a rendered system prompt must not keep any slot syntax")
@@ -56,8 +65,8 @@ class PromptCatalogTest {
     @Test
     fun `the same profile and route produce the same hash twice`() {
         assertEquals(
-            PromptCatalog.plan(ContextRoute.WAKE, profileFixture()).hash,
-            PromptCatalog.plan(ContextRoute.WAKE, profileFixture()).hash,
+            PromptCatalog.plan(PromptRoute.WAKE, profileFixture()).hash,
+            PromptCatalog.plan(PromptRoute.WAKE, profileFixture()).hash,
         )
     }
 
@@ -123,7 +132,7 @@ class PromptCatalogTest {
 
     @Test
     fun `the plan orders core then route then the rendered device profile`() {
-        val plan = PromptCatalog.plan(ContextRoute.WAKE, profileFixture())
+        val plan = PromptCatalog.plan(PromptRoute.WAKE, profileFixture())
 
         assertEquals(
             listOf(
@@ -145,42 +154,95 @@ class PromptCatalogTest {
     }
 
     @Test
-    fun `the wake and proactive routes select their own posture resource`() {
-        val wake = PromptCatalog.plan(ContextRoute.WAKE, profileFixture())
-        val proactive = PromptCatalog.plan(ContextRoute.PROACTIVE, profileFixture())
+    fun `each prompt route selects only its own posture resource`() {
+        val wake = PromptCatalog.plan(PromptRoute.WAKE, profileFixture())
+        val hint = PromptCatalog.plan(PromptRoute.PROACTIVE_HINT, profileFixture())
+        val followUp = PromptCatalog.plan(PromptRoute.PROACTIVE_FOLLOWUP, profileFixture())
         val wakePosture = promptText("route/wake.md")
         val hintPosture = promptText("route/proactive-hint.md")
+        val followUpPosture = promptText("route/proactive-followup.md")
 
         assertTrue(wakePosture.isNotBlank())
         assertTrue(hintPosture.isNotBlank())
+        assertTrue(followUpPosture.isNotBlank())
         assertTrue(wakePosture in wake.systemText)
-        assertTrue(hintPosture in proactive.systemText)
+        assertTrue(hintPosture in hint.systemText)
+        assertTrue(followUpPosture in followUp.systemText)
+
         assertFalse(hintPosture in wake.systemText)
-        assertFalse(wakePosture in proactive.systemText)
-        assertNotEquals(wake.hash, proactive.hash)
+        assertFalse(followUpPosture in wake.systemText)
+        assertFalse(wakePosture in hint.systemText)
+        assertFalse(followUpPosture in hint.systemText)
+        assertFalse(wakePosture in followUp.systemText)
+        assertFalse(hintPosture in followUp.systemText)
+
+        assertEquals(
+            3,
+            setOf(wake.hash, hint.hash, followUp.hash).size,
+            "every prompt route must fingerprint its own plan",
+        )
     }
 
     @Test
-    fun `the phase three follow up resource is authored but not selected yet`() {
-        val followUp = promptText("route/proactive-followup.md")
+    fun `all three plans share the core sections and add only their own route posture`() {
+        val expectedRouteIds = mapOf(
+            PromptRoute.WAKE to "route.wake",
+            PromptRoute.PROACTIVE_HINT to "route.proactive-hint",
+            PromptRoute.PROACTIVE_FOLLOWUP to "route.proactive-followup",
+        )
+        val plans = PromptRoute.entries.associateWith { PromptCatalog.plan(it, profileFixture()) }
+        val wakeCoreTexts = plans.getValue(PromptRoute.WAKE).sections.take(coreIds.size).map { it.text }
 
-        assertTrue(followUp.isNotBlank())
-        assertFalse(followUp in PromptCatalog.plan(ContextRoute.WAKE, profileFixture()).systemText)
-        assertFalse(followUp in PromptCatalog.plan(ContextRoute.PROACTIVE, profileFixture()).systemText)
-    }
-
-    @Test
-    fun `the follow up posture describes a user who replied in a normal task turn`() {
-        val followUp = promptText("route/proactive-followup.md")
-
-        assertTrue("用户已经接话" in followUp, "spec §8.2: the follow-up turn starts from a user reply")
-        assertTrue("正常任务回合" in followUp, "spec §8.2: follow-up is a normal task turn")
-        listOf("观察", "执行", "确认").forEach {
-            assertTrue(it in followUp, "spec §8.2: the follow-up turn may $it")
+        for ((route, plan) in plans) {
+            assertEquals(
+                coreIds,
+                plan.sections.take(coreIds.size).map { it.id },
+                "$route must start with the shared core sections",
+            )
+            assertEquals(
+                wakeCoreTexts,
+                plan.sections.take(coreIds.size).map { it.text },
+                "$route must not rewrite the shared core sections",
+            )
+            assertEquals(
+                expectedRouteIds.getValue(route),
+                plan.sections[coreIds.size].id,
+                "$route's seventh section must be its own posture",
+            )
+            assertEquals(
+                listOf("context.device-profile"),
+                plan.sections.drop(coreIds.size + 1).map { it.id },
+                "$route ends with the same rendered device profile",
+            )
         }
-        assertTrue("修正之前的提醒" in followUp, "spec §8.2: revise the earlier reminder from the latest input")
-        assertFalse("没有回应" in followUp, "the user did reply; silence is the wrong starting state")
-        assertFalse("保持沉默" in followUp, "a follow-up is a normal task turn, not another hint decision")
+    }
+
+    @Test
+    fun `the follow up plan carries the 用户已经接话 posture`() {
+        val followUp = PromptCatalog.plan(PromptRoute.PROACTIVE_FOLLOWUP, profileFixture()).systemText
+        val followUpPosture = promptText("route/proactive-followup.md")
+
+        assertTrue(followUpPosture in followUp, "the follow-up plan must select its own route resource")
+        assertTrue("用户已经接话" in followUp, "spec §8.2: the follow-up turn starts from a user reply")
+    }
+
+    @Test
+    fun `validateCatalog rejects a manifest that omits any route posture`() {
+        for (missing in listOf("route/wake.md", "route/proactive-hint.md", "route/proactive-followup.md")) {
+            val withoutRoute = PromptCatalog.manifest().filterNot { it.file == missing }
+            assertFailsWith<IllegalArgumentException>("a manifest without $missing must be rejected") {
+                PromptCatalog.validateCatalog(withoutRoute)
+            }
+        }
+    }
+
+    @Test
+    fun `the prompt route names are the P3_PROMPT labels`() {
+        assertEquals(
+            listOf("WAKE", "PROACTIVE_HINT", "PROACTIVE_FOLLOWUP"),
+            PromptRoute.entries.map { it.name },
+            "P3_PROMPT must name the three prompt routes, not the two ContextRoute values",
+        )
     }
 
     @Test
@@ -234,8 +296,8 @@ class PromptCatalogTest {
 
     @Test
     fun `a null profile drops the device profile section`() {
-        val withProfile = PromptCatalog.plan(ContextRoute.WAKE, profileFixture())
-        val withoutProfile = PromptCatalog.plan(ContextRoute.WAKE, null)
+        val withProfile = PromptCatalog.plan(PromptRoute.WAKE, profileFixture())
+        val withoutProfile = PromptCatalog.plan(PromptRoute.WAKE, null)
 
         assertTrue(withProfile.sections.any { it.kind == PromptKind.SESSION_STATIC })
         assertFalse(withoutProfile.sections.any { it.kind == PromptKind.SESSION_STATIC })
@@ -245,11 +307,25 @@ class PromptCatalogTest {
     @Test
     fun `the dynamic template stays outside the system prompt`() {
         val template = PromptCatalog.dynamicTemplate()
-        val systemText = PromptCatalog.plan(ContextRoute.WAKE, profileFixture()).systemText
+        val systemText = PromptCatalog.plan(PromptRoute.WAKE, profileFixture()).systemText
 
         assertTrue("{{time}}" in template)
         assertTrue("{{deviceState}}" in template)
         assertFalse(template.trim() in systemText)
         assertFalse("{{" in systemText)
+    }
+
+    @Test
+    fun `the follow up posture describes a user who replied in a normal task turn`() {
+        val followUp = promptText("route/proactive-followup.md")
+
+        assertTrue("用户已经接话" in followUp, "spec §8.2: the follow-up turn starts from a user reply")
+        assertTrue("正常任务回合" in followUp, "spec §8.2: follow-up is a normal task turn")
+        listOf("观察", "执行", "确认").forEach {
+            assertTrue(it in followUp, "spec §8.2: the follow-up turn may $it")
+        }
+        assertTrue("修正之前的提醒" in followUp, "spec §8.2: revise the earlier reminder from the latest input")
+        assertFalse("没有回应" in followUp, "the user did reply; silence is the wrong starting state")
+        assertFalse("保持沉默" in followUp, "a follow-up is a normal task turn, not another hint decision")
     }
 }

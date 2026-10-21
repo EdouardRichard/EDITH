@@ -1,6 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.prompt
 
-import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.plugin.DeviceProfile
 
 /**
@@ -25,9 +24,9 @@ internal data class PromptManifestEntry(
  * how device facts are rendered into them. That keeps the static prompt reviewable as Markdown and
  * keeps `PromptCatalog` free of business wording.
  *
- * Layout produced by [plan], from spec §4.2 and the Task 4 brief:
+ * Layout produced by [plan], from spec §4.2 and the Phase 3 brief:
  * 1. the core sections in filename order (00-identity … 50-memory-policy);
- * 2. the route posture (`route/wake.md` or `route/proactive-hint.md`; Phase 3 adds the follow-up);
+ * 2. the route posture (`route/wake.md`, `route/proactive-hint.md` or `route/proactive-followup.md`);
  * 3. `context/device-profile.md`, rendered from the live [DeviceProfile], only when a profile exists;
  * 4. any `PINNED` sections (none in Phase 1).
  *
@@ -47,10 +46,15 @@ object PromptCatalog {
     /** The only directories a manifest file may live in. */
     private val RESOURCE_FOLDERS = setOf("core", "route", "context")
 
-    /** Phase 1 route mapping; Phase 3 owns the follow-up split (brief, Task 4). */
-    private val ROUTE_FILES: Map<ContextRoute, String> = mapOf(
-        ContextRoute.WAKE to "route/wake.md",
-        ContextRoute.PROACTIVE to "route/proactive-hint.md",
+    /**
+     * Every prompt route's posture resource (0.3 Phase 3 spec §5.1). The follow-up route is a separate posture from
+     * the hint even though both belong to the proactive chain: a hint decides whether to speak, a follow-up answers a
+     * wearer who already replied.
+     */
+    private val ROUTE_FILES: Map<PromptRoute, String> = mapOf(
+        PromptRoute.WAKE to "route/wake.md",
+        PromptRoute.PROACTIVE_HINT to "route/proactive-hint.md",
+        PromptRoute.PROACTIVE_FOLLOWUP to "route/proactive-followup.md",
     )
 
     /** The only accepted placeholder shape, matching [PromptRenderer]. */
@@ -133,7 +137,7 @@ object PromptCatalog {
      * [PromptPlan.hash] fingerprints the rendered texts, so `P3_PROMPT` can prove which prompt ran.
      * The plan never contains a `DYNAMIC` section and never keeps a `{{slot}}`.
      */
-    fun plan(route: ContextRoute, profile: DeviceProfile?): PromptPlan {
+    internal fun plan(route: PromptRoute, profile: DeviceProfile?): PromptPlan {
         val sections = mutableListOf<PromptSection>()
         val entries = manifest()
 
@@ -238,10 +242,13 @@ object PromptCatalog {
     }
 
     /**
-     * Cross-entry invariants: the core sections are STATIC, every Phase 1 route has its posture
-     * file, and there is exactly one device-profile template and one runtime-state template.
+     * Cross-entry invariants: the core sections are STATIC, every [PromptRoute] has its posture file, and there is
+     * exactly one device-profile template and one runtime-state template.
+     *
+     * Internal (rather than private) so the rejection path for a missing route is testable from a manifest fixture,
+     * exactly like [parseManifest].
      */
-    private fun validateCatalog(entries: List<PromptManifestEntry>) {
+    internal fun validateCatalog(entries: List<PromptManifestEntry>) {
         val byFile = entries.associateBy { it.file }
 
         val core = entries.filter { it.file.startsWith("core/") }
@@ -250,7 +257,7 @@ object PromptCatalog {
             require(it.kind == PromptKind.STATIC) { "core section '${it.id}' must be STATIC" }
         }
 
-        for (route in ContextRoute.entries) {
+        for (route in PromptRoute.entries) {
             val routeFile = ROUTE_FILES[route]
                 ?: throw IllegalStateException("no prompt route mapping for $route")
             val routeEntry = byFile[routeFile]

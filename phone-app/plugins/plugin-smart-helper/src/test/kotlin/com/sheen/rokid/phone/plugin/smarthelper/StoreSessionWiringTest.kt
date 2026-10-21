@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemorySource
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryKind
@@ -548,7 +549,7 @@ class StoreSessionWiringTest {
      * is then the only variable, which is exactly the conjunction the ③ gate is.
      */
     private fun tinyWindowProfile(): ModelProfile {
-        val system = PromptCatalog.plan(ContextRoute.WAKE, null).systemText
+        val system = PromptCatalog.plan(PromptRoute.WAKE, null).systemText
         val fixedPrompt = 32 + measure(system) + measure(tinyInput)
         return smartProfile().copy(
             usableWindowTokens = fixedPrompt + 10 + 1_000 + 100,
@@ -623,7 +624,7 @@ class StoreSessionWiringTest {
     private fun windowSizedFor(vararg survivors: String): ModelProfile {
         // 0.3 Task 12: the system slot is the session's profile-less WAKE catalog plan (this rig supplies no device
         // provider and no SKILL directory).
-        val system = PromptCatalog.plan(ContextRoute.WAKE, null).systemText
+        val system = PromptCatalog.plan(PromptRoute.WAKE, null).systemText
         val total = 32 + measure(system) + survivors.sumOf { measure(it) }
         val desiredHardLimit = total + 8
         // `hardLimit = hardInput - max(1, floor(hardInput * 0.10))`; find the first hard input that keeps the survivors.

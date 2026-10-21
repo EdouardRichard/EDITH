@@ -10,6 +10,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.profileFixture
 import com.sheen.rokid.phone.plugin.smarthelper.skill.LoadSkillTool
 import com.sheen.rokid.plugin.Capability
@@ -195,7 +196,7 @@ class PromptTelemetryTest {
         val lines = wakeLines(rig)
 
         val line = promptLine(lines)
-        val plan = PromptCatalog.plan(ContextRoute.WAKE, profile)
+        val plan = PromptCatalog.plan(PromptRoute.WAKE, profile)
         assertTrue(
             Regex(
                 """^P3_PROMPT version=0\.3\.0 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
@@ -285,7 +286,7 @@ class PromptTelemetryTest {
 
         val line = promptLine(lines)
         assertTrue("deviceHash=none" in line, "a missing provider is a stable 'none', not an invented profile: $line")
-        val plan = PromptCatalog.plan(ContextRoute.WAKE, null)
+        val plan = PromptCatalog.plan(PromptRoute.WAKE, null)
         assertEquals(plan.hash, field(line, "hash"), "the plan hash must be the profile-less plan: $line")
         assertEquals(plan.systemText.length.toString(), field(line, "staticChars"), line)
 
@@ -295,7 +296,7 @@ class PromptTelemetryTest {
     }
 
     @Test
-    fun `a proactive request logs route=PROACTIVE with the proactive plan`() {
+    fun `a proactive hint request logs route=PROACTIVE_HINT with the hint plan`() {
         // The proactive route has no AgentLoop: it assembles its frame and calls the gateway directly, so its line is
         // emitted by that request assembly. The plan is the PROACTIVE one, never the wake plan.
         //
@@ -325,22 +326,22 @@ class PromptTelemetryTest {
         }
 
         val line = promptLine(lines)
-        val plan = PromptCatalog.plan(ContextRoute.PROACTIVE, profile)
+        val plan = PromptCatalog.plan(PromptRoute.PROACTIVE_HINT, profile)
         assertTrue(
             Regex(
                 """^P3_PROMPT version=0\.3\.0 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
-                    """catalogHash=(?:[0-9a-f]{64}|none) route=PROACTIVE staticChars=\d+ dynamicChars=0$""",
+                    """catalogHash=(?:[0-9a-f]{64}|none) route=PROACTIVE_HINT staticChars=\d+ dynamicChars=0$""",
             ).matches(line),
             "the proactive line must carry exactly the same pinned field list as the wake line: $line",
         )
-        assertTrue("route=PROACTIVE" in line, "the proactive request must name its own route: $line")
+        assertTrue("route=PROACTIVE_HINT" in line, "the proactive request must name its prompt route: $line")
         assertEquals(plan.hash, field(line, "hash"), "the proactive request must use the proactive plan: $line")
         assertEquals(64, field(line, "deviceHash").length, "a supplied profile hashes to a SHA-256 digest: $line")
         assertNotEquals("none", field(line, "deviceHash"), line)
         assertEquals(plan.systemText.length.toString(), field(line, "staticChars"), line)
         assertEquals("0", field(line, "dynamicChars"), "no memory/skill body was on this request: $line")
         assertNotEquals(
-            PromptCatalog.plan(ContextRoute.WAKE, profile).hash,
+            PromptCatalog.plan(PromptRoute.WAKE, profile).hash,
             field(line, "hash"),
             "the two routes must not claim the same plan",
         )

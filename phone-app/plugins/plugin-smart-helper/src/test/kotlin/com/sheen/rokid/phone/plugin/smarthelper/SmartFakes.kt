@@ -3,9 +3,9 @@ import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextCompressor
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
-import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptKind
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptSection
 
 import com.sheen.rokid.agent.ContextPolicy
@@ -606,7 +606,7 @@ internal class SmartTestRig(
      * 0.3 Phase 1 Task 12: the prompt-catalog seam. `null` uses the production `PromptCatalog.plan`; a test that pins
      * "a catalog change never rewrites a live session" supplies its own observable planner instead.
      */
-    promptCatalog: ((ContextRoute, DeviceProfile?) -> PromptPlan)? = null,
+    promptCatalog: ((PromptRoute, DeviceProfile?) -> PromptPlan)? = null,
     /**
      * 0.3 Phase 1 Task 12: an injected `DeviceStateProvider`. `null` keeps the production resolution
      * (`services.deviceState()` inside `activate`) under test.
@@ -646,9 +646,11 @@ internal class SmartTestRig(
             isPanelVisible = { panelVisible },
             continueDialogue = { continueDialogue },
             speechAvailable = { speechAvailable },
-            promptCatalog = promptCatalog ?: { route, profile -> PromptCatalog.plan(route, profile) },
             deviceState = deviceState,
         )
+        // 0.3 Phase 3: the seam is an internal property (a public constructor must not expose the internal
+        // `PromptRoute`); a test that pins a catalog sets it here, before any activation.
+        promptCatalog?.let { plugin.promptCatalog = it }
     }
 
     fun envelope(generation: Generation = this.generation, sessionId: SessionId = this.sessionId) =

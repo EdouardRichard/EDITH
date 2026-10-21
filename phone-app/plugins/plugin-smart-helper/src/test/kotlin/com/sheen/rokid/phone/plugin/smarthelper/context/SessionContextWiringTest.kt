@@ -8,6 +8,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptKind
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptSection
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.profileFixture
 import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
@@ -97,7 +98,7 @@ class SessionContextWiringTest {
      */
     private fun storeBackedRig(
         device: SmartFakeDeviceState = SmartFakeDeviceState(deviceProfile),
-        promptCatalog: ((ContextRoute, DeviceProfile?) -> PromptPlan)? = null,
+        promptCatalog: ((PromptRoute, DeviceProfile?) -> PromptPlan)? = null,
     ): SmartTestRig {
         val rig = SmartTestRig(
             conversationStores = smartStores(),
@@ -182,12 +183,13 @@ class SessionContextWiringTest {
     }
 
     @Test
-    fun `a store-backed session reads both plans and the device once and keeps the profile in its system slot`() {
+    fun `a store-backed session reads all three plans and the device once and keeps the profile in its system slot`() {
         // 0.3 review fix (Important 1): this used `SmartTestRig()` without stores, so it asserted the legacy
         // `AgentRequest.instructions` path rather than `systemSlot`/`buildFrame`. Production `SmartWiring` always injects
         // the per-route stores, so the production shape is the one this test must run on.
+        // 0.3 Phase 3: activation pins one plan per `PromptRoute`, including the not-yet-driven follow-up.
         val device = SmartFakeDeviceState(deviceProfile)
-        val planned = mutableListOf<ContextRoute>()
+        val planned = mutableListOf<PromptRoute>()
         val rig = storeBackedRig(
             device = device,
             promptCatalog = { route, profile ->
@@ -211,9 +213,9 @@ class SessionContextWiringTest {
         }
 
         assertEquals(
-            listOf(ContextRoute.WAKE, ContextRoute.PROACTIVE),
+            listOf(PromptRoute.WAKE, PromptRoute.PROACTIVE_HINT, PromptRoute.PROACTIVE_FOLLOWUP),
             planned,
-            "activation must load exactly one plan per route, both at once",
+            "activation must load exactly one plan per prompt route, all three at once",
         )
         assertEquals(1, device.profileReads, "the session must read the device profile once at activation")
 
@@ -221,7 +223,7 @@ class SessionContextWiringTest {
         rig.tick(4_000)
         rig.wakeAndFinal("第二问", turnId = "asr-2")
 
-        assertEquals(2, planned.size, "a turn must never re-load a prompt plan")
+        assertEquals(3, planned.size, "a turn must never re-load a prompt plan")
         assertEquals(1, device.profileReads, "a turn must never re-read the device profile")
 
         val systemSlots = rig.model.requests.map { it.instructions }
@@ -234,7 +236,7 @@ class SessionContextWiringTest {
         }
         assertEquals(systemSlots[0], systemSlots[1], "the system slot must be pinned for the whole session")
         assertEquals(
-            PromptCatalog.plan(ContextRoute.WAKE, deviceProfile).systemText,
+            PromptCatalog.plan(PromptRoute.WAKE, deviceProfile).systemText,
             systemSlots[0],
             "the store-backed system slot is the pinned catalog plan, not the legacy instructions string",
         )
@@ -271,9 +273,9 @@ class SessionContextWiringTest {
         }
 
         assertEquals(
-            listOf("first:WAKE", "first:PROACTIVE"),
+            listOf("first:WAKE", "first:PROACTIVE_HINT", "first:PROACTIVE_FOLLOWUP"),
             plans.map { it.systemText },
-            "activation loads exactly one plan per route, in route order",
+            "activation loads exactly one plan per prompt route, in route order",
         )
 
         rig.wakeAndFinal("第一问", turnId = "asr-1")
@@ -293,9 +295,9 @@ class SessionContextWiringTest {
         val proactive = rig.model.requests.single { request ->
             request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }
         }
-        assertEquals("first:PROACTIVE", proactive.instructions)
+        assertEquals("first:PROACTIVE_HINT", proactive.instructions)
 
-        assertEquals(2, plans.size, "a live session must never re-load a prompt plan")
+        assertEquals(3, plans.size, "a live session must never re-load a prompt plan")
         assertEquals(1, device.profileReads, "a live session must never re-read the device profile")
     }
 
@@ -328,7 +330,7 @@ class SessionContextWiringTest {
 
         assertEquals(2, rig.model.requests.size, "the load_skill round-trip must make a second request")
         val (first, second) = rig.model.requests
-        val sessionPlan = PromptCatalog.plan(ContextRoute.WAKE, deviceProfile)
+        val sessionPlan = PromptCatalog.plan(PromptRoute.WAKE, deviceProfile)
         assertTrue(first.instructions.startsWith(sessionPlan.systemText), "the catalog plan is the system text")
         assertTrue(first.instructions.contains("- alpha: d-alpha"), "the catalog must advertise the entry")
         assertFalse(marker in first.instructions, "the body must not be in the first request's system slot")

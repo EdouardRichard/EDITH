@@ -4,8 +4,8 @@ import com.sheen.rokid.phone.plugin.smarthelper.scene.ScenePolicy
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryExtraction
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
 import com.sheen.rokid.phone.plugin.smarthelper.memory.score
-import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 
 import com.sheen.rokid.contracts.AcousticEvent
@@ -488,7 +488,7 @@ class SmartAssistantPluginTest {
         assertEquals(3, request.profileRevision)
         assertEquals(listOf(InputPart.Text("记录一下")), request.input)
         assertEquals(
-            PromptCatalog.plan(ContextRoute.WAKE, null).systemText,
+            PromptCatalog.plan(PromptRoute.WAKE, null).systemText,
             request.instructions,
             "the session's profile-less catalog plan is the system text (the rig grants no device provider)",
         )

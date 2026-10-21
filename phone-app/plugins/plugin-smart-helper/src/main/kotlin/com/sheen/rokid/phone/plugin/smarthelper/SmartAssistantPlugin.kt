@@ -151,6 +151,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.skill.StorageAccessSkillDirector
 import com.sheen.rokid.phone.plugin.smarthelper.turn.ConversationCycle
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.serialization.json.Json
@@ -457,14 +458,6 @@ class SmartAssistantPlugin(
      */
     private val deviceState: DeviceStateProvider? = null,
     /**
-     * 0.3 Phase 1 Task 12 (spec §4.1): the prompt-catalog seam.
-     *
-     * The default is the shipped `PromptCatalog`; the lambda exists so a test can observe **when** a plan is loaded
-     * (once per activation, never per request) and prove that a catalog change cannot rewrite a live session.
-     */
-    private val promptCatalog: (ContextRoute, DeviceProfile?) -> PromptPlan =
-        { route, profile -> PromptCatalog.plan(route, profile) },
-    /**
      * edith-0.2 Phase B (B11): the intervention gate — "should the model step in right now?" (spec §4.7).
      *
      * It sits **after** P3's own admission and throttle, replacing the cloud model's decision rather than adding to
@@ -714,12 +707,24 @@ class SmartAssistantPlugin(
     @Volatile private var activeCompressor: ContextCompressor? = null
 
     /**
-     * 0.3 Phase 1 Task 12 (spec §4.1/§4.4): the plans [activate] pinned for the two routes, or `null` outside a
-     * session. Built once per activation and read by every subsequent request; [deactivate] drops them with the rest
-     * of the session state. A catalog version change therefore takes effect on the **next** activation, never inside a
-     * live session.
+     * 0.3 Phase 1 Task 12 (spec §4.1/§4.4); 0.3 Phase 3 §5.1 adds the follow-up: the plans [activate] pinned for the
+     * **three** prompt routes, or `null` outside a session. Built once per activation and read by every subsequent
+     * request; [deactivate] drops them with the rest of the session state. A catalog version change therefore takes
+     * effect on the **next** activation, never inside a live session.
      */
-    @Volatile private var activePromptPlans: Map<ContextRoute, PromptPlan>? = null
+    @Volatile private var activePromptPlans: Map<PromptRoute, PromptPlan>? = null
+
+    /**
+     * 0.3 Phase 1 Task 12 (spec §4.1): the prompt-catalog seam, keyed by [PromptRoute] since 0.3 Phase 3.
+     *
+     * It is an internal property rather than a constructor parameter because [PromptRoute] is internal to this module
+     * and a public constructor must not expose it. Production never touches it: the default is the shipped
+     * `PromptCatalog`, and the seam exists so a test can observe **when** a plan is loaded (once per activation, never
+     * per request) and prove that a catalog change cannot rewrite a live session. A test sets it before [activate].
+     */
+    internal var promptCatalog: (PromptRoute, DeviceProfile?) -> PromptPlan = { route, profile ->
+        PromptCatalog.plan(route, profile)
+    }
 
     /**
      * 0.3 Phase 1 final-fix wave (spec §4.4/§5.1): the SKILL catalog the session pinned at activation.
@@ -1097,14 +1102,27 @@ class SmartAssistantPlugin(
     /**
      * The session's pinned prompt plan for [route] (0.3 design §4.1/§4.4).
      *
-     * [activate] loads both routes' plans exactly once. Every later request reads this map, so a catalog edit, a
-     * device profile change or a version bump can never rewrite a live session: only a new activation picks them up.
+     * [activate] loads every prompt route's plan exactly once. Every later request reads this map, so a catalog edit,
+     * a device profile change or a version bump can never rewrite a live session: only a new activation picks them up.
      *
      * A call before activation (a direct test seam, never a production request path) falls back to the profile-less
      * catalog plan. It is a plan, not an invented device: the device section is simply absent.
      */
-    private fun promptPlan(route: ContextRoute): PromptPlan =
+    private fun promptPlan(route: PromptRoute): PromptPlan =
         activePromptPlans?.get(route) ?: promptCatalog(route, null)
+
+    /**
+     * The legacy `ContextRoute` → [PromptRoute] mapping for the paths still keyed by the conversation route.
+     *
+     * A `ContextRoute` says which store/transcript a turn belongs to; the proactive chain's two jobs share
+     * `ContextRoute.PROACTIVE` but carry different postures. The existing one-shot proactive request is the **hint**
+     * decision, so it maps to [PromptRoute.PROACTIVE_HINT]; the follow-up turn passes
+     * [PromptRoute.PROACTIVE_FOLLOWUP] explicitly when it is wired (0.3 Phase 3 later task).
+     */
+    private fun ContextRoute.toPromptRoute(): PromptRoute = when (this) {
+        ContextRoute.WAKE -> PromptRoute.WAKE
+        ContextRoute.PROACTIVE -> PromptRoute.PROACTIVE_HINT
+    }
 
     /**
      * 0.3 final-fix wave (spec §6.2): the token-unit window a turn's frame is trimmed to, `ContextPolicy.hardLimit`.
@@ -1178,7 +1196,7 @@ class SmartAssistantPlugin(
      * while the loop's own per-request state line is not (it is request scaffolding, not plugin-owned prompt context).
      * The gateway's `P3_CACHE` line describes the exact kept frame that was sent, after any trim.
      */
-    private fun logPromptRequest(route: ContextRoute, frame: RequestFrame) {
+    private fun logPromptRequest(route: PromptRoute, frame: RequestFrame) {
         val dynamicChars = RequestLayout.dynamicTail(frame.conversationFlow)
             .filter { it.origin != SegmentOrigin.RUNTIME_STATE }
             .sumOf { it.text.length }
@@ -1272,9 +1290,10 @@ class SmartAssistantPlugin(
         activeDeviceStateProvider = deviceProvider
         activePerception = runCatching { context.services.perception() }.getOrNull()
         val sessionDeviceProfile = runCatching { deviceProvider?.profile() }.getOrNull()
-        // §4.1/§4.4: the session pins its plans. Both routes are loaded **now** and never re-planned, so a catalog
-        // change (or a different device read) cannot rewrite a live session or invalidate its prefix cache mid-stream.
-        val sessionPlans = ContextRoute.entries.associateWith { route ->
+        // §4.1/§4.4; 0.3 Phase 3 §5.1: the session pins one plan for **every** prompt route, the not-yet-driven
+        // follow-up included. All are loaded **now** and never re-planned, so a catalog change (or a different device
+        // read) cannot rewrite a live session or invalidate its prefix cache mid-stream.
+        val sessionPlans = PromptRoute.entries.associateWith { route ->
             promptCatalog(route, sessionDeviceProfile)
         }
         activePromptPlans = sessionPlans
@@ -1283,8 +1302,9 @@ class SmartAssistantPlugin(
                 memory = memoryRetrieval,
                 policy = policy,
                 // The manager's instructions are the same session-pinned plan every request's system slot uses, so
-                // the legacy no-store path and the frame path cannot disagree about the system text.
-                promptPlan = { route -> sessionPlans.getValue(route) },
+                // the legacy no-store path and the frame path cannot disagree about the system text. The manager is
+                // still keyed by `ContextRoute`; the proactive one-shot request it assembles is the hint posture.
+                promptPlan = { route -> sessionPlans.getValue(route.toPromptRoute()) },
             )
         }
         activeContextForTurn = contextManager
@@ -2457,7 +2477,7 @@ class SmartAssistantPlugin(
                 AgentRequest(
                     turnId = owned.turnId,
                     utterance = text,
-                    instructions = prompt?.instructions ?: promptPlan(ContextRoute.WAKE).systemText,
+                    instructions = prompt?.instructions ?: promptPlan(PromptRoute.WAKE).systemText,
                     profileId = configured.profileId,
                     deadlineNanos = owned.deadlineNanos,
                     // D49: the profile's timeout caps **one model request**; the turn's own budget is the number above,
@@ -2511,7 +2531,7 @@ class SmartAssistantPlugin(
                     // folding its RUNTIME_STATE/PERCEPTION segments in and before the gateway sends (or refuses), so
                     // the `P3_PROMPT` line describes the exact frame this request is. The legacy no-store path has no
                     // frame and therefore emits no prompt line.
-                    onRequestBuilt = { frame -> logPromptRequest(ContextRoute.WAKE, frame) },
+                    onRequestBuilt = { frame -> logPromptRequest(PromptRoute.WAKE, frame) },
                 ),
             )
         } catch (failure: Throwable) {
@@ -3078,7 +3098,7 @@ class SmartAssistantPlugin(
      * A library that throws contributes no catalog segment rather than failing the request (spec §3.7).
      */
     private fun systemSlot(route: ContextRoute, skills: SkillSnapshot): List<Segment> = buildList {
-        add(Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = promptPlan(route).systemText))
+        add(Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = promptPlan(route.toPromptRoute()).systemText))
         if (skills.catalog.isNotBlank()) {
             add(Segment(SegmentOrigin.SKILL, trusted = true, text = skills.catalog))
         }
@@ -3536,7 +3556,7 @@ class SmartAssistantPlugin(
         // whatever the assembly put there (memory evidence, a pulled SKILL body). A no-frame legacy request (a host
         // wiring without stores) has no frame to describe and stays silent; production always injects the per-route
         // stores.
-        frame?.let { logPromptRequest(ContextRoute.PROACTIVE, it) }
+        frame?.let { logPromptRequest(PromptRoute.PROACTIVE_HINT, it) }
         val reply = try {
             // 0.25 Task 12 (R58/R59): this route deliberately has **no** `AgentLoop` and no `AgentRequest` — it is one
             // proposal request with `propose_hint` as the only control channel. A plan nudge (which exists to push a
@@ -3545,7 +3565,7 @@ class SmartAssistantPlugin(
             gateway.turn(GatewayTurn(
                 turnId = hint.turnId,
                 profileId = configured.profileId,
-                instructions = prompt?.instructions ?: promptPlan(ContextRoute.PROACTIVE).systemText,
+                instructions = prompt?.instructions ?: promptPlan(PromptRoute.PROACTIVE_HINT).systemText,
                 // The gateway lifts a trailing USER turn into `input`, which is what puts the utterance and the
                 // perception last on the wire - the same shape the passive path uses. The assembly's history ends on
                 // this turn's trigger, so that last item is dropped and the full message below becomes the input:

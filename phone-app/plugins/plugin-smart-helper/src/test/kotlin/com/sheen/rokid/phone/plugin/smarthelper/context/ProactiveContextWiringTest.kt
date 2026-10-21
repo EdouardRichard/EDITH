@@ -6,6 +6,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryKind
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemorySource
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
 import com.sheen.rokid.phone.plugin.smarthelper.smartStores
 import com.sheen.rokid.phone.plugin.smarthelper.smartToolCall
@@ -128,7 +129,7 @@ class ProactiveContextWiringTest {
 
         val request = f.rig.model.requests.single()
         assertEquals(
-            PromptCatalog.plan(ContextRoute.PROACTIVE, null).systemText,
+            PromptCatalog.plan(PromptRoute.PROACTIVE_HINT, null).systemText,
             request.instructions,
             "the proactive route assembled its own prompt instead of using the session's catalog plan",
         )

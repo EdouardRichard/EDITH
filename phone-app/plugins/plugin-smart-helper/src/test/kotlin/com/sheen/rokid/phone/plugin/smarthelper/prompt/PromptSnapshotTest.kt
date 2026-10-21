@@ -1,6 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.prompt
 
-import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertNotEquals
@@ -21,15 +20,15 @@ class PromptSnapshotTest {
 
     @Test
     fun `the committed wake and proactive plans match their golden hashes`() {
-        assertEquals(WAKE_GOLDEN_HASH, PromptCatalog.plan(ContextRoute.WAKE, profileFixture()).hash)
-        assertEquals(PROACTIVE_GOLDEN_HASH, PromptCatalog.plan(ContextRoute.PROACTIVE, profileFixture()).hash)
+        assertEquals(WAKE_GOLDEN_HASH, PromptCatalog.plan(PromptRoute.WAKE, profileFixture()).hash)
+        assertEquals(PROACTIVE_GOLDEN_HASH, PromptCatalog.plan(PromptRoute.PROACTIVE_HINT, profileFixture()).hash)
     }
 
     @Test
     fun `the golden hash is tied to the fixture profile not to a constant prompt`() {
         assertNotEquals(
             WAKE_GOLDEN_HASH,
-            PromptCatalog.plan(ContextRoute.WAKE, profileFixture(model = "FixturePhone-B")).hash,
+            PromptCatalog.plan(PromptRoute.WAKE, profileFixture(model = "FixturePhone-B")).hash,
         )
     }
 
