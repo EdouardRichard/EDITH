@@ -5,6 +5,15 @@ import com.sheen.rokid.plugin.ToolObservation
 import com.sheen.rokid.plugin.ToolVision
 
 /**
+ * One source's answer: [observation] is what the attempt could observe (`null` when it produced none) and [images]
+ * carries at most one really-produced [ImageRef] (M4) — never a fabricated or borrowed picture.
+ */
+data class ToolObservationCapture(
+    val observation: ToolObservation?,
+    val images: List<ImageRef> = emptyList(),
+)
+
+/**
  * edith-0.3 Phase 2.2 Task 3 / Phase 3 Task 3 (M4): the host-neutral source of a **best-effort post-call observation**,
  * used when a screen tool's failure/timeout/throw/refusal left no observation of its own.
  *
@@ -25,11 +34,6 @@ import com.sheen.rokid.plugin.ToolVision
  * that result non-persistent, exactly as it does any observation. A source that predates M4 keeps the default: the
  * pre-M4 [observe] answer plus no image, so every existing caller compiles and behaves unchanged.
  */
-data class ToolObservationCapture(
-    val observation: ToolObservation?,
-    val images: List<ImageRef> = emptyList(),
-)
-
 fun interface ToolObservationSource {
     fun observe(deadlineMillis: Long): ToolObservation?
 

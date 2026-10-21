@@ -26,10 +26,12 @@ import kotlin.test.assertTrue
  * edith-0.3 Phase 3 Task 3 (M4): the plugin's bounded loop-level observation source.
  *
  * The loop's failure budget is 250 ms. The source runs `refresh()` then `screenshot()` on one daemon worker and waits
- * with `Future.get`, so a blocking platform read cannot hold the run: a timeout is an explicit
- * `unavailable/observation_timeout`, a provider throw is `unavailable/provider_threw`, and at most one image is
- * attached to a failure result. The first half pins that source; the second half runs the real plugin loop and proves
- * the request really carried it, and that the session closes it on deactivation.
+ * with `Future.get`, so the caller returns by the deadline even when the platform read blocks; the overrunning read
+ * itself is only cancelled cooperatively, and it can still delay this turn's later provider calls (see the source's
+ * KDoc for that turn-level residual). A timeout is an explicit `unavailable/observation_timeout`, a provider throw is
+ * `unavailable/provider_threw`, and at most one image is attached to a failure result. The first half pins that source;
+ * the second half runs the real plugin loop and proves the request really carried it, and that the session closes it on
+ * deactivation.
  */
 class PerceptionObservationSourceTest {
 
@@ -217,6 +219,50 @@ class PerceptionObservationSourceTest {
                 .matches(lines.single()),
             lines.single(),
         )
+    }
+
+    @Test
+    fun `a closed source logs its own reason instead of a false timeout`() {
+        val lines = mutableListOf<String>()
+        val source = requireNotNull(perceptionToolObservationSource(ObservationPerception(), lines::add))
+
+        source.close()
+        val capture = source.observeWithImages(250L)
+
+        assertEquals(ToolVision.Unavailable, capture.observation?.vision)
+        assertEquals(
+            "observation_timeout",
+            capture.observation?.visionReason,
+            "the model-facing wire reason is unchanged; only the attempt's log line tells close from expiry",
+        )
+        assertTrue(
+            Regex("^P3_OBSERVE source=loop ms=\\d+ timeout=false images=0 reason=closed$")
+                .matches(lines.single()),
+            lines.single(),
+        )
+    }
+
+    @Test
+    fun `an interrupted wait logs interrupted instead of a false timeout`() {
+        val lines = mutableListOf<String>()
+        // The refresh blocks long enough that the caller's interrupt must be what ends the wait, never a completed task.
+        val source = requireNotNull(
+            perceptionToolObservationSource(ObservationPerception(refreshDelayMillis = 5_000L), lines::add),
+        )
+        try {
+            Thread.currentThread().interrupt()
+            val capture = source.observeWithImages(5_000L)
+
+            assertTrue(Thread.currentThread().isInterrupted, "the caller's interrupt must be restored")
+            assertEquals("observation_timeout", capture.observation?.visionReason)
+            assertTrue(
+                Regex("^P3_OBSERVE source=loop ms=\\d+ timeout=false images=0 reason=interrupted$")
+                    .matches(lines.single()),
+                lines.single(),
+            )
+        } finally {
+            Thread.interrupted()
+        }
     }
 
     @Test

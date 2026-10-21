@@ -21,6 +21,14 @@ import java.util.concurrent.atomic.AtomicBoolean
 /** The two stable reasons a failed loop-level capture reports; wire values the loop and acceptance already know. */
 private const val OBSERVATION_TIMEOUT = "observation_timeout"
 private const val PROVIDER_THREW = "provider_threw"
+/**
+ * Log-only reasons for attempts that ended without a capture but **not** because the deadline expired. The observation
+ * the model sees stays `observation_timeout` (the pre-M4 wire value); the `P3_OBSERVE` line must not claim a timeout
+ * that never happened.
+ */
+private const val CLOSED = "closed"
+private const val INTERRUPTED = "interrupted"
+private const val CANCELLED = "cancelled"
 /** The one worker a session's source owns. Daemon, so an interrupted platform read can never keep the process alive. */
 private const val OBSERVE_THREAD_NAME = "perception-observe"
 private const val NANOS_PER_MILLI = 1_000_000L
@@ -33,11 +41,21 @@ private const val NANOS_PER_MILLI = 1_000_000L
  * and that came back without an observation of its own. This is the fallback for the paths a tool cannot observe from
  * inside (a policy/confirmation refusal, a confirmed or uncertain timeout, a thrown tool).
  *
- * **Bounded by the deadline.** One task runs `provider.refresh()` then `provider.screenshot()` on a single-thread daemon
- * executor, and the caller waits with `Future.get(deadlineMillis, MILLISECONDS)`. A platform read that overruns cannot
- * hold the run: the caller returns an explicit `unavailable(observation_timeout)` and cancels the task. A provider
- * throw becomes `unavailable(provider_threw)`, never a silent `null`. The loop's whole failure budget is 250 ms; the
- * source gets that number and makes no claim about the read's wall time beyond the bound it enforces.
+ * **Bounded by this source's wait, not by the platform read.** One task runs `provider.refresh()` then
+ * `provider.screenshot()` on a single-thread daemon executor, and the caller waits with
+ * `Future.get(deadlineMillis, MILLISECONDS)`. The deadline bounds only that wait: when it expires the caller returns an
+ * explicit `unavailable(observation_timeout)` and calls `future.cancel(true)`, but **cancellation is best-effort and
+ * cooperative** — a read that does not check the interrupt (the Android provider's `refresh()` does not) keeps running.
+ *
+ * **Turn-level residual (Task 9/acceptance).** The 250 ms number is therefore source-local, not a turn-level bound.
+ * The `AndroidPerceptionProvider`'s `refresh`/`snapshot`/`beginTurn`/`endTurn` are all `@Synchronized`, so an
+ * overrunning worker holds the provider's monitor: this same turn's later provider reads (the request ≥ 1
+ * `perceptionBlockFor`) and its `endTurn` in the run's `finally` can block until that read finishes. The overrun is
+ * still paid by the turn, just after the 250 ms mark. A real turn-level bound needs a design decision (a provider whose
+ * reads do not share one monitor), not a change here; acceptance must not read a `timeout=true` line as "the turn paid
+ * nothing for the read".
+ *
+ * A provider throw becomes `unavailable(provider_threw)`, never a silent `null`.
  *
  * **At most one image.** The screenshot channel is the only image source: `Image` → the observation plus exactly that
  * one [com.sheen.rokid.plugin.ImageRef]; `Disabled` → `vision = disabled`; `Unavailable(reason)` → `vision = unavailable`
@@ -45,11 +63,17 @@ private const val NANOS_PER_MILLI = 1_000_000L
  * screen still renders `screen = null`, never an invented one).
  *
  * **Observability.** Each attempt emits one count-only `P3_OBSERVE source=loop ms=<n> timeout=<bool> images=<n>
- * reason=<stable|->` line: elapsed milliseconds, whether the deadline expired, the image count and the stable vision
- * reason (`-` when the picture channel has none). No screen text, foreground package or reason payload is logged.
+ * reason=<stable|->` line: elapsed milliseconds, whether **the deadline expired**, the image count and one stable
+ * attempt reason — the observation's vision reason when there is one, `-` when the picture channel has none, or a local
+ * token (`observation_timeout`, `provider_threw`, `closed`, `interrupted`, `cancelled`) when no capture was produced.
+ * `timeout=true` only ever accompanies an expired deadline; a closed/interrupted/cancelled attempt logs `timeout=false`
+ * with its own reason instead of claiming `observation_timeout`. No screen text, foreground package or reason payload is
+ * logged.
  *
  * **Lifecycle.** The plugin owns one source per session and calls [close] in `deactivate`; [close] shuts the executor
- * down idempotently, and a capture attempted afterwards answers the timeout fact without starting another task.
+ * down idempotently, and a capture attempted afterwards answers `unavailable(observation_timeout)` without starting
+ * another task. Like the timeout path, [close] cannot stop a read already in progress — the interrupt it sends is the
+ * same best-effort one.
  */
 internal class PerceptionObservationSource(
     private val provider: PerceptionProvider,
@@ -69,7 +93,7 @@ internal class PerceptionObservationSource(
     override fun observeWithImages(deadlineMillis: Long): ToolObservationCapture {
         val startedNanos = System.nanoTime()
         // A closed session source cannot start another task; report the same explicit timeout fact the loop maps.
-        if (closed.get()) return unavailableCapture(startedNanos, timedOut = false)
+        if (closed.get()) return unavailableCapture(startedNanos, timedOut = false, logReason = CLOSED)
         val future = try {
             executor.submit(Callable {
                 // Both reads are one attempt: refresh installs the current screen, screenshot observes the picture
@@ -78,7 +102,7 @@ internal class PerceptionObservationSource(
             })
         } catch (_: RejectedExecutionException) {
             // `close()` raced the submit: the task was never accepted, which is still an explicit timeout fact.
-            return unavailableCapture(startedNanos, timedOut = false)
+            return unavailableCapture(startedNanos, timedOut = false, logReason = CLOSED)
         }
         return try {
             val (snapshot, screenshot) = future.get(deadlineMillis.coerceAtLeast(0L), TimeUnit.MILLISECONDS)
@@ -101,12 +125,13 @@ internal class PerceptionObservationSource(
             ToolObservationCapture(PerceptionToolObservation.unavailable(PROVIDER_THREW))
         } catch (_: InterruptedException) {
             future.cancel(true)
-            // An interrupt is the caller's signal: restore it and still report the attempt's timeout fact.
+            // An interrupt is the caller's signal: restore it and report the attempt honestly (interrupted, not an
+            // expired deadline).
             Thread.currentThread().interrupt()
-            unavailableCapture(startedNanos, timedOut = false)
+            unavailableCapture(startedNanos, timedOut = false, logReason = INTERRUPTED)
         } catch (_: CancellationException) {
             // A future cancelled elsewhere is still an attempt that produced no capture; never let it escape the loop.
-            unavailableCapture(startedNanos, timedOut = false)
+            unavailableCapture(startedNanos, timedOut = false, logReason = CANCELLED)
         }
     }
 
@@ -114,9 +139,19 @@ internal class PerceptionObservationSource(
         if (closed.compareAndSet(false, true)) executor.shutdownNow()
     }
 
-    /** Unavailable/observation_timeout with no image, plus its one count-only line. */
-    private fun unavailableCapture(startedNanos: Long, timedOut: Boolean): ToolObservationCapture {
-        logObserve(startedNanos, timedOut = timedOut, images = 0, reason = OBSERVATION_TIMEOUT)
+    /**
+     * Unavailable/observation_timeout with no image, plus its one count-only line.
+     *
+     * The observation the model sees stays the stable `observation_timeout` wire value; [logReason] is what the
+     * `P3_OBSERVE` line says actually ended the attempt, so a closed session or a caller interrupt is never logged as
+     * an expired deadline.
+     */
+    private fun unavailableCapture(
+        startedNanos: Long,
+        timedOut: Boolean,
+        logReason: String = OBSERVATION_TIMEOUT,
+    ): ToolObservationCapture {
+        logObserve(startedNanos, timedOut = timedOut, images = 0, reason = logReason)
         return ToolObservationCapture(PerceptionToolObservation.unavailable(OBSERVATION_TIMEOUT))
     }
 
