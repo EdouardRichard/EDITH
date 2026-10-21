@@ -29,6 +29,10 @@ import com.sheen.rokid.plugin.PerceptionScreenshotResult
 import com.sheen.rokid.plugin.PerceptionSnapshot
 import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
+import com.sheen.rokid.plugin.ToolVision
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonNull
@@ -269,7 +273,16 @@ class DeviceTool(
             val snapshot = provider.snapshot(include, filter.toPerceptionFilter(), limit)
             // 0.3 Phase 2.1 Task 3: only a screen read has something to look at; any other include returns a snapshot
             // whose `vision` would be a capture the model never asked for.
-            val capture = if (PerceptionSource.SCREEN in include) captureVision() else null
+            val wantsScreen = PerceptionSource.SCREEN in include
+            val capture = if (wantsScreen) captureVision() else null
+            // 0.3 Phase 2.2 Task 4: the same snapshot and the same single capture are the structured observation, so
+            // the text, the picture and `vision` can never describe two different reads.
+            val observation = observeForResult(
+                capture = wantsScreen,
+                visionRequested = wantsScreen,
+                snapshot = snapshot,
+                captureResult = capture,
+            )
             // A read through the perception port already answered: there is no kernel envelope to project, but every
             // `device` call keeps the same model-facing envelope shape.
             result(
@@ -283,6 +296,7 @@ class DeviceTool(
                 ),
                 withVision(observationData(snapshot, include), capture),
                 extraImages = capturedImage(capture),
+                observation = observation,
             )
         }
     }
@@ -350,11 +364,29 @@ class DeviceTool(
                 recoverable = true,
             ),
         )
+        // Task 4: the action was never dispatched (accepted/applied false), and the refreshed read is the observation.
+        val observation = observeForResult(
+            capture = true,
+            visionRequested = true,
+            snapshot = snapshot,
+            captureResult = capture,
+        )
         return ActionResult(
             ActionOutcome.Refused,
             detail,
             images = capturedImage(capture),
             nonPersistent = true,
+            execution = ToolExecution(
+                outcome = ToolOutcome.Refused,
+                code = STALE_REF,
+                message = stale.reason,
+                recoverable = true,
+                accepted = false,
+                applied = false,
+                verified = null,
+                changed = null,
+            ),
+            observation = observation,
         )
     }
 
@@ -387,17 +419,35 @@ class DeviceTool(
      * scroll loop used to bypass it, leaking the projector's `bounds=` text and leaving the provider cache one screen
      * behind). `changed` is derived from the envelope this call actually returns - never assumed from the dispatch.
      */
-    private fun actResult(envelope: DeviceEnvelope, revisionBefore: Long?): ActionResult {
-        val data = decorateActData(project(envelope, lastFilter), envelope)
+    private fun actResult(envelope: DeviceEnvelope, revisionBefore: Long?, partial: Boolean = false): ActionResult {
+        val snapshot = perception?.afterAction()
+        val data = if (snapshot == null) {
+            project(envelope, lastFilter)
+        } else {
+            decorateActData(project(envelope, lastFilter), envelope, snapshot)
+        }
         // Task 3: the capture follows `afterAction()`, so the image is the screen the action produced. `scrollToText`
         // reaches this through its single returned envelope, which is why the loop never captures per inner scroll.
         val capture = captureVision()
+        // Task 4: the forced post-action read and the one capture above are this result's observation. A dispatched act
+        // always carries one, on success and on failure alike; without a perception port there is no honest screen.
+        val observation = snapshot?.let {
+            observeForResult(
+                capture = true,
+                visionRequested = true,
+                snapshot = it,
+                captureResult = capture,
+            )
+        }
         return result(
             envelope,
             withVision(data, capture),
             fingerprintAfter(envelope, revisionBefore),
             stateChanging = true,
             extraImages = capturedImage(capture),
+            observation = observation,
+            // Spec §7.7: an accepted write that provably changed nothing is a partial execution, not a clean success.
+            partial = partial || envelope.error?.code == DeviceErrorCodes.ACCEPTED_NO_EFFECT,
         )
     }
 
@@ -437,15 +487,90 @@ class DeviceTool(
         listOfNotNull((capture as? PerceptionScreenshotResult.Image)?.image)
 
     /**
+     * edith-0.3 Phase 2.2 Task 4: the one post-call observation builder for every `device` result.
+     *
+     * It is deliberately **non-throwing** and returns `null` only when this composition has no perception port (or the
+     * cache projection is unavailable): a tool that cannot observe must say nothing rather than invent a screen. The
+     * observation is rendered from a [PerceptionSnapshot] - normally the exact read the result already projected - so
+     * its text is the same compact screen the model sees and never a second, disagreeing capture. It carries no image:
+     * pictures stay on [ActionResult.images], and [visionOf]/[visionReasonOf] only say what happened to the picture.
+     *
+     * [visionRequested] distinguishes "this call does not want a picture" (`status`/`wait` success, a
+     * notification-only observe: `vision=not_requested`, no picture) from "a picture was wanted but was not taken"
+     * (argument refusals: `vision=unavailable(not_attempted)`). `vision=ok` is reported only when an image really is
+     * attached, and a disabled or failed capture keeps its own honest [ToolVision] value instead.
+     */
+    private fun observeForResult(capture: Boolean, visionRequested: Boolean): ToolObservation? =
+        observeForResult(capture, visionRequested, snapshot = null, captureResult = null)
+
+    /**
+     * The capture-aware half of [observeForResult]: [snapshot] is the read this result already made (or `null` to
+     * project the provider's current cache), and [captureResult] is the one capture the caller attaches. Passing the
+     * capture in is what keeps a result to **at most one image**: the helper never takes a second picture.
+     */
+    private fun observeForResult(
+        capture: Boolean,
+        visionRequested: Boolean,
+        snapshot: PerceptionSnapshot?,
+        captureResult: PerceptionScreenshotResult?,
+    ): ToolObservation? {
+        val provider = perception ?: return null
+        val current = snapshot ?: runCatching {
+            // Cache-only on purpose: the operation above already made this result's real read; this projects it.
+            provider.snapshot(OBSERVATION_SOURCES, lastFilter.toPerceptionFilter(), null)
+        }.getOrNull() ?: return null
+        val shot = if (capture) (captureResult ?: captureVision()) else null
+        return ToolObservation(
+            snapshotId = current.snapshotId.takeIf { it.isNotEmpty() },
+            capturedAtEpochMillis = current.capturedAtEpochMillis,
+            foregroundPackage = current.foregroundPackage,
+            foregroundActivity = current.foregroundActivity,
+            coverage = PerceptionCoverageRenderer.render(current.coverage),
+            screen = CompactSnapshotRenderer.render(current),
+            truncated = CompactSnapshotRenderer.screenTruncated(current),
+            vision = visionOf(capture, visionRequested, shot),
+            visionReason = visionReasonOf(capture, visionRequested, shot),
+        )
+    }
+
+    /** Task 4: the vision fact of one observation; [ToolVision.Ok] is impossible without a real captured image. */
+    private fun visionOf(
+        capture: Boolean,
+        visionRequested: Boolean,
+        shot: PerceptionScreenshotResult?,
+    ): ToolVision = when {
+        capture && shot is PerceptionScreenshotResult.Image -> ToolVision.Ok
+        capture && shot == PerceptionScreenshotResult.Disabled -> ToolVision.Disabled
+        capture -> ToolVision.Unavailable
+        visionRequested -> ToolVision.Unavailable
+        else -> ToolVision.NotRequested
+    }
+
+    /** Task 4: the stable reason that accompanies a non-[ToolVision.Ok] observation, or `null` when none is needed. */
+    private fun visionReasonOf(
+        capture: Boolean,
+        visionRequested: Boolean,
+        shot: PerceptionScreenshotResult?,
+    ): String? = when {
+        capture && shot is PerceptionScreenshotResult.Unavailable -> shot.reason
+        capture && shot == null -> SCREENSHOT_FAILED
+        capture -> null
+        visionRequested -> VISION_NOT_ATTEMPTED
+        else -> null
+    }
+
+    /**
      * Task 7: a forced post-action perception read.
      *
      * `perception.afterAction()` opens a new snapshot under a new id, so a ref from before the action that no longer
      * names a node is stale for the next call (R5). The compact text replaces the projector's full/diff text so the
      * model sees the same bounded shape as `observe`; the existing envelope (ok/error/applied) is untouched.
      */
-    private fun decorateActData(data: JsonObject, envelope: DeviceEnvelope): JsonObject {
-        val provider = perception ?: return data
-        val snapshot = provider.afterAction()
+    private fun decorateActData(
+        data: JsonObject,
+        envelope: DeviceEnvelope,
+        snapshot: PerceptionSnapshot,
+    ): JsonObject {
         val coverage = PerceptionCoverageRenderer.render(snapshot.coverage)
         val foreground = foregroundString(snapshot)
         val compact = CompactSnapshotRenderer.render(snapshot)
@@ -512,6 +637,9 @@ class DeviceTool(
         val started = clock()
         val revisionBefore = operations.revision
         var last: DeviceEnvelope? = null
+        // Task 4 (spec §7.7): a scroll that the platform accepted but whose target was never verified is a *partial*
+        // execution, not a clean failure. Only an accepted dispatch proves that scroll work actually happened.
+        var dispatched = false
         do {
             val remaining = (timeoutMillis - (clock() - started)).coerceAtLeast(1L)
             val scrolled = operations.act(
@@ -523,8 +651,9 @@ class DeviceTool(
                 key = null,
                 timeoutMillis = remaining,
             )
+            if (scrolled.accepted || scrolled.ok) dispatched = true
             if (!scrolled.ok && scrolled.error?.code != DeviceErrorCodes.ACCEPTED_NO_EFFECT) {
-                return actResult(scrolled.copy(action = ACTION_ACT), revisionBefore)
+                return actResult(scrolled.copy(action = ACTION_ACT), revisionBefore, partial = dispatched)
             }
             val waited = operations.waitFor(text, null, false, remaining)
             last = waited
@@ -532,17 +661,19 @@ class DeviceTool(
                 return actResult(waited.copy(action = ACTION_ACT), revisionBefore)
             }
             if (waited.error?.code != DeviceErrorCodes.VERIFY_TIMEOUT) {
-                return actResult(waited.copy(action = ACTION_ACT), revisionBefore)
+                return actResult(waited.copy(action = ACTION_ACT), revisionBefore, partial = dispatched)
             }
         } while (clock() - started < timeoutMillis)
         val envelope = last ?: operations.waitFor(text, null, false, 1L)
-        return actResult(envelope.copy(action = ACTION_ACT), revisionBefore)
+        return actResult(envelope.copy(action = ACTION_ACT), revisionBefore, partial = dispatched)
     }
 
     private fun screenshot(): ActionResult {
         // Task 7: the vision switch is checked before the kernel, so a disabled vision never captures, stores or
         // advertises an image. The refusal names the switch, which is more actionable than a channel error.
-        if (!runCatching { visionEnabled() }.getOrDefault(false)) return refused(VISION_DISABLED)
+        if (!runCatching { visionEnabled() }.getOrDefault(false)) {
+            return refused(VISION_DISABLED, vision = ToolVision.Disabled, visionReason = null)
+        }
         val envelope = operations.screenshot()
         val kernelDiagnostic = envelope.data?.takeIf { it.isNotBlank() }
         val data = if (envelope.ok) {
@@ -559,8 +690,31 @@ class DeviceTool(
                 put("diagnostic", envelope.error?.code ?: kernelDiagnostic ?: "the screenshot failed")
             }
         }
-        return result(envelope, data)
+        // Task 4: the explicit screenshot is its own image, so it never runs the auto-vision capture. Its observation
+        // reports that image as `vision=ok` only when the reference is really resolvable: the kernel reports a failed
+        // artifact store as a successful screenshot with the `pending` placeholder (empty sha256), and naming that a
+        // usable image would be the same lie `PerceptionScreenshotMapping` already refuses to tell. A failed action
+        // reports `unavailable(<kernel code>)` and never fabricates a picture.
+        val observation = observeForResult(capture = false, visionRequested = false)?.let { base ->
+            val image = resolvableImage(envelope)
+            when {
+                image != null -> base.copy(vision = ToolVision.Ok, visionReason = null)
+                envelope.ok && envelope.images.isNotEmpty() ->
+                    base.copy(vision = ToolVision.Unavailable, visionReason = SCREENSHOT_PENDING)
+                envelope.ok -> base.copy(vision = ToolVision.Unavailable, visionReason = SCREENSHOT_FAILED)
+                else -> base.copy(
+                    vision = ToolVision.Unavailable,
+                    visionReason = envelope.error?.code ?: SCREENSHOT_FAILED,
+                )
+            }
+        }
+        return result(envelope, data, observation = observation)
     }
+
+    /** The first image whose artifact the media source can resolve, or `null` for a failed/pending capture. */
+    private fun resolvableImage(envelope: DeviceEnvelope): ImageRef? =
+        envelope.images.firstOrNull()
+            ?.takeIf { it.artifactId != PENDING_ARTIFACT_ID && it.sha256.isNotBlank() }
 
     private fun wait(args: JsonObject): ActionResult {
         val text = args.stringArg("text")?.trim()?.takeIf { it.isNotEmpty() }
@@ -570,24 +724,63 @@ class DeviceTool(
         val timeout = args.longArg("timeout_ms") ?: DEFAULT_TIMEOUT_MILLIS
         if (timeout <= 0L) return refused(INVALID_ARGUMENTS)
         val envelope = operations.waitFor(text, foreground, idle, timeout)
-        return result(envelope, project(envelope, lastFilter))
+        // Task 4: a successful wait answers the current screen as *text* (`vision=not_requested`) and takes no picture;
+        // a failed wait is a screen-tool failure and gets the current read plus one best-effort image. The kernel's wait
+        // does not update the perception cache, so the observation is a real read instead of the turn's opening screen.
+        val snapshot = perception?.let { provider -> runCatching { provider.refresh() }.getOrNull() }
+        val capture = if (snapshot != null && !envelope.ok) captureVision() else null
+        val observation = snapshot?.let {
+            observeForResult(
+                capture = !envelope.ok,
+                visionRequested = !envelope.ok,
+                snapshot = it,
+                captureResult = capture,
+            )
+        }
+        return result(
+            envelope,
+            project(envelope, lastFilter),
+            extraImages = capturedImage(capture),
+            observation = observation,
+        )
     }
 
     private fun status(args: JsonObject): ActionResult {
         val envelope = operations.status()
         val provider = perception
-        val data = if (provider == null) {
-            buildJsonObject {
-                // R41: keep the kernel's key=value diagnostic line verbatim, just inside a JSON object.
+        val data: JsonObject
+        val snapshot: PerceptionSnapshot?
+        if (provider == null) {
+            // R41: keep the kernel's key=value diagnostic line verbatim, just inside a JSON object.
+            data = buildJsonObject {
                 put(STATUS_KEY, envelope.data ?: envelope.error?.code ?: "")
             }
+            snapshot = null
         } else {
             val include = parseStatusInclude(args) ?: return refused(INVALID_ARGUMENTS)
-            statusData(envelope, provider.snapshot(include, PerceptionFilter.ALL, null), include)
+            snapshot = provider.snapshot(include, PerceptionFilter.ALL, null)
+            data = statusData(envelope, snapshot, include)
+        }
+        // Task 4: `status` is not a screen read, so its screen text stays null - coverage/foreground/device facts are
+        // the observation. Success takes no image; a failed status still answers with a real read and one best-effort
+        // image, like every other screen-tool failure.
+        val fresh = if (provider != null && snapshot != null && !envelope.ok) {
+            runCatching { provider.refresh() }.getOrNull() ?: snapshot
+        } else {
+            snapshot
+        }
+        val capture = if (fresh != null && !envelope.ok) captureVision() else null
+        val observation = fresh?.let {
+            observeForResult(
+                capture = !envelope.ok,
+                visionRequested = !envelope.ok,
+                snapshot = it,
+                captureResult = capture,
+            )?.let { observation -> if (envelope.ok) observation.copy(screen = null) else observation }
         }
         // Final review C2 (re-review): [result] marks every device result non-persistent, including this one and the
         // provider-less diagnostic-only branch above.
-        return result(envelope, data)
+        return result(envelope, data, extraImages = capturedImage(capture), observation = observation)
     }
 
     /**
@@ -850,6 +1043,8 @@ class DeviceTool(
         fingerprint: String? = null,
         stateChanging: Boolean = false,
         extraImages: List<ImageRef> = emptyList(),
+        observation: ToolObservation? = null,
+        partial: Boolean = false,
     ): ActionResult {
         val outcome = when {
             envelope.ok -> ActionOutcome.Done
@@ -863,6 +1058,9 @@ class DeviceTool(
         // 0.3 Phase 2.1 Task 3: automatic vision appends its capture here rather than through the kernel envelope, so the
         // JSON `images` and the model request stay one list. When no capture ran, `extraImages` is empty and the shape
         // is exactly the 0.25 one.
+        // 0.3 Phase 2.2 Task 4: the same result carries the structured execution facts and post-call observation, so the
+        // model reads machine facts instead of parsing `detail`. A read's `changed` stays null: only a write can claim
+        // its own screen change, and even then only from the kernel's applied evidence.
         return ActionResult(
             outcome,
             renderEnvelope(envelope, data),
@@ -870,6 +1068,40 @@ class DeviceTool(
             stateChanging,
             images = envelope.images + extraImages,
             nonPersistent = true,
+            execution = executionOf(
+                envelope,
+                changed = if (stateChanging) envelope.applied else null,
+                partial = partial,
+            ),
+            observation = observation,
+        )
+    }
+
+    /**
+     * edith-0.3 Phase 2.2 Task 4: one kernel envelope's execution facts, projected without inventing any.
+     *
+     * The tri-state fields keep the kernel's own honesty: [ToolExecution.accepted]/[ToolExecution.applied] are copied
+     * verbatim, `verified` is `true` only when the kernel named the post-condition it checked, and `changed` is the
+     * write's applied evidence (a read or an unproven write leaves it `null`). `TOOL_THREW`, timeout and uncertain are
+     * loop-level facts and never fabricated here.
+     */
+    private fun executionOf(envelope: DeviceEnvelope, changed: Boolean?, partial: Boolean): ToolExecution {
+        val outcome = when {
+            envelope.ok -> ToolOutcome.Done
+            envelope.error?.recoverable == true -> ToolOutcome.Refused
+            else -> ToolOutcome.Failed
+        }
+        return ToolExecution(
+            outcome = outcome,
+            code = envelope.error?.code,
+            message = envelope.error?.message,
+            recoverable = envelope.error?.recoverable == true,
+            accepted = envelope.accepted,
+            applied = envelope.applied,
+            verified = envelope.verified?.let { true },
+            changed = changed,
+            uncertain = false,
+            partial = partial,
         )
     }
 
@@ -991,7 +1223,39 @@ class DeviceTool(
         }
     }.toString()
 
-    private fun refused(code: String) = ActionResult(ActionOutcome.Refused, code)
+    /**
+     * edith-0.3 Phase 2.2 Task 4: one tool-level refusal (unknown action, invalid arguments, disabled vision).
+     *
+     * The action was never dispatched, so the execution facts are unambiguous: `accepted=false`, `applied=false`;
+     * `verified`/`changed` stay `null` because nothing was checked or written. A refusal still answers with the current
+     * screen **as text** (a cached read, no device call), because the model needs to know what it is looking at when its
+     * call was rejected; [vision] plus [visionReason] say why no picture accompanies it. Argument refusals use
+     * `unavailable(not_attempted)`; a disabled vision switch uses the explicit [ToolVision.Disabled].
+     */
+    private fun refused(
+        code: String,
+        vision: ToolVision = ToolVision.Unavailable,
+        visionReason: String? = VISION_NOT_ATTEMPTED,
+    ): ActionResult {
+        val observation = observeForResult(capture = false, visionRequested = false)
+            ?.copy(vision = vision, visionReason = visionReason)
+        return ActionResult(
+            ActionOutcome.Refused,
+            code,
+            // A refusal now carries screen text, so it may not outlive the run either.
+            nonPersistent = observation != null,
+            execution = ToolExecution(
+                outcome = ToolOutcome.Refused,
+                code = code,
+                recoverable = false,
+                accepted = false,
+                applied = false,
+                verified = null,
+                changed = null,
+            ),
+            observation = observation,
+        )
+    }
 
     companion object {
         const val NAME = "device"
@@ -1024,6 +1288,21 @@ class DeviceTool(
 
         /** The auto-vision marker reason when the injected capture throws despite the provider contract. */
         private const val SCREENSHOT_FAILED = "SCREENSHOT_FAILED"
+
+        /** `DeviceKernel.screenshot()`'s placeholder id while no artifact store reference exists. */
+        private const val PENDING_ARTIFACT_ID = "pending"
+
+        /** The kernel captured bytes but the artifact store did not: an unresolvable reference, never an image. */
+        private const val SCREENSHOT_PENDING = "SCREENSHOT_PENDING"
+
+        /**
+         * The vision reason of an observation that deliberately took no picture (argument refusals): `vision=unavailable`
+         * must never be bare, or the model cannot tell "not attempted" from "the device could not".
+         */
+        private const val VISION_NOT_ATTEMPTED = "not_attempted"
+
+        /** The one source an observation reads when the caller did not already project one from a snapshot. */
+        private val OBSERVATION_SOURCES: Set<PerceptionSource> = setOf(PerceptionSource.SCREEN)
 
         /** The one-line nudge when an accepted write provably changed nothing (spec §7.6). */
         private const val OBSERVE_FIRST_NOTE = "动作未改变画面；先观察再决定"
@@ -1132,6 +1411,10 @@ class DeviceTool(
             // cannot distinguish `act` from `observe`, so each result declares `stateChanging` per call — the loop feeds
             // ProgressGuard from an act (when it has a fingerprint) and never from a read.
             observation = true,
+            // edith-0.3 Phase 2.2 Task 4: every `device` result also carries the structured post-call observation
+            // (`ActionResult.observation`), including failures and refusals. This is what lets the loop skip its own
+            // failure capture for this tool: the tool already described the screen it left behind.
+            screenObservation = true,
         )
     }
 }

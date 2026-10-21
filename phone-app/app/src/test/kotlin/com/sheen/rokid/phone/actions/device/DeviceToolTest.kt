@@ -35,6 +35,10 @@ import com.sheen.rokid.plugin.PerceptionProvider
 import com.sheen.rokid.plugin.PerceptionScreenshotResult
 import com.sheen.rokid.plugin.PerceptionSnapshot
 import com.sheen.rokid.plugin.PerceptionSource
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
+import com.sheen.rokid.plugin.ToolVision
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
@@ -369,6 +373,7 @@ class DeviceToolTest {
                 ),
             ),
         )
+        perception.screenshotResult = screenshotImage("img-scroll-success")
 
         val result = tool(operations, perception = perception).execute(
             """{"action":"act","kind":"scroll_to_text","text":"目标","timeout_ms":5000}""",
@@ -391,6 +396,18 @@ class DeviceToolTest {
         )
         assertFalse("scroll_to_text must not leak projector bounds: ${result.detail}", result.detail.contains("bounds="))
         assertEquals("full", screen["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
+
+        // Task 4: the scroll is one write result with its own post-action observation and one picture.
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.applied)
+        assertEquals(true, execution.changed)
+        assertFalse(execution.partial)
+        val observation = observationOf(result)
+        assertEquals("snap-after-scroll", observation.snapshotId)
+        assertTrue(observation.screen!!.contains("#n4"))
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals("the whole scroll loop attaches exactly one image", 1, result.images.size)
     }
 
     @Test
@@ -406,6 +423,7 @@ class DeviceToolTest {
                 elements = listOf(perceptionElement(ref = "#n1", text = "A")),
             ),
         )
+        perception.screenshotResult = screenshotImage("img-scroll-timeout")
 
         val result = tool(operations, clock = { now }, perception = perception).execute(
             """{"action":"act","kind":"scroll_to_text","text":"never","timeout_ms":50}""",
@@ -420,6 +438,20 @@ class DeviceToolTest {
         assertTrue("a failed scroll still carries the post-action coverage", data.containsKey("coverage"))
         assertFalse("no bounds in the failed scroll either: ${result.detail}", result.detail.contains("bounds="))
         assertEquals(1, operations.actCalls.size)
+
+        // Task 4: a scroll that ran but never proved the target is a partial execution, and its observation is the
+        // final screen it saw. `applied`/`changed` stay null because no post-condition was proven.
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("VERIFY_TIMEOUT", execution.code)
+        assertNull(execution.applied)
+        assertNull(execution.changed)
+        assertTrue("a scroll that dispatched but did not verify is partial", execution.partial)
+        val observation = observationOf(result)
+        assertEquals("snap-timeout", observation.snapshotId)
+        assertTrue(observation.screen!!.contains("#n1"))
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals(1, result.images.size)
     }
 
     @Test
@@ -1092,6 +1124,9 @@ class DeviceToolTest {
             "a non-screen observe must not advertise vision it did not capture: ${body(result)["data"]}",
             body(result)["data"]!!.jsonObject.containsKey("vision"),
         )
+        val observation = observationOf(result)
+        assertEquals("no picture was wanted, so none is claimed", ToolVision.NotRequested, observation.vision)
+        assertNull(observation.visionReason)
     }
 
     @Test
@@ -1106,6 +1141,10 @@ class DeviceToolTest {
         assertEquals(1, perception.screenshotCalls)
         assertTrue(result.images.isEmpty())
         assertEquals("disabled", visionOf(result))
+        val observation = observationOf(result)
+        assertEquals("snap-7", observation.snapshotId)
+        assertEquals(ToolVision.Disabled, observation.vision)
+        assertNull("the disabled value is its own reason", observation.visionReason)
     }
 
     @Test
@@ -1183,6 +1222,20 @@ class DeviceToolTest {
         assertBefore(log, EVENT_REFRESH, EVENT_CAPTURE)
         assertEquals("the stale answer captures exactly once", 1, log.count(EVENT_CAPTURE))
         assertEquals("the stale answer never forces a post-act read", 0, log.count(EVENT_AFTER_ACTION))
+
+        // Task 4: the refusal is a real execution fact and its observation is the refreshed screen.
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("STALE_REF", execution.code)
+        assertEquals(true, execution.recoverable)
+        assertEquals("the action was never dispatched", false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertNull(execution.changed)
+        val observed = observationOf(result)
+        assertEquals("snap-fresh", observed.snapshotId)
+        assertTrue("the stale observation is the refreshed screen: ${observed.screen}", observed.screen!!.contains("#n9"))
+        assertEquals(ToolVision.Ok, observed.vision)
+        assertEquals(1, result.images.size)
     }
 
     @Test
@@ -1196,6 +1249,9 @@ class DeviceToolTest {
         assertEquals("a failed capture does not fail the observation", ActionOutcome.Done, result.outcome)
         assertTrue(result.images.isEmpty())
         assertEquals("unavailable(SCREENSHOT_FAILED)", visionOf(result))
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("SCREENSHOT_FAILED", observation.visionReason)
     }
 
     @Test
@@ -1212,6 +1268,9 @@ class DeviceToolTest {
         assertEquals(1, perception.screenshotCalls)
         assertTrue("a throwing capture contributes no image", result.images.isEmpty())
         assertEquals("unavailable(SCREENSHOT_FAILED)", visionOf(result))
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("SCREENSHOT_FAILED", observation.visionReason)
     }
 
     @Test
@@ -1493,11 +1552,16 @@ class DeviceToolTest {
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("INVALID_ARGUMENTS", result.detail)
-        assertEquals("an invalid status include must not read the provider", 0, perception.snapshotCalls)
+        assertEquals("an invalid status include must not read the device", 0, perception.refreshCalls)
+        assertEquals(0, perception.screenshotCalls)
+        val execution = executionOf(result)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertEquals(ToolVision.Unavailable, observationOf(result).vision)
     }
 
     @Test
-    fun `observe refuses malformed include tokens and non-positive limits without a provider read`() {
+    fun `observe refuses malformed include tokens and non-positive limits without a device read`() {
         val perception = FakePerception(perceptionSnapshot())
         val device = tool(FakeDeviceOperations(observation()), perception = perception)
 
@@ -1508,12 +1572,23 @@ class DeviceToolTest {
             """{"action":"observe","include":[] ,"limit":0}""",
             """{"action":"observe","limit":-3}""",
             """{"action":"observe","limit":"4"}""",
+            """{"action":"observe","filter":"telepathy"}""",
         ).forEach { args ->
             val result = device.execute(args)
             assertEquals("$args must be INVALID_ARGUMENTS", ActionOutcome.Refused, result.outcome)
             assertEquals("$args must be INVALID_ARGUMENTS", "INVALID_ARGUMENTS", result.detail)
+            // Task 4: an argument refusal still answers with the current screen text, but never a picture.
+            val execution = executionOf(result)
+            assertEquals("$args must not reach a device channel", false, execution.accepted)
+            assertEquals("$args must not claim the action applied", false, execution.applied)
+            val observation = observationOf(result)
+            assertEquals(ToolVision.Unavailable, observation.vision)
+            assertEquals("not_attempted", observation.visionReason)
+            assertTrue("$args must not picture the screen", result.images.isEmpty())
         }
-        assertEquals("no provider read may run for invalid arguments", 0, perception.snapshotCalls)
+        assertEquals("no real perception read may run for invalid arguments", 0, perception.refreshCalls)
+        assertEquals(0, perception.afterActions)
+        assertEquals(0, perception.screenshotCalls)
     }
 
     @Test
@@ -1562,12 +1637,25 @@ class DeviceToolTest {
     @Test
     fun `screenshot is refused with VISION_DISABLED and never reaches the kernel when vision is off`() {
         val operations = FakeDeviceOperations(observation())
+        val perception = FakePerception(perceptionSnapshot())
 
-        val result = tool(operations, visionEnabled = { false }).execute("""{"action":"screenshot"}""")
+        val result = tool(operations, visionEnabled = { false }, perception = perception)
+            .execute("""{"action":"screenshot"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("VISION_DISABLED", result.detail)
         assertEquals(0, operations.screenshotCalls)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("VISION_DISABLED", execution.code)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertNull(execution.changed)
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Disabled, observation.vision)
+        assertNull(observation.visionReason)
+        assertTrue("a disabled switch never captures", result.images.isEmpty())
+        assertEquals(0, perception.screenshotCalls)
     }
 
     @Test
@@ -1580,6 +1668,419 @@ class DeviceToolTest {
         assertFalse(device.isStatus("""{"action":"act","kind":"tap"}"""))
         assertFalse(device.isStatus("""{"include":["device"]}"""))
         assertFalse(device.isStatus("not json"))
+    }
+
+    // - 0.3 Phase 2.2 Task 4: execution facts + observation on every result path -
+
+    /*
+     * Every `device` result must let the model answer four questions without prose: did the call run/apply/verify, and
+     * what does the screen look like now? The tests below pin that on every reachable result path, including the
+     * argument and vision refusals that never reach the kernel. Images stay on `ActionResult.images` and are never
+     * fabricated: a picture is attached at most once, and `vision=ok` only when one really was.
+     */
+
+    private fun executionOf(result: ActionResult): ToolExecution {
+        assertNotNull("the device result must carry structured execution facts", result.execution)
+        return result.execution!!
+    }
+
+    private fun observationOf(result: ActionResult): ToolObservation {
+        assertNotNull("the device result must carry a post-call observation", result.observation)
+        return result.observation!!
+    }
+
+    @Test
+    fun `the device descriptor declares that its results observe the screen`() {
+        assertTrue(tool(FakeDeviceOperations(observation())).descriptors().single().screenObservation)
+    }
+
+    @Test
+    fun `a result without a perception port carries execution facts but no fabricated observation`() {
+        val result = tool(FakeDeviceOperations(observation())).execute("""{"action":"observe"}""")
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertNull("a read applies nothing", execution.applied)
+        assertNull("this composition has no perception port", result.observation)
+    }
+
+    @Test
+    fun `a kernel observe failure carries execution facts and no invented observation`() {
+        val operations = FakeDeviceOperations(observation())
+        operations.observeEnvelope = failure("observe", "CHANNEL_UNAVAILABLE", recoverable = true)
+
+        val result = tool(operations).execute("""{"action":"observe"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("CHANNEL_UNAVAILABLE", execution.code)
+        assertEquals(true, execution.recoverable)
+        assertEquals(false, execution.accepted)
+        assertNull(execution.applied)
+        assertNull(execution.changed)
+        assertNull("without a perception port the tool must not invent a screen", result.observation)
+    }
+
+    @Test
+    fun `observe success reports done execution and a compact observation with vision ok`() {
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(
+                elements = listOf(perceptionElement(ref = "#n1", role = "button", text = "搜索", clickable = true)),
+            ),
+        )
+        perception.screenshotResult = screenshotImage("img-observe")
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"observe"}""")
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertNull("a read applies nothing", execution.applied)
+        assertNull(execution.verified)
+        assertNull("a read has no screen-change evidence", execution.changed)
+        assertFalse(execution.uncertain)
+        assertFalse(execution.partial)
+
+        val observation = observationOf(result)
+        assertEquals("snap-7", observation.snapshotId)
+        assertEquals("com.example.app", observation.foregroundPackage)
+        assertEquals(".MainActivity", observation.foregroundActivity)
+        assertEquals(
+            "screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok vision=ok glasses=ok device=ok",
+            observation.coverage,
+        )
+        assertTrue(observation.screen!!.contains("""#n1 button "搜索" center=(0,0) [clickable]"""))
+        assertFalse(observation.truncated)
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertNull(observation.visionReason)
+        assertEquals("the screen include takes exactly one picture", 1, perception.screenshotCalls)
+        assertEquals(1, result.images.size)
+    }
+
+    @Test
+    fun `act success reports applied and changed facts with one post-action observation`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.actEnvelope = DeviceEnvelope.success(
+            action = "act",
+            channel = "accessibility",
+            accepted = true,
+            applied = true,
+            verified = com.sheen.rokid.device.Verified("screen_change", 2L),
+            timing = Timing(0, 0, 0),
+        )
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(
+                snapshotId = "snap-after-act",
+                elements = listOf(perceptionElement(ref = "#n5", text = "B")),
+            ),
+        )
+        perception.screenshotResult = screenshotImage("img-act")
+
+        val result = tool(operations, perception = perception).execute("""{"action":"act","kind":"home"}""")
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertEquals(true, execution.applied)
+        assertEquals(true, execution.verified)
+        assertEquals(true, execution.changed)
+
+        val observation = observationOf(result)
+        assertEquals("the action's own post-action read is the observation", "snap-after-act", observation.snapshotId)
+        assertTrue(observation.screen!!.contains("""#n5 text "B" center=(0,0)"""))
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals(1, result.images.size)
+        assertEquals(1, perception.afterActions)
+        assertEquals(1, perception.screenshotCalls)
+    }
+
+    @Test
+    fun `an act refusal reports applied false and changed false with a best-effort observation image`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.actEnvelope = failure("act", DeviceErrorCodes.ACCEPTED_NO_EFFECT, recoverable = true)
+            .copy(applied = false)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(snapshotId = "snap-no-effect"),
+        )
+        perception.screenshotResult = screenshotImage("img-no-effect")
+
+        val result = tool(operations, perception = perception)
+            .execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals(DeviceErrorCodes.ACCEPTED_NO_EFFECT, execution.code)
+        assertEquals(true, execution.recoverable)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertNull(execution.verified)
+        assertEquals(false, execution.changed)
+        assertTrue("accepted but provably no effect is a partial execution", execution.partial)
+
+        val observation = observationOf(result)
+        assertEquals("snap-no-effect", observation.snapshotId)
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals(1, result.images.size)
+    }
+
+    @Test
+    fun `an act failure with unknown applied keeps the facts null and still observes with one image`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.actEnvelope = failure("act", "VERIFY_TIMEOUT", recoverable = true)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(),
+            afterActionSnapshot = perceptionSnapshot(
+                snapshotId = "snap-failed-act",
+                elements = listOf(perceptionElement(ref = "#n1", text = "A")),
+            ),
+        )
+        perception.screenshotResult = screenshotImage("img-failed-act")
+
+        val result = tool(operations, perception = perception)
+            .execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("VERIFY_TIMEOUT", execution.code)
+        assertEquals(false, execution.accepted)
+        assertNull("a failed write is not known to have applied", execution.applied)
+        assertNull(execution.verified)
+        assertNull("a failed write is not known to have changed the screen", execution.changed)
+        assertFalse(execution.uncertain)
+
+        val observation = observationOf(result)
+        assertEquals("snap-failed-act", observation.snapshotId)
+        assertTrue(observation.screen!!.contains("#n1"))
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals(1, result.images.size)
+    }
+
+    @Test
+    fun `status success reports a text observation with vision not requested and never captures`() {
+        val perception = FakePerception(snapshot = perceptionSnapshot())
+        perception.screenshotResult = screenshotImage("img-must-not-be-used")
+
+        val result = tool(
+            FakeDeviceOperations(observation()),
+            perception = perception,
+            deviceState = FakeDeviceState(deviceState(batteryPercent = 76)),
+        ).execute("""{"action":"status"}""")
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertNull(execution.applied)
+        assertNull(execution.changed)
+
+        val observation = observationOf(result)
+        assertEquals("snap-7", observation.snapshotId)
+        assertEquals("com.example.app", observation.foregroundPackage)
+        assertTrue(observation.coverage!!.contains("device=ok"))
+        assertNull("status is not a screen read; the screen tree stays out of its observation", observation.screen)
+        assertEquals(ToolVision.NotRequested, observation.vision)
+        assertNull(observation.visionReason)
+        assertTrue(result.images.isEmpty())
+        assertEquals(0, perception.screenshotCalls)
+    }
+
+    @Test
+    fun `status failure reports execution facts and a best-effort observation with one image`() {
+        val operations = FakeDeviceOperations(observation())
+        operations.statusEnvelope = failure("status", "ACTION_CHANNEL_UNAVAILABLE", recoverable = true)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(elements = listOf(perceptionElement(ref = "#n1", text = "A"))),
+        )
+        perception.screenshotResult = screenshotImage("img-status-failure")
+
+        val result = tool(operations, perception = perception).execute("""{"action":"status"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("ACTION_CHANNEL_UNAVAILABLE", execution.code)
+        assertEquals(false, execution.accepted)
+        assertNull(execution.applied)
+        assertNull(execution.changed)
+
+        val observation = observationOf(result)
+        assertTrue("a failed status is answered with the current screen", observation.screen!!.contains("#n1"))
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals("a failure observation is a real read", 1, perception.refreshCalls)
+        assertEquals(1, result.images.size)
+        assertEquals(1, perception.screenshotCalls)
+    }
+
+    @Test
+    fun `wait success reports a text observation with vision not requested and never captures`() {
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(elements = listOf(perceptionElement(ref = "#n1", text = "A"))),
+        )
+        perception.screenshotResult = screenshotImage("img-must-not-be-used")
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"wait","idle":true}""")
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertNull(execution.applied)
+        assertNull(execution.changed)
+
+        val observation = observationOf(result)
+        assertEquals("snap-7", observation.snapshotId)
+        assertTrue(observation.screen!!.contains("#n1"))
+        assertEquals(ToolVision.NotRequested, observation.vision)
+        assertNull(observation.visionReason)
+        assertTrue(result.images.isEmpty())
+        assertEquals(0, perception.screenshotCalls)
+    }
+
+    @Test
+    fun `wait failure reports execution facts and a best-effort observation with one image`() {
+        val operations = FakeDeviceOperations(observation(rev = 1, nodes = listOf(node("A"))))
+        operations.waitEnvelope = failure("wait", "VERIFY_TIMEOUT", recoverable = true)
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(elements = listOf(perceptionElement(ref = "#n1", text = "A"))),
+        )
+        perception.screenshotResult = screenshotImage("img-wait-failure")
+
+        val result = tool(operations, perception = perception)
+            .execute("""{"action":"wait","text":"never"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("VERIFY_TIMEOUT", execution.code)
+        assertEquals(false, execution.accepted)
+        assertNull(execution.applied)
+
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals(1, result.images.size)
+        assertEquals(1, perception.screenshotCalls)
+    }
+
+    @Test
+    fun `invalid arguments carry execution facts and a text observation without an image`() {
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(elements = listOf(perceptionElement(ref = "#n1", text = "A"))),
+        )
+        perception.screenshotResult = screenshotImage("img-must-not-be-used")
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"act","kind":"teleport"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("INVALID_ARGUMENTS", result.detail)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("INVALID_ARGUMENTS", execution.code)
+        assertEquals(false, execution.recoverable)
+        assertEquals(false, execution.accepted)
+        assertEquals(false, execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+
+        val observation = observationOf(result)
+        assertEquals("the current screen is still described", "snap-7", observation.snapshotId)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("not_attempted", observation.visionReason)
+        assertTrue("an argument refusal never pictures the screen", result.images.isEmpty())
+        assertEquals(0, perception.refreshCalls)
+        assertEquals(0, perception.afterActions)
+        assertEquals(0, perception.screenshotCalls)
+        assertTrue("the observation text may not be persisted", result.nonPersistent)
+    }
+
+    @Test
+    fun `screenshot success carries an observation and its own image without a second capture`() {
+        val operations = FakeDeviceOperations(observation())
+        operations.screenshotEnvelope = DeviceEnvelope.success(
+            action = "screenshot",
+            channel = "accessibility",
+            accepted = true,
+            applied = null,
+            verified = null,
+            timing = Timing(0, 0, 0),
+            images = listOf(ImageRef("artifact-shot", "image/jpeg", 768, 1664, "sha-shot")),
+        )
+        val perception = FakePerception(
+            snapshot = perceptionSnapshot(elements = listOf(perceptionElement(ref = "#n1", text = "A"))),
+        )
+        perception.screenshotResult = screenshotImage("img-must-not-be-used")
+
+        val result = tool(operations, perception = perception).execute("""{"action":"screenshot"}""")
+
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertNull(execution.applied)
+        assertNull(execution.changed)
+
+        val observation = observationOf(result)
+        assertTrue(observation.screen!!.contains("#n1"))
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertNull(observation.visionReason)
+        assertEquals(1, result.images.size)
+        assertEquals("the explicit screenshot is the only capture", 0, perception.screenshotCalls)
+    }
+
+    @Test
+    fun `a pending screenshot artifact is not claimed as a usable image`() {
+        // The kernel reports a failed artifact store as a successful screenshot with the `pending` placeholder and an
+        // empty sha; an unresolvable id must read as unavailable, exactly like `PerceptionScreenshotMapping` maps it.
+        val operations = FakeDeviceOperations(observation())
+        operations.screenshotEnvelope = DeviceEnvelope.success(
+            action = "screenshot",
+            channel = "accessibility",
+            accepted = true,
+            applied = null,
+            verified = null,
+            timing = Timing(0, 0, 0),
+            images = listOf(ImageRef("pending", "image/jpeg", 768, 1664, "")),
+            data = "diagnostic=screenshot_artifact_pending; reason=NO_STORE",
+        )
+        val perception = FakePerception(snapshot = perceptionSnapshot())
+
+        val result = tool(operations, perception = perception).execute("""{"action":"screenshot"}""")
+
+        assertEquals("the kernel capture still succeeded", ActionOutcome.Done, result.outcome)
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("SCREENSHOT_PENDING", observation.visionReason)
+        assertEquals("the action's own reference is still the result", 1, result.images.size)
+        assertEquals(0, perception.screenshotCalls)
+    }
+
+    @Test
+    fun `a failed screenshot carries vision unavailable with the kernel reason and no image`() {
+        val operations = FakeDeviceOperations(observation())
+        operations.screenshotEnvelope = failure("screenshot", "UNSUPPORTED", recoverable = false)
+        val perception = FakePerception(snapshot = perceptionSnapshot())
+        perception.screenshotResult = screenshotImage("img-must-not-be-used")
+
+        val result = tool(operations, perception = perception).execute("""{"action":"screenshot"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        val execution = executionOf(result)
+        assertEquals(ToolOutcome.Failed, execution.outcome)
+        assertEquals("UNSUPPORTED", execution.code)
+        assertEquals(false, execution.accepted)
+        assertNull(execution.applied)
+        assertNull(execution.changed)
+
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("UNSUPPORTED", observation.visionReason)
+        assertTrue("a failed screenshot never fabricates an image", result.images.isEmpty())
+        assertEquals("the failure does not try a second capture", 0, perception.screenshotCalls)
     }
 
     // - helpers -
