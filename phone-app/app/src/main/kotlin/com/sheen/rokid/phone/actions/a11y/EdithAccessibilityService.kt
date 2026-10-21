@@ -169,11 +169,28 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
             val buffer = result.hardwareBuffer
             try {
                 val hardware = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace) ?: return null
-                // Hardware bitmaps are read-only; copy to ARGB_8888 before the JPEG encoder runs.
+                // Hardware bitmaps are read-only; copy to ARGB_8888 before scaling or JPEG encoding.
                 val software = hardware.copy(Bitmap.Config.ARGB_8888, false) ?: return null
-                val output = ByteArrayOutputStream()
-                if (!software.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, output)) return null
-                Screenshot(output.toByteArray(), "image/jpeg", software.width, software.height)
+                try {
+                    // One shared compression step: every caller pays for the same bounded JPEG, so a
+                    // full-resolution screen never leaves this service (0.3 Phase 2.1, Task 1).
+                    val (targetWidth, targetHeight) = scaledScreenshotSize(software.width, software.height)
+                    val scaled = if (targetWidth == software.width && targetHeight == software.height) {
+                        software
+                    } else {
+                        Bitmap.createScaledBitmap(software, targetWidth, targetHeight, true)
+                    }
+                    try {
+                        val output = ByteArrayOutputStream()
+                        if (!scaled.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, output)) return null
+                        Screenshot(output.toByteArray(), "image/jpeg", scaled.width, scaled.height)
+                    } finally {
+                        // `createScaledBitmap` returns a separate bitmap; free it before the copy.
+                        if (scaled !== software) scaled.recycle()
+                    }
+                } finally {
+                    software.recycle()
+                }
             } finally {
                 buffer.close()
             }
@@ -462,8 +479,8 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
 private const val SCREENSHOT_TIMEOUT_MILLIS = 5_000L
 private const val GESTURE_TIMEOUT_MILLIS = 5_000L
 
-/** JPEG quality of the encoded screenshot. */
-private const val JPEG_QUALITY = 85
+/** JPEG quality of the encoded screenshot (the one shared value every auto-vision capture uses). */
+private const val JPEG_QUALITY = 80
 
 /**
  * The Android implementation of [AccessibilityPlatform] (0.25 Task 9).
