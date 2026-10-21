@@ -7,6 +7,8 @@ import com.sheen.rokid.phone.actions.shizuku.ShellFailure
 import com.sheen.rokid.phone.actions.shizuku.ShellResult
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.ImageRef
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
@@ -433,6 +435,108 @@ class OpenToolTest {
     }
 
     @Test
+    fun `verified launch attaches one screenshot and vision ok`() {
+        val pipeline = ShellPipeline()
+        val image = ImageRef(
+            artifactId = "artifact-open-vision",
+            mime = "image/jpeg",
+            width = 720,
+            height = 1600,
+            sha256 = "sha256-open-vision",
+        )
+        var captureCalls = 0
+        val result = launchedOpen(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            target = "com.example.music",
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("one capture per verified launch", 1, captureCalls)
+        assertEquals("the captured artifact is the result's image", listOf(image), result.images)
+        assertTrue("an attached image must stay request-scoped (C2)", result.nonPersistent)
+        val data = body(result)["data"]!!.jsonObject
+        assertEquals("a verified launch marks vision ok", "ok", data["vision"]!!.jsonPrimitive.content)
+        assertTrue("the verified launch shape stays intact", data["verified"]!!.jsonPrimitive.boolean)
+    }
+
+    @Test
+    fun `unverified launch does not capture`() {
+        val pipeline = ShellPipeline()
+        var captureCalls = 0
+        val result = OpenTool(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            foreground = { "com.android.launcher" },
+            foregroundActivity = { "com.android.launcher/.Launcher" },
+            rootPackage = { "com.android.launcher" },
+            waitForForeground = { _, _ -> false },
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Disabled
+            },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals(ActionOutcome.Failed, result.outcome)
+        assertEquals("STATE_UNCHANGED", errorCode(result))
+        assertEquals("a launch that is not verified in front must not capture", 0, captureCalls)
+        assertTrue("no image may be attached to an unverified launch", result.images.isEmpty())
+        assertFalse(
+            "an unverified answer has no vision marker",
+            body(result)["data"]!!.jsonObject.containsKey("vision"),
+        )
+    }
+
+    @Test
+    fun `already foreground does not capture`() {
+        val shell = FakeShell { command -> ShellResult(command, 0, "Status: ok\n", "") }
+        var captureCalls = 0
+        val result = OpenTool(
+            shell = shell,
+            catalog = knownMusic(),
+            foreground = { "com.example.music" },
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Disabled
+            },
+        ).execute("""{"target":"com.example.music","relaunch":false}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertTrue("already-foreground must not launch", shell.commands.isEmpty())
+        assertEquals("nothing was brought to front, so there is nothing to capture", 0, captureCalls)
+        assertTrue("alreadyForeground attaches no image", result.images.isEmpty())
+        assertFalse(
+            "the alreadyForeground answer has no vision marker",
+            body(result)["data"]!!.jsonObject.containsKey("vision"),
+        )
+    }
+
+    @Test
+    fun `disabled capture still returns done`() {
+        val pipeline = ShellPipeline()
+        var captureCalls = 0
+        val result = launchedOpen(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            target = "com.example.music",
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Disabled
+            },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals("a disabled capture never fails the launch", ActionOutcome.Done, result.outcome)
+        assertEquals(1, captureCalls)
+        assertEquals("disabled", body(result)["data"]!!.jsonObject["vision"]!!.jsonPrimitive.content)
+        assertTrue("a disabled capture attaches no image", result.images.isEmpty())
+        assertFalse("no image means no non-persistent marker", result.nonPersistent)
+    }
+
+    @Test
     fun `a launch whose foreground matches but a11y root does not is STATE_UNCHANGED`() {
         val pipeline = ShellPipeline()
         val result = launchedOpen(
@@ -697,6 +801,7 @@ class OpenToolTest {
         activity: String? = null,
         root: String? = target,
         waitForForeground: (String, Long) -> Boolean = { _, _ -> true },
+        capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
     ): OpenTool = OpenTool(
         shell = shell,
         catalog = catalog,
@@ -706,6 +811,7 @@ class OpenToolTest {
         foregroundActivity = { activity },
         rootPackage = { root },
         waitForForeground = waitForForeground,
+        capture = capture,
     )
 
     /**

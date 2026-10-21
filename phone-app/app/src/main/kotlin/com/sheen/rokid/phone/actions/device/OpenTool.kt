@@ -11,6 +11,8 @@ import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.ImageRef
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
 import com.sheen.rokid.plugin.RiskLevel
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.buildJsonArray
@@ -69,6 +71,17 @@ class OpenTool(
         }
         foreground() == pkg
     },
+    /**
+     * 0.3 Phase 2.1 Task 4: the automatic capture for a **verified** launch, or `Disabled` when this composition has no
+     * perception port.
+     *
+     * Only the `verified = true` success of [launchEnvelope] captures. An ambiguous name, an unknown app, an unusable
+     * shell, the `alreadyForeground` shortcut and a `STATE_UNCHANGED` mismatch all answer without a new screen to show.
+     * The user's vision switch and the selected profile's `IMAGE` capability are gates inside
+     * [com.sheen.rokid.plugin.PerceptionProvider.screenshot] (Task 2), so this tool does not duplicate them: `Disabled`
+     * and `Unavailable` are answers that attach no image and never fail the launch.
+     */
+    private val capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
 ) : ActionExecutor {
 
     private val resolver = AppLaunchResolver(catalog)
@@ -312,6 +325,10 @@ class OpenTool(
      * package. A mismatch is a recoverable `STATE_UNCHANGED` whose `data` carries the same fields a success would:
      * `resolvedPackage`, `foreground` (`package`/`activity`), `rootPackage` and `verified`. The caller's [data] keys
      * (`target`/`component`) stay on both outcomes.
+     *
+     * 0.3 Phase 2.1 Task 4: only the verified success captures an automatic vision image, after the observation above;
+     * the done data gains `vision=ok|disabled|unavailable(<reason>)` and a produced image goes to
+     * [ActionResult.images]. Nothing below the verification captures.
      */
     private fun launchEnvelope(
         target: PrivilegedShell,
@@ -360,11 +377,16 @@ class OpenTool(
                 data = launchData,
             )
         }
+        // 0.3 Phase 2.1 Task 4: only a verified success has a new screen worth showing. The capture runs after the
+        // verification read, so the image and the foreground/root facts describe the same screen.
+        val captured = capture()
         return done(
             buildJsonObject {
                 launchData.forEach { (key, value) -> put(key, value) }
                 put("launched", true)
+                put(VISION_KEY, visionMarker(captured))
             },
+            images = capturedImage(captured),
         )
     }
 
@@ -385,12 +407,37 @@ class OpenTool(
         return result.stdout.lineSequence().any { it.trim() == "$PACKAGE_PREFIX$packageName" }
     }
 
+    /**
+     * 0.3 Phase 2.1 Task 4: the model-facing marker for a verified launch's automatic capture.
+     *
+     * The vocabulary is the one `DeviceTool` uses for observe/act - `ok`, `disabled`, `unavailable(<reason>)` - so one
+     * turn's tool results read alike. An unavailable capture carries the provider's reason (`no_image_profile`,
+     * `SCREENSHOT_FAILED`, ...); it never fails the launch itself.
+     */
+    private fun visionMarker(capture: PerceptionScreenshotResult): String = when (capture) {
+        is PerceptionScreenshotResult.Image -> VISION_MARKER_OK
+        PerceptionScreenshotResult.Disabled -> VISION_MARKER_DISABLED
+        is PerceptionScreenshotResult.Unavailable -> "$VISION_MARKER_UNAVAILABLE(${capture.reason})"
+    }
+
+    /** Task 4: the captured artifact, if the capture produced one; a disabled/unavailable capture adds no image. */
+    private fun capturedImage(capture: PerceptionScreenshotResult): List<ImageRef> =
+        listOfNotNull((capture as? PerceptionScreenshotResult.Image)?.image)
+
     // R98: every `open` call is a write, whatever its outcome — launching an app, a page or a URL changes the
     // foreground state; the declaration describes the call class, not whether the launch got to run.
-    private fun done(data: kotlinx.serialization.json.JsonObject): ActionResult = ActionResult(
+    private fun done(
+        data: kotlinx.serialization.json.JsonObject,
+        images: List<ImageRef> = emptyList(),
+        nonPersistent: Boolean = false,
+    ): ActionResult = ActionResult(
         ActionOutcome.Done,
         toolEnvelope(tool = NAME, ok = true, channel = CHANNEL, accepted = true, data = data),
         stateChanging = true,
+        images = images,
+        // C2: an attached image may live only in this run's model request. A launch result without one carries no
+        // perception content, so its existing persistent shape is unchanged.
+        nonPersistent = nonPersistent || images.isNotEmpty(),
     )
 
     private fun failure(
@@ -472,6 +519,12 @@ class OpenTool(
         private const val INVALID_URL = "INVALID_URL"
         private const val INVALID_ARGUMENTS = "INVALID_ARGUMENTS"
         private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
+
+        /** Task 4: the automatic-vision marker on a verified launch's done data (same vocabulary as `DeviceTool`). */
+        private const val VISION_KEY = "vision"
+        private const val VISION_MARKER_OK = "ok"
+        private const val VISION_MARKER_DISABLED = "disabled"
+        private const val VISION_MARKER_UNAVAILABLE = "unavailable"
 
         private val PACKAGE_NAME = Regex("[A-Za-z0-9._]+")
         private val PLAYER_PACKAGE = Regex("(?i)player|music|video|media")

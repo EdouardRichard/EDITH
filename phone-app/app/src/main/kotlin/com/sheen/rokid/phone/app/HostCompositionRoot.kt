@@ -2260,6 +2260,11 @@ class HostCompositionRoot internal constructor(
                 // Phase 2 Task 10: the live switch, not an assembly-time copy. The provider answers `Disabled` and the
                 // injected capture is not called while it is off.
                 visionEnabled = { visionGate.enabled },
+                // 0.3 Phase 2.1 Task 4: the second gate is live in production. An automatic capture must never attach
+                // an image the selected profile's capability gate would reject; a missing/deleted profile reads false.
+                profileSupportsImage = {
+                    smartWiring.selectedProfile()?.inputs?.contains(InputModality.IMAGE) == true
+                },
                 screenshot = {
                     val envelope = deviceKernel.screenshot()
                     val image = envelope.images.firstOrNull()
@@ -2297,6 +2302,8 @@ class HostCompositionRoot internal constructor(
                     // resolved package is both the foreground app and the accessibility root.
                     foregroundActivity = { EdithAccessibilityService.port()?.foreground()?.activity },
                     rootPackage = { EdithAccessibilityService.port()?.rootPackage() },
+                    // 0.3 Phase 2.1 Task 4: a verified open captures through the same provider gate as observe/act.
+                    capture = { perception.screenshot() },
                 ),
                 // The number validation/permission check/ACTION_CALL hand-off stay in the one executor that owns them.
                 dial = DialTool(actions, callAvailable),
