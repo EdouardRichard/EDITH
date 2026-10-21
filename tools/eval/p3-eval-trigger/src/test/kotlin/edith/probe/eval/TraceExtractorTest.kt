@@ -90,6 +90,56 @@ class TraceExtractorTest {
         assertTrue(step.executed, "TOOL_THREW 发生在执行之后")
     }
 
+    @Test fun `a confirmed timeout was dispatched and therefore executed`() {
+        // ACTION_TIMEOUT is the loop's post-dispatch verdict: the call reached the executor and then overran its bound.
+        // However failed it reads, it is not a pre-dispatch rejection and must not deflate the execution count.
+        val turns = extractTurns(listOf(start(), tool("device", false, "ACTION_TIMEOUT"), end()))
+
+        val step = turns.single().steps.single()
+        assertEquals("allow", step.decision)
+        assertTrue(step.executed, "超时发生在派发之后")
+    }
+
+    @Test fun `an uncertain timeout was dispatched and therefore executed`() {
+        // ACTION_TIMEOUT_UNCERTAIN escalates the whole run, but the call it describes did reach the executor. Only the
+        // outcome is unknown, not whether it ran.
+        val turns = extractTurns(listOf(start(), tool("device", false, "ACTION_TIMEOUT_UNCERTAIN"), end()))
+
+        val step = turns.single().steps.single()
+        assertEquals("allow", step.decision)
+        assertTrue(step.executed, "uncertain 只说明结果不确定，不说明没有执行")
+    }
+
+    @Test fun `the loop's own repeat code never counts as an executed step`() {
+        // `LOOP_REPEAT` is the loop's hang-guard termination code, not a tool result: the repeated call it names was
+        // stopped before dispatch. It must stay in the "did not run" set exactly like a detector's LOOP_WARNING label.
+        val turns = extractTurns(listOf(start(), tool("device", false, "LOOP_REPEAT"), end()))
+
+        val step = turns.single().steps.single()
+        assertNull(step.decision)
+        assertFalse(step.executed, "被循环检测器拦下的调用没有执行")
+    }
+
+    @Test fun `a legacy prefixed line from an old transcript still reads as dispatched`() {
+        // Pre-0.3 `P3_TOOL` lines carried the tools' old `Refused: `/`Failed: ` detail prefixes. The extractor no longer
+        // uses a prefix as dispatch evidence, but replaying those lines must not turn a dispatched failure into a
+        // pre-dispatch rejection. `Failed: STATE_UNCHANGED` also pins the under-counting fix: the old parser only
+        // trusted `Refused:`, so this dispatched post-dispatch failure used to be scored as not executed.
+        val turns = extractTurns(
+            listOf(
+                start(),
+                tool("open_app", false, "Refused: APP_NOT_VISIBLE"),
+                tool("set_brightness", false, "Failed: STATE_UNCHANGED"),
+                end(),
+            ),
+        )
+
+        val steps = turns.single().steps
+        assertEquals(listOf("allow", "allow"), steps.map { it.decision })
+        assertTrue(steps.all { it.executed }, "旧前缀行仍然表示已派发")
+        assertEquals(listOf("Refused: APP_NOT_VISIBLE", "Failed: STATE_UNCHANGED"), steps.map { it.result })
+    }
+
     @Test fun `a detector warning never counts as an executed step`() {
         // A repeated-call warning is synthesized before dispatch, so its `LOOP_*` payload must keep the old
         // "did not run" reading even though it is not one of the registry's pre-dispatch codes.

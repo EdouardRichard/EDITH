@@ -40,7 +40,9 @@ import kotlinx.serialization.json.jsonObject
  *   a JSON non-object, a missing/blank/non-string `name` — is `ActionOutcome.Refused` with a stable code. A name that
  *   is not pullable is refused too, and the two reasons stay distinguishable: an unknown name is [NOT_FOUND] (the
  *   model misremembered the catalog), a disabled entry is [DISABLED] (the user turned it off, so retrying is futile
- *   until the user acts).
+ *   until the user acts). A refusal states its execution facts explicitly (Task 7 fix review): nothing was accepted or
+ *   applied, nothing was verified or changed, there is no observation, and `recoverable` is true only for [NOT_FOUND]
+ *   — a bare `ActionResult(Refused, code)` used to project "unknown, not recoverable", which was a false fact.
  */
 class LoadSkillTool(
     private val lookup: (String) -> SkillLoad,
@@ -82,8 +84,33 @@ class LoadSkillTool(
 
     override fun cancel() = Unit
 
-    /** A refusal is a step the model can correct, never an exception into the loop. */
-    private fun refused(code: String) = ActionResult(ActionOutcome.Refused, code)
+    /**
+     * A refusal is a step the model can correct, never an exception into the loop.
+     *
+     * The facts are explicit (Task 7 fix review): a bare `ActionResult(Refused, code)` made the registry project
+     * `code = null`, `accepted = null`, `applied = null` and `recoverable = false`. A malformed call never reaches the
+     * lookup, and a name that cannot be pulled is rejected by it; either way nothing was accepted or applied
+     * (`accepted = false`, `applied = false`) - the same reading `OpenTool.appNotFound` records for an unknown app
+     * (`APP_NOT_FOUND`), not a half-executed success. No post-condition was checked and no screen observed, so
+     * `verified`/`changed` and `observation` stay `null`.
+     *
+     * [recoverable] separates the two reasons: [NOT_FOUND] (including a malformed call) is a catalog mistake the model
+     * can correct, while [DISABLED] means the user turned the entry off, so retrying the same pull cannot help. The
+     * stable code stays the envelope's `data`.
+     */
+    private fun refused(code: String) = ActionResult(
+        outcome = ActionOutcome.Refused,
+        detail = code,
+        execution = ToolExecution(
+            outcome = ToolOutcome.Refused,
+            code = code,
+            recoverable = code == NOT_FOUND,
+            accepted = false,
+            applied = false,
+            verified = null,
+            changed = null,
+        ),
+    )
 
     companion object {
         private val JSON = Json { isLenient = true }

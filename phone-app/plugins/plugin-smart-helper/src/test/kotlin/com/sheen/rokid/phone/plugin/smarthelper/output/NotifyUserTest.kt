@@ -96,6 +96,42 @@ class NotifyUserTest {
     }
 
     @Test
+    fun `a refused call reaches the model with explicit refusal facts`() {
+        // 0.3 Phase 2.2 Task 7 fix review: a bare `ActionResult(Refused, code)` let the registry project
+        // code=null/accepted=null/applied=null/recoverable=false. That last value is a false fact - invalid arguments are
+        // exactly what the model can correct, and nothing was dispatched. The tool must state the facts itself.
+        val registry = ToolRegistry(listOf(tool))
+
+        val result = registry.execute(
+            ToolCall("c1", "notify_user", """{"text":"x","channel":"telepathy"}"""),
+        )
+
+        assertFalse(result.ok)
+        assertEquals(ToolOutcome.Refused, result.execution.outcome)
+        assertEquals("NOTIFY_ARGUMENTS_INVALID", result.execution.code)
+        assertEquals(false, result.execution.accepted)
+        assertEquals(false, result.execution.applied)
+        assertNull(result.execution.verified)
+        assertNull(result.execution.changed)
+        assertTrue(result.execution.recoverable)
+        assertNull(result.observation)
+        assertEquals("NOTIFY_ARGUMENTS_INVALID", result.data)
+        assertFalse("Refused: " in result.payload, "no legacy prefix: ${result.payload}")
+
+        // The facts must reach the model on the wire too, not only the projected `ToolResult`.
+        val payload = Json.parseToJsonElement(result.payload).jsonObject
+        assertEquals(JsonNull, payload.getValue("observation"))
+        val execution = payload.getValue("execution").jsonObject
+        assertEquals("refused", execution.getValue("outcome").jsonPrimitive.content)
+        assertEquals("NOTIFY_ARGUMENTS_INVALID", execution.getValue("code").jsonPrimitive.content)
+        assertEquals(JsonPrimitive(false), execution.getValue("accepted"))
+        assertEquals(JsonPrimitive(false), execution.getValue("applied"))
+        assertEquals(JsonPrimitive(true), execution.getValue("recoverable"))
+        assertEquals(JsonNull, execution.getValue("verified"))
+        assertEquals(JsonNull, execution.getValue("changed"))
+    }
+
+    @Test
     fun `the result detail carries a sequence number and never the text`() {
         // The progress guard trips on three identical consecutive fingerprints, and the model may legitimately send
         // the same sentence twice. A per-call counter keeps the fingerprints distinct without carrying content.

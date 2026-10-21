@@ -78,6 +78,9 @@ fun decideChannel(channel: NotifyChannel): NotifyDecision = when (channel) {
  *   so it states `accepted = true`; `applied`/`verified`/`changed` stay `null` because this tool has no independent
  *   evidence that the wearer saw or heard the notification, and `observation` is `null` because it never looks at the
  *   screen. Inventing either would be a fabricated fact. The counter stays the envelope's `data`.
+ * - **A refusal also states its facts** (Task 7 fix review). Invalid arguments are refused before anything runs, so
+ *   `accepted = false` and `applied = false`; `recoverable = true` because the model can correct the call. Leaving the
+ *   execution to the registry's projection used to read as "unknown, not recoverable", which was a false fact.
  */
 class NotifyUserTool(private val onNotify: (NotifyChannel, String) -> Unit) : ActionExecutor {
 
@@ -107,11 +110,34 @@ class NotifyUserTool(private val onNotify: (NotifyChannel, String) -> Unit) : Ac
 
     override fun cancel() = Unit
 
-    /** A refusal is a step the model can correct, never an exception into the loop. */
-    private fun refused() = ActionResult(ActionOutcome.Refused, "NOTIFY_ARGUMENTS_INVALID")
+    /**
+     * A refusal is a step the model can correct, never an exception into the loop.
+     *
+     * The facts are explicit (Task 7 fix review): a bare `ActionResult(Refused, code)` made the registry project
+     * `code = null`, `accepted = null`, `applied = null` and `recoverable = false`. Nothing was dispatched, so
+     * `accepted = false`/`applied = false` are facts; invalid arguments are recoverable because the model can fix the
+     * call and retry; no post-condition was checked and no screen observed (`verified`/`changed` and `observation`
+     * stay `null`). The stable code remains the envelope's `data`.
+     */
+    private fun refused() = ActionResult(
+        outcome = ActionOutcome.Refused,
+        detail = NOTIFY_ARGUMENTS_INVALID,
+        execution = ToolExecution(
+            outcome = ToolOutcome.Refused,
+            code = NOTIFY_ARGUMENTS_INVALID,
+            recoverable = true,
+            accepted = false,
+            applied = false,
+            verified = null,
+            changed = null,
+        ),
+    )
 
     companion object {
         private val JSON = Json { isLenient = true }
+
+        /** The stable code for every malformed/unsupported `notify_user` call. */
+        const val NOTIFY_ARGUMENTS_INVALID = "NOTIFY_ARGUMENTS_INVALID"
 
         val DESCRIPTOR = ActionDescriptor(
             name = "notify_user",

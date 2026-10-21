@@ -312,6 +312,7 @@ data: {"type":"response.completed","sequence_number":1,"response":{"id":"r","sta
         assertEquals("call_1", output.getValue("call_id").jsonPrimitive.content)
         assertEquals(envelope, output.getValue("output").jsonPrimitive.content, "the payload is forwarded byte for byte")
         assertTrue("\"observation\":null" in envelope, "no observation is invented: $envelope")
+        assertTrue("\"accepted\":true" in envelope, "the execution facts survive, as on the chat path: $envelope")
         assertFalse("Failed: " in envelope, "no legacy prefix: $envelope")
         assertFalse("Refused: " in envelope, "no legacy prefix: $envelope")
     }

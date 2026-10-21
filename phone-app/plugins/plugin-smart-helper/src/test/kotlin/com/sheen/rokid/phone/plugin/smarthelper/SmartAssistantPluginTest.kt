@@ -1268,7 +1268,7 @@ class SmartAssistantPluginTest {
         val second = rig.model.requests[1]
         assertTrue(
             second.history.any {
-                it is com.sheen.rokid.plugin.ModelHistoryItem.ToolOutput && it.output == doneToolOutput("已记下")
+                it is com.sheen.rokid.plugin.ModelHistoryItem.ToolOutput && it.output == unmigratedToolOutput("已记下")
             },
             "the tool output must be echoed back into the transcript, was ${second.history}",
         )

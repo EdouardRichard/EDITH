@@ -5,17 +5,17 @@ import com.sheen.rokid.plugin.ToolExecution
 import com.sheen.rokid.plugin.ToolOutcome
 
 /**
- * The exact model-facing envelope a successful, observation-less tool result carries (0.3 Phase 2.2, Task 2).
+ * The exact model-facing envelope an **unmigrated** tool result carries (0.3 Phase 2.2, Task 2).
  *
  * Consumer tests used to name the tool's raw detail (`notified:1`); the detail is now the envelope's `data` member, so
  * an assertion compares the whole envelope and keeps pinning the shape the plugin persists and replays instead of
  * decoding it away. `ToolResultEnvelopeTest`/`ToolRegistryTest` pin the wire spelling itself.
  *
- * This helper models an **unmigrated** tool: it states only the outcome, so the registry projects `accepted` and the
- * tri-state facts as unknown. A migrated pure plugin tool (`notify_user`/`load_skill`, Task 7) states the facts it
- * knows, so its tests use [pureToolOutput].
+ * This helper models a tool that states only the outcome, so the registry projects `accepted` and the tri-state facts
+ * as unknown. A migrated pure plugin tool (`notify_user`/`load_skill`, Task 7) states the facts it knows, so its tests
+ * use [pureToolOutput].
  */
-internal fun doneToolOutput(data: String): String =
+internal fun unmigratedToolOutput(data: String): String =
     ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Done), observation = null, data = data)
 
 /**
