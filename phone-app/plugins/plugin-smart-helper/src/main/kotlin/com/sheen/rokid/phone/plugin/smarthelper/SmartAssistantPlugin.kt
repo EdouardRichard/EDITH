@@ -3239,7 +3239,13 @@ class SmartAssistantPlugin(
         // the displayed/rejected/silent decision is made, not in `emit`'s phase check (a `notify_user` answer is
         // emitted while the run is still `Running`).
         settleAnswerAfterRun(owned, fallbackExpected = ledger.calls == 0 && !ledger.suppressed)
-        releaseParkedProactive()
+        // 0.3 Phase 3 Task 7 fix (controller ruling): only a **WAKE** turn may release the proactive work it made wait
+        // (spec §4.6). `runTurnBody` is shared with the FOLLOWUP_TURN, and releasing from a follow-up's end resumed a
+        // trigger parked during the follow-up as a HINT_TURN right after the follow-up answer. That hint's `Displayed`
+        // ACK then installed a fresh PROACTIVE window over the continuation round the follow-up answer had just opened,
+        // so the wearer's next sentence became the hint's follow-up and the continuation was silently superseded. A
+        // follow-up leaves the parked trigger parked - no new queue, no second HINT_TURN.
+        if (owned.route == AssistantRoute.WAKE) releaseParkedProactive()
     }
 
     /**
@@ -4708,6 +4714,10 @@ class SmartAssistantPlugin(
 
     /**
      * The turn a wake opened has finished, so the proactive work it made wait may run (spec §4.6).
+     *
+     * **Only the WAKE route calls this.** The shared `runTurnBody` gates the call on the owning turn's route: a
+     * PROACTIVE follow-up must leave a trigger it merely observed parked, or the resumed hint would install its window
+     * over that follow-up's own continuation round (Task 7 fix).
      *
      * Takes the slot under [gate] before running, so two turns finishing at once cannot both run the same trigger,
      * and runs it outside the lock because `runProactive` starts a task of its own.

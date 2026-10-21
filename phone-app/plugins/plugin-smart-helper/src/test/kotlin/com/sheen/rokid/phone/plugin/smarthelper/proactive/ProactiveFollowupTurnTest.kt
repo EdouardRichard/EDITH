@@ -5,6 +5,7 @@ import com.sheen.rokid.contracts.AcousticLabel
 import com.sheen.rokid.contracts.Assistance
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.ConfirmationResult
+import com.sheen.rokid.contracts.ContextChanged
 import com.sheen.rokid.contracts.OutputStateEvent
 import com.sheen.rokid.contracts.OutputStatus
 import com.sheen.rokid.contracts.SpeechFinished
@@ -88,6 +89,19 @@ class ProactiveFollowupTurnTest {
         val stores: Map<ContextRoute, ConversationStore>,
     )
 
+    /**
+     * A gate that always intervenes and records every judgement, so "the parked trigger never reached the decision
+     * gate" is observable rather than inferred. `ContextChanged` only evaluates an ambient trigger when a gate exists.
+     */
+    private class AlwaysInterveneGate : ProactiveGate {
+        val seen = mutableListOf<ProactiveGateState>()
+        override val form = GateForm.NOUL
+        override fun shouldIntervene(state: ProactiveGateState): GateOutcome {
+            seen += state
+            return GateOutcome(true, 0.9, 1.0)
+        }
+    }
+
     /** The host's perception signal, the plugin's own arming evidence (spec §16.2). */
     private fun arm(rig: SmartTestRig, label: AcousticLabel = AcousticLabel.Speech) {
         rig.plugin.handle(AcousticEvent(rig.envelope(), label))
@@ -160,12 +174,15 @@ class ProactiveFollowupTurnTest {
         channel: ConfirmationChannel? = null,
         perception: com.sheen.rokid.plugin.PerceptionProvider? = null,
         hintText: String = "现在正适合提醒他一句",
+        /** The intervention gate; non-null is what lets a `ContextChanged` reach the proactive admission. */
+        interventionGate: ProactiveGate? = null,
     ): FollowupRig {
         val display = SmartRecordingDisplay()
         val rig = SmartTestRig(
             panelVisible = true,
             continueDialogue = continueDialogue,
             conversationStores = stores,
+            interventionGate = interventionGate,
         )
         rig.actions.descriptors += descriptors
         val overrides = buildMap {
@@ -428,6 +445,93 @@ class ProactiveFollowupTurnTest {
             assertNotNull(next)
             assertEquals(SmartTurnPhase.AwaitingTranscript, next.second)
             assertNotEquals("asr-follow-up", next.first, "the continuation is a new PROACTIVE turn")
+        }
+    }
+
+    // ---- spec §4.6: only a WAKE turn releases the parked proactive trigger -------------------------------------------
+
+    /**
+     * The Task 7 residual defect: `runTurnBody` is shared with the FOLLOWUP_TURN, so its end used to call
+     * `releaseParkedProactive()` for **every** route. A trigger parked while the follow-up was running (the follow-up is
+     * a live conversation, so the admission refuses it as BUSY) was then resumed as a HINT_TURN right after the
+     * follow-up answer. That hint's `Displayed` ACK installed a fresh PROACTIVE window over the continuation round the
+     * follow-up answer had just opened, so the wearer's next sentence became the hint's follow-up and the continuation
+     * was silently superseded.
+     *
+     * Controller ruling: only a **WAKE** turn may release the proactive work it made wait. A follow-up leaves the
+     * trigger parked (no new queue, no second HINT_TURN) and the continuation round stays the conversation's own.
+     */
+    @Test
+    fun `a trigger parked during a follow-up is not released as a new hint`() {
+        val gate = AlwaysInterveneGate()
+        val rig = rigWithDisplayedHint(continueDialogue = true, interventionGate = gate)
+        rig.script.next { request, listener ->
+            // A foreground-changing ContextChanged lands while the follow-up is genuinely in flight. The follow-up is
+            // busy and the context is evaluated, so the trigger is parked instead of run.
+            rig.rig.plugin.handle(ContextChanged(rig.rig.envelope(), 2, mapOf("app.foreground" to "设置")))
+            streamText(request, listener, "第一轮完成。")
+        }
+        // Only the buggy release consumes this handler: a HINT_TURN emitted after the follow-up answer.
+        rig.script.next(proposing("不该出现的提醒"))
+        // The continuation round's own answer.
+        rig.script.next(answering("第二轮完成。"))
+
+        withLines { lines ->
+            injectFollowup(rig, "打开设置", turnId = "asr-1")
+
+            // The follow-up answered and nothing else ran: no resumed HINT_TURN, no second model request.
+            val answer = rig.rig.output.hints.last()
+            assertEquals("第一轮完成。", answer.text)
+            assertEquals(
+                listOf("现在正适合提醒他一句", "第一轮完成。"),
+                rig.rig.output.hints.map { it.text },
+                "the follow-up answer is the only new hint",
+            )
+            assertEquals(2, rig.rig.model.requests.size, "no HINT_TURN ran after the follow-up")
+            assertEquals(1, gate.seen.size, "a parked trigger never reaches the decision gate")
+            assertTrue(lines.any { it == "P3_PROACTIVE park reason=BUSY" }, "the context change was parked: $lines")
+            assertTrue(
+                lines.none { it.startsWith("P3_PROACTIVE resume") },
+                "a follow-up must not release the parked trigger: $lines",
+            )
+            assertEquals(
+                0,
+                lines.count { it.startsWith("P3_PROACTIVE hint") },
+                "no P3_PROACTIVE hint may follow the follow-up answer: $lines",
+            )
+
+            // Acknowledge every hint the host received. The follow-up answer's ACK opens the continuation round; the
+            // resumed hint's ACK (absent once fixed) is what used to install a new window over that round.
+            rig.rig.output.hints.forEach { submitted ->
+                rig.rig.plugin.handle(OutputStateEvent(rig.rig.envelope(), submitted.hintId, OutputStatus.Displayed))
+            }
+            assertNull(
+                rig.rig.plugin.followupWindowTurnIdForTest(),
+                "the parked trigger must not become a new hint window",
+            )
+            assertTrue(
+                lines.none { it.startsWith("P3_PROACTIVE followup open") },
+                "the resumed hint opened no new follow-up window: $lines",
+            )
+            val continuation = rig.rig.plugin.followupTurnStateForTest()
+            assertNotNull(continuation, "the displayed follow-up answer still continues")
+            assertEquals(SmartTurnPhase.AwaitingTranscript, continuation.second)
+            assertTrue(
+                lines.any { it.startsWith("P3_CONV continue route=PROACTIVE") },
+                "the continuation round is the follow-up answer's own: $lines",
+            )
+
+            // The next sentence continues the conversation: two PROACTIVE rounds, the second one the continuation.
+            injectFollowup(rig, "打开蓝牙", turnId = "asr-2", revision = 3)
+            val second = rig.rig.output.hints.last()
+            assertEquals("第二轮完成。", second.text)
+            assertEquals("asr-2", second.sourceTurnId, "the next final continued the conversation, not a hint")
+            assertEquals(
+                2,
+                lines.count { it.startsWith("P3_TURN start") && "route=PROACTIVE" in it },
+                "exactly the follow-up and its continuation ran: $lines",
+            )
+            assertEquals(0, lines.count { it.startsWith("P3_PROACTIVE hint") }, lines.toString())
         }
     }
 
