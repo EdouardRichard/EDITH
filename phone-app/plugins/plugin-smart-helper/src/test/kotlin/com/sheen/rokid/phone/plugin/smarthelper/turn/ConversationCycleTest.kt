@@ -297,6 +297,34 @@ class ConversationCycleTest {
     }
 
     @Test
+    fun `closing only a named turn leaves a newer round alone`() {
+        val rig = rig()
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "hint-turn")
+
+        // Task 9d: a hint that never acquired its panel releases the round it pre-armed. A round that was replaced in
+        // the meantime belongs to a newer attempt and must not be closed by the old one's cleanup.
+        rig.cycle.closeIfTurn(AssistantRoute.PROACTIVE, "stale-turn")
+        assertEquals(0, rig.display.closed, "a mismatched turn id closes nothing")
+        assertEquals(1, rig.scheduler.pending(), "the live round keeps its acquisition wait")
+
+        rig.cycle.closeIfTurn(AssistantRoute.PROACTIVE, "hint-turn")
+        assertEquals(1, rig.display.closed, "the named round is released")
+        assertEquals(0, rig.scheduler.pending(), "its acquisition wait is cancelled with it")
+    }
+
+    @Test
+    fun `releasing a never shown round sends no close`() {
+        val rig = rig()
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "hint-turn")
+        assertEquals(1, rig.scheduler.pending())
+
+        rig.cycle.releaseIfTurn(AssistantRoute.PROACTIVE, "hint-turn")
+
+        assertEquals(0, rig.scheduler.pending(), "the pre-armed acquisition wait is released")
+        assertEquals(0, rig.display.closed, "a panel the phone never opened gets no CLOSE command")
+    }
+
+    @Test
     fun `closing the conversation releases the bounded panel wait`() {
         val rig = rig()
         rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")

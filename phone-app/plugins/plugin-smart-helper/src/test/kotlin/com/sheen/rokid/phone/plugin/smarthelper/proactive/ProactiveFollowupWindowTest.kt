@@ -52,6 +52,8 @@ class ProactiveFollowupWindowTest {
         val rig: SmartTestRig,
         val display: SmartRecordingDisplay,
         val hint: Assistance,
+        /** Every readiness-aware `PANEL_OPEN` the plugin asked the host for; an already visible panel asks for none. */
+        val panelOpenRequests: List<AssistantRoute>,
     )
 
     /** The host's perception signal, which is the plugin's own arming evidence (spec §16.2). */
@@ -127,20 +129,25 @@ class ProactiveFollowupWindowTest {
     /**
      * A proactive hint that the host has acknowledged as displayed, which is the production trigger for the window.
      *
-     * With [panelVisible] false the window waits for `PANEL_SHOWN` inside its bounded acquisition wait; true is the
-     * production state right after a hint reached the glasses, so the official 10 s starts at `onWake`.
+     * The panel is **already visible** when the hint is submitted: the plugin must take the visible branch and never
+     * ask the host for a readiness-aware open (that would reset the conversation the wearer is watching). The hidden
+     * panel branch is exercised by [hiddenPanelRig], where a recorded `PANEL_SHOWN` is what lets the hint submit.
      *
      * [proactiveCooldownMillis] lets a test place a second trigger inside the window after the hint cooldown;
      * [beforeAttach] runs in the install/attach gap (see `beforeFollowupWindowAttachForTest`).
      */
     private fun rigWithDisplayedHint(
-        panelVisible: Boolean = true,
         proactiveCooldownMillis: String? = null,
         interventionGate: ProactiveGate? = null,
         beforeAttach: (() -> Unit)? = null,
     ): HintRig {
         val display = SmartRecordingDisplay()
-        val rig = SmartTestRig(interventionGate = interventionGate)
+        val panelOpenRequests = mutableListOf<AssistantRoute>()
+        val rig = SmartTestRig(
+            panelVisible = true,
+            interventionGate = interventionGate,
+            requestPanelOpen = { route -> panelOpenRequests += route; true },
+        )
         rig.activate(
             proactiveCooldownMillis = proactiveCooldownMillis,
             overrides = mapOf(Capability.ConversationDisplay to display),
@@ -149,10 +156,76 @@ class ProactiveFollowupWindowTest {
         arm(rig)
         rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
         val hint = rig.output.hints.single()
-        rig.panelVisible = panelVisible
         rig.plugin.beforeFollowupWindowAttachForTest = beforeAttach
         rig.plugin.handle(OutputStateEvent(rig.envelope(), hint.hintId, OutputStatus.Displayed))
-        return HintRig(rig, display, hint)
+        return HintRig(rig, display, hint, panelOpenRequests)
+    }
+
+    /**
+     * 0.3 Phase 3 Task 9d: the production-style readiness-aware panel seam, recorded.
+     *
+     * Production's `HostCompositionRoot.requestPanelOpen` hands `PANEL_OPEN` to the link and returns whether the
+     * request was accepted for delivery; `PANEL_SHOWN` arrives later on the host dispatcher. The deterministic inline
+     * variant delivers that report from inside [onRequest], which is the same ordering the production host produces
+     * (the open is processed, and its first layout announced, before the hint is submitted).
+     */
+    private class PanelSeam {
+        val routes = mutableListOf<AssistantRoute>()
+        val hintsAtRequest = mutableListOf<Int>()
+        val requested = CountDownLatch(1)
+        var hints: () -> Int = { 0 }
+        var onRequest: (() -> Unit)? = null
+        var accepted = true
+
+        fun request(route: AssistantRoute): Boolean {
+            routes += route
+            hintsAtRequest += hints()
+            val result = accepted
+            if (result) onRequest?.invoke()
+            requested.countDown()
+            return result
+        }
+    }
+
+    /** A rig whose proactive hint runs on a hidden panel and must acquire the panel through [PanelSeam]. */
+    private data class HiddenPanelRig(
+        val rig: SmartTestRig,
+        val display: SmartRecordingDisplay,
+        val seam: PanelSeam,
+    )
+
+    /**
+     * Starts the hidden-panel production path: the prompt produces a hint, the plugin requests `PANEL_OPEN`, and the
+     * hint may only be submitted after `PANEL_SHOWN`.
+     *
+     * [deliverShown] false models an overlay that never reports its first layout. [tasks] lets a test keep the hint
+     * turn on its own thread while it waits for the panel report (the production shape).
+     */
+    private fun hiddenPanelRig(
+        accepted: Boolean = true,
+        deliverShown: Boolean = true,
+        tasks: com.sheen.rokid.plugin.TaskScope? = null,
+    ): HiddenPanelRig {
+        val seam = PanelSeam()
+        val display = SmartRecordingDisplay()
+        lateinit var rig: SmartTestRig
+        seam.accepted = accepted
+        seam.hints = { rig.output.hints.size }
+        if (deliverShown) {
+            seam.onRequest = {
+                // The link sets visibility before delivering `PANEL_SHOWN` to the host; this seam delivers the host
+                // callback inline, so the test's own display port observes the level the production cycle would show.
+                rig.panelVisible = true
+                rig.plugin.onPanelShown(AssistantRoute.PROACTIVE)
+            }
+        }
+        rig = SmartTestRig(requestPanelOpen = seam::request)
+        rig.activate(
+            overrides = mapOf(Capability.ConversationDisplay to display),
+            tasks = tasks,
+        )
+        rig.model.onRequest = proposing()
+        return HiddenPanelRig(rig, display, seam)
     }
 
     // ---- opening the window ------------------------------------------------------------------------------------------
@@ -160,10 +233,14 @@ class ProactiveFollowupWindowTest {
     @Test
     fun `a displayed hint opens a bounded follow-up window on the proactive route`() {
         withLines { lines ->
-            val (rig, display, hint) = rigWithDisplayedHint()
+            val (rig, display, hint, panelOpenRequests) = rigWithDisplayedHint()
 
             val windowTurn = rig.plugin.followupWindowTurnIdForTest()
             assertNotNull(windowTurn, "the Displayed ACK is what opens the follow-up window")
+            assertTrue(
+                panelOpenRequests.isEmpty(),
+                "an already visible panel must not be reset or reopened by the hint: $panelOpenRequests",
+            )
 
             // The seam's two observable halves: the cycle opened a PROACTIVE listening round for the same turn, and the
             // device vocabulary names the turn and the hint it follows (never the hint's text).
@@ -296,25 +373,137 @@ class ProactiveFollowupWindowTest {
         }
     }
 
+    // ---- Task 9d: the hidden-panel acquisition (open the panel before the hint) -------------------------------------
+
     @Test
-    fun `a hidden panel starts the proactive window at panel shown`() {
+    fun `a hidden panel hint opens the panel before it submits and listens at panel shown`() {
+        val hidden = hiddenPanelRig()
+
         withLines { lines ->
-            val (rig, display, _) = rigWithDisplayedHint(panelVisible = false)
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
 
-            // The overlay's own start latency is not the wearer's silence: no listening level and no 10 s yet.
-            assertNotNull(rig.plugin.followupWindowTurnIdForTest())
-            assertTrue(display.states.isEmpty(), "STATE 1 waits until there is a panel to show it on")
+            // The defect this pins: no production code asked for a window, so the hint was ACKed `Displayed` on a
+            // hidden panel and the 3 s acquisition wait had no satisfier. The readiness-aware PROACTIVE open is now
+            // requested, and the hint is not submitted before it.
+            assertEquals(listOf(AssistantRoute.PROACTIVE), hidden.seam.routes)
+            assertEquals(
+                listOf(0),
+                hidden.seam.hintsAtRequest,
+                "the hint must not be submitted before the panel request",
+            )
 
-            rig.plugin.onPanelShown(AssistantRoute.PROACTIVE)
+            // `PANEL_SHOWN` armed the 10 s window, and only then did the hint go out, so the announced window cannot
+            // be reset by a later `PANEL_OPEN`.
+            val listen = lines.single { it.startsWith("P3_CONV listen route=PROACTIVE") }
+            assertTrue(listen.endsWith("shown=true"), listen)
+            assertTrue(lines.none { it.startsWith("P3_CONV panel_not_shown") }, lines.toString())
+            val hint = hidden.rig.output.hints.single()
+            assertTrue(
+                lines.indexOf(listen) < lines.indexOfFirst { it.startsWith("P3_HINT show") },
+                "the listening window must be armed before the hint is submitted: $lines",
+            )
+            assertTrue(hidden.display.closes.isEmpty(), "opening the panel must not clear the announced window")
 
-            val state = display.states.single { it.route == AssistantRoute.PROACTIVE }
-            assertEquals(OfficialStatus.LISTENING.wire, state.status)
-            assertNotNull(rig.plugin.followupWindowTurnIdForTest(), "the window stays armed across the panel's layout")
+            // The ACK opens the follow-up window on the already visible panel; no second open/reset may follow.
+            hidden.rig.plugin.handle(OutputStateEvent(hidden.rig.envelope(), hint.hintId, OutputStatus.Displayed))
+            val windowTurn = hidden.rig.plugin.followupWindowTurnIdForTest()
+            assertNotNull(windowTurn, "the displayed hint opens the follow-up window")
+            assertEquals(1, hidden.seam.routes.size, "the open must not be repeated once the hint is on the panel")
+            assertTrue(hidden.rig.cancels.isEmpty(), "the displayed hint must survive the panel acquisition")
+            assertTrue(
+                lines.any { it == "P3_PROACTIVE followup open turn=$windowTurn hint=${hint.hintId}" },
+                lines.toString(),
+            )
+        }
+    }
 
-            rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS - 1)
-            assertTrue(lines.none { it.startsWith("P3_PROACTIVE followup close") }, "9_999 ms is inside the window")
-            rig.tick(1)
-            assertTrue(lines.any { it == "P3_PROACTIVE followup close reason=timeout" }, lines.toString())
+    @Test
+    fun `a hidden panel follow-up final starts a proactive turn`() {
+        val hidden = hiddenPanelRig()
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
+            assertEquals(
+                listOf(AssistantRoute.PROACTIVE),
+                hidden.seam.routes,
+                "the hidden path must request the panel before the follow-up can be armed",
+            )
+            assertTrue(
+                lines.any { it.startsWith("P3_CONV listen route=PROACTIVE") },
+                "PANEL_SHOWN must arm the listening window: $lines",
+            )
+            val hint = hidden.rig.output.hints.single()
+            hidden.rig.plugin.handle(OutputStateEvent(hidden.rig.envelope(), hint.hintId, OutputStatus.Displayed))
+            assertNotNull(hidden.rig.plugin.followupWindowTurnIdForTest())
+
+            hidden.rig.model.onRequest = answering()
+            hidden.rig.plugin.handle(
+                TranscriptEvent(hidden.rig.transcript("把亮度调到最低", turnId = "asr-followup", revision = 2)),
+            )
+            hidden.rig.tick()
+
+            assertNull(hidden.rig.plugin.followupWindowTurnIdForTest(), "the usable final consumes the window")
+            assertEquals(
+                "asr-followup",
+                hidden.rig.plugin.followupTurnStateForTest()?.first,
+                "the production hidden-panel path reaches the PROACTIVE follow-up turn",
+            )
+            assertTrue(
+                lines.any { it.startsWith("P3_TURN start") && "route=PROACTIVE" in it },
+                "the follow-up is a routed agent turn: $lines",
+            )
+            assertTrue(lines.none { it.startsWith("P3_CONV panel_not_shown") }, lines.toString())
+        }
+    }
+
+    @Test
+    fun `a refused panel open skips the hint and records the reason`() {
+        val hidden = hiddenPanelRig(accepted = false, deliverShown = false)
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
+
+            assertTrue(hidden.rig.output.hints.isEmpty(), "a refused open must not submit a hidden hint")
+            assertEquals(listOf(AssistantRoute.PROACTIVE), hidden.seam.routes)
+            assertTrue(
+                lines.any { it == "P3_PROACTIVE hint skipped reason=panel_not_shown" },
+                lines.toString(),
+            )
+            assertTrue(lines.none { it.startsWith("P3_PROACTIVE followup open") }, lines.toString())
+            assertNull(hidden.rig.plugin.followupWindowTurnIdForTest())
+            assertTrue(hidden.display.closes.isEmpty(), "a panel that never opened gets no CLOSE command")
+            assertEquals(0, hidden.rig.scheduler.pending(), "the pre-armed acquisition wait is released")
+        }
+    }
+
+    @Test
+    fun `a panel that never reports shown skips the hint at the acquisition bound`() {
+        val tasks = OffThreadTasks()
+        val hidden = hiddenPanelRig(deliverShown = false, tasks = tasks)
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
+            assertTrue(hidden.seam.requested.await(5, TimeUnit.SECONDS), "the hint requested the panel")
+            assertTrue(hidden.rig.output.hints.isEmpty(), "the hint waits for PANEL_SHOWN")
+
+            // The cycle's bounded panel wait (3 s) is the acquisition bound; its timeout is the real reason, and the
+            // hint turn records the stable skip line instead of submitting a hint on a hidden panel.
+            hidden.rig.tick(3_000)
+            tasks.joinAll()
+
+            assertTrue(hidden.rig.output.hints.isEmpty(), "a hidden hint must not be submitted after a timeout")
+            assertTrue(
+                lines.any { it == "P3_PROACTIVE hint skipped reason=panel_not_shown" },
+                lines.toString(),
+            )
+            assertTrue(lines.any { it.startsWith("P3_CONV panel_not_shown") }, "the real bound is named: $lines")
+            assertTrue(lines.none { it.startsWith("P3_PROACTIVE followup open") }, lines.toString())
+            assertNull(hidden.rig.plugin.followupWindowTurnIdForTest())
+            assertEquals(0, hidden.rig.scheduler.pending(), "the timed-out acquisition round is released")
         }
     }
 
@@ -617,6 +806,24 @@ class ProactiveFollowupWindowTest {
                 OfficialStatus.LISTENING.wire,
                 display.states.last { it.route == AssistantRoute.WAKE }.status,
             )
+        }
+    }
+
+    @Test
+    fun `a wake answer never requests the proactive panel open`() {
+        // WAKE's own window request belongs to the composition's wake detector; the plugin's proactive acquisition
+        // must not add a second request on the wake route.
+        val seam = PanelSeam()
+        val rig = SmartTestRig(requestPanelOpen = seam::request)
+        seam.hints = { rig.output.hints.size }
+        rig.activate()
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
+
+        withLines {
+            rig.wakeAndFinal("问题")
+
+            assertEquals(listOf(AssistantRoute.WAKE), rig.output.hints.map { it.route })
+            assertTrue(seam.routes.isEmpty(), "the wake route must keep its own panel path: ${seam.routes}")
         }
     }
 

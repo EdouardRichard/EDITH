@@ -2127,6 +2127,7 @@ class HostCompositionRoot internal constructor(
             val smartWiring = SmartWiring(smartSettings, profiles, clock, scheduler, { sessionId, generation, turnId ->
                 hostHolder[0]?.cancelOutputTurn(sessionId, generation, turnId)
             }, isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false },
+                requestPanelOpen = { route -> rootHolder[0]?.requestPanelOpen(route) ?: false },
                 speechAvailable = { speechPlayerHolder.get() != null })
             // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
             // One router is the single `Capability.Actions` provider, so the advertised tool set is exactly the set of

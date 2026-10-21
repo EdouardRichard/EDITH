@@ -588,6 +588,12 @@ internal class SmartTestRig(
      */
     var panelVisible: Boolean = false,
     /**
+     * 0.3 Phase 3 Task 9d: the host's readiness-aware `PANEL_OPEN` request, or `null` for a host that has no panel
+     * opening path at all (the legacy hidden submission). Production wires `HostCompositionRoot.requestPanelOpen`
+     * through `SmartWiring`; a test that drives the hidden-panel acquisition supplies its own recording seam.
+     */
+    requestPanelOpen: ((AssistantRoute) -> Boolean)? = null,
+    /**
      * 0.24 S3: continual dialogue after a displayed answer. Default `false` preserves the pre-0.24 tests, which were
      * written before an automatic next round existed; the tests about the feature opt in.
      */
@@ -644,6 +650,7 @@ internal class SmartTestRig(
             contextTuning = contextTuning,
             conversationStores = conversationStores,
             isPanelVisible = { panelVisible },
+            requestPanelOpen = requestPanelOpen,
             continueDialogue = { continueDialogue },
             speechAvailable = { speechAvailable },
             deviceState = deviceState,

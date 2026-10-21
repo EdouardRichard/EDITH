@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.plugin.smarthelper.host
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
 import com.sheen.rokid.agent.ConversationStore
+import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.plugin.DeadlineScheduler
@@ -34,6 +35,12 @@ internal class SmartWiring(
      * stand-alone wiring (mostly tests) on the hidden-panel path.
      */
     isPanelVisible: () -> Boolean = { false },
+    /**
+     * 0.3 Phase 3 Task 9d: the composition's readiness-aware `PANEL_OPEN` request (the same one the wake detector
+     * uses), or `null` for a stand-alone wiring with no panel to open. The production `create` passes
+     * `HostCompositionRoot.requestPanelOpen`, which carries the link's `appStart`/retry/readiness handshake.
+     */
+    requestPanelOpen: ((AssistantRoute) -> Boolean)? = null,
     /**
      * 0.24 S3 Task 14 fix (C2, spec risk row 17): whether the host can actually speak a hint right now.
      *
@@ -89,6 +96,9 @@ internal class SmartWiring(
         // 0.24 S3 fix (C1): the production composition reads the link's live visibility, so a wake on an already-visible
         // panel starts the official 10 s at once instead of waiting for a `PANEL_SHOWN` that will not be repeated.
         isPanelVisible = isPanelVisible,
+        // 0.3 Phase 3 Task 9d: the proactive hint path opens a hidden panel through the same readiness-aware seam the
+        // wake detector uses, instead of submitting a hint the wearer cannot see.
+        requestPanelOpen = requestPanelOpen,
         // 0.24 S3 (spec §5.5): the persisted「持续对话」switch. Read through the wiring's settings snapshot, which is the
         // same value the settings screen writes and `create` reads once at assembly time.
         continueDialogue = { settings.continueDialogue },

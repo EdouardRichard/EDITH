@@ -213,6 +213,16 @@ private const val AUDIT_CAPACITY = 512
 private const val DEFAULT_PROACTIVE_COOLDOWN_NANOS = 60_000_000_000L
 
 /**
+ * 0.3 Phase 3 Task 9d: the last-resort wall-clock bound on a hidden-panel hint's wait for `PANEL_SHOWN`.
+ *
+ * The **product** bound is the conversation cycle's own panel-acquisition cap (3 s), armed by the pre-open `onWake`;
+ * its timeout cancels this wait through [SmartAssistantPlugin.cancelConversationTurn], so the wearer never waits this
+ * long. This longer value only keeps a hint task from blocking forever if that callback is missed - for example a host
+ * that never reports the panel and never releases the cycle round.
+ */
+private const val HINT_PANEL_ACQUIRE_TIMEOUT_MILLIS = 5_000L
+
+/**
  * How long one **summary** request may take (spec §4.4 step 3).
  *
  * It is deliberately shorter than a turn's own budget: a summary is a background improvement to a transcript that is
@@ -491,6 +501,19 @@ class SmartAssistantPlugin(
      * a panel (tests, harnesses), which keeps every pre-0.24 hidden-panel path intact.
      */
     private val isPanelVisible: () -> Boolean = { false },
+    /**
+     * 0.3 Phase 3 Task 9d (spec §4.3): the host's **readiness-aware** `PANEL_OPEN` request for a route, or `null` for a
+     * host that has no panel opening path.
+     *
+     * This is the seam the proactive hint path uses when the panel is hidden: `HostCompositionRoot.requestPanelOpen`
+     * carries the link's `appStart`/retry/readiness handshake, which the plain `ConversationDisplay.panelOpen` does
+     * not. The request is asynchronous: it returns whether it was accepted for delivery, and the glasses answer with
+     * `PANEL_SHOWN` once the overlay's first layout is up. The plugin opens **before** submitting its hint because the
+     * glasses' `PANEL_OPEN` resets the panel's conversation (and would wipe an earlier-accepted hint), and the CXR
+     * command channel does not guarantee delivery order. `null` keeps the pre-0.24 hidden-panel behavior for a host
+     * without a window (tests, harnesses), so those hosts are not required to have a panel at all.
+     */
+    private val requestPanelOpen: ((AssistantRoute) -> Boolean)? = null,
     /**
      * 0.24 S3 (spec §5.5): whether an answer opens the next listening round.
      *
@@ -1058,6 +1081,69 @@ class SmartAssistantPlugin(
     private var followupAttachInProgress = false
 
     /**
+     * 0.3 Phase 3 Task 9d (spec §4.3): the outcome of acquiring the PROACTIVE panel before a hint is submitted.
+     *
+     * [ACQUIRED] covers both "the panel was already visible" and "the glasses reported its first layout", because the
+     * hint turn only needs to know that the sentence will land on a panel. [PANEL_NOT_SHOWN] is the acquisition
+     * failure that is recorded; [CANCELLED] is a STOP/replacement/session end and is not a panel verdict.
+     */
+    private enum class HintPanelAcquisition { ACQUIRED, PANEL_NOT_SHOWN, CANCELLED }
+
+    /**
+     * One hint waiting for the PROACTIVE panel before it may be submitted.
+     *
+     * The glasses' `PANEL_OPEN` resets the panel's conversation, and the CXR custom-command channel does not guarantee
+     * delivery order, so a `SHOW` crossing an `PANEL_OPEN` is wiped. The hint turn therefore asks for the window first
+     * and blocks here (bounded) until `PANEL_SHOWN` proves the reset already happened. The wait also ends when the
+     * cycle's acquisition cap closes the pre-armed round, or when the hint is stopped/replaced/session-ended.
+     *
+     * The monitor is a private object rather than the plugin lock: [onPanelShown] may run on the host dispatcher while
+     * the hint task is blocked, and neither may hold [gate] across that hand-off.
+     */
+    private class PendingHintPanel(val hint: ProactiveHint) {
+        private val monitor = Object()
+        private var shown = false
+        private var abort: HintPanelAcquisition? = null
+
+        /** The glasses reported the panel's first layout. A late abort cannot undo a panel that is already up. */
+        fun signalShown() {
+            synchronized(monitor) {
+                if (abort == null) shown = true
+                monitor.notifyAll()
+            }
+        }
+
+        /** Ends the wait without a panel: [reason] is [HintPanelAcquisition.PANEL_NOT_SHOWN] or `CANCELLED`. */
+        fun abort(reason: HintPanelAcquisition) {
+            synchronized(monitor) {
+                if (!shown && abort == null) abort = reason
+                monitor.notifyAll()
+            }
+        }
+
+        fun awaitAcquisition(timeoutMillis: Long): HintPanelAcquisition {
+            val deadline = System.nanoTime() + timeoutMillis * 1_000_000L
+            synchronized(monitor) {
+                while (!shown && abort == null) {
+                    val remaining = deadline - System.nanoTime()
+                    if (remaining <= 0L) return HintPanelAcquisition.PANEL_NOT_SHOWN
+                    try {
+                        monitor.wait(maxOf(1L, remaining / 1_000_000L))
+                    } catch (interrupted: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return HintPanelAcquisition.CANCELLED
+                    }
+                }
+                if (shown) return HintPanelAcquisition.ACQUIRED
+                return abort ?: HintPanelAcquisition.CANCELLED
+            }
+        }
+    }
+
+    /** The hint waiting for the PROACTIVE panel, or `null`. Read and written under [gate]. */
+    private var pendingHintPanel: PendingHintPanel? = null
+
+    /**
      * 0.3 Phase 3 Task 6: one accepted follow-up utterance on its way to the FOLLOWUP_TURN engine.
      *
      * Task 6 deliberately stops at this hand-off: it clears the listening window, closes the cycle round and records
@@ -1570,6 +1656,10 @@ class SmartAssistantPlugin(
         proactiveRequest?.cancelled = true
         proactiveRequest = null
         proactiveInFlight = false
+        // 0.3 Phase 3 Task 9d: a hint still waiting for the panel belongs to the session that is ending; it must not
+        // submit into the next one. The hint task wakes and ends without a sentence.
+        pendingHintPanel?.abort(HintPanelAcquisition.CANCELLED)
+        pendingHintPanel = null
         // 0.3 Phase 3 Task 6: the PROACTIVE follow-up window and its hand-off are session state. A later session must
         // never inherit a listening round or a turn started from a hint the previous session showed.
         proactiveFollowup = null
@@ -1875,6 +1965,12 @@ class SmartAssistantPlugin(
         val liveTurn = synchronized(gate) { turn != null }
         if (liveTurn && !conversationCycle.hasTurn(route)) return
         conversationCycle.onPanelShown(route)
+        // 0.3 Phase 3 Task 9d: a hint that pre-armed this round is waiting for the first layout before it may submit.
+        // The cycle call above has already armed the 10 s window for that round, so the hint lands on a listening
+        // panel; a report whose pre-armed round was closed meanwhile arms nothing and must not release the hint.
+        if (route == AssistantRoute.PROACTIVE && conversationCycle.hasTurn(route)) {
+            synchronized(gate) { pendingHintPanel }?.signalShown()
+        }
     }
 
     /**
@@ -1964,6 +2060,16 @@ class SmartAssistantPlugin(
      */
     private fun cancelConversationTurn(route: AssistantRoute, expectedTurnId: String) {
         if (route == AssistantRoute.PROACTIVE) {
+            // 0.3 Phase 3 Task 9d: the cycle's bounded panel-acquisition wait ended without `PANEL_SHOWN` for a hint
+            // that pre-armed this round. No window/turn exists yet; the hint task is waiting to submit and must be
+            // released with the real reason, so it records the skip line instead of displaying on a hidden panel.
+            val pending = synchronized(gate) {
+                pendingHintPanel?.takeIf { it.hint.turnId == expectedTurnId }?.also { pendingHintPanel = null }
+            }
+            if (pending != null) {
+                pending.abort(HintPanelAcquisition.PANEL_NOT_SHOWN)
+                return
+            }
             var cancelledTurn: SmartTurn? = null
             var closedWindow = false
             val cleared = synchronized(gate) {
@@ -4072,16 +4178,21 @@ class SmartAssistantPlugin(
         val (message, contextEntries) = proactiveMessage(trigger)
         val hint = ProactiveHint(hintId = "hint-${UUID.randomUUID()}", turnId = "proactive-${UUID.randomUUID()}")
         val request = ProactiveHintRequest(hintId = hint.hintId, turnId = hint.turnId, startedNanos = started)
+        var replacedPanelWait: PendingHintPanel? = null
         synchronized(gate) {
             if (context !== current) return
             // A newer trigger may legitimately replace an older slot; the old run's gateway polls this flag as its
             // `stop` predicate, so marking it is what keeps the replaced turn from writing back.
             proactiveHint?.cancelled = true
             proactiveRequest?.cancelled = true
+            // 0.3 Phase 3 Task 9d: a hint still waiting for the panel is replaced with the turn it belongs to.
+            replacedPanelWait = pendingHintPanel
+            pendingHintPanel = null
             proactiveHint = hint
             proactiveRequest = request
             proactiveInFlight = true
         }
+        replacedPanelWait?.abort(HintPanelAcquisition.CANCELLED)
         // Phase C: the proactive route is now working, and the wearer's ring should say so from the trigger rather than
         // from the first thing that happens to arrive. Outside the lock, as `publishBusy` requires.
         publishBusy()
@@ -4323,6 +4434,22 @@ class SmartAssistantPlugin(
             filter.noteRequest(clock.nowNanos())
             filter.noteDedup(trigger)
             P3Log.line("P3_PROACTIVE hint chars=${hintText.length} ms=$elapsed")
+            // 0.3 Phase 3 Task 9d: a hidden panel is opened **before** the hint goes out. The glasses' `PANEL_OPEN`
+            // resets the panel's conversation, and the CXR channel is unordered, so submitting first would let the
+            // open wipe the sentence; waiting for `PANEL_SHOWN` is what proves the reset already happened.
+            when (acquireHintPanel(hint)) {
+                HintPanelAcquisition.ACQUIRED -> Unit
+                HintPanelAcquisition.PANEL_NOT_SHOWN -> {
+                    // No hint on an invisible panel: count-only evidence, and the deterministic hint turn ends here.
+                    P3Log.line("P3_PROACTIVE hint skipped reason=panel_not_shown")
+                    discard(request, hint)
+                    return
+                }
+                HintPanelAcquisition.CANCELLED -> {
+                    discard(request, hint)
+                    return
+                }
+            }
             // B3/B6 / spec §4.9: the proactive route records its own turn into its own transcript and compresses it
             // against the same budget, **before** the hint is submitted. The order is the submission's, not the
             // compressor's: the compressor's truncation is what writes the dropped messages to memory, and the trigger
@@ -4462,12 +4589,14 @@ class SmartAssistantPlugin(
      * cancel the new one.
      */
     private fun discard(request: ProactiveHintRequest, hint: ProactiveHint) {
-        synchronized(gate) {
+        val abandonedPanelWait = synchronized(gate) {
             hint.cancelled = true
             request.cancelled = true
             if (proactiveHint === hint) proactiveHint = null
             if (proactiveRequest === request) proactiveRequest = null
+            pendingHintPanel?.takeIf { it.hint === hint }?.also { pendingHintPanel = null }
         }
+        abandonedPanelWait?.abort(HintPanelAcquisition.CANCELLED)
     }
 
     /**
@@ -4510,6 +4639,7 @@ class SmartAssistantPlugin(
             null
         }
         var cancelLateOutput = false
+        var releaseAcquisition = false
         var openedFollowup: FollowupWindow? = null
         synchronized(gate) {
             hint.submitting = false
@@ -4530,15 +4660,22 @@ class SmartAssistantPlugin(
                 hint.cancelled = true
                 if (proactiveHint === hint) proactiveHint = null
                 cancelLateOutput = true
+                releaseAcquisition = true
             } else {
                 // Refused by the host's display gate: one line, no retry, no second request.
                 P3Log.line("P3_PROACTIVE hint rejected chars=${assistance.text.length}")
                 hint.cancelled = true
                 if (proactiveHint === hint) proactiveHint = null
+                releaseAcquisition = true
             }
         }
         val opened = openedFollowup
         if (opened != null) openFollowupWindow(opened)
+        if (releaseAcquisition) {
+            // 0.3 Phase 3 Task 9d: a hint the host refused (or one replaced mid-submit) does not own a listening
+            // round. Release the round the hidden-panel acquisition pre-armed; a newer attempt's round is untouched.
+            conversationCycle.closeIfTurn(AssistantRoute.PROACTIVE, hint.turnId)
+        }
         if (cancelLateOutput) {
             runCatching { cancelOutputTurn(current.sessionId, current.generation, hint.turnId) }
         }
@@ -4652,6 +4789,84 @@ class SmartAssistantPlugin(
     }
 
     /**
+     * 0.3 Phase 3 Task 9d (spec §4.3): makes sure a hidden panel is **open** before the hint is submitted.
+     *
+     * The glasses' `PANEL_OPEN` runs `resetForOpen()`/`clearConversation()`, so an open processed after the hint's
+     * `SHOW` wipes the just-ACKed sentence; the CXR custom-command channel is unordered, so "send open then show" is
+     * not a guarantee. The order here is therefore: pre-arm the cycle round (so the panel's own `PANEL_SHOWN` arms the
+     * official 10 s window instead of the turn-less defensive close), request the readiness-aware open, wait for that
+     * report, and only then submit.
+     *
+     * With an already visible panel there is nothing to acquire: the caller submits immediately (the visible branch of
+     * the conversation cycle arms the window at the hint's ACK), so a panel the wearer is watching is never reset. A
+     * host with no panel-opening seam (`requestPanelOpen == null`) keeps the legacy behavior.
+     *
+     * A refused request or a bounded timeout returns [HintPanelAcquisition.PANEL_NOT_SHOWN]; the caller records the
+     * stable skip line and submits nothing. The wait's real bound is the cycle's 3 s acquisition cap; the hint task's
+     * own wall-clock bound is the defensive backstop.
+     */
+    private fun acquireHintPanel(hint: ProactiveHint): HintPanelAcquisition {
+        val openPanel = requestPanelOpen ?: return HintPanelAcquisition.ACQUIRED
+        if (isPanelVisible()) return HintPanelAcquisition.ACQUIRED
+        val pending = PendingHintPanel(hint)
+        val claimed = synchronized(gate) {
+            if (proactiveHint !== hint || hint.cancelled || pendingHintPanel != null) {
+                false
+            } else {
+                pendingHintPanel = pending
+                true
+            }
+        }
+        if (!claimed) return HintPanelAcquisition.CANCELLED
+        var result = HintPanelAcquisition.PANEL_NOT_SHOWN
+        try {
+            // The pre-arm is what gives `PANEL_SHOWN` a real turn to start the 10 s window on. It displays nothing on
+            // a hidden panel, so it cannot itself clear a hint.
+            conversationCycle.onWake(AssistantRoute.PROACTIVE, hint.turnId)
+            if (isPanelVisible()) {
+                // The panel came up between the check and the pre-arm; the pre-arm already took the visible branch.
+                pending.signalShown()
+                result = HintPanelAcquisition.ACQUIRED
+            } else {
+                // A STOP or a replacement that landed between the pre-arm and the request must not ask the glasses to
+                // open a window the turn no longer wants.
+                if (!synchronized(gate) { pendingHintPanel === pending && !hint.cancelled }) {
+                    result = HintPanelAcquisition.CANCELLED
+                } else {
+                    val accepted = runCatching { openPanel(AssistantRoute.PROACTIVE) }.getOrDefault(false)
+                    when {
+                        accepted -> result = pending.awaitAcquisition(HINT_PANEL_ACQUIRE_TIMEOUT_MILLIS)
+                        isPanelVisible() -> {
+                            // The link answers "not needed" for an already visible panel. Take the visible branch of
+                            // the cycle before submitting so the ACK's window is not charged to a hidden acquisition.
+                            conversationCycle.onWake(AssistantRoute.PROACTIVE, hint.turnId)
+                            pending.signalShown()
+                            result = HintPanelAcquisition.ACQUIRED
+                        }
+                        else -> result = HintPanelAcquisition.PANEL_NOT_SHOWN
+                    }
+                }
+            }
+        } finally {
+            synchronized(gate) { if (pendingHintPanel === pending) pendingHintPanel = null }
+            // A failed acquisition releases the round it pre-armed; the identity-checked release keeps a newer
+            // attempt's round safe, and a panel that never opened gets no CLOSE command.
+            if (result != HintPanelAcquisition.ACQUIRED) {
+                conversationCycle.releaseIfTurn(AssistantRoute.PROACTIVE, hint.turnId)
+            }
+        }
+        return result
+    }
+
+    /** Ends the panel wait of a hint that is being stopped/replaced/closed. Must not hold [gate] when notifying. */
+    private fun cancelPendingHintPanel(reason: HintPanelAcquisition) {
+        val pending = synchronized(gate) {
+            pendingHintPanel.also { pendingHintPanel = null }
+        }
+        pending?.abort(reason)
+    }
+
+    /**
      * Clears the PROACTIVE conversation's listening window, a not-yet-started hand-off and the follow-up turn itself,
      * recording [reason] once.
      *
@@ -4660,6 +4875,7 @@ class SmartAssistantPlugin(
      * running/waiting follow-up turn is cancelled here too, and its loop/assembler are torn down outside [gate].
      */
     private fun closeFollowup(reason: String) {
+        cancelPendingHintPanel(HintPanelAcquisition.PANEL_NOT_SHOWN)
         var cancelledTurn: SmartTurn? = null
         val cleared = synchronized(gate) {
             val had = proactiveFollowup != null || followupTurnRequest != null || followupTurn != null
@@ -4989,6 +5205,7 @@ class SmartAssistantPlugin(
         var cancelledHintLoop: AgentLoop? = null
         var cancelledFollowup = false
         var stoppedFollowup: SmartTurn? = null
+        var cancelledPanelWait: PendingHintPanel? = null
         var accepted = false
         val stopped = synchronized(gate) {
             if (!matches(envelope)) null
@@ -5005,6 +5222,9 @@ class SmartAssistantPlugin(
                 cancelledHintRun?.cancelled = true
                 cancelledHintLoop = cancelledHintRun?.loop
                 proactiveRequest = null
+                // 0.3 Phase 3 Task 9d: a hint that is still acquiring the panel belongs to this stopped turn too.
+                cancelledPanelWait = pendingHintPanel
+                pendingHintPanel = null
                 // 0.3 Phase 3 Task 6/7: STOP is also the emergency brake for the PROACTIVE conversation. The window,
                 // a not-yet-started hand-off and a running/waiting FOLLOWUP_TURN are all cancelled here; the hint
                 // already on the panel keeps its TTL (spec §4.3).
@@ -5048,7 +5268,12 @@ class SmartAssistantPlugin(
         if (accepted && cancelledFollowup) {
             P3Log.line("P3_PROACTIVE followup close reason=stop")
             conversationCycle.onStop(AssistantRoute.PROACTIVE)
+        } else if (accepted && cancelledPanelWait != null) {
+            // A hint that never got past the panel acquisition pre-armed a round but no window exists: release the
+            // round without an IDLE/CLOSE a wearer with no panel could not use.
+            conversationCycle.onClose(AssistantRoute.PROACTIVE)
         }
+        cancelledPanelWait?.abort(HintPanelAcquisition.CANCELLED)
         // Outside the lock, as `publishBusy` requires.
         publishBusy()
     }
@@ -5063,6 +5288,8 @@ class SmartAssistantPlugin(
         // levels without a display call keeps a stale 10 s window from closing the panel during this turn. A foreign
         // Help never reaches here, so it cannot reset this session's conversation.
         if (!synchronized(gate) { matches(envelope) }) return
+        // 0.3 Phase 3 Task 9d: a hint still waiting for the panel cannot submit into the turn Help is opening.
+        cancelPendingHintPanel(HintPanelAcquisition.CANCELLED)
         conversationCycle.reset()
         val started = synchronized(gate) {
             if (!matches(envelope)) return

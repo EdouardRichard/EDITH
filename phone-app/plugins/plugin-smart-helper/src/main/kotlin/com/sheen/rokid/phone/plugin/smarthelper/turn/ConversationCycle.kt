@@ -460,6 +460,39 @@ internal class ConversationCycle(
         cancelledTurn?.let { cancelTurn(route, it) }
     }
 
+    /**
+     * 0.3 Phase 3 Task 9d: closes the round **only if it is still [turnId]**.
+     *
+     * The proactive hint path pre-arms a hidden-panel round so the glasses' `PANEL_SHOWN` can arm the 10 s window
+     * before the hint is submitted. When that acquisition is abandoned (a refused open, a timeout, a rejected submit)
+     * the round it pre-armed must be released, but a round that was replaced by a newer attempt meanwhile belongs to
+     * that attempt and must not be closed by the old one's cleanup.
+     */
+    fun closeIfTurn(route: AssistantRoute, turnId: String) {
+        synchronized(lock) {
+            val current = state(route)
+            if (current.turnId != turnId) return
+            closeLocked(route, current)
+        }
+    }
+
+    /**
+     * 0.3 Phase 3 Task 9d: releases the round **only if it is still [turnId]**, without a display call.
+     *
+     * A hidden-panel acquisition that was refused or timed out pre-armed a round for a panel that never reported its
+     * first layout: there is no window to close, so sending `CLOSE` would be a command about a panel the phone never
+     * opened. This releases the timers and the turn identity and leaves the wire alone, while [closeIfTurn] stays the
+     * path for a round whose panel really was open.
+     */
+    fun releaseIfTurn(route: AssistantRoute, turnId: String) {
+        synchronized(lock) {
+            val current = state(route)
+            if (current.turnId != turnId) return
+            cancelAllTimersLocked(current)
+            resetRouteLocked(current)
+        }
+    }
+
     /** Session end: release every deadline and forget every route, without calling the host (spec §5.7). */
     fun reset() {
         synchronized(lock) {
