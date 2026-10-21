@@ -83,6 +83,8 @@ class ConversationCycleTest {
         val scheduler = SmartFakeScheduler(clock)
         val display = RecordingDisplay()
         val continuations = mutableListOf<String>()
+        /** 0.3 Phase 3 Task 7: the route each continuation was opened for, in the same order as [continuations]. */
+        val continuationRoutes = mutableListOf<AssistantRoute>()
         val cancelled = mutableListOf<Pair<AssistantRoute, String>>()
         val logs = mutableListOf<String>()
         val cycle = ConversationCycle(
@@ -90,7 +92,10 @@ class ConversationCycleTest {
             scheduler = scheduler,
             display = { display },
             continueDialogue = { continueOn },
-            openContinuation = { turnId -> continuations += turnId },
+            openContinuation = { route, turnId ->
+                continuationRoutes += route
+                continuations += turnId
+            },
             isPanelVisible = { panelVisible },
             cancelTurn = { route, turnId -> cancelled += route to turnId },
             log = { line -> logs += line },
@@ -434,12 +439,33 @@ class ConversationCycleTest {
 
         assertEquals(OfficialStatus.AUDIO_FINISHED.wire, rig.display.statuses.last())
         assertEquals(listOf("turn-1"), rig.continuations, "the continuation is opened once, for the finished turn")
+        assertEquals(listOf(AssistantRoute.WAKE), rig.continuationRoutes, "a wake answer continues the wake route")
         assertEquals(0, rig.display.closed)
         assertEquals(emptyList(), rig.cancelled, "a normal continued answer must not cancel a turn")
         // R106: only an answer that asked to be spoken waits; the speech-off path still settles at `Displayed`.
         assertEquals(0, rig.scheduler.pending(), "a silent answer arms no speech wait")
         rig.advance(OfficialConversation.SPEECH_LIVENESS_MILLIS)
         assertEquals(0, rig.display.closed)
+    }
+
+    @Test
+    fun `a proactive answer continues only the proactive route`() {
+        // 0.3 Phase 3 Task 7 / P3-13: the callbacks carry the route, so a PROACTIVE answer can never open a WAKE
+        // round (and vice versa). This is the mechanism the plugin's two sessions rely on.
+        val rig = rig(panelVisible = true)
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "followup-1")
+        rig.cycle.onStatus(AssistantRoute.PROACTIVE, OfficialStatus.ANSWERING)
+
+        rig.cycle.onAnswerDone(AssistantRoute.PROACTIVE, displayed = true, speech = false)
+
+        assertEquals(listOf("followup-1"), rig.continuations)
+        assertEquals(listOf(AssistantRoute.PROACTIVE), rig.continuationRoutes)
+        assertEquals(
+            OfficialStatus.AUDIO_FINISHED.wire,
+            rig.display.states.last().status,
+        )
+        assertEquals(AssistantRoute.PROACTIVE, rig.display.states.last().route)
+        assertEquals(emptyList(), rig.cancelled)
     }
 
     @Test

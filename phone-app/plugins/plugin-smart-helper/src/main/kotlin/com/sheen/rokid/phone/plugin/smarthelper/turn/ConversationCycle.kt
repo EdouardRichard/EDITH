@@ -47,7 +47,15 @@ internal class ConversationCycle(
     private val scheduler: DeadlineScheduler,
     private val display: () -> ConversationDisplay?,
     private val continueDialogue: () -> Boolean,
-    private val openContinuation: (turnId: String) -> Unit,
+    /**
+     * 0.3 Phase 3 Task 7: opens the next listening round for the **route whose answer** just finished.
+     *
+     * The route is carried explicitly instead of being inferred by the opener: a PROACTIVE answer must never open a
+     * WAKE round (P3-13), and the cycle is the only component that knows which route's answer-done decision this is.
+     * The turn id is the finished turn's, so a stale continuation (the turn was stopped or replaced meanwhile) opens
+     * nothing.
+     */
+    private val openContinuation: (route: AssistantRoute, turnId: String) -> Unit,
     /**
      * Whether the panel is visible right now. A turn that opens while it is already up must start its 10 s window
      * immediately rather than wait for a `PANEL_SHOWN` the glasses will not send again (spec §5.3; Task 11 exposes the
@@ -351,7 +359,7 @@ internal class ConversationCycle(
             }
         }
         // Outside the lock: the opener re-enters the plugin and eventually this cycle's `onWake`.
-        continuation?.let(openContinuation)
+        continuation?.let { openContinuation(route, it) }
         cancelledTurn?.let { cancelTurn(route, it) }
     }
 
@@ -383,7 +391,7 @@ internal class ConversationCycle(
             log("P3_CONV speech route=${route.name} result=$result")
             continuation = settleSpokenAnswerLocked(route, current, continueOn)
         }
-        continuation?.let(openContinuation)
+        continuation?.let { openContinuation(route, it) }
     }
 
     /**

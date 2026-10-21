@@ -14,6 +14,7 @@ import com.sheen.rokid.output.OfficialConversation
 import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.phone.plugin.smarthelper.SmartRecordingDisplay
 import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig
+import com.sheen.rokid.phone.plugin.smarthelper.OffThreadTasks
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.smartToolCall
 import com.sheen.rokid.phone.plugin.smarthelper.streamText
@@ -21,6 +22,8 @@ import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -109,6 +112,18 @@ class ProactiveFollowupWindowTest {
         }
     }
 
+    /** Polls the asynchronous hint/follow-up work for a submitted hint. */
+    private fun awaitHints(rig: SmartTestRig, expected: Int, millis: Long = 2_000) {
+        val deadline = System.nanoTime() + millis * 1_000_000
+        while (rig.output.hints.size < expected && System.nanoTime() < deadline) Thread.sleep(5)
+        assertEquals(expected, rig.output.hints.size, "the expected hint was not submitted")
+    }
+
+    /** The follow-up's answer when Task 7's engine runs it (the window tests only need it to complete). */
+    private fun answering(text: String = "好的。") = { request: ModelRequest, listener: (ModelStreamEvent) -> Unit ->
+        streamText(request, listener, text)
+    }
+
     /**
      * A proactive hint that the host has acknowledged as displayed, which is the production trigger for the window.
      *
@@ -193,8 +208,11 @@ class ProactiveFollowupWindowTest {
             assertTrue(lines.any { it.startsWith("P3_PROACTIVE followup open") }, lines.toString())
 
             // The window opened by the in-submit branch is a real listening round, not just flagged state.
+            rig.model.onRequest = answering()
             rig.plugin.handle(TranscriptEvent(rig.transcript("把亮度调到最低", turnId = "asr-followup", revision = 2)))
-            assertEquals(windowTurn, rig.plugin.followupTurnForTest()?.first)
+            rig.tick()
+            assertNull(rig.plugin.followupWindowTurnIdForTest(), "the usable final consumes the window")
+            assertEquals("asr-followup", rig.plugin.followupTurnStateForTest()?.first)
         }
     }
 
@@ -232,8 +250,12 @@ class ProactiveFollowupWindowTest {
             )
             assertTrue(lines.none { it.startsWith("P3_PROACTIVE followup close") }, lines.toString())
 
+            rig.model.onRequest = answering()
             rig.plugin.handle(TranscriptEvent(rig.transcript("把亮度调到最低", turnId = "asr-followup", revision = 2)))
-            assertEquals(windowTurn, rig.plugin.followupTurnForTest()?.first, "the surviving window accepts the follow-up")
+            rig.tick()
+            assertNull(rig.plugin.followupWindowTurnIdForTest())
+            assertEquals("asr-followup", rig.plugin.followupTurnStateForTest()?.first,
+                "the surviving window accepts the follow-up")
         }
     }
 
@@ -389,28 +411,38 @@ class ProactiveFollowupWindowTest {
         }
     }
 
-    // ---- the usable final: the Task 6 seam ---------------------------------------------------------------------------
+    // ---- the usable final: the Task 7 follow-up turn ---------------------------------------------------------------
 
     @Test
-    fun `a usable final closes the window and hands the utterance to the follow-up seam`() {
+    fun `a usable final closes the window and starts the follow-up turn`() {
         val (rig, _, _) = rigWithDisplayedHint()
+        rig.model.onRequest = answering()
 
         withLines { lines ->
-            val windowTurn = rig.plugin.followupWindowTurnIdForTest()
             val proactiveLinesBefore = lines.count { it.startsWith("P3_PROACTIVE") }
             val requestsBefore = rig.model.requests.size
 
             rig.plugin.handle(TranscriptEvent(rig.transcript("把亮度调到最低", turnId = "asr-followup", revision = 2)))
+            rig.tick()
 
             assertNull(rig.plugin.followupWindowTurnIdForTest(), "a usable final consumes the window")
-            val handoff = rig.plugin.followupTurnForTest()
-            assertNotNull(handoff, "the accepted utterance is handed to the follow-up seam")
-            assertEquals(windowTurn, handoff.first, "the follow-up reuses the listening window's turn id")
-            assertEquals("把亮度调到最低", handoff.second)
-            // Task 6 stops at the seam: no follow-up loop runs here (Task 7 owns it), and the utterance is not also
-            // re-judged as a new proactive trigger.
-            assertEquals(requestsBefore, rig.model.requests.size)
-            assertEquals(proactiveLinesBefore, lines.count { it.startsWith("P3_PROACTIVE") })
+            // Task 7 completes the seam: the hand-off is consumed by a real PROACTIVE turn immediately.
+            assertNull(rig.plugin.followupTurnForTest(), "the hand-off is no longer a pending record")
+            assertEquals(
+                "asr-followup",
+                rig.plugin.followupTurnStateForTest()?.first,
+                "the accepted utterance became the PROACTIVE follow-up turn",
+            )
+            assertEquals(requestsBefore + 1, rig.model.requests.size, "the follow-up ran the normal model loop")
+            assertEquals(
+                proactiveLinesBefore,
+                lines.count { it.startsWith("P3_PROACTIVE") },
+                "the utterance is not re-judged as a new proactive trigger",
+            )
+            assertTrue(
+                lines.any { it.startsWith("P3_TURN start") && "route=PROACTIVE" in it },
+                "the follow-up turn is a routed agent turn: $lines",
+            )
         }
     }
 
@@ -444,25 +476,54 @@ class ProactiveFollowupWindowTest {
     // ---- wake preemption ---------------------------------------------------------------------------------------------
 
     @Test
-    fun `a wake preempts an accepted follow-up and opens only the wake turn`() {
-        val (rig, display, _) = rigWithDisplayedHint()
+    fun `a wake preempts a running follow-up and opens only the wake turn`() {
+        val display = SmartRecordingDisplay()
+        val tasks = OffThreadTasks()
+        val rig = SmartTestRig()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display), tasks = tasks)
+        rig.model.onRequest = proposing()
+        arm(rig)
+        rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+        awaitHints(rig, 1)
+        val hint = rig.output.hints.single()
+        rig.panelVisible = true
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hint.hintId, OutputStatus.Displayed))
+        assertNotNull(rig.plugin.followupWindowTurnIdForTest())
+
+        // Task 7 runs the follow-up as a real, blocking agent turn: hold it inside the transport so the wake really
+        // arrives while it is in flight (P3-4's shape, instead of the pre-Task-7 pending hand-off).
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        rig.model.onRequest = { request, listener ->
+            entered.countDown()
+            release.await(5, TimeUnit.SECONDS)
+            streamText(request, listener, "迟到的回答。")
+        }
         rig.plugin.handle(TranscriptEvent(rig.transcript("把亮度调到最低", turnId = "asr-followup")))
-        assertNotNull(rig.plugin.followupTurnForTest())
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "the follow-up must be in flight when the wake arrives")
 
         withLines { lines ->
             rig.plugin.handle(rig.wakeEvent())
 
-            // P3-4: the wake cancels the handed-over follow-up, but not the hint already on the panel.
-            assertNull(rig.plugin.followupTurnForTest(), "the wake cancels the pending follow-up")
+            // P3-4: the wake cancels the running follow-up, but not the hint already on the panel.
+            assertNull(rig.plugin.followupTurnStateForTest(), "the wake cancels the running follow-up turn")
             assertNull(rig.plugin.followupWindowTurnIdForTest())
             assertTrue(lines.any { it == "P3_PROACTIVE preempt reason=WAKE_PREEMPTED" }, lines.toString())
 
             val wakeState = display.states.single { it.route == AssistantRoute.WAKE }
             assertEquals(OfficialStatus.LISTENING.wire, wakeState.status)
-            assertEquals(1, rig.model.requests.size, "the follow-up's loop never runs")
-            assertEquals(1, rig.output.hints.size, "no second display for the preempted follow-up")
-            assertTrue(rig.cancels.isEmpty(), "the displayed hint is not cancelled by the preemption")
+            assertTrue(
+                rig.cancels.none { it.third == hint.sourceTurnId },
+                "the displayed hint is not cancelled by the preemption",
+            )
         }
+
+        release.countDown()
+        tasks.joinAll()
+        rig.tick()
+        assertEquals(1, rig.output.hints.size, "the preempted follow-up's late answer must not be displayed")
+        assertEquals(2, rig.model.requests.size, "the follow-up made exactly its one request before the wake")
+        assertNull(rig.plugin.followupTurnStateForTest())
     }
 
     @Test

@@ -2,9 +2,11 @@ package com.sheen.rokid.phone.plugin.smarthelper.turn
 import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
 
 import com.sheen.rokid.agent.AgentLoop
+import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.OutputStatus
 import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
@@ -55,6 +57,23 @@ internal class SmartTurn private constructor(
     deadlineNanos: Long,
     val hintId: String,
     private val hintGraceNanos: Long,
+    /**
+     * 0.3 Phase 3 Task 7: which conversation this turn belongs to (P3-13).
+     *
+     * The wake and proactive routes share this class, the display path and the loop **mechanism** but never a turn:
+     * the route decides which plugin slot owns the turn and which `ConversationDisplay`/`ConversationCycle` route its
+     * levels, rows, answer and continuation are published on. Defaulted to [AssistantRoute.WAKE] so every pre-Task-7
+     * call site and every existing wake test keeps exactly its old behaviour.
+     */
+    val route: AssistantRoute = AssistantRoute.WAKE,
+    /**
+     * 0.3 Phase 3 Task 7: the session-pinned prompt posture this turn's requests are assembled under.
+     *
+     * Deliberately separate from [route]: a proactive follow-up turn is a PROACTIVE conversation turn rendered with
+     * [PromptRoute.PROACTIVE_FOLLOWUP] instructions, while a proactive hint turn is the `PROACTIVE_HINT` posture. The
+     * default [PromptRoute.WAKE] is the pre-Task-7 behaviour.
+     */
+    val promptRoute: PromptRoute = PromptRoute.WAKE,
 ) {
     var phase: SmartTurnPhase = SmartTurnPhase.AwaitingTranscript
         private set
@@ -235,6 +254,12 @@ internal class SmartTurn private constructor(
             hintGraceNanos: Long,
             hintId: String,
             onEmit: (String) -> Unit,
+            /**
+             * 0.3 Phase 3 Task 7: the turn's conversation route and prompt posture. Both default to the wake route, so
+             * every pre-Task-7 call site is source-compatible and the wake behaviour is unchanged.
+             */
+            route: AssistantRoute = AssistantRoute.WAKE,
+            promptRoute: PromptRoute = PromptRoute.WAKE,
         ): SmartTurn {
             val turn = SmartTurn(
                 turnId = turnId,
@@ -243,6 +268,8 @@ internal class SmartTurn private constructor(
                 deadlineNanos = deadlineNanos,
                 hintId = hintId,
                 hintGraceNanos = hintGraceNanos,
+                route = route,
+                promptRoute = promptRoute,
             )
             turn.hintValidUntil = saturatingAdd(deadlineNanos, hintGraceNanos)
             turn.assembler = ReadableHintAssembler(clock, scheduler, onEmit)
