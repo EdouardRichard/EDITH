@@ -36,7 +36,9 @@ import kotlinx.serialization.json.put
  *
  * Outcome mapping: a completed zero-exit command is `Done`; a completed non-zero exit is `Failed`
  * (it ran and failed, with its exit code and output kept); a channel failure is `Refused` (the
- * command could not run at all).
+ * command could not run at all). A throw from the shell **after** the command was handed over is
+ * `Failed` in the legacy projection and `Uncertain` in [ToolExecution] (M1): the call may have run
+ * and applied, which a pre-dispatch refusal would misstate.
  */
 class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
 
@@ -94,7 +96,25 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
         val result = try {
             target.run(command)
         } catch (t: Throwable) {
-            return channelFailure(SHELL_FAILED)
+            // edith-0.3 Phase 3 M1: the command already crossed into the shell, so a throw is **not** a pre-dispatch
+            // refusal. The legacy three-state projection cannot express uncertainty; the structured fact is
+            // `Uncertain` with accepted=true and every tri-state field unknown - the command may have applied.
+            return ActionResult(
+                outcome = ActionOutcome.Failed,
+                detail = "{}",
+                stateChanging = true,
+                execution = ToolExecution(
+                    outcome = ToolOutcome.Uncertain,
+                    code = SHELL_FAILED,
+                    message = SHELL_DISPATCH_UNCERTAIN,
+                    recoverable = true,
+                    accepted = true,
+                    applied = null,
+                    verified = null,
+                    changed = null,
+                    uncertain = true,
+                ),
+            )
         }
         val (stdout, stdoutCut) = truncateUtf8(result.stdout, maxBytes.toInt())
         val (stderr, stderrCut) = truncateUtf8(result.stderr, maxBytes.toInt())
@@ -211,6 +231,9 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
         private const val SHELL_NOT_BOUND = "SHELL_NOT_BOUND"
         private const val SHELL_REPLY_TOO_LARGE = "SHELL_REPLY_TOO_LARGE"
         private const val SHELL_FAILED = "SHELL_FAILED"
+
+        /** M1: the stable, content-free reason for a throw that happened after the command was dispatched. */
+        private const val SHELL_DISPATCH_UNCERTAIN = "the shell call may have been dispatched"
 
         val DESCRIPTOR: ActionDescriptor = ActionDescriptor(
             name = NAME,

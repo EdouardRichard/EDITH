@@ -38,6 +38,9 @@ import kotlinx.serialization.json.longOrNull
  * keep their own outcome/detail shapes) and reuses the host observation source `OpenTool` gets;
  * `device`/`open` were migrated by Tasks 4-5 and keep their own policies. Since Task 8 the tools state
  * their own `execution` facts; the catalog only fills a missing execution for a hand-built result.
+ * Phase 3 M5 extends the same enrichment to the refusals the **catalog** itself constructs for
+ * `device`/`open` (accessibility off, shell down, unlock refused): no tool ever saw those calls, so the
+ * catalog supplies the observation + one best-effort picture. Tool results are never re-enriched.
  *
  * `cancel`/`beginTurn`/`close` are the turn lifecycle (R42): the kernel's cancellation is
  * turn-scoped, so a new turn re-arms it and the composition closes the catalog to stop the kernel's
@@ -105,18 +108,16 @@ class ToolCatalog(
             // and a gate would hide the condition behind the question "can you unlock?". Every other action keeps both
             // checks. The gate comes **before** the a11y probe: a locked phone can be exactly the reason the service
             // is unbound, so probing first would refuse the call without ever trying to unlock and reconnect.
+            // M5: `status` returns the tool's own text-only observation untouched; the catalog never re-enriches it.
             if (device.isStatus(argsJson)) {
                 device.execute(name, argsJson)
             } else {
-                gated(unlock.ensureUnlocked(requireAccessibility = true)) {
-                    if (a11yAvailable()) device.execute(name, argsJson) else channelRefused()
-                }
+                deviceCall(name, argsJson)
             }
         ShellTool.NAME ->
             screenCall(ShellTool.NAME) { if (shellAvailable()) shell.execute(name, argsJson) else channelRefused() }
         OpenTool.NAME ->
-            if (!shellAvailable()) channelRefused()
-            else gated(unlock.ensureUnlocked(requireAccessibility = false)) { open.execute(name, argsJson) }
+            openCall(name, argsJson)
         DialTool.NAME ->
             screenCall(DialTool.NAME) {
                 if (!callAvailable()) {
@@ -140,28 +141,65 @@ class ToolCatalog(
     }
 
     /**
+     * M5: one catalog-level `device` call.
+     *
+     * The unlock gate and the a11y probe are decisions of **this** catalog, so their refusals are the ones no tool
+     * result describes; they go through the same [screenCall] enrichment `shell`/`dial` get (observation + at most one
+     * best-effort picture + `nonPersistent=true`). Once both checks pass, the device tool's own result - success or its
+     * own refusal - already carries an observation and a picture, so it is returned untouched and never re-enriched.
+     */
+    private fun deviceCall(name: String, argsJson: String): ActionResult {
+        val unlockOutcome = unlock.ensureUnlocked(requireAccessibility = true)
+        if (!unlockOutcome.usable) return screenCall(DeviceTool.NAME) { lockedRefusal(unlockOutcome) }
+        if (!a11yAvailable()) return screenCall(DeviceTool.NAME) { channelRefused() }
+        return device.execute(name, argsJson)
+    }
+
+    /**
+     * M5: one catalog-level `open` call.
+     *
+     * A shell that is down and an unlock that was refused are the catalog's own refusals, enriched like `shell`/`dial`.
+     * `list` is a read, not a screen operation, so its refusal observes the screen as text only and takes no picture;
+     * the tool result itself is never re-enriched.
+     */
+    private fun openCall(name: String, argsJson: String): ActionResult {
+        val list = isListCall(argsJson)
+        if (!shellAvailable()) return openRefusal(list) { channelRefused() }
+        val unlockOutcome = unlock.ensureUnlocked(requireAccessibility = false)
+        if (!unlockOutcome.usable) return openRefusal(list) { lockedRefusal(unlockOutcome) }
+        return open.execute(name, argsJson)
+    }
+
+    /** M5: one `open` catalog refusal; a `list` read is answered with a text observation and never a picture. */
+    private fun openRefusal(list: Boolean, call: () -> ActionResult): ActionResult =
+        screenCall(OpenTool.NAME, attachPicture = !list) { call() }
+
+    /** Mirrors `OpenTool`'s own `list=true` reading so a non-screen read is not enriched with a picture. */
+    private fun isListCall(argsJson: String): Boolean =
+        parseObject(argsJson)?.booleanArg("list") == true
+
+    /**
      * A refused unlock is reported as a refusal with a code the model can act on; the tool body is never entered, so a
      * device action cannot run against a still-locked screen and get mislabeled as an accessibility failure.
      *
      * Task 8: the catalog's own refusals now carry structured execution facts (the stable code, `accepted`/`applied` =
      * false) and an empty tool-specific `data`, instead of a bare detail string and the old `toolEnvelope` copy.
+     * M5: [deviceCall]/[openCall] feed this answer through the shared screen enrichment.
      */
+    private fun lockedRefusal(outcome: UnlockOutcome): ActionResult = ActionResult(
+        ActionOutcome.Refused,
+        "{}",
+        execution = ToolExecution(
+            outcome = ToolOutcome.Refused,
+            code = "LOCKED_UNLOCK_FAILED:${outcome.name}",
+            recoverable = true,
+            accepted = false,
+            applied = false,
+        ),
+    )
+
     private inline fun gated(outcome: UnlockOutcome, action: () -> ActionResult): ActionResult =
-        if (outcome.usable) {
-            action()
-        } else {
-            ActionResult(
-                ActionOutcome.Refused,
-                "{}",
-                execution = ToolExecution(
-                    outcome = ToolOutcome.Refused,
-                    code = "LOCKED_UNLOCK_FAILED:${outcome.name}",
-                    recoverable = true,
-                    accepted = false,
-                    applied = false,
-                ),
-            )
-        }
+        if (outcome.usable) action() else lockedRefusal(outcome)
 
     /**
      * 0.25 Task 11 (R49): only the raw-command tool has a call-level risk; every other tool answers the additive
@@ -234,8 +272,11 @@ class ToolCatalog(
      * `nonPersistent` is raised whenever an observation or picture exists, because both are perception content that may
      * live only in the current model request (C2).
      */
-    private fun screenCall(tool: String, call: () -> ActionResult): ActionResult =
-        enrichScreenResult(tool, call())
+    private fun screenCall(
+        tool: String,
+        attachPicture: Boolean = true,
+        call: () -> ActionResult,
+    ): ActionResult = enrichScreenResult(tool, call(), attachPicture)
 
     /**
      * The enrichment half of [screenCall], split out so the JVM gate can feed a synthetic tool result.
@@ -244,9 +285,16 @@ class ToolCatalog(
      * future tool version may attach one; the final `vision` fact is therefore derived from the **final** image list
      * (never from the capture's marker alone) and that list is coerced to at most one image, so a tool picture can never
      * be paired with `vision = disabled/unavailable`.
+     *
+     * M5: [attachPicture] false is the `open list` case - a non-screen read still observes the screen as text, but never
+     * takes a picture.
      */
-    internal fun enrichScreenResult(tool: String, result: ActionResult): ActionResult {
-        val observed = if (isArgumentRefusal(tool, result)) {
+    internal fun enrichScreenResult(
+        tool: String,
+        result: ActionResult,
+        attachPicture: Boolean = true,
+    ): ActionResult {
+        val observed = if (!attachPicture || isArgumentRefusal(tool, result)) {
             ObservationAttempt(textObservation(), emptyList())
         } else {
             screenAttempt(attachPicture = result.images.isEmpty())

@@ -2267,6 +2267,129 @@ class DeviceToolTest {
         assertEquals("the failure does not try a second capture", 0, perception.screenshotCalls)
     }
 
+    // - M2/M3: explicit observation degradation and data.device de-duplication -
+
+    /*
+     * M2: a provider that is present but broken must answer an explicit observation instead of a silent `null`.
+     * "No observation" means "this composition has no perception port"; a provider that threw is a different fact and
+     * must say `unavailable(provider_threw)`. M3: `data.device` no longer repeats `foreground=`, which the observation
+     * already carries as `foregroundPackage`/`foregroundActivity`.
+     */
+
+    @Test
+    fun `a throwing projection answers an explicit provider_threw observation instead of null`() {
+        // `refused()` is the path that projects the provider's cache itself (`observeForResult` with no snapshot), so a
+        // throwing `snapshot()` used to return null and hide the broken port behind "no observation".
+        val perception = FakePerception(perceptionSnapshot())
+        perception.snapshotThrows = true
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"act","kind":"teleport"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals("INVALID_ARGUMENTS", executionOf(result).code)
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("provider_threw", observation.visionReason)
+        assertNull("a projection that threw has no screen text", observation.screen)
+        assertFalse("nothing readable can be truncated", observation.truncated)
+        assertTrue("an explicit observation is still perception content", result.nonPersistent)
+    }
+
+    @Test
+    fun `a done result with a broken cache and refresh keeps provider_threw instead of a silent null`() {
+        // A `Done` device result must not silently drop its observation when a provider is still wired.
+        val operations = FakeDeviceOperations(observation())
+        val perception = FakePerception(perceptionSnapshot())
+        perception.refreshThrows = true
+        perception.snapshotThrows = true
+
+        val result = tool(operations, perception = perception)
+            .execute("""{"action":"wait","idle":true}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val observation = observationOf(result)
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("provider_threw", observation.visionReason)
+        assertNull(observation.screen)
+        assertFalse(observation.truncated)
+    }
+
+    @Test
+    fun `an unavailable screen coverage is not rendered as an empty screen`() {
+        // The snapshot-wide renderer would otherwise turn an unavailable read (no elements) into `screen=""`, which reads
+        // like a genuinely empty screen. The coverage token is the honest answer and the screen stays absent.
+        val perception = FakePerception(
+            perceptionSnapshot(
+                elements = listOf(perceptionElement(ref = "#n1", text = "A")),
+                screenCoverage = "unavailable(no_accessibility)",
+            ),
+        )
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"observe"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val observation = observationOf(result)
+        assertNull("an unavailable screen read has no screen text", observation.screen)
+        assertFalse("a screen that was not read cannot be truncated", observation.truncated)
+        assertTrue(
+            "the coverage line must still name the unavailable source: ${observation.coverage}",
+            observation.coverage!!.contains("screen=unavailable(no_accessibility)"),
+        )
+    }
+
+    @Test
+    fun `a non-screen observe never reports a rendered screen`() {
+        val perception = FakePerception(
+            perceptionSnapshot(elements = listOf(perceptionElement(ref = "#n1", text = "A"))),
+        )
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"observe","include":["notifications"]}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val observation = observationOf(result)
+        assertNull("a notification-only read has no screen fact", observation.screen)
+        assertFalse(observation.truncated)
+        assertTrue("the foreground facts still ride the observation", observation.foregroundPackage == "com.example.app")
+    }
+
+    @Test
+    fun `data device omits the duplicated foreground and the observation keeps it`() {
+        val state = deviceState(batteryPercent = 76).copy(
+            foregroundPackage = "com.example.app",
+            foregroundActivity = ".MainActivity",
+        )
+        val perception = FakePerception(perceptionSnapshot())
+
+        val result = tool(
+            FakeDeviceOperations(observation()),
+            perception = perception,
+            deviceState = FakeDeviceState(state),
+        ).execute("""{"action":"status"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val deviceLine = body(result)["device"]!!.jsonPrimitive.content
+        assertTrue("the device line keeps the real state facts: $deviceLine", deviceLine.contains("battery=76%"))
+        assertFalse(
+            "foreground is the observation's fact; data.device must not repeat it: $deviceLine",
+            deviceLine.contains("foreground="),
+        )
+        val observation = observationOf(result)
+        assertEquals("com.example.app", observation.foregroundPackage)
+        assertEquals(".MainActivity", observation.foregroundActivity)
+    }
+
+    @Test
+    fun `runtimeState keeps its own foreground line because it is not data`() {
+        val operations = FakeDeviceOperations(
+            observation(rev = 9, windows = listOf(window(packageName = "com.android.settings"))),
+        )
+
+        assertEquals("foreground=com.android.settings window=0 revision=9", tool(operations).runtimeState())
+    }
+
     // - helpers -
 
     private fun body(result: ActionResult): JsonObject =

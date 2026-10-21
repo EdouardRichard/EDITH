@@ -286,14 +286,15 @@ class DeviceTool(
             val wantsScreen = PerceptionSource.SCREEN in include
             val capture = if (wantsScreen) captureVision() else null
             // 0.3 Phase 2.2 Task 4: the same snapshot and the same single capture are the structured observation, so
-            // the text, the picture and `vision` can never describe two different reads. A non-screen include has no
-            // screen to report: `screen=null`, never the compact renderer's empty string (fix review minor).
+            // the text, the picture and `vision` can never describe two different reads. M2: a non-screen include has
+            // no screen to report (`screen=null`), and an unavailable screen read is never rendered as an empty screen.
             val observation = observeForResult(
                 capture = wantsScreen,
                 visionRequested = wantsScreen,
                 snapshot = snapshot,
                 captureResult = capture,
-            )?.let { if (wantsScreen) it else it.copy(screen = null) }
+                wantsScreen = wantsScreen,
+            )
             // Task 8: the screen tree, coverage, foreground and vision live in `observation` only; `data` keeps the
             // tool-specific non-screen sources the caller asked for.
             result(
@@ -541,31 +542,65 @@ class DeviceTool(
      * The capture-aware half of [observeForResult]: [snapshot] is the read this result already made (or `null` to
      * project the provider's current cache), and [captureResult] is the one capture the caller attaches. Passing the
      * capture in is what keeps a result to **at most one image**: the helper never takes a second picture.
+     *
+     * edith-0.3 Phase 3 M2 adds the two facts that keep a broken or blind read from looking like a good one:
+     *  - a provider that throws while projecting answers an **explicit** `unavailable(provider_threw)` observation
+     *    instead of `null` ("no observation" must mean "no perception port", not "the port failed quietly");
+     *  - [wantsScreen] false, or a screen whose coverage is neither `ok` nor `truncated`, clears `screen` and
+     *    `truncated` instead of rendering an unavailable read as an empty (or stale) screen.
+     *
+     * [projectionFallback] is the one caller that wants `null` back from a broken cache projection: the explicit
+     * screenshot path first tries the cache, then a real [PerceptionProvider.refresh] read (review important 2), and
+     * only a second failure becomes the explicit `provider_threw` observation.
      */
     private fun observeForResult(
         capture: Boolean,
         visionRequested: Boolean,
         snapshot: PerceptionSnapshot?,
         captureResult: PerceptionScreenshotResult?,
+        wantsScreen: Boolean = true,
+        projectionFallback: Boolean = true,
     ): ToolObservation? {
         val provider = perception ?: return null
-        val current = snapshot ?: runCatching {
+        val current = try {
             // Cache-only on purpose: the operation above already made this result's real read; this projects it.
-            provider.snapshot(OBSERVATION_SOURCES, lastFilter.toPerceptionFilter(), null)
-        }.getOrNull() ?: return null
-        val shot = if (capture) (captureResult ?: captureVision()) else null
-        return ToolObservation(
-            snapshotId = current.snapshotId.takeIf { it.isNotEmpty() },
-            capturedAtEpochMillis = current.capturedAtEpochMillis,
-            foregroundPackage = current.foregroundPackage,
-            foregroundActivity = current.foregroundActivity,
-            coverage = PerceptionCoverageRenderer.render(current.coverage),
-            screen = CompactSnapshotRenderer.render(current),
-            truncated = CompactSnapshotRenderer.screenTruncated(current),
-            vision = visionOf(capture, visionRequested, shot),
-            visionReason = visionReasonOf(capture, visionRequested, shot),
-        )
+            snapshot ?: provider.snapshot(OBSERVATION_SOURCES, lastFilter.toPerceptionFilter(), null)
+        } catch (t: Throwable) {
+            return if (projectionFallback) providerThrewObservation() else null
+        }
+        val screenReadable = current.coverage.screen == SCREEN_COVERAGE_OK ||
+            current.coverage.screen == SCREEN_COVERAGE_TRUNCATED
+        val includeScreen = wantsScreen && screenReadable
+        return try {
+            val shot = if (capture) (captureResult ?: captureVision()) else null
+            ToolObservation(
+                snapshotId = current.snapshotId.takeIf { it.isNotEmpty() },
+                capturedAtEpochMillis = current.capturedAtEpochMillis,
+                foregroundPackage = current.foregroundPackage,
+                foregroundActivity = current.foregroundActivity,
+                coverage = PerceptionCoverageRenderer.render(current.coverage),
+                screen = if (includeScreen) CompactSnapshotRenderer.render(current) else null,
+                truncated = includeScreen && CompactSnapshotRenderer.screenTruncated(current),
+                vision = visionOf(capture, visionRequested, shot),
+                visionReason = visionReasonOf(capture, visionRequested, shot),
+            )
+        } catch (t: Throwable) {
+            if (projectionFallback) providerThrewObservation() else null
+        }
     }
+
+    /**
+     * M2: a provider that exists but threw is an explicit observation, never a silent `null`.
+     *
+     * `screen = null`/`truncated = false` are the honest facts: nothing was read. The reason is the stable
+     * `provider_threw` token, so the model can tell it from `no_accessibility` or a screenshot failure.
+     */
+    private fun providerThrewObservation(): ToolObservation = ToolObservation(
+        vision = ToolVision.Unavailable,
+        visionReason = VISION_PROVIDER_THREW,
+        screen = null,
+        truncated = false,
+    )
 
     /** Task 4: the vision fact of one observation; [ToolVision.Ok] is impossible without a real captured image. */
     private fun visionOf(
@@ -705,14 +740,23 @@ class DeviceTool(
     /**
      * Fix review important 2: the screenshot's observation, from the cached projection normally.
      *
-     * A provider that throws from its cache projection must not silently drop the observation even though the call has
-     * a picture: one real [PerceptionProvider.refresh] is the fallback, and only a second throw leaves it `null`. This
-     * is deliberately screenshot-only - an argument refusal must never turn its cached read into a device read.
+     * A provider that throws from its cache projection is retried with one real [PerceptionProvider.refresh] read
+     * (the screenshot has a picture either way, so the screen facts must be a real read rather than a gap). M2: a
+     * second throw no longer leaves the observation `null` - it answers the explicit `unavailable(provider_threw)`
+     * observation, because a `Done` result with a provider present must not silently drop its observation.
      */
     private fun observationForScreenshot(): ToolObservation? {
-        observeForResult(capture = false, visionRequested = false)?.let { return it }
+        observeForResult(
+            capture = false,
+            visionRequested = false,
+            snapshot = null,
+            captureResult = null,
+            // The cache projection may be retried with a real read below; only that second failure is reported.
+            projectionFallback = false,
+        )?.let { return it }
         val provider = perception ?: return null
-        val snapshot = runCatching { provider.refresh() }.getOrNull() ?: return null
+        val snapshot = runCatching { provider.refresh() }.getOrNull()
+            ?: return providerThrewObservation()
         return observeForResult(
             capture = false,
             visionRequested = false,
@@ -791,10 +835,10 @@ class DeviceTool(
                 visionRequested = !envelope.ok,
                 snapshot = it,
                 captureResult = capture,
-            )?.let { observation ->
-                // A status success reports no screen, so no `screen` fact and no screen truncation may survive.
-                if (envelope.ok) observation.copy(screen = null, truncated = false) else observation
-            }
+                // A status success reports no screen, so no `screen` fact and no screen truncation may survive: M2
+                // folds the old copy-after-the-fact into the one observation builder.
+                wantsScreen = !envelope.ok,
+            )
         }
         // Final review C2 (re-review): [result] marks every device result non-persistent, including this one and the
         // provider-less diagnostic-only branch above.
@@ -863,6 +907,11 @@ class DeviceTool(
     /**
      * The compact device line (spec §7.3's `device:` row): every non-null fact, joined into one line.
      * A fact the platform did not report is omitted - the coverage line already says whether the source is complete.
+     *
+     * M3: `foreground=` is deliberately **not** here. The observation already carries `foregroundPackage` /
+     * `foregroundActivity`, so repeating it in `data.device` was a second copy of one fact (and could disagree with the
+     * observation). [runtimeState] keeps its own `foreground=` because that line is the loop's `RUNTIME_STATE`, a
+     * different carrier, not `data`.
      */
     private fun renderDeviceState(state: DeviceState): String = buildString {
         append("time=").append(state.localTime)
@@ -877,7 +926,6 @@ class DeviceTool(
         state.brightness?.let { append(" brightness=").append(it) }
         state.volumePercent?.let { append(" volume=").append(it).append('%') }
         state.imeVisible?.let { append(" ime=").append(it) }
-        state.foregroundPackage?.let { append(" foreground=").append(it) }
     }
 
     /** The media fact as structured JSON; absent metadata stays `null`, never a fabricated value. */
@@ -1206,8 +1254,17 @@ class DeviceTool(
         vision: ToolVision = ToolVision.Unavailable,
         visionReason: String? = VISION_NOT_ATTEMPTED,
     ): ActionResult {
+        // M2: a provider that threw already answered `unavailable(provider_threw)`, which is the honest reason for the
+        // missing screen. The refusal's own `not_attempted`/`disabled` marker must not overwrite it, or a broken port
+        // would read exactly like a refusal that chose not to read.
         val observation = observeForResult(capture = false, visionRequested = false)
-            ?.copy(vision = vision, visionReason = visionReason)
+            ?.let { observation ->
+                if (observation.visionReason == VISION_PROVIDER_THREW) {
+                    observation
+                } else {
+                    observation.copy(vision = vision, visionReason = visionReason)
+                }
+            }
         return ActionResult(
             ActionOutcome.Refused,
             // Task 8: the stable code is `execution.code`; repeating it as the whole `data` was a second copy.
@@ -1270,6 +1327,13 @@ class DeviceTool(
          * must never be bare, or the model cannot tell "not attempted" from "the device could not".
          */
         private const val VISION_NOT_ATTEMPTED = "not_attempted"
+
+        /** M2: the stable reason for a provider that exists but threw while projecting the observation. */
+        private const val VISION_PROVIDER_THREW = "provider_threw"
+
+        /** M2: the two screen coverage tokens that mean the screen text is a real, model-usable read. */
+        private const val SCREEN_COVERAGE_OK = "ok"
+        private const val SCREEN_COVERAGE_TRUNCATED = "truncated"
 
         /** The one source an observation reads when the caller did not already project one from a snapshot. */
         private val OBSERVATION_SOURCES: Set<PerceptionSource> = setOf(PerceptionSource.SCREEN)

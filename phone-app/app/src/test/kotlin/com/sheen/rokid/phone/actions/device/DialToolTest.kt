@@ -85,6 +85,41 @@ class DialToolTest {
         assertTrue(executor.calls.isEmpty())
     }
 
+    // ---- M1: a post-dispatch throw is uncertain, never a pre-dispatch refusal ----
+
+    @Test
+    fun `a dispatched dial whose executor throws is uncertain and accepted`() {
+        val executor = ThrowingExecutor()
+
+        val result = DialTool(executor) { true }.execute("""{"number":"10086"}""")
+
+        assertEquals("the legacy projection cannot express uncertainty", ActionOutcome.Failed, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Uncertain, execution.outcome)
+        assertEquals("DIAL_FAILED", execution.code)
+        assertEquals("the call reached the executor before the throw", true, execution.accepted)
+        assertTrue("a dispatched call may have applied", execution.uncertain)
+        assertEquals("an uncertain call can be retried", true, execution.recoverable)
+        assertNull(execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        assertEquals("{}", result.detail)
+        assertFalse("the number must never be echoed", result.detail.contains("10086"))
+        assertEquals(listOf("dial"), executor.calls.map { it.first })
+    }
+
+    @Test
+    fun `a missing number stays a pre-dispatch refusal`() {
+        val result = DialTool(FakeExecutor()) { true }.execute("{}")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("a malformed call never dispatched anything", false, execution.accepted)
+        assertFalse(execution.uncertain)
+        assertEquals("ARGUMENTS_INVALID", execution.code)
+    }
+
     // ---- R129: dial never asks, including under the default L1 ceiling ----
 
     @Test
@@ -141,6 +176,20 @@ class DialToolTest {
         override fun execute(name: String, argsJson: String): ActionResult {
             calls += name to argsJson
             return result
+        }
+
+        override fun cancel() = Unit
+    }
+
+    /** M1: the executor blows up after the tool has dispatched the dial. */
+    private class ThrowingExecutor : ActionExecutor {
+        val calls = mutableListOf<Pair<String, String>>()
+
+        override fun descriptors(): List<ActionDescriptor> = emptyList()
+
+        override fun execute(name: String, argsJson: String): ActionResult {
+            calls += name to argsJson
+            error("dial executor died mid-call")
         }
 
         override fun cancel() = Unit

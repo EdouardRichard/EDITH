@@ -58,7 +58,25 @@ class DialTool(
         val result = try {
             target.execute(NAME, argsJson)
         } catch (t: Throwable) {
-            return refused(DIAL_FAILED)
+            // edith-0.3 Phase 3 M1: the dial already reached the executor, so a throw is not a pre-dispatch refusal.
+            // The legacy projection cannot express uncertainty; the structured fact is `Uncertain` with accepted=true
+            // and every tri-state field unknown - the call may have been placed.
+            return ActionResult(
+                outcome = ActionOutcome.Failed,
+                detail = "{}",
+                stateChanging = true,
+                execution = ToolExecution(
+                    outcome = ToolOutcome.Uncertain,
+                    code = DIAL_FAILED,
+                    message = DIAL_DISPATCH_UNCERTAIN,
+                    recoverable = true,
+                    accepted = true,
+                    applied = null,
+                    verified = null,
+                    changed = null,
+                    uncertain = true,
+                ),
+            )
         }
         return when (result.outcome) {
             ActionOutcome.Done -> ActionResult(
@@ -130,6 +148,9 @@ class DialTool(
         private const val CALL_PERMISSION_MISSING = "CALL_PERMISSION_MISSING"
         private const val DIAL_FAILED = "DIAL_FAILED"
         private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
+
+        /** M1: the stable, content-free reason for a throw that happened after the dial was dispatched. */
+        private const val DIAL_DISPATCH_UNCERTAIN = "the dial call may have been dispatched"
 
         val DESCRIPTOR: ActionDescriptor = ActionDescriptor(
             name = NAME,

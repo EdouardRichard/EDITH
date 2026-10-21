@@ -22,7 +22,13 @@ import com.sheen.rokid.phone.plugin.smarthelper.skill.SkillLoadReason
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.ImageRef
+import com.sheen.rokid.plugin.PerceptionCoverage
+import com.sheen.rokid.plugin.PerceptionElement
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
 import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.PrecheckDecision
 import com.sheen.rokid.plugin.ToolExecution
 import com.sheen.rokid.plugin.ToolObservation
@@ -878,8 +884,179 @@ class ToolCatalogTest {
         assertEquals("no capture for an unknown name", 0, captureCalls)
     }
 
+    // - M5: catalog-level device/open refusals carry an observation and one best-effort picture -
+
+    /*
+     * M5: the refusals the **catalog** constructs (a11y off, shell off, unlock refused) are the only ones the tool never
+     * saw, so they are enriched exactly like `shell`/`dial`. Tool results - including a successful `device`/`open` that
+     * already carries its own observation and image - are never re-enriched; `status` success stays text-only and
+     * `open list`/an unknown action never take a picture.
+     */
+
     @Test
-    fun `open keeps its own observation policy and is never enriched by the catalog`() {
+    fun `a catalog accessibility refusal for device observes the screen with one image`() {
+        var captureCalls = 0
+        val catalog = catalog(
+            probes = Probes(a11y = false),
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("device", """{"action":"observe"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals(ToolCatalog.CHANNEL_UNAVAILABLE, result.execution?.code)
+        assertEquals("a real catalog refusal takes one best-effort picture", 1, captureCalls)
+        val observation = requireNotNull(result.observation) {
+            "a catalog-level device refusal must not silently drop its observation"
+        }
+        assertEquals("#n1 button \"OK\"", observation.screen)
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertNull("an attached picture needs no unavailable reason", observation.visionReason)
+        assertEquals(listOf(IMAGE), result.images)
+        assertTrue("observation and picture content stay request-scoped", result.nonPersistent)
+    }
+
+    @Test
+    fun `a catalog shell refusal for open observes the screen with one image`() {
+        var captureCalls = 0
+        val catalog = catalog(
+            probes = Probes(shell = false),
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("open", """{"target":"com.example.absent"}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals(ToolCatalog.CHANNEL_UNAVAILABLE, result.execution?.code)
+        assertEquals(1, captureCalls)
+        val observation = requireNotNull(result.observation) {
+            "a catalog-level open refusal must not silently drop its observation"
+        }
+        assertEquals(ToolVision.Ok, observation.vision)
+        assertEquals(1, result.images.size)
+        assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `a catalog unlock refusal for device and open observes the screen with one image`() {
+        val gate = com.sheen.rokid.phone.lock.UnlockGate { com.sheen.rokid.phone.lock.UnlockOutcome.FAILED }
+        var captureCalls = 0
+        val catalog = catalog(
+            unlock = gate,
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        listOf("device" to """{"action":"observe"}""", "open" to """{"target":"com.example.absent"}""")
+            .forEach { (name, args) ->
+                val result = catalog.execute(name, args)
+                assertEquals("$name keeps its own outcome", ActionOutcome.Refused, result.outcome)
+                assertEquals(
+                    "$name keeps the gate's own code",
+                    "LOCKED_UNLOCK_FAILED:FAILED",
+                    result.execution?.code,
+                )
+                val observation = requireNotNull(result.observation) {
+                    "$name's catalog refusal must not silently drop its observation"
+                }
+                assertEquals("$name observes the screen that refused it", "#n1 button \"OK\"", observation.screen)
+                assertEquals(ToolVision.Ok, observation.vision)
+                assertEquals("$name takes one best-effort picture", 1, result.images.size)
+                assertTrue(result.nonPersistent)
+            }
+        assertEquals("one picture per catalog refusal", 2, captureCalls)
+    }
+
+    @Test
+    fun `a catalog refusal with a disabled capture reports disabled without an image`() {
+        val catalog = catalog(
+            probes = Probes(a11y = false),
+            observe = { screenFacts() },
+            capture = { PerceptionScreenshotResult.Disabled },
+        )
+
+        val result = catalog.execute("device", """{"action":"observe"}""")
+
+        val observation = requireNotNull(result.observation)
+        assertEquals("the source facts survive with an honest disabled vision", ToolVision.Disabled, observation.vision)
+        assertNull(observation.visionReason)
+        assertEquals("com.example.launcher", observation.foregroundPackage)
+        assertTrue("a disabled switch contributes no image", result.images.isEmpty())
+        assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `open list is a read so its catalog refusal observes text only without an image`() {
+        // Task 5: `list` is not a screen operation. M5 still answers the catalog's own refusal with an observation, but
+        // never with a picture.
+        var captureCalls = 0
+        var observeCalls = 0
+        val catalog = catalog(
+            probes = Probes(shell = false),
+            observe = { observeCalls++; screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("open", """{"list":true}""")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals(ToolCatalog.CHANNEL_UNAVAILABLE, result.execution?.code)
+        val observation = requireNotNull(result.observation) { "a catalog refusal still observes the screen" }
+        assertEquals(ToolVision.Unavailable, observation.vision)
+        assertEquals("not_attempted", observation.visionReason)
+        assertEquals("a list read takes no picture", 0, captureCalls)
+        assertEquals("the text observation is the one read", 1, observeCalls)
+        assertTrue(result.images.isEmpty())
+        assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `a successful device result is not re-enriched by the catalog`() {
+        var captureCalls = 0
+        var observeCalls = 0
+        val catalog = catalog(
+            deviceOperations = RecordingDeviceOperations(),
+            perception = StubPerception(catalogSnapshot(), imageResult()),
+            observe = { observeCalls++; screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("device", """{"action":"observe"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val observation = requireNotNull(result.observation) { "the tool's own observation must survive" }
+        assertTrue("the tool's compact screen is kept: ${observation.screen}", observation.screen!!.contains("#n1"))
+        assertEquals("the tool's own capture is the only picture", 1, result.images.size)
+        assertEquals("the catalog must not capture a second picture", 0, captureCalls)
+        assertEquals("the catalog must not read the screen again", 0, observeCalls)
+    }
+
+    @Test
+    fun `a status success stays the tool's text-only observation and is not re-enriched`() {
+        var captureCalls = 0
+        var observeCalls = 0
+        val catalog = catalog(
+            deviceOperations = RecordingDeviceOperations(),
+            perception = StubPerception(catalogSnapshot(), imageResult()),
+            observe = { observeCalls++; screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+
+        val result = catalog.execute("device", """{"action":"status"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        val observation = requireNotNull(result.observation) { "status success carries the tool's observation" }
+        assertEquals("status is not a screen read", ToolVision.NotRequested, observation.vision)
+        assertNull("status success reports no screen tree", observation.screen)
+        assertTrue("status success takes no picture", result.images.isEmpty())
+        assertEquals("the catalog must not capture for status", 0, captureCalls)
+        assertEquals("the catalog must not read the screen for status", 0, observeCalls)
+    }
+
+    @Test
+    fun `an unknown action still keeps its bare refusal without an observation or a picture`() {
         var captureCalls = 0
         var observeCalls = 0
         val catalog = catalog(
@@ -887,21 +1064,18 @@ class ToolCatalogTest {
             capture = { captureCalls++; imageResult() },
         )
 
-        // `list` through the shell-less fixture refuses at the channel; it is Task 5's non-screen path, not ours.
-        val result = catalog.execute("open", """{"list":true}""")
+        val result = catalog.execute("teleport", "{}")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertTrue("the tool's own channel refusal is kept: ${result.execution}",
-            result.execution?.code == "CHANNEL_UNAVAILABLE")
-        assertNull("the catalog must not add an observation to open", result.observation)
+        assertEquals(ToolCatalog.UNKNOWN_ACTION, result.execution?.code)
+        assertNull("an unknown name is not a screen operation", result.observation)
         assertTrue(result.images.isEmpty())
-        assertEquals(0, observeCalls)
-        assertEquals(0, captureCalls)
+        assertEquals("no observation for an unknown name", 0, observeCalls)
+        assertEquals("no capture for an unknown name", 0, captureCalls)
     }
 
     @Test
-    fun `the production composition backs open and shell with the perception observation source`() {
-        val root = com.sheen.rokid.phone.app.HostCompositionRoot.create(android.content.ContextWrapper(null))
+    fun `the production composition backs open and shell with the perception observation source`() {        val root = com.sheen.rokid.phone.app.HostCompositionRoot.create(android.content.ContextWrapper(null))
         try {
             // a11y is down on the JVM composition: the source must answer an explicit unavailable observation, never a
             // fabricated screen and never a silent null.
@@ -935,6 +1109,8 @@ class ToolCatalogTest {
 
     // - helpers -
 
+    // - helpers -
+
     private fun catalog(
         probes: Probes = Probes(),
         deviceOperations: RecordingDeviceOperations = RecordingDeviceOperations(),
@@ -944,11 +1120,13 @@ class ToolCatalogTest {
         shell: ShellTool = ShellTool(null),
         observe: () -> ToolObservation? = { null },
         capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
+        perception: PerceptionProvider? = null,
     ): ToolCatalog {
         val registry = RefRegistry()
         val device = DeviceTool(
             deviceOperations,
             ScreenProjector(ObservationRenderer(registry), registry),
+            perception = perception,
         )
         return ToolCatalog(
             device = device,
@@ -974,6 +1152,50 @@ class ToolCatalogTest {
         screen = "#n1 button \"OK\"",
         vision = ToolVision.NotRequested,
     )
+
+    /** One healthy perception read for the device tool, so a successful `device` result is a real tool result. */
+    private fun catalogSnapshot(): PerceptionSnapshot = PerceptionSnapshot(
+        snapshotId = "snap-catalog",
+        capturedAtEpochMillis = 1_000L,
+        foregroundPackage = "com.example.app",
+        foregroundActivity = ".MainActivity",
+        elements = listOf(
+            PerceptionElement(ref = "#n1", role = "button", text = "OK", centerX = 1, centerY = 2, clickable = true),
+        ),
+        coverage = PerceptionCoverage(
+            screen = "ok",
+            notifications = "ok",
+            media = "ok",
+            calendar = "ok",
+            acoustic = "ok",
+            clipboard = "ok",
+            vision = "ok",
+            glasses = "ok",
+            device = "ok",
+        ),
+    )
+
+    /** A perception port that answers one fixed snapshot; used to prove tool results are not re-enriched. */
+    private class StubPerception(
+        private val snapshot: PerceptionSnapshot,
+        private val shot: PerceptionScreenshotResult = PerceptionScreenshotResult.Disabled,
+    ) : PerceptionProvider {
+        override fun beginTurn(): PerceptionSnapshot = snapshot
+
+        override fun snapshot(
+            include: Set<PerceptionSource>,
+            filter: PerceptionFilter,
+            limit: Int?,
+        ): PerceptionSnapshot = snapshot
+
+        override fun refresh(): PerceptionSnapshot = snapshot
+
+        override fun afterAction(): PerceptionSnapshot = snapshot
+
+        override fun screenshot(): PerceptionScreenshotResult = shot
+
+        override fun endTurn() = Unit
+    }
 
     private fun imageResult(): PerceptionScreenshotResult.Image =
         PerceptionScreenshotResult.Image(IMAGE, "image/png", 100, 50)

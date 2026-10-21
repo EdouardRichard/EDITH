@@ -162,6 +162,42 @@ class ShellToolTest {
         assertTrue(shell.commands.isEmpty())
     }
 
+    // ---- M1: a post-dispatch throw is uncertain, never a pre-dispatch refusal ----
+
+    @Test
+    fun `a dispatched command whose shell throws is uncertain and accepted`() {
+        val shell = ThrowingShell()
+
+        val result = ShellTool(shell).execute("""{"command":"reboot"}""")
+
+        assertEquals("the legacy projection cannot express uncertainty", ActionOutcome.Failed, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Uncertain, execution.outcome)
+        assertEquals("SHELL_FAILED", execution.code)
+        assertEquals("the command crossed into the shell before the throw", true, execution.accepted)
+        assertTrue("a dispatched call may have applied", execution.uncertain)
+        assertEquals("an uncertain channel can be retried", true, execution.recoverable)
+        assertNull("the command may have applied", execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        assertEquals("the shell call may have been dispatched", execution.message)
+        assertEquals("the dispatch really reached the shell", listOf("reboot"), shell.commands)
+        assertTrue("a shell call is a write even when it threw", result.stateChanging)
+        assertEquals("no tool-specific data for a thrown call", "{}", result.detail)
+    }
+
+    @Test
+    fun `an argument refusal stays a pre-dispatch refusal`() {
+        val result = ShellTool(FakeShell()).execute("""{"timeout_ms":10}""")
+
+        val execution = requireNotNull(result.execution)
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("a malformed call never dispatched anything", false, execution.accepted)
+        assertFalse(execution.uncertain)
+        assertEquals("INVALID_ARGUMENTS", execution.code)
+    }
+
     // ---- the kernel-side ShellPort adapter ----
 
     @Test
@@ -272,6 +308,16 @@ class ShellToolTest {
         override fun run(command: String): ShellResult {
             commands += command
             return result
+        }
+    }
+
+    /** M1: the dispatch itself blows up (a broken binder/port); the call already reached the shell. */
+    private class ThrowingShell : PrivilegedShell {
+        val commands = mutableListOf<String>()
+
+        override fun run(command: String): ShellResult {
+            commands += command
+            error("shell port died mid-call")
         }
     }
 }
