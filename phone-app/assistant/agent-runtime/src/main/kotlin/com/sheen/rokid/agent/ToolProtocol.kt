@@ -140,7 +140,10 @@ data class ToolResult(
 
 /**
  * Platform-independent description of one tool offered to the model, projected from `plugin-api`'s
- * [com.sheen.rokid.plugin.ActionDescriptor] (its `title` becomes [description]).
+ * [com.sheen.rokid.plugin.ActionDescriptor].
+ *
+ * Two copy channels are deliberately separate (edith-0.3 Phase 4A Task 5): [description] is the model-facing
+ * instruction prose, while [title] is the short label user-facing surfaces (a confirmation summary, a tool row) paint.
  */
 data class ToolDescriptor(
     val name: String,
@@ -187,6 +190,17 @@ data class ToolDescriptor(
      * keeps every pure tool out of the failure observer, preserving `observation = null` for it.
      */
     val screenObservation: Boolean = false,
+    /**
+     * edith-0.3 Phase 4A Task 5 (A5): the short, **user-facing** label projected from
+     * `ActionDescriptor.title`.
+     *
+     * Unlike [description] — the model-only instruction prose (when to use the tool, when not to, how it fails, what the
+     * arguments constrain) — this field is the copy the wearer may see as a tool row or a confirmation summary, and the
+     * long description must never be painted there (the A1 review finding). It defaults to [description] so every
+     * pre-A5 `ToolDescriptor` construction keeps compiling and keeps showing the copy it showed before the split; the
+     * registry projects the descriptor's real title.
+     */
+    val title: String = description,
 )
 
 /** A descriptor bound to the executor that declared it. */

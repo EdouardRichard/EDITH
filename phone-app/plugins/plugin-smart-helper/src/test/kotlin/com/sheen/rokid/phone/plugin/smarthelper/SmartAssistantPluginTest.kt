@@ -790,10 +790,19 @@ class SmartAssistantPluginTest {
     // ------------------------------------------------- 0.24 S4 (Task 17): tool status rows
 
     /** A panel-visible rig whose host advertises one L1 action with a caller-chosen user-facing title. */
-    private fun toolRig(title: String = "记笔记"): Pair<SmartTestRig, SmartRecordingDisplay> {
+    private fun toolRig(
+        title: String = "记笔记",
+        description: String = title,
+    ): Pair<SmartTestRig, SmartRecordingDisplay> {
         val display = SmartRecordingDisplay()
         val rig = SmartTestRig(panelVisible = true)
-        rig.actions.descriptors += smartAction("compose_note", risk = RiskLevel.L1, scope = "note", title = title)
+        rig.actions.descriptors += smartAction(
+            "compose_note",
+            risk = RiskLevel.L1,
+            scope = "note",
+            title = title,
+            description = description,
+        )
         rig.actions.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "记好了") }
         rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
         return rig to display
@@ -829,6 +838,26 @@ class SmartAssistantPluginTest {
         )
         assertEquals(listOf("compose_note" to "{}"), rig.actions.executed)
         assertEquals(listOf("已经记好了。"), rig.hintTexts, "the tool call never becomes the answer")
+    }
+
+    @Test fun `S4 the tool row shows the user title and never the long model description`() {
+        // edith-0.3 Phase 4A Task 5 (A5): description is the model's instruction prose. Painting it as the row label
+        // would put a paragraph on the glasses; the row reads the host's short title.
+        val longDescription = "Use compose_note when the wearer asks to keep a short local note. " +
+            "Do not use it for messages or files. STORAGE_UNAVAILABLE means nothing was written. ".repeat(6)
+        val (rig, display) = toolRig(title = "记笔记", description = longDescription)
+        rig.composeNoteRun(preamble = null)
+        rig.wakeAndFinal("帮我记一条笔记")
+        rig.tick()
+
+        assertEquals(
+            listOf(
+                SmartRecordingDisplay.ToolStatusCall(AssistantRoute.WAKE, "asr-1", ToolPhase.START, "记笔记"),
+                SmartRecordingDisplay.ToolStatusCall(AssistantRoute.WAKE, "asr-1", ToolPhase.END, "记笔记"),
+            ),
+            display.toolStatuses,
+            "the row must use the user title, never the model-facing description",
+        )
     }
 
     @Test fun `S4 an unknown action name is published raw rather than guessed`() {

@@ -1442,6 +1442,7 @@ class DeviceTool(
         val DESCRIPTOR: ActionDescriptor = ActionDescriptor(
             name = NAME,
             title = "设备控制",
+            description = "结构化的设备感知与操作总入口，用 action 选择：observe 读屏幕并给出可引用的 ref；act 按 ref 执行 tap/long_press/double_tap/swipe/scroll/scroll_to_text/type/press_key/home/back/recents/notifications；screenshot 截图；wait 等界面稳定；status 读当前状态。需要 ref 引用、一次读取后连续多步操作、截图、等待，或读通知/媒体/日历/剪贴板等多来源时用它；只读一次屏幕后马上按索引动作时用 read_screen、tap、long_press、scroll、input_text 更省一步，按键可以用 system_action。ref 过期返回 STALE_REF 并附最新观察，此时必须重新 observe 再操作；act 的 ref 必须来自本回合 observe，不要编造索引或坐标。通道掉线返回 CHANNEL_UNAVAILABLE，等通道恢复后重试。",
             parametersJson = """{"type":"object","properties":{""" +
                 """"action":{"type":"string","enum":["observe","act","screenshot","wait","status"]},""" +
                 """"filter":{"type":"string","enum":["interactive","text","all"]},""" +

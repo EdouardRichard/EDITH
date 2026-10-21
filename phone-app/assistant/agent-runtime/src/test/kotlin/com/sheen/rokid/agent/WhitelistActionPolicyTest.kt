@@ -14,7 +14,11 @@ import kotlin.test.assertNotSame
  */
 class WhitelistActionPolicyTest {
 
-    /** A descriptor whose [ToolDescriptor.description] is the projected `ActionDescriptor.title`. */
+    /**
+     * A descriptor whose user-visible [ToolDescriptor.title] is `"Title of <name>"` and whose model-facing
+     * [ToolDescriptor.description] is intentionally longer prose: the confirmation summary must only ever read the
+     * title (edith-0.3 Phase 4A A5).
+     */
     private fun descriptor(
         name: String = "message.send",
         scope: String = "contact:A",
@@ -22,7 +26,8 @@ class WhitelistActionPolicyTest {
         requiresConfirmation: Boolean = false,
     ) = ToolDescriptor(
         name = name,
-        description = "Title of $name",
+        title = "Title of $name",
+        description = "Model-facing guidance for $name: when to use it, when not to, and how it fails.",
         parametersJson = """{"type":"object"}""",
         risk = risk,
         requiresConfirmation = requiresConfirmation,
@@ -118,6 +123,25 @@ class WhitelistActionPolicyTest {
         assertEquals(
             PolicyDecision.RequireConfirmation("Title of message.send"),
             policy.decide(descriptor(risk = RiskLevel.L0, requiresConfirmation = true)),
+        )
+    }
+
+    @Test fun `a long model description never becomes the confirmation summary`() {
+        // edith-0.3 Phase 4A Task 5 (A5): the description is the model's instruction prose. Once the 24 tools carry
+        // real multi-sentence descriptions, reading it back as the wearer's question would show a paragraph in a
+        // confirmation card. The summary is the short user-facing title, whatever the description says.
+        val policy = WhitelistActionPolicy(maxLevel = RiskLevel.L3, whitelist = emptyList())
+        val longDescription = "Use this action when the wearer asks for it, never when the screen is locked. " +
+            "It may fail with STATE_UNCHANGED. ".repeat(6)
+        val described = descriptor(risk = RiskLevel.L2).copy(description = longDescription)
+
+        val decision = policy.decide(described)
+
+        assertEquals(PolicyDecision.RequireConfirmation("Title of message.send"), decision)
+        assertEquals(
+            "Title of message.send",
+            (decision as PolicyDecision.RequireConfirmation).summary,
+            "the confirmation card shows the user title, not the model-facing description",
         )
     }
 

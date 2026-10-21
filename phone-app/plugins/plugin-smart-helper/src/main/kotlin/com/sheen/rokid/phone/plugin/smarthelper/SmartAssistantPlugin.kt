@@ -3193,11 +3193,11 @@ class SmartAssistantPlugin(
         // (rather than inside `buildLoop`) so the frame's tool table and the loop's own are the same table.
         val registry = registryFor(current, owned, ledger)
         val gateway = gatewayFor(current, owned)
-        // 0.24 S4 Task 17 (spec §5.6): the tool row's copy. `ToolDescriptor.description` is the host action's own
-        // user-facing title, so the labels cannot drift from the actions `ExecutionRouter` actually advertises; a name
-        // no descriptor declared falls back to the raw model name. The plugin's own answer/skill tools are not device
-        // actions and are filtered out before the display.
-        val toolLabels = registry.descriptors().associate { it.name to it.description }
+        // 0.24 S4 Task 17 (spec §5.6): the tool row's copy. edith-0.3 Phase 4A Task 5 (A5) reads the descriptor's
+        // **user-facing title**, not `description`: the latter is the model's instruction prose and painting it would put
+        // a paragraph on the glasses. The label map stays the fallback for a name the host advertised without copy; a
+        // name in neither is the raw model name.
+        val toolLabels = registry.descriptors().associate { it.name to it.title }
         // A **builder**, not a one-shot frame: a tool round makes this run ask the model a second time, and that
         // request must be rendered by the same renderer from the transcript it continues. Only the store path gets one;
         // the legacy path keeps its frame-less behaviour byte for byte.

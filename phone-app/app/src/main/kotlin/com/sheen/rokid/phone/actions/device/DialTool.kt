@@ -155,6 +155,7 @@ class DialTool(
         val DESCRIPTOR: ActionDescriptor = ActionDescriptor(
             name = NAME,
             title = "拨打电话",
+            description = "直接拨打电话：number 只接受由数字、+、*、# 组成的号码（其它形式返回 ARGUMENTS_INVALID）。只在用户明确要求“打电话给…”时使用；只是把号码填进拨号盘、发消息或查询号码不要用它。没有通话权限返回 CALL_PERMISSION_MISSING，拨号失败返回 DIAL_FAILED。号码属于隐私，工具不会把它写入审计；失败的拨号不会自动重拨。",
             parametersJson = """{"type":"object","properties":{"number":{"type":"string"}},""" +
                 """"required":["number"],"additionalProperties":false}""",
             // R129: L1 - the user's ruling is that dial never asks; see the class KDoc.

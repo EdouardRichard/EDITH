@@ -86,11 +86,12 @@ private val SETTINGS_PAGES: Map<String, String> = mapOf(
     "data_usage" to Settings.ACTION_DATA_USAGE_SETTINGS,
 )
 
-/** The exact five L0/L1 declarations; `agent-runtime` projects `title` to the model-visible description. */
+/** The exact five L0/L1 declarations; `agent-runtime` projects `description` to the model and `title` to user copy. */
 private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = OPEN_APP,
         title = "打开 App",
+        description = "按应用名称启动一个已安装的 App（name 为应用名或包名）。名称唯一匹配时直接打开；找不到匹配返回 APP_NOT_FOUND，匹配到多个时返回 APP_NOT_VISIBLE，且不会给出候选、也不会替你猜。只在名称明确、且不需要列应用、打开链接或设置页时用它；用户说的是类别词（如“音乐”“浏览器”）、可能有歧义或需要候选时用 open。启动器拒绝时返回 LAUNCH_REFUSED；未安装的 App 不会被假装打开。",
         parametersJson = """{"type":"object","properties":{"name":{"type":"string","description":"App 名称"}},""" +
             """"required":["name"],"additionalProperties":false}""",
         risk = RiskLevel.L0,
@@ -102,6 +103,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = OPEN_URL,
         title = "打开网页",
+        description = "用系统浏览器打开一个 http/https 链接（url 必须是带主机的 http(s) 地址；其它 scheme、file://、content:// 或裸路径返回 INVALID_URL）。只在用户明确要打开网页、且链接已知时用它；要按应用名打开、去设置页、或者需要候选与 list 时用 open。浏览器不可用或启动被拒返回 LAUNCH_REFUSED，不会静默换成搜索页。",
         parametersJson = """{"type":"object","properties":{"url":{"type":"string","description":"http 或 https 链接"}},""" +
             """"required":["url"],"additionalProperties":false}""",
         risk = RiskLevel.L0,
@@ -113,6 +115,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = OPEN_SETTINGS,
         title = "打开系统设置",
+        description = "打开系统设置页，page 只能取 wifi、bluetooth、apps、display、sound、battery、location、notifications、accessibility、data_usage 之一（其它值返回 INVALID_SETTINGS_PAGE）。只在用户明确要改某个系统设置时用它；打开应用或网页用 open_app、open_url，需要通用打开与候选时用 open。该页 Activity 在设备上不存在时返回 LAUNCH_REFUSED，不会静默打开别的页面。",
         parametersJson = """{"type":"object","properties":{"page":{"type":"string","enum":[""" +
             SETTINGS_PAGES.keys.joinToString(",") { "\"$it\"" } +
             """]}},"required":["page"],"additionalProperties":false}""",
@@ -125,6 +128,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = SET_ALARM,
         title = "设置闹钟",
+        description = "用系统时钟预填并设置一个闹钟：hour 为 0-23、minute 为 0-59、label 必填（越界或 label 为空返回 INVALID_TIME）。只在用户明确要设定某个时刻的闹钟时用它；查询已有闹钟或设置计时器不要用它。系统时钟不可用或被拒返回 LAUNCH_REFUSED，工具不会替你确认闹钟是否真的会响。",
         parametersJson = """{"type":"object","properties":{"hour":{"type":"integer","minimum":0,"maximum":23},""" +
             """"minute":{"type":"integer","minimum":0,"maximum":59},"label":{"type":"string"}},""" +
             """"required":["hour","minute","label"],"additionalProperties":false}""",
@@ -137,6 +141,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = COMPOSE_NOTE,
         title = "记一条笔记",
+        description = "把 title 与 body 写入 App 自己的加密笔记存储（两者都必填；同时为空返回 INVALID_NOTE）。只在用户要记一条本地笔记时用它；发消息、发通知、写外部文件不要用它。存储未接线或写入失败返回 STORAGE_UNAVAILABLE，此时不要声称已经记录。",
         parametersJson = """{"type":"object","properties":{"title":{"type":"string"},"body":{"type":"string"}},""" +
             """"required":["title","body"],"additionalProperties":false}""",
         risk = RiskLevel.L1,

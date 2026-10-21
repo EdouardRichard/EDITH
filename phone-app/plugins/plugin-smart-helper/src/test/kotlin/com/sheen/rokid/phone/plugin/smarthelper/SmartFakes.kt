@@ -520,6 +520,8 @@ internal fun smartAction(
     requiresConfirmation: Boolean = false,
     scope: String = "app",
     title: String = "Action $name",
+    /** edith-0.3 Phase 4A A5: the model-facing prose, which must never be painted as the tool row. */
+    description: String = title,
     /** Task 6: a fake screen tool whose failures the loop should enrich from the host observation source. */
     screenObservation: Boolean = false,
 ) = ActionDescriptor(
@@ -532,6 +534,7 @@ internal fun smartAction(
     reversible = true,
     scope = scope,
     screenObservation = screenObservation,
+    description = description,
 )
 
 /** One text-delta-then-terminal stream, the shape a successful answer arrives in. */

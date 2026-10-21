@@ -129,6 +129,7 @@ class LoadSkillTool(
         val DESCRIPTOR = ActionDescriptor(
             name = NAME,
             title = "读取 SKILL 正文",
+            description = "按 name 读取一个 SKILL 的完整正文；正文只在本回合的请求尾部追加，不会出现在工具结果里。当系统提示给出的 SKILL 目录里有与本任务匹配的技能时，先调用它拿到步骤再执行；不需要技能的任务不要调用。名称不在目录返回 SKILL_NOT_FOUND（可核对目录后重试），技能被用户停用返回 SKILL_DISABLED（重试无意义，转告用户）。读取正文不算一步设备操作，不消耗 maxSteps。",
             parametersJson = """{"type":"object","properties":{"name":{"type":"string","description":"SKILL 目录中的 name"}},"required":["name"],"additionalProperties":false}""",
             risk = RiskLevel.L0,
             requiresConfirmation = false,

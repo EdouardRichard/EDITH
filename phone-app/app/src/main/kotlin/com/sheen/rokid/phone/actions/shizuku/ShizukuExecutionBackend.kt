@@ -56,6 +56,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = CLEAR_DATA,
         title = "清除 App 数据",
+        description = "清除指定 package 的全部应用数据（package 必须是完整包名，如 com.example.app，其它形式返回 ARGUMENTS_INVALID）。不可逆，会删除登录态、缓存与本地文件，只在用户明确要求清空某个应用数据时使用。L3 动作，执行前用户会收到确认。命令完成但数据未清空返回 STATE_UNCHANGED；通道掉线返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"package":{"type":"string"}},""" +
             """"required":["package"],"additionalProperties":false}""",
         risk = RiskLevel.L3,
@@ -68,6 +69,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = UNINSTALL,
         title = "卸载 App",
+        description = "卸载指定 package（完整包名，格式不合法返回 ARGUMENTS_INVALID）。不可逆，只在用户明确要求卸载应用时使用；只是停用用 disable_app，清数据用 clear_data。L3 动作，执行前用户会收到确认。卸载未真正生效返回 STATE_UNCHANGED；通道掉线返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"package":{"type":"string"}},""" +
             """"required":["package"],"additionalProperties":false}""",
         risk = RiskLevel.L3,
@@ -80,6 +82,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = DISABLE_APP,
         title = "停用 App",
+        description = "停用指定 package（完整包名，格式不合法返回 ARGUMENTS_INVALID）。可逆但影响大：停用后应用从启动器消失，只在用户明确要求停用时使用，恢复需要用户手动或经 shell 重新启用。L4 动作，执行前用户会收到确认。停用未生效返回 STATE_UNCHANGED；通道掉线返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"package":{"type":"string"}},""" +
             """"required":["package"],"additionalProperties":false}""",
         risk = RiskLevel.L4,
@@ -92,6 +95,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = SET_PERMISSION,
         title = "变更 App 权限",
+        description = "授予或撤销某个 App 的一项运行时权限：package（完整包名）、permission（如 android.permission.CAMERA）、granted（布尔值，true 授予、false 撤销）。只在用户明确要改一项具体权限时使用；引导用户去设置页改权限用 open_settings。L4 动作，执行前用户会收到确认。参数不合法返回 ARGUMENTS_INVALID，权限状态未变化返回 STATE_UNCHANGED，通道掉线返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"package":{"type":"string"},""" +
             """"permission":{"type":"string"},"granted":{"type":"boolean"}},""" +
             """"required":["package","permission","granted"],"additionalProperties":false}""",
@@ -105,6 +109,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = SET_BRIGHTNESS,
         title = "调整屏幕亮度",
+        description = "把系统屏幕亮度设为 value（0-255 的整数，越界或非整数返回 ARGUMENTS_INVALID），写入后回读确认。只在用户明确要求调整亮度时使用，读取当前亮度不要用它。写入成功但回读不一致返回 STATE_UNCHANGED；通道掉线返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"value":{"type":"integer","minimum":0,"maximum":255}},""" +
             """"required":["value"],"additionalProperties":false}""",
         risk = RiskLevel.L2,

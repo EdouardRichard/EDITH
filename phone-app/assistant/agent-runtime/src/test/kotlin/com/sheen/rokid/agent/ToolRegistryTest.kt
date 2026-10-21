@@ -19,6 +19,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNotEquals
 import kotlin.test.assertNull
 import kotlin.test.assertSame
 import kotlin.test.assertTrue
@@ -99,6 +100,45 @@ class ToolRegistryTest {
             ToolSpec(titledTool.name, titledTool.description, titledTool.parametersJson).description,
             "without a declared description the title still stands in, so user labels are unchanged",
         )
+    }
+
+    @Test fun `the registry projects the user title separately from the model description`() {
+        // edith-0.3 Phase 4A Task 5 (A5): the confirmation summary and the tool row read `title`; only the model schema
+        // reads `description`. A descriptor that carries both must project both, or the long prose leaks into user copy.
+        val described = ActionDescriptor(
+            name = "clear_data",
+            title = "清除 App 数据",
+            parametersJson = """{"type":"object"}""",
+            risk = RiskLevel.L3,
+            requiresConfirmation = false,
+            idempotent = false,
+            reversible = false,
+            scope = "app",
+            description = "Clear the package's data. Irreversible; the wearer is asked first. STATE_UNCHANGED means it did not clear.",
+        )
+
+        val projected = ToolRegistry(listOf(RecordingActionExecutor(listOf(described)))).descriptors().single()
+
+        assertEquals("清除 App 数据", projected.title, "the user-facing label is the descriptor title")
+        assertEquals(described.description, projected.description, "the model still reads the long description")
+        assertNotEquals(projected.title, projected.description, "the two channels must stay separate")
+    }
+
+    @Test fun `an old construction without a title keeps the description as its label`() {
+        // Source compatibility: every pre-A5 `ToolDescriptor` construction compiles and keeps a non-blank label; the
+        // default is the description, which is exactly the copy those constructions showed the user before the split.
+        val legacy = ToolDescriptor(
+            name = "legacy.tool",
+            description = "Legacy copy that used to be both the label and the model description.",
+            parametersJson = """{"type":"object"}""",
+            risk = RiskLevel.L1,
+            requiresConfirmation = false,
+            idempotent = true,
+            reversible = true,
+            scope = "legacy",
+        )
+
+        assertEquals(legacy.description, legacy.title)
     }
 
     @Test fun `registration rejects a schema that is not well formed JSON and names the tool`() {

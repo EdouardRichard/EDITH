@@ -811,6 +811,7 @@ class OpenTool(
         val DESCRIPTOR: ActionDescriptor = ActionDescriptor(
             name = NAME,
             title = "打开应用、http(s) 页面或设置页",
+            description = "按 target 打开：应用名/包名、http(s) 链接，或设置页别名（wifi/bluetooth/apps/display/sound/battery 等）。应用名有歧义时返回 APP_AMBIGUOUS 并附候选，此时问用户选哪个，不要猜；找不到返回 APP_NOT_FOUND；启动后前台不是目标应用返回 STATE_UNCHANGED。list=true 只列可启动应用（只列目录时 list_apps 也可），不执行打开；relaunch=false 时目标已在前台不会重开。名称明确且只要启动时用 open_app，精确包名可用 launch_app，已知网页用 open_url，已知设置页用 open_settings；本工具适合名称不确定、类别词、需要候选或需要 list 的场合。不支持 file://、content:// 与裸本地路径。",
             parametersJson = """{"type":"object","properties":{""" +
                 """"target":{"type":"string","description":"应用名/包名、http(s) URL、或设置页别名（wifi/bluetooth/apps/display/sound/battery 等）。用户说类别词（如“文件”）时保持原词，不要自行扩成某个具体应用；歧义由工具返回候选。不支持 file://、content://、裸本地路径。"},""" +
                 """"list":{"type":"boolean","description":"true 时列出可启动应用，不执行打开。"},""" +

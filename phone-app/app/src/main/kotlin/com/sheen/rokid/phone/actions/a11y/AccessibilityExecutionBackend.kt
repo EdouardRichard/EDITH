@@ -31,6 +31,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = READ_SCREEN,
         title = "读取当前屏幕内容",
+        description = "读取当前屏幕，返回按索引编号的元素列表（文本与 clickable/editable/scrollable 等标记），供 tap、long_press、input_text 使用。只想快速看一眼、或准备紧接着做一次索引动作时用它：一次 read_screen 之后索引才有效；需要 ref 引用、截图、等待界面稳定、读取通知/媒体/剪贴板等多来源，或一次读取后连续多步操作时用 device。filter 取 interactive（默认，只列可交互项）、text 或 all，all 输出最大。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，不要改用 shell 模拟点击，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"filter":{"type":"string","enum":["all","interactive","text"],"default":"interactive"}},"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -42,6 +43,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = TAP,
         title = "点击指定索引的元素",
+        description = "点击最近一次 read_screen 列表中的第 index 个元素（index 必须来自本回合上一次 read_screen；快照过期或越界返回 ARGUMENTS_INVALID）。只做一次点击、不需要引用或验证时用它；需要按 ref 操作、连续多步、或点完还要等待/校验界面时用 device 的 act（kind=tap）。界面不接受点击返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决定，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"],"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -53,6 +55,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = LONG_PRESS,
         title = "长按指定索引的元素",
+        description = "长按最近一次 read_screen 列表中的第 index 个元素（index 来自本回合上一次 read_screen；越界或快照过期返回 ARGUMENTS_INVALID）。用于呼出上下文菜单、多选、拖动前抓取等长按手势；普通单击用 tap，需要 ref、连续多步或长按后还要验证时用 device 的 act（kind=long_press）。界面不接受返回 NODE_NOT_CLICKABLE，接受但屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen 再决策，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"index":{"type":"integer"}},"required":["index"],"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -64,6 +67,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = SCROLL,
         title = "滚动屏幕",
+        description = "按 direction 滚动当前界面，direction 只能是 forward 或 backward。用于一屏内翻页浏览列表、文章；需要滚到指定文字（scroll_to_text）、按 ref 操作，或滚动后继续多步操作时用 device 的 act（kind=scroll/scroll_to_text）。已到边界返回 NO_SCREEN_CHANGE；滚动会让之前的 read_screen 索引失效，继续索引动作前要重新 read_screen。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"direction":{"type":"string","enum":["forward","backward"]}},"required":["direction"],"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,
@@ -75,6 +79,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = INPUT_TEXT,
         title = "在指定索引的输入框输入文字",
+        description = "在最近一次 read_screen 列表中的第 index 个可编辑元素输入 text（index 来自本回合上一次 read_screen；text 不能为空、不能含换行、最多 100 个字符，否则返回 ARGUMENTS_INVALID）。用于搜索词、名称、号码等短文本；需要按 ref 定位、输入长文本或输入后还要等待/校验时用 device 的 act（kind=type）。元素不可编辑返回 NODE_NOT_CLICKABLE，写入后屏幕没变化返回 NO_SCREEN_CHANGE；失败后重新 read_screen，不要重复同一 index。无障碍通道掉线时返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
         parametersJson = """{"type":"object","properties":{"index":{"type":"integer"},"text":{"type":"string"}},"required":["index","text"],"additionalProperties":false}""",
         risk = RiskLevel.L1,
         requiresConfirmation = false,

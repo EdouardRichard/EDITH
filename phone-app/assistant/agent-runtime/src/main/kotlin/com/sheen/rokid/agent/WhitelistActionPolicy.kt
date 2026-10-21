@@ -42,16 +42,18 @@ class WhitelistActionPolicy(
         // 1. Above the ceiling the action is refused outright: the user configured a level they never want crossed.
         if (descriptor.risk.ordinal > maxLevel.ordinal) return PolicyDecision.Refuse
         // 2. An app declaration can only tighten: it forces a question the user's grants may not answer for them.
-        if (descriptor.requiresConfirmation) return PolicyDecision.RequireConfirmation(descriptor.description)
+        // edith-0.3 Phase 4A Task 5 (A5): the question shows the short user title; `description` is the model's
+        // instruction prose and must never be painted as a confirmation summary.
+        if (descriptor.requiresConfirmation) return PolicyDecision.RequireConfirmation(descriptor.title)
         // 3. L0/L1 are the levels the user has already accepted outright, so they run without asking.
         if (descriptor.risk <= RiskLevel.L1) return PolicyDecision.Allow
         // 4. L3/L4 may never be added to the免确认 list, so they always ask, listed or not.
-        if (descriptor.risk >= RiskLevel.L3) return PolicyDecision.RequireConfirmation(descriptor.description)
+        if (descriptor.risk >= RiskLevel.L3) return PolicyDecision.RequireConfirmation(descriptor.title)
         // 5. L2 is opt-in, and only for this exact (action, scope) pair.
         return if (WhitelistEntry(descriptor.name, descriptor.scope) in whitelist) {
             PolicyDecision.Allow
         } else {
-            PolicyDecision.RequireConfirmation(descriptor.description)
+            PolicyDecision.RequireConfirmation(descriptor.title)
         }
     }
 }

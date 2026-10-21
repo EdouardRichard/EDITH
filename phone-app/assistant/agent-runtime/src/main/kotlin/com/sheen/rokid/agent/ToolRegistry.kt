@@ -156,6 +156,9 @@ private fun ActionDescriptor.toToolDescriptor() = ToolDescriptor(
     // edith-0.3 Phase 4A (A1): the model-facing description is the new field; its default is the title, which keeps
     // every descriptor that declares no description on the pre-4A copy.
     description = description,
+    // edith-0.3 Phase 4A (A5): keep the user-facing label a separate channel. The confirmation summary and the tool
+    // row read this; the model never does.
+    title = title,
     parametersJson = parametersJson,
     risk = risk,
     requiresConfirmation = requiresConfirmation,

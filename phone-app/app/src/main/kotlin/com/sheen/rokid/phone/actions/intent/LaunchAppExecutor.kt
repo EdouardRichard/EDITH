@@ -61,6 +61,7 @@ class LaunchAppExecutor(
         ActionDescriptor(
             name = LAUNCH_APP,
             title = "打开指定应用",
+            description = "按应用名称经特权通道启动 App（name 为应用名）：先解析启动组件再 am start，需要 Shizuku。名称有歧义返回 APP_AMBIGUOUS 并附候选，此时问用户选哪个，不要猜；找不到返回 APP_NOT_FOUND；启动命令未成功返回 STATE_UNCHANGED。只在已知确切应用名、且不需要打开链接/设置页或列应用时用它；名称不确定或有候选时用 open。通道掉线返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
             parametersJson = """{"type":"object","properties":{"name":{"type":"string"}},"required":["name"],"additionalProperties":false}""",
             risk = RiskLevel.L1,
             requiresConfirmation = false,
@@ -72,6 +73,7 @@ class LaunchAppExecutor(
         ActionDescriptor(
             name = LIST_APPS,
             title = "列出已安装的应用",
+            description = "列出可启动的已安装应用（每行“名称 (包名)”），无参数；只读、无副作用。结果超过 100 项会截断并标注 truncated: true，此时不要假设列表完整。需要一边列应用一边打开、或想复用通用打开流程时用 open 的 list=true；本工具不执行任何打开操作。",
             parametersJson = """{"type":"object","properties":{},"additionalProperties":false}""",
             risk = RiskLevel.L0,
             requiresConfirmation = false,

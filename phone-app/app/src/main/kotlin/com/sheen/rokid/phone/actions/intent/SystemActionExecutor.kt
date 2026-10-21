@@ -61,6 +61,7 @@ class SystemActionExecutor(
         ActionDescriptor(
             name = SYSTEM_ACTION,
             title = "执行系统级按键动作",
+            description = "执行一个系统级按键动作：action 只能是 back、home、recents、notifications 之一（其它值返回 UNKNOWN_ACTION）。用于在任意界面按键、且不需要界面元素引用时；需要按 ref 点击/输入/滑动或验证界面时用 device 的 act，具体界面操作优先用对应专用工具。不要用 shell 的 input keyevent 代替它。通道掉线返回 ACTION_CHANNEL_UNAVAILABLE，等通道恢复后重试。",
             parametersJson = """{"type":"object","properties":{"action":{"type":"string","enum":["back","home","recents","notifications"]}},"required":["action"],"additionalProperties":false}""",
             risk = RiskLevel.L1,
             requiresConfirmation = false,
