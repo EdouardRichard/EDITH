@@ -16,9 +16,10 @@ import com.sheen.rokid.plugin.ToolOutcome
  * This is an adapter, not a second router with policy: it advertises what its executors declare, routes a call to the
  * one executor that declared the name, forwards the turn lifecycle, and leaves every availability/confirmation
  * decision to the executor that owns it. In particular, the catalog's four umbrella tools are advertised
- * unconditionally (A3 made `ToolCatalog.descriptors()` stable) and a channel that is down answers its own
- * `CHANNEL_UNAVAILABLE` refusal; the atomic backends do the same, which keeps the schema and the cached prompt prefix
- * unchanged mid-session.
+ * unconditionally (A3 made `ToolCatalog.descriptors()` stable) and a channel that is down answers its own stable
+ * refusal - the umbrella catalog's `CHANNEL_UNAVAILABLE`, the legacy atomic backends' `ACTION_CHANNEL_UNAVAILABLE` (A4
+ * does not normalize the two historical shapes) - which keeps the schema and the cached prompt prefix unchanged
+ * mid-session.
  *
  * Two executors claiming one action name is a wiring bug: routing would be ambiguous, so it is rejected in the
  * constructor rather than silently resolved by list order. Descriptor order is fixed - the [atomic] executors in list
@@ -49,8 +50,7 @@ class ToolSurface(
      *
      * The check is on descriptors, not on trying executors in turn: an executor that accepts arbitrary names must not
      * make an unadvertised name executable. A declared action is always delegated, even while its channel is down, so
-     * the executor can answer its own stable `CHANNEL_UNAVAILABLE` refusal - that refusal is why the tool stays
-     * advertised.
+     * the executor can answer its own stable channel-refusal code - that refusal is why the tool stays advertised.
      */
     override fun execute(name: String, argsJson: String): ActionResult {
         val atomicOwner = atomic.firstOrNull { executor ->

@@ -768,6 +768,20 @@ class SmartAssistantPlugin(
     @Volatile private var skillCatalogChangeLogged: Boolean = false
 
     /**
+     * 0.3 Phase 4A Task 4 review (I2): the session whose one count-only `P4_TOOLFACE` line has already been emitted.
+     *
+     * `registryFor` builds a registry every turn, so an unguarded emit repeated the line per turn. The tool face is
+     * pinned for the session (spec §4.2: the 24 schemas are fixed for the session), which makes the count a
+     * session-boundary fact: it is reported on the session's first registry build and again only when
+     * [PluginContext.sessionId] changes. The id, not a boolean cleared in `deactivate`, is the reset - a re-activation
+     * that keeps the session id is still the same face.
+     */
+    private var toolFaceLoggedSession: SessionId? = null
+
+    /** Guards [toolFaceLoggedSession]; two turns can build their registries on different threads. */
+    private val toolFaceLock = Any()
+
+    /**
      * 0.3 Phase 1 final-fix wave (spec §5.2): the session's fail-closed policy code, or `null` when the policy built.
      *
      * A missing profile is still the gateway's `PROFILE_MISSING`; this keeps the distinct `PROFILE_INVALID` /
@@ -3597,9 +3611,12 @@ class SmartAssistantPlugin(
      * one, or the counter receipt restarts and `ProgressGuard` mistakes a working pull for `NO_PROGRESS`.
      *
      * edith-0.3 Phase 4A Task 4 (A4): the host half is the 22-descriptor `ToolSurface` (18 atomic + 4 umbrella), so this
-     * registry is the 24-tool default face. Every build reports one **count-only** `P4_TOOLFACE` line: `tools` is the
-     * model-visible tool count after `ToolRegistry`'s duplicate merge, `duplicate` is how many declarations that merge
-     * absorbed (0 on the pinned Phase 4A face). No tool name, argument or content may reach the line (D117).
+     * registry is the 24-tool default face. The count-only `P4_TOOLFACE` line reports `tools` (the model-visible tool
+     * count after `ToolRegistry`'s duplicate merge) and `duplicate` (how many declarations that merge absorbed; 0 on the
+     * pinned Phase 4A face). No tool name, argument or content may reach the line (D117).
+     *
+     * The line is a **session** fact, not a per-build one: the registry is rebuilt every turn, while the face it
+     * describes is pinned for the session, so [toolFaceLoggedSession] emits it once and again only for a new session.
      */
     private fun registryFor(context: PluginContext, owned: SmartTurn, ledger: NotifyLedger): ToolRegistry {
         val executors = listOf(
@@ -3617,9 +3634,14 @@ class SmartAssistantPlugin(
         )
         val registry = ToolRegistry(executors)
         val declaredNames = executors.flatMap { executor -> executor.descriptors() }.map { it.name }
-        P3Log.line(
-            "P4_TOOLFACE tools=${registry.descriptors().size} duplicate=${declaredNames.size - declaredNames.toSet().size}",
-        )
+        val faceLine = "P4_TOOLFACE tools=${registry.descriptors().size} " +
+            "duplicate=${declaredNames.size - declaredNames.toSet().size}"
+        synchronized(toolFaceLock) {
+            if (toolFaceLoggedSession != context.sessionId) {
+                P3Log.line(faceLine)
+                toolFaceLoggedSession = context.sessionId
+            }
+        }
         return registry
     }
 

@@ -15,7 +15,8 @@ import kotlin.test.assertTrue
  * test feeds the plugin exactly the production host **names** and pins what the plugin adds beside them:
  * - `notify_user` (the model's only channel to the wearer) and `load_skill` (the catalog's only way to a body), for 24;
  * - no `propose_hint` on the default face — that tool belongs to the proactive hint turn alone;
- * - one count-only `P4_TOOLFACE tools=24 duplicate=0` line per registry build, carrying counts and nothing else.
+ * - one count-only `P4_TOOLFACE tools=24 duplicate=0` line per **session** (the registry is rebuilt every turn, so a
+ *   session-keyed one-shot is what keeps the line from repeating);
  *
  * The 22 host names are duplicated here on purpose: `plugin-smart-helper` must not depend on `phone-app`, and the list
  * is the contract the host side pins independently in `ToolFaceWiringTest`/`ToolFaceCompositionTest`.
@@ -90,6 +91,29 @@ class SmartToolFaceRegistryTest {
         assertFalse(
             line.contains("notify_user") || line.contains("load_skill"),
             "no plugin tool name either: $line",
+        )
+    }
+
+    @Test
+    fun `two turns in the same session emit one P4_TOOLFACE line`() {
+        val rig = rigWithHostFace()
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { line -> lines += line }
+        try {
+            rig.wakeAndFinal("打开设置", turnId = "asr-1")
+            // The wake path has a 3 s cooldown; the second turn must be past it to build its own registry.
+            rig.tick(4_000)
+            rig.wakeAndFinal("再打开一次设置", turnId = "asr-2")
+        } finally {
+            P3Log.sink = previous
+        }
+
+        assertEquals(2, rig.model.requests.size, "the session must have run two turns, each building a registry")
+        assertEquals(
+            listOf("P4_TOOLFACE tools=24 duplicate=0"),
+            lines.filter { it.startsWith("P4_TOOLFACE") },
+            "the face is pinned for the session, so its count is a session fact, not a per-turn one",
         )
     }
 

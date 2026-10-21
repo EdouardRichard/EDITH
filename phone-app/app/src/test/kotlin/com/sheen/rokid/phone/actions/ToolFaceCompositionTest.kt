@@ -4,6 +4,7 @@ import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.RiskLevel
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Test
 
 /**
@@ -114,7 +115,7 @@ class ToolFaceCompositionTest {
             assertEquals(ActionOutcome.Refused, result.outcome)
             assertEquals(ToolSurface.UNKNOWN_ACTION, result.execution?.code)
             assertEquals("{}", result.detail)
-            assertEquals("an unknown name applied nothing", false, result.execution!!.applied)
+            assertFalse("an unknown name applied nothing", result.execution!!.applied == true)
         } finally {
             root.close()
         }

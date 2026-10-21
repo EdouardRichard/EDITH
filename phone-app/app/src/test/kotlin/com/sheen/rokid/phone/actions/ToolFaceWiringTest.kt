@@ -33,10 +33,12 @@ import com.sheen.rokid.phone.actions.shizuku.PrivilegedShell
 import com.sheen.rokid.phone.actions.shizuku.ShellResult
 import com.sheen.rokid.phone.actions.shizuku.ShizukuExecutionBackend
 import com.sheen.rokid.phone.actions.shizuku.TargetState
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.RiskLevel
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -147,7 +149,9 @@ class ToolFaceWiringTest {
 
         val first = surface.descriptors().map { it.name }
         val second = surface.descriptors().map { it.name }
-        val afterExecute = surface.execute("teleport", "{}").let { surface.descriptors().map { name -> name.name } }
+        // The refusal's own result is deliberately discarded: only the schema read after it matters here.
+        surface.execute("teleport", "{}")
+        val afterExecute = surface.descriptors().map { it.name }
 
         assertEquals(hostNames, first)
         assertEquals(first, second)
@@ -276,6 +280,26 @@ class ToolFaceWiringTest {
         )
     }
 
+    // ── adapter contract ─────────────────────────────────────────────────────────────────────────────────────
+
+    @Test
+    fun `the surface's close reaches a closeable atomic backend through the adapter`() {
+        val closeable = CloseableBackend()
+        // The second adapter wraps a backend that owns nothing: its close is in the same broadcast and must be a no-op
+        // (the unsafe `as AutoCloseable` would throw here, and the test would fail before the assertion below).
+        val surface = ToolSurface(
+            catalog = EmptyCatalog,
+            atomic = listOf(AtomicActionExecutor(closeable), AtomicActionExecutor(StatelessBackend)),
+        )
+
+        surface.close()
+
+        assertTrue(
+            "ToolSurface.close only closes an atomic that is AutoCloseable, so the adapter must forward it",
+            closeable.closed,
+        )
+    }
+
     // ── fakes ────────────────────────────────────────────────────────────────────────────────────────────────
 
     private class RecordingLauncher : IntentLauncher {
@@ -327,6 +351,34 @@ class ToolFaceWiringTest {
         override fun permissionGranted(pkg: String, permission: String): Boolean = fail()
         override fun disabled(pkg: String): Boolean = fail()
         override fun setting(name: String): String? = fail()
+    }
+
+    /** A legacy backend that owns a resource: only a `Closeable` backend has anything to forward the close to. */
+    private class CloseableBackend : ExecutionBackend, AutoCloseable {
+        var closed = false
+
+        override val id = "closeable"
+        override fun available() = true
+        override fun descriptors(): List<ActionDescriptor> = emptyList()
+        override fun execute(name: String, argsJson: String): ActionResult = error("this fake is never executed")
+        override fun close() {
+            closed = true
+        }
+    }
+
+    /** A legacy backend that owns nothing: closing the adapter over it must be a no-op, never a fabricated close. */
+    private object StatelessBackend : ExecutionBackend {
+        override val id = "stateless"
+        override fun available() = true
+        override fun descriptors(): List<ActionDescriptor> = emptyList()
+        override fun execute(name: String, argsJson: String): ActionResult = error("this fake is never executed")
+    }
+
+    /** The close path needs a catalog with no names, so the surface's uniqueness check has nothing to reject. */
+    private object EmptyCatalog : ActionExecutor {
+        override fun descriptors(): List<ActionDescriptor> = emptyList()
+        override fun execute(name: String, argsJson: String): ActionResult = error("this fake is never executed")
+        override fun cancel() = Unit
     }
 
     /** The device kernel seam: the exercised host-face paths never call it, so any call is a wiring bug. */
