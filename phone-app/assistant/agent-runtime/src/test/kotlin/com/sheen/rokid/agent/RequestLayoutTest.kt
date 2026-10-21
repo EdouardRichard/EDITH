@@ -19,6 +19,16 @@ class RequestLayoutTest {
         }
     }
 
+    @Test fun `a system segment carrying a runtime placeholder is rejected`() {
+        // 0.3 design §3.6 rule 4: a system plan is rendered once for the session. A `{{slot}}` that reaches
+        // the system slot was never substituted, so it must fail here rather than reach the model as template syntax.
+        assertFailsWith<IllegalArgumentException> {
+            RequestLayout.validateSystem(
+                listOf(Segment(SegmentOrigin.INSTRUCTIONS, trusted = true, text = "当前时间：{{time}}")),
+            )
+        }
+    }
+
     @Test fun `every origin except the three stable ones is rejected from the system slot`() {
         val allowed = setOf(
             SegmentOrigin.INSTRUCTIONS,

@@ -28,14 +28,22 @@ object RequestLayout {
     )
 
     /**
-     * Rejects a system slot containing anything but the three stable origins.
+     * Rejects a system slot containing anything but the three stable origins, or any segment whose text still
+     * carries a runtime placeholder.
      *
-     * @throws IllegalArgumentException naming the offending origin when a dynamic segment tries to become system text.
+     * A plan is rendered once for the session (spec §4.1): a `{{slot}}` that reaches the system slot was never
+     * substituted and would either be sent to the model as template syntax or become a prompt-injection surface.
+     *
+     * @throws IllegalArgumentException naming the offending origin when a dynamic segment tries to become system text,
+     * or naming the placeholder-bearing origin when a system segment was never rendered.
      */
     fun validateSystem(segments: List<Segment>) {
         for (segment in segments) {
             require(segment.origin in SYSTEM_ORIGINS) {
                 "System segments must only have INSTRUCTIONS, SKILL, or MEMORY_POLICY origin; found ${segment.origin}"
+            }
+            require("{{" !in segment.text && "}}" !in segment.text) {
+                "System segments must not carry runtime placeholders; found one in a ${segment.origin} segment"
             }
         }
     }

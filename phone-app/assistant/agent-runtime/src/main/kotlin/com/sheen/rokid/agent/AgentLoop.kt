@@ -131,8 +131,8 @@ data class AgentRequest(
      * 0.25 Task 12 (R58): whether a text-only **plan** answer may be nudged back into executing it.
      *
      * `false` — the default — keeps every pre-0.25 caller byte for byte: a text turn with no tool call is the answer.
-     * The production plugin sets it `true` for the WAKE route (the wearer is waiting for an action) and leaves it
-     * `false` for PROACTIVE, whose single request is a proposal, not a plan to execute (D3 §1.6). A nudge is loop
+     * The production plugin sets it `true` when the wearer is waiting for an action and leaves it `false` for the hint
+     * turn, whose single request is a proposal, not a plan to execute (D3 §1.6). A nudge is loop
      * scaffolding: it is never persisted and `withoutRetryScaffolding` strips it.
      */
     val allowPlanNudge: Boolean = false,
