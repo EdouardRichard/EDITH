@@ -537,6 +537,88 @@ class OpenToolTest {
     }
 
     @Test
+    fun `an unavailable capture still returns done`() {
+        val pipeline = ShellPipeline()
+        var captureCalls = 0
+        val result = launchedOpen(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            target = "com.example.music",
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Unavailable("no_image_profile")
+            },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals("an unavailable capture never fails the launch", ActionOutcome.Done, result.outcome)
+        assertEquals(1, captureCalls)
+        val data = body(result)["data"]!!.jsonObject
+        assertEquals(
+            "the provider's reason travels to the model",
+            "unavailable(no_image_profile)",
+            data["vision"]!!.jsonPrimitive.content,
+        )
+        assertTrue("an unavailable capture attaches no image", result.images.isEmpty())
+        assertFalse("no image means no non-persistent marker", result.nonPersistent)
+    }
+
+    @Test
+    fun `a throwing capture is unavailable and still returns done`() {
+        val pipeline = ShellPipeline()
+        var captureCalls = 0
+        val result = launchedOpen(
+            shell = pipeline.shell,
+            catalog = knownMusic(),
+            target = "com.example.music",
+            capture = {
+                captureCalls++
+                throw IllegalStateException("the capture port blew up")
+            },
+        ).execute("""{"target":"com.example.music"}""")
+
+        assertEquals("a throwing capture must not turn a verified launch into a thrown tool", ActionOutcome.Done, result.outcome)
+        assertEquals(1, captureCalls)
+        val data = body(result)["data"]!!.jsonObject
+        assertEquals(
+            "a thrown capture is an unavailable image, not a failed launch",
+            "unavailable(SCREENSHOT_FAILED)",
+            data["vision"]!!.jsonPrimitive.content,
+        )
+        assertTrue("a failed capture attaches no image", result.images.isEmpty())
+        assertFalse("no image means no non-persistent marker", result.nonPersistent)
+    }
+
+    @Test
+    fun `a verified url launch captures the page`() {
+        val image = ImageRef(
+            artifactId = "artifact-url-vision",
+            mime = "image/jpeg",
+            width = 720,
+            height = 1600,
+            sha256 = "sha256-url-vision",
+        )
+        var captureCalls = 0
+        val result = foregroundOpen(
+            shell = FakeShell { command -> ShellResult(command, 0, "Status: ok\n", "") },
+            catalog = FakeCatalog(),
+            foreground = "com.android.chrome",
+            capture = {
+                captureCalls++
+                PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
+            },
+        ).execute("""{"target":"https://example.com"}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("a verified URL launch has a new page to show", 1, captureCalls)
+        assertEquals("the page capture is attached", listOf(image), result.images)
+        assertTrue("an attached image must stay request-scoped (C2)", result.nonPersistent)
+        assertEquals(
+            "ok",
+            body(result)["data"]!!.jsonObject["vision"]!!.jsonPrimitive.content,
+        )
+    }
+
+    @Test
     fun `a launch whose foreground matches but a11y root does not is STATE_UNCHANGED`() {
         val pipeline = ShellPipeline()
         val result = launchedOpen(
@@ -825,6 +907,7 @@ class OpenToolTest {
         activity: String? = null,
         root: String? = foreground,
         waitForForeground: (String, Long) -> Boolean = { _, _ -> true },
+        capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
     ): OpenTool = OpenTool(
         shell = shell,
         catalog = catalog,
@@ -832,6 +915,7 @@ class OpenToolTest {
         foregroundActivity = { activity },
         rootPackage = { root },
         waitForForeground = waitForForeground,
+        capture = capture,
     )
 
     private class FakeCatalog(

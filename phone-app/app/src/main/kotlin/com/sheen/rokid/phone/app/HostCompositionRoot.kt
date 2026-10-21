@@ -798,11 +798,13 @@ class HostCompositionRoot internal constructor(
      * refuses (locked keystore, deleted payload) yields null rather than propagating: the configuration still has to
      * be built, and the plugin's own lookup finds nothing until storage answers again.
      */
-    private fun selectedProfile(pluginId: String): ModelProfile? {
-        val chosen = runCatching { (profiles as? AndroidProfileRepository)?.selections()?.get(pluginId) }.getOrNull()
-        if (chosen != null) runCatching { profiles.get(chosen) }.getOrNull()?.let { return it }
-        return if (pluginId == smartWiring?.plugin?.descriptor?.pluginId) smartWiring?.selectedProfile() else null
-    }
+    private fun selectedProfile(pluginId: String): ModelProfile? = resolveTurnProfile(
+        selection = { (profiles as? AndroidProfileRepository)?.selections()?.get(pluginId) },
+        load = profiles::get,
+        fallback = {
+            if (pluginId == smartWiring?.plugin?.descriptor?.pluginId) smartWiring?.selectedProfile() else null
+        },
+    )
 
     /** The diagnostic text plugin's own configuration shape; it refuses every key that is not one of these. */
     private fun diagnosticValues(profile: ModelProfile?): Map<String, String> = mapOf(
@@ -2260,20 +2262,24 @@ class HostCompositionRoot internal constructor(
                 // Phase 2 Task 10: the live switch, not an assembly-time copy. The provider answers `Disabled` and the
                 // injected capture is not called while it is off.
                 visionEnabled = { visionGate.enabled },
-                // 0.3 Phase 2.1 Task 4: the second gate is live in production. An automatic capture must never attach
-                // an image the selected profile's capability gate would reject; a missing/deleted profile reads false.
+                // 0.3 Phase 2.1 Task 4 fix: the second gate resolves the **turn's** profile, not the assembly-time
+                // settings choice. The repository selection (the same source `selectedProfile(pluginId)`/the turn
+                // configuration reads) wins; the settings profile is only the fallback. Both are read inside the lambda,
+                // so a profile selection change applies to the next capture. Null/exception reads false (no image).
                 profileSupportsImage = {
-                    smartWiring.selectedProfile()?.inputs?.contains(InputModality.IMAGE) == true
+                    autoVisionProfileSupportsImage(
+                        selection = {
+                            (profiles as? AndroidProfileRepository)?.selections()
+                                ?.get(smartWiring.plugin.descriptor.pluginId)
+                        },
+                        load = profiles::get,
+                        fallback = smartWiring::selectedProfile,
+                    )
                 },
-                screenshot = {
-                    val envelope = deviceKernel.screenshot()
-                    val image = envelope.images.firstOrNull()
-                    if (image == null) {
-                        PerceptionScreenshotResult.Unavailable(envelope.error?.code ?: "SCREENSHOT_FAILED")
-                    } else {
-                        PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height)
-                    }
-                },
+                // 0.3 Phase 2.1 Task 4 fix: one mapping for the kernel envelope. A `pending` placeholder (the capture
+                // worked, the artifact store did not) is `Unavailable("SCREENSHOT_PENDING")`, never an unresolvable
+                // image reference in a model request.
+                screenshot = { perceptionScreenshotResult(deviceKernel.screenshot()) },
                 latestObservation = { deviceKernel.latestObservation },
                 clock = { System.currentTimeMillis() },
             )

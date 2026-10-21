@@ -79,7 +79,8 @@ class OpenTool(
      * shell, the `alreadyForeground` shortcut and a `STATE_UNCHANGED` mismatch all answer without a new screen to show.
      * The user's vision switch and the selected profile's `IMAGE` capability are gates inside
      * [com.sheen.rokid.plugin.PerceptionProvider.screenshot] (Task 2), so this tool does not duplicate them: `Disabled`
-     * and `Unavailable` are answers that attach no image and never fail the launch.
+     * and `Unavailable` are answers that attach no image and never fail the launch. A capture that throws is mapped to
+     * `Unavailable("SCREENSHOT_FAILED")` here (Task 4 fix), so a broken port cannot turn the launch into `TOOL_THREW`.
      */
     private val capture: () -> PerceptionScreenshotResult = { PerceptionScreenshotResult.Disabled },
 ) : ActionExecutor {
@@ -378,8 +379,11 @@ class OpenTool(
             )
         }
         // 0.3 Phase 2.1 Task 4: only a verified success has a new screen worth showing. The capture runs after the
-        // verification read, so the image and the foreground/root facts describe the same screen.
-        val captured = capture()
+        // verification read, so the image and the foreground/root facts describe the same screen. A capture port that
+        // throws is still just "no image" (Task 4 fix): the verified launch succeeded, so it must not turn the tool
+        // result into TOOL_THREW.
+        val captured = runCatching { capture() }
+            .getOrElse { PerceptionScreenshotResult.Unavailable(SCREENSHOT_FAILED) }
         return done(
             buildJsonObject {
                 launchData.forEach { (key, value) -> put(key, value) }
@@ -525,6 +529,9 @@ class OpenTool(
         private const val VISION_MARKER_OK = "ok"
         private const val VISION_MARKER_DISABLED = "disabled"
         private const val VISION_MARKER_UNAVAILABLE = "unavailable"
+
+        /** Task 4 fix: a capture port that throws becomes this `unavailable` reason, not a thrown tool. */
+        private const val SCREENSHOT_FAILED = "SCREENSHOT_FAILED"
 
         private val PACKAGE_NAME = Regex("[A-Za-z0-9._]+")
         private val PLAYER_PACKAGE = Regex("(?i)player|music|video|media")
