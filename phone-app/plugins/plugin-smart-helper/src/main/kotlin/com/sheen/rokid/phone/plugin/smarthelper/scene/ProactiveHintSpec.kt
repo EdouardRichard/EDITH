@@ -6,7 +6,7 @@ import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.plugin.ToolSpec
 
 /**
- * The one tool a proactive hint turn offers, and the constants of its display bound.
+ * The one tool a proactive hint turn offers, and the constants that bound that turn and its display.
  *
  * 0.3 Phase 1 Task 12 (spec §4.5): the instruction prose this object used to own moved to the versioned prompt
  * catalog (`prompts/core/` + `route/wake.md` / `route/proactive-hint.md`). Keeping a second copy here would be a
@@ -63,8 +63,23 @@ internal object ProactiveHintSpec {
      */
     const val PROACTIVE_HINT_MAX_CHARS = 60
 
-    /** The one proactive request's own bound: a hint that is not worth waiting for is not worth showing. */
-    const val PROACTIVE_DEADLINE_MILLIS = 8_000L
+    /**
+     * The **total** machine budget of one HINT_TURN, in milliseconds.
+     *
+     * It is anchored at the turn's start, not at the model call: the intervention gate, the perception snapshot,
+     * memory retrieval, prompt assembly, the model request itself and the `propose_hint` round all spend this one
+     * budget. A hint turn is not a bare model call, so a bound on only the request would not bound the turn.
+     *
+     * Owner decision A2 (2026-10-21), after Task 9's device readings: on the K40 the pre-model pipeline alone
+     * measured 5.306/6.616/6.936 s (gate -> `P3_PROMPT`), leaving too little of the previous 8 s for the model's
+     * 0.751-1.826 s reply - 3 of 4 measured hint turns ended `DEADLINE`. The old rule this constant carried ("a hint
+     * that is not worth waiting for is not worth showing") was therefore judging the wrong interval. The owner chose
+     * 15-20 s; this is the lower bound, **15 s**.
+     *
+     * Distinct from [PROACTIVE_HINT_TTL_MILLIS]: this bounds how long the turn may take to *produce* a hint, that
+     * one how long an accepted hint may stay on the glasses.
+     */
+    const val PROACTIVE_DEADLINE_MILLIS = 15_000L
 
     /** How long a submitted proactive hint stays valid; the display's own TTL is a separate, shorter window. */
     const val PROACTIVE_HINT_TTL_MILLIS = 8_000L

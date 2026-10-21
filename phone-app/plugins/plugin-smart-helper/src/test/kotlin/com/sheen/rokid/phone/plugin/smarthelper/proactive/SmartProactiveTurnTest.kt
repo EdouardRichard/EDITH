@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.plugin.smarthelper.proactive
 import com.sheen.rokid.agent.SCOPE_TERMINAL
+import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeClock
 import com.sheen.rokid.phone.plugin.smarthelper.SmartFakePerception
 import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig
 import com.sheen.rokid.phone.plugin.smarthelper.smartProfile
@@ -611,7 +612,8 @@ class SmartProactiveTurnTest {
         val rig = SmartTestRig()
         rig.activate()
         rig.model.onRequest = { request, listener ->
-            // The reply lands seven seconds into the eight-second request deadline.
+            // The reply lands seven seconds into the fifteen-second request deadline, but the visible window must
+            // still start at the submit.
             rig.clock.advance(7_000_000_000L)
             proposing()(request, listener)
         }
@@ -714,6 +716,22 @@ class SmartProactiveTurnTest {
         }
     }
 
+    /**
+     * A gate that accepts, but spends [spendNanos] of the turn's clock first.
+     *
+     * It stands in for the K40's measured pre-model pipeline (Task 9: gate -> `P3_PROMPT` 5.306-6.936 s) without
+     * pretending to be that pipeline: what matters to the deadline is that *some* real time passes between the
+     * trigger and the model request. The clock is assigned after the rig exists because the rig owns it.
+     */
+    private class SlowGate(private val spendNanos: Long) : ProactiveGate {
+        var clock: SmartFakeClock? = null
+        override val form = GateForm.NOUL
+        override fun shouldIntervene(state: ProactiveGateState): GateOutcome {
+            clock?.advance(spendNanos)
+            return GateOutcome(true, 0.9, spendNanos / 1_000_000.0)
+        }
+    }
+
     @Test
     fun `a declining gate builds no hint run and costs no model request`() {
         val gate = FixedGate(intervene = false)
@@ -812,6 +830,36 @@ class SmartProactiveTurnTest {
             assertEquals(listOf("propose_hint"), rig.model.requests.single().tools.map { it.name })
             assertTrue(rig.actions.executed.isEmpty(), "the hint turn must not execute a device action")
         }
+    }
+
+    @Test
+    fun `the hint request deadline is the full fifteen seconds measured from the trigger`() {
+        // Owner decision A2 (2026-10-21): the old 8 s budget was mostly spent *before* the model call on the K40
+        // (Task 9: gate -> P3_PROMPT measured 5.306/6.616/6.936 s), so 3 of 4 measured hint turns ended DEADLINE.
+        // The deadline here is therefore the **total** HINT_TURN budget: work already done before the request - the
+        // gate's five simulated seconds stand in for that pipeline - is charged to the same 15 s, not added on top
+        // of it. Anchoring at the model call instead would pass a frozen-clock test but reproduce the device bug.
+        val gate = SlowGate(spendNanos = 5_000_000_000L)
+        val rig = SmartTestRig(interventionGate = gate)
+        gate.clock = rig.clock
+        // The profile's per-request cap is a separate number (D49); a cap longer than the turn budget leaves the
+        // turn's own deadline as the binding one the request receives.
+        rig.profile = smartProfile(timeoutMillis = 60_000)
+        rig.activate()
+        rig.model.onRequest = proposing()
+
+        arm(rig)
+        val turnStart = rig.clock.nowNanos()
+        rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+
+        val request = rig.model.requests.single()
+        assertEquals(turnStart + 5_000_000_000L, rig.clock.nowNanos(),
+            "the gate must have spent part of the budget before the request was built")
+        assertEquals(
+            turnStart + 15_000_000_000L,
+            request.deadlineNanos,
+            "the hint request must be bounded by the 15 s total HINT_TURN budget, anchored at the trigger",
+        )
     }
 
     @Test
