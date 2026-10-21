@@ -205,9 +205,11 @@ data class AgentStep(
  *
  * [modelMillis] is the run's summed time inside model turns, [toolMillis] the summed machine time of its tool calls,
  * and [observeMillis] the subset of that time spent in calls whose descriptor declared `observation = true`. [images]
- * is the number of **distinct images produced by the run**, not only the images a model request happened to carry: a
- * picture attached to the call that ends the run (a repeated-error failure, a timeout, an uncertain result) still counts,
- * because no later request can carry it. Every field is a count; none can carry a page, a transcript or a credential.
+ * is the number of **distinct images produced by this run's tool calls, including images a terminal run never carried**:
+ * a picture attached to the call that ends the run (a repeated-error failure, a timeout, an uncertain result) still
+ * counts, while a picture merely carried from previous-turn history does not — the request path is not a source for this
+ * field. Artifact ids key the set, so the same image produced twice counts once. Every field is a count; none can carry
+ * a page, a transcript or a credential.
  *
  * Task 9's docs (`STATUS`/`ACCEPTANCE`/P3 metric口径) must describe `images` with the same produced-by-the-run meaning;
  * this KDoc is the code-side source for that wording, and the fix report points Task 9 at it.
@@ -675,9 +677,6 @@ class AgentLoop(
             // Observability is never a verdict: a throwing hook must not turn an assembled request into a failed run.
             frameForTurn?.let { frame -> runCatching { request.onRequestBuilt?.invoke(frame) } }
             openingTurn = false
-            // R78: count this request's images before it is sent. Distinct artifact ids, so a picture carried by two
-            // requests of the same run is one image, not two.
-            recordMetricImages(frameForTurn, history)
             metricCalls++
             val modelStartedNanos = clock.nowNanos()
             val reply = gateway.turn(
@@ -1392,8 +1391,8 @@ class AgentLoop(
     }
 
     /**
-     * Appends one `ToolOutput`, remembers a non-persistent result's call id and counts the images it carries (final
-     * review C2; Task 8).
+     * Appends one `ToolOutput`, remembers a non-persistent result's call id and counts the images this run produced
+     * (final review C2; Task 8).
      *
      * Every ToolOutput append path goes through this helper, so no branch can forget to mark a perception-bearing output;
      * the in-run history keeps the full payload and only the stored transcript is redacted at [finish].
@@ -1404,10 +1403,11 @@ class AgentLoop(
      *   content nor the image reference reaches `ConversationStore`/`AgentRun.transcript`. Production's image results
      *   already set the flag (every `device` result is marked, including `screenshot`); the gate is outcome-independent
      *   because "successful images persist" was never a real store path (fix review);
-     * - **the metric counts produced images, not only carried ones** — a picture attached to the call that ends the run
-     *   (a repeated-error failure, a timeout, an uncertain result) never reaches another model request, so counting it
-     *   only from a request would lose it. The set keys on the artifact id, so a picture that is both appended and later
-     *   carried is still one image.
+     * - **the metric counts only images produced by this run's tool calls, including images a terminal run never
+     *   carried** — this append-time set is the field's only source. A picture attached to the call that ends the run
+     *   (a repeated-error failure, a timeout, an uncertain result) never reaches another model request, so counting only
+     *   requests would lose it; a picture merely carried from previous-turn history was not produced here and is never
+     *   added. The set keys on the artifact id, so the same picture appended twice is still one image.
      */
     private fun appendToolOutput(
         history: MutableList<ModelHistoryItem>,
@@ -1525,18 +1525,6 @@ class AgentLoop(
         total == null -> "missing"
         value == null -> "unknown"
         else -> value.toString()
-    }
-
-    /**
-     * Adds the images one model request carries to the run's distinct-image count (R78): a request-flow segment's
-     * `images` and a history tool output's `images`. Artifact ids key the set, so the same screenshot echoed by two
-     * requests of one run counts once.
-     */
-    private fun recordMetricImages(frame: RequestFrame?, history: List<ModelHistoryItem>) {
-        frame?.conversationFlow?.forEach { segment -> segment.images.forEach { metricImageIds += it.artifactId } }
-        history.forEach { item ->
-            if (item is ModelHistoryItem.ToolOutput) item.images.forEach { metricImageIds += it.artifactId }
-        }
     }
 
     /**

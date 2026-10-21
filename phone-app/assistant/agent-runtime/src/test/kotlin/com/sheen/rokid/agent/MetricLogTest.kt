@@ -23,6 +23,9 @@ import kotlin.test.assertTrue
  * 0.3 Phase 2 Task 11 moves provider cache accounting to `ModelClientGateway` (one `P3_CACHE` line per model request,
  * asserted in `GatewayCacheMetricTest`); a finished run therefore emits exactly this one line. The shape below is the
  * run-level contract and is unchanged.
+ *
+ * `images` counts only artifacts produced by this run's tool calls, including one a terminal failed call never carried
+ * in a later request; a picture merely carried from previous-turn history is not this run's image.
  */
 class MetricLogTest {
 
@@ -59,12 +62,9 @@ class MetricLogTest {
             clock.now += 3_000_000L
             ActionResult(ActionOutcome.Done, "done")
         }
-        val image = ImageRef("img-1", "image/png", 8, 8, "sha")
         val history = listOf(
             ModelHistoryItem.Text(MessageRole.USER, "MARKER-PREVIOUS-QUESTION"),
             ModelHistoryItem.Text(MessageRole.ASSISTANT, "MARKER-PREVIOUS-ANSWER"),
-            ModelHistoryItem.ToolCall("c0", "lookup", "{}", "fc0"),
-            ModelHistoryItem.ToolOutput("c0", "MARKER-OBSERVATION", listOf(image)),
         )
         val gateway = MetricGateway(clock, listOf(
             GatewayReply(listOf(call("c1", "lookup")), "checking", ModelEnd.COMPLETED, null, ModelUsage(12, 5)),
@@ -76,7 +76,7 @@ class MetricLogTest {
         assertEquals(1, lines.size, lines.toString())
         assertEquals(
             "P3_METRIC calls=2 toolCalls=1 modelMs=8 toolMs=3 observeMs=3 " +
-                "inputTokens=15 outputTokens=7 images=1 nudges=0 overflows=0",
+                "inputTokens=15 outputTokens=7 images=0 nudges=0 overflows=0",
             lines.single(),
         )
         // The line is counts only: no request/history/tool body, and no credential-shaped text.
@@ -84,19 +84,46 @@ class MetricLogTest {
     }
 
     @Test
-    fun `an image from a failed tool result is counted even when the run ends right after that call`() {
-        // Task 8: a failure's picture is a picture. The third identical failure ends the run (REPEATED_ERROR) after its
-        // output is appended, so no later model request can carry that last image — the count must come from the result,
-        // not only from the requests.
+    fun `an image carried from previous-turn history is not counted as this run's image`() {
+        // P3_METRIC.images is produced-by-this-run only. The caller's transcript may already carry a picture from an
+        // earlier turn and this run's requests do carry it, but this run's tool calls produced none.
+        val lines = mutableListOf<String>()
+        val carried = ImageRef("img-carried", "image/png", 8, 8, "sha-carried")
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "MARKER-PREVIOUS-QUESTION"),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "MARKER-PREVIOUS-ANSWER"),
+            ModelHistoryItem.ToolCall("c0", "lookup", "{}", "fc0"),
+            ModelHistoryItem.ToolOutput("c0", "MARKER-OBSERVATION", listOf(carried)),
+        )
+        val gateway = MetricGateway(FakeMetricClock(), listOf(
+            GatewayReply(emptyList(), "answer", ModelEnd.COMPLETED, null, null),
+        ))
+
+        val run = loop(gateway, lines = lines).run(request(history = history))
+
+        assertEquals(0, run.metrics.images, "a carried image is not produced by this run: ${lines.single()}")
+        assertTrue(lines.single().contains(" images=0"), lines.single())
+    }
+
+    @Test
+    fun `a produced image on a terminal failed call is counted even though no later request carries it`() {
+        // Task 8 fix: a failure's picture is a picture, but only this run's produced one. The third identical failure
+        // ends the run (REPEATED_ERROR) after its output is appended, so no later model request can carry that last
+        // image — the append-time produced set must count it.
         val lines = mutableListOf<String>()
         var produced = 0
         val executor = RecordingActionExecutor(listOf(actionDescriptor("open")))
         executor.outcome = { _, _ ->
-            ActionResult(
-                ActionOutcome.Failed,
-                "STATE_UNCHANGED",
-                images = listOf(ImageRef("img-failure-${++produced}", "image/png", 8, 8, "sha-$produced")),
-            )
+            produced++
+            if (produced == 3) {
+                ActionResult(
+                    ActionOutcome.Failed,
+                    "STATE_UNCHANGED",
+                    images = listOf(ImageRef("img-terminal", "image/png", 8, 8, "sha-terminal")),
+                )
+            } else {
+                ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED")
+            }
         }
         val replies = (1..3).map { index ->
             // Distinct arguments keep the repeat detector from skipping the call: the error identity is tool+code, so
@@ -111,10 +138,60 @@ class MetricLogTest {
 
         assertEquals(AgentOutcome.FAILED, run.outcome)
         assertEquals("REPEATED_ERROR", run.safeCode)
-        assertEquals(3, run.metrics.images, "every failed call's picture is a distinct run image")
-        assertTrue(lines.single().contains(" images=3"), lines.single())
-        assertFalse(lines.single().contains("sha-"), "the metric line stays count-only: ${lines.single()}")
-        assertFalse(lines.single().contains("img-failure"), "no artifact id reaches the metric line: ${lines.single()}")
+        assertEquals(1, run.metrics.images, "the terminal failed call produced this run's one image")
+        assertTrue(lines.single().contains(" images=1"), lines.single())
+        assertFalse(lines.single().contains("sha-terminal"), "the metric line stays count-only: ${lines.single()}")
+        assertFalse(lines.single().contains("img-terminal"), "no artifact id reaches the metric line: ${lines.single()}")
+    }
+
+    @Test
+    fun `two distinct produced images are counted as two`() {
+        val lines = mutableListOf<String>()
+        val produced = listOf(
+            ImageRef("img-a", "image/png", 8, 8, "sha-a"),
+            ImageRef("img-b", "image/png", 8, 8, "sha-b"),
+        )
+        var calls = 0
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("lookup")))
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, "done", images = listOf(produced[calls++]))
+        }
+        val replies = listOf(
+            GatewayReply(
+                listOf(call("c1", "lookup", """{"page":1}"""), call("c2", "lookup", """{"page":2}""")),
+                "checking", ModelEnd.COMPLETED, null, null,
+            ),
+            GatewayReply(emptyList(), "answer", ModelEnd.COMPLETED, null, null),
+        )
+
+        val run = loop(MetricGateway(FakeMetricClock(), replies), ToolRegistry(listOf(executor)), lines = lines)
+            .run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(2, run.metrics.images, "two distinct artifacts produced by this run are two images")
+        assertTrue(lines.single().contains(" images=2"), lines.single())
+    }
+
+    @Test
+    fun `the same produced artifact twice is one image`() {
+        val lines = mutableListOf<String>()
+        val image = ImageRef("img-same", "image/png", 8, 8, "sha-same")
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("lookup")))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done", images = listOf(image)) }
+        val replies = listOf(
+            GatewayReply(
+                listOf(call("c1", "lookup", """{"page":1}"""), call("c2", "lookup", """{"page":2}""")),
+                "checking", ModelEnd.COMPLETED, null, null,
+            ),
+            GatewayReply(emptyList(), "answer", ModelEnd.COMPLETED, null, null),
+        )
+
+        val run = loop(MetricGateway(FakeMetricClock(), replies), ToolRegistry(listOf(executor)), lines = lines)
+            .run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(1, run.metrics.images, "the artifact id keys the produced set")
+        assertTrue(lines.single().contains(" images=1"), lines.single())
     }
 
     @Test

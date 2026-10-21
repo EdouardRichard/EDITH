@@ -59,7 +59,7 @@ class ToolImageHistoryTest {
         val continuation = gateway.requests.single { turn -> turn.history.any { it is ModelHistoryItem.ToolOutput } }
         val sent = assertIs<ModelHistoryItem.ToolOutput>(continuation.history.last())
         assertEquals(listOf(image), sent.images, "the next request's history must carry the tool image: $sent")
-        assertEquals(1, run.metrics.images, "P3_METRIC.images counts the artifact the request now carries (R78)")
+        assertEquals(1, run.metrics.images, "P3_METRIC.images counts the artifact this run's tool call produced (R78)")
 
         // Task 8 fix review: the stored transcript is not a second image carrier. The model saw the picture and the
         // call remains attributable by id; the artifact reference itself does not outlive the run.
