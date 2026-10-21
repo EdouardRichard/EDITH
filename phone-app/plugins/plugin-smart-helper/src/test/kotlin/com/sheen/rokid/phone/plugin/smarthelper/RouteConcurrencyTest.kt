@@ -2,7 +2,12 @@ package com.sheen.rokid.phone.plugin.smarthelper
 
 import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
+import com.sheen.rokid.contracts.ContextChanged
 import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.GateForm
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.GateOutcome
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGateState
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
@@ -18,6 +23,23 @@ class RouteConcurrencyTest {
 
     private fun arm(rig: SmartTestRig) {
         rig.plugin.handle(AcousticEvent(rig.envelope(), AcousticLabel.Speech))
+    }
+
+    /**
+     * The `ContextChanged` entry point only evaluates an ambient trigger when a gate exists; this one always accepts,
+     * so a trigger that passed admission really ran its HINT_TURN.
+     */
+    private class AlwaysInterveneGate : ProactiveGate {
+        override val form = GateForm.NOUL
+        override fun shouldIntervene(state: ProactiveGateState) = GateOutcome(true, 0.9, 1.0)
+    }
+
+    /**
+     * A foreground change is the proactive trigger that remains legal while a wake turn is in flight: a final that
+     * arrives in that state belongs to WAKE (P3-13), so it cannot stand in for a proactive utterance here.
+     */
+    private fun contextChange(rig: SmartTestRig, revision: Long, foreground: String) {
+        rig.plugin.handle(ContextChanged(rig.envelope(), revision, mapOf("app.foreground" to foreground)))
     }
 
     /**
@@ -56,7 +78,7 @@ class RouteConcurrencyTest {
     }
 
     private fun rig(): SmartTestRig {
-        val rig = SmartTestRig()
+        val rig = SmartTestRig(interventionGate = AlwaysInterveneGate())
         rig.activate()
         rig.model.onRequest = { request, listener -> streamText(request, listener, "答案。") }
         return rig
@@ -74,7 +96,7 @@ class RouteConcurrencyTest {
         val turn = BlockedWakeTurn(rig)
         try {
             arm(rig)
-            rig.plugin.handle(TranscriptEvent(rig.transcript("今天星期几", turnId = "asr-2")))
+            contextChange(rig, revision = 2, foreground = "设置")
 
             assertEquals(1, rig.model.requests.size, "nothing may run beside the wake turn")
         } finally {
@@ -93,8 +115,8 @@ class RouteConcurrencyTest {
         val turn = BlockedWakeTurn(rig)
         try {
             arm(rig)
-            rig.plugin.handle(TranscriptEvent(rig.transcript("今天星期几", turnId = "asr-2")))
-            rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了", turnId = "asr-3")))
+            contextChange(rig, revision = 2, foreground = "设置")
+            contextChange(rig, revision = 3, foreground = "音乐")
         } finally {
             turn.finish()
         }
@@ -113,7 +135,7 @@ class RouteConcurrencyTest {
         val turn = BlockedWakeTurn(rig)
         try {
             arm(rig)
-            rig.plugin.handle(TranscriptEvent(rig.transcript("今天星期几", turnId = "asr-2")))
+            contextChange(rig, revision = 2, foreground = "设置")
             rig.plugin.deactivate(com.sheen.rokid.plugin.DeactivationReason.Stopped)
         } finally {
             turn.finish()
@@ -130,7 +152,7 @@ class RouteConcurrencyTest {
         val turn = BlockedWakeTurn(rig)
         try {
             // Deliberately not armed: no `AcousticEvent` has been seen in this session.
-            rig.plugin.handle(TranscriptEvent(rig.transcript("今天星期几", turnId = "asr-2")))
+            contextChange(rig, revision = 2, foreground = "设置")
         } finally {
             turn.finish()
         }

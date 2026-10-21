@@ -1003,6 +1003,70 @@ class ProactiveFollowupWindowTest {
         }
     }
 
+    /**
+     * Final review Important 1: the resolver's "a WAKE final never enters the proactive session" rule must hold while
+     * the WAKE turn is **Running**, not only while it is `AwaitingTranscript`.
+     *
+     * The stray final is delivered from inside the WAKE turn's own model request, which is exactly the moment that turn
+     * is `Running`: `acceptFollowupTranscript` refuses it (WAKE is busy), and `acceptTranscript` used to remember it as
+     * Help's next wake utterance before its phase check. The proactive trigger then parked it as BUSY and the wake
+     * turn's end resumed it as a HINT_TURN. The final belongs to WAKE and must do none of that.
+     */
+    @Test
+    fun `a usable final while the wake turn is running never enters the proactive session`() {
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.model.onRequest = proposing()
+        arm(rig)
+        rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+        val hint = rig.output.hints.single()
+
+        // The hint's ACK lands after the wake opened, so the PROACTIVE window is armed while WAKE owns the panel.
+        rig.plugin.handle(rig.wakeEvent())
+        rig.panelVisible = true
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hint.hintId, OutputStatus.Displayed))
+        val windowTurn = rig.plugin.followupWindowTurnIdForTest()
+        assertNotNull(windowTurn, "the displayed hint armed the proactive window")
+
+        var strayDelivered = false
+        rig.model.onRequest = { request, listener ->
+            if (request.turnId.startsWith("proactive-")) {
+                // Under the defect this is the parked trigger resumed as a HINT_TURN after the wake answer.
+                proposing("不该出现的提醒")(request, listener)
+            } else {
+                if (!strayDelivered) {
+                    strayDelivered = true
+                    // Reentrant, from inside the WAKE turn's request: the turn's phase is Running here.
+                    rig.plugin.handle(TranscriptEvent(rig.transcript("帮我记一条笔记", turnId = "asr-stray", revision = 3)))
+                }
+                streamText(request, listener, "唤醒回答。")
+            }
+        }
+
+        withLines { lines ->
+            rig.plugin.handle(TranscriptEvent(rig.transcript("打开设置", turnId = "asr-wake", revision = 2)))
+            assertTrue(strayDelivered, "the stray final was delivered while the WAKE turn was Running")
+            // The closing wake answer is emitted through the assembler's merge interval, like every fallback answer.
+            rig.tick()
+
+            assertTrue(
+                lines.none { it.startsWith("P3_TRANSCRIPT") && "turn=asr-stray" in it },
+                "a Running WAKE turn's final must not reach acceptTranscript: $lines",
+            )
+            assertTrue(lines.none { it == "P3_PROACTIVE park reason=BUSY" }, lines.toString())
+            assertTrue(lines.none { it.startsWith("P3_PROACTIVE resume") }, lines.toString())
+            assertEquals(0, lines.count { it.startsWith("P3_PROACTIVE hint") }, "no HINT_TURN may start: $lines")
+            assertEquals(
+                listOf("现在正适合提醒他一句", "唤醒回答。"),
+                rig.output.hints.map { it.text },
+                "the WAKE answer is the only new hint",
+            )
+            assertEquals(2, rig.model.requests.size, "only the hint turn and the WAKE turn issued requests")
+            assertEquals(windowTurn, rig.plugin.followupWindowTurnIdForTest(), "the WAKE final did not touch the window")
+        }
+    }
+
     @Test
     fun `a wake answer and its continuation never open a proactive window`() {
         val display = SmartRecordingDisplay()

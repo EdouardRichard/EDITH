@@ -295,7 +295,7 @@ class SmartProactiveTurnTest {
 
     @Test
     fun `a wake turn that is still running makes the proactive trigger give way`() {
-        val rig = SmartTestRig()
+        val rig = SmartTestRig(interventionGate = FixedGate(intervene = true))
         rig.activate()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -313,7 +313,9 @@ class SmartProactiveTurnTest {
         try {
             withLines { lines ->
                 arm(rig)
-                rig.plugin.handle(TranscriptEvent(rig.transcript("今天星期几", turnId = "asr-2")))
+                // A `ContextChanged` is the trigger that stays available while WAKE is Running: a final arriving in
+                // this state belongs to WAKE (P3-13, final review Important 1) and must not reach proactive admission.
+                rig.plugin.handle(ContextChanged(rig.envelope(), 2, mapOf("app.foreground" to "设置")))
 
                 awaitRequests(rig, 1)
                 assertEquals(1, rig.model.requests.size,

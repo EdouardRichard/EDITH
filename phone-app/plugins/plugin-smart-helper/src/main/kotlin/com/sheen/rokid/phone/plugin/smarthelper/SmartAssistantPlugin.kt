@@ -2448,15 +2448,20 @@ class SmartAssistantPlugin(
                                         event.revision.text.trim(),
                                     )
                                 }
-                                // P3-13: the PROACTIVE continuation round is tried first, but it refuses itself while a
-                                // WAKE turn is waiting/running - so a WAKE final is still consumed by WAKE, and a
-                                // follow-up final never reaches `acceptTranscript` (which would also remember it as
-                                // Help's next wake utterance). The proactive trigger is consulted only when neither
-                                // conversation took the final.
+                                // P3-13 (final review Important 1): a usable final that arrives while the WAKE turn is
+                                // **Running** belongs to WAKE and is not a proactive utterance. It must not reach
+                                // `acceptTranscript`, which remembers a final as Help's next wake utterance *before* its
+                                // phase check, and must not reach the proactive trigger either: admission would park it
+                                // while WAKE is busy, and the wake turn's own end would then run it as a HINT_TURN. The
+                                // `AwaitingTranscript` case is different and stays with `acceptTranscript` - that final
+                                // is the wake turn's own utterance.
+                                val wakeRunning = turn?.phase == SmartTurnPhase.Running
+                                val wakeOwnsFinal = wakeRunning && event.revision.final && usableText
                                 val continuation =
                                     acceptFollowupContinuation(event.revision, waitingTurnId, waitingArmed)
                                 if (continuation != null) followupContinuation = continuation
-                                val consumed = if (continuation == null) acceptTranscript(event.revision) else null
+                                val consumed =
+                                    if (continuation == null && !wakeOwnsFinal) acceptTranscript(event.revision) else null
                                 consumedFinal = consumed != null
                                 // The ASR final's own id replaces the wake's placeholder; the official levels below
                                 // must carry that id, not the placeholder.
@@ -2465,7 +2470,11 @@ class SmartAssistantPlugin(
                                     confirmation.excludeSegment(event.revision.turnId)
                                 }
                                 consumed to (
-                                    if (consumed == null && continuation == null) proactiveTrigger(event.revision) else null
+                                    if (consumed == null && continuation == null && !wakeOwnsFinal) {
+                                        proactiveTrigger(event.revision)
+                                    } else {
+                                        null
+                                    }
                                     )
                             }
                         }
@@ -3937,10 +3946,14 @@ class SmartAssistantPlugin(
         // ended, the first real utterance produced `skip reason=BUSY` instead of a request.
         //
         // The PROACTIVE follow-up window is a live conversation too (spec §4.5): its 10 s round, the accepted
-        // follow-up hand-off and a running/awaiting FOLLOWUP_TURN must not be overlapped by a hint turn. Without this,
-        // a foreground-changing `ContextChanged` after the (configurable) hint cooldown but inside the window starts a
-        // HINT_TURN beside the follow-up round.
-        val followupLive = proactiveFollowup != null || followupTurnRequest != null || followupBusy
+        // follow-up hand-off, a running/awaiting FOLLOWUP_TURN **and an answer that has not settled into its
+        // continuation yet** must not be overlapped by a hint turn. The answer emit clears `followupBusy` (the busy
+        // ring stops exactly when the sentence appears), so between that emit and the continuation's `Displayed` ACK
+        // the installed FOLLOWUP_TURN is the only busy marker. Without it, a foreground-changing `ContextChanged`
+        // after the (configurable) hint cooldown starts a HINT_TURN whose own `Displayed` ACK installs a new follow-up
+        // window over the continuation (final review Important 2).
+        val followupLive = proactiveFollowup != null || followupTurnRequest != null ||
+            followupBusy || followupTurn != null
         val busy = turn?.let { it.phase != SmartTurnPhase.Idle } == true || proactiveInFlight || followupLive
         val skip = proactive.admit(trigger, armed = armedNow(), busy = busy)
         if (skip != null) {
@@ -4397,7 +4410,7 @@ class SmartAssistantPlugin(
                             started,
                             ProactiveHintSpec.PROACTIVE_DEADLINE_MILLIS * 1_000_000L,
                         ),
-                        // D49: the profile's timeout caps **one request**; the turn's own 8 s budget above is the
+                        // D49: the profile's timeout caps **one request**; the turn's own 15 s budget above is the
                         // machine deadline, and the loop sends the earlier of the two.
                         requestTimeoutNanos = modelRequestTimeoutNanos(proactiveProfile?.timeoutMillis),
                         maxOutputTokens = proactiveProfile?.maxOutputTokens,

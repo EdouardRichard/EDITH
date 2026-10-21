@@ -176,6 +176,8 @@ class ProactiveFollowupTurnTest {
         hintText: String = "现在正适合提醒他一句",
         /** The intervention gate; non-null is what lets a `ContextChanged` reach the proactive admission. */
         interventionGate: ProactiveGate? = null,
+        /** The configured hint cooldown, so a test can reach admission after the hint without waiting 60 s. */
+        proactiveCooldownMillis: String? = null,
     ): FollowupRig {
         val display = SmartRecordingDisplay()
         val rig = SmartTestRig(
@@ -190,7 +192,12 @@ class ProactiveFollowupTurnTest {
             channel?.let { put(Capability.Confirmation, it) }
             perception?.let { put(Capability.Perception, it) }
         }
-        rig.activate(maxLevel = maxLevel, overrides = overrides, tasks = tasks)
+        rig.activate(
+            maxLevel = maxLevel,
+            overrides = overrides,
+            tasks = tasks,
+            proactiveCooldownMillis = proactiveCooldownMillis,
+        )
         val script = ModelScript()
         script.install(rig)
         script.next(proposing(hintText))
@@ -445,6 +452,59 @@ class ProactiveFollowupTurnTest {
             assertNotNull(next)
             assertEquals(SmartTurnPhase.AwaitingTranscript, next.second)
             assertNotEquals("asr-follow-up", next.first, "the continuation is a new PROACTIVE turn")
+        }
+    }
+
+    /**
+     * Final review Important 2: the follow-up answer's emit clears `followupBusy` (the ring stops exactly when the
+     * sentence appears), but the continuation is not open until that answer's `Displayed` ACK settles it. In that gap
+     * the installed FOLLOWUP_TURN is still the live PROACTIVE round; a foreground-changing `ContextChanged` after the
+     * hint cooldown must not start a HINT_TURN whose own ACK would install a window over the continuation.
+     */
+    @Test
+    fun `a context change before the continuation ACK starts no hint`() {
+        val gate = AlwaysInterveneGate()
+        val rig = rigWithDisplayedHint(
+            continueDialogue = true,
+            interventionGate = gate,
+            proactiveCooldownMillis = "1000",
+        )
+        rig.script.next(answering("第一轮完成。"))
+        // Only the defect consumes this handler: a HINT_TURN started in the answer->continuation gap.
+        rig.script.next(proposing("不该出现的提醒"))
+
+        withLines { lines ->
+            injectFollowup(rig, "打开设置", turnId = "asr-1")
+            val answer = rig.rig.output.hints.last()
+            assertEquals("第一轮完成。", answer.text)
+            // The answer is out; its ACK has not arrived, so no continuation exists yet.
+            assertEquals(SmartTurnPhase.Idle, rig.rig.plugin.followupTurnStateForTest()?.second)
+            assertTrue(lines.none { it.startsWith("P3_CONV continue") }, lines.toString())
+            val requests = rig.rig.model.requests.size
+            val gateCalls = gate.seen.size
+
+            // Past the configured 1 s hint cooldown, before the answer's ACK.
+            rig.rig.tick(2_000)
+            rig.rig.plugin.handle(ContextChanged(rig.rig.envelope(), 2, mapOf("app.foreground" to "设置")))
+
+            assertEquals(
+                requests,
+                rig.rig.model.requests.size,
+                "a pending continuation is busy: no HINT_TURN may start",
+            )
+            assertEquals(gateCalls, gate.seen.size, "a busy trigger is refused before the intervention gate")
+            assertTrue(lines.any { it == "P3_PROACTIVE park reason=BUSY" }, lines.toString())
+            assertEquals(2, rig.rig.output.hints.size, "the hint and its follow-up answer are the only hints")
+
+            // The delayed ACK still opens the continuation the answer was waiting for.
+            rig.rig.plugin.handle(OutputStateEvent(rig.rig.envelope(), answer.hintId, OutputStatus.Displayed))
+            val continuation = rig.rig.plugin.followupTurnStateForTest()
+            assertNotNull(continuation, "the pending continuation still opens after the ACK")
+            assertEquals(SmartTurnPhase.AwaitingTranscript, continuation.second)
+            assertTrue(
+                lines.any { it.startsWith("P3_CONV continue route=PROACTIVE") },
+                "the continuation survived the refused hint: $lines",
+            )
         }
     }
 
