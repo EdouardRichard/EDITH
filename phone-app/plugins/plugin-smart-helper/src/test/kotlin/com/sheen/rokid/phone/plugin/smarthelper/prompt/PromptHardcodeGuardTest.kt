@@ -7,14 +7,15 @@ import kotlin.test.assertFalse
 /**
  * Production prompt resources may contain policy and placeholders, never concrete device facts
  * (spec §4.2.1 rule 1, §4.6). Otherwise every device-wording change would silently ship a prompt
- * that describes the developer's phone rather than the wearer's.
+ * that describes the developer's phone rather than the wearer's. The scan covers the system
+ * sections **and** A7's independent loop/pinned/summarizer fragments, which are model-facing too.
  *
  * This is the resource-side guard; `PromptDeviceFidelityTest` proves that the values really come
  * from the device at render time.
  */
 class PromptHardcodeGuardTest {
 
-    private val staticResources = listOf(
+    private val fixedResources = listOf(
         "core/00-identity.md",
         "core/10-operating.md",
         "core/20-tools.md",
@@ -24,6 +25,14 @@ class PromptHardcodeGuardTest {
         "route/wake.md",
         "route/proactive-hint.md",
         "route/proactive-followup.md",
+        // A7's independent fixed prompts are model-facing too: the loop instructions, the pinned gate
+        // question/options and the summarizer template must not acquire a device fact either.
+        "loop/retry.md",
+        "loop/plan-nudge.md",
+        "loop/timeout.md",
+        "pinned/proactive-gate.md",
+        "pinned/proactive-gate-options.md",
+        "summarizer.md",
     )
 
     private val deviceLiterals = listOf(
@@ -44,7 +53,7 @@ class PromptHardcodeGuardTest {
 
     @Test
     fun `prompt resources contain no device literals or dynamic system slots`() {
-        for (resource in staticResources) {
+        for (resource in fixedResources) {
             val text = promptText(resource)
             for (literal in deviceLiterals) {
                 assertFalse(text.contains(literal), "$resource must not hardcode $literal")
@@ -79,7 +88,7 @@ class PromptHardcodeGuardTest {
         val date = Regex("""\b20\d{2}-\d{2}-\d{2}\b""")
         val clock = Regex("""\b([01]\d|2[0-3]):[0-5]\d\b""")
 
-        for (resource in staticResources + "context/device-profile.md") {
+        for (resource in fixedResources + "context/device-profile.md") {
             val text = promptText(resource)
             assertFalse(date.containsMatchIn(text), "$resource must not hardcode a date")
             assertFalse(clock.containsMatchIn(text), "$resource must not hardcode a wall clock time")

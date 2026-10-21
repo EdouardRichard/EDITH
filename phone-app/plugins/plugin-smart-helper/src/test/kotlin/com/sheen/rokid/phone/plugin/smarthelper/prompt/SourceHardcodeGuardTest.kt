@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.plugin.smarthelper.prompt
 
 import java.io.File
 import kotlin.test.Test
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -21,14 +22,21 @@ import kotlin.test.assertTrue
  * 2. prompt construction patterns banned by §4.6 are rejected anywhere: `SmartPrompts`,
  *    `PROACTIVE_INSTRUCTION`, a `你是一名`/`You are` identity opener, or a Chinese literal assigned to
  *    `instructions`/`prompt`;
- * 3. an authored system-prompt line (≥20 Han characters) must not reappear verbatim in a source
- *    literal, and the files that load/select prompt resources must not carry paragraph-scale inline
- *    prompt prose;
- * 4. user-facing copy is exempt only at four named sites: [ToolLabelMap] labels, `ActionDescriptor.title`,
- *    the confirmation summary, and `SmartConfirmation.APPROVALS`/`DENIALS`. These are localizable UI
+ * 3. an authored prompt line (≥20 Han characters, or an English loop instruction of ≥20 letters) must
+ *    not reappear verbatim in a source literal, and the files that load/select prompt resources must
+ *    not carry paragraph-scale inline prompt prose;
+ * 4. user-facing copy is exempt only at four named sites, each scoped to the files that own it:
+ *    [ToolLabelMap] labels, `ActionDescriptor.title` in the descriptor files, the confirmation summary
+ *    in `SmartAssistantPlugin`, and `SmartConfirmation.APPROVALS`/`DENIALS`. These are localizable UI
  *    strings, not model instructions (design §4.4 keeps the two channels separate). The allowlist is
  *    exact line-shaped, not a file-wide exclusion, and [the user copy allowlist is bounded to four named sites]
- *    proves each entry alone is allowed.
+ *    proves each entry alone is allowed;
+ * 5. the plugin half of rule 2 scans **literals** (comments and identifiers are not prompt prose in the
+ *    module that owns the product vocabulary). Two genuine non-prompt literals are exempted line-shaped:
+ *    the `propose_hint` wire name and the `/sdcard/EDITH/skills` storage path;
+ * 6. the three English loop defaults are authored prompt prose too, although the ≥20-Han corpus would
+ *    not see them; `AgentLoop.kt` is their only permitted mirror and a byte-equality test ties it to
+ *    `PromptCatalog.loop`.
  *
  * A blanket "no Chinese literal" test would be dishonest here: tool-schema prose (pinned by A5's
  * `ToolContractTest`), memory keyword tables and phonetic/app-name synonyms legitimately stay in
@@ -50,6 +58,73 @@ class SourceHardcodeGuardTest {
     }
 
     @Test
+    fun `plugin sources carry no product vocabulary outside the named tool and path literals`() {
+        val files = ProductionSourceScan.pluginSources()
+        assertTrue(files.size > 40, "plugin main-source scope unexpectedly small: ${files.size} files")
+
+        val findings = files.flatMap { ProductionSourceScan.pluginProductVocabulary(it) }
+
+        assertTrue(
+            findings.isEmpty(),
+            "the plugin may name product routes in code and comments, but not in a prompt literal. " +
+                "Found:\n${ProductionSourceScan.render(findings)}",
+        )
+    }
+
+    @Test
+    fun `the plugin vocabulary scan is line shaped and comment aware`() {
+        assertTrue(
+            ProductionSourceScan.pluginProductVocabulary(
+                "Fixture.kt",
+                "private val instructions = \"你是 EDITH，先观察再行动。\"",
+            ).isNotEmpty(),
+            "a plugin prompt literal naming the product must be rejected",
+        )
+        assertTrue(
+            ProductionSourceScan.pluginProductVocabulary(
+                "Fixture.kt",
+                "private val route = \"WAKE 时先观察\"",
+            ).isNotEmpty(),
+            "a plugin prompt literal naming a product route must be rejected",
+        )
+        assertTrue(
+            ProductionSourceScan.pluginProductVocabulary(
+                "Fixture.kt",
+                "// EDITH 是产品名，注释不是提示词",
+            ).isEmpty(),
+            "a comment is not prompt content",
+        )
+        assertTrue(
+            ProductionSourceScan.pluginProductVocabulary(
+                "Fixture.kt",
+                "private val route = PromptRoute.WAKE",
+            ).isEmpty(),
+            "an identifier is code, not a prompt literal",
+        )
+        assertTrue(
+            ProductionSourceScan.pluginProductVocabulary(
+                "Fixture.kt",
+                """const val NAME = "propose_hint"""",
+            ).isNotEmpty(),
+            "the tool-name literal is exempt only at its named owner, not file-wide",
+        )
+        assertTrue(
+            ProductionSourceScan.pluginProductVocabulary(
+                "ProactiveHintSpec.kt",
+                """    const val NAME = "propose_hint"""",
+            ).isEmpty(),
+            "the propose_hint tool name is a genuine non-prompt literal",
+        )
+        assertTrue(
+            ProductionSourceScan.pluginProductVocabulary(
+                "StorageAccessSkillDirectory.kt",
+                """    const val SKILL_DIRECTORY = "/sdcard/EDITH/skills"""",
+            ).isEmpty(),
+            "the EDITH skill path is a genuine non-prompt literal",
+        )
+    }
+
+    @Test
     fun `main sources carry no legacy prompt construction outside the resources`() {
         val files = ProductionSourceScan.allModuleSources()
         assertTrue(files.size > 60, "main-source scan scope unexpectedly small: ${files.size} files")
@@ -63,7 +138,7 @@ class SourceHardcodeGuardTest {
     }
 
     @Test
-    fun `main sources do not duplicate an authored system prompt line`() {
+    fun `main sources do not duplicate an authored prompt line`() {
         val authoredLines = authoredPromptLines()
         assertTrue(authoredLines.size > 20, "the authored prompt corpus unexpectedly small: ${authoredLines.size} lines")
 
@@ -73,6 +148,54 @@ class SourceHardcodeGuardTest {
         assertTrue(
             findings.isEmpty(),
             "an authored prompt line was copied back into Kotlin. Found:\n${ProductionSourceScan.render(findings)}",
+        )
+    }
+
+    @Test
+    fun `the authored corpus covers the non Han loop defaults`() {
+        val corpus = authoredPromptLines()
+
+        for (key in listOf("retry", "plan-nudge", "timeout")) {
+            assertTrue(
+                PromptCatalog.loop(key) in corpus,
+                "loop/$key.md must stay in the authored-line corpus, or its copy in Kotlin becomes invisible",
+            )
+        }
+    }
+
+    @Test
+    fun `the agent loop defaults are byte identical to the loop resources`() {
+        // The three constants are file-private in AgentLoop.kt, so this plugin-side test ties their bytes at the
+        // source level instead of widening production visibility inside a guard-only round.
+        val source = File(
+            ProductionSourceScan.repositoryRoot(),
+            "${ProductionSourceScan.AGENT_RUNTIME}/src/main/kotlin/com/sheen/rokid/agent/AgentLoop.kt",
+        ).readText()
+        val code = ProductionSourceScan.codeOnly(source)
+
+        assertEquals(PromptCatalog.loop("retry"), ProductionSourceScan.constantLiteral(code, "RETRY_INSTRUCTION"))
+        assertEquals(
+            PromptCatalog.loop("plan-nudge"),
+            ProductionSourceScan.constantLiteral(code, "PLAN_NUDGE_INSTRUCTION"),
+        )
+        assertEquals(PromptCatalog.loop("timeout"), ProductionSourceScan.constantLiteral(code, "ACTION_TIMEOUT_NOTE"))
+    }
+
+    @Test
+    fun `the AgentLoop loop default whitelist is line shaped`() {
+        val retry = PromptCatalog.loop("retry")
+
+        assertTrue(
+            ProductionSourceScan.isLoopDefaultMirror("AgentLoop.kt", "    \"$retry\""),
+            "the AgentLoop retry default is the intentional mirror of loop/retry.md",
+        )
+        assertFalse(
+            ProductionSourceScan.isLoopDefaultMirror("Fixture.kt", "    \"$retry\""),
+            "the loop-default exemption is scoped to AgentLoop.kt",
+        )
+        assertFalse(
+            ProductionSourceScan.isLoopDefaultMirror("AgentLoop.kt", "    \"你是一名智能助手。\""),
+            "the loop-default exemption is the authored line, not any literal in AgentLoop.kt",
         )
     }
 
@@ -147,6 +270,9 @@ class SourceHardcodeGuardTest {
             "SmartConfirmation approvals" to (
                 "SmartConfirmation.kt" to """        val APPROVALS = setOf("确认", "允许")"""
                 ),
+            "SmartConfirmation denials" to (
+                "SmartConfirmation.kt" to """        val DENIALS = setOf("拒绝", "取消")"""
+                ),
         )
 
         allowed.forEach { (label, sample) ->
@@ -170,15 +296,34 @@ class SourceHardcodeGuardTest {
             ProductionSourceScan.isUserCopy("SmartConfirmation.kt", """        val APPROVALS = setOf("你是一名")"""),
             "the approval allowlist is the set line, not any line in the file that mentions APPROVALS",
         )
+        assertFalse(
+            ProductionSourceScan.isUserCopy("AgentLoop.kt", """        title = "你是一名智能助手","""),
+            "a title assignment outside the descriptor files is not user copy",
+        )
+        assertFalse(
+            ProductionSourceScan.isUserCopy("AgentLoop.kt", """        val summary = "你是一名智能助手""""),
+            "a summary assignment outside the confirmation owner is not user copy",
+        )
     }
 
-    /** The authored system-prompt lines (Chinese prose only) that must never be copied back into source. */
+    /**
+     * The authored prompt lines substantial enough that a copy in Kotlin is a prompt, not a short token:
+     * ≥20 Han characters, or an English loop instruction of ≥20 letters.
+     */
     private fun authoredPromptLines(): List<String> =
         PromptCatalog.manifest()
             .flatMap { entry -> promptText(entry.file).lines() }
             .map { it.trim() }
-            .filter { line -> line.count { it in '\u4e00'..'\u9fff' } >= 20 }
+            .filter(::isAuthoredPromptLine)
             .distinct()
+
+    private fun isAuthoredPromptLine(line: String): Boolean {
+        if (line.count { it in '\u4e00'..'\u9fff' } >= 20) return true
+        // The loop defaults are English translations of the same instructions; without this branch the
+        // Han-only corpus would silently ignore the three texts the loop actually feeds the model.
+        val asciiLetters = line.count { it in 'A'..'Z' || it in 'a'..'z' }
+        return asciiLetters >= 20 && "{{" !in line && !line.startsWith("#")
+    }
 }
 
 /**
@@ -215,6 +360,51 @@ internal object ProductionSourceScan {
     private val TITLE_ASSIGNMENT = Regex("""\btitle\s*=\s*"[^"]*",?\s*$""")
     private val CONFIRMATION_SUMMARY = Regex("""\bDEFAULT_SUMMARY\s*=\s*"[^"]*"|^\s*val\s+summary\s*=\s*"[^"]*",?\s*$""")
 
+    /** Files that construct an [ActionDescriptor], and therefore own `title =` user copy. */
+    private val TITLE_OWNING_FILES = setOf("NotifyUser.kt", "LoadSkillTool.kt", "ProactiveHintSpec.kt")
+
+    /** Files that own the confirmation card's summary copy. */
+    private val CONFIRMATION_SUMMARY_FILES = setOf("SmartAssistantPlugin.kt")
+
+    /** A named, whole-line exemption: the name is the reason, the file and pattern bound it. */
+    private data class LiteralExemption(val name: String, val file: String, val pattern: Regex) {
+        fun matches(fileName: String, line: String): Boolean =
+            file == fileName && pattern.matches(line.trim())
+    }
+
+    /** Genuine plugin literals that are values, not prose: a wire tool name and a storage path. */
+    private val NON_PROMPT_PRODUCT_LITERALS = listOf(
+        LiteralExemption(
+            "propose_hint wire tool name (ProactiveHintSpec.NAME)",
+            "ProactiveHintSpec.kt",
+            Regex("""^const val NAME = "propose_hint"$"""),
+        ),
+        LiteralExemption(
+            "EDITH skill storage path (StorageAccessSkillDirectory.SKILL_DIRECTORY)",
+            "StorageAccessSkillDirectory.kt",
+            Regex("""^const val SKILL_DIRECTORY = "/sdcard/EDITH/skills"$"""),
+        ),
+    )
+
+    /** The three intentional copies of the loop resources that AgentLoop.kt keeps as constructor defaults. */
+    private val LOOP_DEFAULT_MIRRORS = listOf(
+        LiteralExemption(
+            "AgentLoop RETRY_INSTRUCTION mirrors loop/retry.md",
+            "AgentLoop.kt",
+            Regex("""^"${Regex.escape(PromptCatalog.loop("retry"))}"$"""),
+        ),
+        LiteralExemption(
+            "AgentLoop PLAN_NUDGE_INSTRUCTION mirrors loop/plan-nudge.md",
+            "AgentLoop.kt",
+            Regex("""^"${Regex.escape(PromptCatalog.loop("plan-nudge"))}"$"""),
+        ),
+        LiteralExemption(
+            "AgentLoop ACTION_TIMEOUT_NOTE mirrors loop/timeout.md",
+            "AgentLoop.kt",
+            Regex("""^"${Regex.escape(PromptCatalog.loop("timeout"))}"$"""),
+        ),
+    )
+
     fun repositoryRoot(): File =
         generateSequence(File("").absoluteFile) { it.parentFile }
             .firstOrNull { File(it, "settings.gradle.kts").isFile }
@@ -232,9 +422,13 @@ internal object ProductionSourceScan {
 
     fun allModuleSources(): List<File> = modules.flatMap(::moduleSources)
 
+    /** The two product modules design rule 2's plugin half covers. */
+    fun pluginSources(): List<File> = listOf(SMART_HELPER, DIAGNOSTIC).flatMap(::moduleSources)
+
     /**
-     * The sources that load, select or formerly owned authored prompts. Product copy and tool-schema
-     * prose live elsewhere by design, so they are not part of this inline-prose check.
+     * A heuristic surface for the inline-prose check: every `prompt` package source plus the five named
+     * callers. It does not prove that no other file holds prompt prose — the duplicated-line check still
+     * covers every main source — but it bounds which files the paragraph-scale check visits.
      */
     fun promptOwningSources(): List<File> {
         val inPromptPackage = allModuleSources().filter { file ->
@@ -275,6 +469,32 @@ internal object ProductionSourceScan {
             )
         }
 
+    /**
+     * Design rule 2's plugin half. The plugin owns the product vocabulary (`PromptRoute.WAKE`,
+     * `AssistantRoute.PROACTIVE`), so identifiers and comments are legitimate there; what must not exist is
+     * a **literal** carrying product prose the model could read. Comments are stripped first. The two
+     * genuine non-prompt literals (a wire tool name and a storage path) are exempted line-shaped, not
+     * file-wide, so the same text in another file still fails.
+     */
+    fun pluginProductVocabulary(file: File): List<Finding> =
+        pluginProductVocabulary(file.name, file.readText())
+
+    fun pluginProductVocabulary(fileName: String, source: String): List<Finding> {
+        val code = codeOnly(source)
+        val lines = code.lines()
+        return literals(code).mapNotNull { literal ->
+            val match = PRODUCT_VOCABULARY.find(literal.value) ?: return@mapNotNull null
+            val lineText = lines.getOrNull(literal.line - 1).orEmpty()
+            if (isNonPromptProductLiteral(fileName, lineText)) return@mapNotNull null
+            Finding(
+                fileName,
+                literal.line,
+                "product vocabulary '${match.value}' in a literal",
+                literal.value.take(180),
+            )
+        }
+    }
+
     /** Comment-aware legacy prompt construction scan. */
     fun legacyPromptConstructs(file: File): List<Finding> =
         legacyPromptConstructs(file.name, file.readText())
@@ -311,7 +531,7 @@ internal object ProductionSourceScan {
         return findings.distinctBy { Triple(it.line, it.rule, it.snippet) }
     }
 
-    /** An authored system-prompt line (≥20 Han) must not reappear inside a Kotlin literal. */
+    /** An authored prompt line (≥20 Han, or an English loop instruction) must not reappear in a Kotlin literal. */
     fun duplicatedPromptLines(file: File, authoredLines: List<String>): List<Finding> =
         duplicatedPromptLines(file.name, file.readText(), authoredLines)
 
@@ -322,6 +542,7 @@ internal object ProductionSourceScan {
         for (literal in literals(code)) {
             val lineText = lines.getOrNull(literal.line - 1).orEmpty()
             if (isUserCopy(fileName, lineText)) continue
+            if (isLoopDefaultMirror(fileName, lineText)) continue
             val duplicated = authoredLines.firstOrNull { it in literal.value } ?: continue
             findings += Finding(
                 fileName,
@@ -353,7 +574,8 @@ internal object ProductionSourceScan {
 
     /**
      * The only Kotlin text allowed to be user-facing copy rather than model prompt prose. Each branch is
-     * line-shaped so an unrelated literal in the same file cannot hide behind it.
+     * line-shaped **and** scoped to the file that owns that copy, so the same assignment in another file
+     * cannot hide behind it.
      */
     fun isUserCopy(fileName: String, line: String): Boolean {
         val trimmed = line.trim()
@@ -363,8 +585,30 @@ internal object ProductionSourceScan {
                 (trimmed.startsWith("val APPROVALS =") || trimmed.startsWith("val DENIALS =")) &&
                     listOf("\"确认\"", "\"允许\"", "\"拒绝\"", "\"取消\"").any { it in line }
             }
-            else -> TITLE_ASSIGNMENT.containsMatchIn(line) || CONFIRMATION_SUMMARY.containsMatchIn(line)
+            in TITLE_OWNING_FILES -> TITLE_ASSIGNMENT.containsMatchIn(line)
+            in CONFIRMATION_SUMMARY_FILES -> CONFIRMATION_SUMMARY.containsMatchIn(line)
+            else -> false
         }
+    }
+
+    /** A product token in a literal that is genuinely a value (tool name or path), not prompt prose. */
+    fun isNonPromptProductLiteral(fileName: String, line: String): Boolean =
+        NON_PROMPT_PRODUCT_LITERALS.any { it.matches(fileName, line) }
+
+    /** The three loop defaults AgentLoop.kt intentionally mirrors from the catalog resources. */
+    fun isLoopDefaultMirror(fileName: String, line: String): Boolean =
+        LOOP_DEFAULT_MIRRORS.any { it.matches(fileName, line) }
+
+    /**
+     * The first string literal after `private const val <name> =` in [code]. The loop defaults are
+     * file-private, so a test in another module cannot read them through Kotlin; this ties their bytes at
+     * the source level instead.
+     */
+    fun constantLiteral(code: String, name: String): String {
+        val declaration = Regex("""\bprivate const val $name\s*=\s*""").find(code)
+            ?: error("constant '$name' not found")
+        return literals(code.substring(declaration.range.last + 1)).firstOrNull()?.value
+            ?: error("constant '$name' has no string literal")
     }
 
     /** Removes comments while preserving string/char literals and the line structure. */

@@ -84,9 +84,8 @@ class PromptArchitectureTest {
             "phone-app/plugins/plugin-smart-helper/src/main/resources/prompts",
             "phone-app/plugins/plugin-diagnostic/src/main/resources/prompts",
             // Design §4.1 keeps the generic loop mechanism in the base layer; 4A's ruling leaves the
-            // actual loop resources in the plugin catalog, and this path is the only future allowance.
+            // actual loop resources in the plugin catalog, and this root is the only future allowance.
             "phone-app/assistant/agent-runtime/src/main/resources/prompts",
-            "phone-app/assistant/agent-runtime/src/main/resources/prompts/loop",
         )
         for (dir in promptDirs) {
             val relative = dir.relativeTo(root).invariantSeparatorsPath
@@ -96,13 +95,29 @@ class PromptArchitectureTest {
             )
         }
 
-        // Even the base-layer allowance is mechanism-only: a product prompt folder there must fail.
+        // A file directly at an allowed `prompts/` root is a prompt resource too, so walking only directories
+        // would let it through. Derive each file's nearest `prompts` ancestor and apply the same root allowlist.
+        val promptFiles = promptDirs.flatMap { dir ->
+            dir.walkTopDown().filter { it.isFile }.toList()
+        }
+        for (file in promptFiles) {
+            val promptRoot = generateSequence(file.parentFile) { it.parentFile }
+                .first { it.name == "prompts" }
+            val relativeRoot = promptRoot.relativeTo(root).invariantSeparatorsPath
+            assertTrue(
+                relativeRoot in allowed,
+                "'${file.relativeTo(root).invariantSeparatorsPath}' is under an unlisted prompt root '$relativeRoot'",
+            )
+        }
+
+        // Even the base-layer allowance is mechanism-only: a product prompt folder or a root-level file
+        // there must fail, so `prompts/loop/` is the only legal child.
         val basePromptRoot = File(root, "phone-app/assistant/agent-runtime/src/main/resources/prompts")
         if (basePromptRoot.isDirectory) {
-            assertEquals(
-                setOf("loop"),
-                basePromptRoot.listFiles()!!.filter { it.isDirectory }.map { it.name }.toSet(),
-                "the base layer may only carry generic loop prompts",
+            val unexpected = basePromptRoot.listFiles()!!.filterNot { it.isDirectory && it.name == "loop" }
+            assertTrue(
+                unexpected.isEmpty(),
+                "the base layer may only carry generic prompts/loop; found ${unexpected.map { it.name }}",
             )
         }
 
@@ -245,7 +260,26 @@ class PromptArchitectureTest {
             mentions(prompt, "propose_hint"),
             "propose_hint is advertised only on the hint turn; it is not part of the default face",
         )
+
+        // Generic rather than a second hand-written exclusion: every snake_case tool-shaped identifier the
+        // authored prompts name must be on the advertised face. Single-word unadvertised names stay out of
+        // this cheap check (the face's own single words are `device`/`shell`/`open`/`dial`).
+        val authoredCorpus = PromptCatalog.manifest().joinToString("\n") { promptText(it.file) }
+        val unadvertised = unadvertisedToolNames(authoredCorpus, registered.keys)
+        assertTrue(
+            unadvertised.isEmpty(),
+            "the prompts name tool-shaped identifiers that the face does not advertise: $unadvertised",
+        )
+        assertEquals(
+            setOf("propose_hint"),
+            unadvertisedToolNames("调用 read_screen 或 propose_hint。", registered.keys),
+            "the generic scan must catch an unadvertised tool name, not just the authored literal",
+        )
     }
+
+    /** The tool-shaped identifiers in [corpus] that [advertised] does not register. */
+    private fun unadvertisedToolNames(corpus: String, advertised: Set<String>): Set<String> =
+        TOOL_NAME.findAll(corpus).map { it.value }.toSet() - advertised
 
     /** Parses one synthetic manifest row through the production validator. */
     private fun parse(file: String, kind: String, body: String) =
@@ -265,5 +299,8 @@ class PromptArchitectureTest {
         /** A tool name as a whole token, so `open` is not satisfied by `open_app`. */
         fun mentions(text: String, name: String): Boolean =
             Regex("(?<![A-Za-z0-9_])${Regex.escape(name)}(?![A-Za-z0-9_])").containsMatchIn(text)
+
+        /** A snake_case tool-shaped identifier; the prompt's own prose has no other underscore words. */
+        val TOOL_NAME = Regex("""(?<![A-Za-z0-9_])[a-z][a-z0-9]*(?:_[a-z0-9]+)+(?![A-Za-z0-9_])""")
     }
 }
