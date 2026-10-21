@@ -132,7 +132,7 @@ class LoopGuardsWiringTest {
         val proactiveRequests = rig.model.requests.filter { request ->
             request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }
         }
-        assertEquals(1, proactiveRequests.size, "PROACTIVE is one request; there is no AgentLoop to nudge")
+        assertEquals(1, proactiveRequests.size, "PROACTIVE is one request; the hint loop may not nudge a plan")
         assertTrue(rig.output.hints.isEmpty(), "a plan without the propose_hint call is silence, not a hint")
     }
 

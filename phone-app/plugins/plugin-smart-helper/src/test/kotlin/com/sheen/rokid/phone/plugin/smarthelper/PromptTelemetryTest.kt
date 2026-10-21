@@ -31,12 +31,12 @@ import kotlin.test.assertTrue
  *
  * It is how a device log can prove which prompt ran without ever printing it: the catalog version, the pinned plan's
  * ordered-section hash, the deterministic device-profile hash, the pinned SKILL catalog hash, the route, and the
- * system/tail sizes of the assembled request. It is emitted for both production frame paths — the wake route through
- * `AgentRequest.onRequestBuilt`, called by `AgentLoop` after its `RUNTIME_STATE`/`PERCEPTION` segments are folded in
- * and before the gateway sends (a tool round is a second assembled request), and the proactive request assembly (which
- * has no `AgentLoop`) — and no longer once per activation. A gateway overflow re-send reuses an already-assembled
- * request and reports only `P3_CACHE`; a request the gateway refuses before sending still has its `P3_PROMPT`, because
- * the assembly really happened.
+ * system/tail sizes of the assembled request. It is emitted for both production frame paths — the wake route and,
+ * since 0.3 Phase 3 Task 5, the proactive hint route — through `AgentRequest.onRequestBuilt`, called by `AgentLoop`
+ * after its `RUNTIME_STATE`/`PERCEPTION` segments are folded in and before the gateway sends (a tool round is a second
+ * assembled request). It is no longer emitted once per activation. A gateway overflow re-send reuses an
+ * already-assembled request and reports only `P3_CACHE`; a request the gateway refuses before sending still has its
+ * `P3_PROMPT`, because the assembly really happened.
  *
  * `dynamicChars` is the assembled frame's [com.sheen.rokid.agent.RequestLayout.dynamicTail] length **excluding** the
  * loop-owned `RUNTIME_STATE` segment: memory evidence, a pulled SKILL body, a retry instruction and the `PERCEPTION`
@@ -297,12 +297,13 @@ class PromptTelemetryTest {
 
     @Test
     fun `a proactive hint request logs route=PROACTIVE_HINT with the hint plan`() {
-        // The proactive route has no AgentLoop: it assembles its frame and calls the gateway directly, so its line is
-        // emitted by that request assembly. The plan is the PROACTIVE one, never the wake plan.
+        // Phase 3 Task 5: the hint turn is an AgentLoop, so its line comes from `AgentRequest.onRequestBuilt` like the
+        // wake route's — one line for the one assembled request the terminal `propose_hint` ends. The plan is the
+        // PROACTIVE_HINT one, never the wake plan.
         //
-        // The perception-derived context of this route is folded into the request's USER_INPUT (the proactive
-        // `message`), not into a PERCEPTION tail segment, so it is neither static nor dynamic by construction and
-        // `dynamicChars` is 0 here. Memory and a pulled SKILL body would still be counted, and this route pulls none.
+        // This rig grants no perception port, so the loop folds no PERCEPTION tail and `dynamicChars` stays 0: the
+        // proactive message rides USER_INPUT (not counted), and memory/SKILL tails are absent here. With a perception
+        // port granted the rendered block is counted as the tail; SmartProactiveTurnTest pins that separately.
         val rig = SmartTestRig(conversationStores = smartStores())
         rig.activate(
             overrides = mapOf(
@@ -325,6 +326,7 @@ class PromptTelemetryTest {
             rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
         }
 
+        assertEquals(1, rig.model.requests.size, "the terminal proposal ends the hint run after one request")
         val line = promptLine(lines)
         val plan = PromptCatalog.plan(PromptRoute.PROACTIVE_HINT, profile)
         assertTrue(

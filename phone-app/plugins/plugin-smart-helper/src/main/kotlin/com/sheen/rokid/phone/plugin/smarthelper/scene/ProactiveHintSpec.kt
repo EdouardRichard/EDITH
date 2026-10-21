@@ -1,17 +1,22 @@
 package com.sheen.rokid.phone.plugin.smarthelper.scene
 
+import com.sheen.rokid.agent.SCOPE_TERMINAL
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.plugin.ToolSpec
 
 /**
- * The one tool a proactive request offers, and the constants of its display bound.
+ * The one tool a proactive hint turn offers, and the constants of its display bound.
  *
  * 0.3 Phase 1 Task 12 (spec §4.5): the instruction prose this object used to own moved to the versioned prompt
  * catalog (`prompts/core/` + `route/wake.md` / `route/proactive-hint.md`). Keeping a second copy here would be a
  * second source of truth for the same sentences, and a model would receive both. What remains is genuinely
  * **behaviour**, not prose: the tool schema a proactive request advertises and the numbers its one call is judged by.
  *
- * The tool calling itself means "say this", and it is **never executed and never fed back** (`ProactiveTurn` sends one
- * request and stops), so the call can carry a sentence and nothing else.
+ * 0.3 Phase 3 Task 5: the proactive hint is no longer a one-shot reply whose tool call was parsed and discarded. It is
+ * an `AgentLoop` turn, and `propose_hint` is the loop's **only** tool and a `SCOPE_TERMINAL` one: a successful call
+ * ends the run with its `data` (the trimmed sentence) as the run's `finalText`. The declaration therefore carries the
+ * loop's descriptor fields too, while [PROPOSE_HINT] stays the wire schema the frame and registry both project.
  *
  * The schema asks for ~40 characters while [PROACTIVE_HINT_MAX_CHARS] is the display-side bound: the prompt narrows
  * what the model generates, the constant rejects what the glasses would silently clip
@@ -19,11 +24,37 @@ import com.sheen.rokid.plugin.ToolSpec
  */
 internal object ProactiveHintSpec {
 
+    /** The one tool name, shared by the wire spec, the descriptor and the executor. */
+    const val NAME = "propose_hint"
+
     /** The only control channel of a proactive request: calling it means "say this", silence is a legal answer. */
     val PROPOSE_HINT = ToolSpec(
-        "propose_hint",
+        NAME,
         "在用户未开口时给出至多一句短提示；不值得打断用户时不要调用。",
         """{"type":"object","properties":{"text":{"type":"string","description":"不超过 40 字的一句短提示"}},"required":["text"],"additionalProperties":false}""",
+    )
+
+    /**
+     * The loop's declaration of [PROPOSE_HINT] (0.3 Phase 3 spec §4.2).
+     *
+     * It is deliberately **L0 with no confirmation**: the call changes nothing on the device, it only proposes one
+     * sentence, so asking the wearer to approve it would be a question about a sentence that has already been decided.
+     * `SCOPE_TERMINAL` is what makes a successful call end the run; `countsTowardStepLimit = true` plus the hint loop's
+     * `maxSteps = 1` bounds the turn to its single proposal. `screenObservation = false` keeps the loop's failure
+     * observer out of a turn that never looks at the screen.
+     */
+    val DESCRIPTOR = ActionDescriptor(
+        name = NAME,
+        title = PROPOSE_HINT.description,
+        parametersJson = PROPOSE_HINT.parametersJson,
+        risk = RiskLevel.L0,
+        requiresConfirmation = false,
+        idempotent = true,
+        reversible = true,
+        scope = SCOPE_TERMINAL,
+        countsTowardStepLimit = true,
+        timeoutMillis = 5_000L,
+        screenObservation = false,
     )
 
     /**

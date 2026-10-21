@@ -34,7 +34,6 @@ import com.sheen.rokid.agent.ConfirmationSource
 import com.sheen.rokid.agent.ContextPolicy
 import com.sheen.rokid.agent.ContextTuning
 import com.sheen.rokid.agent.ConversationStore
-import com.sheen.rokid.agent.GatewayTurn
 import com.sheen.rokid.agent.MemoryRetrieval
 import com.sheen.rokid.agent.ModelClientGateway
 import com.sheen.rokid.agent.PerceptionPolicy
@@ -138,6 +137,8 @@ import com.sheen.rokid.phone.plugin.smarthelper.proactive.GateForm
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.NoulGate
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGateState
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveHintRequest
+import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProposeHintTool
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
 import com.sheen.rokid.phone.plugin.smarthelper.memory.normalize
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryModule
@@ -155,12 +156,9 @@ import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
 import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import java.util.UUID
 import java.util.concurrent.atomic.AtomicInteger
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.put
 
 private const val CONFIG_SCHEMA_VERSION = 1
@@ -238,9 +236,6 @@ private const val CALENDAR_KEY = "calendar.todayTitles"
  * because local transcription continues while it is off - see [SmartAssistantPlugin.armedNow].
  */
 internal const val PROACTIVE_ARMED_KEY = "proactive.armed"
-
-/** Lenient for the same reason the loop is: model-authored arguments are not always strictly formed JSON. */
-private val proactiveJson = Json { isLenient = true }
 
 /** Configuration keys this plugin understands; anything else is refused rather than silently ignored. */
 private val KNOWN_KEYS = setOf("profileId", "profileRevision", "wakeWords", "maxLevel", "whitelist", "requestConsent",
@@ -977,12 +972,23 @@ class SmartAssistantPlugin(
     private var proactiveHint: ProactiveHint? = null
 
     /**
+     * 0.3 Phase 3 Task 5: the hint turn in flight, or `null`.
+     *
+     * It carries the loop handle and the cancellation flag the hint run's gateway polls; [proactiveHint] keeps owning
+     * the submitted-`Assistance` bookkeeping. Both are opened together in [runProactive] and share one `hintId`/
+     * `turnId`, and both are cleared by every terminal path ([discard], `Stop`, deactivate).
+     *
+     * Read and written under [gate].
+     */
+    private var proactiveRequest: ProactiveHintRequest? = null
+
+    /**
      * The hint a proactive turn submitted, and the little state its ACK needs.
      *
-     * Deliberately not a [SmartTurn]: a proactive turn has no listening window, no transcript to adopt and no loop, so
-     * reusing the wake turn's machinery would arm waits that can never be satisfied. It owns only what the display
-     * conversation needs - its identity, its expiry and the submit/ACK race - and is the vehicle [Stop][stopAll]
-     * cancels.
+     * Deliberately not a [SmartTurn]: a hint turn has no listening window and no transcript to adopt, so reusing the
+     * wake turn's machinery would arm waits that can never be satisfied. Its `AgentLoop` lives on the separate
+     * [ProactiveHintRequest]; this class owns only what the display conversation needs - its identity, its expiry and
+     * the submit/ACK race - and is the displayed row [Stop][stopAll] cancels.
      */
     private class ProactiveHint(val hintId: String, val turnId: String) {
         /**
@@ -1134,9 +1140,9 @@ class SmartAssistantPlugin(
      * The legacy `ContextRoute` → [PromptRoute] mapping for the paths still keyed by the conversation route.
      *
      * A `ContextRoute` says which store/transcript a turn belongs to; the proactive chain's two jobs share
-     * `ContextRoute.PROACTIVE` but carry different postures. The existing one-shot proactive request is the **hint**
-     * decision, so it maps to [PromptRoute.PROACTIVE_HINT]; the follow-up turn passes
-     * [PromptRoute.PROACTIVE_FOLLOWUP] explicitly when it is wired (0.3 Phase 3 later task).
+     * `ContextRoute.PROACTIVE` but carry different postures. The HINT_TURN is the **hint** decision, so it maps to
+     * [PromptRoute.PROACTIVE_HINT]; the follow-up turn passes [PromptRoute.PROACTIVE_FOLLOWUP] explicitly when it is
+     * wired (0.3 Phase 3 later task).
      */
     private fun ContextRoute.toPromptRoute(): PromptRoute = when (this) {
         ContextRoute.WAKE -> PromptRoute.WAKE
@@ -1325,7 +1331,7 @@ class SmartAssistantPlugin(
                 policy = policy,
                 // The manager's instructions are the same session-pinned plan every request's system slot uses, so
                 // the legacy no-store path and the frame path cannot disagree about the system text. The manager is
-                // still keyed by `ContextRoute`; the proactive one-shot request it assembles is the hint posture.
+                // still keyed by `ContextRoute`; the PROACTIVE route it assembles is the hint posture.
                 promptPlan = { route -> sessionPlans.getValue(route.toPromptRoute()) },
             )
         }
@@ -1463,6 +1469,12 @@ class SmartAssistantPlugin(
         lastContextValues = emptyMap()
         proactiveHint?.cancelled = true
         proactiveHint = null
+        // 0.3 Phase 3 Task 5: a session that ends also cancels the hint turn it may be running. The flag is the
+        // gateway's `stop` predicate, so an in-flight request ends CANCELLED instead of writing back into a session
+        // whose state has already been dropped; a late success is suppressed by `submitProactiveHint`'s ownership
+        // check and by `hintDecision`'s cancelled branch.
+        proactiveRequest?.cancelled = true
+        proactiveRequest = null
         proactiveInFlight = false
         // A parked trigger describes a session that is ending; running it later would act on a stale world under a
         // session that never observed it.
@@ -2921,53 +2933,6 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * Phase 5's request shape for one turn: the system slot (the session-pinned plan plus the SKILL catalog), the
-     * route's snapshot, the memory the assembly retrieved, the bodies pulled this turn, and this turn's utterance
-     * **last** (0.3 design §5.1).
-     *
-     * The plugin's job stops at "segments and their attribution": neither the memory nor a SKILL body is folded into
-     * the first user message here. That is `ModelClientGateway.frameToTranscript`'s single job, and doing it in two
-     * places would give two renderers that drift. Both are request-scoped tail content, so a pull or a new retrieval
-     * never rewrites the cacheable prefix.
-     *
-     * The system slot's catalog and the tail's pulled bodies are read as **one** snapshot ([requestSkillSegments]);
-     * a turn boundary that cleared the bodies between two separate reads would split the pair.
-     *
-     * 0.3 Phase 2 Task 11: this factory builds the proactive request's frame; the caller (`runProactive`) emits the
-     * per-assembled-request `P3_PROMPT` line from the returned frame immediately before `gateway.turn`. The wake
-     * route's equivalent is `AgentRequest.onRequestBuilt`, not its frame builder: the wake frame is assembled further
-     * by `AgentLoop` (which folds the loop-owned segments in), so only the loop's hook sees the complete frame.
-     *
-     * @param store the route's session store, whose [ConversationStore.snapshot] opens the flow.
-     * @param prompt the session assembly. `null` means no manager was built (a host without a profile); the system
-     *   slot still carries the pinned plan, and the flow simply carries no memory.
-     */
-    private fun buildFrame(
-        store: ConversationStore,
-        route: ContextRoute,
-        userInput: String,
-        prompt: PromptAssembly?,
-        tools: List<ToolSpec>,
-    ): RequestFrame {
-        // Both SKILL layers come from one snapshot (`requestSkillSegments`): the catalog (system) and the pulled
-        // bodies (tail) belong to the same moment of the turn, and `beginSkillTurn` clears the bodies under the same
-        // lock, so two separate reads could pair a newer catalog with the previous turn's bodies.
-        val skills = requestSkillSegments(route)
-        val flow = buildList {
-            addAll(store.snapshot())
-            // 0.3 design §5.1: request-scoped context rides the tail, in this order, ahead of the one USER_INPUT.
-            addAll(prompt?.memorySegments.orEmpty())
-            addAll(skills.bodies)
-            add(Segment(SegmentOrigin.USER_INPUT, trusted = true, text = userInput))
-        }
-        return RequestFrame(
-            systemSegments = skills.system,
-            conversationFlow = flow,
-            tools = tools,
-        )
-    }
-
-    /**
      * Phase 5: the frame for **one** model request, built from the transcript that request continues.
      *
      * This is the builder `AgentRequest.frameFor` calls for every request of the run, which is what keeps a tool round's
@@ -3441,13 +3406,16 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * One proactive round trip: **one** request, one tool table, and a decision that is either a sentence or silence.
+     * Opens one proactive **HINT_TURN** (0.3 Phase 3 spec §4.2) and hands its blocking half to the task scope.
      *
-     * The gateway is called directly rather than through an `AgentLoop`, because the loop's whole purpose - feeding
-     * tool results back and retrying until it makes progress - is exactly what a proactive turn must not do: the
-     * `propose_hint` call *is* the answer, it is never executed, and there is no second turn to run. The request runs
-     * **outside** [gate] for the same reason the wake loop does: it blocks on the transport, and `Stop` must be able to
-     * mark it cancelled while it waits.
+     * The turn is either a sentence or silence. After the intervention gate accepts, the blocking half runs an
+     * `AgentLoop` whose only tool is the terminal `propose_hint`: the call is the decision to speak, it is never a
+     * device action, and a successful call ends the run (see [runHintTurn]). The gate therefore sits **before** the
+     * hint turn and is untouched by this task (Q1=A0: four-key state, no forced gate).
+     *
+     * The whole turn runs **outside** [gate]: it blocks on the transport, and `Stop` must be able to cancel it while it
+     * waits. [ProactiveHintRequest] carries the identity and the cancellation flag the gateway's `stop` predicate reads;
+     * [ProactiveHint] keeps owning the submitted-`Assistance` bookkeeping.
      */
     private fun runProactive(trigger: ProactiveTrigger) {
         val (current, configured, filter) = synchronized(gate) {
@@ -3469,30 +3437,35 @@ class SmartAssistantPlugin(
         val started = clock.nowNanos()
         val (message, contextEntries) = proactiveMessage(trigger)
         val hint = ProactiveHint(hintId = "hint-${UUID.randomUUID()}", turnId = "proactive-${UUID.randomUUID()}")
+        val request = ProactiveHintRequest(hintId = hint.hintId, turnId = hint.turnId, startedNanos = started)
         synchronized(gate) {
             if (context !== current) return
+            // A newer trigger may legitimately replace an older slot; the old run's gateway polls this flag as its
+            // `stop` predicate, so marking it is what keeps the replaced turn from writing back.
             proactiveHint?.cancelled = true
+            proactiveRequest?.cancelled = true
             proactiveHint = hint
+            proactiveRequest = request
             proactiveInFlight = true
         }
         // Phase C: the proactive route is now working, and the wearer's ring should say so from the trigger rather than
         // from the first thing that happens to arrive. Outside the lock, as `publishBusy` requires.
         publishBusy()
         P3Log.line("P3_PROACTIVE request ctx=$contextEntries chars=${trigger.transcript.length}")
-        // Off the host's dispatcher: the request blocks on the transport, and running it inside `handle` would hold
+        // Off the host's dispatcher: the hint turn blocks on the transport, and running it inside `handle` would hold
         // the host's single drain thread for up to the deadline - delaying `Stop` (and its UI thread) and the next
         // wake turn. The task re-checks ownership under `gate` before writing anything back. A test host runs the task
         // inline, which is what keeps the plugin's own tests deterministic.
         current.services.tasks.launch {
-            // Phase 6 (obligation 1): the proactive turn's SKILL boundary opens here, before `deliverProactive`'s
-            // blocking work, and closes in the `finally` that every proactive ending passes through - a hint, a
-            // decline, a failure, a cancellation or a throw. The proactive route has no `load_skill` tool, so its
-            // `begin` is a **joiner** whenever a wake turn already owns the lifecycle: it must not clear that turn's
-            // pulled bodies. When it is alone it owns its own turn, which is what gives it its own observation
-            // instead of folding it into the next wake turn (design D-3).
+            // Phase 6 (obligation 1): the proactive turn's SKILL boundary opens here, before the blocking work, and
+            // closes in the `finally` that every proactive ending passes through - a hint, a decline, a failure, a
+            // cancellation or a throw. The hint turn has no `load_skill` tool, so its `begin` is a **joiner** whenever
+            // a wake turn already owns the lifecycle: it must not clear that turn's pulled bodies. When it is alone it
+            // owns its own turn, which is what gives it its own observation instead of folding it into the next wake
+            // turn (design D-3).
             val skillGeneration = beginSkillTurn(owner = false)
             try {
-                deliverProactive(current, configured, filter, hint, trigger, message, started)
+                deliverProactive(current, configured, filter, request, hint, trigger, message)
             } finally {
                 // Phase C: this is the one place every proactive ending passes through - a hint, a decline, a failure,
                 // a cancellation - which is why the level is cleared here rather than on each branch. The report happens
@@ -3503,6 +3476,10 @@ class SmartAssistantPlugin(
                 // folded turn, and a stale close from a turn that has already been replaced is a no-op.
                 endSkillTurn(skillGeneration)
                 synchronized(gate) {
+                    // The request's loop handle dies with the turn: a `Stop` that already cleared the slot cannot be
+                    // holding it, and a later cancel must not reach a finished run.
+                    if (proactiveRequest === request) proactiveRequest = null
+                    request.loop = null
                     // Only the turn that still owns the proactive slot may clear the level. A STOP (or a newer trigger)
                     // can have replaced this turn while it was blocked; the old `finally` must not clear the new
                     // turn's BUSY level, which would send the glasses back to idle while work is still in flight.
@@ -3513,18 +3490,25 @@ class SmartAssistantPlugin(
         }
     }
 
-    /** The blocking half of one proactive turn; runs on the task scope, never under [gate]. */
-    private fun deliverProactive(current: PluginContext, configured: Config, filter: SmartProactive,
-        hint: ProactiveHint, trigger: ProactiveTrigger, message: String, started: Long) {
-        // Phase 6 (obligation 1): the proactive turn's `beginTurn()` opened at the task launch in `runProactive`,
-        // before this blocking half; its matching `endTurn()` is that launch's `finally`. Neither is here so the
-        // whole turn - including this function throwing - is inside the pair.
-        //
-        // The intervention gate runs **here**, on the task scope, and that placement is load-bearing: it is a
-        // local-model forward pass (~231 ms GPU / ~742 ms CPU per A5), and the plugin's own rule forbids one inside
-        // `handle` - it would hold the host's single drain thread *and* the plugin lock, putting `Stop`, confirmations
-        // and the next wake turn behind a model call. By this point the trigger has passed P3's admission and
-        // throttle (C11), so this is the last decision before the cloud request.
+    /**
+     * The intervention decision of one proactive turn; runs on the task scope, never under [gate].
+     *
+     * The gate is the last decision **before** the hint turn, and that placement is load-bearing: it is a local-model
+     * forward pass (~231 ms GPU / ~742 ms CPU per A5), and the plugin's own rule forbids one inside `handle` - it would
+     * hold the host's single drain thread *and* the plugin lock, putting `Stop`, confirmations and the next wake turn
+     * behind a model call. By this point the trigger has passed P3's admission and throttle (C11). A declined trigger
+     * must cost nothing at all: no `AgentLoop` is built and no model request is made.
+     */
+    private fun deliverProactive(
+        current: PluginContext,
+        configured: Config,
+        filter: SmartProactive,
+        request: ProactiveHintRequest,
+        hint: ProactiveHint,
+        trigger: ProactiveTrigger,
+        message: String,
+    ) {
+        val started = request.startedNanos
         activeGate()?.let { gate ->
             val outcome = gate.shouldIntervene(gateState(trigger))
             P3Log.line(
@@ -3537,119 +3521,232 @@ class SmartAssistantPlugin(
                 // `ContextChanged` would spend another forward pass asking the same question.
                 filter.noteRefused(clock.nowNanos())
                 P3Log.line("P3_PROACTIVE silence reason=GATE_DECLINED ms=${elapsedMillis(started)}")
-                discard(hint)
+                discard(request, hint)
                 return
             }
         }
+        runHintTurn(current, configured, filter, request, hint, trigger, message)
+    }
+
+    /**
+     * The blocking half of one **HINT_TURN** (0.3 Phase 3 spec §4.2): the gate has accepted, so this opens the
+     * perception boundary, runs the single-use `AgentLoop` whose only tool is the terminal `propose_hint`, and turns
+     * the run's `finalText` into the hint the wearer sees - or into silence.
+     *
+     * The loop is the point of the task: it gives the hint turn the shared cancellation, timeout, audit and result
+     * envelope, while a terminal tool keeps the turn at one proposal and no device action. Its registry holds
+     * **nothing but** `ProposeHintTool`, so even a model that names `device`/`open`/`shell`/`dial` cannot execute one.
+     * `maxSteps = 1` bounds execution to the single proposal; a refused call may be fed back once (that is the loop's
+     * shared behaviour), but a second call is refused before it runs.
+     *
+     * Two request shapes are assembled exactly as the wake route's: with a store, a `frameFor` builder renders every
+     * request from the PROACTIVE transcript (system slot = the pinned `PROACTIVE_HINT` plan, memory tail, USER_INPUT
+     * last) and `onRequestBuilt` emits the per-request `P3_PROMPT` line **after** the loop folds its
+     * `RUNTIME_STATE`/`PERCEPTION` segments in; without a store, the legacy history path is preserved byte for byte
+     * and there is no frame to describe. [AgentRequest.instructions] and the frame's system slot are the same pinned
+     * plan, so the two cannot disagree about the hint posture.
+     *
+     * Perception (spec §7.5/§5.2): the host's `beginTurn()`/`endTurn()` pair wraps the **whole** hint turn, including
+     * the gate-accepted run and every exit (a hint, silence, a cancellation, a throw). The opening request renders the
+     * full snapshot (the `P3_PERCEPTION` line is emitted by the renderer); a continuation after a refused call renders
+     * the ambient subset, exactly as the wake route does. `observationSource` is explicitly `null`: the hint turn never
+     * runs a screen tool, so there is no failure for the loop to observe.
+     */
+    private fun runHintTurn(
+        current: PluginContext,
+        configured: Config,
+        filter: SmartProactive,
+        request: ProactiveHintRequest,
+        hint: ProactiveHint,
+        trigger: ProactiveTrigger,
+        message: String,
+    ) {
+        val started = request.startedNanos
         val proactiveProfile = runCatching { profileLookup(configured.profileId) }.getOrNull()
-        val gateway = ModelClientGateway(
-            client = runCatching { current.services.model() }.getOrElse { failure ->
-                P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")
-                discard(hint)
-                return
-            },
-            profileLookup = profileLookup,
-            clock = clock,
-            scheduler = scheduler,
-            envelopeFor = { requestId, startNanos, endNanos ->
-                EventEnvelope(current.sessionId, current.generation, requestId, startNanos, endNanos)
-            },
-            stop = { hint.cancelled },
-            // 0.3 Phase 2 Task 11: the proactive route calls the gateway directly, so wiring the same count-only sink
-            // here is what gives it the same per-request `P3_CACHE` line as the wake run.
-            metricLine = P3Log::line,
-        )
-        // B1/B3/B6 / spec §4.2: the proactive route consumes the **session's own** assembly exactly as the wake route
-        // does — its transcript comes from `buildPrompt` under `ContextRoute.PROACTIVE` (the SKILL catalog arrives
-        // through the shared `systemSlot` and the pulled bodies through the frame's `SKILL_BODY` tail, not through this
-        // assembly). Before this, the route hand-built a proactive prose plus one history item, so the manager's
-        // PROACTIVE context was constructed and never read: "two independent conversations" held for the wake route
-        // only. `null` is the pre-Phase-B shape a test without a manager gets.
-        val prompt = activeContextForTurn?.let { contexts ->
-            runCatching { contexts.buildPrompt(ContextRoute.PROACTIVE, trigger.transcript) }.getOrNull()
-        }
-        // Phase 5: with a store injected, this route's request is a `RequestFrame` too — the PROACTIVE snapshot, the
-        // memory this assembly retrieved, and the perception message last. The frame's user segment is `message`, not
-        // the trigger: the trigger is what the transcript records (see `recordProactiveTurn`), while the message is
-        // what this request asks the model about.
-        val frame = activeStores?.get(ContextRoute.PROACTIVE)?.let {
-            buildFrame(it, ContextRoute.PROACTIVE, message, prompt, listOf(ProactiveHintSpec.PROPOSE_HINT))
-        }
-        // 0.3 Phase 2 Task 11: this route has no AgentLoop, so the per-assembled-request prompt line is emitted here,
-        // before the one model request it makes. The perception-derived context of this route is folded into the
-        // request's USER_INPUT (the proactive `message`), not into a `PERCEPTION` tail segment, so it is neither part
-        // of `staticChars` nor of `dynamicChars` — its contribution is 0 by construction. The counted dynamic tail is
-        // whatever the assembly put there (memory evidence, a pulled SKILL body). A no-frame legacy request (a host
-        // wiring without stores) has no frame to describe and stays silent; production always injects the per-route
-        // stores.
-        frame?.let { logPromptRequest(PromptRoute.PROACTIVE_HINT, it) }
-        val reply = try {
-            // 0.25 Task 12 (R58/R59): this route deliberately has **no** `AgentLoop` and no `AgentRequest` — it is one
-            // proposal request with `propose_hint` as the only control channel. A plan nudge (which exists to push a
-            // text plan into tool execution) and a loop-injected runtime state are therefore structurally absent here;
-            // the `AgentRequest.allowPlanNudge` default `false` is the PROACTIVE answer wherever a loop is used.
-            gateway.turn(GatewayTurn(
-                turnId = hint.turnId,
-                profileId = configured.profileId,
-                instructions = prompt?.instructions ?: promptPlan(PromptRoute.PROACTIVE_HINT).systemText,
-                // The gateway lifts a trailing USER turn into `input`, which is what puts the utterance and the
-                // perception last on the wire - the same shape the passive path uses. The assembly's history ends on
-                // this turn's trigger, so that last item is dropped and the full message below becomes the input:
-                // passing it whole would put the observation to the model twice.
-                history = (prompt?.history?.dropLast(1).orEmpty() +
-                    ModelHistoryItem.Text(MessageRole.USER, message)),
-                tools = listOf(ProactiveHintSpec.PROPOSE_HINT),
-                deadlineNanos = SmartTurn.saturatingAdd(started, ProactiveHintSpec.PROACTIVE_DEADLINE_MILLIS * 1_000_000L),
-                frame = frame,
-                // 0.3 final-fix wave (spec §5.2): the proactive route is one turn like any other, so the profile's
-                // per-turn output cap and the session policy's trim window/fail-closed code apply here too.
-                maxOutputTokens = proactiveProfile?.maxOutputTokens,
-                limitTokens = turnHardLimit(proactiveProfile),
-                contextFailure = activeContextFailure,
-            ))
-        } catch (failure: Throwable) {
-            // `D53`① (2026-10-11): this is no longer "the upload gate said no" - there is no such gate any more. It is
-            // the model client refusing for its own reasons (an unverified profile operation, a missing capability),
-            // which is an honest **failure** of this turn, and the reason vocabulary therefore says `FAILED`.
-            //
-            // What must **not** change is the cooldown: `noteRequest` runs only on a *successful* hint, so without this
-            // call a profile the client keeps refusing would log `P3_PROACTIVE request` and attempt a call on **every**
-            // final utterance instead of once per cooldown window (review I1: the earlier revision dropped this call
-            // and its comment wrongly claimed the cooldown was already covered).
-            filter.noteRefused(clock.nowNanos())
-            P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")
-            discard(hint)
-            return
-        }
-        val elapsed = elapsedMillis(started)
-        when {
-            reply.terminal == ModelEnd.CANCELLED -> silence(hint, "CANCELLED", elapsed)
-            reply.terminal == ModelEnd.DEADLINE -> silence(hint, "DEADLINE", elapsed)
-            // 0.3 final-fix wave: a fail-closed policy refusal (PROFILE_*/PROMPT_EXCEEDS_BUDGET) is a distinct
-            // machine-readable reason, not a generic transport failure. The code is shape-bounded by the gateway.
-            reply.terminal != ModelEnd.COMPLETED -> silence(hint, reply.safeCode ?: "FAILED", elapsed)
-            else -> {
-                val call = reply.toolCalls.firstOrNull { it.name == ProactiveHintSpec.PROPOSE_HINT.name }
-                val text = call?.let { parseHint(it.argsJson) }
-                when {
-                    call == null -> silence(hint, "NO_CALL", elapsed)
-                    text == null -> silence(hint, "UNPARSABLE", elapsed)
-                    text.codePointCount(0, text.length) > ProactiveHintSpec.PROACTIVE_HINT_MAX_CHARS ->
-                        silence(hint, "TOO_LONG", elapsed)
-                    else -> {
-                        filter.noteRequest(clock.nowNanos())
-                        filter.noteDedup(trigger)
-                        P3Log.line("P3_PROACTIVE hint chars=${text.length} ms=$elapsed")
-                        // B3/B6 / spec §4.9: the proactive route records its own turn into its own transcript and
-                        // compresses it against the same budget, **before** the hint is submitted. The order is the
-                        // submission's, not the compressor's: the compressor's truncation is what writes the dropped
-                        // messages to memory, and the trigger belongs to the conversation whether or not the display
-                        // accepted it.
-                        recordProactiveTurn(trigger.transcript, text, hint.hintId, hint.turnId, gateway.lastTrim)
-                        submitProactiveHint(hint, text)
-                    }
-                }
+        // Task 9's boundary protocol, applied to the hint route: one ticket per opened turn, serialised with every
+        // other begin/end, and a superseded turn's late close is a no-op.
+        val perception = activePerception
+        val perceptionTurn = perception?.let { provider -> beginPerceptionTurn(provider) }
+        val perceptionRequests = AtomicInteger(0)
+        try {
+            synchronized(gate) { if (request.cancelled) return }
+            val gateway = ModelClientGateway(
+                client = runCatching { current.services.model() }.getOrElse { failure ->
+                    // `D53`①: no upload gate exists any more; a client that cannot be resolved is an honest turn
+                    // failure, and the cooldown must still restart so a broken profile is not asked on every trigger.
+                    filter.noteRefused(clock.nowNanos())
+                    P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")
+                    discard(request, hint)
+                    return
+                },
+                profileLookup = profileLookup,
+                clock = clock,
+                scheduler = scheduler,
+                envelopeFor = { requestId, startNanos, endNanos ->
+                    EventEnvelope(current.sessionId, current.generation, requestId, startNanos, endNanos)
+                },
+                // The one cancellation seam of the hint turn: `Stop`/deactivate set this flag and the gateway ends
+                // the blocked request with CANCELLED instead of waiting for the transport's own terminal.
+                stop = { request.cancelled },
+                // 0.3 Phase 2 Task 11: the same count-only sink gives the hint route its per-request `P3_CACHE` line.
+                metricLine = P3Log::line,
+            )
+            // B1/B3/B6 / spec §4.2: the route consumes the **session's own** assembly under `ContextRoute.PROACTIVE`
+            // (the SKILL catalog arrives through the shared system slot and pulled bodies through the frame tail). The
+            // manager is still `ContextRoute`-keyed and maps PROACTIVE -> PROACTIVE_HINT, which is this route's job
+            // (Task 7 owns the follow-up mapping).
+            val prompt = activeContextForTurn?.let { contexts ->
+                runCatching { contexts.buildPrompt(ContextRoute.PROACTIVE, trigger.transcript) }.getOrNull()
             }
+            // Phase 5: with a store injected the request is a `RequestFrame`: the PROACTIVE snapshot, the memory this
+            // assembly retrieved, and the perception message last. The frame's user segment is `message`, not the
+            // trigger: the trigger is what the transcript records (see `recordProactiveTurn`), while the message is
+            // what this request asks the model about.
+            val store = activeStores?.get(ContextRoute.PROACTIVE)
+            val tools = listOf(ProactiveHintSpec.PROPOSE_HINT)
+            val frameFor = store?.let {
+                frameBuilderFor(it, ContextRoute.PROACTIVE, message, prompt, tools)
+            }
+            // Phase 2 Task 10: the profile's own image capability; `null` (no profile) is not evidence that images are
+            // unsupported, so only a real profile that omits `IMAGE` downgrades the rendered coverage.
+            val profileAcceptsImages = proactiveProfile?.let { InputModality.IMAGE in it.inputs }
+            val tool = ProposeHintTool()
+            val loop = AgentLoop(
+                gateway = gateway,
+                registry = ToolRegistry(listOf(tool)),
+                policy = WhitelistActionPolicy(configured.maxLevel, configured.whitelist),
+                guard = ProgressGuard(),
+                audit = audit,
+                clock = clock,
+                // A hint turn may execute exactly one tool call: the terminal `propose_hint` *is* the answer.
+                maxSteps = 1,
+                metricLine = P3Log::line,
+            )
+            synchronized(gate) {
+                if (request.cancelled) return
+                if (proactiveRequest === request) request.loop = loop
+            }
+            val run = try {
+                loop.run(
+                    AgentRequest(
+                        turnId = request.turnId,
+                        utterance = message,
+                        // The brief's pinned identity: the *hint* plan, and the frame's system slot resolves to the
+                        // same plan through `ContextRoute.PROACTIVE.toPromptRoute()`.
+                        instructions = promptPlan(PromptRoute.PROACTIVE_HINT).systemText,
+                        profileId = configured.profileId,
+                        deadlineNanos = SmartTurn.saturatingAdd(
+                            started,
+                            ProactiveHintSpec.PROACTIVE_DEADLINE_MILLIS * 1_000_000L,
+                        ),
+                        // D49: the profile's timeout caps **one request**; the turn's own 8 s budget above is the
+                        // machine deadline, and the loop sends the earlier of the two.
+                        requestTimeoutNanos = modelRequestTimeoutNanos(proactiveProfile?.timeoutMillis),
+                        maxOutputTokens = proactiveProfile?.maxOutputTokens,
+                        limitTokens = turnHardLimit(proactiveProfile),
+                        contextFailure = activeContextFailure,
+                        // The store path hands its transcript over whole: the loop appends this turn's utterance and
+                        // drops it again before calling `frameFor`, so the builder receives the session exactly as it
+                        // stands. The legacy path keeps the old `dropLast(1)` convention.
+                        history = store?.history() ?: prompt?.history?.dropLast(1).orEmpty(),
+                        frameFor = frameFor,
+                        // 0.25 Task 12 (R58): a hint is a proposal, never a plan to execute - no nudge here.
+                        allowPlanNudge = false,
+                        runtimeState = { runtimeStateForTurn() },
+                        perception = perception?.let { provider ->
+                            {
+                                perceptionBlockFor(
+                                    provider,
+                                    perceptionTurn?.initialSnapshot,
+                                    perceptionRequests,
+                                    profileAcceptsImages,
+                                )
+                            }
+                        },
+                        onRequestBuilt = { frame -> logPromptRequest(PromptRoute.PROACTIVE_HINT, frame) },
+                        // The hint turn never executes a screen tool; the loop's failure observation has no subject.
+                        observationSource = null,
+                    ),
+                )
+            } catch (failure: Throwable) {
+                // `D53`① (2026-10-11): a transport/client refusal is an honest failure of this turn, and the cooldown
+                // must restart - `noteRequest` runs only on a successful hint, so without this a profile the client
+                // keeps refusing would be attempted on every final utterance inside one window.
+                filter.noteRefused(clock.nowNanos())
+                P3Log.line("P3_PROACTIVE silence reason=FAILED ms=${elapsedMillis(started)}")
+                discard(request, hint)
+                return
+            } finally {
+                synchronized(gate) { if (request.loop === loop) request.loop = null }
+            }
+            val elapsed = elapsedMillis(started)
+            val decision = hintDecision(run, tool, request)
+            val hintText = decision.text
+            if (hintText == null) {
+                silence(request, hint, decision.reason ?: "FAILED", elapsed)
+                return
+            }
+            filter.noteRequest(clock.nowNanos())
+            filter.noteDedup(trigger)
+            P3Log.line("P3_PROACTIVE hint chars=${hintText.length} ms=$elapsed")
+            // B3/B6 / spec §4.9: the proactive route records its own turn into its own transcript and compresses it
+            // against the same budget, **before** the hint is submitted. The order is the submission's, not the
+            // compressor's: the compressor's truncation is what writes the dropped messages to memory, and the trigger
+            // belongs to the conversation whether or not the display accepted it.
+            recordProactiveTurn(trigger.transcript, hintText, hint.hintId, hint.turnId, gateway.lastTrim)
+            submitProactiveHint(hint, hintText)
+        } finally {
+            // Every exit - a hint, silence, a cancellation, a throw - closes the perception boundary it opened.
+            if (perception != null && perceptionTurn != null) endPerceptionTurn(perception, perceptionTurn.ticket)
+        }
+    }
+
+    /** The text a hint run may show, or the reason it must stay silent. */
+    private class HintDecision(val text: String?, val reason: String?)
+
+    /**
+     * The one sentence a hint run may show, or the reason it must stay silent.
+     *
+     * The `propose_hint` call is the decision to speak (spec §4.1's state machine: "the model does not call it →
+     * silence"). A text-only reply is a legal silence even though `AgentLoop` reports it as `COMPLETED` with that text
+     * as `finalText`, so the run must end on a **successful terminal `propose_hint` step** and only then may its
+     * `finalText` become the hint. The sentence is re-validated here as well: the tool is the authority, but a
+     * different final path must never be able to put an over-long or blank sentence on the glasses.
+     *
+     * The silence vocabulary keeps the P3.2 codes the device triage already reads (`NO_CALL`, `UNPARSABLE`, `BLANK`,
+     * `TOO_LONG`), mapped from the tool's own rejection record; a run that failed for another reason reports the
+     * loop's stable code (or its outcome name). A cancelled run always reports `CANCELLED`, whatever a refused attempt
+     * earlier in it recorded.
+     */
+    private fun hintDecision(
+        run: AgentRun,
+        tool: ProposeHintTool,
+        request: ProactiveHintRequest,
+    ): HintDecision {
+        if (request.cancelled || run.outcome == AgentOutcome.CANCELLED) return HintDecision(null, "CANCELLED")
+        tool.lastRejection?.let { return HintDecision(null, it.name) }
+        // The registry refuses arguments that are not parseable JSON **before** the tool runs, so that refusal has no
+        // tool-side record and is named by the shared result code instead. It is checked before the outcome mapping
+        // because the very next request after the feedback is refused by the one-step bound (`STEP_LIMIT`), which is
+        // the turn's ending but not the reason the proposal never happened.
+        val attempted = run.steps.firstOrNull { it.action == ProposeHintTool.NAME }
+        if (attempted?.result == "ARGUMENTS_INVALID") return HintDecision(null, "UNPARSABLE")
+        if (run.outcome != AgentOutcome.COMPLETED) {
+            return HintDecision(null, run.safeCode ?: run.outcome.name)
+        }
+        val last = run.steps.lastOrNull()
+        val proposed = last != null && last.action == ProposeHintTool.NAME && last.result == "ok"
+        if (!proposed) {
+            // A text-only reply is a legal silence; an attempt that reached the tool but did not end the run keeps its
+            // own stable code.
+            return HintDecision(null, attempted?.result ?: "NO_CALL")
+        }
+        val text = run.finalText
+        return when {
+            text.isNullOrBlank() -> HintDecision(null, "BLANK")
+            text.codePointCount(0, text.length) > ProactiveHintSpec.PROACTIVE_HINT_MAX_CHARS ->
+                HintDecision(null, "TOO_LONG")
+            else -> HintDecision(text, null)
         }
     }
 
@@ -3719,31 +3816,23 @@ class SmartAssistantPlugin(
         return fresh ?: remembered
     }
 
-    /**
-     * The hint text in one tool call's arguments, or null when they are not a JSON object whose `text` is a non-blank
-     * **string**.
-     *
-     * The schema asks for a string, so a number or an object is a model error, not a hint: coercing `42` into `"42"`
-     * would put text on the wearer's screen that no instruction asked for.
-     */
-    private fun parseHint(argsJson: String): String? = runCatching {
-        val element = proactiveJson.parseToJsonElement(argsJson).jsonObject["text"] ?: return null
-        val primitive = element as? JsonPrimitive ?: return null
-        if (!primitive.isString) return null
-        primitive.content.takeIf { it.isNotBlank() }
-    }.getOrNull()
-
-    /** Records a proactive outcome that shows nothing, and releases the hint slot. */
-    private fun silence(hint: ProactiveHint, reason: String, elapsedMillis: Long) {
+    /** Records a proactive outcome that shows nothing, and releases the hint/request slots. */
+    private fun silence(request: ProactiveHintRequest, hint: ProactiveHint, reason: String, elapsedMillis: Long) {
         P3Log.line("P3_PROACTIVE silence reason=$reason ms=$elapsedMillis")
-        discard(hint)
+        discard(request, hint)
     }
 
-    /** Must hold [gate]: releases the hint only if it is still the current one. */
-    private fun discard(hint: ProactiveHint) {
+    /**
+     * Releases one hint turn: the displayed-hint bookkeeping and the loop request, but only while this turn still owns
+     * either slot. A STOP (or a newer trigger) may already have replaced them, and the old turn's late ending must not
+     * cancel the new one.
+     */
+    private fun discard(request: ProactiveHintRequest, hint: ProactiveHint) {
         synchronized(gate) {
             hint.cancelled = true
+            request.cancelled = true
             if (proactiveHint === hint) proactiveHint = null
+            if (proactiveRequest === request) proactiveRequest = null
         }
     }
 
@@ -4130,16 +4219,24 @@ class SmartAssistantPlugin(
      */
     private fun stopAll(envelope: EventEnvelope) {
         var cancelledProactive: ProactiveHint? = null
+        var cancelledHintRun: ProactiveHintRequest? = null
+        var cancelledHintLoop: AgentLoop? = null
         var accepted = false
         val stopped = synchronized(gate) {
             if (!matches(envelope)) null
             else {
                 accepted = true
-                // P3.2: a proactive request is in flight outside this lock; marking its hint cancelled is what the
-                // gateway's `stop` predicate reads, and what stops a late reply from being shown.
+                // P3.2: a proactive request is in flight outside this lock; marking its hint cancelled is what stops a
+                // late reply from being shown. 0.3 Phase 3 Task 5: the hint turn is an AgentLoop, so its request object
+                // is also marked (the gateway's `stop` predicate) and its loop is captured to be cancelled outside the
+                // lock, exactly as the wake turn's loop is.
                 cancelledProactive = proactiveHint
+                cancelledHintRun = proactiveRequest
                 proactiveHint?.cancelled = true
                 proactiveHint = null
+                cancelledHintRun?.cancelled = true
+                cancelledHintLoop = cancelledHintRun?.loop
+                proactiveRequest = null
                 // 0.23 P5 (U11): the level must be down before `publishBusy` runs, or the glasses keep thinking after
                 // the wearer asked to interrupt.
                 proactiveInFlight = false
@@ -4154,6 +4251,10 @@ class SmartAssistantPlugin(
         // and a tap that arrived afterwards settled the gate as approved - reaching `host.execute` after the wearer had
         // stopped the assistant (the R52 bypass). A foreign Stop is not this session's stop and cancels nothing.
         if (accepted) confirmation.cancelAll()
+        // The hint loop's own cancel flag is the second half of the stop: the gateway predicate above ends a blocked
+        // request, and this stops the run between steps and asks its (single, pure) executor to stop. Outside the lock,
+        // because `cancel` reaches the executors.
+        cancelledHintLoop?.cancel()
         teardown(stopped)
         // 0.23 P5 (D145): an already-displayed proactive hint is output too. The official `stopTalk` stops the speech
         // and leaves the panel idle without closing it; `cancelOutputTurn` is the host path that both stops speech and
