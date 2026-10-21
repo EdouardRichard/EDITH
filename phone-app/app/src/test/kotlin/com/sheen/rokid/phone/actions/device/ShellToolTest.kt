@@ -87,6 +87,10 @@ class ShellToolTest {
             assertEquals("a channel refusal never dispatched the command", false, execution.accepted)
             assertEquals(false, execution.applied)
             assertEquals("the channel can come back", true, execution.recoverable)
+            assertTrue(
+                "a channel failure keeps a stable, content-free message: ${execution.message}",
+                !execution.message.isNullOrBlank() && !execution.message!!.contains("marker"),
+            )
         }
     }
 
@@ -132,6 +136,7 @@ class ShellToolTest {
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("UNSUPPORTED", requireNotNull(result.execution).code)
         assertEquals("a malformed call has no recoverable channel", false, result.execution!!.recoverable)
+        assertEquals("stdin is not supported", result.execution!!.message)
         assertTrue(shell.commands.isEmpty())
     }
 
@@ -249,6 +254,11 @@ class ShellToolTest {
         // The declaration describes the call class, not whether the command got to run.
         val refused = ShellTool(null).execute("""{"command":"echo hi"}""")
         assertTrue("a shell call is a write even when its channel is unavailable", refused.stateChanging)
+
+        // Fix review: an unknown action is not a shell call at all, so it must not declare a state change.
+        val unknown = ShellTool(null).execute("device", "{}")
+        assertEquals("UNKNOWN_ACTION", requireNotNull(unknown.execution).code)
+        assertFalse("an unknown name is not a shell call", unknown.stateChanging)
     }
 
     private fun body(result: ActionResult): JsonObject =

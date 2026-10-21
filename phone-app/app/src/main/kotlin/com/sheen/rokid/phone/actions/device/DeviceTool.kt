@@ -136,17 +136,19 @@ class DeviceKernelOperations(private val kernel: DeviceKernel) : DeviceOperation
  * [DeviceOperations], the kernel owns the channels and the settle, and this class only
  *  - parses the model-facing arguments (a schema without `via`/coordinates, D84),
  *  - runs the one tool-layer loop the kernel refuses to own (`scroll_to_text`, R46),
- *  - projects the kernel envelope into the §4.6 screen JSON (R41): with a perception port the tree is
- *    `ActionResult.observation`, and the legacy no-provider path keeps it in `data` as the only screen carrier
- *    (Task 8 removed every duplicated observation/execution field from `data`).
+ *  - projects the kernel envelope into the §4.6 screen JSON: with a perception port the tree is
+ *    [ActionResult.observation], and the legacy no-provider path keeps it in `data` as the only screen carrier
+ *    (Task 8 removed every duplicated observation/execution field from `data`). The legacy path is a non-production
+ *    composition — `HostCompositionRoot` always injects perception — and TurnTrimmer's ⓪ does not treat its `data.screen`
+ *    as a UI tree.
  *
  * **Screenshot (R44).** This task keeps the kernel's `ImageRef("pending", ...)` and never inline
  * bytes; `region` and `annotate` are not advertised, because the artifact store and image pipeline
  * arrive in Task 13.
  *
  * **Outcome mapping.** `ok` from the kernel becomes [ActionOutcome.Done]; a failed envelope is
- * [ActionOutcome.Refused] when `error.recoverable` and [ActionOutcome.Failed] otherwise. The raw
- * code survives in the JSON `error` object either way. That three-state legacy projection cannot
+ * [ActionOutcome.Refused] when `error.recoverable` and [ActionOutcome.Failed] otherwise. The raw code survives in
+ * [ToolExecution.code], with the outcome in [ToolExecution.outcome]. That three-state legacy projection cannot
  * express "the platform may still have applied it", so [ToolExecution] is the authoritative fact:
  * a kernel `ACTION_TIMEOUT` is [ToolOutcome.Uncertain] with `uncertain=true` and every tri-state
  * field unknown, and a kernel `CANCELLED` is [ToolOutcome.Cancelled].
@@ -262,9 +264,9 @@ class DeviceTool(
         return if (provider == null) {
             val revisionBefore = operations.revision
             val envelope = operations.observe(filter)
-            // Legacy composition: there is no perception port, so the projector's tree is the only screen carrier and
-            // stays in `data` (it is not duplicated — no observation exists). Task 4's ruling stands: no observation is
-            // fabricated without a real source.
+            // Legacy non-production composition: there is no perception port, so the projector's tree is the only screen
+            // carrier and stays in `data` (it is not duplicated — no observation exists). Task 4's ruling stands: no
+            // observation is fabricated without a real source. Production always injects perception.
             result(envelope, project(envelope, filter), fingerprintAfter(envelope, revisionBefore))
         } else {
             val include = parseInclude(args, DEFAULT_OBSERVE_INCLUDE, OBSERVE_SOURCES)
@@ -417,8 +419,8 @@ class DeviceTool(
         // reaches this through its single returned envelope, which is why the loop never captures per inner scroll.
         val capture = captureVision()
         // Task 4: the forced post-action read and the one capture above are this result's observation. A dispatched act
-        // always carries one, on success and on failure alike; without a perception port there is no honest observation
-        // and the legacy projector's tree stays the only screen carrier in `data`.
+        // always carries one, on success and on failure alike; without a perception port (a non-production composition)
+        // there is no honest observation and the legacy projector's tree stays the only screen carrier in `data`.
         val observation = snapshot?.let {
             observeForResult(
                 capture = true,
@@ -464,9 +466,10 @@ class DeviceTool(
      * observation model cannot express — the kernel revision, the IME flag and the full/diff change marker — survives,
      * and `app` is deliberately read from `observation.foregroundPackage` instead of being repeated.
      *
-     * The legacy composition (no perception port) keeps the whole projection instead: there the tree is the **only**
-     * screen carrier, so dropping it would lose the screen rather than de-duplicate it (Task 4's "no fabricated
-     * observation" ruling stands).
+     * The legacy composition (no perception port; non-production) keeps the whole projection instead: there the tree is
+     * the **only** screen carrier, so dropping it would lose the screen rather than de-duplicate it (Task 4's "no
+     * fabricated observation" ruling stands). TurnTrimmer's ⓪ only reads `observation.screen`, so this path's tree is
+     * deliberately not compressed; production never reaches it.
      */
     private fun legacyData(projected: JsonObject): JsonObject {
         val screen = projected[SCREEN_KEY] as? JsonObject
@@ -670,8 +673,12 @@ class DeviceTool(
             }
         } else {
             buildJsonObject {
-                // On failure the error code is the reason; never replace it with a sentence the kernel did not say.
-                put(DIAGNOSTIC_KEY, envelope.error?.code ?: kernelDiagnostic ?: "the screenshot failed")
+                // Fix review: the failure's reason is `execution.code`; repeating it as `data.diagnostic` was a second
+                // copy. Only a kernel diagnostic that adds information beyond the code is kept here.
+                val errorCode = envelope.error?.code
+                if (kernelDiagnostic != null && kernelDiagnostic != errorCode) {
+                    put(DIAGNOSTIC_KEY, kernelDiagnostic)
+                }
             }
         }
         // Task 4: the explicit screenshot is its own image, so it never runs the auto-vision capture. Its observation
@@ -1022,7 +1029,7 @@ class DeviceTool(
      * caller (which is how `wait` used to slip through). The loop still shows the full detail to the model for this
      * run; only the stored transcript keeps the safe marker. It remains an additive contract with the default `false`
      * for every other tool. Argument-validation refusals do not pass through this projection: [refused] builds them and
-     * sets `nonPersistent` itself whenever its observation text is present.
+     * sets `nonPersistent` itself whenever an observation is present.
      */
     private fun result(
         envelope: DeviceEnvelope,

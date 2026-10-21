@@ -12,6 +12,7 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlin.test.Test
@@ -85,6 +86,14 @@ class TurnTrimmerTypeAwareTest {
     private fun outputText(segment: Segment): String =
         outputOf(segment).getValue("output").jsonPrimitive.content
 
+    /** The envelope an output entry carries after the type-aware cut, parsed for member-level assertions. */
+    private fun outputEnvelope(segment: Segment): JsonObject =
+        Json.parseToJsonElement(outputText(segment)).jsonObject
+
+    /** The compact screen a kept output still carries (the elided header when cut ⓪ rewrote it). */
+    private fun observationScreen(segment: Segment): String? =
+        ((outputEnvelope(segment)["observation"] as? JsonObject)?.get("screen") as? JsonPrimitive)?.content
+
     private fun outputImages(segment: Segment): JsonArray =
         outputOf(segment)["images"] as? JsonArray ?: JsonArray(emptyList())
 
@@ -126,23 +135,82 @@ class TurnTrimmerTypeAwareTest {
             toolOutput("fresh", callId = "c2"),
             user("now"),
         )
+        val original = Json.parseToJsonElement(payload).jsonObject
 
         val report = TurnTrimmer().trim(f, limitTokens = 1_000_000)
 
         assertEquals(1, report.elidedUiTrees)
         val kept = report.kept.conversationFlow.filter { it.origin == SegmentOrigin.TOOL_ROUND }
-        val header = outputText(kept[0])
+        val header = observationScreen(kept[0]).orEmpty()
         assertTrue(header.startsWith("[screen observation elided:"), header)
         assertTrue(header.contains("#n1"), "the refs survive: $header")
         assertTrue(header.contains("lines=2"), "the header keeps the tree's line count: $header")
         assertFalse(header.contains("button Wi-Fi"), "the full tree does not survive: $header")
+        // Task 8 fix review: ⓪ replaces only `observation.screen`; the rest of the envelope is still the tool's result.
+        assertEquals(original["data"], outputEnvelope(kept[0])["data"], "tool data survives the screen elision")
+        assertEquals(
+            original["execution"],
+            outputEnvelope(kept[0])["execution"],
+            "execution facts survive the screen elision",
+        )
         assertEquals("fresh", outputText(kept[1]), "the newest output is still untouched")
     }
 
     @Test
+    fun `eliding an old screen preserves the execution facts and non-empty tool data`() {
+        // Task 8 fix review: the pre-fix cut replaced the whole output with a header, so a shell/open result lost its
+        // exit code / stdout / candidate list and its `execution` block. Only `observation.screen` may change.
+        val payload = ToolResultEnvelope.encode(
+            ToolExecution(
+                outcome = ToolOutcome.Failed,
+                code = "STATE_UNCHANGED",
+                message = "the launch command succeeded but the request is not verified in front",
+                recoverable = true,
+                accepted = true,
+                applied = null,
+                verified = false,
+            ),
+            ToolObservation(
+                foregroundPackage = "com.example.app",
+                foregroundActivity = ".MainActivity",
+                rootPackage = "com.example.app",
+                coverage = "screen=ok",
+                screen = "#n1 button \"旧\"\n#n2 text old",
+                vision = ToolVision.Unavailable,
+                visionReason = "no_source",
+            ),
+            """{"target":"com.example","component":"com.example/.Main","candidates":[{"label":"文件","packageName":"com.android.fileexplorer"}]}""",
+        )
+        val original = Json.parseToJsonElement(payload).jsonObject
+        val f = frame(
+            userTurn("u"),
+            assistant("a"),
+            toolOutput(payload, callId = "c1"),
+            toolOutput("fresh", callId = "c2"),
+            user("now"),
+        )
+
+        val report = TurnTrimmer().trim(f, limitTokens = 1_000_000)
+
+        assertEquals(1, report.elidedUiTrees)
+        val kept = report.kept.conversationFlow.filter { it.origin == SegmentOrigin.TOOL_ROUND }.first()
+        val keptEnvelope = outputEnvelope(kept)
+        assertEquals(original["execution"], keptEnvelope["execution"], "execution facts are not collateral damage")
+        assertEquals(original["data"], keptEnvelope["data"], "tool-specific data is not collateral damage")
+        val observation = keptEnvelope["observation"] as JsonObject
+        val originalObservation = original["observation"] as JsonObject
+        assertEquals(originalObservation["foregroundPackage"], observation["foregroundPackage"])
+        assertEquals(originalObservation["vision"], observation["vision"])
+        val screen = observation.getValue("screen").jsonPrimitive.content
+        assertTrue(screen.startsWith("[screen observation elided:"), screen)
+        assertFalse(screen.contains("button \"旧\""), "only the tree is gone, not the envelope: $screen")
+    }
+
+    @Test
     fun `an old data screen object without an observation is not elided`() {
-        // Discriminating guard for the re-point: reading `data.screen` would elide this legacy shape, reading
-        // `observation.screen` leaves it alone (Task 8 removed the duplication; the data path no longer carries a tree).
+        // The documented non-production exception: the pre-0.3 `data.screen` shape exists only in a composition without a
+        // perception port (production always injects one). It is deliberately not a UI tree this cut elides - the
+        // production device tree lives in `observation.screen` and is covered above - so ⓪ stays effective where it counts.
         val legacy = buildJsonObject {
             put("execution", buildJsonObject { put("outcome", "done") })
             put("observation", kotlinx.serialization.json.JsonNull)
@@ -178,20 +246,26 @@ class TurnTrimmerTypeAwareTest {
         assertEquals(4, report.elidedUiTrees, "the four non-last observations are the type-aware cut")
         val keptOutputs = report.kept.conversationFlow
             .filter { it.origin == SegmentOrigin.TOOL_ROUND }
-            .map(::outputText)
         assertEquals(5, keptOutputs.size)
         (0 until 4).forEach { index ->
+            val screen = observationScreen(keptOutputs[index]).orEmpty()
             assertTrue(
-                keptOutputs[index].startsWith("[screen observation elided:"),
-                "old tree $index must be a header, was: ${keptOutputs[index]}",
+                screen.startsWith("[screen observation elided:"),
+                "old tree $index must be a header, was: $screen",
             )
-            assertTrue(keptOutputs[index].contains("已压缩"), "header marks the compression: ${keptOutputs[index]}")
-            assertTrue(keptOutputs[index].contains("#n1"), "the refs survive the compression: ${keptOutputs[index]}")
-            assertTrue(!keptOutputs[index].contains("button Wi-Fi"), "the full text does not survive")
+            assertTrue(screen.contains("已压缩"), "header marks the compression: $screen")
+            assertTrue(screen.contains("#n1"), "the refs survive the compression: $screen")
+            assertTrue(!screen.contains("button Wi-Fi"), "the full text does not survive")
+            // The envelope around the elided screen is still the device result: execution and data are untouched.
+            assertEquals(
+                """{"action":"observe","rev":${index + 1},"app":"com.example.app"}""",
+                (outputEnvelope(keptOutputs[index])["data"] as JsonObject).toString(),
+                "the tool data of old tree $index survives",
+            )
         }
         assertEquals(
             screenObservation(5, "#n1 button Wi-Fi", "#n2 text hi"),
-            keptOutputs[4],
+            outputText(keptOutputs[4]),
             "the newest observation is untouched",
         )
     }

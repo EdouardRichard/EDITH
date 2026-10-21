@@ -23,10 +23,12 @@ class LockToolProbeActivity : Activity() {
             try {
                 val root = (application as EdithApplication).composition
                 val result = root.executeToolForProbe("device", """{"action":"status"}""")
+                // Task 8 privacy: `detail` is tool data (status includes device/notification content), so the probe
+                // logs only the outcome and the stable execution code - never the data body.
                 Log.i(
                     TAG,
                     "P3_LOCKTOOL name=device outcome=${result?.outcome?.name ?: "NO_CATALOG"} " +
-                        "detail=${result?.detail ?: ""}",
+                        "code=${ProbeResultProjection.of(result).executionCode ?: "none"}",
                 )
             } catch (failure: Throwable) {
                 Log.i(TAG, "P3_LOCKTOOL name=device outcome=THREW throw=${failure.javaClass.simpleName}")

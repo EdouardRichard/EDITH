@@ -122,6 +122,11 @@ class DialToolTest {
         assertTrue(DialTool(FakeExecutor()) { true }.execute("""{"number":"10086"}""").stateChanging)
         // The declaration describes the call class, not whether CALL_PHONE allowed it to run.
         assertTrue(DialTool(FakeExecutor()) { false }.execute("""{"number":"10086"}""").stateChanging)
+
+        // Fix review: an unknown action is not a dial call at all, so it must not declare a state change.
+        val unknown = DialTool(FakeExecutor()) { true }.execute("device", "{}")
+        assertEquals("UNKNOWN_ACTION", requireNotNull(unknown.execution).code)
+        assertFalse("an unknown name is not a dial call", unknown.stateChanging)
     }
 
     private fun errorCode(result: ActionResult): String? = result.execution?.code

@@ -398,7 +398,7 @@ class DeviceToolTest {
             "the compact post-scroll screen replaces the projected bounds view: ${observation.screen}",
             observation.screen!!.contains("""#n4 button "目标" center=(11,22) [clickable]"""),
         )
-        assertFalse("scroll_to_text must not leak projector bounds: ${result.detail}", result.detail.contains("bounds="))
+        assertFalse("scroll_to_text must not leak projector bounds: ${observation.screen}", observation.screen!!.contains("bounds="))
 
         // Task 4: the scroll is one write result with its own post-action observation and one picture. The facts come
         // from the final wait envelope: applied/changed are unknown, the wait's own post-condition is verified.
@@ -437,7 +437,10 @@ class DeviceToolTest {
         assertEquals(1, perception.afterActions)
         assertFalse("no data.changed when applied is unknown", body(result).containsKey("changed"))
         assertEquals("full", body(result)["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
-        assertFalse("no bounds in the failed scroll either: ${result.detail}", result.detail.contains("bounds="))
+        assertFalse(
+            "no bounds in the failed scroll either: ${observationOf(result).screen}",
+            observationOf(result).screen.orEmpty().contains("bounds="),
+        )
         assertEquals(1, operations.actCalls.size)
 
         // Task 4: a scroll that ran but never proved the target is a partial execution, and its observation is the
@@ -475,7 +478,10 @@ class DeviceToolTest {
         assertEquals("CHANNEL_UNAVAILABLE", executionOf(result).code)
         assertEquals("a dispatched scroll always gets the forced read", 1, perception.afterActions)
         assertEquals("snap-failed-scroll", observationOf(result).snapshotId)
-        assertFalse("no bounds after a failed scroll: ${result.detail}", result.detail.contains("bounds="))
+        assertFalse(
+            "no bounds after a failed scroll: ${observationOf(result).screen}",
+            observationOf(result).screen.orEmpty().contains("bounds="),
+        )
     }
 
     // - screenshot (R44) -
@@ -538,7 +544,9 @@ class DeviceToolTest {
     }
 
     @Test
-    fun `a failed screenshot keeps the kernel error code as its diagnostic`() {
+    fun `a failed screenshot does not repeat its kernel error code in data`() {
+        // Fix review: the failure reason is `execution.code`; the pre-fix `data.diagnostic=UNSUPPORTED` was a second
+        // copy of the same fact. With no extra kernel diagnostic, `data` is empty.
         val operations = FakeDeviceOperations(observation())
         operations.screenshotEnvelope = failure("screenshot", "UNSUPPORTED", recoverable = false)
 
@@ -546,11 +554,7 @@ class DeviceToolTest {
 
         assertEquals(ActionOutcome.Failed, result.outcome)
         val body = body(result)
-        assertEquals(
-            "a failed screenshot must name the kernel's error code, not a generic sentence",
-            "UNSUPPORTED",
-            body["diagnostic"]!!.jsonPrimitive.content,
-        )
+        assertFalse("the stable code is not duplicated into data", body.containsKey("diagnostic"))
         assertEquals("UNSUPPORTED", executionOf(result).code)
     }
 
@@ -1047,7 +1051,7 @@ class DeviceToolTest {
             "the action's own screen projection must be replaced by the compact post-action view",
             observation.screen!!.contains("""#n5 text "B" center=(0,0)"""),
         )
-        assertFalse("act must not leak projector bounds either", result.detail.contains("bounds="))
+        assertFalse("act must not leak projector bounds either", observation.screen.orEmpty().contains("bounds="))
         val data = body(result)
         assertEquals("full", data["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
         assertFalse("data no longer repeats the screen facts", data.containsKey("screen"))
@@ -1062,10 +1066,9 @@ class DeviceToolTest {
     /*
      * Auto vision ordering and scope.
      *
-     * Authoritative contract: `ActionResult.images` and the top-level `data.vision` marker are the auto-vision
-     * result. The JSON body's `images` array is rendered from the **kernel envelope** only
-     * (`DeviceTool.renderEnvelope`), so an auto-captured image deliberately does not appear there; assert the
-     * former and do not "fix" the latter by changing rendering.
+     * Authoritative contract (Task 8): `ActionResult.images` and the `observation.vision` member are the auto-vision
+     * result. The tool-specific `data` no longer repeats a vision marker (the pre-Task-8 `data.vision` copy is gone), so
+     * these tests assert the structured observation and must not "fix" a missing data marker by adding one back.
      *
      * Capture scope: argument validation runs before any perception call, so early `INVALID_ARGUMENTS` refusals
      * never capture. A stale-ref refusal and a kernel-dispatched refusal do capture, each after its own fresh read

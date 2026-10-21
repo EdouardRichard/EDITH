@@ -35,8 +35,9 @@ import kotlinx.serialization.json.longOrNull
  *
  * edith-0.3 Phase 2.2 Task 6: `shell`/`dial` results also carry a post-call observation, structured
  * execution facts and at most one best-effort image. This catalog owns that enrichment (the two tools
- * keep their own outcome/envelope shapes) and reuses the host observation source `OpenTool` gets;
- * `device`/`open` were migrated by Tasks 4-5 and keep their own policies.
+ * keep their own outcome/detail shapes) and reuses the host observation source `OpenTool` gets;
+ * `device`/`open` were migrated by Tasks 4-5 and keep their own policies. Since Task 8 the tools state
+ * their own `execution` facts; the catalog only fills a missing execution for a hand-built result.
  *
  * `cancel`/`beginTurn`/`close` are the turn lifecycle (R42): the kernel's cancellation is
  * turn-scoped, so a new turn re-arms it and the composition closes the catalog to stop the kernel's
@@ -225,10 +226,10 @@ class ToolCatalog(
      * Adds the shared execution facts + observation + at most one picture to one `shell`/`dial` result.
      *
      * Outcome, detail and `stateChanging` are never rewritten: a channel refusal stays `CHANNEL_UNAVAILABLE`, a shell
-     * argument refusal keeps its bare code, and a non-zero exit stays `Failed`. A refused **argument** is the one case
-     * that takes no picture (matching the `device`/`open` convention: there is no action to explain), while a real
-     * attempt - success, execution failure, channel/call/lock refusal - gets one best-effort capture and the
-     * `vision = ok` only when that capture really produced an image.
+     * argument refusal keeps its empty `data` (its code is `execution.code`), and a non-zero exit stays `Failed`. A
+     * refused **argument** is the one case that takes no picture (matching the `device`/`open` convention: there is no
+     * action to explain), while a real attempt - success, execution failure, channel/call/lock refusal - gets one
+     * best-effort capture and the `vision = ok` only when that capture really produced an image.
      *
      * `nonPersistent` is raised whenever an observation or picture exists, because both are perception content that may
      * live only in the current model request (C2).

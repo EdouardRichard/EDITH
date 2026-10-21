@@ -331,6 +331,13 @@ class HostCompositionRoot internal constructor(
      */
     internal var openToolForProbe: com.sheen.rokid.phone.actions.device.OpenTool? = null
 
+    /**
+     * Debug-only seam: runs one production tool call and returns its raw [com.sheen.rokid.plugin.ActionResult].
+     *
+     * The result is **not** a rendered envelope: `observation` carries the screen, `execution` the stable facts, and
+     * `detail` is tool-specific data only. A host-started probe must read those members (the debug probes use their own
+     * `ProbeResultProjection`); parsing `detail` for an envelope silently yields no screen (Task 8 review).
+     */
     internal fun executeToolForProbe(name: String, argsJson: String) =
         toolCatalogForProbe?.execute(name, argsJson)
 

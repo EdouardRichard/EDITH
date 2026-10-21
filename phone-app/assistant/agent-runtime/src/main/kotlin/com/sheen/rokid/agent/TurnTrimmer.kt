@@ -135,9 +135,12 @@ val TrimReport.counts: TrimCounts
  *
  * - **Old UI tree**: a `TOOL_ROUND` output whose envelope carries a non-blank `observation.screen` (the compact UI
  *   tree; Task 8 re-pointed this from the pre-0.3 `data.screen` object), and which is not the *last* tool result,
- *   becomes a header that keeps the action/revision/app, the line count and the visible refs (`#n…`) but not the full
- *   tree. That is the "header + 已压缩" rule; refs survive because the model may still act on them, the hundreds of node
- *   lines do not.
+ *   has **only `observation.screen`** replaced by a header that keeps the action/revision/app, the line count and the
+ *   visible refs (`#n…`) but not the full tree. The rest of the envelope — `execution` and the tool-specific `data` —
+ *   is preserved verbatim, so an old shell/open result keeps its exit code, candidate list and facts. That is the
+ *   "header + 已压缩" rule; refs survive because the model may still act on them, the hundreds of node lines do not.
+ *   The pre-0.3 `data.screen` object is a **non-production** shape (a composition without a perception port; production
+ *   always injects one) and is deliberately not elided: the production device tree lives in `observation.screen`.
  * - **Old images**: only the newest [IMAGE_KEEP] images across the whole flow stay whole; older
  *   `ToolOutput.images`/`Segment.images` entries are removed and a visible `[image <id> <mime> <w>x<h> (elided)]` text
  *   is appended to the owner. The newest K are the references the context may still contain, which is what keeps
@@ -359,8 +362,8 @@ class TurnTrimmer(
     }
 
     /**
-     * A tool result whose `observation.screen` is a compact UI tree, replaced by a header that keeps the refs and the
-     * summary.
+     * A tool result whose `observation.screen` is a compact UI tree, with **only that member** replaced by a header
+     * that keeps the refs and the summary; `execution` and `data` stay byte-for-byte the tool's result.
      *
      * 0.3 Phase 2.2 Task 8 re-point: the unified envelope
      * (`{execution, observation|null, data}`) carries the screen tree in `observation.screen` as a string; `data` no
@@ -368,6 +371,8 @@ class TurnTrimmer(
      * tool-specific facts (the `device` tool does), so a shell/open observation still elides with `?` placeholders.
      * A result whose observation is `null` — a pure tool, or an unmigrated tool whose `data` happens to hold a screen
      * object — is deliberately **not** a UI tree this cut can elide: reading `data.screen` again is what Task 8 removed.
+     * The legacy no-perception `data.screen` is a non-production composition, documented on [TurnTrimmer]; ⓪ remains
+     * effective for the production device UI tree in `observation.screen`.
      */
     private fun elideUiTree(output: String): String? {
         val envelope = parseObject(output) ?: return null
@@ -379,7 +384,7 @@ class TurnTrimmer(
         val app = data?.string("app") ?: observation.string("foregroundPackage")
         val lines = screen.lineSequence().count { it.isNotBlank() }
         val refs = REF_PATTERN.findAll(screen).map { it.value }.distinct().take(MAX_ELIDED_REFS).toList()
-        return buildString {
+        val header = buildString {
             append("[screen observation elided: action=").append(action)
             append(" rev=").append(revision)
             if (app != null) append(" app=").append(app)
@@ -387,6 +392,13 @@ class TurnTrimmer(
             append(" refs=").append(if (refs.isEmpty()) "-" else refs.joinToString(","))
             append(" · 已压缩]")
         }
+        // Replace exactly `observation.screen`; every other member of the envelope (and of the observation) survives.
+        val rewrittenObservation = JsonObject(
+            LinkedHashMap(observation).apply { put("screen", JsonPrimitive(header)) },
+        )
+        return JsonObject(
+            LinkedHashMap(envelope).apply { put("observation", rewrittenObservation) },
+        ).toString()
     }
 
     private fun headTail(text: String): String {

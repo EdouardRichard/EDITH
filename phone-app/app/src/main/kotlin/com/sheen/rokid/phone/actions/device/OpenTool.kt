@@ -26,8 +26,8 @@ import kotlinx.serialization.json.put
 /**
  * R43/spec §4.11: `open` — a name, package, URL or settings page, launched through the shell.
  *
- * The result is always the structured envelope:
- *  - ambiguity is `Refused` with `error.code = APP_AMBIGUOUS` and
+ * The result is projected by the registry onto the unified envelope:
+ *  - ambiguity is `Refused` with `execution.code = APP_AMBIGUOUS` and
  *    `data.candidates = [{"label":...,"packageName":...}]` — never a `Done`, and never parsed out of
  *    a `CODE:payload` detail string (R20);
  *  - an unknown name is `APP_NOT_FOUND`; a package-shaped token counts as a package when the catalog knows it, and
@@ -42,8 +42,9 @@ import kotlinx.serialization.json.put
  *  - `relaunch=false` with the target already in front does not start it again;
  *  - `am start`'s `Status: ok` alone is **not** success (0.3 Phase 2 Task 8): after the shell accepts a launch, the
  *    resolved package must be the foreground app **and** the accessibility root, or the call is a recoverable
- *    `STATE_UNCHANGED` carrying the observed values. A URL/settings page knows no target package, so its observed
- *    foreground app must equal the accessibility root instead.
+ *    `STATE_UNCHANGED` whose observed values are `observation`/`execution` facts (Task 8 moved them off `data`). A
+ *    URL/settings page knows no target package, so its observed foreground app must equal the accessibility root
+ *    instead.
  *
  * A URL is restricted to `http(s)` and single-quote-escaped before it enters the command, so a URL
  * containing a quote or a shell metacharacter stays one literal argument. The settings-page table is
@@ -574,9 +575,9 @@ class OpenTool(
     /**
      * edith-0.3 Phase 2.2 Task 5: an unknown action is not an `open` call at all.
      *
-     * Its model-facing detail stays the bare `UNKNOWN_ACTION` code (the pre-Task-5 shape), but it carries the same
-     * structured refusal facts a validation refusal does. It is not a screen operation, so it invents no observation
-     * and attaches no image.
+     * Its model-facing `data` is empty and the stable code lives in `execution.code`; it carries the same structured
+     * refusal facts a validation refusal does. It is not a screen operation, so it invents no observation and attaches
+     * no image.
      */
     private fun unknownAction(): ActionResult = ActionResult(
         ActionOutcome.Refused,

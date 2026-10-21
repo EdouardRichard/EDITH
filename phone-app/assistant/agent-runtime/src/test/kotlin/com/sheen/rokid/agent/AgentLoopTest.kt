@@ -316,6 +316,26 @@ class AgentLoopTest {
         assertEquals(emptyList(), stored.images, "no image may be persisted: ${stored.output}")
     }
 
+    @Test fun `a successful image without the tool flag is still redacted from the stored transcript`() {
+        // Task 8 fix review: the last gate must not exempt a Done image. Production's image results already set
+        // `nonPersistent`, but a tool that forgets it may not put a picture into the stored transcript; the in-run
+        // request still carries it for the model.
+        val image = ImageRef("artifact-done-1", "image/png", 768, 1664, "sha-done-1")
+        val executor = executorOf("lookup")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "captured", images = listOf(image)) }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "看完了")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val inRun = gateway.requests[1].history.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals(listOf(image), inRun.images, "the model sees the successful picture during the run")
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals(emptyList(), stored.images, "no image may be persisted, whatever the outcome: ${stored.output}")
+    }
+
     @Test fun `pure execution facts of a failure stay persistent when the loop attaches no observation`() {
         // The complement of the C2 rule: persistence is only withdrawn for content the loop itself attaches. A pure tool
         // result (no screen observation) is execution facts, so its stored output keeps the tool detail.

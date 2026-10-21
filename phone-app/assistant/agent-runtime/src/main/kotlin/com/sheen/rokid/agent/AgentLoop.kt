@@ -205,8 +205,12 @@ data class AgentStep(
  *
  * [modelMillis] is the run's summed time inside model turns, [toolMillis] the summed machine time of its tool calls,
  * and [observeMillis] the subset of that time spent in calls whose descriptor declared `observation = true`. [images]
- * is the number of distinct image artifacts the run's requests carried. Every field is a count; none can carry a
- * page, a transcript or a credential.
+ * is the number of **distinct images produced by the run**, not only the images a model request happened to carry: a
+ * picture attached to the call that ends the run (a repeated-error failure, a timeout, an uncertain result) still counts,
+ * because no later request can carry it. Every field is a count; none can carry a page, a transcript or a credential.
+ *
+ * Task 9's docs (`STATUS`/`ACCEPTANCE`/P3 metric口径) must describe `images` with the same produced-by-the-run meaning;
+ * this KDoc is the code-side source for that wording, and the fix report points Task 9 at it.
  */
 data class AgentMetrics(
     val calls: Int = 0,
@@ -248,10 +252,10 @@ data class AgentRun(
      * loop-internal and must not be persisted as the wearer's speech (0.25 review ruling R16).
      *
      * **Perception content is redacted here** (0.3 Phase 2 final review C2): a tool output **this run** marked
-     * `nonPersistent` (every `device.*` result, including `wait`/`screenshot` and the legacy no-provider projection) is
-     * replaced by a safe marker with no images. The model saw the full payload in this run; this list is the only shape
-     * a `ConversationStore` may persist (spec §7.8), so the content cannot outlive the request. An earlier turn's
-     * output with the same call id is left verbatim (C2 re-review).
+     * `nonPersistent`, carrying an observation, or carrying any image is replaced by a safe marker with no images. The
+     * model saw the full payload in this run; this list is the only shape a `ConversationStore` may persist (spec §7.8),
+     * so the content cannot outlive the request. An earlier turn's output with the same call id is left verbatim
+     * (C2 re-review).
      */
     val transcript: List<ModelHistoryItem> = emptyList(),
     /**
@@ -1395,11 +1399,11 @@ class AgentLoop(
      * the in-run history keeps the full payload and only the stored transcript is redacted at [finish].
      *
      * Task 8 adds the last-gate belt for two facts the run already produced:
-     * - **observation content and failure images are perception content** — a result that carries an observation, or a
-     *   non-`Done` result that carries a picture, is marked non-persistent even when its tool forgot (or could not
-     *   know) to set the flag, so neither reaches `ConversationStore`/`AgentRun.transcript`. A **successful** tool's
-     *   image reference stays persistent (0.25 R133): that is the artifact the next turn may legitimately reuse, which
-     *   is why the gate keys on the outcome and not on the mere presence of an image;
+     * - **observation content and every picture are perception content** — a result that carries an observation or any
+     *   image is marked non-persistent even when its tool forgot (or could not know) to set the flag, so neither the
+     *   content nor the image reference reaches `ConversationStore`/`AgentRun.transcript`. Production's image results
+     *   already set the flag (every `device` result is marked, including `screenshot`); the gate is outcome-independent
+     *   because "successful images persist" was never a real store path (fix review);
      * - **the metric counts produced images, not only carried ones** — a picture attached to the call that ends the run
      *   (a repeated-error failure, a timeout, an uncertain result) never reaches another model request, so counting it
      *   only from a request would lose it. The set keys on the artifact id, so a picture that is both appended and later
@@ -1420,15 +1424,21 @@ class AgentLoop(
     /**
      * Task 8: whether this result's stored form must be redacted.
      *
-     * An observation is perception content by construction. A **non-`Done`** result's picture is evidence of the failed
-     * call and may not outlive the request either; a successful tool's image reference stays persistent (the 0.25 R133
-     * channel). The tool's own flag wins in all cases — this is a belt for a tool that could not set it (a
-     * framework-synthesized failure, a loop timeout, a policy refusal).
+     * An observation is perception content by construction, and **any** picture — a success, a failure or an uncertain
+     * capture — is an image artifact that may not outlive the request (fix review: the earlier "Done image stays
+     * persistent" exemption was based on a false premise; production's image results all set `nonPersistent` already).
+     * The tool's own flag wins in all cases — this is a belt for a tool that could not set it (a framework-synthesized
+     * failure, a loop timeout, a policy refusal).
+     *
+     * An `unavailable` observation (`vision = unavailable`, no screen text) carries no perception content, yet it is
+     * still redacted: a conservative marker keeps every observation-bearing result on the same side of the C2 boundary,
+     * and the in-run request still shows the model the schema-shaped empty observation. (A refinement to "content only"
+     * would need an explicit contract decision; privacy-safe over-reporting is deliberate.)
      */
     private fun mustRedact(result: ToolResult): Boolean =
         result.nonPersistent ||
             result.observation != null ||
-            (result.execution.outcome != ToolOutcome.Done && result.images.isNotEmpty())
+            result.images.isNotEmpty()
 
     /**
      * The transcript a caller may persist: this run's history with every non-persistent tool output **of this run**

@@ -16,6 +16,10 @@ import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.SecretHandle
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
+import com.sheen.rokid.plugin.ToolVision
 import com.sheen.rokid.testsupport.FakeCancellation
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
@@ -73,18 +77,17 @@ class ContextOverflowTest {
 
     // ── the frame every test sends: two turns, each with a tool round ───────────────────────────────
 
-    private fun screenTree(label: String): String = buildJsonObject {
-        put("ok", true)
-        put("tool", "device")
-        put("action", "observe")
-        put("data", buildJsonObject {
-            put("screen", buildJsonObject {
-                put("rev", 1)
-                put("app", "com.example.app")
-                put("text", "#n1 button $label")
-            })
-        })
-    }.toString()
+    private fun screenTree(label: String): String = ToolResultEnvelope.encode(
+        ToolExecution(outcome = ToolOutcome.Done, accepted = true),
+        // Task 8 fix review: the frame now carries a real unified envelope, not the pre-0.3 `data.screen` copy. The
+        // screen tree is `observation.screen`, so recovery sees the same payload shape production sends.
+        ToolObservation(
+            foregroundPackage = "com.example.app",
+            screen = "#n1 button $label",
+            vision = ToolVision.NotRequested,
+        ),
+        """{"action":"observe"}""",
+    )
 
     private fun toolCall(callId: String): Segment = Segment(
         SegmentOrigin.TOOL_ROUND,

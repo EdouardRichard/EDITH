@@ -12,10 +12,12 @@ import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
 /**
- * R41: the spec §4.6 `data.screen` projection.
+ * R41: the pre-0.3 `data.screen` projection, kept for the **non-production** composition without a perception port.
  *
- * The kernel deliberately does not render (see [com.sheen.rokid.device.DeviceEnvelope]); this is
- * the one place the observation becomes the model-facing JSON:
+ * The kernel deliberately does not render (see [com.sheen.rokid.device.DeviceEnvelope]); this is the one place the
+ * legacy observation becomes JSON. In a perception composition the model-facing tree is
+ * `ActionResult.observation.screen` instead, and this projection only supplies the tool-specific metadata the result
+ * keeps (`rev`/`ime`/`changes`/`diagnostic`).
  *
  * ```
  * {"screen":{"rev":42,"app":"com.android.settings","activity":null,"ime":false,
@@ -81,7 +83,7 @@ class ScreenProjector(
     }
 
     /**
-     * Projects [observation] as the `data` object of a device result.
+     * Projects [observation] as the legacy `data` object of a device result (non-production, no perception port).
      *
      * [filter] is the render filter of the operation that produced the observation (the observe
      * filter, or the kernel's last observation filter for an action's auto-observation).

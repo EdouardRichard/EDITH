@@ -113,7 +113,8 @@ class MetricLogTest {
         assertEquals("REPEATED_ERROR", run.safeCode)
         assertEquals(3, run.metrics.images, "every failed call's picture is a distinct run image")
         assertTrue(lines.single().contains(" images=3"), lines.single())
-        assertFalse(lines.single().contains("SHA"), "the metric line stays count-only: ${lines.single()}")
+        assertFalse(lines.single().contains("sha-"), "the metric line stays count-only: ${lines.single()}")
+        assertFalse(lines.single().contains("img-failure"), "no artifact id reaches the metric line: ${lines.single()}")
     }
 
     @Test

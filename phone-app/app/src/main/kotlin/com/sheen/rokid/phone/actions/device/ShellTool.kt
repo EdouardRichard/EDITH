@@ -70,7 +70,8 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
                 ActionOutcome.Refused,
                 // Task 8: the stable code is `execution.code`, not a copy of the whole result in `data`.
                 "{}",
-                stateChanging = true,
+                // Fix review: an unknown action is not a `shell` call at all, so it cannot declare a state change.
+                stateChanging = false,
                 execution = refusedExecution(UNKNOWN_ACTION, recoverable = false),
             )
         }
@@ -158,6 +159,7 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
         ActionOutcome.Failed -> ToolExecution(
             outcome = ToolOutcome.Failed,
             code = code,
+            message = messageFor(code),
             recoverable = true,
             accepted = true,
             applied = null,
@@ -167,6 +169,8 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
             ToolExecution(
                 outcome = ToolOutcome.Refused,
                 code = code,
+                // Fix review: the channel reasons are useful to the model; the dropped plumbing message left only a code.
+                message = messageFor(code),
                 recoverable = true,
                 accepted = executedAnyway,
                 applied = if (executedAnyway) null else false,
@@ -177,10 +181,21 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
     private fun refusedExecution(code: String, recoverable: Boolean): ToolExecution = ToolExecution(
         outcome = ToolOutcome.Refused,
         code = code,
+        message = messageFor(code),
         recoverable = recoverable,
         accepted = false,
         applied = false,
     )
+
+    /** Stable, content-free reasons for the shell refusals (the command and its output never appear here). */
+    private fun messageFor(code: String?): String? = when (code) {
+        UNSUPPORTED -> "stdin is not supported"
+        SHELL_NOT_BOUND -> "the privileged shell is not bound"
+        SHELL_FAILED -> "the privileged shell call failed"
+        INVALID_ARGUMENTS -> "the shell arguments are invalid"
+        UNKNOWN_ACTION -> "shell is not this tool's action"
+        else -> null
+    }
 
     companion object {
         const val NAME = "shell"
