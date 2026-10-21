@@ -13,7 +13,6 @@ private const val INVALID_TOOL_SCHEMA = "INVALID_TOOL_SCHEMA"
 private const val DUPLICATE_TOOL_MERGED = "DUPLICATE_TOOL_MERGED"
 private const val UNKNOWN_TOOL = "UNKNOWN_TOOL"
 private const val ARGUMENTS_INVALID = "ARGUMENTS_INVALID"
-private const val TOOL_THREW = "TOOL_THREW"
 
 /** Strict parser: the schema check and the first arguments pass. */
 private val strictJson = Json
@@ -90,7 +89,9 @@ class ToolRegistry(
             // The executor receives the model's original string: validating arguments must not rewrite them.
             tool.executor.execute(call.name, call.argsJson)
         } catch (_: Exception) {
-            return ToolResult.error(call.id, TOOL_THREW)
+            // The call was dispatched, so it may have applied part of itself: `accepted`/`applied`/`changed` are
+            // unknown and the result is Uncertain. Claiming "nothing changed" here would be a fabricated fact.
+            return ToolResult.threw(call.id)
         }
         // R57: the observation fingerprint rides through verbatim, on every outcome — a refused write that left the
         // screen unchanged is exactly the evidence the poll/global detectors need. R98: so does the per-call
@@ -103,7 +104,9 @@ class ToolRegistry(
         val execution = result.execution ?: ToolExecution(outcome = result.outcome.toToolOutcome())
         return ToolResult(
             id = call.id,
-            ok = result.outcome == ActionOutcome.Done,
+            // `ok` describes the execution the model (and every consumer) receives: an explicit execution is
+            // authoritative and the legacy ActionOutcome must never report a success it denies.
+            ok = execution.outcome == ToolOutcome.Done,
             execution = execution,
             observation = result.observation,
             data = result.detail,

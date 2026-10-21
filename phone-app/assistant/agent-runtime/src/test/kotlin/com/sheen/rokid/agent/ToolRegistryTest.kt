@@ -274,7 +274,7 @@ class ToolRegistryTest {
         }
     }
 
-    @Test fun `an executor that throws never propagates and becomes a TOOL_THREW envelope`() {
+    @Test fun `an executor that throws never propagates and becomes an uncertain TOOL_THREW envelope`() {
         val executor = executorOf("exploding.tool")
         executor.failure = IllegalStateException("boom")
         val registry = ToolRegistry(listOf(executor))
@@ -283,7 +283,39 @@ class ToolRegistryTest {
 
         assertEquals("call-7", result.id)
         assertFalse(result.ok)
-        assertErrorResult(result, "TOOL_THREW")
+        // The executor was dispatched and may have applied something: no tri-state fact may claim "no change".
+        assertEquals(ToolOutcome.Uncertain, result.execution.outcome)
+        assertEquals("TOOL_THREW", result.execution.code)
+        assertTrue(result.execution.uncertain, "a thrown call is explicitly uncertain")
+        assertNull(result.execution.accepted, "a dispatched throw is not known to have been accepted")
+        assertNull(result.execution.applied, "a dispatched throw is not known to have applied nothing")
+        assertNull(result.execution.changed, "a dispatched throw is not known to have changed nothing")
+        assertNull(result.observation)
+        assertEquals(
+            """{"execution":{"outcome":"uncertain","code":"TOOL_THREW","message":null,"recoverable":false,""" +
+                """"accepted":null,"applied":null,"verified":null,"changed":null,"uncertain":true,"partial":false},""" +
+                """"observation":null,"data":""}""",
+            result.payload,
+        )
+    }
+
+    @Test fun `ok follows the explicit execution instead of contradicting it`() {
+        // A migrated tool states its own execution facts. A legacy `Done` outcome must not report a success the
+        // explicit execution denies: `ok` is derived from the execution the envelope and every consumer carry.
+        val executor = executorOf("device")
+        executor.outcome = { _, _ ->
+            ActionResult(
+                ActionOutcome.Done,
+                "STATE_UNCHANGED",
+                execution = ToolExecution(outcome = ToolOutcome.Failed, code = "STATE_UNCHANGED"),
+            )
+        }
+
+        val result = ToolRegistry(listOf(executor)).execute(ToolCall("call-ok", "device", "{}"))
+
+        assertFalse(result.ok)
+        assertEquals(ToolOutcome.Failed, result.execution.outcome)
+        assertEquals("STATE_UNCHANGED", result.execution.code)
     }
 
     @Test fun `an explicit execution and observation from the tool survive projection`() {
@@ -465,9 +497,10 @@ class ToolRegistryTest {
         (Json.parseToJsonElement(result.payload) as JsonObject).getValue("data").jsonPrimitive.content
 
     /**
-     * The framework-synthesized failure shape: the supplied stable code, `accepted=false`/`applied=false` (the
-     * pre-dispatch facts unknown tool/arguments establish), and no invented observation. `TOOL_THREW` still uses this
-     * shape in Task 2; Task 3 replaces it with the uncertain post-dispatch fact.
+     * The framework-synthesized **pre-dispatch** failure shape: the supplied stable code,
+     * `accepted=false`/`applied=false` (the facts an unknown tool, unparsable arguments or a policy refusal
+     * establish), and no invented observation. A **dispatched** throw is *not* this shape: it is `Uncertain` with
+     * unknown tri-state fields (see the TOOL_THREW test).
      */
     private fun assertErrorResult(result: ToolResult, code: String, id: String? = null) {
         if (id != null) assertEquals(id, result.id)

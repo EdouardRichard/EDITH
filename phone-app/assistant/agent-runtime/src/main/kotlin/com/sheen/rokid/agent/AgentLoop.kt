@@ -1092,7 +1092,9 @@ class AgentLoop(
             } catch (_: TimeoutException) {
                 // Keep waiting; the loop above re-checks cancellation and the remaining budget.
             } catch (_: ExecutionException) {
-                return ToolInvocation(ToolResult.error(call.id, "TOOL_THREW"), executed = true)
+                // The call was already dispatched when `registry.execute` itself failed, so it may have applied part of
+                // the call: report the unknown facts as uncertain rather than claiming "nothing changed".
+                return ToolInvocation(ToolResult.threw(call.id), executed = true)
             } catch (interrupted: InterruptedException) {
                 Thread.currentThread().interrupt()
                 runCatching { registry.cancel() }
@@ -1434,14 +1436,16 @@ class AgentLoop(
     }
 
     /**
-     * The short stable label one `AgentStep` (and one audit line) carries: `ok` for a success, otherwise the execution's
-     * stable code, or its outcome token when an unmigrated tool named no code.
+     * The short stable label one `AgentStep` (and one audit line) carries: `ok` for a success, otherwise the
+     * execution's stable code. An unmigrated tool names no execution code, so its legacy detail is asked for one too
+     * (the same code-only extraction `ErrorTracker` uses); a detail that names none yields the outcome token.
      *
      * Never the tool detail and never the envelope: `AgentStep.result` reaches the plugin's `P3_TOOL` count-only log,
      * and `data`/`observation` may carry content that is only allowed in the current model request (C2).
      */
     private fun stepResultOf(result: ToolResult): String =
-        if (result.ok) "ok" else result.execution.code ?: result.execution.outcome.name
+        if (result.ok) "ok"
+        else result.execution.code ?: legacyCodeOf(result.data) ?: result.execution.outcome.name
 
     private fun outcomeOf(result: ToolResult) = stepResultOf(result)
 

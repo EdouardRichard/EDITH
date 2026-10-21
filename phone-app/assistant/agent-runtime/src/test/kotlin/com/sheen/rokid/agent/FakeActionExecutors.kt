@@ -15,7 +15,8 @@ internal class RecordingActionExecutor(
 ) : ActionExecutor {
     val calls = mutableListOf<Pair<String, String>>()
     var outcome: (String, String) -> ActionResult = { _, _ -> ActionResult(ActionOutcome.Done, "done") }
-    var failure: RuntimeException? = null
+    /** `Throwable` so a test can let an `Error` escape the registry's `Exception` guard, as `runTool` must survive. */
+    var failure: Throwable? = null
     var cancellations = 0
     var begins = 0
     var beginTurnFailure: RuntimeException? = null

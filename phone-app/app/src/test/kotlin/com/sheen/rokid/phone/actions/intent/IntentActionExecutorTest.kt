@@ -20,8 +20,9 @@ import org.junit.Test
  *
  * Two properties matter as much as the happy paths:
  * - every refusal is [ActionOutcome.Refused] with the code **exactly** in the payload - never `Failed` and never a
- *   thrown exception, because `agent-runtime`'s registry turns the outcome into the model-visible
- *   `"Refused: <code>"` / `"Failed: <code>"` text and a failure reads as a broken tool rather than a decision;
+ *   thrown exception, because `agent-runtime`'s registry projects the outcome and the model sees the code as the
+ *   envelope's `data` (the old `"Refused: <code>"` / `"Failed: <code>"` text is gone), so a refusal reads as a
+ *   decision rather than a broken tool;
  * - a refusal performs no side effect: the launcher is not called and nothing is written.
  */
 class IntentActionExecutorTest {

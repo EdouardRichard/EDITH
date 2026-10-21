@@ -286,7 +286,9 @@ class StoreSessionWiringTest {
             "request 2 must still carry the earlier assistant turn: ${second.history}",
         )
         assertTrue(
-            second.history.any { it is ModelHistoryItem.ToolOutput && it.output == "notified:1" },
+            second.history.any {
+                it is ModelHistoryItem.ToolOutput && it.output == doneToolOutput("notified:1")
+            },
             "request 2 must carry this turn's tool round: ${second.history}",
         )
         assertTrue(

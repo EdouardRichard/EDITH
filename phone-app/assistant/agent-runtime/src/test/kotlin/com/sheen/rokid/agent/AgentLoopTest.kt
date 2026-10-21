@@ -388,6 +388,26 @@ class AgentLoopTest {
         assertEquals(RecordedAuditEntry("turn-7", "device.get_volume", "executed", "ok"), audit.entries.single())
     }
 
+    @Test fun `an unmigrated failure keeps the legacy detail's stable code in the step and the audit`() {
+        // The registry projects an ActionResult outcome but fabricates no execution code, and the legacy detail still
+        // names one. The step label and the audit line are content-free, so they keep that code (the same identity
+        // ErrorTracker uses) instead of collapsing it to the outcome token.
+        val executor = executorOf("open_app")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Refused, "APP_NOT_VISIBLE") }
+        val audit = RecordingAuditSink()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("call-1", "open_app"))), reply(text = "没能打开")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor)), audit = audit).run(request())
+
+        assertEquals(listOf(AgentStep(1, "open_app", "APP_NOT_VISIBLE")), run.steps)
+        assertEquals(
+            RecordedAuditEntry("turn-7", "open_app", "executed", "APP_NOT_VISIBLE"),
+            audit.entries.single(),
+        )
+    }
+
     // ---------------------------------------------------------------- tool status callbacks (0.24 S4 Task 17)
 
     @Test fun `a tool call reports START before it executes and END after it returns`() {
@@ -764,6 +784,26 @@ class AgentLoopTest {
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals("recovered", run.finalText)
         assertEquals(listOf(AgentStep(1, "lookup", "TOOL_THREW")), run.steps)
+    }
+
+    @Test fun `a defensive failure after dispatch does not claim the call changed nothing`() {
+        // An `Error` escapes `ToolRegistry.execute`'s `Exception` guard and surfaces through the future as an
+        // `ExecutionException`. The call was dispatched, so the result is Uncertain with no tri-state fact; the loop
+        // still treats it as one recoverable failed step.
+        val executor = executorOf("lookup").apply { failure = AssertionError("boom") }
+        val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "recovered")))
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(listOf(AgentStep(1, "lookup", "TOOL_THREW")), run.steps)
+        assertEquals(
+            ModelHistoryItem.ToolOutput(
+                "c1",
+                envelope(ToolExecution(outcome = ToolOutcome.Uncertain, code = "TOOL_THREW", uncertain = true), ""),
+            ),
+            gateway.requests[1].history.last(),
+        )
     }
 
     // ---------------------------------------------------------------- terminal tools

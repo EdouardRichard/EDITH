@@ -352,10 +352,10 @@ class AgentLoopGuardTest {
 
     @Test
     fun `three identical device failures with different timings fail as REPEATED_ERROR`() {
-        // The production shape: ToolRegistry wraps a failed ActionResult as `Refused: <detail>` and DeviceTool's detail
-        // is the whole envelope, whose timing block differs on every call. The error.code inside the JSON is the
-        // identity; if the loop hashes the payload body instead, these are three different failures and the run
-        // never terminates.
+        // The production shape: ToolRegistry projects a failed ActionResult onto the matching outcome and its detail
+        // becomes the envelope's `data` (the pre-0.3 `Refused:` prefix is gone). DeviceTool's detail is the whole device
+        // envelope, whose timing block differs on every call. The error.code inside the JSON is the identity; if the
+        // loop hashes the payload body instead, these are three different failures and the run never terminates.
         val executor = executor(descriptor("device"))
         var attempt = 0
         executor.outcome = { _, _ ->

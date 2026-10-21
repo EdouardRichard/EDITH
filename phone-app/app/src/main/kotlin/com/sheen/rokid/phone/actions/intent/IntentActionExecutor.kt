@@ -171,8 +171,9 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
  * of a model-chosen action string.
  *
  * Failure policy, which the registry depends on:
- * - a refusal is [ActionOutcome.Refused] with the code **exactly** as its detail, so the model sees
- *   `"Refused: <CODE>"` rather than a broken-tool failure;
+ * - a refusal is [ActionOutcome.Refused] with the code **exactly** as its detail; the registry projects the outcome
+ *   and the code reaches the model as the envelope's `data` (the pre-0.3 `"Refused: <CODE>"` prefix is gone), so a
+ *   refusal reads as a decision rather than a broken tool;
  * - nothing throws: malformed arguments, an unknown tool name, a missing capability and a declining launcher all
  *   become refusals;
  * - a refusal performs no side effect.
@@ -191,8 +192,9 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
  * action string, and `dial` refuses without `CALL_PHONE` rather than silently opening the dialer instead.
  *
  * Failure policy, which the registry depends on:
- * - a refusal is [ActionOutcome.Refused] with the code **exactly** as its detail, so the model sees
- *   `"Refused: <CODE>"` rather than a broken-tool failure;
+ * - a refusal is [ActionOutcome.Refused] with the code **exactly** as its detail; the registry projects the outcome
+ *   and the code reaches the model as the envelope's `data` (the pre-0.3 `"Refused: <CODE>"` prefix is gone), so a
+ *   refusal reads as a decision rather than a broken tool;
  * - nothing throws: malformed arguments, an unknown tool name, a missing capability and a declining launcher all
  *   become refusals;
  * - a refusal performs no side effect.

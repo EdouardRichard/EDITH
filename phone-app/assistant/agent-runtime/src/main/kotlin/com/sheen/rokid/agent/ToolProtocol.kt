@@ -94,12 +94,13 @@ data class ToolResult(
 
     companion object {
         /**
-         * A failed step the framework itself produced: an unknown tool, unparsable arguments, a thrown executor, or a
-         * policy/confirmation refusal.
+         * A failed step the framework synthesized **before dispatch**, or before any tool produced a result: an unknown
+         * tool, unparsable arguments, or a policy/confirmation refusal.
          *
          * The action was never dispatched, so `accepted=false` and `applied=false` are facts, not guesses; no observation
          * is fabricated. The code is the stable machine identity the loop's error detectors already key on — the old
-         * `"Failed: "`/`"Refused: "` prefix is deliberately gone.
+         * `"Failed: "`/`"Refused: "` prefix is deliberately gone. A **dispatched** call that threw is not this shape:
+         * see [threw].
          */
         fun error(id: String, safeCode: String): ToolResult = ToolResult(
             id = id,
@@ -112,6 +113,25 @@ data class ToolResult(
             ),
             observation = null,
         )
+
+        /**
+         * A **dispatched** call whose executor threw: the tool may have applied part of the call, so no tri-state fact
+         * is known (`accepted`/`applied`/`changed` stay `null`) and the result is explicitly [ToolExecution.uncertain].
+         *
+         * The stable code is `TOOL_THREW`; no observation is fabricated.
+         */
+        fun threw(id: String): ToolResult = ToolResult(
+            id = id,
+            ok = false,
+            execution = ToolExecution(
+                outcome = ToolOutcome.Uncertain,
+                code = TOOL_THREW,
+                uncertain = true,
+            ),
+            observation = null,
+        )
+
+        private const val TOOL_THREW = "TOOL_THREW"
     }
 }
 

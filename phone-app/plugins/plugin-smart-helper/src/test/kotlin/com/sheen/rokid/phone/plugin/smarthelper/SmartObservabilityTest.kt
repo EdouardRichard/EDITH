@@ -164,7 +164,7 @@ class SmartObservabilityTest {
         }
 
         assertEquals(
-            "P3_TOOL call=open_app ok=false detail=Refused: APP_NOT_VISIBLE",
+            "P3_TOOL call=open_app ok=false detail=APP_NOT_VISIBLE",
             lines.single { it.startsWith("P3_TOOL") },
         )
     }
