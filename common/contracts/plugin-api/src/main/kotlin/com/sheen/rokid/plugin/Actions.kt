@@ -106,10 +106,23 @@ data class ActionDescriptor(
      * not a wire contract.
      */
     val screenObservation: Boolean = false,
+    /**
+     * edith-0.3 Phase 4A (A1): the **model-facing** description of when and how to use this action.
+     *
+     * Unlike [title] — the short, user-visible row copy — this is the prose the model reads in the tool schema: when to
+     * choose the action (and when not to), what a failure means, and what the arguments constrain. The default keeps
+     * every pre-4A descriptor byte-for-byte: a plugin that declares no description gets its title, exactly the copy the
+     * model received before this field existed.
+     *
+     * The value must be non-blank: an empty description would offer the model a tool it cannot decide to call. The
+     * user-visible label channel (`ToolLabelMap`) stays a name→label table and is not derived from this field.
+     */
+    val description: String = title,
 ) {
     init {
         require(name.isNotBlank())
         require(title.isNotBlank())
+        require(description.isNotBlank())
         require(scope.isNotBlank())
         require(auditTargetArgument == null || auditTargetArgument.isNotBlank()) {
             "auditTargetArgument must be null or non-blank"

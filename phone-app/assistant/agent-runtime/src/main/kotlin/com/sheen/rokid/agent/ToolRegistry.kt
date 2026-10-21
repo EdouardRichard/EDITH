@@ -153,7 +153,9 @@ class ToolRegistry(
 
 private fun ActionDescriptor.toToolDescriptor() = ToolDescriptor(
     name = name,
-    description = title,
+    // edith-0.3 Phase 4A (A1): the model-facing description is the new field; its default is the title, which keeps
+    // every descriptor that declares no description on the pre-4A copy.
+    description = description,
     parametersJson = parametersJson,
     risk = risk,
     requiresConfirmation = requiresConfirmation,

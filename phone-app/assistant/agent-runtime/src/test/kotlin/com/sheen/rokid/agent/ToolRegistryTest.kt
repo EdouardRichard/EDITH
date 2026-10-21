@@ -1,5 +1,6 @@
 package com.sheen.rokid.agent
 
+import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.ImageRef
@@ -7,6 +8,7 @@ import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.plugin.ToolExecution
 import com.sheen.rokid.plugin.ToolObservation
 import com.sheen.rokid.plugin.ToolOutcome
+import com.sheen.rokid.plugin.ToolSpec
 import com.sheen.rokid.plugin.ToolVision
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
@@ -68,6 +70,35 @@ class ToolRegistryTest {
         assertFalse(descriptor.idempotent)
         assertFalse(descriptor.reversible)
         assertEquals("device", descriptor.scope)
+    }
+
+    @Test fun `a custom description is projected while an undeclared one keeps the title`() {
+        // edith-0.3 Phase 4A (A1): the model reads the long description; the short title stays the user-visible label
+        // source, so a tool that declares no description keeps the pre-4A projected copy exactly.
+        val described = ActionDescriptor(
+            name = "device",
+            title = "设备控制",
+            parametersJson = """{"type":"object"}""",
+            risk = RiskLevel.L1,
+            requiresConfirmation = false,
+            idempotent = true,
+            reversible = true,
+            scope = "device",
+            description = "Read the screen or change the phone when the wearer asks for it.",
+        )
+        val describedTool = ToolRegistry(listOf(RecordingActionExecutor(listOf(described)))).descriptors().single()
+
+        assertEquals(
+            "Read the screen or change the phone when the wearer asks for it.",
+            ToolSpec(describedTool.name, describedTool.description, describedTool.parametersJson).description,
+        )
+
+        val titledTool = ToolRegistry(listOf(executorOf("device"))).descriptors().single()
+        assertEquals(
+            "Title of device",
+            ToolSpec(titledTool.name, titledTool.description, titledTool.parametersJson).description,
+            "without a declared description the title still stands in, so user labels are unchanged",
+        )
     }
 
     @Test fun `registration rejects a schema that is not well formed JSON and names the tool`() {
