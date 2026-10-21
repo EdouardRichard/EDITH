@@ -877,10 +877,12 @@ class AgentLoopGuardTest {
             run.metrics.toolMillis < 300L,
             "the human wait must stay out of toolMs: ${run.metrics.toolMillis}",
         )
-        val toolMs = Regex(" toolMs=(\\d+) ").find(metricLines.single())?.groupValues?.get(1)?.toLong()
+        // Phase 3 Task 4 adds one per-call P3_TOOLRESULT line on the same sink; the run-level line is the subject here.
+        val metricLine = metricLines.single { it.startsWith("P3_METRIC") }
+        val toolMs = Regex(" toolMs=(\\d+) ").find(metricLine)?.groupValues?.get(1)?.toLong()
         assertEquals(
             run.metrics.toolMillis, toolMs,
-            "P3_METRIC.toolMs must carry the same machine-time count: ${metricLines.single()}",
+            "P3_METRIC.toolMs must carry the same machine-time count: $metricLine",
         )
         executor.awaitWorkers(1_000)
     }
@@ -1118,6 +1120,181 @@ class AgentLoopGuardTest {
         assertTrue(gateway.requests.size == 1)
         executor.release()
         runner.join(5_000)
+    }
+
+    // ---------------------------------------------------------------- P3_TOOLRESULT (Phase 3 Task 4)
+
+    /** The per-call lines only; the loop's one run-level `P3_METRIC` shares the same sink. */
+    private fun toolResultLines(lines: List<String>): List<String> = lines.filter { it.startsWith("P3_TOOLRESULT") }
+
+    /**
+     * P3-9 (spec §7.1): one count-only `P3_TOOLRESULT` line per tool call, on the loop's existing sink.
+     *
+     * The exact literal pins the required field order. `shape` is `ad4e36aa`, the independently computed digest of this
+     * done envelope's shape (all strings masked, numbers zeroed, `{"ok":true}` kept); the envelope's own algorithm is
+     * pinned separately in `ToolResultEnvelopeTest`. No argument, payload or observation text may reach the line.
+     */
+    @Test
+    fun `a tool call emits one P3_TOOLRESULT line with the exact field order and no content`() {
+        val lines = mutableListOf<String>()
+        val executor = executor(descriptor("lookup"))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, """{"ok":true}""") }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "lookup", """{"secret":"MARKER-ARGUMENT"}"""))),
+                reply(text = "答"),
+            ),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor)), metricLine = { lines += it }).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(
+            listOf(
+                "P3_TOOLRESULT turn=turn-guard call=c1 tool=lookup outcome=done code=- recoverable=false " +
+                    "accepted=- applied=- verified=- changed=- uncertain=false partial=false observation=none " +
+                    "vision=not_requested screenChars=- images=0 shape=ad4e36aa",
+            ),
+            toolResultLines(lines),
+        )
+        assertFalse(lines.any { it.contains("MARKER-ARGUMENT") }, lines.toString())
+    }
+
+    @Test
+    fun `two calls in one round emit one line each`() {
+        val lines = mutableListOf<String>()
+        val executor = executor(descriptor("lookup"))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done") }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "lookup", """{"page":1}"""), call("c2", "lookup", """{"page":2}"""))),
+                reply(text = "答"),
+            ),
+        )
+
+        loop(gateway, ToolRegistry(listOf(executor)), metricLine = { lines += it }).run(request())
+
+        assertEquals(listOf("c1", "c2"), toolResultLines(lines).map { Regex(" call=(\\S+) ").find(it)!!.groupValues[1] })
+    }
+
+    @Test
+    fun `a thrown call emits an uncertain line with unknown tri states`() {
+        val lines = mutableListOf<String>()
+        val executor = executor(descriptor("open"))
+        executor.failure = RuntimeException("boom")
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "好")),
+        )
+
+        loop(gateway, ToolRegistry(listOf(executor)), metricLine = { lines += it }).run(request())
+
+        val line = toolResultLines(lines).single()
+        assertTrue(line.contains(" tool=open outcome=uncertain code=TOOL_THREW "), line)
+        assertTrue(line.contains(" accepted=- applied=- verified=- changed=- uncertain=true "), line)
+        assertTrue(Regex(" shape=[0-9a-f]{8}$").containsMatchIn(line), line)
+    }
+
+    @Test
+    fun `a refused call emits its own line with the legacy stable code`() {
+        val lines = mutableListOf<String>()
+        val executor = executor(descriptor("shell"))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Refused, "STATE_UNCHANGED") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "shell"))), reply(text = "好")),
+        )
+
+        loop(gateway, ToolRegistry(listOf(executor)), metricLine = { lines += it }).run(request())
+
+        val line = toolResultLines(lines).single()
+        assertTrue(line.contains(" tool=shell outcome=refused code=STATE_UNCHANGED "), line)
+        assertTrue(line.contains(" accepted=- applied=- verified=- changed=- uncertain=false "), line)
+    }
+
+    @Test
+    fun `a confirmed timeout emits a timeout line`() {
+        val lines = mutableListOf<String>()
+        val executor = SleepingExecutor(descriptor("slow", timeoutMillis = 50L), sleepMillis = 5_000L)
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "slow"))), reply(text = "先看看屏幕")),
+        )
+
+        loop(gateway, ToolRegistry(listOf(executor)), metricLine = { lines += it }).run(request())
+
+        val line = toolResultLines(lines).single()
+        assertTrue(line.contains(" tool=slow outcome=timeout code=ACTION_TIMEOUT "), line)
+        assertTrue(line.contains(" accepted=- applied=- verified=- changed=- uncertain=false "), line)
+        executor.awaitWorkers(1_000)
+    }
+
+    @Test
+    fun `a call carrying one image reports that call's image count and no artifact identity`() {
+        val lines = mutableListOf<String>()
+        val image = ImageRef("artifact-per-call", "image/jpeg", 768, 1664, "sha256-per-call")
+        val executor = executor(descriptor("shot"))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done", images = listOf(image)) }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "shot"))), reply(text = "好")),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor)), metricLine = { lines += it }).run(request())
+
+        val line = toolResultLines(lines).single()
+        assertTrue(line.contains(" observation=image "), line)
+        assertTrue(line.contains(" images=1 "), line)
+        assertFalse(line.contains("artifact-per-call"), line)
+        assertFalse(line.contains("sha256-per-call"), line)
+        assertEquals(1, run.metrics.images, "the run-level image count is unchanged")
+    }
+
+    @Test
+    fun `a failed screen call logs the observation kind and screen length but never the screen text`() {
+        val lines = mutableListOf<String>()
+        val executor = executor(descriptor("open", screenObservation = true))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val observation = ToolObservation(
+            foregroundPackage = "com.secret.package",
+            screen = "SECRET-SCREEN-TEXT",
+            vision = ToolVision.NotRequested,
+        )
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "好")),
+        )
+
+        loop(
+            gateway,
+            ToolRegistry(listOf(executor)),
+            metricLine = { lines += it },
+        ).run(request(observationSource = ToolObservationSource { observation }))
+
+        val line = toolResultLines(lines).single()
+        assertTrue(line.contains(" observation=text "), line)
+        assertTrue(line.contains(" vision=not_requested "), line)
+        assertTrue(line.contains(" screenChars=18 "), line)
+        assertFalse(line.contains("SECRET-SCREEN-TEXT"), line)
+        assertFalse(line.contains("com.secret.package"), line)
+    }
+
+    @Test
+    fun `a throwing metric sink cannot change the tool result or the run outcome`() {
+        val executor = executor(descriptor("lookup"))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "done") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "答")),
+        )
+        val agent = AgentLoop(
+            gateway,
+            ToolRegistry(listOf(executor)),
+            ScriptedPolicy(),
+            ProgressGuard(),
+            RecordingAuditSink(),
+            FakeClock(),
+            metricLine = { error("logger exploded") },
+        )
+
+        val run = agent.run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome, "telemetry is never a verdict")
+        assertEquals("ok", run.steps.single().result)
     }
 
     // ---------------------------------------------------------------- fakes

@@ -595,6 +595,69 @@ class OpenToolTest {
     }
 
     @Test
+    fun `a verified launch emits one count only P3_OBSERVE tool line`() {
+        val lines = mutableListOf<String>()
+        val image = openImage("artifact-observe-line")
+        val open = launchedOpen(
+            shell = ShellPipeline().shell,
+            catalog = knownMusic(),
+            target = "com.example.music",
+            capture = { PerceptionScreenshotResult.Image(image, image.mime, image.width, image.height) },
+            observe = { openObservation(screen = "SECRET-SCREEN-TEXT") },
+        )
+        val previous = com.sheen.rokid.phone.platform.P3Log.sink
+        com.sheen.rokid.phone.platform.P3Log.sink = { lines += it }
+        try {
+            val result = open.execute("""{"target":"com.example.music"}""")
+            assertEquals(ActionOutcome.Done, result.outcome)
+        } finally {
+            com.sheen.rokid.phone.platform.P3Log.sink = previous
+        }
+
+        val observeLines = lines.filter { it.startsWith("P3_OBSERVE") }
+        assertEquals(lines.toString(), 1, observeLines.size)
+        assertTrue(
+            "the exact count-only shape is required: ${observeLines.single()}",
+            Regex("^P3_OBSERVE source=tool tool=open observeMs=\\d+ captureMs=\\d+ result=ok$")
+                .matches(observeLines.single()),
+        )
+        assertFalse(observeLines.single(), observeLines.single().contains("SECRET-SCREEN-TEXT"))
+        assertFalse(observeLines.single(), observeLines.single().contains("com.android.launcher"))
+    }
+
+    @Test
+    fun `an unverified launch still reports its capture attempt once`() {
+        // Every real screen attempt reports, not only the verified success: the failure's observation is the screen the
+        // model needs to correct itself, so its latency is exactly what acceptance measures.
+        val lines = mutableListOf<String>()
+        val open = OpenTool(
+            shell = ShellPipeline().shell,
+            catalog = knownMusic(),
+            foreground = { "com.android.launcher" },
+            foregroundActivity = { "com.android.launcher/.Launcher" },
+            rootPackage = { "com.android.launcher" },
+            waitForForeground = { _, _ -> false },
+            capture = { PerceptionScreenshotResult.Disabled },
+            observe = { openObservation() },
+        )
+        val previous = com.sheen.rokid.phone.platform.P3Log.sink
+        com.sheen.rokid.phone.platform.P3Log.sink = { lines += it }
+        try {
+            val result = open.execute("""{"target":"com.example.music"}""")
+            assertEquals(ActionOutcome.Failed, result.outcome)
+        } finally {
+            com.sheen.rokid.phone.platform.P3Log.sink = previous
+        }
+
+        val observeLines = lines.filter { it.startsWith("P3_OBSERVE") }
+        assertEquals(lines.toString(), 1, observeLines.size)
+        assertTrue(
+            "the disabled capture must be reported as disabled: ${observeLines.single()}",
+            observeLines.single().contains(" result=disabled"),
+        )
+    }
+
+    @Test
     fun `an unverified launch observes the current screen and attaches one image`() {
         val pipeline = ShellPipeline()
         val image = openImage("artifact-state-unchanged")

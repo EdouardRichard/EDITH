@@ -297,7 +297,7 @@ class ToolCatalog(
         val observed = if (!attachPicture || isArgumentRefusal(tool, result)) {
             ObservationAttempt(textObservation(), emptyList())
         } else {
-            screenAttempt(attachPicture = result.images.isEmpty())
+            screenAttempt(tool, attachPicture = result.images.isEmpty())
         }
         // Task 6 review: only the final image list may claim `vision = ok`; `take(1)` keeps one result to one image even
         // if a future tool ever returns more than one.
@@ -341,14 +341,24 @@ class ToolCatalog(
      * (never a `TOOL_THREW`), and a missing or throwing observation source is `unavailable/no_source` instead of a
      * silent null. A source that already reported the screen unavailable keeps its own reason when no image arrived
      * (for example `no_accessibility`): that reason is the more useful of the two failure strings.
+     *
+     * P3-9 (Phase 3 Task 4): one real attempt that captures reports one count-only `P3_OBSERVE source=tool` line with
+     * the two measured latencies and the capture's result token ([tool] is the tool being enriched). A path that takes
+     * no picture ([attachPicture] false - an argument refusal or a tool that already attached its own image) measures no
+     * capture and emits no line, so `result=disabled` always means the capture port really answered `Disabled`.
      */
-    private fun screenAttempt(attachPicture: Boolean): ObservationAttempt {
+    private fun screenAttempt(tool: String, attachPicture: Boolean): ObservationAttempt {
+        val captureStarted = System.nanoTime()
         val captured = if (attachPicture) {
             runCatching { capture() }.getOrElse { PerceptionScreenshotResult.Unavailable(SCREENSHOT_FAILED) }
         } else {
             PerceptionScreenshotResult.Disabled
         }
+        val captureNanos = System.nanoTime() - captureStarted
+        val observeStarted = System.nanoTime()
         val source = runCatching { observe() }.getOrNull()
+        val observeNanos = System.nanoTime() - observeStarted
+        if (attachPicture) ToolObserveTelemetry.emit(tool, observeNanos, captureNanos, captured)
         val image = (captured as? PerceptionScreenshotResult.Image)?.image
         val observation = when {
             source != null -> source.copy(
@@ -413,6 +423,43 @@ class ToolCatalog(
         private const val VISION_NOT_ATTEMPTED = "not_attempted"
         private const val SCREENSHOT_FAILED = "SCREENSHOT_FAILED"
     }
+}
+
+/**
+ * P3-9 (edith-0.3 Phase 3 Task 4): the one count-only `P3_OBSERVE source=tool` line per real observe/capture attempt.
+ *
+ * `source=loop` (the best-effort failure capture) is emitted by the plugin's observation source; this line is the tool
+ * side, so acceptance can tell a slow platform read from a slow model/turn. Both emitters are the **tool call sites**
+ * (`ToolCatalog` and `OpenTool`), never the shared source lambdas in the composition: those lambdas are consumed by two
+ * tools, and timing them there would either lose the tool name or count the same capture twice. Each tool emits exactly
+ * once per attempt that really captured.
+ *
+ * Only milliseconds, the tool name and the capture's own result token are carried; the reason lives in the observation
+ * (and, for the loop source, in `P3_OBSERVE source=loop reason=`), and no screen, package, title, command or number can
+ * reach this line.
+ */
+internal object ToolObserveTelemetry {
+
+    /** The exact line shape the Phase 3 device acceptance greps. */
+    fun line(tool: String, observeNanos: Long, captureNanos: Long, capture: PerceptionScreenshotResult): String =
+        "P3_OBSERVE source=tool tool=$tool observeMs=${millis(observeNanos)} " +
+            "captureMs=${millis(captureNanos)} result=${resultToken(capture)}"
+
+    /** Emits one line through the phone-side sink; the call sites are already inside the turn's failure path. */
+    fun emit(tool: String, observeNanos: Long, captureNanos: Long, capture: PerceptionScreenshotResult) {
+        P3Log.line(line(tool, observeNanos, captureNanos, capture))
+    }
+
+    /** Nanoseconds -> whole milliseconds, never negative (integer division keeps the field deterministic). */
+    private fun millis(nanos: Long): Long = (nanos / NANOS_PER_MILLI).coerceAtLeast(0L)
+
+    private fun resultToken(capture: PerceptionScreenshotResult): String = when (capture) {
+        is PerceptionScreenshotResult.Image -> "ok"
+        PerceptionScreenshotResult.Disabled -> "disabled"
+        is PerceptionScreenshotResult.Unavailable -> "unavailable"
+    }
+
+    private const val NANOS_PER_MILLI = 1_000_000L
 }
 
 /** The lenient parser model-authored arguments need (unquoted members are accepted). */

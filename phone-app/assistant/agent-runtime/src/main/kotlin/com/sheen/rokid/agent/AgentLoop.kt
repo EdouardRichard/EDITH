@@ -438,12 +438,12 @@ class AgentLoop(
      */
     private val maxObservations: Int = 24,
     /**
-     * 0.25 Task 14 (R78): where the run's count-only metric line goes. `{}` (the default) emits nothing, keeping every
+     * 0.25 Task 14 (R78): where the run's count-only metric lines go. `{}` (the default) emits nothing, keeping every
      * pre-0.25 caller and test byte-for-byte; the production plugin passes its log sink. The loop emits exactly one
-     * `P3_METRIC` line per run. Provider cache accounting is **not** a run total: it is `P3_CACHE`, emitted by
-     * `ModelClientGateway` once per model request (0.3 Phase 2 Task 11), so the proactive path and every overflow
-     * re-send are covered. The loop still reports the same numbers in [AgentRun.metrics] for a caller that has its own
-     * consumer.
+     * `P3_METRIC` line per run, plus (edith-0.3 Phase 3 Task 4, P3-9) one `P3_TOOLRESULT` line per tool call. Provider
+     * cache accounting is **not** a run total: it is `P3_CACHE`, emitted by `ModelClientGateway` once per model request
+     * (0.3 Phase 2 Task 11), so the proactive path and every overflow re-send are covered. The loop still reports the
+     * same numbers in [AgentRun.metrics] for a caller that has its own consumer.
      *
      * Observability must never change the outcome, so a throwing sink is swallowed like the display callbacks are.
      */
@@ -965,6 +965,12 @@ class AgentLoop(
                     registry.beginTurn()
                 }
                 val result = observedFailure(execution.result, descriptor, request.observationSource)
+                // edith-0.3 Phase 3 Task 4 (P3-9): one count-only `P3_TOOLRESULT` per tool call, after the best-effort
+                // failure observation has been attached (so `observation`/`vision`/`screenChars`/`images` describe the
+                // final result the model will see) and before any output is appended or redacted. The `shape` digest is
+                // the only envelope fingerprint: no screen, package, title, command, number or artifact id can ride it.
+                // Observability is never a verdict, so a throwing sink is swallowed like the run-level line's.
+                runCatching { metricLine(renderToolResult(request.turnId, call, result)) }
                 // R60: a call that did not stop within the grace window ends the run; no later write may run while the
                 // previous one may still be in flight.
                 if (execution.uncertain) {
@@ -1519,6 +1525,62 @@ class AgentLoop(
             outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps, usage,
             spentObservations, planNudgeCap, metrics,
         )
+    }
+
+    /**
+     * edith-0.3 Phase 3 Task 4 (P3-9, design §7.1): the one count-only `P3_TOOLRESULT` line of one tool call.
+     *
+     * It is emitted after [observedFailure], so every value describes the **final** result: a screen tool's failure
+     * carries the observation and any capture image the loop attached, and a policy/confirmation refusal that never ran
+     * reports the framework's own `accepted=false`/`applied=false` facts. The exact field order is the contract the
+     * device acceptance reads; only counts, stable codes, booleans and the eight-hex [ToolResultEnvelope.shapeDigest]
+     * appear. The screen text is reduced to [ToolObservation.screen]'s length, images to their count, and no artifact id,
+     * package, title, command or number can reach the line.
+     *
+     * `accepted`/`applied`/`verified`/`changed` are `-` when the result honestly does not know the fact (never `f` for
+     * unknown). `observation` is `image` whenever this call produced at least one picture, `text` for an observation
+     * without one, and `none` for no observation at all; `vision` follows the observation and is `not_requested` when
+     * there is none. `code` is the execution's stable code, falling back to the code an unmigrated tool's legacy detail
+     * names, and `-` when it names none.
+     *
+     * A detector-skipped or detector-critical call never reaches this point: it has no [ToolResult] at all (its answer is
+     * a synthetic loop payload), so it emits no line rather than invented execution facts. A cancelled call is likewise
+     * unfinished — no output is appended for it and no result line is written.
+     */
+    private fun renderToolResult(turnId: String, call: ToolCall, result: ToolResult): String = buildString {
+        val execution = result.execution
+        append("P3_TOOLRESULT")
+        append(" turn=").append(turnId)
+        append(" call=").append(call.id)
+        append(" tool=").append(call.name)
+        append(" outcome=").append(execution.outcome.wireValue)
+        append(" code=").append(execution.code ?: legacyCodeOf(result.data) ?: "-")
+        append(" recoverable=").append(execution.recoverable)
+        append(" accepted=").append(triState(execution.accepted))
+        append(" applied=").append(triState(execution.applied))
+        append(" verified=").append(triState(execution.verified))
+        append(" changed=").append(triState(execution.changed))
+        append(" uncertain=").append(execution.uncertain)
+        append(" partial=").append(execution.partial)
+        append(" observation=").append(observationKind(result))
+        append(" vision=").append((result.observation?.vision ?: ToolVision.NotRequested).wireValue)
+        append(" screenChars=").append(result.observation?.screen?.length ?: "-")
+        append(" images=").append(result.images.size)
+        append(" shape=").append(ToolResultEnvelope.shapeDigest(result.payload) ?: "-")
+    }
+
+    /** P3-9: `t`/`f` for a known tri-state fact, `-` for the honest "unknown" `null`. */
+    private fun triState(value: Boolean?): String = when (value) {
+        true -> "t"
+        false -> "f"
+        null -> "-"
+    }
+
+    /** P3-9: what kind of perception this call returned — a picture, text, or nothing. */
+    private fun observationKind(result: ToolResult): String = when {
+        result.images.isNotEmpty() -> "image"
+        result.observation != null -> "text"
+        else -> "none"
     }
 
     /**

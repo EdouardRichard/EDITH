@@ -623,6 +623,146 @@ class ToolCatalogTest {
         assertEquals(false, execution.recoverable)
     }
 
+    // - P3-9: P3_OBSERVE source=tool timing -
+
+    @Test
+    fun `a real screen attempt emits one count only P3_OBSERVE tool line`() {
+        val lines = mutableListOf<String>()
+        val catalog = catalog(
+            observe = { screenFacts() },
+            capture = { imageResult() },
+        )
+        val previous = com.sheen.rokid.phone.platform.P3Log.sink
+        com.sheen.rokid.phone.platform.P3Log.sink = { lines += it }
+        try {
+            val result = catalog.execute("dial", """{"number":"10086"}""")
+            assertEquals(ActionOutcome.Done, result.outcome)
+        } finally {
+            com.sheen.rokid.phone.platform.P3Log.sink = previous
+        }
+
+        val observeLines = lines.filter { it.startsWith("P3_OBSERVE") }
+        assertEquals(lines.toString(), 1, observeLines.size)
+        assertTrue(
+            "the exact count-only shape is required: ${observeLines.single()}",
+            Regex("^P3_OBSERVE source=tool tool=dial observeMs=\\d+ captureMs=\\d+ result=ok$")
+                .matches(observeLines.single()),
+        )
+        assertFalse("no screen text may reach the line: ${observeLines.single()}", observeLines.single().contains("OK"))
+        assertFalse(
+            "no package name may reach the line: ${observeLines.single()}",
+            observeLines.single().contains("com.example.launcher"),
+        )
+    }
+
+    @Test
+    fun `a disabled and an unavailable capture report their own result token`() {
+        fun lineFor(capture: () -> PerceptionScreenshotResult): String {
+            val lines = mutableListOf<String>()
+            val catalog = catalog(observe = { screenFacts() }, capture = capture)
+            val previous = com.sheen.rokid.phone.platform.P3Log.sink
+            com.sheen.rokid.phone.platform.P3Log.sink = { lines += it }
+            try {
+                catalog.execute("shell", """{"command":"id"}""")
+            } finally {
+                com.sheen.rokid.phone.platform.P3Log.sink = previous
+            }
+            return lines.single { it.startsWith("P3_OBSERVE") }
+        }
+
+        assertTrue(
+            Regex("^P3_OBSERVE source=tool tool=shell observeMs=\\d+ captureMs=\\d+ result=disabled$")
+                .matches(lineFor { PerceptionScreenshotResult.Disabled }),
+        )
+        assertTrue(
+            Regex("^P3_OBSERVE source=tool tool=shell observeMs=\\d+ captureMs=\\d+ result=unavailable$")
+                .matches(lineFor { PerceptionScreenshotResult.Unavailable("SCREENSHOT_FAILED") }),
+        )
+    }
+
+    @Test
+    fun `a text only observation emits no tool observe line because no capture was attempted`() {
+        val lines = mutableListOf<String>()
+        var captureCalls = 0
+        val catalog = catalog(
+            shell = ShellTool(FakeShell { command -> ShellResult(command, 0, "", "") }),
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+        val previous = com.sheen.rokid.phone.platform.P3Log.sink
+        com.sheen.rokid.phone.platform.P3Log.sink = { lines += it }
+        try {
+            val result = catalog.execute("shell", """{"command":""}""")
+            assertEquals("INVALID_ARGUMENTS", result.execution?.code)
+        } finally {
+            com.sheen.rokid.phone.platform.P3Log.sink = previous
+        }
+
+        assertEquals(0, captureCalls)
+        assertTrue(
+            "an observation-only attempt has no capture timing to report: $lines",
+            lines.none { it.startsWith("P3_OBSERVE") },
+        )
+    }
+
+    @Test
+    fun `the catalog does not double count the open tool's own observation`() {
+        // `open` enriches itself (OpenTool), and the catalog delegates to it. Exactly one real capture happened, so
+        // exactly one line may be emitted: the catalog must not wrap the delegation in a second measurement.
+        val shell = FakeShell { command ->
+            when {
+                command.startsWith("cmd package resolve-activity") -> ShellResult(
+                    command,
+                    0,
+                    "priority=0 preferredOrder=0\ncom.example.music/.MainActivity\n",
+                    "",
+                )
+                command.startsWith("am start -W") -> ShellResult(command, 0, "Status: ok\n", "")
+                else -> ShellResult(command, 0, "", "")
+            }
+        }
+        val open = OpenTool(
+            shell = shell,
+            catalog = object : AppCatalog {
+                override fun visibleApps(): List<AppEntry> =
+                    listOf(AppEntry("com.example.music", "Music", "android.intent.action.MAIN"))
+            },
+            foreground = { "com.example.music" },
+            foregroundActivity = { "com.example.music/.MainActivity" },
+            rootPackage = { "com.example.music" },
+            waitForForeground = { _, _ -> true },
+            capture = { imageResult() },
+            observe = { screenFacts() },
+        )
+        val registry = RefRegistry()
+        val catalog = ToolCatalog(
+            device = DeviceTool(
+                RecordingDeviceOperations(),
+                ScreenProjector(ObservationRenderer(registry), registry),
+            ),
+            shell = ShellTool(null),
+            open = open,
+            dial = DialTool(RecordingExecutor()) { true },
+            a11yAvailable = { true },
+            shellAvailable = { true },
+            callAvailable = { true },
+        )
+        val lines = mutableListOf<String>()
+        val previous = com.sheen.rokid.phone.platform.P3Log.sink
+        com.sheen.rokid.phone.platform.P3Log.sink = { lines += it }
+        try {
+            val result = catalog.execute("open", """{"target":"com.example.music"}""")
+            assertEquals(ActionOutcome.Done, result.outcome)
+        } finally {
+            com.sheen.rokid.phone.platform.P3Log.sink = previous
+        }
+
+        val observeLines = lines.filter { it.startsWith("P3_OBSERVE") }
+        assertEquals("one real capture, one line: $lines", 1, observeLines.size)
+        assertTrue("the line names the open tool: ${observeLines.single()}", observeLines.single().contains(" tool=open "))
+        assertTrue("the line reports the capture: ${observeLines.single()}", observeLines.single().endsWith(" result=ok"))
+    }
+
     @Test
     fun `a successful dial carries the observation one image and accepted only facts`() {
         val executor = RecordingExecutor()

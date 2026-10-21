@@ -11,6 +11,9 @@ import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -275,5 +278,110 @@ class ToolResultEnvelopeTest {
 
         assertEquals(listOf("done", "refused", "failed", "timeout", "uncertain", "cancelled"), outcomes)
         assertEquals(listOf("ok", "disabled", "unavailable", "not_requested"), visions)
+    }
+
+    // ---------------------------------------------------------------- Phase 3 Task 4: content-free shape digest
+
+    /**
+     * P3-9 (spec §7.2): the digest describes the envelope **shape**, never its content.
+     *
+     * Two payloads whose string and number values differ, including a nested array, must hash identically; a changed
+     * boolean is a different shape (booleans are preserved, not masked). This is what lets the device
+     * `P3_TOOLRESULT shape=` line prove the runtime payload is an envelope without logging one byte of its values.
+     */
+    @Test
+    fun `shape digest ignores string and number values but keeps booleans nulls and keys`() {
+        val first = """{"name":"one","count":1,"ratio":1.5,"enabled":true,"absent":null,"items":[{"label":"a","n":2}]}"""
+        val second = """{"name":"two","count":999,"ratio":-0.25,"enabled":true,"absent":null,"items":[{"label":"b","n":0}]}"""
+        val booleanChanged = first.replace(""""enabled":true""", """"enabled":false""")
+
+        val digest = ToolResultEnvelope.shapeDigest(first)
+        assertNotNull(digest)
+        assertEquals(digest, ToolResultEnvelope.shapeDigest(second), "only values differ, so the shapes are identical")
+        assertNotEquals(digest, ToolResultEnvelope.shapeDigest(booleanChanged), "booleans are shape, not content")
+    }
+
+    @Test
+    fun `shape digest differs for different keys and nullness`() {
+        val base = ToolResultEnvelope.shapeDigest("""{"a":"x","b":null}""")
+        assertNotNull(base)
+        assertNotEquals(base, ToolResultEnvelope.shapeDigest("""{"a":"x","c":null}"""), "a renamed key is a new shape")
+        assertNotEquals(base, ToolResultEnvelope.shapeDigest("""{"a":"x","b":false}"""), "null -> false is a new shape")
+        assertNotEquals(base, ToolResultEnvelope.shapeDigest("""{"b":null,"a":"x"}"""), "key order is part of the shape")
+    }
+
+    @Test
+    fun `shape digest is null for a payload that is not json`() {
+        assertNull(ToolResultEnvelope.shapeDigest("state unchanged"))
+        assertNull(ToolResultEnvelope.shapeDigest("{not json"))
+        assertNull(ToolResultEnvelope.shapeDigest(""))
+    }
+
+    @Test
+    fun `shape digest is the first eight lowercase hex characters of sha256`() {
+        val digest = requireNotNull(ToolResultEnvelope.shapeDigest("""{"a":1}"""))
+
+        assertEquals(8, digest.length)
+        assertTrue(Regex("[0-9a-f]{8}").matches(digest), digest)
+    }
+
+    /**
+     * The four envelope shapes the device acceptance compares against (spec §7.2): done, failed, uncertain and a pure
+     * tool. The constants were computed independently from the masked payload (all strings -> `""`, all numbers -> `0`,
+     * booleans/null kept, compact JSON), so they pin the algorithm rather than echoing the implementation.
+     */
+    @Test
+    fun `shape digest pins the done failed uncertain and pure tool shapes`() {
+        assertEquals(
+            "e63adc62",
+            ToolResultEnvelope.shapeDigest(
+                ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Done), observation = null, data = "{}"),
+            ),
+        )
+        assertEquals(
+            "494536a3",
+            ToolResultEnvelope.shapeDigest(
+                ToolResultEnvelope.encode(
+                    execution = ToolExecution(
+                        outcome = ToolOutcome.Failed,
+                        code = "STATE_UNCHANGED",
+                        message = "launch not verified",
+                        recoverable = true,
+                        accepted = true,
+                        applied = null,
+                        verified = false,
+                        changed = null,
+                        uncertain = true,
+                    ),
+                    observation = null,
+                    data = """{"detail":"foreground still launcher"}""",
+                ),
+            ),
+        )
+        assertEquals(
+            "7726d5a3",
+            ToolResultEnvelope.shapeDigest(
+                ToolResultEnvelope.encode(
+                    ToolExecution(outcome = ToolOutcome.Uncertain, uncertain = true),
+                    observation = null,
+                    data = "{}",
+                ),
+            ),
+        )
+        assertEquals(
+            "18719ed7",
+            ToolResultEnvelope.shapeDigest(
+                ToolResultEnvelope.encode(
+                    ToolExecution(
+                        outcome = ToolOutcome.Done,
+                        accepted = true,
+                        applied = true,
+                        changed = false,
+                    ),
+                    observation = null,
+                    data = """{"delivered":true}""",
+                ),
+            ),
+        )
     }
 }

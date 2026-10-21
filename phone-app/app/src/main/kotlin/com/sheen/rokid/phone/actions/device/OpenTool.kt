@@ -628,11 +628,21 @@ class OpenTool(
      * Task 8: a source observation (or an attached picture) is completed with the tool's own foreground/root facts
      * where the source had none — `rootPackage` is not part of a perception snapshot, and the launch's own verification
      * read is the most honest value available. The foreground/root facts are no longer repeated in `data`.
+     *
+     * P3-9 (Phase 3 Task 4): every screen attempt captures exactly once, so it emits one count-only
+     * `P3_OBSERVE source=tool tool=open observeMs=<n> captureMs=<n> result=<ok|unavailable|disabled>` line. The token
+     * is the capture port's own answer even when the observation also reports a picture from the tool: the line measures
+     * this attempt, never the payload.
      */
     private fun screenAttempt(probe: ObservationProbes? = null): ObservationAttempt {
+        val captureStarted = System.nanoTime()
         val captured = runCatching { capture() }
             .getOrElse { PerceptionScreenshotResult.Unavailable(SCREENSHOT_FAILED) }
+        val captureNanos = System.nanoTime() - captureStarted
+        val observeStarted = System.nanoTime()
         val observed = runCatching { observe() }.getOrNull()
+        val observeNanos = System.nanoTime() - observeStarted
+        ToolObserveTelemetry.emit(NAME, observeNanos, captureNanos, captured)
         val image = (captured as? PerceptionScreenshotResult.Image)?.image
         val observation = when {
             observed != null -> observed.copy(

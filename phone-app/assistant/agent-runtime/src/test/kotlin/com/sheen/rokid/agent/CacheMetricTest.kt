@@ -81,11 +81,13 @@ class CacheMetricTest {
         val run = loop(gateway, clock, lines, ToolRegistry(listOf(executor))).run(request())
 
         assertEquals(2, gateway.requests.size, "the tool round must make two model turns for the sum to mean anything")
-        assertEquals(1, lines.size, lines.toString())
+        // Phase 3 Task 4 shares the sink with one per-call `P3_TOOLRESULT` line; the run-level line is still one.
+        val metricLines = lines.filter { it.startsWith("P3_METRIC") }
+        assertEquals(1, metricLines.size, lines.toString())
         assertEquals(
             "P3_METRIC calls=2 toolCalls=1 modelMs=8 toolMs=3 observeMs=0 " +
                 "inputTokens=110 outputTokens=25 images=0 nudges=0 overflows=0",
-            lines.single(),
+            metricLines.single(),
         )
         assertFalse(lines.any { it.startsWith("P3_CACHE") }, lines.toString())
         assertEquals(ModelUsage(110, 25, 70, 40), run.usage)

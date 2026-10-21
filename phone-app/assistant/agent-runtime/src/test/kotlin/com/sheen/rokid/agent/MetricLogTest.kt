@@ -26,6 +26,10 @@ import kotlin.test.assertTrue
  *
  * `images` counts only artifacts produced by this run's tool calls, including one a terminal failed call never carried
  * in a later request; a picture merely carried from previous-turn history is not this run's image.
+ *
+ * Phase 3 Task 4 adds per-call `P3_TOOLRESULT` lines on the same sink, so a test that asserts the run-level line filters
+ * by its `P3_METRIC` prefix. The run-level count keeps its distinct-artifact meaning; the per-call sum is compared with
+ * it in `per call P3_TOOLRESULT images sum to the run level distinct count`.
  */
 class MetricLogTest {
 
@@ -73,14 +77,14 @@ class MetricLogTest {
 
         loop(gateway, ToolRegistry(listOf(executor)), clock, lines).run(request(history = history))
 
-        assertEquals(1, lines.size, lines.toString())
+        assertEquals(1, lines.count { it.startsWith("P3_METRIC") }, lines.toString())
         assertEquals(
             "P3_METRIC calls=2 toolCalls=1 modelMs=8 toolMs=3 observeMs=3 " +
                 "inputTokens=15 outputTokens=7 images=0 nudges=0 overflows=0",
-            lines.single(),
+            metricLine(lines),
         )
         // The line is counts only: no request/history/tool body, and no credential-shaped text.
-        assertFalse(lines.single().contains("MARKER"), lines.toString())
+        assertFalse(lines.any { it.contains("MARKER") }, lines.toString())
     }
 
     @Test
@@ -139,9 +143,9 @@ class MetricLogTest {
         assertEquals(AgentOutcome.FAILED, run.outcome)
         assertEquals("REPEATED_ERROR", run.safeCode)
         assertEquals(1, run.metrics.images, "the terminal failed call produced this run's one image")
-        assertTrue(lines.single().contains(" images=1"), lines.single())
-        assertFalse(lines.single().contains("sha-terminal"), "the metric line stays count-only: ${lines.single()}")
-        assertFalse(lines.single().contains("img-terminal"), "no artifact id reaches the metric line: ${lines.single()}")
+        assertTrue(metricLine(lines).contains(" images=1"), metricLine(lines))
+        assertFalse(metricLine(lines).contains("sha-terminal"), "the metric line stays count-only: ${metricLine(lines)}")
+        assertFalse(metricLine(lines).contains("img-terminal"), "no artifact id reaches the metric line: ${metricLine(lines)}")
     }
 
     @Test
@@ -169,7 +173,7 @@ class MetricLogTest {
 
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals(2, run.metrics.images, "two distinct artifacts produced by this run are two images")
-        assertTrue(lines.single().contains(" images=2"), lines.single())
+        assertTrue(metricLine(lines).contains(" images=2"), metricLine(lines))
     }
 
     @Test
@@ -191,7 +195,7 @@ class MetricLogTest {
 
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals(1, run.metrics.images, "the artifact id keys the produced set")
-        assertTrue(lines.single().contains(" images=1"), lines.single())
+        assertTrue(metricLine(lines).contains(" images=1"), metricLine(lines))
     }
 
     @Test
@@ -243,10 +247,51 @@ class MetricLogTest {
             lines = lines).run(request(allowPlanNudge = true))
 
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
-        assertTrue(lines.single().contains(" nudges=3"), lines.single())
+        assertTrue(metricLine(lines).contains(" nudges=3"), metricLine(lines))
+    }
+
+    /**
+     * Q8=A: the per-call `P3_TOOLRESULT images=` counts add up to the run-level `P3_METRIC images=`.
+     *
+     * Two calls in one round produce two distinct artifacts, so the per-call counts are `1 + 1` and the run-level
+     * distinct count is `2`. Neither line may carry an artifact id or hash.
+     */
+    @Test
+    fun `per call P3_TOOLRESULT images sum to the run level distinct count`() {
+        val lines = mutableListOf<String>()
+        val produced = listOf(
+            ImageRef("img-first", "image/png", 8, 8, "sha-first"),
+            ImageRef("img-second", "image/png", 8, 8, "sha-second"),
+        )
+        var calls = 0
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("lookup")))
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, "done", images = listOf(produced[calls++]))
+        }
+        val replies = listOf(
+            GatewayReply(
+                listOf(call("c1", "lookup", """{"page":1}"""), call("c2", "lookup", """{"page":2}""")),
+                "checking", ModelEnd.COMPLETED, null, null,
+            ),
+            GatewayReply(emptyList(), "answer", ModelEnd.COMPLETED, null, null),
+        )
+
+        val run = loop(MetricGateway(FakeMetricClock(), replies), ToolRegistry(listOf(executor)), lines = lines)
+            .run(request())
+
+        val perCall = lines.filter { it.startsWith("P3_TOOLRESULT") }
+            .map { Regex(" images=(\\d+) ").find(it)!!.groupValues[1].toInt() }
+        assertEquals(listOf(1, 1), perCall, lines.toString())
+        assertEquals(2, perCall.sum())
+        assertEquals(run.metrics.images, perCall.sum(), "per-call counts add to the run-level distinct count")
+        assertTrue(metricLine(lines).contains(" images=2"), metricLine(lines))
+        assertFalse(lines.any { it.contains("img-first") || it.contains("sha-first") }, lines.toString())
     }
 
     // ---------------------------------------------------------------- helpers
+
+    /** The run-level line: Phase 3 Task 4 puts per-call `P3_TOOLRESULT` lines on the same sink. */
+    private fun metricLine(lines: List<String>): String = lines.single { it.startsWith("P3_METRIC") }
 
     private fun runWithUsage(usage: ModelUsage?): String {
         val lines = mutableListOf<String>()
