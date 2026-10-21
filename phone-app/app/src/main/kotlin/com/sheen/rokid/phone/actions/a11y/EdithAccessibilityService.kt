@@ -175,6 +175,8 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
                     // One shared compression step: every caller pays for the same bounded JPEG, so a
                     // full-resolution screen never leaves this service (0.3 Phase 2.1, Task 1).
                     val (targetWidth, targetHeight) = scaledScreenshotSize(software.width, software.height)
+                    // `0 to 0` means the sizing rule refused degenerate input; never request that bitmap.
+                    if (targetWidth <= 0 || targetHeight <= 0) return null
                     val scaled = if (targetWidth == software.width && targetHeight == software.height) {
                         software
                     } else {
@@ -182,8 +184,8 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
                     }
                     try {
                         val output = ByteArrayOutputStream()
-                        if (!scaled.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, output)) return null
-                        Screenshot(output.toByteArray(), "image/jpeg", scaled.width, scaled.height)
+                        if (!scaled.compress(Bitmap.CompressFormat.JPEG, SCREENSHOT_JPEG_QUALITY, output)) return null
+                        Screenshot(output.toByteArray(), SCREENSHOT_MIME, scaled.width, scaled.height)
                     } finally {
                         // `createScaledBitmap` returns a separate bitmap; free it before the copy.
                         if (scaled !== software) scaled.recycle()
@@ -478,9 +480,6 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
 /** Five seconds is the whole budget for one screenshot or one synthetic gesture. */
 private const val SCREENSHOT_TIMEOUT_MILLIS = 5_000L
 private const val GESTURE_TIMEOUT_MILLIS = 5_000L
-
-/** JPEG quality of the encoded screenshot (the one shared value every auto-vision capture uses). */
-private const val JPEG_QUALITY = 80
 
 /**
  * The Android implementation of [AccessibilityPlatform] (0.25 Task 9).

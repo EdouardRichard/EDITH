@@ -4,10 +4,11 @@ package com.sheen.rokid.phone.actions.a11y
  * Computes the size a screenshot is scaled to before it leaves the accessibility service
  * (0.3 Phase 2.1, Task 1).
  *
- * The screen is scaled down uniformly so its aspect ratio is preserved: the widest edge never
- * exceeds [maxWidth] and the longest edge never exceeds [maxLongEdge]. Both caps apply
- * independently, which is why a 1200x2000 screen is capped by [maxLongEdge] at 720x1200 while a
- * 1080x2400 screen is capped by [maxWidth] at 720x1600. Small screens are never upscaled: a scale
+ * The screen is scaled down uniformly so its aspect ratio is preserved: the width never exceeds
+ * [maxWidth] and the longest edge never exceeds [maxLongEdge]. Both caps apply independently and the
+ * stricter one wins: a 1200x2000 screen is capped by [maxWidth] at 720x1200 (scale 0.6, not 0.8),
+ * while a 1080x2520 screen is capped by [maxLongEdge] at 685x1600 (scale 0.635, not 0.667). A
+ * 1080x2400 screen reaches both caps at once: 720x1600. Small screens are never upscaled: a scale
  * factor above 1 would only waste bytes on made-up pixels.
  *
  * A non-positive dimension is not something to guess at: [width], [height], [maxWidth] and
@@ -29,3 +30,15 @@ internal fun scaledScreenshotSize(
     val scaledHeight = (height * scale).toInt().coerceAtLeast(1)
     return scaledWidth to scaledHeight
 }
+
+/**
+ * The MIME type of every screenshot the accessibility service returns (spec §5.2, V-04).
+ *
+ * The encoder contract lives here, next to the sizing rule, so the JVM tests can pin it: a later
+ * change from JPEG to another format must change this declaration and [SCREENSHOT_JPEG_QUALITY]
+ * together, and a test fails until it does.
+ */
+internal const val SCREENSHOT_MIME = "image/jpeg"
+
+/** The JPEG quality every screenshot is encoded at (spec §5.2, V-04: q80). */
+internal const val SCREENSHOT_JPEG_QUALITY = 80
