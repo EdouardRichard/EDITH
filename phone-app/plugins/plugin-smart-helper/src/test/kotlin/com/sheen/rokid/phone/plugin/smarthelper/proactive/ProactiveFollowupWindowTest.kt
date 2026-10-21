@@ -4,8 +4,10 @@ import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
 import com.sheen.rokid.contracts.Assistance
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.ContextChanged
 import com.sheen.rokid.contracts.OutputStateEvent
 import com.sheen.rokid.contracts.OutputStatus
+import com.sheen.rokid.contracts.PinChanged
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.contracts.UserAction
 import com.sheen.rokid.output.OfficialConversation
@@ -21,6 +23,7 @@ import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
@@ -60,6 +63,40 @@ class ProactiveFollowupWindowTest {
             listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
         }
 
+    /**
+     * A gate that records every judgement and always intervenes, so "the first stage refused the trigger before the
+     * gate" is observable (the busy test is exactly that assertion).
+     */
+    private class RecordingGate : ProactiveGate {
+        val seen = mutableListOf<ProactiveGateState>()
+        override val form = GateForm.NOUL
+        override fun shouldIntervene(state: ProactiveGateState): GateOutcome {
+            seen += state
+            return GateOutcome(true, 0.9, 1.0)
+        }
+    }
+
+    /**
+     * Runs [block] on another thread and waits for it. The attach gap is a cross-thread interleaving in production
+     * (the host dispatcher installs the window while the composition's scheduler delivers the panel event), so the
+     * test must not fake it on the attaching thread.
+     */
+    private fun onAnotherThread(block: () -> Unit) {
+        var failure: Throwable? = null
+        val thread = Thread({
+            try {
+                block()
+            } catch (t: Throwable) {
+                failure = t
+            }
+        }, "followup-lifecycle")
+        thread.isDaemon = true
+        thread.start()
+        thread.join(5_000)
+        assertFalse(thread.isAlive, "the concurrent lifecycle event did not finish")
+        failure?.let { throw it }
+    }
+
     /** Swaps [P3Log]'s sink for a collector and always restores it. */
     private fun <T> withLines(block: (MutableList<String>) -> T): T {
         val lines = mutableListOf<String>()
@@ -77,16 +114,28 @@ class ProactiveFollowupWindowTest {
      *
      * With [panelVisible] false the window waits for `PANEL_SHOWN` inside its bounded acquisition wait; true is the
      * production state right after a hint reached the glasses, so the official 10 s starts at `onWake`.
+     *
+     * [proactiveCooldownMillis] lets a test place a second trigger inside the window after the hint cooldown;
+     * [beforeAttach] runs in the install/attach gap (see `beforeFollowupWindowAttachForTest`).
      */
-    private fun rigWithDisplayedHint(panelVisible: Boolean = true): HintRig {
+    private fun rigWithDisplayedHint(
+        panelVisible: Boolean = true,
+        proactiveCooldownMillis: String? = null,
+        interventionGate: ProactiveGate? = null,
+        beforeAttach: (() -> Unit)? = null,
+    ): HintRig {
         val display = SmartRecordingDisplay()
-        val rig = SmartTestRig()
-        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        val rig = SmartTestRig(interventionGate = interventionGate)
+        rig.activate(
+            proactiveCooldownMillis = proactiveCooldownMillis,
+            overrides = mapOf(Capability.ConversationDisplay to display),
+        )
         rig.model.onRequest = proposing()
         arm(rig)
         rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
         val hint = rig.output.hints.single()
         rig.panelVisible = panelVisible
+        rig.plugin.beforeFollowupWindowAttachForTest = beforeAttach
         rig.plugin.handle(OutputStateEvent(rig.envelope(), hint.hintId, OutputStatus.Displayed))
         return HintRig(rig, display, hint)
     }
@@ -115,6 +164,113 @@ class ProactiveFollowupWindowTest {
             rig.plugin.handle(OutputStateEvent(rig.envelope(), hint.hintId, OutputStatus.Displayed))
             assertEquals(windowTurn, rig.plugin.followupWindowTurnIdForTest())
             assertEquals(1, lines.count { it.startsWith("P3_PROACTIVE followup open") })
+        }
+    }
+
+    @Test
+    fun `an in-submit displayed ack opens the follow-up window`() {
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig(panelVisible = true)
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.model.onRequest = proposing()
+        // The host's output port acknowledges synchronously, inside `submit`: the hint is still `submitting`, so the
+        // plugin remembers the ACK and opens the window from the admitted-submit branch afterwards.
+        rig.output.onSubmit = { assistance ->
+            rig.plugin.handle(OutputStateEvent(rig.envelope(), assistance.hintId, OutputStatus.Displayed))
+        }
+        arm(rig)
+
+        withLines { lines ->
+            rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+
+            val windowTurn = rig.plugin.followupWindowTurnIdForTest()
+            assertNotNull(windowTurn, "the in-submit ACK opens the window once the hint is admitted")
+            assertEquals(
+                OfficialStatus.LISTENING.wire,
+                display.states.single { it.route == AssistantRoute.PROACTIVE }.status,
+                "the in-submit ACK arms the same PROACTIVE round as a dispatched ACK",
+            )
+            assertTrue(lines.any { it.startsWith("P3_PROACTIVE followup open") }, lines.toString())
+
+            // The window opened by the in-submit branch is a real listening round, not just flagged state.
+            rig.plugin.handle(TranscriptEvent(rig.transcript("把亮度调到最低", turnId = "asr-followup", revision = 2)))
+            assertEquals(windowTurn, rig.plugin.followupTurnForTest()?.first)
+        }
+    }
+
+    // ---- the install/attach gap: PANEL_SHOWN and UI_CLOSED can land before the cycle is armed ------------------------
+
+    /**
+     * A `Displayed` ACK whose window is installed, with the panel lifecycle event injected on another thread in the gap
+     * before the cycle's `onWake`. This is the production interleaving: the host dispatcher installs the window, while
+     * the composition's scheduler thread delivers the glasses' report.
+     */
+    @Test
+    fun `a panel shown while the window is attaching does not clear it as inert`() {
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.model.onRequest = proposing()
+        arm(rig)
+        rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+        val hint = rig.output.hints.single()
+        rig.panelVisible = true
+        rig.plugin.beforeFollowupWindowAttachForTest = {
+            onAnotherThread { rig.plugin.onPanelShown(AssistantRoute.PROACTIVE) }
+        }
+
+        withLines { lines ->
+            rig.plugin.handle(OutputStateEvent(rig.envelope(), hint.hintId, OutputStatus.Displayed))
+
+            // `onPanelShown` must not treat a window whose cycle round is still being attached as an inert
+            // "has no turn" window.
+            val windowTurn = rig.plugin.followupWindowTurnIdForTest()
+            assertNotNull(windowTurn, "the panel announcement in the attach gap must not drop the pending window")
+            assertEquals(
+                OfficialStatus.LISTENING.wire,
+                display.states.single { it.route == AssistantRoute.PROACTIVE }.status,
+            )
+            assertTrue(lines.none { it.startsWith("P3_PROACTIVE followup close") }, lines.toString())
+
+            rig.plugin.handle(TranscriptEvent(rig.transcript("把亮度调到最低", turnId = "asr-followup", revision = 2)))
+            assertEquals(windowTurn, rig.plugin.followupTurnForTest()?.first, "the surviving window accepts the follow-up")
+        }
+    }
+
+    @Test
+    fun `a panel close while the window is attaching cannot leave an orphan proactive round`() {
+        val display = SmartRecordingDisplay()
+        val rig = SmartTestRig()
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.model.onRequest = proposing()
+        arm(rig)
+        rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+        val hint = rig.output.hints.single()
+        rig.panelVisible = true
+        rig.plugin.beforeFollowupWindowAttachForTest = {
+            onAnotherThread { rig.plugin.onPanelClosed(AssistantRoute.PROACTIVE) }
+        }
+
+        withLines { lines ->
+            rig.plugin.handle(OutputStateEvent(rig.envelope(), hint.hintId, OutputStatus.Displayed))
+
+            assertNull(rig.plugin.followupWindowTurnIdForTest(), "the panel is gone, so its window is gone")
+            assertNull(rig.plugin.followupTurnForTest())
+            assertTrue(lines.any { it == "P3_PROACTIVE followup close reason=ui_closed" }, lines.toString())
+            assertTrue(
+                lines.none { it.startsWith("P3_PROACTIVE followup open") },
+                "an attach aborted by UI_CLOSED must not report a window it no longer owns",
+            )
+            // The bug this pins: `onWake` still arms the cycle's 10 s round after the window was cleared, and no
+            // deadline owner remains. With the fix the round is either never armed or released again.
+            assertEquals(0, rig.scheduler.pending(), "no listening deadline is left without a window")
+            assertTrue(display.closes.isEmpty(), "UI_CLOSED sends no CLOSE")
+
+            rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+            assertTrue(
+                lines.none { it.startsWith("P3_CONV close route=PROACTIVE") },
+                "an orphan PROACTIVE round would time out here and close a panel the wearer already closed",
+            )
         }
     }
 
@@ -157,6 +313,55 @@ class ProactiveFollowupWindowTest {
             // The hint has its own TTL; the listening window must not cancel the sentence the wearer is reading.
             assertTrue(rig.cancels.isEmpty(), "the displayed hint is not cancelled by the window's timeout")
             assertEquals(0, rig.scheduler.pending(), "the fired window is released")
+        }
+    }
+
+    @Test
+    fun `a pinned window times out with the pinned reason and keeps the panel`() {
+        val (rig, display, _) = rigWithDisplayedHint()
+        rig.plugin.handle(PinChanged(rig.envelope(), AssistantRoute.PROACTIVE))
+
+        withLines { lines ->
+            rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+
+            assertNull(rig.plugin.followupWindowTurnIdForTest(), "the pinned round idles and ends the window")
+            assertNull(rig.plugin.followupTurnForTest())
+            assertTrue(lines.any { it == "P3_PROACTIVE followup close reason=pinned_timeout" }, lines.toString())
+            assertTrue(lines.any { it == "P3_CONV idle route=PROACTIVE reason=timeout" }, lines.toString())
+            assertTrue(display.idleCalls.any { it.first == AssistantRoute.PROACTIVE }, "the pinned timeout shows idle")
+            assertTrue(display.closes.isEmpty(), "the pinned idle keeps the panel until its own 120 s close")
+            assertTrue(rig.cancels.isEmpty(), "the displayed hint keeps its TTL")
+
+            // The pinned close is the cycle's separate 120 s timer; the plugin's close callback is not called again.
+            rig.tick(OfficialConversation.PINNED_CLOSE_MILLIS)
+            assertEquals(listOf(AssistantRoute.PROACTIVE), display.closes)
+            assertNull(rig.plugin.followupTurnForTest())
+        }
+    }
+
+    // ---- spec §4.5: the open follow-up window is a busy conversation -------------------------------------------------
+
+    @Test
+    fun `a context change inside the follow-up window does not start a second proactive turn`() {
+        val gate = RecordingGate()
+        val (rig, _, _) = rigWithDisplayedHint(interventionGate = gate, proactiveCooldownMillis = "1000")
+        val windowTurn = rig.plugin.followupWindowTurnIdForTest()
+        assertNotNull(windowTurn)
+        val gateCalls = gate.seen.size
+        val requests = rig.model.requests.size
+
+        withLines { lines ->
+            // Past the hint's own cooldown (1 s) but inside the 10 s follow-up window: without the busy rule this
+            // foreground-changing `ContextChanged` is admitted and starts a HINT_TURN beside the open PROACTIVE round.
+            rig.tick(2_000)
+            assertEquals(windowTurn, rig.plugin.followupWindowTurnIdForTest())
+
+            rig.plugin.handle(ContextChanged(rig.envelope(), 2, mapOf("app.foreground" to "设置")))
+
+            assertEquals(requests, rig.model.requests.size, "the follow-up window is busy: no second HINT_TURN")
+            assertEquals(gateCalls, gate.seen.size, "a busy trigger is refused before the intervention gate")
+            assertTrue(lines.any { it == "P3_PROACTIVE park reason=BUSY" }, lines.toString())
+            assertEquals(windowTurn, rig.plugin.followupWindowTurnIdForTest(), "the refused trigger leaves the window")
         }
     }
 
@@ -257,6 +462,42 @@ class ProactiveFollowupWindowTest {
             assertEquals(1, rig.model.requests.size, "the follow-up's loop never runs")
             assertEquals(1, rig.output.hints.size, "no second display for the preempted follow-up")
             assertTrue(rig.cancels.isEmpty(), "the displayed hint is not cancelled by the preemption")
+        }
+    }
+
+    @Test
+    fun `a wake the scene cooldown refuses still preempts the follow-up window`() {
+        val display = SmartRecordingDisplay()
+        // A long wake cooldown so the second wake stays refused; the proactive hint has no prior cooldown.
+        val rig = SmartTestRig(cooldownNanos = 30_000_000_000L, panelVisible = true)
+        rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
+        rig.model.onRequest = proposing()
+        arm(rig)
+
+        // The cooldown starts at an admitted wake. STOP ends that turn but not the scene's cooldown, which lets the
+        // follow-up window open while a wake would still be refused.
+        rig.plugin.handle(rig.wakeEvent())
+        rig.plugin.handle(UserAction(rig.envelope(), UserAction.Action.Stop))
+        rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了", turnId = "asr-proactive")))
+        val hint = rig.output.hints.single()
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hint.hintId, OutputStatus.Displayed))
+        assertNotNull(rig.plugin.followupWindowTurnIdForTest())
+        val requests = rig.model.requests.size
+        val cancels = rig.cancels.size
+        val wakeStates = display.states.count { it.route == AssistantRoute.WAKE }
+
+        withLines { lines ->
+            rig.plugin.handle(rig.wakeEvent())
+
+            // A wake word is an explicit route switch: even a refused one ends the follow-up window rather than
+            // letting the wake segment's echo/next speech be consumed as PROACTIVE after the wearer asked for WAKE.
+            assertNull(rig.plugin.followupWindowTurnIdForTest(), "a refused wake still preempts the window")
+            assertTrue(lines.any { it == "P3_PROACTIVE preempt reason=WAKE_PREEMPTED" }, lines.toString())
+            assertEquals(requests, rig.model.requests.size, "a refused wake opens no turn and runs no loop")
+            assertEquals(wakeStates, display.states.count { it.route == AssistantRoute.WAKE }, "no new WAKE level")
+            assertEquals(1, rig.auditEntries.count { it.outcome == "CooldownRefused" }, "the wake really was refused")
+            assertEquals(cancels, rig.cancels.size, "the displayed hint is not cancelled by the refused wake")
+            assertEquals(0, rig.scheduler.pending(), "the preempted round's deadline is released")
         }
     }
 

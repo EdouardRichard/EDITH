@@ -1021,10 +1021,27 @@ class SmartAssistantPlugin(
         val hint: ProactiveHint,
         val turnId: String,
         val openedNanos: Long,
-    )
+    ) {
+        /**
+         * Whether the window's PROACTIVE round is armed on the conversation cycle yet.
+         *
+         * The `Displayed` ACK installs the window under [gate], but `onWake` must run outside the lock (the cycle
+         * displays through the host port). Between those two steps the host can deliver `PANEL_SHOWN`/`UI_CLOSED` on
+         * another thread; only an **attached** window may be treated as "has no cycle turn" by `onPanelShown`. Written
+         * under [gate].
+         */
+        var attached: Boolean = false
+    }
 
     /** The PROACTIVE follow-up window, or `null` when the displayed hint has no listening round. Under [gate]. */
     private var proactiveFollowup: FollowupWindow? = null
+
+    /**
+     * True while [openFollowupWindow] is arming a window's cycle round (between the install and the post-`onWake`
+     * revalidation). It serializes attaches: a window installed in that gap is picked up by the in-flight call, so the
+     * cycle always ends up armed for the **newest** window and no attach can overwrite a newer round. Under [gate].
+     */
+    private var followupAttachInProgress = false
 
     /**
      * 0.3 Phase 3 Task 6: one accepted follow-up utterance on its way to the FOLLOWUP_TURN engine.
@@ -1743,11 +1760,13 @@ class SmartAssistantPlugin(
         // cycle's own duplicate-`PANEL_SHOWN` handling below.
         if (route == AssistantRoute.PROACTIVE) {
             // The identity is captured so the inert clear below cannot drop a **newer** window that opened between the
-            // two locks (a timeout callback and the host dispatcher are different threads).
-            val armedTurnId = synchronized(gate) { proactiveFollowup?.turnId }
-            if (armedTurnId != null && !conversationCycle.hasTurn(AssistantRoute.PROACTIVE)) {
+            // two locks (a timeout callback and the host dispatcher are different threads). A window that is still
+            // **attaching** is not inert: its cycle round is armed immediately after the install (see
+            // `openFollowupWindow`), so clearing it here would leave that round with no plugin window behind it.
+            val armed = synchronized(gate) { proactiveFollowup?.takeIf { it.attached } }
+            if (armed != null && !conversationCycle.hasTurn(AssistantRoute.PROACTIVE)) {
                 synchronized(gate) {
-                    if (proactiveFollowup?.turnId == armedTurnId) {
+                    if (proactiveFollowup === armed) {
                         proactiveFollowup = null
                         followupTurnRequest = null
                     }
@@ -3410,7 +3429,13 @@ class SmartAssistantPlugin(
         // stops it (the wake path does that on purpose, so a late ACK still finds its identity), and counting it as
         // busy would refuse every proactive trigger for the rest of the session. Found on the K40: after one wake turn
         // ended, the first real utterance produced `skip reason=BUSY` instead of a request.
-        val busy = turn?.let { it.phase != SmartTurnPhase.Idle } == true || proactiveInFlight
+        //
+        // The PROACTIVE follow-up window is a live conversation too (spec §4.5): its 10 s round and the accepted
+        // Task 7 hand-off must not be overlapped by a hint turn. Without this, a foreground-changing
+        // `ContextChanged` after the (configurable) hint cooldown but inside the window starts a HINT_TURN beside the
+        // follow-up round.
+        val followupBusy = proactiveFollowup != null || followupTurnRequest != null
+        val busy = turn?.let { it.phase != SmartTurnPhase.Idle } == true || proactiveInFlight || followupBusy
         val skip = proactive.admit(trigger, armed = armedNow(), busy = busy)
         if (skip != null) {
             // B10 / spec §4.6: WAKE outranks PROACTIVE, and a trigger refused *only* because a wake turn is in flight
@@ -3566,6 +3591,12 @@ class SmartAssistantPlugin(
      * the model's tool call makes instead of manufacturing a body into the turn's map.
      */
     internal fun loadSkillToolForTest(): LoadSkillTool = loadSkillTool
+
+    /**
+     * Test-only: runs in the lifecycle gap between installing the PROACTIVE window and arming its cycle round, i.e.
+     * exactly where the host can deliver `PANEL_SHOWN`/`UI_CLOSED` on another thread. Production never sets it.
+     */
+    internal var beforeFollowupWindowAttachForTest: (() -> Unit)? = null
 
     /**
      * Test-only: the PROACTIVE follow-up window's turn id, or `null` when no window is armed.
@@ -4151,11 +4182,68 @@ class SmartAssistantPlugin(
     /**
      * Opens the PROACTIVE listening round through the conversation cycle. Never called while [gate] is held: the cycle's
      * `onWake` displays the official listening level through the host port, which may re-enter [handle].
+     *
+     * Install and attach are two steps - [gate] is released before the host-visible `onWake` - so this is also where a
+     * `PANEL_SHOWN`/`UI_CLOSED` delivered on the composition's scheduler thread is reconciled:
+     * - the window starts **unattached**, which is what makes [onPanelShown] defer its inert clear;
+     * - the install is revalidated immediately before the attach (a close in the gap arms nothing);
+     * - it is revalidated again after the attach, and a round whose window was cleared or replaced meanwhile is
+     *   released (or replaced by the newer window's own attach) rather than left orphaned with no plugin window.
+     *
+     * Attaches are serialized by [followupAttachInProgress]: a window installed while another one is attaching is
+     * picked up by the in-flight call after its own attach, so the cycle always ends up armed for the newest window.
      */
     private fun openFollowupWindow(window: FollowupWindow) {
-        conversationCycle.onWake(AssistantRoute.PROACTIVE, window.turnId)
-        // Counts and identities only - the hint's text is display content and never reaches the log.
-        P3Log.line("P3_PROACTIVE followup open turn=${window.turnId} hint=${window.hint.hintId}")
+        var next: FollowupWindow? = window
+        while (true) {
+            val candidate = next ?: return
+            val target = synchronized(gate) {
+                if (proactiveFollowup !== candidate || candidate.attached) return
+                if (followupAttachInProgress) return
+                followupAttachInProgress = true
+                candidate
+            }
+            var armed = false
+            var attachedNow = false
+            var currentAfter: FollowupWindow? = null
+            try {
+                beforeFollowupWindowAttachForTest?.invoke()
+                // Revalidate immediately before the host-visible attach: a close that landed in the install gap must
+                // not arm a round with no window behind it.
+                if (synchronized(gate) { proactiveFollowup === target }) {
+                    conversationCycle.onWake(AssistantRoute.PROACTIVE, target.turnId)
+                    armed = true
+                }
+            } finally {
+                synchronized(gate) {
+                    followupAttachInProgress = false
+                    if (proactiveFollowup === target) {
+                        target.attached = true
+                        attachedNow = true
+                    } else {
+                        currentAfter = proactiveFollowup
+                    }
+                }
+            }
+            if (attachedNow) {
+                // Counts and identities only - the hint's text is display content and never reaches the log.
+                P3Log.line("P3_PROACTIVE followup open turn=${target.turnId} hint=${target.hint.hintId}")
+                return
+            }
+            val newer = currentAfter
+            if (newer != null) {
+                // A newer window replaced this one while it was attaching. Attaching it now replaces the round this
+                // call just armed (`onWake` cancels this round's timers and installs the newer turn id).
+                next = newer
+                continue
+            }
+            if (armed) {
+                // Cleared while attaching (UI_CLOSED/STOP/wake) with no newer window behind it: release the round this
+                // call armed, so no 10 s PROACTIVE turn without a plugin window is left behind.
+                conversationCycle.onClose(AssistantRoute.PROACTIVE)
+            }
+            return
+        }
     }
 
     /**
