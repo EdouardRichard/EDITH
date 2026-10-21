@@ -20,6 +20,7 @@ import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.PerceptionElement
 import com.sheen.rokid.plugin.SecretHandle
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.int
@@ -316,6 +317,75 @@ class TurnTranscriptRecordTest {
             "perception content must not be persisted into ConversationStore: $stored",
         )
         assertEquals(1, stored.count { it is ModelHistoryItem.ToolOutput }, "the stored call/output pair stays attributable")
+    }
+
+    @Test
+    fun `a loop enriched failure observation never reaches the conversation store`() {
+        // 0.3 Phase 2.2 Task 8: `AgentLoop.observedFailure` attaches an observation to a failure that came back without
+        // one. The tool-returned result was persistent (nonPersistent=false); the loop's copy carries perception content,
+        // so only the same-run request may see it.
+        val sentinel = "SYNTHETIC-LOOP-OBSERVATION-6623"
+        val stores = stores()
+        val perception = SmartFakePerception(
+            initial = smartPerceptionSnapshot(
+                elements = listOf(
+                    PerceptionElement(ref = "#n7", role = "text", text = sentinel, centerX = 1, centerY = 2),
+                ),
+            ),
+        )
+        val rig = SmartTestRig(conversationStores = stores).also {
+            it.activate(
+                overrides = mapOf(
+                    Capability.Storage to SmartFakeStorage(),
+                    Capability.Perception to perception,
+                ),
+            )
+        }
+        rig.actions.descriptors += smartAction("open", screenObservation = true)
+        rig.actions.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", images = listOf(reference))
+        }
+        // A wide window so the failure round (envelope + observation + image reference) fits the fixture and the test is
+        // about the store redaction, never about eviction.
+        rig.profile = smartProfile().copy(
+            usableWindowTokens = 100_000,
+            inputBudgetTokens = 93_000,
+            maxOutputTokens = 6_000,
+            safetyTokens = 1_000,
+        )
+        var request = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            request++
+            if (request == 1) {
+                listener(smartToolCall("c1", "open", """{"target":"com.example.music"}""", requestId = modelRequest.requestId))
+                listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(modelRequest, listener, "看到了。")
+            }
+        }
+
+        rig.wakeAndFinal("打开音乐")
+
+        assertEquals(2, rig.model.requests.size, "the failure round must issue a continuation request")
+        val continuationOutputs = rig.model.requests[1].history.filterIsInstance<ModelHistoryItem.ToolOutput>()
+        assertTrue(
+            continuationOutputs.any { it.callId == "c1" },
+            "the continuation request must carry the failure output: ${rig.model.requests.map { it.history }}",
+        )
+        val sent = continuationOutputs.single { it.callId == "c1" }
+        assertTrue(sent.output.contains(sentinel), "the model must see the loop observation: ${sent.output}")
+        assertEquals(listOf(reference), sent.images, "the in-run request keeps the failure's picture reference")
+        val stored = stores.getValue(ContextRoute.WAKE).history()
+        assertTrue(
+            stored.none { it.containsContent(sentinel) },
+            "a loop-attached observation must not be persisted into ConversationStore: $stored",
+        )
+        val storedOutput = stored.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals(
+            emptyList(),
+            storedOutput.images,
+            "a failure image must never reach the stored transcript: ${storedOutput.output}",
+        )
     }
 
     @Test

@@ -133,10 +133,11 @@ val TrimReport.counts: TrimCounts
  *
  * ## ⓪ is type-aware, not a second budget (R69)
  *
- * - **Old UI tree**: a `TOOL_ROUND` output whose text is a device envelope with a `data.screen` object, and which is
- *   not the *last* tool result, becomes a header that keeps the action/revision/app, the line count and the visible
- *   refs (`#n…`) but not the full tree. That is the "header + 已压缩" rule; refs survive because the model may still
- *   act on them, the hundreds of node lines do not.
+ * - **Old UI tree**: a `TOOL_ROUND` output whose envelope carries a non-blank `observation.screen` (the compact UI
+ *   tree; Task 8 re-pointed this from the pre-0.3 `data.screen` object), and which is not the *last* tool result,
+ *   becomes a header that keeps the action/revision/app, the line count and the visible refs (`#n…`) but not the full
+ *   tree. That is the "header + 已压缩" rule; refs survive because the model may still act on them, the hundreds of node
+ *   lines do not.
  * - **Old images**: only the newest [IMAGE_KEEP] images across the whole flow stay whole; older
  *   `ToolOutput.images`/`Segment.images` entries are removed and a visible `[image <id> <mime> <w>x<h> (elided)]` text
  *   is appended to the owner. The newest K are the references the context may still contain, which is what keeps
@@ -357,16 +358,27 @@ class TurnTrimmer(
         return found
     }
 
-    /** A device envelope whose `data.screen` is an object, replaced by a header that keeps the refs and the summary. */
+    /**
+     * A tool result whose `observation.screen` is a compact UI tree, replaced by a header that keeps the refs and the
+     * summary.
+     *
+     * 0.3 Phase 2.2 Task 8 re-point: the unified envelope
+     * (`{execution, observation|null, data}`) carries the screen tree in `observation.screen` as a string; `data` no
+     * longer repeats it. The optional `data.action`/`data.rev`/`data.app` metadata is read only when the tool kept those
+     * tool-specific facts (the `device` tool does), so a shell/open observation still elides with `?` placeholders.
+     * A result whose observation is `null` — a pure tool, or an unmigrated tool whose `data` happens to hold a screen
+     * object — is deliberately **not** a UI tree this cut can elide: reading `data.screen` again is what Task 8 removed.
+     */
     private fun elideUiTree(output: String): String? {
         val envelope = parseObject(output) ?: return null
-        val data = envelope["data"] as? JsonObject ?: return null
-        val screen = data["screen"] as? JsonObject ?: return null
-        val action = envelope.string("action") ?: "?"
-        val revision = screen.string("rev") ?: "?"
-        val app = screen.string("app")
-        val lines = screen.string("text")?.lineSequence()?.count { it.isNotBlank() } ?: 0
-        val refs = REF_PATTERN.findAll(output).map { it.value }.distinct().take(MAX_ELIDED_REFS).toList()
+        val observation = envelope["observation"] as? JsonObject ?: return null
+        val screen = observation.string("screen")?.takeIf { it.isNotBlank() } ?: return null
+        val data = envelope["data"] as? JsonObject
+        val action = data?.string("action") ?: "?"
+        val revision = data?.let { (it["rev"] as? JsonPrimitive)?.contentOrNull } ?: "?"
+        val app = data?.string("app") ?: observation.string("foregroundPackage")
+        val lines = screen.lineSequence().count { it.isNotBlank() }
+        val refs = REF_PATTERN.findAll(screen).map { it.value }.distinct().take(MAX_ELIDED_REFS).toList()
         return buildString {
             append("[screen observation elided: action=").append(action)
             append(" rev=").append(revision)

@@ -16,15 +16,10 @@ import com.sheen.rokid.phone.lock.UnlockGate
 import com.sheen.rokid.phone.lock.UnlockOutcome
 import com.sheen.rokid.phone.platform.P3Log
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.booleanOrNull
-import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.longOrNull
-import kotlinx.serialization.json.put
 
 /**
  * R40/R47: the production `Capability.Actions` provider.
@@ -129,16 +124,43 @@ class ToolCatalog(
                     gated(unlock.ensureUnlocked(requireAccessibility = false)) { dial.execute(name, argsJson) }
                 }
             }
-            else -> ActionResult(ActionOutcome.Refused, UNKNOWN_ACTION)
+            else -> ActionResult(
+                ActionOutcome.Refused,
+                // Task 8: the stable code is the execution fact; `data` repeats nothing.
+                "{}",
+                execution = ToolExecution(
+                    outcome = ToolOutcome.Refused,
+                    code = UNKNOWN_ACTION,
+                    accepted = false,
+                    applied = false,
+                ),
+            )
         }
     }
 
     /**
      * A refused unlock is reported as a refusal with a code the model can act on; the tool body is never entered, so a
      * device action cannot run against a still-locked screen and get mislabeled as an accessibility failure.
+     *
+     * Task 8: the catalog's own refusals now carry structured execution facts (the stable code, `accepted`/`applied` =
+     * false) and an empty tool-specific `data`, instead of a bare detail string and the old `toolEnvelope` copy.
      */
     private inline fun gated(outcome: UnlockOutcome, action: () -> ActionResult): ActionResult =
-        if (outcome.usable) action() else ActionResult(ActionOutcome.Refused, "LOCKED_UNLOCK_FAILED:${outcome.name}")
+        if (outcome.usable) {
+            action()
+        } else {
+            ActionResult(
+                ActionOutcome.Refused,
+                "{}",
+                execution = ToolExecution(
+                    outcome = ToolOutcome.Refused,
+                    code = "LOCKED_UNLOCK_FAILED:${outcome.name}",
+                    recoverable = true,
+                    accepted = false,
+                    applied = false,
+                ),
+            )
+        }
 
     /**
      * 0.25 Task 11 (R49): only the raw-command tool has a call-level risk; every other tool answers the additive
@@ -173,9 +195,29 @@ class ToolCatalog(
         device.close()
     }
 
-    private fun channelRefused() = ActionResult(ActionOutcome.Refused, CHANNEL_UNAVAILABLE)
+    private fun channelRefused() = ActionResult(
+        ActionOutcome.Refused,
+        "{}",
+        execution = ToolExecution(
+            outcome = ToolOutcome.Refused,
+            code = CHANNEL_UNAVAILABLE,
+            recoverable = true,
+            accepted = false,
+            applied = false,
+        ),
+    )
 
-    private fun callRefused() = ActionResult(ActionOutcome.Refused, CALL_PERMISSION_MISSING)
+    private fun callRefused() = ActionResult(
+        ActionOutcome.Refused,
+        "{}",
+        execution = ToolExecution(
+            outcome = ToolOutcome.Refused,
+            code = CALL_PERMISSION_MISSING,
+            recoverable = true,
+            accepted = false,
+            applied = false,
+        ),
+    )
 
     // ── edith-0.3 Phase 2.2 Task 6: shell/dial post-call observation ─────────────────────────────────────
 
@@ -217,13 +259,24 @@ class ToolCatalog(
             observed.observation.copy(vision = ToolVision.Ok, visionReason = null)
         }
         return result.copy(
-            execution = result.execution ?: executionFacts(tool, result),
+            // Task 8: the tool now states its own facts; the catalog only fills a missing execution for a hand-built
+            // result (a test seam). It never parses `data` again: `accepted/applied/verified/changed` live in one place.
+            execution = result.execution ?: implicitExecution(result.outcome),
             observation = observation,
             images = images,
             // Every `shell`/`dial` result now carries an observation, so it is perception content by definition (C2).
             nonPersistent = true,
         )
     }
+
+    /** The outcome-only fallback for a result that predates Task 8; no tri-state fact is invented. */
+    private fun implicitExecution(outcome: ActionOutcome): ToolExecution = ToolExecution(
+        outcome = when (outcome) {
+            ActionOutcome.Done -> ToolOutcome.Done
+            ActionOutcome.Refused -> ToolOutcome.Refused
+            ActionOutcome.Failed -> ToolOutcome.Failed
+        },
+    )
 
     /** One screen attempt's observation and the picture it kept (never more than one). */
     private data class ObservationAttempt(
@@ -282,75 +335,19 @@ class ToolCatalog(
     /**
      * Whether [result] is a pure argument refusal, which takes no picture.
      *
-     * The classifier reads only the tools' own stable codes, whose casing and shape are already part of their
-     * contract: the shell rejects a malformed command (`INVALID_ARGUMENTS`) or stdin (`UNSUPPORTED`), the dial tool an
-     * undialable number (`ARGUMENTS_INVALID`). Every other refusal is a real attempt whose screen the model should see.
+     * Task 8 migrates this classifier to the **structured** execution facts: the tool states its stable code in
+     * `execution.code` (the shell rejects a malformed command (`INVALID_ARGUMENTS`) or stdin (`UNSUPPORTED`), the dial
+     * tool an undialable number (`ARGUMENTS_INVALID`)). It no longer parses `data.error.code`, which was the second copy
+     * of facts the envelope already carries — and an argument refusal must still take no picture.
      */
     private fun isArgumentRefusal(tool: String, result: ActionResult): Boolean {
         if (result.outcome != ActionOutcome.Refused) return false
+        val code = result.execution?.code ?: return false
         return when (tool) {
-            ShellTool.NAME -> errorCodeOf(result).let { it == INVALID_ARGUMENTS || it == UNSUPPORTED }
-            DialTool.NAME -> errorCodeOf(result) == ARGUMENTS_INVALID
+            ShellTool.NAME -> code == INVALID_ARGUMENTS || code == UNSUPPORTED
+            DialTool.NAME -> code == ARGUMENTS_INVALID
             else -> false
         }
-    }
-
-    /**
-     * The structured execution facts of one `shell`/`dial` result, derived from its own outcome and stable code.
-     *
-     * The shell is deliberately not given a verdict it cannot support: an exit code is **not** a target-state answer
-     * (`PrivilegedShell` documents a false `OK` and a false `BLOCKED` measured on the K40), so a completed shell call is
-     * `accepted = true` with `applied = null` whether it exited 0 or not - the command ran, whether it took effect is
-     * unknown. The one exception is a truncated reply (`SHELL_REPLY_TOO_LARGE`): the command did run, only the answer
-     * was cut. A refusal that never dispatched the action keeps `accepted/applied = false`, and an intent hand-off is
-     * never verified as applied. Only a malformed argument is marked non-recoverable.
-     */
-    private fun executionFacts(tool: String, result: ActionResult): ToolExecution {
-        val code = errorCodeOf(result)
-        return when (result.outcome) {
-            ActionOutcome.Done -> ToolExecution(
-                outcome = ToolOutcome.Done,
-                accepted = true,
-                applied = null,
-            )
-            ActionOutcome.Failed -> ToolExecution(
-                outcome = ToolOutcome.Failed,
-                code = code,
-                recoverable = true,
-                accepted = true,
-                // `dial`'s one failure means the intent could not be launched (nothing dispatched); a shell command's
-                // non-zero exit does not prove its side effects did not happen, so that stays unknown.
-                applied = if (tool == DialTool.NAME) false else null,
-            )
-            ActionOutcome.Refused -> {
-                val executedAnyway = code == SHELL_REPLY_TOO_LARGE
-                ToolExecution(
-                    outcome = ToolOutcome.Refused,
-                    code = code,
-                    recoverable = code !in NON_RECOVERABLE_REFUSALS,
-                    accepted = executedAnyway,
-                    applied = if (executedAnyway) null else false,
-                )
-            }
-        }
-    }
-
-    /**
-     * The stable error code of a tool result, or `null`.
-     *
-     * `shell`/`dial` return two shapes: a bare code for a validation refusal (the pre-Task-6 shape is kept) and the
-     * `toolEnvelope` JSON for everything that reached the channel, which carries `error.code` (or `null` for a
-     * zero/non-zero exit that crossed the shell). Reading it here is what lets the structured facts stay stable without
-     * touching either tool.
-     */
-    private fun errorCodeOf(result: ActionResult): String? {
-        val detail = result.detail
-        if (!detail.startsWith("{")) return detail.takeIf { it.isNotBlank() }
-        return runCatching {
-            val root = toolArgumentsJson.parseToJsonElement(detail) as? JsonObject ?: return@runCatching null
-            val error = root["error"] as? JsonObject ?: return@runCatching null
-            (error["code"] as? JsonPrimitive)?.takeIf { it.isString }?.content
-        }.getOrNull()
     }
 
     companion object {
@@ -362,11 +359,6 @@ class ToolCatalog(
         private const val INVALID_ARGUMENTS = "INVALID_ARGUMENTS"
         private const val ARGUMENTS_INVALID = "ARGUMENTS_INVALID"
         private const val UNSUPPORTED = "UNSUPPORTED"
-
-        /** The one shell refusal where the command is known to have run (only its reply was cut). */
-        private const val SHELL_REPLY_TOO_LARGE = "SHELL_REPLY_TOO_LARGE"
-
-        private val NON_RECOVERABLE_REFUSALS = setOf(INVALID_ARGUMENTS, ARGUMENTS_INVALID, UNSUPPORTED)
 
         private const val VISION_NO_SOURCE = "no_source"
         private const val VISION_NOT_ATTEMPTED = "not_attempted"
@@ -392,47 +384,3 @@ internal fun JsonObject.booleanArg(key: String): Boolean? =
 /** A member that must be a JSON integer; a quoted `"10"` is a wrong type, not 10. */
 internal fun JsonObject.longArg(key: String): Long? =
     (this[key] as? JsonPrimitive)?.takeIf { !it.isString }?.longOrNull
-
-/** One tool failure rendered into the model-facing JSON `error` object. */
-internal data class ToolFailure(
-    val code: String,
-    val message: String,
-    val recoverable: Boolean = true,
-)
-
-/**
- * The common envelope shape for the non-device tools (`open`/`dial`; `device` adds `verified`,
- * `images` and `timing` itself). Every field is always present so a result has one shape whether it
- * succeeded, was refused or failed.
- */
-internal fun toolEnvelope(
-    tool: String,
-    ok: Boolean,
-    channel: String,
-    accepted: Boolean = ok,
-    applied: Boolean? = null,
-    data: JsonElement? = null,
-    error: ToolFailure? = null,
-    extra: JsonObjectBuilder.() -> Unit = {},
-): String = buildJsonObject {
-    put("tool", tool)
-    put("action", tool)
-    put("channel", channel)
-    put("ok", ok)
-    put("accepted", accepted)
-    if (applied == null) put("applied", JsonNull) else put("applied", applied)
-    put("data", data ?: JsonNull)
-    if (error == null) {
-        put("error", JsonNull)
-    } else {
-        put(
-            "error",
-            buildJsonObject {
-                put("code", error.code)
-                put("message", error.message)
-                put("recoverable", error.recoverable)
-            },
-        )
-    }
-    extra()
-}.toString()

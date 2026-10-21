@@ -148,8 +148,8 @@ class DeviceToolTest {
         val result = tool(operations).execute("""{"action":"observe"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
+        // Legacy composition (no perception port): the projector's tree is the only screen carrier and stays in `data`.
         val body = body(result)
-        assertEquals(true, body["ok"]!!.jsonPrimitive.boolean)
         val screen = body.screen()
         assertEquals(41L, screen["rev"]!!.jsonPrimitive.long)
         assertEquals("com.android.settings", screen["app"]!!.jsonPrimitive.content)
@@ -266,10 +266,10 @@ class DeviceToolTest {
         val result = tool(operations).execute("""{"action":"act","kind":"tap","ref":"#n1"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        val body = body(result)
-        assertEquals("DEVICE_SCREEN_OFF", body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
-        assertTrue(body["error"]!!.jsonObject["recoverable"]!!.jsonPrimitive.boolean)
-        assertFalse(body["ok"]!!.jsonPrimitive.boolean)
+        val execution = executionOf(result)
+        assertEquals("DEVICE_SCREEN_OFF", execution.code)
+        assertTrue(execution.recoverable)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
     }
 
     @Test
@@ -279,7 +279,7 @@ class DeviceToolTest {
         val result = tool(operations).execute("""{"action":"act","kind":"teleport"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("INVALID_ARGUMENTS", result.detail)
+        assertEquals("INVALID_ARGUMENTS", executionOf(result).code)
         assertTrue(operations.actCalls.isEmpty())
     }
 
@@ -326,7 +326,7 @@ class DeviceToolTest {
         )
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("VERIFY_TIMEOUT", body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("VERIFY_TIMEOUT", executionOf(result).code)
         assertEquals(1, operations.actCalls.size)
     }
 
@@ -336,7 +336,7 @@ class DeviceToolTest {
 
         val result = tool(operations).execute("""{"action":"act","kind":"scroll_to_text"}""")
 
-        assertEquals("INVALID_ARGUMENTS", result.detail)
+        assertEquals("INVALID_ARGUMENTS", executionOf(result).code)
         assertTrue(operations.actCalls.isEmpty())
     }
 
@@ -383,27 +383,22 @@ class DeviceToolTest {
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals("the forced post-action read must run exactly once", 1, perception.afterActions)
-        val data = body(result)["data"]!!.jsonObject
-        assertEquals("snap-after-scroll", data["snap"]!!.jsonPrimitive.content)
+        val observation = observationOf(result)
+        assertEquals("snap-after-scroll", observation.snapshotId)
         assertEquals(
             "screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok vision=ok glasses=ok device=ok",
-            data["coverage"]!!.jsonPrimitive.content,
+            observation.coverage,
         )
-        // A wait success applies nothing, so the existing projection reports changed=false and the structured fact is
-        // unknown rather than a fabricated false/true pair.
-        assertEquals(
-            "the final wait envelope applies nothing, so data.changed stays false",
-            false,
-            data["changed"]!!.jsonPrimitive.boolean,
-        )
-        val screen = data["screen"]!!.jsonObject
-        assertEquals("snap-after-scroll", screen["snap"]!!.jsonPrimitive.content)
+        // Task 8: the unknown `changed` is never written into `data`; the change marker here is the full/empty view of
+        // the compact observation, not a claimed state change.
+        val data = body(result)
+        assertFalse("no data.changed when applied is unknown", data.containsKey("changed"))
+        assertEquals("full", data["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
         assertTrue(
-            "the compact post-scroll screen replaces the projected bounds view: ${screen["text"]}",
-            screen["text"]!!.jsonPrimitive.content.contains("""#n4 button "目标" center=(11,22) [clickable]"""),
+            "the compact post-scroll screen replaces the projected bounds view: ${observation.screen}",
+            observation.screen!!.contains("""#n4 button "目标" center=(11,22) [clickable]"""),
         )
         assertFalse("scroll_to_text must not leak projector bounds: ${result.detail}", result.detail.contains("bounds="))
-        assertEquals("full", screen["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
 
         // Task 4: the scroll is one write result with its own post-action observation and one picture. The facts come
         // from the final wait envelope: applied/changed are unknown, the wait's own post-condition is verified.
@@ -413,8 +408,6 @@ class DeviceToolTest {
         assertNull("without applied evidence there is no changed fact", execution.changed)
         assertEquals(true, execution.verified)
         assertFalse(execution.partial)
-        val observation = observationOf(result)
-        assertEquals("snap-after-scroll", observation.snapshotId)
         assertTrue(observation.screen!!.contains("#n4"))
         assertEquals(ToolVision.Ok, observation.vision)
         assertEquals("the whole scroll loop attaches exactly one image", 1, result.images.size)
@@ -440,12 +433,10 @@ class DeviceToolTest {
         )
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("VERIFY_TIMEOUT", body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("VERIFY_TIMEOUT", executionOf(result).code)
         assertEquals(1, perception.afterActions)
-        val data = body(result)["data"]!!.jsonObject
-        assertEquals(false, data["changed"]!!.jsonPrimitive.boolean)
-        assertEquals("snap-timeout", data["snap"]!!.jsonPrimitive.content)
-        assertTrue("a failed scroll still carries the post-action coverage", data.containsKey("coverage"))
+        assertFalse("no data.changed when applied is unknown", body(result).containsKey("changed"))
+        assertEquals("full", body(result)["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
         assertFalse("no bounds in the failed scroll either: ${result.detail}", result.detail.contains("bounds="))
         assertEquals(1, operations.actCalls.size)
 
@@ -481,9 +472,9 @@ class DeviceToolTest {
         )
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("CHANNEL_UNAVAILABLE", body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("CHANNEL_UNAVAILABLE", executionOf(result).code)
         assertEquals("a dispatched scroll always gets the forced read", 1, perception.afterActions)
-        assertEquals("snap-failed-scroll", body(result)["data"]!!.jsonObject["snap"]!!.jsonPrimitive.content)
+        assertEquals("snap-failed-scroll", observationOf(result).snapshotId)
         assertFalse("no bounds after a failed scroll: ${result.detail}", result.detail.contains("bounds="))
     }
 
@@ -505,12 +496,13 @@ class DeviceToolTest {
         val result = tool(operations).execute("""{"action":"screenshot"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val images = body(result)["images"]!!.jsonArray
+        val images = result.images
         assertEquals(1, images.size)
-        assertEquals("pending", images[0].jsonObject["artifactId"]!!.jsonPrimitive.content)
-        assertEquals("image/jpeg", images[0].jsonObject["mime"]!!.jsonPrimitive.content)
-        assertEquals(768, images[0].jsonObject["width"]!!.jsonPrimitive.int)
+        assertEquals("pending", images[0].artifactId)
+        assertEquals("image/jpeg", images[0].mime)
+        assertEquals(768, images[0].width)
         assertFalse(result.detail.contains("base64", ignoreCase = true))
+        assertFalse("data no longer repeats the image list", body(result).containsKey("images"))
     }
 
     @Test
@@ -533,7 +525,7 @@ class DeviceToolTest {
         val result = tool(operations).execute("""{"action":"screenshot"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val diagnostic = body(result)["data"]!!.jsonObject["diagnostic"]!!.jsonPrimitive.content
+        val diagnostic = body(result)["diagnostic"]!!.jsonPrimitive.content
         assertTrue(
             "the kernel diagnostic must survive the projection, was `$diagnostic`",
             diagnostic.contains("screenshot_artifact_pending"),
@@ -542,7 +534,7 @@ class DeviceToolTest {
             "the store's reason must survive too: `$diagnostic`",
             diagnostic.contains("artifact store unavailable"),
         )
-        assertEquals("pending", body(result)["images"]!!.jsonArray[0].jsonObject["artifactId"]!!.jsonPrimitive.content)
+        assertEquals("pending", result.images.single().artifactId)
     }
 
     @Test
@@ -557,9 +549,9 @@ class DeviceToolTest {
         assertEquals(
             "a failed screenshot must name the kernel's error code, not a generic sentence",
             "UNSUPPORTED",
-            body["data"]!!.jsonObject["diagnostic"]!!.jsonPrimitive.content,
+            body["diagnostic"]!!.jsonPrimitive.content,
         )
-        assertEquals("UNSUPPORTED", body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("UNSUPPORTED", executionOf(result).code)
     }
 
     @Test
@@ -595,12 +587,9 @@ class DeviceToolTest {
                 val body = body(result)
                 assertEquals(
                     "screenshot is an artifact reference; bytes are not inlined",
-                    body["data"]!!.jsonObject["diagnostic"]!!.jsonPrimitive.content,
+                    body["diagnostic"]!!.jsonPrimitive.content,
                 )
-                assertEquals(
-                    image.artifactId,
-                    body["images"]!!.jsonArray.single().jsonObject["artifactId"]!!.jsonPrimitive.content,
-                )
+                assertFalse("data no longer repeats the image list", body.containsKey("images"))
             } finally {
                 screenTool.close()
             }
@@ -626,7 +615,7 @@ class DeviceToolTest {
 
             assertEquals(ActionOutcome.Done, result.outcome)
             assertEquals(ImageRef("pending", "image/jpeg", 768, 1664, ""), result.images.single())
-            val diagnostic = body(result)["data"]!!.jsonObject["diagnostic"]!!.jsonPrimitive.content
+            val diagnostic = body(result)["diagnostic"]!!.jsonPrimitive.content
             assertTrue("the kernel's pending reason must survive: $diagnostic", diagnostic.contains("screenshot_artifact_pending"))
             assertTrue("the store's absence must survive: $diagnostic", diagnostic.contains("NO_STORE"))
         } finally {
@@ -643,7 +632,7 @@ class DeviceToolTest {
         val result = tool(operations).execute("""{"action":"wait"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("INVALID_ARGUMENTS", result.detail)
+        assertEquals("INVALID_ARGUMENTS", executionOf(result).code)
         assertTrue(operations.waitCalls.isEmpty())
     }
 
@@ -676,7 +665,7 @@ class DeviceToolTest {
         val result = tool(operations).execute("""{"action":"status"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val data = body(result)["data"]!!.jsonObject
+        val data = body(result)
         assertEquals(
             "foreground=com.example.app/? interactive=true locked=false accessibility=true shell=false",
             data["status"]!!.jsonPrimitive.content,
@@ -699,7 +688,8 @@ class DeviceToolTest {
         val result = tool(operations).execute("""{"action":"act","kind":"tap","ref":"#n1"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val data = body(result)["data"]!!.jsonObject
+        // Legacy composition (no perception port): the projector's tree is the only screen carrier, so it stays in data.
+        val data = body(result)
         assertEquals(JsonNull, data["screen"])
         assertEquals(
             "diagnostic=shell_accepted_unobserved; the accessibility service is not bound",
@@ -722,7 +712,7 @@ class DeviceToolTest {
 
         val result = tool(operations).execute("""{"action":"act","kind":"tap","ref":"#n1"}""")
 
-        val data = body(result)["data"]!!.jsonObject
+        val data = body(result)
         assertEquals(JsonNull, data["screen"])
         assertTrue(
             data["diagnostic"]!!.jsonPrimitive.content.startsWith("diagnostic=shell_accepted_unobserved"),
@@ -764,14 +754,17 @@ class DeviceToolTest {
         val result = tool(operations).execute("""{"action":"observe"}""")
 
         assertEquals(ActionOutcome.Failed, result.outcome)
-        assertEquals("UNSUPPORTED", body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("UNSUPPORTED", executionOf(result).code)
     }
 
     @Test
     fun `the device tool refuses an unknown name rather than guessing`() {
         val operations = FakeDeviceOperations(observation())
 
-        assertEquals("UNKNOWN_ACTION", tool(operations).execute("shell", "{}").detail)
+        assertEquals(
+            "UNKNOWN_ACTION",
+            tool(operations).execute("shell", "{}").execution!!.code,
+        )
         assertTrue(operations.calls.isEmpty())
     }
 
@@ -801,18 +794,21 @@ class DeviceToolTest {
         val result = tool(operations, perception = perception).execute("""{"action":"observe"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val screen = body(result).screen()
-        assertEquals("snap-7", screen["snap"]!!.jsonPrimitive.content)
+        // Task 8: the observation is the one screen carrier (a perception composition has no `data.screen`).
+        val observation = observationOf(result)
+        assertEquals("snap-7", observation.snapshotId)
         assertEquals(
             "screen=truncated notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok vision=ok glasses=ok device=ok",
-            screen["coverage"]!!.jsonPrimitive.content,
+            observation.coverage,
         )
-        assertEquals("com.example.app/.MainActivity", screen["foreground"]!!.jsonPrimitive.content)
-        assertTrue(screen["truncated"]!!.jsonPrimitive.boolean)
-        val text = screen["text"]!!.jsonPrimitive.content
+        assertEquals("com.example.app", observation.foregroundPackage)
+        assertEquals(".MainActivity", observation.foregroundActivity)
+        assertTrue(observation.truncated)
+        val text = observation.screen!!
         assertTrue("the compact line must be model-facing: $text", text.contains("""#n12 button "搜索" center=(540,320) [clickable]"""))
         assertTrue("truncation must be visible: $text", text.contains("truncated"))
         assertFalse("bounds must never face the model: $text", text.contains("bounds="))
+        assertFalse("a perception composition does not repeat the tree in data", body(result).containsKey("screen"))
         assertEquals("the default include is screen only", setOf(PerceptionSource.SCREEN), perception.lastInclude)
         assertEquals(PerceptionFilter.INTERACTIVE, perception.lastFilter)
         assertNull(perception.lastLimit)
@@ -840,13 +836,13 @@ class DeviceToolTest {
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals(1, perception.refreshCalls)
-        val screen = body(result).screen()
-        assertEquals("snap-fresh", screen["snap"]!!.jsonPrimitive.content)
+        val observation = observationOf(result)
+        assertEquals("snap-fresh", observation.snapshotId)
         assertTrue(
-            "the explicit observe must answer from the refreshed observation: ${screen["text"]}",
-            screen["text"]!!.jsonPrimitive.content.contains("手动切换后的新屏幕"),
+            "the explicit observe must answer from the refreshed observation: ${observation.screen}",
+            observation.screen!!.contains("手动切换后的新屏幕"),
         )
-        assertFalse(screen["text"]!!.jsonPrimitive.content.contains("缓存的旧屏幕"))
+        assertFalse(observation.screen!!.contains("缓存的旧屏幕"))
         assertEquals("the caller's projection still applies after the refresh", PerceptionFilter.INTERACTIVE, perception.lastFilter)
     }
 
@@ -886,13 +882,16 @@ class DeviceToolTest {
         // needs the observed screen in this run; the action result must now say the body may not be persisted.
         val sentinel = "WAIT-SCREEN-SENTINEL-3f81"
         val operations = FakeDeviceOperations(observation(nodes = listOf(node(sentinel))))
-        val result = tool(operations, perception = FakePerception(perceptionSnapshot()))
+        val perception = FakePerception(
+            perceptionSnapshot(elements = listOf(perceptionElement(ref = "#n1", text = sentinel))),
+        )
+        val result = tool(operations, perception = perception)
             .execute("""{"action":"wait","idle":true}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertTrue(
-            "the in-run model request must still see the observed screen: ${result.detail}",
-            result.detail.contains(sentinel),
+            "the in-run model request must still see the observed screen: ${result.observation}",
+            observationOf(result).screen!!.contains(sentinel),
         )
         assertTrue("a wait result may not be persisted", result.nonPersistent)
     }
@@ -933,7 +932,7 @@ class DeviceToolTest {
         )
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val data = body(result)["data"]!!.jsonObject
+        val data = body(result)
         assertEquals("微信", data["notifications"]!!.jsonArray[0].jsonObject["app"]!!.jsonPrimitive.content)
         assertEquals("晚上一起吃饭吗？", data["notifications"]!!.jsonArray[0].jsonObject["text"]!!.jsonPrimitive.content)
         assertEquals("PLAYING", data["media"]!!.jsonObject["state"]!!.jsonPrimitive.content)
@@ -985,11 +984,10 @@ class DeviceToolTest {
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        val body = body(result)
-        assertEquals("STALE_REF", body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("STALE_REF", executionOf(result).code)
         assertTrue(
-            "a stale ref must be answered with a freshly observed compact snapshot: ${body["data"]}",
-            body["data"]!!.jsonObject["snapshot"]!!.jsonPrimitive.content.contains("#n9"),
+            "a stale ref must be answered with a freshly observed compact snapshot: ${result.observation}",
+            observationOf(result).screen!!.contains("#n9"),
         )
         assertTrue("the action must not be dispatched", operations.actCalls.isEmpty())
         assertTrue("the stale answer carries fresh perception content", result.nonPersistent)
@@ -1036,22 +1034,27 @@ class DeviceToolTest {
         assertEquals(1, operations.actCalls.size)
         assertEquals(Ref("#n0"), operations.actCalls.single().ref)
         assertEquals(1, perception.afterActions)
-        val data = body(result)["data"]!!.jsonObject
-        assertEquals(true, data["changed"]!!.jsonPrimitive.boolean)
-        assertEquals("snap-after", data["snap"]!!.jsonPrimitive.content)
+        // Task 8: the observation is the one screen carrier; `data` keeps only the change marker and timing.
+        val observation = observationOf(result)
+        assertEquals("snap-after", observation.snapshotId)
         assertEquals(
             "screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok vision=ok glasses=ok device=ok",
-            data["coverage"]!!.jsonPrimitive.content,
+            observation.coverage,
         )
-        assertEquals("com.example.app/.MainActivity", data["foreground"]!!.jsonPrimitive.content)
-        val screen = data["screen"]!!.jsonObject
-        assertEquals("snap-after", screen["snap"]!!.jsonPrimitive.content)
+        assertEquals("com.example.app", observation.foregroundPackage)
+        assertEquals(".MainActivity", observation.foregroundActivity)
         assertTrue(
             "the action's own screen projection must be replaced by the compact post-action view",
-            screen["text"]!!.jsonPrimitive.content.contains("""#n5 text "B" center=(0,0)"""),
+            observation.screen!!.contains("""#n5 text "B" center=(0,0)"""),
         )
         assertFalse("act must not leak projector bounds either", result.detail.contains("bounds="))
-        assertEquals("full", screen["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
+        val data = body(result)
+        assertEquals("full", data["changes"]!!.jsonObject["mode"]!!.jsonPrimitive.content)
+        assertFalse("data no longer repeats the screen facts", data.containsKey("screen"))
+        assertFalse("data no longer repeats the snapshot id", data.containsKey("snap"))
+        assertFalse("data no longer repeats coverage", data.containsKey("coverage"))
+        assertFalse("data no longer repeats the applied answer", data.containsKey("changed"))
+        assertEquals(true, executionOf(result).changed)
     }
 
     // - Phase 2.1 Task 3: auto vision on observe/act -
@@ -1080,8 +1083,15 @@ class DeviceToolTest {
             height = 1280,
         )
 
-    private fun visionOf(result: ActionResult): String =
-        body(result)["data"]!!.jsonObject["vision"]!!.jsonPrimitive.content
+    private fun visionOf(result: ActionResult): String {
+        val observation = observationOf(result)
+        return when (observation.vision) {
+            ToolVision.Ok -> "ok"
+            ToolVision.Disabled -> "disabled"
+            ToolVision.Unavailable -> "unavailable(${observation.visionReason ?: "?"})"
+            ToolVision.NotRequested -> "not_requested"
+        }
+    }
 
     /** Fails unless both events were logged and [before] happened first. */
     private fun assertBefore(log: EventLog, before: String, after: String) {
@@ -1097,8 +1107,8 @@ class DeviceToolTest {
     private fun assertNoAutoVision(action: String, result: ActionResult) {
         assertTrue("$action must not attach an auto-captured image: ${result.images}", result.images.isEmpty())
         assertFalse(
-            "$action must not carry a top-level vision marker: ${body(result)["data"]}",
-            body(result)["data"]!!.jsonObject.containsKey("vision"),
+            "$action must not carry a duplicated vision marker: ${result.detail}",
+            body(result).containsKey("vision"),
         )
     }
 
@@ -1131,8 +1141,8 @@ class DeviceToolTest {
         assertEquals(0, perception.screenshotCalls)
         assertTrue(result.images.isEmpty())
         assertFalse(
-            "a non-screen observe must not advertise vision it did not capture: ${body(result)["data"]}",
-            body(result)["data"]!!.jsonObject.containsKey("vision"),
+            "a non-screen observe must not advertise vision it did not capture: ${result.detail}",
+            body(result).containsKey("vision"),
         )
         val observation = observationOf(result)
         assertEquals("no picture was wanted, so none is claimed", ToolVision.NotRequested, observation.vision)
@@ -1215,16 +1225,14 @@ class DeviceToolTest {
             refTtlMillis = { 0L },
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
 
-        val detail = body(result)
-        val data = detail["data"]!!.jsonObject
-        val snapshotText = data["snapshot"]!!.jsonPrimitive.content
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("STALE_REF", detail["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("STALE_REF", executionOf(result).code)
         assertEquals("the stale answer reads the screen once", 1, perception.refreshCalls)
         assertEquals("afterAction is reserved for post-act only", 0, perception.afterActions)
-        // CompactSnapshotRenderer renders elements, not the snapshot id; `#n9` is the body-visible proof that the
+        // CompactSnapshotRenderer renders elements, not the snapshot id; `#n9` is the model-visible proof that the
         // fresh `snap-fresh` read (not the cached `snap-old-cache`) produced this answer.
-        assertTrue("the refreshed screen must be in the body: $snapshotText", snapshotText.contains("#n9"))
+        val snapshotText = observationOf(result).screen.orEmpty()
+        assertTrue("the refreshed screen must be in the observation: $snapshotText", snapshotText.contains("#n9"))
         assertFalse("the cached turn snapshot must not answer the stale ref: $snapshotText", snapshotText.contains("旧缓存"))
         assertEquals("the refreshed screen is captured for the refusal", 1, perception.screenshotCalls)
         assertEquals("img-stale", result.images.single().artifactId)
@@ -1369,15 +1377,15 @@ class DeviceToolTest {
             .execute("""{"action":"observe"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val screen = body(result).screen()
-        assertFalse("a complete screen must stay untruncated: ${screen["coverage"]}", screen["truncated"]!!.jsonPrimitive.boolean)
+        val observation = observationOf(result)
+        assertFalse("a complete screen must stay untruncated: ${observation.coverage}", observation.truncated)
         assertFalse(
-            "a notification cut must not append a screen truncation marker: ${screen["text"]}",
-            screen["text"]!!.jsonPrimitive.content.contains("truncated"),
+            "a notification cut must not append a screen truncation marker: ${observation.screen}",
+            observation.screen!!.contains("truncated"),
         )
         assertTrue(
             "the notifications source must still report its own cut",
-            screen["coverage"]!!.jsonPrimitive.content.contains("notifications=truncated"),
+            observation.coverage!!.contains("notifications=truncated"),
         )
     }
 
@@ -1418,11 +1426,12 @@ class DeviceToolTest {
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val screen = body(result)["data"]!!.jsonObject["screen"]!!.jsonObject
-        assertFalse("act must apply the same screen-specific rule", screen["truncated"]!!.jsonPrimitive.boolean)
+        // Task 8: the notification cut is an observation fact; the screen flag follows the screen source only.
+        val observation = observationOf(result)
+        assertFalse("act must apply the same screen-specific rule", observation.truncated)
         assertFalse(
             "act's compact text must not append the marker for a notification cut",
-            screen["text"]!!.jsonPrimitive.content.contains("truncated"),
+            observation.screen!!.contains("truncated"),
         )
     }
 
@@ -1446,13 +1455,9 @@ class DeviceToolTest {
         ).execute("""{"action":"act","kind":"tap","ref":"#n0"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        val body = body(result)
-        assertEquals(
-            DeviceErrorCodes.ACCEPTED_NO_EFFECT,
-            body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content,
-        )
-        val data = body["data"]!!.jsonObject
-        assertEquals(false, data["changed"]!!.jsonPrimitive.boolean)
+        assertEquals(DeviceErrorCodes.ACCEPTED_NO_EFFECT, executionOf(result).code)
+        val data = body(result)
+        assertFalse("no data.changed=false for an unknown applied", data.containsKey("changed"))
         assertTrue(
             "the refusal must tell the model to observe before deciding again: $data",
             data["note"]!!.jsonPrimitive.content.contains("先观察再决定"),
@@ -1490,22 +1495,27 @@ class DeviceToolTest {
         )
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val data = body(result)["data"]!!.jsonObject
+        val data = body(result)
         assertEquals(
             "foreground=com.example.app/.MainActivity interactive=false locked=true accessibility=false shell=false",
             data["status"]!!.jsonPrimitive.content,
         )
+        // Task 8: coverage and foreground are observation facts; `data` keeps the status-specific sources.
+        val observation = observationOf(result)
         assertEquals(
             "screen=ok notifications=ok media=ok calendar=ok acoustic=ok clipboard=ok vision=ok glasses=ok device=ok",
-            data["coverage"]!!.jsonPrimitive.content,
+            observation.coverage,
         )
         assertTrue(data["device"]!!.jsonPrimitive.content.contains("battery=76%"))
-        assertEquals("com.example.app/.MainActivity", data["foreground"]!!.jsonPrimitive.content)
+        assertEquals("com.example.app", observation.foregroundPackage)
+        assertEquals(".MainActivity", observation.foregroundActivity)
         assertEquals("PLAYING", data["media"]!!.jsonObject["state"]!!.jsonPrimitive.content)
         assertEquals("稻香", data["media"]!!.jsonObject["title"]!!.jsonPrimitive.content)
         assertEquals("信息", data["notifications"]!!.jsonArray[0].jsonObject["title"]!!.jsonPrimitive.content)
         assertFalse(data["panel"]!!.jsonPrimitive.boolean)
         assertTrue(data["glasses"]!!.jsonObject["connected"]!!.jsonPrimitive.boolean)
+        assertFalse("data no longer repeats coverage", data.containsKey("coverage"))
+        assertFalse("data no longer repeats the foreground", data.containsKey("foreground"))
         assertFalse("status must never repeat the screen tree", data.containsKey("screen"))
         assertFalse("status must never carry compact screen text", data.containsKey("text"))
         assertFalse("no screen refs in a status result", result.detail.contains("#n"))
@@ -1526,7 +1536,7 @@ class DeviceToolTest {
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals("the ambient status question defaults to device facts", setOf(PerceptionSource.DEVICE), perception.lastInclude)
-        val data = body(result)["data"]!!.jsonObject
+        val data = body(result)
         assertFalse("notification content must not be read unasked", data.containsKey("notifications"))
         assertTrue("the device facts are always present", data.containsKey("device"))
     }
@@ -1551,7 +1561,7 @@ class DeviceToolTest {
         assertEquals(setOf(PerceptionSource.NOTIFICATIONS), perception.lastInclude)
         assertTrue(
             "the notifications that were requested must still be returned",
-            body(result)["data"]!!.jsonObject.containsKey("notifications"),
+            body(result).containsKey("notifications"),
         )
     }
 
@@ -1563,7 +1573,7 @@ class DeviceToolTest {
             .execute("""{"action":"status","include":["telepathy"]}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("INVALID_ARGUMENTS", result.detail)
+        assertEquals("INVALID_ARGUMENTS", executionOf(result).code)
         assertEquals("an invalid status include must not read the device", 0, perception.refreshCalls)
         assertEquals(0, perception.screenshotCalls)
         val execution = executionOf(result)
@@ -1588,7 +1598,7 @@ class DeviceToolTest {
         ).forEach { args ->
             val result = device.execute(args)
             assertEquals("$args must be INVALID_ARGUMENTS", ActionOutcome.Refused, result.outcome)
-            assertEquals("$args must be INVALID_ARGUMENTS", "INVALID_ARGUMENTS", result.detail)
+            assertEquals("$args must be INVALID_ARGUMENTS", "INVALID_ARGUMENTS", executionOf(result).code)
             // Task 4: an argument refusal still answers with the current screen text, but never a picture.
             val execution = executionOf(result)
             assertEquals("$args must not reach a device channel", false, execution.accepted)
@@ -1655,7 +1665,7 @@ class DeviceToolTest {
             .execute("""{"action":"screenshot"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("VISION_DISABLED", result.detail)
+        assertEquals("VISION_DISABLED", executionOf(result).code)
         assertEquals(0, operations.screenshotCalls)
         val execution = executionOf(result)
         assertEquals(ToolOutcome.Refused, execution.outcome)
@@ -2114,7 +2124,7 @@ class DeviceToolTest {
             .execute("""{"action":"act","kind":"teleport"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("INVALID_ARGUMENTS", result.detail)
+        assertEquals("INVALID_ARGUMENTS", executionOf(result).code)
         val execution = executionOf(result)
         assertEquals(ToolOutcome.Refused, execution.outcome)
         assertEquals("INVALID_ARGUMENTS", execution.code)
@@ -2259,7 +2269,11 @@ class DeviceToolTest {
     private fun body(result: ActionResult): JsonObject =
         json.parseToJsonElement(result.detail).jsonObject
 
-    private fun JsonObject.screen(): JsonObject = this["data"]!!.jsonObject["screen"]!!.jsonObject
+    /**
+     * The legacy (no perception port) projection's screen object. A perception composition has no `data.screen` at all
+     * (Task 8): its tree is `observation.screen`, and tests that way assert the observation directly.
+     */
+    private fun JsonObject.screen(): JsonObject = this["screen"]!!.jsonObject
 
     private fun success(action: String, data: String? = null): DeviceEnvelope = DeviceEnvelope.success(
         action = action,

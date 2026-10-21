@@ -136,7 +136,9 @@ class DeviceKernelOperations(private val kernel: DeviceKernel) : DeviceOperation
  * [DeviceOperations], the kernel owns the channels and the settle, and this class only
  *  - parses the model-facing arguments (a schema without `via`/coordinates, D84),
  *  - runs the one tool-layer loop the kernel refuses to own (`scroll_to_text`, R46),
- *  - projects the kernel envelope into the §4.6 JSON with `data.screen` (R41).
+ *  - projects the kernel envelope into the §4.6 screen JSON (R41): with a perception port the tree is
+ *    `ActionResult.observation`, and the legacy no-provider path keeps it in `data` as the only screen carrier
+ *    (Task 8 removed every duplicated observation/execution field from `data`).
  *
  * **Screenshot (R44).** This task keeps the kernel's `ImageRef("pending", ...)` and never inline
  * bytes; `region` and `annotate` are not advertised, because the artifact store and image pipeline
@@ -260,6 +262,9 @@ class DeviceTool(
         return if (provider == null) {
             val revisionBefore = operations.revision
             val envelope = operations.observe(filter)
+            // Legacy composition: there is no perception port, so the projector's tree is the only screen carrier and
+            // stays in `data` (it is not duplicated — no observation exists). Task 4's ruling stands: no observation is
+            // fabricated without a real source.
             result(envelope, project(envelope, filter), fingerprintAfter(envelope, revisionBefore))
         } else {
             val include = parseInclude(args, DEFAULT_OBSERVE_INCLUDE, OBSERVE_SOURCES)
@@ -287,8 +292,8 @@ class DeviceTool(
                 snapshot = snapshot,
                 captureResult = capture,
             )?.let { if (wantsScreen) it else it.copy(screen = null) }
-            // A read through the perception port already answered: there is no kernel envelope to project, but every
-            // `device` call keeps the same model-facing envelope shape.
+            // Task 8: the screen tree, coverage, foreground and vision live in `observation` only; `data` keeps the
+            // tool-specific non-screen sources the caller asked for.
             result(
                 DeviceEnvelope.success(
                     action = ACTION_OBSERVE,
@@ -298,7 +303,7 @@ class DeviceTool(
                     verified = null,
                     timing = Timing(0, 0, 0),
                 ),
-                withVision(observationData(snapshot, include), capture),
+                observationData(snapshot, include),
                 extraImages = capturedImage(capture),
                 observation = observation,
             )
@@ -348,26 +353,8 @@ class DeviceTool(
         }
         val snapshot = provider.refresh()
         // Task 3: the refreshed screen is exactly what the model needs to re-target, so the refusal carries its image
-        // and the same vision marker an observe would.
+        // and the same vision marker an observe would. Task 8: that screen is the observation; `data` repeats none of it.
         val capture = captureVision()
-        val data = withVision(
-            buildJsonObject {
-                put("snapshot", CompactSnapshotRenderer.render(snapshot))
-                put("coverage", PerceptionCoverageRenderer.render(snapshot.coverage))
-            },
-            capture,
-        )
-        val detail = toolEnvelope(
-            tool = NAME,
-            ok = false,
-            channel = CHANNEL_ACCESSIBILITY,
-            data = data,
-            error = ToolFailure(
-                code = STALE_REF,
-                message = stale.reason,
-                recoverable = true,
-            ),
-        )
         // Task 4: the action was never dispatched (accepted/applied false), and the refreshed read is the observation.
         val observation = observeForResult(
             capture = true,
@@ -377,7 +364,7 @@ class DeviceTool(
         )
         return ActionResult(
             ActionOutcome.Refused,
-            detail,
+            "{}",
             images = capturedImage(capture),
             nonPersistent = true,
             execution = ToolExecution(
@@ -425,16 +412,13 @@ class DeviceTool(
      */
     private fun actResult(envelope: DeviceEnvelope, revisionBefore: Long?, partial: Boolean = false): ActionResult {
         val snapshot = perception?.afterAction()
-        val data = if (snapshot == null) {
-            project(envelope, lastFilter)
-        } else {
-            decorateActData(project(envelope, lastFilter), envelope, snapshot)
-        }
+        val projected = project(envelope, lastFilter)
         // Task 3: the capture follows `afterAction()`, so the image is the screen the action produced. `scrollToText`
         // reaches this through its single returned envelope, which is why the loop never captures per inner scroll.
         val capture = captureVision()
         // Task 4: the forced post-action read and the one capture above are this result's observation. A dispatched act
-        // always carries one, on success and on failure alike; without a perception port there is no honest screen.
+        // always carries one, on success and on failure alike; without a perception port there is no honest observation
+        // and the legacy projector's tree stays the only screen carrier in `data`.
         val observation = snapshot?.let {
             observeForResult(
                 capture = true,
@@ -445,7 +429,7 @@ class DeviceTool(
         }
         return result(
             envelope,
-            withVision(data, capture),
+            if (snapshot == null) projected else actData(projected, envelope),
             fingerprintAfter(envelope, revisionBefore),
             stateChanging = true,
             extraImages = capturedImage(capture),
@@ -472,18 +456,61 @@ class DeviceTool(
             .getOrElse { PerceptionScreenshotResult.Unavailable(SCREENSHOT_FAILED) }
     }
 
-    /** Task 3: adds the model-facing vision marker to [data]; `null` leaves the shape untouched. */
-    private fun withVision(data: JsonObject, capture: PerceptionScreenshotResult?): JsonObject {
-        val marker = when (capture) {
-            null -> return data
-            is PerceptionScreenshotResult.Image -> VISION_MARKER_OK
-            PerceptionScreenshotResult.Disabled -> VISION_MARKER_DISABLED
-            is PerceptionScreenshotResult.Unavailable -> "$VISION_MARKER_UNAVAILABLE(${capture.reason})"
-        }
+    /**
+     * Task 8: the tool-specific metadata `data` keeps for one kernel projection when the observation already carries
+     * the screen (a perception composition).
+     *
+     * The rendered tree is **not** here: [ToolObservation.screen] is its one canonical carrier. Only the metadata the
+     * observation model cannot express — the kernel revision, the IME flag and the full/diff change marker — survives,
+     * and `app` is deliberately read from `observation.foregroundPackage` instead of being repeated.
+     *
+     * The legacy composition (no perception port) keeps the whole projection instead: there the tree is the **only**
+     * screen carrier, so dropping it would lose the screen rather than de-duplicate it (Task 4's "no fabricated
+     * observation" ruling stands).
+     */
+    private fun legacyData(projected: JsonObject): JsonObject {
+        val screen = projected[SCREEN_KEY] as? JsonObject
+            ?: return buildJsonObject {
+                (projected[DIAGNOSTIC_KEY] as? JsonPrimitive)?.let { put(DIAGNOSTIC_KEY, it) }
+            }
         return buildJsonObject {
-            data.forEach { (key, value) -> put(key, value) }
-            put(VISION_KEY, marker)
+            (screen[REV_KEY] as? JsonPrimitive)?.let { put(REV_KEY, it) }
+            (screen[IME_KEY] as? JsonPrimitive)?.let { put(IME_KEY, it) }
+            (screen[CHANGES_KEY] as? JsonObject)?.let { put(CHANGES_KEY, it) }
         }
+    }
+
+    /**
+     * Task 8: the tool-specific half of one `act` result that has a perception observation.
+     *
+     * The compact observation is the post-action screen and a kernel diff would describe a frame the model no longer
+     * receives, so the change marker is the explicit full/empty one. `data.changed` is gone: [ToolExecution.changed] is
+     * the one authoritative carrier and an unknown value must never be written as `false`.
+     */
+    private fun actData(projected: JsonObject, envelope: DeviceEnvelope): JsonObject {
+        val screen = projected[SCREEN_KEY] as? JsonObject
+        return buildJsonObject {
+            if (screen == null) {
+                (projected[DIAGNOSTIC_KEY] as? JsonPrimitive)?.let { put(DIAGNOSTIC_KEY, it) }
+            } else {
+                (screen[REV_KEY] as? JsonPrimitive)?.let { put(REV_KEY, it) }
+                (screen[IME_KEY] as? JsonPrimitive)?.let { put(IME_KEY, it) }
+                put(CHANGES_KEY, emptyChanges())
+            }
+            val changed = envelope.applied == true
+            if (!changed && (envelope.applied == false ||
+                    envelope.error?.code == DeviceErrorCodes.ACCEPTED_NO_EFFECT)) {
+                put(NOTE_KEY, OBSERVE_FIRST_NOTE)
+            }
+        }
+    }
+
+    /** The empty `mode=full` marker the post-action observation needs (no diff lines to describe). */
+    private fun emptyChanges(): JsonObject = buildJsonObject {
+        put("mode", "full")
+        put("added", buildJsonArray { })
+        put("updated", buildJsonArray { })
+        put("removed", buildJsonArray { })
     }
 
     /** Task 3: the captured artifact, if the capture produced one; a disabled/unavailable capture adds no image. */
@@ -569,67 +596,13 @@ class DeviceTool(
     }
 
     /**
-     * Task 7: a forced post-action perception read.
-     *
-     * `perception.afterAction()` opens a new snapshot under a new id, so a ref from before the action that no longer
-     * names a node is stale for the next call (R5). The compact text replaces the projector's full/diff text so the
-     * model sees the same bounded shape as `observe`; the existing envelope (ok/error/applied) is untouched.
-     */
-    private fun decorateActData(
-        data: JsonObject,
-        envelope: DeviceEnvelope,
-        snapshot: PerceptionSnapshot,
-    ): JsonObject {
-        val coverage = PerceptionCoverageRenderer.render(snapshot.coverage)
-        val foreground = foregroundString(snapshot)
-        val compact = CompactSnapshotRenderer.render(snapshot)
-        val changed = envelope.applied == true
-        return buildJsonObject {
-            data.forEach { (key, value) -> if (key != SCREEN_KEY) put(key, value) }
-            put(SNAP_KEY, snapshot.snapshotId)
-            put(COVERAGE_KEY, coverage)
-            put(FOREGROUND_KEY, foreground)
-            put(CHANGED_KEY, changed)
-            (data[SCREEN_KEY] as? JsonObject)?.let { screen ->
-                put(
-                    SCREEN_KEY,
-                    buildJsonObject {
-                        screen.forEach { (key, value) -> put(key, value) }
-                        put(SNAP_KEY, snapshot.snapshotId)
-                        put(COVERAGE_KEY, coverage)
-                        put(FOREGROUND_KEY, foreground)
-                        put(TRUNCATED_KEY, CompactSnapshotRenderer.screenTruncated(snapshot))
-                        put(TEXT_KEY, compact)
-                        // The projector's full/diff lines carry `bounds=`, which is evidence-only and must not face the
-                        // model (spec §7.3). The compact text above is the complete post-action screen, so the change
-                        // mode is full again rather than a diff whose line format would reintroduce bounds.
-                        put(
-                            CHANGES_KEY,
-                            buildJsonObject {
-                                put("mode", "full")
-                                put("added", buildJsonArray { })
-                                put("updated", buildJsonArray { })
-                                put("removed", buildJsonArray { })
-                            },
-                        )
-                    },
-                )
-            }
-            if (!changed && (envelope.applied == false ||
-                    envelope.error?.code == DeviceErrorCodes.ACCEPTED_NO_EFFECT)) {
-                put(NOTE_KEY, OBSERVE_FIRST_NOTE)
-            }
-        }
-    }
-
-    /**
      * R46: one scroll + one bounded wait per round, stopping on the first hit.
      *
      * The loop is deliberately here rather than in the kernel: the kernel's `SCROLL_TO_TEXT` is one
      * scroll step, and the tool owns the overall `timeout_ms` budget. A kernel error that is not
      * "the screen did not change" ends the loop immediately; a `VERIFY_TIMEOUT` from one round only
      * means "keep scrolling until the budget is spent", and the last envelope keeps the final
-     * observation (`data.screen` is projected from it).
+     * observation (`observation.screen` is projected from it, Task 8).
      */
     /**
      * A model sometimes sends the rendered ref as `n12` instead of `#n12`; the registry only knows the `#` form. Accept
@@ -685,18 +658,20 @@ class DeviceTool(
         }
         val envelope = operations.screenshot()
         val kernelDiagnostic = envelope.data?.takeIf { it.isNotBlank() }
+        // Task 8: `data` keeps only the tool-specific diagnostic. The pictures are [ActionResult.images] and the screen
+        // state is [ActionResult.observation]; `data.screen=null` was a third, redundant copy of both.
         val data = if (envelope.ok) {
             buildJsonObject {
                 // R131: the kernel's `diagnostic=screenshot_artifact_pending; reason=…` is the only honest record that
                 // the capture worked and the store did not. A generic sentence here would overwrite the failure reason
                 // and make a broken artifact store indistinguishable from a normal pending reference.
-                put("diagnostic", kernelDiagnostic ?: "screenshot is an artifact reference; bytes are not inlined")
+                put(DIAGNOSTIC_KEY, kernelDiagnostic
+                    ?: "screenshot is an artifact reference; bytes are not inlined")
             }
         } else {
             buildJsonObject {
-                put("screen", JsonNull)
                 // On failure the error code is the reason; never replace it with a sentence the kernel did not say.
-                put("diagnostic", envelope.error?.code ?: kernelDiagnostic ?: "the screenshot failed")
+                put(DIAGNOSTIC_KEY, envelope.error?.code ?: kernelDiagnostic ?: "the screenshot failed")
             }
         }
         // Task 4: the explicit screenshot is its own image, so it never runs the auto-vision capture. Its observation
@@ -772,7 +747,7 @@ class DeviceTool(
         }
         return result(
             envelope,
-            project(envelope, lastFilter),
+            if (provider == null) project(envelope, lastFilter) else legacyData(project(envelope, lastFilter)),
             extraImages = capturedImage(capture),
             observation = observation,
         )
@@ -833,18 +808,10 @@ class DeviceTool(
         include: Set<PerceptionSource>,
     ): JsonObject {
         val state = deviceStateOrNull()
+        // Task 8: coverage and foreground are observation facts; `data` keeps the ambient sources status really adds.
         return buildJsonObject {
             put(STATUS_KEY, envelope.data ?: envelope.error?.code ?: "")
-            put(COVERAGE_KEY, PerceptionCoverageRenderer.render(snapshot.coverage))
             put(DEVICE_KEY, state?.let(::renderDeviceState))
-            put(
-                FOREGROUND_KEY,
-                foregroundString(snapshot) ?: state?.let {
-                    it.foregroundPackage?.let { packageName ->
-                        "$packageName/${it.foregroundActivity ?: UNKNOWN_ACTIVITY}"
-                    }
-                },
-            )
             put(MEDIA_KEY, mediaJson(snapshot.media ?: state?.media))
             put(PANEL_KEY, state?.panelVisible)
             put(GLASSES_KEY, glassesJson(state))
@@ -854,21 +821,9 @@ class DeviceTool(
         }
     }
 
-    /** One `observe` result: the compact screen object plus every non-screen source the caller asked for. */
+    /** One `observe` result's non-screen sources. Task 8: the screen itself is `observation.screen` only. */
     private fun observationData(snapshot: PerceptionSnapshot, include: Set<PerceptionSource>): JsonObject =
         buildJsonObject {
-            put(
-                SCREEN_KEY,
-                buildJsonObject {
-                    put(SNAP_KEY, snapshot.snapshotId)
-                    put(COVERAGE_KEY, PerceptionCoverageRenderer.render(snapshot.coverage))
-                    put(FOREGROUND_KEY, foregroundString(snapshot))
-                    // Review I3: the snapshot-wide flag also covers a notification cut; the screen flag must follow the
-                    // screen source only, or a complete screen claims to be truncated.
-                    put(TRUNCATED_KEY, CompactSnapshotRenderer.screenTruncated(snapshot))
-                    put(TEXT_KEY, CompactSnapshotRenderer.render(snapshot))
-                },
-            )
             if (PerceptionSource.NOTIFICATIONS in include) {
                 put(NOTIFICATIONS_KEY, notificationsJson(snapshot.notifications))
             }
@@ -893,11 +848,6 @@ class DeviceTool(
             if (PerceptionSource.DEVICE in include) {
                 put(DEVICE_KEY, deviceStateOrNull()?.let(::renderDeviceState))
             }
-        }
-
-    private fun foregroundString(snapshot: PerceptionSnapshot): String? =
-        snapshot.foregroundPackage?.let { packageName ->
-            "$packageName/${snapshot.foregroundActivity ?: UNKNOWN_ACTIVITY}"
         }
 
     private fun deviceStateOrNull(): DeviceState? =
@@ -1100,7 +1050,7 @@ class DeviceTool(
         // its own screen change, and even then only from the kernel's applied evidence.
         return ActionResult(
             outcome,
-            renderEnvelope(envelope, data),
+            renderData(envelope, data),
             fingerprint,
             stateChanging,
             images = envelope.images + extraImages,
@@ -1212,62 +1162,27 @@ class DeviceTool(
     private fun StringBuilder.field(value: String?): StringBuilder =
         append(value?.length ?: -1).append(':').append(value.orEmpty()).append('|')
 
-    private fun renderEnvelope(envelope: DeviceEnvelope, data: JsonObject): String = buildJsonObject {
-        put("ok", envelope.ok)
-        put("tool", envelope.tool)
-        put("action", envelope.action)
-        put("channel", envelope.channel)
-        put("accepted", envelope.accepted)
-        if (envelope.applied == null) put("applied", JsonNull) else put("applied", envelope.applied)
-        val verified = envelope.verified
-        if (verified == null) {
-            put("verified", JsonNull)
-        } else {
-            put(
-                "verified",
-                buildJsonObject {
-                    put("kind", verified.kind)
-                    put("rev", verified.revision)
-                },
-            )
-        }
-        put("data", data)
+    /**
+     * Task 8: one device result's model-facing `data` — tool-specific facts only.
+     *
+     * The pre-Task-8 `renderEnvelope` repeated the whole result here: `ok`, `tool`, `channel`, `accepted`, `applied`,
+     * `verified`, the image list and the `error` object all restated the envelope's `execution`/`images` members, and
+     * the nested `data.screen` restated `observation`. Now `execution` is the one execution-fact carrier, `images` the
+     * one picture carrier and `observation` the one screen carrier; `data` keeps the device sub-action, the kernel
+     * projection metadata each action really adds (revision/IME/changes/diagnostic, requested non-screen sources) and
+     * the kernel timing, which nothing else carries.
+     */
+    private fun renderData(envelope: DeviceEnvelope, fields: JsonObject): String = buildJsonObject {
+        put(ACTION_KEY, envelope.action)
+        fields.forEach { (key, value) -> put(key, value) }
         put(
-            "images",
-            buildJsonArray {
-                envelope.images.forEach { image ->
-                    add(
-                        buildJsonObject {
-                            put("artifactId", image.artifactId)
-                            put("mime", image.mime)
-                            put("width", image.width)
-                            put("height", image.height)
-                        },
-                    )
-                }
-            },
-        )
-        put(
-            "timing",
+            TIMING_KEY,
             buildJsonObject {
                 put("actMs", envelope.timing.actMs)
                 put("observeMs", envelope.timing.observeMs)
                 put("totalMs", envelope.timing.totalMs)
             },
         )
-        val error = envelope.error
-        if (error == null) {
-            put("error", JsonNull)
-        } else {
-            put(
-                "error",
-                buildJsonObject {
-                    put("code", error.code)
-                    put("message", error.message)
-                    put("recoverable", error.recoverable)
-                },
-            )
-        }
     }.toString()
 
     /**
@@ -1288,7 +1203,8 @@ class DeviceTool(
             ?.copy(vision = vision, visionReason = visionReason)
         return ActionResult(
             ActionOutcome.Refused,
-            code,
+            // Task 8: the stable code is `execution.code`; repeating it as the whole `data` was a second copy.
+            "{}",
             // A refusal now carries screen text, so it may not outlive the run either.
             nonPersistent = observation != null,
             execution = ToolExecution(
@@ -1354,23 +1270,15 @@ class DeviceTool(
         /** The one-line nudge when an accepted write provably changed nothing (spec §7.6). */
         private const val OBSERVE_FIRST_NOTE = "动作未改变画面；先观察再决定"
 
-        /** The activity placeholder when only the package is known; the model can still tell it is unresolved. */
-        private const val UNKNOWN_ACTIVITY = "?"
-
-        // Model-facing keys shared by observe/act/status. Kept private and spelled once so the three shapes cannot drift.
+        // Model-facing `data` keys. Task 8 keeps only what the envelope/observation do not already carry.
         private const val SCREEN_KEY = "screen"
         private const val CHANGES_KEY = "changes"
-        private const val SNAP_KEY = "snap"
-        private const val COVERAGE_KEY = "coverage"
-        private const val FOREGROUND_KEY = "foreground"
-        private const val TRUNCATED_KEY = "truncated"
-        private const val TEXT_KEY = "text"
-        private const val CHANGED_KEY = "changed"
         private const val NOTE_KEY = "note"
-        private const val VISION_KEY = "vision"
-        private const val VISION_MARKER_OK = "ok"
-        private const val VISION_MARKER_DISABLED = "disabled"
-        private const val VISION_MARKER_UNAVAILABLE = "unavailable"
+        private const val ACTION_KEY = "action"
+        private const val TIMING_KEY = "timing"
+        private const val REV_KEY = "rev"
+        private const val IME_KEY = "ime"
+        private const val DIAGNOSTIC_KEY = "diagnostic"
         private const val STATUS_KEY = "status"
         private const val DEVICE_KEY = "device"
         private const val MEDIA_KEY = "media"

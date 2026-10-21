@@ -50,14 +50,16 @@ class OpenTargetProbeActivity : Activity() {
                 )
                 val args = buildJsonObject { put("target", target) }.toString()
                 val result = root.executeToolForProbe("open", args)
+                // 0.3 Phase 2.2 Task 8: the unified envelope. The stable code and applied fact live in `execution`; the
+                // tool-specific candidate list is still `data.candidates`.
                 val body = result?.detail?.let {
                     runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull()
                 }
-                val code = (body?.get("error") as? kotlinx.serialization.json.JsonObject)
-                    ?.get("code")?.jsonPrimitive?.contentOrNull
+                val execution = body?.get("execution") as? kotlinx.serialization.json.JsonObject
+                val code = (execution?.get("code") as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
+                val applied = (execution?.get("applied") as? kotlinx.serialization.json.JsonPrimitive)?.contentOrNull
                 val data = body?.get("data") as? kotlinx.serialization.json.JsonObject
                 val candidates = (data?.get("candidates") as? kotlinx.serialization.json.JsonArray)?.size ?: 0
-                val applied = body?.get("applied")?.jsonPrimitive?.contentOrNull
                 Log.i(
                     TAG,
                     "P3_OPENTARGET outcome=${result?.outcome?.name ?: "NO_CATALOG"} code=${code ?: "none"} " +

@@ -210,7 +210,6 @@ class OpenTool(
         // Task 5: `list` is a read, not a screen operation - execution facts only, no observation and no image.
         return done(data, execution = listDoneExecution())
     }
-
     /**
      * R104: one package per launchable component line (`com.pkg/.Activity` or `com.pkg/com.pkg.Activity`), deduplicated
      * in the shell's order. Headers (`priority=0 preferredOrder=0`), blanks and anything else are not components.
@@ -343,13 +342,13 @@ class OpenTool(
      * The shell's `Status: ok` is only the precondition. For a package launch ([expectedPackage] set) the tool waits for
      * that package and then requires the **foreground** and the **accessibility root** to both name it; for a
      * URL/settings launch no target package is known, so the observed foreground must be non-null and equal the root
-     * package. A mismatch is a recoverable `STATE_UNCHANGED` whose `data` carries the same fields a success would:
-     * `resolvedPackage`, `foreground` (`package`/`activity`), `rootPackage` and `verified`. The caller's [data] keys
-     * (`target`/`component`) stay on both outcomes.
+     * package. A mismatch is a recoverable `STATE_UNCHANGED` whose `data` keeps the caller's target/component only:
+     * the observed foreground/root and the `verified` answer are the result's `observation` and `execution` facts
+     * (Task 8).
      *
-     * 0.3 Phase 2.2 Task 5: every outcome observes the screen and attaches at most one best-effort picture. Only a
-     * verified success keeps the `vision=ok|disabled|unavailable(<reason>)` marker in `data` (the Phase 2.1 shape);
-     * every other path carries the fact as `observation.vision` and a produced image in [ActionResult.images].
+     * 0.3 Phase 2.2 Task 5: every outcome observes the screen and attaches at most one best-effort picture. Task 8 moved
+     * the `vision` marker off `data` (it is `observation.vision`) and the foreground/rootPackage facts into the
+     * observation, where they are canonical.
      */
     private fun launchEnvelope(
         target: PrivilegedShell,
@@ -367,6 +366,7 @@ class OpenTool(
                 recoverable = true,
                 outcome = ActionOutcome.Failed,
                 applied = false,
+                data = data,
             )
         }
         if (!result.stdout.contains(STATUS_OK)) {
@@ -379,6 +379,7 @@ class OpenTool(
                 recoverable = true,
                 outcome = ActionOutcome.Failed,
                 applied = null,
+                data = data,
             )
         }
         val reachedForeground = expectedPackage == null ||
@@ -386,36 +387,24 @@ class OpenTool(
         val observedForeground = foreground()
         val observedActivity = foregroundActivity()
         val observedRoot = rootPackage()
-        val resolvedPackage = expectedPackage ?: observedForeground
         val verified = if (expectedPackage != null) {
             reachedForeground && observedForeground == expectedPackage && observedRoot == expectedPackage
         } else {
             observedForeground != null && observedForeground == observedRoot
         }
-        val launchData = buildJsonObject {
-            data.forEach { (key, value) -> put(key, value) }
-            put("resolvedPackage", resolvedPackage)
-            put(
-                "foreground",
-                buildJsonObject {
-                    put("package", observedForeground)
-                    put("activity", observedActivity)
-                },
-            )
-            put("rootPackage", observedRoot)
-            put("verified", verified)
-        }
         if (!verified) {
-            // Task 5 / T7: a verification mismatch keeps its Failed/STATE_UNCHANGED outcome and its data shape, but it
-            // now observes the screen it actually left behind (and attaches one best-effort picture). `applied` stays
-            // null: the mismatch proves the request is not in front, not that the command never applied.
+            // Task 5 / T7: a verification mismatch keeps its Failed/STATE_UNCHANGED outcome and its target/component
+            // data, but it now observes the screen it actually left behind (and attaches one best-effort picture).
+            // `applied` stays null: the mismatch proves the request is not in front, not that the command never applied.
             return failure(
                 code = STATE_UNCHANGED,
                 message = "the launch command succeeded but the request is not verified in front",
                 recoverable = true,
                 outcome = ActionOutcome.Failed,
-                data = launchData,
+                data = data,
                 applied = null,
+                // The probes above are this call's own foreground/root answer; they ride the observation.
+                probe = ObservationProbes(observedForeground, observedActivity, observedRoot),
             )
         }
         // 0.3 Phase 2.2 Task 5: a verified success observes and captures after the verification read. The observation
@@ -423,13 +412,11 @@ class OpenTool(
         // and the foreground/root facts describe the same frame; Task 6's production source must make them consistent.
         // A capture port that throws is still just "no image" (Task 4 fix): the verified launch succeeded, so it must
         // not turn the tool result into TOOL_THREW.
-        val attempt = screenAttempt()
-        val captured = attempt.captured
+        val attempt = screenAttempt(ObservationProbes(observedForeground, observedActivity, observedRoot))
         return done(
             buildJsonObject {
-                launchData.forEach { (key, value) -> put(key, value) }
+                data.forEach { (key, value) -> put(key, value) }
                 put("launched", true)
-                put(VISION_KEY, visionMarker(captured))
             },
             images = attempt.images,
             observation = attempt.observation,
@@ -454,19 +441,6 @@ class OpenTool(
         return result.stdout.lineSequence().any { it.trim() == "$PACKAGE_PREFIX$packageName" }
     }
 
-    /**
-     * 0.3 Phase 2.1 Task 4: the model-facing marker for a verified launch's automatic capture.
-     *
-     * The vocabulary is the one `DeviceTool` uses for observe/act - `ok`, `disabled`, `unavailable(<reason>)` - so one
-     * turn's tool results read alike. An unavailable capture carries the provider's reason (`no_image_profile`,
-     * `SCREENSHOT_FAILED`, ...); it never fails the launch itself.
-     */
-    private fun visionMarker(capture: PerceptionScreenshotResult): String = when (capture) {
-        is PerceptionScreenshotResult.Image -> VISION_MARKER_OK
-        PerceptionScreenshotResult.Disabled -> VISION_MARKER_DISABLED
-        is PerceptionScreenshotResult.Unavailable -> "$VISION_MARKER_UNAVAILABLE(${capture.reason})"
-    }
-
     /** Task 4: the captured artifact, if the capture produced one; a disabled/unavailable capture adds no image. */
     private fun capturedImage(capture: PerceptionScreenshotResult): List<ImageRef> =
         listOfNotNull((capture as? PerceptionScreenshotResult.Image)?.image)
@@ -480,11 +454,12 @@ class OpenTool(
         execution: ToolExecution = ToolExecution(outcome = ToolOutcome.Done),
     ): ActionResult = ActionResult(
         ActionOutcome.Done,
-        toolEnvelope(tool = NAME, ok = true, channel = CHANNEL, accepted = true, data = data),
+        // Task 8: `data` is the tool-specific payload only. The pre-Task-8 `toolEnvelope` repeated ok/channel/accepted/
+        // applied/error and a vision marker in it; execution/observation are the canonical carriers.
+        data.toString(),
         stateChanging = true,
         images = images,
-        // C2: observation text and an attached image may live only in this run's model request. A launch result
-        // without either keeps its existing persistent shape; Task 8 still owns the loop-copy nonPersistent audit.
+        // C2: observation text and an attached image may live only in this run's model request.
         nonPersistent = observation != null || images.isNotEmpty(),
         execution = execution,
         observation = observation,
@@ -493,13 +468,17 @@ class OpenTool(
     /**
      * edith-0.3 Phase 2.2 Task 5: one refusal or failure of a screen operation.
      *
-     * The outcome and the model-facing `error` shape are exactly what they were before Task 5; this helper only adds
-     * the structured facts. [captureImage] and [attachObservation] encode the task's image boundary: the launch
-     * paths observe and attach at most one picture, a pure argument refusal observes text only, and `list` does
-     * neither. Nothing here can change the outcome or fail the call.
+     * [captureImage] and [attachObservation] encode the task's image boundary: the launch paths observe and attach at
+     * most one picture, a pure argument refusal observes text only, and `list` does neither. Nothing here can change
+     * the outcome or fail the call. Task 8 keeps `data` to the caller's tool-specific `target`/`component`/`candidates`
+     * and moves the foreground/root/verified/vision facts to [observation]/[execution].
      *
      * [applied] defaults to `null`: a failure without evidence must not claim the action did not apply. A caller that
      * knows nothing was dispatched (a pure refusal, or a non-zero shell exit) passes `false` explicitly.
+     *
+     * [probe] is the foreground/root read this call already made for its own verification. Passing it in keeps the
+     * observation's foreground/root facts identical to the ones the verdict was based on, instead of reading the screen
+     * a second time; a path without probes simply lets [screenAttempt] read them.
      */
     private fun failure(
         code: String,
@@ -510,6 +489,7 @@ class OpenTool(
         applied: Boolean? = null,
         captureImage: Boolean = true,
         attachObservation: Boolean = true,
+        probe: ObservationProbes? = null,
     ): ActionResult {
         val observation: ToolObservation?
         val images: List<ImageRef>
@@ -519,28 +499,20 @@ class OpenTool(
                 images = emptyList()
             }
             captureImage -> {
-                val attempt = screenAttempt()
+                val attempt = screenAttempt(probe)
                 observation = attempt.observation
                 images = attempt.images
             }
             else -> {
-                observation = textObservation()
+                observation = textObservation(probe)
                 images = emptyList()
             }
         }
         val failed = outcome == ActionOutcome.Failed
         return ActionResult(
             outcome,
-            toolEnvelope(
-                tool = NAME,
-                ok = false,
-                channel = CHANNEL,
-                // The legacy detail envelope keeps its pre-Task-5 shape (`accepted=false` on a failure); the new
-                // structured `execution` below is where Task 5's honest facts live until Task 8 removes the duplication.
-                accepted = false,
-                data = data,
-                error = ToolFailure(code, message, recoverable),
-            ),
+            // Task 8: tool-specific data only (the tool's stable code lives in `execution.code`).
+            (data ?: buildJsonObject { }).toString(),
             stateChanging = true,
             images = images,
             nonPersistent = observation != null || images.isNotEmpty(),
@@ -608,7 +580,8 @@ class OpenTool(
      */
     private fun unknownAction(): ActionResult = ActionResult(
         ActionOutcome.Refused,
-        UNKNOWN_ACTION,
+        // Task 8: the stable code is `execution.code`; the bare data copy is gone.
+        "{}",
         execution = ToolExecution(
             outcome = ToolOutcome.Refused,
             code = UNKNOWN_ACTION,
@@ -620,7 +593,7 @@ class OpenTool(
     )
 
     /**
-     * edith-0.3 Phase 2.2 Task 5: one screen attempt's observation, picture and raw capture result.
+     * edith-0.3 Phase 2.2 Task 5: one screen attempt's observation and picture.
      *
      * [captured] is never null: [screenAttempt] always takes exactly one picture (or records how the capture port
      * answered), which is what keeps every result to **at most one image**.
@@ -628,7 +601,13 @@ class OpenTool(
     private data class ObservationAttempt(
         val observation: ToolObservation,
         val images: List<ImageRef>,
-        val captured: PerceptionScreenshotResult,
+    )
+
+    /** The foreground/root read one launch already made for its verification, reused by the observation. */
+    private data class ObservationProbes(
+        val foreground: String?,
+        val activity: String?,
+        val rootPackage: String?,
     )
 
     /**
@@ -644,14 +623,21 @@ class OpenTool(
      * perception content), and `vision = ok` is reported because the picture is attached. Without an image the result
      * says `unavailable/no_source`. A capture port that throws is mapped to `unavailable/SCREENSHOT_FAILED`, exactly
      * as Task 4 fixed for the verified path.
+     *
+     * Task 8: a source observation (or an attached picture) is completed with the tool's own foreground/root facts
+     * where the source had none — `rootPackage` is not part of a perception snapshot, and the launch's own verification
+     * read is the most honest value available. The foreground/root facts are no longer repeated in `data`.
      */
-    private fun screenAttempt(): ObservationAttempt {
+    private fun screenAttempt(probe: ObservationProbes? = null): ObservationAttempt {
         val captured = runCatching { capture() }
             .getOrElse { PerceptionScreenshotResult.Unavailable(SCREENSHOT_FAILED) }
         val observed = runCatching { observe() }.getOrNull()
         val image = (captured as? PerceptionScreenshotResult.Image)?.image
         val observation = when {
             observed != null -> observed.copy(
+                foregroundPackage = observed.foregroundPackage ?: probe?.foreground ?: probeForeground(),
+                foregroundActivity = observed.foregroundActivity ?: probe?.activity ?: probeForegroundActivity(),
+                rootPackage = observed.rootPackage ?: probe?.rootPackage ?: probeRootPackage(),
                 vision = when {
                     image != null -> ToolVision.Ok
                     captured == PerceptionScreenshotResult.Disabled -> ToolVision.Disabled
@@ -672,14 +658,22 @@ class OpenTool(
             image != null -> ToolObservation(
                 // No source answered, so no screen/coverage text may be invented. The tool's own probes are the
                 // honest facts it still has; `screen`/`coverage` stay null to say "no observation source".
-                foregroundPackage = probeForeground(),
-                foregroundActivity = probeForegroundActivity(),
-                rootPackage = probeRootPackage(),
+                foregroundPackage = probe?.foreground ?: probeForeground(),
+                foregroundActivity = probe?.activity ?: probeForegroundActivity(),
+                rootPackage = probe?.rootPackage ?: probeRootPackage(),
                 vision = ToolVision.Ok,
             )
-            else -> ToolObservation(vision = ToolVision.Unavailable, visionReason = VISION_NO_SOURCE)
+            else -> ToolObservation(
+                // A verification read that produced no screen source still knows where the phone is; those facts are
+                // the observation's foreground/root (Task 8) even when no capture exists.
+                foregroundPackage = probe?.foreground,
+                foregroundActivity = probe?.activity,
+                rootPackage = probe?.rootPackage,
+                vision = ToolVision.Unavailable,
+                visionReason = VISION_NO_SOURCE,
+            )
         }
-        return ObservationAttempt(observation, capturedImage(captured), captured)
+        return ObservationAttempt(observation, capturedImage(captured))
     }
 
     /** A throwing foreground port must degrade the observation, never turn the tool result into `TOOL_THREW`. */
@@ -690,10 +684,16 @@ class OpenTool(
     private fun probeRootPackage(): String? = runCatching { rootPackage() }.getOrNull()
 
     /** Task 5: the observation text a pure argument refusal can afford - no picture is attempted. */
-    private fun textObservation(): ToolObservation {
+    private fun textObservation(probe: ObservationProbes? = null): ToolObservation {
         val observed = runCatching { observe() }.getOrNull()
             ?: return ToolObservation(vision = ToolVision.Unavailable, visionReason = VISION_NO_SOURCE)
-        return observed.copy(vision = ToolVision.Unavailable, visionReason = VISION_NOT_ATTEMPTED)
+        return observed.copy(
+            foregroundPackage = observed.foregroundPackage ?: probe?.foreground ?: probeForeground(),
+            foregroundActivity = observed.foregroundActivity ?: probe?.activity ?: probeForegroundActivity(),
+            rootPackage = observed.rootPackage ?: probe?.rootPackage ?: probeRootPackage(),
+            vision = ToolVision.Unavailable,
+            visionReason = VISION_NOT_ATTEMPTED,
+        )
     }
 
     /**
@@ -742,7 +742,6 @@ class OpenTool(
     companion object {
         const val NAME = "open"
 
-        private const val CHANNEL = "shell"
         private const val MAX_LIST_ROWS = 100
         private const val PACKAGE_PREFIX = "package:"
 
@@ -767,12 +766,6 @@ class OpenTool(
         private const val INVALID_URL = "INVALID_URL"
         private const val INVALID_ARGUMENTS = "INVALID_ARGUMENTS"
         private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
-
-        /** Task 4: the automatic-vision marker on a verified launch's done data (same vocabulary as `DeviceTool`). */
-        private const val VISION_KEY = "vision"
-        private const val VISION_MARKER_OK = "ok"
-        private const val VISION_MARKER_DISABLED = "disabled"
-        private const val VISION_MARKER_UNAVAILABLE = "unavailable"
 
         /** Task 5: why a screen attempt has no picture, in the same vocabulary `AgentLoop` uses. */
         private const val VISION_NO_SOURCE = "no_source"

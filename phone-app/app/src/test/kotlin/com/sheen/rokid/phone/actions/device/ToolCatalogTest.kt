@@ -132,17 +132,20 @@ class ToolCatalogTest {
             dialExecutor = executor,
         )
 
-        assertEquals("CHANNEL_UNAVAILABLE", catalog.execute("device", "{}").detail)
-        assertEquals("CHANNEL_UNAVAILABLE", catalog.execute("shell", "{}").detail)
-        assertEquals("CHANNEL_UNAVAILABLE", catalog.execute("open", "{}").detail)
-        assertEquals("CALL_PERMISSION_MISSING", catalog.execute("dial", "{}").detail)
+        // Task 8: the stable code is an execution fact; `data` is the tool-specific payload only.
+        assertEquals("CHANNEL_UNAVAILABLE", catalog.execute("device", "{}").execution?.code)
+        assertEquals("CHANNEL_UNAVAILABLE", catalog.execute("shell", "{}").execution?.code)
+        assertEquals("CHANNEL_UNAVAILABLE", catalog.execute("open", "{}").execution?.code)
+        assertEquals("CALL_PERMISSION_MISSING", catalog.execute("dial", "{}").execution?.code)
+        assertEquals("{}", catalog.execute("dial", "{}").detail)
         assertTrue("no device operation may run while the channel is down", operations.observeEnvelopes.isEmpty())
         assertTrue("the dial executor must not be reached", executor.calls.isEmpty())
     }
 
     @Test
     fun `an unknown name is UNKNOWN_ACTION`() {
-        assertEquals("UNKNOWN_ACTION", catalog().execute("teleport", "{}").detail)
+        assertEquals("UNKNOWN_ACTION", catalog().execute("teleport", "{}").execution?.code)
+        assertEquals("{}", catalog().execute("teleport", "{}").detail)
     }
 
     @Test
@@ -382,7 +385,7 @@ class ToolCatalogTest {
         assertEquals(
             "an unlocked but a11y-down device still refuses observe",
             "CHANNEL_UNAVAILABLE",
-            unlocked.execute("device", """{"action":"observe"}""").detail,
+            unlocked.execute("device", """{"action":"observe"}""").execution?.code,
         )
         assertEquals(listOf(true), calls)
     }
@@ -410,7 +413,7 @@ class ToolCatalogTest {
                 ActionOutcome.Done,
                 result.outcome,
             )
-            val data = json.parseToJsonElement(result.detail).jsonObject["data"]!!.jsonObject
+            val data = json.parseToJsonElement(result.detail).jsonObject
             val status = data["status"]!!.jsonPrimitive.content
             assertTrue("the diagnostic must report the blind channel: $status", status.contains("accessibility=false"))
             assertFalse(
@@ -499,7 +502,7 @@ class ToolCatalogTest {
         val result = catalog.execute("shell", """{"command":"dumpsys window"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertTrue("the tool's own code is kept: ${result.detail}", result.detail.contains("SHELL_REPLY_TOO_LARGE"))
+        assertTrue("the tool's own code is kept: ${result.detail}", result.execution?.code == "SHELL_REPLY_TOO_LARGE")
         val execution = requireNotNull(result.execution)
         assertEquals(ToolOutcome.Refused, execution.outcome)
         assertEquals("SHELL_REPLY_TOO_LARGE", execution.code)
@@ -520,7 +523,7 @@ class ToolCatalogTest {
         val result = catalog.execute("shell", """{"command":"id"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals(ToolCatalog.CHANNEL_UNAVAILABLE, result.detail)
+        assertEquals(ToolCatalog.CHANNEL_UNAVAILABLE, result.execution?.code)
         assertEquals(1, captureCalls)
         assertEquals(ToolVision.Ok, requireNotNull(result.observation).vision)
         assertEquals(1, result.images.size)
@@ -531,6 +534,37 @@ class ToolCatalogTest {
         assertEquals(false, execution.applied)
         assertEquals("the channel can come back", true, execution.recoverable)
         assertTrue(result.nonPersistent)
+    }
+
+    @Test
+    fun `the argument refusal classifier reads structured execution not the old data envelope`() {
+        // Task 8 migration: the catalog used to parse `data.error.code`. These synthetic results carry the stable code
+        // only in `execution` (their `data` is `{}`), so an old-shape reader would classify both as real attempts.
+        var captureCalls = 0
+        val catalog = catalog(
+            observe = { screenFacts() },
+            capture = { captureCalls++; imageResult() },
+        )
+        fun refusal(code: String) = ActionResult(
+            ActionOutcome.Refused,
+            "{}",
+            execution = ToolExecution(
+                outcome = ToolOutcome.Refused,
+                code = code,
+                recoverable = code != "ARGUMENTS_INVALID",
+                accepted = false,
+                applied = false,
+            ),
+        )
+
+        val argument = catalog.enrichScreenResult("dial", refusal("ARGUMENTS_INVALID"))
+        assertEquals("an argument refusal takes no picture", 0, captureCalls)
+        assertEquals(ToolVision.Unavailable, requireNotNull(argument.observation).vision)
+        assertEquals("not_attempted", argument.observation!!.visionReason)
+
+        val realAttempt = catalog.enrichScreenResult("dial", refusal("CALL_PERMISSION_MISSING"))
+        assertEquals("a real refusal still observes the screen it left", 1, captureCalls)
+        assertEquals(ToolVision.Ok, requireNotNull(realAttempt.observation).vision)
     }
 
     @Test
@@ -545,7 +579,7 @@ class ToolCatalogTest {
         val result = catalog.execute("shell", """{"command":""}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("the bare argument code is unchanged", "INVALID_ARGUMENTS", result.detail)
+        assertEquals("the bare argument code is unchanged", "INVALID_ARGUMENTS", result.execution?.code)
         assertEquals("an argument refusal takes no picture", 0, captureCalls)
         val observation = requireNotNull(result.observation) { "a refusal still observes the current screen" }
         assertEquals("#n1 button \"OK\"", observation.screen)
@@ -573,7 +607,7 @@ class ToolCatalogTest {
         val result = catalog.execute("shell", """{"command":"id","stdin":"x"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertTrue("the tool envelope is unchanged: ${result.detail}", result.detail.contains("UNSUPPORTED"))
+        assertTrue("the tool's own code is unchanged: ${result.execution}", result.execution?.code == "UNSUPPORTED")
         assertEquals(0, captureCalls)
         assertEquals("not_attempted", requireNotNull(result.observation).visionReason)
         val execution = requireNotNull(result.execution)
@@ -649,7 +683,7 @@ class ToolCatalogTest {
         val result = catalog.execute("dial", """{"number":"10086"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("CALL_PERMISSION_MISSING", result.detail)
+        assertEquals("CALL_PERMISSION_MISSING", result.execution?.code)
         assertTrue("the executor must not be reached", executor.calls.isEmpty())
         assertEquals(1, captureCalls)
         assertEquals(ToolVision.Ok, requireNotNull(result.observation).vision)
@@ -675,8 +709,8 @@ class ToolCatalogTest {
         val result = catalog.execute("dial", """{"number":"10086"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertTrue("the gate's own code must survive: ${result.detail}",
-            result.detail.startsWith("LOCKED_UNLOCK_FAILED"))
+        assertTrue("the gate's own code must survive: ${result.execution}",
+            result.execution?.code?.startsWith("LOCKED_UNLOCK_FAILED") == true)
         assertEquals("a locked phone still shows the model what is on screen", 1, captureCalls)
         assertEquals(ToolVision.Ok, requireNotNull(result.observation).vision)
         assertEquals(1, result.images.size)
@@ -703,7 +737,7 @@ class ToolCatalogTest {
         val result = catalog.execute("dial", """{"number":"   "}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertTrue("the tool envelope is unchanged: ${result.detail}", result.detail.contains("ARGUMENTS_INVALID"))
+        assertTrue("the tool's stable code is unchanged: ${result.execution}", result.execution?.code == "ARGUMENTS_INVALID")
         assertTrue("an undialable number never reaches the executor", executor.calls.isEmpty())
         assertEquals(0, captureCalls)
         assertEquals("not_attempted", requireNotNull(result.observation).visionReason)
@@ -837,7 +871,7 @@ class ToolCatalogTest {
         val result = catalog.execute("teleport", "{}")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals(ToolCatalog.UNKNOWN_ACTION, result.detail)
+        assertEquals(ToolCatalog.UNKNOWN_ACTION, result.execution?.code)
         assertNull("an unknown name is not a screen operation", result.observation)
         assertTrue(result.images.isEmpty())
         assertEquals("no observation for an unknown name", 0, observeCalls)
@@ -857,8 +891,8 @@ class ToolCatalogTest {
         val result = catalog.execute("open", """{"list":true}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertTrue("the tool's own channel refusal is kept: ${result.detail}",
-            result.detail.contains("CHANNEL_UNAVAILABLE"))
+        assertTrue("the tool's own channel refusal is kept: ${result.execution}",
+            result.execution?.code == "CHANNEL_UNAVAILABLE")
         assertNull("the catalog must not add an observation to open", result.observation)
         assertTrue(result.images.isEmpty())
         assertEquals(0, observeCalls)

@@ -34,8 +34,8 @@ class T6ClickProbeActivity : Activity() {
             val observe = root.executeToolForProbe("device", """{"action":"observe","filter":"interactive"}""")
             val refs = refsFor(observe?.detail)
             val text = screenText(observe?.detail)
+            // Task 8: evidence stays count-only; the screen body itself is never written to logcat.
             Log.i(TAG, "P3_T6CLICK_TEXT len=${text?.length ?: 0} hasRed=${text?.contains("红")} hasButton=${text?.contains("button")}")
-            text?.take(1800)?.chunked(400)?.forEachIndexed { i, part -> Log.i(TAG, "P3_T6CLICK_CHUNK$i $part") }
             val outcome = mutableListOf<String>()
             for (label in listOf("红", "绿", "蓝", "提交")) {
                 val ref = refs[label]
@@ -57,8 +57,10 @@ class T6ClickProbeActivity : Activity() {
 
     private fun screenText(detail: String?): String? {
         val body = detail?.let { runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull() } ?: return null
-        val screen = body["data"]?.jsonObject?.get("screen")?.jsonObject ?: return null
-        return screen["text"]?.jsonPrimitive?.contentOrNull
+        // 0.3 Phase 2.2 Task 8: the compact screen tree is `observation.screen` (a string); `data.screen` no longer
+        // exists and this probe must read the production shape.
+        val observation = body["observation"] as? kotlinx.serialization.json.JsonObject ?: return null
+        return observation["screen"]?.jsonPrimitive?.contentOrNull
     }
 
     private fun refsFor(detail: String?): Map<String, String> {

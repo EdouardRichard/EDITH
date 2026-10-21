@@ -970,7 +970,7 @@ class AgentLoop(
                         call.id,
                         result.payload,
                         result.images,
-                        nonPersistent = result.nonPersistent,
+                        nonPersistent = mustRedact(result),
                     )
                     return finish(AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps)
                 }
@@ -1013,7 +1013,13 @@ class AgentLoop(
                 // empty list keeps the pre-0.25 item shape, and the plugin's TOOL_ROUND segment is the one channel that
                 // carries these references to the next model request. Final review C2: a non-persistent (perception)
                 // result is still shown to the model here; [finish] keeps it out of the stored transcript.
-                appendToolOutput(history, call.id, historyPayload, result.images, nonPersistent = result.nonPersistent)
+                appendToolOutput(
+                    history,
+                    call.id,
+                    historyPayload,
+                    result.images,
+                    nonPersistent = mustRedact(result),
+                )
                 if (execution.executed && result.ok) successfulToolExecutions++
                 if (guard.tripped) return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps)
                 if (errorsSeen.repeatTerminated) {
@@ -1066,6 +1072,12 @@ class AgentLoop(
      * synthetic result never reaches this helper, and its `observation = null` is "not attempted" rather than a failed
      * capture.
      *
+     * **Privacy (Task 8).** The copy this helper returns carries perception content, so it is marked
+     * [ToolResult.nonPersistent] even when the tool-returned result said otherwise (a framework-synthesized failure, a
+     * policy/confirmation refusal, a loop timeout — all of them start persistent). Persistence is withdrawn **only**
+     * when an observation is really attached: a result with no observation is pure execution facts and keeps whatever
+     * mark the tool gave it, so `AgentRun.transcript` still records that the tool ran and why it failed.
+     *
      * The execution facts are untouched: a timeout stays a timeout, a throw stays `Uncertain`, and an unconfirmed
      * refusal keeps its `accepted=false`/`applied=false`. The observation only says what the screen looked like when
      * the loop learned the outcome; it is not evidence that the call was stable.
@@ -1093,7 +1105,9 @@ class AgentLoop(
                 unavailableObservation(OBSERVATION_TIMEOUT)
             }
         }
-        return result.copy(observation = observation)
+        // Task 8: this copy now carries observation content, which may live only in the current model request. The
+        // in-run history keeps it; `finish` replaces the stored form and drops its images (C2).
+        return result.copy(observation = observation, nonPersistent = true)
     }
 
     private fun unavailableObservation(reason: String): ToolObservation =
@@ -1374,10 +1388,22 @@ class AgentLoop(
     }
 
     /**
-     * Appends one `ToolOutput` and remembers a non-persistent result's call id (final review C2).
+     * Appends one `ToolOutput`, remembers a non-persistent result's call id and counts the images it carries (final
+     * review C2; Task 8).
      *
      * Every ToolOutput append path goes through this helper, so no branch can forget to mark a perception-bearing output;
      * the in-run history keeps the full payload and only the stored transcript is redacted at [finish].
+     *
+     * Task 8 adds the last-gate belt for two facts the run already produced:
+     * - **observation content and failure images are perception content** — a result that carries an observation, or a
+     *   non-`Done` result that carries a picture, is marked non-persistent even when its tool forgot (or could not
+     *   know) to set the flag, so neither reaches `ConversationStore`/`AgentRun.transcript`. A **successful** tool's
+     *   image reference stays persistent (0.25 R133): that is the artifact the next turn may legitimately reuse, which
+     *   is why the gate keys on the outcome and not on the mere presence of an image;
+     * - **the metric counts produced images, not only carried ones** — a picture attached to the call that ends the run
+     *   (a repeated-error failure, a timeout, an uncertain result) never reaches another model request, so counting it
+     *   only from a request would lose it. The set keys on the artifact id, so a picture that is both appended and later
+     *   carried is still one image.
      */
     private fun appendToolOutput(
         history: MutableList<ModelHistoryItem>,
@@ -1386,9 +1412,23 @@ class AgentLoop(
         images: List<ImageRef> = emptyList(),
         nonPersistent: Boolean = false,
     ) {
+        images.forEach { metricImageIds += it.artifactId }
         if (nonPersistent) nonPersistentCallIds += callId
         history += ModelHistoryItem.ToolOutput(callId, output, images)
     }
+
+    /**
+     * Task 8: whether this result's stored form must be redacted.
+     *
+     * An observation is perception content by construction. A **non-`Done`** result's picture is evidence of the failed
+     * call and may not outlive the request either; a successful tool's image reference stays persistent (the 0.25 R133
+     * channel). The tool's own flag wins in all cases — this is a belt for a tool that could not set it (a
+     * framework-synthesized failure, a loop timeout, a policy refusal).
+     */
+    private fun mustRedact(result: ToolResult): Boolean =
+        result.nonPersistent ||
+            result.observation != null ||
+            (result.execution.outcome != ToolOutcome.Done && result.images.isNotEmpty())
 
     /**
      * The transcript a caller may persist: this run's history with every non-persistent tool output **of this run**

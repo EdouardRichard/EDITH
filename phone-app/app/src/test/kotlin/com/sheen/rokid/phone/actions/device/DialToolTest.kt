@@ -8,14 +8,10 @@ import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.RiskLevel
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonNull
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.boolean
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import com.sheen.rokid.plugin.ToolOutcome
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -25,8 +21,6 @@ import org.junit.Test
  */
 class DialToolTest {
 
-    private val json = Json
-
     @Test
     fun `without CALL_PHONE the dial is refused and the executor is never called`() {
         val executor = FakeExecutor()
@@ -35,6 +29,8 @@ class DialToolTest {
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("CALL_PERMISSION_MISSING", errorCode(result))
+        assertEquals(false, requireNotNull(result.execution).accepted)
+        assertEquals(false, result.execution!!.applied)
         assertTrue(executor.calls.isEmpty())
     }
 
@@ -45,11 +41,14 @@ class DialToolTest {
         val result = DialTool(executor) { true }.execute("""{"number":"10086"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val body = body(result)
-        assertEquals(true, body["ok"]!!.jsonPrimitive.boolean)
-        assertEquals(true, body["accepted"]!!.jsonPrimitive.boolean)
-        assertEquals(JsonNull, body["applied"])
-        assertEquals("intent", body["channel"]!!.jsonPrimitive.content)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertEquals("an intent hand-off never proves applied", null, execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        // Task 8: `data` is empty — the facts are the execution's and a number never appears anywhere.
+        assertEquals("{}", result.detail)
         assertEquals(listOf("dial" to """{"number":"10086"}"""), executor.calls)
         assertFalse("the number must not be repeated into the result", result.detail.contains("10086"))
     }
@@ -125,11 +124,7 @@ class DialToolTest {
         assertTrue(DialTool(FakeExecutor()) { false }.execute("""{"number":"10086"}""").stateChanging)
     }
 
-    private fun body(result: ActionResult): JsonObject =
-        json.parseToJsonElement(result.detail).jsonObject
-
-    private fun errorCode(result: ActionResult): String =
-        body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content
+    private fun errorCode(result: ActionResult): String? = result.execution?.code
 
     private class FakeExecutor(
         private val result: ActionResult = ActionResult(ActionOutcome.Done, "dialing"),

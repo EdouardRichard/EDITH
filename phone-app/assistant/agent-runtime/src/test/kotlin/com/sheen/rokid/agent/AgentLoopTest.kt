@@ -260,6 +260,85 @@ class AgentLoopTest {
         assertTrue(stored[1].output.isNotBlank(), "the current call/output pair keeps a safe marker")
     }
 
+    @Test fun `a loop enriched failure observation reaches the model but never the stored transcript`() {
+        // 0.3 Phase 2.2 Task 8: the loop is a second producer of perception content, not only the tools. A failure result
+        // that came back with no observation (the tool declared none, or the framework synthesized it) is enriched by
+        // `observedFailure`; that copy must be marked non-persistent even though the tool-returned result was not.
+        val sentinel = "SYNTHETIC-LOOP-OBSERVATION-3381"
+        val image = ImageRef("artifact-failure-1", "image/png", 768, 1664, "sha-failure-1")
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", images = listOf(image))
+        }
+        val observation = ToolObservation(
+            foregroundPackage = "com.example.launcher",
+            screen = sentinel,
+            vision = ToolVision.NotRequested,
+        )
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "看到了")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor)))
+            .run(request(observationSource = { observation }))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val inRun = gateway.requests[1].history.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertTrue(inRun.output.contains(sentinel), "the model must see the loop's observation: ${inRun.output}")
+        assertEquals(listOf(image), inRun.images, "the in-run request keeps the failure's picture reference")
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertFalse(
+            stored.output.contains(sentinel),
+            "the loop-attached observation may not outlive the request: ${stored.output}",
+        )
+        assertTrue(stored.output.isNotBlank(), "the stored call/output pair stays attributable")
+        assertEquals(emptyList(), stored.images, "the stored transcript carries no failure image")
+    }
+
+    @Test fun `a failure image is never persisted even when the tool marked the result persistent`() {
+        // Defence in depth for the last gate: a tool that returns a picture but forgets `nonPersistent` (or a future
+        // image-bearing result with no observation) still may not leave the picture in the stored transcript.
+        val image = ImageRef("artifact-failure-2", "image/png", 768, 1664, "sha-failure-2")
+        val executor = executorOf("lookup")
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", images = listOf(image))
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "知道了")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val inRun = gateway.requests[1].history.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals(listOf(image), inRun.images, "the model still sees the picture during the run")
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals(emptyList(), stored.images, "no image may be persisted: ${stored.output}")
+    }
+
+    @Test fun `pure execution facts of a failure stay persistent when the loop attaches no observation`() {
+        // The complement of the C2 rule: persistence is only withdrawn for content the loop itself attaches. A pure tool
+        // result (no screen observation) is execution facts, so its stored output keeps the tool detail.
+        val executor = executorOf("notify_user")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "DELIVERY_FAILED") }
+        val source = ToolObservationSource {
+            error("a pure tool must never be observed")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "notify_user"))), reply(text = "知道了")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertTrue(
+            stored.output.contains("DELIVERY_FAILED"),
+            "a pure execution fact must remain persistable: ${stored.output}",
+        )
+        assertFalse(stored.output.contains("perception content not persisted"), stored.output)
+    }
+
     @Test fun `a productive tool turn resets the empty counter`() {
         // Two empty turns, a productive tool turn, then two more empty turns. Without the reset the third empty turn
         // would have been the third consecutive unproductive turn and the run would be INSUFFICIENT after 3 turns.

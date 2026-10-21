@@ -2,6 +2,10 @@ package com.sheen.rokid.agent
 
 import com.sheen.rokid.contracts.ImageBudget
 import com.sheen.rokid.plugin.ImageRef
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
+import com.sheen.rokid.plugin.ToolVision
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
@@ -84,27 +88,85 @@ class TurnTrimmerTypeAwareTest {
     private fun outputImages(segment: Segment): JsonArray =
         outputOf(segment)["images"] as? JsonArray ?: JsonArray(emptyList())
 
-    /** The shape `DeviceTool` actually returns: a device envelope whose `data.screen` is the rendered tree. */
-    private fun screenObservation(rev: Int, vararg lines: String): String = buildJsonObject {
-        put("ok", true)
-        put("tool", "device")
-        put("action", "observe")
-        put("data", buildJsonObject {
-            put("screen", buildJsonObject {
-                put("rev", rev)
-                put("app", "com.example.app")
-                put("ime", false)
-                put("truncated", false)
-                put("changes", buildJsonObject {
-                    put("mode", "full")
-                    put("added", buildJsonArray { })
-                    put("updated", buildJsonArray { })
-                    put("removed", buildJsonArray { })
-                })
-                put("text", lines.joinToString("\n"))
-            })
-        })
-    }.toString()
+    /**
+     * The shape the loop really sends after Task 1/8: the unified `{execution, observation, data}` envelope, built by
+     * the production encoder. The screen tree lives in `observation.screen`; `data` carries only tool-specific facts
+     * (here the action/revision/app metadata the header may still name).
+     */
+    private fun screenObservation(rev: Int, vararg lines: String): String = ToolResultEnvelope.encode(
+        ToolExecution(outcome = ToolOutcome.Done),
+        ToolObservation(
+            snapshotId = "snap-$rev",
+            capturedAtEpochMillis = rev.toLong(),
+            foregroundPackage = "com.example.app",
+            screen = lines.joinToString("\n"),
+            vision = ToolVision.NotRequested,
+        ),
+        """{"action":"observe","rev":$rev,"app":"com.example.app"}""",
+    )
+
+    @Test
+    fun `a real encoded envelope is elided from observation screen even without data metadata`() {
+        // The Task 8 contract: the screen tree is `observation.screen` (a string), not the pre-0.3 `data.screen` object.
+        // The payload here is produced by the real encoder and its `data` deliberately names no action/rev/app, so only
+        // the observation can make the elision fire.
+        val payload = ToolResultEnvelope.encode(
+            ToolExecution(outcome = ToolOutcome.Done),
+            ToolObservation(
+                foregroundPackage = "com.example.app",
+                screen = "#n1 button Wi-Fi\n#n2 text hi",
+                vision = ToolVision.NotRequested,
+            ),
+            """{"apps":[]}""",
+        )
+        val f = frame(
+            userTurn("u"),
+            assistant("a"),
+            toolOutput(payload, callId = "c1"),
+            toolOutput("fresh", callId = "c2"),
+            user("now"),
+        )
+
+        val report = TurnTrimmer().trim(f, limitTokens = 1_000_000)
+
+        assertEquals(1, report.elidedUiTrees)
+        val kept = report.kept.conversationFlow.filter { it.origin == SegmentOrigin.TOOL_ROUND }
+        val header = outputText(kept[0])
+        assertTrue(header.startsWith("[screen observation elided:"), header)
+        assertTrue(header.contains("#n1"), "the refs survive: $header")
+        assertTrue(header.contains("lines=2"), "the header keeps the tree's line count: $header")
+        assertFalse(header.contains("button Wi-Fi"), "the full tree does not survive: $header")
+        assertEquals("fresh", outputText(kept[1]), "the newest output is still untouched")
+    }
+
+    @Test
+    fun `an old data screen object without an observation is not elided`() {
+        // Discriminating guard for the re-point: reading `data.screen` would elide this legacy shape, reading
+        // `observation.screen` leaves it alone (Task 8 removed the duplication; the data path no longer carries a tree).
+        val legacy = buildJsonObject {
+            put("execution", buildJsonObject { put("outcome", "done") })
+            put("observation", kotlinx.serialization.json.JsonNull)
+            put(
+                "data",
+                buildJsonObject {
+                    put("screen", buildJsonObject { put("text", "#n1 button Wi-Fi") })
+                },
+            )
+        }.toString()
+        val f = frame(
+            userTurn("u"),
+            assistant("a"),
+            toolOutput(legacy, callId = "c1"),
+            toolOutput("fresh", callId = "c2"),
+            user("now"),
+        )
+
+        val report = TurnTrimmer().trim(f, limitTokens = 1_000_000)
+
+        assertEquals(0, report.elidedUiTrees)
+        val kept = report.kept.conversationFlow.filter { it.origin == SegmentOrigin.TOOL_ROUND }
+        assertEquals(legacy, outputText(kept[0]), "a non-observation data screen is not a UI tree to elide")
+    }
 
     @Test
     fun `only the newest of five screen observations stays whole and the four old ones become headers`() {
@@ -132,6 +194,42 @@ class TurnTrimmerTypeAwareTest {
             keptOutputs[4],
             "the newest observation is untouched",
         )
+    }
+
+    @Test
+    fun `failure and uncertain images follow the same newest three rule`() {
+        // Task 8: a failed/uncertain result's picture is an ordinary image reference on the tool output, so the budget
+        // rule cannot special-case it out of retention.
+        val rounds = (1..4).map { index ->
+            val payload = ToolResultEnvelope.encode(
+                ToolExecution(
+                    outcome = if (index % 2 == 0) ToolOutcome.Failed else ToolOutcome.Uncertain,
+                    code = if (index % 2 == 0) "STATE_UNCHANGED" else "ACTION_TIMEOUT_UNCERTAIN",
+                    uncertain = index % 2 != 0,
+                ),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "SCREENSHOT_FAILED"),
+                """{"detail":"failed $index"}""",
+            )
+            toolOutput(payload, images = listOf(index), callId = "c$index")
+        }
+        val f = frame(
+            userTurn("u"),
+            assistant("a"),
+            *rounds.toTypedArray(),
+            toolOutput("fresh", callId = "c5"),
+            user("now"),
+        )
+
+        val report = TurnTrimmer().trim(f, limitTokens = 1_000_000)
+
+        assertEquals(1, report.elidedImages, "four failure pictures: the newest three stay whole")
+        val kept = report.kept.conversationFlow.filter { it.origin == SegmentOrigin.TOOL_ROUND }
+        assertEquals(0, outputImages(kept[0]).size, "the oldest failure image is elided from the wire")
+        assertTrue(
+            outputText(kept[0]).contains("image img-1 image/jpeg 100x50 (elided)"),
+            "the elided failure image stays visible as a count/summary: ${outputText(kept[0])}",
+        )
+        (1..3).forEach { index -> assertEquals(1, outputImages(kept[index]).size, "image ${index + 1} stays") }
     }
 
     @Test
@@ -230,11 +328,13 @@ class TurnTrimmerTypeAwareTest {
             runtime(),
             user("now"),
         )
-        // Token-unit total = 32(fixed) + 33(sys) + 33(u1) + 33(a1) + 106(the observation JSON: 74 tokens + 32)
-        // + 39(runtime: 7 tokens + 32) + 33(now) = **309**. The limit is below that, so cut ① removes that whole
-        // turn group — u1, a1 and the tool round (33 + 33 + 106 = 172 units) — while `RUNTIME_STATE` is protected,
-        // leaving 32 + 33 + 39 + 33 = **137** ≤ 220. The runtime line is counted and stays regardless.
-        val report = TurnTrimmer().trim(f, limitTokens = 220)
+        // One unit below the frame's own price forces cut ①: the whole turn group (u1, a1, the tool round) leaves while
+        // the request-scoped `RUNTIME_STATE` is protected. The price is computed, not written as a literal, so a payload
+        // shape change (Task 8's real envelope) cannot silently move the boundary being tested.
+        val total = FIXED_OVERHEAD +
+            tokenUnitsPlusOverhead(f.systemText) +
+            f.conversationFlow.sumOf { tokenUnitsPlusOverhead(it.text) }
+        val report = TurnTrimmer().trim(f, limitTokens = total - 1)
 
         assertEquals(1, report.droppedTurns)
         assertTrue(
@@ -245,8 +345,13 @@ class TurnTrimmerTypeAwareTest {
         val keptTotal = FIXED_OVERHEAD +
             tokenUnitsPlusOverhead(report.kept.systemText) +
             report.kept.conversationFlow.sumOf { tokenUnitsPlusOverhead(it.text) }
-        assertEquals(137, keptTotal, "the kept frame: 32(fixed) + 33(sys) + 39(runtime) + 33(now)")
-        assertFalse(report.compressionOwed, "the kept frame fits the 220-unit limit")
+        assertEquals(
+            FIXED_OVERHEAD + tokenUnitsPlusOverhead("sys") + tokenUnitsPlusOverhead(runtime().text) +
+                tokenUnitsPlusOverhead("now"),
+            keptTotal,
+            "the kept frame is the system slot, the protected runtime line and the current input",
+        )
+        assertFalse(report.compressionOwed, "the kept frame fits the limit")
     }
 
     @Test

@@ -103,10 +103,19 @@ class AgentLoopGuardTest {
     private fun outputs(run: AgentRun): List<ModelHistoryItem.ToolOutput> =
         run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>()
 
-    /** The envelope of the run's single tool output, with the loop's trailing stable hint removed. */
-    private fun envelopeOf(run: AgentRun): JsonObject {
-        val payload = outputs(run).single().output.substringBefore("\n\nLOOP_HINT:")
-        return Json.parseToJsonElement(payload) as JsonObject
+    /**
+     * The envelope the **model** received for the run's single tool output.
+     *
+     * Task 8: a loop-enriched failure observation is non-persistent, so `run.transcript` carries the safe marker
+     * instead of the payload. The contract those tests assert is what the model saw in this run, which is the next
+     * request's history — not the stored form.
+     */
+    private fun envelopeInRequest(gateway: ScriptedGateway): JsonObject {
+        val output = gateway.requests.last().history
+            .filterIsInstance<ModelHistoryItem.ToolOutput>()
+            .single()
+            .output
+        return Json.parseToJsonElement(output.substringBefore("\n\nLOOP_HINT:")) as JsonObject
     }
 
     private fun minimalFrame(userInput: String): (List<ModelHistoryItem>) -> RequestFrame = {
@@ -586,16 +595,19 @@ class AgentLoopGuardTest {
 
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals(listOf(250L), deadlines, "a timeout observation gets its own short deadline")
-        val execution = envelopeOf(run).getValue("execution").jsonObject
+        val envelope = envelopeInRequest(gateway)
+        val execution = envelope.getValue("execution").jsonObject
         assertEquals("timeout", execution.getValue("outcome").jsonPrimitive.content)
         assertEquals("ACTION_TIMEOUT", execution.getValue("code").jsonPrimitive.content)
         assertFalse(execution.getValue("uncertain").jsonPrimitive.boolean, "a confirmed stop is not uncertain")
         assertTrue(execution.getValue("applied") is JsonNull, "a timed-out write's effect is unknown")
         assertTrue(execution.getValue("changed") is JsonNull, "a timed-out write's change is unknown")
-        val observationJson = envelopeOf(run).getValue("observation").jsonObject
+        val observationJson = envelope.getValue("observation").jsonObject
         assertEquals("Settings", observationJson.getValue("screen").jsonPrimitive.content)
         assertEquals("com.android.settings", observationJson.getValue("foregroundPackage").jsonPrimitive.content)
         assertEquals("not_requested", observationJson.getValue("vision").jsonPrimitive.content)
+        // Task 8: the model saw it; the stored transcript must not keep the observation text.
+        assertFalse(outputs(run).single().output.contains("Settings"))
         executor.awaitWorkers(1_000)
     }
 
@@ -612,7 +624,7 @@ class AgentLoopGuardTest {
         val run = loop(gateway, ToolRegistry(listOf(executor))).run(request())
 
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
-        val observation = envelopeOf(run).getValue("observation").jsonObject
+        val observation = envelopeInRequest(gateway).getValue("observation").jsonObject
         assertEquals("unavailable", observation.getValue("vision").jsonPrimitive.content)
         assertEquals("no_source", observation.getValue("visionReason").jsonPrimitive.content)
         executor.awaitWorkers(1_000)
@@ -626,25 +638,35 @@ class AgentLoopGuardTest {
             screen = "Settings",
             vision = ToolVision.NotRequested,
         )
+        val deadlines = mutableListOf<Long>()
+        var sourceCalls = 0
         val gateway = ScriptedGateway(
             listOf(reply(calls = listOf(call("c1", "stuck"), call("c2", "stuck-second")))),
         )
 
         val run = loop(gateway, ToolRegistry(listOf(executor))).run(
-            request(observationSource = { observation }),
+            request(observationSource = ToolObservationSource { deadlineMillis ->
+                sourceCalls++
+                deadlines += deadlineMillis
+                observation
+            }),
         )
 
         assertEquals(AgentOutcome.FAILED, run.outcome)
         assertEquals("ACTION_TIMEOUT_UNCERTAIN", run.safeCode)
-        val execution = envelopeOf(run).getValue("execution").jsonObject
-        assertEquals("uncertain", execution.getValue("outcome").jsonPrimitive.content)
-        assertTrue(execution.getValue("uncertain").jsonPrimitive.boolean)
-        assertTrue(execution.getValue("accepted") is JsonNull, "a still-running call is not accepted or refused")
-        assertTrue(execution.getValue("applied") is JsonNull, "a mid-flight call may still apply")
-        assertTrue(execution.getValue("changed") is JsonNull, "a mid-flight frame is not a stable fact")
-        val observationJson = envelopeOf(run).getValue("observation").jsonObject
-        assertEquals("Settings", observationJson.getValue("screen").jsonPrimitive.content)
-        assertEquals("not_requested", observationJson.getValue("vision").jsonPrimitive.content)
+        assertEquals(1, sourceCalls, "the uncertain call still asks the source once")
+        assertEquals(listOf(250L), deadlines, "an uncertain observation gets the short failure deadline")
+        assertEquals(
+            "ACTION_TIMEOUT_UNCERTAIN",
+            run.steps.single().result,
+            "the step keeps the stable code even though the payload is content",
+        )
+        // Task 8: the run ends here, so the model never receives this output; the observation (and the execution facts
+        // inside the same payload) must not be persisted. The pair stays attributable through the safe marker.
+        val stored = outputs(run).single()
+        assertFalse(stored.output.contains("Settings"), "the uncertain observation may not be stored: ${stored.output}")
+        assertTrue(stored.output.isNotBlank(), "the call/output pair keeps a marker")
+        assertEquals(1, gateway.requests.size, "the uncertain result never reaches another request")
         executor.release()
     }
 

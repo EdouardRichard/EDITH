@@ -72,7 +72,7 @@ class OpenToolTest {
         ).execute("""{"list":true}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val data = body(result)["data"]!!.jsonObject
+        val data = body(result)
         assertEquals(100, data["apps"]!!.jsonArray.size)
         assertTrue(data["truncated"]!!.jsonPrimitive.boolean)
         val text = data["text"]!!.jsonPrimitive.content
@@ -130,7 +130,7 @@ class OpenToolTest {
         val result = OpenTool(shell, catalog).execute("""{"list":true}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val data = body(result)["data"]!!.jsonObject
+        val data = body(result)
         assertEquals(
             "every launchable package is listed, system apps included",
             listOf(
@@ -179,7 +179,7 @@ class OpenToolTest {
             com.sheen.rokid.phone.platform.P3Log.sink = previous
         }
 
-        val data = body(result)["data"]!!.jsonObject
+        val data = body(result)
         assertEquals("launcher", data["catalogVia"]!!.jsonPrimitive.content)
         assertEquals(3, data["catalogCount"]!!.jsonPrimitive.int)
         assertTrue(data["hasPlayer"]!!.jsonPrimitive.boolean)
@@ -222,7 +222,7 @@ class OpenToolTest {
             )
             assertEquals(
                 listOf("com.system.camera", "com.example.notes"),
-                body(result)["data"]!!.jsonObject["apps"]!!.jsonArray
+                body(result)["apps"]!!.jsonArray
                     .map { it.jsonObject["packageName"]!!.jsonPrimitive.content },
             )
             assertTrue(
@@ -300,9 +300,9 @@ class OpenToolTest {
 
         assertEquals("ambiguity stays a refusal", ActionOutcome.Refused, result.outcome)
         val body = body(result)
-        assertEquals("APP_AMBIGUOUS", body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
-        assertTrue(body["error"]!!.jsonObject["recoverable"]!!.jsonPrimitive.boolean)
-        val candidates = body["data"]!!.jsonObject["candidates"]!!.jsonArray
+        assertEquals("APP_AMBIGUOUS", executionOf(result).code)
+        assertTrue("ambiguity is recoverable", executionOf(result).recoverable)
+        val candidates = body["candidates"]!!.jsonArray
         assertEquals(2, candidates.size)
         assertEquals("音乐", candidates[0].jsonObject["label"]!!.jsonPrimitive.content)
         assertEquals("com.example.music1", candidates[0].jsonObject["packageName"]!!.jsonPrimitive.content)
@@ -421,7 +421,7 @@ class OpenToolTest {
         assertEquals(
             "the missing catalog label falls back to the package name, never a guess",
             "com.android.fileexplorer",
-            body(result)["data"]!!.jsonObject["target"]!!.jsonPrimitive.content,
+            body(result)["target"]!!.jsonPrimitive.content,
         )
     }
 
@@ -441,7 +441,7 @@ class OpenToolTest {
         assertEquals("APP_AMBIGUOUS", errorCode(result))
         assertEquals(
             listOf("com.android.fileexplorer", "com.android.documentsui"),
-            body(result)["data"]!!.jsonObject["candidates"]!!.jsonArray
+            body(result)["candidates"]!!.jsonArray
                 .map { it.jsonObject["packageName"]!!.jsonPrimitive.content },
         )
         assertTrue("ambiguity must not guess or probe the shell", shell.commands.isEmpty())
@@ -524,23 +524,22 @@ class OpenToolTest {
         ).execute("""{"target":"com.example.music"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val data = body(result)["data"]!!.jsonObject
-        assertEquals("com.example.music", data["resolvedPackage"]!!.jsonPrimitive.content)
+        // Task 8: foreground/root/verified are observation and execution facts; `data` keeps the caller's target.
+        val observation = observationOf(result)
+        assertEquals("com.example.music", observation.foregroundPackage)
+        assertEquals("com.example.music/.MainActivity", observation.foregroundActivity)
+        assertEquals("com.example.music", observation.rootPackage)
+        assertEquals("foreground and the a11y root both name the target", true, executionOf(result).verified)
+        val data = body(result)
         assertEquals(
-            "com.example.music",
-            data["foreground"]!!.jsonObject["package"]!!.jsonPrimitive.content,
-        )
-        assertEquals(
-            "com.example.music/.MainActivity",
-            data["foreground"]!!.jsonObject["activity"]!!.jsonPrimitive.content,
-        )
-        assertEquals("com.example.music", data["rootPackage"]!!.jsonPrimitive.content)
-        assertTrue("foreground and the a11y root both name the target", data["verified"]!!.jsonPrimitive.boolean)
-        assertEquals(
-            "the existing target key stays beside the verification fields",
+            "the existing target key stays beside the structured facts",
             "com.example.music",
             data["target"]!!.jsonPrimitive.content,
         )
+        assertFalse("data no longer repeats the resolved package", data.containsKey("resolvedPackage"))
+        assertFalse("data no longer repeats the foreground", data.containsKey("foreground"))
+        assertFalse("data no longer repeats the root package", data.containsKey("rootPackage"))
+        assertFalse("data no longer repeats the verified answer", data.containsKey("verified"))
         assertEquals(
             "the post-launch wait polls for the resolved package for the full 2 s budget",
             listOf("com.example.music" to 2_000L),
@@ -574,9 +573,9 @@ class OpenToolTest {
         assertEquals("one capture per verified launch", 1, captureCalls)
         assertEquals("the captured artifact is the result's image", listOf(image), result.images)
         assertTrue("an attached image must stay request-scoped (C2)", result.nonPersistent)
-        val data = body(result)["data"]!!.jsonObject
-        assertEquals("a verified launch marks vision ok", "ok", data["vision"]!!.jsonPrimitive.content)
-        assertTrue("the verified launch shape stays intact", data["verified"]!!.jsonPrimitive.boolean)
+        val data = body(result)
+        assertFalse("data carries no vision marker", data.containsKey("vision"))
+        assertFalse("data carries no verified duplicate", data.containsKey("verified"))
 
         val execution = executionOf(result)
         assertEquals(ToolOutcome.Done, execution.outcome)
@@ -633,8 +632,8 @@ class OpenToolTest {
         assertEquals("the observation is the failed launch's screen", "com.android.launcher", observation.foregroundPackage)
         assertEquals(ToolVision.Ok, observation.vision)
 
-        val data = body(result)["data"]!!.jsonObject
-        assertEquals("the failure data keeps its existing shape", false, data["verified"]!!.jsonPrimitive.boolean)
+        val data = body(result)
+        assertFalse("failure data gains no verified duplicate", data.containsKey("verified"))
         assertFalse("failure data gains no vision marker", data.containsKey("vision"))
     }
 
@@ -684,7 +683,7 @@ class OpenToolTest {
         assertEquals("com.example.music/.MainActivity", observation.foregroundActivity)
         assertEquals("com.example.music", observation.rootPackage)
         assertEquals(ToolVision.Ok, observation.vision)
-        val data = body(result)["data"]!!.jsonObject
+        val data = body(result)
         assertTrue("the alreadyForeground shape stays intact", data["alreadyForeground"]!!.jsonPrimitive.boolean)
         assertFalse("the alreadyForeground data gains no vision marker", data.containsKey("vision"))
     }
@@ -706,7 +705,7 @@ class OpenToolTest {
 
         assertEquals("a disabled capture never fails the launch", ActionOutcome.Done, result.outcome)
         assertEquals(1, captureCalls)
-        assertEquals("disabled", body(result)["data"]!!.jsonObject["vision"]!!.jsonPrimitive.content)
+        assertFalse("data no longer carries the vision marker", body(result).containsKey("vision"))
         assertTrue("a disabled capture attaches no image", result.images.isEmpty())
         assertTrue("the observation still exists, so its content is non-persistent", result.nonPersistent)
         val observation = observationOf(result)
@@ -732,12 +731,7 @@ class OpenToolTest {
 
         assertEquals("an unavailable capture never fails the launch", ActionOutcome.Done, result.outcome)
         assertEquals(1, captureCalls)
-        val data = body(result)["data"]!!.jsonObject
-        assertEquals(
-            "the provider's reason travels to the model",
-            "unavailable(no_image_profile)",
-            data["vision"]!!.jsonPrimitive.content,
-        )
+        assertFalse("data no longer carries the vision marker", body(result).containsKey("vision"))
         assertTrue("an unavailable capture attaches no image", result.images.isEmpty())
         assertTrue("the observation still exists, so its content is non-persistent", result.nonPersistent)
         val observation = observationOf(result)
@@ -762,12 +756,7 @@ class OpenToolTest {
 
         assertEquals("a throwing capture must not turn a verified launch into a thrown tool", ActionOutcome.Done, result.outcome)
         assertEquals(1, captureCalls)
-        val data = body(result)["data"]!!.jsonObject
-        assertEquals(
-            "a thrown capture is an unavailable image, not a failed launch",
-            "unavailable(SCREENSHOT_FAILED)",
-            data["vision"]!!.jsonPrimitive.content,
-        )
+        assertFalse("data no longer carries the vision marker", body(result).containsKey("vision"))
         assertTrue("a failed capture attaches no image", result.images.isEmpty())
         assertTrue(result.nonPersistent)
         val observation = observationOf(result)
@@ -800,10 +789,7 @@ class OpenToolTest {
         assertEquals("a verified URL launch has a new page to show", 1, captureCalls)
         assertEquals("the page capture is attached", listOf(image), result.images)
         assertTrue("an attached image must stay request-scoped (C2)", result.nonPersistent)
-        assertEquals(
-            "ok",
-            body(result)["data"]!!.jsonObject["vision"]!!.jsonPrimitive.content,
-        )
+        assertFalse("data no longer carries the vision marker", body(result).containsKey("vision"))
         val execution = executionOf(result)
         assertEquals(ToolOutcome.Done, execution.outcome)
         assertEquals(true, execution.accepted)
@@ -833,24 +819,22 @@ class OpenToolTest {
 
         assertEquals(ActionOutcome.Failed, result.outcome)
         assertEquals("STATE_UNCHANGED", errorCode(result))
-        val body = body(result)
-        assertTrue(
-            "a launch that did not reach the target is recoverable",
-            body["error"]!!.jsonObject["recoverable"]!!.jsonPrimitive.boolean,
-        )
-        val data = body["data"]!!.jsonObject
-        assertFalse("the a11y root disagrees with the target", data["verified"]!!.jsonPrimitive.boolean)
-        assertEquals(
-            "com.example.music",
-            data["foreground"]!!.jsonObject["package"]!!.jsonPrimitive.content,
-        )
-        assertEquals("com.android.launcher", data["rootPackage"]!!.jsonPrimitive.content)
-        assertEquals("com.example.music", data["resolvedPackage"]!!.jsonPrimitive.content)
+        assertTrue("a launch that did not reach the target is recoverable", executionOf(result).recoverable)
+        // Task 8: the verification probes are the observation's foreground/root facts, not a second copy in `data`.
+        val observation = observationOf(result)
+        assertEquals("the a11y root disagrees with the target", false, executionOf(result).verified)
+        assertEquals("the observed foreground is reported, not the target", "com.android.launcher", observation.foregroundPackage)
+        assertEquals("com.android.launcher", observation.rootPackage)
+        val data = body(result)
         assertEquals(
             "the failed launch keeps the existing target data",
             "com.example.music",
             data["target"]!!.jsonPrimitive.content,
         )
+        assertFalse("data no longer repeats resolvedPackage", data.containsKey("resolvedPackage"))
+        assertFalse("data no longer repeats foreground", data.containsKey("foreground"))
+        assertFalse("data no longer repeats rootPackage", data.containsKey("rootPackage"))
+        assertFalse("data no longer repeats verified", data.containsKey("verified"))
 
         val execution = executionOf(result)
         assertEquals(ToolOutcome.Failed, execution.outcome)
@@ -885,15 +869,15 @@ class OpenToolTest {
 
         assertEquals(ActionOutcome.Failed, result.outcome)
         assertEquals("STATE_UNCHANGED", errorCode(result))
-        val data = body(result)["data"]!!.jsonObject
-        assertFalse("am start's Status: ok alone is not success", data["verified"]!!.jsonPrimitive.boolean)
+        val observation = observationOf(result)
+        assertEquals("am start's Status: ok alone is not success", false, executionOf(result).verified)
         assertEquals(
             "the observed foreground is reported, not the target",
             "com.android.launcher",
-            data["foreground"]!!.jsonObject["package"]!!.jsonPrimitive.content,
+            observation.foregroundPackage,
         )
-        assertEquals("com.android.launcher", data["rootPackage"]!!.jsonPrimitive.content)
-        assertEquals("com.example.music", data["resolvedPackage"]!!.jsonPrimitive.content)
+        assertEquals("com.android.launcher", observation.rootPackage)
+        assertFalse("data no longer repeats the verification probes", body(result).containsKey("resolvedPackage"))
         assertEquals(
             "the wait was tried against the resolved package",
             listOf("com.example.music" to 2_000L),
@@ -1017,12 +1001,11 @@ class OpenToolTest {
             "am start -W -a android.intent.action.VIEW -d 'https://example.com/a'\\''b'",
             shell.commands.single(),
         )
-        val data = body(result)["data"]!!.jsonObject
-        assertTrue(data["verified"]!!.jsonPrimitive.boolean)
+        assertEquals(true, executionOf(result).verified)
         assertEquals(
-            "a URL has no known target package, so resolvedPackage is the observed foreground",
+            "a URL has no known target package, so the observation's foreground is the resolved package",
             "com.android.browser",
-            data["resolvedPackage"]!!.jsonPrimitive.content,
+            observationOf(result).foregroundPackage,
         )
     }
 
@@ -1044,18 +1027,16 @@ class OpenToolTest {
 
         assertEquals(ActionOutcome.Failed, result.outcome)
         assertEquals("STATE_UNCHANGED", errorCode(result))
-        val data = body(result)["data"]!!.jsonObject
-        assertFalse("the a11y root is not the URL's foreground app", data["verified"]!!.jsonPrimitive.boolean)
+        val observation = observationOf(result)
+        assertEquals("the a11y root is not the URL's foreground app", false, executionOf(result).verified)
         assertEquals(
-            "no target package is known; the resolved package is the observed foreground",
+            "no target package is known; the observation's foreground is the observed app",
             "com.android.chrome",
-            data["resolvedPackage"]!!.jsonPrimitive.content,
+            observation.foregroundPackage,
         )
-        assertEquals(
-            "com.android.chrome",
-            data["foreground"]!!.jsonObject["package"]!!.jsonPrimitive.content,
-        )
-        assertEquals("com.android.launcher", data["rootPackage"]!!.jsonPrimitive.content)
+        assertEquals("com.android.chrome", observation.foregroundPackage)
+        assertEquals("com.android.launcher", observation.rootPackage)
+        assertFalse("data no longer repeats resolvedPackage", body(result).containsKey("resolvedPackage"))
         assertTrue("a URL launch must not poll for an invented target package", waits.isEmpty())
     }
 
@@ -1068,7 +1049,7 @@ class OpenToolTest {
 
         assertEquals(ActionOutcome.Done, result.outcome)
         assertEquals("am start -W -a android.settings.WIFI_SETTINGS", shell.commands.single())
-        assertTrue(body(result)["data"]!!.jsonObject["verified"]!!.jsonPrimitive.boolean)
+        assertEquals(true, executionOf(result).verified)
     }
 
     @Test
@@ -1151,7 +1132,7 @@ class OpenToolTest {
         ).execute("shell", "{}")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("UNKNOWN_ACTION", result.detail)
+        assertEquals("UNKNOWN_ACTION", executionOf(result).code)
         assertEquals("UNKNOWN_ACTION is not a screen operation", 0, captureCalls)
         assertEquals(0, observeCalls)
         assertNull("an unknown action invents no screen", result.observation)
@@ -1264,8 +1245,11 @@ class OpenToolTest {
         val observation = observationOf(result)
         assertEquals(ToolVision.Unavailable, observation.vision)
         assertEquals("no_source", observation.visionReason)
-        assertNull("no image means no invented foreground fact", observation.foregroundPackage)
-        assertNull(observation.screen)
+        // Task 8: the launch's own verification read still knows where the phone is; those are observation facts, not
+        // invented screen text. No source answered, so the screen/coverage stay null.
+        assertEquals("com.example.music", observation.foregroundPackage)
+        assertEquals("com.example.music", observation.rootPackage)
+        assertNull("a throwing source leaves no screen facts", observation.screen)
     }
 
     @Test
@@ -1348,8 +1332,7 @@ class OpenToolTest {
     private fun body(result: ActionResult): JsonObject =
         json.parseToJsonElement(result.detail).jsonObject
 
-    private fun errorCode(result: ActionResult): String =
-        body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content
+    private fun errorCode(result: ActionResult): String? = result.execution?.code
 
     /** 0.3 Phase 2.2 Task 5: every `open` result must carry structured execution facts. */
     private fun executionOf(result: ActionResult): ToolExecution {

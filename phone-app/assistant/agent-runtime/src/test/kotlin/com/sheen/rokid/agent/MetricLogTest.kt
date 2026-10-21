@@ -46,8 +46,9 @@ class MetricLogTest {
         registry: ToolRegistry = ToolRegistry(emptyList()),
         clock: MonotonicClock = FakeMetricClock(),
         lines: MutableList<String>,
+        maxSteps: Int = 24,
     ) = AgentLoop(gateway, registry, ScriptedPolicy(), ProgressGuard(), RecordingAuditSink(), clock,
-        metricLine = { lines += it })
+        maxSteps = maxSteps, metricLine = { lines += it })
 
     @Test
     fun `one run emits exactly one P3_METRIC line with the count fields`() {
@@ -80,6 +81,39 @@ class MetricLogTest {
         )
         // The line is counts only: no request/history/tool body, and no credential-shaped text.
         assertFalse(lines.single().contains("MARKER"), lines.toString())
+    }
+
+    @Test
+    fun `an image from a failed tool result is counted even when the run ends right after that call`() {
+        // Task 8: a failure's picture is a picture. The third identical failure ends the run (REPEATED_ERROR) after its
+        // output is appended, so no later model request can carry that last image — the count must come from the result,
+        // not only from the requests.
+        val lines = mutableListOf<String>()
+        var produced = 0
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open")))
+        executor.outcome = { _, _ ->
+            ActionResult(
+                ActionOutcome.Failed,
+                "STATE_UNCHANGED",
+                images = listOf(ImageRef("img-failure-${++produced}", "image/png", 8, 8, "sha-$produced")),
+            )
+        }
+        val replies = (1..3).map { index ->
+            // Distinct arguments keep the repeat detector from skipping the call: the error identity is tool+code, so
+            // three real failures still terminate as REPEATED_ERROR.
+            GatewayReply(
+                listOf(call("c$index", "open", """{"step":$index}""")), "opening", ModelEnd.COMPLETED, null, null,
+            )
+        } + GatewayReply(emptyList(), "unreachable", ModelEnd.COMPLETED, null, null)
+
+        val run = loop(MetricGateway(FakeMetricClock(), replies), ToolRegistry(listOf(executor)), lines = lines)
+            .run(request())
+
+        assertEquals(AgentOutcome.FAILED, run.outcome)
+        assertEquals("REPEATED_ERROR", run.safeCode)
+        assertEquals(3, run.metrics.images, "every failed call's picture is a distinct run image")
+        assertTrue(lines.single().contains(" images=3"), lines.single())
+        assertFalse(lines.single().contains("SHA"), "the metric line stays count-only: ${lines.single()}")
     }
 
     @Test

@@ -5,6 +5,8 @@ import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
 
 /**
  * R43/§4.12: `dial` — a direct call, and only a direct call.
@@ -40,7 +42,14 @@ class DialTool(
     fun execute(argsJson: String): ActionResult = execute(NAME, argsJson)
 
     override fun execute(name: String, argsJson: String): ActionResult {
-        if (name != NAME) return ActionResult(ActionOutcome.Refused, UNKNOWN_ACTION)
+        if (name != NAME) {
+            return ActionResult(
+                ActionOutcome.Refused,
+                "{}",
+                stateChanging = true,
+                execution = refusedExecution(UNKNOWN_ACTION),
+            )
+        }
         val args = parseObject(argsJson) ?: return refused(ARGUMENTS_INVALID)
         args.stringArg("number")?.trim()?.takeIf { it.isNotEmpty() } ?: return refused(ARGUMENTS_INVALID)
         if (!callAvailable()) return refused(CALL_PERMISSION_MISSING)
@@ -51,43 +60,60 @@ class DialTool(
             return refused(DIAL_FAILED)
         }
         return when (result.outcome) {
-            ActionOutcome.Done -> ActionResult(ActionOutcome.Done, acceptedOnly(), stateChanging = true)
-            ActionOutcome.Refused -> refused(result.detail.ifBlank { ARGUMENTS_INVALID })
-            ActionOutcome.Failed -> ActionResult(
-                ActionOutcome.Failed,
-                toolEnvelope(
-                    tool = NAME,
-                    ok = false,
-                    channel = CHANNEL,
-                    accepted = false,
-                    error = ToolFailure(DIAL_FAILED, "the dial intent could not be launched", recoverable = true),
-                ),
+            ActionOutcome.Done -> ActionResult(
+                ActionOutcome.Done,
+                "{}",
                 stateChanging = true,
+                execution = ToolExecution(
+                    outcome = ToolOutcome.Done,
+                    accepted = true,
+                    applied = null,
+                ),
             )
+            ActionOutcome.Refused -> refused(result.detail.ifBlank { ARGUMENTS_INVALID })
+            ActionOutcome.Failed -> failed()
         }
     }
 
-    /** The `accepted_only` success shape: no observation, no number in the payload. */
-    private fun acceptedOnly(): String = toolEnvelope(
-        tool = NAME,
-        ok = true,
-        channel = CHANNEL,
-        accepted = true,
-        applied = null,
+    /**
+     * Task 8: the `DIAL_FAILED` shape, stated once.
+     *
+     * `data` carries no facts at all (a phone number never appears in a payload): the execution facts are authoritative
+     * and the observation, when the catalog enriches this result, is the call UI. `accepted=true`/`applied=false` is the
+     * same reading `ToolCatalog` used to derive: the valid call reached the executor, but the intent did not launch.
+     */
+    private fun failed(): ActionResult = ActionResult(
+        ActionOutcome.Failed,
+        "{}",
+        stateChanging = true,
+        execution = ToolExecution(
+            outcome = ToolOutcome.Failed,
+            code = DIAL_FAILED,
+            message = "the dial intent could not be launched",
+            recoverable = true,
+            accepted = true,
+            applied = false,
+        ),
     )
 
     // R98: every `dial` call is a write, whatever its outcome — the declaration describes the call class, not whether
-    // CALL_PHONE let the intent run.
+    // CALL_PHONE let the intent run. `execution` is the one carrier of the stable code; `data` stays empty because no
+    // part of a dial result is tool-specific content that may face the model.
     private fun refused(code: String): ActionResult = ActionResult(
         ActionOutcome.Refused,
-        toolEnvelope(
-            tool = NAME,
-            ok = false,
-            channel = CHANNEL,
-            accepted = false,
-            error = ToolFailure(code, messageFor(code), recoverable = code != ARGUMENTS_INVALID),
-        ),
+        "{}",
         stateChanging = true,
+        execution = refusedExecution(code),
+    )
+
+    /** A dial refusal never dispatched the intent: `accepted=false`/`applied=false` are facts; only bad arguments are fatal. */
+    private fun refusedExecution(code: String): ToolExecution = ToolExecution(
+        outcome = ToolOutcome.Refused,
+        code = code,
+        message = messageFor(code),
+        recoverable = code != ARGUMENTS_INVALID,
+        accepted = false,
+        applied = false,
     )
 
     private fun messageFor(code: String): String = when (code) {
@@ -99,7 +125,6 @@ class DialTool(
     companion object {
         const val NAME = "dial"
 
-        private const val CHANNEL = "intent"
         private const val ARGUMENTS_INVALID = "ARGUMENTS_INVALID"
         private const val CALL_PERMISSION_MISSING = "CALL_PERMISSION_MISSING"
         private const val DIAL_FAILED = "DIAL_FAILED"
