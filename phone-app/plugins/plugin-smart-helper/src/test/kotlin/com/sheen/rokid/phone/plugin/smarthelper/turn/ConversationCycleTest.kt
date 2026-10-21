@@ -325,6 +325,47 @@ class ConversationCycleTest {
     }
 
     @Test
+    fun `stopping a named round whose panel is up shows the official idle`() {
+        // Task 9d fix (review Important 1): STOP can arrive after the hint acquired its panel but before the ACK opens
+        // a plugin window. The pre-armed round is a real listening round then, so the official STOP behavior applies:
+        // idle, keep the panel, and cancel only the turn the round still belongs to.
+        val rig = rig()
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "hint-turn")
+        rig.cycle.onPanelShown(AssistantRoute.PROACTIVE)
+        assertEquals(1, rig.scheduler.pending(), "PANEL_SHOWN armed the 10 s window")
+
+        rig.cycle.stopIfTurn(AssistantRoute.PROACTIVE, "other-turn")
+
+        assertEquals(0, rig.display.idled, "a mismatched turn id stops nothing")
+        assertEquals(1, rig.scheduler.pending(), "the live round keeps its window")
+        assertEquals(emptyList(), rig.cancelled)
+
+        rig.cycle.stopIfTurn(AssistantRoute.PROACTIVE, "hint-turn")
+
+        assertEquals(1, rig.display.idled, "STOP shows the official idle and keeps the panel")
+        assertEquals(0, rig.scheduler.pending(), "the named round is released")
+        assertEquals(listOf(AssistantRoute.PROACTIVE to "hint-turn"), rig.cancelled)
+        rig.advance(60_000)
+        assertEquals(0, rig.display.closed, "the official idle panel is not closed by STOP")
+    }
+
+    @Test
+    fun `stopping a round that never showed its panel releases it without a display call`() {
+        // During the hidden acquisition the panel may not exist yet: there is nothing to idle or close, so the round is
+        // released exactly like `releaseIfTurn`, and no turn callback is queued for a hint that never submitted.
+        val rig = rig()
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "hint-turn")
+        assertEquals(1, rig.scheduler.pending())
+
+        rig.cycle.stopIfTurn(AssistantRoute.PROACTIVE, "hint-turn")
+
+        assertEquals(0, rig.display.idled, "no idle for a panel that never reported shown")
+        assertEquals(0, rig.display.closed, "a panel the phone never opened gets no CLOSE")
+        assertEquals(0, rig.scheduler.pending(), "the acquisition cap is released")
+        assertEquals(emptyList(), rig.cancelled, "nothing was shown, so no turn callback is needed")
+    }
+
+    @Test
     fun `closing the conversation releases the bounded panel wait`() {
         val rig = rig()
         rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")

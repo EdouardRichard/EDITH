@@ -493,6 +493,35 @@ internal class ConversationCycle(
         }
     }
 
+    /**
+     * 0.3 Phase 3 Task 9d fix (review Important 1): the official [onStop] for a round **only if it is still [turnId]**.
+     *
+     * A hint that acquired its panel pre-armed this round, but its plugin window does not exist until the hint's
+     * `Displayed` ACK. A STOP in that gap must not leave the pending round to time out into a `CLOSE`: when the panel
+     * really reported its first layout the official STOP applies (idle, keep the panel, cancel only this turn); while
+     * the round is still waiting for `PANEL_SHOWN` there is no panel to paint, so it is released like [releaseIfTurn].
+     * The identity check is what keeps a newer attempt's round safe from the old hint's cleanup.
+     */
+    fun stopIfTurn(route: AssistantRoute, turnId: String) {
+        var cancelledTurn: String? = null
+        synchronized(lock) {
+            val current = state(route)
+            if (current.turnId != turnId) return
+            cancelAllTimersLocked(current)
+            if (current.awaitingPanel) {
+                // No window is up yet: idle would be a command about a panel the phone never opened.
+                resetRouteLocked(current)
+            } else {
+                log("P3_CONV idle route=${route.name} reason=stop")
+                showIdleLocked(route, current)
+                current.turnId = null
+                current.awaitingPanel = false
+                cancelledTurn = turnId
+            }
+        }
+        cancelledTurn?.let { cancelTurn(route, it) }
+    }
+
     /** Session end: release every deadline and forget every route, without calling the host (spec §5.7). */
     fun reset() {
         synchronized(lock) {

@@ -19,9 +19,11 @@ import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.smartToolCall
 import com.sheen.rokid.phone.plugin.smarthelper.streamText
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.DeactivationReason
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.OutputSubmission
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
@@ -104,7 +106,9 @@ class ProactiveFollowupWindowTest {
 
     /** Swaps [P3Log]'s sink for a collector and always restores it. */
     private fun <T> withLines(block: (MutableList<String>) -> T): T {
-        val lines = mutableListOf<String>()
+        // The acquisition tests keep the hint task blocked on another thread while the cycle's timeout worker logs,
+        // so the collector must tolerate concurrent appends (the same shape `SmartAssistantPluginTest` uses).
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
         val previous = P3Log.sink
         P3Log.sink = { lines += it }
         return try {
@@ -205,6 +209,8 @@ class ProactiveFollowupWindowTest {
         accepted: Boolean = true,
         deliverShown: Boolean = true,
         tasks: com.sheen.rokid.plugin.TaskScope? = null,
+        /** `"0"` lets a test admit a newer trigger right after the hint turn finished (the replacement race). */
+        proactiveCooldownMillis: String? = null,
     ): HiddenPanelRig {
         val seam = PanelSeam()
         val display = SmartRecordingDisplay()
@@ -221,6 +227,7 @@ class ProactiveFollowupWindowTest {
         }
         rig = SmartTestRig(requestPanelOpen = seam::request)
         rig.activate(
+            proactiveCooldownMillis = proactiveCooldownMillis,
             overrides = mapOf(Capability.ConversationDisplay to display),
             tasks = tasks,
         )
@@ -504,6 +511,218 @@ class ProactiveFollowupWindowTest {
             assertTrue(lines.none { it.startsWith("P3_PROACTIVE followup open") }, lines.toString())
             assertNull(hidden.rig.plugin.followupWindowTurnIdForTest())
             assertEquals(0, hidden.rig.scheduler.pending(), "the timed-out acquisition round is released")
+        }
+    }
+
+    @Test
+    fun `a panel shown from the host thread releases a hint that waits for it`() {
+        // Production keeps the hint turn on the plugin's task pool, and the host dispatcher delivers `PANEL_SHOWN` on
+        // its own thread. Delivering the report inline from the opening seam would bypass the real wait/release, so
+        // this test blocks the hint task and hands the report over from the test (host) thread.
+        val tasks = OffThreadTasks()
+        val hidden = hiddenPanelRig(deliverShown = false, tasks = tasks)
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
+            assertTrue(hidden.seam.requested.await(5, TimeUnit.SECONDS), "the hint requested the panel")
+            assertTrue(hidden.rig.output.hints.isEmpty(), "the hint task blocks until the panel reports its layout")
+
+            hidden.rig.panelVisible = true
+            hidden.rig.plugin.onPanelShown(AssistantRoute.PROACTIVE)
+            tasks.joinAll()
+
+            assertEquals(listOf(AssistantRoute.PROACTIVE), hidden.seam.routes)
+            assertEquals(1, hidden.rig.output.hints.size, "the released hint task submits after the panel report")
+            val listen = lines.single { it.startsWith("P3_CONV listen route=PROACTIVE") }
+            assertTrue(listen.endsWith("shown=true"), listen)
+            assertTrue(lines.none { it.startsWith("P3_CONV panel_not_shown") }, lines.toString())
+
+            val hint = hidden.rig.output.hints.single()
+            hidden.rig.plugin.handle(OutputStateEvent(hidden.rig.envelope(), hint.hintId, OutputStatus.Displayed))
+            assertNotNull(hidden.rig.plugin.followupWindowTurnIdForTest(), "the ACK opens the follow-up window")
+        }
+    }
+
+    @Test
+    fun `a stop after the panel is acquired shows idle and leaves no timeout close`() {
+        // Important 1: `acquireHintPanel` has already cleared `pendingHintPanel`, and no follow-up window exists until
+        // the hint's `Displayed` ACK. Without tying the pre-armed round to the hint, STOP fell through both cleanup
+        // branches and the 10 s listening round later closed the panel (`reason=timeout`) instead of the official idle.
+        val hidden = hiddenPanelRig()
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
+            assertEquals(1, hidden.rig.output.hints.size)
+            assertEquals(1, hidden.rig.scheduler.pending(), "PANEL_SHOWN armed the official 10 s window")
+
+            hidden.rig.plugin.handle(UserAction(hidden.rig.envelope(), UserAction.Action.Stop))
+
+            assertTrue(
+                hidden.display.idleCalls.any { it.first == AssistantRoute.PROACTIVE },
+                "STOP shows the official idle and keeps the panel",
+            )
+            assertEquals(0, hidden.rig.scheduler.pending(), "STOP releases the acquired hint's round")
+            assertTrue(hidden.display.closes.isEmpty(), "STOP keeps the panel; no CLOSE is sent")
+
+            hidden.rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+            assertTrue(
+                lines.none { it.startsWith("P3_CONV close route=PROACTIVE") },
+                "a stopped round must not time out into a CLOSE: $lines",
+            )
+        }
+    }
+
+    @Test
+    fun `a newer silent trigger closes the replaced hint's pre-armed round`() {
+        // Important 1, replacement half: the newer final is admitted once the hint turn is no longer in flight. It
+        // replaces the submitted hint, the ACK will never open a window for the old one, and a silent newer trigger
+        // would otherwise leave the old pre-armed round to time out into a CLOSE.
+        val hidden = hiddenPanelRig(proactiveCooldownMillis = "0")
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了", turnId = "asr-1")))
+            assertEquals(1, hidden.rig.output.hints.size)
+            assertEquals(1, hidden.rig.scheduler.pending(), "the acquired hint listens on its pre-armed round")
+
+            hidden.rig.model.onRequest = { request, listener -> streamText(request, listener, "保持沉默") }
+            hidden.rig.plugin.handle(
+                TranscriptEvent(hidden.rig.transcript("再帮我看一看", turnId = "asr-2", revision = 2)),
+            )
+
+            assertEquals(1, hidden.rig.output.hints.size, "the newer trigger stays silent")
+            assertEquals(0, hidden.rig.scheduler.pending(), "the replaced hint's round is released with it")
+            hidden.rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+            assertTrue(
+                lines.none { it.startsWith("P3_CONV close route=PROACTIVE") },
+                "no timeout CLOSE for a hint that was replaced: $lines",
+            )
+        }
+    }
+
+    @Test
+    fun `a rejected submit through the hidden acquisition closes the pre-armed round`() {
+        // Important 3: the legacy `SmartProactiveTurnTest` never acquires a panel, so it cannot exercise the
+        // identity-checked `closeIfTurn` cleanup of the round the hidden-panel acquisition pre-armed.
+        val hidden = hiddenPanelRig()
+        hidden.rig.output.submission = OutputSubmission.Rejected
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
+
+            assertTrue(lines.any { it.startsWith("P3_PROACTIVE hint rejected") }, lines.toString())
+            assertEquals(
+                listOf(AssistantRoute.PROACTIVE),
+                hidden.display.closes,
+                "the round the acquisition opened is closed on the wire",
+            )
+            assertEquals(0, hidden.rig.scheduler.pending(), "the rejected hint leaves no listening deadline")
+            assertNull(hidden.rig.plugin.followupWindowTurnIdForTest())
+            hidden.rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+            assertTrue(lines.none { it.startsWith("P3_CONV close route=PROACTIVE") }, lines.toString())
+        }
+    }
+
+    // ---- Task 9d fix: a hint cancelled while it waits for the panel ---------------------------------------------------
+
+    @Test
+    fun `a stop while the hint waits for the panel leaves no orphan round`() {
+        // Important 3: the pre-arm has happened (`pendingHintPanel` is set) but `PANEL_SHOWN` has not. STOP must release
+        // the acquisition cap and leave no 10 s round behind, and must not paint an idle on a panel that never came up.
+        val tasks = OffThreadTasks()
+        val hidden = hiddenPanelRig(deliverShown = false, tasks = tasks)
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
+            assertTrue(hidden.seam.requested.await(5, TimeUnit.SECONDS))
+            assertEquals(1, hidden.rig.scheduler.pending(), "the pre-arm's acquisition cap is the only deadline")
+
+            hidden.rig.plugin.handle(UserAction(hidden.rig.envelope(), UserAction.Action.Stop))
+            tasks.joinAll()
+
+            assertEquals(0, hidden.rig.scheduler.pending(), "STOP releases the pre-armed acquisition round")
+            assertTrue(hidden.rig.output.hints.isEmpty(), "a stopped hint does not submit")
+            assertTrue(hidden.display.idleCalls.isEmpty(), "the panel never reported shown: no idle for it")
+            assertTrue(hidden.display.closes.isEmpty(), "a panel that never came up gets no CLOSE")
+            hidden.rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+            assertTrue(lines.none { it.startsWith("P3_CONV close route=PROACTIVE") }, lines.toString())
+            assertTrue(lines.none { it.startsWith("P3_PROACTIVE followup open") }, lines.toString())
+        }
+    }
+
+    @Test
+    fun `a panel close while the hint waits for the panel leaves no orphan round`() {
+        val tasks = OffThreadTasks()
+        val hidden = hiddenPanelRig(deliverShown = false, tasks = tasks)
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
+            assertTrue(hidden.seam.requested.await(5, TimeUnit.SECONDS))
+
+            hidden.rig.plugin.onPanelClosed(AssistantRoute.PROACTIVE)
+            tasks.joinAll()
+
+            assertEquals(0, hidden.rig.scheduler.pending(), "UI_CLOSED releases the acquisition round")
+            assertTrue(hidden.rig.output.hints.isEmpty(), "a hint for a closed panel does not submit")
+            assertTrue(hidden.display.closes.isEmpty(), "the panel is already gone; no CLOSE is sent")
+            hidden.rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+            assertTrue(lines.none { it.startsWith("P3_CONV close route=PROACTIVE") }, lines.toString())
+        }
+    }
+
+    @Test
+    fun `help while the hint waits for the panel leaves no orphan round`() {
+        val tasks = OffThreadTasks()
+        val hidden = hiddenPanelRig(deliverShown = false, tasks = tasks)
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
+            assertTrue(hidden.seam.requested.await(5, TimeUnit.SECONDS))
+            // Help reuses the last final and runs its own WAKE turn; script it after the hint turn already made its
+            // request, so this only changes the model's answer for Help.
+            hidden.rig.model.onRequest = { request, listener -> streamText(request, listener, "在。") }
+
+            hidden.rig.plugin.handle(UserAction(hidden.rig.envelope(), UserAction.Action.Help))
+            tasks.joinAll()
+
+            // Help's own WAKE turn legitimately arms its fallback deadline, so the assertion is about the PROACTIVE
+            // round: releasing the acquisition must leave no listening round/close line behind on that route.
+            hidden.rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+            assertTrue(lines.none { it.startsWith("P3_CONV close route=PROACTIVE") }, lines.toString())
+            assertTrue(lines.none { it.startsWith("P3_CONV idle route=PROACTIVE") }, lines.toString())
+            assertTrue(lines.none { it.startsWith("P3_CONV panel_not_shown route=PROACTIVE") }, lines.toString())
+            assertTrue(
+                hidden.rig.output.hints.none { it.route == AssistantRoute.PROACTIVE },
+                "no PROACTIVE hint may submit after Help: ${hidden.rig.output.hints.map { it.route }}",
+            )
+            assertTrue(hidden.display.closes.none { it == AssistantRoute.PROACTIVE }, lines.toString())
+        }
+    }
+
+    @Test
+    fun `a session end while the hint waits for the panel leaves no orphan round`() {
+        val tasks = OffThreadTasks()
+        val hidden = hiddenPanelRig(deliverShown = false, tasks = tasks)
+
+        withLines { lines ->
+            arm(hidden.rig)
+            hidden.rig.plugin.handle(TranscriptEvent(hidden.rig.transcript("现在几点了")))
+            assertTrue(hidden.seam.requested.await(5, TimeUnit.SECONDS))
+
+            hidden.rig.plugin.deactivate(DeactivationReason.Stopped)
+            tasks.joinAll()
+
+            assertEquals(0, hidden.rig.scheduler.pending(), "a session end releases the acquisition round")
+            assertTrue(hidden.rig.output.hints.isEmpty(), "a session-end cancellation does not submit")
+            assertTrue(hidden.display.closes.isEmpty(), "a session end sends no CLOSE for a panel never shown")
+            hidden.rig.tick(OfficialConversation.LISTEN_TIMEOUT_MILLIS)
+            assertTrue(lines.none { it.startsWith("P3_CONV close route=PROACTIVE") }, lines.toString())
         }
     }
 

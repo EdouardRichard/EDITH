@@ -4179,20 +4179,33 @@ class SmartAssistantPlugin(
         val hint = ProactiveHint(hintId = "hint-${UUID.randomUUID()}", turnId = "proactive-${UUID.randomUUID()}")
         val request = ProactiveHintRequest(hintId = hint.hintId, turnId = hint.turnId, startedNanos = started)
         var replacedPanelWait: PendingHintPanel? = null
+        var replacedHint: ProactiveHint? = null
+        var replacedHintHadWindow = false
         synchronized(gate) {
             if (context !== current) return
             // A newer trigger may legitimately replace an older slot; the old run's gateway polls this flag as its
             // `stop` predicate, so marking it is what keeps the replaced turn from writing back.
+            replacedHint = proactiveHint
             proactiveHint?.cancelled = true
             proactiveRequest?.cancelled = true
             // 0.3 Phase 3 Task 9d: a hint still waiting for the panel is replaced with the turn it belongs to.
             replacedPanelWait = pendingHintPanel
             pendingHintPanel = null
+            replacedHintHadWindow = replacedHint != null && proactiveFollowup?.hint === replacedHint
             proactiveHint = hint
             proactiveRequest = request
             proactiveInFlight = true
         }
         replacedPanelWait?.abort(HintPanelAcquisition.CANCELLED)
+        // 0.3 Phase 3 Task 9d fix (review Important 1): a replaced hint that already acquired its panel pre-armed a
+        // listening round, and a newer trigger that stays silent never cancels it - the old round then closed the panel
+        // at the 10 s deadline. Close it with the replaced hint's own id, so a newer attempt's round is untouched. A
+        // hint still waiting for the panel is handled by its acquisition (release, or the submit early return); a
+        // displayed hint with a live follow-up window cannot be admitted over (the busy rule), so it is left alone.
+        val superseded = replacedHint
+        if (replacedPanelWait == null && superseded != null && !replacedHintHadWindow) {
+            conversationCycle.closeIfTurn(AssistantRoute.PROACTIVE, superseded.turnId)
+        }
         // Phase C: the proactive route is now working, and the wearer's ring should say so from the trigger rather than
         // from the first thing that happens to arrive. Outside the lock, as `publishBusy` requires.
         publishBusy()
@@ -4607,29 +4620,40 @@ class SmartAssistantPlugin(
         val current = currentContext() ?: return
         val now = clock.nowNanos()
         val assistance = synchronized(gate) {
-            if (proactiveHint !== hint || hint.cancelled) return
-            // The visible window starts here, not at the trigger: a reply that used most of the request deadline must
-            // still give the wearer a full window (a review finding).
-            val expiry = SmartTurn.saturatingAdd(now, ProactiveHintSpec.PROACTIVE_HINT_TTL_MILLIS * 1_000_000L)
-            hint.expiryNanos = expiry
-            hint.submitting = true
-            hint.pendingAck = false
-            Assistance(
-                hintId = hint.hintId,
-                sessionId = current.sessionId,
-                generation = current.generation,
-                sourceTurnId = hint.turnId,
-                // Phase C follow-up (owner report, 2026-10-15): the route decides which conversation this hint is
-                // filed under - on the glasses the wire route is the route the entry lands in. It defaults to WAKE,
-                // so leaving it out filed every proactive answer under the wake conversation.
-                route = AssistantRoute.PROACTIVE,
-                priority = 0,
-                text = text,
-                // P5 (spec §S6): proactive hints carry speech so the TTS path is exercised. The host's capability
-                // gate decides whether it actually plays; without a player the hint still displays normally (§S2).
-                optionalSpeech = SpeechRequest(),
-                expiresAtNanos = expiry,
-            )
+            if (proactiveHint !== hint || hint.cancelled) {
+                // 0.3 Phase 3 Task 9d fix (review Important 1): the hint lost its slot after acquiring the panel (a
+                // STOP or a replacement). Return the marker for the identity-checked round cleanup outside the lock.
+                null
+            } else {
+                // The visible window starts here, not at the trigger: a reply that used most of the request deadline must
+                // still give the wearer a full window (a review finding).
+                val expiry = SmartTurn.saturatingAdd(now, ProactiveHintSpec.PROACTIVE_HINT_TTL_MILLIS * 1_000_000L)
+                hint.expiryNanos = expiry
+                hint.submitting = true
+                hint.pendingAck = false
+                Assistance(
+                    hintId = hint.hintId,
+                    sessionId = current.sessionId,
+                    generation = current.generation,
+                    sourceTurnId = hint.turnId,
+                    // Phase C follow-up (owner report, 2026-10-15): the route decides which conversation this hint is
+                    // filed under - on the glasses the wire route is the route the entry lands in. It defaults to WAKE,
+                    // so leaving it out filed every proactive answer under the wake conversation.
+                    route = AssistantRoute.PROACTIVE,
+                    priority = 0,
+                    text = text,
+                    // P5 (spec §S6): proactive hints carry speech so the TTS path is exercised. The host's capability
+                    // gate decides whether it actually plays; without a player the hint still displays normally (§S2).
+                    optionalSpeech = SpeechRequest(),
+                    expiresAtNanos = expiry,
+                )
+            }
+        }
+        if (assistance == null) {
+            // The pre-armed round belongs to this hint's turn; a newer attempt's round is untouched by the identity
+            // check, and a round that never showed its panel gets no CLOSE (it was released by the acquisition).
+            conversationCycle.closeIfTurn(AssistantRoute.PROACTIVE, hint.turnId)
+            return
         }
         val sink: OutputSink? = runCatching { current.services.textOutput() }.getOrNull()
         val result = if (sink != null) {
@@ -5265,13 +5289,17 @@ class SmartAssistantPlugin(
         if (accepted) conversationCycle.onStop(AssistantRoute.WAKE)
         // 0.3 Phase 3 Task 6: STOP also ends the PROACTIVE listening round - but only when one existed, so a stop in a
         // session with no proactive conversation does not paint an idle on that route.
+        // 0.3 Phase 3 Task 9d fix (review Important 1): a hint that already acquired its panel has no plugin window yet
+        // (`cancelledFollowup` is false) and `acquireHintPanel` has already cleared `pendingHintPanel`, so cleanup is
+        // tied to the hint's own turn id. With the panel up that is the official idle/keep-panel; while the round is
+        // still waiting for `PANEL_SHOWN` it is released without a display call. The identity check keeps a newer
+        // attempt's round safe.
+        val cancelledHint = cancelledProactive ?: cancelledPanelWait?.hint
         if (accepted && cancelledFollowup) {
             P3Log.line("P3_PROACTIVE followup close reason=stop")
             conversationCycle.onStop(AssistantRoute.PROACTIVE)
-        } else if (accepted && cancelledPanelWait != null) {
-            // A hint that never got past the panel acquisition pre-armed a round but no window exists: release the
-            // round without an IDLE/CLOSE a wearer with no panel could not use.
-            conversationCycle.onClose(AssistantRoute.PROACTIVE)
+        } else if (accepted && cancelledHint != null) {
+            conversationCycle.stopIfTurn(AssistantRoute.PROACTIVE, cancelledHint.turnId)
         }
         cancelledPanelWait?.abort(HintPanelAcquisition.CANCELLED)
         // Outside the lock, as `publishBusy` requires.
