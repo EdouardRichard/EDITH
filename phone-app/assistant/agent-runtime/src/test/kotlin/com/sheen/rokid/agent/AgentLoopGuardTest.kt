@@ -570,7 +570,7 @@ class AgentLoopGuardTest {
         val observation = ToolObservation(
             foregroundPackage = "com.android.settings",
             screen = "Settings",
-            vision = ToolVision.Ok,
+            vision = ToolVision.NotRequested,
         )
         val deadlines = mutableListOf<Long>()
         val gateway = ScriptedGateway(
@@ -595,7 +595,7 @@ class AgentLoopGuardTest {
         val observationJson = envelopeOf(run).getValue("observation").jsonObject
         assertEquals("Settings", observationJson.getValue("screen").jsonPrimitive.content)
         assertEquals("com.android.settings", observationJson.getValue("foregroundPackage").jsonPrimitive.content)
-        assertEquals("ok", observationJson.getValue("vision").jsonPrimitive.content)
+        assertEquals("not_requested", observationJson.getValue("vision").jsonPrimitive.content)
         executor.awaitWorkers(1_000)
     }
 
@@ -624,7 +624,7 @@ class AgentLoopGuardTest {
         val observation = ToolObservation(
             foregroundPackage = "com.android.settings",
             screen = "Settings",
-            vision = ToolVision.Ok,
+            vision = ToolVision.NotRequested,
         )
         val gateway = ScriptedGateway(
             listOf(reply(calls = listOf(call("c1", "stuck"), call("c2", "stuck-second")))),
@@ -644,7 +644,72 @@ class AgentLoopGuardTest {
         assertTrue(execution.getValue("changed") is JsonNull, "a mid-flight frame is not a stable fact")
         val observationJson = envelopeOf(run).getValue("observation").jsonObject
         assertEquals("Settings", observationJson.getValue("screen").jsonPrimitive.content)
-        assertEquals("ok", observationJson.getValue("vision").jsonPrimitive.content)
+        assertEquals("not_requested", observationJson.getValue("vision").jsonPrimitive.content)
+        executor.release()
+    }
+
+    @Test
+    fun `a confirmed timeout is re-armed before the failure observation source runs`() {
+        // Review I1: the source reads the device through the very executors the timeout just cancelled, so a confirmed
+        // timeout must re-arm them before asking. Otherwise the 250 ms capture sees a CANCELLED kernel / stale screen.
+        val executor = TurnScopedExecutor(
+            descriptor("slow", timeoutMillis = 50L, screenObservation = true),
+            descriptor("quick"),
+        )
+        val beginTurnsWhenObserved = AtomicInteger(-1)
+        var sourceCalls = 0
+        val deadlines = mutableListOf<Long>()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "slow"))), reply(text = "先看看屏幕")),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(
+            request(observationSource = ToolObservationSource { deadlineMillis ->
+                sourceCalls++
+                deadlines += deadlineMillis
+                beginTurnsWhenObserved.set(executor.beginTurns.get())
+                ToolObservation(screen = "Settings", vision = ToolVision.NotRequested)
+            }),
+        )
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(1, sourceCalls, "a confirmed timeout asks the source exactly once")
+        assertEquals(listOf(250L), deadlines, "the failure observation gets the short deadline")
+        assertEquals(
+            1,
+            beginTurnsWhenObserved.get(),
+            "the confirmed timeout must re-arm before the source observes, not after",
+        )
+        assertEquals(1, executor.beginTurns.get(), "the confirmed timeout still re-arms exactly once")
+    }
+
+    @Test
+    fun `an uncertain stop never re-arms before or after the failure observation`() {
+        // An uncertain stop may still be in flight: no later write may run, so the executors stay cancelled. The source
+        // is still asked once (the screen may be readable), but it must not observe a re-armed executor.
+        val executor = StuckExecutor(descriptor("stuck", timeoutMillis = 50L, screenObservation = true))
+        val beginTurnsWhenObserved = AtomicInteger(-1)
+        var sourceCalls = 0
+        val deadlines = mutableListOf<Long>()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "stuck"), call("c2", "stuck-second")))),
+        )
+
+        val run = loop(gateway, ToolRegistry(listOf(executor))).run(
+            request(observationSource = ToolObservationSource { deadlineMillis ->
+                sourceCalls++
+                deadlines += deadlineMillis
+                beginTurnsWhenObserved.set(executor.beginTurns.get())
+                ToolObservation(screen = "Settings", vision = ToolVision.NotRequested)
+            }),
+        )
+
+        assertEquals(AgentOutcome.FAILED, run.outcome)
+        assertEquals("ACTION_TIMEOUT_UNCERTAIN", run.safeCode)
+        assertEquals(1, sourceCalls, "an uncertain stop asks the source exactly once")
+        assertEquals(listOf(250L), deadlines, "the failure observation gets the short deadline")
+        assertEquals(0, beginTurnsWhenObserved.get(), "an uncertain stop must never re-arm the executors")
+        assertEquals(0, executor.beginTurns.get(), "the re-arm stays off on the uncertain path")
         executor.release()
     }
 

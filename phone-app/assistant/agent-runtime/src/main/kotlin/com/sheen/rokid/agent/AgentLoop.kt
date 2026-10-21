@@ -815,7 +815,8 @@ class AgentLoop(
                             appendToolOutput(history, call.id, warning)
                             // A skipped observation still spends the observation budget (D3 §1.8), and a cancel or an
                             // expired deadline still ends the run. Nothing else about a skipped call is recorded: no
-                            // fingerprint, no guard feed, no global no-progress count, no error streak.
+                            // fingerprint, no guard feed, no global no-progress count, no error streak. It is also the
+                            // "not attempted" null: the call never executed, so no failure observation is taken here.
                             if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
                             if (spentObservations >= maxObservations) {
                                 return finish(
@@ -951,6 +952,14 @@ class AgentLoop(
                 // treatment, whether it came back from the executor (a throw or a tool's own failure), from a
                 // policy/confirmation refusal, or from the loop's own confirmed/uncertain timeout. The timeout results
                 // are built by `runTool` without a source, so this is the one place that can attach the fact.
+                //
+                // Review I1: a confirmed timeout's stop is turn-scoped on the host side (DeviceKernel.cancel refuses
+                // every call until beginTurn), so the source would read a CANCELLED kernel / stale screen if it ran
+                // first. Re-arm the executors **before** observing; an uncertain stop never reaches this re-arm because
+                // it ends the run below without a re-arm of its own.
+                if (execution.timedOut && !execution.uncertain && !cancelled) {
+                    registry.beginTurn()
+                }
                 val result = observedFailure(execution.result, descriptor, request.observationSource)
                 // R60: a call that did not stop within the grace window ends the run; no later write may run while the
                 // previous one may still be in flight.
@@ -965,13 +974,8 @@ class AgentLoop(
                     )
                     return finish(AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps)
                 }
-                // R97: the stop a timeout issued is turn-scoped on the host side (DeviceKernel.cancel refuses every call
-                // until beginTurn). The call really stopped, so re-arm the executors here, once the timeout result exists,
-                // and the rest of this same turn can still act. An uncertain stop ended the run above; a STOP, a cancel
-                // and a teardown must stay cancelled, so those paths never reach this re-arm.
-                if (execution.timedOut && !cancelled) {
-                    registry.beginTurn()
-                }
+                // R97: the re-arm above is exactly-once per confirmed timeout, and only a confirmed stop gets it: a STOP,
+                // a cancel and a teardown stay cancelled, so those paths never reach it.
                 // R98/R100: the per-call state-changing declaration is the only write signal — `device` declares
                 // observation=true for act too, so `!descriptor.observation` would treat `notify_user` as a write and a
                 // real device act as a read. It feeds the detectors' progress reset, the error streak's reset and the
@@ -1053,8 +1057,14 @@ class AgentLoop(
      *   `notify_user`/`load_skill`;
      * - a screen tool's failure asks [AgentRequest.observationSource] **once**, with
      *   [FAILURE_OBSERVATION_DEADLINE_MILLIS]. A missing source is `unavailable/no_source`; a source that returns `null`
-     *   or throws is `unavailable/observation_timeout`. None of these is a silent `null`, and a throwing source never
-     *   fails the run.
+     *   or throws an [Exception] is `unavailable/observation_timeout`. None of these is a silent `null`, a throwing
+     *   source never fails the run, and an [InterruptedException] is restored before the timeout fact is recorded. A
+     *   non-[Exception] `Throwable` is deliberately not swallowed.
+     *
+     * A `null` observation therefore means one of two honest things: the tool does not observe the screen (pure tool),
+     * or no capture was attempted. The detector-`Warn` skip path is the second case: the call was never executed, its
+     * synthetic result never reaches this helper, and its `observation = null` is "not attempted" rather than a failed
+     * capture.
      *
      * The execution facts are untouched: a timeout stays a timeout, a throw stays `Uncertain`, and an unconfirmed
      * refusal keeps its `accepted=false`/`applied=false`. The observation only says what the screen looked like when
@@ -1071,8 +1081,17 @@ class AgentLoop(
         val observation = if (source == null) {
             unavailableObservation(OBSERVATION_NO_SOURCE)
         } else {
-            runCatching { source.observe(FAILURE_OBSERVATION_DEADLINE_MILLIS) }
-                .getOrNull() ?: unavailableObservation(OBSERVATION_TIMEOUT)
+            try {
+                source.observe(FAILURE_OBSERVATION_DEADLINE_MILLIS) ?: unavailableObservation(OBSERVATION_TIMEOUT)
+            } catch (_: InterruptedException) {
+                // An interrupt is the caller's signal, not an observation failure: restore it for the run's owner and
+                // still record the attempt's timeout fact.
+                Thread.currentThread().interrupt()
+                unavailableObservation(OBSERVATION_TIMEOUT)
+            } catch (_: Exception) {
+                // A throwing source is a failed attempt, never a run failure; an Error is deliberately not swallowed.
+                unavailableObservation(OBSERVATION_TIMEOUT)
+            }
         }
         return result.copy(observation = observation)
     }

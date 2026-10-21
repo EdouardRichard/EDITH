@@ -1155,7 +1155,7 @@ class AgentLoopTest {
         val observation = ToolObservation(
             foregroundPackage = "com.example.launcher",
             screen = "Home",
-            vision = ToolVision.Ok,
+            vision = ToolVision.NotRequested,
         )
         val deadlines = mutableListOf<Long>()
         val source = ToolObservationSource { deadlineMillis ->
@@ -1199,16 +1199,24 @@ class AgentLoopTest {
     @Test fun `a throwing screen tool is uncertain and carries the best-effort observation`() {
         val executor = RecordingActionExecutor(listOf(actionDescriptor("shell", screenObservation = true)))
         executor.failure = IllegalStateException("boom")
-        val observation = ToolObservation(screen = "Home", vision = ToolVision.Ok)
+        val observation = ToolObservation(screen = "Home", vision = ToolVision.NotRequested)
+        val deadlines = mutableListOf<Long>()
+        var sourceCalls = 0
         val gateway = ScriptedGateway(
             listOf(reply(calls = listOf(call("c1", "shell"))), reply(text = "先不动")),
         )
 
         val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
-            request(observationSource = { observation }),
+            request(observationSource = { deadlineMillis ->
+                sourceCalls++
+                deadlines += deadlineMillis
+                observation
+            }),
         )
 
         assertEquals("TOOL_THREW", run.steps.single().result)
+        assertEquals(1, sourceCalls, "a thrown screen call asks the source exactly once")
+        assertEquals(listOf(250L), deadlines, "a thrown screen call gets the short failure deadline")
         assertEquals(
             ToolResultEnvelope.encode(
                 ToolExecution(outcome = ToolOutcome.Uncertain, code = "TOOL_THREW", uncertain = true),
@@ -1262,15 +1270,23 @@ class AgentLoopTest {
     @Test fun `a throwing observation source yields observation timeout and never fails the run`() {
         val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
         executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val deadlines = mutableListOf<Long>()
+        var sourceCalls = 0
         val gateway = ScriptedGateway(
             listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "没看到")),
         )
 
         val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
-            request(observationSource = ToolObservationSource { throw IllegalStateException("capture timed out") }),
+            request(observationSource = ToolObservationSource { deadlineMillis ->
+                sourceCalls++
+                deadlines += deadlineMillis
+                throw IllegalStateException("capture timed out")
+            }),
         )
 
         assertEquals(AgentOutcome.COMPLETED, run.outcome, "an observation failure is never a run failure")
+        assertEquals(1, sourceCalls, "a throwing source is asked exactly once")
+        assertEquals(listOf(250L), deadlines, "a throwing source gets the short failure deadline")
         assertEquals(
             ToolResultEnvelope.encode(
                 ToolExecution(outcome = ToolOutcome.Failed),
@@ -1281,8 +1297,45 @@ class AgentLoopTest {
         )
     }
 
+    @Test fun `an interrupted observation source yields observation timeout and restores the interrupt`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "没看到")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(observationSource = ToolObservationSource { throw InterruptedException("stop observing") }),
+        )
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertTrue(Thread.interrupted(), "the loop must restore an interrupt it swallowed")
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(outcome = ToolOutcome.Failed),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "observation_timeout"),
+                data = "STATE_UNCHANGED",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `an error from the observation source is not swallowed`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "没看到")),
+        )
+
+        assertFailsWith<AssertionError> {
+            newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+                request(observationSource = ToolObservationSource { throw AssertionError("fatal") }),
+            )
+        }
+    }
+
     @Test fun `a tool supplied observation is authoritative and is never replaced`() {
-        val toolObservation = ToolObservation(screen = "tool screen", vision = ToolVision.Ok)
+        val toolObservation = ToolObservation(screen = "tool screen", vision = ToolVision.NotRequested)
         val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
         executor.outcome = { _, _ ->
             ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", observation = toolObservation)
@@ -1290,7 +1343,7 @@ class AgentLoopTest {
         var observed = 0
         val source = ToolObservationSource {
             observed++
-            ToolObservation(screen = "source screen", vision = ToolVision.Ok)
+            ToolObservation(screen = "source screen", vision = ToolVision.NotRequested)
         }
         val gateway = ScriptedGateway(
             listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "看到了")),
@@ -1329,7 +1382,7 @@ class AgentLoopTest {
         val executor = RecordingActionExecutor(
             listOf(actionDescriptor("app.uninstall", requiresConfirmation = true, screenObservation = true)),
         )
-        val observation = ToolObservation(screen = "Home", vision = ToolVision.Ok)
+        val observation = ToolObservation(screen = "Home", vision = ToolVision.NotRequested)
         val gateway = ScriptedGateway(
             listOf(reply(calls = listOf(call("c1", "app.uninstall"))), reply(text = "那就不动")),
         )
