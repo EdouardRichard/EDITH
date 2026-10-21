@@ -58,7 +58,8 @@ class AgentLoopTest {
         maxEmptyTurns: Int = 3,
         maxSteps: Int = 24,
         confirmation: ConfirmationPort? = null,
-    ) = AgentLoop(gateway, registry, policy, guard, audit, clock, maxEmptyTurns, maxSteps, confirmation)
+        metricLine: (String) -> Unit = {},
+    ) = AgentLoop(gateway, registry, policy, guard, audit, clock, maxEmptyTurns, maxSteps, confirmation, metricLine = metricLine)
 
     /**
      * The exact envelope the loop feeds back for a tool result. The envelope shape itself is pinned in
@@ -1772,5 +1773,81 @@ class AgentLoopTest {
         newLoop(gateway, clock = clock).run(request(deadlineNanos = 4_242L))
 
         assertEquals(4_242L, gateway.requests.single().deadlineNanos, "0 = 旧行为：仍拿回合 deadline 当请求上限")
+    }
+
+    // --------------------------------------------- per-tool latency telemetry (Phase 4A A9)
+
+    /** The per-call latency lines only; the run-level `P3_METRIC` and per-call `P3_TOOLRESULT` share the sink. */
+    private fun p4ToolLines(lines: List<String>): List<String> = lines.filter { it.startsWith("P4_TOOL") }
+
+    /**
+     * Phase 4A Task 9: one count-only `P4_TOOL` line per measured tool call, on the loop's existing metric sink.
+     *
+     * `ms` is the call's machine time from the injected clock, so the literal is deterministic. The argument and the
+     * result body are sentinels: neither may reach the line, which carries only the tool name, the whole-millisecond
+     * machine time and the envelope's existing wire outcome.
+     */
+    @Test fun `a tool call emits one P4_TOOL line with its machine millis and wire outcome`() {
+        val clock = FakeClock(0)
+        val lines = mutableListOf<String>()
+        val executor = executorOf("lookup")
+        executor.outcome = { _, _ ->
+            clock.advance(7_000_000L)
+            ActionResult(ActionOutcome.Done, """{"text":"MARKER-RESULT-BODY"}""")
+        }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "lookup", """{"secret":"MARKER-ARGUMENT"}"""))),
+                reply(text = "答"),
+            ),
+        )
+
+        val run = newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), clock = clock, metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(listOf("P4_TOOL tool=lookup ms=7 outcome=done"), p4ToolLines(lines))
+        assertFalse(
+            lines.any { it.contains("MARKER-ARGUMENT") || it.contains("MARKER-RESULT-BODY") },
+            "the latency line may carry no argument or result content: $lines",
+        )
+    }
+
+    /**
+     * Two calls in one round are two readings, each with its own tool, machine time and wire token. The second call is a
+     * failure, which pins that `outcome` reuses the envelope vocabulary rather than the run's own terminal state.
+     */
+    @Test fun `two calls in one round emit one P4_TOOL line each with their own outcome`() {
+        val clock = FakeClock(0)
+        val lines = mutableListOf<String>()
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("lookup"), actionDescriptor("open")))
+        executor.outcome = { name, _ ->
+            when (name) {
+                "lookup" -> {
+                    clock.advance(3_000_000L)
+                    ActionResult(ActionOutcome.Done, "ok")
+                }
+                else -> {
+                    clock.advance(11_000_000L)
+                    ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED")
+                }
+            }
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"), call("c2", "open"))), reply(text = "好")),
+        )
+
+        newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), clock = clock, metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(
+            listOf(
+                "P4_TOOL tool=lookup ms=3 outcome=done",
+                "P4_TOOL tool=open ms=11 outcome=failed",
+            ),
+            p4ToolLines(lines),
+        )
     }
 }

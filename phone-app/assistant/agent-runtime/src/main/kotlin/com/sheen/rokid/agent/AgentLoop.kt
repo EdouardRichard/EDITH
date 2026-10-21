@@ -440,7 +440,8 @@ class AgentLoop(
     /**
      * 0.25 Task 14 (R78): where the run's count-only metric lines go. `{}` (the default) emits nothing, keeping every
      * pre-0.25 caller and test byte-for-byte; the production plugin passes its log sink. The loop emits exactly one
-     * `P3_METRIC` line per run, plus (edith-0.3 Phase 3 Task 4, P3-9) one `P3_TOOLRESULT` line per tool call. Provider
+     * `P3_METRIC` line per run, plus (edith-0.3 Phase 3 Task 4, P3-9) one `P3_TOOLRESULT` line per tool call and
+     * (edith-0.3 Phase 4A Task 9, A9) one `P4_TOOL` latency line per measured tool call. Provider
      * cache accounting is **not** a run total: it is `P3_CACHE`, emitted by `ModelClientGateway` once per model request
      * (0.3 Phase 2 Task 11), so the proactive path and every overflow re-send are covered. The loop still reports the
      * same numbers in [AgentRun.metrics] for a caller that has its own consumer.
@@ -959,6 +960,14 @@ class AgentLoop(
                     (humanWaitNanos - humanWaitBefore) - execution.deadlineShiftNanos).coerceAtLeast(0L)
                 metricToolNanos += machineToolNanos
                 if (descriptor?.observation == true) metricObserveNanos += machineToolNanos
+                // edith-0.3 Phase 4A Task 9 (A9): one count-only `P4_TOOL` line per **measured** tool call, on the same
+                // sink as the run-level and per-result lines. `ms` is this call's machine time — the same number the
+                // run-level `toolMs` sums — and `outcome` is the envelope's existing wire token, not a second
+                // taxonomy. A detector-skipped/critical call never reaches this point, so it has no reading rather than
+                // a fabricated zero. Observability is never a verdict: a throwing sink is swallowed like the others'.
+                runCatching {
+                    metricLine(renderToolLatency(call.name, machineToolNanos, execution.result.execution.outcome))
+                }
                 // R99/D49: a mayAskHuman call may have spent part of D47's decision window inside `execute`; that time
                 // belongs to the person, not the turn. Shift it before any deadline check below can charge the run for
                 // a legal approval. Every other call contributes nothing.
@@ -1548,6 +1557,25 @@ class AgentLoop(
             outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps, usage,
             spentObservations, planNudgeCap, metrics,
         )
+    }
+
+    /**
+     * edith-0.3 Phase 4A Task 9 (A9): the one count-only `P4_TOOL` line of one measured tool call.
+     *
+     * The exact field order — `P4_TOOL tool=<name> ms=<millis> outcome=<wire>` — is the contract the K40 latency matrix
+     * reads. [machineToolNanos] is the same machine time the run-level `P3_METRIC toolMs=` sums, floored to whole
+     * milliseconds and never negative; [outcome] is [ToolOutcome.wireValue], the model-facing envelope's existing
+     * vocabulary, so the two records cannot drift into two taxonomies. Nothing else is appended: no argument, command,
+     * result text, ref, URL or content number can reach the line.
+     *
+     * A call a loop detector skipped or ended before execution never has its machine time measured, so it emits no line
+     * (an absent reading, never an invented `ms=0`). A cancelled call is measured and does emit its line; its synthetic
+     * result carries the framework's own wire token, exactly as `P3_TOOLRESULT` would render it if it emitted.
+     */
+    private fun renderToolLatency(tool: String, machineToolNanos: Long, outcome: ToolOutcome): String = buildString {
+        append("P4_TOOL tool=").append(tool)
+        append(" ms=").append(machineToolNanos / NANOS_PER_MILLI)
+        append(" outcome=").append(outcome.wireValue)
     }
 
     /**
