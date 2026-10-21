@@ -269,7 +269,7 @@ class TurnTranscriptRecordTest {
         assertEquals("c1", call.callId)
         val output = history.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
         assertEquals("c1", output.callId)
-        assertEquals(doneToolOutput("notified:1"), output.output)
+        assertEquals(pureToolOutput("notified:1"), output.output)
         // The closing assistant text is what the wearer actually heard/saw: the notification bodies plus the model's
         // closing text, exactly the sentence `recordTurnAndCompress` has always recorded.
         val closing = history.last()
@@ -400,7 +400,7 @@ class TurnTranscriptRecordTest {
         )
         assertTrue(
             sent.history.any {
-                it is ModelHistoryItem.ToolOutput && it.callId == "c1" && it.output == doneToolOutput("notified:1")
+                it is ModelHistoryItem.ToolOutput && it.callId == "c1" && it.output == pureToolOutput("notified:1")
             },
             "the previous turn's output must be in the next request's history: ${sent.history}",
         )

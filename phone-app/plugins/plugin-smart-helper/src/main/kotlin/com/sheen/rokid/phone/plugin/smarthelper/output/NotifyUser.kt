@@ -6,6 +6,8 @@ import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -72,6 +74,10 @@ fun decideChannel(channel: NotifyChannel): NotifyDecision = when (channel) {
  * - **The result detail is `notified:<n>`.** `AgentLoop` feeds every tool result to `ProgressGuard`, which trips on
  *   three identical consecutive fingerprints; a model that sends the same sentence twice would otherwise end its own
  *   run as `NO_PROGRESS`. The counter keeps the fingerprints distinct and carries no content.
+ * - **The model-facing result is the unified envelope** (0.3 Phase 2.2 Task 7). The call was accepted and completed,
+ *   so it states `accepted = true`; `applied`/`verified`/`changed` stay `null` because this tool has no independent
+ *   evidence that the wearer saw or heard the notification, and `observation` is `null` because it never looks at the
+ *   screen. Inventing either would be a fabricated fact. The counter stays the envelope's `data`.
  */
 class NotifyUserTool(private val onNotify: (NotifyChannel, String) -> Unit) : ActionExecutor {
 
@@ -91,7 +97,12 @@ class NotifyUserTool(private val onNotify: (NotifyChannel, String) -> Unit) : Ac
             ?: return refused()
 
         onNotify(channel, text)
-        return ActionResult(ActionOutcome.Done, "notified:${sequence.incrementAndGet()}")
+        return ActionResult(
+            outcome = ActionOutcome.Done,
+            detail = "notified:${sequence.incrementAndGet()}",
+            execution = ToolExecution(outcome = ToolOutcome.Done, accepted = true),
+            observation = null,
+        )
     }
 
     override fun cancel() = Unit

@@ -123,8 +123,8 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
  *
  * Three properties, each one paid for by a P0 measurement:
  * 1. **the state decides, not the exit code.** Every action re-reads [TargetState] afterwards, and a command that
- *    "succeeded" without changing what it claimed to change is `Failed: STATE_UNCHANGED`. This is the honest answer to
- *    the `pm grant` false-positive in the T3a matrix;
+ *    "succeeded" without changing what it claimed to change is the failure `STATE_UNCHANGED`. This is the honest
+ *    answer to the `pm grant` false-positive in the T3a matrix;
  * 2. **arguments are refused, not escaped.** See [PACKAGE_NAME];
  * 3. **a channel that is down is refused twice**: [available] gates [execute], so a call that arrives after Shizuku
  *    stopped gets `ACTION_CHANNEL_UNAVAILABLE` instead of a command running as the wrong identity.

@@ -6,6 +6,8 @@ import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
 import java.util.concurrent.atomic.AtomicInteger
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
@@ -30,6 +32,10 @@ import kotlinx.serialization.json.jsonObject
  *   gate). The body itself travels only through [onLoaded], which the plugin keeps for the current turn and renders as
  *   request-tail `SKILL_BODY` content (0.3 Task 12; it no longer rides the system slot), so it never appears in a
  *   receipt, a log line or the descriptor.
+ * - **The model-facing result is the unified envelope** (0.3 Phase 2.2 Task 7). A successful pull was accepted and
+ *   completed, so it states `accepted = true`; `applied`/`verified`/`changed` stay `null` because this tool has no
+ *   independent evidence about a later model request or any device state, and `observation` is `null` because reading
+ *   a SKILL never looks at the screen. The counter stays the envelope's `data`.
  * - **A refusal is a step the model can correct, never an exception into the loop.** Every parse failure — non-JSON,
  *   a JSON non-object, a missing/blank/non-string `name` — is `ActionOutcome.Refused` with a stable code. A name that
  *   is not pullable is refused too, and the two reasons stay distinguishable: an unknown name is [NOT_FOUND] (the
@@ -59,7 +65,12 @@ class LoadSkillTool(
                 onLoaded(load.skill)
                 val n = sequence.incrementAndGet()
                 val detail = if (load.wasDormant) "$DORMANT loaded:$n" else "loaded:$n"
-                ActionResult(ActionOutcome.Done, detail)
+                ActionResult(
+                    outcome = ActionOutcome.Done,
+                    detail = detail,
+                    execution = ToolExecution(outcome = ToolOutcome.Done, accepted = true),
+                    observation = null,
+                )
             }
 
             is SkillLoad.NotFound -> when (load.reason) {

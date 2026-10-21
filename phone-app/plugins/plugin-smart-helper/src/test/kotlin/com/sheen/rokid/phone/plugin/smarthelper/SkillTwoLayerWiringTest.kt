@@ -459,7 +459,7 @@ class SkillTwoLayerWiringTest {
             .filterIsInstance<ModelHistoryItem.ToolOutput>()
             .map { it.output }
         assertEquals(
-            listOf("loaded:1", "loaded:2", "loaded:3").map(::doneToolOutput), receipts,
+            listOf("loaded:1", "loaded:2", "loaded:3").map(::pureToolOutput), receipts,
             "one instance across requests is what keeps the receipts distinct: $receipts",
         )
         assertTrue(turnCompleted(lines), "the turn must complete, not trip NO_PROGRESS: $lines")

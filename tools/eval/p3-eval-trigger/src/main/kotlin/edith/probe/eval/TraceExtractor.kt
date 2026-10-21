@@ -4,6 +4,14 @@ private val TURN_START = Regex("P3_TURN start turn=(\\S+)")
 private val TURN_END = Regex("P3_TURN end turn=(\\S+) outcome=(\\S+) code=(\\S+) steps=(\\d+)")
 private val TOOL_LINE = Regex("P3_TOOL call=(\\S+) ok=(true|false) detail=(.*)$")
 
+private const val REFUSED_BY_POLICY = "REFUSED_BY_POLICY"
+private const val CONFIRMATION_PREFIX = "CONFIRMATION_"
+private const val UNKNOWN_TOOL = "UNKNOWN_TOOL"
+private const val ARGUMENTS_INVALID = "ARGUMENTS_INVALID"
+
+/** A detector's synthetic warning/critical label; the call it describes was never dispatched. */
+private const val LOOP_PREFIX = "LOOP_"
+
 /** One turn while it is being read: the steps seen so far, and whether an end line has arrived. */
 private class TurnBuilder(val turnId: String) {
     val steps = mutableListOf<StepTrace>()
@@ -19,8 +27,16 @@ private class TurnBuilder(val turnId: String) {
  *  - `REFUSED_BY_POLICY` - the policy refused; the executor never ran (`decision = refuse`, `executed = false`);
  *  - `CONFIRMATION_*` - the confirmation was declined, timed out or was unavailable; the executor never ran either
  *    (`decision = require_confirmation`, `executed = false`);
- *  - `Refused: …` - the policy **allowed** it and the privileged channel then refused: the executor *did* run
- *    (`decision = allow`, `executed = true`). Folding this into "refused" would make the escalation rate meaningless.
+ *  - `UNKNOWN_TOOL` / `ARGUMENTS_INVALID` - the registry rejected the call before dispatch (`decision = null`,
+ *    `executed = false`);
+ *  - a detector's `LOOP_*` warning - the call was skipped before dispatch (`decision = null`, `executed = false`);
+ *  - **any other failed stable code** - the policy **allowed** it and the executor ran; the tool, the privileged
+ *    channel or the post-call verdict then failed/refused (`decision = allow`, `executed = true`). Folding this into
+ *    "refused" would make the escalation rate meaningless.
+ *
+ * 0.3 Phase 2.2: `P3_TOOL detail=` is the envelope-derived `execution.code` (or `ok`), with no `"Refused: "` /
+ * `"Failed: "` prefix. That prefix used to be the only evidence that a failed call had been dispatched, so the
+ * pre-dispatch codes above are now the complete "did not run" list; the parser keys on them rather than on a prefix.
  *
  * A turn with no `end` line is reported with outcome `UNKNOWN` rather than dropped: it is a turn that did not finish,
  * and dropping it would quietly raise the completion rate.
@@ -71,12 +87,28 @@ fun extractTurns(lines: List<String>): List<TurnTrace> {
 }
 
 private fun stepOf(action: String, ok: Boolean, detail: String): StepTrace {
+    val dispatched = ok || !wasRejectedBeforeDispatch(detail)
     val decision = when {
-        detail == "REFUSED_BY_POLICY" -> "refuse"
-        detail.startsWith("CONFIRMATION_") -> "require_confirmation"
-        ok || detail.startsWith("Refused:") -> "allow"
+        detail == REFUSED_BY_POLICY -> "refuse"
+        detail.startsWith(CONFIRMATION_PREFIX) -> "require_confirmation"
+        dispatched -> "allow"
         else -> null
     }
-    val executed = ok || detail.startsWith("Refused:")
-    return StepTrace(action = action, ok = ok, decision = decision, executed = executed, result = detail)
+    return StepTrace(action = action, ok = ok, decision = decision, executed = dispatched, result = detail)
 }
+
+/**
+ * Whether a `P3_TOOL detail=` value names a call the framework rejected **before** the executor ran.
+ *
+ * The current envelope-derived shape carries the bare `execution.code`, so "did not run" has to be a closed set:
+ * the registry's two pre-dispatch errors, the loop's policy/confirmation codes, and a detector's `LOOP_*` label.
+ * Every other failed code - `STATE_UNCHANGED`, `ACTION_CHANNEL_UNAVAILABLE`, `TOOL_THREW`, a timeout, a tool's own
+ * refusal - comes from a call that really was dispatched. The old `Refused:`/`Failed:` prefix is deliberately not
+ * part of this rule; it no longer exists on the wire.
+ */
+private fun wasRejectedBeforeDispatch(detail: String): Boolean =
+    detail == REFUSED_BY_POLICY ||
+        detail.startsWith(CONFIRMATION_PREFIX) ||
+        detail == UNKNOWN_TOOL ||
+        detail == ARGUMENTS_INVALID ||
+        detail.startsWith(LOOP_PREFIX)

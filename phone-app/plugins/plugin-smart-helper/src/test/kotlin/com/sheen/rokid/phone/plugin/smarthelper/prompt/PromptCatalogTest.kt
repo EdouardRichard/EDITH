@@ -39,6 +39,21 @@ class PromptCatalogTest {
     }
 
     @Test
+    fun `the prompt never teaches the pre-envelope failed or refused result prefixes`() {
+        // 0.3 Phase 2.2: the model-facing tool result is the `{execution, observation|null, data}` envelope. A prompt
+        // that still shows the pre-0.3 `Failed: …`/`Refused: …` string would teach the model a shape the runtime no
+        // longer produces, so the authored resources are checked as a whole (including the unselected follow-up route).
+        val corpus = buildString {
+            PromptCatalog.manifest().forEach { appendLine(promptText(it.file)) }
+            appendLine(PromptCatalog.dynamicTemplate())
+            appendLine(PromptCatalog.perceptionTemplate())
+        }
+
+        assertFalse("Failed: " in corpus, "the prompt must not teach the old Failed prefix")
+        assertFalse("Refused: " in corpus, "the prompt must not teach the old Refused prefix")
+    }
+
+    @Test
     fun `the same profile and route produce the same hash twice`() {
         assertEquals(
             PromptCatalog.plan(ContextRoute.WAKE, profileFixture()).hash,

@@ -1,8 +1,17 @@
 package com.sheen.rokid.phone.plugin.smarthelper.skill
 
 import com.sheen.rokid.agent.SCOPE_TERMINAL
+import com.sheen.rokid.agent.ToolCall
+import com.sheen.rokid.agent.ToolRegistry
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -63,6 +72,38 @@ class LoadSkillToolTest {
         assertEquals(listOf(skill), seen)
         assertEquals("loaded:1", result.detail)
         assertTrue("SECRET-BODY" !in result.detail, "the body must never travel in the tool receipt")
+    }
+
+    @Test fun `a successful pull states the done facts it knows and reports no observation`() {
+        // 0.3 Phase 2.2 Task 7: reading a SKILL is not a screen action, so observation is null. The pull was accepted
+        // and its body handed over. Independent verification of a later request and a device-state change are unknown
+        // here, so those tri-state facts stay null rather than being guessed.
+        val result = tool().execute("load_skill", """{"name":"alpha"}""")
+
+        assertEquals(ToolExecution(outcome = ToolOutcome.Done, accepted = true), result.execution)
+        assertNull(result.execution?.applied)
+        assertNull(result.execution?.verified)
+        assertNull(result.execution?.changed)
+        assertNull(result.observation)
+        assertEquals("loaded:1", result.detail, "the tool-specific data stays the envelope's data")
+    }
+
+    @Test fun `the model sees the envelope with a null observation and no legacy prefix`() {
+        val registry = ToolRegistry(listOf(tool()))
+
+        val result = registry.execute(
+            ToolCall("c1", "load_skill", """{"name":"alpha"}"""),
+        )
+
+        val payload = Json.parseToJsonElement(result.payload).jsonObject
+        assertEquals(setOf("execution", "observation", "data"), payload.keys)
+        val execution = payload.getValue("execution").jsonObject
+        assertEquals("done", execution.getValue("outcome").jsonPrimitive.content)
+        assertEquals(JsonPrimitive(true), execution.getValue("accepted"))
+        assertEquals(JsonNull, payload.getValue("observation"))
+        assertEquals("loaded:1", payload.getValue("data").jsonPrimitive.content)
+        assertFalse("Failed: " in result.payload, "no legacy prefix: ${result.payload}")
+        assertFalse("Refused: " in result.payload, "no legacy prefix: ${result.payload}")
     }
 
     @Test fun `two pulls of the same name get different receipts so the guard cannot call it no-progress`() {
