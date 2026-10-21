@@ -12,6 +12,7 @@ import com.sheen.rokid.device.Ref
 import com.sheen.rokid.device.RefRegistry
 import com.sheen.rokid.device.RefResult
 import com.sheen.rokid.device.ScreenFilter
+import com.sheen.rokid.phone.app.autoVisionProfileSupportsImage
 import com.sheen.rokid.phone.context.AcousticSource
 import com.sheen.rokid.phone.context.CalendarSource
 import com.sheen.rokid.phone.context.ClipboardSource
@@ -19,13 +20,18 @@ import com.sheen.rokid.phone.context.GlassesStateSource
 import com.sheen.rokid.phone.context.MediaSessionSource
 import com.sheen.rokid.phone.context.NotificationContent
 import com.sheen.rokid.phone.context.NotificationContentSource
+import com.sheen.rokid.plugin.CapabilityVerification
 import com.sheen.rokid.plugin.DeviceProfile
 import com.sheen.rokid.plugin.DeviceState
 import com.sheen.rokid.plugin.DeviceStateProvider
 import com.sheen.rokid.plugin.ImageRef
+import com.sheen.rokid.plugin.InputModality
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.PerceptionFilter
 import com.sheen.rokid.plugin.PerceptionScreenshotResult
 import com.sheen.rokid.plugin.PerceptionSource
+import com.sheen.rokid.plugin.SecretHandle
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
@@ -119,6 +125,32 @@ class AndroidPerceptionProviderTest {
         foregroundPackage = "com.example.app",
     )
 
+    /**
+     * A profile that declares `IMAGE` but carries only the verifications the caller scripts. The production resolver
+     * (`autoVisionProfileSupportsImage`) is what decides the provider's second gate, so tests can pin the
+     * declared-vs-verified boundary end to end through [AndroidPerceptionProvider.screenshot].
+     */
+    private fun declaredImageProfile(
+        verifications: List<CapabilityVerification> = emptyList(),
+    ): ModelProfile = ModelProfile(
+        id = "declared-image-profile",
+        revision = 1,
+        name = "Synthetic declared IMAGE",
+        service = "Synthetic",
+        baseUrl = "https://synthetic.example/v1",
+        protocolId = "DEEPSEEK_RESPONSES",
+        model = "synthetic-model",
+        secret = object : SecretHandle { override val id = "synthetic-secret" },
+        usableWindowTokens = 4096,
+        inputBudgetTokens = 2048,
+        maxOutputTokens = 1024,
+        safetyTokens = 128,
+        timeoutMillis = 5000,
+        inputs = setOf(InputModality.TEXT, InputModality.IMAGE),
+        outputs = setOf(OutputModality.TEXT),
+        verifications = verifications,
+    )
+
     private fun notification(title: String): NotificationContent = NotificationContent(
         packageName = "com.tencent.mm",
         appLabel = "微信",
@@ -150,7 +182,7 @@ class AndroidPerceptionProviderTest {
         var now = 1_000L
         var policyValue = PerceptionPolicy()
         var vision = true
-        var profileSupportsImage = true
+        var profileSupportsImage: () -> Boolean = { true }
         var screenshotCalls = 0
         var screenshotThrows = false
         var screenshotResult: PerceptionScreenshotResult =
@@ -216,7 +248,8 @@ class AndroidPerceptionProviderTest {
             ),
             policy = { policyValue },
             visionEnabled = { vision },
-            profileSupportsImage = { profileSupportsImage },
+            // Read through the property on every call so a test can re-script the gate after construction.
+            profileSupportsImage = { profileSupportsImage() },
             screenshot = {
                 screenshotCalls++
                 if (screenshotThrows) error("capture died") else screenshotResult
@@ -598,7 +631,7 @@ class AndroidPerceptionProviderTest {
         // injected capture is never asked for an image it would have to throw away.
         val harness = Harness()
         harness.vision = false
-        harness.profileSupportsImage = true
+        harness.profileSupportsImage = { true }
 
         assertEquals(PerceptionScreenshotResult.Disabled, harness.provider.screenshot())
         assertEquals(0, harness.screenshotCalls)
@@ -610,7 +643,7 @@ class AndroidPerceptionProviderTest {
         // rejects the whole request. This is an explicit absence, not a capture attempt.
         val harness = Harness()
         harness.vision = true
-        harness.profileSupportsImage = false
+        harness.profileSupportsImage = { false }
 
         assertEquals(
             PerceptionScreenshotResult.Unavailable("no_image_profile"),
@@ -620,10 +653,38 @@ class AndroidPerceptionProviderTest {
     }
 
     @Test
+    fun screenshotIsUnavailableWhenProfileDeclaresImageButIsNotVerified() {
+        // Final whole-branch fix: the production second gate is autoVisionProfileSupportsImage. A profile that only
+        // declares IMAGE would let the first auto image reach CapabilityGate, which requires the current revision's
+        // latest IMAGE_REQUEST to be Verified and otherwise throws CapabilityMissing for the whole turn. The provider
+        // must read the gate as false and never touch the capture channel.
+        val harness = Harness()
+        harness.vision = true
+        val declared = declaredImageProfile(verifications = emptyList())
+        harness.profileSupportsImage = {
+            autoVisionProfileSupportsImage(
+                selection = { declared.id },
+                load = { id -> declared.takeIf { it.id == id } },
+                fallback = { null },
+            )
+        }
+
+        assertEquals(
+            PerceptionScreenshotResult.Unavailable("no_image_profile"),
+            harness.provider.screenshot(),
+        )
+        assertEquals(
+            "a declared-but-unverified image profile must not capture",
+            0,
+            harness.screenshotCalls,
+        )
+    }
+
+    @Test
     fun screenshotUsesCaptureWhenUserAndProfileAllowIt() {
         val harness = Harness()
         harness.vision = true
-        harness.profileSupportsImage = true
+        harness.profileSupportsImage = { true }
         val image = PerceptionScreenshotResult.Image(
             image = ImageRef("artifact-2", "image/jpeg", 10, 20, "sha256"),
             mime = "image/jpeg",
@@ -640,7 +701,7 @@ class AndroidPerceptionProviderTest {
     fun screenshotCaptureFailureIsUnavailableWithCode() {
         val harness = Harness()
         harness.vision = true
-        harness.profileSupportsImage = true
+        harness.profileSupportsImage = { true }
         harness.screenshotThrows = true
 
         assertEquals(

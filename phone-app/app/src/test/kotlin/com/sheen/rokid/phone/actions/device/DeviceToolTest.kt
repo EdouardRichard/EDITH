@@ -1199,6 +1199,22 @@ class DeviceToolTest {
     }
 
     @Test
+    fun `a throwing provider capture degrades to unavailable instead of failing the call`() {
+        // The provider contract says screenshot() returns an answer, never throws. If a future implementation breaks
+        // that, the tool must still not turn a successful observe into TOOL_THREW: degrade the vision marker only.
+        val perception = FakePerception(snapshot = perceptionSnapshot())
+        perception.screenshotThrows = true
+
+        val result = tool(FakeDeviceOperations(observation()), perception = perception)
+            .execute("""{"action":"observe"}""")
+
+        assertEquals("a broken capture port must not fail the observation", ActionOutcome.Done, result.outcome)
+        assertEquals(1, perception.screenshotCalls)
+        assertTrue("a throwing capture contributes no image", result.images.isEmpty())
+        assertEquals("unavailable(SCREENSHOT_FAILED)", visionOf(result))
+    }
+
+    @Test
     fun `scroll to text captures one screenshot for the final result`() {
         val log = EventLog()
         val operations = FakeDeviceOperations(
@@ -1831,6 +1847,7 @@ class DeviceToolTest {
         var snapshotCalls = 0
         var screenshotCalls = 0
         var screenshotResult: PerceptionScreenshotResult = PerceptionScreenshotResult.Disabled
+        var screenshotThrows = false
         var lastInclude: Set<PerceptionSource>? = null
         var lastFilter: PerceptionFilter? = null
         var lastLimit: Int? = null
@@ -1866,6 +1883,7 @@ class DeviceToolTest {
         override fun screenshot(): PerceptionScreenshotResult {
             events.record(EVENT_CAPTURE)
             screenshotCalls++
+            if (screenshotThrows) error("capture port died")
             return screenshotResult
         }
 

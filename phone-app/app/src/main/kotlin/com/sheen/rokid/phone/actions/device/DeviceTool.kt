@@ -408,8 +408,15 @@ class DeviceTool(
      * so the tool does not duplicate them: [PerceptionScreenshotResult.Disabled] and
      * [PerceptionScreenshotResult.Unavailable] are answers, never exceptions. The caller captures **after** the
      * observation it decorates, so the image and the text describe the same screen.
+     *
+     * Final fix: a provider that throws anyway is still only "no image" (`Unavailable("SCREENSHOT_FAILED")`). The
+     * provider contract says it never throws, but a broken capture port must not turn a successful observe/act into
+     * `TOOL_THREW`; the operation itself already succeeded.
      */
-    private fun captureVision(): PerceptionScreenshotResult? = perception?.screenshot()
+    private fun captureVision(): PerceptionScreenshotResult? = perception?.let { provider ->
+        runCatching { provider.screenshot() }
+            .getOrElse { PerceptionScreenshotResult.Unavailable(SCREENSHOT_FAILED) }
+    }
 
     /** Task 3: adds the model-facing vision marker to [data]; `null` leaves the shape untouched. */
     private fun withVision(data: JsonObject, capture: PerceptionScreenshotResult?): JsonObject {
@@ -1014,6 +1021,9 @@ class DeviceTool(
         /** edith-0.3 Phase 2 Task 7: the two tool-level refusals the model can branch on. */
         private const val STALE_REF = "STALE_REF"
         private const val VISION_DISABLED = "VISION_DISABLED"
+
+        /** The auto-vision marker reason when the injected capture throws despite the provider contract. */
+        private const val SCREENSHOT_FAILED = "SCREENSHOT_FAILED"
 
         /** The one-line nudge when an accepted write provably changed nothing (spec §7.6). */
         private const val OBSERVE_FIRST_NOTE = "动作未改变画面；先观察再决定"

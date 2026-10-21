@@ -55,8 +55,10 @@ import java.util.UUID
  * @param observe the kernel-backed whole-screen read. Called with [ScreenFilter.ALL]; a throw means the channel is
  *   down and only the screen source degrades.
  * @param foreground the app in front, or null when the channel cannot tell. A throw is treated as unknown.
- * @param profileSupportsImage whether the profile selected for this turn advertises the `IMAGE` input. A throw is
- *   treated as "no image": an automatic capture must never attach an image the plugin's capability gate would reject.
+ * @param profileSupportsImage whether this turn's request may carry an image: the profile declares the `IMAGE` input
+ *   **and** its current revision's latest `IMAGE_REQUEST` verification is `Verified` (the same admission rule the
+ *   plugin's `CapabilityGate` applies on the wire). The default is `false`, so an unwired provider never captures. A
+ *   throw is treated as "no image": an automatic capture must never attach an image the capability gate would reject.
  * @param screenshot the injected capture (Task 7 maps the kernel's `ImageRef` or failure code); only called when the
  *   user's vision switch **and** [profileSupportsImage] are both on, and a throw becomes
  *   `Unavailable("SCREENSHOT_FAILED")`.
@@ -75,7 +77,7 @@ internal class AndroidPerceptionProvider(
     private val glasses: GlassesStateSource,
     private val policy: () -> PerceptionPolicy,
     private val visionEnabled: () -> Boolean,
-    private val profileSupportsImage: () -> Boolean = { true },
+    private val profileSupportsImage: () -> Boolean = { false },
     screenshot: () -> PerceptionScreenshotResult,
     private val latestObservation: () -> Observation?,
     private val clock: () -> Long,
@@ -177,8 +179,9 @@ internal class AndroidPerceptionProvider(
      *
      * 1. The user's vision switch off is an explicit [PerceptionScreenshotResult.Disabled] - the user said no, so the
      *    profile is irrelevant.
-     * 2. A profile without the `IMAGE` input is an explicit `Unavailable("no_image_profile")`. Task 3's automatic
-     *    capture would otherwise attach an image the plugin's `CapabilityGate` rejects for the whole request.
+     * 2. A profile that does not pass the auto-vision image gate (no declared `IMAGE`, or no current-revision
+     *    `IMAGE_REQUEST=Verified`) is an explicit `Unavailable("no_image_profile")`. Task 3's automatic capture would
+     *    otherwise attach an image the plugin's `CapabilityGate` rejects for the whole request.
      *
      * A capture failure stays an explicit `Unavailable`, never an exception; both gates fail closed on a throw.
      */

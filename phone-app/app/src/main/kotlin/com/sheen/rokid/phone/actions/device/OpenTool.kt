@@ -433,7 +433,6 @@ class OpenTool(
     private fun done(
         data: kotlinx.serialization.json.JsonObject,
         images: List<ImageRef> = emptyList(),
-        nonPersistent: Boolean = false,
     ): ActionResult = ActionResult(
         ActionOutcome.Done,
         toolEnvelope(tool = NAME, ok = true, channel = CHANNEL, accepted = true, data = data),
@@ -441,7 +440,7 @@ class OpenTool(
         images = images,
         // C2: an attached image may live only in this run's model request. A launch result without one carries no
         // perception content, so its existing persistent shape is unchanged.
-        nonPersistent = nonPersistent || images.isNotEmpty(),
+        nonPersistent = images.isNotEmpty(),
     )
 
     private fun failure(
