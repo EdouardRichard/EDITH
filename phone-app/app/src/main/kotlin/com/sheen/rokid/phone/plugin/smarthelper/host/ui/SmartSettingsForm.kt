@@ -43,6 +43,11 @@ object SmartSettingsForm {
          * user set it; the host applies it to the live gate on a successful save.
          */
         val visionEnabled: Boolean = true,
+        /**
+         * 0.3 Phase 4B (`D189`): the 「不拦截」 switch. Like the switches above it is a boolean carried through exactly
+         * as set; the screen owns the second confirmation that must happen before this can become `true`.
+         */
+        val noInterception: Boolean = false,
     )
 
     /**
@@ -72,6 +77,7 @@ object SmartSettingsForm {
         proactiveSensitivity = settings.effectiveProactiveSensitivity(),
         continueDialogue = settings.continueDialogue,
         visionEnabled = settings.visionEnabled,
+        noInterception = settings.noInterception,
     )
 
     /**
@@ -101,6 +107,7 @@ object SmartSettingsForm {
                 proactiveSensitivity = proactiveSensitivity ?: base.effectiveProactiveSensitivity(),
                 continueDialogue = draft.continueDialogue,
                 visionEnabled = draft.visionEnabled,
+                noInterception = draft.noInterception,
             ),
             errors = errors,
         )

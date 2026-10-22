@@ -10,11 +10,14 @@ import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.SecretHandle
 import com.sheen.rokid.storage.ProfileRepository
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -327,6 +330,78 @@ class SmartSettingsStoreTest {
 
         assertEquals(true, loaded.visionEnabled)
         assertEquals("the rest of the old blob must still load", "L1", loaded.maxLevel)
+    }
+
+    // ---- 0.3 Phase 4B (`D189`): the 「不拦截」 switch ----------------------------------------------
+
+    @Test
+    fun noInterceptionIsOffByDefaultInAFreshStoreAndInAFreshSettingsValue() {
+        assertFalse("the mode is dangerous and must ship off", SmartSettings().noInterception)
+        assertFalse(SmartSettingsStore(TestBlobs()).load().noInterception)
+    }
+
+    @Test
+    fun noInterceptionSurvivesASaveAndLoadInBothDirections() {
+        val blobs = TestBlobs()
+        SmartSettingsStore(blobs).save(SmartSettings(noInterception = true))
+        assertTrue("an explicit on must persist", SmartSettingsStore(blobs).load().noInterception)
+
+        SmartSettingsStore(blobs).save(SmartSettings(noInterception = false))
+        assertFalse("an explicit off must persist", SmartSettingsStore(blobs).load().noInterception)
+    }
+
+    @Test
+    fun aBlobWrittenBeforeTheNoInterceptionKeyExistedLoadsItAsOff() {
+        // Exactly the shape written before 4B: no noInterception key anywhere. The safe upgrade path is off - an old
+        // blob must never enable unconfirmed execution by omission.
+        val blobs = TestBlobs()
+        writeJson(blobs, SmartSettingsStore.BLOB_ID, buildJsonObject {
+            put("version", 1)
+            put("wakeWords", buildJsonArray { add("伊迪丝") })
+            put("maxLevel", "L2")
+            put("whitelist", buildJsonArray {})
+            put("cooldownMillis", 4500L)
+        })
+
+        val loaded = SmartSettingsStore(blobs).load()
+
+        assertFalse(loaded.noInterception)
+        assertEquals("the rest of the old blob must still load", "L2", loaded.maxLevel)
+    }
+
+    @Test
+    fun aCorruptNoInterceptionValueFallsBackToOffInsteadOfTruthyCoercion() {
+        listOf<JsonElement>(
+            JsonPrimitive("true"),
+            buildJsonObject { put("unexpected", true) },
+        ).forEach { corrupt ->
+            val blobs = TestBlobs()
+            writeJson(blobs, SmartSettingsStore.BLOB_ID, buildJsonObject {
+                put("version", 1)
+                put("wakeWords", buildJsonArray { add("伊迪丝") })
+                put("maxLevel", "L1")
+                put("whitelist", buildJsonArray {})
+                put("cooldownMillis", 3000L)
+                put("noInterception", corrupt)
+            })
+
+            assertFalse("a corrupt value must never read as on: $corrupt",
+                SmartSettingsStore(blobs).load().noInterception)
+        }
+    }
+
+    @Test
+    fun aNormalSaveOfAnotherFieldKeepsAnExplicitlyDisabledNoInterception() {
+        val blobs = TestBlobs()
+        // The screen saves the whole value. An edit to an unrelated field must not reset the switch.
+        SmartSettingsStore(blobs).save(
+            SmartSettings(noInterception = false, maxLevel = "L2", cooldownMillis = 5000L))
+
+        val reloaded = SmartSettingsStore(blobs).load()
+
+        assertFalse(reloaded.noInterception)
+        assertEquals("L2", reloaded.maxLevel)
+        assertEquals(5000L, reloaded.cooldownMillis)
     }
 
     @Test

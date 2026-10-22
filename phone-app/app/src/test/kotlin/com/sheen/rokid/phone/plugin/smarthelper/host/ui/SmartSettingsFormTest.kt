@@ -27,9 +27,42 @@ class SmartSettingsFormTest {
         proactiveEnabled: Boolean = true,
         continueDialogue: Boolean = true,
         visionEnabled: Boolean = true,
+        noInterception: Boolean = false,
     ) = SmartSettings(wakeWords, maxLevel, whitelist, profileId, cooldownMillis,
         proactiveCooldownMillis, proactiveSensitivity, proactiveEnabled, continueDialogue = continueDialogue,
-        visionEnabled = visionEnabled)
+        visionEnabled = visionEnabled, noInterception = noInterception)
+
+    // ---- 0.3 Phase 4B (`D189`): the 「不拦截」 switch ------------------------------------------------
+
+    @Test
+    fun theNoInterceptionSwitchRoundTripsThroughTheFormInBothDirections() {
+        val base = settings(noInterception = false)
+
+        val draft = SmartSettingsForm.fromSettings(base)
+        assertFalse("the screen must show the stored off switch", draft.noInterception)
+
+        val on = SmartSettingsForm.toSettings(draft.copy(noInterception = true), base)
+        assertTrue("a valid switch reports no errors: ${on.errors}", on.errors.isEmpty())
+        assertTrue("turning the switch on must be stored", on.settings.noInterception)
+
+        val storedOn = settings(noInterception = true)
+        val untouched = SmartSettingsForm.toSettings(SmartSettingsForm.fromSettings(storedOn), storedOn)
+        assertTrue("loading and saving an untouched on switch must not turn it off", untouched.settings.noInterception)
+    }
+
+    @Test
+    fun aFormSaveOfAnotherFieldNeverResetsTheNoInterceptionSwitch() {
+        // The form edits one page and saves the whole value: an unrelated edit must carry the persisted mode through,
+        // not fall back to the Draft default (`false`).
+        val base = settings(noInterception = true)
+
+        val result = SmartSettingsForm.toSettings(
+            SmartSettingsForm.fromSettings(base).copy(maxLevel = "L2"), base)
+
+        assertTrue(result.errors.toString(), result.errors.isEmpty())
+        assertTrue("an unrelated save must keep the mode on", result.settings.noInterception)
+        assertEquals("L2", result.settings.maxLevel)
+    }
 
     // ---- 0.3 Phase 2 Task 10: the perception-screenshot switch ---------------------------------------
 

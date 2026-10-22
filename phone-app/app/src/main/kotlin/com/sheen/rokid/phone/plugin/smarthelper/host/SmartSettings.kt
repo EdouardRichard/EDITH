@@ -83,6 +83,18 @@ data class SmartSettings(
      * user turns it off, no path may turn it back on automatically (`D53`② same-shape rule).
      */
     val visionEnabled: Boolean = true,
+    /**
+     * 0.3 Phase 4B (`D189`): the global 「不拦截」 switch, persisted and **off by default**.
+     *
+     * When on, the host's live [NoInterceptionGate] makes the policy allow every tool call (L0–L4), bypassing both
+     * `maxLevel` and any per-action confirmation. It is a **persisted global mode**, not a per-session grant: closing,
+     * killing or restarting the App does not reset it, and only the user's explicit off exits it. A blob written before
+     * 4B lacks this key and takes the default (off) - the only safe upgrade path for a switch that removes confirmations.
+     *
+     * This field is the persisted half only; `HostCompositionRoot` owns the live gate and updates it on a successful
+     * save. Kept as the **last** field so positional construction of older call sites is unchanged.
+     */
+    val noInterception: Boolean = false,
 ) {
     /**
      * The plugin's own cooldown parameter.
@@ -200,6 +212,7 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
             put("speechEnabled", settings.speechEnabled)
             put("continueDialogue", settings.continueDialogue)
             put("visionEnabled", settings.visionEnabled)
+            put("noInterception", settings.noInterception)
         })
     }
 
@@ -235,6 +248,12 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
                 // explicit off is the user's act - it must never be inferred from an older blob.
                 visionEnabled = json["visionEnabled"]?.jsonPrimitive?.booleanOrNull
                     ?: SmartSettings().visionEnabled,
+                // Absent in a blob written before 4B: takes the default (**off**). This is the safe upgrade path - an
+                // old blob must never remove confirmation by omission. `strictBoolean` additionally refuses a string
+                // "true"/"false" (which kotlinx's `booleanOrNull` would coerce): a corrupt or hand-edited value must not
+                // arm the mode. A non-primitive still fails the whole read, the store's existing wrong-shape rule.
+                noInterception = strictBoolean(json, "noInterception")
+                    ?: SmartSettings().noInterception,
             )
         }.getOrNull()
     }
@@ -243,6 +262,21 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
     private fun strings(json: JsonObject, key: String): List<String>? {
         val element = json[key] ?: return null
         return element.jsonArray.map { it.jsonPrimitive.content }
+    }
+
+    /**
+     * A boolean that only honours a real JSON boolean.
+     *
+     * kotlinx's `booleanOrNull` also accepts the JSON **strings** `"true"`/`"false"`. For the 「不拦截」 switch that
+     * coercion is unsafe - a corrupt or hand-edited blob must never be able to arm a mode that removes confirmations -
+     * so a string primitive is treated as absent and the safe default (off) applies. A non-primitive still throws out of
+     * `jsonPrimitive`, which the caller's `runCatching` turns into the whole-read default, the store's existing rule.
+     */
+    private fun strictBoolean(json: JsonObject, key: String): Boolean? {
+        val element = json[key] ?: return null
+        val primitive = element.jsonPrimitive
+        if (primitive.isString) return null
+        return primitive.booleanOrNull
     }
 
     companion object {

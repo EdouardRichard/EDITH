@@ -22,6 +22,7 @@ import com.sheen.rokid.phone.session.confirmation.ConfirmationGlasses
 import com.sheen.rokid.phone.model.ScriptedModelWire
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillDirectoryView
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
+import com.sheen.rokid.phone.plugin.smarthelper.host.NoInterceptionGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.VisionGate
 import com.sheen.rokid.phone.actions.ExecutionChannelStatus
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.StorageAccessSkillView
@@ -293,6 +294,16 @@ class HostCompositionRoot internal constructor(
      * hand-built composition (tests, harnesses) keeps the default on, which is the shipped setting.
      */
     private val visionGate: VisionGate = VisionGate(true),
+    /**
+     * 0.3 Phase 4B (`D189`): the **live** global 「不拦截」 gate.
+     *
+     * [create] seeds it from the persisted [SmartSettings.noInterception] (default off); [saveSmartSettings] updates
+     * the same instance, and the settings page's banner reads its current value. B3 hands
+     * [NoInterceptionGate.provider] to the plugin/policy and shell precheck; this task deliberately does **not** wire
+     * that consumer yet, so the mode is persisted and live but not yet consulted by a tool call. A hand-built
+     * composition (tests, harnesses) keeps the safe default (off).
+     */
+    internal val noInterceptionGate: NoInterceptionGate = NoInterceptionGate(false),
     /**
      * `D53`② (2026-10-11): the **persisted, global** 「主动辅助」 switch - it replaced P3.2's session-scoped one.
      *
@@ -749,12 +760,19 @@ class HostCompositionRoot internal constructor(
      * applied before the blob write and stays applied if the write fails: persistence is the durability half, while a
      * failed save must never leave capture enabled after the user asked for off. A save that turns vision on applies
      * only after the blob accepted it, so a failed write cannot arm capture.
+     *
+     * 0.3 Phase 4B (`D189`): the 「不拦截」 gate follows the same half-live rule for a stronger reason. Turning it
+     * **on** applies only after the blob accepted it (a failed write must not leave the process running unconfirmed
+     * by a mode the next restart will not remember); turning it **off** applies before the write and stays applied if
+     * the write fails (a failed save must never keep unconfirmed execution alive after the user disabled it).
      */
     fun saveSmartSettings(settings: SmartSettings) {
         val store = requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }
         if (!settings.visionEnabled) visionGate.set(false)
+        if (!settings.noInterception) noInterceptionGate.set(false)
         store.save(settings)
         visionGate.set(settings.visionEnabled)
+        noInterceptionGate.set(settings.noInterception)
     }
 
     /**
@@ -1975,6 +1993,10 @@ class HostCompositionRoot internal constructor(
             // switch. A save updates this same instance through `saveSmartSettings`; the old `{ true }` hardcodes on
             // both consumers are gone, so the switch really is the only source of truth.
             val visionGate = VisionGate(smartSettings.visionEnabled)
+            // 4B (`D189`): the live 「不拦截」 gate, seeded from the same persisted snapshot. It is deliberately not
+            // passed to the plugin yet (B3 owns that wiring); today only `saveSmartSettings` and the settings banner
+            // read it. Default off, including for a pre-4B blob and for a hand-built composition.
+            val noInterceptionGate = NoInterceptionGate(smartSettings.noInterception)
             // Task 14b: the self-audio seam. P3.1 emits no audio at all, so the gate stays open and this wiring
             // changes nothing today; it is what P3.2 hands to the speech output path. See `PlaybackGate`.
             //
@@ -2665,6 +2687,7 @@ class HostCompositionRoot internal constructor(
                 smartWiring = smartWiring,
                 smartSettingsStore = smartSettingsStore,
                 visionGate = visionGate,
+                noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
                 playbackGate = playbackGate)
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
