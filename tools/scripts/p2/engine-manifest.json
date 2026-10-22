@@ -1,0 +1,74 @@
+{
+  "schemaVersion": 1,
+  "runtimeVersion": "sherpa-onnx-1.13.8",
+  "runtime": {
+    "sha256": "633C24321E06B1FE79FEAFA03EA16CBC0F8A286641E2DA3559BAC91BDB13BD96",
+    "bytes": 50129134,
+    "sourceUrl": "https://github.com/k2-fsa/sherpa-onnx/releases/tag/v1.13.8",
+    "revision": "11afbd009a7f8c08f4bcf2fc1b265d0df4670fbf",
+    "licensePath": "licenses/sherpa-v1.13.8-Apache-2.0.txt",
+    "embeddedOnnxRuntimeVersion": "1.28.2",
+    "embeddedVersionEvidence": "All four ELF libonnxruntime.so contain VERS_1.28.2; per-ABI hashes in runtime-binary-evidence.json. No native execution or full SBOM claim.",
+    "distributionReview": "Incomplete"
+  },
+  "sampleRateHz": 16000,
+  "threadCount": 2,
+  "provider": "cpu",
+  "frameMillis": 20,
+  "endpointMillis": 350,
+  "allowedThreadCounts": [1, 2, 4],
+  "allowedEndpointMillis": [250, 350, 450],
+  "boundaryOwner": "VAD",
+  "recognizerEndpointEnabled": false,
+  "vadWindowSamples": 512,
+  "vadThreshold": 0.5,
+  "vadMinSpeechSeconds": 0.25,
+  "vadMaxSpeechSeconds": 20,
+  "selection": "Unverified",
+  "artifacts": [
+    {
+      "role": "encoder", "path": "encoder-epoch-99-avg-1.int8.onnx", "bytes": 181895032,
+      "sha256": "8FA764187A261844F859D7143EBAA563AF5D10ADFECE4C18A8F414C88CBA2A9B",
+      "sourceUrl": "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/98590b7ed6443e77b714204da2757d75e1a642f4/encoder-epoch-99-avg-1.int8.onnx",
+      "revision": "98590b7ed6443e77b714204da2757d75e1a642f4",
+      "licensePath": "licenses/Apache-2.0-standard.txt", "declarationPath": "licenses/asr-model-card.md"
+    },
+    {
+      "role": "decoder", "path": "decoder-epoch-99-avg-1.onnx", "bytes": 13876452,
+      "sha256": "2E3B5EC371F8899EE6ACD829FD753BA45772DF57A91BDF37CDE3136354E7DB7D",
+      "sourceUrl": "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/98590b7ed6443e77b714204da2757d75e1a642f4/decoder-epoch-99-avg-1.onnx",
+      "revision": "98590b7ed6443e77b714204da2757d75e1a642f4",
+      "licensePath": "licenses/Apache-2.0-standard.txt", "declarationPath": "licenses/asr-model-card.md"
+    },
+    {
+      "role": "joiner", "path": "joiner-epoch-99-avg-1.int8.onnx", "bytes": 3228404,
+      "sha256": "1ED689C5ED19DBAA725D9D191BB4822B5F4855A39E1FFD28CBC1F340D25B2EE0",
+      "sourceUrl": "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/98590b7ed6443e77b714204da2757d75e1a642f4/joiner-epoch-99-avg-1.int8.onnx",
+      "revision": "98590b7ed6443e77b714204da2757d75e1a642f4",
+      "licensePath": "licenses/Apache-2.0-standard.txt", "declarationPath": "licenses/asr-model-card.md"
+    },
+    {
+      "role": "tokens", "path": "tokens.txt", "bytes": 56317,
+      "sha256": "A8E0E4EC53810E433789B54A5C0134A7EAA2FFCA595A6334D54C00DA858841D3",
+      "sourceUrl": "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/98590b7ed6443e77b714204da2757d75e1a642f4/tokens.txt",
+      "revision": "98590b7ed6443e77b714204da2757d75e1a642f4",
+      "licensePath": "licenses/Apache-2.0-standard.txt", "declarationPath": "licenses/asr-model-card.md"
+    },
+    {
+      "role": "vad", "path": "silero_vad.onnx", "bytes": 2313101,
+      "sha256": "6B99CBFD39246B6706F98EC13C7C50C6B299181F2474FA05CBC8046ACC274396",
+      "sourceUrl": "https://raw.githubusercontent.com/snakers4/silero-vad/5cd2ba54db059f961e7545d4f211b44f005a6dfb/files/silero_vad.onnx",
+      "revision": "5cd2ba54db059f961e7545d4f211b44f005a6dfb",
+      "licensePath": "licenses/silero-v5-MIT.txt", "declarationPath": "licenses/silero-v5-model-card.md",
+      "modelVersion": "Silero v5 / opset16; relation to historical op15 unverified"
+    },
+    {
+      "role": "speaker", "path": "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx", "bytes": 39593761,
+      "sha256": "1A331345F04805BADBB495C775A6DDFFCDD1A732567D5EC8B3D5749E3C7A5E4B",
+      "sourceUrl": "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+      "revision": "release133152315/asset198893098; mutable tag",
+      "licensePath": "licenses/Apache-2.0-standard.txt", "declarationPath": "licenses/speaker-v1.0.1-model-card.md",
+      "exporterLinkage": "Unverified; captured export source is contextual attribution"
+    }
+  ]
+}

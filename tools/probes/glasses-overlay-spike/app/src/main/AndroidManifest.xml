@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  S1 throwaway probe (0.24): the device gate for third-party overlay + side keys + screen-off launch.
+
+  Only the three permissions the gate names are declared. `SYSTEM_ALERT_WINDOW` is granted by the host with
+  `appops set ... SYSTEM_ALERT_WINDOW allow` and read back before anything is drawn; the probe never asks the user.
+  `FOREGROUND_SERVICE` keeps the overlay service alive while the Activity that started it has finished;
+  `WAKE_LOCK` only exists for the screen-off launch/light half of the gate.
+
+  Service type is `specialUse` (the 0.24 plan's pinned choice for the product service). If the glasses' Android 12
+  `startForeground` rejects that type, the failure is evidence and gets recorded rather than papered over.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <application
+        android:allowBackup="false"
+        android:label="EDITH S1 overlay spike"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+
+        <!-- Shell trampoline. Starts the foreground service and finishes; the overlay outlives it. -->
+        <activity
+            android:name=".SpikeActivity"
+            android:exported="true"
+            android:label="EDITH S1 overlay spike"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".SpikeOverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="S1 device probe: focusable status overlay for key-reachability measurement" />
+        </service>
+    </application>
+
+</manifest>

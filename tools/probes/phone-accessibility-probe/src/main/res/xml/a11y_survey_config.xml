@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  S1 survey config, deliberately different from `a11y_probe_config.xml` in one flag that the survey exists to measure:
+  `flagReportViewIds`. Without it `getViewIdResourceName()` is null and `findAccessibilityNodeInfosByViewId()` finds
+  nothing; `A11ySurveyNoIdsService` carries the flag-less twin so the difference is measured, not cited.
+
+  Event types are the union the survey counts, and `flagRetrieveInteractiveWindows` is what makes `getWindows()` return
+  anything but this service's own window.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault|flagReportViewIds|flagRetrieveInteractiveWindows|flagIncludeNotImportantViews"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:notificationTimeout="50" />

@@ -1,0 +1,13 @@
+<resources>
+    <string name="app_name">EDITH</string>
+    <string name="session_channel">会话控制</string>
+    <string name="session_active">会话已开启</string>
+    <string name="paused">已暂停</string>
+    <string name="pause">暂停</string>
+    <string name="resume">继续</string>
+    <string name="stop">停止</string>
+    <!-- P3.3 Task 10: shown by the system in the accessibility settings list. It says what the service is for and what
+         it does not do, because this is the screen where the user decides whether to grant it. -->
+    <string name="a11y_service_label">EDITH 界面操作</string>
+    <string name="a11y_service_description">只在助手执行指令时操作界面：按文字点击、在输入框输入。不读取、不上传屏幕内容；可随时在系统设置中关闭。</string>
+</resources>

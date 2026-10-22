@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The accessibility service's one and only configuration (0.25 Task 9, spec §6.4).
+
+  `canRetrieveWindowContent` makes the node tree readable. The six capabilities below are what the
+  0.25 adapter needs and nothing more: gestures for the synthesized double tap, screenshots for the
+  Task 13 artifact path, interactive windows for multi-window/IME segments, view ids for stable
+  refs, not-important views so containers do not disappear from the pre-order list, and every event
+  type so `foreground()` can track the visible app without reading content.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeAllMask"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagRetrieveInteractiveWindows|flagReportViewIds|flagIncludeNotImportantViews"
+    android:canPerformGestures="true"
+    android:canRetrieveWindowContent="true"
+    android:canTakeScreenshot="true"
+    android:description="@string/a11y_service_description"
+    android:notificationTimeout="100" />

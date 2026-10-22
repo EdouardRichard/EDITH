@@ -1,0 +1,114 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 0.3 Phase 1 (§4.2.1): `AndroidDeviceStateProvider.network()` reads `ConnectivityManager.activeNetwork` /
+         `getNetworkCapabilities()` for the `{{network}}` device fact. Those calls throw `SecurityException` without this
+         permission and the per-fact `runCatching` would silently turn every read into `null`. It is a normal install-time
+         permission: no runtime prompt, no user grant. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!--
+      edith-0.2 Phase B (B4): the SKILL library lives at /sdcard/EDITH/skills (spec §3.5), which is outside the app's
+      own directories, so reading it needs shared-storage access. On API 33 the legacy READ_EXTERNAL_STORAGE does not
+      cover an arbitrary directory the user created, so "All files access" is what actually makes the library
+      readable; the legacy permission stays for API <= 32 with maxSdkVersion. Both are requested at runtime.
+      NOTE FOR THE OWNER: MANAGE_EXTERNAL_STORAGE is Play-policy-sensitive. If a store listing matters more than the
+      fixed /sdcard/EDITH path, the alternatives are a directory the user picks through SAF, or moving the library
+      into the app's own external directory.
+    -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
+    <uses-permission
+        android:name="android.permission.READ_EXTERNAL_STORAGE"
+        android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- Lock-screen unlock keeps the display interactive for the bounded duration of a device tool call. -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" android:maxSdkVersion="30" />
+    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
+    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" android:usesPermissionFlags="neverForLocation" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- P3.3 (§17.4, owner directive 2026-10-10): a confirmation question is time-boxed, and a question that only lands
+         in the shade is one nobody notices. On a locked or dark screen the full-screen intent brings the session page
+         (and its card) forward instead. On Android 13 this is an install-time permission. -->
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <!-- P3.3 (§17.4, owner directive 2026-10-10): the question must reach the user like a system popup, not as an entry
+         in the shade. Raising the session page from the background is one of Android 10+'s documented background-activity
+         exemptions **only** with this permission, and MIUI gates it behind its own "后台弹出界面" switch as well; when
+         either is missing the App keeps its notification path instead. Granted by the user in Settings, never assumed. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <!-- P3.3 Task 9: the L2 `dial` action places a real call. Requested at runtime; without the grant `dial` refuses
+         with CALL_PERMISSION_MISSING rather than opening the dialer instead. -->
+    <uses-permission android:name="android.permission.CALL_PHONE" />
+    <!-- API 30+ package visibility: the L0 "打开 App" action resolves a spoken app name to a package, so the App must
+         be able to see the other installed apps. Without this permission getInstalledApplications returns only the
+         App's own packages and every open_app would refuse APP_NOT_VISIBLE. The alternative is an explicit <queries>
+         allowlist (kept below for the Rokid/glasses packages), which cannot resolve an arbitrary spoken name. -->
+    <uses-permission android:name="android.permission.QUERY_ALL_PACKAGES" />
+    <!-- P3.2 Stage B (Task 11): the foreground app is the one context signal that needs this **special** permission.
+         It cannot be requested at runtime; the user grants it in Settings → Special app access → Usage access, and
+         without it `ForegroundAppSource` contributes no key at all (never a placeholder). `tools:ignore` is required
+         because the protection level makes lint treat it as a protected permission. -->
+    <uses-permission android:name="android.permission.PACKAGE_USAGE_STATS" tools:ignore="ProtectedPermissions" />
+    <!-- P3.2 Stage B (Task 13): today's event titles. A runtime permission, requested from the session page. -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+    <queries>
+        <package android:name="com.rokid.sprite.aiapp" />
+        <package android:name="com.rokid.sprite.global.aiapp" />
+        <package android:name="com.rokid.uxr" />
+    </queries>
+    <!-- App icon: the portrait kept in docs/assets/brand (see that directory's README); the build only reads
+         res/mipmap-*, never the source PNG path. minSdk 28 means API 26+ always resolves the adaptive icon and the
+         square PNG is only a fallback consumer. -->
+    <application android:name=".app.EdithApplication" android:allowBackup="false" android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher" android:roundIcon="@mipmap/ic_launcher"
+        android:dataExtractionRules="@xml/data_extraction_rules" android:fullBackupContent="false"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar" android:usesCleartextTraffic="false">
+        <!-- P3.3 Task 1: the Shizuku provider is how this app acquires the shell-UID binder. The declaration is the
+             vendor's own (Shizuku-API README, checked 2026-10-10) and the `provider` AAR contributes only the
+             `moe.shizuku.manager.permission.API_V23` permission and the `moe.shizuku.client.V3_SUPPORT` meta-data, so
+             nothing here is invented. `INTERACT_ACROSS_USERS_FULL` keeps other apps out of this provider. -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+        <activity android:name=".app.MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+        <service android:name=".session.SessionService" android:exported="false" android:foregroundServiceType="connectedDevice" />
+        <!-- P3.3 (§17.4): the notification's three buttons (允许/拒绝/急停). `exported="false"` is load-bearing, not a
+             formality: an exported receiver would let any App on the phone answer a confirmation on the user's behalf.
+             The PendingIntents that reach it are explicit and immutable. -->
+        <receiver android:name=".session.confirmation.ConfirmationActionReceiver" android:exported="false" />
+        <!-- P3.3 Task 10: the accessibility channel. The user enables it in system settings; the service cannot and must
+             not enable itself, and the host stops advertising the channel the moment the system unbinds it. -->
+        <service android:name=".actions.a11y.EdithAccessibilityService" android:exported="false"
+            android:label="@string/a11y_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data android:name="android.accessibilityservice"
+                android:resource="@xml/edith_accessibility_config" />
+        </service>
+        <!-- P3.2 Stage B (Task 12): notification access is the user's grant, made in Settings. The service reads the
+             opaque category/channel id and, since 0.3 Phase 2 Task 3 (D179), notification content in memory only (see
+             NotificationCategoryService/NotificationContentSource); the permission it binds with is declared by the
+             platform, not by us. -->
+        <service android:name=".context.NotificationCategoryService" android:exported="false"
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
+            <intent-filter>
+                <action android:name="android.service.notification.NotificationListenerService" />
+            </intent-filter>
+        </service>
+    </application>
+</manifest>

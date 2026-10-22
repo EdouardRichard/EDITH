@@ -1,0 +1,12 @@
+{
+  "runtimeAarSha256": "633C24321E06B1FE79FEAFA03EA16CBC0F8A286641E2DA3559BAC91BDB13BD96",
+  "method": "Read-only byte-string/version-symbol inspection; no native execution",
+  "versionSymbol": "VERS_1.28.2",
+  "fullComponentMap": "Unverified",
+  "binaries": [
+    {"path": "jni/arm64-v8a/libonnxruntime.so", "bytes": 22249560, "sha256": "33847AD43BFFE204699FD4A27F7F3603452A8CDAF2F9A44983A0BC31FFCF2DA1"},
+    {"path": "jni/armeabi-v7a/libonnxruntime.so", "bytes": 15359592, "sha256": "7A8F17A707E52E0AC3A026BE319272876D9EAE61F4BB19585292772D785F7744"},
+    {"path": "jni/x86/libonnxruntime.so", "bytes": 26491148, "sha256": "FCB6CD80415F7951E58FDD8158A238946DCE3710D5FEE492B67174D5131F9EEE"},
+    {"path": "jni/x86_64/libonnxruntime.so", "bytes": 25581120, "sha256": "087E84297CAD64ACB823C3D901D6E0CC934E91ADD7CDB20DA802CD1C0BEA5C3E"}
+  ]
+}

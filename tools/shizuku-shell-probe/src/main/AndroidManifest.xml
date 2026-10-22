@@ -1,0 +1,64 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  TEMPORARY survey probe (2026-10-16). Installed only to bind Shizuku's UserService and log what the remote process
+  actually is. Uninstalled after the survey; not a delivery module.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <application
+        android:allowBackup="false"
+        android:label="Shizuku shell survey"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="Shizuku shell survey">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- Survey helper: is a temporary IME a viable channel for Unicode text the platform's `input text` cannot
+             produce? Reachable only by an explicit broadcast, and only while this IME is the active one. -->
+        <service
+            android:name=".ProbeImeService"
+            android:exported="true"
+            android:label="EDITH survey IME"
+            android:permission="android.permission.BIND_INPUT_METHOD">
+            <intent-filter>
+                <action android:name="android.view.InputMethod" />
+            </intent-filter>
+            <meta-data
+                android:name="android.view.im"
+                android:resource="@xml/probe_ime" />
+        </service>
+
+        <activity
+            android:name=".InjectActivity"
+            android:exported="true"
+            android:label="EDITH survey inject"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar" />
+
+        <!-- Shizuku instantiates this by name inside its elevated process, so it must be declared and keep a public
+             no-argument constructor (the vendor demo's shape, same as the delivery app's EdithShellService). -->
+        <service
+            android:name=".ProbeShellService"
+            android:exported="false" />
+
+        <!-- The vendor's own provider; `api-version` must match the pinned artifact or Shizuku refuses to start. -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL">
+            <meta-data
+                android:name="moe.shizuku.client.V3_SUPPORT"
+                android:value="true" />
+        </provider>
+    </application>
+
+</manifest>

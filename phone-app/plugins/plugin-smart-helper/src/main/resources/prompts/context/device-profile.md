@@ -1,0 +1,13 @@
+【设备画像】（本会话固定，不是本轮实时状态）
+- 设备：{{deviceManufacturer}} {{deviceModel}}
+- 设备名：{{deviceName}}
+- 系统版本：{{androidRelease}}
+- 系统 API level：{{apiLevel}}
+- 手机屏幕：{{screenWidth}}×{{screenHeight}} 像素，{{densityDpi}} dpi
+- 眼镜型号：{{glassesModel}}
+- 眼镜固件：{{glassesFirmware}}
+- 眼镜屏幕：{{glassesWidth}}×{{glassesHeight}} 像素
+- App 版本：{{appVersion}}
+- 语言与时区：{{locale}}（{{timeZone}}）
+- 唤醒词：{{wakeWords}}
+- 可用能力：{{capabilities}}

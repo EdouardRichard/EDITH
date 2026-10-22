@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  EDITH panel accessibility service. It is used only for the TYPE_ACCESSIBILITY_OVERLAY token; it reads no window
+  content, performs no gestures and receives no text. The glasses has no system settings page, so enabling this is an
+  ADB operation documented in README.md.
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:notificationTimeout="100"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/a11y_service_description" />

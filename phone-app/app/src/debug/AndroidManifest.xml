@@ -1,0 +1,297 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Debug-source-set manifest additions. Merged into the debug variant only; every release build is built from
+  `src/main/AndroidManifest.xml` alone and therefore contains none of this.
+
+  `DebugAudioInjector` is a **debug-only PCM injection instrument** (P3.1 device diagnosis): it offers a WAV file's
+  PCM straight to the live CXR `PcmIngress` so keyword-spotting recall can be measured without the acoustic path.
+  It is `exported="true"` because the only caller is an `adb shell am broadcast` running as the shell UID - an
+  unexported receiver cannot be reached that way and the instrument would be unusable. That export is exactly why
+  this file must never be merged into a release build: no shipped APK may contain a component that accepts audio
+  injection from a host shell.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <receiver
+            android:name=".debug.DebugAudioInjector"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_INJECT" />
+            </intent-filter>
+        </receiver>
+        <!--
+          F-01 keyword-recall probe (2026-10-20): builds the real packed spotter, feeds a WAV from the host shell and
+          logs which keyword labels fired. Same export rule and the same reason as `DebugAudioInjector`: only
+          `adb shell am broadcast` drives it, so it must be exported and must never exist in a release build.
+        -->
+        <receiver
+            android:name=".debug.DebugKwsProbe"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_KWS" />
+            </intent-filter>
+        </receiver>
+        <!--
+          F-01 session-control instrument (2026-10-20): drives the composition's own start/stop so a second session
+          re-arm can be measured in one process (the 2x PCM rate hypothesis). Same export rule and the same reason as
+          the instruments above: shell-driven, debug-only, never in a release build.
+        -->
+        <receiver
+            android:name=".debug.DebugSessionControl"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_SESSION" />
+            </intent-filter>
+        </receiver>
+        <!--
+          Phase 4B B8 instrument: drives the production settings store + NoInterceptionGate so the persisted
+          「不拦截」 mode can be verified without relying on a Compose switch click. Same export rule and the same
+          reason as the instruments above: shell-driven, debug-only, never in a release build. It logs booleans only.
+        -->
+        <receiver
+            android:name=".debug.DebugNoInterceptionControl"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_NO_INTERCEPTION" />
+            </intent-filter>
+        </receiver>
+        <!--
+          P3.2 Stage 0 hint-length instrument. Same reasoning as `DebugAudioInjector`: the only caller is an
+          `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
+          release build. It carries synthetic text only and logs counts only.
+        -->
+        <receiver
+            android:name=".debug.DebugHintInjector"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_HINT" />
+            </intent-filter>
+        </receiver>
+        <!--
+          P3.3 Stage C instrument. Same reasoning and the same export rule as the two above: the only caller is an
+          `adb shell am broadcast`, so it must be exported and must therefore never exist in a release build. It arms
+          the scripted model wire, which answers the model request from a script instead of the network so the L3/L4
+          half of the execution layer can be exercised through the real policy, gate, executor and audit. It bypasses
+          nothing but the transport, and it logs the action name only - never the arguments.
+        -->
+        <receiver
+            android:name=".debug.DebugToolCallInjector"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_TOOLCALL" />
+            </intent-filter>
+        </receiver>
+        <!-- P5 Task 12: creates a model profile from .local/p5-omni.properties for AUDIO_REQUEST verification. -->
+        <receiver
+            android:name=".debug.DebugProfileCreator"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_CREATE_PROFILE" />
+            </intent-filter>
+        </receiver>
+        <!--
+          0.25 Task 15 (R82 / D116): the text turn injection seam the frozen acceptance corpus runs on. Same export
+          rule and the same reason as the instruments above: the only caller is an `adb shell am broadcast` from the
+          host, so it must be exported, and it must therefore never exist in a release build. It submits a synthetic
+          final `TranscriptRevision` through the production host entry (no KWS/ASR), and logs a status, a route name, the
+          fixed turn id, the revision and a character count - never the utterance text.
+        -->
+        <receiver
+            android:name=".debug.DebugUtterance"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_UTTERANCE" />
+            </intent-filter>
+        </receiver>
+        <!--
+          Laya backend probe. Same export rule and the same reason as the instruments above: the only caller is
+          an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in
+          a release build. It exists because MIUI on the K40 refuses the androidTest APK, so the CPU-vs-GPU
+          comparison has to be driven through the app itself. Logs counts and one probability - no user content.
+        -->
+        <receiver
+            android:name=".debug.DebugLayaProbe"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_LAYA" />
+            </intent-filter>
+        </receiver>
+        <!--
+          R-9 reply-cap instrument. Same export rule and the same reason as the instruments above: the only caller is
+          an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
+          release build. It runs one command through the **production** Shizuku shell and logs the reply's shape only -
+          a fixed label, exit code, stdout/stderr byte counts, the `truncated` flag, the channel's own failure code and
+          the elapsed milliseconds. It logs neither the command nor the reply's text.
+        -->
+        <receiver
+            android:name=".debug.DebugShellCapProbe"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_SHELLCAP" />
+            </intent-filter>
+        </receiver>
+        <!--
+          Phase 7 F4 memory-form switch. Same export rule and the same reason as the instruments above: the only caller
+          is an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
+          release build. It selects the measurement form the plugin reads at activation - `A` legacy raw, `B`
+          production - so the A/B experiment can share one APK and one memory document. It logs the form name and
+          whether a plugin accepted it, never memory text.
+        -->
+        <receiver
+            android:name=".debug.DebugMemoryForm"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_MEMORY_FORM" />
+            </intent-filter>
+        </receiver>
+        <!--
+          Phase 7 F4 memory backup → seed → restore. Same export rule and the same reason as the instruments above: the
+          only caller is an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never
+          exist in a release build. It reads the production `smart-assistant` memory document, saves its exact bytes,
+          writes the one pre-registered FACT, and can put the original bytes back. It logs counts, ids and SHA-256 only,
+          never memory text.
+        -->
+        <receiver
+            android:name=".debug.DebugF4Memory"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_MEMORY_SEED" />
+            </intent-filter>
+        </receiver>
+        <!--
+          Phase 7 F4 assistant-output capture. Same export rule and the same reason as the instruments above: the only
+          caller is an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist
+          in a release build. It copies the WAKE route's last USER/ASSISTANT text to files and logs character counts and
+          SHA-256 only - the text itself never reaches logcat.
+        -->
+        <receiver
+            android:name=".debug.DebugF4Answer"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_F4_ANSWER" />
+            </intent-filter>
+        </receiver>
+        <!--
+          0.23 P1 layout evidence seed. Same export rule and the same reason as the instruments above: the only caller is
+          an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
+          release build. It appends synthetic Chinese lines through the production ConversationLog.append API so the
+          assistant page can be screenshotted with a record longer than one screen. It logs counts only, never text.
+        -->
+        <receiver
+            android:name=".debug.DebugConversationSeed"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_CONVERSATION" />
+            </intent-filter>
+        </receiver>
+        <!--
+          0.23 P2 memory-page evidence seed. Same export rule and the same reason as the instruments above: the only
+          caller is an `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist
+          in a release build. It saves the production memory document's exact bytes, replaces it with two synthetic
+          sentences either side of the 40-code-point preview cap, and puts the original bytes back with a byte-for-byte
+          verification. It logs counts, ids and SHA-256 only - never a memory sentence.
+        -->
+        <receiver
+            android:name=".debug.DebugMemoryLogSeed"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_MEMORY_LOG_SEED" />
+            </intent-filter>
+        </receiver>
+        <!--
+          0.23 P5 wake-chime evidence: drives the production 「语音朗读」 switch from a host shell so the wake path can
+          be measured with the switch off (`P5_CHIME state=disabled`) and on (`state=played`). Same export rule and the
+          same reason as the instruments above: the only caller is an `adb shell am broadcast`, so it must be exported
+          and must therefore never exist in a release build. It logs only the requested/committed boolean.
+        -->
+        <receiver
+            android:name=".debug.DebugSpeechToggle"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_SPEECH" />
+            </intent-filter>
+        </receiver>
+        <!--
+          `DebugModelProbe` (the generic all-models-on-an-accelerator probe) is NOT registered here yet: it needs the
+          process's single shared LiteRT `Environment`, which lives in the vendored `com.laya` file as a
+          file-private object, so the probe cannot compile without making vendored code non-private. Its entry, its
+          source and the decision about how to expose that environment belong to the Laya line; leaving a receiver
+          with no class behind it would only ship a debug build whose broadcast dies at run time.
+        -->
+        <!--
+          2026-10-20 lock-screen probe: shell-started so it does not depend on the MIUI broadcast queue. Debug source
+          set only; it executes the production Shizuku shell and logs shape only (never stdout).
+        -->
+        <activity
+            android:name=".debug.ShizukuLockProbeActivity"
+            android:exported="true"
+            android:label="EDITH Shizuku lock probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <!-- Debug-only PIN writer; the user-facing path is the settings page. -->
+        <activity
+            android:name=".debug.LockPinProbeActivity"
+            android:exported="true"
+            android:label="EDITH lock PIN probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.LockUnlockProbeActivity"
+            android:exported="true"
+            android:label="EDITH lock unlock probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.LockToolProbeActivity"
+            android:exported="true"
+            android:label="EDITH lock tool probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.OpenListProbeActivity"
+            android:exported="true"
+            android:label="EDITH open list probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.OpenTargetProbeActivity"
+            android:exported="true"
+            android:label="EDITH open target probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.T6PageServerActivity"
+            android:exported="true"
+            android:label="EDITH T6 page server"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.T6SequenceProbeActivity"
+            android:exported="true"
+            android:label="EDITH T6 sequence probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+        <activity
+            android:name=".debug.T6ClickProbeActivity"
+            android:exported="true"
+            android:label="EDITH T6 click probe"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar"
+            android:excludeFromRecents="true" />
+    </application>
+</manifest>

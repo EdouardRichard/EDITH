@@ -1,0 +1,34 @@
+[versions]
+# Kotlin 2.4.0 is not a preference: `litert-api` 2.3.0 is compiled with Kotlin 2.4.0 metadata (`mv=[2,4,0]`),
+# which a 2.2.x compiler refuses to read. Moving LiteRT to 2.3.0 is what forces this bump, and the Compose
+# compiler plugin has to follow the Kotlin version exactly.
+kotlin = "2.4.0"
+coroutines = "1.10.2"
+okhttp = "4.12.0"
+serialization = "1.9.0"
+agp = "9.2.1"
+android-compose = "2.4.0"
+# P3.3: the on-device shell-UID backend (spec §17.2). `provider` carries the Shizuku provider the API binds to.
+shizuku = "13.1.5"
+# 2.3.0 as of 2026-10-14: the delivery target's NPU is a MediaTek APU (MT6989), and the MediaTek NeuroPilot
+# dispatch + JIT compiler plugin is published only from 2.3.0 (`litert-npu-runtime-mediatek`). 2.3.0 also splits
+# the GPU accelerator out of `litert` into `litert-gpu`, which the production GPU backend needs on its own.
+litert = "2.3.0"
+litert-npu-mediatek = "2.3.0"
+
+[libraries]
+kotlin-test = { module = "org.jetbrains.kotlin:kotlin-test", version.ref = "kotlin" }
+kotlin-test-junit5 = { module = "org.jetbrains.kotlin:kotlin-test-junit5", version.ref = "kotlin" }
+kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "coroutines" }
+okhttp = { module = "com.squareup.okhttp3:okhttp", version.ref = "okhttp" }
+mockwebserver = { module = "com.squareup.okhttp3:mockwebserver", version.ref = "okhttp" }
+kotlinx-serialization-json = { module = "org.jetbrains.kotlinx:kotlinx-serialization-json", version.ref = "serialization" }
+shizuku-api = { module = "dev.rikka.shizuku:api", version.ref = "shizuku" }
+shizuku-provider = { module = "dev.rikka.shizuku:provider", version.ref = "shizuku" }
+litert = { module = "com.google.ai.edge.litert:litert", version.ref = "litert" }
+litert-gpu = { module = "com.google.ai.edge.litert:litert-gpu", version.ref = "litert" }
+litert-npu-mediatek = { module = "com.google.ai.edge.litert:litert-npu-runtime-mediatek", version.ref = "litert-npu-mediatek" }
+
+[plugins]
+kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
+android-application = { id = "com.android.application", version.ref = "agp" }

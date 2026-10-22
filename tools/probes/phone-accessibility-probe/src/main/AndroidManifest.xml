@@ -1,0 +1,150 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      P3.0 T3b throwaway probe. It reads the accessibility tree and dispatches gestures on this phone only, while the
+      operator watches. It uploads nothing, stores nothing and holds no credentials.
+
+      P3.3 Task 17 gives it one more job: it is also the **L3/L4 target** (spec §17.1#2, §17.3) - the app the privileged
+      channel is allowed to clear, uninstall, disable and grant/revoke, because we built it and can reinstall it. The
+      permission below is the L4 target for `set_permission`: a normal, revocable runtime permission whose granted state
+      is readable back with `dumpsys package`, which is how the acceptance checks the *state* rather than an exit code.
+    -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <!--
+      P3.0 A1's popup scenario measures the accessibility click on a *system* runtime-permission dialog, and it needs a
+      permission that is (a) not auto-granted and (b) not in the normal-use path of this probe, so requesting it changes
+      nothing for the other modes. `READ_CALENDAR` is exactly that: the probe never reads a calendar. The permission is
+      declared here and never *used* - the measurement is the dialog and the state flip.
+
+      The Lead revokes it with `pm revoke` before a run; an already-GRANTED state is reported as `popupSkipped`, because
+      the probe cannot revoke a permission from inside its own process.
+    -->
+    <uses-permission android:name="android.permission.READ_CALENDAR" />
+
+    <!--
+      S1 (2026-10-16) survey: the floating-window half of the capability question. Declared but never requested from the
+      user; the operator grants the appop with `appops set edith.phone.a11yprobe SYSTEM_ALERT_WINDOW allow` before the
+      `overlay` scenario, and the scenario reports `SURVEY_O00_OVERLAY_SKIPPED` when it is absent rather than failing.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <application
+        android:allowBackup="false"
+        android:label="EDITH P3 T3b"
+        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        <activity
+            android:name=".A11yProbeActivity"
+            android:exported="true"
+            android:label="EDITH P3 T3b">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          A1's runner. Deliberately NOT a launcher and NOT auto-running: it is reachable only by an explicit
+          `am start` carrying the A1 action plus `confirm=true`, so opening the app or a stray intent cannot make the
+          probe tap through a permission dialog. It shares the service below; the T3b activity above is untouched.
+        -->
+        <activity
+            android:name=".A11yIntentActivity"
+            android:exported="true"
+            android:label="EDITH P3 A1">
+            <intent-filter>
+                <action android:name="edith.phone.a11yprobe.intent.A1_RUN" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          Click-now: the unattended "click whichever of these labels is on screen" action, for dialogs that only the
+          accessibility tree can see (the MIUI install confirmation), and its coordinate arm ("tap this screen point,
+          optionally only if it is outside the marker window") used for the confirmation-dialog outside-tap check.
+          Exported and reachable only by an explicit `am start` carrying the action plus `confirm=true`, like A1 above,
+          because it taps on someone else's window.
+
+          `Theme.Translucent.NoTitleBar` is deliberate: this activity is started *before* the dialog exists, so its own
+          window must not paint over the screen the dialog is coming up on. `excludeFromRecents` keeps the run out of the
+          operator's task list.
+        -->
+        <activity
+            android:name=".A11yClickActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="EDITH P3 click"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="edith.phone.a11yprobe.intent.CLICK_NOW" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          S1 (2026-10-16) survey runner. Same rule as A1 and click-now: reachable only by an explicit `am start` carrying
+          the action plus `confirm=true`, because it reads another app's window and dispatches touches. Not a launcher,
+          does not auto-run, and it is the only component the survey scenarios are driven through.
+        -->
+        <activity
+            android:name=".A11ySurveyActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="EDITH S1 survey">
+            <intent-filter>
+                <action android:name="edith.phone.a11yprobe.intent.SURVEY" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          Enabled by the user in system settings; the probe cannot and must not enable itself. `canPerformGestures` is
+          required for `dispatchGesture` (the coordinate mode), and `canRetrieveWindowContent` for the node mode.
+        -->
+        <service
+            android:name=".A11yProbeService"
+            android:exported="false"
+            android:label="EDITH P3 T3b probe"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/a11y_probe_config" />
+        </service>
+
+        <!--
+          S1 survey services. The pair differs in exactly two flags (`flagReportViewIds`,
+          `flagRetrieveInteractiveWindows`) so the survey can read one screen through both and report what those flags
+          change instead of citing it. Both are off unless the operator enables them in system settings.
+        -->
+        <service
+            android:name=".A11ySurveyService"
+            android:exported="false"
+            android:label="EDITH S1 survey (view ids)"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/a11y_survey_config" />
+        </service>
+
+        <service
+            android:name=".A11ySurveyNoIdsService"
+            android:exported="false"
+            android:label="EDITH S1 survey (no view ids)"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/a11y_survey_noids_config" />
+        </service>
+    </application>
+
+</manifest>

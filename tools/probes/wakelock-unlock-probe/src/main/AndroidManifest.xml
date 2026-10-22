@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      D5/D6 throwaway spike (2026-10-19). Two questions: can the app itself light the panel from
+      screen-off, and can it dismiss a non-secure swipe keyguard with no user interaction? D6 adds
+      background trigger paths (broadcast receiver, foreground-service notification FSI) so the
+      answer is not limited to a PC `am start`. It uploads nothing, stores nothing, holds no
+      credentials and has no launcher.
+
+      Note there are deliberately NO android:showWhenLocked / android:turnScreenOn attributes on
+      the activity: a manifest-level turnScreenOn would be applied by the system at launch and
+      would contaminate the `mode=wakelock` measurement. The activity calls the flags at runtime,
+      after it has recorded the pre-trigger state.
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <!-- D6: notification + FSI path. POST_NOTIFICATIONS is granted with `pm grant` for the probe. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.USE_FULL_SCREEN_INTENT" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <!-- D6: the operator grants the appop with `appops set ... SYSTEM_ALERT_WINDOW allow` for one
+         round, to test the BAL exemption for background `startActivity`; uninstalling removes it. -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+
+    <application
+        android:allowBackup="false"
+        android:label="EDITH D6 keyguard probe"
+        android:theme="@android:style/Theme.Translucent.NoTitleBar">
+        <activity
+            android:name=".ProbeActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="EDITH D6 keyguard probe" />
+
+        <!-- D6 background trigger: adb broadcast only, confirm=true required. -->
+        <receiver
+            android:name=".WakeTriggerReceiver"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.phone.wakelockprobe.WAKE" />
+            </intent-filter>
+        </receiver>
+
+        <service
+            android:name=".WakeService"
+            android:exported="false" />
+    </application>
+
+</manifest>

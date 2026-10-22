@@ -1,0 +1,11 @@
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="24dp"
+    android:height="24dp"
+    android:viewportWidth="24"
+    android:viewportHeight="24">
+    <!-- The confirmation question's small icon: a shield with a check. Drawn here rather than borrowed from a
+         framework drawable, because this is a product surface and framework icons vary by OEM. -->
+    <path
+        android:fillColor="#FFFFFFFF"
+        android:pathData="M12,2 L20,6 V12 C20,16.4 16.6,20.4 12,22 C7.4,20.4 4,16.4 4,12 V6 Z M10.6,16.4 L17,10 L15.6,8.6 L10.6,13.6 L8.4,11.4 L7,12.8 Z" />
+</vector>

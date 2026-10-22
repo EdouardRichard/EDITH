@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- TEMPORARY survey probe (2026-10-16): minimal IME metadata, so the probe can be selected as the input method. -->
+<input-method xmlns:android="http://schemas.android.com/apk/res/android"
+    android:settingsActivity="edith.survey.shizukuprobe.InjectActivity" />

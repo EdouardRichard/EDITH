@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Stable view ids for the capability survey (S1). They must be *resource* ids, not `View.generateViewId()` values:
+  `AccessibilityNodeInfo.getViewIdResourceName()` and `findAccessibilityNodeInfosByViewId()` only ever see a name of the
+  form `package:id/name`, so a programmatic id would make the by-id capability untestable rather than untested.
+-->
+<resources>
+    <item name="survey_row_alpha" type="id" />
+    <item name="survey_button" type="id" />
+    <item name="survey_hits" type="id" />
+    <item name="survey_static" type="id" />
+    <item name="survey_edit" type="id" />
+    <item name="survey_edit_reject" type="id" />
+    <item name="survey_check" type="id" />
+    <item name="survey_disabled" type="id" />
+    <item name="survey_expand" type="id" />
+    <item name="survey_scroll" type="id" />
+    <item name="survey_item_first" type="id" />
+    <item name="survey_item_last" type="id" />
+    <item name="survey_wide" type="id" />
+    <item name="survey_deep_label" type="id" />
+    <item name="survey_webview" type="id" />
+    <item name="survey_secure_text" type="id" />
+    <item name="survey_secure_edit" type="id" />
+    <item name="survey_normal_text" type="id" />
+    <item name="survey_noimportant" type="id" />
+</resources>

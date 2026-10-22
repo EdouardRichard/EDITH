@@ -1,0 +1,88 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      The glasses side renders hints and nothing else: it captures no audio, reads no files and holds no credentials,
+      so the phone owns the microphone, the model and the storage.
+    -->
+    <!--
+      The one permission, approved as option A on 2026-10-08: a pushed hint must be able to light a sleeping panel.
+      The vendor SDK has no wake API (the official FAQ documents only FLAG_KEEP_SCREEN_ON, and states that the ring's
+      KEY_POWER screen on/off "应用层无法拦截"), so the standard Android screen wake lock is the only mechanism. It is
+      held only while a hint is on screen and released on expiry, clear, disconnect or a bounded timeout.
+    -->
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+
+    <!--
+      0.24 S2 Task 9 (D158): the production default is a foreground service that draws the official panel as a
+      TYPE_APPLICATION_OVERLAY window, so it can appear over another app and while the glasses screen is off. The
+      app-op must be granted by the wearer in settings; nothing here can grant it. specialUse is the only type that
+      describes a resident display service with no media/location/phone category, and S1 measured that this Android 12
+      build accepts it.
+    -->
+    <uses-permission android:name="android.permission.SYSTEM_ALERT_WINDOW" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+
+    <!-- App icon: the portrait kept in docs/assets/brand (see that directory's README); the build only reads
+         res/mipmap-*, never the source PNG path. minSdk 28 means API 26+ always resolves the adaptive icon. -->
+    <application
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
+        android:label="EDITH"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <!--
+          0.24 S5 Task 21 follow-up (owner decision A): the production CXR scene must stay RESUMED but must not cover
+          the launcher. `Theme.Edith.CxrScene` makes this a translucent ActivityRecord (platform `Theme.Translucent`),
+          so ActivityManager keeps the activity below visible; the 480x380 panel is the service's overlay window, not
+          this Activity. The debug EXTRA_HOST_PANEL host lives on its own opaque component below.
+        -->
+        <activity
+            android:name=".app.GlassesActivity"
+            android:exported="true"
+            android:theme="@style/Theme.Edith.CxrScene"
+            android:label="EDITH">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          The debug-only EXTRA_HOST_PANEL seam keeps the pre-Task-21 full-screen opaque panel window unchanged
+          (`Theme.Material.NoActionBar`). Instrumentation launches it; production/CXR appStart never names it.
+        -->
+        <activity
+            android:name=".app.GlassesPanelHostActivity"
+            android:exported="false"
+            android:theme="@android:style/Theme.Material.NoActionBar"
+            android:label="EDITH" />
+
+        <!-- The resident panel host; exported=false: only this app starts it. -->
+        <service
+            android:name=".app.GlassesOverlayService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse" />
+
+        <!--
+          2026-10-20 owner-approved: the vendor home HUD is a system window above every TYPE_APPLICATION_OVERLAY. This
+          accessibility service contributes only its WindowManager token so the existing panel service can use
+          TYPE_ACCESSIBILITY_OVERLAY (base layer 311000, above the HUD's 271000). It reads no window content and draws
+          nothing itself. The glasses has no system settings page for this; enable and verify it with ADB (README.md).
+        -->
+        <service
+            android:name=".accessibility.GlassesAccessibilityService"
+            android:exported="true"
+            android:label="@string/a11y_service_label"
+            android:permission="android.permission.BIND_ACCESSIBILITY_SERVICE">
+            <intent-filter>
+                <action android:name="android.accessibilityservice.AccessibilityService" />
+            </intent-filter>
+            <meta-data
+                android:name="android.accessibilityservice"
+                android:resource="@xml/edith_accessibility" />
+        </service>
+    </application>
+
+</manifest>

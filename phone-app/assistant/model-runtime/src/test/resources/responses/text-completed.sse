@@ -1,0 +1,23 @@
+: Synthetic compatibility-schema fixture, not a captured DeepSeek response.
+event: response.created
+data: {"type":"response.created","sequence_number":8,"response":{"id":"r","status":"in_progress"}}
+
+event: response.output_item.added
+data: {"type":"response.output_item.added","sequence_number":10,"output_index":0,"item":{"id":"i","type":"message","role":"assistant","content":[]}}
+
+event: response.content_part.added
+data: {"type":"response.content_part.added","sequence_number":12,"item_id":"i","output_index":0,"content_index":0,"part":{"type":"output_text","text":""}}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":15,"item_id":"i","output_index":0,"content_index":0,"delta":"\u63d0\u793a"}
+
+event: response.output_text.delta
+data: {"type":"response.output_text.delta","sequence_number":18,"item_id":"i","output_index":0,"content_index":0,"delta":"\ud83d\ude00"}
+
+event: response.output_text.done
+data: {"type":"response.output_text.done","sequence_number":19,"item_id":"i","output_index":0,"content_index":0,"text":"\u63d0\u793a\ud83d\ude00"}
+
+event: response.completed
+data: {"type":"response.completed","sequence_number":21,"response":{"id":"r","status":"completed","output":[{"id":"i","type":"message","role":"assistant","content":[{"type":"output_text","text":"\u63d0\u793a\ud83d\ude00","annotations":[]}]}],"usage":{"input_tokens":12,"output_tokens":4,"input_tokens_details":{"cached_tokens":0},"unknown":true}}}
+
+

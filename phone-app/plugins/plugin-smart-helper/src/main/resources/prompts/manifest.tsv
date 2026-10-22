@@ -1,0 +1,17 @@
+core.identity	core/00-identity.md	STATIC	1	身份与两条链路
+core.operating	core/10-operating.md	STATIC	1	工作循环与证据规则
+core.tools	core/20-tools.md	STATIC	3	工具纪律（24 工具两档路由）
+core.safety	core/30-safety.md	STATIC	1	安全与确认
+core.output	core/40-output.md	STATIC	2	输出契约
+core.memory-policy	core/50-memory-policy.md	STATIC	1	记忆策略
+route.wake	route/wake.md	STATIC	2	唤醒路由姿态
+route.proactive-hint	route/proactive-hint.md	STATIC	2	主动提示路由姿态
+route.proactive-followup	route/proactive-followup.md	STATIC	2	主动追问路由姿态
+context.device-profile	context/device-profile.md	SESSION_STATIC	1	设备画像模板（只允许 DeviceProfile 占位符）
+context.runtime-state	context/runtime-state.md	DYNAMIC	2	每请求动态运行块模板
+loop.retry	loop/retry.md	STATIC	1	循环：空回合重试指令
+loop.plan-nudge	loop/plan-nudge.md	STATIC	1	循环：计划未执行纠偏指令
+loop.timeout	loop/timeout.md	STATIC	1	循环：工具超时后的观察指令
+pinned.proactive-gate	pinned/proactive-gate.md	PINNED	1	Laya 门问句（标定后冻结，不得改写字面）
+pinned.proactive-gate-options	pinned/proactive-gate-options.md	PINNED	1	Laya 门选项 A/B（标定后冻结，不得改写字面）
+summarizer	summarizer.md	STATIC	2	异步摘要指令（0.3 设计 §6.4 六段结构化模板）
