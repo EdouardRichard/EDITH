@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+      0.24 S5 Task 21 follow-up (owner decision A): the CXR scene Activity must be a *translucent* ActivityRecord.
+
+      The scene host draws nothing and keeps no panel; the foreground overlay service is the only visible surface.
+      Setting `Window.setFormat(PixelFormat.TRANSLUCENT)` at runtime was not enough: ActivityManager decides whether the
+      activity below is visible from the ActivityInfo theme *before* the process starts, so without
+      `android:windowIsTranslucent` the scene was still a full-screen opaque window. The measured consequence was a black
+      composited screen whenever the panel was hidden, with the launcher task forced invisible
+      (`translucent=false`, launcher task `visibleRequested=false`).
+
+      `Theme.Translucent.NoTitleBar` is the platform form of this window (translucent ActivityRecord, transparent
+      background, no title, no dim). It is applied to GlassesActivity only. The debug EXTRA_HOST_PANEL seam keeps the
+      original opaque `Theme.Material.NoActionBar` through a separate component, so the interaction/visual
+      instrumentation still runs against the unchanged full-screen window.
+    -->
+    <style name="Theme.Edith.CxrScene" parent="@android:style/Theme.Translucent.NoTitleBar">
+        <item name="android:windowIsTranslucent">true</item>
+        <item name="android:windowBackground">@android:color/transparent</item>
+        <item name="android:windowNoTitle">true</item>
+        <item name="android:backgroundDimEnabled">false</item>
+    </style>
+
+</resources>

@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <!--
+      P3.0 T0/T1 throwaway probe. It captures no audio of its own and reads no files; T1's microphone contention check
+      is about whether the two SDK lines fight over the microphone the bridge already owns.
+    -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
+
+    <application
+        android:allowBackup="false"
+        android:label="EDITH P3 T0T1"
+        android:theme="@android:style/Theme.Material.NoActionBar">
+        <activity
+            android:name=".CoexistenceActivity"
+            android:exported="true"
+            android:label="EDITH P3 T0T1">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+    </application>
+
+</manifest>
