@@ -84,7 +84,7 @@ class DebugToolCallInjector : BroadcastReceiver() {
             intent.getStringExtra(EXTRA_CHANNEL),
             intent.getStringExtra(EXTRA_COMMAND),
         ).size
-        report("armed action=${action.ifBlank { "none" }} members=$members times=$times fail=$fail args=$args")
+        report("armed action=${action.ifBlank { "none" }} members=$members times=$times fail=$fail")
     }
 
     private fun report(state: String) = P3Log.line("P3_SCRIPT state=$state")
