@@ -30,10 +30,11 @@ internal enum class SmartTurnPhase { AwaitingTranscript, Running, Idle }
  * (`AgentLoop` is single-use), so nothing here can leak a half-finished run into the next turn. [loop] is kept only so
  * `Stop` and `deactivate` can cancel a run that is already in flight.
  *
- * [hintValidUntil] bounds the turn's `sourceTurnId` lifetime: the turn's deadline plus a small grace window, so a hint
- * can still expire on its own after the deadline passes instead of sitting on the glasses forever. [hintExpiry] is the
- * concrete expiry stamped on the hint currently shown; a `Displayed` ACK is honoured only while it is still in the
- * future, which is what keeps a late ACK for an already-expired hint from being counted.
+ * [hintValidUntil] bounds the turn's `sourceTurnId` lifetime: the turn's deadline plus a small grace window. Since
+ * 2026-10-22 (D197) the deadline is a 24 h sanity ceiling, so this window is effectively open for the turn's lifetime;
+ * `emit` still refines it per hint from the hint's own reading budget, and [hintExpiry] is the concrete expiry stamped
+ * on the hint currently shown. A `Displayed` ACK is honoured only while it is still in the future, which is what keeps
+ * a late ACK for an already-expired hint from being counted.
  *
  * [submitting] and [pendingAck] are the two halves of the race the diagnostic plugin already solves: an
  * `OutputStateEvent` the host delivers *inside* `submit` (before `submit` returned) must not be dropped, and must not
@@ -79,11 +80,14 @@ internal class SmartTurn private constructor(
         private set
 
     /**
-     * The turn's **machine** budget: when the agent run must stop.
+     * The turn's **machine** budget: when the agent run must stop, or an effectively unbounded value for no product
+     * cap.
      *
-     * It is not a listening window. Since 0.24 S3 the official 10 s belongs to `ConversationCycle` and starts at
-     * `PANEL_SHOWN`; this number bounds the model/tool work and is re-anchored at the usable final ([extendDeadline]),
-     * so waiting for the wearer cannot eat the run's budget. [extendDeadline] moves it forward and never back.
+     * Since 2026-10-22 (D197) a normal turn carries a 24 h sanity ceiling only: the loop is bounded by its step and
+     * no-progress guards, each provider request is bounded by the profile's timeout, and the wearer can stop it. It
+     * is not a listening window: since 0.24 S3 the official 10 s belongs to `ConversationCycle` and starts at
+     * `PANEL_SHOWN`. The hint window moves with it (`deadline + grace`), which is harmless at this ceiling because
+     * `emit` still sizes each shown hint's own expiry.
      */
     var deadlineNanos: Long = deadlineNanos
         private set
@@ -207,13 +211,11 @@ internal class SmartTurn private constructor(
     }
 
     /**
-     * Moves the turn's deadline - and the hint window that follows it - to [newDeadlineNanos], never backwards.
+     * Moves the turn's machine deadline to [newDeadlineNanos], never backwards.
      *
-     * 0.24 S3: this is the **machine budget**, not a listening window. `acceptTranscript` re-anchors it at the usable
-     * final (the official conversation may stay open for a long time while the wearer is still speaking), and the
-     * run-end path extends it by the human wait a confirmation consumed. Both halves have to move together: a hint
-     * assembled after the original deadline would otherwise be dropped as expired, and the plugin would go silent on
-     * exactly the path that must never be silent.
+     * Since 2026-10-22 (D197) an agent turn has a 24 h sanity ceiling instead of a 180 s product cap, so this is
+     * normally a no-op; it remains for the human-wait accounting path. The hint window still moves with the deadline
+     * (`deadline + grace`), and `emit` refines the shown hint's own expiry from its reading budget.
      */
     fun extendDeadline(newDeadlineNanos: Long) {
         if (newDeadlineNanos <= deadlineNanos) return
@@ -249,10 +251,9 @@ internal class SmartTurn private constructor(
          *
          * The assembler is built here, once per turn, and its emit callback is the plugin's own — so a hint can only
          * ever be emitted while this exact turn is still the plugin's current one. [deadlineNanos] is the **machine
-         * budget** the caller chose (the configured profile's timeout, or its documented default), not a listening
-         * window: since 0.24 S3 the official 10 s lives in `ConversationCycle` and starts at `PANEL_SHOWN`, and the
-         * budget is re-anchored at the usable final. A turn opened before a profile exists still gets a usable budget
-         * and a later, honest failure rather than an unbounded one.
+         * budget** the caller chose; production passes a 24 h sanity ceiling (D197: no product wall-clock cap), while
+         * the step/no-progress guards and the profile's per-request timeout bound the run. It is not a listening window:
+         * since 0.24 S3 the official 10 s lives in `ConversationCycle` and starts at `PANEL_SHOWN`.
          */
         fun awaiting(
             turnId: String,

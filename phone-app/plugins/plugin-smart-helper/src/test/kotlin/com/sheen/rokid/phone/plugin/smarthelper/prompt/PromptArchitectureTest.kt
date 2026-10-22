@@ -246,10 +246,10 @@ class PromptArchitectureTest {
     }
 
     @Test
-    fun `the prompt names exactly the twenty four tools the label map registers`() {
+    fun `the prompt names exactly the twenty three tools the label map registers`() {
         val registered = ToolLabelMap.entries
-        assertEquals(24, registered.size, "ToolLabelMap is the face's registration: ${registered.keys}")
-        assertEquals(DEFAULT_TOOL_NAMES, registered.keys, "the registered face must be the spec's 24 names")
+        assertEquals(23, registered.size, "ToolLabelMap is the face's registration: ${registered.keys}")
+        assertEquals(DEFAULT_TOOL_NAMES, registered.keys, "the registered face must be the spec's 23 names")
         assertTrue(registered.values.all { it.isNotBlank() }, "every registered tool needs a user-facing label")
 
         val prompt = promptText("core/20-tools.md")
@@ -286,12 +286,12 @@ class PromptArchitectureTest {
         PromptCatalog.parseManifest("x\t$file\t$kind\t1\tdescription") { body }
 
     private companion object {
-        /** The 24-tool default face of 0.3 Phase 4A, the same set A5's `ToolContractTest` owns. */
+        /** The 23-tool default face after the 2026-10-22 retirement, the same set A5's `ToolContractTest` owns. */
         val DEFAULT_TOOL_NAMES: Set<String> = linkedSetOf(
             "read_screen", "tap", "long_press", "scroll", "input_text",
             "open_app", "open_url", "open_settings", "set_alarm", "compose_note",
             "clear_data", "uninstall", "disable_app", "set_permission", "set_brightness",
-            "launch_app", "list_apps", "system_action",
+            "list_apps", "system_action",
             "device", "shell", "open", "dial",
             "notify_user", "load_skill",
         )

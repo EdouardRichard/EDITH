@@ -24,8 +24,12 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
 
+    <!-- App icon: the portrait kept in docs/assets/brand (see that directory's README); the build only reads
+         res/mipmap-*, never the source PNG path. minSdk 28 means API 26+ always resolves the adaptive icon. -->
     <application
         android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher"
         android:label="EDITH"
         android:theme="@android:style/Theme.Material.NoActionBar">
         <!--

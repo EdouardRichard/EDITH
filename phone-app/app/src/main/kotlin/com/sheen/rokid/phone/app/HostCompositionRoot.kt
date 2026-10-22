@@ -38,6 +38,7 @@ import com.sheen.rokid.phone.context.NotificationCategoryService
 import com.sheen.rokid.phone.context.NotificationContentSource
 import com.sheen.rokid.phone.context.androidDeviceStateProvider
 import com.sheen.rokid.phone.perception.AndroidPerceptionProvider
+import com.sheen.rokid.phone.perception.ScreenReadUnavailable
 import com.sheen.rokid.agent.PerceptionPolicy
 import com.sheen.rokid.phone.bridge.CxrHintLink
 import com.sheen.rokid.phone.bridge.HintIdentity
@@ -123,6 +124,7 @@ import com.sheen.rokid.phone.actions.shizuku.ShizukuTargetState
 import com.sheen.rokid.phone.actions.shizuku.ShizukuUserServiceShell
 import com.sheen.rokid.phone.actions.AtomicActionExecutor
 import com.sheen.rokid.phone.actions.ToolSurface
+import com.sheen.rokid.phone.actions.UnlockGatedActions
 import com.sheen.rokid.phone.actions.a11y.AccessibilityExecutionBackend
 import com.sheen.rokid.phone.actions.a11y.AccessibilityUi
 import com.sheen.rokid.phone.actions.a11y.ScreenFilter as A11yScreenFilter
@@ -347,7 +349,7 @@ class HostCompositionRoot internal constructor(
     internal var unlockCoordinatorForProbe: UnlockGate? = null
 
     internal fun ensureUnlockedForProbe(): UnlockOutcome =
-        unlockCoordinatorForProbe?.ensureUnlocked(requireAccessibility = true) ?: UnlockOutcome.FAILED
+        unlockCoordinatorForProbe?.ensureUnlocked(requireAccessibility = true) ?: UnlockOutcome.STILL_LOCKED
 
     /** Debug-only seam: the production catalog, so an Activity can exercise the real gate + tool body. */
     internal var toolCatalogForProbe: com.sheen.rokid.phone.actions.device.ToolCatalog? = null
@@ -2277,6 +2279,7 @@ class HostCompositionRoot internal constructor(
             val lockPinStore = KeystoreLockPinStore(context)
             val screenKeepAlive = ScreenKeepAlive(context)
             val keyguard = context.getSystemService(android.app.KeyguardManager::class.java)
+            val powerManager = context.getSystemService(android.os.PowerManager::class.java)
             val unlockCoordinator = UnlockCoordinator(
                 lockState = object : LockState {
                     override fun isLocked(): Boolean = keyguard?.isKeyguardLocked ?: true
@@ -2294,6 +2297,11 @@ class HostCompositionRoot internal constructor(
                         Thread.currentThread().interrupt()
                     }
                 },
+                // 2026-10-22 K70 acceptance: the PIN keyguard is drawn ~1.9 s after the wake key, so the gate must
+                // poll the display state and the keyguard's own PIN view before injecting any digit.
+                interactive = { powerManager?.isInteractive == true },
+                keyguardPinVisible = { EdithAccessibilityService.keyguardPinVisibleNow() },
+                trace = { stage -> P3Log.line("P3_UNLOCK $stage") },
             )
             // The one production gate the catalog and the debug probe share; the log line carries the outcome, never
             // the PIN or a shell command.
@@ -2399,8 +2407,10 @@ class HostCompositionRoot internal constructor(
             val perceptionPolicy = PerceptionPolicy()
             val observe = { filter: DeviceScreenFilter ->
                 val envelope = deviceKernel.observe(filter)
-                if (!envelope.ok) throw IllegalStateException(envelope.error?.code ?: "OBSERVE_FAILED")
-                deviceKernel.latestObservation ?: throw IllegalStateException("OBSERVE_NO_OBSERVATION")
+                // Carry the kernel's own reason (DEVICE_LOCKED / DEVICE_SCREEN_OFF / CHANNEL_UNAVAILABLE) instead of a
+                // bare failure: the coverage line must be able to say "locked" rather than blaming accessibility.
+                if (!envelope.ok) throw ScreenReadUnavailable(envelope.error?.code)
+                deviceKernel.latestObservation ?: throw ScreenReadUnavailable("OBSERVE_NO_OBSERVATION")
             }
             val perception = AndroidPerceptionProvider(
                 observe = observe,
@@ -2526,10 +2536,9 @@ class HostCompositionRoot internal constructor(
                     live().setTextByIndex(snapshotId, index, text)
                 override fun structuralFingerprint(): ScreenFingerprint = live().structuralFingerprint()
             }
-            // `launch_app`/`list_apps` resolve spoken names against the same `appCatalog` instance the umbrella `open`
-            // tool uses. `open_app` (intent) resolves through its own executor's package catalog over the same package
-            // manager, so the three paths cannot disagree about what is installed.
-            val atomicLaunchResolver = AppLaunchResolver(appCatalog)
+            // `list_apps` and the umbrella `open` resolve spoken names against the same `appCatalog` instance.
+            // `open_app` (intent) resolves through its own executor's package catalog over the same package manager,
+            // so the paths cannot disagree about what is installed.
             // The a11y backend owns turn-scoped state (its `read_screen` snapshot), so its adapter is the one given
             // the turn-boundary seam: `ToolSurface.beginTurn()` then clears that snapshot at the start of every turn
             // and the index tools can only use a snapshot read in the current turn. The other legs own no turn state.
@@ -2553,15 +2562,8 @@ class HostCompositionRoot internal constructor(
                         channelUp = { shizukuShell.ready() },
                     ),
                 ),
-                // Shizuku: `launch_app`/`list_apps` (their own L0/L1 group, same binder)
-                AtomicActionExecutor(
-                    LaunchAppExecutor(
-                        resolver = atomicLaunchResolver,
-                        catalog = appCatalog,
-                        shell = shizukuShell,
-                        channelUp = { shizukuShell.ready() },
-                    ),
-                ),
+                // Local: `list_apps` only (no Shizuku; `launch_app` was retired 2026-10-22, 24 → 23)
+                AtomicActionExecutor(LaunchAppExecutor(catalog = appCatalog)),
                 // Shizuku: back/home/recents/notifications
                 AtomicActionExecutor(
                     SystemActionExecutor(shell = shizukuShell, channelUp = { shizukuShell.ready() }),
@@ -2574,6 +2576,10 @@ class HostCompositionRoot internal constructor(
                 atomic = atomicExecutors,
                 onClose = { toolCatalog.close() },
             )
+            // B (2026-10-22 acceptance): one lock-screen gate over every tool that needs an unlocked phone. The
+            // catalog still owns `device`/`open`/`dial`; this decorator covers the atomic screen/intent tools that
+            // used to run straight into the keyguard (`read_screen`, `open_app`, ...).
+            val gatedActions = UnlockGatedActions(toolSurface, unlockGate)
             // 0.3 Phase 4B (B5): the production phone surface, through the named seam so a JVM test drives **this**
             // rule rather than a copy of it. It used to be `rootHolder[0] != null`, which is true for the whole
             // session and made the presenter's aggregate dishonest.
@@ -2694,7 +2700,7 @@ class HostCompositionRoot internal constructor(
                     // 0.3 Phase 4A Task 4: it is the one `ToolSurface` - the 18 atomic tools plus the catalog's four
                     // (22 host descriptors). A down channel keeps its tools and answers its own refusal (A3); the
                     // plugin adds `notify_user`/`load_skill` beside it for 24. The old 21-tool router stays retired.
-                    put(Capability.Actions, toolSurface)
+                    put(Capability.Actions, gatedActions)
                     // P3.3: the confirmation channel is answerable whenever the composition has a screen to show the
                     // question on; a host that cannot ask must refuse the action, and this provider is what lets it ask.
                     put(Capability.Confirmation, confirmationPresenter)
@@ -2752,8 +2758,9 @@ class HostCompositionRoot internal constructor(
                 })
                 // 0.25 Task 10 (R42): closing the surface closes the device kernel (through the catalog's onClose) and
                 // any closeable atomic executor, so a closed composition cannot leave a device thread behind. The
-                // surface is added here **instead of** the catalog: one owner, so the catalog closes exactly once.
-                add(toolSurface)
+                // The surface is added here **instead of** the catalog: one owner, so the catalog closes exactly once.
+                // B wraps it in the lock-screen decorator, which closes the surface (and through it the catalog) once.
+                add(gatedActions)
                 // Closes the pipeline (and with it the native engines) with the composition that owns them.
                 audio?.let { add(it) }
                 // 0.23 P5: the chime's ToneGenerator is a native resource; release it with the composition.

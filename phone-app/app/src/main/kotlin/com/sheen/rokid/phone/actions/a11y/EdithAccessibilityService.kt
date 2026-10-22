@@ -456,6 +456,61 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
             }.getOrNull()
         }
 
+        /**
+         * Whether the keyguard's PIN entry view is on screen, or `null` when this channel cannot tell.
+         *
+         * The lock-screen gate needs a real "the PIN view is up" signal before it injects digits: the 2026-10-22
+         * K70 acceptance log showed the view appears about 1.9 s after the wake key, so digits typed immediately
+         * were dropped even with a correct PIN. Only window structure and the keyguard's own view id are read -
+         * never text. `null` means the service is off or the platform would not answer, so a caller must treat it
+         * as "unknown" (bounded wait) instead of "no PIN view".
+         */
+        fun keyguardPinVisibleNow(): Boolean? {
+            val service = instance ?: return null
+            return runCatching {
+                val windows = service.windows ?: return@runCatching null
+                val roots = windows.mapNotNull { it.root }
+                if (roots.isEmpty()) return@runCatching null
+                val found = roots.any { containsPinEntry(it) }
+                if (!found) {
+                    // 2026-10-22 acceptance diagnostic: the unlock gate polls this probe before typing. Counts and
+                    // the keyguard's own view ids only - no text, no user content.
+                    val ids = buildList { roots.forEach { collectIds(it, 12, this) } }.distinct()
+                    android.util.Log.i(
+                        "EdithA11y",
+                        "PIN_PROBE found=false windows=${windows.size} roots=${roots.size} " +
+                            "types=${windows.map { it.type }} ids=$ids",
+                    )
+                }
+                found
+            }.getOrNull()
+        }
+
+        private fun collectIds(node: AccessibilityNodeInfo, budget: Int, into: MutableList<String>) {
+            if (budget <= 0 || into.size >= 24) return
+            node.viewIdResourceName?.let { into += it.substringAfterLast('/') }
+            for (index in 0 until node.childCount) {
+                val child = node.getChild(index) ?: continue
+                collectIds(child, budget - 1, into)
+            }
+        }
+
+        private const val KEYGUARD_PIN_ENTRY_ID = "com.android.systemui:id/pinEntry"
+
+        private fun containsPinEntry(root: AccessibilityNodeInfo): Boolean {
+            var budget = MAX_NODES
+            fun walk(node: AccessibilityNodeInfo): Boolean {
+                if (budget-- <= 0) return false
+                if (node.viewIdResourceName == KEYGUARD_PIN_ENTRY_ID) return true
+                for (index in 0 until node.childCount) {
+                    val child = node.getChild(index) ?: continue
+                    if (walk(child)) return true
+                }
+                return false
+            }
+            return walk(root)
+        }
+
         /** The live UI port, or `null` while the user has the service switched off. */
         fun ui(): AccessibilityUi? = instance
 

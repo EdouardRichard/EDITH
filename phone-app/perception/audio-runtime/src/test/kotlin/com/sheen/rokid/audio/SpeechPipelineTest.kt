@@ -52,16 +52,32 @@ class SpeechPipelineTest {
         release.countDown()
     }
 
-    @Test fun `only the immediately preceding 200ms enters ASR pre roll`() = Fixture().use { f ->
+    @Test fun `only the immediately preceding 600ms enters ASR pre roll`() = Fixture().use { f ->
         f.vad.decision = VadDecision(false, false)
-        repeat(13) { f.pipeline.accept(frame(it)) }
+        repeat(40) { f.pipeline.accept(frame(it)) }
         assertTrue(f.asr.accepted.isEmpty())
         f.vad.decision = VadDecision(true, false)
-        f.pipeline.accept(frame(13))
-        assertEquals(11, f.asr.accepted.size)
-        assertEquals(SampleRange("c", 960, 1280), f.asr.accepted.first())
-        assertEquals(SampleRange("c", 4160, 4480), f.asr.accepted.last())
-        assertEquals(60_000_000L, f.transcripts.first().startNanos)
+        f.pipeline.accept(frame(40))
+        assertEquals(31, f.asr.accepted.size)
+        assertEquals(SampleRange("c", 3200, 3520), f.asr.accepted.first())
+        assertEquals(200_000_000L, f.transcripts.first().startNanos)
+    }
+
+    @Test fun `pre roll covers the vad min speech delay`() = Fixture().use { f ->
+        // Silero only reports speech about 250-286 ms after the real onset (minSpeechDuration 0.25 s plus window
+        // alignment), so the pre-roll must be at least that long or the first syllable never reaches the ASR.
+        // Frame 30 is the real onset; the VAD first says speech on frame 42.
+        f.vad.decision = VadDecision(false, false)
+        repeat(42) { f.pipeline.accept(frame(it)) }
+        f.vad.decision = VadDecision(true, false)
+        f.pipeline.accept(frame(42))
+
+        val onset = 30 * 320L
+        val first = f.asr.accepted.first().first
+        assertTrue(first <= onset - 4000, "the onset ($onset) must be inside the pre-roll, first=$first")
+        f.asr.accepted.zipWithNext().forEach { (a, b) ->
+            assertEquals(a.endExclusive, b.first, "pre-roll and trigger frames must be contiguous")
+        }
     }
 
     @Test fun `duplicate hypothesis does not increment revision and final seals turn`() = Fixture().use { f ->

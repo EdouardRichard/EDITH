@@ -9,6 +9,14 @@ import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 
+/**
+ * How much audio before the VAD's speech trigger is replayed into the ASR.
+ *
+ * Must stay above the VAD's own start gate (`minSpeechDuration` 0.25 s plus window alignment); 600 ms is that gate
+ * plus margin. See [SpeechPipeline]'s `remember` for the acceptance evidence.
+ */
+private const val PRE_ROLL_MILLIS = 600L
+
 class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEngine,
     private val speaker: SpeakerEngine, private val emit: (HostEvent) -> Unit,
     private val cancelTurn: (String) -> Unit, val timeline: TurnTimeline = TurnTimeline(),
@@ -193,7 +201,12 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
     private fun remember(frame: PcmFrame) {
         preRoll += frame.copy(samples = frame.samples.copyOf())
         preRollSamples += frame.samples.size
-        val capacity = frame.sampleRateHz / 5L
+        // 600 ms, not 200 ms (2026-10-22 K70 acceptance): Silero reports speech only after `minSpeechDuration` (0.25 s)
+        // plus window alignment, i.e. ~250-286 ms after the real onset. A 200 ms pre-roll therefore started the ASR at
+        // onset+50..86 ms and a fast first syllable reached the recognizer truncated; speaking slowly widened the
+        // syllable enough to hide it. 600 ms carries the whole gate delay plus margin (the VAD's own segment start is
+        // trigger-322 ms, which this now covers).
+        val capacity = frame.sampleRateHz * PRE_ROLL_MILLIS / 1000L
         while (preRollSamples > capacity) {
             val first = preRoll.removeFirst()
             val discard = minOf(preRollSamples - capacity, first.samples.size.toLong()).toInt()

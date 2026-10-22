@@ -63,7 +63,7 @@ class ToolFaceWiringTest {
 
     // ── the expected host face ───────────────────────────────────────────────────────────────────────────────
 
-    /** The 18 atomic descriptors, grouped the way the five backends declare them. */
+    /** The 17 atomic descriptors, grouped the way the five backends declare them. */
     private val atomicNames = listOf(
         // accessibility (atomic perception/operation)
         "read_screen", "tap", "long_press", "scroll", "input_text",
@@ -71,8 +71,8 @@ class ToolFaceWiringTest {
         "open_app", "open_url", "open_settings", "set_alarm", "compose_note",
         // Shizuku (atomic privileged/settings)
         "clear_data", "uninstall", "disable_app", "set_permission", "set_brightness",
-        // Shizuku launch/list
-        "launch_app", "list_apps",
+        // local app directory (`launch_app` retired 2026-10-22, 24 → 23)
+        "list_apps",
         // Shizuku system keys
         "system_action",
     )
@@ -129,7 +129,7 @@ class ToolFaceWiringTest {
             AtomicActionExecutor(accessibilityBackend, onTurnBoundary = accessibilityBackend::beginTurn),
             atomicIntent,
             AtomicActionExecutor(ShizukuExecutionBackend(shell, NeverAskedState, shizuku)),
-            AtomicActionExecutor(LaunchAppExecutor(AppLaunchResolver(appCatalog), appCatalog, shell, shizuku)),
+            AtomicActionExecutor(LaunchAppExecutor(appCatalog)),
             AtomicActionExecutor(SystemActionExecutor(shell, shizuku)),
         )
         return HostFace(ToolSurface(catalog, atomic), intent, atomicIntent, launcher, shell)
@@ -138,17 +138,17 @@ class ToolFaceWiringTest {
     // ── the 22-name face ─────────────────────────────────────────────────────────────────────────────────────
 
     @Test
-    fun `the host face advertises the eighteen atomic tools then the catalog's four`() {
+    fun `the host face advertises the seventeen atomic tools then the catalog's four`() {
         val names = hostFace().surface.descriptors().map { it.name }
 
         assertEquals(atomicNames.size, names.count { it in atomicNames })
-        assertEquals(18, atomicNames.size)
+        assertEquals(17, atomicNames.size)
         assertEquals(hostNames, names)
-        assertEquals("22 distinct names, no duplicate", 22, names.toSet().size)
+        assertEquals("21 distinct names, no duplicate", 21, names.toSet().size)
     }
 
     @Test
-    fun `every read advertises the same 22 names`() {
+    fun `every read advertises the same 21 names`() {
         val surface = hostFace().surface
 
         val first = surface.descriptors().map { it.name }
@@ -216,7 +216,7 @@ class ToolFaceWiringTest {
     }
 
     @Test
-    fun `a down Shizuku channel keeps all 22 advertised and runs no command`() {
+    fun `a down Shizuku channel keeps all 21 advertised and runs no command`() {
         var up = false
         val face = hostFace(shizuku = { up })
 
@@ -224,7 +224,6 @@ class ToolFaceWiringTest {
 
         listOf(
             "clear_data" to """{"package":"com.example.app"}""",
-            "launch_app" to """{"name":"设置"}""",
             "system_action" to """{"action":"back"}""",
         ).forEach { (name, args) ->
             val result = face.surface.execute(name, args)
@@ -240,8 +239,8 @@ class ToolFaceWiringTest {
             face.surface.execute("set_brightness", """{"value":999}""").detail)
         assertEquals("UNKNOWN_ACTION",
             face.surface.execute("system_action", """{"action":"nope"}""").detail)
-        assertEquals("APP_NOT_FOUND",
-            face.surface.execute("launch_app", """{"name":"不存在"}""").detail)
+        // `list_apps` is a local PackageManager read: no channel, an empty catalog is a valid Done.
+        assertEquals(ActionOutcome.Done, face.surface.execute("list_apps", "{}").outcome)
         assertTrue("none of those refusals had a side effect", face.shell.commands.isEmpty())
     }
 

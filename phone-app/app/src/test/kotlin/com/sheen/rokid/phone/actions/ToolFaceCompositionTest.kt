@@ -24,14 +24,14 @@ class ToolFaceCompositionTest {
         "open_app", "open_url", "open_settings", "set_alarm", "compose_note",
         // atomic Shizuku
         "clear_data", "uninstall", "disable_app", "set_permission", "set_brightness",
-        // atomic launch/system
-        "launch_app", "list_apps", "system_action",
+        // atomic local directory / system keys (`launch_app` retired 2026-10-22, 24 → 23)
+        "list_apps", "system_action",
         // the umbrella catalog
         "device", "shell", "open", "dial",
     )
 
     @Test
-    fun `the production composition wires the 22 host tools into the one Actions surface`() {
+    fun `the production composition wires the 21 host tools into the one Actions surface`() {
         val root = HostCompositionRoot.create(android.content.ContextWrapper(null))
         try {
             val surface = requireNotNull(root.toolSurfaceForProbe) {
@@ -40,8 +40,8 @@ class ToolFaceCompositionTest {
 
             val names = surface.descriptors().map { it.name }
 
-            assertEquals(22, names.size)
-            assertEquals("no duplicate name may be advertised", 22, names.toSet().size)
+            assertEquals(21, names.size)
+            assertEquals("no duplicate name may be advertised", 21, names.toSet().size)
             assertEquals(hostNames, names)
             assertEquals("a second read is the same fixed schema", names, surface.descriptors().map { it.name })
 
@@ -71,7 +71,7 @@ class ToolFaceCompositionTest {
     }
 
     @Test
-    fun `a blind JVM composition keeps the 22 advertised and refuses the channel dependent legs`() {
+    fun `a blind JVM composition keeps the 21 advertised and refuses the channel dependent legs`() {
         val root = HostCompositionRoot.create(android.content.ContextWrapper(null))
         try {
             val surface = requireNotNull(root.toolSurfaceForProbe)
@@ -98,7 +98,7 @@ class ToolFaceCompositionTest {
             assertEquals("CHANNEL_UNAVAILABLE", shell.execution?.code)
 
             // Nothing above may have changed the advertised schema.
-            assertEquals(22, surface.descriptors().size)
+            assertEquals(21, surface.descriptors().size)
         } finally {
             root.close()
         }

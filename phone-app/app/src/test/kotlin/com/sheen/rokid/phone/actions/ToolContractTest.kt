@@ -35,12 +35,12 @@ import org.junit.Test
 class ToolContractTest {
 
     @Test
-    fun `the default face is exactly the twenty four described tools`() {
+    fun `the default face is exactly the twenty three described tools`() {
         val face = ToolFaceFixture.face()
 
-        assertEquals("the default face is 24 tools", 24, face.size)
+        assertEquals("the default face is 23 tools", 23, face.size)
         assertEquals(
-            "the model-visible names are the spec's 24, whatever the executors' order",
+            "the model-visible names are the spec's 23, whatever the executors' order",
             ToolFaceFixture.DEFAULT_FACE,
             face.keys,
         )
@@ -138,16 +138,20 @@ class ToolContractTest {
             return result.detail
         }
 
-        // Production has one code for "no match" and "several matches", and it resolves display labels only.
+        // Two distinct answers, because they are two different facts: a missing name is not an ambiguity, and both are
+        // worth telling the model to retry with `open` (which resolves packages and returns candidates).
         val notFound = refusedCode("open_app", """{"name":"地图"}""")
         val ambiguous = refusedCode("open_app", """{"name":"cam"}""")
         val packageName = refusedCode("open_app", """{"name":"com.camera"}""")
-        assertEquals("APP_NOT_VISIBLE", notFound)
-        assertEquals("both open_app outcomes share one honest code", notFound, ambiguous)
-        assertEquals("a package name is not a display label, so it matches nothing", notFound, packageName)
+        assertTrue("a missing name is APP_NOT_FOUND: $notFound", notFound.startsWith("APP_NOT_FOUND"))
+        assertTrue("an ambiguity is APP_AMBIGUOUS with candidates: $ambiguous", ambiguous.startsWith("APP_AMBIGUOUS:["))
+        assertTrue("a package name is not a display label: $packageName", packageName.startsWith("APP_NOT_FOUND"))
+        val refused = executor.execute("open_app", """{"name":"地图"}""")
+        assertEquals("the model must be told to retry with open", true, refused.execution?.recoverable)
+        assertEquals("APP_NOT_FOUND", refused.execution?.code)
         val openApp = face.getValue("open_app").description
-        assertTrue("open_app must name the code it really returns: $openApp", openApp.contains(notFound))
-        assertFalse("open_app never returns APP_NOT_FOUND: $openApp", openApp.contains("APP_NOT_FOUND"))
+        assertTrue("open_app must name the missing-app code: $openApp", openApp.contains("APP_NOT_FOUND"))
+        assertTrue("open_app must name the ambiguity code: $openApp", openApp.contains("APP_AMBIGUOUS"))
         assertTrue("open_app's name is a display label, not a package name: $openApp", openApp.contains("不是包名"))
 
         // A refused launch is passed through from the intent leg; DIAL_FAILED belongs to the post-dispatch shape.
@@ -210,7 +214,7 @@ class ToolContractTest {
                 clause.contains("用 $tier") && !clause.contains("不要用 $tier")
             }
 
-        /** The exact default face after Phase 4A Task 4: 18 atomic + 4 umbrella + the plugin's 2 delivery tools. */
+        /** The exact default face after the 2026-10-22 retirement: 17 atomic + 4 umbrella + the plugin's 2 delivery tools. */
         val ATOMIC_TO_UMBRELLA: Map<String, List<String>> = linkedMapOf(
             "read_screen" to listOf("device"),
             "tap" to listOf("device"),
@@ -220,7 +224,6 @@ class ToolContractTest {
             "open_app" to listOf("open"),
             "open_url" to listOf("open"),
             "open_settings" to listOf("open"),
-            "launch_app" to listOf("open"),
             "list_apps" to listOf("open"),
             "system_action" to listOf("device", "shell"),
         )
@@ -242,7 +245,6 @@ class ToolContractTest {
             "disable_app" to listOf("package"),
             "set_permission" to listOf("package", "permission", "granted"),
             "set_brightness" to listOf("value"),
-            "launch_app" to listOf("name"),
             "list_apps" to emptyList(),
             "system_action" to listOf("action"),
             "device" to listOf("action"),
@@ -264,7 +266,7 @@ class ToolContractTest {
             "long_press" to listOf("NODE_NOT_CLICKABLE"),
             "scroll" to listOf("NO_SCREEN_CHANGE"),
             "input_text" to listOf("ARGUMENTS_INVALID"),
-            "open_app" to listOf("APP_NOT_VISIBLE"),
+            "open_app" to listOf("APP_NOT_FOUND", "APP_AMBIGUOUS"),
             "open_url" to listOf("INVALID_URL"),
             "open_settings" to listOf("INVALID_SETTINGS_PAGE"),
             "set_alarm" to listOf("INVALID_TIME"),
@@ -274,7 +276,6 @@ class ToolContractTest {
             "disable_app" to listOf("STATE_UNCHANGED"),
             "set_permission" to listOf("STATE_UNCHANGED"),
             "set_brightness" to listOf("STATE_UNCHANGED"),
-            "launch_app" to listOf("APP_AMBIGUOUS"),
             "list_apps" to listOf("truncated"),
             "system_action" to listOf("ACTION_CHANNEL_UNAVAILABLE", "COMMAND_FAILED"),
             "device" to listOf("STALE_REF"),
@@ -288,7 +289,7 @@ class ToolContractTest {
 }
 
 /**
- * The default 24-tool face, assembled from the production executors. Test code only: both the contract and the routing
+ * The default 23-tool face, assembled from the production executors. Test code only: both the contract and the routing
  * suite read this one fixture, so neither can drift into a hand-written stand-in for the composition.
  */
 internal object ToolFaceFixture {
@@ -300,8 +301,8 @@ internal object ToolFaceFixture {
         "open_app", "open_url", "open_settings", "set_alarm", "compose_note",
         // atomic Shizuku
         "clear_data", "uninstall", "disable_app", "set_permission", "set_brightness",
-        // atomic launch/system
-        "launch_app", "list_apps", "system_action",
+        // atomic local directory / system keys (`launch_app` retired 2026-10-22, 24 → 23)
+        "list_apps", "system_action",
         // the umbrella catalog
         "device", "shell", "open", "dial",
         // the plugin's delivery tools

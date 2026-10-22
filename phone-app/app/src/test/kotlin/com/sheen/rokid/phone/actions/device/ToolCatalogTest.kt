@@ -291,7 +291,7 @@ class ToolCatalogTest {
         val calls = mutableListOf<Boolean>()
         val gate = com.sheen.rokid.phone.lock.UnlockGate { requireAccessibility ->
             calls += requireAccessibility
-            com.sheen.rokid.phone.lock.UnlockOutcome.FAILED
+            com.sheen.rokid.phone.lock.UnlockOutcome.STILL_LOCKED
         }
         val catalog = catalog(unlock = gate)
 
@@ -327,7 +327,7 @@ class ToolCatalogTest {
         val calls = mutableListOf<Boolean>()
         val gate = com.sheen.rokid.phone.lock.UnlockGate { requireAccessibility ->
             calls += requireAccessibility
-            com.sheen.rokid.phone.lock.UnlockOutcome.FAILED
+            com.sheen.rokid.phone.lock.UnlockOutcome.STILL_LOCKED
         }
         val catalog = catalog(probes = Probes(a11y = false), unlock = gate)
 
@@ -344,7 +344,7 @@ class ToolCatalogTest {
         val calls = mutableListOf<Boolean>()
         val gate = com.sheen.rokid.phone.lock.UnlockGate { requireAccessibility ->
             calls += requireAccessibility
-            com.sheen.rokid.phone.lock.UnlockOutcome.FAILED
+            com.sheen.rokid.phone.lock.UnlockOutcome.STILL_LOCKED
         }
         val operations = RecordingDeviceOperations(
             statusEnvelope = DeviceEnvelope.success(
@@ -375,7 +375,7 @@ class ToolCatalogTest {
         val calls = mutableListOf<Boolean>()
         val gate = com.sheen.rokid.phone.lock.UnlockGate { requireAccessibility ->
             calls += requireAccessibility
-            com.sheen.rokid.phone.lock.UnlockOutcome.FAILED
+            com.sheen.rokid.phone.lock.UnlockOutcome.STILL_LOCKED
         }
         val catalog = catalog(probes = Probes(a11y = false), unlock = gate)
 
@@ -847,7 +847,7 @@ class ToolCatalogTest {
 
     @Test
     fun `a dial blocked by the lock gate is refused with the screen one image and refused facts`() {
-        val gate = com.sheen.rokid.phone.lock.UnlockGate { com.sheen.rokid.phone.lock.UnlockOutcome.FAILED }
+        val gate = com.sheen.rokid.phone.lock.UnlockGate { com.sheen.rokid.phone.lock.UnlockOutcome.STILL_LOCKED }
         var captureCalls = 0
         val catalog = catalog(
             unlock = gate,
@@ -865,7 +865,7 @@ class ToolCatalogTest {
         assertEquals(1, result.images.size)
         val execution = requireNotNull(result.execution)
         assertEquals(ToolOutcome.Refused, execution.outcome)
-        assertEquals("LOCKED_UNLOCK_FAILED:FAILED", execution.code)
+        assertEquals("LOCKED_UNLOCK_FAILED:STILL_LOCKED", execution.code)
         assertEquals(false, execution.accepted)
         assertEquals(false, execution.applied)
         assertEquals("an unlock can succeed on the next attempt", true, execution.recoverable)
@@ -1084,7 +1084,7 @@ class ToolCatalogTest {
 
     @Test
     fun `a catalog unlock refusal for device and open observes the screen with one image`() {
-        val gate = com.sheen.rokid.phone.lock.UnlockGate { com.sheen.rokid.phone.lock.UnlockOutcome.FAILED }
+        val gate = com.sheen.rokid.phone.lock.UnlockGate { com.sheen.rokid.phone.lock.UnlockOutcome.STILL_LOCKED }
         var captureCalls = 0
         val catalog = catalog(
             unlock = gate,
@@ -1098,7 +1098,7 @@ class ToolCatalogTest {
                 assertEquals("$name keeps its own outcome", ActionOutcome.Refused, result.outcome)
                 assertEquals(
                     "$name keeps the gate's own code",
-                    "LOCKED_UNLOCK_FAILED:FAILED",
+                    "LOCKED_UNLOCK_FAILED:STILL_LOCKED",
                     result.execution?.code,
                 )
                 val observation = requireNotNull(result.observation) {

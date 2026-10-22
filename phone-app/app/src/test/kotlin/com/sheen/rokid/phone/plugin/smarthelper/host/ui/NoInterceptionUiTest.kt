@@ -41,14 +41,6 @@ class NoInterceptionUiTest {
     }
 
     @Test
-    fun theBannerIsThePersistentInAppReminder() {
-        assertTrue(NoInterceptionUi.BANNER.contains("不拦截已开启"))
-        assertTrue("the banner must name the bypassed range", NoInterceptionUi.BANNER.contains("L0–L4"))
-        assertTrue("the banner must say the mode is sticky", NoInterceptionUi.BANNER_DETAIL.contains("重启"))
-        assertTrue("the banner must say how to leave the mode", NoInterceptionUi.BANNER_DETAIL.contains("手动关闭"))
-    }
-
-    @Test
     fun theSwitchRowCarriesTheRiskWithoutOpeningTheDialog() {
         listOf("L0–L4", "不再确认", "重启", "手动关闭", "无法撤销").forEach { expected ->
             assertTrue("the always-visible switch copy must mention 「$expected」",

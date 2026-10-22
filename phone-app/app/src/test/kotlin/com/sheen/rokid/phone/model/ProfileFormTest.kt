@@ -14,6 +14,23 @@ import org.junit.Test
 class ProfileFormTest {
     private fun form() = ProfileForm.from(profile("form"))
 
+    @Test fun aNewProfileDefaultsToACloudSizedWindowNotAnEightKOne() {
+        // 2026-10-22 acceptance: the assistant's model is a cloud service (large context on the provider side); the
+        // on-device models are Laya/embedding/ASR only. Defaulting a new profile to 8 K/1 K made the prompt budget so
+        // tight that a one-line safety hint summarised skill bodies - a configuration defect, not a model limit.
+        val fresh = ProfileForm.from(null)
+        assertEquals("128", fresh.maxInputK)
+        assertEquals("8", fresh.maxOutputK)
+        val draft = fresh.copy(
+            name = "cloud", service = "deepseek", baseUrl = "https://api.deepseek.com",
+            model = "deepseek-chat", protocolId = "DEEPSEEK_RESPONSES",
+        ).draft("new", null, hasNewSecret = true)
+        assertEquals(131_072, draft.usableWindowTokens)
+        assertEquals(8_192, draft.maxOutputTokens)
+        assertEquals(256, draft.safetyTokens)
+        assertEquals(122_624, draft.inputBudgetTokens)
+    }
+
     @Test fun newProfileUsesDeclaredDecimalKCapacityAndReservesOutputAndSafety() {
         val draft = form().copy(maxInputK = "8.0009765625", maxOutputK = "1.5")
             .draft("new", null, true)

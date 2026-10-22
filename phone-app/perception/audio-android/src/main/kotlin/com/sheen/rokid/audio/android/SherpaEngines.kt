@@ -59,6 +59,7 @@ class SherpaStreamingAsrEngine internal constructor(private val native: Recogniz
     private var closed = false
     private var partial: String? = null
     private var final: AsrHypothesis? = null
+    private var tailPadded = false
 
     @Synchronized override fun accept(frame: PcmFrame): List<AsrHypothesis> {
         check(!closed && final == null)
@@ -71,13 +72,26 @@ class SherpaStreamingAsrEngine internal constructor(private val native: Recogniz
 
     @Synchronized override fun finish(): AsrHypothesis {
         check(!closed)
-        return final ?: AsrHypothesis(native.finish(), true).also { final = it }
+        return final ?: run {
+            if (!tailPadded) {
+                tailPadded = true
+                // Streaming zipformer decodes in chunks of T = 39 frames (32 decoded + 7 right-context pad), and
+                // `decode` only runs while `processed + chunkSize < framesReady`. The VAD's endpoint arrives after
+                // 350 ms of silence, which can be 50 ms short of the 400 ms the last chunk needs; the last syllable's
+                // tokens are then never decoded (the 2026-10-22 K70 acceptance: the final character was consistently
+                // wrong at normal speed, fine when speaking slowly). The official sherpa streaming example for this
+                // model appends 0.4 s of silence before `inputFinished()`; do the same, once, before finishing.
+                native.accept(FloatArray(TAIL_PAD_SAMPLES), SAMPLE_RATE_HZ)
+            }
+            AsrHypothesis(native.finish(), true).also { final = it }
+        }
     }
 
     @Synchronized override fun reset() {
         check(!closed)
         native.reset()
         partial = null; final = null
+        tailPadded = false
     }
 
     @Synchronized override fun close() {
@@ -85,6 +99,12 @@ class SherpaStreamingAsrEngine internal constructor(private val native: Recogniz
         closed = true
         partial = null; final = null
         native.release()
+    }
+
+    private companion object {
+        /** 0.4 s at 16 kHz: the tail padding the model's official streaming example uses before `inputFinished()`. */
+        const val TAIL_PAD_SAMPLES = 6400
+        const val SAMPLE_RATE_HZ = 16_000
     }
 }
 

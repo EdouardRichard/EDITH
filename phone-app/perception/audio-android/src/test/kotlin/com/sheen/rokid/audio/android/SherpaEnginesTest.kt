@@ -24,6 +24,20 @@ class SherpaEnginesTest {
         assertThrows(IllegalStateException::class.java) { engine.accept(frame()) }
     }
 
+    @Test fun asrFinishPadsTheFinalChunkOnceWithFourHundredMillisecondsOfSilence() {
+        val port = RecordingRecognizerPort().apply { final = "done" }
+        val engine = SherpaStreamingAsrEngine(port)
+        try {
+            engine.accept(frame())
+            assertEquals(AsrHypothesis("done", true), engine.finish())
+            assertEquals("one real frame plus one padded tail", 2, port.accepts)
+            assertEquals("0.4 s at 16 kHz", 6400, port.acceptSizes.last())
+            assertTrue("the tail must be silence", port.lastAcceptAllZero)
+            engine.finish()
+            assertEquals("the cached final must not pad a second time", 2, port.accepts)
+        } finally { engine.close() }
+    }
+
     @Test fun asrResetClearsDedupAndRejectsInputAfterFinalUntilReset() {
         val port = RecordingRecognizerPort().apply { partial = "same"; final = "first" }
         val engine = SherpaStreamingAsrEngine(port)
@@ -62,7 +76,14 @@ class SherpaEnginesTest {
 
     private class RecordingRecognizerPort : RecognizerPort {
         var partial = ""; var final = ""; var finished = 0; var releases = 0; var resets = 0; var accepts = 0
-        override fun accept(samples: FloatArray, sampleRateHz: Int) = partial.also { accepts++ }
+        val acceptSizes = mutableListOf<Int>()
+        var lastAcceptAllZero = false
+        override fun accept(samples: FloatArray, sampleRateHz: Int): String {
+            accepts++
+            acceptSizes += samples.size
+            lastAcceptAllZero = samples.isNotEmpty() && samples.all { it == 0f }
+            return partial
+        }
         override fun finish() = final.also { finished++ }
         override fun reset() { resets++ }
         override fun release() { releases++ }

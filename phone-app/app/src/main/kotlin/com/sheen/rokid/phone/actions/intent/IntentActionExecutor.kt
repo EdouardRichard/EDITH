@@ -11,6 +11,8 @@ import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.plugin.StorageHandle
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.intOrNull
@@ -27,7 +29,8 @@ private const val DIAL = "dial"
 
 private const val ARGUMENTS_INVALID = "ARGUMENTS_INVALID"
 private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
-private const val APP_NOT_VISIBLE = "APP_NOT_VISIBLE"
+private const val APP_NOT_FOUND = "APP_NOT_FOUND"
+private const val APP_AMBIGUOUS = "APP_AMBIGUOUS"
 private const val LAUNCH_REFUSED = "LAUNCH_REFUSED"
 private const val INVALID_URL = "INVALID_URL"
 private const val INVALID_SETTINGS_PAGE = "INVALID_SETTINGS_PAGE"
@@ -35,6 +38,10 @@ private const val INVALID_TIME = "INVALID_TIME"
 private const val STORAGE_UNAVAILABLE = "STORAGE_UNAVAILABLE"
 private const val INVALID_NOTE = "INVALID_NOTE"
 private const val CALL_PERMISSION_MISSING = "CALL_PERMISSION_MISSING"
+
+/** Why a failed `open_app` is worth another step: the app umbrella can resolve a package the display name cannot. */
+private const val OPEN_FALLBACK_HINT = "打开应用优先用 open（支持包名与候选）"
+private const val OPEN_AMBIGUOUS_HINT = "请用 open 传包名，或问用户选哪个"
 
 /**
  * A dialable number and nothing else. Same rule as the privileged channel's package name: the model's string is
@@ -91,7 +98,7 @@ private val DESCRIPTORS: List<ActionDescriptor> = listOf(
     ActionDescriptor(
         name = OPEN_APP,
         title = "打开 App",
-        description = "按应用显示名启动一个设备上可见的 App（name 是显示名，不是包名）。名称唯一匹配时直接打开；找不到匹配、或匹配到多个时都返回 APP_NOT_VISIBLE，且不会给出候选、也不会替你猜。只在名称明确、且不需要列应用、打开链接或设置页时用它；用户说的是类别词（如“音乐”“浏览器”）、可能有歧义或需要候选时用 open。启动器拒绝时返回 LAUNCH_REFUSED；未安装的 App 不会被假装打开。",
+        description = "按应用显示名打开一个设备上可见的 App（name 是显示名，不是包名）。名称唯一匹配时直接打开；匹配到多个返回 APP_AMBIGUOUS 并附候选（用 open 传包名，或问用户选哪个）；找不到返回 APP_NOT_FOUND；启动器拒绝返回 LAUNCH_REFUSED。打开应用优先用 open（它有包名兜底、候选和前台校验）；本工具只在需要不依赖 Shizuku 的 Intent 通道兜底时使用。",
         parametersJson = """{"type":"object","properties":{"name":{"type":"string","description":"App 名称"}},""" +
             """"required":["name"],"additionalProperties":false}""",
         risk = RiskLevel.L0,
@@ -239,10 +246,22 @@ class IntentActionExecutor(
     private fun openApp(argsJson: String): ActionResult {
         val args = objectArguments(argsJson) ?: return refused(ARGUMENTS_INVALID)
         val name = args.string(NAME) ?: return refused(ARGUMENTS_INVALID)
-        val resolution = resolver.resolve(name)
-        val target = (resolution as? LaunchResolution.Found)?.target ?: return refused(APP_NOT_VISIBLE)
-        val launched = launcher.launch(Intent.ACTION_MAIN, PACKAGE_URI_SCHEME + target.packageName, emptyMap())
-        return if (launched) done("opened ${target.label}") else refused(LAUNCH_REFUSED)
+        // The resolver's three answers are different facts and must stay apart: a name that matched two apps is not
+        // "not found", and neither is "the app is not visible". The old `?: APP_NOT_VISIBLE` collapsed all three into
+        // one unrecoverable code, so the model retried the same guess (2026-10-22 K70 acceptance: one failed
+        // `open_app` on 微信 cost a step before the open umbrella resolved it).
+        return when (val resolution = resolver.resolve(name)) {
+            is LaunchResolution.NotFound -> refusedLaunch(APP_NOT_FOUND, detail = OPEN_FALLBACK_HINT)
+            is LaunchResolution.Ambiguous -> refusedLaunch(
+                APP_AMBIGUOUS,
+                detail = formatCandidates(resolution.candidates) + "；" + OPEN_AMBIGUOUS_HINT,
+            )
+            is LaunchResolution.Found -> {
+                val target = resolution.target
+                val launched = launcher.launch(Intent.ACTION_MAIN, PACKAGE_URI_SCHEME + target.packageName, emptyMap())
+                if (launched) done("opened ${target.label}") else refusedLaunch(LAUNCH_REFUSED)
+            }
+        }
     }
 
     private fun openUrl(argsJson: String): ActionResult {
@@ -353,4 +372,28 @@ class IntentActionExecutor(
 
     private fun done(detail: String) = ActionResult(ActionOutcome.Done, detail)
     private fun refused(code: String) = ActionResult(ActionOutcome.Refused, code)
+
+    /**
+     * A refused launch carries `recoverable = true` on purpose: all three answers (not found / ambiguous / launcher
+     * refused) are worth one more step with `open`, whose resolver has a package fallback and returns candidates.
+     * Without the execution block the default is `recoverable = false`, which tells the model to give up.
+     */
+    private fun refusedLaunch(code: String, detail: String? = null): ActionResult = ActionResult(
+        ActionOutcome.Refused,
+        if (detail == null) code else "$code:$detail",
+        execution = ToolExecution(outcome = ToolOutcome.Refused, code = code, recoverable = true),
+    )
+
+    /** The candidates in the same shape `open` returns, so the model can hand a package back. */
+    private fun formatCandidates(candidates: List<AppLaunchResolver.LaunchTarget>): String =
+        candidates.joinToString(",", "[", "]") { candidate ->
+            """{"label":"${escapeJson(candidate.label)}","packageName":"${escapeJson(candidate.packageName)}"}"""
+        }
+
+    private fun escapeJson(value: String): String = value
+        .replace("\\", "\\\\")
+        .replace("\"", "\\\"")
+        .replace("\n", "\\n")
+        .replace("\r", "\\r")
+        .replace("\t", "\\t")
 }

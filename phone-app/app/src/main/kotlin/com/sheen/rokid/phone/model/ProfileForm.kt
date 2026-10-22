@@ -42,9 +42,23 @@ data class ProfileForm(
     }
 
     companion object {
-        fun from(profile: ModelProfile?) = ProfileForm(profile?.name ?: "", profile?.service ?: "", profile?.baseUrl ?: "",
-            profile?.model ?: "", profile?.protocolId ?: "DEEPSEEK_RESPONSES", formatKTokens(profile?.usableWindowTokens ?: 8192),
-            formatKTokens(profile?.maxOutputTokens ?: 1024), (profile?.timeoutMillis ?: 30000).toString(),
+        /**
+         * A new profile defaults to a **cloud-sized** window: 128 K in, 8 K out.
+         *
+         * The assistant's model is a cloud service; the on-device models (Laya, embedding, ASR) never answer the
+         * assistant turn. The old 8 K/1 K defaults made the prompt budget so tight that a one-line hint summarised
+         * skill bodies (2026-10-22 K70 acceptance), which is a configuration defect rather than a model limit. The
+         * provider's real limit stays editable per profile.
+         */
+        const val DEFAULT_WINDOW_TOKENS = 131_072
+        const val DEFAULT_OUTPUT_TOKENS = 8_192
+
+        fun from(profile: ModelProfile?) = ProfileForm(
+            profile?.name ?: "", profile?.service ?: "", profile?.baseUrl ?: "",
+            profile?.model ?: "", profile?.protocolId ?: "DEEPSEEK_RESPONSES",
+            formatKTokens(profile?.usableWindowTokens ?: DEFAULT_WINDOW_TOKENS),
+            formatKTokens(profile?.maxOutputTokens ?: DEFAULT_OUTPUT_TOKENS),
+            (profile?.timeoutMillis ?: 30000).toString(),
             profile?.inputs ?: setOf(InputModality.TEXT), profile?.outputs ?: setOf(OutputModality.TEXT))
     }
 }

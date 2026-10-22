@@ -374,13 +374,45 @@ class AndroidPerceptionProviderTest {
 
         val snapshot = harness.provider.beginTurn()
 
-        assertEquals("unavailable(no_accessibility)", snapshot.coverage.screen)
+        assertEquals("an unknown failure is not blamed on the permission", "unavailable(observe_failed)",
+            snapshot.coverage.screen)
         assertTrue(snapshot.elements.isEmpty())
         assertEquals("ok", snapshot.coverage.notifications)
         assertEquals("ok", snapshot.coverage.clipboard)
         assertEquals("ok", snapshot.coverage.acoustic)
         assertEquals("ok", snapshot.coverage.calendar)
         assertNotNull(harness.registry.currentSnapshot())
+    }
+
+    @Test
+    fun aLockedPhoneIsReportedAsLockedNotAsAMissingPermission() {
+        val harness = Harness()
+        harness.observeFailure = ScreenReadUnavailable("DEVICE_LOCKED")
+
+        val snapshot = harness.provider.beginTurn()
+
+        assertEquals("unavailable(locked)", snapshot.coverage.screen)
+        assertTrue(snapshot.elements.isEmpty())
+    }
+
+    @Test
+    fun aDozingPhoneIsReportedAsScreenOff() {
+        val harness = Harness()
+        harness.observeFailure = ScreenReadUnavailable("DEVICE_SCREEN_OFF")
+
+        val snapshot = harness.provider.beginTurn()
+
+        assertEquals("unavailable(screen_off)", snapshot.coverage.screen)
+    }
+
+    @Test
+    fun anUnboundAccessibilityChannelStillReportsNoAccessibility() {
+        val harness = Harness()
+        harness.observeFailure = ScreenReadUnavailable("CHANNEL_UNAVAILABLE")
+
+        val snapshot = harness.provider.beginTurn()
+
+        assertEquals("unavailable(no_accessibility)", snapshot.coverage.screen)
     }
 
     @Test

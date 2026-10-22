@@ -93,7 +93,11 @@ internal class AndroidPerceptionProvider(
         val observation: Observation?,
         val refs: Map<String, Ref>,
         val foreground: Foreground?,
+        val screenUnavailable: String?,
     )
+
+    /** The screen source's answer: an observation, or the reason it has none ([screenUnavailable]). */
+    private data class ScreenRead(val observation: Observation?, val screenUnavailable: String?)
 
     private var cached: CachedTurn? = null
 
@@ -113,14 +117,18 @@ internal class AndroidPerceptionProvider(
 
     @Synchronized
     override fun afterAction(): PerceptionSnapshot {
-        val observation = latestObservationOrNull() ?: observeAll()
-        return openSnapshot(observation)
+        val latest = latestObservationOrNull()
+        val read = if (latest != null) ScreenRead(latest, null) else observeAll()
+        return openSnapshot(read.observation, read.screenUnavailable)
     }
 
-    private fun openFreshSnapshot(): PerceptionSnapshot = openSnapshot(observeAll())
+    private fun openFreshSnapshot(): PerceptionSnapshot {
+        val read = observeAll()
+        return openSnapshot(read.observation, read.screenUnavailable)
+    }
 
     /** Opens a new snapshot over [observation] and caches the result; the one fresh-build body for begin/refresh/action. */
-    private fun openSnapshot(observation: Observation?): PerceptionSnapshot {
+    private fun openSnapshot(observation: Observation?, screenUnavailable: String?): PerceptionSnapshot {
         val foregroundFacts = foregroundOrNull()
         val now = safeClock()
         val snapshotId = UUID.randomUUID().toString()
@@ -134,8 +142,9 @@ internal class AndroidPerceptionProvider(
             include = ALL_SOURCES,
             filter = PerceptionFilter.ALL,
             limit = null,
+            screenUnavailable = screenUnavailable,
         )
-        cached = CachedTurn(snapshotId, now, observation, refs, foregroundFacts)
+        cached = CachedTurn(snapshotId, now, observation, refs, foregroundFacts, screenUnavailable)
         return snapshot
     }
 
@@ -156,6 +165,7 @@ internal class AndroidPerceptionProvider(
                 include = include,
                 filter = filter,
                 limit = limit,
+                screenUnavailable = turn.screenUnavailable,
             )
         }
         // No open turn (snapshot() after endTurn, or before beginTurn): rebuild from what is already cached only. No
@@ -217,6 +227,7 @@ internal class AndroidPerceptionProvider(
         include: Set<PerceptionSource>,
         filter: PerceptionFilter,
         limit: Int?,
+        screenUnavailable: String? = null,
     ): PerceptionSnapshot {
         val effectivePolicy = runCatching { policy() }.getOrDefault(PerceptionPolicy())
         val profile = runCatching { deviceState.profile() }.getOrNull()
@@ -261,6 +272,7 @@ internal class AndroidPerceptionProvider(
             include = include,
             filter = filter,
             limit = limit,
+            screenUnavailable = screenUnavailable,
         )
     }
 
@@ -303,7 +315,27 @@ internal class AndroidPerceptionProvider(
         return runCatching { registry.assign(observation) }.getOrDefault(emptyMap())
     }
 
-    private fun observeAll(): Observation? = runCatching { observe(ScreenFilter.ALL) }.getOrNull()
+    private fun observeAll(): ScreenRead = runCatching {
+        ScreenRead(observe(ScreenFilter.ALL), null)
+    }.getOrElse { failure ->
+        ScreenRead(null, screenUnavailable(failure))
+    }
+
+    /**
+     * Maps the kernel's failure to the coverage token the model reads.
+     *
+     * `DEVICE_LOCKED` / `DEVICE_SCREEN_OFF` are not accessibility failures: the service is bound, there is simply no
+     * readable window. Reporting them as `no_accessibility` made the assistant tell the wearer the screen-reading
+     * permission was off (2026-10-22 K70 acceptance). Unknown failures keep their own honest token so the prompt no
+     * longer blames the permission for everything.
+     */
+    private fun screenUnavailable(failure: Throwable): String =
+        when ((failure as? ScreenReadUnavailable)?.reason) {
+            "DEVICE_LOCKED" -> "locked"
+            "DEVICE_SCREEN_OFF" -> "screen_off"
+            "CHANNEL_UNAVAILABLE" -> "no_accessibility"
+            else -> "observe_failed"
+        }
 
     private fun foregroundOrNull(): Foreground? = runCatching { foreground() }.getOrNull()
 

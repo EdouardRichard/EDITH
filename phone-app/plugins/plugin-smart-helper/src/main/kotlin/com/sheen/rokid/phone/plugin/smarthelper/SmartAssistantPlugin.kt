@@ -182,25 +182,19 @@ private const val SKILL_HASH_NONE = "none"
 private const val FALLBACK_EMIT_WAIT_MILLIS = 1_000L
 
 /**
- * How much machine budget one turn's agent run gets when its configured profile has no timeout to borrow.
+ * The agent run's wall-clock budget: effectively **none** (2026-10-22, D197).
  *
- * The budget is the profile's own `timeoutMillis` whenever there is one, because that is the number the user chose for
- * this assistant; this is the documented fallback for the configurations that have no profile (or whose profile has
- * gone missing). It is deliberately longer than the ~5.5 s the device measured between the wake segment's blank final
- * and the request's own final, because a turn whose model request runs in that segment must not be starved by the
- * recogniser's own delay.
+ * Mainstream agents bound a run with per-request/per-tool timeouts plus step and no-progress guards, not with a total
+ * duration: Claude's Agent SDK leaves `maxTurns`/`maxBudgetUsd` off unless the caller sets them, OpenAI's Agents SDK
+ * uses a turn count (10), and LangGraph uses a recursion limit. The old 180 s total cap cut a **working** 22-step
+ * proactive follow-up at exactly 180 s (K70 acceptance 2026-10-22: `modelMs=120997` + `toolMs=56056`) and surfaced
+ * the cut as "回答超时了，稍后再试"; the run was making progress.
  *
- * The official **10 s listening window** is a different number and lives in `OfficialConversation` /
- * `ConversationCycle`; it starts at `PANEL_SHOWN` and never bounds this run.
+ * The guards that remain describe "stuck", not "slow": `AgentLoop.maxSteps` (24), `ProgressGuard`, the error streak,
+ * the observation budget, the profile's per-request timeout, and the user's STOP/panel close. 24 h is a sanity
+ * ceiling for arithmetic/schedulers, not a product limit; a real run ends long before it on the step guard.
  */
-private const val DEFAULT_TURN_BUDGET_MILLIS = 15_000L
-
-/**
- * The agent turn is a multi-step UI task, not one model request. The profile timeout bounds each provider request;
- * using it as the whole turn budget cut T7 (search → play → home) at 30 s while the corpus allows 180 s. Keep the
- * provider cap untouched and give the agent a floor that matches the multi-step acceptance window.
- */
-private const val MIN_AGENT_TURN_BUDGET_MILLIS = 180_000L
+private const val AGENT_TURN_BUDGET_NANOS = 24L * 60L * 60L * 1_000_000_000L
 private const val AUDIT_CAPACITY = 512
 
 /**
@@ -692,6 +686,14 @@ class SmartAssistantPlugin(
         checkNotNull(activeContextForTurn) {
             "no session context policy: the configured model profile is missing or invalid"
         }.compressionBudgetTokens()
+
+    /**
+     * Test-only: the wall-clock budget the next agent turn receives.
+     *
+     * Since 2026-10-22 (D197) this is the effectively unbounded [AGENT_TURN_BUDGET_NANOS], not the old 180 s product
+     * cap. The behavioral guards are `AgentLoop.maxSteps`, `ProgressGuard` and the per-request profile timeout.
+     */
+    internal fun agentTurnBudgetNanosForTest(): Long = turnBudgetNanos()
 
     private data class Config(
         val profileId: String,
@@ -2899,21 +2901,16 @@ class SmartAssistantPlugin(
     }
 
     /**
-     * The **machine budget** one turn's agent run gets: the configured profile's timeout when there is one (the number
-     * the user chose), otherwise [DEFAULT_TURN_BUDGET_MILLIS].
+     * The agent run's **machine budget** (2026-10-22, D197): none.
      *
-     * This is deliberately not the official 10 s listening window. Since 0.24 S3 that window belongs to
-     * [conversationCycle] and starts at `PANEL_SHOWN`; this number bounds the run that starts once a usable transcript
-     * arrives, and Task 12 re-anchors it at that moment rather than at the wake, so waiting a long time before speaking
-     * cannot eat the model's budget.
+     * The profile timeout still bounds each **provider request** (`requestTimeoutNanos`), and the loop still stops on
+     * the step guard, `ProgressGuard`, the error streak and the observation budget. A total wall-clock cap is what the
+     * mainstream harnesses do not use, and it cut a working multi-step proactive follow-up at 180 s.
+     *
+     * This is deliberately not the official 10 s listening window: since 0.24 S3 that window belongs to
+     * [conversationCycle] and starts at `PANEL_SHOWN`; this number no longer bounds the run at all.
      */
-    private fun turnBudgetNanos(): Long {
-        val configuredMillis = config?.let { profileLookup(it.profileId) }?.timeoutMillis ?: 0L
-        // The profile timeout is the per-request cap; the agent loop is multi-step (T7: search → play → home). A floor
-        // keeps the provider cap from truncating the whole turn before the task can finish.
-        val turnMillis = maxOf(configuredMillis, MIN_AGENT_TURN_BUDGET_MILLIS)
-        return turnMillis * 1_000_000L
-    }
+    private fun turnBudgetNanos(): Long = AGENT_TURN_BUDGET_NANOS
 
     /**
      * The final-transcript gate.

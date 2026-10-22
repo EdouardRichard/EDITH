@@ -10,7 +10,7 @@ package com.sheen.rokid.phone.plugin.smarthelper.host.ui
  *   (the dialog must never stand between a user and disabling unconfirmed execution).
  * - **The warning says what the mode really does.** It names the whole L0–L4 range, says confirmations stop, says the
  *   mode survives close/kill/restart, says only a manual disable exits it, and warns that destructive actions may not
- *   be undoable. The persistent banner repeats the short form on every page while the mode is on.
+ *   be undoable. The owner removed the persistent top banner on 2026-10-22; the settings page keeps this copy.
  *
  * The Compose wiring around this object is not claimed as device-tested in B2; it is verified by compilation and the
  * pure state test only.
@@ -37,11 +37,7 @@ object NoInterceptionUi {
         "审计记录与「急停」仍然可用。",
     )
 
-    /** The persistent in-App banner while the mode is on. */
-    const val BANNER = "不拦截已开启：L0–L4 工具调用将直接执行，不再请求确认"
-
-    /** The banner's second line: how long it lasts and how to leave it. */
-    const val BANNER_DETAIL = "关闭 App、被杀或重启后仍保持开启；需在设置页手动关闭。"
+    /** The persistent top banner was removed by the owner on 2026-10-22; the settings copy above remains. */
 
     /**
      * True only for the dangerous off → on move.

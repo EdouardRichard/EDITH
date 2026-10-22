@@ -21,7 +21,7 @@ import kotlin.test.assertTrue
  */
 class ToolLabelMapTest {
 
-    /** The 24 default tools, with the label the user sees for each. */
+    /** The 23 default tools, with the label the user sees for each. */
     private val labeled = listOf(
         // atomic a11y
         "read_screen" to "读取屏幕内容",
@@ -41,8 +41,7 @@ class ToolLabelMapTest {
         "disable_app" to "停用应用",
         "set_permission" to "变更应用权限",
         "set_brightness" to "调整亮度",
-        // atomic launch/system
-        "launch_app" to "启动应用",
+        // atomic local directory / system keys (`launch_app` retired 2026-10-22, 24 → 23)
         "list_apps" to "列出应用",
         "system_action" to "系统按键",
         // the umbrella catalog
@@ -56,12 +55,12 @@ class ToolLabelMapTest {
     )
 
     @Test
-    fun allTwentyFourToolsAreRegisteredWithTheirUserFacingLabel() {
-        assertEquals(24, labeled.size, "the fixture is the default face")
+    fun allTwentyThreeToolsAreRegisteredWithTheirUserFacingLabel() {
+        assertEquals(23, labeled.size, "the fixture is the default face")
         assertEquals(
             labeled.map { it.first }.toSet(),
             ToolLabelMap.entries.keys,
-            "the map must cover exactly the 24 default tools",
+            "the map must cover exactly the 23 default tools",
         )
         labeled.forEach { (action, label) ->
             assertTrue(ToolLabelMap.isRegistered(action), "$action must be registered")

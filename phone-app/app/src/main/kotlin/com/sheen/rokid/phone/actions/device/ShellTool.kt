@@ -238,7 +238,7 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
         val DESCRIPTOR: ActionDescriptor = ActionDescriptor(
             name = NAME,
             title = "终端命令",
-            description = "在特权 shell（Shizuku）执行一条命令：command 必填；stdin 本版不支持（返回 UNSUPPORTED），每个输出流按 max_bytes 截断并标 truncated；timeout_ms 只是语义参数，本版不会中断已发出的命令。只在没有专用工具能完成时使用：点击/输入/滑动用 device 或对应的 atomic 工具，按键用 system_action，启动应用用 open 或 launch_app，不要用 shell 模拟用户操作。可能改变系统状态的命令（pm clear/uninstall、settings put、rm、reboot、su 等）会先走命令级确认。退出码非 0 是 Failed 且 data 带 exitCode/stdout/stderr；回包被截断返回 SHELL_REPLY_TOO_LARGE，载体或解析失败返回 SHELL_FAILED，通道未就绪返回 SHELL_NOT_BOUND。不要用它处理用户隐私内容，也不要拼接未转义输入。",
+            description = "在特权 shell（Shizuku）执行一条命令：command 必填；stdin 本版不支持（返回 UNSUPPORTED），每个输出流按 max_bytes 截断并标 truncated；timeout_ms 只是语义参数，本版不会中断已发出的命令。只在没有专用工具能完成时使用：点击/输入/滑动用 device 或对应的 atomic 工具，按键用 system_action，启动应用用 open，不要用 shell 模拟用户操作。可能改变系统状态的命令（pm clear/uninstall、settings put、rm、reboot、su 等）会先走命令级确认。退出码非 0 是 Failed 且 data 带 exitCode/stdout/stderr；回包被截断返回 SHELL_REPLY_TOO_LARGE，载体或解析失败返回 SHELL_FAILED，通道未就绪返回 SHELL_NOT_BOUND。不要用它处理用户隐私内容，也不要拼接未转义输入。",
             parametersJson = """{"type":"object","properties":{""" +
                 """"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},""" +
                 """"max_bytes":{"type":"integer","minimum":1},"stdin":{"type":"string"}},""" +

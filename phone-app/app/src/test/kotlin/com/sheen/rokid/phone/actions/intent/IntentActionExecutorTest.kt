@@ -293,13 +293,22 @@ class IntentActionExecutorTest {
     // ---- refusals -----------------------------------------------------------------------------------------
 
     @Test
-    fun openAppRefusesAnAmbiguousOrUnknownNameInsteadOfGuessing() {
+    fun openAppReportsMissingAndAmbiguousNamesAsDistinctRetryableAnswers() {
         val rig = rig(AppEntry("com.camera", "Camera", Intent.ACTION_MAIN),
             AppEntry("com.scanner", "CamScanner", Intent.ACTION_MAIN))
 
-        rig.refused("open_app", """{"name":"cam"}""", "APP_NOT_VISIBLE")
-        rig.refused("open_app", """{"name":"地图"}""", "APP_NOT_VISIBLE")
-        rig.refused("open_app", """{"name":"   "}""", "APP_NOT_VISIBLE")
+        val ambiguous = rig.execute("open_app", """{"name":"cam"}""")
+        assertEquals("an ambiguity is a Refused, never a Done", ActionOutcome.Refused, ambiguous.outcome)
+        assertTrue("the candidates must travel: ${ambiguous.detail}", ambiguous.detail.startsWith("APP_AMBIGUOUS:["))
+        assertTrue("both packages must be visible to the model: ${ambiguous.detail}",
+            ambiguous.detail.contains("com.camera") && ambiguous.detail.contains("com.scanner"))
+        assertEquals("APP_AMBIGUOUS", ambiguous.execution?.code)
+        assertEquals("the model can retry with open", true, ambiguous.execution?.recoverable)
+
+        rig.refused("open_app", """{"name":"地图"}""",
+            "APP_NOT_FOUND:打开应用优先用 open（支持包名与候选）")
+        rig.refused("open_app", """{"name":"   "}""",
+            "APP_NOT_FOUND:打开应用优先用 open（支持包名与候选）")
         assertTrue("a refusal must not launch anything", rig.launcher.calls.isEmpty())
     }
 

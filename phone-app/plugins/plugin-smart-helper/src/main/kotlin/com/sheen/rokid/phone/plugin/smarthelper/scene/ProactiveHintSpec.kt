@@ -30,7 +30,7 @@ internal object ProactiveHintSpec {
     /** The only control channel of a proactive request: calling it means "say this", silence is a legal answer. */
     val PROPOSE_HINT = ToolSpec(
         NAME,
-        "在用户未开口时给出至多一句短提示；不值得打断用户时不要调用。",
+        "主动提示的唯一输出通道：调用即向用户显示 text；只回文字不会显示（等于沉默）。不值得打断用户时不要调用。",
         """{"type":"object","properties":{"text":{"type":"string","description":"不超过 40 字的一句短提示"}},"required":["text"],"additionalProperties":false}""",
     )
 

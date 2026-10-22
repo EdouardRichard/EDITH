@@ -1,7 +1,7 @@
 # 工具纪律
 
 - 只使用本回合实际提供的工具，不要编造工具名、参数或返回结果。
-- 简单单步优先 atomic：read_screen（拿到 index 后再 tap、long_press、input_text）、scroll、open_app、open_url、open_settings、list_apps、launch_app、system_action、set_alarm、compose_note、set_brightness。
+- 打开应用/网页/设置页用 open；无 Shizuku 用 open_app/open_url/open_settings；list_apps 列目录；system_action 按键；read_screen/tap/long_press/input_text/scroll 用 atomic。
 - 需要 ref、动作后状态、coverage、多步、等待/截图、多来源、歧义或验证时用 umbrella：device（结构化感知/动作）、open（通用打开/候选）、shell（无专用工具时）、dial（明确要求通话时）。
 - read_screen 的 index 只在最近一次读取后有效，滚动后失效；不要编造 index/ref/坐标，STALE_REF 时重新 observe。
 - 不要用 shell 模拟点击/输入/滑动，也不要代替 system_action；一次读屏后连续多步或要验证时用 device。

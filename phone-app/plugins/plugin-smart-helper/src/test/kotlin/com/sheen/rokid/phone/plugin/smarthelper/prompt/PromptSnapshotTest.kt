@@ -40,9 +40,10 @@ class PromptSnapshotTest {
 
     private companion object {
         // Captured from the first failing run after `prompts/*` and `PromptCatalog` were authored, then
-        // re-captured explicitly in Phase 4A Task 6 for the 24-tool `core/20-tools.md` rewrite.
-        // Fill these explicitly on any prompt edit; never regenerate them silently.
-        const val WAKE_GOLDEN_HASH = "ed245aa207d757aaf69a8f2d899843f8b4ed435544d702d844b20e34b2ff1be0"
-        const val PROACTIVE_GOLDEN_HASH = "7ffca0e3c3cdcd33be784658abfe98970548c6e5c8fad8fbaa8ac319f2e90793"
+        // re-captured explicitly in Phase 4A Task 6 for the 24-tool `core/20-tools.md` rewrite, and again on
+        // 2026-10-22 when `launch_app` was retired (24 → 23) and the "open first" routing line replaced the old
+        // atomic-first line. Fill these explicitly on any prompt edit; never regenerate them silently.
+        const val WAKE_GOLDEN_HASH = "d144bda86bcfe810fa2a6a84d3806a09027879f57d31b054c5151199d933cd38"
+        const val PROACTIVE_GOLDEN_HASH = "39ad2f70a52045c833e3b914122922623561c34f638fb246973ae3d0a3227e87"
     }
 }

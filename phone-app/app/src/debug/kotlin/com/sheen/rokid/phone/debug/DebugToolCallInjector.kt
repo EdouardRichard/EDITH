@@ -106,7 +106,7 @@ class DebugToolCallInjector : BroadcastReceiver() {
         const val EXTRA_TIMES = "times"
         /** Serve a provider failure instead of the closing answer (`--ez fail true`). */
         const val EXTRA_FAIL = "fail"
-        /** The app name for `launch_app` (`--es name 音乐`). */
+        /** The app name for `open_app` (`--es name 音乐`). */
         const val EXTRA_NAME = "name"
         /** The command for `shell` (`--es command 'cmd package list packages'`); B8 classifier matrix. */
         const val EXTRA_COMMAND = "command"

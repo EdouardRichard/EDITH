@@ -140,26 +140,15 @@ class MainActivity : ComponentActivity() {
                         dismissButton = {},
                     )
                 }
-                // 4B (`D189`): the persistent in-App reminder. It reads the composition's live gate, which is seeded
-                // from the persisted setting and updated by `saveSmartSettings`; the save callback below refreshes this
-                // state from that same gate, so a successful save is reflected without waiting for a restart. The value
-                // is not a separate UI flag: the settings screen itself always loads its draft from the persisted store.
-                var noInterceptionOn by remember { mutableStateOf(root.noInterceptionGate.enabled) }
+                // 2026-10-22 (owner): the persistent top banner was removed. The mode is still enforced and its risk
+                // copy still precedes the switch; the banner repeated it on every page and the owner asked for it to
+                // go. The settings page remains the single place that states the mode and how to leave it.
                 Column(Modifier.fillMaxSize()) {
-                    if (noInterceptionOn) NoInterceptionBanner()
                     Box(Modifier.weight(1f)) {
                         PhoneScreen(state, root, viewModel, profileViewModel, ::requestStart,
                             { SessionService.commandFromUi(this@MainActivity, it) }, notificationsGranted(),
-                            { root.storedSettings() }, { settings ->
-                                // The live gate is the source of truth even when the write fails: `saveSmartSettings`
-                                // applies a disable before the write, so the banner must follow the gate rather than
-                                // assume the save succeeded.
-                                try {
-                                    root.saveSmartSettings(settings)
-                                } finally {
-                                    noInterceptionOn = root.noInterceptionGate.enabled
-                                }
-                            }, remainingSeconds)
+                            { root.storedSettings() }, { settings -> root.saveSmartSettings(settings) },
+                            remainingSeconds)
                     }
                 }
             }
@@ -228,24 +217,11 @@ class MainActivity : ComponentActivity() {
 }
 
 /**
- * 0.3 Phase 4B (`D189`): the persistent in-App banner while 「不拦截」 is on.
+ * 0.3 Phase 4B (`D189`): the persistent in-App banner was removed by the owner on 2026-10-22.
  *
- * It sits above the whole page rather than inside the settings tab, so the mode cannot be forgotten after the user
- * navigates away from the switch. The composition's live gate is its source; see the save callback in [onCreate].
+ * The mode's risk copy stays on the settings page, before the switch and in the second confirmation; the banner
+ * repeated it above every page, which the owner asked to stop. See [NoInterceptionUi] for the remaining copy.
  */
-@Composable
-private fun NoInterceptionBanner() {
-    Surface(
-        color = MaterialTheme.colorScheme.errorContainer,
-        contentColor = MaterialTheme.colorScheme.onErrorContainer,
-        modifier = Modifier.fillMaxWidth(),
-    ) {
-        Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
-            Text(NoInterceptionUi.BANNER, style = MaterialTheme.typography.titleSmall)
-            Text(NoInterceptionUi.BANNER_DETAIL, style = MaterialTheme.typography.bodySmall)
-        }
-    }
-}
 
 /**
  * R109 (user report 2026-10-20, pocket false touch): a confirmation is settled **only** by its 拒绝 / 急停 / 允许

@@ -1,10 +1,11 @@
 package com.sheen.rokid.phone.plugin.smarthelper.output
 
 /**
- * edith-0.3 Phase 4A Task 5 (A5): the tool-row labels for the **24-tool default face**.
+ * edith-0.3 Phase 4A Task 5 (A5), updated 2026-10-22 (launch_app retired: 24 → 23): the tool-row labels for the
+ * **23-tool default face**.
  *
- * The host's `ToolSurface` advertises 22 descriptors — the four umbrella tools `device`/`shell`/`open`/`dial` and the
- * 18 atomic tools — and the plugin adds its own `notify_user`/`load_skill`. This table names all 24, so a tool row can
+ * The host's `ToolSurface` advertises 21 descriptors — the four umbrella tools `device`/`shell`/`open`/`dial` and the
+ * 17 atomic tools — and the plugin adds its own `notify_user`/`load_skill`. This table names all 23, so a tool row can
  * always be painted with user copy even when the host descriptor arrives without a usable title.
  *
  * These values are **user-facing labels, never model-facing descriptions**: `ActionDescriptor.description` is the
@@ -40,7 +41,6 @@ object ToolLabelMap {
         "set_permission" to "变更应用权限",
         "set_brightness" to "调整亮度",
         // atomic launch/system
-        "launch_app" to "启动应用",
         "list_apps" to "列出应用",
         "system_action" to "系统按键",
         // the umbrella catalog

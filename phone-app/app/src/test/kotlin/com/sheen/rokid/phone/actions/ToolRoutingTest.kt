@@ -43,29 +43,25 @@ class ToolRoutingTest {
     }
 
     @Test
-    fun `an ambiguous app name routes to open and never to the intent leg`() {
+    fun `an ambiguous app name routes to open, which can carry the candidates`() {
         val open = face.getValue("open").description
         val openApp = face.getValue("open_app").description
 
         assertTrue("open must name the ambiguity refusal: $open", open.contains("APP_AMBIGUOUS"))
-        assertTrue("open must name open_app as the exact-name tier: $open", open.contains("open_app"))
-        assertFalse(
-            "open_app cannot return candidates; promising them would route the model into APP_AMBIGUOUS, " +
-                "which the atomic tier never emits: $openApp",
-            openApp.contains("APP_AMBIGUOUS"),
-        )
+        assertTrue("open must keep the no-Shizuku fallback discoverable: $open", open.contains("open_app"))
+        assertTrue("open_app must also surface ambiguity now: $openApp", openApp.contains("APP_AMBIGUOUS"))
     }
 
     @Test
-    fun `a known exact app name may route to the atomic open_app`() {
+    fun `a known exact app name may route to the atomic open_app, which points back at open`() {
         val openApp = face.getValue("open_app").description
 
         assertTrue(
-            "open_app must say an unmatched or ambiguous name is APP_NOT_VISIBLE: $openApp",
-            openApp.contains("APP_NOT_VISIBLE"),
+            "open_app must name the missing-app code: $openApp",
+            openApp.contains("APP_NOT_FOUND"),
         )
-        assertFalse("open_app never returns APP_NOT_FOUND: $openApp", openApp.contains("APP_NOT_FOUND"))
-        assertTrue("open_app must point at open for the ambiguous case: $openApp", openApp.contains("用 open"))
+        assertTrue("open_app must name the ambiguity code: $openApp", openApp.contains("APP_AMBIGUOUS"))
+        assertTrue("open_app must point at open for the ambiguous case: $openApp", openApp.contains("open"))
     }
 
     @Test
@@ -74,7 +70,7 @@ class ToolRoutingTest {
         // and the model must wait for recovery instead of switching to a different tier or simulating through shell.
         listOf(
             "read_screen", "tap", "long_press", "scroll", "input_text",
-            "system_action", "launch_app",
+            "system_action",
         ).forEach { name ->
             val description = face.getValue(name).description
             assertTrue("$name must name its channel refusal: $description", description.contains("ACTION_CHANNEL_UNAVAILABLE"))

@@ -70,6 +70,9 @@ internal object PerceptionSnapshotBuilder {
      * @param glasses the link facts, or null when the host has no glasses state.
      * @param visionEnabled the injected vision gate; only consulted when [PerceptionPolicy.includeVision] is on.
      * @param include which sources' *content* the caller asked for; coverage is always complete.
+     * @param screenUnavailable the reason the screen source had no observation (`locked`, `screen_off`,
+     *   `no_accessibility`, `observe_failed`). Null keeps the historical `no_accessibility` token for callers that do
+     *   not know better.
      */
     fun build(
         snapshotId: String,
@@ -93,6 +96,7 @@ internal object PerceptionSnapshotBuilder {
         include: Set<PerceptionSource>,
         filter: PerceptionFilter,
         limit: Int?,
+        screenUnavailable: String? = null,
     ): PerceptionSnapshot {
         val elementLimit = (limit ?: policy.elementLimit)
             .coerceAtMost(policy.elementLimit)
@@ -128,7 +132,7 @@ internal object PerceptionSnapshotBuilder {
 
         val coverage = PerceptionCoverage(
             screen = when {
-                observation == null -> SCREEN_UNAVAILABLE
+                observation == null -> "unavailable(${screenUnavailable ?: SCREEN_UNAVAILABLE_REASON})"
                 observation.truncated || elementCut -> TRUNCATED
                 else -> OK
             },
@@ -318,7 +322,7 @@ internal object PerceptionSnapshotBuilder {
     private const val OK = "ok"
     private const val EMPTY = "empty"
     private const val TRUNCATED = "truncated"
-    private const val SCREEN_UNAVAILABLE = "unavailable(no_accessibility)"
+    private const val SCREEN_UNAVAILABLE_REASON = "no_accessibility"
     private const val NOTIFICATIONS_UNAVAILABLE = "unavailable(no_access)"
 
     /** Final review I3: the listener grant is live but the producer failed; a failed read is not an empty result. */

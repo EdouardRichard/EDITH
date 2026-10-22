@@ -153,7 +153,7 @@ class PromptCatalogTest {
     }
 
     @Test
-    fun `the tools prompt names the twenty four tool face and no route only tool`() {
+    fun `the tools prompt names the twenty three tool face and no route only tool`() {
         val tools = promptText("core/20-tools.md")
 
         DEFAULT_TOOL_NAMES.forEach { name ->
@@ -396,12 +396,12 @@ class PromptCatalogTest {
     }
 
     private companion object {
-        /** The 24-tool default face of 0.3 Phase 4A; the same set `ToolFaceFixture` reads from production. */
+        /** The 23-tool default face after the 2026-10-22 retirement; the same set `ToolFaceFixture` reads from production. */
         val DEFAULT_TOOL_NAMES: Set<String> = linkedSetOf(
             "read_screen", "tap", "long_press", "scroll", "input_text",
             "open_app", "open_url", "open_settings", "set_alarm", "compose_note",
             "clear_data", "uninstall", "disable_app", "set_permission", "set_brightness",
-            "launch_app", "list_apps", "system_action",
+            "list_apps", "system_action",
             "device", "shell", "open", "dial",
             "notify_user", "load_skill",
         )
