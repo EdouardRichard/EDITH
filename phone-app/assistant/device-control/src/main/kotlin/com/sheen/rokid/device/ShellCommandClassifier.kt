@@ -25,8 +25,10 @@ import com.sheen.rokid.plugin.PrecheckDecision
  * 2. **The reason is a category, never the command.** Shell text can contain user data (`content delete --uri …`), so
  *    the reason carried to the audit trail and the summary shown to the wearer name a class of risk, not the words.
  *
- * `settings put`/`pm disable`/`am force-stop` are intentionally allowed: they are reversible (R50), and the window is
- * about irreversible/paid consequences, not about whether the device state changed at all.
+ * The allow list is deliberately narrow: read-only queries (`dumpsys`, `pm list`, `settings get`, `cmd package list`,
+ * …) need no question, while every command that changes device state (`pm disable`, `settings put`, `am force-stop`,
+ * `input`, `reboot`, …) or whose content cannot be read is confirmed. An unknown command is confirmed, never allowed,
+ * so a command this build has not seen fails closed.
  */
 object ShellCommandClassifier {
 
@@ -89,6 +91,12 @@ object ShellCommandClassifier {
 
     /** A prefix that runs another command; the real command is resolved past it. */
     private val PREFIX_WRAPPERS = setOf("env", "xargs", "nohup", "timeout", "nice", "command", "exec", "stdbuf")
+
+    /**
+     * The only `cmd package` verbs allowed without a question: each one reports state and writes nothing. The rest of
+     * `cmd` stays [UNKNOWN_COMMAND] (ask), so a service/verb this table has not vetted cannot ride the allow path.
+     */
+    private val CMD_PACKAGE_READ_ONLY = setOf("list", "path", "resolve-activity")
 
     private val WHITESPACE = Regex("\\s+")
 
@@ -366,23 +374,28 @@ object ShellCommandClassifier {
         if (base in READ_ONLY_COMMANDS) return null
         return when (base) {
             "pm" -> when (tokens.getOrNull(1)) {
-                "list", "path", "disable", "enable", "dump" -> null
+                "list", "path", "dump" -> null
+                // Disabling/enabling a package and writing a setting change device state, so they are asked even
+                // though they can be reversed afterwards.
+                "disable", "disable-user", "enable" -> DEVICE_STATE
                 "clear", "uninstall" -> IRREVERSIBLE
                 "grant", "revoke" -> SECURITY
                 else -> if (tokens.getOrNull(1)?.startsWith("get-") == true) null else UNKNOWN_COMMAND
             }
             "settings" -> when (tokens.getOrNull(1)) {
-                "get", "list", "put" -> null
+                "get", "list" -> null
+                "put" -> DEVICE_STATE
                 "delete", "reset" -> IRREVERSIBLE
                 else -> UNKNOWN_COMMAND
             }
             "am" -> when (tokens.getOrNull(1)) {
-                "start", "start-activity", "force-stop" -> null
-                "kill", "kill-all" -> PROCESS_KILL
+                "start", "start-activity" -> null
+                "force-stop", "kill", "kill-all" -> PROCESS_KILL
                 else -> UNKNOWN_COMMAND
             }
             "cmd" -> when {
-                tokens.getOrNull(1) == "package" && tokens.getOrNull(2) == "resolve-activity" -> null
+                tokens.getOrNull(1) == "package" &&
+                    tokens.getOrNull(2) in CMD_PACKAGE_READ_ONLY -> null
                 else -> UNKNOWN_COMMAND
             }
             "content" -> when (tokens.getOrNull(1)) {

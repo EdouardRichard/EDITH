@@ -5,6 +5,7 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertNotNull
+import kotlin.test.assertNull
 import kotlin.test.assertTrue
 
 /**
@@ -21,26 +22,137 @@ import kotlin.test.assertTrue
 class ShellCommandClassifierTest {
 
     @Test
-    fun `read only and explicitly reversible commands are allowed`() {
+    fun `benign queries and read only commands are allowed`() {
         val commands = listOf(
             "dumpsys window",
             "pm list packages",
+            "pm path com.x",
             "settings get system screen_brightness",
+            "settings list global",
             "getprop ro.product.model",
             "ls /sdcard",
             "stat /sdcard/x",
+            "content query --uri content://com.x/items",
             "am start -a android.intent.action.VIEW -d https://x",
-            // Reversible, so R50 keeps them out of the confirmation path even though they change state.
-            "am force-stop com.x",
-            "pm disable com.x",
-            "settings put system screen_brightness 10",
+            // B6: `cmd package` queries are read-only; they must not be treated as an unknown command.
+            "cmd package list packages",
+            "cmd package list packages -3",
+            "cmd package path com.x",
             "cmd package resolve-activity --brief com.x",
-            "pm path com.x",
+            // The same benign words with extra whitespace, an absolute path and quoting are still benign.
+            "  cmd   package   list   packages  ",
+            "\tcmd\tpackage\tlist\tpackages\t",
+            "/system/bin/cmd package list packages",
+            "'cmd' 'package' 'list' 'packages'",
+            "cmd \"package\" list 'packages'",
+            "cmd package list packages 2>/dev/null",
         )
 
         commands.forEach { command ->
-            assertEquals(PrecheckDecision.Allow, ShellCommandClassifier.classify(command).decision,
-                "expected Allow for `$command`")
+            val result = ShellCommandClassifier.classify(command)
+            assertEquals(PrecheckDecision.Allow, result.decision, "expected Allow for `$command`")
+            assertNull(result.reason, "Allow is 'no question needed', so it carries no risk category: `$command`")
+        }
+    }
+
+    @Test
+    fun `high risk device state commands require confirmation with a category reason`() {
+        val cases = listOf(
+            // B6: these used to be allowed. They change device state, so the wearer must be asked.
+            "pm disable com.x" to "DEVICE_STATE",
+            "  pm   disable   com.x  " to "DEVICE_STATE",
+            "'pm' 'disable' com.x" to "DEVICE_STATE",
+            "/system/bin/pm disable com.x" to "DEVICE_STATE",
+            "pm disable-user --user 0 com.x" to "DEVICE_STATE",
+            "pm enable com.x" to "DEVICE_STATE",
+            "settings put system screen_brightness 10" to "DEVICE_STATE",
+            "am force-stop com.x" to "PROCESS_KILL",
+            // The rest of the dangerous table, pinned by category so a reclassification cannot pass silently.
+            "input tap 100 200" to "DEVICE_STATE",
+            "reboot" to "DEVICE_STATE",
+            "su -c id" to "SECURITY",
+            "settings delete global screen_brightness" to "IRREVERSIBLE",
+            "settings reset global" to "IRREVERSIBLE",
+            "pm clear com.x" to "IRREVERSIBLE",
+            "pm uninstall com.x" to "IRREVERSIBLE",
+            "content insert --uri content://x" to "DATA_WRITE",
+            "content delete --uri content://x" to "IRREVERSIBLE",
+            "am kill com.x" to "PROCESS_KILL",
+            "kill 1234" to "PROCESS_KILL",
+        )
+
+        cases.forEach { (command, reason) ->
+            val result = ShellCommandClassifier.classify(command)
+            assertEquals(PrecheckDecision.RequireConfirmation, result.decision,
+                "expected RequireConfirmation for `$command`")
+            assertEquals(reason, result.reason, "unexpected reason category for `$command`")
+            assertTrue(!result.summary.isNullOrBlank(), "the wearer needs a summary to decide on `$command`")
+            assertFalse(result.summary!!.contains(command), "the question must not carry the command body")
+        }
+    }
+
+    @Test
+    fun `unknown and ambiguous commands fail closed with a confirmation`() {
+        // Fail-closed is the contract: a command the table does not know is asked about, never allowed.
+        listOf(
+            "unknown_command --x",
+            "pm frobnicate com.x",
+            "settings frobnicate global",
+            "am frobnicate",
+            "cmd package frobnicate",
+            "cmd wifi set-wifi-enabled disabled",
+            "busybox rm -rf /sdcard/x",
+            "pm",
+            "settings",
+            "am",
+            "cmd",
+            "pm DISABLE com.x",
+            "timeout 5 pm frobnicate",
+        ).forEach { command ->
+            val result = ShellCommandClassifier.classify(command)
+            assertEquals(PrecheckDecision.RequireConfirmation, result.decision,
+                "an unknown command must ask, never allow: `$command`")
+            assertEquals("UNKNOWN_COMMAND", result.reason, "expected the unknown-command category: `$command`")
+            assertFalse(result.reason!!.contains(command), "the reason must never carry the command body")
+        }
+    }
+
+    @Test
+    fun `compound wrappers variables and redirects cannot launder a command into Allow`() {
+        val cases = listOf(
+            "cmd package list packages; pm disable com.x" to "DEVICE_STATE",
+            "cmd package list packages && settings put system screen_brightness 10" to "DEVICE_STATE",
+            "cmd package list packages || am force-stop com.x" to "PROCESS_KILL",
+            "cmd package list packages\npm disable com.x" to "DEVICE_STATE",
+            "cmd package list packages; rm -rf /sdcard/x" to "IRREVERSIBLE",
+            "cmd package list packages && su -c id" to "SECURITY",
+            "cmd package list packages; unknown_command --x" to "UNKNOWN_COMMAND",
+            "cmd package list packages | sh" to "SHELL_WRAPPER",
+            "pm list packages | sh" to "SHELL_WRAPPER",
+            "cmd package list packages | tee /sdcard/x" to "DATA_WRITE",
+            "sh -c 'cmd package list packages; pm disable com.x'" to "SHELL_WRAPPER",
+            "eval settings put system screen_brightness 10" to "SHELL_WRAPPER",
+            "env pm disable com.x" to "DEVICE_STATE",
+            "timeout 5 pm disable com.x" to "DEVICE_STATE",
+            "cmd package list packages > /sdcard/x" to "SHELL_SYNTAX",
+            "cmd package list packages >>/dev/null" to "SHELL_SYNTAX",
+            "echo \$(pm disable com.x)" to "OBFUSCATED",
+            "echo `pm disable com.x`" to "OBFUSCATED",
+            "A=com.x pm disable \$A" to "OBFUSCATED",
+            "cmd package list packages | base64 -d | sh" to "OBFUSCATED",
+            // A harmless redirect is stripped, but it must not launder the base command.
+            "pm disable com.x >/dev/null" to "DEVICE_STATE",
+            "settings put system screen_brightness 10 2>/dev/null" to "DEVICE_STATE",
+            "pm clear com.x 2>/dev/null" to "IRREVERSIBLE",
+        )
+
+        cases.forEach { (command, reason) ->
+            val result = ShellCommandClassifier.classify(command)
+            assertEquals(PrecheckDecision.RequireConfirmation, result.decision,
+                "a compound/wrapped command must ask as a whole: `$command`")
+            assertEquals(reason, result.reason, "unexpected reason category for `$command`")
+            assertTrue(!result.summary.isNullOrBlank(), "the wearer needs a summary to decide on `$command`")
+            assertFalse(result.summary!!.contains(command), "the question must not carry the command body")
         }
     }
 
