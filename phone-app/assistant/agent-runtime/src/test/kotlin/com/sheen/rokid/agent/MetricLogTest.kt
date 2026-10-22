@@ -8,6 +8,7 @@ import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.RiskLevel
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -286,6 +287,39 @@ class MetricLogTest {
         assertEquals(run.metrics.images, perCall.sum(), "per-call counts add to the run-level distinct count")
         assertTrue(metricLine(lines).contains(" images=2"), metricLine(lines))
         assertFalse(lines.any { it.contains("img-first") || it.contains("sha-first") }, lines.toString())
+    }
+
+    /**
+     * 0.3 Phase 4B (B7): the new per-decision `P4_POLICY` line shares this sink, and the run-level `P3_METRIC` shape is
+     * **unchanged** by it - the same exact field list and order, with the same numbers as before the line existed.
+     */
+    @Test
+    fun `a policy decision adds one P4_POLICY line and leaves the run metric shape unchanged`() {
+        val lines = mutableListOf<String>()
+        val clock = FakeMetricClock()
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("lookup", risk = RiskLevel.L1)))
+        executor.outcome = { _, _ ->
+            clock.now += 3_000_000L
+            ActionResult(ActionOutcome.Done, "done")
+        }
+        val gateway = MetricGateway(clock, listOf(
+            GatewayReply(listOf(call("c1", "lookup")), "checking", ModelEnd.COMPLETED, null, null),
+            GatewayReply(emptyList(), "answer", ModelEnd.COMPLETED, null, null),
+        ))
+
+        loop(gateway, ToolRegistry(listOf(executor)), clock, lines).run(request())
+
+        assertEquals(
+            listOf("P4_POLICY mode=normal action=lookup risk=L1 decision=Allow"),
+            lines.filter { it.startsWith("P4_POLICY") },
+            lines.toString(),
+        )
+        assertEquals(
+            "P3_METRIC calls=2 toolCalls=1 modelMs=8 toolMs=3 observeMs=0 " +
+                "inputTokens=missing outputTokens=missing images=0 nudges=0 overflows=0",
+            metricLine(lines),
+        )
+        assertFalse(lines.any { it.contains("MARKER") }, lines.toString())
     }
 
     // ---------------------------------------------------------------- helpers

@@ -976,8 +976,11 @@ class HostCompositionRoot internal constructor(
     }
 
     /** P3.3: puts the question the host was asked to present on the session page - and, when nobody can see that page,
-     * runs the B5 channel ladder (glasses -> notification -> Edith page). */
-    internal fun showConfirmation(requestId: String, summary: String) {
+     * runs the B5 channel ladder (glasses -> notification -> Edith page).
+     *
+     * 0.3 Phase 4B (B7): returns the rung that actually took the question (or `null` for none), so the presenter's
+     * count-only `P4_CONFIRM` line names the real channel instead of guessing between notification and dialog. */
+    internal fun showConfirmation(requestId: String, summary: String): ConfirmationChannelKind? {
         mutableState.update {
             it.copy(
                 pendingConfirmation = PendingConfirmation(
@@ -989,7 +992,7 @@ class HostCompositionRoot internal constructor(
                 ),
             )
         }
-        deliverToPhone(requestId, summary)
+        return deliverToPhone(requestId, summary)
     }
 
     /**
@@ -1002,28 +1005,30 @@ class HostCompositionRoot internal constructor(
      * notification **and** raised the page on every background question, which is the "duplicate surfaces" the spec
      * rules out.
      */
-    private fun deliverToPhone(requestId: String, summary: String) {
-        if (uiIsVisible) return
+    private fun deliverToPhone(requestId: String, summary: String): ConfirmationChannelKind? {
+        if (uiIsVisible) return ConfirmationChannelKind.DIALOG
         val channel = confirmationPresentationChannel(
             glassesServing = confirmationPresenter?.isServingOnGlasses(requestId) == true,
             notificationAvailable = notificationsCanPost(),
             dialogAvailable = canRaiseConfirmationPage(),
         )
-        when (channel) {
-            ConfirmationChannelKind.GLASSES -> Unit  // the glasses already carry it
+        return when (channel) {
+            ConfirmationChannelKind.GLASSES -> ConfirmationChannelKind.GLASSES  // the glasses already carry it
             ConfirmationChannelKind.NOTIFICATION -> {
-                if (notifier()?.post(requestId, summary) == true) return
+                if (notifier()?.post(requestId, summary) == true) return ConfirmationChannelKind.NOTIFICATION
                 // A shade that became unavailable between the probe and the post degrades, it does not drop the
                 // question: the page is the last fallback.
                 raiseConfirmationPage()
+                ConfirmationChannelKind.DIALOG
             }
             // The notification was skipped because it cannot post; record the stable reason before degrading (§5.4:
             // a missing channel must say why, never silently become "Edith only").
             ConfirmationChannelKind.DIALOG -> {
                 notificationSurface?.let { notifier()?.reportUnavailable(requestId) }
                 raiseConfirmationPage()
+                ConfirmationChannelKind.DIALOG
             }
-            ConfirmationChannelKind.VOICE, null -> Unit
+            ConfirmationChannelKind.VOICE, null -> null
         }
     }
 
@@ -2910,10 +2915,10 @@ class HostCompositionRoot internal constructor(
                 override fun available(): Boolean = composition()?.canPresentOnPhone() == true
 
                 // Through the composition that asked: the question is shown only after a session starts, by which
-                // time the holder is filled.
-                override fun show(requestId: String, summary: String) {
+                // time the holder is filled. B7: the returned rung is the surface that really took the question, so the
+                // presenter's count-only line names it instead of assuming the dialog.
+                override fun show(requestId: String, summary: String): ConfirmationChannelKind? =
                     composition()?.showConfirmation(requestId, summary)
-                }
 
                 override fun hide(requestId: String) {
                     composition()?.hideConfirmation(requestId)

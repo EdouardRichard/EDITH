@@ -1890,4 +1890,148 @@ class AgentLoopTest {
             p4ToolLines(lines),
         )
     }
+
+    // --------------------------------------------- policy telemetry (0.3 Phase 4B B7)
+
+    /** The per-decision policy lines only; `P3_*`/`P4_TOOL` lines share the same sink. */
+    private fun p4PolicyLines(lines: List<String>): List<String> = lines.filter { it.startsWith("P4_POLICY") }
+
+    /** The confirmation lines the loop may emit itself: the early no-channel refusal. */
+    private fun p4ConfirmLines(lines: List<String>): List<String> = lines.filter { it.startsWith("P4_CONFIRM") }
+
+    /**
+     * 0.3 Phase 4B (B7): exactly one count-only `P4_POLICY` line per policy decision.
+     *
+     * Two calls are decided in one round, one allowed and one refused. The exact field order
+     * (`mode action risk decision`) is the contract, and the decision's own words are the sealed class
+     * names. The argument and summary sentinels pin that neither is ever appended.
+     */
+    @Test fun `each policy decision emits one P4_POLICY line with mode action risk and decision`() {
+        val lines = mutableListOf<String>()
+        val executor = RecordingActionExecutor(
+            listOf(actionDescriptor("lookup", risk = RiskLevel.L1), actionDescriptor("danger", risk = RiskLevel.L3)),
+        )
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, """{"text":"MARKER-RESULT"}""") }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(
+                    calls = listOf(
+                        call("c1", "lookup", """{"secret":"MARKER-ARGUMENT"}"""),
+                        call("c2", "danger"),
+                    ),
+                ),
+                reply(text = "好"),
+            ),
+        )
+
+        newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("danger" to PolicyDecision.Refuse)),
+            metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(
+            listOf(
+                "P4_POLICY mode=normal action=lookup risk=L1 decision=Allow",
+                "P4_POLICY mode=normal action=danger risk=L3 decision=Refuse",
+            ),
+            p4PolicyLines(lines),
+        )
+        assertFalse(
+            lines.any { it.contains("MARKER-ARGUMENT") || it.contains("MARKER-RESULT") },
+            "the policy line carries no argument or result content: $lines",
+        )
+    }
+
+    /**
+     * A question the policy requires is still one decision line; its human-readable summary is free text and must stay
+     * off the count-only record (only the action's name, risk and the decision token ride it).
+     */
+    @Test fun `a required confirmation is recorded as a decision without its summary text`() {
+        val lines = mutableListOf<String>()
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("app.uninstall", requiresConfirmation = true)))
+        val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "app.uninstall"))), reply(text = "那就不动")))
+
+        newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(
+                mapOf("app.uninstall" to PolicyDecision.RequireConfirmation("MARKER-SUMMARY 卸载？")),
+            ),
+            confirmation = ScriptedConfirmation(ConfirmationOutcome(false, ConfirmationSource.PHONE)),
+            metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(
+            listOf("P4_POLICY mode=normal action=app.uninstall risk=L0 decision=RequireConfirmation"),
+            p4PolicyLines(lines),
+        )
+        assertFalse(lines.any { it.contains("MARKER-SUMMARY") }, "the question text must not reach the line: $lines")
+    }
+
+    /**
+     * The mode is not a turn snapshot: it is the live B3 provider's answer at **each** decision. The first call runs
+     * while 不拦截 is on (an L3 tool is allowed); the call itself then switches the provider off, and the second L3 call
+     * of the same round is escalated. One line per decision, each naming the mode that actually produced it.
+     */
+    @Test fun `the no interception mode is read live for every policy decision`() {
+        var bypass = true
+        val lines = mutableListOf<String>()
+        val executor = RecordingActionExecutor(
+            listOf(actionDescriptor("first", risk = RiskLevel.L3), actionDescriptor("second", risk = RiskLevel.L3)),
+        )
+        executor.outcome = { name, _ ->
+            if (name == "first") bypass = false
+            ActionResult(ActionOutcome.Done, "done")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "first"), call("c2", "second"))), reply(text = "好")),
+        )
+
+        newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = WhitelistActionPolicy(RiskLevel.L1, emptyList(), noInterception = { bypass }),
+            metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(
+            listOf(
+                "P4_POLICY mode=no_interception action=first risk=L3 decision=Allow",
+                "P4_POLICY mode=normal action=second risk=L3 decision=RequireConfirmation",
+            ),
+            p4PolicyLines(lines),
+        )
+    }
+
+    /** B4's early refusal is the honest no-channel point; the loop records it with channel `none`. */
+    @Test fun `an unavailable confirmation channel emits one P4_CONFIRM unavailable line`() {
+        val lines = mutableListOf<String>()
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("app.uninstall", requiresConfirmation = true)))
+        val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "app.uninstall"))), reply(text = "那就不动")))
+
+        newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("app.uninstall" to PolicyDecision.RequireConfirmation("卸载？"))),
+            confirmation = UnavailableConfirmation(),
+            metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(
+            listOf("P4_CONFIRM tool=app.uninstall decision=unavailable channel=none"),
+            p4ConfirmLines(lines),
+        )
+    }
+
+    /** An unknown tool never reaches the policy, so it has no decision and must not invent a policy line. */
+    @Test fun `an unknown tool emits no P4_POLICY line`() {
+        val lines = mutableListOf<String>()
+        val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "mystery"))), reply(text = "不认识这个工具")))
+
+        newLoop(gateway, metricLine = { lines += it }).run(request())
+
+        assertTrue(p4PolicyLines(lines).isEmpty(), "an unknown name is not a policy decision: $lines")
+    }
 }

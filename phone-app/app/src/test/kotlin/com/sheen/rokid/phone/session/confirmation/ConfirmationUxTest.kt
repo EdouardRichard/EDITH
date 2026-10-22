@@ -42,7 +42,17 @@ class ConfirmationUxTest {
     private class FakeUi : ConfirmationUi {
         val shown = mutableListOf<Pair<String, String>>()
         val hidden = mutableListOf<String>()
-        override fun show(requestId: String, summary: String) { shown += requestId to summary }
+
+        /**
+         * 0.3 Phase 4B (B7): the rung this fake reports it used. Like the production composition, a `show` that
+         * happened reports the surface that took the question; `null` models "no surface".
+         */
+        var presentedChannel: ConfirmationChannelKind? = ConfirmationChannelKind.DIALOG
+
+        override fun show(requestId: String, summary: String): ConfirmationChannelKind? {
+            shown += requestId to summary
+            return presentedChannel
+        }
         override fun hide(requestId: String) { hidden += requestId }
     }
 

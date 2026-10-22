@@ -63,6 +63,8 @@ class ConfirmationGuardTest {
         var outcome: ConfirmationOutcome = ConfirmationOutcome(true, ConfirmationSource.PHONE),
     ) : ConfirmationPort {
         val requested = mutableListOf<Pair<String, String>>()
+        /** 0.3 Phase 4B (B7): the action name the wrapper reported with each question. */
+        val tools = mutableListOf<String>()
         val outcomes = ArrayDeque<ConfirmationOutcome>()
         var failure: RuntimeException? = null
 
@@ -70,6 +72,11 @@ class ConfirmationGuardTest {
             failure?.let { throw it }
             requested += requestId to summary
             return outcomes.removeFirstOrNull() ?: outcome
+        }
+
+        override fun request(requestId: String, summary: String, tool: String): ConfirmationOutcome {
+            tools += tool
+            return request(requestId, summary)
         }
     }
 
@@ -79,12 +86,13 @@ class ConfirmationGuardTest {
         canAsk: Boolean = true,
         requestIds: MutableList<String> = mutableListOf("request-1"),
         noInterception: () -> Boolean = { false },
+        diagnostics: (String) -> Unit = { },
     ): ConfirmingActions = ConfirmingActions(
         host = actions,
         confirmation = confirmation,
         canAsk = { canAsk },
         newRequestId = { requestIds.removeFirstOrNull() ?: "request-fallback" },
-        diagnostics = { },
+        diagnostics = diagnostics,
         noInterception = noInterception,
     )
 
@@ -117,6 +125,8 @@ class ConfirmationGuardTest {
         assertNotNull(runCatching { UUID.fromString(requestId) }.getOrNull(),
             "R52 requires the confirmation to be addressed by a UUID, was `$requestId`")
         assertEquals("不可逆终端命令", summary)
+        assertEquals(listOf("shell"), confirmation.tools,
+            "B7: the host needs the tool's wire name to count confirmations per tool")
     }
 
     @Test
@@ -187,6 +197,24 @@ class ConfirmationGuardTest {
         assertRefusalFacts(result, "CONFIRMATION_UNAVAILABLE", recoverable = true)
         assertTrue(actions.executed.isEmpty())
         assertTrue(confirmation.requested.isEmpty(), "a missing channel means there is nobody to ask")
+    }
+
+    /**
+     * 0.3 Phase 4B (B7): the shell path's no-channel decision is counted too. Nobody was asked, so the line says
+     * `unavailable`/`none`; it is not a denial by the wearer and it must not be read as one.
+     */
+    @Test
+    fun `a missing confirmation channel emits one unavailable P4_CONFIRM line`() {
+        val actions = FakeActions(ActionPrecheck(PrecheckDecision.RequireConfirmation, summary = "危险"))
+        val lines = mutableListOf<String>()
+
+        wrapper(actions, canAsk = false, diagnostics = { lines += it }).execute("shell", args)
+
+        assertEquals(
+            listOf("P4_CONFIRM tool=shell decision=unavailable channel=none"),
+            lines.filter { it.startsWith("P4_CONFIRM") },
+            lines.toString(),
+        )
     }
 
     @Test

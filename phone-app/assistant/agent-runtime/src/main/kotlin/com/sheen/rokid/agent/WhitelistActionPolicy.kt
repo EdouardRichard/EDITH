@@ -45,6 +45,14 @@ class WhitelistActionPolicy(
     /** An independent copy of this rule set, taken by the caller at turn start. The live gate travels with it. */
     fun snapshot(): WhitelistActionPolicy = WhitelistActionPolicy(maxLevel, whitelist, noInterception)
 
+    /**
+     * 0.3 Phase 4B (B7): the mode the next [decide] will apply, read from the same live provider [decide] reads.
+     *
+     * It is a read on each call, never a captured snapshot, for the same reason [decide] is: the owner's saved switch
+     * must apply from the next tool call.
+     */
+    override fun mode(): PolicyMode = if (noInterception()) PolicyMode.NO_INTERCEPTION else PolicyMode.NORMAL
+
     override fun decide(descriptor: ToolDescriptor): PolicyDecision {
         // 0. The host's explicit mode outranks every rule below (spec §5.1). It is read on each decision because the
         // user's save must apply from the next tool call, and it must never be frozen into a turn snapshot.

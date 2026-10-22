@@ -350,11 +350,17 @@ internal class ConfirmingActions(
         // withdrawn, so the honest answer is a denial, not "unavailable".
         if (!runCatching(canAsk).getOrDefault(false)) {
             diagnostics("P3_CONFIRM action=$name outcome=unavailable reason=NO_CHANNEL")
+            // B7: the count-only companion of the line above. No question ever reached a surface, so the decision is
+            // `unavailable` with no channel - recorded here because this is where the shell path's no-channel answer
+            // is taken, and it must not be mistaken for the wearer denying anything.
+            diagnostics("P4_CONFIRM tool=$name decision=unavailable channel=none")
             return refusal(CONFIRMATION_UNAVAILABLE, recoverable = true)
         }
         val requestId = newRequestId()
         val summary = precheck.summary?.takeIf { it.isNotBlank() } ?: DEFAULT_SUMMARY
-        val outcome = runCatching { confirmation.request(requestId, summary) }.getOrElse {
+        // B7: the tool's wire name (`shell`) travels with the question so the host's count-only line can count this
+        // confirmation per tool; it is never shown and never the command text.
+        val outcome = runCatching { confirmation.request(requestId, summary, name) }.getOrElse {
             diagnostics("P3_CONFIRM request=$requestId outcome=unavailable reason=CHANNEL_FAILED")
             return refusal(CONFIRMATION_UNAVAILABLE, recoverable = true)
         }

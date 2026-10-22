@@ -1,6 +1,18 @@
 package com.sheen.rokid.agent
 
 /**
+ * 0.3 Phase 4B (D189, spec §5.1/§6.2): which rule set a policy decision was taken under.
+ *
+ * [NORMAL] is the ceiling/whitelist/plugin-tightening rule set. [NO_INTERCEPTION] is the owner's explicit global
+ * 「不拦截」 mode, which allows L0-L4 alike and is outranked by nothing. The type lives here (not in `plugin-api`)
+ * because both the host's composition and the plugin's policy wiring read it; it is a value, never a wire field.
+ *
+ * The enum names are the count-only `P4_POLICY mode=` tokens once lower-cased (`normal` / `no_interception`), so the
+ * telemetry line cannot drift from the mode the policy actually applied.
+ */
+enum class PolicyMode { NORMAL, NO_INTERCEPTION }
+
+/**
  * The policy port the loop consults before executing any tool.
  *
  * P3.1 declares the port only. **Task 8 owns every implementation** — `WhitelistActionPolicy`, `ConfirmationGate` and
@@ -9,6 +21,16 @@ package com.sheen.rokid.agent
  */
 interface ActionPolicy {
     fun decide(descriptor: ToolDescriptor): PolicyDecision
+
+    /**
+     * 0.3 Phase 4B (B7, spec §5.3/§6.3): the mode [decide] applies **right now**, for the count-only `P4_POLICY` line.
+     *
+     * It is a separate question because `PolicyDecision` deliberately carries no mode: a caller must not be able to
+     * infer the owner's global switch from an `Allow`. The default is [PolicyMode.NORMAL], which keeps every pre-4B
+     * policy (including a test fake) honest without an override. A live implementation must read its provider on every
+     * call — a saved switch applies from the next decision, never from a stale turn snapshot.
+     */
+    fun mode(): PolicyMode = PolicyMode.NORMAL
 }
 
 /**

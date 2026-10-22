@@ -93,7 +93,18 @@ internal class SmartConfirmation(
         synchronized(lock) { excludedSegment = turnId }
     }
 
-    override fun request(requestId: String, summary: String): ConfirmationOutcome {
+    override fun request(requestId: String, summary: String): ConfirmationOutcome =
+        requestInternal(requestId, summary, tool = null)
+
+    /**
+     * 0.3 Phase 4B (B7): the same question with the action's wire name. The name is passed through to the host's
+     * channel unchanged, so its count-only `P4_CONFIRM` line can count confirmations per tool; this class never reads
+     * it and it is never shown to the wearer.
+     */
+    override fun request(requestId: String, summary: String, tool: String): ConfirmationOutcome =
+        requestInternal(requestId, summary, tool)
+
+    private fun requestInternal(requestId: String, summary: String, tool: String?): ConfirmationOutcome {
         // 0.3 Phase 4B (B4, spec §5.4): check the channel's own availability **before** arming the gate and before
         // `present`, so a surface that is gone refuses at once instead of blocking for the decision window. The check
         // is read live here rather than trusting the caller's earlier `canAsk`, and a throwing check is unavailable.
@@ -121,7 +132,16 @@ internal class SmartConfirmation(
         gate.request(requestId, summary) { approved -> settleByGate(requestId, approved) }
 
         val target = channel
-        val presented = target?.let { runCatching { it.present(requestId, summary, timeoutMillis) } }
+        val presented = target?.let {
+            runCatching {
+                if (tool != null) {
+                    it.present(requestId, summary, timeoutMillis, tool)
+                } else {
+                    // A caller that cannot name the action keeps the pre-B7 wire exactly: no invented name.
+                    it.present(requestId, summary, timeoutMillis)
+                }
+            }
+        }
         if (presented == null || presented.isFailure) {
             // The channel detached, or a host that could not show the question: nobody was asked, so report UNAVAILABLE
             // rather than a denial - and never a silent approval.
@@ -201,9 +221,28 @@ internal class SmartConfirmation(
             presentation = null
             handle to live
         }
+        val outcome = entry.second.outcome.get() ?: ConfirmationOutcome(false, ConfirmationSource.TIMEOUT)
+        // 0.3 Phase 4B (B7, spec §6.3): report the plugin-owned decision to the host **before** withdrawing it, so the
+        // host can pair it with the channel it captured when the question went up. This is the only settlement point
+        // that knows a timeout/cancellation from the gate, and a voice answer from a tap; a phone tap was already
+        // answered (and recorded) by the host's presenter, whose question is gone by now, so this reports nothing new
+        // for it. Telemetry only: a legacy channel ignores the call and a throwing one changes nothing.
+        runCatching {
+            channel?.settle(
+                requestId,
+                when {
+                    outcome.approved -> "allow"
+                    outcome.source == ConfirmationSource.TIMEOUT -> "timeout"
+                    outcome.source == ConfirmationSource.UNAVAILABLE -> "unavailable"
+                    else -> "deny"
+                },
+                // §5.4: a spoken phrase never presents a question, so this is the one answer channel the host cannot
+                // capture at present time. Every other source is the channel the host itself presented on.
+                if (outcome.source == ConfirmationSource.VOICE) "voice" else null,
+            )
+        }
         // Withdrawing the host's question is right on every settlement: the UI must not outlive the decision.
         runCatching { entry.first?.cancel() }
-        val outcome = entry.second.outcome.get() ?: ConfirmationOutcome(false, ConfirmationSource.TIMEOUT)
         log("P3_CONFIRM request=$requestId outcome=${if (outcome.approved) "approved" else "denied"} " +
             "source=${outcome.source.name.lowercase()}")
         entry.second.latch.countDown()

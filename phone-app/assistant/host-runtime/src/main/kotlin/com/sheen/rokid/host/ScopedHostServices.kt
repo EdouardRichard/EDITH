@@ -176,5 +176,20 @@ class ScopedHostServices(
             require(timeoutMillis > 0) { "confirmation window must be positive, was $timeoutMillis" }
             return provider.present(requestId, summary, timeoutMillis)
         }
+
+        // 0.3 Phase 4B (B7): the action's name and the plugin's settlement are telemetry-only additions. Without
+        // these two forwards the interface defaults would run and the production presenter would never see the tool
+        // name or the decision the plugin's gate owns (the timeout/cancel/voice paths).
+        override fun present(requestId: String, summary: String, timeoutMillis: Long, tool: String): CancellationHandle {
+            scope.checkActive()
+            require(requestId.isNotBlank()) { "confirmation request id must not be blank" }
+            require(timeoutMillis > 0) { "confirmation window must be positive, was $timeoutMillis" }
+            return provider.present(requestId, summary, timeoutMillis, tool)
+        }
+
+        // A settlement can arrive while the scope is being revoked (deactivation/STOP); reporting it is never worth an
+        // exception on the plugin's turn thread, so an inactive scope simply reports nothing.
+        override fun settle(requestId: String, decision: String, answerChannel: String?): Boolean =
+            runCatching { scope.active { provider.settle(requestId, decision, answerChannel) } }.getOrDefault(false)
     }
 }

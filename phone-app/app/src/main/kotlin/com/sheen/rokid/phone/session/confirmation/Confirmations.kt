@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.session.confirmation
 import com.sheen.rokid.plugin.ConfirmationChannel
 import com.sheen.rokid.phone.app.HostCompositionRoot
+import com.sheen.rokid.phone.platform.P3Log
 
 import com.sheen.rokid.contracts.ConfirmationResult
 import com.sheen.rokid.contracts.EventEnvelope
@@ -69,7 +70,15 @@ fun interface ConfirmationGlasses {
 
 /** The phone-side question: a card on the session page and, when notifications are allowed, the same two actions. */
 interface ConfirmationUi {
-    fun show(requestId: String, summary: String)
+    /**
+     * Puts the question on the phone, on whichever rung of the B5 ladder is actually available.
+     *
+     * 0.3 Phase 4B (B7): returns the surface that took the question, or `null` when no surface could - the count-only
+     * `P4_CONFIRM` line must record where the wearer could really see it, and the presenter is not allowed to guess
+     * between the notification and the page. A pre-B7 host that cannot tell answers `null` (a surface that predates the
+     * report is still used; it just cannot contribute that one field).
+     */
+    fun show(requestId: String, summary: String): ConfirmationChannelKind? = null
     fun hide(requestId: String)
 
     /**
@@ -88,8 +97,36 @@ interface ConfirmationUi {
  * [VOICE] is named because D191 names it, but it is an **answer** channel and never a presentation fallback: spec §5.4
  * says a spoken phrase only settles a confirmation that has already been presented, so voice cannot make the question
  * visible and is deliberately never selected by [confirmationPresentationChannel].
+ *
+ * 0.3 Phase 4B (B7): [wire] is the token the count-only `P4_CONFIRM channel=` field carries. The enum is closed, so a
+ * telemetry line can only ever name one of the surfaces the system really has.
  */
-internal enum class ConfirmationChannelKind { GLASSES, NOTIFICATION, VOICE, DIALOG }
+enum class ConfirmationChannelKind(val wire: String) {
+    GLASSES("glasses"),
+    NOTIFICATION("notification"),
+    VOICE("voice"),
+    DIALOG("dialog"),
+}
+
+/**
+ * 0.3 Phase 4B (B7, spec §6.3): the closed decision set of the count-only `P4_CONFIRM` line.
+ *
+ * The plugin's gate owns what a settlement means, so it reports one of these words through
+ * [ConfirmationChannel.settle]; the host only renders it. `unavailable` is the one decision the **host** also takes on
+ * its own (a question no surface could take, or a channel that cannot ask at all).
+ */
+internal enum class ConfirmationDecision(val wire: String) {
+    ALLOW("allow"),
+    DENY("deny"),
+    TIMEOUT("timeout"),
+    UNAVAILABLE("unavailable"),
+    ;
+
+    companion object {
+        /** The only words accepted from a plugin; anything else is ignored rather than written to the log. */
+        fun fromWire(value: String): ConfirmationDecision? = entries.firstOrNull { it.wire == value }
+    }
+}
 
 /**
  * The channel a question that is not yet visible should go to next: glasses (panel + keys) -> notification action ->
@@ -160,6 +197,15 @@ class ConfirmationPresenter(
      * hidden resident window receives neither visibly.
      */
     private val panel: ConfirmationPanel = ConfirmationPanel { false },
+    /**
+     * 0.3 Phase 4B (B7, spec §6.3): where the count-only `P4_CONFIRM` lines go. The default is the phone's single `P3_`
+     * sink (logcat in production), so the production composition needs no new argument; a JVM test installs a collector.
+     *
+     * Only counts and closed tokens are ever formatted here - the tool's wire name, a decision word and a channel word -
+     * never the question's summary or an argument. Telemetry is never a verdict: a throwing sink must not turn a
+     * settlement into a failure, so every emit is wrapped.
+     */
+    private val log: (String) -> Unit = { P3Log.line(it) },
 ) : ConfirmationChannel {
 
     private class Pending(
@@ -171,6 +217,12 @@ class ConfirmationPresenter(
          */
         val hintId: String,
         val summary: String,
+        /**
+         * 0.3 Phase 4B (B7): the action's wire name, carried only for the count-only `P4_CONFIRM` line. It is never
+         * shown and never used to address the question; [UNKNOWN_TOOL] keeps a pre-B7 caller honest without inventing
+         * a name.
+         */
+        val tool: String,
         val envelope: EventEnvelope,
         /** When the plugin's window closes, so a re-announcement carries a fresh, honest TTL rather than a new one. */
         val deadlineNanos: Long,
@@ -183,6 +235,20 @@ class ConfirmationPresenter(
          * notification or the Edith fallback.
          */
         var servingOnGlasses = false
+
+        /**
+         * 0.3 Phase 4B (B7, spec §5.4): where the question was really put in front of the wearer, captured **when it
+         * went up** - a settlement cannot ask the screen afterwards (the surfaces are being torn down at that moment).
+         * `null` means no surface took it. Guarded by the presenter's lock.
+         */
+        var channel: ConfirmationChannelKind? = null
+
+        /**
+         * B7: whether this question's one `P4_CONFIRM` line has already been written. Exactly one line per presented
+         * question, whichever settlement path wins the race (an answer, the plugin's gate, or this host's own timer).
+         * Guarded by the presenter's lock.
+         */
+        var reported = false
 
         /** A second `present` with a live id gets this no-op handle: it never displaces the question already up. */
         val ignoredBy = object : CancellationHandle { override fun cancel() = Unit }
@@ -208,7 +274,22 @@ class ConfirmationPresenter(
      */
     override fun available(): Boolean = uiCanServe() || (summaryCanServe() && glassesCanServe())
 
-    override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle {
+    /**
+     * 0.3 Phase 4B (B5/B4 carry-forward): puts the same question up without a tool name. Kept because it is the
+     * interface's original contract; the B7 count-only line records [UNKNOWN_TOOL] rather than inventing a name.
+     */
+    override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle =
+        present(requestId, summary, timeoutMillis, tool = UNKNOWN_TOOL)
+
+    /**
+     * 0.3 Phase 4B (B7): the question plus the action's wire name, which only the `P4_CONFIRM` line reads.
+     *
+     * The presentation channel is captured **here**, from what each surface reports it really took (glasses keys,
+     * the composition's notification/dialog rung), and stored on the pending question: by settlement time the screens
+     * are being torn down and the truth is no longer askable. A question no surface took is the one present-time
+     * decision this method takes on its own: `unavailable`/`none`, written once.
+     */
+    override fun present(requestId: String, summary: String, timeoutMillis: Long, tool: String): CancellationHandle {
         require(requestId.isNotBlank()) { "confirmation request id must not be blank" }
         require(timeoutMillis > 0) { "confirmation window must be positive, was $timeoutMillis" }
         val text = truncate(summary)
@@ -228,7 +309,7 @@ class ConfirmationPresenter(
         // B5/B4 carry-forward: one id per question, reused by the re-announcement on PANEL_SHOWN. Minted here (not per
         // send) so the glasses replace `say-${hintId}` instead of appending a second row when the panel appears late.
         val hintId = "confirm-${UUID.randomUUID()}"
-        val entry = Pending(requestId, hintId, text, envelope, deadlineNanos)
+        val entry = Pending(requestId, hintId, text, tool, envelope, deadlineNanos)
         synchronized(lock) {
             val live = pending[requestId]
             if (live != null) return live.ignoredBy   // lost the race for this id: the live question keeps it
@@ -250,10 +331,18 @@ class ConfirmationPresenter(
             runCatching { this.summary.show(hintId, text, timeoutMillis + SUMMARY_MARGIN_MILLIS) }.getOrDefault(false)
         val keysAccepted = displayAccepted && glassesAvailable && tellGlasses(requestId, active = true)
         synchronized(lock) { if (pending[requestId] === entry) entry.servingOnGlasses = keysAccepted }
-        if (uiCanServe()) runCatching { ui.show(requestId, text) }
+        // B7: the composition reports which rung it really used (notification or page); `null` is "no surface took it".
+        // The glasses are read from this presenter's own SHOW+keys answer instead, so the two can never disagree about
+        // which surface can settle the question.
+        val uiChannel = if (uiCanServe()) runCatching { ui.show(requestId, text) }.getOrNull() else null
+        val presentedOn = if (keysAccepted) ConfirmationChannelKind.GLASSES else uiChannel
+        synchronized(lock) { if (pending[requestId] === entry) entry.channel = presentedOn }
 
-        val timer = scheduler.at(deadlineNanos) { withdraw(requestId) }
+        val timer = scheduler.at(deadlineNanos) { withdraw(requestId, ConfirmationDecision.TIMEOUT) }
         synchronized(lock) { pending[requestId]?.timer = timer }
+        // No surface took the question: the one present-time decision this side owns. The question still exists (the
+        // plugin's gate owns its window), so `reported` stops its later settlement from writing a second line.
+        if (presentedOn == null) emitConfirm(entry, ConfirmationDecision.UNAVAILABLE)
         return object : CancellationHandle { override fun cancel() = withdraw(requestId) }
     }
 
@@ -304,12 +393,17 @@ class ConfirmationPresenter(
     /**
      * The phone's answer. `true` only when this settles the question that is actually up, so a stale tap - one that
      * arrives after a timeout - delivers nothing.
+     *
+     * 0.3 Phase 4B (B7): this is also where a tap/ENTER/BACK settlement is recorded - the question is already off the
+     * screens by the time the plugin's gate hears about it, so the presenter writes its one `P4_CONFIRM` line here.
+     * The channel is the one captured when the question went up; the answer's own surface is not re-derived.
      */
     fun answer(requestId: String, approved: Boolean): Boolean {
         val live = synchronized(lock) { pending.remove(requestId) } ?: return false
         live.timer?.cancel()
         runCatching { ui.hide(requestId) }
         tellGlasses(requestId, active = false)
+        emitConfirm(live, if (approved) ConfirmationDecision.ALLOW else ConfirmationDecision.DENY)
         deliver(ConfirmationResult(live.envelope, requestId, approved))
         return true
     }
@@ -323,17 +417,70 @@ class ConfirmationPresenter(
      */
     fun answerFromGlasses(requestId: String, approved: Boolean): Boolean = answer(requestId, approved)
 
-    /** Takes a question off both screens without answering it: used by the timer, by 急停 and by session teardown. */
-    private fun withdraw(requestId: String) {
+    /**
+     * 0.3 Phase 4B (B7): the plugin's settlement, reported by [ConfirmationChannel.settle].
+     *
+     * The plugin's gate is the authority on a timeout, a STOP/cancellation and a voice answer, and it knows which of
+     * those happened; the host knows where the question was shown. This method joins the two: it takes the question
+     * down (the returned handle's `cancel` will then find nothing, so no settlement is repeated) and writes the one
+     * count-only line, using the captured presentation channel unless the answer arrived on `voice`.
+     *
+     * It deliberately does **not** deliver a `ConfirmationResult`: the plugin already settled the question, and a
+     * second answer would be a fabricated wearer decision. An unknown decision word or an unknown request id returns
+     * `false` and writes nothing.
+     */
+    override fun settle(requestId: String, decision: String, answerChannel: String?): Boolean {
+        val outcome = ConfirmationDecision.fromWire(decision) ?: return false
+        val live = synchronized(lock) { pending.remove(requestId) } ?: return false
+        live.timer?.cancel()
+        runCatching { ui.hide(requestId) }
+        tellGlasses(requestId, active = false)
+        // Only a closed answer channel is honoured: a plugin cannot smuggle arbitrary text into a log line.
+        emitConfirm(live, outcome, answerChannel?.takeIf { it == ConfirmationChannelKind.VOICE.wire })
+        return true
+    }
+
+    /**
+     * Takes a question off both screens without answering it: used by the plugin's withdrawal, by the timer, by 急停 and
+     * by session teardown.
+     *
+     * [decision] is non-null only where the withdrawal is itself a settlement the host can honestly name: its own
+     * window closing (`timeout`) or an explicit 急停/teardown (`deny`, which is how the plugin's gate reports a
+     * cancellation). The plugin's own settlement path calls [settle] first, so the handle's bare `cancel` stays silent
+     * and one question can never produce two lines.
+     */
+    private fun withdraw(requestId: String, decision: ConfirmationDecision? = null) {
         val live = synchronized(lock) { pending.remove(requestId) } ?: return
         live.timer?.cancel()
         runCatching { ui.hide(requestId) }
         tellGlasses(requestId, active = false)
+        if (decision != null) emitConfirm(live, decision)
     }
 
     /** Withdraws every open question; called when the session ends so a later tap cannot answer a dead turn. */
     fun withdrawAll() {
-        synchronized(lock) { pending.keys.toList() }.forEach(::withdraw)
+        synchronized(lock) { pending.keys.toList() }.forEach { withdraw(it, ConfirmationDecision.DENY) }
+    }
+
+    /**
+     * 0.3 Phase 4B (B7, spec §6.3): writes the question's one count-only `P4_CONFIRM` line.
+     *
+     * Field order is the contract: `P4_CONFIRM tool=<name> decision=<allow|deny|timeout|unavailable> channel=<...>`.
+     * The tool is the action's wire name, the decision a closed word, the channel the surface captured at present time
+     * (or `none`). The `reported` flag is claimed under the lock **before** the sink runs, so two settlement paths that
+     * race still write exactly one line; a throwing sink is swallowed because telemetry is never a verdict.
+     */
+    private fun emitConfirm(
+        entry: Pending,
+        decision: ConfirmationDecision,
+        answerChannel: String? = null,
+    ) {
+        synchronized(lock) {
+            if (entry.reported) return
+            entry.reported = true
+        }
+        val channel = answerChannel ?: entry.channel?.wire ?: NO_CHANNEL
+        runCatching { log("P4_CONFIRM tool=${entry.tool} decision=${decision.wire} channel=$channel") }
     }
 
     private fun truncate(summary: String): String {
@@ -364,5 +511,14 @@ class ConfirmationPresenter(
 
         /** The summary stays up a little past the window, so the question never vanishes before the deadline. */
         const val SUMMARY_MARGIN_MILLIS = 2_000L
+
+        /**
+         * 0.3 Phase 4B (B7): the `tool=` token of a question presented through the original 3-arg path. An honest
+         * "the caller did not name the action", never an invented tool name.
+         */
+        const val UNKNOWN_TOOL = "unknown"
+
+        /** B7: the `channel=` token of a question no surface took. */
+        const val NO_CHANNEL = "none"
     }
 }

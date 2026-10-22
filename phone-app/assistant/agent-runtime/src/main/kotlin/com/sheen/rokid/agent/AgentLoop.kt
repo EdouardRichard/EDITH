@@ -885,7 +885,14 @@ class AgentLoop(
                         unknown
                     } else {
                         val shape = registered.descriptor
-                        when (val decision = policy.decide(shape)) {
+                        val policyDecision = policy.decide(shape)
+                        // edith-0.3 Phase 4B (B7, spec §6.3): exactly one count-only `P4_POLICY` line per decision, on
+                        // the same sink as the other metric lines. `mode` is the policy's live answer (never a turn
+                        // snapshot), `risk`/`decision` are this descriptor's and this decision's; the action's name is
+                        // the only free-ish field, because the baseline is counted per tool. Observability is never a
+                        // verdict: a throwing sink or mode provider must not change the run.
+                        runCatching { metricLine(renderPolicyDecision(shape, policyDecision)) }
+                        when (policyDecision) {
                             PolicyDecision.Allow -> {
                                 val executed = runTool(
                                     call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor,
@@ -914,6 +921,12 @@ class AgentLoop(
                                 // Refuse before the wait is measured or entered, so the action fails immediately with
                                 // CONFIRMATION_UNAVAILABLE instead of spending D47's 120 s window first.
                                 if (!confirmationAvailable()) {
+                                    // 0.3 Phase 4B (B7): the honest no-channel decision is recorded where it is taken -
+                                    // before the host is ever asked - so the baseline can count unavailable tellings
+                                    // without inventing a presenting channel.
+                                    runCatching {
+                                        metricLine(renderConfirmUnavailable(call.name))
+                                    }
                                     audit.record(
                                         request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE,
                                         scope = shape.scope, risk = shape.risk.name,
@@ -929,7 +942,9 @@ class AgentLoop(
                                     // instead of returning (review I-1).
                                     val waitStartedNanos = clock.nowNanos()
                                     val outcome = try {
-                                        confirmation?.request(call.id, decision.summary)
+                                        // B7: the action's name rides along so the host's confirmation line can count
+                                        // per tool; it is the descriptor's wire name, never the model's arguments.
+                                        confirmation?.request(call.id, policyDecision.summary, call.name)
                                     } finally {
                                         val waitedNanos = clock.nowNanos() - waitStartedNanos
                                         if (waitedNanos > 0L) {
@@ -1588,6 +1603,37 @@ class AgentLoop(
             spentObservations, planNudgeCap, metrics,
         )
     }
+
+    /**
+     * edith-0.3 Phase 4B (B7, spec §6.3): the one count-only `P4_POLICY` line of one policy decision.
+     *
+     * The exact field order — `P4_POLICY mode=<normal|no_interception> action=<name> risk=<Lx> decision=<...>` — is the
+     * contract the 4B baseline reads. [decision] renders the sealed type's own name (`Allow`/`RequireConfirmation`/
+     * `Refuse`), so a new decision cannot silently share a token with an old one. [descriptor] contributes only its wire
+     * name and risk level: no argument, command, question text or scope ever reaches the line. [ActionPolicy.mode] is
+     * read per decision, never cached, because the owner's 不拦截 switch applies from the next tool call.
+     */
+    private fun renderPolicyDecision(descriptor: ToolDescriptor, decision: PolicyDecision): String = buildString {
+        append("P4_POLICY")
+        append(" mode=").append(runCatching { policy.mode() }.getOrDefault(PolicyMode.NORMAL).name.lowercase())
+        append(" action=").append(descriptor.name)
+        append(" risk=").append(descriptor.risk.name)
+        append(" decision=").append(
+            when (decision) {
+                PolicyDecision.Allow -> "Allow"
+                PolicyDecision.Refuse -> "Refuse"
+                is PolicyDecision.RequireConfirmation -> "RequireConfirmation"
+            },
+        )
+    }
+
+    /**
+     * edith-0.3 Phase 4B (B7): the `P4_CONFIRM` line of a confirmation that never reached the host because no channel
+     * could ask. It is the loop's own decision, so it is emitted here; every question that *was* presented is settled
+     * by the host's presenter, which owns the channel reading. [tool] is the descriptor's wire name only.
+     */
+    private fun renderConfirmUnavailable(tool: String): String =
+        "P4_CONFIRM tool=$tool decision=unavailable channel=none"
 
     /**
      * edith-0.3 Phase 4A Task 9 (A9): the one count-only `P4_TOOL` line of one measured tool call.

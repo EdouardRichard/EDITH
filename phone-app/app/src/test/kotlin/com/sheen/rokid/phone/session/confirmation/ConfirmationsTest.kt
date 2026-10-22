@@ -44,8 +44,18 @@ class ConfirmationsTest {
         val shown = mutableListOf<Pair<String, String>>()
         val hidden = mutableListOf<String>()
         var canServe = true
+
+        /**
+         * 0.3 Phase 4B (B7): the surface the composition reports it really used for the question. `null` models a
+         * composition that could not put it anywhere; the presenter must then record `channel=none`.
+         */
+        var presentedChannel: ConfirmationChannelKind? = ConfirmationChannelKind.DIALOG
+
         override fun available(): Boolean = canServe
-        override fun show(requestId: String, summary: String) { shown += requestId to summary }
+        override fun show(requestId: String, summary: String): ConfirmationChannelKind? {
+            shown += requestId to summary
+            return presentedChannel
+        }
         override fun hide(requestId: String) { hidden += requestId }
     }
 
@@ -76,6 +86,9 @@ class ConfirmationsTest {
         val delivered = mutableListOf<ConfirmationResult>()
         val clock = FakeClock()
         val scheduler = ManualScheduler(clock)
+
+        /** Every count-only line the presenter emits. In production the default sink is the phone's `P3Log`. */
+        val lines = mutableListOf<String>()
         val presenter = ConfirmationPresenter(
             summary = summary,
             ui = ui,
@@ -87,6 +100,7 @@ class ConfirmationsTest {
             envelopeFor = { requestId ->
                 EventEnvelope(SessionId("s"), Generation(1), requestId, 0, 1)
             },
+            log = { lines += it },
         )
     }
 
@@ -373,5 +387,141 @@ class ConfirmationsTest {
                 pageVisible = false, canRaisePage = false, notificationsAvailable = false,
             ),
         )
+    }
+
+    // ------------------------------------- 0.3 Phase 4B (B7): count-only confirmation telemetry
+
+    /** The presenter's count-only confirmation lines; the `Rig` sink carries nothing else today. */
+    private fun confirmLines(rig: Rig): List<String> = rig.lines.filter { it.startsWith("P4_CONFIRM") }
+
+    /**
+     * B7: a question raised on the glasses and allowed settles as exactly one line. The channel is captured when the
+     * question goes up (the presenter cannot learn it later), and the summary - free text chosen by a human - never
+     * reaches the count-only record.
+     */
+    @Test
+    fun `an allowed question emits one P4_CONFIRM allow line with the captured glasses channel`() {
+        val rig = rig()
+
+        rig.presenter.present("c1", "卸载 App：MARKER-SUMMARY", 10_000L, tool = "app.uninstall")
+        assertTrue("the question is raised, not answered yet", rig.delivered.isEmpty())
+
+        assertTrue(rig.presenter.answer("c1", approved = true))
+
+        assertEquals(
+            listOf("P4_CONFIRM tool=app.uninstall decision=allow channel=glasses"),
+            confirmLines(rig),
+        )
+        assertFalse(
+            "the confirmation line may carry no question text: ${rig.lines}",
+            rig.lines.any { it.contains("MARKER-SUMMARY") },
+        )
+    }
+
+    /** The notification rung is a real presentation channel: the composition reports it, the line must say so. */
+    @Test
+    fun `a denied question presented as a notification emits a deny line with the notification channel`() {
+        val rig = rig()
+        rig.summary.canServe = false
+        rig.glasses.canServe = false
+        rig.ui.presentedChannel = ConfirmationChannelKind.NOTIFICATION
+
+        rig.presenter.present("c1", "删除文件", 10_000L, tool = "shell")
+        assertTrue(rig.presenter.answer("c1", approved = false))
+
+        assertEquals(listOf("P4_CONFIRM tool=shell decision=deny channel=notification"), confirmLines(rig))
+    }
+
+    /** The phone card/dialog is the last presentation rung, and a denial there is still a `deny`. */
+    @Test
+    fun `a denied question presented on the Edith dialog emits a deny line with the dialog channel`() {
+        val rig = rig()
+        rig.summary.canServe = false
+        rig.glasses.canServe = false
+        rig.ui.presentedChannel = ConfirmationChannelKind.DIALOG
+
+        rig.presenter.present("c1", "删除文件", 10_000L, tool = "shell")
+        assertTrue(rig.presenter.answer("c1", approved = false))
+
+        assertEquals(listOf("P4_CONFIRM tool=shell decision=deny channel=dialog"), confirmLines(rig))
+    }
+
+    /** The window closing is a `timeout` - and it still delivers nothing: only the plugin's gate decides silence. */
+    @Test
+    fun `a question whose window closes emits a timeout line and no answer`() {
+        val rig = rig()
+        rig.presenter.present("c1", "卸载 App", 10_000L, tool = "app.uninstall")
+
+        rig.clock.advance(10_001_000_000L)
+        rig.scheduler.runDue()
+
+        assertEquals(listOf("P4_CONFIRM tool=app.uninstall decision=timeout channel=glasses"), confirmLines(rig))
+        assertTrue("the host's timer must never turn silence into an answer", rig.delivered.isEmpty())
+    }
+
+    /**
+     * The no-channel case: `present` was reached but no surface could take the question. The line says `unavailable`
+     * with `channel=none`, and a later settlement (the plugin's gate still expires) must not write a second line.
+     */
+    @Test
+    fun `a question no surface can take emits one unavailable line with no channel`() {
+        val rig = rig()
+        rig.summary.canServe = false
+        rig.ui.canServe = false
+        rig.glasses.canServe = false
+
+        rig.presenter.present("c1", "卸载 App", 10_000L, tool = "app.uninstall")
+
+        assertEquals(listOf("P4_CONFIRM tool=app.uninstall decision=unavailable channel=none"), confirmLines(rig))
+
+        // The question still exists (the plugin's gate owns its window) and its later timeout must not duplicate.
+        rig.clock.advance(10_001_000_000L)
+        rig.scheduler.runDue()
+        assertEquals("one line per question: ${rig.lines}", 1, confirmLines(rig).size)
+    }
+
+    /**
+     * A voice answer never reaches the presenter as a tap: the plugin's gate settles it and reports the settlement back
+     * with the answer channel it knows. The presentation channel was captured earlier, but the answer was `voice`.
+     */
+    @Test
+    fun `a voice answer settled by the plugin emits allow with the voice channel`() {
+        val rig = rig()
+        rig.presenter.present("c1", "卸载 App", 10_000L, tool = "app.uninstall")
+
+        assertTrue(rig.presenter.settle("c1", "allow", answerChannel = "voice"))
+
+        assertEquals(listOf("P4_CONFIRM tool=app.uninstall decision=allow channel=voice"), confirmLines(rig))
+        assertTrue("settling reports a decision, it does not deliver a second answer", rig.delivered.isEmpty())
+    }
+
+    /**
+     * The plugin's timeout is the authority (its gate settles first in production); reporting it through [settle] must
+     * use the captured presentation channel, and the presenter's own timer must then be a no-op - one line total.
+     */
+    @Test
+    fun `a plugin timeout settles once with the captured channel and the fallback timer adds no line`() {
+        val rig = rig()
+        rig.presenter.present("c1", "卸载 App", 10_000L, tool = "app.uninstall")
+
+        assertTrue(rig.presenter.settle("c1", "timeout"))
+
+        rig.clock.advance(10_001_000_000L)
+        rig.scheduler.runDue()
+
+        assertEquals(listOf("P4_CONFIRM tool=app.uninstall decision=timeout channel=glasses"), confirmLines(rig))
+        assertTrue(rig.delivered.isEmpty())
+    }
+
+    /** Two settlement paths racing for the same id still produce one line; the second observes no live question. */
+    @Test
+    fun `a second settlement for the same question adds no second line`() {
+        val rig = rig()
+        rig.presenter.present("c1", "卸载 App", 10_000L, tool = "app.uninstall")
+
+        assertTrue(rig.presenter.answer("c1", approved = true))
+        assertFalse(rig.presenter.settle("c1", "allow", answerChannel = "voice"))
+
+        assertEquals(listOf("P4_CONFIRM tool=app.uninstall decision=allow channel=glasses"), confirmLines(rig))
     }
 }

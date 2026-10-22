@@ -24,6 +24,7 @@ import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
 import com.sheen.rokid.plugin.PluginLifecycle
 import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticHintPlugin
+import com.sheen.rokid.phone.session.confirmation.ConfirmationChannelKind
 import com.sheen.rokid.phone.session.confirmation.ConfirmationGlasses
 import com.sheen.rokid.phone.session.confirmation.ConfirmationPanel
 import com.sheen.rokid.phone.session.confirmation.ConfirmationPresenter
@@ -1635,7 +1636,9 @@ class CxrHintLinkTest {
                 true
             },
             ui = object : ConfirmationUi {
-                override fun show(requestId: String, summary: String) = Unit
+                // 0.3 Phase 4B (B7): this link-focused rig has no phone surface; reporting `null` keeps the presenter's
+                // count-only line honest without touching the assertions below.
+                override fun show(requestId: String, summary: String): ConfirmationChannelKind? = null
                 override fun hide(requestId: String) = Unit
             },
             glasses = ConfirmationGlasses { requestId, active -> rig.link.confirmationState(requestId, active) },
