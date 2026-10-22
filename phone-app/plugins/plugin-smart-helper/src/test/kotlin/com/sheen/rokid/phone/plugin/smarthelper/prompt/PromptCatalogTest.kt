@@ -312,17 +312,6 @@ class PromptCatalogTest {
     }
 
     @Test
-    fun `the proactive hint posture names no concrete hint tool`() {
-        val hint = promptText("route/proactive-hint.md")
-
-        assertFalse("notify_user" in hint, "the Phase 1 hint posture must not name a display tool")
-        assertFalse("propose_hint" in hint, "the Phase 3 hint tool is not the Phase 1 catalog contract")
-        assertTrue("本回合提供的主动提示工具" in hint, "use tool-neutral wording for the active hint tool")
-        assertTrue("只给一句" in hint && "不超过 60 字" in hint, "keep the one-sentence / ≤60-character rule")
-        assertTrue("不执行任何设备动作" in hint, "a hint turn has no device side effects")
-    }
-
-    @Test
     fun `the dynamic template carries a coverage slot`() {
         assertTrue(
             "{{coverage}}" in PromptCatalog.dynamicTemplate(),

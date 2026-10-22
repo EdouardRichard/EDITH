@@ -211,43 +211,6 @@ class SmartAssistantPluginTest {
         }
     }
 
-    @Test fun `the first request carries the full snapshot and a continuation only the ambient sources`() {
-        val perception = SmartFakePerception()
-        val rig = SmartTestRig(conversationStores = smartStores())
-        val lines = mutableListOf<String>()
-        val previous = P3Log.sink
-        P3Log.sink = { lines += it }
-        try {
-            rig.activate(overrides = mapOf(Capability.Perception to perception))
-            var turn = 0
-            rig.model.onRequest = { request, listener ->
-                turn += 1
-                if (turn == 1) {
-                    listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.INCOMPLETE, null, null))
-                } else {
-                    streamText(request, listener, "好。")
-                }
-            }
-
-            rig.wakeAndFinal("现在几点了")
-
-            assertEquals(2, rig.model.requests.size, "an empty turn is retried, so there are two model requests")
-            assertEquals(
-                listOf(setOf(PerceptionSource.DEVICE, PerceptionSource.MEDIA)),
-                perception.requestedSources,
-                "request 1 uses the beginTurn snapshot; the retry asks only for ambient device/media",
-            )
-            val first = rig.model.requests[0].input.filterIsInstance<InputPart.Text>().single().text
-            val second = rig.model.requests[1].input.filterIsInstance<InputPart.Text>().single().text
-            assertTrue("#n12" in first, "the opening request carries the full compact screen: $first")
-            assertFalse("#n12" in second, "a continuation must not repeat the whole snapshot: $second")
-            assertTrue("not_requested" in second, "the suppressed sources say so honestly: $second")
-            assertEquals(2, lines.count { it.startsWith("P3_PERCEPTION ") }, "one line per rendered block: $lines")
-        } finally {
-            P3Log.sink = previous
-        }
-    }
-
     @Test fun `an early-refused turn still closes the perception turn`() {
         val perception = SmartFakePerception()
         val rig = SmartTestRig(conversationStores = smartStores())

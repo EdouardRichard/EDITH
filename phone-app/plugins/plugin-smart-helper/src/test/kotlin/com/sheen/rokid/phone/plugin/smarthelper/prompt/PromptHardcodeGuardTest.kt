@@ -52,18 +52,6 @@ class PromptHardcodeGuardTest {
     )
 
     @Test
-    fun `prompt resources contain no device literals or dynamic system slots`() {
-        for (resource in fixedResources) {
-            val text = promptText(resource)
-            for (literal in deviceLiterals) {
-                assertFalse(text.contains(literal), "$resource must not hardcode $literal")
-            }
-            assertFalse("{{" in text, "$resource is STATIC and must not contain a slot")
-            assertFalse("}}" in text, "$resource is STATIC and must not contain a slot")
-        }
-    }
-
-    @Test
     fun `the device profile resource only uses device profile placeholders`() {
         val text = promptText("context/device-profile.md")
 

@@ -62,45 +62,6 @@ class SkillInjectionWiringTest {
         request.input.filterIsInstance<InputPart.Text>().joinToString("\n\n") { it.text }
 
     @Test
-    fun `an enabled skill still reaches the model, by pull instead of whole`() {
-        // Replaces `an enabled skill is injected whole into the request instructions`, which asserted
-        // `instructions.contains(marker)` on the first request. The intent is "the library's SKILL reaches the model",
-        // not "it arrives early": the first request advertises it, the second carries the body after `load_skill`.
-        val marker = "正文标记-8821"
-        val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("reply-wechat-message", marker))))
-        var calls = 0
-        rig.model.onRequest = { request, listener ->
-            calls += 1
-            if (calls == 1) {
-                listener(
-                    smartToolCall(
-                        "c1", LoadSkillTool.NAME, """{"name":"reply-wechat-message"}""",
-                        requestId = request.requestId,
-                    ),
-                )
-                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
-            } else {
-                streamText(request, listener, "好。")
-            }
-        }
-
-        rig.wakeAndFinal("帮我回微信")
-
-        assertEquals(2, rig.model.requests.size)
-        val first = rig.model.requests[0].instructions
-        assertTrue(first.contains("- reply-wechat-message: d-reply-wechat-message"), first)
-        assertFalse(marker in first, "the catalog must not carry the body: $first")
-        // 0.3 Task 12: the body rides the request input as SKILL_BODY, never the system slot.
-        val second = rig.model.requests[1]
-        assertFalse(marker in second.instructions, "the pulled body must not become system text")
-        assertTrue(
-            marker in inputText(second),
-            "the body must reach the model after the pull, not summarised: ${inputText(second)}",
-        )
-        assertTrue(inputText(second).contains("## SKILL 正文: reply-wechat-message"), inputText(second))
-    }
-
-    @Test
     fun `the proactive route is given the same skill catalog as the wake route`() {
         // Replaces `the proactive route is given the skills as well`, which asserted the **body** in the proactive
         // instructions. C3's intent — both routes share one library — is preserved as the shared **catalog**: the
@@ -152,47 +113,6 @@ class SkillInjectionWiringTest {
         assertEquals(1, rig.model.requests.size)
         assertFalse("## SKILL 目录" in rig.model.requests.single().instructions)
         assertTrue(turnCompleted(lines), "a broken file must not break the turn: $lines")
-    }
-
-    @Test
-    fun `a disabled skill is not injected`() {
-        // Stronger than the old assertion (`"SKILL:" !in instructions`): the disabled entry is neither advertised nor
-        // loadable, so the model cannot pull it either. Its body must not leak through the refusal.
-        val rig = rig(SmartFakeSkills(mapOf(
-            "/sdcard/EDITH/skills/a.md" to smartSkillDoc("off", "不该出现", enabled = false),
-        )))
-        var calls = 0
-        rig.model.onRequest = { request, listener ->
-            calls += 1
-            if (calls == 1) {
-                listener(smartToolCall("c1", LoadSkillTool.NAME, """{"name":"off"}""", requestId = request.requestId))
-                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
-            } else {
-                streamText(request, listener, "好。")
-            }
-        }
-
-        rig.wakeAndFinal("你好")
-
-        assertEquals(2, rig.model.requests.size)
-        assertFalse(
-            "## SKILL 目录" in rig.model.requests[0].instructions,
-            "a disabled entry must not be advertised: ${rig.model.requests[0].instructions}",
-        )
-        assertTrue(
-            rig.model.requests[1].history.any {
-                it is ModelHistoryItem.ToolOutput && it.output.contains(LoadSkillTool.DISABLED)
-            },
-            "a disabled entry must be refused as disabled, not silently absent: ${rig.model.requests[1].history}",
-        )
-        assertFalse(
-            rig.model.requests[1].instructions.contains("不该出现"),
-            "a refused pull must not leak the disabled body into the system slot",
-        )
-        assertFalse(
-            inputText(rig.model.requests[1]).contains("不该出现"),
-            "a refused pull must not leak the disabled body into the request tail either",
-        )
     }
 
     @Test

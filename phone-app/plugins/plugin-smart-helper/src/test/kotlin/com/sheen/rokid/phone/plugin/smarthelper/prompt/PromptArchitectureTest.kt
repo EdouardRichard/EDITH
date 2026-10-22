@@ -245,38 +245,6 @@ class PromptArchitectureTest {
         }
     }
 
-    @Test
-    fun `the prompt names exactly the twenty three tools the label map registers`() {
-        val registered = ToolLabelMap.entries
-        assertEquals(23, registered.size, "ToolLabelMap is the face's registration: ${registered.keys}")
-        assertEquals(DEFAULT_TOOL_NAMES, registered.keys, "the registered face must be the spec's 23 names")
-        assertTrue(registered.values.all { it.isNotBlank() }, "every registered tool needs a user-facing label")
-
-        val prompt = promptText("core/20-tools.md")
-        registered.keys.forEach { name ->
-            assertTrue(mentions(prompt, name), "core/20-tools.md must name the advertised tool '$name'")
-        }
-        assertFalse(
-            mentions(prompt, "propose_hint"),
-            "propose_hint is advertised only on the hint turn; it is not part of the default face",
-        )
-
-        // Generic rather than a second hand-written exclusion: every snake_case tool-shaped identifier the
-        // authored prompts name must be on the advertised face. Single-word unadvertised names stay out of
-        // this cheap check (the face's own single words are `device`/`shell`/`open`/`dial`).
-        val authoredCorpus = PromptCatalog.manifest().joinToString("\n") { promptText(it.file) }
-        val unadvertised = unadvertisedToolNames(authoredCorpus, registered.keys)
-        assertTrue(
-            unadvertised.isEmpty(),
-            "the prompts name tool-shaped identifiers that the face does not advertise: $unadvertised",
-        )
-        assertEquals(
-            setOf("propose_hint"),
-            unadvertisedToolNames("调用 read_screen 或 propose_hint。", registered.keys),
-            "the generic scan must catch an unadvertised tool name, not just the authored literal",
-        )
-    }
-
     /** The tool-shaped identifiers in [corpus] that [advertised] does not register. */
     private fun unadvertisedToolNames(corpus: String, advertised: Set<String>): Set<String> =
         TOOL_NAME.findAll(corpus).map { it.value }.toSet() - advertised

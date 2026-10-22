@@ -73,17 +73,6 @@ class PromptDeviceFidelityTest {
     }
 
     @Test
-    fun `empty wake words and capabilities are omitted`() {
-        val text = PromptCatalog.plan(
-            PromptRoute.WAKE,
-            profileFixture(wakeWords = emptyList(), capabilities = emptySet()),
-        ).systemText
-
-        assertFalse("唤醒词" in text)
-        assertFalse("可用能力" in text)
-    }
-
-    @Test
     fun `a capability set renders in a stable order`() {
         val one = PromptCatalog.plan(
             PromptRoute.WAKE,

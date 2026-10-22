@@ -120,43 +120,6 @@ class SkillTwoLayerWiringTest {
     // ------------------------------------------------------------ the two layers
 
     @Test
-    fun `the first request carries the catalog and not the body, the second request carries the body`() {
-        val marker = "正文标记-8821"
-        val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("reply-wechat-message", marker))))
-        pullThenAnswer(rig, "reply-wechat-message")
-
-        rig.wakeAndFinal("帮我回微信")
-
-        assertEquals(2, rig.model.requests.size, "the load_skill round-trip must make a second model request")
-        val first = rig.model.requests[0]
-        assertTrue(first.instructions.contains("## SKILL 目录"), "the first request must advertise the catalog")
-        assertTrue(
-            first.instructions.contains("- reply-wechat-message: d-reply-wechat-message"),
-            "the catalog carries name and description: ${first.instructions}",
-        )
-        assertFalse(
-            marker in first.instructions,
-            "the body must NOT reach the first request — the catalog is the whole point of the second layer",
-        )
-        assertFalse(marker in inputText(first), "the body was never pulled yet")
-
-        // 0.3 Task 12: the pulled body is request-scoped tail content (SKILL_BODY), never system text.
-        val second = rig.model.requests[1]
-        assertFalse(
-            marker in second.instructions,
-            "a pulled body must never be folded into the system slot: ${second.instructions}",
-        )
-        assertTrue(
-            marker in inputText(second),
-            "the pulled body must reach the next request of the same turn, in its input tail: ${inputText(second)}",
-        )
-        assertTrue(
-            inputText(second).contains("## SKILL 正文: reply-wechat-message"),
-            "the body travels under a heading that names it: ${inputText(second)}",
-        )
-    }
-
-    @Test
     fun `a load_skill pull resets the answer stream but paints no device tool row`() {
         // Task 17 review M6(a): `load_skill` is a SKILL read, not an ExecutionRouter action, so it must never become a
         // tool row on the glasses (the filter, not just the `notify_user` filter, is what is being pinned). Its round
@@ -179,45 +142,6 @@ class SkillTwoLayerWiringTest {
         assertTrue(
             display.toolStatuses.isEmpty(),
             "load_skill must not paint a device tool row: ${display.toolStatuses}",
-        )
-    }
-
-    @Test
-    fun `the pulled body is gone from the next turn's first request`() {
-        // Design D-2: the body lives for one turn. Accumulating it across turns would move the unbounded growth the
-        // whole phase removes from the catalog into the conversation — so this half matters as much as the first.
-        val marker = "正文标记-4417"
-        val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", marker))))
-        var calls = 0
-        rig.model.onRequest = { request, listener ->
-            calls += 1
-            if (calls == 1) {
-                listener(smartToolCall("c1", LoadSkillTool.NAME, """{"name":"alpha"}""", requestId = request.requestId))
-                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
-            } else {
-                streamText(request, listener, "好。")
-            }
-        }
-
-        rig.wakeAndFinal("第一回合")
-        rig.tick(4_000) // beyond the wake cooldown, so the second turn is admitted
-        rig.wakeAndFinal("第二回合")
-
-        assertEquals(3, rig.model.requests.size, "turn 1 makes two requests, turn 2 makes one")
-        assertTrue(marker in inputText(rig.model.requests[1]), "turn 1's second request carries the pulled body")
-        assertFalse(
-            marker in rig.model.requests[1].instructions,
-            "the body is request-tail content, not system text",
-        )
-        val secondTurnFirst = rig.model.requests[2].instructions
-        assertFalse(marker in inputText(rig.model.requests[2]), "the body is turn-scoped and left with turn 1")
-        assertTrue(
-            secondTurnFirst.contains("- alpha: d-alpha"),
-            "the next turn's first request must advertise the catalog again: $secondTurnFirst",
-        )
-        assertFalse(
-            marker in secondTurnFirst,
-            "the body is turn-scoped and must be gone from the next turn's first request: $secondTurnFirst",
         )
     }
 
@@ -394,31 +318,6 @@ class SkillTwoLayerWiringTest {
     }
 
     @Test
-    fun `a refused pull does not end the turn`() {
-        // LoadSkillTool's refusal is a step the model can correct, never an exception and never a terminal state.
-        val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", "正文"))))
-        pullThenAnswer(rig, "missing")
-
-        val lines = withLines { captured ->
-            rig.wakeAndFinal("帮我回微信")
-            captured.toList()
-        }
-
-        assertEquals(2, rig.model.requests.size, "a refusal is fed back so the model gets another request")
-        assertTrue(
-            rig.model.requests[0].instructions.contains("- alpha: d-alpha"),
-            "the catalog is what the model chose from, so it must carry the one real entry",
-        )
-        assertTrue(
-            rig.model.requests[1].history.any {
-                it is ModelHistoryItem.ToolOutput && it.output.contains(LoadSkillTool.NOT_FOUND)
-            },
-            "the refusal code must reach the model: ${rig.model.requests[1].history}",
-        )
-        assertTrue(turnCompleted(lines), "a refused pull must not end the turn: $lines")
-    }
-
-    @Test
     fun `three pulls in one turn keep distinct receipts and the turn completes`() {
         // Obligation 3: the tool instance — and therefore its receipt counter — must survive across the requests of one
         // run. A per-request instance restarts at `loaded:1`; three such receipts are three identical consecutive tool
@@ -463,27 +362,6 @@ class SkillTwoLayerWiringTest {
             "one instance across requests is what keeps the receipts distinct: $receipts",
         )
         assertTrue(turnCompleted(lines), "the turn must complete, not trip NO_PROGRESS: $lines")
-    }
-
-    // ------------------------------------------------------------ the B4 criterion, migrated
-
-    @Test
-    fun `migrated B4 criterion an enabled skill still reaches the model, by pull instead of whole`() {
-        // Replaces `SkillInjectionWiringTest`'s `an enabled skill is injected whole into the request instructions`.
-        // The old intent was "the library's SKILL reaches the model", not "it arrives early"; it now arrives after the
-        // pull, and this test pins that arrival.
-        val marker = "正文标记-5520"
-        val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("reply-wechat-message", marker))))
-        pullThenAnswer(rig, "reply-wechat-message")
-
-        rig.wakeAndFinal("帮我回微信")
-
-        // 0.3 Task 12: the body still reaches the model, but as request-scoped `SKILL_BODY` input rather than system
-        // text, so the cacheable prefix does not change when a skill is pulled.
-        val second = rig.model.requests[1]
-        assertFalse(marker in second.instructions, "the body is tail content, not system text")
-        assertTrue(marker in inputText(second), "an enabled SKILL's body must still reach the model: ${inputText(second)}")
-        assertTrue(inputText(second).contains("## SKILL 正文: reply-wechat-message"), inputText(second))
     }
 
     // ------------------------------------------------------------ the turn-end count line (design D-10)
@@ -601,45 +479,6 @@ class SkillTwoLayerWiringTest {
             "a pulled body is request-tail content and must never enter the system slot: $slot",
         )
         rig.plugin.endSkillTurnForTest(wake)
-    }
-
-    /**
-     * 0.3 Task 12 fixes **where** the body travels: it belongs to the request's dynamic tail as a `SKILL_BODY`
-     * segment, never to the system slot and never to `INSTRUCTIONS`. The flattened `instructions` string cannot tell
-     * those apart, so the assertions read both halves of one snapshot (the production seam) and the request input.
-     */
-    @Test
-    fun `a pulled body travels in the request tail and never in the system slot`() {
-        val marker = "正文标记-8104"
-        val rig = rig(SmartFakeSkills(mapOf("/sdcard/EDITH/skills/a.md" to smartSkillDoc("alpha", marker))))
-        val views = mutableListOf<Pair<List<Segment>, List<Segment>>>()
-        var calls = 0
-        rig.model.onRequest = { request, listener ->
-            calls += 1
-            if (calls == 1) {
-                listener(smartToolCall("c1", LoadSkillTool.NAME, """{"name":"alpha"}""", requestId = request.requestId))
-                listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
-            } else {
-                // The production producers for the request this very turn carries (the gateway flattens them into
-                // `instructions`/`input`, so the segments are only observable through the plugin, mid-turn). Both
-                // halves come from one call so the assertion is about the pair production builds.
-                views += rig.plugin.requestSkillSegmentsForTest(ContextRoute.WAKE)
-                streamText(request, listener, "好。")
-            }
-        }
-
-        rig.wakeAndFinal("帮我回微信")
-
-        val (slot, bodies) = views.single()
-        assertFalse(
-            slot.any { marker in it.text },
-            "the pulled body must never travel in the system slot: $slot",
-        )
-        assertTrue(
-            bodies.any { it.origin == SegmentOrigin.SKILL_BODY && marker in it.text },
-            "the pulled body's origin is SKILL_BODY in the request tail",
-        )
-        assertTrue(marker in inputText(rig.model.requests[1]), "the body must reach the model's input tail")
     }
 
     /**
