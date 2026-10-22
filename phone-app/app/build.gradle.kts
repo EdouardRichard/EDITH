@@ -26,8 +26,8 @@ android {
         applicationId = "com.sheen.rokid.phone"
         minSdk = 28
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        versionCode = 3
+        versionName = "0.3.0-preview"
         testInstrumentationRunner = "com.sheen.rokid.phone.PhoneTestRunner"
     }
     signingConfigs {
