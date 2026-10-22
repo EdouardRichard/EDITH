@@ -1,6 +1,24 @@
-# EDITH（伊迪丝）——运行在 Rokid Glasses 上的全时主动智能 Agent
+<div align="center">
+  <picture>
+    <img alt="EDITH" src="docs/assets/brand/readme-logo.png" width="14%">
+  </picture>
+</div>
 
-[English](README.md) | **简体中文**
+<h3 align="center">
+EDITH（伊迪丝）：运行在安卓端、连接 Rokid Glasses 的全时主动智能 Agent
+</h3>
+
+<p align="center">
+  | <a href="#演示视频"><b>演示视频</b></a> |
+  <a href="#技术路线"><b>技术路线</b></a> |
+  <a href="#项目结构"><b>项目结构</b></a> |
+  <a href="#注意事项"><b>注意事项</b></a> |
+  <a href="LICENSE"><b>Apache-2.0</b></a> |
+</p>
+
+<p align="center">
+  <a href="README.md">English</a> | <strong>简体中文</strong>
+</p>
 
 > **预览版状态**：EDITH 目前处于预览版阶段，功能可用，但性能、稳定性与整体体验仍需持续优化。
 
@@ -14,16 +32,31 @@ APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒�
   媒体、日历、设备状态），规划并执行跨应用的多步操作（打开应用/页面、点按、输入中文、滚动、拨号、
   执行 shell），然后在眼镜 HUD 上作答并朗读答案。在 10 秒监听窗口内，后续追问不需要再次唤醒。
 - **主动辅助**：点一次「开始」后，EDITH 保持常驻收音与环境感知；端侧小模型（Laya，GPU）判断
-  “此时用户是否需要辅助”，需要辅助时**无需唤醒词**、静默地把提示推上眼镜，
-  并打开 10 秒接话窗口。你直接接话后，一个完整的 Agent 回合（含工具与确认）随即执行。唤醒词会
-  抢占主动接话；两条链路各自维护独立的对话历史。
+  “此时用户是否需要辅助”，需要辅助时**无需唤醒词**、静默地把提示推上眼镜，并打开 10 秒接话窗口。
+  你直接接话后，一个完整的 Agent 回合（含工具与确认）随即执行。唤醒词会抢占主动接话；两条链路
+  各自维护独立的对话历史。
 
 ## 演示视频
 
-| 链路 | 视频 |
-| --- | --- |
-| 唤醒词唤醒 | [▶ wake-up.mp4](docs/assets/videos/wake-up.mp4) |
-| 主动智能辅助 | [▶ proactive.mp4](docs/assets/videos/proactive.mp4) |
+**唤醒词唤醒**——说“EDITH”或“伊迪丝”，面板打开并由 EDITH 执行请求。
+
+<div align="center">
+  <a href="docs/assets/videos/wake-up.mp4">
+    <img src="docs/assets/videos/wake-up-preview.gif" width="65%" alt="唤醒词唤醒演示——点击播放完整视频">
+  </a>
+</div>
+
+**主动辅助**——EDITH 感知上下文后主动给出提示，接话后继续执行。
+
+<div align="center">
+  <a href="docs/assets/videos/proactive.mp4">
+    <img src="docs/assets/videos/proactive-preview.gif" width="65%" alt="主动辅助演示——点击播放完整视频">
+  </a>
+</div>
+
+<!-- GitHub 会清洗指向仓库路径的 <video> 标签，所以这里用 GIF 做内联预览。把两个 MP4 拖进 GitHub
+     的 README 编辑器或 issue 评论框上传后，可以把上面的预览块替换为：
+     <div align="center"><video src="https://github.com/user-attachments/assets/..." controls></video></div> -->
 
 ## 适配与依赖说明
 
@@ -133,6 +166,15 @@ flowchart LR
 唤醒链路相同的工具面 · 眼镜悬浮面板（经 CXR 自定义命令）。闸门拒绝时**不产生任何模型请求**；
 两条链路使用各自独立的 `ConversationStore`。
 
+## 项目结构
+
+- `phone-app/` — Android 手机宿主：会话与插件宿主、感知、语音、模型运行时、原生动作通道（无障碍 / Shizuku）
+- `glasses-app/` — 眼镜端 CustomApp：CXR-S 桥接、悬浮面板与渲染
+- `common/` — 两端共用的契约与展示 / 输出模块
+- `tools/` — 探针、评测装置与脚本（非交付）
+- `third_party/` — vendored 构建输入（如 CXR SDK）
+- `docs/` — 项目文档、证据、品牌与演示资源
+
 ## 注意事项
 
 ### 1. 依赖无障碍服务（必需）
@@ -171,7 +213,7 @@ adb -s $phone shell dumpsys accessibility | Select-String "Bound services|EDITH"
 
 ### 2. 模型文件（必需）
 
-**模型文件下载链接**：*https://pan.quark.cn/s/d53caa9e395f?pwd=veEd* <!-- TODO: 发布前填入网盘链接 -->
+**模型文件下载链接**：[夸克网盘](https://pan.quark.cn/s/d53caa9e395f?pwd=veEd)
 
 EDITH 依赖四组端侧模型文件。它们是运行期依赖，不是可选的附加项：智能助手插件把 ASR、SystemOne
 （Laya）、Embedding、Perception 声明为必需能力，缺任何一组会导致会话激活失败。

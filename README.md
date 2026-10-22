@@ -1,6 +1,24 @@
-# EDITH — an Always-On Proactive AI Agent on Rokid Glasses
+<div align="center">
+  <picture>
+    <img alt="EDITH" src="docs/assets/brand/readme-logo.png" width="14%">
+  </picture>
+</div>
 
-**English** | [简体中文](README.zh-CN.md)
+<h3 align="center">
+EDITH: An Always-On Proactive AI Agent on Android, Connected to Rokid Glasses
+</h3>
+
+<p align="center">
+  | <a href="#demo-videos"><b>Demo</b></a> |
+  <a href="#technical-routes"><b>Technical routes</b></a> |
+  <a href="#project-structure"><b>Project structure</b></a> |
+  <a href="#notes"><b>Setup notes</b></a> |
+  <a href="LICENSE"><b>Apache-2.0</b></a> |
+</p>
+
+<p align="center">
+  <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
+</p>
 
 > **Preview status:** EDITH is currently in preview. Its features are usable, but performance,
 > stability and the overall experience still need optimization.
@@ -19,17 +37,32 @@ on the glasses HUD (with TTS over the glasses' Bluetooth audio).
   for a follow-up utterance without another wake word inside the 10-second listening window.
 - **Proactive route** — After you tap “Start” once, EDITH keeps listening and watching ambient
   context. A small on-device gate model (Laya, GPU) decides whether the user needs help right now;
-  if so, EDITH pushes a silent hint to the glasses **without any wake word** and
-  opens a 10-second follow-up window. You can answer directly, and a full agent turn with tools and
-  confirmations then runs. A wake word preempts the follow-up; the two routes keep separate
-  conversation history.
+  if so, EDITH pushes a silent hint to the glasses **without any wake word** and opens a 10-second
+  follow-up window. You can answer directly, and a full agent turn with tools and confirmations then
+  runs. A wake word preempts the follow-up; the two routes keep separate conversation history.
 
 ## Demo videos
 
-| Route | Video |
-| --- | --- |
-| Wake word | [▶ wake-up.mp4](docs/assets/videos/wake-up.mp4) |
-| Proactive assistance | [▶ proactive.mp4](docs/assets/videos/proactive.mp4) |
+**Wake-word route** — say “EDITH” or “伊迪丝”; the panel opens and EDITH executes the request.
+
+<div align="center">
+  <a href="docs/assets/videos/wake-up.mp4">
+    <img src="docs/assets/videos/wake-up-preview.gif" width="65%" alt="Wake-word demo — click to play the full video">
+  </a>
+</div>
+
+**Proactive route** — EDITH notices the context, offers help without a wake word, and continues after the reply.
+
+<div align="center">
+  <a href="docs/assets/videos/proactive.mp4">
+    <img src="docs/assets/videos/proactive-preview.gif" width="65%" alt="Proactive demo — click to play the full video">
+  </a>
+</div>
+
+<!-- The inline previews are GIFs because GitHub strips <video> tags that point at repository
+     files. After uploading the two MP4s to GitHub (drag them into the README editor or an issue
+     comment), a preview block can be replaced with:
+     <div align="center"><video src="https://github.com/user-attachments/assets/..." controls></video></div> -->
 
 ## Compatibility and dependencies
 
@@ -145,6 +178,15 @@ tool face as the wake route for FOLLOWUP_TURN · glasses overlay panel via CXR c
 When the gate declines, **zero** model requests are made. The two routes use independent
 `ConversationStore`s.
 
+## Project structure
+
+- `phone-app/` — Android phone host: session and plugin host, perception, speech, model runtime, native action channels (accessibility / Shizuku)
+- `glasses-app/` — glasses CustomApp: CXR-S bridge, overlay panel and rendering
+- `common/` — contracts and presentation / output modules shared by both ends
+- `tools/` — probes, evaluation harness and scripts (not shipped)
+- `third_party/` — vendored build inputs such as the CXR SDK
+- `docs/` — project documents, evidence, brand and demo assets
+
 ## Notes
 
 ### 1. Accessibility service (required)
@@ -184,7 +226,7 @@ serial `<glasses-serial>`.
 
 ### 2. Model files (required)
 
-**Model download link:** *https://pan.quark.cn/s/d53caa9e395f?pwd=veEd* <!-- TODO: fill in the cloud-drive link before publishing -->
+**Model download link:** [Quark Drive](https://pan.quark.cn/s/d53caa9e395f?pwd=veEd)
 
 EDITH needs four local model sets. They are runtime dependencies, not optional add-ons: the
 assistant plugin declares ASR, SystemOne (Laya), Embedding and Perception as required capabilities,
