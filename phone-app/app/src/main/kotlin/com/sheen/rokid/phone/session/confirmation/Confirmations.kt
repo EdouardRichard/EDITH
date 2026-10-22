@@ -18,6 +18,26 @@ import com.sheen.rokid.plugin.MonotonicClock
 fun interface SummaryDisplayer {
     /** Returns `false` when nothing could be displayed; a broken display is a degradation, never a refusal. */
     fun show(text: String, ttlMillis: Long): Boolean
+
+    /**
+     * 0.3 Phase 4B (B4): whether the glasses display can receive a question right now. Defaults to `true` - a display
+     * that predates the check (or whose state is unknown) keeps being used; only an explicitly unavailable surface
+     * answers `false`, and a throwing check counts as unavailable for that surface.
+     */
+    fun available(): Boolean = true
+}
+
+/**
+ * 0.3 Phase 4B (B4, spec §5.4): the narrow seam that asks the glasses to **create** the panel.
+ *
+ * The confirmation path used to send only `SHOW`/`CONFIRM_STATE`, but the resident panel is created by `PANEL_OPEN`;
+ * a hidden window receives the two announcements invisibly, and reopening it resets the glasses' own question state.
+ * The presenter therefore asks for the panel **before** it announces the question. The wire contract is unchanged: the
+ * production implementation is the composition's existing `requestPanelOpen` (`PANEL_OPEN`), never a new command.
+ */
+fun interface ConfirmationPanel {
+    /** Returns whether the open was accepted for delivery; a refused open is a degradation, never a failed question. */
+    fun open(): Boolean
 }
 
 /**
@@ -31,12 +51,24 @@ fun interface SummaryDisplayer {
 fun interface ConfirmationGlasses {
     /** Returns `false` when the glasses could not be told; a broken link is a degradation, never a failed answer. */
     fun show(requestId: String, active: Boolean): Boolean
+
+    /**
+     * 0.3 Phase 4B (B4): whether the glasses' key channel can carry a question right now (an established session).
+     * Defaults to `true` so a pre-4B link keeps its behaviour; the presenter opens the panel only when this is true.
+     */
+    fun available(): Boolean = true
 }
 
 /** The phone-side question: a card on the session page and, when notifications are allowed, the same two actions. */
 interface ConfirmationUi {
     fun show(requestId: String, summary: String)
     fun hide(requestId: String)
+
+    /**
+     * 0.3 Phase 4B (B4): whether the phone card can be put in front of the wearer right now. Defaults to `true`; a host
+     * whose page/surface cannot show the card overrides this with `false` so the presenter's aggregate is honest.
+     */
+    fun available(): Boolean = true
 }
 
 /**
@@ -65,9 +97,23 @@ class ConfirmationPresenter(
      * still fully answerable on the phone.
      */
     private val glasses: ConfirmationGlasses = ConfirmationGlasses { _, _ -> false },
+    /**
+     * 0.3 Phase 4B (B4, spec §5.4): the panel-creation seam (the composition's `requestPanelOpen` -> `PANEL_OPEN`).
+     *
+     * A no-op by default, so every pre-4B construction (and every host without a glasses link) is unchanged. When the
+     * glasses surface can serve, [present] asks for the panel **before** it sends `SHOW`/`CONFIRM_STATE`, because a
+     * hidden resident window receives neither visibly.
+     */
+    private val panel: ConfirmationPanel = ConfirmationPanel { false },
 ) : ConfirmationChannel {
 
-    private class Pending(val requestId: String, val summary: String, val envelope: EventEnvelope) {
+    private class Pending(
+        val requestId: String,
+        val summary: String,
+        val envelope: EventEnvelope,
+        /** When the plugin's window closes, so a re-announcement carries a fresh, honest TTL rather than a new one. */
+        val deadlineNanos: Long,
+    ) {
         var timer: CancellationHandle? = null
         /** A second `present` with a live id gets this no-op handle: it never displaces the question already up. */
         val ignoredBy = object : CancellationHandle { override fun cancel() = Unit }
@@ -79,10 +125,24 @@ class ConfirmationPresenter(
     /** How many questions are up; 0 or 1 in practice, exposed so the invariant is testable. */
     val pendingCount: Int get() = synchronized(lock) { pending.size }
 
+    /**
+     * 0.3 Phase 4B (B4, spec §5.4): whether **any** of this presenter's surfaces can put the question to the wearer.
+     *
+     * The surfaces are aggregated because the wearer may answer on any of them: the glasses display (SHOW), the phone
+     * card, or the glasses keys (CONFIRM_STATE). Each check is live and a throwing one counts as unavailable **for that
+     * surface only** - a broken display must not hide a working phone card. The panel is not aggregated: opening it is
+     * an aid to the glasses surface, not an answer path by itself.
+     */
+    override fun available(): Boolean =
+        runCatching { summary.available() }.getOrDefault(false) ||
+            runCatching { ui.available() }.getOrDefault(false) ||
+            runCatching { glasses.available() }.getOrDefault(false)
+
     override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle {
         require(requestId.isNotBlank()) { "confirmation request id must not be blank" }
         require(timeoutMillis > 0) { "confirmation window must be positive, was $timeoutMillis" }
         val text = truncate(summary)
+        val deadlineNanos = clock.nowNanos() + timeoutMillis * 1_000_000L
         // A question that is **already up** keeps its slot and does not even ask for an identity it will not use. (A
         // duplicate that lands between this check and the registration below still reads one identity and throws it
         // away; that is the deliberate price of not holding our lock across `envelopeFor`.)
@@ -98,9 +158,15 @@ class ConfirmationPresenter(
         synchronized(lock) {
             val live = pending[requestId]
             if (live != null) return live.ignoredBy   // lost the race for this id: the live question keeps it
-            pending[requestId] = Pending(requestId, text, envelope)
+            pending[requestId] = Pending(requestId, text, envelope, deadlineNanos)
         }
 
+        // 0.3 Phase 4B (B4): the panel is created by PANEL_OPEN, not by SHOW. Ask for it first when the glasses surface
+        // can serve - a hidden window would otherwise receive the two announcements invisibly, and the panel's own
+        // `resetForOpen` would erase them as it comes up. A refused open is a degradation, never a failed question.
+        if (glassesCanServe()) {
+            runCatching { panel.open() }
+        }
         // Both screens, and neither failure is fatal: the phone is the fallback screen, and a question that cannot be
         // displayed anywhere is still settled by the gate's timeout (as a denial).
         runCatching { this.summary.show(text, timeoutMillis + SUMMARY_MARGIN_MILLIS) }
@@ -109,9 +175,36 @@ class ConfirmationPresenter(
         // session introduced, link down) is a degradation only: the phone and the window still settle the question.
         tellGlasses(requestId, active = true)
 
-        val timer = scheduler.at(clock.nowNanos() + timeoutMillis * 1_000_000L) { withdraw(requestId) }
+        val timer = scheduler.at(deadlineNanos) { withdraw(requestId) }
         synchronized(lock) { pending[requestId]?.timer = timer }
         return object : CancellationHandle { override fun cancel() = withdraw(requestId) }
+    }
+
+    /**
+     * 0.3 Phase 4B (B4, spec §5.4): the glasses reported that the panel's first layout completed.
+     *
+     * The panel may have been created **after** [present] already sent `SHOW`/`CONFIRM_STATE` (a cold `appStart`, or a
+     * resident window that was hidden). Its first layout is therefore the moment to announce the same question again:
+     * repeat `SHOW` and the active `CONFIRM_STATE` for every question still pending.
+     *
+     * This is an announcement, **not** a settlement: an unsettled question keeps its slot (only an answer, a timeout or
+     * an explicit withdrawal removes one), so reopening the panel can never silently drop the question the plugin is
+     * blocked on. The repeat deliberately does not raise the phone card a second time.
+     */
+    fun panelShownArrived() {
+        val live = synchronized(lock) { pending.values.toList() }
+        if (live.isEmpty()) return
+        live.forEach { entry ->
+            val remainingMillis = synchronized(lock) {
+                // A settlement racing this pass must not leave a withdrawn question armed on the glasses.
+                if (pending[entry.requestId] !== entry) return@forEach
+                // The TTL is the question's **remaining** window plus the usual margin, not a second full window.
+                ((entry.deadlineNanos - clock.nowNanos()) / 1_000_000L).coerceAtLeast(0L) +
+                    SUMMARY_MARGIN_MILLIS
+            }
+            runCatching { summary.show(entry.summary, remainingMillis) }
+            tellGlasses(entry.requestId, active = true)
+        }
     }
 
     /**
@@ -159,6 +252,12 @@ class ConfirmationPresenter(
     private fun tellGlasses(requestId: String, active: Boolean) {
         runCatching { glasses.show(requestId, active) }
     }
+
+    /**
+     * 0.3 Phase 4B (B4): whether the glasses surface can carry the question now. A throwing check is `false`: the panel
+     * is an aid, and a broken availability probe must not be treated as proof that a panel exists to open.
+     */
+    private fun glassesCanServe(): Boolean = runCatching { glasses.available() }.getOrDefault(false)
 
     companion object {
         /** The glasses hint path clips beyond its budget; a confirmation summary is short by construction. */

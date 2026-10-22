@@ -24,10 +24,12 @@ class SmartConfirmationTest {
     private val clock = SmartFakeClock()
     private val scheduler = SmartFakeScheduler(clock)
 
-    private class FakeChannel : ConfirmationChannel {
+    private class FakeChannel(var canServe: Boolean = true) : ConfirmationChannel {
         val presented = mutableListOf<Triple<String, String, Long>>()
         var cancelled = 0
         var failure: RuntimeException? = null
+
+        override fun available(): Boolean = canServe
 
         override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle {
             failure?.let { throw it }
@@ -166,6 +168,39 @@ class SmartConfirmationTest {
         assertEquals(ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE),
             subject.request("c1", "卸载探针 App"))
         assertEquals(0, subject.pendingCount, "an unasked question must not stay armed")
+    }
+
+    // ------------------- 0.3 Phase 4B (B4): an unavailable surface is refused at once, not after the window
+
+    @Test fun `a channel that reports itself unavailable makes the plugin unavailable at once`() {
+        val channel = FakeChannel().apply { canServe = false }
+        val subject = confirmation(channel)
+
+        assertFalse(subject.available(), "the plugin's availability must delegate to the host channel")
+        assertFalse(subject.canAsk, "an attached but unusable channel is not somebody to ask")
+        val startedNanos = System.nanoTime()
+        val outcome = subject.request("c1", "卸载探针 App")
+        val elapsedMillis = (System.nanoTime() - startedNanos) / 1_000_000
+
+        assertEquals(ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE), outcome)
+        assertTrue(channel.presented.isEmpty(), "an unavailable channel must never be asked to present")
+        assertEquals(0, subject.pendingCount, "nothing may stay armed behind an immediate refusal")
+        assertTrue(elapsedMillis < 1_000, "the refusal must not wait for the 120 s window, waited ${elapsedMillis}ms")
+    }
+
+    @Test fun `availability follows the channel attached at activation`() {
+        val subject = SmartConfirmation(channel = null, gate = ConfirmationGate(clock, scheduler))
+        assertFalse(subject.available(), "a plugin nobody has attached a host channel to cannot ask")
+        assertFalse(subject.canAsk)
+
+        val channel = FakeChannel()
+        subject.attach(channel)
+        assertTrue(subject.available(), "the attached channel can present, so the plugin can ask")
+        assertTrue(subject.canAsk)
+
+        channel.canServe = false
+        assertFalse(subject.available(), "the surface check is live, not cached at attach time")
+        assertFalse(subject.canAsk)
     }
 
     @Test fun `a channel attached at activation can present a question the plugin was built without`() {

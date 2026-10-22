@@ -1547,6 +1547,18 @@ class AgentLoopTest {
         }
     }
 
+    /** 0.3 Phase 4B (B4): a host that says nobody can be asked right now. Asking it at all is the defect. */
+    private class UnavailableConfirmation : ConfirmationPort {
+        var asked = 0
+
+        override fun available(): Boolean = false
+
+        override fun request(requestId: String, summary: String): ConfirmationOutcome {
+            asked++
+            error("an unavailable confirmation channel must never be asked")
+        }
+    }
+
     /** A gateway that spends **machine** time on every turn: that time is the loop's own budget and must still count. */
     private class ClockMovingGateway(
         private val clock: FakeClock,
@@ -1680,6 +1692,34 @@ class AgentLoopTest {
         assertEquals(AgentStep(1, "device.set_volume", "CONFIRMATION_UNAVAILABLE"), run.steps.single())
         assertTrue(executor.calls.isEmpty(), "没有通道的确认动作永不执行")
         assertEquals(500_000_000L, gateway.requests.first().deadlineNanos, "单次请求上限照常生效")
+    }
+
+    @Test fun `an unavailable confirmation channel is refused without entering the wait`() {
+        // 0.3 Phase 4B (B4), review focus 3: a channel whose surface is gone must not be asked and must not make the
+        // loop block out D47's 120 s window before returning the same refusal.
+        val clock = FakeClock(0)
+        val executor = gatedExecutor()
+        val audit = RecordingAuditSink()
+        val confirmation = UnavailableConfirmation()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "没有确认通道，先不动")),
+        )
+
+        val run = newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), audit = audit, clock = clock,
+            confirmation = confirmation,
+        ).run(request(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(AgentStep(1, "device.set_volume", "CONFIRMATION_UNAVAILABLE"), run.steps.single())
+        assertEquals(0, confirmation.asked, "the loop must ask availability before blocking on the port")
+        assertEquals(0L, run.humanWaitNanos, "nobody waited, so the turn has no human wait to report")
+        assertEquals(0L, clock.nowNanos, "the loop did not spend the 120 s window")
+        assertEquals(
+            RecordedAuditEntry("turn-7", "device.set_volume", "policy", "ConfirmationUnavailable"),
+            audit.entries.single(),
+        )
+        assertTrue(executor.calls.isEmpty(), "an unconfirmed action must never execute")
     }
 
     @Test fun `a cancel during the wait ends the turn as CANCELLED`() {

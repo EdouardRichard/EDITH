@@ -165,6 +165,11 @@ class ScopedHostServices(
      * plugin's tool call fails with a contract error instead of arming a question nobody can settle.
      */
     private fun scopedConfirmation(provider: ConfirmationChannel) = object : ConfirmationChannel {
+        // 0.3 Phase 4B (B4): the plugin asks the scoped wrapper whether the host can ask. Without this forwarding the
+        // interface default `true` would run and the production channel's unavailability would never reach the loop's
+        // early refusal. A revoked scope can ask nobody, so it answers false rather than throwing from a query.
+        override fun available(): Boolean = runCatching { scope.active { provider.available() } }.getOrDefault(false)
+
         override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle {
             scope.checkActive()
             require(requestId.isNotBlank()) { "confirmation request id must not be blank" }

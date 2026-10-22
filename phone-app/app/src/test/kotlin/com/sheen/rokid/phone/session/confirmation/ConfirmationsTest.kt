@@ -30,6 +30,8 @@ class ConfirmationsTest {
     private class FakeSummary(var accepts: Boolean = true) : SummaryDisplayer {
         val shown = mutableListOf<Pair<String, Long>>()
         var failure: RuntimeException? = null
+        var canServe = true
+        override fun available(): Boolean = canServe
         override fun show(text: String, ttlMillis: Long): Boolean {
             failure?.let { throw it }
             shown += text to ttlMillis
@@ -40,19 +42,44 @@ class ConfirmationsTest {
     private class FakeUi : ConfirmationUi {
         val shown = mutableListOf<Pair<String, String>>()
         val hidden = mutableListOf<String>()
+        var canServe = true
+        override fun available(): Boolean = canServe
         override fun show(requestId: String, summary: String) { shown += requestId to summary }
         override fun hide(requestId: String) { hidden += requestId }
+    }
+
+    private class FakeGlasses : ConfirmationGlasses {
+        val states = mutableListOf<Pair<String, Boolean>>()
+        var canServe = true
+        override fun available(): Boolean = canServe
+        override fun show(requestId: String, active: Boolean): Boolean {
+            states += requestId to active
+            return canServe
+        }
+    }
+
+    private class FakePanel : ConfirmationPanel {
+        var opens = 0
+        var accepts = true
+        override fun open(): Boolean {
+            opens++
+            return accepts
+        }
     }
 
     private class Rig {
         val summary = FakeSummary()
         val ui = FakeUi()
+        val glasses = FakeGlasses()
+        val panel = FakePanel()
         val delivered = mutableListOf<ConfirmationResult>()
         val clock = FakeClock()
         val scheduler = ManualScheduler(clock)
         val presenter = ConfirmationPresenter(
             summary = summary,
             ui = ui,
+            glasses = glasses,
+            panel = panel,
             deliver = { delivered += it },
             clock = clock,
             scheduler = scheduler,
@@ -205,5 +232,44 @@ class ConfirmationsTest {
         assertEquals("answering must not ask the host for an identity again", 1, reads)
         assertEquals(Generation(7), delivered.single().envelope.generation)
         assertEquals("c1", delivered.single().requestId)
+    }
+
+    // ---------------------------------------- 0.3 Phase 4B (B4): channel availability and the glasses panel
+
+    @Test
+    fun `a presenter whose every surface is unavailable is unavailable`() {
+        val rig = rig()
+        rig.summary.canServe = false
+        rig.ui.canServe = false
+        rig.glasses.canServe = false
+
+        assertFalse(
+            "a host with no screen and no glasses keys has nobody to ask; the loop must refuse instead of waiting",
+            rig.presenter.available(),
+        )
+    }
+
+    @Test
+    fun `any one available surface makes the presenter available`() {
+        listOf("glasses display", "phone card", "glasses keys").forEach { surface ->
+            val rig = rig()
+            rig.summary.canServe = surface == "glasses display"
+            rig.ui.canServe = surface == "phone card"
+            rig.glasses.canServe = surface == "glasses keys"
+
+            assertTrue("the question is still askable through the $surface", rig.presenter.available())
+        }
+    }
+
+    @Test
+    fun `the panel is requested before the first question and only when the glasses keys can serve`() {
+        val withGlasses = rig()
+        withGlasses.presenter.present("c1", "卸载 App", 10_000L)
+        assertEquals("a presentable question must open the hidden panel first", 1, withGlasses.panel.opens)
+
+        val withoutGlasses = rig()
+        withoutGlasses.glasses.canServe = false
+        withoutGlasses.presenter.present("c1", "卸载 App", 10_000L)
+        assertEquals("no glasses surface means no panel to open", 0, withoutGlasses.panel.opens)
     }
 }

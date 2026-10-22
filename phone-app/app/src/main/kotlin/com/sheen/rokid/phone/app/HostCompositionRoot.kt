@@ -47,6 +47,7 @@ import com.sheen.rokid.phone.session.PlaybackGate
 import com.sheen.rokid.phone.bridge.CxrConnection
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.confirmation.ConfirmationUi
+import com.sheen.rokid.phone.session.confirmation.ConfirmationPanel
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.bridge.RokidConnection
 import com.sheen.rokid.phone.audio.AudioIngressLoop
@@ -1266,7 +1267,9 @@ class HostCompositionRoot internal constructor(
      * Receives `PANEL_SHOWN` from the link and hands it to [onPanelShown] on a host thread.
      *
      * The validated identity is checked against the host's current one at delivery, so a queued event from a previous
-     * session cannot start the new conversation's timer.
+     * session cannot start the new conversation's timer. 0.3 Phase 4B (B4, spec §5.4): a live confirmation question is
+     * announced to the newly laid-out panel here as well - the panel may have been created *after* `present` sent its
+     * first `SHOW`/`CONFIRM_STATE`, and that repeat must not count as settling the question.
      */
     internal fun panelShownArrived(identity: HintIdentity, route: AssistantRoute) {
         dispatchHostEvent {
@@ -1276,6 +1279,9 @@ class HostCompositionRoot internal constructor(
                 return@dispatchHostEvent
             }
             P3Log.line("P3_PANEL shown route=${route.name}")
+            // Re-announce before the turn owner starts its window: the question is on the panel by the time the
+            // wearer's listening/answer window opens.
+            confirmationPresenter?.panelShownArrived()
             onPanelShown?.invoke(identity, route)
         }
     }
@@ -2490,6 +2496,10 @@ class HostCompositionRoot internal constructor(
                 onClose = { toolCatalog.close() },
             )
             val confirmationUi = object : ConfirmationUi {
+                // 0.3 Phase 4B (B4): the page card is a real surface once the composition exists. Before that no turn
+                // can ask a question at all, so "no root" is the only honest unavailable answer here.
+                override fun available(): Boolean = rootHolder[0] != null
+
                 // Through the holder: this object is built inside `create`, where no composition instance exists yet,
                 // and the question is shown only after a session starts - by which time the holder is filled.
                 override fun show(requestId: String, summary: String) {
@@ -2501,28 +2511,34 @@ class HostCompositionRoot internal constructor(
                 }
             }
             val confirmationPresenter = ConfirmationPresenter(
-                summary = SummaryDisplayer { text, ttlMillis ->
-                    val device = hintLink.liveOutput() ?: return@SummaryDisplayer false
-                    val identity = hostHolder[0]?.currentIdentity() ?: return@SummaryDisplayer false
-                    val now = clock.nowNanos()
-                    runCatching {
-                        device.show(
-                            Assistance(
-                                hintId = "confirm-${UUID.randomUUID()}",
-                                sessionId = identity.first,
-                                generation = identity.second,
-                                sourceTurnId = null,
-                                priority = 3,
-                                text = text,
-                                // The host refuses an assistance that carries speech, and P3.3 ships no speech path.
-                                optionalSpeech = null,
-                                expiresAtNanos = now + ttlMillis * 1_000_000L,
-                            ),
-                            revision = now,
-                            listener = { },
-                        )
-                        true
-                    }.getOrDefault(false)
+                summary = object : SummaryDisplayer {
+                    // 0.3 Phase 4B (B4): SHOW needs a live clock mapping; without one the display would drop the hint
+                    // silently, so the surface reports itself unavailable instead of claiming it can present.
+                    override fun available(): Boolean = hintLink.liveOutput() != null
+
+                    override fun show(text: String, ttlMillis: Long): Boolean {
+                        val device = hintLink.liveOutput() ?: return false
+                        val identity = hostHolder[0]?.currentIdentity() ?: return false
+                        val now = clock.nowNanos()
+                        return runCatching {
+                            device.show(
+                                Assistance(
+                                    hintId = "confirm-${UUID.randomUUID()}",
+                                    sessionId = identity.first,
+                                    generation = identity.second,
+                                    sourceTurnId = null,
+                                    priority = 3,
+                                    text = text,
+                                    // The host refuses an assistance that carries speech, and P3.3 ships no speech path.
+                                    optionalSpeech = null,
+                                    expiresAtNanos = now + ttlMillis * 1_000_000L,
+                                ),
+                                revision = now,
+                                listener = { },
+                            )
+                            true
+                        }.getOrDefault(false)
+                    }
                 },
                 ui = confirmationUi,
                 // The host owns the identity: the result is rebuilt and emitted through the same path every other
@@ -2559,8 +2575,19 @@ class HostCompositionRoot internal constructor(
                 },
                 // 0.25 Task 11 (R51): the presenter announces the question to the glasses through the same link that
                 // carries hints; a link with no established session answers false, which only degrades to phone-only.
-                glasses = ConfirmationGlasses { requestId, active ->
-                    hintLink.confirmationState(requestId, active)
+                // 0.3 Phase 4B (B4): the keys can serve exactly while a session is established; that is also the
+                // condition under which the presenter asks the link to create the panel below.
+                glasses = object : ConfirmationGlasses {
+                    override fun available(): Boolean = hintLink.isEstablished()
+
+                    override fun show(requestId: String, active: Boolean): Boolean =
+                        hintLink.confirmationState(requestId, active)
+                },
+                // 0.3 Phase 4B (B4, spec §5.4): `PANEL_OPEN` creates the resident window, so the question is announced
+                // into a visible panel rather than a hidden one. The route is WAKE: a confirmation is the wake turn's
+                // decision, and a proactive turn opens its own (PROACTIVE) panel without a question.
+                panel = ConfirmationPanel {
+                    rootHolder[0]?.requestPanelOpen(AssistantRoute.WAKE) ?: false
                 },
             )
             // P5 (spec §S1/S5): construct the speech player only when the user switch is on AND the engine is ready.

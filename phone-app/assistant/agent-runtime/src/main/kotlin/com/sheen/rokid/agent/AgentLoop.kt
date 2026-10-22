@@ -574,6 +574,17 @@ class AgentLoop(
     val measuredHumanWaitNanos: Long get() = humanWaitNanos
 
     /**
+     * 0.3 Phase 4B (B4, spec §5.4): whether a confirmation question can be put to the wearer at all.
+     *
+     * A missing port, a port whose surface is explicitly unavailable, and a port whose check throws are all "nobody can
+     * be asked": the flagged action is then refused at once with `CONFIRMATION_UNAVAILABLE` instead of spending D47's
+     * decision window. Read at the decision point - never cached for the run - because a link, a page or a permission
+     * can come back between tool calls.
+     */
+    private fun confirmationAvailable(): Boolean =
+        runCatching { confirmation?.available() == true }.getOrDefault(false)
+
+    /**
      * Requests that the run stop at its next check. Safe to call from another thread, including while a gateway turn
      * or a tool call is in flight: the flag is read again as soon as either returns, and the first cancel also asks
      * every executor to stop the work it is running (R61 — before Task 12 a blocked tool never saw the flag at all).
@@ -899,55 +910,74 @@ class AgentLoop(
                                 ToolInvocation(ToolResult.error(call.id, REFUSED_BY_POLICY), executed = false)
                             }
                             is PolicyDecision.RequireConfirmation -> {
-                                // Waiting on a person is not the turn spending its own budget (D49): measure the call and
-                                // shift the deadline by the same amount. `finally` so a channel that throws is not
-                                // punished for the time it already spent waiting. The same measurement is **published**
-                                // as it is taken ([measuredHumanWaitNanos]), so a caller whose own windows derive from
-                                // the deadline can move them even when this run ends by throwing instead of returning
-                                // (review I-1).
-                                val waitStartedNanos = clock.nowNanos()
-                                val outcome = try {
-                                    confirmation?.request(call.id, decision.summary)
-                                } finally {
-                                    val waitedNanos = clock.nowNanos() - waitStartedNanos
-                                    if (waitedNanos > 0L) {
-                                        humanWaitNanos += waitedNanos
-                                        turnDeadlineNanos += waitedNanos
+                                // 0.3 Phase 4B (B4, spec §5.4): a channel that cannot ask is "nobody can be asked".
+                                // Refuse before the wait is measured or entered, so the action fails immediately with
+                                // CONFIRMATION_UNAVAILABLE instead of spending D47's 120 s window first.
+                                if (!confirmationAvailable()) {
+                                    audit.record(
+                                        request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE,
+                                        scope = shape.scope, risk = shape.risk.name,
+                                        decision = AUDIT_REQUIRE_CONFIRMATION,
+                                    )
+                                    ToolInvocation(ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE), executed = false)
+                                } else {
+                                    // Waiting on a person is not the turn spending its own budget (D49): measure the call
+                                    // and shift the deadline by the same amount. `finally` so a channel that throws is not
+                                    // punished for the time it already spent waiting. The same measurement is
+                                    // **published** as it is taken ([measuredHumanWaitNanos]), so a caller whose own
+                                    // windows derive from the deadline can move them even when this run ends by throwing
+                                    // instead of returning (review I-1).
+                                    val waitStartedNanos = clock.nowNanos()
+                                    val outcome = try {
+                                        confirmation?.request(call.id, decision.summary)
+                                    } finally {
+                                        val waitedNanos = clock.nowNanos() - waitStartedNanos
+                                        if (waitedNanos > 0L) {
+                                            humanWaitNanos += waitedNanos
+                                            turnDeadlineNanos += waitedNanos
+                                        }
                                     }
-                                }
-                                when {
-                                    // No channel at all: P3.1's behaviour, and an unconfirmed action never runs.
-                                    outcome == null -> {
-                                        audit.record(
-                                            request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE,
-                                            scope = shape.scope, risk = shape.risk.name,
-                                            decision = AUDIT_REQUIRE_CONFIRMATION,
-                                        )
-                                        ToolInvocation(ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE), executed = false)
-                                    }
-                                    outcome.approved -> {
-                                        val executed = runTool(
-                                            call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor,
-                                            mayAskHuman = shape.mayAskHuman,
-                                        )
-                                        if (!executed.cancelled) {
+                                    when {
+                                        // No channel at all: P3.1's behaviour, and an unconfirmed action never runs.
+                                        outcome == null -> {
                                             audit.record(
-                                                request.turnId, call.name, auditSummary(shape, call.argsJson),
-                                                outcomeOf(executed.result), scope = shape.scope, risk = shape.risk.name,
-                                                decision = AUDIT_REQUIRE_CONFIRMATION, confirmationSource = outcome.source,
+                                                request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE,
+                                                scope = shape.scope, risk = shape.risk.name,
+                                                decision = AUDIT_REQUIRE_CONFIRMATION,
+                                            )
+                                            ToolInvocation(
+                                                ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE), executed = false,
                                             )
                                         }
-                                        executed
-                                    }
-                                    else -> {
-                                        val code = if (outcome.source == ConfirmationSource.TIMEOUT) CONFIRMATION_TIMEOUT
-                                        else CONFIRMATION_DENIED
-                                        audit.record(
-                                            request.turnId, call.name, code, code, scope = shape.scope,
-                                            risk = shape.risk.name, decision = AUDIT_REQUIRE_CONFIRMATION,
-                                            confirmationSource = outcome.source,
-                                        )
-                                        ToolInvocation(ToolResult.error(call.id, code), executed = false)
+                                        outcome.approved -> {
+                                            val executed = runTool(
+                                                call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor,
+                                                mayAskHuman = shape.mayAskHuman,
+                                            )
+                                            if (!executed.cancelled) {
+                                                audit.record(
+                                                    request.turnId, call.name, auditSummary(shape, call.argsJson),
+                                                    outcomeOf(executed.result), scope = shape.scope,
+                                                    risk = shape.risk.name,
+                                                    decision = AUDIT_REQUIRE_CONFIRMATION,
+                                                    confirmationSource = outcome.source,
+                                                )
+                                            }
+                                            executed
+                                        }
+                                        else -> {
+                                            val code = if (outcome.source == ConfirmationSource.TIMEOUT) {
+                                                CONFIRMATION_TIMEOUT
+                                            } else {
+                                                CONFIRMATION_DENIED
+                                            }
+                                            audit.record(
+                                                request.turnId, call.name, code, code, scope = shape.scope,
+                                                risk = shape.risk.name, decision = AUDIT_REQUIRE_CONFIRMATION,
+                                                confirmationSource = outcome.source,
+                                            )
+                                            ToolInvocation(ToolResult.error(call.id, code), executed = false)
+                                        }
                                     }
                                 }
                             }

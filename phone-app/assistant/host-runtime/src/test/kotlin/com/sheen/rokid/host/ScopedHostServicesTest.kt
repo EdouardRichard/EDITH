@@ -295,6 +295,29 @@ class ScopedHostServicesTest {
         assertEquals(1, seen.size)
     }
 
+    @Test fun `a scoped Confirmation channel forwards availability and reports a revoked scope unavailable`() {
+        // 0.3 Phase 4B (B4): the plugin asks the *scoped* channel whether its surface can serve. Without this
+        // forwarding the interface default `true` would run and the production channel's unavailability would never
+        // reach the loop's early refusal.
+        var canAsk = true
+        val provider = object : ConfirmationChannel {
+            override fun available(): Boolean = canAsk
+            override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle =
+                object : CancellationHandle { override fun cancel() = Unit }
+        }
+        val scope = scope()
+        val services = ScopedHostServices(scope, setOf(Capability.Confirmation),
+            mapOf(Capability.Confirmation to provider), FakeTaskScope())
+        val confirmation = services.confirmation()
+
+        assertTrue(confirmation.available())
+        canAsk = false
+        assertFalse(confirmation.available(), "the check must be live, not a snapshot taken at activation")
+
+        scope.revoke()
+        assertFalse(confirmation.available(), "a revoked scope can ask nobody")
+    }
+
     @Test fun `a granted actions channel forwards beginTurn so a later turn re-arms the provider`() {
         var begins = 0
         var cancels = 0

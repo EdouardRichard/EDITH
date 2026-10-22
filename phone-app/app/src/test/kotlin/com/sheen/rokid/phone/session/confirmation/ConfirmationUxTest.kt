@@ -26,10 +26,11 @@ import org.junit.Test
  */
 class ConfirmationUxTest {
 
-    private class FakeSummary : SummaryDisplayer {
+    private class FakeSummary(private val events: MutableList<String>? = null) : SummaryDisplayer {
         val shown = mutableListOf<Pair<String, Long>>()
         override fun show(text: String, ttlMillis: Long): Boolean {
             shown += text to ttlMillis
+            events?.add("show")
             return true
         }
     }
@@ -41,11 +42,24 @@ class ConfirmationUxTest {
         override fun hide(requestId: String) { hidden += requestId }
     }
 
-    private class FakeGlasses : ConfirmationGlasses {
+    private class FakeGlasses(private val events: MutableList<String>? = null) : ConfirmationGlasses {
         val states = mutableListOf<Pair<String, Boolean>>()
         var accepts = true
+        var canServe = true
+        override fun available(): Boolean = canServe
         override fun show(requestId: String, active: Boolean): Boolean {
             states += requestId to active
+            events?.add("state:$active")
+            return accepts
+        }
+    }
+
+    private class FakePanel(private val events: MutableList<String>? = null) : ConfirmationPanel {
+        var opens = 0
+        var accepts = true
+        override fun open(): Boolean {
+            opens++
+            events?.add("panel")
             return accepts
         }
     }
@@ -53,14 +67,17 @@ class ConfirmationUxTest {
     private class Rig {
         val clock = FakeClock()
         val scheduler = ManualScheduler(clock)
-        val summary = FakeSummary()
+        val events = mutableListOf<String>()
+        val summary = FakeSummary(events)
         val ui = FakeUi()
-        val glasses = FakeGlasses()
+        val glasses = FakeGlasses(events)
+        val panel = FakePanel(events)
         val delivered = mutableListOf<ConfirmationResult>()
         val presenter = ConfirmationPresenter(
             summary = summary,
             ui = ui,
             glasses = glasses,
+            panel = panel,
             deliver = { delivered += it },
             clock = clock,
             scheduler = scheduler,
@@ -205,5 +222,67 @@ class ConfirmationUxTest {
         assertEquals("the phone is the fallback screen, not a second failure", 1, rig.ui.shown.size)
         assertTrue("the question is still answerable on the phone", rig.presenter.answer("c1", approved = true))
         assertEquals(1, rig.delivered.size)
+    }
+
+    // ------------------------- 0.3 Phase 4B (B4): open the hidden panel first, then announce the question
+
+    @Test
+    fun `the panel is opened before the question is shown and the keys are armed`() {
+        val rig = Rig()
+
+        rig.presenter.present("c1", "卸载 App：edith.phone.a11yprobe", 120_000L)
+
+        assertEquals(
+            "a hidden panel receives nothing, so PANEL_OPEN must come before SHOW/CONFIRM_STATE",
+            listOf("panel", "show", "state:true"),
+            rig.events,
+        )
+        assertEquals(1, rig.presenter.pendingCount)
+    }
+
+    @Test
+    fun `a panel shown later re-announces the live question and does not clear it`() {
+        // The panel can be created after `present` already sent its first SHOW/CONFIRM_STATE (a cold appStart, or a
+        // hidden window). Its first layout is therefore the moment to announce the same question again - and it must
+        // not behave like a settlement: the question stays answerable and the phone card is not raised twice.
+        val rig = Rig()
+        rig.presenter.present("c1", "卸载 App", 120_000L)
+        rig.events.clear()
+
+        rig.presenter.panelShownArrived()
+
+        assertEquals(
+            "the new panel must receive the live question: SHOW and the active CONFIRM_STATE",
+            listOf("show", "state:true"),
+            rig.events,
+        )
+        assertEquals("reopening must not clear an unsettled question", 1, rig.presenter.pendingCount)
+        assertEquals("the phone already shows the card; a panel layout is not a second question", 1, rig.ui.shown.size)
+        assertTrue("the re-announced question is still live", rig.summary.shown.last().second > 0L)
+        assertTrue("and the keys still answer it", rig.presenter.answerFromGlasses("c1", approved = true))
+        assertEquals(1, rig.delivered.size)
+    }
+
+    @Test
+    fun `a panel shown after the question settled re-announces nothing`() {
+        val rig = Rig()
+        rig.presenter.present("c1", "卸载 App", 120_000L)
+        assertTrue(rig.presenter.answer("c1", approved = true))
+        rig.events.clear()
+
+        rig.presenter.panelShownArrived()
+
+        assertEquals("a settled question must not be put back on the glasses", emptyList<String>(), rig.events)
+        assertEquals(1, rig.delivered.size)
+    }
+
+    @Test
+    fun `the panel is not requested when the glasses surface cannot serve`() {
+        val rig = Rig()
+        rig.glasses.canServe = false
+
+        rig.presenter.present("c1", "卸载 App", 120_000L)
+
+        assertEquals("no glasses surface means nothing to open", 0, rig.panel.opens)
     }
 }
