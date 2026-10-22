@@ -176,6 +176,16 @@ class ScriptedModelWireTest {
         )
     }
 
+    @Test fun `a shell command is scriptable, so B8 can drive the classifier on the device`() {
+        assertEquals(
+            """{"command":"cmd package list packages"}""",
+            scriptedToolCallArgs(
+                packageName = null, permission = null, granted = null, value = null,
+                command = "cmd package list packages",
+            ),
+        )
+    }
+
     @Test fun `an arming with no tool calls serves only the closing text, so a silent model is scriptable`() {
         // §6.2's fallback exists for a model that answers without notifying. Arming with zero calls is how that turn
         // is produced on a device: the first answer is text, with no `function_call` anywhere in it.
