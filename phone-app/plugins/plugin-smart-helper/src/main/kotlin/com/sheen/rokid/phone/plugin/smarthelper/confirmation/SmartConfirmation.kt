@@ -48,15 +48,26 @@ internal class SmartConfirmation(
     }
 
     /**
-     * 0.25 Task 11 (R52): whether a host channel is attached right now.
+     * 0.25 Task 11 (R52): whether a host channel can present a question right now.
      *
      * [request] answers `CANCEL` for a live question withdrawn by the wearer's STOP/急停, but a question nobody could
      * present is `UNAVAILABLE` instead. The caller that has to tell "unavailable" from "denied" asks this **before**
-     * requesting: false means there is nobody to ask. The answer can change while a question is in flight (deactivation
-     * detaches the channel and cancels the pending question), which is why this is a read-only property rather than a
-     * promise; [request] itself reports `UNAVAILABLE` whenever presentation finds no channel.
+     * requesting: false means there is nobody to ask. Since 0.3 Phase 4B (B4) this is the channel's **live** availability
+     * check, so an attached host whose surface is gone (no page, no glasses, no notification) is not "somebody to ask"
+     * either - the answer can change while a question is in flight (deactivation detaches the channel and cancels the
+     * pending question), which is why this is a read-only property rather than a promise; [request] itself reports
+     * `UNAVAILABLE` whenever the channel cannot present.
      */
-    val canAsk: Boolean get() = channel != null
+    val canAsk: Boolean get() = available()
+
+    /**
+     * 0.3 Phase 4B (B4, spec §5.4): whether this port can put a question to the wearer at all.
+     *
+     * Delegates to the attached host channel's own [ConfirmationChannel.available] and defaults to `false` when no
+     * channel is attached. The agent loop reads it before blocking, so a plugin with nobody to ask refuses the action
+     * with `CONFIRMATION_UNAVAILABLE` at once instead of waiting out D47's 120 s window.
+     */
+    override fun available(): Boolean = channel?.let { runCatching { it.available() }.getOrDefault(false) } ?: false
 
     /** One live question; [outcome] is set exactly once, by whichever resolver gets there first. */
     private class Pending(val requestId: String, val latch: CountDownLatch = CountDownLatch(1)) {
@@ -82,13 +93,35 @@ internal class SmartConfirmation(
         synchronized(lock) { excludedSegment = turnId }
     }
 
-    override fun request(requestId: String, summary: String): ConfirmationOutcome {
+    override fun request(requestId: String, summary: String): ConfirmationOutcome =
+        requestInternal(requestId, summary, tool = null)
+
+    /**
+     * 0.3 Phase 4B (B7): the same question with the action's wire name. The name is passed through to the host's
+     * channel unchanged, so its count-only `P4_CONFIRM` line can count confirmations per tool; this class never reads
+     * it and it is never shown to the wearer.
+     */
+    override fun request(requestId: String, summary: String, tool: String): ConfirmationOutcome =
+        requestInternal(requestId, summary, tool)
+
+    private fun requestInternal(requestId: String, summary: String, tool: String?): ConfirmationOutcome {
+        // 0.3 Phase 4B (B4, spec §5.4): check the channel's own availability **before** arming the gate and before
+        // `present`, so a surface that is gone refuses at once instead of blocking for the decision window. The check
+        // is read live here rather than trusting the caller's earlier `canAsk`, and a throwing check is unavailable.
+        // BUSY keeps precedence: a live question is still the answer when the second request cannot be queued.
+        val canPresent = channel?.let { runCatching { it.available() }.getOrDefault(false) } ?: false
         val entry = synchronized(lock) {
             if (pending != null) {
                 log("P3_CONFIRM request=$requestId outcome=unavailable source=none reason=BUSY")
                 return ConfirmationOutcome(false, ConfirmationSource.CANCEL)
             }
-            Pending(requestId).also { pending = it }
+            if (canPresent) Pending(requestId).also { pending = it } else null
+        }
+        if (entry == null) {
+            // No channel, or a channel whose surface is explicitly unavailable: nobody was asked, so report UNAVAILABLE
+            // rather than a denial - and never a silent approval. Nothing was armed, so nothing has to be released.
+            log("P3_CONFIRM request=$requestId outcome=unavailable source=none")
+            return ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE)
         }
 
         // The gate is armed **before** the question is shown, because `onConfirmationResult` resolves *through* the
@@ -99,10 +132,19 @@ internal class SmartConfirmation(
         gate.request(requestId, summary) { approved -> settleByGate(requestId, approved) }
 
         val target = channel
-        val presented = target?.let { runCatching { it.present(requestId, summary, timeoutMillis) } }
+        val presented = target?.let {
+            runCatching {
+                if (tool != null) {
+                    it.present(requestId, summary, timeoutMillis, tool)
+                } else {
+                    // A caller that cannot name the action keeps the pre-B7 wire exactly: no invented name.
+                    it.present(requestId, summary, timeoutMillis)
+                }
+            }
+        }
         if (presented == null || presented.isFailure) {
-            // No channel, or a host that could not show the question: nobody was asked, so report UNAVAILABLE rather
-            // than a denial - and never a silent approval.
+            // The channel detached, or a host that could not show the question: nobody was asked, so report UNAVAILABLE
+            // rather than a denial - and never a silent approval.
             log("P3_CONFIRM request=$requestId outcome=unavailable source=none")
             entry.outcome.set(ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE))
             finish(requestId)
@@ -179,9 +221,28 @@ internal class SmartConfirmation(
             presentation = null
             handle to live
         }
+        val outcome = entry.second.outcome.get() ?: ConfirmationOutcome(false, ConfirmationSource.TIMEOUT)
+        // 0.3 Phase 4B (B7, spec §6.3): report the plugin-owned decision to the host **before** withdrawing it, so the
+        // host can pair it with the channel it captured when the question went up. This is the only settlement point
+        // that knows a timeout/cancellation from the gate, and a voice answer from a tap; a phone tap was already
+        // answered (and recorded) by the host's presenter, whose question is gone by now, so this reports nothing new
+        // for it. Telemetry only: a legacy channel ignores the call and a throwing one changes nothing.
+        runCatching {
+            channel?.settle(
+                requestId,
+                when {
+                    outcome.approved -> "allow"
+                    outcome.source == ConfirmationSource.TIMEOUT -> "timeout"
+                    outcome.source == ConfirmationSource.UNAVAILABLE -> "unavailable"
+                    else -> "deny"
+                },
+                // §5.4: a spoken phrase never presents a question, so this is the one answer channel the host cannot
+                // capture at present time. Every other source is the channel the host itself presented on.
+                if (outcome.source == ConfirmationSource.VOICE) "voice" else null,
+            )
+        }
         // Withdrawing the host's question is right on every settlement: the UI must not outlive the decision.
         runCatching { entry.first?.cancel() }
-        val outcome = entry.second.outcome.get() ?: ConfirmationOutcome(false, ConfirmationSource.TIMEOUT)
         log("P3_CONFIRM request=$requestId outcome=${if (outcome.approved) "approved" else "denied"} " +
             "source=${outcome.source.name.lowercase()}")
         entry.second.latch.countDown()

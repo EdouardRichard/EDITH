@@ -44,11 +44,12 @@ data class GatewayTurn(
     val tools: List<ToolSpec>,
     val deadlineNanos: Long,
     /**
-     * Test seam only: the byte limit the frame is trimmed to. [Int.MAX_VALUE] (the default) means
-     * "no override" — the gateway trims to `ModelClientGateway.windowBytes(profile)`, which is the send-time
-     * `ContextBudgeter` bound minus a deliberate 32-byte margin. Ignored when [frame] is null.
+     * Test seam / session wiring: the token-unit limit the frame is trimmed to. [Int.MAX_VALUE] (the default) means
+     * "no override" — the gateway trims to `ContextPolicy.hardLimit`, the send-time policy's own hard bound (0.3
+     * Phase 1 final-fix wave). The production plugin passes its session policy's `hardLimit`. Ignored when [frame] is
+     * null.
      */
-    val limitBytes: Int = Int.MAX_VALUE,
+    val limitTokens: Int = Int.MAX_VALUE,
     /**
      * Phase 5: 已装配的请求形状。非 null 时网关从它派生 [ModelRequest] 并先裁到窗口内；
      * null（默认）时完全保持 Phase 3 之前的 `split(history)` 行为 ⇒ 既有调用点一行不改。
@@ -71,6 +72,22 @@ data class GatewayTurn(
      * duplicate Task 26 removed). `null` — the default — keeps every pre-Task-27 construction and caller unaltered.
      */
     val userUtterance: String? = null,
+    /**
+     * 0.3 design §5.2: this turn's output cap, forwarded verbatim into `ModelRequest.maxOutputTokens`.
+     *
+     * `null` — the default — keeps every pre-0.3 caller unaltered: the adapter then sends the profile's
+     * `maxOutputTokens`, which is only the window-reservation value. A non-null cap is the turn policy's decision
+     * (a short answer, a compression summary, a proactive hint) and wins over the profile at encode time.
+     */
+    val maxOutputTokens: Int? = null,
+    /**
+     * 0.3 final-fix wave (spec §5.2): the session's fail-closed policy code, or `null` when a policy exists.
+     *
+     * The gateway itself classifies an invalid/too-small profile; this field carries the **activation-time** failure
+     * (the plugin derives the same policy while activating) so a turn of that session refuses with the same code and
+     * never reaches the transport. A non-null value wins over re-derivation.
+     */
+    val contextFailure: String? = null,
 )
 
 /**

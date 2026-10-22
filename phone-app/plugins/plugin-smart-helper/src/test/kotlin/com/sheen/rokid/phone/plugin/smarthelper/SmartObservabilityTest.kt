@@ -131,7 +131,8 @@ class SmartObservabilityTest {
             captured.toList()
         }
 
-        val tool = lines.single { it.startsWith("P3_TOOL") }
+        // Phase 3 Task 4 adds `P3_TOOLRESULT ...` on the same sink, so the space is part of the filter.
+        val tool = lines.single { it.startsWith("P3_TOOL ") }
         assertEquals("P3_TOOL call=compose_note ok=true detail=ok", tool)
         assertFalse(tool.contains("MARKER-NOTE-TITLE"), "an executor detail with user content must not be logged: $tool")
         assertTrue(
@@ -164,8 +165,8 @@ class SmartObservabilityTest {
         }
 
         assertEquals(
-            "P3_TOOL call=open_app ok=false detail=Refused: APP_NOT_VISIBLE",
-            lines.single { it.startsWith("P3_TOOL") },
+            "P3_TOOL call=open_app ok=false detail=APP_NOT_VISIBLE",
+            lines.single { it.startsWith("P3_TOOL ") },
         )
     }
 

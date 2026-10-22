@@ -3,12 +3,17 @@ package com.sheen.rokid.agent
 import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
 import com.sheen.rokid.plugin.ToolSpec
+import com.sheen.rokid.plugin.ToolVision
 import com.sheen.rokid.testsupport.FakeClock
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
@@ -28,6 +33,8 @@ class AgentLoopTest {
         requestTimeoutNanos: Long = 0L,
         onTextDelta: ((String) -> Unit)? = null,
         onToolStatus: ((String, ToolPhase) -> Unit)? = null,
+        history: List<ModelHistoryItem> = emptyList(),
+        observationSource: ToolObservationSource? = null,
     ) = AgentRequest(
         turnId = "turn-7",
         utterance = "把音量调小一点",
@@ -37,6 +44,8 @@ class AgentLoopTest {
         requestTimeoutNanos = requestTimeoutNanos,
         onTextDelta = onTextDelta,
         onToolStatus = onToolStatus,
+        history = history,
+        observationSource = observationSource,
     )
 
     private fun newLoop(
@@ -49,7 +58,27 @@ class AgentLoopTest {
         maxEmptyTurns: Int = 3,
         maxSteps: Int = 24,
         confirmation: ConfirmationPort? = null,
-    ) = AgentLoop(gateway, registry, policy, guard, audit, clock, maxEmptyTurns, maxSteps, confirmation)
+        metricLine: (String) -> Unit = {},
+    ) = AgentLoop(gateway, registry, policy, guard, audit, clock, maxEmptyTurns, maxSteps, confirmation, metricLine = metricLine)
+
+    /**
+     * The exact envelope the loop feeds back for a tool result. The envelope shape itself is pinned in
+     * `ToolResultEnvelopeTest`/`ToolRegistryTest`; the loop tests only need the byte-identical string a result carries.
+     */
+    private fun envelope(execution: ToolExecution, data: String): String =
+        ToolResultEnvelope.encode(execution, observation = null, data = data)
+
+    private fun doneEnvelope(data: String): String = envelope(ToolExecution(outcome = ToolOutcome.Done), data)
+
+    private fun errorEnvelope(code: String): String = envelope(
+        ToolExecution(
+            outcome = ToolOutcome.Failed,
+            code = code,
+            accepted = false,
+            applied = false,
+        ),
+        data = "",
+    )
 
     // ---------------------------------------------------------------- turn state
 
@@ -131,6 +160,26 @@ class AgentLoopTest {
         assertTrue(retry.text.isNotBlank())
     }
 
+    @Test fun `a custom retry instruction is the one the model receives`() {
+        // 0.3 Phase 4A A7: the retry prose is injected, and production passes `PromptCatalog.loop("retry")` here.
+        val gateway = ScriptedGateway(listOf(reply(text = ""), reply(text = "answer")))
+        val loop = AgentLoop(
+            gateway,
+            ToolRegistry(emptyList()),
+            ScriptedPolicy(),
+            ProgressGuard(),
+            RecordingAuditSink(),
+            FakeClock(),
+            retryInstruction = "资源重试指令",
+        )
+
+        val run = loop.run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val retried = gateway.requests[1].history
+        assertEquals("资源重试指令", assertIs<ModelHistoryItem.Text>(retried.last()).text)
+    }
+
     @Test fun `a retry never leaves the transcript on the pending user turn`() {
         val gateway = ScriptedGateway(listOf(reply(text = ""), reply(text = "answer")))
         val loop = newLoop(gateway)
@@ -162,6 +211,173 @@ class AgentLoopTest {
         assertEquals(AgentOutcome.INSUFFICIENT, run.outcome)
         assertEquals("EMPTY_TURN", run.safeCode)
         assertEquals(2, gateway.requests.size)
+    }
+
+    @Test fun `a non-persistent tool result reaches the model but never the stored transcript`() {
+        // 0.3 Phase 2 final review C2: perception content may live only in the in-run model request. The stored
+        // transcript (what a ConversationStore persists) keeps the call/output pair attributable but must not carry the
+        // content or its image reference.
+        val sentinel = "SYNTHETIC-PERCEPTION-CONTENT-9182"
+        val image = ImageRef("artifact-perception-1", "image/png", 768, 1664, "sha-perception-1")
+        val executor = executorOf("device").apply {
+            outcome = { _, _ ->
+                ActionResult(ActionOutcome.Done, sentinel, nonPersistent = true, images = listOf(image))
+            }
+        }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "device"))),
+                reply(text = "看完了。"),
+            ),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val inRun = gateway.requests[1].history.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertTrue(inRun.output.contains(sentinel), "the model must see the content during the run: ${inRun.output}")
+        assertEquals(listOf(image), inRun.images, "the in-run request keeps the image reference")
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertFalse(
+            stored.output.contains(sentinel),
+            "the stored transcript must not carry perception content: ${stored.output}",
+        )
+        assertTrue(stored.output.isNotBlank(), "a safe marker keeps the call/output pair attributable")
+        assertEquals(emptyList(), stored.images, "the stored transcript carries no image reference")
+    }
+
+    @Test fun `a reused call id redacts only this run's output and keeps an earlier turn verbatim`() {
+        // 0.3 Phase 2 final review C2 (re-review): a run may reuse a call id that a previous turn already used (ids only
+        // need to be non-blank). Redacting the whole history by id turned the earlier, persistent output into the marker
+        // too, which made the stored transcript stop being a prefix of the store and dropped the current tool round.
+        val earlier = ModelHistoryItem.ToolOutput("c1", "EARLIER-LEGACY-OUTPUT-5521")
+        val sentinel = "SYNTHETIC-PERCEPTION-CONTENT-7719"
+        val executor = executorOf("device").apply {
+            outcome = { _, _ -> ActionResult(ActionOutcome.Done, sentinel, nonPersistent = true) }
+        }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "device"))),
+                reply(text = "看完了。"),
+            ),
+        )
+        val history = listOf(
+            ModelHistoryItem.Text(MessageRole.USER, "之前的屏幕"),
+            ModelHistoryItem.Text(MessageRole.ASSISTANT, "稍等"),
+            ModelHistoryItem.ToolCall("c1", "device", """{"action":"observe"}""", "item-1"),
+            earlier,
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(history = history))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().filter { it.callId == "c1" }
+        assertEquals(2, stored.size, "both the earlier and the current output must stay attributable: ${run.transcript}")
+        assertEquals(earlier.output, stored[0].output, "an earlier turn's output must survive verbatim")
+        assertFalse(
+            stored[1].output.contains(sentinel),
+            "only this run's output is perception content: ${stored[1].output}",
+        )
+        assertTrue(stored[1].output.isNotBlank(), "the current call/output pair keeps a safe marker")
+    }
+
+    @Test fun `a loop enriched failure observation reaches the model but never the stored transcript`() {
+        // 0.3 Phase 2.2 Task 8: the loop is a second producer of perception content, not only the tools. A failure result
+        // that came back with no observation (the tool declared none, or the framework synthesized it) is enriched by
+        // `observedFailure`; that copy must be marked non-persistent even though the tool-returned result was not.
+        val sentinel = "SYNTHETIC-LOOP-OBSERVATION-3381"
+        val image = ImageRef("artifact-failure-1", "image/png", 768, 1664, "sha-failure-1")
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", images = listOf(image))
+        }
+        val observation = ToolObservation(
+            foregroundPackage = "com.example.launcher",
+            screen = sentinel,
+            vision = ToolVision.NotRequested,
+        )
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "看到了")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor)))
+            .run(request(observationSource = { observation }))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val inRun = gateway.requests[1].history.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertTrue(inRun.output.contains(sentinel), "the model must see the loop's observation: ${inRun.output}")
+        assertEquals(listOf(image), inRun.images, "the in-run request keeps the failure's picture reference")
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertFalse(
+            stored.output.contains(sentinel),
+            "the loop-attached observation may not outlive the request: ${stored.output}",
+        )
+        assertTrue(stored.output.isNotBlank(), "the stored call/output pair stays attributable")
+        assertEquals(emptyList(), stored.images, "the stored transcript carries no failure image")
+    }
+
+    @Test fun `a failure image is never persisted even when the tool marked the result persistent`() {
+        // Defence in depth for the last gate: a tool that returns a picture but forgets `nonPersistent` (or a future
+        // image-bearing result with no observation) still may not leave the picture in the stored transcript.
+        val image = ImageRef("artifact-failure-2", "image/png", 768, 1664, "sha-failure-2")
+        val executor = executorOf("lookup")
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", images = listOf(image))
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "知道了")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val inRun = gateway.requests[1].history.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals(listOf(image), inRun.images, "the model still sees the picture during the run")
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals(emptyList(), stored.images, "no image may be persisted: ${stored.output}")
+    }
+
+    @Test fun `a successful image without the tool flag is still redacted from the stored transcript`() {
+        // Task 8 fix review: the last gate must not exempt a Done image. Production's image results already set
+        // `nonPersistent`, but a tool that forgets it may not put a picture into the stored transcript; the in-run
+        // request still carries it for the model.
+        val image = ImageRef("artifact-done-1", "image/png", 768, 1664, "sha-done-1")
+        val executor = executorOf("lookup")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "captured", images = listOf(image)) }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "看完了")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val inRun = gateway.requests[1].history.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals(listOf(image), inRun.images, "the model sees the successful picture during the run")
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals(emptyList(), stored.images, "no image may be persisted, whatever the outcome: ${stored.output}")
+    }
+
+    @Test fun `pure execution facts of a failure stay persistent when the loop attaches no observation`() {
+        // The complement of the C2 rule: persistence is only withdrawn for content the loop itself attaches. A pure tool
+        // result (no screen observation) is execution facts, so its stored output keeps the tool detail.
+        val executor = executorOf("notify_user")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "DELIVERY_FAILED") }
+        val source = ToolObservationSource {
+            error("a pure tool must never be observed")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "notify_user"))), reply(text = "知道了")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertTrue(
+            stored.output.contains("DELIVERY_FAILED"),
+            "a pure execution fact must remain persistable: ${stored.output}",
+        )
+        assertFalse(stored.output.contains("perception content not persisted"), stored.output)
     }
 
     @Test fun `a productive tool turn resets the empty counter`() {
@@ -289,11 +505,31 @@ class AgentLoopTest {
                 ModelHistoryItem.Text(MessageRole.USER, "把音量调小一点"),
                 ModelHistoryItem.Text(MessageRole.ASSISTANT, "(tool call)"),
                 ModelHistoryItem.ToolCall("call-1", "device.get_volume", "{}"),
-                ModelHistoryItem.ToolOutput("call-1", "volume=5"),
+                ModelHistoryItem.ToolOutput("call-1", doneEnvelope("volume=5")),
             ),
             second,
         )
         assertEquals(RecordedAuditEntry("turn-7", "device.get_volume", "executed", "ok"), audit.entries.single())
+    }
+
+    @Test fun `an unmigrated failure keeps the legacy detail's stable code in the step and the audit`() {
+        // The registry projects an ActionResult outcome but fabricates no execution code, and the legacy detail still
+        // names one. The step label and the audit line are content-free, so they keep that code (the same identity
+        // ErrorTracker uses) instead of collapsing it to the outcome token.
+        val executor = executorOf("open_app")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Refused, "APP_NOT_VISIBLE") }
+        val audit = RecordingAuditSink()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("call-1", "open_app"))), reply(text = "没能打开")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor)), audit = audit).run(request())
+
+        assertEquals(listOf(AgentStep(1, "open_app", "APP_NOT_VISIBLE")), run.steps)
+        assertEquals(
+            RecordedAuditEntry("turn-7", "open_app", "executed", "APP_NOT_VISIBLE"),
+            audit.entries.single(),
+        )
     }
 
     // ---------------------------------------------------------------- tool status callbacks (0.24 S4 Task 17)
@@ -405,8 +641,8 @@ class AgentLoopTest {
                 ModelHistoryItem.Text(MessageRole.ASSISTANT, "(tool call)"),
                 ModelHistoryItem.ToolCall("c1", "a", "{}"),
                 ModelHistoryItem.ToolCall("c2", "b", "{}"),
-                ModelHistoryItem.ToolOutput("c1", "payload-a"),
-                ModelHistoryItem.ToolOutput("c2", "payload-b"),
+                ModelHistoryItem.ToolOutput("c1", doneEnvelope("payload-a")),
+                ModelHistoryItem.ToolOutput("c2", doneEnvelope("payload-b")),
             ),
             gateway.requests[1].history,
         )
@@ -435,10 +671,10 @@ class AgentLoopTest {
                 ModelHistoryItem.Text(MessageRole.USER, "把音量调小一点"),
                 ModelHistoryItem.Text(MessageRole.ASSISTANT, "first"),
                 ModelHistoryItem.ToolCall("c1", "a", "{}"),
-                ModelHistoryItem.ToolOutput("c1", "payload-a"),
+                ModelHistoryItem.ToolOutput("c1", doneEnvelope("payload-a")),
                 ModelHistoryItem.Text(MessageRole.ASSISTANT, "second"),
                 ModelHistoryItem.ToolCall("c2", "b", "{}"),
-                ModelHistoryItem.ToolOutput("c2", "payload-b"),
+                ModelHistoryItem.ToolOutput("c2", doneEnvelope("payload-b")),
             ),
             gateway.requests[2].history,
         )
@@ -487,7 +723,7 @@ class AgentLoopTest {
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals(listOf(AgentStep(1, "nope", "UNKNOWN_TOOL")), run.steps)
         assertTrue(policy.seen.isEmpty(), "an unknown name must never reach the policy")
-        assertEquals(ModelHistoryItem.ToolOutput("c1", "UNKNOWN_TOOL"), gateway.requests[1].history.last())
+        assertEquals(ModelHistoryItem.ToolOutput("c1", errorEnvelope("UNKNOWN_TOOL")), gateway.requests[1].history.last())
         // An unresolved name was never executed, so the audit summary must not reuse the execution label asserted by
         // `an allowed tool call is one ok step...`; the outcome keeps the stable UNKNOWN_TOOL safe code.
         assertEquals(RecordedAuditEntry("turn-7", "nope", "UnknownTool", "UNKNOWN_TOOL"), audit.entries.single())
@@ -507,7 +743,7 @@ class AgentLoopTest {
         assertEquals(listOf(AgentStep(1, "device.set_volume", "REFUSED_BY_POLICY")), run.steps)
         assertTrue(executor.calls.isEmpty())
         assertEquals(RecordedAuditEntry("turn-7", "device.set_volume", "policy", "Refused"), audit.entries.single())
-        assertEquals(ModelHistoryItem.ToolOutput("c1", "REFUSED_BY_POLICY"), gateway.requests[1].history.last())
+        assertEquals(ModelHistoryItem.ToolOutput("c1", errorEnvelope("REFUSED_BY_POLICY")), gateway.requests[1].history.last())
     }
 
     @Test fun `a confirmation-gated action is refused as unavailable and the loop continues`() {
@@ -674,6 +910,26 @@ class AgentLoopTest {
         assertEquals(listOf(AgentStep(1, "lookup", "TOOL_THREW")), run.steps)
     }
 
+    @Test fun `a defensive failure after dispatch does not claim the call changed nothing`() {
+        // An `Error` escapes `ToolRegistry.execute`'s `Exception` guard and surfaces through the future as an
+        // `ExecutionException`. The call was dispatched, so the result is Uncertain with no tri-state fact; the loop
+        // still treats it as one recoverable failed step.
+        val executor = executorOf("lookup").apply { failure = AssertionError("boom") }
+        val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "lookup"))), reply(text = "recovered")))
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(listOf(AgentStep(1, "lookup", "TOOL_THREW")), run.steps)
+        assertEquals(
+            ModelHistoryItem.ToolOutput(
+                "c1",
+                envelope(ToolExecution(outcome = ToolOutcome.Uncertain, code = "TOOL_THREW", uncertain = true), ""),
+            ),
+            gateway.requests[1].history.last(),
+        )
+    }
+
     // ---------------------------------------------------------------- terminal tools
 
     @Test fun `a successful non-terminal tool keeps the loop going`() {
@@ -688,7 +944,7 @@ class AgentLoopTest {
         assertEquals(1, run.steps.size)
     }
 
-    @Test fun `only a successful terminal tool ends the run with its payload as the final text`() {
+    @Test fun `only a successful terminal tool ends the run with its tool detail as the final text`() {
         val executor = terminalExecutor("report_done")
         executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "最终答案") }
         val gateway = ScriptedGateway(listOf(reply(text = "thinking", calls = listOf(call("c1", "report_done")))))
@@ -740,7 +996,7 @@ class AgentLoopTest {
         assertEquals(AgentOutcome.COMPLETED, run.outcome)
         assertEquals("answer", run.finalText)
         assertEquals(
-            listOf(AgentStep(1, "report_done", "Failed: missing field"), AgentStep(2, "report_done", "ok")),
+            listOf(AgentStep(1, "report_done", "Failed"), AgentStep(2, "report_done", "ok")),
             run.steps,
         )
     }
@@ -979,6 +1235,302 @@ class AgentLoopTest {
         assertEquals(2, run.steps.size)
     }
 
+    // ---------------------------------------------------------------- failure observation (0.3 Phase 2.2 Task 3)
+
+    /**
+     * The envelope part of one model-facing tool output. The loop appends its stable `LOOP_HINT` **after** the envelope,
+     * so a test that pins the result contract compares the envelope alone; the hints have their own tests.
+     */
+    private fun envelopePart(output: ModelHistoryItem.ToolOutput): String =
+        output.output.substringBefore("\n\nLOOP_HINT:")
+
+    @Test fun `a policy refusal of a screen tool reports an unavailable observation when no source exists`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("device.set_volume", screenObservation = true)))
+        val policy = ScriptedPolicy(mapOf("device.set_volume" to PolicyDecision.Refuse))
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "那就不动")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor)), policy = policy).run(request())
+
+        assertTrue(executor.calls.isEmpty(), "a refused action never reaches the executor")
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(
+                    outcome = ToolOutcome.Failed,
+                    code = "REFUSED_BY_POLICY",
+                    accepted = false,
+                    applied = false,
+                ),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "no_source"),
+                data = "",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a failed screen tool gets the source observation with the short failure deadline`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val observation = ToolObservation(
+            foregroundPackage = "com.example.launcher",
+            screen = "Home",
+            vision = ToolVision.NotRequested,
+        )
+        val deadlines = mutableListOf<Long>()
+        val source = ToolObservationSource { deadlineMillis ->
+            deadlines += deadlineMillis
+            observation
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "看到了")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(listOf(250L), deadlines, "a failure observation gets its own short deadline")
+        assertEquals(
+            ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Failed), observation, "STATE_UNCHANGED"),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a pure tool failure never asks the observation source`() {
+        val executor = executorOf("notify_user")
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "DELIVERY_FAILED") }
+        var observed = 0
+        val source = ToolObservationSource {
+            observed++
+            ToolObservation(screen = "Home")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "notify_user"))), reply(text = "知道了")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(0, observed, "a pure tool must keep observation=null instead of inventing a screen")
+        assertEquals(
+            ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Failed), null, "DELIVERY_FAILED"),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a throwing screen tool is uncertain and carries the best-effort observation`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("shell", screenObservation = true)))
+        executor.failure = IllegalStateException("boom")
+        val observation = ToolObservation(screen = "Home", vision = ToolVision.NotRequested)
+        val deadlines = mutableListOf<Long>()
+        var sourceCalls = 0
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "shell"))), reply(text = "先不动")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(observationSource = { deadlineMillis ->
+                sourceCalls++
+                deadlines += deadlineMillis
+                observation
+            }),
+        )
+
+        assertEquals("TOOL_THREW", run.steps.single().result)
+        assertEquals(1, sourceCalls, "a thrown screen call asks the source exactly once")
+        assertEquals(listOf(250L), deadlines, "a thrown screen call gets the short failure deadline")
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(outcome = ToolOutcome.Uncertain, code = "TOOL_THREW", uncertain = true),
+                observation,
+                data = "",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a throwing screen tool without a source still reports an unavailable observation`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("shell", screenObservation = true)))
+        executor.failure = IllegalStateException("boom")
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "shell"))), reply(text = "先不动")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request())
+
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(outcome = ToolOutcome.Uncertain, code = "TOOL_THREW", uncertain = true),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "no_source"),
+                data = "",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `an observation source that returns null yields observation timeout`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "没看到")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(observationSource = ToolObservationSource { null }),
+        )
+
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(outcome = ToolOutcome.Failed),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "observation_timeout"),
+                data = "STATE_UNCHANGED",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a throwing observation source yields observation timeout and never fails the run`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val deadlines = mutableListOf<Long>()
+        var sourceCalls = 0
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "没看到")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(observationSource = ToolObservationSource { deadlineMillis ->
+                sourceCalls++
+                deadlines += deadlineMillis
+                throw IllegalStateException("capture timed out")
+            }),
+        )
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome, "an observation failure is never a run failure")
+        assertEquals(1, sourceCalls, "a throwing source is asked exactly once")
+        assertEquals(listOf(250L), deadlines, "a throwing source gets the short failure deadline")
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(outcome = ToolOutcome.Failed),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "observation_timeout"),
+                data = "STATE_UNCHANGED",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `an interrupted observation source yields observation timeout and restores the interrupt`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "没看到")),
+        )
+
+        val run = newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+            request(observationSource = ToolObservationSource { throw InterruptedException("stop observing") }),
+        )
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertTrue(Thread.interrupted(), "the loop must restore an interrupt it swallowed")
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(outcome = ToolOutcome.Failed),
+                ToolObservation(vision = ToolVision.Unavailable, visionReason = "observation_timeout"),
+                data = "STATE_UNCHANGED",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `an error from the observation source is not swallowed`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED") }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "没看到")),
+        )
+
+        assertFailsWith<AssertionError> {
+            newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(
+                request(observationSource = ToolObservationSource { throw AssertionError("fatal") }),
+            )
+        }
+    }
+
+    @Test fun `a tool supplied observation is authoritative and is never replaced`() {
+        val toolObservation = ToolObservation(screen = "tool screen", vision = ToolVision.NotRequested)
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("open", screenObservation = true)))
+        executor.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", observation = toolObservation)
+        }
+        var observed = 0
+        val source = ToolObservationSource {
+            observed++
+            ToolObservation(screen = "source screen", vision = ToolVision.NotRequested)
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "open"))), reply(text = "看到了")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(0, observed, "the loop must not overwrite an observation the tool already supplied")
+        assertEquals(
+            ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Failed), toolObservation, "STATE_UNCHANGED"),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a successful screen tool is not observed by the loop`() {
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("device", screenObservation = true)))
+        var observed = 0
+        val source = ToolObservationSource {
+            observed++
+            ToolObservation(screen = "Home")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device"))), reply(text = "好了")),
+        )
+
+        newLoop(gateway, registry = ToolRegistry(listOf(executor))).run(request(observationSource = source))
+
+        assertEquals(0, observed, "a success observation belongs to the tool (Tasks 4-6), not the failure observer")
+        assertEquals(
+            ToolResultEnvelope.encode(ToolExecution(outcome = ToolOutcome.Done), null, "done"),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
+    @Test fun `a denied confirmation of a screen tool still gets a best-effort observation`() {
+        val executor = RecordingActionExecutor(
+            listOf(actionDescriptor("app.uninstall", requiresConfirmation = true, screenObservation = true)),
+        )
+        val observation = ToolObservation(screen = "Home", vision = ToolVision.NotRequested)
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "app.uninstall"))), reply(text = "那就不动")),
+        )
+
+        val run = newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("app.uninstall" to PolicyDecision.RequireConfirmation("卸载?"))),
+            confirmation = ScriptedConfirmation(ConfirmationOutcome(false, ConfirmationSource.PHONE)),
+        ).run(request(observationSource = { observation }))
+
+        assertTrue(executor.calls.isEmpty(), "a denied action must never execute")
+        assertEquals("CONFIRMATION_DENIED", run.steps.single().result)
+        assertEquals(
+            ToolResultEnvelope.encode(
+                ToolExecution(
+                    outcome = ToolOutcome.Failed,
+                    code = "CONFIRMATION_DENIED",
+                    accepted = false,
+                    applied = false,
+                ),
+                observation,
+                data = "",
+            ),
+            envelopePart(assertIs(gateway.requests[1].history.last())),
+        )
+    }
+
     // ------------------------------------------------- the confirmation wait is not the turn's budget (D49)
 
     /** A confirmation channel that spends the **user's** time: the clock moves while it waits. */
@@ -992,6 +1544,18 @@ class AgentLoopTest {
             clock.nowNanos += waitNanos
             onWait()
             return outcome
+        }
+    }
+
+    /** 0.3 Phase 4B (B4): a host that says nobody can be asked right now. Asking it at all is the defect. */
+    private class UnavailableConfirmation : ConfirmationPort {
+        var asked = 0
+
+        override fun available(): Boolean = false
+
+        override fun request(requestId: String, summary: String): ConfirmationOutcome {
+            asked++
+            error("an unavailable confirmation channel must never be asked")
         }
     }
 
@@ -1130,6 +1694,34 @@ class AgentLoopTest {
         assertEquals(500_000_000L, gateway.requests.first().deadlineNanos, "单次请求上限照常生效")
     }
 
+    @Test fun `an unavailable confirmation channel is refused without entering the wait`() {
+        // 0.3 Phase 4B (B4), review focus 3: a channel whose surface is gone must not be asked and must not make the
+        // loop block out D47's 120 s window before returning the same refusal.
+        val clock = FakeClock(0)
+        val executor = gatedExecutor()
+        val audit = RecordingAuditSink()
+        val confirmation = UnavailableConfirmation()
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "device.set_volume"))), reply(text = "没有确认通道，先不动")),
+        )
+
+        val run = newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), policy = gatedPolicy(), audit = audit, clock = clock,
+            confirmation = confirmation,
+        ).run(request(deadlineNanos = 1_000_000_000L))
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(AgentStep(1, "device.set_volume", "CONFIRMATION_UNAVAILABLE"), run.steps.single())
+        assertEquals(0, confirmation.asked, "the loop must ask availability before blocking on the port")
+        assertEquals(0L, run.humanWaitNanos, "nobody waited, so the turn has no human wait to report")
+        assertEquals(0L, clock.nowNanos, "the loop did not spend the 120 s window")
+        assertEquals(
+            RecordedAuditEntry("turn-7", "device.set_volume", "policy", "ConfirmationUnavailable"),
+            audit.entries.single(),
+        )
+        assertTrue(executor.calls.isEmpty(), "an unconfirmed action must never execute")
+    }
+
     @Test fun `a cancel during the wait ends the turn as CANCELLED`() {
         val clock = FakeClock(0)
         val executor = gatedExecutor()
@@ -1221,5 +1813,225 @@ class AgentLoopTest {
         newLoop(gateway, clock = clock).run(request(deadlineNanos = 4_242L))
 
         assertEquals(4_242L, gateway.requests.single().deadlineNanos, "0 = 旧行为：仍拿回合 deadline 当请求上限")
+    }
+
+    // --------------------------------------------- per-tool latency telemetry (Phase 4A A9)
+
+    /** The per-call latency lines only; the run-level `P3_METRIC` and per-call `P3_TOOLRESULT` share the sink. */
+    private fun p4ToolLines(lines: List<String>): List<String> = lines.filter { it.startsWith("P4_TOOL") }
+
+    /**
+     * Phase 4A Task 9: one count-only `P4_TOOL` line per measured tool call, on the loop's existing metric sink.
+     *
+     * `ms` is the call's machine time from the injected clock, so the literal is deterministic. The argument and the
+     * result body are sentinels: neither may reach the line, which carries only the tool name, the whole-millisecond
+     * machine time and the envelope's existing wire outcome.
+     */
+    @Test fun `a tool call emits one P4_TOOL line with its machine millis and wire outcome`() {
+        val clock = FakeClock(0)
+        val lines = mutableListOf<String>()
+        val executor = executorOf("lookup")
+        executor.outcome = { _, _ ->
+            clock.advance(7_000_000L)
+            ActionResult(ActionOutcome.Done, """{"text":"MARKER-RESULT-BODY"}""")
+        }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(calls = listOf(call("c1", "lookup", """{"secret":"MARKER-ARGUMENT"}"""))),
+                reply(text = "答"),
+            ),
+        )
+
+        val run = newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), clock = clock, metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(AgentOutcome.COMPLETED, run.outcome)
+        assertEquals(listOf("P4_TOOL tool=lookup ms=7 outcome=done"), p4ToolLines(lines))
+        assertFalse(
+            lines.any { it.contains("MARKER-ARGUMENT") || it.contains("MARKER-RESULT-BODY") },
+            "the latency line may carry no argument or result content: $lines",
+        )
+    }
+
+    /**
+     * Two calls in one round are two readings, each with its own tool, machine time and wire token. The second call is a
+     * failure, which pins that `outcome` reuses the envelope vocabulary rather than the run's own terminal state.
+     */
+    @Test fun `two calls in one round emit one P4_TOOL line each with their own outcome`() {
+        val clock = FakeClock(0)
+        val lines = mutableListOf<String>()
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("lookup"), actionDescriptor("open")))
+        executor.outcome = { name, _ ->
+            when (name) {
+                "lookup" -> {
+                    clock.advance(3_000_000L)
+                    ActionResult(ActionOutcome.Done, "ok")
+                }
+                else -> {
+                    clock.advance(11_000_000L)
+                    ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED")
+                }
+            }
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "lookup"), call("c2", "open"))), reply(text = "好")),
+        )
+
+        newLoop(
+            gateway, registry = ToolRegistry(listOf(executor)), clock = clock, metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(
+            listOf(
+                "P4_TOOL tool=lookup ms=3 outcome=done",
+                "P4_TOOL tool=open ms=11 outcome=failed",
+            ),
+            p4ToolLines(lines),
+        )
+    }
+
+    // --------------------------------------------- policy telemetry (0.3 Phase 4B B7)
+
+    /** The per-decision policy lines only; `P3_*`/`P4_TOOL` lines share the same sink. */
+    private fun p4PolicyLines(lines: List<String>): List<String> = lines.filter { it.startsWith("P4_POLICY") }
+
+    /** The confirmation lines the loop may emit itself: the early no-channel refusal. */
+    private fun p4ConfirmLines(lines: List<String>): List<String> = lines.filter { it.startsWith("P4_CONFIRM") }
+
+    /**
+     * 0.3 Phase 4B (B7): exactly one count-only `P4_POLICY` line per policy decision.
+     *
+     * Two calls are decided in one round, one allowed and one refused. The exact field order
+     * (`mode action risk decision`) is the contract, and the decision's own words are the sealed class
+     * names. The argument and summary sentinels pin that neither is ever appended.
+     */
+    @Test fun `each policy decision emits one P4_POLICY line with mode action risk and decision`() {
+        val lines = mutableListOf<String>()
+        val executor = RecordingActionExecutor(
+            listOf(actionDescriptor("lookup", risk = RiskLevel.L1), actionDescriptor("danger", risk = RiskLevel.L3)),
+        )
+        executor.outcome = { _, _ -> ActionResult(ActionOutcome.Done, """{"text":"MARKER-RESULT"}""") }
+        val gateway = ScriptedGateway(
+            listOf(
+                reply(
+                    calls = listOf(
+                        call("c1", "lookup", """{"secret":"MARKER-ARGUMENT"}"""),
+                        call("c2", "danger"),
+                    ),
+                ),
+                reply(text = "好"),
+            ),
+        )
+
+        newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("danger" to PolicyDecision.Refuse)),
+            metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(
+            listOf(
+                "P4_POLICY mode=normal action=lookup risk=L1 decision=Allow",
+                "P4_POLICY mode=normal action=danger risk=L3 decision=Refuse",
+            ),
+            p4PolicyLines(lines),
+        )
+        assertFalse(
+            lines.any { it.contains("MARKER-ARGUMENT") || it.contains("MARKER-RESULT") },
+            "the policy line carries no argument or result content: $lines",
+        )
+    }
+
+    /**
+     * A question the policy requires is still one decision line; its human-readable summary is free text and must stay
+     * off the count-only record (only the action's name, risk and the decision token ride it).
+     */
+    @Test fun `a required confirmation is recorded as a decision without its summary text`() {
+        val lines = mutableListOf<String>()
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("app.uninstall", requiresConfirmation = true)))
+        val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "app.uninstall"))), reply(text = "那就不动")))
+
+        newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(
+                mapOf("app.uninstall" to PolicyDecision.RequireConfirmation("MARKER-SUMMARY 卸载？")),
+            ),
+            confirmation = ScriptedConfirmation(ConfirmationOutcome(false, ConfirmationSource.PHONE)),
+            metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(
+            listOf("P4_POLICY mode=normal action=app.uninstall risk=L0 decision=RequireConfirmation"),
+            p4PolicyLines(lines),
+        )
+        assertFalse(lines.any { it.contains("MARKER-SUMMARY") }, "the question text must not reach the line: $lines")
+    }
+
+    /**
+     * The mode is not a turn snapshot: it is the live B3 provider's answer at **each** decision. The first call runs
+     * while 不拦截 is on (an L3 tool is allowed); the call itself then switches the provider off, and the second L3 call
+     * of the same round is escalated. One line per decision, each naming the mode that actually produced it.
+     */
+    @Test fun `the no interception mode is read live for every policy decision`() {
+        var bypass = true
+        val lines = mutableListOf<String>()
+        val executor = RecordingActionExecutor(
+            listOf(actionDescriptor("first", risk = RiskLevel.L3), actionDescriptor("second", risk = RiskLevel.L3)),
+        )
+        executor.outcome = { name, _ ->
+            if (name == "first") bypass = false
+            ActionResult(ActionOutcome.Done, "done")
+        }
+        val gateway = ScriptedGateway(
+            listOf(reply(calls = listOf(call("c1", "first"), call("c2", "second"))), reply(text = "好")),
+        )
+
+        newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = WhitelistActionPolicy(RiskLevel.L1, emptyList(), noInterception = { bypass }),
+            metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(
+            listOf(
+                "P4_POLICY mode=no_interception action=first risk=L3 decision=Allow",
+                "P4_POLICY mode=normal action=second risk=L3 decision=RequireConfirmation",
+            ),
+            p4PolicyLines(lines),
+        )
+    }
+
+    /** B4's early refusal is the honest no-channel point; the loop records it with channel `none`. */
+    @Test fun `an unavailable confirmation channel emits one P4_CONFIRM unavailable line`() {
+        val lines = mutableListOf<String>()
+        val executor = RecordingActionExecutor(listOf(actionDescriptor("app.uninstall", requiresConfirmation = true)))
+        val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "app.uninstall"))), reply(text = "那就不动")))
+
+        newLoop(
+            gateway,
+            registry = ToolRegistry(listOf(executor)),
+            policy = ScriptedPolicy(mapOf("app.uninstall" to PolicyDecision.RequireConfirmation("卸载？"))),
+            confirmation = UnavailableConfirmation(),
+            metricLine = { lines += it },
+        ).run(request())
+
+        assertEquals(
+            listOf("P4_CONFIRM tool=app.uninstall decision=unavailable channel=none"),
+            p4ConfirmLines(lines),
+        )
+    }
+
+    /** An unknown tool never reaches the policy, so it has no decision and must not invent a policy line. */
+    @Test fun `an unknown tool emits no P4_POLICY line`() {
+        val lines = mutableListOf<String>()
+        val gateway = ScriptedGateway(listOf(reply(calls = listOf(call("c1", "mystery"))), reply(text = "不认识这个工具")))
+
+        newLoop(gateway, metricLine = { lines += it }).run(request())
+
+        assertTrue(p4PolicyLines(lines).isEmpty(), "an unknown name is not a policy decision: $lines")
     }
 }

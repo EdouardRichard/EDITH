@@ -1,8 +1,13 @@
 package com.sheen.rokid.phone.plugin.smarthelper.proactive
+import com.sheen.rokid.agent.SCOPE_TERMINAL
+import com.sheen.rokid.phone.plugin.smarthelper.SmartFakeClock
+import com.sheen.rokid.phone.plugin.smarthelper.SmartFakePerception
 import com.sheen.rokid.phone.plugin.smarthelper.SmartTestRig
+import com.sheen.rokid.phone.plugin.smarthelper.smartProfile
 import com.sheen.rokid.phone.plugin.smarthelper.streamText
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
 import com.sheen.rokid.phone.plugin.smarthelper.smartAction
+import com.sheen.rokid.phone.plugin.smarthelper.smartStores
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.smartToolCall
 
@@ -15,23 +20,31 @@ import com.sheen.rokid.contracts.OutputStatus
 import com.sheen.rokid.contracts.SpeechRequest
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.contracts.UserAction
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputSubmission
+import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolOutcome
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.*
 
 /**
- * Task 8: one proactive model request, `propose_hint` as the only control channel, silence otherwise.
+ * Task 8 + 0.3 Phase 3 Task 5: one proactive **HINT_TURN**, with `propose_hint` as the only control channel and
+ * silence otherwise.
  *
- * The shape under test is the ruling (spec §16.1#5): a **single** `gateway.turn` whose tool call *is* the decision to
- * speak. The tool is never executed and never fed back, so an unwelcome proactive turn cannot act - it can only say
- * one sentence. Every test here drives the real plugin through `handle`, with the fake transport standing in for the
- * model, and asserts on what the plugin did to the collaborators that matter: the model client, the action executor
- * and the output sink.
+ * The shape under test is the HINT_TURN ruling (Phase 3 spec §4.2): once the gate accepts, an `AgentLoop` runs with
+ * `propose_hint` as its **only**, terminal tool. Calling it *is* the decision to speak and ends the run, so a hint turn
+ * cannot act and cannot issue a second model request once the sentence has been proposed. A text-only reply is a legal
+ * silence, not a hint. These tests cover only the proactive-specific shape; the shared loop/tool/protocol behaviour
+ * (retries, terminal scope, step bounds) is already pinned by the WAKE route's suites.
+ *
+ * Every test drives the real plugin through `handle`, with the fake transport standing in for the model, and asserts
+ * on what the plugin did to the collaborators that matter: the model client, the action executor and the output sink.
  */
 class SmartProactiveTurnTest {
 
@@ -177,7 +190,7 @@ class SmartProactiveTurnTest {
     }
 
     @Test
-    fun `unparsable tool arguments are silence and never a second request`() {
+    fun `unparsable tool arguments are silence and never a second executed call`() {
         val rig = SmartTestRig()
         rig.activate()
         rig.model.onRequest = { request, listener ->
@@ -191,7 +204,10 @@ class SmartProactiveTurnTest {
 
             assertTrue(rig.output.hints.isEmpty())
             awaitRequests(rig, 1)
-            assertEquals(1, rig.model.requests.size, "the proactive turn is one request, never a retry loop")
+            // Phase 3 Task 5: the HINT_TURN is an AgentLoop, so a refused call is fed back once and the model is asked
+            // again. What is bounded is execution: `maxSteps = 1` refuses the second call before it runs, so this is
+            // two *requests* and never a third; the loop no longer changes the turn into a retry chain.
+            assertEquals(2, rig.model.requests.size, "one refusal is fed back, and the one-step bound refuses the rest")
             assertTrue(lines.any { it.startsWith("P3_PROACTIVE silence reason=UNPARSABLE") }, lines.toString())
         }
     }
@@ -216,7 +232,7 @@ class SmartProactiveTurnTest {
 
     @Test
     fun `a hint longer than the display bound is silence rather than a clipped screen`() {
-        val tooLong = rigWithProposal("字".repeat(SmartPrompts.PROACTIVE_HINT_MAX_CHARS + 1))
+        val tooLong = rigWithProposal("字".repeat(ProactiveHintSpec.PROACTIVE_HINT_MAX_CHARS + 1))
 
         withLines { lines ->
             arm(tooLong)
@@ -229,7 +245,7 @@ class SmartProactiveTurnTest {
 
     @Test
     fun `a hint at the display bound is still delivered`() {
-        val atBound = rigWithProposal("字".repeat(SmartPrompts.PROACTIVE_HINT_MAX_CHARS))
+        val atBound = rigWithProposal("字".repeat(ProactiveHintSpec.PROACTIVE_HINT_MAX_CHARS))
 
         arm(atBound)
         atBound.plugin.handle(TranscriptEvent(atBound.transcript("现在几点了")))
@@ -237,11 +253,49 @@ class SmartProactiveTurnTest {
         assertEquals(1, atBound.output.hints.size)
     }
 
+    @Test
+    fun `a blank hint is silence and is never submitted`() {
+        val rig = rigWithProposal("   ")
+
+        withLines { lines ->
+            arm(rig)
+            rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+
+            assertTrue(rig.output.hints.isEmpty(), "an empty proposal is not a sentence to show")
+            assertTrue(lines.any { it.startsWith("P3_PROACTIVE silence reason=BLANK") }, lines.toString())
+        }
+    }
+
+    @Test
+    fun `a second tool call in the same hint turn is refused by the one step bound`() {
+        // Phase 3 Task 5 (HINT_TURN): the loop's `maxSteps = 1` is what makes `propose_hint` the *only* call a hint
+        // turn can execute. The first proposal is refused as blank; the second model request offers a valid sentence,
+        // and it must not run - otherwise a turn could spend a step on a bad proposal and still speak.
+        val rig = SmartTestRig()
+        rig.activate()
+        var calls = 0
+        rig.model.onRequest = { request, listener ->
+            calls += 1
+            val args = if (calls == 1) """{"text":""}""" else """{"text":"现在正适合提醒他一句"}"""
+            listener(smartToolCall("c$calls", "propose_hint", args, requestId = request.requestId))
+            listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
+        }
+
+        withLines { lines ->
+            arm(rig)
+            rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+
+            assertEquals(2, rig.model.requests.size, "the refusal is fed back exactly once")
+            assertTrue(rig.output.hints.isEmpty(), "the second proposal must not execute after the one spent step")
+            assertTrue(lines.any { it.startsWith("P3_PROACTIVE silence reason=BLANK") }, lines.toString())
+        }
+    }
+
     // ---- concurrency and cancellation ------------------------------------------------------------------------------
 
     @Test
     fun `a wake turn that is still running makes the proactive trigger give way`() {
-        val rig = SmartTestRig()
+        val rig = SmartTestRig(interventionGate = FixedGate(intervene = true))
         rig.activate()
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
@@ -259,7 +313,9 @@ class SmartProactiveTurnTest {
         try {
             withLines { lines ->
                 arm(rig)
-                rig.plugin.handle(TranscriptEvent(rig.transcript("今天星期几", turnId = "asr-2")))
+                // A `ContextChanged` is the trigger that stays available while WAKE is Running: a final arriving in
+                // this state belongs to WAKE (P3-13, final review Important 1) and must not reach proactive admission.
+                rig.plugin.handle(ContextChanged(rig.envelope(), 2, mapOf("app.foreground" to "设置")))
 
                 awaitRequests(rig, 1)
                 assertEquals(1, rig.model.requests.size,
@@ -296,9 +352,10 @@ class SmartProactiveTurnTest {
     }
 
     @Test
-    fun `stop cancels the in flight proactive request and nothing is shown`() {
+    fun `stop cancels the in flight hint run and nothing is shown`() {
+        val perception = SmartFakePerception()
         val rig = SmartTestRig()
-        rig.activate()
+        rig.activate(overrides = mapOf(Capability.Perception to perception))
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         rig.model.onRequest = { request, listener ->
@@ -311,14 +368,18 @@ class SmartProactiveTurnTest {
         val worker = Thread { rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了"))) }
         worker.isDaemon = true
         worker.start()
-        assertTrue(entered.await(2, TimeUnit.SECONDS), "the proactive run must reach the model client")
+        assertTrue(entered.await(2, TimeUnit.SECONDS), "the hint run must reach the model client")
 
         rig.plugin.handle(UserAction(rig.envelope(), UserAction.Action.Stop))
         release.countDown()
         worker.join(5_000)
 
         assertTrue(rig.model.handles.any { it.cancelled }, "Stop must cancel the transport")
-        assertTrue(rig.output.hints.isEmpty(), "a cancelled proactive turn must say nothing")
+        assertTrue(rig.output.hints.isEmpty(), "a cancelled hint turn must say nothing")
+        // Phase 3 Task 5: the perception boundary of the hint turn closes on the cancellation path too, so the host's
+        // refs/snapshot cannot survive into the next turn.
+        assertEquals(1, perception.beginTurns, "the hint turn opened the perception boundary")
+        assertEquals(1, perception.endTurns, "STOP still closes the perception boundary")
     }
 
     // ---- a rejected display ----------------------------------------------------------------------------------------
@@ -553,7 +614,8 @@ class SmartProactiveTurnTest {
         val rig = SmartTestRig()
         rig.activate()
         rig.model.onRequest = { request, listener ->
-            // The reply lands seven seconds into the eight-second request deadline.
+            // The reply lands seven seconds into the fifteen-second request deadline, but the visible window must
+            // still start at the submit.
             rig.clock.advance(7_000_000_000L)
             proposing()(request, listener)
         }
@@ -642,5 +704,213 @@ class SmartProactiveTurnTest {
         assertTrue(input.contains("现在几点了"), "the utterance has to reach the model")
         assertTrue(input.contains("afternoon"), "the context the host delivered has to reach the model")
         assertEquals(1, request.tools.size)
+    }
+
+    // ---- HINT_TURN: the gate, the loop and the perception tail (0.3 Phase 3 Task 5) -------------------------------
+
+    /** A gate that answers a fixed verdict and records what it was asked, so "no loop ran" is observable. */
+    private class FixedGate(private val intervene: Boolean) : ProactiveGate {
+        val seen = mutableListOf<ProactiveGateState>()
+        override val form = GateForm.NOUL
+        override fun shouldIntervene(state: ProactiveGateState): GateOutcome {
+            seen += state
+            return GateOutcome(intervene, 0.9, 12.0)
+        }
+    }
+
+    /**
+     * A gate that accepts, but spends [spendNanos] of the turn's clock first.
+     *
+     * It stands in for the K40's measured pre-model pipeline (Task 9: gate -> `P3_PROMPT` 5.306-6.936 s) without
+     * pretending to be that pipeline: what matters to the deadline is that *some* real time passes between the
+     * trigger and the model request. The clock is assigned after the rig exists because the rig owns it.
+     */
+    private class SlowGate(private val spendNanos: Long) : ProactiveGate {
+        var clock: SmartFakeClock? = null
+        override val form = GateForm.NOUL
+        override fun shouldIntervene(state: ProactiveGateState): GateOutcome {
+            clock?.advance(spendNanos)
+            return GateOutcome(true, 0.9, spendNanos / 1_000_000.0)
+        }
+    }
+
+    @Test
+    fun `a declining gate builds no hint run and costs no model request`() {
+        val gate = FixedGate(intervene = false)
+        val rig = SmartTestRig(interventionGate = gate)
+        rig.activate()
+        rig.model.onRequest = proposing()
+
+        withLines { lines ->
+            arm(rig)
+            rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+            settle()
+
+            assertEquals(1, gate.seen.size, "the admitted trigger reaches the gate exactly once")
+            assertTrue(rig.model.requests.isEmpty(), "a declined gate must not start a hint run")
+            assertTrue(rig.output.hints.isEmpty())
+            assertTrue(rig.actions.executed.isEmpty(), "a declined hint turn may not execute anything")
+            assertTrue(
+                lines.any { it.startsWith("P3_PROACTIVE silence reason=GATE_DECLINED") },
+                lines.toString(),
+            )
+        }
+    }
+
+    @Test
+    fun `an accepted hint turn runs the loop with only propose hint and ends on its terminal result`() {
+        val rig = SmartTestRig(conversationStores = smartStores())
+        rig.activate()
+        // The host really advertises the device tools; the hint turn's registry must not offer any of them.
+        listOf("device", "open", "shell", "dial").forEach { name -> rig.actions.descriptors += smartAction(name) }
+        rig.model.onRequest = proposing("现在正适合提醒他一句")
+
+        withLines { lines ->
+            arm(rig)
+            rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+
+            val request = rig.model.requests.single()
+            assertEquals(listOf("propose_hint"), request.tools.map { it.name })
+            // The loop's per-call result line is the proof that the terminal tool was really executed by AgentLoop:
+            // the pre-Task-5 one-shot path never executed `propose_hint` at all.
+            val toolResult = lines.single { it.startsWith("P3_TOOLRESULT ") }
+            assertTrue("tool=propose_hint" in toolResult, toolResult)
+            assertTrue("outcome=done" in toolResult, toolResult)
+            assertEquals("现在正适合提醒他一句", rig.output.hints.single().text)
+            assertTrue(rig.actions.executed.isEmpty(), "a hint turn must not execute a device action")
+            assertTrue(
+                lines.any { it.startsWith("P3_PROMPT ") && "route=PROACTIVE_HINT" in it },
+                "the loop's assembled request must report the hint plan: $lines",
+            )
+            assertTrue(lines.any { it.startsWith("P3_METRIC ") }, "the loop's one run metric line: $lines")
+        }
+    }
+
+    @Test
+    fun `the hint turn opens a perception boundary and puts the full snapshot in the request tail`() {
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        // A wide window so the trimmer cannot be what removes the perception tail this test measures.
+        rig.profile = smartProfile(
+            usableWindowTokens = 32_000,
+            inputBudgetTokens = 16_000,
+            maxOutputTokens = 2_000,
+            safetyTokens = 1_000,
+        )
+        rig.activate(overrides = mapOf(Capability.Perception to perception))
+        rig.model.onRequest = proposing()
+
+        withLines { lines ->
+            arm(rig)
+            rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+
+            assertEquals(1, perception.beginTurns, "the whole hint turn is one perception boundary")
+            assertEquals(1, perception.endTurns, "and it closes on the same turn")
+            assertTrue(
+                perception.requestedSources.isEmpty(),
+                "the opening request must use the beginTurn snapshot, not a second full read",
+            )
+            val line = lines.single { it.startsWith("P3_PERCEPTION ") }
+            assertTrue("elements=1" in line, "the count-only line describes the rendered snapshot: $line")
+
+            val parts = rig.model.requests.single().input.filterIsInstance<InputPart.Text>()
+            // The gateway folds the request-scoped tail and the one USER_INPUT into a single input text, tail first,
+            // so the order assertion is on the combined string.
+            val input = parts.joinToString("\n\n") { it.text }
+            val perceptionIndex = input.indexOf("【本轮运行上下文】")
+            val userIndex = input.indexOf("用户没有对你说话")
+            assertTrue(perceptionIndex >= 0, "the PERCEPTION tail must be on the wire: $input")
+            assertTrue(userIndex >= 0, "the proactive message must be the USER_INPUT: $input")
+            assertTrue(
+                perceptionIndex < userIndex,
+                "PERCEPTION must be the request-scoped tail before USER_INPUT: $input",
+            )
+            assertTrue(
+                "com.miui.player" in input,
+                "the full snapshot's foreground must ride the PERCEPTION tail: $input",
+            )
+            assertEquals(listOf("propose_hint"), rig.model.requests.single().tools.map { it.name })
+            assertTrue(rig.actions.executed.isEmpty(), "the hint turn must not execute a device action")
+        }
+    }
+
+    @Test
+    fun `the hint request deadline is the full fifteen seconds measured from the trigger`() {
+        // Owner decision A2 (2026-10-21): the old 8 s budget was mostly spent *before* the model call on the K40
+        // (Task 9: gate -> P3_PROMPT measured 5.306/6.616/6.936 s), so 3 of 4 measured hint turns ended DEADLINE.
+        // The deadline here is therefore the **total** HINT_TURN budget: work already done before the request - the
+        // gate's five simulated seconds stand in for that pipeline - is charged to the same 15 s, not added on top
+        // of it. Anchoring at the model call instead would pass a frozen-clock test but reproduce the device bug.
+        val gate = SlowGate(spendNanos = 5_000_000_000L)
+        val rig = SmartTestRig(interventionGate = gate)
+        gate.clock = rig.clock
+        // The profile's per-request cap is a separate number (D49); a cap longer than the turn budget leaves the
+        // turn's own deadline as the binding one the request receives.
+        rig.profile = smartProfile(timeoutMillis = 60_000)
+        rig.activate()
+        rig.model.onRequest = proposing()
+
+        arm(rig)
+        val turnStart = rig.clock.nowNanos()
+        rig.plugin.handle(TranscriptEvent(rig.transcript("现在几点了")))
+
+        val request = rig.model.requests.single()
+        assertEquals(turnStart + 5_000_000_000L, rig.clock.nowNanos(),
+            "the gate must have spent part of the budget before the request was built")
+        assertEquals(
+            turnStart + 15_000_000_000L,
+            request.deadlineNanos,
+            "the hint request must be bounded by the 15 s total HINT_TURN budget, anchored at the trigger",
+        )
+    }
+
+    @Test
+    fun `the hint tool is a terminal L0 proposal with no confirmation and a short bound`() {
+        val descriptor = ProposeHintTool().descriptors().single()
+
+        assertEquals("propose_hint", descriptor.name)
+        assertEquals(SCOPE_TERMINAL, descriptor.scope, "a successful call ends the hint run")
+        assertEquals(RiskLevel.L0, descriptor.risk)
+        assertFalse(descriptor.requiresConfirmation)
+        assertTrue(descriptor.countsTowardStepLimit)
+        assertTrue(descriptor.idempotent)
+        assertFalse(descriptor.screenObservation, "a sentence is not a screen observation")
+        assertEquals(5_000L, descriptor.timeoutMillis)
+        assertEquals(ProactiveHintSpec.PROPOSE_HINT.parametersJson, descriptor.parametersJson)
+        assertEquals(ProactiveHintSpec.PROPOSE_HINT.description, descriptor.title)
+    }
+
+    @Test
+    fun `the hint tool trims the sentence and reports a done execution with no observation`() {
+        val result = ProposeHintTool().execute(ProposeHintTool.NAME, """{"text":"  该休息了  "}""")
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals("该休息了", result.detail, "the sentence is trimmed before it can be shown")
+        val execution = assertNotNull(result.execution)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertNull(result.observation, "a proposal never observes the screen")
+    }
+
+    @Test
+    fun `the hint tool refuses blank over long non string and unparsable arguments`() {
+        val invalid = listOf(
+            "blank" to """{"text":"   "}""",
+            "too long" to """{"text":"${"字".repeat(ProactiveHintSpec.PROACTIVE_HINT_MAX_CHARS + 1)}"}""",
+            "non string" to """{"text":42}""",
+            "unparsable" to "{not json",
+        )
+
+        invalid.forEach { (label, args) ->
+            val result = ProposeHintTool().execute(ProposeHintTool.NAME, args)
+            assertEquals(ActionOutcome.Refused, result.outcome, label)
+            assertEquals(ProposeHintTool.PROPOSE_HINT_INVALID, result.detail, label)
+            val execution = assertNotNull(result.execution, label)
+            assertEquals(ToolOutcome.Refused, execution.outcome, label)
+            assertEquals(ProposeHintTool.PROPOSE_HINT_INVALID, execution.code, label)
+            assertEquals(false, execution.accepted, label)
+            assertEquals(false, execution.applied, label)
+            assertNull(result.observation, label)
+        }
     }
 }

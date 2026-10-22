@@ -75,7 +75,7 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
                             put("role", "user")
                             put("content", segment.text)
                         })
-                        SegmentOrigin.PERCEPTION -> add(buildJsonObject {
+                        SegmentOrigin.PERCEPTION, SegmentOrigin.SKILL_BODY -> add(buildJsonObject {
                             put("role", "user")
                             put("content", segment.text)
                         })
@@ -181,7 +181,9 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             put("stream", true)
             put("stream_options", buildJsonObject { put("include_usage", true) })
             put("modalities", buildJsonArray { add("text") })
-            put("max_tokens", profile.maxOutputTokens)
+            // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
+            // when the request declares no cap of its own (every pre-0.3 caller).
+            put("max_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
             put("messages", buildJsonArray {
                 // History, including the tool round-trip the stateless endpoint needs echoed back.
                 historyToMessages(budgeted.request.history).forEach { add(it) }

@@ -39,7 +39,9 @@ import com.sheen.rokid.device.Stroke
  * **R38 — platform fields map 1:1, never fabricated.** [DeviceNode.role] is the lowercased simple
  * class name (`android.widget.Button` -> `button`, no class name -> `unknown`); a platform action id
  * the vocabulary does not know is preserved as `action_<id>`; collection/range/tooltip/paneTitle/hint
- * stay null when the platform has no value.
+ * stay null when the platform has no value. `AccessibilityNodeInfo.isVisibleToUser` is carried into
+ * [DeviceNode.visibleToUser] for the same reason: the collector reports the platform's answer and the
+ * perception layer decides what is model-facing.
  */
 
 /**
@@ -96,6 +98,12 @@ data class PlatformNode(
     val actionIds: List<Int>,
     val collection: PlatformCollectionInfo?,
     val range: PlatformRangeInfo?,
+    /**
+     * `AccessibilityNodeInfo.isVisibleToUser`, carried 1:1 (edith-0.3 Phase 2). Defaults to `true`
+     * so an older producer keeps every node visible; the perception layer is what drops invisible
+     * nodes, never the collector.
+     */
+    val visibleToUser: Boolean = true,
 )
 
 /** One top-level window and its pre-order nodes, as the Android collector saw them. */
@@ -413,6 +421,7 @@ private fun PlatformNode.toDeviceNode(): DeviceNode = DeviceNode(
     drawingOrder = drawingOrder,
     windowId = windowId,
     depth = depth,
+    visibleToUser = visibleToUser,
 )
 
 private fun Bounds.centre(): Point = Point(

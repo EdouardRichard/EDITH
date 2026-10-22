@@ -59,10 +59,16 @@ class ContextEvictionSemanticsTest {
 
     /** Three messages that cost 3, 2 and 2 tokens: 7 in total, so a budget of 3 needs two of them gone. */
     private fun context(): ConversationContext = ConversationContext(ContextRoute.WAKE).also {
-        it.appendUser("11111111")
-        it.appendAssistant("2222")
-        it.appendUser("3333")
+        it.appendUser("一一一")
+        it.appendAssistant("二二")
+        it.appendUser("三三")
     }
+
+    private fun compressor(budgetTokens: Int, memory: MemoryModule? = null) = ContextCompressor(
+        historyBudgetTokens = budgetTokens,
+        summaryMaxTokens = 64,
+        memory = memory,
+    )
 
     private fun ConversationContext.texts(): List<String> =
         history().map { (it as ModelHistoryItem.Text).text }
@@ -72,11 +78,11 @@ class ContextEvictionSemanticsTest {
         val memory = memory()
         val ctx = context()
 
-        val report = ContextCompressor(memory = memory).compressIfNeeded(ctx, budgetTokens = 3)
+        val report = compressor(budgetTokens = 3, memory = memory).compressIfNeeded(ctx)
 
         // Message at a time: u1 and a1 both went, and exactly the last user turn survived. A body that charged a
         // turn one message but removed a count of them left `[a1, u2]` here - a dangling assistant head.
-        assertEquals(listOf("3333"), ctx.texts())
+        assertEquals(listOf("三三"), ctx.texts())
         assertEquals(MessageRole.USER, (ctx.history().first() as ModelHistoryItem.Text).role)
         assertEquals(2, report.truncated)
     }
@@ -85,11 +91,11 @@ class ContextEvictionSemanticsTest {
     fun `everything the context path dropped reached memory before it left`() {
         val memory = memory()
 
-        ContextCompressor(memory = memory).compressIfNeeded(context(), budgetTokens = 3)
+        compressor(budgetTokens = 3, memory = memory).compressIfNeeded(context())
 
         val stored = memory.entries().map { it.text }
-        assertTrue("11111111" in stored, stored.toString())
-        assertTrue("2222" in stored, stored.toString())
+        assertTrue("一一一" in stored, stored.toString())
+        assertTrue("二二" in stored, stored.toString())
     }
 
     @Test
@@ -98,15 +104,15 @@ class ContextEvictionSemanticsTest {
         // may go. Over-dropping is the store-path bug; under-dropping is the shared-body bug.
         val ctx = context()
 
-        val report = ContextCompressor().compressIfNeeded(ctx, budgetTokens = 6)
+        val report = compressor(budgetTokens = 6).compressIfNeeded(ctx)
 
-        assertEquals(listOf("2222", "3333"), ctx.texts())
+        assertEquals(listOf("二二", "三三"), ctx.texts())
         assertEquals(1, report.truncated)
     }
 
     @Test
     fun `the context path counts messages dropped and the turns they came from separately`() {
-        val report = ContextCompressor().compressIfNeeded(context(), budgetTokens = 3)
+        val report = compressor(budgetTokens = 3).compressIfNeeded(context())
 
         // Two messages went, and both came out of the first turn - the two units of the report really differ.
         assertEquals(2, report.truncated)

@@ -15,7 +15,8 @@ internal class RecordingActionExecutor(
 ) : ActionExecutor {
     val calls = mutableListOf<Pair<String, String>>()
     var outcome: (String, String) -> ActionResult = { _, _ -> ActionResult(ActionOutcome.Done, "done") }
-    var failure: RuntimeException? = null
+    /** `Throwable` so a test can let an `Error` escape the registry's `Exception` guard, as `runTool` must survive. */
+    var failure: Throwable? = null
     var cancellations = 0
     var begins = 0
     var beginTurnFailure: RuntimeException? = null
@@ -54,6 +55,8 @@ internal fun actionDescriptor(
     timeoutMillis: Long = 30_000L,
     // Task 12 fix (R99): whether the executor may wait for a person inside `execute`.
     mayAskHuman: Boolean = false,
+    // edith-0.3 Phase 2.2 Task 3: whether a failed call should carry a best-effort post-call observation.
+    screenObservation: Boolean = false,
 ) = ActionDescriptor(
     name = name,
     title = "Title of $name",
@@ -68,6 +71,7 @@ internal fun actionDescriptor(
     observation = observation,
     timeoutMillis = timeoutMillis,
     mayAskHuman = mayAskHuman,
+    screenObservation = screenObservation,
 )
 
 /** An executor offering exactly one tool, described by [actionDescriptor] defaults. */

@@ -71,6 +71,30 @@ data class SmartSettings(
      * default (on); once the user turns it off, no path may turn it back on automatically.
      */
     val continueDialogue: Boolean = true,
+    /**
+     * 0.3 Phase 2 Task 10: the 「感知截图」 switch, persisted globally and **on by default**.
+     *
+     * It is the host's live vision gate: when off, the perception provider answers `PerceptionScreenshotResult.Disabled`
+     * and the device tool refuses `screenshot` with `VISION_DISABLED` before touching the kernel. The field is only
+     * the persisted half - the composition owns a live `VisionGate` that mirrors it and is updated on save, so the
+     * switch takes effect without an App restart.
+     *
+     * A blob written before this key exists takes the default (on), because the phase ships with vision on. Once the
+     * user turns it off, no path may turn it back on automatically (`D53`② same-shape rule).
+     */
+    val visionEnabled: Boolean = true,
+    /**
+     * 0.3 Phase 4B (`D189`): the global 「不拦截」 switch, persisted and **off by default**.
+     *
+     * When on, the host's live [NoInterceptionGate] makes the policy allow every tool call (L0–L4), bypassing both
+     * `maxLevel` and any per-action confirmation. It is a **persisted global mode**, not a per-session grant: closing,
+     * killing or restarting the App does not reset it, and only the user's explicit off exits it. A blob written before
+     * 4B lacks this key and takes the default (off) - the only safe upgrade path for a switch that removes confirmations.
+     *
+     * This field is the persisted half only; `HostCompositionRoot` owns the live gate and updates it on a successful
+     * save. Kept as the **last** field so positional construction of older call sites is unchanged.
+     */
+    val noInterception: Boolean = false,
 ) {
     /**
      * The plugin's own cooldown parameter.
@@ -116,6 +140,10 @@ data class SmartSettings(
         "whitelist" to whitelist.joinToString(","),
         "proactiveCooldownMillis" to proactiveCooldownMillis.toString(),
         "proactiveSensitivity" to effectiveProactiveSensitivity(),
+        // 0.3 Phase 4B (`D189`): the persisted 「不拦截」 value travels in the closed configuration shape. The plugin's
+        // live behavior comes from the host gate provider (spec §5.1), never from this turn snapshot; sending the key
+        // is what keeps a restarted App's configuration complete and the plugin's key set in agreement with the store.
+        "noInterception" to noInterception.toString(),
     )
 
     /** The plugin's `PluginConfiguration`, at the schema version the plugin declares. */
@@ -187,6 +215,8 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
             put("proactiveEnabled", settings.proactiveEnabled)
             put("speechEnabled", settings.speechEnabled)
             put("continueDialogue", settings.continueDialogue)
+            put("visionEnabled", settings.visionEnabled)
+            put("noInterception", settings.noInterception)
         })
     }
 
@@ -218,6 +248,16 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
                 // blob must continue conversations; only the user's explicit off is stored as false.
                 continueDialogue = json["continueDialogue"]?.jsonPrimitive?.booleanOrNull
                     ?: SmartSettings().continueDialogue,
+                // Absent in a blob written before Phase 2 Task 10: takes the default (on). The switch ships on, and an
+                // explicit off is the user's act - it must never be inferred from an older blob.
+                visionEnabled = json["visionEnabled"]?.jsonPrimitive?.booleanOrNull
+                    ?: SmartSettings().visionEnabled,
+                // Absent in a blob written before 4B: takes the default (**off**). This is the safe upgrade path - an
+                // old blob must never remove confirmation by omission. `strictBoolean` additionally refuses a string
+                // "true"/"false" (which kotlinx's `booleanOrNull` would coerce): a corrupt or hand-edited value must not
+                // arm the mode. A non-primitive still fails the whole read, the store's existing wrong-shape rule.
+                noInterception = strictBoolean(json, "noInterception")
+                    ?: SmartSettings().noInterception,
             )
         }.getOrNull()
     }
@@ -226,6 +266,21 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
     private fun strings(json: JsonObject, key: String): List<String>? {
         val element = json[key] ?: return null
         return element.jsonArray.map { it.jsonPrimitive.content }
+    }
+
+    /**
+     * A boolean that only honours a real JSON boolean.
+     *
+     * kotlinx's `booleanOrNull` also accepts the JSON **strings** `"true"`/`"false"`. For the 「不拦截」 switch that
+     * coercion is unsafe - a corrupt or hand-edited blob must never be able to arm a mode that removes confirmations -
+     * so a string primitive is treated as absent and the safe default (off) applies. A non-primitive still throws out of
+     * `jsonPrimitive`, which the caller's `runCatching` turns into the whole-read default, the store's existing rule.
+     */
+    private fun strictBoolean(json: JsonObject, key: String): Boolean? {
+        val element = json[key] ?: return null
+        val primitive = element.jsonPrimitive
+        if (primitive.isString) return null
+        return primitive.booleanOrNull
     }
 
     companion object {

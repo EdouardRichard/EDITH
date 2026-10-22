@@ -307,35 +307,56 @@ private val REFUSED_PREFIXES = listOf("Refused:", "Failed:")
 /**
  * Extracts the **identity** of a failed result without keeping its body (R56: D117 allows a hash, never the text).
  *
- * In order:
- * 1. `Refused: CODE` / `Failed: CODE` — the token right after the prefix when it looks like a stable code;
+ * This is the legacy-detail fallback used when a result carries no `ToolExecution.code`. In order:
+ * 1. `Refused: CODE` / `Failed: CODE` — the pre-0.3 registry prefix, accepted here only for legacy details (a
+ *    persisted transcript or an unmigrated executor's old string); the current registry never adds it;
  * 2. a bare all-caps token (`UNKNOWN_TOOL`, `REFUSED_BY_POLICY`);
  * 3. a leading `CODE:` (`ACTION_TIMEOUT: may or may not have taken effect`);
- * 4. an `"error":{"code":"CODE"}` member of the payload's JSON (the device/shell tools render their stable code there,
- *    and `ToolRegistry` prefixes that whole JSON with `Refused:`/`Failed:`);
+ * 4. an `"error":{"code":"CODE"}` member of the payload's JSON (the device/shell tools render their stable code there);
  * 5. otherwise SHA-256 truncated to 16 hex characters. A JSON body is canonicalised and its `timing` member removed
  *    first, so the same failure with different timing values (the device envelope embeds per-call timings) hashes
  *    identically instead of looking like a new error on every attempt.
  *
  * A `Refused: the channel …` detail whose first token is prose falls through to the hash: the first token of a sentence
  * is not a stable code, and treating every "the" as the same identity would end runs on unrelated failures.
+ *
+ * [legacyCodeOf] is the code-only half of this extraction, for the loop's content-free step/audit label.
  */
 internal fun stableCodeOf(payload: String): String {
+    val identity = legacyIdentity(payload)
+    identity.code?.let { return it }
+    if (identity.body.startsWith("{")) return sha256Hex(canonicalJsonWithoutTiming(identity.body)).take(16)
+    // Prose behind a prefix (or a bare sentence) keeps the old whole-payload identity; there is nothing to strip.
+    return sha256Hex(payload.trim()).take(16)
+}
+
+/**
+ * The stable code an unmigrated **legacy detail** names, or `null` when it names none.
+ *
+ * This is the code-only extraction the loop's `AgentStep`/audit label uses **after** the explicit execution code: a
+ * detail such as `APP_NOT_VISIBLE` keeps its identity, and a prose detail yields `null` so the label falls back to the
+ * outcome token. Unlike [stableCodeOf], prose is never turned into a hash here: a hash is a fine streak identity but
+ * not a meaningful count-only log label.
+ */
+internal fun legacyCodeOf(payload: String): String? = legacyIdentity(payload).code
+
+/** A legacy detail split into its prefix-free body and the code-shaped identity it names, if any. */
+private class LegacyIdentity(val body: String, val code: String?)
+
+private fun legacyIdentity(payload: String): LegacyIdentity {
     val text = payload.trim()
     val prefix = REFUSED_PREFIXES.firstOrNull { text.startsWith(it) }
     val body = if (prefix == null) text else text.substring(prefix.length).trim()
-    if (prefix != null) {
+    val code = if (prefix != null) {
         val token = body.substringBefore(' ').substringBefore('\n')
-        if (STABLE_TOKEN.matches(token)) return token
+        token.takeIf { STABLE_TOKEN.matches(it) }
     } else {
-        if (STABLE_TOKEN.matches(body)) return body
-        PREFIXED_CODE.find(body)?.let { return it.groupValues[1] }
+        when {
+            STABLE_TOKEN.matches(body) -> body
+            else -> PREFIXED_CODE.find(body)?.groupValues?.get(1)
+        }
     }
-    // The production device/shell failure is JSON behind the prefix; its stable code lives inside the payload.
-    jsonErrorCode(body)?.let { return it }
-    if (body.startsWith("{")) return sha256Hex(canonicalJsonWithoutTiming(body)).take(16)
-    // Prose behind a prefix (or a bare sentence) keeps the old whole-payload identity; there is nothing to strip.
-    return sha256Hex(text).take(16)
+    return LegacyIdentity(body, code ?: jsonErrorCode(body))
 }
 
 /** The `error.code` member of a JSON payload, when it is present and shaped like a stable code. */
@@ -380,7 +401,9 @@ internal data class ErrorAssessment(
  * never counted and carry a "do not retry automatically" hint. `REFUSED_BY_POLICY` does count — it is deterministic and
  * the model must change course.
  *
- * Hints for known stable codes are injected once per code per run; the body of the payload is never retained.
+ * Hints for known stable codes are injected once per code per run; the body of the payload is never retained. The
+ * identity is the execution's own `code` when the tool named one; only an unmigrated result falls back to parsing its
+ * legacy detail ([stableCodeOf]).
  */
 internal class ErrorTracker(private val limit: Int = 3) {
     init {
@@ -399,7 +422,9 @@ internal class ErrorTracker(private val limit: Int = 3) {
             }
             return ErrorAssessment()
         }
-        val code = stableCodeOf(result.payload)
+        // edith-0.3 Phase 2.2: a migrated result states its stable code in the execution facts, so the body is never
+        // parsed. An unmigrated tool's legacy `data` is the fallback identity (the same parser the old payload used).
+        val code = result.execution.code ?: stableCodeOf(result.data)
         if (code == CONFIRMATION_DENIED || code == CONFIRMATION_TIMEOUT) {
             // The wearer answered (or the question expired): retrying is exactly the wrong response, and the result is
             // not evidence the tool is broken.

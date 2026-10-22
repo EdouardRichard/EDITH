@@ -2,6 +2,11 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
     xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 0.3 Phase 1 (§4.2.1): `AndroidDeviceStateProvider.network()` reads `ConnectivityManager.activeNetwork` /
+         `getNetworkCapabilities()` for the `{{network}}` device fact. Those calls throw `SecurityException` without this
+         permission and the per-fact `runCatching` would silently turn every read into `null`. It is a normal install-time
+         permission: no runtime prompt, no user grant. -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
     <!--
       edith-0.2 Phase B (B4): the SKILL library lives at /sdcard/EDITH/skills (spec §3.5), which is outside the app's
       own directories, so reading it needs shared-storage access. On API 33 the legacy READ_EXTERNAL_STORAGE does not
@@ -91,9 +96,10 @@
             <meta-data android:name="android.accessibilityservice"
                 android:resource="@xml/edith_accessibility_config" />
         </service>
-        <!-- P3.2 Stage B (Task 12): notification access is the user's grant, made in Settings. The service only ever
-             reads a notification's category/channel id (see NotificationCategoryService); the permission it binds
-             with is declared by the platform, not by us. -->
+        <!-- P3.2 Stage B (Task 12): notification access is the user's grant, made in Settings. The service reads the
+             opaque category/channel id and, since 0.3 Phase 2 Task 3 (D179), notification content in memory only (see
+             NotificationCategoryService/NotificationContentSource); the permission it binds with is declared by the
+             platform, not by us. -->
         <service android:name=".context.NotificationCategoryService" android:exported="false"
             android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter>

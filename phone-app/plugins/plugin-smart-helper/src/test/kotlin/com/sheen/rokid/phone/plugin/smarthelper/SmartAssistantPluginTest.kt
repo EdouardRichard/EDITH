@@ -4,7 +4,8 @@ import com.sheen.rokid.phone.plugin.smarthelper.scene.ScenePolicy
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryExtraction
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryLog
 import com.sheen.rokid.phone.plugin.smarthelper.memory.score
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 
 import com.sheen.rokid.contracts.AcousticEvent
@@ -27,15 +28,26 @@ import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ConfigSchema
 import com.sheen.rokid.plugin.DeactivationReason
+import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.OutputSubmission
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
+import com.sheen.rokid.plugin.TaskScope
 import com.sheen.rokid.plugin.PluginConfiguration
 import com.sheen.rokid.plugin.PluginLifecycle
 import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.output.HintReadingBudget
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.*
 
 /**
@@ -66,6 +78,32 @@ class SmartAssistantPluginTest {
         assertFailsWith<IllegalArgumentException> { plugin.validate(configuration(mapOf("proactiveNonsense" to "1"))) }
     }
 
+    /**
+     * 0.3 Phase 4B (`D189`, spec §5.3): the persisted mode is now part of the closed configuration shape.
+     *
+     * The key's value is accepted at its persisted spelling and defaults to **false** when absent; the live gate is the
+     * constructor provider, not this turn snapshot (spec §5.1), so this test pins only the shape and the safe default.
+     */
+    @Test fun `the no-interception configuration key is accepted and defaults to false`() {
+        val plugin = SmartAssistantPlugin()
+        fun configuration(extra: Map<String, String>) = PluginConfiguration(1,
+            mapOf("profileId" to "p-1", "profileRevision" to "1") + extra)
+
+        plugin.validate(configuration(mapOf("noInterception" to "true")))
+        plugin.validate(configuration(mapOf("noInterception" to "false")))
+        plugin.validate(configuration(emptyMap()))
+
+        assertFalse(plugin.noInterceptionConfigured, "an absent key takes the safe default (off)")
+        plugin.configure(configuration(mapOf("noInterception" to "true")))
+        assertTrue(plugin.noInterceptionConfigured)
+        plugin.configure(configuration(mapOf("noInterception" to "false")))
+        assertFalse(plugin.noInterceptionConfigured)
+
+        assertFailsWith<IllegalArgumentException> {
+            plugin.validate(configuration(mapOf("noInterception" to "yes")))
+        }
+    }
+
     @Test fun `descriptor is stable and lifecycle toggles active`() {
         val rig = SmartTestRig()
         val plugin: PluginLifecycle = rig.plugin
@@ -81,7 +119,15 @@ class SmartAssistantPluginTest {
                 // empty and no `SAID`/`BUSY` ever reached the glasses, because the plugin consumed the port without
                 // declaring it and the optional access degraded to "no port" in silence. This list is the gate that
                 // now makes that omission fail here instead of on the wearer's face.
-                Capability.ConversationDisplay),
+                Capability.ConversationDisplay,
+                // 0.3 Phase 2 Task 9: the host's per-turn perception port. The block is optional (a host without the
+                // provider still activates), but declaring the capability is what makes `services.perception()`
+                // reachable at all.
+                Capability.Perception,
+                // 0.3 Phase 1 Task 12: the static device profile that the session pins into its prompt plan. The host
+                // only hands over a capability the descriptor declares, so declaring it is what makes the prompt's
+                // device section reachable at all.
+                Capability.DeviceState),
             plugin.descriptor.capabilities,
         )
         // P3.2 Task 8: `Context` is no longer absent. It is what the proactive path runs on - the host delivers
@@ -90,6 +136,353 @@ class SmartAssistantPluginTest {
         assertFalse(rig.plugin.active)
         rig.plugin.deactivate(DeactivationReason.Stopped)
         assertFalse(rig.plugin.active)
+    }
+
+    @Test fun `a perception provider opens and closes the turn and its block rides before the utterance`() {
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertEquals(1, perception.beginTurns, "the turn must open the provider exactly once")
+            assertEquals(1, perception.endTurns, "the turn must close the provider on its success path")
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue(input.startsWith("【本轮运行上下文】"), "the perception block is the request tail head: $input")
+            assertTrue(input.contains("#n12 button \"搜索\""), input)
+            assertTrue(input.endsWith("现在几点了"), "the wearer's utterance stays last: $input")
+            val telemetry = lines.filter { it.startsWith("P3_PERCEPTION ") }
+            assertEquals(1, telemetry.size, "one count-only line per rendered block: $lines")
+            assertTrue("elements=1" in telemetry.single(), telemetry.single())
+            assertTrue("images=0" in telemetry.single(), telemetry.single())
+            assertFalse("搜索" in telemetry.single(), "the telemetry must not carry screen text: ${telemetry.single()}")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `a text-only profile says vision is unavailable instead of reporting the host gate as ok`() {
+        // Phase 2 Task 10: the host's snapshot token says the capture path is on (`vision=ok`), but the selected
+        // profile declares no IMAGE input. The rendered coverage must name that gap, and the telemetry must agree.
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue("vision=unavailable(no_image_profile)" in input, input)
+            val telemetry = lines.single { it.startsWith("P3_PERCEPTION ") }
+            assertTrue("vision=unavailable(no_image_profile)" in telemetry, telemetry)
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `an image-capable profile keeps vision ok`() {
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        rig.profile = smartProfile().copy(inputs = setOf(InputModality.TEXT, InputModality.IMAGE))
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue("vision=ok" in input, input)
+            val telemetry = lines.single { it.startsWith("P3_PERCEPTION ") }
+            assertTrue("vision=ok" in telemetry, telemetry)
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `the first request carries the full snapshot and a continuation only the ambient sources`() {
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            var turn = 0
+            rig.model.onRequest = { request, listener ->
+                turn += 1
+                if (turn == 1) {
+                    listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.INCOMPLETE, null, null))
+                } else {
+                    streamText(request, listener, "好。")
+                }
+            }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertEquals(2, rig.model.requests.size, "an empty turn is retried, so there are two model requests")
+            assertEquals(
+                listOf(setOf(PerceptionSource.DEVICE, PerceptionSource.MEDIA)),
+                perception.requestedSources,
+                "request 1 uses the beginTurn snapshot; the retry asks only for ambient device/media",
+            )
+            val first = rig.model.requests[0].input.filterIsInstance<InputPart.Text>().single().text
+            val second = rig.model.requests[1].input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue("#n12" in first, "the opening request carries the full compact screen: $first")
+            assertFalse("#n12" in second, "a continuation must not repeat the whole snapshot: $second")
+            assertTrue("not_requested" in second, "the suppressed sources say so honestly: $second")
+            assertEquals(2, lines.count { it.startsWith("P3_PERCEPTION ") }, "one line per rendered block: $lines")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `an early-refused turn still closes the perception turn`() {
+        val perception = SmartFakePerception()
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(
+                overrides = mapOf(
+                    Capability.Perception to perception,
+                    // A hard dependency that is missing refuses the turn **after** the turn has opened, which is the
+                    // early-return path the `finally` exists for.
+                    Capability.SystemOne to SmartFakeSystemOne(available = false),
+                ),
+            )
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertTrue(lines.any { it.startsWith("P3_DEPENDENCY reason=") }, "the dependency refuses the turn: $lines")
+            assertEquals(1, perception.beginTurns)
+            assertEquals(1, perception.endTurns, "an early return must still close the perception turn")
+            assertTrue(rig.model.requests.isEmpty(), "a refused turn never reaches the transport")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `a host without a perception provider still activates and runs a turn`() {
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            // The descriptor declares Perception, but this host grants no provider: absence must be "no block".
+            rig.activate()
+            assertTrue(rig.plugin.active)
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertEquals(1, rig.model.requests.size)
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertFalse("【本轮运行上下文】" in input, "a missing provider injects nothing: $input")
+            assertTrue(input.endsWith("现在几点了"), input)
+            assertTrue(lines.none { it.startsWith("P3_PERCEPTION ") }, "no provider, no telemetry: $lines")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `a beginTurn that throws falls back to an explicit full snapshot`() {
+        val perception = SmartFakePerception(initialFailure = IllegalStateException("synthetic-begin-failure"))
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertEquals(1, perception.beginTurns, "the failed opening is still one beginTurn attempt")
+            assertEquals(
+                listOf(PerceptionSource.entries.toSet()),
+                perception.requestedSources,
+                "a failed beginTurn must be recovered by one explicit full snapshot read",
+            )
+            val input = rig.model.requests.single().input.filterIsInstance<InputPart.Text>().single().text
+            assertTrue(input.startsWith("【本轮运行上下文】"), "the fallback snapshot still renders the block: $input")
+            assertTrue("#n12 button \"搜索\"" in input, input)
+            assertEquals(1, lines.count { it.startsWith("P3_PERCEPTION ") }, "one line for the fallback block: $lines")
+            assertEquals(1, perception.endTurns, "the failed opening is still closed by the finally")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `an ambient snapshot that throws injects no block and no telemetry`() {
+        val perception = SmartFakePerception(ambientFailure = IllegalStateException("synthetic-ambient-failure"))
+        val rig = SmartTestRig(conversationStores = smartStores())
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception))
+            var turn = 0
+            rig.model.onRequest = { request, listener ->
+                turn += 1
+                if (turn == 1) {
+                    listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.INCOMPLETE, null, null))
+                } else {
+                    streamText(request, listener, "好。")
+                }
+            }
+
+            rig.wakeAndFinal("现在几点了")
+
+            assertEquals(2, rig.model.requests.size, "the empty turn is retried")
+            assertEquals(
+                listOf(setOf(PerceptionSource.DEVICE, PerceptionSource.MEDIA)),
+                perception.requestedSources,
+                "only the retry asks the provider for the ambient snapshot",
+            )
+            val second = rig.model.requests[1].input.filterIsInstance<InputPart.Text>().single().text
+            assertFalse("【本轮运行上下文】" in second, "a throwing ambient read contributes no block: $second")
+            assertEquals(
+                1,
+                lines.count { it.startsWith("P3_PERCEPTION ") },
+                "only the first request's block is rendered and logged: $lines",
+            )
+            assertEquals(1, perception.endTurns)
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    @Test fun `a superseded turn cannot close the newer turn's perception boundary`() {
+        val perception = TicketProbePerception()
+        val tasks = JoinableTasks()
+        val firstRequestStarted = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        val secondRequestStarted = CountDownLatch(1)
+        val releaseSecond = CountDownLatch(1)
+        val rig = SmartTestRig(cooldownNanos = 0L)
+        val previous = P3Log.sink
+        P3Log.sink = { }
+        try {
+            rig.activate(overrides = mapOf(Capability.Perception to perception), tasks = tasks)
+            var request = 0
+            rig.model.onRequest = { modelRequest, listener ->
+                when (++request) {
+                    1 -> {
+                        firstRequestStarted.countDown()
+                        releaseFirst.await(5, TimeUnit.SECONDS)
+                        streamText(modelRequest, listener, "第一个答案。")
+                    }
+                    2 -> {
+                        secondRequestStarted.countDown()
+                        releaseSecond.await(5, TimeUnit.SECONDS)
+                        streamText(modelRequest, listener, "第二个答案。")
+                    }
+                    else -> streamText(modelRequest, listener, "好。")
+                }
+            }
+
+            rig.plugin.handle(rig.wakeEvent())
+            rig.plugin.handle(TranscriptEvent(rig.transcript("第一个问题", turnId = "asr-a")))
+            assertTrue(perception.firstBegin.await(5, TimeUnit.SECONDS), "turn A opens its perception turn")
+            assertTrue(firstRequestStarted.await(5, TimeUnit.SECONDS), "turn A is inside its model request")
+
+            // A newer wake replaces A while A is still blocked, and opens its own perception boundary.
+            rig.clock.advance(1_000_000L)
+            rig.plugin.handle(rig.wakeEvent())
+            rig.plugin.handle(TranscriptEvent(rig.transcript("第二个问题", turnId = "asr-b")))
+            assertTrue(perception.secondBegin.await(5, TimeUnit.SECONDS), "turn B opens its perception turn")
+            assertTrue(secondRequestStarted.await(5, TimeUnit.SECONDS), "turn B is inside its model request")
+
+            // A now unwinds on its own worker. Its finally must not close B's still-open boundary.
+            releaseFirst.countDown()
+            tasks.join(0)
+            assertEquals(
+                0,
+                perception.endTurns.get(),
+                "a superseded turn must not call endTurn: it would clear the newer turn's snapshot/refs",
+            )
+            assertTrue(perception.liveSnapshot != null, "turn B's snapshot/refs survive turn A's finally")
+
+            releaseSecond.countDown()
+            tasks.join(1)
+            assertEquals(1, perception.endTurns.get(), "only the live turn closes the provider")
+        } finally {
+            P3Log.sink = previous
+        }
+    }
+
+    /**
+     * The host port for the superseded-turn test: it models the one thing the real provider owns — a live snapshot/ref
+     * set that `beginTurn` installs and `endTurn` clears — and lets the test see that set from outside.
+     */
+    private class TicketProbePerception : PerceptionProvider {
+        val firstBegin = CountDownLatch(1)
+        val secondBegin = CountDownLatch(1)
+        val endTurns = AtomicInteger(0)
+        private val begins = AtomicInteger(0)
+
+        @Volatile
+        var liveSnapshot: PerceptionSnapshot? = null
+            private set
+
+        override fun beginTurn(): PerceptionSnapshot {
+            val number = begins.incrementAndGet()
+            val snapshot = smartPerceptionSnapshot(snapshotId = "snap-$number")
+            liveSnapshot = snapshot
+            if (number == 1) firstBegin.countDown() else secondBegin.countDown()
+            return snapshot
+        }
+
+        override fun snapshot(
+            include: Set<PerceptionSource>,
+            filter: PerceptionFilter,
+            limit: Int?,
+        ): PerceptionSnapshot =
+            checkNotNull(liveSnapshot) { "snapshot requested after the perception turn closed" }
+
+        override fun afterAction(): PerceptionSnapshot =
+            snapshot(emptySet(), PerceptionFilter.ALL, null)
+
+        override fun screenshot(): PerceptionScreenshotResult =
+            PerceptionScreenshotResult.Unavailable("test")
+
+        override fun endTurn() {
+            endTurns.incrementAndGet()
+            liveSnapshot = null
+        }
+    }
+
+    /** A task scope whose workers the test can join one at a time, in launch order. */
+    private class JoinableTasks : TaskScope {
+        private val workers = mutableListOf<Thread>()
+
+        override fun launch(block: () -> Unit): CancellationHandle {
+            val worker = Thread(block, "perception-turn-worker-${workers.size + 1}")
+            worker.isDaemon = true
+            synchronized(workers) { workers += worker }
+            worker.start()
+            return object : CancellationHandle { override fun cancel() = Unit }
+        }
+
+        override fun cancelAll() = Unit
+
+        fun join(index: Int, millis: Long = 5_000L) {
+            synchronized(workers) { workers[index] }.join(millis)
+        }
     }
 
     @Test fun `activate declares the configured wake words and builds nothing else`() {
@@ -120,7 +513,11 @@ class SmartAssistantPluginTest {
         assertEquals("smart-profile", request.profileId)
         assertEquals(3, request.profileRevision)
         assertEquals(listOf(InputPart.Text("记录一下")), request.input)
-        assertEquals(SmartPrompts.instructions(), request.instructions)
+        assertEquals(
+            PromptCatalog.plan(PromptRoute.WAKE, null).systemText,
+            request.instructions,
+            "the session's profile-less catalog plan is the system text (the rig grants no device provider)",
+        )
         assertEquals(OutputModality.TEXT, request.output)
     }
 
@@ -419,10 +816,19 @@ class SmartAssistantPluginTest {
     // ------------------------------------------------- 0.24 S4 (Task 17): tool status rows
 
     /** A panel-visible rig whose host advertises one L1 action with a caller-chosen user-facing title. */
-    private fun toolRig(title: String = "记笔记"): Pair<SmartTestRig, SmartRecordingDisplay> {
+    private fun toolRig(
+        title: String = "记笔记",
+        description: String = title,
+    ): Pair<SmartTestRig, SmartRecordingDisplay> {
         val display = SmartRecordingDisplay()
         val rig = SmartTestRig(panelVisible = true)
-        rig.actions.descriptors += smartAction("compose_note", risk = RiskLevel.L1, scope = "note", title = title)
+        rig.actions.descriptors += smartAction(
+            "compose_note",
+            risk = RiskLevel.L1,
+            scope = "note",
+            title = title,
+            description = description,
+        )
         rig.actions.outcome = { _, _ -> ActionResult(ActionOutcome.Done, "记好了") }
         rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
         return rig to display
@@ -458,6 +864,26 @@ class SmartAssistantPluginTest {
         )
         assertEquals(listOf("compose_note" to "{}"), rig.actions.executed)
         assertEquals(listOf("已经记好了。"), rig.hintTexts, "the tool call never becomes the answer")
+    }
+
+    @Test fun `S4 the tool row shows the user title and never the long model description`() {
+        // edith-0.3 Phase 4A Task 5 (A5): description is the model's instruction prose. Painting it as the row label
+        // would put a paragraph on the glasses; the row reads the host's short title.
+        val longDescription = "Use compose_note when the wearer asks to keep a short local note. " +
+            "Do not use it for messages or files. STORAGE_UNAVAILABLE means nothing was written. ".repeat(6)
+        val (rig, display) = toolRig(title = "记笔记", description = longDescription)
+        rig.composeNoteRun(preamble = null)
+        rig.wakeAndFinal("帮我记一条笔记")
+        rig.tick()
+
+        assertEquals(
+            listOf(
+                SmartRecordingDisplay.ToolStatusCall(AssistantRoute.WAKE, "asr-1", ToolPhase.START, "记笔记"),
+                SmartRecordingDisplay.ToolStatusCall(AssistantRoute.WAKE, "asr-1", ToolPhase.END, "记笔记"),
+            ),
+            display.toolStatuses,
+            "the row must use the user title, never the model-facing description",
+        )
     }
 
     @Test fun `S4 an unknown action name is published raw rather than guessed`() {
@@ -896,7 +1322,9 @@ class SmartAssistantPluginTest {
         assertEquals(listOf("已经记好了。"), rig.hintTexts)
         val second = rig.model.requests[1]
         assertTrue(
-            second.history.any { it is com.sheen.rokid.plugin.ModelHistoryItem.ToolOutput && it.output == "已记下" },
+            second.history.any {
+                it is com.sheen.rokid.plugin.ModelHistoryItem.ToolOutput && it.output == unmigratedToolOutput("已记下")
+            },
             "the tool output must be echoed back into the transcript, was ${second.history}",
         )
     }

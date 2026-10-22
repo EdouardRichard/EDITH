@@ -27,7 +27,6 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 
-private const val PROFILE_MISSING = "PROFILE_MISSING"
 private const val NO_USER_TURN = "NO_USER_TURN"
 private const val NO_TERMINAL = "NO_TERMINAL"
 private const val DEADLINE = "DEADLINE"
@@ -52,10 +51,11 @@ private val toolRoundJson = Json { isLenient = true }
  * stateless [ModelRequest], accumulates the stream into a [GatewayReply], and owns the turn's wall-clock bound.
  *
  * **The request input is the in-flight user turn, not history.** `ModelRequest.input` is rendered last on the wire, so
- * a transcript that ends on the pending `Text(USER)` lifts that turn into `input`. When the transcript has already
- * moved past that turn (a tool round appended after it), the whole transcript stays `ModelRequest.history` and the
- * request carries an empty `input`: a history-only request, which `plugin-api` admits and `ContextBudgeter` validates.
- * That keeps the tool output last on the wire instead of re-asserting the user message after it.
+ * a transcript that ends on the pending `Text(USER)` lifts that turn into `input`, prefixed by the request-scoped
+ * dynamic tail (perception, memory evidence, a skill body, runtime state, a retry instruction). When the transcript has
+ * already moved past that turn (a tool round appended after it), the whole transcript stays `ModelRequest.history` and
+ * the request carries an empty `input`: a history-only request, which `plugin-api` admits and `ContextBudgeter`
+ * validates. That keeps the tool output last on the wire instead of re-asserting the user message after it.
  *
  * **A turn has one verdict.** Only a [ModelStreamEvent.Terminal] ends the turn; a tool-call delta whose terminal never
  * arrived is not a call, and an empty turn left by one is `INCOMPLETE`/`TOOL_CALL_DELIVERY_INCOMPLETE` rather than a
@@ -75,10 +75,17 @@ class ModelClientGateway(
     private val stop: () -> Boolean = { false },
     /**
      * P5 (spec §A2): optional audio parts appended to the request input after the transcript. Null reproduces the
-     * pre-P5 text-only behaviour byte for byte. A lambda rather than a value so the segment is resolved at request
+     * pre-P5 text-only behaviour exactly. A lambda rather than a value so the segment is resolved at request
      * time, not at gateway construction time.
      */
     private val audioParts: (() -> List<InputPart>)? = null,
+    /**
+     * 0.3 Phase 2 Task 11 (spec §5.3): the count-only telemetry sink this gateway reports one `P3_CACHE` line to per
+     * model request. A lambda keeps `agent-runtime` free of Android/logging dependencies; the production plugin passes
+     * its `P3Log::line`, tests collect into a list. Defaulted so every pre-Task-11 construction is unchanged, and
+     * failures are the sink's problem: a throwing logger must never turn a delivered reply into a failed turn.
+     */
+    private val metricLine: (String) -> Unit = {},
 ) : ModelGateway {
 
     /**
@@ -113,41 +120,87 @@ class ModelClientGateway(
 
     companion object {
         /**
-         * The byte budget a frame is trimmed to, in the same unit and against the same bound `ContextBudgeter`
-         * enforces at send time (`minOf(inputBudgetTokens, usableWindow - maxOutput - safety)`).
+         * The token-unit budget a frame is trimmed to (0.3 design §6.2): the session `ContextPolicy.hardLimit`,
+         * `hardInputLimit - hardMargin`. Before the final-fix wave this was a second, ad-hoc formula
+         * (`minOf(inputBudget, usable - maxOutput - safety) - FIXED_OVERHEAD`), which left the policy's hard margin
+         * dead: the trimmer ran closer to the send-time bound than the policy said it should.
          *
-         * The `- [FIXED_OVERHEAD]` is a **deliberate 32-byte safety margin**, not a correction.
-         * [TurnTrimmer.total] and `ContextBudgeter.prepare` (`ContextBudgeter.kt:55-65`) compute structurally
-         * identical totals against the same `minOf(...)` limit — the same per-item `bytes + 32`, the same fixed 32,
-         * and `instructions == frame.systemText` — so with one shared limit they would already agree exactly. They
-         * also charge the same `ImageBudget.UNITS_PER_IMAGE` per image (R68), so an image-bearing request keeps that
-         * identity. Taking one more 32 off makes the trimmer 32 bytes **stricter** than the check it must satisfy,
-         * which is the safe direction; the cost is that a frame within 32 bytes of fitting is trimmed one message
-         * earlier than strictly necessary. Nothing here claims the subtraction is what prevents a rejection: the
-         * acceptance test's discriminating assertion is the send-time `prepare` call itself.
+         * Both stages still price text with [TokenMeter] and charge the same
+         * [com.sheen.rokid.contracts.ImageBudget.UNITS_PER_IMAGE] per image (R68), and a `TOOL_ROUND` is itemised into
+         * one wire item per call/output while the trimmer charged one +32 for the whole segment. The real gate remains
+         * the send-time `ContextBudgeter.prepare`: when it throws
+         * [ContractError.ContextWindowExceeded], the gateway's bounded AGGRESSIVE/HARD recovery re-trims and resends
+         * the same turn, and exhausting both recoveries is reported as `CONTEXT_OVERFLOW`.
          */
-        internal fun windowBytes(profile: ModelProfile): Int =
-            minOf(
-                profile.inputBudgetTokens,
-                profile.usableWindowTokens - profile.maxOutputTokens - profile.safetyTokens,
-            ) - FIXED_OVERHEAD
+        internal fun windowTokens(profile: ModelProfile): Int = ContextPolicy.from(profile).hardLimit
     }
+
+    /**
+     * One fail-closed turn: a typed safe code and no transport call. Used for a missing profile, a policy that cannot
+     * be derived, and a fixed prompt that cannot fit — three different conditions that must not read as one.
+     */
+    private fun refusal(code: String): GatewayReply =
+        GatewayReply(emptyList(), "", ModelEnd.FAILED, code)
 
     override fun turn(request: GatewayTurn): GatewayReply {
         val profile = profileLookup(request.profileId)
-            ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, PROFILE_MISSING)
+            ?: return refusal(ContextPolicy.PROFILE_MISSING)
+        // The plugin derived the same policy at activation. If it failed there, every turn of the session must fail
+        // with that exact code; otherwise the gateway classifies the profile itself (invalid vs too small).
+        request.contextFailure?.let { return refusal(it) }
+        ContextPolicy.failureCode(profile)?.let { return refusal(it) }
+        val policy = ContextPolicy.from(profile)
         // Phase 5: an assembled RequestFrame is trimmed below and mapped to the request's shape; without one, the
         // pre-Phase-5 `split(history)` path is kept verbatim, including its "a transport exception escapes" contract.
         val frame = request.frame
         if (frame == null) {
             val transcript = split(request.history)
-                ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN)
+                ?: return refusal(NO_USER_TURN)
+            // The fixed prompt alone (system slot + this turn's input) can already exceed the hard input; no history
+            // trim can rescue that request, so it is refused with its own code instead of burning the overflow
+            // recoveries. Measured before `sendTurn`, so the transport is never called.
+            if (fixedPromptTokens(request.instructions, transcript.input) > policy.hardInputLimit) {
+                return refusal(ContextPolicy.PROMPT_EXCEEDS_BUDGET)
+            }
             return sendTurn(request, modelRequest(request, profile, request.instructions, transcript))
         }
-        // The window is the same expression `ContextBudgeter` bounds the send with, minus the deliberate
-        // 32-byte margin (see [windowBytes]). A caller-supplied `limitBytes` (test seam) wins.
-        val limit = if (request.limitBytes == Int.MAX_VALUE) windowBytes(profile) else request.limitBytes
+        // Same fail-closed check for the frame path, against the untrimmed system slot + dynamic tail + current
+        // input. A frame with no USER_INPUT is left to `frameToTranscript` (it answers NO_USER_TURN).
+        val fixed = fixedPromptTokens(frame)
+        if (fixed != null && fixed > policy.hardInputLimit) {
+            return refusal(ContextPolicy.PROMPT_EXCEEDS_BUDGET)
+        }
+        // The trim window is the policy's hard limit; a caller-supplied `limitTokens` (the plugin's session policy,
+        // or a test seam) wins.
+        val limit = if (request.limitTokens == Int.MAX_VALUE) policy.hardLimit else request.limitTokens
         return turnWithOverflowRecovery(request, profile, frame, limit)
+    }
+
+    /**
+     * The fixed, untrimmable prompt cost: the `+32` accounting overhead once, the system slot as one message, and the
+     * request input — which on the frame path already folds the request-scoped dynamic tail and the wearer's turn.
+     * Token units, the same unit [TokenMeter] and the trimmer use.
+     */
+    private fun fixedPromptTokens(instructions: String, input: List<InputPart>): Int {
+        var total = FIXED_OVERHEAD + tokenUnitsPlusOverhead(instructions)
+        input.forEach { part ->
+            if (part is InputPart.Text) total += tokenUnitsPlusOverhead(part.text)
+        }
+        return total
+    }
+
+    /**
+     * The frame path's fixed prompt cost before trimming: system slot + the request-scoped tail + the one
+     * `USER_INPUT`, each at the trimmer's own per-segment price. `null` when the frame carries no `USER_INPUT`
+     * (`frameToTranscript` owns that verdict).
+     */
+    private fun fixedPromptTokens(frame: RequestFrame): Int? {
+        val flow = frame.conversationFlow
+        val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
+        if (inputIndex < 0) return null
+        val dynamic = RequestLayout.dynamicTail(flow).sumOf { tokenUnitsPlusOverhead(it.text) }
+        return FIXED_OVERHEAD + tokenUnitsPlusOverhead(frame.systemText) + dynamic +
+            tokenUnitsPlusOverhead(flow[inputIndex].text)
     }
 
     /**
@@ -180,7 +233,9 @@ class ModelClientGateway(
                 ?: return GatewayReply(emptyList(), "", ModelEnd.FAILED, NO_USER_TURN, overflowRecoveries = recoveries)
             val modelRequest = modelRequest(request, profile, frame.systemText, transcript)
             val reply = try {
-                sendTurn(request, modelRequest)
+                // The metric describes the kept frame, never the untrimmed assembly: a HARD recovery can drop the
+                // request-scoped tail, and a `P3_CACHE` line that still counted it would claim bytes no longer sent.
+                sendTurn(request, modelRequest, report.kept)
             } catch (rejected: ContractError.ContextWindowExceeded) {
                 // The one local rejection this path may answer with a cheaper request: the send-time budget refused
                 // the shape the trimmer produced. A plain `ConfigurationRejected` is a different refusal and still
@@ -241,6 +296,9 @@ class ModelClientGateway(
             output = OutputModality.TEXT,
             deadlineNanos = request.deadlineNanos,
             tools = request.tools,
+            // 0.3 design §5.2: the turn policy's cap travels beside the shape it applies to; the adapter falls back to
+            // the profile's window-reservation value when this is null (pre-0.3 callers).
+            maxOutputTokens = request.maxOutputTokens,
         )
     }
 
@@ -248,8 +306,54 @@ class ModelClientGateway(
      * One model round trip: send the request, wait for the terminal (or the deadline/stop), and turn the accumulated
      * stream into a [GatewayReply]. Extracted verbatim from [turn] so overflow recovery can repeat it; a transport
      * failure is still not caught here.
+     *
+     * Every request reports its own count-only `P3_CACHE` line when the reply carried usage — the wake run's tool
+     * rounds, the proactive `turn`, and each deterministic overflow re-send alike. The line is per request, never a
+     * sum: [AgentLoop] no longer reports a run-total duplicate (0.3 Phase 2 Task 11). [sentFrame] is the frame that was
+     * actually put on the wire (the trimmer's kept frame); the untrimmed [GatewayTurn.frame] is never used for sizes.
      */
-    private fun sendTurn(request: GatewayTurn, modelRequest: ModelRequest): GatewayReply {
+    private fun sendTurn(
+        request: GatewayTurn,
+        modelRequest: ModelRequest,
+        sentFrame: RequestFrame? = request.frame,
+    ): GatewayReply {
+        val reply = sendTurnOnce(request, modelRequest)
+        emitCacheMetric(request, reply, sentFrame)
+        return reply
+    }
+
+    /**
+     * The single `P3_CACHE` line of one model request, or nothing when the provider reported no accounting.
+     *
+     * Counts only, fixed field order: `cached`/`miss` from the provider's own cache members (an unreported counter is
+     * `-`, a reported zero stays `0`), `inputTokens`/`outputTokens`, and the request's shape as two character counts —
+     * the sent frame's system slot and the sum of its dynamic-tail segment texts. The legacy no-frame path sends
+     * `instructions` directly, so it reports that length and a zero tail. No text ever rides the line.
+     */
+    private fun emitCacheMetric(request: GatewayTurn, reply: GatewayReply, sentFrame: RequestFrame?) {
+        val usage = reply.usage ?: return
+        // `systemText` joins the system segments with newlines; for one segment it is exactly its text.
+        val systemChars = sentFrame?.systemText?.length ?: request.instructions.length
+        val dynamicChars = sentFrame?.conversationFlow
+            ?.let { flow -> RequestLayout.dynamicTail(flow).sumOf { it.text.length } }
+            ?: 0
+        val line = buildString {
+            append("P3_CACHE")
+            append(" cached=").append(countField(usage.cachedInputTokens))
+            append(" miss=").append(countField(usage.cacheMissInputTokens))
+            append(" inputTokens=").append(countField(usage.inputTokens))
+            append(" outputTokens=").append(countField(usage.outputTokens))
+            append(" systemChars=").append(systemChars)
+            append(" dynamicChars=").append(dynamicChars)
+        }
+        // Observability is never a verdict: a throwing sink must not turn a delivered reply into a failed turn.
+        runCatching { metricLine(line) }
+    }
+
+    /** `-` for a count the provider did not report; a reported zero is printed as `0`, never fabricated. */
+    private fun countField(value: Long?): String = value?.toString() ?: "-"
+
+    private fun sendTurnOnce(request: GatewayTurn, modelRequest: ModelRequest): GatewayReply {
         val accumulated = Accumulated()
         val wakeAtDeadline = scheduler.at(request.deadlineNanos) { accumulated.wake() }
         val caller = Thread.currentThread()
@@ -332,28 +436,49 @@ class ModelClientGateway(
     /**
      * Maps a (already trimmed) frame's conversation flow onto the request's `input`/`history` shape.
      *
-     * The in-flight user turn is the frame's one `USER_INPUT` segment and becomes `input` — never history. A
-     * conversation-flow segment's `role` is metadata ([Segment.role]), never inferred from text.
+     * The in-flight user turn is the frame's one `USER_INPUT` segment and is the **last** text carried by `input` —
+     * never history. A conversation-flow segment's `role` is metadata ([Segment.role]), never inferred from text.
      *
-     * ## The summary and the memory form the head of the history — as one user message
+     * ## The prefix is system + tools + history; the request-scoped context is the input tail
      *
-     * A `SUMMARY`, every `MEMORY_EVIDENCE` and every `PERCEPTION` segment is not a conversation turn: it is lifted
-     * out of the flow and folded into the **one leading user message**, ahead of the oldest surviving transcript
-     * text. Attribution is `origin == SUMMARY` throughout — never a text prefix — and a summary body is rendered
-     * with [SummaryBoundary] here unless it already carries the boundary (the store hands over the bounded text).
+     * `history` is the transcript, verbatim: its first item is the oldest surviving transcript text, tool rounds keep
+     * their structured call/output items, and a summary is folded into that first user turn. Nothing request-scoped is
+     * ever folded in: `PERCEPTION`, `MEMORY_EVIDENCE`, `SKILL_BODY`, `RUNTIME_STATE` and `RETRY` ride the request
+     * `input` ahead of the wearer's turn, in flow order (0.3 design §5.1/§5.3, [RequestLayout.dynamicTail]). A
+     * perception tick, newly retrieved memory, a `load_skill` pull or a retry therefore rewrites only the tail, never
+     * the system slot or the history, so the provider's prefix cache stays warm; the one accepted prefix rewrite is a
+     * compression point replacing the summary (§6.5).
      *
-     * This is the owner-approved shape (2026-10-16). The previous order (transcript → memory → `USER_INPUT`) made
-     * the history end on a lone `Text(USER, memory)` group immediately before the request `input`, a shape
-     * `ContextBudgeter` rejects **by design** (whole-group eviction depends on it), so every later turn would fail
-     * `ConfigurationRejected` until an app restart — the 2026-10-14 incident.
+     * ## The summary is the one head context
+     *
+     * A `SUMMARY` is not a conversation turn: it is lifted out of the flow and folded into the history's **first
+     * user text**, ahead of the oldest surviving transcript text. Attribution is `origin == SUMMARY` throughout —
+     * never a text prefix — and a summary body is rendered with [SummaryBoundary] here unless it already carries the
+     * boundary (the store hands over the bounded text).
      *
      * The leading context cannot be a **standalone** user message: `ContextBudgeter` requires the history to open
-     * with a user text and then alternate, so a leading user message followed by the transcript's own first user
-     * turn is two consecutive user texts and is rejected. Folding the context **into** that first user turn keeps
-     * one leading user message, keeps the alternation, and leaves every transcript role untouched. When the flow
-     * carries no transcript user turn to ride (an empty store — the first turn of a session that already has
-     * memory), the context is folded into the request `input` instead, because a history holding only the context
-     * would be a lone user group and unsendable.
+     * with a user text and then alternate, so a leading user message followed by the transcript's own first user turn
+     * is two consecutive user texts and is rejected. Folding the summary **into** that first user turn keeps one
+     * leading user message, keeps the alternation, and leaves every transcript role untouched. When the flow carries
+     * no transcript user turn to ride (an empty store — the first turn of a session that already has a summary), the
+     * summary is folded into the request `input` instead, because a history holding only the summary would be a lone
+     * user group and unsendable.
+     *
+     * `RUNTIME_STATE` (Task 12, R59) and `RETRY` were the first tail riders: as history turns they would open a
+     * **new** group ending on a bare user text, which `ContextBudgeter` rejects by design (`groups.last().size == 1`)
+     * — the loop's designed retry would be refused before it was ever sent. They now share the dynamic tail with
+     * memory, perception and a pulled skill body, in flow order: the surviving transcript's last group stays closed,
+     * and the request-scoped context is the first thing the model reads in the message it is answering.
+     *
+     * Folding a context segment into the head/input message removes that segment's own +32 per-message overhead, so
+     * the merged message prices at or below the trimmer's per-segment total for the pieces it merges (the `\n\n`
+     * separators the join introduces are at most one token unit each). That is only the price-lowering direction: a
+     * `TOOL_ROUND` renders as one wire item per call/output entry, and `ContextBudgeter` charges each item its own +32
+     * while the trimmer charged one +32 for the whole segment, so with several entries the rendered request can price
+     * more than the 32-unit window margin above the trimmer's total. Nothing here claims the rendered request is priced
+     * identically to the per-segment total, and the margin is not the guarantee that the request fits: the real gate
+     * is the send-time `ContextBudgeter.prepare`, whose `ContextWindowExceeded` is answered by the gateway's bounded
+     * AGGRESSIVE/HARD recovery.
      *
      * Returns `null` — the caller answers `NO_USER_TURN` — when the mapping could not produce a request
      * `ContextBudgeter` would send: no `USER_INPUT` segment at all, a non-empty history whose first text is not
@@ -366,54 +491,36 @@ class ModelClientGateway(
      * carries the wearer's question (Task 26). `TurnTrimmer` cut ① removes whole turns from the oldest end and the
      * current turn is a turn too: under a tight window it can evict the current `USER` transcript and leave the cue as
      * the model's **only** input. When no `Text(USER)` survives in the built history and [fallbackUtterance] is
-     * non-blank, the request input is rebuilt from that utterance instead of the cue. The request-scoped metadata that
-     * normally rides ahead of the input (`RUNTIME_STATE`/`RETRY`, or the folded context when the history is empty) is
-     * kept, so the first turn — whose input already is the utterance — is rendered byte for byte as before. When a
-     * `USER` text does survive, the input is left untouched: restoring it there would reintroduce the duplicate Task 26
-     * removed. A blank fallback changes nothing; the gateway never invents a question.
-     *
-     * ## A `RETRY` is folded into the request `input`, never a history turn
-     *
-     * A retry instruction is the loop talking to the model, not the wearer speaking. As a history turn it would open
-     * a **new** group ending on a bare user text, which `ContextBudgeter` rejects by design (`groups.last().size == 1`)
-     * — the loop's designed retry would be refused before it was ever sent. It therefore rides **ahead of the request
-     * `input`**, in flow order, exactly as a summary and the memory ride ahead of the history's first user turn: the
-     * surviving transcript's last group stays closed, and the loop's nudge is the first thing the model reads in the
-     * message it is answering. The frame's one `USER_INPUT` is still the request `input` — it is not replaced.
-     *
-     * A `RUNTIME_STATE` segment (Task 12, R59) rides the same way: it is request metadata, not a conversation turn, so
-     * it precedes the retry text and the input inside the one message. Putting it in history would create the same lone
-     * user group a retry would; putting it after the input would make the wearer's turn stop being last.
-     *
-     * Folding several context segments into one message removes one 32-byte per-message overhead per folded segment and
-     * adds 2 bytes per join, so it is cheaper whenever more than one segment is folded. With a **single** context
-     * segment it is 2 bytes **more** expensive than the trimmer's measurement of that one segment (no overhead is
-     * removed), which the gateway's deliberate 32-byte window margin absorbs; the trimmer's verdict therefore stays
-     * the conservative one either way and no fold can push a request over the limit.
+     * non-blank, the request input is rebuilt from that utterance instead of the cue. The request-scoped dynamic tail
+     * that normally rides ahead of the input is kept, so the first turn — whose input already is the utterance — is
+     * rendered identically as before. When a `USER` text does survive, the input is left untouched: restoring it there
+     * would reintroduce the duplicate Task 26 removed. A blank fallback changes nothing; the gateway never invents a
+     * question.
      */
     private fun frameToTranscript(frame: RequestFrame, fallbackUtterance: String?): Transcript? {
         val flow = frame.conversationFlow
         val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
         if (inputIndex < 0) return null
         val inputText = flow[inputIndex].text
-        // Loop-internal continuations are not conversation turns; see the KDoc above. A runtime state (Task 12) rides
-        // ahead of them: it is where the device is, then what the model must do next, then the wearer's turn.
-        val runtimeText = flow.take(inputIndex)
-            .filter { it.origin == SegmentOrigin.RUNTIME_STATE }
-            .joinToString("\n\n") { it.text }
-        val retryText = flow.take(inputIndex)
-            .filter { it.origin == SegmentOrigin.RETRY }
-            .joinToString("\n\n") { it.text }
-        val leadingInput = listOf(runtimeText, retryText).filter { it.isNotEmpty() }
-        val requestInput =
-            if (leadingInput.isEmpty()) inputText else "${leadingInput.joinToString("\n\n")}\n\n$inputText"
-        val leading = mutableListOf<String>()
+        // The request-scoped context is the request tail (0.3 design §5.1/§5.3): `dynamicTail` selects exactly
+        // PERCEPTION/MEMORY_EVIDENCE/SKILL_BODY/RUNTIME_STATE/RETRY before the input and keeps their frame order.
+        val dynamicTexts = RequestLayout.dynamicTail(flow)
+            .map { it.text }
+            .filter { it.isNotBlank() }
+        val dynamicText = dynamicTexts.joinToString("\n\n")
+        val requestInput = if (dynamicText.isEmpty()) inputText else "$dynamicText\n\n$inputText"
+        val summaries = mutableListOf<String>()
         val history = mutableListOf<ModelHistoryItem>()
         for (segment in flow.take(inputIndex)) {
             when (segment.origin) {
-                SegmentOrigin.SUMMARY -> leading += boundedSummary(segment.text)
-                SegmentOrigin.MEMORY_EVIDENCE, SegmentOrigin.PERCEPTION -> leading += segment.text
-                SegmentOrigin.RETRY, SegmentOrigin.RUNTIME_STATE -> Unit
+                SegmentOrigin.SUMMARY -> summaries += boundedSummary(segment.text)
+                // Request-scoped context: it is already in `dynamicTexts` above and must never enter the cacheable
+                // history — not even as part of the head user message.
+                SegmentOrigin.MEMORY_EVIDENCE,
+                SegmentOrigin.PERCEPTION,
+                SegmentOrigin.SKILL_BODY,
+                SegmentOrigin.RETRY,
+                SegmentOrigin.RUNTIME_STATE -> Unit
                 SegmentOrigin.TOOL_ROUND -> {
                     // A tool round is not conversation-flow text: the endpoint is stateless, so the model's own call
                     // must be echoed back as a call item beside its result or the exchange does not round-trip (and two
@@ -429,22 +536,28 @@ class ModelClientGateway(
                 else -> history += ModelHistoryItem.Text(roleOf(segment), segment.text)
             }
         }
+        val summaryText = summaries.joinToString("\n\n")
+        // A summary with no transcript user turn to ride goes into the input; `restoreCurrentUtterance` must then
+        // keep that summary prefix too.
+        var summaryInInput = false
         val transcript = when {
-            leading.isEmpty() ->
+            summaries.isEmpty() ->
                 if (history.isEmpty() || opensWithUser(history)) {
                     Transcript(listOf(InputPart.Text(requestInput)), history)
                 } else {
                     null
                 }
             else -> {
-                val context = leading.joinToString("\n\n")
                 val head = history.firstOrNull()
                 when {
                     head is ModelHistoryItem.Text && head.role == MessageRole.USER -> {
-                        history[0] = ModelHistoryItem.Text(MessageRole.USER, "$context\n\n${head.text}")
+                        history[0] = ModelHistoryItem.Text(MessageRole.USER, "$summaryText\n\n${head.text}")
                         Transcript(listOf(InputPart.Text(requestInput)), history)
                     }
-                    history.isEmpty() -> Transcript(listOf(InputPart.Text("$context\n\n$requestInput")), history)
+                    history.isEmpty() -> {
+                        summaryInInput = true
+                        Transcript(listOf(InputPart.Text("$summaryText\n\n$requestInput")), history)
+                    }
                     else -> null
                 }
             }
@@ -454,17 +567,22 @@ class ModelClientGateway(
         // design** (`groups.last().size == 1` — whole-group eviction depends on it). Handing it to the transport would
         // make every later turn fail with `ConfigurationRejected` until a restart (the 2026-10-14 incident).
         if (history.isNotEmpty() && !lastGroupIsClosed(history)) return null
-        return restoreCurrentUtterance(transcript, leading + leadingInput, fallbackUtterance)
+        val prefix = buildList {
+            if (summaryInInput) add(summaryText)
+            addAll(dynamicTexts)
+        }
+        return restoreCurrentUtterance(transcript, prefix, fallbackUtterance)
     }
 
     /**
      * R143's safety net: when the trimmed history carries no `USER` text, the current input is rebuilt on
      * [fallbackUtterance] (the wearer's question) rather than on the frame's fixed cue.
      *
-     * Only the frame's own `USER_INPUT` is interchangeable here. The leading texts — the folded summary/memory context,
-     * runtime state, a retry instruction — are not the wearer's conversation turn and stay ahead of it, exactly as
-     * [frameToTranscript] had arranged them. That is also why the opening turn is unchanged: its input already is the
-     * utterance, so the rebuilt string is byte-identical.
+     * Only the frame's own `USER_INPUT` is interchangeable here. The request-scoped tail — perception, memory
+     * evidence, a skill body, runtime state, a retry instruction, and a summary that had no transcript user head to
+     * ride — is not the wearer's conversation turn and stays ahead of it ([prefix]), exactly as [frameToTranscript]
+     * had arranged it. That is also why the opening turn is unchanged: its input already is the utterance, so the
+     * rebuilt string is identical.
      *
      * A history that still carries a `USER` text keeps its input: the question is already there once, and replacing the
      * input would be the duplicate Task 26 removed. A null or blank fallback never invents content.

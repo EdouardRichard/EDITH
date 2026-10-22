@@ -1,17 +1,22 @@
 package com.sheen.rokid.model
 
+import com.sheen.rokid.agent.TokenMeter
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.contracts.ImageBudget
 
 /**
- * 0.25 spec §4.9 (ruling R68): one image's cost in the budgeter's existing unit — UTF-8 bytes, the unit
- * `inputBudgetTokens` is already treated as. The single source is [ImageBudget.UNITS_PER_IMAGE] in core-contracts, which
- * `TurnTrimmer` charges too: two pre-send stages that priced an image differently would let the trimmer hand the
- * budgeter a request the budgeter rejects.
+ * 0.25 spec §4.9 (ruling R68): one image's cost in the budgeter's unit — token units, the unit `inputBudgetTokens` is
+ * treated as now that text is priced by [TokenMeter] (0.3 design §5.2). The single source is
+ * [ImageBudget.UNITS_PER_IMAGE] in core-contracts, which `TurnTrimmer` charges too: two pre-send stages that priced an
+ * image differently would let the trimmer hand the budgeter a request the budgeter rejects.
  */
 private val IMAGE_BUDGET_UNITS = ImageBudget.UNITS_PER_IMAGE
 
+/**
+ * [estimatedInputTokens] keeps its name for source compatibility with the gateway/adapter callers, but it counts
+ * **token units** ([TokenMeter]), not UTF-8 bytes.
+ */
 data class BudgetedRequest(val request: ModelRequest, val estimatedInputTokens: Int, val removedIds: List<String>, val estimated: Boolean)
 
 class ContextBudgeter {
@@ -108,5 +113,10 @@ class ContextBudgeter {
         }
     }
 
-    fun estimateText(text: String): Long = text.toByteArray(Charsets.UTF_8).size.toLong()
+    /**
+     * The token-unit estimate for one text, in the same unit the profile fields speak and the same one `TurnTrimmer`
+     * charges through [TokenMeter] (0.3 design §5.2). The previous implementation counted UTF-8 bytes, which
+     * over-priced CJK up to threefold and made the profile's `inputBudgetTokens` name untrue.
+     */
+    fun estimateText(text: String): Long = TokenMeter.estimate(text).toLong()
 }

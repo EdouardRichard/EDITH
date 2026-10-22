@@ -38,6 +38,16 @@ object SmartSettingsForm {
          * rejection to report - it is carried through exactly as the user set it.
          */
         val continueDialogue: Boolean = true,
+        /**
+         * 0.3 Phase 2 Task 10: the 「感知截图」 switch. A boolean like the switch above, carried through exactly as the
+         * user set it; the host applies it to the live gate on a successful save.
+         */
+        val visionEnabled: Boolean = true,
+        /**
+         * 0.3 Phase 4B (`D189`): the 「不拦截」 switch. Like the switches above it is a boolean carried through exactly
+         * as set; the screen owns the second confirmation that must happen before this can become `true`.
+         */
+        val noInterception: Boolean = false,
     )
 
     /**
@@ -66,6 +76,8 @@ object SmartSettingsForm {
         proactiveCooldown = settings.proactiveCooldownMillis.toString(),
         proactiveSensitivity = settings.effectiveProactiveSensitivity(),
         continueDialogue = settings.continueDialogue,
+        visionEnabled = settings.visionEnabled,
+        noInterception = settings.noInterception,
     )
 
     /**
@@ -94,6 +106,8 @@ object SmartSettingsForm {
                 proactiveCooldownMillis = proactiveCooldown ?: base.proactiveCooldownMillis,
                 proactiveSensitivity = proactiveSensitivity ?: base.effectiveProactiveSensitivity(),
                 continueDialogue = draft.continueDialogue,
+                visionEnabled = draft.visionEnabled,
+                noInterception = draft.noInterception,
             ),
             errors = errors,
         )

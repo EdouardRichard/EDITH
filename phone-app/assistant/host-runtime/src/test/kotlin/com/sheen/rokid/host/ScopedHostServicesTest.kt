@@ -49,6 +49,85 @@ class ScopedHostServicesTest {
         }
     }
 
+    @Test fun `a granted device-state channel forwards the provider`() {
+        val provider = object : DeviceStateProvider {
+            override fun profile() = DeviceProfile(
+                manufacturer = "Xiaomi",
+                model = "M2012K11AC",
+                deviceName = null,
+                androidRelease = "13",
+                apiLevel = 33,
+                screenWidthPx = 1080,
+                screenHeightPx = 2400,
+                densityDpi = 440,
+                glassesModel = null,
+                glassesFirmware = null,
+                glassesWidthPx = null,
+                glassesHeightPx = null,
+                appVersion = "0.3",
+                locale = "zh-CN",
+                timeZone = "Asia/Shanghai",
+                wakeWords = listOf("EDITH"),
+                capabilities = setOf("a11y"),
+            )
+
+            override fun state() = DeviceState(
+                capturedAtEpochMillis = 0,
+                timeZone = "Asia/Shanghai",
+                localDate = "2026-10-20",
+                weekday = "星期一",
+                localTime = "18:23",
+            )
+        }
+        val services = ScopedHostServices(
+            scope(), setOf(Capability.DeviceState), mapOf(Capability.DeviceState to provider), FakeTaskScope(),
+        )
+        assertSame(provider, services.deviceState())
+        assertEquals("M2012K11AC", services.deviceState().profile().model)
+    }
+
+    // edith-0.3 Phase 2 Task 1: perception is additive. The host forwards the provider untouched, exactly as it does
+    // the other stateless read ports, and granting it must not disturb the device-state channel beside it.
+    @Test fun `a granted perception channel forwards the provider and device state still forwards`() {
+        val perception = object : PerceptionProvider {
+            override fun beginTurn() = fakeSnapshot()
+            override fun snapshot(include: Set<PerceptionSource>, filter: PerceptionFilter, limit: Int?) = fakeSnapshot()
+            override fun afterAction() = fakeSnapshot()
+            override fun screenshot(): PerceptionScreenshotResult = PerceptionScreenshotResult.Unavailable("test double")
+            override fun endTurn() = Unit
+        }
+        val device = object : DeviceStateProvider {
+            override fun profile() = DeviceProfile(
+                manufacturer = "Xiaomi", model = "M2012K11AC", deviceName = null, androidRelease = "13",
+                apiLevel = 33, screenWidthPx = 1080, screenHeightPx = 2400, densityDpi = 440,
+                glassesModel = null, glassesFirmware = null, glassesWidthPx = null, glassesHeightPx = null,
+                appVersion = "0.3", locale = "zh-CN", timeZone = "Asia/Shanghai", wakeWords = listOf("EDITH"),
+                capabilities = setOf("a11y"),
+            )
+            override fun state() = DeviceState(
+                capturedAtEpochMillis = 0, timeZone = "Asia/Shanghai", localDate = "2026-10-20",
+                weekday = "星期一", localTime = "18:23",
+            )
+        }
+        val services = ScopedHostServices(
+            scope(), setOf(Capability.Perception, Capability.DeviceState),
+            mapOf(Capability.Perception to perception, Capability.DeviceState to device), FakeTaskScope(),
+        )
+
+        assertSame(perception, services.perception())
+        assertSame(device, services.deviceState())
+    }
+
+    private fun fakeSnapshot() = PerceptionSnapshot(
+        snapshotId = "snap",
+        capturedAtEpochMillis = 0,
+        coverage = PerceptionCoverage(
+            screen = "unavailable", notifications = "unavailable", media = "unavailable",
+            calendar = "unavailable", acoustic = "unavailable", clipboard = "unavailable",
+            vision = "disabled", glasses = "unavailable", device = "available",
+        ),
+    )
+
     @Test fun `capability injection rejects missing and wrong provider types`() {
         assertFailsWith<ContractError.CapabilityMissing> {
             ScopedHostServices(scope(), setOf(Capability.Model), emptyMap(), FakeTaskScope())
@@ -214,6 +293,29 @@ class ScopedHostServicesTest {
         scope.revoke()
         assertFailsWith<ContractError.Cancelled> { services.confirmation().present("r2", "x", 1_000L) }
         assertEquals(1, seen.size)
+    }
+
+    @Test fun `a scoped Confirmation channel forwards availability and reports a revoked scope unavailable`() {
+        // 0.3 Phase 4B (B4): the plugin asks the *scoped* channel whether its surface can serve. Without this
+        // forwarding the interface default `true` would run and the production channel's unavailability would never
+        // reach the loop's early refusal.
+        var canAsk = true
+        val provider = object : ConfirmationChannel {
+            override fun available(): Boolean = canAsk
+            override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle =
+                object : CancellationHandle { override fun cancel() = Unit }
+        }
+        val scope = scope()
+        val services = ScopedHostServices(scope, setOf(Capability.Confirmation),
+            mapOf(Capability.Confirmation to provider), FakeTaskScope())
+        val confirmation = services.confirmation()
+
+        assertTrue(confirmation.available())
+        canAsk = false
+        assertFalse(confirmation.available(), "the check must be live, not a snapshot taken at activation")
+
+        scope.revoke()
+        assertFalse(confirmation.available(), "a revoked scope can ask nobody")
     }
 
     @Test fun `a granted actions channel forwards beginTurn so a later turn re-arms the provider`() {

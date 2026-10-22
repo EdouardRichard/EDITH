@@ -13,7 +13,8 @@ import com.sheen.rokid.plugin.ActionPrecheck
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.PrecheckDecision
 import com.sheen.rokid.plugin.RiskLevel
-import kotlinx.serialization.json.JsonNull
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 
@@ -35,7 +36,9 @@ import kotlinx.serialization.json.put
  *
  * Outcome mapping: a completed zero-exit command is `Done`; a completed non-zero exit is `Failed`
  * (it ran and failed, with its exit code and output kept); a channel failure is `Refused` (the
- * command could not run at all).
+ * command could not run at all). A throw from the shell **after** the command was handed over is
+ * `Failed` in the legacy projection and `Uncertain` in [ToolExecution] (M1): the call may have run
+ * and applied, which a pre-dispatch refusal would misstate.
  */
 class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
 
@@ -64,7 +67,16 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
         if (name == NAME) classify(argsJson) else ActionPrecheck(PrecheckDecision.Allow)
 
     override fun execute(name: String, argsJson: String): ActionResult {
-        if (name != NAME) return ActionResult(ActionOutcome.Refused, UNKNOWN_ACTION)
+        if (name != NAME) {
+            return ActionResult(
+                ActionOutcome.Refused,
+                // Task 8: the stable code is `execution.code`, not a copy of the whole result in `data`.
+                "{}",
+                // Fix review: an unknown action is not a `shell` call at all, so it cannot declare a state change.
+                stateChanging = false,
+                execution = refusedExecution(UNKNOWN_ACTION, recoverable = false),
+            )
+        }
         val args = parseObject(argsJson) ?: return refused(INVALID_ARGUMENTS)
         val command = args.stringArg("command")?.takeIf { it.isNotBlank() } ?: return refused(INVALID_ARGUMENTS)
         val timeout = args.longArg("timeout_ms") ?: DEFAULT_TIMEOUT_MILLIS
@@ -75,25 +87,34 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
         if (!stdin.isNullOrEmpty()) {
             return ActionResult(
                 ActionOutcome.Refused,
-                toolEnvelope(
-                    tool = NAME,
-                    ok = false,
-                    channel = CHANNEL,
-                    accepted = false,
-                    error = ToolFailure(
-                        UNSUPPORTED,
-                        "stdin is not supported by the privileged shell in this version",
-                        recoverable = false,
-                    ),
-                ),
+                "{}",
                 stateChanging = true,
+                execution = refusedExecution(UNSUPPORTED, recoverable = false),
             )
         }
         val target = shell ?: return channelFailure(SHELL_NOT_BOUND)
         val result = try {
             target.run(command)
         } catch (t: Throwable) {
-            return channelFailure(SHELL_FAILED)
+            // edith-0.3 Phase 3 M1: the command already crossed into the shell, so a throw is **not** a pre-dispatch
+            // refusal. The legacy three-state projection cannot express uncertainty; the structured fact is
+            // `Uncertain` with accepted=true and every tri-state field unknown - the command may have applied.
+            return ActionResult(
+                outcome = ActionOutcome.Failed,
+                detail = "{}",
+                stateChanging = true,
+                execution = ToolExecution(
+                    outcome = ToolOutcome.Uncertain,
+                    code = SHELL_FAILED,
+                    message = SHELL_DISPATCH_UNCERTAIN,
+                    recoverable = true,
+                    accepted = true,
+                    applied = null,
+                    verified = null,
+                    changed = null,
+                    uncertain = true,
+                ),
+            )
         }
         val (stdout, stdoutCut) = truncateUtf8(result.stdout, maxBytes.toInt())
         val (stderr, stderrCut) = truncateUtf8(result.stderr, maxBytes.toInt())
@@ -113,44 +134,88 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
             failureCode != null -> ActionOutcome.Refused
             else -> ActionOutcome.Failed
         }
+        // Task 8: the tool-specific data is the command's answer only. `ok`/`channel` are the envelope's execution
+        // facts now, and `error` moved to `execution.code`/`message`.
         val detail = buildJsonObject {
-            put("ok", ok)
             put("exitCode", result.exitCode)
             put("stdout", stdout)
             put("stderr", stderr)
             put("truncated", truncated)
-            put("channel", CHANNEL)
-            if (failureCode == null) {
-                put("error", JsonNull)
-            } else {
-                put(
-                    "error",
-                    buildJsonObject {
-                        put("code", failureCode)
-                        put("message", "the privileged shell channel reported $failureCode")
-                        put("recoverable", true)
-                    },
-                )
-            }
         }.toString()
-        return ActionResult(outcome, detail, stateChanging = true)
+        return ActionResult(outcome, detail, stateChanging = true, execution = executionFacts(outcome, failureCode))
     }
 
     private fun channelFailure(code: String): ActionResult = ActionResult(
         ActionOutcome.Refused,
-        toolEnvelope(
-            tool = NAME,
-            ok = false,
-            channel = CHANNEL,
-            accepted = false,
-            error = ToolFailure(code, "the privileged shell channel is not usable", recoverable = true),
-        ),
+        "{}",
         stateChanging = true,
+        execution = refusedExecution(code, recoverable = true),
     )
 
     // R98: every `shell` call is a write, whatever its outcome — the declaration describes the call class, not
     // whether the command got to run.
-    private fun refused(code: String) = ActionResult(ActionOutcome.Refused, code, stateChanging = true)
+    private fun refused(code: String): ActionResult = ActionResult(
+        ActionOutcome.Refused,
+        "{}",
+        stateChanging = true,
+        execution = refusedExecution(code, recoverable = false),
+    )
+
+    /**
+     * edith-0.3 Phase 2.2 Task 8: the structured facts of one shell call, now stated **by the tool** instead of parsed
+     * back out of its `detail` by `ToolCatalog`.
+     *
+     * A completed shell call is `accepted=true` with `applied=null` whether it exited 0 or not: the command ran, but an
+     * exit code is not a target-state answer (`PrivilegedShell` documents a false `OK` and a false `BLOCKED` measured on
+     * the K40). A reply the carrier cut proves the command ran (only the answer was lost), so it stays accepted with
+     * `applied=null`; every other refusal never dispatched the command and keeps `accepted=false`/`applied=false`.
+     */
+    private fun executionFacts(outcome: ActionOutcome, code: String?): ToolExecution = when (outcome) {
+        ActionOutcome.Done -> ToolExecution(
+            outcome = ToolOutcome.Done,
+            accepted = true,
+            applied = null,
+        )
+        ActionOutcome.Failed -> ToolExecution(
+            outcome = ToolOutcome.Failed,
+            code = code,
+            message = messageFor(code),
+            recoverable = true,
+            accepted = true,
+            applied = null,
+        )
+        ActionOutcome.Refused -> {
+            val executedAnyway = code == SHELL_REPLY_TOO_LARGE
+            ToolExecution(
+                outcome = ToolOutcome.Refused,
+                code = code,
+                // Fix review: the channel reasons are useful to the model; the dropped plumbing message left only a code.
+                message = messageFor(code),
+                recoverable = true,
+                accepted = executedAnyway,
+                applied = if (executedAnyway) null else false,
+            )
+        }
+    }
+
+    private fun refusedExecution(code: String, recoverable: Boolean): ToolExecution = ToolExecution(
+        outcome = ToolOutcome.Refused,
+        code = code,
+        message = messageFor(code),
+        recoverable = recoverable,
+        accepted = false,
+        applied = false,
+    )
+
+    /** Stable, content-free reasons for the shell refusals (the command and its output never appear here). */
+    private fun messageFor(code: String?): String? = when (code) {
+        UNSUPPORTED -> "stdin is not supported"
+        SHELL_NOT_BOUND -> "the privileged shell is not bound"
+        SHELL_FAILED -> "the privileged shell call failed"
+        INVALID_ARGUMENTS -> "the shell arguments are invalid"
+        UNKNOWN_ACTION -> "shell is not this tool's action"
+        else -> null
+    }
 
     companion object {
         const val NAME = "shell"
@@ -160,7 +225,6 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
         /** Spec §4.6: Shizuku replies are targeted at 64 KiB. */
         const val DEFAULT_MAX_BYTES = 65_536L
 
-        private const val CHANNEL = "shell"
         private const val INVALID_ARGUMENTS = "INVALID_ARGUMENTS"
         private const val UNKNOWN_ACTION = "UNKNOWN_ACTION"
         private const val UNSUPPORTED = "UNSUPPORTED"
@@ -168,9 +232,13 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
         private const val SHELL_REPLY_TOO_LARGE = "SHELL_REPLY_TOO_LARGE"
         private const val SHELL_FAILED = "SHELL_FAILED"
 
+        /** M1: the stable, content-free reason for a throw that happened after the command was dispatched. */
+        private const val SHELL_DISPATCH_UNCERTAIN = "the shell call may have been dispatched"
+
         val DESCRIPTOR: ActionDescriptor = ActionDescriptor(
             name = NAME,
             title = "终端命令",
+            description = "在特权 shell（Shizuku）执行一条命令：command 必填；stdin 本版不支持（返回 UNSUPPORTED），每个输出流按 max_bytes 截断并标 truncated；timeout_ms 只是语义参数，本版不会中断已发出的命令。只在没有专用工具能完成时使用：点击/输入/滑动用 device 或对应的 atomic 工具，按键用 system_action，启动应用用 open 或 launch_app，不要用 shell 模拟用户操作。可能改变系统状态的命令（pm clear/uninstall、settings put、rm、reboot、su 等）会先走命令级确认。退出码非 0 是 Failed 且 data 带 exitCode/stdout/stderr；回包被截断返回 SHELL_REPLY_TOO_LARGE，载体或解析失败返回 SHELL_FAILED，通道未就绪返回 SHELL_NOT_BOUND。不要用它处理用户隐私内容，也不要拼接未转义输入。",
             parametersJson = """{"type":"object","properties":{""" +
                 """"command":{"type":"string"},"timeout_ms":{"type":"integer","minimum":1},""" +
                 """"max_bytes":{"type":"integer","minimum":1},"stdin":{"type":"string"}},""" +
@@ -185,6 +253,10 @@ class ShellTool(private val shell: PrivilegedShell?) : ActionExecutor {
             // R99: the plugin's confirming wrapper asks the wearer inside `execute` (D47's 120 s window). The loop must
             // add its human allowance to the machine cap instead of clamping the whole call by the turn deadline.
             mayAskHuman = true,
+            // edith-0.3 Phase 2.2 Task 6: a command can leave any screen behind, and `ToolCatalog` attaches the shared
+            // post-call observation. This is the screen-observation declaration, not the fingerprint seam (`observation`
+            // stays false), so `shell` does not start feeding the progress detectors.
+            screenObservation = true,
         )
     }
 }

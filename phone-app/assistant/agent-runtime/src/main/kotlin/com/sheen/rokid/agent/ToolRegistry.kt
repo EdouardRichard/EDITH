@@ -3,6 +3,8 @@ package com.sheen.rokid.agent
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
 import kotlinx.serialization.SerializationException
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -11,7 +13,6 @@ private const val INVALID_TOOL_SCHEMA = "INVALID_TOOL_SCHEMA"
 private const val DUPLICATE_TOOL_MERGED = "DUPLICATE_TOOL_MERGED"
 private const val UNKNOWN_TOOL = "UNKNOWN_TOOL"
 private const val ARGUMENTS_INVALID = "ARGUMENTS_INVALID"
-private const val TOOL_THREW = "TOOL_THREW"
 
 /** Strict parser: the schema check and the first arguments pass. */
 private val strictJson = Json
@@ -88,27 +89,32 @@ class ToolRegistry(
             // The executor receives the model's original string: validating arguments must not rewrite them.
             tool.executor.execute(call.name, call.argsJson)
         } catch (_: Exception) {
-            return ToolResult.error(call.id, TOOL_THREW)
+            // The call was dispatched, so it may have applied part of itself: `accepted`/`applied`/`changed` are
+            // unknown and the result is Uncertain. Claiming "nothing changed" here would be a fabricated fact.
+            return ToolResult.threw(call.id)
         }
         // R57: the observation fingerprint rides through verbatim, on every outcome — a refused write that left the
         // screen unchanged is exactly the evidence the poll/global detectors need. R98: so does the per-call
         // state-changing declaration, which is what tells a write that returns an observation apart from a read.
         // 0.25 Task 24 (R133): so do the images the call produced: a screenshot's reference reaches the model through
         // the tool output, and dropping it here would make the whole image path unreachable again.
-        return when (result.outcome) {
-            ActionOutcome.Done -> ToolResult(
-                call.id, ok = true, payload = result.detail,
-                fingerprint = result.fingerprint, stateChanging = result.stateChanging, images = result.images,
-            )
-            ActionOutcome.Refused -> ToolResult(
-                call.id, ok = false, payload = "${ActionOutcome.Refused.name}: ${result.detail}",
-                fingerprint = result.fingerprint, stateChanging = result.stateChanging, images = result.images,
-            )
-            ActionOutcome.Failed -> ToolResult(
-                call.id, ok = false, payload = "${ActionOutcome.Failed.name}: ${result.detail}",
-                fingerprint = result.fingerprint, stateChanging = result.stateChanging, images = result.images,
-            )
-        }
+        // edith-0.3 Phase 2.2: a migrated tool's explicit execution/observation are authoritative; an unmigrated tool's
+        // ActionOutcome is projected onto the matching ToolOutcome, and its old `detail` becomes the envelope's `data`
+        // verbatim (never prefixed, never duplicated into the observation).
+        val execution = result.execution ?: ToolExecution(outcome = result.outcome.toToolOutcome())
+        return ToolResult(
+            id = call.id,
+            // `ok` describes the execution the model (and every consumer) receives: an explicit execution is
+            // authoritative and the legacy ActionOutcome must never report a success it denies.
+            ok = execution.outcome == ToolOutcome.Done,
+            execution = execution,
+            observation = result.observation,
+            data = result.detail,
+            fingerprint = result.fingerprint,
+            stateChanging = result.stateChanging,
+            images = result.images,
+            nonPersistent = result.nonPersistent,
+        )
     }
 
     /**
@@ -147,7 +153,12 @@ class ToolRegistry(
 
 private fun ActionDescriptor.toToolDescriptor() = ToolDescriptor(
     name = name,
-    description = title,
+    // edith-0.3 Phase 4A (A1): the model-facing description is the new field; its default is the title, which keeps
+    // every descriptor that declares no description on the pre-4A copy.
+    description = description,
+    // edith-0.3 Phase 4A (A5): keep the user-facing label a separate channel. The confirmation summary and the tool
+    // row read this; the model never does.
+    title = title,
     parametersJson = parametersJson,
     risk = risk,
     requiresConfirmation = requiresConfirmation,
@@ -159,4 +170,12 @@ private fun ActionDescriptor.toToolDescriptor() = ToolDescriptor(
     observation = observation,
     timeoutMillis = timeoutMillis,
     mayAskHuman = mayAskHuman,
+    screenObservation = screenObservation,
 )
+
+/** The pre-0.3 declaration projected onto the unified execution vocabulary; no facts beyond the outcome are invented. */
+private fun ActionOutcome.toToolOutcome(): ToolOutcome = when (this) {
+    ActionOutcome.Done -> ToolOutcome.Done
+    ActionOutcome.Refused -> ToolOutcome.Refused
+    ActionOutcome.Failed -> ToolOutcome.Failed
+}

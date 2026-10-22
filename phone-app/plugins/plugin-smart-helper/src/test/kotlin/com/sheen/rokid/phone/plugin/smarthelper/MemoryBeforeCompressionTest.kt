@@ -22,19 +22,23 @@ class MemoryBeforeCompressionTest {
      * Records what the memory store held **at the moment compression ran**. That is the whole assertion: if the
      * store already contains this turn's message when `compressIfNeeded` is entered, the write came first.
      */
-    private class OrderWatchingCompressor(private val store: MemoryLog) : ContextCompressor() {
+    private class OrderWatchingCompressor(private val store: MemoryLog) :
+        ContextCompressor(historyBudgetTokens = 3, summaryMaxTokens = 64) {
         val storeAtCompression = mutableListOf<List<String>>()
         var calls = 0
 
-        override fun compressIfNeeded(ctx: ConversationContext, budgetTokens: Int): CompressionReport {
+        override fun compressIfNeeded(ctx: ConversationContext): CompressionReport {
             calls++
             storeAtCompression += store.entries().map { it.text }
             return CompressionReport(truncated = 0, summaryStarted = false, summaryReason = null)
         }
     }
 
+    private fun manager(): ContextManager =
+        ContextManager(policy = smartContextPolicy(), promptPlan = smartPromptPlan("SYSTEM"))
+
     private fun rig(storage: SmartFakeStorage, compressor: ContextCompressor): SmartTestRig =
-        SmartTestRig(contextForTurn = ContextManager(), compressor = compressor).also {
+        SmartTestRig(contextForTurn = manager(), compressor = compressor).also {
             it.activate(overrides = mapOf(Capability.Storage to storage))
             it.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
         }
@@ -58,7 +62,7 @@ class MemoryBeforeCompressionTest {
     @Test
     fun `the transcript records the turn that just ended`() {
         val storage = SmartFakeStorage()
-        val contexts = ContextManager()
+        val contexts = manager()
         val watcher = OrderWatchingCompressor(MemoryLog(storage, log = {}))
         val rig = SmartTestRig(contextForTurn = contexts, compressor = watcher).also {
             it.activate(overrides = mapOf(Capability.Storage to storage))

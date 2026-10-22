@@ -1,5 +1,6 @@
 package com.sheen.rokid.model
 
+import com.sheen.rokid.agent.ToolResult
 import com.sheen.rokid.plugin.*
 import kotlinx.serialization.json.*
 import kotlin.test.*
@@ -282,6 +283,38 @@ data: {"type":"response.completed","sequence_number":1,"response":{"id":"r","sta
         assertEquals("call_1", input[3].getValue("call_id").jsonPrimitive.content)
         assertEquals("noted", input[3].getValue("output").jsonPrimitive.content)
         assertEquals(setOf("role", "content"), input[4].keys)
+    }
+
+    @Test fun `a tool result envelope reaches the function call output unchanged`() {
+        // 0.3 Phase 2.2 Task 7: `ToolResult.payload` is already the model-facing envelope; the Responses adapter forwards
+        // it as the `function_call_output.output` string and never rewrites it.
+        val envelope = ToolResult(
+            id = "call_1",
+            ok = true,
+            execution = ToolExecution(outcome = ToolOutcome.Done, accepted = true),
+            observation = null,
+            data = "loaded:1",
+        ).payload
+        val body = encodedBody(
+            requestFixture().copy(
+                history = listOf(
+                    ModelHistoryItem.Text(MessageRole.USER, "pull the skill"),
+                    ModelHistoryItem.Text(MessageRole.ASSISTANT, "pulling"),
+                    ModelHistoryItem.ToolCall("call_1", "load_skill", """{"name":"alpha"}""", "fc_1"),
+                    ModelHistoryItem.ToolOutput("call_1", envelope),
+                ),
+            ),
+        )
+
+        val input = body.getValue("input").jsonArray.map { it.jsonObject }
+        val output = input[3]
+        assertEquals("function_call_output", output.getValue("type").jsonPrimitive.content)
+        assertEquals("call_1", output.getValue("call_id").jsonPrimitive.content)
+        assertEquals(envelope, output.getValue("output").jsonPrimitive.content, "the payload is forwarded byte for byte")
+        assertTrue("\"observation\":null" in envelope, "no observation is invented: $envelope")
+        assertTrue("\"accepted\":true" in envelope, "the execution facts survive, as on the chat path: $envelope")
+        assertFalse("Failed: " in envelope, "no legacy prefix: $envelope")
+        assertFalse("Refused: " in envelope, "no legacy prefix: $envelope")
     }
 
     @Test fun `a continuation request with no input keeps the tool output last on the wire`() {

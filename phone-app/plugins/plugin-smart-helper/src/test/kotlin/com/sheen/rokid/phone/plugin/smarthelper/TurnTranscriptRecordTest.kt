@@ -20,6 +20,7 @@ import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.PerceptionElement
 import com.sheen.rokid.plugin.SecretHandle
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.int
@@ -269,13 +270,172 @@ class TurnTranscriptRecordTest {
         assertEquals("c1", call.callId)
         val output = history.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
         assertEquals("c1", output.callId)
-        assertEquals("notified:1", output.output)
+        assertEquals(pureToolOutput("notified:1"), output.output)
         // The closing assistant text is what the wearer actually heard/saw: the notification bodies plus the model's
         // closing text, exactly the sentence `recordTurnAndCompress` has always recorded.
         val closing = history.last()
         assertTrue(closing is ModelHistoryItem.Text, "the turn must close on assistant text: $history")
         assertEquals(MessageRole.ASSISTANT, closing.role)
         assertEquals("稍等\n已经看过了。", closing.text)
+    }
+
+    @Test
+    fun `a non-persistent perception tool result never reaches the conversation store`() {
+        // 0.3 Phase 2 final review C2: the production store path is the one that persists. The model sees the content
+        // during the run, but the stored transcript must hold only the safe marker.
+        val sentinel = "SYNTHETIC-SCREEN-CONTENT-4471"
+        val stores = stores()
+        val rig = rig(stores)
+        rig.actions.descriptors += smartAction("device")
+        rig.actions.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, sentinel, nonPersistent = true)
+        }
+        var request = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            request++
+            if (request == 1) {
+                listener(smartToolCall("c1", "device", """{"action":"observe"}""", requestId = modelRequest.requestId))
+                listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(modelRequest, listener, "看完了。")
+            }
+        }
+
+        rig.wakeAndFinal("屏幕上有什么")
+
+        assertEquals(2, rig.model.requests.size, "the tool round must issue a continuation request")
+        val continuation = rig.model.requests[1]
+        val sent = continuation.history.filterIsInstance<ModelHistoryItem.ToolOutput>()
+            .single { it.callId == "c1" }
+        assertTrue(
+            sent.output.contains(sentinel),
+            "the model must see the perception content during the run: ${sent.output}",
+        )
+        val stored = stores.getValue(ContextRoute.WAKE).history()
+        assertTrue(
+            stored.none { it.containsContent(sentinel) },
+            "perception content must not be persisted into ConversationStore: $stored",
+        )
+        assertEquals(1, stored.count { it is ModelHistoryItem.ToolOutput }, "the stored call/output pair stays attributable")
+    }
+
+    @Test
+    fun `a loop enriched failure observation never reaches the conversation store`() {
+        // 0.3 Phase 2.2 Task 8: `AgentLoop.observedFailure` attaches an observation to a failure that came back without
+        // one. The tool-returned result was persistent (nonPersistent=false); the loop's copy carries perception content,
+        // so only the same-run request may see it.
+        val sentinel = "SYNTHETIC-LOOP-OBSERVATION-6623"
+        val stores = stores()
+        val perception = SmartFakePerception(
+            initial = smartPerceptionSnapshot(
+                elements = listOf(
+                    PerceptionElement(ref = "#n7", role = "text", text = sentinel, centerX = 1, centerY = 2),
+                ),
+            ),
+        )
+        val rig = SmartTestRig(conversationStores = stores).also {
+            it.activate(
+                overrides = mapOf(
+                    Capability.Storage to SmartFakeStorage(),
+                    Capability.Perception to perception,
+                ),
+            )
+        }
+        rig.actions.descriptors += smartAction("open", screenObservation = true)
+        rig.actions.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Failed, "STATE_UNCHANGED", images = listOf(reference))
+        }
+        // A wide window so the failure round (envelope + observation + image reference) fits the fixture and the test is
+        // about the store redaction, never about eviction.
+        rig.profile = smartProfile().copy(
+            usableWindowTokens = 100_000,
+            inputBudgetTokens = 93_000,
+            maxOutputTokens = 6_000,
+            safetyTokens = 1_000,
+        )
+        var request = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            request++
+            if (request == 1) {
+                listener(smartToolCall("c1", "open", """{"target":"com.example.music"}""", requestId = modelRequest.requestId))
+                listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(modelRequest, listener, "看到了。")
+            }
+        }
+
+        rig.wakeAndFinal("打开音乐")
+
+        assertEquals(2, rig.model.requests.size, "the failure round must issue a continuation request")
+        val continuationOutputs = rig.model.requests[1].history.filterIsInstance<ModelHistoryItem.ToolOutput>()
+        assertTrue(
+            continuationOutputs.any { it.callId == "c1" },
+            "the continuation request must carry the failure output: ${rig.model.requests.map { it.history }}",
+        )
+        val sent = continuationOutputs.single { it.callId == "c1" }
+        assertTrue(sent.output.contains(sentinel), "the model must see the loop observation: ${sent.output}")
+        assertEquals(listOf(reference), sent.images, "the in-run request keeps the failure's picture reference")
+        val stored = stores.getValue(ContextRoute.WAKE).history()
+        assertTrue(
+            stored.none { it.containsContent(sentinel) },
+            "a loop-attached observation must not be persisted into ConversationStore: $stored",
+        )
+        val storedOutput = stored.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals(
+            emptyList(),
+            storedOutput.images,
+            "a failure image must never reach the stored transcript: ${storedOutput.output}",
+        )
+    }
+
+    @Test
+    fun `a reused call id keeps the store prefix and records this turn's tool round`() {
+        // C2 re-review: redaction keyed on the current run's call ids alone rewrote an **earlier** turn's persistent
+        // tool output when this run reused its id (ids only need to be non-blank). The stored transcript then stopped
+        // being a prefix of the store, so `recordStoreTurn` fell back to two text halves and dropped this run's round.
+        val stores = stores()
+        val rig = rig(stores)
+        stores.getValue(ContextRoute.WAKE).appendTranscript(
+            listOf(
+                ModelHistoryItem.Text(MessageRole.USER, "看一下屏幕"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "稍等"),
+                ModelHistoryItem.ToolCall("c1", "device", """{"action":"observe"}""", "item-1"),
+                ModelHistoryItem.ToolOutput("c1", "EARLIER-LEGACY-OUTPUT-5521"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "看到了"),
+            ),
+        )
+        val sentinel = "SYNTHETIC-SCREEN-CONTENT-8842"
+        rig.actions.descriptors += smartAction("device")
+        rig.actions.outcome = { _, _ ->
+            ActionResult(ActionOutcome.Done, sentinel, nonPersistent = true)
+        }
+        var request = 0
+        rig.model.onRequest = { modelRequest, listener ->
+            request++
+            if (request == 1) {
+                listener(smartToolCall("c1", "device", """{"action":"observe"}""", requestId = modelRequest.requestId))
+                listener(ModelStreamEvent.Terminal(modelRequest.requestId, ModelEnd.COMPLETED, null, null))
+            } else {
+                streamText(modelRequest, listener, "看完了。")
+            }
+        }
+
+        rig.wakeAndFinal("屏幕上有什么")
+
+        val history = stores.getValue(ContextRoute.WAKE).history()
+        val outputs = history.filterIsInstance<ModelHistoryItem.ToolOutput>()
+        assertEquals(2, outputs.size, "the earlier round and this run's round must both be stored: $history")
+        assertEquals("EARLIER-LEGACY-OUTPUT-5521", outputs[0].output, "an earlier turn must stay verbatim")
+        assertTrue(outputs[1].output.isNotBlank(), "this run's output keeps a safe marker")
+        assertTrue(
+            history.none { it.containsContent(sentinel) },
+            "this run's perception content must not be persisted: $history",
+        )
+        assertEquals(
+            2,
+            history.count { it is ModelHistoryItem.ToolCall },
+            "the reused call id must not drop this run's call from the store: $history",
+        )
     }
 
     @Test
@@ -309,7 +469,9 @@ class TurnTranscriptRecordTest {
             "the previous turn's call must be in the next request's history: ${sent.history}",
         )
         assertTrue(
-            sent.history.any { it is ModelHistoryItem.ToolOutput && it.callId == "c1" && it.output == "notified:1" },
+            sent.history.any {
+                it is ModelHistoryItem.ToolOutput && it.callId == "c1" && it.output == pureToolOutput("notified:1")
+            },
             "the previous turn's output must be in the next request's history: ${sent.history}",
         )
         assertTrue(
@@ -456,5 +618,12 @@ class TurnTranscriptRecordTest {
             stores.getValue(ContextRoute.WAKE).history(),
             "the retry instruction and its placeholder are loop-internal, not wearer/assistant speech",
         )
+    }
+
+    /** Whether a stored item carries [value]; the store path must keep perception content out of all three shapes. */
+    private fun ModelHistoryItem.containsContent(value: String): Boolean = when (this) {
+        is ModelHistoryItem.Text -> text.contains(value)
+        is ModelHistoryItem.ToolCall -> argsJson.contains(value)
+        is ModelHistoryItem.ToolOutput -> output.contains(value)
     }
 }

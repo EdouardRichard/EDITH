@@ -83,6 +83,8 @@ class ConversationCycleTest {
         val scheduler = SmartFakeScheduler(clock)
         val display = RecordingDisplay()
         val continuations = mutableListOf<String>()
+        /** 0.3 Phase 3 Task 7: the route each continuation was opened for, in the same order as [continuations]. */
+        val continuationRoutes = mutableListOf<AssistantRoute>()
         val cancelled = mutableListOf<Pair<AssistantRoute, String>>()
         val logs = mutableListOf<String>()
         val cycle = ConversationCycle(
@@ -90,7 +92,10 @@ class ConversationCycleTest {
             scheduler = scheduler,
             display = { display },
             continueDialogue = { continueOn },
-            openContinuation = { turnId -> continuations += turnId },
+            openContinuation = { route, turnId ->
+                continuationRoutes += route
+                continuations += turnId
+            },
             isPanelVisible = { panelVisible },
             cancelTurn = { route, turnId -> cancelled += route to turnId },
             log = { line -> logs += line },
@@ -292,6 +297,75 @@ class ConversationCycleTest {
     }
 
     @Test
+    fun `closing only a named turn leaves a newer round alone`() {
+        val rig = rig()
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "hint-turn")
+
+        // Task 9d: a hint that never acquired its panel releases the round it pre-armed. A round that was replaced in
+        // the meantime belongs to a newer attempt and must not be closed by the old one's cleanup.
+        rig.cycle.closeIfTurn(AssistantRoute.PROACTIVE, "stale-turn")
+        assertEquals(0, rig.display.closed, "a mismatched turn id closes nothing")
+        assertEquals(1, rig.scheduler.pending(), "the live round keeps its acquisition wait")
+
+        rig.cycle.closeIfTurn(AssistantRoute.PROACTIVE, "hint-turn")
+        assertEquals(1, rig.display.closed, "the named round is released")
+        assertEquals(0, rig.scheduler.pending(), "its acquisition wait is cancelled with it")
+    }
+
+    @Test
+    fun `releasing a never shown round sends no close`() {
+        val rig = rig()
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "hint-turn")
+        assertEquals(1, rig.scheduler.pending())
+
+        rig.cycle.releaseIfTurn(AssistantRoute.PROACTIVE, "hint-turn")
+
+        assertEquals(0, rig.scheduler.pending(), "the pre-armed acquisition wait is released")
+        assertEquals(0, rig.display.closed, "a panel the phone never opened gets no CLOSE command")
+    }
+
+    @Test
+    fun `stopping a named round whose panel is up shows the official idle`() {
+        // Task 9d fix (review Important 1): STOP can arrive after the hint acquired its panel but before the ACK opens
+        // a plugin window. The pre-armed round is a real listening round then, so the official STOP behavior applies:
+        // idle, keep the panel, and cancel only the turn the round still belongs to.
+        val rig = rig()
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "hint-turn")
+        rig.cycle.onPanelShown(AssistantRoute.PROACTIVE)
+        assertEquals(1, rig.scheduler.pending(), "PANEL_SHOWN armed the 10 s window")
+
+        rig.cycle.stopIfTurn(AssistantRoute.PROACTIVE, "other-turn")
+
+        assertEquals(0, rig.display.idled, "a mismatched turn id stops nothing")
+        assertEquals(1, rig.scheduler.pending(), "the live round keeps its window")
+        assertEquals(emptyList(), rig.cancelled)
+
+        rig.cycle.stopIfTurn(AssistantRoute.PROACTIVE, "hint-turn")
+
+        assertEquals(1, rig.display.idled, "STOP shows the official idle and keeps the panel")
+        assertEquals(0, rig.scheduler.pending(), "the named round is released")
+        assertEquals(listOf(AssistantRoute.PROACTIVE to "hint-turn"), rig.cancelled)
+        rig.advance(60_000)
+        assertEquals(0, rig.display.closed, "the official idle panel is not closed by STOP")
+    }
+
+    @Test
+    fun `stopping a round that never showed its panel releases it without a display call`() {
+        // During the hidden acquisition the panel may not exist yet: there is nothing to idle or close, so the round is
+        // released exactly like `releaseIfTurn`, and no turn callback is queued for a hint that never submitted.
+        val rig = rig()
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "hint-turn")
+        assertEquals(1, rig.scheduler.pending())
+
+        rig.cycle.stopIfTurn(AssistantRoute.PROACTIVE, "hint-turn")
+
+        assertEquals(0, rig.display.idled, "no idle for a panel that never reported shown")
+        assertEquals(0, rig.display.closed, "a panel the phone never opened gets no CLOSE")
+        assertEquals(0, rig.scheduler.pending(), "the acquisition cap is released")
+        assertEquals(emptyList(), rig.cancelled, "nothing was shown, so no turn callback is needed")
+    }
+
+    @Test
     fun `closing the conversation releases the bounded panel wait`() {
         val rig = rig()
         rig.cycle.onWake(AssistantRoute.WAKE, "turn-1")
@@ -434,12 +508,33 @@ class ConversationCycleTest {
 
         assertEquals(OfficialStatus.AUDIO_FINISHED.wire, rig.display.statuses.last())
         assertEquals(listOf("turn-1"), rig.continuations, "the continuation is opened once, for the finished turn")
+        assertEquals(listOf(AssistantRoute.WAKE), rig.continuationRoutes, "a wake answer continues the wake route")
         assertEquals(0, rig.display.closed)
         assertEquals(emptyList(), rig.cancelled, "a normal continued answer must not cancel a turn")
         // R106: only an answer that asked to be spoken waits; the speech-off path still settles at `Displayed`.
         assertEquals(0, rig.scheduler.pending(), "a silent answer arms no speech wait")
         rig.advance(OfficialConversation.SPEECH_LIVENESS_MILLIS)
         assertEquals(0, rig.display.closed)
+    }
+
+    @Test
+    fun `a proactive answer continues only the proactive route`() {
+        // 0.3 Phase 3 Task 7 / P3-13: the callbacks carry the route, so a PROACTIVE answer can never open a WAKE
+        // round (and vice versa). This is the mechanism the plugin's two sessions rely on.
+        val rig = rig(panelVisible = true)
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "followup-1")
+        rig.cycle.onStatus(AssistantRoute.PROACTIVE, OfficialStatus.ANSWERING)
+
+        rig.cycle.onAnswerDone(AssistantRoute.PROACTIVE, displayed = true, speech = false)
+
+        assertEquals(listOf("followup-1"), rig.continuations)
+        assertEquals(listOf(AssistantRoute.PROACTIVE), rig.continuationRoutes)
+        assertEquals(
+            OfficialStatus.AUDIO_FINISHED.wire,
+            rig.display.states.last().status,
+        )
+        assertEquals(AssistantRoute.PROACTIVE, rig.display.states.last().route)
+        assertEquals(emptyList(), rig.cancelled)
     }
 
     @Test
@@ -958,6 +1053,31 @@ class ConversationCycleTest {
 
         rig.advance(200_000)
         assertEquals(0, rig.display.closed, "STOP must not arm a close the S3 spec has not confirmed")
+    }
+
+    @Test
+    fun `a proactive follow-up window and a wake window expire independently`() {
+        val rig = rig(panelVisible = true)
+        // P3-13: PROACTIVE and WAKE are two independent sessions. The cycle keeps one state per route, so a follow-up
+        // window that started earlier must close on its own deadline without touching a younger wake round.
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "followup-1")
+        rig.advance(OfficialConversation.LISTEN_TIMEOUT_MILLIS - 1_000)
+        rig.cycle.onWake(AssistantRoute.WAKE, "wake-1")
+
+        rig.advance(1_000)
+        assertEquals(
+            listOf(AssistantRoute.PROACTIVE),
+            rig.display.calls.filterIsInstance<RecordingDisplay.Call.Close>().map { it.route },
+        )
+        assertEquals(listOf(AssistantRoute.PROACTIVE to "followup-1"), rig.cancelled)
+        assertEquals(1, rig.display.closed, "the younger wake window must still be open")
+
+        rig.advance(OfficialConversation.LISTEN_TIMEOUT_MILLIS - 1_000)
+        assertEquals(2, rig.display.closed)
+        assertEquals(
+            listOf(AssistantRoute.PROACTIVE to "followup-1", AssistantRoute.WAKE to "wake-1"),
+            rig.cancelled,
+        )
     }
 
     @Test

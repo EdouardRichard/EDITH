@@ -4,15 +4,14 @@ import android.app.Activity
 import android.os.Bundle
 import android.util.Log
 import com.sheen.rokid.phone.app.EdithApplication
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.contentOrNull
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
 
 /**
  * Debug-only 2026-10-20 instrument for the replacement T6: drive the **production** `device` tool on the semantic page
  * by reading the refs from the production `observe` output. It proves whether `device.act` can click the page's buttons;
  * it is not the corpus model and its result is not a model PASS.
+ *
+ * The probe reads [com.sheen.rokid.plugin.ActionResult] through [ProbeResultProjection]: the compact tree is
+ * `observation.screen`, not the old rendered envelope that `detail` no longer carries.
  */
 class T6ClickProbeActivity : Activity() {
 
@@ -32,10 +31,11 @@ class T6ClickProbeActivity : Activity() {
             Thread.sleep(1500)
             val root = app.composition
             val observe = root.executeToolForProbe("device", """{"action":"observe","filter":"interactive"}""")
-            val refs = refsFor(observe?.detail)
-            val text = screenText(observe?.detail)
+            val observeFacts = ProbeResultProjection.of(observe)
+            val refs = refsFor(observeFacts.screen)
+            val text = observeFacts.screen
+            // Task 8: evidence stays count-only; the screen body itself is never written to logcat.
             Log.i(TAG, "P3_T6CLICK_TEXT len=${text?.length ?: 0} hasRed=${text?.contains("红")} hasButton=${text?.contains("button")}")
-            text?.take(1800)?.chunked(400)?.forEachIndexed { i, part -> Log.i(TAG, "P3_T6CLICK_CHUNK$i $part") }
             val outcome = mutableListOf<String>()
             for (label in listOf("红", "绿", "蓝", "提交")) {
                 val ref = refs[label]
@@ -55,14 +55,8 @@ class T6ClickProbeActivity : Activity() {
         }, "edith-t6-click-probe").apply { isDaemon = true }.start()
     }
 
-    private fun screenText(detail: String?): String? {
-        val body = detail?.let { runCatching { Json.parseToJsonElement(it).jsonObject }.getOrNull() } ?: return null
-        val screen = body["data"]?.jsonObject?.get("screen")?.jsonObject ?: return null
-        return screen["text"]?.jsonPrimitive?.contentOrNull
-    }
-
-    private fun refsFor(detail: String?): Map<String, String> {
-        val text = screenText(detail) ?: return emptyMap()
+    private fun refsFor(screen: String?): Map<String, String> {
+        val text = screen ?: return emptyMap()
         return listOf("红", "绿", "蓝", "提交").mapNotNull { label ->
             val line = text.lineSequence().firstOrNull {
                 it.contains(" button \"$label\"") && it.contains("clickable")

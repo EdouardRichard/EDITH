@@ -6,8 +6,8 @@ import com.sheen.rokid.phone.actions.shizuku.ShellResult
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.PrecheckDecision
+import com.sheen.rokid.plugin.ToolOutcome
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.boolean
 import kotlinx.serialization.json.int
@@ -35,14 +35,17 @@ class ShellToolTest {
         val result = ShellTool(shell).execute("""{"command":"echo hi"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
         val body = body(result)
-        assertEquals(true, body["ok"]!!.jsonPrimitive.boolean)
         assertEquals(0, body["exitCode"]!!.jsonPrimitive.int)
         assertEquals("hi\n", body["stdout"]!!.jsonPrimitive.content)
         assertEquals("", body["stderr"]!!.jsonPrimitive.content)
         assertFalse(body["truncated"]!!.jsonPrimitive.boolean)
-        assertEquals("shell", body["channel"]!!.jsonPrimitive.content)
-        assertEquals(JsonNull, body["error"])
+        assertFalse("data no longer repeats ok/channel/error", body.containsKey("ok"))
+        assertFalse(body.containsKey("channel"))
+        assertFalse(body.containsKey("error"))
         assertEquals(listOf("echo hi"), shell.commands)
     }
 
@@ -53,12 +56,14 @@ class ShellToolTest {
         val result = ShellTool(shell).execute("""{"command":"false"}""")
 
         assertEquals(ActionOutcome.Failed, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Failed, execution.outcome)
+        assertEquals("a non-zero exit is not a missing channel", null, execution.code)
+        assertEquals("the command ran", true, execution.accepted)
         val body = body(result)
-        assertEquals(false, body["ok"]!!.jsonPrimitive.boolean)
         assertEquals(2, body["exitCode"]!!.jsonPrimitive.int)
         assertEquals("partial", body["stdout"]!!.jsonPrimitive.content)
         assertEquals("bad thing", body["stderr"]!!.jsonPrimitive.content)
-        assertEquals(JsonNull, body["error"])
     }
 
     @Test
@@ -76,7 +81,16 @@ class ShellToolTest {
             val result = ShellTool(shell).execute("""{"command":"x"}""")
 
             assertEquals("$failure must refuse", ActionOutcome.Refused, result.outcome)
-            assertEquals(expected, body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+            val execution = requireNotNull(result.execution)
+            assertEquals(ToolOutcome.Refused, execution.outcome)
+            assertEquals(expected, execution.code)
+            assertEquals("a channel refusal never dispatched the command", false, execution.accepted)
+            assertEquals(false, execution.applied)
+            assertEquals("the channel can come back", true, execution.recoverable)
+            assertTrue(
+                "a channel failure keeps a stable, content-free message: ${execution.message}",
+                !execution.message.isNullOrBlank() && !execution.message!!.contains("marker"),
+            )
         }
     }
 
@@ -87,9 +101,11 @@ class ShellToolTest {
         val result = ShellTool(shell).execute("""{"command":"x"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals("SHELL_REPLY_TOO_LARGE", execution.code)
+        assertEquals("a cut reply proves the command ran", true, execution.accepted)
+        assertEquals("only the answer was cut; applying is unknown", null, execution.applied)
         val body = body(result)
-        assertEquals("SHELL_REPLY_TOO_LARGE", body["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
-        assertEquals(false, body["ok"]!!.jsonPrimitive.boolean)
         assertTrue(body["truncated"]!!.jsonPrimitive.boolean)
         assertEquals("a prefix", body["stdout"]!!.jsonPrimitive.content)
     }
@@ -118,7 +134,9 @@ class ShellToolTest {
         val result = ShellTool(shell).execute("""{"command":"ls","stdin":"data"}""")
 
         assertEquals(ActionOutcome.Refused, result.outcome)
-        assertEquals("UNSUPPORTED", body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content)
+        assertEquals("UNSUPPORTED", requireNotNull(result.execution).code)
+        assertEquals("a malformed call has no recoverable channel", false, result.execution!!.recoverable)
+        assertEquals("stdin is not supported", result.execution!!.message)
         assertTrue(shell.commands.isEmpty())
     }
 
@@ -128,7 +146,7 @@ class ShellToolTest {
 
         val result = ShellTool(shell).execute("""{"command":"slow","timeout_ms":1}""")
 
-        val code = body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content
+        val code = requireNotNull(result.execution).code
         assertEquals("SHELL_FAILED", code)
         assertFalse("the shell has no timeout API; the tool must not claim ACTION_TIMEOUT",
             result.detail.contains("ACTION_TIMEOUT"))
@@ -138,8 +156,46 @@ class ShellToolTest {
     fun `a missing command is refused as invalid arguments`() {
         val shell = FakeShell()
 
-        assertEquals("INVALID_ARGUMENTS", ShellTool(shell).execute("""{"timeout_ms":10}""").detail)
+        val result = ShellTool(shell).execute("""{"timeout_ms":10}""")
+        assertEquals("INVALID_ARGUMENTS", requireNotNull(result.execution).code)
+        assertEquals("a malformed call is not recoverable", false, result.execution!!.recoverable)
         assertTrue(shell.commands.isEmpty())
+    }
+
+    // ---- M1: a post-dispatch throw is uncertain, never a pre-dispatch refusal ----
+
+    @Test
+    fun `a dispatched command whose shell throws is uncertain and accepted`() {
+        val shell = ThrowingShell()
+
+        val result = ShellTool(shell).execute("""{"command":"reboot"}""")
+
+        assertEquals("the legacy projection cannot express uncertainty", ActionOutcome.Failed, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Uncertain, execution.outcome)
+        assertEquals("SHELL_FAILED", execution.code)
+        assertEquals("the command crossed into the shell before the throw", true, execution.accepted)
+        assertTrue("a dispatched call may have applied", execution.uncertain)
+        assertEquals("an uncertain channel can be retried", true, execution.recoverable)
+        assertNull("the command may have applied", execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        assertEquals("the shell call may have been dispatched", execution.message)
+        assertEquals("the dispatch really reached the shell", listOf("reboot"), shell.commands)
+        assertTrue("a shell call is a write even when it threw", result.stateChanging)
+        assertEquals("no tool-specific data for a thrown call", "{}", result.detail)
+    }
+
+    @Test
+    fun `an argument refusal stays a pre-dispatch refusal`() {
+        val result = ShellTool(FakeShell()).execute("""{"timeout_ms":10}""")
+
+        val execution = requireNotNull(result.execution)
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("a malformed call never dispatched anything", false, execution.accepted)
+        assertFalse(execution.uncertain)
+        assertEquals("INVALID_ARGUMENTS", execution.code)
     }
 
     // ---- the kernel-side ShellPort adapter ----
@@ -234,6 +290,11 @@ class ShellToolTest {
         // The declaration describes the call class, not whether the command got to run.
         val refused = ShellTool(null).execute("""{"command":"echo hi"}""")
         assertTrue("a shell call is a write even when its channel is unavailable", refused.stateChanging)
+
+        // Fix review: an unknown action is not a shell call at all, so it must not declare a state change.
+        val unknown = ShellTool(null).execute("device", "{}")
+        assertEquals("UNKNOWN_ACTION", requireNotNull(unknown.execution).code)
+        assertFalse("an unknown name is not a shell call", unknown.stateChanging)
     }
 
     private fun body(result: ActionResult): JsonObject =
@@ -247,6 +308,16 @@ class ShellToolTest {
         override fun run(command: String): ShellResult {
             commands += command
             return result
+        }
+    }
+
+    /** M1: the dispatch itself blows up (a broken binder/port); the call already reached the shell. */
+    private class ThrowingShell : PrivilegedShell {
+        val commands = mutableListOf<String>()
+
+        override fun run(command: String): ShellResult {
+            commands += command
+            error("shell port died mid-call")
         }
     }
 }

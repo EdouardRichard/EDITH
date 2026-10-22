@@ -6,6 +6,7 @@ import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
 import com.sheen.rokid.contracts.TranscriptEvent
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelStreamEvent
@@ -56,6 +57,10 @@ class SkillInjectionWiringTest {
     private fun turnCompleted(lines: List<String>): Boolean =
         lines.any { it.startsWith("P3_TURN end ") && it.contains("outcome=COMPLETED") }
 
+    /** 0.3 Task 12: a pulled body is request-scoped tail content, so it arrives in the request input. */
+    private fun inputText(request: com.sheen.rokid.plugin.ModelRequest): String =
+        request.input.filterIsInstance<InputPart.Text>().joinToString("\n\n") { it.text }
+
     @Test
     fun `an enabled skill still reaches the model, by pull instead of whole`() {
         // Replaces `an enabled skill is injected whole into the request instructions`, which asserted
@@ -85,9 +90,14 @@ class SkillInjectionWiringTest {
         val first = rig.model.requests[0].instructions
         assertTrue(first.contains("- reply-wechat-message: d-reply-wechat-message"), first)
         assertFalse(marker in first, "the catalog must not carry the body: $first")
-        val second = rig.model.requests[1].instructions
-        assertTrue(second.contains(marker), "the body must reach the model after the pull, not summarised: $second")
-        assertTrue(second.contains("## SKILL 正文: reply-wechat-message"), second)
+        // 0.3 Task 12: the body rides the request input as SKILL_BODY, never the system slot.
+        val second = rig.model.requests[1]
+        assertFalse(marker in second.instructions, "the pulled body must not become system text")
+        assertTrue(
+            marker in inputText(second),
+            "the body must reach the model after the pull, not summarised: ${inputText(second)}",
+        )
+        assertTrue(inputText(second).contains("## SKILL 正文: reply-wechat-message"), inputText(second))
     }
 
     @Test
@@ -178,6 +188,10 @@ class SkillInjectionWiringTest {
         assertFalse(
             rig.model.requests[1].instructions.contains("不该出现"),
             "a refused pull must not leak the disabled body into the system slot",
+        )
+        assertFalse(
+            inputText(rig.model.requests[1]).contains("不该出现"),
+            "a refused pull must not leak the disabled body into the request tail either",
         )
     }
 

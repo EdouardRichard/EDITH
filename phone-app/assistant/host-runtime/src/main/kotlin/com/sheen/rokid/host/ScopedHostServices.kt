@@ -46,6 +46,15 @@ class ScopedHostServices(
                 // cancellation surface, so a scoped wrapper would add a layer that conveys nothing. The grant itself
                 // is still checked: `require` refuses a capability this scope was not given.
                 Capability.StorageAccess -> provider as? com.sheen.rokid.plugin.StorageAccess ?: wrong(capability)
+                // edith-0.3 Phase 1 (spec §3.2): device profile/state. Unwrapped for the same reason as the local
+                // model services — a stateless read-only port with no subscription to fence and no cancellation
+                // surface. The grant itself is still checked by `require`, so an ungranted scope cannot reach it.
+                Capability.DeviceState -> provider as? com.sheen.rokid.plugin.DeviceStateProvider ?: wrong(capability)
+                // edith-0.3 Phase 2 Task 1: the perception port. Unwrapped for the same reason as the device-state
+                // port above — the host implementation owns the turn boundary and there is no subscription to fence.
+                // The grant itself is still checked by `require`, so an ungranted scope cannot reach it; granting
+                // this capability changes nothing for a caller that never asks for it.
+                Capability.Perception -> provider as? PerceptionProvider ?: wrong(capability)
                 // edith-0.2 Phase C: the conversation view. Unwrapped for the same reason as the two above — four
                 // statements with no subscription and nothing to cancel. The scope's own grant check still applies, so
                 // a plugin that was not granted this capability cannot reach it.
@@ -156,11 +165,31 @@ class ScopedHostServices(
      * plugin's tool call fails with a contract error instead of arming a question nobody can settle.
      */
     private fun scopedConfirmation(provider: ConfirmationChannel) = object : ConfirmationChannel {
+        // 0.3 Phase 4B (B4): the plugin asks the scoped wrapper whether the host can ask. Without this forwarding the
+        // interface default `true` would run and the production channel's unavailability would never reach the loop's
+        // early refusal. A revoked scope can ask nobody, so it answers false rather than throwing from a query.
+        override fun available(): Boolean = runCatching { scope.active { provider.available() } }.getOrDefault(false)
+
         override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle {
             scope.checkActive()
             require(requestId.isNotBlank()) { "confirmation request id must not be blank" }
             require(timeoutMillis > 0) { "confirmation window must be positive, was $timeoutMillis" }
             return provider.present(requestId, summary, timeoutMillis)
         }
+
+        // 0.3 Phase 4B (B7): the action's name and the plugin's settlement are telemetry-only additions. Without
+        // these two forwards the interface defaults would run and the production presenter would never see the tool
+        // name or the decision the plugin's gate owns (the timeout/cancel/voice paths).
+        override fun present(requestId: String, summary: String, timeoutMillis: Long, tool: String): CancellationHandle {
+            scope.checkActive()
+            require(requestId.isNotBlank()) { "confirmation request id must not be blank" }
+            require(timeoutMillis > 0) { "confirmation window must be positive, was $timeoutMillis" }
+            return provider.present(requestId, summary, timeoutMillis, tool)
+        }
+
+        // A settlement can arrive while the scope is being revoked (deactivation/STOP); reporting it is never worth an
+        // exception on the plugin's turn thread, so an inactive scope simply reports nothing.
+        override fun settle(requestId: String, decision: String, answerChannel: String?): Boolean =
+            runCatching { scope.active { provider.settle(requestId, decision, answerChannel) } }.getOrDefault(false)
     }
 }

@@ -87,10 +87,42 @@ data class ActionDescriptor(
      * human wait, because the turn deadline would still clamp it.
      */
     val mayAskHuman: Boolean = false,
+    /**
+     * edith-0.3 Phase 2.2 Task 3: whether one call of this action **touches the screen**, so its non-successful result
+     * should still carry a best-effort post-call observation for the model.
+     *
+     * This is deliberately **not** [observation]: that flag means the call returns a fingerprint for the loop's
+     * progress detectors (`open` changes the screen but declares `observation = false`), while this one means the host
+     * has a screen to observe after the call. Only `device`/`open`/`shell`/`dial` declare it `true` (Tasks 4-6); a pure
+     * plugin tool (`notify_user`, `load_skill`) keeps the default `false`, because inventing a screen observation for a
+     * tool that never looks at one would be a fabricated fact.
+     *
+     * `agent-runtime` reads it only for a **non-`Done`** result that carries no observation of its own: it calls the
+     * injected `ToolObservationSource.observeWithImages(250)` **once**. A missing source is `unavailable(no_source)`;
+     * a source that returns null, throws or times out is `unavailable(observation_timeout)`; a real capture may add at
+     * most one failure image (the provider reports its own `provider_threw`/timeout reason). A successful call's
+     * observation belongs to the tool. The model-facing form is the single `{execution, observation|null, data}`
+     * envelope derived by `ToolResultEnvelope` in `agent-runtime`; this flag is not a second payload and this KDoc is
+     * not a wire contract.
+     */
+    val screenObservation: Boolean = false,
+    /**
+     * edith-0.3 Phase 4A (A1): the **model-facing** description of when and how to use this action.
+     *
+     * Unlike [title] — the short, user-visible row copy — this is the prose the model reads in the tool schema: when to
+     * choose the action (and when not to), what a failure means, and what the arguments constrain. The default keeps
+     * every pre-4A descriptor byte-for-byte: a plugin that declares no description gets its title, exactly the copy the
+     * model received before this field existed.
+     *
+     * The value must be non-blank: an empty description would offer the model a tool it cannot decide to call. The
+     * user-visible label channel (`ToolLabelMap`) stays a name→label table and is not derived from this field.
+     */
+    val description: String = title,
 ) {
     init {
         require(name.isNotBlank())
         require(title.isNotBlank())
+        require(description.isNotBlank())
         require(scope.isNotBlank())
         require(auditTargetArgument == null || auditTargetArgument.isNotBlank()) {
             "auditTargetArgument must be null or non-blank"
@@ -144,6 +176,36 @@ data class ActionResult(
      * that produces no image pays nothing extra on the wire.
      */
     val images: List<ImageRef> = emptyList(),
+    /**
+     * edith-0.3 Phase 2 final review (C2): this result's [detail] carries **perception content** (screen text,
+     * notifications, clipboard, calendar, ...), which may live only in the current model request and must never be
+     * persisted to a `ConversationStore` or an `AgentRun.transcript` (spec §7.8).
+     *
+     * The agent loop still feeds the full detail back to the model for this run; at `finish` it replaces the stored
+     * form of a marked tool output with a safe marker and drops its images. Every content-bearing `device` action
+     * result (`observe`/`act`/`screenshot`/`wait`/`status`) sets it: the perception-backed actions carry the compact
+     * screen, the legacy projector path still renders raw screen text into `observe`/`wait`/`act`, and `screenshot`
+     * carries artifact references (final-review C2 re-review; argument-validation refusals carry no content). `false` —
+     * the default — keeps every other tool's construction and output byte-for-byte unchanged.
+     */
+    val nonPersistent: Boolean = false,
+    /**
+     * edith-0.3 Phase 2.2: the structured execution facts of this call, or `null` for a tool that has not been migrated
+     * to the unified result contract yet.
+     *
+     * `null` is not "success": the host projects the plain [outcome] onto `ToolOutcome.Done/Refused/Failed` and the tool
+     * keeps its [detail] as the envelope's `data`. A migrated tool fills this with the facts the model actually needs
+     * (`accepted/applied/verified/changed` as tri-state, `uncertain`/`partial` flags) instead of encoding them in prose.
+     */
+    val execution: ToolExecution? = null,
+    /**
+     * edith-0.3 Phase 2.2: what the device looked like after this call, or `null` when the tool does not observe the
+     * screen (a pure tool such as `notify_user`) or did not attempt an observation.
+     *
+     * An observation is a device fact, never a restatement of [detail]; a tool that fills this must not repeat its
+     * fields in [detail]. An empty-but-attempted observation is a real observation (see [ToolObservation]).
+     */
+    val observation: ToolObservation? = null,
 )
 
 /**

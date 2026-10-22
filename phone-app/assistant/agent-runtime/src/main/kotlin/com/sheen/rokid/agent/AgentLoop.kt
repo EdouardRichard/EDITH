@@ -1,12 +1,17 @@
 package com.sheen.rokid.agent
 
 import com.sheen.rokid.contracts.ToolPhase
+import com.sheen.rokid.plugin.ImageRef
 import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolObservation
+import com.sheen.rokid.plugin.ToolOutcome
 import com.sheen.rokid.plugin.ToolSpec
+import com.sheen.rokid.plugin.ToolVision
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -46,6 +51,26 @@ data class AgentRequest(
      * transport's timeout to spend.
      */
     val requestTimeoutNanos: Long = 0L,
+    /**
+     * 0.3 design §5.2: this turn's output cap, carried verbatim into every [GatewayTurn] of the run.
+     *
+     * `null` — the default — keeps every pre-0.3 caller unchanged: the adapter then sends the profile's
+     * `maxOutputTokens`. The wiring that owns the profile passes that same value explicitly so the per-turn decision is
+     * inspectable and cannot silently drift from the profile it was derived from.
+     */
+    val maxOutputTokens: Int? = null,
+    /**
+     * 0.3 design §5.2/§6.2: the token-unit bound every [RequestFrame] of this run is trimmed to, from the session's
+     * `ContextPolicy.hardLimit`. [Int.MAX_VALUE] — the default — means "no override" and keeps the gateway's own
+     * profile-derived window, so a pre-0.3 caller is unaffected.
+     */
+    val limitTokens: Int = Int.MAX_VALUE,
+    /**
+     * 0.3 final-fix wave (spec §5.2): the session's fail-closed policy code (`PROFILE_INVALID`/`PROFILE_TOO_SMALL`),
+     * or `null` when the policy was built. A non-null code makes every model turn of the run refuse with that code
+     * before the transport instead of silently running on a profile whose budget could not be derived.
+     */
+    val contextFailure: String? = null,
     /**
      * The transcript this turn continues, oldest first (spec §4.2: the plugin owns a session's conversation, not a
      * turn's). Empty — the default — reproduces the previous behaviour exactly: the utterance opens the history on
@@ -106,8 +131,8 @@ data class AgentRequest(
      * 0.25 Task 12 (R58): whether a text-only **plan** answer may be nudged back into executing it.
      *
      * `false` — the default — keeps every pre-0.25 caller byte for byte: a text turn with no tool call is the answer.
-     * The production plugin sets it `true` for the WAKE route (the wearer is waiting for an action) and leaves it
-     * `false` for PROACTIVE, whose single request is a proposal, not a plan to execute (D3 §1.6). A nudge is loop
+     * The production plugin sets it `true` when the wearer is waiting for an action and leaves it `false` for the hint
+     * turn, whose single request is a proposal, not a plan to execute (D3 §1.6). A nudge is loop
      * scaffolding: it is never persisted and `withoutRetryScaffolding` strips it.
      */
     val allowPlanNudge: Boolean = false,
@@ -120,6 +145,45 @@ data class AgentRequest(
      * or a tool result; it lives only in the assembled request and is folded into the request input by the gateway.
      */
     val runtimeState: (() -> TurnRuntimeState?)? = null,
+    /**
+     * edith-0.3 Phase 2 Task 9: the host's perception block to fold into each request as one untrusted `PERCEPTION`
+     * segment immediately before `USER_INPUT`.
+     *
+     * `null` — the default — injects nothing. The provider is called once per model request and a result identical to
+     * the previous request's is skipped, so a steady screen does not pay the same bytes on every tool round. The block
+     * never enters the transcript, a `ConversationStore` or a tool result; it lives only in the assembled request and
+     * is folded into the request input by the gateway. A provider that returns `null` or blank, or throws, contributes
+     * nothing — never a fabricated block.
+     */
+    val perception: (() -> String?)? = null,
+    /**
+     * 0.3 Phase 2 Task 11 review fix (controller ruling R12): an optional observer of this run's **assembled** request
+     * frames.
+     *
+     * Called once per model request of the run, after the loop has folded [runtimeState] and [perception] into the
+     * frame and before the gateway is asked to send it. A request that assembles no frame — the legacy history path, or
+     * a caller whose frame builder returned nothing — never calls it. This is the only seam that sees the whole frame:
+     * the caller's builder runs **before** the loop adds those request-scoped segments, so a provenance line emitted
+     * there would under-count the tail it claims to describe.
+     *
+     * Observability only: the callback receives a frame it must not mutate (the loop has already fixed the shape), and
+     * a throwing callback is swallowed so a logger can never fail a delivered turn. The callback is not called for the
+     * gateway's own overflow re-sends — those re-send one already-assembled request (they report `P3_CACHE` only) — and
+     * it *is* called for a request the gateway then refuses before sending, because the assembly did happen.
+     */
+    val onRequestBuilt: ((RequestFrame) -> Unit)? = null,
+    /**
+     * edith-0.3 Phase 2.2 Task 3: the host's source for a best-effort post-call observation, or `null` when this caller
+     * has none (every pre-Phase-2.2 caller, and the JVM tests that do not exercise screen tools).
+     *
+     * The loop reads it only after a **non-`Done`** result from a descriptor that declared `screenObservation = true`
+     * and that came back without an observation. It then calls [ToolObservationSource.observeWithImages] once with the
+     * short failure deadline; `null` or a throwing source becomes an explicit `vision = unavailable` observation
+     * (`no_source` / `observation_timeout`), never a silent `null`. A capture that carries images appends them to the
+     * failed result and withdraws that result from persistence (M4). A pure tool is never observed, and a successful
+     * screen tool's observation remains the tool's own (Tasks 4-6).
+     */
+    val observationSource: ToolObservationSource? = null,
 )
 
 /** One executed (or refused) tool call; [result] is `ok`, or the stable safe code fed back to the model. */
@@ -142,8 +206,14 @@ data class AgentStep(
  *
  * [modelMillis] is the run's summed time inside model turns, [toolMillis] the summed machine time of its tool calls,
  * and [observeMillis] the subset of that time spent in calls whose descriptor declared `observation = true`. [images]
- * is the number of distinct image artifacts the run's requests carried. Every field is a count; none can carry a
- * page, a transcript or a credential.
+ * is the number of **distinct images produced by this run's tool calls, including images a terminal run never carried**:
+ * a picture attached to the call that ends the run (a repeated-error failure, a timeout, an uncertain result) still
+ * counts, while a picture merely carried from previous-turn history does not — the request path is not a source for this
+ * field. Artifact ids key the set, so the same image produced twice counts once. Every field is a count; none can carry
+ * a page, a transcript or a credential.
+ *
+ * Task 9's docs (`STATUS`/`ACCEPTANCE`/P3 metric口径) must describe `images` with the same produced-by-the-run meaning;
+ * this KDoc is the code-side source for that wording, and the fix report points Task 9 at it.
  */
 data class AgentMetrics(
     val calls: Int = 0,
@@ -183,6 +253,12 @@ data class AgentRun(
      * from [`finalText`] would get a different conversation than the one the model saw. A caller that stores the
      * conversation (rather than continuing it) additionally applies [withoutRetryScaffolding]: a retry nudge is
      * loop-internal and must not be persisted as the wearer's speech (0.25 review ruling R16).
+     *
+     * **Perception content is redacted here** (0.3 Phase 2 final review C2): a tool output **this run** marked
+     * `nonPersistent`, carrying an observation, or carrying any image is replaced by a safe marker with no images. The
+     * model saw the full payload in this run; this list is the only shape a `ConversationStore` may persist (spec §7.8),
+     * so the content cannot outlive the request. An earlier turn's output with the same call id is left verbatim
+     * (C2 re-review).
      */
     val transcript: List<ModelHistoryItem> = emptyList(),
     /**
@@ -201,7 +277,8 @@ data class AgentRun(
     /**
      * Task 6 (spec §4.8 / §4.13): the provider's token accounting for the run, summed over **every** model turn it
      * made — a tool round and a retry each cost a turn, so the run's total is their sum, not the last turn's counts.
-     * Each component is summed independently (a turn that reported only one counter leaves the other total intact).
+     * Each component — including the two cache counters — is summed independently (a turn that reported only one
+     * counter leaves the other totals intact), and a cache counter stays `null` until some turn reports it.
      *
      * `null` — the default — means no turn reported usage at all, which is different from a reported zero. Counts only:
      * no text, prompt or completion body reaches this field. It is the source Task 14's `P3_METRIC` reads; the existing
@@ -238,6 +315,11 @@ private const val STEP_LIMIT = "STEP_LIMIT"
 private const val EMPTY_TURN_TEXT = "(empty turn)"
 private const val TOOL_CALL_TEXT = "(tool call)"
 private const val CLOSED_TURN_TEXT = "(no reply)"
+/**
+ * Final review C2: the safe marker that replaces a non-persistent tool output in the **stored** transcript. It names
+ * why the body is gone without carrying any of it; the model already saw the full payload in this run.
+ */
+private const val NON_PERSISTENT_TOOL_OUTPUT = "(perception content not persisted)"
 private const val RETRY_INSTRUCTION =
     "The previous turn produced no tool call and no text. Call a tool, or state the final answer."
 private const val AUDIT_POLICY = "policy"
@@ -259,6 +341,17 @@ private const val ACTION_TIMEOUT_NOTE =
     "the action may or may not have taken effect; observe the screen before deciding."
 private const val ACTION_TIMEOUT_UNCERTAIN_NOTE =
     "the tool did not stop within the grace window; the run is stopping and the channel must be re-observed."
+/**
+ * edith-0.3 Phase 2.2 Task 3: the whole budget one best-effort **failure** observation may spend.
+ *
+ * The spec suggests 250 ms. The source is given the number and must return by then; the loop does not retry it, because
+ * a late observation of a failed call is worth less than the turn time it would cost. It is not a turn budget and a
+ * source that cannot answer within it is reported, never silently skipped.
+ */
+private const val FAILURE_OBSERVATION_DEADLINE_MILLIS = 250L
+/** The two honest reasons a screen tool's failure has no captured observation; they are wire values. */
+private const val OBSERVATION_NO_SOURCE = "no_source"
+private const val OBSERVATION_TIMEOUT = "observation_timeout"
 /** R58: the loop instruction that turns a plan-only answer back into a tool call. Never stored. */
 private const val PLAN_NUDGE_INSTRUCTION =
     "You described a plan but did not execute it. Observe first, then act: call the tool now instead of only promising it."
@@ -345,13 +438,40 @@ class AgentLoop(
      */
     private val maxObservations: Int = 24,
     /**
-     * 0.25 Task 14 (R78): where the run's one `P3_METRIC` line goes. `{}` (the default) emits nothing, keeping every
-     * pre-0.25 caller and test byte-for-byte; the production plugin passes its log sink. The loop still reports the
+     * 0.25 Task 14 (R78): where the run's count-only metric lines go. `{}` (the default) emits nothing, keeping every
+     * pre-0.25 caller and test byte-for-byte; the production plugin passes its log sink. The loop emits exactly one
+     * `P3_METRIC` line per run, plus (edith-0.3 Phase 3 Task 4, P3-9) one `P3_TOOLRESULT` line per tool call and
+     * (edith-0.3 Phase 4A Task 9, A9) one `P4_TOOL` latency line per measured tool call. Provider
+     * cache accounting is **not** a run total: it is `P3_CACHE`, emitted by `ModelClientGateway` once per model request
+     * (0.3 Phase 2 Task 11), so the proactive path and every overflow re-send are covered. The loop still reports the
      * same numbers in [AgentRun.metrics] for a caller that has its own consumer.
      *
      * Observability must never change the outcome, so a throwing sink is swallowed like the display callbacks are.
      */
     private val metricLine: (String) -> Unit = {},
+    /**
+     * edith-0.3 Phase 4A A7: the retry prose fed back after an unproductive turn.
+     *
+     * The default is this module's own literal so every pre-A7 caller keeps its exact bytes; the production plugin
+     * passes `PromptCatalog.loop("retry")`. [withoutRetryScaffolding] still matches the loop-owned
+     * [RETRY_INSTRUCTION], because that is the value the default (and production's byte-identical resource) uses.
+     */
+    private val retryInstruction: String = RETRY_INSTRUCTION,
+    /**
+     * A7: the plan-nudge prose, defaulting to [PLAN_NUDGE_INSTRUCTION]. Production passes
+     * `PromptCatalog.loop("plan-nudge")`; the injected text is what the model receives.
+     */
+    private val planNudgeInstruction: String = PLAN_NUDGE_INSTRUCTION,
+    /**
+     * A7: the note attached to a **stopped** tool timeout, defaulting to [ACTION_TIMEOUT_NOTE]. Production passes
+     * `PromptCatalog.loop("timeout")`. `ACTION_TIMEOUT_UNCERTAIN_NOTE` stays a fixed terminal verdict, not this seam.
+     */
+    private val timeoutInstruction: String = ACTION_TIMEOUT_NOTE,
+    /**
+     * A7: the wording this run treats as a plan, defaulting to [PLAN_MARKERS]. Injection only: no catalog resource
+     * exists for matching constants, and passing an empty list explicitly disables plan detection.
+     */
+    private val planMarkers: List<String> = PLAN_MARKERS,
 ) {
     init {
         require(maxObservations >= 1) { "maxObservations must be at least 1, was $maxObservations" }
@@ -399,6 +519,24 @@ class AgentLoop(
     /** R59: the hash of the runtime state last injected, so an unchanged state is sent only once. */
     private var lastRuntimeStateHash: String? = null
 
+    /** Task 9: the hash of the perception block last injected, so an unchanged block is sent only once per run. */
+    private var lastPerceptionHash: String? = null
+
+    /**
+     * Final review C2: the call ids whose tool result carried perception content. The in-run [history] keeps their full
+     * payloads (the model must see them), but [finish] replaces their stored form with [NON_PERSISTENT_TOOL_OUTPUT].
+     * Per-run state, reset on entry like the other accumulators.
+     */
+    private val nonPersistentCallIds = LinkedHashSet<String>()
+
+    /**
+     * Final review C2 (re-review): the index in the run's `history` where **this run's** items start (the caller's
+     * prefix plus the appended utterance). Only outputs at or after it are redacted by [transcriptForStorage]: a call
+     * id only has to be non-blank, so this run may reuse an earlier turn's id, and that earlier output is not this
+     * run's perception content. Set in [runInternal] once the history is built; a loop instance is single-use.
+     */
+    private var runHistoryStart = 0
+
     /** R58: the last text that was nudged, so an identical plan cannot be nudged again in place. */
     private var lastNudgedText: String? = null
     private var nudges = 0
@@ -434,6 +572,17 @@ class AgentLoop(
      * measurement.
      */
     val measuredHumanWaitNanos: Long get() = humanWaitNanos
+
+    /**
+     * 0.3 Phase 4B (B4, spec §5.4): whether a confirmation question can be put to the wearer at all.
+     *
+     * A missing port, a port whose surface is explicitly unavailable, and a port whose check throws are all "nobody can
+     * be asked": the flagged action is then refused at once with `CONFIRMATION_UNAVAILABLE` instead of spending D47's
+     * decision window. Read at the decision point - never cached for the run - because a link, a page or a permission
+     * can come back between tool calls.
+     */
+    private fun confirmationAvailable(): Boolean =
+        runCatching { confirmation?.available() == true }.getOrDefault(false)
 
     /**
      * Requests that the run stop at its next check. Safe to call from another thread, including while a gateway turn
@@ -481,6 +630,9 @@ class AgentLoop(
         spentObservations = 0
         planNudgeCap = 0
         lastRuntimeStateHash = null
+        lastPerceptionHash = null
+        nonPersistentCallIds.clear()
+        runHistoryStart = 0
         lastNudgedText = null
         nudges = 0
         lastWriteUnverified = false
@@ -508,6 +660,10 @@ class AgentLoop(
         // The user's turn opens the history: the loop has no other channel to hand the model what was asked. When the
         // caller supplies a session transcript, this turn's utterance is appended to it rather than replacing it.
         val history = (request.history + ModelHistoryItem.Text(MessageRole.USER, request.utterance)).toMutableList()
+        // Final review C2 (re-review): remember where this run's own items start. Redaction must never touch the
+        // caller-supplied prefix: a reused call id is legal, and rewriting an earlier turn's output would make the
+        // stored transcript stop being a prefix of the `ConversationStore`, so `recordStoreTurn` would drop this turn.
+        runHistoryStart = history.size
         // Where this turn's utterance sits in that transcript. It is the pending user turn until a tool round or a
         // retry appends after it, and a frame renders the pending user turn as its one `USER_INPUT` rather than as a
         // history entry (a history that ended on it would be the lone user group `ContextBudgeter` refuses) — so the
@@ -550,11 +706,13 @@ class AgentLoop(
                 request.frameFor != null -> request.frameFor(frameTranscript(history, utteranceIndex))
                 openingTurn -> request.frame
                 else -> null
-            }?.let { withRuntimeState(it, request, spentSteps) }
+            }?.let { withRuntimeState(it, request, spentSteps) }?.let { withPerception(it, request) }
+            // 0.3 Phase 2 Task 11 review fix (R12): one request-level telemetry observation per assembled request.
+            // It runs **after** the loop's RUNTIME_STATE and PERCEPTION segments are folded in and **before** the
+            // gateway can send (or refuse) the request, so the callback describes the frame this request really is.
+            // Observability is never a verdict: a throwing hook must not turn an assembled request into a failed run.
+            frameForTurn?.let { frame -> runCatching { request.onRequestBuilt?.invoke(frame) } }
             openingTurn = false
-            // R78: count this request's images before it is sent. Distinct artifact ids, so a picture carried by two
-            // requests of the same run is one image, not two.
-            recordMetricImages(frameForTurn, history)
             metricCalls++
             val modelStartedNanos = clock.nowNanos()
             val reply = gateway.turn(
@@ -577,6 +735,11 @@ class AgentLoop(
                     // 0.25 Task 27 (R143): the gateway's trim safety net restores this question if cut ① evicts the
                     // current turn's USER transcript; the continuation cue alone would otherwise be the whole input.
                     userUtterance = request.utterance,
+                    // 0.3 final-fix wave (spec §5.2): the session policy's per-turn decisions ride every model turn,
+                    // not only the opening one - a tool round must not lose the cap or fall back to another window.
+                    limitTokens = request.limitTokens,
+                    maxOutputTokens = request.maxOutputTokens,
+                    contextFailure = request.contextFailure,
                 ),
             )
             metricModelNanos += (clock.nowNanos() - modelStartedNanos).coerceAtLeast(0L)
@@ -688,10 +851,11 @@ class AgentLoop(
                         is LoopDecision.Warn -> {
                             val warning = loopWarningPayload(decision.pattern)
                             steps += AgentStep(steps.size + 1, call.name, warning, executed = false)
-                            history += ModelHistoryItem.ToolOutput(call.id, warning)
+                            appendToolOutput(history, call.id, warning)
                             // A skipped observation still spends the observation budget (D3 §1.8), and a cancel or an
                             // expired deadline still ends the run. Nothing else about a skipped call is recorded: no
-                            // fingerprint, no guard feed, no global no-progress count, no error streak.
+                            // fingerprint, no guard feed, no global no-progress count, no error streak. It is also the
+                            // "not attempted" null: the call never executed, so no failure observation is taken here.
                             if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
                             if (spentObservations >= maxObservations) {
                                 return finish(
@@ -706,7 +870,7 @@ class AgentLoop(
                         is LoopDecision.Critical -> {
                             val code = decision.pattern.safeCode
                             steps += AgentStep(steps.size + 1, call.name, code, executed = false)
-                            history += ModelHistoryItem.ToolOutput(call.id, code)
+                            appendToolOutput(history, call.id, code)
                             return finish(AgentOutcome.NO_PROGRESS, code, null, steps, history, "", spentSteps)
                         }
                         LoopDecision.Allow -> Unit
@@ -721,7 +885,14 @@ class AgentLoop(
                         unknown
                     } else {
                         val shape = registered.descriptor
-                        when (val decision = policy.decide(shape)) {
+                        val policyDecision = policy.decide(shape)
+                        // edith-0.3 Phase 4B (B7, spec §6.3): exactly one count-only `P4_POLICY` line per decision, on
+                        // the same sink as the other metric lines. `mode` is the policy's live answer (never a turn
+                        // snapshot), `risk`/`decision` are this descriptor's and this decision's; the action's name is
+                        // the only free-ish field, because the baseline is counted per tool. Observability is never a
+                        // verdict: a throwing sink or mode provider must not change the run.
+                        runCatching { metricLine(renderPolicyDecision(shape, policyDecision)) }
+                        when (policyDecision) {
                             PolicyDecision.Allow -> {
                                 val executed = runTool(
                                     call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor,
@@ -743,58 +914,85 @@ class AgentLoop(
                                     request.turnId, call.name, AUDIT_POLICY, AUDIT_REFUSED,
                                     scope = shape.scope, risk = shape.risk.name, decision = AUDIT_REFUSE,
                                 )
-                                ToolExecution(ToolResult.error(call.id, REFUSED_BY_POLICY), executed = false)
+                                ToolInvocation(ToolResult.error(call.id, REFUSED_BY_POLICY), executed = false)
                             }
                             is PolicyDecision.RequireConfirmation -> {
-                                // Waiting on a person is not the turn spending its own budget (D49): measure the call and
-                                // shift the deadline by the same amount. `finally` so a channel that throws is not
-                                // punished for the time it already spent waiting. The same measurement is **published**
-                                // as it is taken ([measuredHumanWaitNanos]), so a caller whose own windows derive from
-                                // the deadline can move them even when this run ends by throwing instead of returning
-                                // (review I-1).
-                                val waitStartedNanos = clock.nowNanos()
-                                val outcome = try {
-                                    confirmation?.request(call.id, decision.summary)
-                                } finally {
-                                    val waitedNanos = clock.nowNanos() - waitStartedNanos
-                                    if (waitedNanos > 0L) {
-                                        humanWaitNanos += waitedNanos
-                                        turnDeadlineNanos += waitedNanos
+                                // 0.3 Phase 4B (B4, spec §5.4): a channel that cannot ask is "nobody can be asked".
+                                // Refuse before the wait is measured or entered, so the action fails immediately with
+                                // CONFIRMATION_UNAVAILABLE instead of spending D47's 120 s window first.
+                                if (!confirmationAvailable()) {
+                                    // 0.3 Phase 4B (B7): the honest no-channel decision is recorded where it is taken -
+                                    // before the host is ever asked - so the baseline can count unavailable tellings
+                                    // without inventing a presenting channel.
+                                    runCatching {
+                                        metricLine(renderConfirmUnavailable(call.name))
                                     }
-                                }
-                                when {
-                                    // No channel at all: P3.1's behaviour, and an unconfirmed action never runs.
-                                    outcome == null -> {
-                                        audit.record(
-                                            request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE,
-                                            scope = shape.scope, risk = shape.risk.name,
-                                            decision = AUDIT_REQUIRE_CONFIRMATION,
-                                        )
-                                        ToolExecution(ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE), executed = false)
+                                    audit.record(
+                                        request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE,
+                                        scope = shape.scope, risk = shape.risk.name,
+                                        decision = AUDIT_REQUIRE_CONFIRMATION,
+                                    )
+                                    ToolInvocation(ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE), executed = false)
+                                } else {
+                                    // Waiting on a person is not the turn spending its own budget (D49): measure the call
+                                    // and shift the deadline by the same amount. `finally` so a channel that throws is not
+                                    // punished for the time it already spent waiting. The same measurement is
+                                    // **published** as it is taken ([measuredHumanWaitNanos]), so a caller whose own
+                                    // windows derive from the deadline can move them even when this run ends by throwing
+                                    // instead of returning (review I-1).
+                                    val waitStartedNanos = clock.nowNanos()
+                                    val outcome = try {
+                                        // B7: the action's name rides along so the host's confirmation line can count
+                                        // per tool; it is the descriptor's wire name, never the model's arguments.
+                                        confirmation?.request(call.id, policyDecision.summary, call.name)
+                                    } finally {
+                                        val waitedNanos = clock.nowNanos() - waitStartedNanos
+                                        if (waitedNanos > 0L) {
+                                            humanWaitNanos += waitedNanos
+                                            turnDeadlineNanos += waitedNanos
+                                        }
                                     }
-                                    outcome.approved -> {
-                                        val executed = runTool(
-                                            call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor,
-                                            mayAskHuman = shape.mayAskHuman,
-                                        )
-                                        if (!executed.cancelled) {
+                                    when {
+                                        // No channel at all: P3.1's behaviour, and an unconfirmed action never runs.
+                                        outcome == null -> {
                                             audit.record(
-                                                request.turnId, call.name, auditSummary(shape, call.argsJson),
-                                                outcomeOf(executed.result), scope = shape.scope, risk = shape.risk.name,
-                                                decision = AUDIT_REQUIRE_CONFIRMATION, confirmationSource = outcome.source,
+                                                request.turnId, call.name, AUDIT_POLICY, AUDIT_CONFIRMATION_UNAVAILABLE,
+                                                scope = shape.scope, risk = shape.risk.name,
+                                                decision = AUDIT_REQUIRE_CONFIRMATION,
+                                            )
+                                            ToolInvocation(
+                                                ToolResult.error(call.id, CONFIRMATION_UNAVAILABLE), executed = false,
                                             )
                                         }
-                                        executed
-                                    }
-                                    else -> {
-                                        val code = if (outcome.source == ConfirmationSource.TIMEOUT) CONFIRMATION_TIMEOUT
-                                        else CONFIRMATION_DENIED
-                                        audit.record(
-                                            request.turnId, call.name, code, code, scope = shape.scope,
-                                            risk = shape.risk.name, decision = AUDIT_REQUIRE_CONFIRMATION,
-                                            confirmationSource = outcome.source,
-                                        )
-                                        ToolExecution(ToolResult.error(call.id, code), executed = false)
+                                        outcome.approved -> {
+                                            val executed = runTool(
+                                                call, shape.timeoutMillis, turnDeadlineNanos, toolExecutor,
+                                                mayAskHuman = shape.mayAskHuman,
+                                            )
+                                            if (!executed.cancelled) {
+                                                audit.record(
+                                                    request.turnId, call.name, auditSummary(shape, call.argsJson),
+                                                    outcomeOf(executed.result), scope = shape.scope,
+                                                    risk = shape.risk.name,
+                                                    decision = AUDIT_REQUIRE_CONFIRMATION,
+                                                    confirmationSource = outcome.source,
+                                                )
+                                            }
+                                            executed
+                                        }
+                                        else -> {
+                                            val code = if (outcome.source == ConfirmationSource.TIMEOUT) {
+                                                CONFIRMATION_TIMEOUT
+                                            } else {
+                                                CONFIRMATION_DENIED
+                                            }
+                                            audit.record(
+                                                request.turnId, call.name, code, code, scope = shape.scope,
+                                                risk = shape.risk.name, decision = AUDIT_REQUIRE_CONFIRMATION,
+                                                confirmationSource = outcome.source,
+                                            )
+                                            ToolInvocation(ToolResult.error(call.id, code), executed = false)
+                                        }
                                     }
                                 }
                             }
@@ -807,6 +1005,14 @@ class AgentLoop(
                     (humanWaitNanos - humanWaitBefore) - execution.deadlineShiftNanos).coerceAtLeast(0L)
                 metricToolNanos += machineToolNanos
                 if (descriptor?.observation == true) metricObserveNanos += machineToolNanos
+                // edith-0.3 Phase 4A Task 9 (A9): one count-only `P4_TOOL` line per **measured** tool call, on the same
+                // sink as the run-level and per-result lines. `ms` is this call's machine time — the same number the
+                // run-level `toolMs` sums — and `outcome` is the envelope's existing wire token, not a second
+                // taxonomy. A detector-skipped/critical call never reaches this point, so it has no reading rather than
+                // a fabricated zero. Observability is never a verdict: a throwing sink is swallowed like the others'.
+                runCatching {
+                    metricLine(renderToolLatency(call.name, machineToolNanos, execution.result.execution.outcome))
+                }
                 // R99/D49: a mayAskHuman call may have spent part of D47's decision window inside `execute`; that time
                 // belongs to the person, not the turn. Shift it before any deadline check below can charge the run for
                 // a legal approval. Every other call contributes nothing.
@@ -823,23 +1029,40 @@ class AgentLoop(
                 if (execution.cancelled) {
                     return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
                 }
+                // edith-0.3 Phase 2.2 Task 3: every non-Done screen-tool result gets the same best-effort observation
+                // treatment, whether it came back from the executor (a throw or a tool's own failure), from a
+                // policy/confirmation refusal, or from the loop's own confirmed/uncertain timeout. The timeout results
+                // are built by `runTool` without a source, so this is the one place that can attach the fact.
+                //
+                // Review I1: a confirmed timeout's stop is turn-scoped on the host side (DeviceKernel.cancel refuses
+                // every call until beginTurn), so the source would read a CANCELLED kernel / stale screen if it ran
+                // first. Re-arm the executors **before** observing; an uncertain stop never reaches this re-arm because
+                // it ends the run below without a re-arm of its own.
+                if (execution.timedOut && !execution.uncertain && !cancelled) {
+                    registry.beginTurn()
+                }
+                val result = observedFailure(execution.result, descriptor, request.observationSource)
+                // edith-0.3 Phase 3 Task 4 (P3-9): one count-only `P3_TOOLRESULT` per tool call, after the best-effort
+                // failure observation has been attached (so `observation`/`vision`/`screenChars`/`images` describe the
+                // final result the model will see) and before any output is appended or redacted. The `shape` digest is
+                // the only envelope fingerprint: no screen, package, title, command, number or artifact id can ride it.
+                // Observability is never a verdict, so a throwing sink is swallowed like the run-level line's.
+                runCatching { metricLine(renderToolResult(request.turnId, call, result)) }
                 // R60: a call that did not stop within the grace window ends the run; no later write may run while the
                 // previous one may still be in flight.
                 if (execution.uncertain) {
-                    steps += AgentStep(steps.size + 1, call.name, execution.result.payload, executed = true)
-                    history += ModelHistoryItem.ToolOutput(
-                        call.id, execution.result.payload, execution.result.images,
+                    steps += AgentStep(steps.size + 1, call.name, stepResultOf(result), executed = true)
+                    appendToolOutput(
+                        history,
+                        call.id,
+                        result.payload,
+                        result.images,
+                        nonPersistent = mustRedact(result),
                     )
                     return finish(AgentOutcome.FAILED, ACTION_TIMEOUT_UNCERTAIN, null, steps, history, "", spentSteps)
                 }
-                // R97: the stop a timeout issued is turn-scoped on the host side (DeviceKernel.cancel refuses every call
-                // until beginTurn). The call really stopped, so re-arm the executors here, once the timeout result exists,
-                // and the rest of this same turn can still act. An uncertain stop ended the run above; a STOP, a cancel
-                // and a teardown must stay cancelled, so those paths never reach this re-arm.
-                if (execution.timedOut && !cancelled) {
-                    registry.beginTurn()
-                }
-                val result = execution.result
+                // R97: the re-arm above is exactly-once per confirmed timeout, and only a confirmed stop gets it: a STOP,
+                // a cancel and a teardown stay cancelled, so those paths never reach it.
                 // R98/R100: the per-call state-changing declaration is the only write signal — `device` declares
                 // observation=true for act too, so `!descriptor.observation` would treat `notify_user` as a write and a
                 // real device act as a read. It feeds the detectors' progress reset, the error streak's reset and the
@@ -866,7 +1089,7 @@ class AgentLoop(
                 )
                 // The step keeps the raw stable code (`ok` on success, as before Task 12); the model-facing output
                 // additionally carries the one-time hints and the one-time global notice.
-                val stepResult = if (result.ok) "ok" else result.payload
+                val stepResult = stepResultOf(result)
                 val historyPayload = buildString {
                     append(result.payload)
                     errorsSeen.hint?.let { append("\n\n").append(it) }
@@ -875,8 +1098,15 @@ class AgentLoop(
                 steps += AgentStep(steps.size + 1, call.name, stepResult, executed = true)
                 // 0.25 Task 24 (R133): the executor's images ride on the tool output exactly as the payload does. An
                 // empty list keeps the pre-0.25 item shape, and the plugin's TOOL_ROUND segment is the one channel that
-                // carries these references to the next model request.
-                history += ModelHistoryItem.ToolOutput(call.id, historyPayload, result.images)
+                // carries these references to the next model request. Final review C2: a non-persistent (perception)
+                // result is still shown to the model here; [finish] keeps it out of the stored transcript.
+                appendToolOutput(
+                    history,
+                    call.id,
+                    historyPayload,
+                    result.images,
+                    nonPersistent = mustRedact(result),
+                )
                 if (execution.executed && result.ok) successfulToolExecutions++
                 if (guard.tripped) return finish(AgentOutcome.NO_PROGRESS, NO_PROGRESS, null, steps, history, "", spentSteps)
                 if (errorsSeen.repeatTerminated) {
@@ -889,7 +1119,7 @@ class AgentLoop(
                     )
                 }
                 if (registered?.descriptor?.scope == SCOPE_TERMINAL && result.ok) {
-                    return finish(AgentOutcome.COMPLETED, null, result.payload, steps, history, "", spentSteps)
+                    return finish(AgentOutcome.COMPLETED, null, result.data, steps, history, "", spentSteps)
                 }
                 if (cancelled) return finish(AgentOutcome.CANCELLED, null, null, steps, history, "", spentSteps)
                 if (spentObservations >= maxObservations) {
@@ -907,6 +1137,87 @@ class AgentLoop(
         runCatching { request.onToolStatus?.invoke(action, phase) }
     }
 
+    // ---------------------------------------------------------------- failure observation (0.3 Phase 2.2 Task 3)
+
+    /**
+     * Attaches the best-effort post-call observation to one **non-`Done`** result.
+     *
+     * One rule serves every failure shape, which is why it lives here rather than in each branch:
+     * - a `Done` result is left alone — a successful screen tool's observation belongs to the tool (Tasks 4-6), and a
+     *   pure tool never had one to begin with;
+     * - a result that already carries an observation is authoritative and is never replaced by a second capture;
+     * - a pure tool (`screenObservation = false`) keeps `observation = null`, so no screen is invented for
+     *   `notify_user`/`load_skill`;
+     * - a screen tool's failure asks [AgentRequest.observationSource] **once**, through
+     *   [ToolObservationSource.observeWithImages], with [FAILURE_OBSERVATION_DEADLINE_MILLIS]. A missing source is
+     *   `unavailable/no_source`; a source that returns `null`/no observation or throws an [Exception] is
+     *   `unavailable/observation_timeout`. None of these is a silent `null`, a throwing source never fails the run, and
+     *   an [InterruptedException] is restored before the timeout fact is recorded. A non-[Exception] `Throwable` is
+     *   deliberately not swallowed.
+     *
+     * **M4 (images).** A capture may carry at most one picture the source really took. When it does, the returned copy
+     * appends it to the result's existing images; the transcript redaction below then drops it from the stored form
+     * (`AgentRun.transcript`), while the model sees it in this run's request. A capture without images keeps the
+     * previous copy shape exactly.
+     *
+     * A `null` observation therefore means one of two honest things: the tool does not observe the screen (pure tool),
+     * or no capture was attempted. The detector-`Warn` skip path is the second case: the call was never executed, its
+     * synthetic result never reaches this helper, and its `observation = null` is "not attempted" rather than a failed
+     * capture.
+     *
+     * **Privacy (Task 8).** The copy this helper returns carries perception content, so it is marked
+     * [ToolResult.nonPersistent] even when the tool-returned result said otherwise (a framework-synthesized failure, a
+     * policy/confirmation refusal, a loop timeout — all of them start persistent). Persistence is withdrawn **only**
+     * when an observation is really attached: a result with no observation is pure execution facts and keeps whatever
+     * mark the tool gave it, so `AgentRun.transcript` still records that the tool ran and why it failed.
+     *
+     * The execution facts are untouched: a timeout stays a timeout, a throw stays `Uncertain`, and an unconfirmed
+     * refusal keeps its `accepted=false`/`applied=false`. The observation only says what the screen looked like when
+     * the loop learned the outcome; it is not evidence that the call was stable.
+     */
+    private fun observedFailure(
+        result: ToolResult,
+        descriptor: ToolDescriptor?,
+        source: ToolObservationSource?,
+    ): ToolResult {
+        if (result.execution.outcome == ToolOutcome.Done) return result
+        if (result.observation != null) return result
+        if (descriptor?.screenObservation != true) return result
+        // M4: one image-aware call. A source that cannot answer (missing, timed-out, throwing) still yields the same
+        // explicit unavailable observation it did before; images are additive and never replace what the tool returned.
+        val capture = if (source == null) {
+            null
+        } else {
+            try {
+                source.observeWithImages(FAILURE_OBSERVATION_DEADLINE_MILLIS)
+            } catch (_: InterruptedException) {
+                // An interrupt is the caller's signal, not an observation failure: restore it for the run's owner and
+                // still record the attempt's timeout fact.
+                Thread.currentThread().interrupt()
+                null
+            } catch (_: Exception) {
+                // A throwing source is a failed attempt, never a run failure; an Error is deliberately not swallowed.
+                null
+            }
+        }
+        val captured = capture?.observation
+        val observation = when {
+            source == null -> unavailableObservation(OBSERVATION_NO_SOURCE)
+            captured != null -> captured
+            else -> unavailableObservation(OBSERVATION_TIMEOUT)
+        }
+        // Task 8 / M4: this copy now carries observation (and possibly image) content, which may live only in the
+        // current model request. The in-run history keeps it; `finish` replaces the stored form and drops its images.
+        return result.copy(
+            observation = observation,
+            images = result.images + capture?.images.orEmpty(),
+            nonPersistent = true,
+        )
+    }
+
+    private fun unavailableObservation(reason: String): ToolObservation =
+        ToolObservation(vision = ToolVision.Unavailable, visionReason = reason)
+
     /**
      * The transcript a frame builder continues: the run's accumulated history, minus this turn's utterance while that
      * utterance is still the pending user turn — a history ending on it is the lone user group the budgeter refuses,
@@ -922,7 +1233,7 @@ class AgentLoop(
      * One tool attempt's outcome, including the three states the old synchronous call could not express: cancelled,
      * timed out (confirmed stop) and uncertain (the tool did not stop).
      */
-    private class ToolExecution(
+    private class ToolInvocation(
         val result: ToolResult,
         val executed: Boolean,
         val timedOut: Boolean = false,
@@ -948,7 +1259,7 @@ class AgentLoop(
      *
      * R99: [mayAskHuman] is the descriptor's declaration that the executor may spend D47's decision window inside
      * `execute`. Such a call is bounded by `timeoutMillis + HUMAN_CONFIRMATION_ALLOWANCE_NANOS` and **not** clamped by
-     * the turn deadline; whatever it spent beyond the machine cap is reported as [ToolExecution.deadlineShiftNanos] so
+     * the turn deadline; whatever it spent beyond the machine cap is reported as [ToolInvocation.deadlineShiftNanos] so
      * the caller can shift the turn deadline (D49). Every other call keeps `min(timeoutMillis, deadline - now)`.
      */
     private fun runTool(
@@ -957,7 +1268,7 @@ class AgentLoop(
         turnDeadlineNanos: Long,
         toolExecutor: ExecutorService,
         mayAskHuman: Boolean = false,
-    ): ToolExecution {
+    ): ToolInvocation {
         val machineBudgetNanos = timeoutMillis.coerceAtLeast(1L) * 1_000_000L
         val timeoutNanos = if (mayAskHuman) {
             machineBudgetNanos + HUMAN_CONFIRMATION_ALLOWANCE_NANOS
@@ -970,7 +1281,7 @@ class AgentLoop(
         while (true) {
             if (cancelled) {
                 awaitToolStop(future)
-                return ToolExecution(ToolResult.error(call.id, ACTION_TIMEOUT), executed = false, cancelled = true)
+                return ToolInvocation(ToolResult.error(call.id, ACTION_TIMEOUT), executed = false, cancelled = true)
             }
             val remaining = timeoutNanos - (System.nanoTime() - startedAt)
             if (remaining <= 0L) break
@@ -979,7 +1290,7 @@ class AgentLoop(
                 // that does arrive is a real completed call: it is recorded like before Task 12, and the loop's own
                 // cancellation check right after the call ends the run.
                 val completed = future.get(minOf(remaining, TOOL_POLL_STEP_NANOS), TimeUnit.NANOSECONDS)
-                return ToolExecution(
+                return ToolInvocation(
                     completed,
                     executed = true,
                     deadlineShiftNanos = humanWaitShiftNanos(mayAskHuman, startedAt, machineBudgetNanos),
@@ -987,27 +1298,44 @@ class AgentLoop(
             } catch (_: TimeoutException) {
                 // Keep waiting; the loop above re-checks cancellation and the remaining budget.
             } catch (_: ExecutionException) {
-                return ToolExecution(ToolResult.error(call.id, "TOOL_THREW"), executed = true)
+                // The call was already dispatched when `registry.execute` itself failed, so it may have applied part of
+                // the call: report the unknown facts as uncertain rather than claiming "nothing changed".
+                return ToolInvocation(ToolResult.threw(call.id), executed = true)
             } catch (interrupted: InterruptedException) {
                 Thread.currentThread().interrupt()
                 runCatching { registry.cancel() }
                 awaitToolStop(future)
-                return ToolExecution(ToolResult.error(call.id, ACTION_TIMEOUT), executed = false, cancelled = true)
+                return ToolInvocation(ToolResult.error(call.id, ACTION_TIMEOUT), executed = false, cancelled = true)
             }
         }
         runCatching { registry.cancel() }
         val stopped = awaitToolStop(future)
         val humanShift = humanWaitShiftNanos(mayAskHuman, startedAt, machineBudgetNanos)
         return if (stopped) {
-            ToolExecution(
-                ToolResult(call.id, ok = false, payload = "$ACTION_TIMEOUT: $ACTION_TIMEOUT_NOTE"),
+            // The call really stopped: the caller may observe again and continue. `applied`/`changed` stay unknown
+            // (Task 3 fills the evidence it can get); the fixed note is the execution message, not tool `data`.
+            val execution = ToolExecution(
+                outcome = ToolOutcome.Timeout,
+                code = ACTION_TIMEOUT,
+                message = timeoutInstruction,
+            )
+            ToolInvocation(
+                ToolResult(id = call.id, ok = false, execution = execution, observation = null),
                 executed = true,
                 timedOut = true,
                 deadlineShiftNanos = humanShift,
             )
         } else {
-            ToolExecution(
-                ToolResult(call.id, ok = false, payload = "$ACTION_TIMEOUT_UNCERTAIN: $ACTION_TIMEOUT_UNCERTAIN_NOTE"),
+            // The call did not stop within the grace window: it may still be running, so no tri-state field may be
+            // written as if it were known. The run ends before any later write.
+            val execution = ToolExecution(
+                outcome = ToolOutcome.Uncertain,
+                code = ACTION_TIMEOUT_UNCERTAIN,
+                message = ACTION_TIMEOUT_UNCERTAIN_NOTE,
+                uncertain = true,
+            )
+            ToolInvocation(
+                ToolResult(id = call.id, ok = false, execution = execution, observation = null),
                 executed = true,
                 uncertain = true,
             )
@@ -1086,6 +1414,32 @@ class AgentLoop(
     }
 
     /**
+     * Folds the current [AgentRequest.perception] block into [frame] as one untrusted `PERCEPTION` segment immediately
+     * before the frame's `USER_INPUT`, unless it is byte-identical to the block the previous request carried.
+     *
+     * The provider is invoked once per model request. A `null`, blank or throwing provider contributes nothing, and an
+     * unchanged block is skipped: both keep a steady screen from spending the same bytes on every tool round. The
+     * segment is request metadata, never appended to `history`, so it cannot reach [AgentRun.transcript], a
+     * `ConversationStore` or a tool result.
+     */
+    private fun withPerception(frame: RequestFrame, request: AgentRequest): RequestFrame {
+        val block = runCatching { request.perception?.invoke() }.getOrNull()?.takeIf { it.isNotBlank() } ?: return frame
+        val hash = sha256Hex(block)
+        if (hash == lastPerceptionHash) return frame
+        val flow = frame.conversationFlow
+        val inputIndex = flow.indexOfLast { it.origin == SegmentOrigin.USER_INPUT }
+        // A block that could not be placed was not sent, so it must not be remembered as sent (review minor). The
+        // branch is defensive: `RequestFrame` requires exactly one USER_INPUT, so `inputIndex` is always >= 0 today.
+        if (inputIndex < 0) return frame
+        lastPerceptionHash = hash
+        return frame.copy(
+            conversationFlow = flow.take(inputIndex) +
+                Segment(SegmentOrigin.PERCEPTION, trusted = false, text = block) +
+                flow.drop(inputIndex),
+        )
+    }
+
+    /**
      * R100: whether one call carries the model's text-entry payload — the `value` member the `device` schema uses for
      * a typed value (`ActionPlanner` types `value` and falls back to `text`).
      *
@@ -1125,7 +1479,7 @@ class AgentLoop(
         if (spentObservations >= maxObservations) return false
         val lower = text.lowercase()
         if (PLAN_COMPLETION_MARKERS.any { text.contains(it) || lower.contains(it) }) return false
-        return PLAN_MARKERS.any { marker -> text.contains(marker) || lower.contains(marker) }
+        return planMarkers.any { marker -> text.contains(marker) || lower.contains(marker) }
     }
 
     /**
@@ -1135,7 +1489,79 @@ class AgentLoop(
      */
     private fun appendPlanNudge(history: MutableList<ModelHistoryItem>, text: String) {
         history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT })
-        history += ModelHistoryItem.Text(MessageRole.USER, PLAN_NUDGE_INSTRUCTION)
+        history += ModelHistoryItem.Text(MessageRole.USER, planNudgeInstruction)
+    }
+
+    /**
+     * Appends one `ToolOutput`, remembers a non-persistent result's call id and counts the images this run produced
+     * (final review C2; Task 8).
+     *
+     * Every ToolOutput append path goes through this helper, so no branch can forget to mark a perception-bearing output;
+     * the in-run history keeps the full payload and only the stored transcript is redacted at [finish].
+     *
+     * Task 8 adds the last-gate belt for two facts the run already produced:
+     * - **observation content and every picture are perception content** — a result that carries an observation or any
+     *   image is marked non-persistent even when its tool forgot (or could not know) to set the flag, so neither the
+     *   content nor the image reference reaches `ConversationStore`/`AgentRun.transcript`. Production's image results
+     *   already set the flag (every `device` result is marked, including `screenshot`); the gate is outcome-independent
+     *   because "successful images persist" was never a real store path (fix review);
+     * - **the metric counts only images produced by this run's tool calls, including images a terminal run never
+     *   carried** — this append-time set is the field's only source. A picture attached to the call that ends the run
+     *   (a repeated-error failure, a timeout, an uncertain result) never reaches another model request, so counting only
+     *   requests would lose it; a picture merely carried from previous-turn history was not produced here and is never
+     *   added. The set keys on the artifact id, so the same picture appended twice is still one image.
+     */
+    private fun appendToolOutput(
+        history: MutableList<ModelHistoryItem>,
+        callId: String,
+        output: String,
+        images: List<ImageRef> = emptyList(),
+        nonPersistent: Boolean = false,
+    ) {
+        images.forEach { metricImageIds += it.artifactId }
+        if (nonPersistent) nonPersistentCallIds += callId
+        history += ModelHistoryItem.ToolOutput(callId, output, images)
+    }
+
+    /**
+     * Task 8: whether this result's stored form must be redacted.
+     *
+     * An observation is perception content by construction, and **any** picture — a success, a failure or an uncertain
+     * capture — is an image artifact that may not outlive the request (fix review: the earlier "Done image stays
+     * persistent" exemption was based on a false premise; production's image results all set `nonPersistent` already).
+     * The tool's own flag wins in all cases — this is a belt for a tool that could not set it (a framework-synthesized
+     * failure, a loop timeout, a policy refusal).
+     *
+     * An `unavailable` observation (`vision = unavailable`, no screen text) carries no perception content, yet it is
+     * still redacted: a conservative marker keeps every observation-bearing result on the same side of the C2 boundary,
+     * and the in-run request still shows the model the schema-shaped empty observation. (A refinement to "content only"
+     * would need an explicit contract decision; privacy-safe over-reporting is deliberate.)
+     */
+    private fun mustRedact(result: ToolResult): Boolean =
+        result.nonPersistent ||
+            result.observation != null ||
+            result.images.isNotEmpty()
+
+    /**
+     * The transcript a caller may persist: this run's history with every non-persistent tool output **of this run**
+     * replaced by a safe marker and stripped of its images (final review C2; spec §7.8).
+     *
+     * Only items at or after [fromIndex] — where [runHistoryStart] placed this run's first item — are considered. Call
+     * ids are only required to be non-blank, so a run may reuse an earlier turn's id; redacting by id across the whole
+     * history would rewrite that earlier, persistent output and break the `ConversationStore` prefix check, which
+     * drops the current turn's tool round instead of storing it. The in-run history is never touched - the model saw
+     * the content - and the replacement keeps the call id, so the stored call/output pair stays attributable and a
+     * later turn still sees that the tool ran.
+     */
+    private fun transcriptForStorage(history: List<ModelHistoryItem>, fromIndex: Int): List<ModelHistoryItem> {
+        if (nonPersistentCallIds.isEmpty()) return history.toList()
+        return history.mapIndexed { index, item ->
+            if (index >= fromIndex && item is ModelHistoryItem.ToolOutput && item.callId in nonPersistentCallIds) {
+                item.copy(output = NON_PERSISTENT_TOOL_OUTPUT, images = emptyList())
+            } else {
+                item
+            }
+        }
     }
 
     /**
@@ -1156,7 +1582,7 @@ class AgentLoop(
         if (last is ModelHistoryItem.Text && last.role == MessageRole.USER) {
             history += ModelHistoryItem.Text(MessageRole.ASSISTANT, closingText.ifBlank { CLOSED_TURN_TEXT })
         }
-        lastTranscript = history.toList()
+        lastTranscript = transcriptForStorage(history, runHistoryStart)
         val metrics = AgentMetrics(
             calls = metricCalls,
             toolCalls = steps.size,
@@ -1167,13 +1593,121 @@ class AgentLoop(
             nudges = nudges,
             overflows = metricOverflows,
         )
-        // 0.25 Task 14 (R78): exactly one count-only line per run. The sink is observability, never a verdict: a
-        // throwing logger must not turn a completed run into an exception.
+        // 0.25 Task 14 (R78): exactly one count-only `P3_METRIC` line per run. Provider cache accounting moved to
+        // `ModelClientGateway` (0.3 Phase 2 Task 11), once per model request, so this run-level line never repeats it
+        // and its shape stays byte-identical. The sink is observability, never a verdict: a throwing logger must not
+        // turn a completed run into an exception.
         runCatching { metricLine(renderMetric(metrics)) }
         return AgentRun(
             outcome, safeCode, finalText, steps.toList(), humanWaitNanos, lastTranscript, spentSteps, usage,
             spentObservations, planNudgeCap, metrics,
         )
+    }
+
+    /**
+     * edith-0.3 Phase 4B (B7, spec §6.3): the one count-only `P4_POLICY` line of one policy decision.
+     *
+     * The exact field order — `P4_POLICY mode=<normal|no_interception> action=<name> risk=<Lx> decision=<...>` — is the
+     * contract the 4B baseline reads. [decision] renders the sealed type's own name (`Allow`/`RequireConfirmation`/
+     * `Refuse`), so a new decision cannot silently share a token with an old one. [descriptor] contributes only its wire
+     * name and risk level: no argument, command, question text or scope ever reaches the line. [ActionPolicy.mode] is
+     * read per decision, never cached, because the owner's 不拦截 switch applies from the next tool call.
+     */
+    private fun renderPolicyDecision(descriptor: ToolDescriptor, decision: PolicyDecision): String = buildString {
+        append("P4_POLICY")
+        append(" mode=").append(runCatching { policy.mode() }.getOrDefault(PolicyMode.NORMAL).name.lowercase())
+        append(" action=").append(descriptor.name)
+        append(" risk=").append(descriptor.risk.name)
+        append(" decision=").append(
+            when (decision) {
+                PolicyDecision.Allow -> "Allow"
+                PolicyDecision.Refuse -> "Refuse"
+                is PolicyDecision.RequireConfirmation -> "RequireConfirmation"
+            },
+        )
+    }
+
+    /**
+     * edith-0.3 Phase 4B (B7): the `P4_CONFIRM` line of a confirmation that never reached the host because no channel
+     * could ask. It is the loop's own decision, so it is emitted here; every question that *was* presented is settled
+     * by the host's presenter, which owns the channel reading. [tool] is the descriptor's wire name only.
+     */
+    private fun renderConfirmUnavailable(tool: String): String =
+        "P4_CONFIRM tool=$tool decision=unavailable channel=none"
+
+    /**
+     * edith-0.3 Phase 4A Task 9 (A9): the one count-only `P4_TOOL` line of one measured tool call.
+     *
+     * The exact field order — `P4_TOOL tool=<name> ms=<millis> outcome=<wire>` — is the contract the K40 latency matrix
+     * reads. [machineToolNanos] is the same machine time the run-level `P3_METRIC toolMs=` sums, floored to whole
+     * milliseconds and never negative; [outcome] is [ToolOutcome.wireValue], the model-facing envelope's existing
+     * vocabulary, so the two records cannot drift into two taxonomies. Nothing else is appended: no argument, command,
+     * result text, ref, URL or content number can reach the line.
+     *
+     * A call a loop detector skipped or ended before execution never has its machine time measured, so it emits no line
+     * (an absent reading, never an invented `ms=0`). A cancelled call is measured and does emit its line; its synthetic
+     * result carries the framework's own wire token, exactly as `P3_TOOLRESULT` would render it if it emitted.
+     */
+    private fun renderToolLatency(tool: String, machineToolNanos: Long, outcome: ToolOutcome): String = buildString {
+        append("P4_TOOL tool=").append(tool)
+        append(" ms=").append(machineToolNanos / NANOS_PER_MILLI)
+        append(" outcome=").append(outcome.wireValue)
+    }
+
+    /**
+     * edith-0.3 Phase 3 Task 4 (P3-9, design §7.1): the one count-only `P3_TOOLRESULT` line of one tool call.
+     *
+     * It is emitted after [observedFailure], so every value describes the **final** result: a screen tool's failure
+     * carries the observation and any capture image the loop attached, and a policy/confirmation refusal that never ran
+     * reports the framework's own `accepted=false`/`applied=false` facts. The exact field order is the contract the
+     * device acceptance reads; only counts, stable codes, booleans and the eight-hex [ToolResultEnvelope.shapeDigest]
+     * appear. The screen text is reduced to [ToolObservation.screen]'s length, images to their count, and no artifact id,
+     * package, title, command or number can reach the line.
+     *
+     * `accepted`/`applied`/`verified`/`changed` are `-` when the result honestly does not know the fact (never `f` for
+     * unknown). `observation` is `image` whenever this call produced at least one picture, `text` for an observation
+     * without one, and `none` for no observation at all; `vision` follows the observation and is `not_requested` when
+     * there is none. `code` is the execution's stable code, falling back to the code an unmigrated tool's legacy detail
+     * names, and `-` when it names none.
+     *
+     * A detector-skipped or detector-critical call never reaches this point: it has no [ToolResult] at all (its answer is
+     * a synthetic loop payload), so it emits no line rather than invented execution facts. A cancelled call is likewise
+     * unfinished — no output is appended for it and no result line is written.
+     */
+    private fun renderToolResult(turnId: String, call: ToolCall, result: ToolResult): String = buildString {
+        val execution = result.execution
+        append("P3_TOOLRESULT")
+        append(" turn=").append(turnId)
+        append(" call=").append(call.id)
+        append(" tool=").append(call.name)
+        append(" outcome=").append(execution.outcome.wireValue)
+        append(" code=").append(execution.code ?: legacyCodeOf(result.data) ?: "-")
+        append(" recoverable=").append(execution.recoverable)
+        append(" accepted=").append(triState(execution.accepted))
+        append(" applied=").append(triState(execution.applied))
+        append(" verified=").append(triState(execution.verified))
+        append(" changed=").append(triState(execution.changed))
+        append(" uncertain=").append(execution.uncertain)
+        append(" partial=").append(execution.partial)
+        append(" observation=").append(observationKind(result))
+        append(" vision=").append((result.observation?.vision ?: ToolVision.NotRequested).wireValue)
+        append(" screenChars=").append(result.observation?.screen?.length ?: "-")
+        append(" images=").append(result.images.size)
+        append(" shape=").append(ToolResultEnvelope.shapeDigest(result.payload) ?: "-")
+    }
+
+    /** P3-9: `t`/`f` for a known tri-state fact, `-` for the honest "unknown" `null`. */
+    private fun triState(value: Boolean?): String = when (value) {
+        true -> "t"
+        false -> "f"
+        null -> "-"
+    }
+
+    /** P3-9: what kind of perception this call returned — a picture, text, or nothing. */
+    private fun observationKind(result: ToolResult): String = when {
+        result.images.isNotEmpty() -> "image"
+        result.observation != null -> "text"
+        else -> "none"
     }
 
     /**
@@ -1202,21 +1736,10 @@ class AgentLoop(
     }
 
     /**
-     * Adds the images one model request carries to the run's distinct-image count (R78): a request-flow segment's
-     * `images` and a history tool output's `images`. Artifact ids key the set, so the same screenshot echoed by two
-     * requests of one run counts once.
-     */
-    private fun recordMetricImages(frame: RequestFrame?, history: List<ModelHistoryItem>) {
-        frame?.conversationFlow?.forEach { segment -> segment.images.forEach { metricImageIds += it.artifactId } }
-        history.forEach { item ->
-            if (item is ModelHistoryItem.ToolOutput) item.images.forEach { metricImageIds += it.artifactId }
-        }
-    }
-
-    /**
-     * Adds one turn's accounting to the run's total. A turn that reported nothing contributes nothing; the two
-     * counters are summed independently because [ModelUsage] admits one side being absent. The total stays `null`
-     * until the first turn reports something, so "no accounting" is never fabricated as a zero count.
+     * Adds one turn's accounting to the run's total. A turn that reported nothing contributes nothing; every counter is
+     * summed independently because [ModelUsage] admits a side being absent — including the two cache counters, which a
+     * multi-turn run must not lose. The total stays `null` until the first turn reports something, and a cache counter
+     * stays `null` until some turn reports it, so "no accounting" is never fabricated as a zero count.
      */
     private fun accumulatedUsage(total: ModelUsage?, turn: ModelUsage?): ModelUsage? {
         if (turn == null) return total
@@ -1224,6 +1747,8 @@ class AgentLoop(
         return ModelUsage(
             inputTokens = sumTokens(total.inputTokens, turn.inputTokens),
             outputTokens = sumTokens(total.outputTokens, turn.outputTokens),
+            cachedInputTokens = sumTokens(total.cachedInputTokens, turn.cachedInputTokens),
+            cacheMissInputTokens = sumTokens(total.cacheMissInputTokens, turn.cacheMissInputTokens),
         )
     }
 
@@ -1240,10 +1765,22 @@ class AgentLoop(
      */
     private fun appendRetry(history: MutableList<ModelHistoryItem>, text: String) {
         history += ModelHistoryItem.Text(MessageRole.ASSISTANT, text.ifBlank { EMPTY_TURN_TEXT })
-        history += ModelHistoryItem.Text(MessageRole.USER, RETRY_INSTRUCTION)
+        history += ModelHistoryItem.Text(MessageRole.USER, retryInstruction)
     }
 
-    private fun outcomeOf(result: ToolResult) = if (result.ok) "ok" else result.payload
+    /**
+     * The short stable label one `AgentStep` (and one audit line) carries: `ok` for a success, otherwise the
+     * execution's stable code. An unmigrated tool names no execution code, so its legacy detail is asked for one too
+     * (the same code-only extraction `ErrorTracker` uses); a detail that names none yields the outcome token.
+     *
+     * Never the tool detail and never the envelope: `AgentStep.result` reaches the plugin's `P3_TOOL` count-only log,
+     * and `data`/`observation` may carry content that is only allowed in the current model request (C2).
+     */
+    private fun stepResultOf(result: ToolResult): String =
+        if (result.ok) "ok"
+        else result.execution.code ?: legacyCodeOf(result.data) ?: result.execution.outcome.name
+
+    private fun outcomeOf(result: ToolResult) = stepResultOf(result)
 
     /**
      * The one argument an audit line may carry (spec §17.5).

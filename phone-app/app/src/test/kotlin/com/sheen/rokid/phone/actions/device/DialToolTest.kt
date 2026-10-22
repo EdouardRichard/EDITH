@@ -8,14 +8,10 @@ import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.RiskLevel
-import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonNull
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.boolean
-import kotlinx.serialization.json.jsonObject
-import kotlinx.serialization.json.jsonPrimitive
+import com.sheen.rokid.plugin.ToolOutcome
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -25,8 +21,6 @@ import org.junit.Test
  */
 class DialToolTest {
 
-    private val json = Json
-
     @Test
     fun `without CALL_PHONE the dial is refused and the executor is never called`() {
         val executor = FakeExecutor()
@@ -35,6 +29,8 @@ class DialToolTest {
 
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("CALL_PERMISSION_MISSING", errorCode(result))
+        assertEquals(false, requireNotNull(result.execution).accepted)
+        assertEquals(false, result.execution!!.applied)
         assertTrue(executor.calls.isEmpty())
     }
 
@@ -45,11 +41,14 @@ class DialToolTest {
         val result = DialTool(executor) { true }.execute("""{"number":"10086"}""")
 
         assertEquals(ActionOutcome.Done, result.outcome)
-        val body = body(result)
-        assertEquals(true, body["ok"]!!.jsonPrimitive.boolean)
-        assertEquals(true, body["accepted"]!!.jsonPrimitive.boolean)
-        assertEquals(JsonNull, body["applied"])
-        assertEquals("intent", body["channel"]!!.jsonPrimitive.content)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Done, execution.outcome)
+        assertEquals(true, execution.accepted)
+        assertEquals("an intent hand-off never proves applied", null, execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        // Task 8: `data` is empty — the facts are the execution's and a number never appears anywhere.
+        assertEquals("{}", result.detail)
         assertEquals(listOf("dial" to """{"number":"10086"}"""), executor.calls)
         assertFalse("the number must not be repeated into the result", result.detail.contains("10086"))
     }
@@ -84,6 +83,41 @@ class DialToolTest {
         assertEquals(ActionOutcome.Refused, result.outcome)
         assertEquals("ARGUMENTS_INVALID", errorCode(result))
         assertTrue(executor.calls.isEmpty())
+    }
+
+    // ---- M1: a post-dispatch throw is uncertain, never a pre-dispatch refusal ----
+
+    @Test
+    fun `a dispatched dial whose executor throws is uncertain and accepted`() {
+        val executor = ThrowingExecutor()
+
+        val result = DialTool(executor) { true }.execute("""{"number":"10086"}""")
+
+        assertEquals("the legacy projection cannot express uncertainty", ActionOutcome.Failed, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Uncertain, execution.outcome)
+        assertEquals("DIAL_FAILED", execution.code)
+        assertEquals("the call reached the executor before the throw", true, execution.accepted)
+        assertTrue("a dispatched call may have applied", execution.uncertain)
+        assertEquals("an uncertain call can be retried", true, execution.recoverable)
+        assertNull(execution.applied)
+        assertNull(execution.verified)
+        assertNull(execution.changed)
+        assertEquals("{}", result.detail)
+        assertFalse("the number must never be echoed", result.detail.contains("10086"))
+        assertEquals(listOf("dial"), executor.calls.map { it.first })
+    }
+
+    @Test
+    fun `a missing number stays a pre-dispatch refusal`() {
+        val result = DialTool(FakeExecutor()) { true }.execute("{}")
+
+        assertEquals(ActionOutcome.Refused, result.outcome)
+        val execution = requireNotNull(result.execution)
+        assertEquals(ToolOutcome.Refused, execution.outcome)
+        assertEquals("a malformed call never dispatched anything", false, execution.accepted)
+        assertFalse(execution.uncertain)
+        assertEquals("ARGUMENTS_INVALID", execution.code)
     }
 
     // ---- R129: dial never asks, including under the default L1 ceiling ----
@@ -123,13 +157,14 @@ class DialToolTest {
         assertTrue(DialTool(FakeExecutor()) { true }.execute("""{"number":"10086"}""").stateChanging)
         // The declaration describes the call class, not whether CALL_PHONE allowed it to run.
         assertTrue(DialTool(FakeExecutor()) { false }.execute("""{"number":"10086"}""").stateChanging)
+
+        // Fix review: an unknown action is not a dial call at all, so it must not declare a state change.
+        val unknown = DialTool(FakeExecutor()) { true }.execute("device", "{}")
+        assertEquals("UNKNOWN_ACTION", requireNotNull(unknown.execution).code)
+        assertFalse("an unknown name is not a dial call", unknown.stateChanging)
     }
 
-    private fun body(result: ActionResult): JsonObject =
-        json.parseToJsonElement(result.detail).jsonObject
-
-    private fun errorCode(result: ActionResult): String =
-        body(result)["error"]!!.jsonObject["code"]!!.jsonPrimitive.content
+    private fun errorCode(result: ActionResult): String? = result.execution?.code
 
     private class FakeExecutor(
         private val result: ActionResult = ActionResult(ActionOutcome.Done, "dialing"),
@@ -141,6 +176,20 @@ class DialToolTest {
         override fun execute(name: String, argsJson: String): ActionResult {
             calls += name to argsJson
             return result
+        }
+
+        override fun cancel() = Unit
+    }
+
+    /** M1: the executor blows up after the tool has dispatched the dial. */
+    private class ThrowingExecutor : ActionExecutor {
+        val calls = mutableListOf<Pair<String, String>>()
+
+        override fun descriptors(): List<ActionDescriptor> = emptyList()
+
+        override fun execute(name: String, argsJson: String): ActionResult {
+            calls += name to argsJson
+            error("dial executor died mid-call")
         }
 
         override fun cancel() = Unit

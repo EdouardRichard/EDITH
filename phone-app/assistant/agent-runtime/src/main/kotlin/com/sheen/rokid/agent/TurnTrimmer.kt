@@ -58,7 +58,10 @@ object TrimOrder {
  * assistant texts the removal brings together are merged, so the result is still a shape `ContextBudgeter` sends.
  * [HARD] is overflow recovery ②: only the newest whole turn and the current input remain (plus request-scoped
  * `RUNTIME_STATE`/`RETRY` metadata and the untouched system slot), and within that turn only the newest tool round,
- * its assistant opener and the closing assistant text survive.
+ * its assistant opener and the closing assistant text survive. The request-scoped dynamic tail
+ * (`PERCEPTION`/`MEMORY_EVIDENCE`/`SKILL_BODY`/`RUNTIME_STATE`) is kept, shortened to head + marker + tail; only a
+ * frame that is still over budget after that gives a whole origin up, in the fixed order `SKILL_BODY` →
+ * `MEMORY_EVIDENCE` → `PERCEPTION`, and every removal is recorded (Task 12, spec §6.6).
  */
 enum class TrimMode { STANDARD, AGGRESSIVE, HARD }
 
@@ -73,6 +76,10 @@ enum class TrimMode { STANDARD, AGGRESSIVE, HARD }
  * @param elidedUiTrees how many old UI-tree tool results ⓪ replaced with a header (Task 13).
  * @param elidedImages how many historical images ⓪ degraded to a text summary (Task 13; newest K = 3 stay whole).
  * @param elidedToolResults how many long non-last tool results ⓪ truncated to head+tail (Task 13).
+ * @param truncatedOrigins the origins of HARD-recovery dynamic segments that survived **truncated** (Task 12): the
+ *   segment is still in [kept], with `head + "\n...[truncated]...\n" + tail`. A segment that was truncated and then
+ *   given up by the still-over-budget cleanup is reported in [droppedOrigins] instead, so the two lists never name the
+ *   same segment. Empty for STANDARD/AGGRESSIVE.
  */
 data class TrimReport(
     val kept: RequestFrame,
@@ -82,6 +89,7 @@ data class TrimReport(
     val elidedUiTrees: Int = 0,
     val elidedImages: Int = 0,
     val elidedToolResults: Int = 0,
+    val truncatedOrigins: List<SegmentOrigin> = emptyList(),
 )
 
 /**
@@ -98,6 +106,7 @@ data class TrimCounts(
     val elidedUiTrees: Int = 0,
     val elidedImages: Int = 0,
     val elidedToolResults: Int = 0,
+    val truncatedOrigins: List<SegmentOrigin> = emptyList(),
 )
 
 /** The counts-only view of this report: safe to log, `toString()`, or hand to a probe. */
@@ -109,11 +118,12 @@ val TrimReport.counts: TrimCounts
         elidedUiTrees,
         elidedImages,
         elidedToolResults,
+        truncatedOrigins,
     )
 
 /**
- * Trims a [RequestFrame] down to a byte budget in the fixed order (H2 + H3 + R69). A pure function: it never mutates
- * its input, never touches a store, and calls nothing asynchronous.
+ * Trims a [RequestFrame] down to a token-unit budget in the fixed order (H2 + H3 + R69). A pure function: it never
+ * mutates its input, never touches a store, and calls nothing asynchronous.
  *
  * ⓪ [TrimOrder.TYPE_AWARE] runs first, unconditionally — a stale observation or an expired image is cheaper as a
  * header/summary no matter how much room the frame has. Then ① [TrimOrder.OLDEST_TURNS] (whole old turns) and
@@ -123,10 +133,14 @@ val TrimReport.counts: TrimCounts
  *
  * ## ⓪ is type-aware, not a second budget (R69)
  *
- * - **Old UI tree**: a `TOOL_ROUND` output whose text is a device envelope with a `data.screen` object, and which is
- *   not the *last* tool result, becomes a header that keeps the action/revision/app, the line count and the visible
- *   refs (`#n…`) but not the full tree. That is the "header + 已压缩" rule; refs survive because the model may still
- *   act on them, the hundreds of node lines do not.
+ * - **Old UI tree**: a `TOOL_ROUND` output whose envelope carries a non-blank `observation.screen` (the compact UI
+ *   tree; Task 8 re-pointed this from the pre-0.3 `data.screen` object), and which is not the *last* tool result,
+ *   has **only `observation.screen`** replaced by a header that keeps the action/revision/app, the line count and the
+ *   visible refs (`#n…`) but not the full tree. The rest of the envelope — `execution` and the tool-specific `data` —
+ *   is preserved verbatim, so an old shell/open result keeps its exit code, candidate list and facts. That is the
+ *   "header + 已压缩" rule; refs survive because the model may still act on them, the hundreds of node lines do not.
+ *   The pre-0.3 `data.screen` object is a **non-production** shape (a composition without a perception port; production
+ *   always injects one) and is deliberately not elided: the production device tree lives in `observation.screen`.
  * - **Old images**: only the newest [IMAGE_KEEP] images across the whole flow stay whole; older
  *   `ToolOutput.images`/`Segment.images` entries are removed and a visible `[image <id> <mime> <w>x<h> (elided)]` text
  *   is appended to the owner. The newest K are the references the context may still contain, which is what keeps
@@ -145,7 +159,7 @@ val TrimReport.counts: TrimCounts
  * [RequestFrame]'s `require`). So if anything survives, it is the input — the input survives because
  * it is never offered for eviction, not because it "happens to" survive.
  *
- * This is **not** the same as "the input always fits": when `USER_INPUT` alone exceeds `limitBytes`
+ * This is **not** the same as "the input always fits": when `USER_INPUT` alone exceeds `limitTokens`
  * the kept frame still carries it and [TrimReport.compressionOwed] is `true`. Refusing an oversized
  * input stays `ContextBudgeter`'s existing `ConfigurationRejected` rule — out of scope here, and this
  * class never emits an oversized input into a send path that would bypass that rule.
@@ -157,28 +171,41 @@ val TrimReport.counts: TrimCounts
  * [total] strictly falls, so the loop cannot spin and an empty candidate slice is unreachable — there
  * is deliberately no empty-slice guard (one existed and was dead code).
  *
- * ## Byte accounting — the same unit and the same total as `ContextBudgeter`
+ * ## Token accounting — the same unit and the same per-message formula as `ContextBudgeter`
  *
- * [measure] is the arithmetic `ContextBudgeter` uses for one message (UTF-8 bytes + 32, see
- * `ContextBudgeter.kt`'s `message(text)`), plus one [ImageBudget.UNITS_PER_IMAGE] per image the adapter will put on the
- * wire (R68). The two stages therefore price an image identically, and an image-bearing frame cannot be trimmed to a
- * request the send-time budgeter then rejects. [total] adds the same fixed [FIXED_OVERHEAD] that `ContextBudgeter.kt`
- * adds once (`Math.addExact(32L, message(instructions))`). The two totals are **structurally identical** against the
- * same `minOf(...)` limit, and a frame whose `total()` is at or under that limit is accepted by the send-time check.
- * (The gateway still trims to `limit - 32` as a deliberate safety margin; that is stricter, never the other way round.)
+ * [measure] prices one message the way `ContextBudgeter.message(text)` does — [TokenMeter.estimate] token units plus
+ * the same 32-unit per-message overhead — plus one [ImageBudget.UNITS_PER_IMAGE] per image the adapter will put on the
+ * wire (R68). The two stages therefore price a text and an image identically, and an image-bearing frame cannot be
+ * trimmed to a request the send-time budgeter then rejects. [total] adds the same fixed [FIXED_OVERHEAD] that
+ * `ContextBudgeter.kt` adds once (`Math.addExact(32L, message(instructions))`).
+ *
+ * The rendered request is not necessarily the exact sum of those per-segment prices: the gateway folds the leading
+ * context into one message and renders a `TOOL_ROUND` as one or more wire items, so the send-time total can differ
+ * from [total] by the cost of that rendering. The gateway therefore trims to the session `ContextPolicy.hardLimit`,
+ * which reserves the policy's own hard margin (`hardInputLimit - hardMargin`) below the send-time bound — a deliberate
+ * stricter bound, not a guarantee that the two totals are identical. The acceptance tests' discriminating assertion is
+ * the send-time `prepare` call itself, never a claim that the two totals are identical.
  *
  * A `SUMMARY` segment is **not a turn**: it never participates in turn eviction. But it does count toward [total] —
  * it gets no exemption from the budget check.
  *
- * @param measure the per-segment byte cost. Defaults to [defaultSegmentMeasure], which includes image units.
+ * @param measure the per-segment token-unit cost. Defaults to [defaultSegmentMeasure], which includes image units.
+ * @param hardDynamicHeadChars how much of a HARD-kept dynamic tail segment's head survives (Task 12). 400 is a policy
+ *   starting point, not a model constant: the caller may tune it.
+ * @param hardDynamicTailChars the tail counterpart of [hardDynamicHeadChars]; 100 is likewise a tunable starting point.
  */
-class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasure) {
+class TurnTrimmer(
+    private val measure: (Segment) -> Int = ::defaultSegmentMeasure,
+    private val hardDynamicHeadChars: Int = 400,
+    private val hardDynamicTailChars: Int = 100,
+) {
 
-    fun trim(frame: RequestFrame, limitBytes: Int, mode: TrimMode = TrimMode.STANDARD): TrimReport {
+    fun trim(frame: RequestFrame, limitTokens: Int, mode: TrimMode = TrimMode.STANDARD): TrimReport {
+        val hard = if (mode == TrimMode.HARD) hardTruncate(frame.conversationFlow) else null
         val prepared = when (mode) {
             TrimMode.STANDARD -> frame.conversationFlow
             TrimMode.AGGRESSIVE -> dropOlderToolRounds(frame.conversationFlow)
-            TrimMode.HARD -> hardTruncate(frame.conversationFlow)
+            TrimMode.HARD -> hard!!.flow
         }
         val hardDroppedTurns = if (mode == TrimMode.HARD) {
             val lastTurn = frame.conversationFlow.indexOfLast { isTurnStart(it) }
@@ -190,14 +217,44 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
         val flow = typeAware.flow.toMutableList()
         var droppedTurns = hardDroppedTurns
         val droppedOrigins = mutableListOf<SegmentOrigin>()
+        // Task 12: indexes into `flow` of the HARD dynamic segments that were shortened. `applyTypeAware` maps the list
+        // one-to-one in order (it never reorders or resizes), so [HardTruncation.truncatedIndexes] stay valid here; every
+        // removal below goes through `removeSegmentAt`, which keeps them pointing at the same segments.
+        val truncatedIndexes = hard?.truncatedIndexes?.toMutableSet() ?: mutableSetOf()
 
         fun total(): Int = FIXED_OVERHEAD +
             measure(Segment(SegmentOrigin.INSTRUCTIONS, true, frame.systemText)) +
             flow.sumOf(measure)
 
+        /** Removes one segment and shifts the truncated-index bookkeeping. */
+        fun removeSegmentAt(index: Int): Segment {
+            val removed = flow.removeAt(index)
+            truncatedIndexes.remove(index)
+            val shifted = truncatedIndexes.filter { it > index }
+            if (shifted.isNotEmpty()) {
+                truncatedIndexes.removeAll(shifted.toSet())
+                shifted.forEach { truncatedIndexes += it - 1 }
+            }
+            return removed
+        }
+
+        // HARD only (Task 12, spec §6.6): truncation is not enough, so give up whole dynamic origins in the declared
+        // order — SKILL_BODY, then MEMORY_EVIDENCE, then PERCEPTION — one segment at a time, the oldest/first first.
+        // The loop never touches USER_INPUT/RUNTIME_STATE/RETRY/the newest turn: those origins are not in its order, and
+        // it stops the moment the frame fits. Every removal is recorded in `droppedOrigins`.
+        if (mode == TrimMode.HARD) {
+            for (origin in HARD_CLEANUP_ORDER) {
+                while (total() > limitTokens) {
+                    val index = flow.indexOfFirst { it.origin == origin }
+                    if (index < 0) break
+                    droppedOrigins += removeSegmentAt(index).origin
+                }
+            }
+        }
+
         // ① 旧整回合：一组 = 一条 role=USER 的 TRANSCRIPT（或它引发的 TOOL_ROUND 段）到下一个
         // USER 之前。整组淘汰 ⇒ 永远不发"半个回合"。从最旧一组开始，只在还超预算时才落。
-        while (total() > limitBytes) {
+        while (total() > limitTokens) {
             val start = flow.indexOfFirst { isTurnStart(it) }
             if (start < 0) break
             val next = flow.subList(start + 1, flow.size).indexOfFirst { isTurnStart(it) }
@@ -207,7 +264,7 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
             // ⇒ isEvictable 必为真。故不存在（也不需要）空集分支。每轮至少删掉 flow[start]，
             // flow 单调变短、total() 单调变小 ⇒ 循环必终止，① 不会空转。
             val slice = (start until stop).filter { isEvictable(flow[it]) }
-            slice.sortedDescending().forEach { flow.removeAt(it) }
+            slice.sortedDescending().forEach { removeSegmentAt(it) }
             droppedTurns++
         }
 
@@ -216,21 +273,27 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
         // `flow.size`，把记忆段一起带走并记在 droppedTurns 上（见 `TrimOrder` 的 KDoc）。它保留下来是为了
         // 没有任何回合组可让的请求（`[memory, USER_INPUT]`），以及为后续阶段保留"按相关性单独让出记忆"的能力。
         var index = flow.lastIndex
-        while (total() > limitBytes && index >= 0) {
+        while (total() > limitTokens && index >= 0) {
             if (flow[index].origin == SegmentOrigin.MEMORY_EVIDENCE) {
-                droppedOrigins += flow.removeAt(index).origin
+                droppedOrigins += removeSegmentAt(index).origin
             }
             index--
         }
+
+        // Task 12: a segment that was truncated and then given up is reported as dropped, not truncated.
+        val truncatedOrigins = flow.indices
+            .filter { it in truncatedIndexes }
+            .map { flow[it].origin }
 
         return TrimReport(
             kept = frame.copy(conversationFlow = flow.toList()),
             droppedTurns = droppedTurns,
             droppedOrigins = droppedOrigins.toList(),
-            compressionOwed = total() > limitBytes,
+            compressionOwed = total() > limitTokens,
             elidedUiTrees = typeAware.elidedUiTrees,
             elidedImages = typeAware.elidedImages,
             elidedToolResults = typeAware.elidedToolResults,
+            truncatedOrigins = truncatedOrigins,
         )
     }
 
@@ -298,17 +361,30 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
         return found
     }
 
-    /** A device envelope whose `data.screen` is an object, replaced by a header that keeps the refs and the summary. */
+    /**
+     * A tool result whose `observation.screen` is a compact UI tree, with **only that member** replaced by a header
+     * that keeps the refs and the summary; `execution` and `data` stay byte-for-byte the tool's result.
+     *
+     * 0.3 Phase 2.2 Task 8 re-point: the unified envelope
+     * (`{execution, observation|null, data}`) carries the screen tree in `observation.screen` as a string; `data` no
+     * longer repeats it. The optional `data.action`/`data.rev`/`data.app` metadata is read only when the tool kept those
+     * tool-specific facts (the `device` tool does), so a shell/open observation still elides with `?` placeholders.
+     * A result whose observation is `null` — a pure tool, or an unmigrated tool whose `data` happens to hold a screen
+     * object — is deliberately **not** a UI tree this cut can elide: reading `data.screen` again is what Task 8 removed.
+     * The legacy no-perception `data.screen` is a non-production composition, documented on [TurnTrimmer]; ⓪ remains
+     * effective for the production device UI tree in `observation.screen`.
+     */
     private fun elideUiTree(output: String): String? {
         val envelope = parseObject(output) ?: return null
-        val data = envelope["data"] as? JsonObject ?: return null
-        val screen = data["screen"] as? JsonObject ?: return null
-        val action = envelope.string("action") ?: "?"
-        val revision = screen.string("rev") ?: "?"
-        val app = screen.string("app")
-        val lines = screen.string("text")?.lineSequence()?.count { it.isNotBlank() } ?: 0
-        val refs = REF_PATTERN.findAll(output).map { it.value }.distinct().take(MAX_ELIDED_REFS).toList()
-        return buildString {
+        val observation = envelope["observation"] as? JsonObject ?: return null
+        val screen = observation.string("screen")?.takeIf { it.isNotBlank() } ?: return null
+        val data = envelope["data"] as? JsonObject
+        val action = data?.string("action") ?: "?"
+        val revision = data?.let { (it["rev"] as? JsonPrimitive)?.contentOrNull } ?: "?"
+        val app = data?.string("app") ?: observation.string("foregroundPackage")
+        val lines = screen.lineSequence().count { it.isNotBlank() }
+        val refs = REF_PATTERN.findAll(screen).map { it.value }.distinct().take(MAX_ELIDED_REFS).toList()
+        val header = buildString {
             append("[screen observation elided: action=").append(action)
             append(" rev=").append(revision)
             if (app != null) append(" app=").append(app)
@@ -316,6 +392,13 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
             append(" refs=").append(if (refs.isEmpty()) "-" else refs.joinToString(","))
             append(" · 已压缩]")
         }
+        // Replace exactly `observation.screen`; every other member of the envelope (and of the observation) survives.
+        val rewrittenObservation = JsonObject(
+            LinkedHashMap(observation).apply { put("screen", JsonPrimitive(header)) },
+        )
+        return JsonObject(
+            LinkedHashMap(envelope).apply { put("observation", rewrittenObservation) },
+        ).toString()
     }
 
     private fun headTail(text: String): String {
@@ -507,52 +590,113 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
      * assistant text(s) that follow it (the turn's closing answer). The older rounds of the same turn are exactly the
      * "compression was not enough" cost this cut exists to remove; keeping them let a multi-round turn end
      * `CONTEXT_OVERFLOW` at a size this truncation already fits. A newest turn with no tool round keeps its text only.
-     * Request-scoped `RUNTIME_STATE`/`RETRY` metadata and `USER_INPUT` always survive in flow order; a stored
-     * `SUMMARY`/`MEMORY_EVIDENCE`/`PERCEPTION` is exactly the "old context" this hard cut removes. With no turn group
-     * at all, only the metadata and the current input remain.
+     * Request-scoped `RUNTIME_STATE`/`RETRY` metadata and `USER_INPUT` always survive in flow order.
+     *
+     * ## The dynamic tail is kept, shortened (Task 12, spec §6.6)
+     *
+     * A request-scoped tail segment (`PERCEPTION`/`MEMORY_EVIDENCE`/`SKILL_BODY`/`RUNTIME_STATE`) is **not** dropped
+     * whole: it survives as `head + "\n...[truncated]...\n" + tail` (the cap is the constructor's
+     * [hardDynamicHeadChars]/[hardDynamicTailChars] policy pair; an already-shorter segment is unchanged), and its
+     * index is returned in [HardTruncation.truncatedIndexes] so the report can name the origin. A stored `SUMMARY` is
+     * still exactly the "old context" this hard cut removes, and it is not in the dynamic tail. If the shortened frame
+     * is still over budget, `trim` cleans whole dynamic origins in the declared order (SKILL_BODY → MEMORY_EVIDENCE →
+     * PERCEPTION, recorded in `droppedOrigins`); this function only truncates, it does not measure.
+     *
+     * The returned indexes address the returned list; `trim` keeps them in sync while it removes segments.
      */
-    private fun hardTruncate(flow: List<Segment>): List<Segment> {
+    private fun hardTruncate(flow: List<Segment>): HardTruncation {
         val lastTurn = flow.indexOfLast { isTurnStart(it) }
         val kept = if (lastTurn < 0) flow else flow.subList(lastTurn, flow.size)
         val lastTool = kept.indexOfLast { it.origin == SegmentOrigin.TOOL_ROUND }
-        if (lastTool < 0) {
-            return kept.filter {
+        val survivors = if (lastTool < 0) {
+            kept.filter {
                 it.origin == SegmentOrigin.TRANSCRIPT ||
                     it.origin == SegmentOrigin.USER_INPUT ||
-                    it.origin == SegmentOrigin.RUNTIME_STATE ||
-                    it.origin == SegmentOrigin.RETRY
+                    it.origin == SegmentOrigin.RETRY ||
+                    it.origin in HARD_DYNAMIC_ORIGINS
             }
-        }
-        var newestRunStart = lastTool
-        while (newestRunStart > 0 && kept[newestRunStart - 1].origin == SegmentOrigin.TOOL_ROUND) {
-            newestRunStart--
-        }
-        // The assistant text immediately before the newest run. Every production round is opened by one (AgentLoop
-        // appends a placeholder when the model sent no text); if a frame has none, the run is kept as it is and the
-        // send-time budgeter remains the judge of the orphaned-call shape.
-        val opener = (newestRunStart - 1 downTo 0).firstOrNull { index -> isAssistantTranscript(kept[index]) }
-        // The turn's own opening user text: the history must open on a user item and the turn must not be a lone half.
-        val turnUser = (0 until newestRunStart).firstOrNull { index ->
-            kept[index].origin == SegmentOrigin.TRANSCRIPT && kept[index].role == SegmentRole.USER
-        }
-        val keep = mutableSetOf<Int>()
-        // Request-scoped metadata and the current input are never evicted, wherever the turn put them.
-        kept.forEachIndexed { index, segment ->
-            if (segment.origin == SegmentOrigin.USER_INPUT ||
-                segment.origin == SegmentOrigin.RUNTIME_STATE ||
-                segment.origin == SegmentOrigin.RETRY
-            ) {
-                keep += index
+        } else {
+            var newestRunStart = lastTool
+            while (newestRunStart > 0 && kept[newestRunStart - 1].origin == SegmentOrigin.TOOL_ROUND) {
+                newestRunStart--
             }
+            // The assistant text immediately before the newest run. Every production round is opened by one (AgentLoop
+            // appends a placeholder when the model sent no text); if a frame has none, the run is kept as it is and the
+            // send-time budgeter remains the judge of the orphaned-call shape.
+            val opener = (newestRunStart - 1 downTo 0).firstOrNull { index -> isAssistantTranscript(kept[index]) }
+            // The turn's own opening user text: the history must open on a user item and the turn must not be a lone half.
+            val turnUser = (0 until newestRunStart).firstOrNull { index ->
+                kept[index].origin == SegmentOrigin.TRANSCRIPT && kept[index].role == SegmentRole.USER
+            }
+            val keep = mutableSetOf<Int>()
+            // Request-scoped metadata, the dynamic tail and the current input are never evicted, wherever the turn put them.
+            kept.forEachIndexed { index, segment ->
+                if (segment.origin == SegmentOrigin.USER_INPUT ||
+                    segment.origin == SegmentOrigin.RETRY ||
+                    segment.origin in HARD_DYNAMIC_ORIGINS
+                ) {
+                    keep += index
+                }
+            }
+            turnUser?.let(keep::add)
+            opener?.let(keep::add)
+            (newestRunStart..lastTool).forEach(keep::add)
+            // Everything the assistant said after its last tool round is the turn's closing answer, kept in flow order.
+            for (index in (lastTool + 1) until kept.size) {
+                if (kept[index].origin == SegmentOrigin.TRANSCRIPT) keep += index
+            }
+            kept.filterIndexed { index, _ -> index in keep }
         }
-        turnUser?.let(keep::add)
-        opener?.let(keep::add)
-        (newestRunStart..lastTool).forEach(keep::add)
-        // Everything the assistant said after its last tool round is the turn's closing answer, kept in flow order.
-        for (index in (lastTool + 1) until kept.size) {
-            if (kept[index].origin == SegmentOrigin.TRANSCRIPT) keep += index
+        val truncatedIndexes = mutableSetOf<Int>()
+        val shortened = survivors.mapIndexed { index, segment ->
+            if (segment.origin !in HARD_DYNAMIC_ORIGINS) return@mapIndexed segment
+            val text = truncateDynamicText(segment.text) ?: return@mapIndexed segment
+            truncatedIndexes += index
+            segment.copy(text = text)
         }
-        return kept.filterIndexed { index, _ -> index in keep }
+        return HardTruncation(shortened, truncatedIndexes)
+    }
+
+    /** The shortened HARD survivors plus the indexes (into [flow]) of the dynamic segments that were shortened. */
+    private data class HardTruncation(val flow: List<Segment>, val truncatedIndexes: Set<Int>)
+
+    /**
+     * The head+tail form of one dynamic-tail segment, or `null` when the segment is already short enough to keep whole.
+     *
+     * The cap pair is a policy starting point, not a model constant. The marker is fixed text, never the segment's
+     * content, so the kept request says exactly where the middle went. Both cuts are code-point safe: a cap that lands
+     * inside a surrogate pair drops the orphan half instead of emitting an unpaired surrogate into the request.
+     */
+    private fun truncateDynamicText(text: String): String? {
+        val head = text.takeCodePointSafe(hardDynamicHeadChars)
+        val tail = text.takeLastCodePointSafe(hardDynamicTailChars)
+        if (text.length <= head.length + tail.length + HARD_TRUNCATED_MARKER.length) return null
+        return head + HARD_TRUNCATED_MARKER + tail
+    }
+
+    /** `take(count)` without splitting a surrogate pair; an orphan high surrogate is dropped. */
+    private fun String.takeCodePointSafe(count: Int): String {
+        if (count <= 0) return ""
+        if (count >= length) return this
+        val end = if (Character.isHighSurrogate(this[count - 1]) && Character.isLowSurrogate(this[count])) {
+            count - 1
+        } else {
+            count
+        }
+        return substring(0, end)
+    }
+
+    /** `takeLast(count)` without splitting a surrogate pair; an orphan low surrogate is dropped. */
+    private fun String.takeLastCodePointSafe(count: Int): String {
+        if (count <= 0) return ""
+        if (count >= length) return this
+        val start = length - count
+        val from = if (Character.isLowSurrogate(this[start]) && Character.isHighSurrogate(this[start - 1])) {
+            start + 1
+        } else {
+            start
+        }
+        return substring(from)
     }
 
     // ── shared helpers ───────────────────────────────────────────────────────────────────────────
@@ -603,23 +747,50 @@ class TurnTrimmer(private val measure: (Segment) -> Int = ::defaultSegmentMeasur
         /** A screen header keeps its visible refs, bounded so the header cannot become the new cost. */
         const val MAX_ELIDED_REFS: Int = 24
 
+        /**
+         * Task 12: the exact marker between a HARD-kept dynamic segment's head and tail. It is fixed text — never a
+         * character count — so the kept request states that a middle was removed without pricing it.
+         */
+        const val HARD_TRUNCATED_MARKER: String = "\n...[truncated]...\n"
+
+        /**
+         * Task 12: request-scoped context keeps its origin when the HARD cut shortens it. `RUNTIME_STATE` is here as
+         * well because it is request metadata, not a turn, and it uses the same cap as the rest of the tail.
+         */
+        private val HARD_DYNAMIC_ORIGINS = setOf(
+            SegmentOrigin.PERCEPTION,
+            SegmentOrigin.MEMORY_EVIDENCE,
+            SegmentOrigin.SKILL_BODY,
+            SegmentOrigin.RUNTIME_STATE,
+        )
+
+        /**
+         * Task 12: the fixed order a still-over-budget HARD frame gives whole dynamic origins up in. It is a declared
+         * order, not flow order, and each origin is removed one segment at a time (oldest/first first). `USER_INPUT`,
+         * `RUNTIME_STATE`, `RETRY` and the newest turn are deliberately absent: the cleanup may never pick them.
+         */
+        private val HARD_CLEANUP_ORDER = listOf(
+            SegmentOrigin.SKILL_BODY,
+            SegmentOrigin.MEMORY_EVIDENCE,
+            SegmentOrigin.PERCEPTION,
+        )
+
         private val REF_PATTERN = Regex("#n\\d+")
     }
 }
 
 /**
  * The fixed `+32` `ContextBudgeter` adds once on top of the per-message costs
- * (`Math.addExact(32L, message(request.instructions))`). It is part of the **shared** formula, not a
- * correction: `TurnTrimmer.total` and `ContextBudgeter.prepare` count the same terms, so including it
- * here is what makes the two agree exactly. (`ModelClientGateway.windowBytes` subtracts one more 32 as
- * a deliberate margin.)
+ * (`Math.addExact(32L, message(request.instructions))`), in token units like every other term. It is a
+ * structural part of the shared formula: `TurnTrimmer.total` adds it once and `ContextBudgeter.prepare`
+ * adds it once. (`ContextPolicy.hardLimit` is the trim window; it already reserves the policy's hard margin.)
  */
 internal const val FIXED_OVERHEAD = 32
 
 /**
- * 与 `ContextBudgeter` 同口径：UTF-8 字节 + 每条 32 的记账开销（`ContextBudgeter.message()` 用同一算式）。
+ * 与 `ContextBudgeter.message()` 同口径：TokenMeter token 单位 + 每条 32 的记账开销。
  */
-internal fun utf8BytesPlusOverhead(text: String): Int = text.toByteArray(Charsets.UTF_8).size + 32
+internal fun tokenUnitsPlusOverhead(text: String): Int = TokenMeter.estimate(text) + 32
 
 /**
  * The default per-segment price: the text cost above plus one [ImageBudget.UNITS_PER_IMAGE] for every image the
@@ -627,7 +798,7 @@ internal fun utf8BytesPlusOverhead(text: String): Int = text.toByteArray(Charset
  * [Segment.images] reference. R68: `ContextBudgeter` charges the same per image, so the two stages cannot disagree.
  */
 internal fun defaultSegmentMeasure(segment: Segment): Int {
-    var cost = utf8BytesPlusOverhead(segment.text)
+    var cost = tokenUnitsPlusOverhead(segment.text)
     cost += imageUnits(segment.images.size)
     if (segment.origin == SegmentOrigin.TOOL_ROUND) cost += imageUnits(toolRoundImageCount(segment.text))
     return cost

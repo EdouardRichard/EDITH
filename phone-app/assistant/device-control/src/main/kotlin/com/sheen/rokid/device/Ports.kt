@@ -91,6 +91,15 @@ interface AccessibilityPort {
     fun screenshot(): Screenshot?
 
     fun foreground(): Foreground
+
+    /**
+     * The package that owns the accessibility **root** window, or `null` when the channel has no answer.
+     *
+     * [foreground] is the window-state event's package (which can lag or name a popup's window); this is
+     * the active window's own root, the second witness `open` verifies a launch against (0.3 Phase 2
+     * Task 8). The default keeps every existing fake/implementation source-compatible.
+     */
+    fun rootPackage(): String? = null
 }
 
 /**

@@ -68,11 +68,18 @@ class CompressionTest {
         return ctx
     }
 
+    /**
+     * The compressor under test: the policy-derived allowances are constructor state (0.3 Task 11), so a test picks
+     * the history allowance it needs and the summary cap is one fixed, small value.
+     */
     private fun compressor(
         memory: MemoryModule? = null,
-        summarize: ((String) -> String?)? = null,
+        summarize: ((String, Int) -> String?)? = null,
         tasks: TaskScope? = null,
+        budgetTokens: Int = 3,
     ) = ContextCompressor(
+        historyBudgetTokens = budgetTokens,
+        summaryMaxTokens = SUMMARY_MAX_TOKENS,
         memory = memory,
         summarizer = summarize,
         scope = tasks,
@@ -81,7 +88,7 @@ class CompressionTest {
     @Test
     fun `a history inside the budget is not touched and starts no summary`() {
         val ctx = context("一", "二")
-        val report = compressor(summarize = { "不该调用" }).compressIfNeeded(ctx, budgetTokens = 10_000)
+        val report = compressor(summarize = { _, _ -> "不该调用" }, budgetTokens = 10_000).compressIfNeeded(ctx)
 
         assertEquals(2, ctx.size())
         assertEquals(0, report.truncated)
@@ -92,7 +99,7 @@ class CompressionTest {
     fun `truncation drops the oldest messages first`() {
         val ctx = context("最早的一句", "回答一", "第二句", "回答二", "最近一句", "回答三")
 
-        val report = compressor().compressIfNeeded(ctx, budgetTokens = 12)
+        val report = compressor(budgetTokens = 12).compressIfNeeded(ctx)
 
         assertTrue(report.truncated > 0)
         val kept = ctx.history().map { (it as ModelHistoryItem.Text).text }
@@ -105,7 +112,7 @@ class CompressionTest {
         // §4.4's first anchor: whatever the wearer just asked is the one thing the turn cannot lose.
         val ctx = context("很久以前", "回答", "刚刚这句")
 
-        compressor().compressIfNeeded(ctx, budgetTokens = 1)
+        compressor(budgetTokens = 1).compressIfNeeded(ctx)
 
         val kept = ctx.history().map { (it as ModelHistoryItem.Text).text }
         assertTrue("刚刚这句" in kept, kept.toString())
@@ -119,7 +126,7 @@ class CompressionTest {
         ctx.appendToolCall("c1", "compose_note", "{}")
         ctx.appendToolOutput("c1", "ok")
 
-        compressor().compressIfNeeded(ctx, budgetTokens = 1)
+        compressor(budgetTokens = 1).compressIfNeeded(ctx)
 
         val transcript = ctx.history()
         assertTrue(transcript.any { it is ModelHistoryItem.ToolCall }, transcript.toString())
@@ -132,7 +139,7 @@ class CompressionTest {
         val memory = memory()
         val ctx = context("值得记住的一句", "回答", "最近一句")
 
-        compressor(memory = memory).compressIfNeeded(ctx, budgetTokens = 3)
+        compressor(memory = memory).compressIfNeeded(ctx)
 
         assertTrue(memory.entries().any { it.text == "值得记住的一句" }, memory.entries().map { it.text }.toString())
     }
@@ -143,8 +150,8 @@ class CompressionTest {
         val tasks = CapturingTasks()
         val asked = mutableListOf<String>()
 
-        val report = compressor(memory = memory(), summarize = { asked += it; "（摘要）" }, tasks = tasks)
-            .compressIfNeeded(ctx, budgetTokens = 3)
+        val report = compressor(memory = memory(), summarize = { text, _ -> asked += text; "（摘要）" }, tasks = tasks)
+            .compressIfNeeded(ctx)
 
         assertEquals(true, report.summaryStarted)
         assertEquals(emptyList(), asked, "the summary must not have run on the caller's thread")
@@ -159,7 +166,7 @@ class CompressionTest {
         val ctx = context("最早的一句", "回答", "最近一句")
         val tasks = CapturingTasks()
 
-        compressor(summarize = { "（摘要）" }, tasks = tasks).compressIfNeeded(ctx, budgetTokens = 3)
+        compressor(summarize = { _, _ -> "（摘要）" }, tasks = tasks).compressIfNeeded(ctx)
 
         // Nothing about the transcript is half-written: a prompt built now is a complete one.
         assertTrue(ctx.history().isNotEmpty())
@@ -171,7 +178,7 @@ class CompressionTest {
         val ctx = context("最早的一句", "回答", "最近一句")
         val tasks = CapturingTasks()
 
-        compressor(summarize = { "（此前对话已摘要）" }, tasks = tasks).compressIfNeeded(ctx, budgetTokens = 3)
+        compressor(summarize = { _, _ -> "（此前对话已摘要）" }, tasks = tasks).compressIfNeeded(ctx)
         val afterCompression = ctx.size()
         tasks.runAll()
 
@@ -188,8 +195,8 @@ class CompressionTest {
         val ctx = context("原始的一句", "回答", "最近一句")
         val tasks = CapturingTasks()
 
-        compressor(memory = memory, summarize = { "（摘要）" }, tasks = tasks)
-            .compressIfNeeded(ctx, budgetTokens = 3)
+        compressor(memory = memory, summarize = { _, _ -> "（摘要）" }, tasks = tasks)
+            .compressIfNeeded(ctx)
         tasks.runAll()
 
         val stored = memory.entries().map { it.text }
@@ -198,11 +205,25 @@ class CompressionTest {
     }
 
     @Test
+    fun `the summary call carries the policy's output allowance`() {
+        // 0.3 design §6.4: the summary declares its own cap; it never inherits the profile's window reservation.
+        val ctx = context("最早的一句", "回答", "最近一句")
+        val tasks = CapturingTasks()
+        var askedMax: Int? = null
+
+        compressor(summarize = { _, maxOutputTokens -> askedMax = maxOutputTokens; "（摘要）" }, tasks = tasks)
+            .compressIfNeeded(ctx)
+        tasks.runAll()
+
+        assertEquals(SUMMARY_MAX_TOKENS, askedMax)
+    }
+
+    @Test
     fun `an unavailable summarizer degrades to pure truncation and reports no error`() {
         // B3's acceptance line: 云端不可用时退化为纯截断且不报错. No summarizer at all is that case.
         val ctx = context("最早的一句", "回答", "最近一句")
 
-        val report = compressor().compressIfNeeded(ctx, budgetTokens = 3)
+        val report = compressor().compressIfNeeded(ctx)
 
         assertEquals(false, report.summaryStarted)
         assertEquals("NO_SUMMARIZER", report.summaryReason)
@@ -214,7 +235,7 @@ class CompressionTest {
         val ctx = context("最早的一句", "回答", "最近一句")
         val tasks = CapturingTasks()
 
-        compressor(summarize = { error("cloud down") }, tasks = tasks).compressIfNeeded(ctx, budgetTokens = 3)
+        compressor(summarize = { _, _ -> error("cloud down") }, tasks = tasks).compressIfNeeded(ctx)
         // The throw is on the task scope, so it must not escape into the caller either.
         runCatching { tasks.runAll() }
 
@@ -226,7 +247,7 @@ class CompressionTest {
         val ctx = context("最早的一句", "回答", "最近一句")
         val tasks = CapturingTasks()
 
-        compressor(summarize = { null }, tasks = tasks).compressIfNeeded(ctx, budgetTokens = 3)
+        compressor(summarize = { _, _ -> null }, tasks = tasks).compressIfNeeded(ctx)
         val afterCompression = ctx.size()
         tasks.runAll()
 
@@ -237,7 +258,7 @@ class CompressionTest {
     fun `the report carries counts and a reason code but never text`() {
         val ctx = context("秘密正文标记", "回答", "最近一句")
 
-        val report = compressor().compressIfNeeded(ctx, budgetTokens = 3)
+        val report = compressor().compressIfNeeded(ctx)
 
         val rendered = report.toString()
         assertTrue("秘密正文标记" !in rendered, rendered)
@@ -248,7 +269,7 @@ class CompressionTest {
     fun `an empty history compresses to nothing`() {
         val ctx = ConversationContext(ContextRoute.WAKE)
 
-        val report = compressor().compressIfNeeded(ctx, budgetTokens = 10)
+        val report = compressor(budgetTokens = 10).compressIfNeeded(ctx)
 
         assertEquals(0, report.truncated)
         assertEquals(false, report.summaryStarted)
@@ -260,7 +281,7 @@ class CompressionTest {
         // overrunning it, because the prompt would then have no user turn at all.
         val ctx = context("一", "二")
 
-        compressor().compressIfNeeded(ctx, budgetTokens = 0)
+        compressor(budgetTokens = 0).compressIfNeeded(ctx)
 
         assertTrue(ctx.history().isNotEmpty(), "a compressed transcript must still say something")
     }
@@ -276,8 +297,13 @@ class CompressionTest {
         )
         val ctx = context("最早的一句", "回答", "最近一句")
 
-        val report = compressor(memory = refused).compressIfNeeded(ctx, budgetTokens = 3)
+        val report = compressor(memory = refused).compressIfNeeded(ctx)
 
         assertTrue(report.truncated > 0)
+    }
+
+    private companion object {
+        /** The policy's summary cap as this fixture models it; the production value comes from `ContextPolicy`. */
+        const val SUMMARY_MAX_TOKENS = 64
     }
 }

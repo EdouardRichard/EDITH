@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.actions.a11y
 import com.sheen.rokid.phone.storage.unavailable
 import com.sheen.rokid.phone.actions.ExecutionBackend
 import com.sheen.rokid.phone.actions.ExecutionRouter
+import com.sheen.rokid.phone.actions.device.DeviceTool
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.ActionResult
@@ -12,11 +13,14 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * T1.5 — Tool surface wiring verification.
+ * T1.5 — the accessibility backend's five tools, and the **retired** router's availability gate.
  *
- * Verifies that the five new tools (read_screen, tap, long_press, scroll, input_text) are correctly registered
- * in the accessibility backend, that old tools (tap_text, type_text) are gone, and that availability gating
- * works correctly through the ExecutionRouter.
+ * Verifies that the five tools (read_screen, tap, long_press, scroll, input_text) are correctly registered in the
+ * accessibility backend and that old tools (tap_text, type_text) are gone. The two router tests below pin
+ * `ExecutionRouter`'s historical rule (an unavailable channel's tools are hidden) for the class that still exists for
+ * those tests; since edith-0.3 Phase 4A Task 4 production no longer uses that router. The production face is
+ * `com.sheen.rokid.phone.actions.ToolSurface`, which deliberately keeps a down channel's tools advertised and refuses
+ * the call instead (A3; see `ToolFaceWiringTest`/`ToolFaceCompositionTest`).
  */
 class ToolSurfaceWiringTest {
 
@@ -142,7 +146,7 @@ class ToolSurfaceWiringTest {
         assertFalse("type_text must be removed", names.contains("type_text"))
     }
 
-    // ── Test 3: Shizuku unavailable ⇒ read_screen still available ────────────
+    // ── Test 3: Shizuku unavailable ⇒ read_screen still available (router rule) ──
 
     @Test
     fun `read_screen is available when accessibility is up regardless of shizuku`() {
@@ -167,17 +171,20 @@ class ToolSurfaceWiringTest {
         assertFalse("clear_data must NOT be advertised (shizuku down)", names.contains("clear_data"))
     }
 
-    // ── Test 4: Accessibility unavailable ⇒ none of the 5 tools advertised ───
+    // ── Test 4: Accessibility unavailable ⇒ the retired router advertises none ──
 
     @Test
-    fun `accessibility unavailable means none of the five tools are advertised`() {
+    fun `the retired router hides a down channels tools, unlike the stable production surface`() {
+        // This is ExecutionRouter's rule (the class kept for its own tests). The production `ToolSurface` deliberately
+        // does the opposite: A3 keeps the tools advertised so the schema/cached prefix cannot change mid-session, and
+        // `execute` answers `ACTION_CHANNEL_UNAVAILABLE`. `ToolFaceWiringTest` pins that production behaviour.
         val ui = FakeUi()
         val a11yBackend = backend(ui, connected = false)
         val router = ExecutionRouter(listOf(a11yBackend))
 
         val names = router.descriptors().map { it.name }.toSet()
 
-        assertTrue("no tools should be advertised", names.isEmpty())
+        assertTrue("the retired router advertises nothing while the channel is down", names.isEmpty())
     }
 
     // ── Test 5: read_screen with default filter ──────────────────────────────
@@ -306,18 +313,32 @@ class ToolSurfaceWiringTest {
             assertFalse("${d.name} reversible", d.reversible)
         }
 
-        // Risk levels
+        // Risk levels (A2: the atomic a11y writes are L1, same as the umbrella `device` tool)
         assertEquals(RiskLevel.L1, byName["read_screen"]?.risk)
-        assertEquals(RiskLevel.L2, byName["tap"]?.risk)
-        assertEquals(RiskLevel.L2, byName["long_press"]?.risk)
+        assertEquals(RiskLevel.L1, byName["tap"]?.risk)
+        assertEquals(RiskLevel.L1, byName["long_press"]?.risk)
         assertEquals(RiskLevel.L1, byName["scroll"]?.risk)
-        assertEquals(RiskLevel.L2, byName["input_text"]?.risk)
+        assertEquals(RiskLevel.L1, byName["input_text"]?.risk)
 
         // Idempotent: only scroll could be true, but spec says false for all except scroll
         assertFalse(byName["read_screen"]!!.idempotent)
         assertFalse(byName["tap"]!!.idempotent)
         assertFalse(byName["long_press"]!!.idempotent)
         assertFalse(byName["input_text"]!!.idempotent)
+    }
+
+    @Test
+    fun `tap long_press and input_text carry the same risk as the device tool`() {
+        val byName = backend(FakeUi()).descriptors().associateBy { it.name }
+        val deviceRisk = DeviceTool.DESCRIPTOR.risk
+
+        listOf("tap", "long_press", "input_text").forEach { name ->
+            assertEquals(
+                "$name must match the umbrella device tool's risk",
+                deviceRisk,
+                byName.getValue(name).risk,
+            )
+        }
     }
 
     @Test

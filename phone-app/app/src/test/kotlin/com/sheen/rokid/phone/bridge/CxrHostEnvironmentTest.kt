@@ -14,6 +14,12 @@ import com.sheen.rokid.plugin.HintDevice
 import com.sheen.rokid.plugin.HostServices
 import com.sheen.rokid.plugin.InputPort
 import com.sheen.rokid.plugin.MonotonicClock
+import com.sheen.rokid.plugin.PerceptionCoverage
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -107,14 +113,28 @@ class CxrHostEnvironmentTest {
     }
 
     @Test
+    fun aProvidedPerceptionProviderIsAdvertisedAndAnswerable() {
+        // edith-0.3 Phase 2 Task 7: the composition registers the Android perception provider. The environment's rule
+        // is unchanged - a provider that is present is advertised, and the same scope can answer it.
+        val perception = FakePerception()
+        val env = CxrHostEnvironment(clock = clock, input = input, liveOutput = { FakeHintDevice() },
+            scheduler = scheduler, providers = mapOf(Capability.Perception to perception))
+
+        assertTrue(Capability.Perception in env.availableCapabilities)
+        val services = env.services(scope(), setOf(Capability.Perception))
+        assertEquals(perception, services.require(Capability.Perception))
+    }
+
+    @Test
     fun capabilitiesThisEnvironmentCannotHonourAreNotAdvertised() {
-        // Audio, ASR, speaker, model, storage and speech all need services this environment does not provide. If any
-        // were advertised, a plugin asking for them would pass the host's check and then fail at require().
+        // Audio, ASR, speaker, model, storage, speech and perception all need services this environment does not
+        // provide. If any were advertised, a plugin asking for them would pass the host's check and then fail at
+        // require().
         val env = CxrHostEnvironment(clock = clock, input = input, liveOutput = { FakeHintDevice() },
             scheduler = scheduler)
 
         listOf(Capability.Audio, Capability.Asr, Capability.Speaker, Capability.Model, Capability.Storage,
-            Capability.SpeechOutput).forEach { capability ->
+            Capability.SpeechOutput, Capability.Perception).forEach { capability ->
             assertFalse("$capability is not wired and must not be advertised", capability in env.availableCapabilities)
         }
     }
@@ -155,6 +175,38 @@ class CxrHostEnvironmentTest {
 
         val thrown = runCatching { services.require(Capability.Model) }.exceptionOrNull()
         assertTrue("an unwired capability must not be resolvable, was $thrown", thrown != null)
+    }
+
+    private class FakePerception : PerceptionProvider {
+        private fun snapshot(): PerceptionSnapshot = PerceptionSnapshot(
+            snapshotId = "snap",
+            capturedAtEpochMillis = 0L,
+            coverage = PerceptionCoverage(
+                screen = "ok",
+                notifications = "ok",
+                media = "ok",
+                calendar = "ok",
+                acoustic = "ok",
+                clipboard = "ok",
+                vision = "ok",
+                glasses = "ok",
+                device = "ok",
+            ),
+        )
+
+        override fun beginTurn(): PerceptionSnapshot = snapshot()
+
+        override fun snapshot(
+            include: Set<PerceptionSource>,
+            filter: PerceptionFilter,
+            limit: Int?,
+        ): PerceptionSnapshot = snapshot()
+
+        override fun afterAction(): PerceptionSnapshot = snapshot()
+
+        override fun screenshot(): PerceptionScreenshotResult = PerceptionScreenshotResult.Disabled
+
+        override fun endTurn() = Unit
     }
 
     private fun scope() = ResourceScope("test-plugin", SessionId("s-1"), Generation(1))

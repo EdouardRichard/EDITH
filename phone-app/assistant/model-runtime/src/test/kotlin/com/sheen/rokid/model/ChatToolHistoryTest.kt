@@ -1,5 +1,6 @@
 package com.sheen.rokid.model
 
+import com.sheen.rokid.agent.ToolResult
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
@@ -7,6 +8,7 @@ import com.sheen.rokid.plugin.*
 import kotlinx.serialization.json.*
 import kotlin.test.Test
 import kotlin.test.assertEquals
+import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
 /**
@@ -87,6 +89,37 @@ class ChatToolHistoryTest {
         assertEquals("10:00", toolB.getValue("content").jsonPrimitive.content)
 
         assertEquals("user", messages[4].jsonObject.role(), "the current turn stays last")
+    }
+
+    @Test
+    fun `a tool result envelope reaches the tool message unchanged`() {
+        // 0.3 Phase 2.2 Task 7: the adapter consumes `ToolResult.payload` as an opaque model-facing string. It must not
+        // parse, re-serialize or prefix it; the envelope's execution and data reach the endpoint exactly as produced.
+        val envelope = ToolResult(
+            id = "call_1",
+            ok = true,
+            execution = ToolExecution(outcome = ToolOutcome.Done, accepted = true),
+            observation = null,
+            data = "notified:1",
+        ).payload
+
+        val messages = encode(
+            listOf(
+                ModelHistoryItem.Text(MessageRole.USER, "notify me"),
+                ModelHistoryItem.Text(MessageRole.ASSISTANT, "Notifying."),
+                ModelHistoryItem.ToolCall("call_1", "notify_user", """{"text":"x","channel":"screen"}"""),
+                ModelHistoryItem.ToolOutput("call_1", envelope),
+            ),
+        )
+
+        val tool = messages[2].jsonObject
+        assertEquals("tool", tool.role())
+        assertEquals("call_1", tool.getValue("tool_call_id").jsonPrimitive.content)
+        assertEquals(envelope, tool.getValue("content").jsonPrimitive.content, "the payload is forwarded byte for byte")
+        assertTrue("\"observation\":null" in envelope, "no observation is invented: $envelope")
+        assertTrue("\"accepted\":true" in envelope, "the execution facts survive: $envelope")
+        assertFalse("Failed: " in envelope, "no legacy prefix: $envelope")
+        assertFalse("Refused: " in envelope, "no legacy prefix: $envelope")
     }
 
     @Test

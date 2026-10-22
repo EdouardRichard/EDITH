@@ -351,6 +351,40 @@ class CxrWiringTest {
         }
     }
 
+    // -------------------------------------------------- 0.3 Phase 2 Task 2: the wearing fact
+
+    /** `glassesWearing` is the host's own tri-state: no event is `null`, and a lost link cannot keep an old answer. */
+    @Test
+    fun theWearingStateIsUnknownUntilAnEventAndClearedWhenTheLinkDies() {
+        Task20Rig().use { rig ->
+            assertNull("no wearing event has arrived, so there is no wearing fact", rig.root.glassesWearing())
+
+            rig.startEstablished()
+            assertNull("establishing the session is not a wearing event", rig.root.glassesWearing())
+
+            rig.root.onWearingChanged(false)
+            assertEquals(false, rig.root.glassesWearing())
+            rig.root.onWearingChanged(true)
+            assertEquals(true, rig.root.glassesWearing())
+
+            rig.host.interrupt()
+            assertNull("the dead link's last wearing fact must not survive it", rig.root.glassesWearing())
+        }
+    }
+
+    @Test
+    fun stoppingTheSessionForgetsTheWearingState() {
+        Task20Rig().use { rig ->
+            rig.startEstablished()
+            rig.root.onWearingChanged(true)
+            assertEquals(true, rig.root.glassesWearing())
+
+            rig.root.stop()
+
+            assertNull("a stopped session has no wearer to describe", rig.root.glassesWearing())
+        }
+    }
+
     private class FakeConnection : CxrConnection {
         val connectedWith = mutableListOf<Any>()
         var resultCode: Int? = null

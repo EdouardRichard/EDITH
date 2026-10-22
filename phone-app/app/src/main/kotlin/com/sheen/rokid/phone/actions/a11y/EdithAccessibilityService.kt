@@ -128,6 +128,15 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
     }
 
     /**
+     * The active window's root package — the second witness `open` verifies a launch against.
+     *
+     * Only the package string is read; no node content. A failed or missing root answers `null` (an
+     * honest "cannot tell"), never the last event's package.
+     */
+    override fun rootPackage(): String? =
+        runCatching { rootInActiveWindow?.packageName?.toString() }.getOrNull()
+
+    /**
      * Takes one JPEG screenshot through the platform's `takeScreenshot` (API 30+).
      *
      * The encoded bytes are returned to the caller only; the service never writes the payload to
@@ -160,11 +169,30 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
             val buffer = result.hardwareBuffer
             try {
                 val hardware = Bitmap.wrapHardwareBuffer(buffer, result.colorSpace) ?: return null
-                // Hardware bitmaps are read-only; copy to ARGB_8888 before the JPEG encoder runs.
+                // Hardware bitmaps are read-only; copy to ARGB_8888 before scaling or JPEG encoding.
                 val software = hardware.copy(Bitmap.Config.ARGB_8888, false) ?: return null
-                val output = ByteArrayOutputStream()
-                if (!software.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, output)) return null
-                Screenshot(output.toByteArray(), "image/jpeg", software.width, software.height)
+                try {
+                    // One shared compression step: every caller pays for the same bounded JPEG, so a
+                    // full-resolution screen never leaves this service (0.3 Phase 2.1, Task 1).
+                    val (targetWidth, targetHeight) = scaledScreenshotSize(software.width, software.height)
+                    // `0 to 0` means the sizing rule refused degenerate input; never request that bitmap.
+                    if (targetWidth <= 0 || targetHeight <= 0) return null
+                    val scaled = if (targetWidth == software.width && targetHeight == software.height) {
+                        software
+                    } else {
+                        Bitmap.createScaledBitmap(software, targetWidth, targetHeight, true)
+                    }
+                    try {
+                        val output = ByteArrayOutputStream()
+                        if (!scaled.compress(Bitmap.CompressFormat.JPEG, SCREENSHOT_JPEG_QUALITY, output)) return null
+                        Screenshot(output.toByteArray(), SCREENSHOT_MIME, scaled.width, scaled.height)
+                    } finally {
+                        // `createScaledBitmap` returns a separate bitmap; free it before the copy.
+                        if (scaled !== software) scaled.recycle()
+                    }
+                } finally {
+                    software.recycle()
+                }
             } finally {
                 buffer.close()
             }
@@ -412,6 +440,22 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
         /** The channel's own answer to "am I usable right now". */
         fun connected(): Boolean = instance != null
 
+        /**
+         * Whether an input-method window is up (0.3 Phase 2, Task 2's IME fact), or `null` when it cannot be told.
+         *
+         * A service the user has switched off is `null`, not `false`: it never looked, and a `false` would be a fact
+         * this channel does not have. While connected, the platform's window list is the answer - a
+         * `TYPE_INPUT_METHOD` window present means the IME is up, and a readable list without one means it is down.
+         * Only the window **type** is read; no window content, title or node is touched.
+         */
+        fun imeVisibleNow(): Boolean? {
+            val service = instance ?: return null
+            return runCatching {
+                val windows = service.windows ?: return@runCatching null
+                windows.any { it.type == AccessibilityWindowInfo.TYPE_INPUT_METHOD }
+            }.getOrNull()
+        }
+
         /** The live UI port, or `null` while the user has the service switched off. */
         fun ui(): AccessibilityUi? = instance
 
@@ -436,9 +480,6 @@ class EdithAccessibilityService : AccessibilityService(), AccessibilityUi, Acces
 /** Five seconds is the whole budget for one screenshot or one synthetic gesture. */
 private const val SCREENSHOT_TIMEOUT_MILLIS = 5_000L
 private const val GESTURE_TIMEOUT_MILLIS = 5_000L
-
-/** JPEG quality of the encoded screenshot. */
-private const val JPEG_QUALITY = 85
 
 /**
  * The Android implementation of [AccessibilityPlatform] (0.25 Task 9).
@@ -651,6 +692,7 @@ private class AndroidAccessibilityPlatform(
             tooltipText = tooltipText?.toString(),
             drawingOrder = drawingOrder,
             actionIds = actionList.map { it.id },
+            visibleToUser = isVisibleToUser,
             collection = collectionInfo?.let {
                 PlatformCollectionInfo(
                     rowCount = it.rowCount,

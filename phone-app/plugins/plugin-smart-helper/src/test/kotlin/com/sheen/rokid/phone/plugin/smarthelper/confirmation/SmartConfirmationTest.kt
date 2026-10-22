@@ -24,15 +24,31 @@ class SmartConfirmationTest {
     private val clock = SmartFakeClock()
     private val scheduler = SmartFakeScheduler(clock)
 
-    private class FakeChannel : ConfirmationChannel {
+    private class FakeChannel(var canServe: Boolean = true) : ConfirmationChannel {
         val presented = mutableListOf<Triple<String, String, Long>>()
+        /** 0.3 Phase 4B (B7): the action names the host channel was told, one per 4-arg `present`. */
+        val presentedTools = mutableListOf<String>()
+        /** B7: every settlement the plugin reported to the host: (request id, decision, answer channel). */
+        val settled = mutableListOf<Triple<String, String, String?>>()
         var cancelled = 0
         var failure: RuntimeException? = null
+
+        override fun available(): Boolean = canServe
 
         override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle {
             failure?.let { throw it }
             presented += Triple(requestId, summary, timeoutMillis)
             return object : CancellationHandle { override fun cancel() { cancelled++ } }
+        }
+
+        override fun present(requestId: String, summary: String, timeoutMillis: Long, tool: String): CancellationHandle {
+            presentedTools += tool
+            return present(requestId, summary, timeoutMillis)
+        }
+
+        override fun settle(requestId: String, decision: String, answerChannel: String?): Boolean {
+            settled += Triple(requestId, decision, answerChannel)
+            return true
         }
     }
 
@@ -116,6 +132,21 @@ class SmartConfirmationTest {
         assertEquals(ConfirmationOutcome(false, ConfirmationSource.TIMEOUT), ask.join())
     }
 
+    @Test fun `a sentence that merely contains an answer word is not an exact answer`() {
+        // Spec §5.4: the voice channel accepts only an exact ASR-final word and never guesses from a sentence. Every
+        // one of these is a plausible reply that must leave the question open - only the exact word may settle it.
+        val subject = confirmation(FakeChannel())
+        val ask = ask(subject)
+
+        listOf("我觉得可以允许", "不允许", "拒绝吧", "好的确认一下", "允许吗").forEach { sentence ->
+            assertFalse(subject.onTranscript(revision(sentence)), "'$sentence' is not an exact answer")
+        }
+        assertNull(ask.result, "an inexact phrase must leave the question pending")
+
+        assertTrue(subject.onTranscript(revision(" 允许 ")), "the exact word still settles it")
+        assertEquals(ConfirmationOutcome(true, ConfirmationSource.VOICE), ask.join())
+    }
+
     @Test fun `the segment that carried the command cannot answer its own question`() {
         val subject = confirmation(FakeChannel())
         subject.excludeSegment("asr-1")
@@ -166,6 +197,39 @@ class SmartConfirmationTest {
         assertEquals(ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE),
             subject.request("c1", "卸载探针 App"))
         assertEquals(0, subject.pendingCount, "an unasked question must not stay armed")
+    }
+
+    // ------------------- 0.3 Phase 4B (B4): an unavailable surface is refused at once, not after the window
+
+    @Test fun `a channel that reports itself unavailable makes the plugin unavailable at once`() {
+        val channel = FakeChannel().apply { canServe = false }
+        val subject = confirmation(channel)
+
+        assertFalse(subject.available(), "the plugin's availability must delegate to the host channel")
+        assertFalse(subject.canAsk, "an attached but unusable channel is not somebody to ask")
+        val startedNanos = System.nanoTime()
+        val outcome = subject.request("c1", "卸载探针 App")
+        val elapsedMillis = (System.nanoTime() - startedNanos) / 1_000_000
+
+        assertEquals(ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE), outcome)
+        assertTrue(channel.presented.isEmpty(), "an unavailable channel must never be asked to present")
+        assertEquals(0, subject.pendingCount, "nothing may stay armed behind an immediate refusal")
+        assertTrue(elapsedMillis < 1_000, "the refusal must not wait for the 120 s window, waited ${elapsedMillis}ms")
+    }
+
+    @Test fun `availability follows the channel attached at activation`() {
+        val subject = SmartConfirmation(channel = null, gate = ConfirmationGate(clock, scheduler))
+        assertFalse(subject.available(), "a plugin nobody has attached a host channel to cannot ask")
+        assertFalse(subject.canAsk)
+
+        val channel = FakeChannel()
+        subject.attach(channel)
+        assertTrue(subject.available(), "the attached channel can present, so the plugin can ask")
+        assertTrue(subject.canAsk)
+
+        channel.canServe = false
+        assertFalse(subject.available(), "the surface check is live, not cached at attach time")
+        assertFalse(subject.canAsk)
     }
 
     @Test fun `a channel attached at activation can present a question the plugin was built without`() {
@@ -249,5 +313,67 @@ class SmartConfirmationTest {
         val next = ask(subject, requestId = "c2")
         assertTrue(subject.onConfirmationResult(tap("c2", true)))
         assertEquals(ConfirmationOutcome(true, ConfirmationSource.PHONE), next.join())
+    }
+
+    // ------------------------- 0.3 Phase 4B (B7): the count-only telemetry's two plugin-owned inputs
+
+    @Test fun `the action name travels with the question to the host channel`() {
+        val channel = FakeChannel()
+        val subject = confirmation(channel)
+        val worker = thread(name = "confirmation-tool-test") {
+            subject.request("c1", "卸载探针 App", "app.uninstall")
+        }
+        Thread.sleep(20)
+
+        assertTrue(subject.onConfirmationResult(tap("c1", true)))
+        worker.join(2_000)
+
+        assertEquals(
+            listOf("app.uninstall"),
+            channel.presentedTools,
+            "the host needs the wire name to count a confirmation per tool; it is never the summary",
+        )
+    }
+
+    @Test fun `the plugin reports the decision it owns and the voice answer channel to the host`() {
+        // A phone tap: the host's own presenter already recorded it, so this report carries no answer channel.
+        val tapChannel = FakeChannel()
+        val tapSubject = confirmation(tapChannel)
+        val tapAsk = ask(tapSubject)
+        assertTrue(tapSubject.onConfirmationResult(tap("c1", true)))
+        assertEquals(ConfirmationOutcome(true, ConfirmationSource.PHONE), tapAsk.join())
+        assertEquals(listOf(Triple("c1", "allow", null as String?)), tapChannel.settled)
+
+        // A voice phrase: the one answer channel that never presents the question, so the plugin must name it.
+        val voiceChannel = FakeChannel()
+        val voiceSubject = confirmation(voiceChannel)
+        val voiceAsk = ask(voiceSubject)
+        assertTrue(voiceSubject.onTranscript(revision("确认")))
+        assertEquals(ConfirmationOutcome(true, ConfirmationSource.VOICE), voiceAsk.join())
+        assertEquals(listOf<Triple<String, String, String?>>(Triple("c1", "allow", "voice")), voiceChannel.settled)
+
+        // Silence: the gate owns the timeout, so the host is told `timeout` rather than inferring it from its timer.
+        val timeoutChannel = FakeChannel()
+        val timeoutSubject = confirmation(timeoutChannel)
+        val timeoutAsk = ask(timeoutSubject)
+        clock.advance(11_000_000_000L); scheduler.runDue()
+        assertEquals(ConfirmationOutcome(false, ConfirmationSource.TIMEOUT), timeoutAsk.join())
+        assertEquals(listOf(Triple("c1", "timeout", null as String?)), timeoutChannel.settled)
+
+        // A denial is a `deny`, and a channel that cannot present is `unavailable` - never a silence that looks like
+        // consent.
+        val denyChannel = FakeChannel()
+        val denySubject = confirmation(denyChannel)
+        val denyAsk = ask(denySubject)
+        assertTrue(denySubject.onConfirmationResult(tap("c1", false)))
+        assertEquals(ConfirmationOutcome(false, ConfirmationSource.PHONE), denyAsk.join())
+        assertEquals(listOf(Triple("c1", "deny", null as String?)), denyChannel.settled)
+
+        val unavailableChannel = FakeChannel().apply { failure = RuntimeException("no display") }
+        assertEquals(
+            ConfirmationOutcome(false, ConfirmationSource.UNAVAILABLE),
+            confirmation(unavailableChannel).request("c9", "卸载探针 App"),
+        )
+        assertEquals(listOf(Triple("c9", "unavailable", null as String?)), unavailableChannel.settled)
     }
 }

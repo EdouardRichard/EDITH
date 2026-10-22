@@ -7,7 +7,7 @@ import com.sheen.rokid.plugin.InputPart
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -118,7 +118,7 @@ class LoopGuardsWiringTest {
         val rig = SmartTestRig()
         rig.activate()
         rig.model.onRequest = { request, listener ->
-            if (request.tools.any { it.name == SmartPrompts.PROPOSE_HINT.name }) {
+            if (request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }) {
                 streamText(request, listener, "接下来我会先观察屏幕，然后再提醒。")
             } else {
                 streamText(request, listener, "好。")
@@ -130,16 +130,16 @@ class LoopGuardsWiringTest {
         awaitProactive(rig)
 
         val proactiveRequests = rig.model.requests.filter { request ->
-            request.tools.any { it.name == SmartPrompts.PROPOSE_HINT.name }
+            request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }
         }
-        assertEquals(1, proactiveRequests.size, "PROACTIVE is one request; there is no AgentLoop to nudge")
+        assertEquals(1, proactiveRequests.size, "PROACTIVE is one request; the hint loop may not nudge a plan")
         assertTrue(rig.output.hints.isEmpty(), "a plan without the propose_hint call is silence, not a hint")
     }
 
     private fun awaitProactive(rig: SmartTestRig, millis: Long = 2_000) {
         val deadline = System.nanoTime() + millis * 1_000_000
         while (rig.model.requests.none { request ->
-                request.tools.any { it.name == SmartPrompts.PROPOSE_HINT.name }
+                request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }
             } && System.nanoTime() < deadline
         ) {
             Thread.sleep(5)

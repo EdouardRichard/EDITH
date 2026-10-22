@@ -1,12 +1,15 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemorySource
-import com.sheen.rokid.phone.plugin.smarthelper.scene.SmartPrompts
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
+import com.sheen.rokid.phone.plugin.smarthelper.scene.ProactiveHintSpec
 import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.memory.MemoryKind
 
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.SegmentOrigin
 import com.sheen.rokid.agent.SummaryBoundary
+import com.sheen.rokid.agent.TokenMeter
 import com.sheen.rokid.contracts.AcousticEvent
 import com.sheen.rokid.contracts.AcousticLabel
 import com.sheen.rokid.contracts.TranscriptEvent
@@ -44,12 +47,24 @@ class StoreSessionWiringTest {
     private fun stores(): Map<ContextRoute, ConversationStore> =
         ContextRoute.entries.associateWith { ConversationStore() }
 
-    /** An activated production-shaped rig whose two route stores are `stores`. */
+    /**
+     * An activated production-shaped rig whose two route stores are `stores`.
+     *
+     * The wide window keeps the 24-tool system prompt (0.3 Phase 4A Task 6) out of these content assertions: a
+     * 4k-token fixture that just fitted the old six-tool prompt would otherwise let the trimmer drop the memory or a
+     * tool round the test is about. Tests that need a budget edge override `rig.profile` explicitly.
+     */
     private fun rig(
         stores: Map<ContextRoute, ConversationStore> = stores(),
         compressor: ContextCompressor? = null,
         overrides: Map<Capability, Any> = mapOf(Capability.Storage to SmartFakeStorage()),
     ): SmartTestRig = SmartTestRig(conversationStores = stores, compressor = compressor).also {
+        it.profile = smartProfile(
+            usableWindowTokens = 32_000,
+            inputBudgetTokens = 16_000,
+            maxOutputTokens = 2_000,
+            safetyTokens = 1_000,
+        )
         it.activate(overrides = overrides)
         it.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
     }
@@ -92,7 +107,7 @@ class StoreSessionWiringTest {
         val stores = stores()
         val rig = rig(stores)
         rig.model.onRequest = { request, listener ->
-            if (request.tools.any { it.name == SmartPrompts.PROPOSE_HINT.name }) {
+            if (request.tools.any { it.name == ProactiveHintSpec.PROPOSE_HINT.name }) {
                 listener(smartToolCall("c1", "propose_hint", """{"text":"主动提示"}""", requestId = request.requestId))
                 listener(ModelStreamEvent.Terminal(request.requestId, ModelEnd.COMPLETED, null, null))
             } else {
@@ -119,11 +134,15 @@ class StoreSessionWiringTest {
         )
     }
 
+    /** A manager with a plan and the fixture profile's policy; the store path never writes its transcript. */
+    private fun manager(): ContextManager =
+        ContextManager(policy = smartContextPolicy(), promptPlan = smartPromptPlan("SYSTEM"))
+
     @Test
     fun `with no injected stores the plugin keeps the legacy transcript`() {
         // Regression: with no store the Phase B behaviour is unchanged — the `ContextManager` transcript is what the
         // session records into, and no frame is assembled.
-        val contexts = ContextManager()
+        val contexts = manager()
         val rig = SmartTestRig(contextForTurn = contexts)
         rig.activate(overrides = mapOf(Capability.Storage to SmartFakeStorage()))
         rig.model.onRequest = { request, listener -> streamText(request, listener, "好。") }
@@ -215,26 +234,48 @@ class StoreSessionWiringTest {
 
         assertEquals(2, rig.model.requests.size, "the tool round must make a second model request")
         val first = rig.model.requests[0]
-        assertEquals(listOf("香菜"), first.input.filterIsInstance<InputPart.Text>().map { it.text })
+        // 0.3 Task 10 (spec §5.1): memory rides the request **input** ahead of the wearer's turn; it is no longer
+        // folded into the first history message. The input is one joined text — the dynamic tail, then the utterance.
+        val firstInput = first.input.filterIsInstance<InputPart.Text>().map { it.text }
+        assertEquals(1, firstInput.size, "the request carries one input message: ${first.input}")
+        assertTrue(
+            firstInput.single().contains("reference_context") && firstInput.single().contains("我不吃香菜"),
+            "the retrieved memory must ride the input tail: ${firstInput.single()}",
+        )
+        assertTrue(
+            firstInput.single().endsWith("香菜"),
+            "the wearer's utterance must stay last in the input: ${firstInput.single()}",
+        )
         assertTrue(
             first.history.none { it is ModelHistoryItem.ToolOutput },
             "the opening request is issued before any tool has run: ${first.history}",
         )
-        val firstHead = first.history.firstOrNull()
-        assertTrue(
-            firstHead is ModelHistoryItem.Text && firstHead.role == MessageRole.USER &&
-                firstHead.text.contains("reference_context") && firstHead.text.contains("旧问题"),
-            "the opening request must carry the session and the memory too: ${first.history}",
+        // The cacheable history is the transcript verbatim: it opens on the oldest surviving user turn, and the
+        // request-scoped memory must never be folded into it (that is what would rewrite the prefix every turn).
+        val firstHead = first.history.first() as ModelHistoryItem.Text
+        assertEquals("旧问题", firstHead.text, "history[0] must be the oldest transcript user turn: ${first.history}")
+        assertFalse(
+            firstHead.text.contains("reference_context"),
+            "memory must not be folded into history[0] any more: ${first.history}",
+        )
+        assertEquals(
+            listOf("旧问题", "旧回答"),
+            first.history.filterIsInstance<ModelHistoryItem.Text>().map { it.text },
+            "the opening request must carry the session transcript",
         )
 
         val second = rig.model.requests[1]
         // 0.25 Task 26 (R140): the transcript already carries this turn's utterance, so the frame's one `USER_INPUT`
-        // is the fixed loop-internal cue — not the question again. The gateway maps everything before it into the
-        // history, so the continuation still carries the utterance exactly once, and the tool output stays last.
-        assertEquals(
-            listOf(CONTINUE_AFTER_TOOL),
-            second.input.filterIsInstance<InputPart.Text>().map { it.text },
-            "the continuation must not repeat this turn's utterance as the request input: ${second.input}",
+        // is the fixed loop-internal cue — not the question again. The memory tail rides ahead of that cue.
+        val secondInput = second.input.filterIsInstance<InputPart.Text>().map { it.text }
+        assertEquals(1, secondInput.size, "the continuation carries one input message: ${second.input}")
+        assertTrue(
+            secondInput.single().contains("reference_context") && secondInput.single().contains("我不吃香菜"),
+            "request 2 must still carry the retrieved memory on the input tail: ${secondInput.single()}",
+        )
+        assertTrue(
+            secondInput.single().endsWith(CONTINUE_AFTER_TOOL),
+            "the continuation's input must be the fixed cue after the dynamic tail: ${secondInput.single()}",
         )
         assertEquals(
             1,
@@ -247,20 +288,20 @@ class StoreSessionWiringTest {
             second.history.lastOrNull() is ModelHistoryItem.ToolOutput,
             "the tool output must stay last in the transcript: ${second.history}",
         )
-        val head = second.history.firstOrNull()
-        assertTrue(
-            head is ModelHistoryItem.Text && head.role == MessageRole.USER && head.text.contains("reference_context"),
-            "request 2 must still carry the retrieved memory: ${second.history}",
+        val head = second.history.first() as ModelHistoryItem.Text
+        assertEquals("旧问题", head.text, "request 2's history must open on the transcript, not on memory: ${second.history}")
+        assertFalse(
+            head.text.contains("reference_context"),
+            "request 2 must not fold the memory into history[0] either: ${second.history}",
         )
-        val headText = (head as ModelHistoryItem.Text).text
-        assertTrue(headText.contains("旧问题"), "request 2 must still carry the earlier session turn: $headText")
-        assertTrue(headText.contains("我不吃香菜"), "request 2 must carry the memory content: $headText")
         assertTrue(
             second.history.filterIsInstance<ModelHistoryItem.Text>().map { it.text }.any { it == "旧回答" },
             "request 2 must still carry the earlier assistant turn: ${second.history}",
         )
         assertTrue(
-            second.history.any { it is ModelHistoryItem.ToolOutput && it.output == "notified:1" },
+            second.history.any {
+                it is ModelHistoryItem.ToolOutput && it.output == pureToolOutput("notified:1")
+            },
             "request 2 must carry this turn's tool round: ${second.history}",
         )
         assertTrue(
@@ -271,7 +312,10 @@ class StoreSessionWiringTest {
             acceptableWireHistory(second.history),
             "the continuation must stay a shape the send-time budgeter accepts: ${second.history}",
         )
-        assertTrue(second.instructions.contains(SmartPrompts.MEMORY_POLICY), "the fixed memory policy rides along")
+        assertTrue(
+            second.instructions.contains("记忆策略"),
+            "the catalog plan's memory-policy section rides along: ${second.instructions}",
+        )
         // Important 2: the count line must report the store's own session, not the manager the store path never writes
         // (which holds only this utterance, so the line used to read `history=1` however many turns the store held).
         assertTrue(
@@ -455,14 +499,14 @@ class StoreSessionWiringTest {
      * already carries this turn's two halves when `compressStore` is entered, then ③ (memory write), ④ (transcript
      * record) and ⑤ (compression) ran in that order.
      */
-    private class OrderWatchingStoreCompressor(private val memory: MemoryLog) : ContextCompressor() {
+    private class OrderWatchingStoreCompressor(private val memory: MemoryLog) :
+        ContextCompressor(historyBudgetTokens = 3, summaryMaxTokens = 64) {
         val memoryAtCompression = mutableListOf<List<String>>()
         val storeAtCompression = mutableListOf<List<String>>()
         var calls = 0
 
         override fun compressStore(
             store: ConversationStore,
-            shareTokens: Int,
             compressionOwed: Boolean,
         ): CompressionReport {
             calls++
@@ -495,12 +539,11 @@ class StoreSessionWiringTest {
     // ------------------------------------------------------------ the ③ gate, both directions
 
     /** Records the caller's half of the ③ gate — what the plugin decided, not what compression then did. */
-    private class GateWatchingCompressor : ContextCompressor() {
+    private class GateWatchingCompressor : ContextCompressor(historyBudgetTokens = 3, summaryMaxTokens = 64) {
         val owedAtEntry = mutableListOf<Boolean>()
 
         override fun compressStore(
             store: ConversationStore,
-            shareTokens: Int,
             compressionOwed: Boolean,
         ): CompressionReport {
             owedAtEntry += compressionOwed
@@ -508,17 +551,25 @@ class StoreSessionWiringTest {
         }
     }
 
+    /** The fixed utterance the tiny-window helpers measure against. */
+    private val tinyInput = "现在几点"
+
     /**
-     * A profile whose frame window (32 bytes) fits nothing at all: the system slot alone overruns it, so the trimmer
-     * reports `compressionOwed = true` on every turn. Whether a **whole turn was dropped** is then the only variable,
-     * which is exactly the conjunction the ③ gate is.
+     * A profile whose **send-time hard limit** (`hardInputLimit - hardMargin`) is below the fixed prompt, so the
+     * trimmer reports `compressionOwed = true` on every turn, while the fixed prompt itself still fits the hard input
+     * (otherwise the gateway refuses with `PROMPT_EXCEEDS_BUDGET` before any trim). Whether a **whole turn was dropped**
+     * is then the only variable, which is exactly the conjunction the ③ gate is.
      */
-    private fun tinyWindowProfile(): ModelProfile = smartProfile().copy(
-        usableWindowTokens = 1_000,
-        inputBudgetTokens = 64,
-        maxOutputTokens = 100,
-        safetyTokens = 100,
-    )
+    private fun tinyWindowProfile(): ModelProfile {
+        val system = PromptCatalog.plan(PromptRoute.WAKE, null).systemText
+        val fixedPrompt = 32 + measure(system) + measure(tinyInput)
+        return smartProfile().copy(
+            usableWindowTokens = fixedPrompt + 10 + 1_000 + 100,
+            inputBudgetTokens = fixedPrompt + 10,
+            maxOutputTokens = 1_000,
+            safetyTokens = 100,
+        )
+    }
 
     @Test
     fun `the store gate opens only when a turn was dropped and compression is still owed`() {
@@ -540,8 +591,10 @@ class StoreSessionWiringTest {
             "cut ① dropped a whole turn and the frame is still over budget, so ③ is owed",
         )
         assertTrue(
-            lines.contains("P3_CONTEXT trim route=WAKE droppedTurns=1 compressionOwed=true"),
-            "the trim counts must be logged as two numbers: $lines",
+            lines.contains(
+                "P3_CONTEXT trim route=WAKE droppedTurns=1 compressionOwed=true truncated=- dropped=-",
+            ),
+            "the trim counts and origin lists must be logged: $lines",
         )
     }
 
@@ -561,29 +614,37 @@ class StoreSessionWiringTest {
             "no turn was dropped, so the caller's half of the ③ gate must be false",
         )
         assertTrue(
-            lines.contains("P3_CONTEXT trim route=WAKE droppedTurns=0 compressionOwed=true"),
-            "the two counts must be logged even when cut ① did nothing: $lines",
+            lines.contains(
+                "P3_CONTEXT trim route=WAKE droppedTurns=0 compressionOwed=true truncated=- dropped=-",
+            ),
+            "the counts and origin lists must be logged even when cut ① did nothing: $lines",
         )
     }
 
     // ------------------------------------------------------------ the lone one-item user group
 
-    /** `TurnTrimmer.total`'s own byte unit (`UTF-8 bytes + 32`), so the window below is exact. */
-    private fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+    /** `TurnTrimmer.total`'s own token unit (`TokenMeter.estimate + 32`), so the window below is exact. */
+    private fun measure(text: String) = TokenMeter.estimate(text) + 32
 
     /**
-     * A profile whose window fits the system slot, the surviving pending user turn and this turn's input — with 8
-     * bytes to spare — so cut ① evicts the older whole turn and stops there. The system slot is composed exactly as
-     * `buildFrame` composes it.
+     * A profile whose window fits the system slot, the surviving pending user turn and this turn's input — with a
+     * small margin — so cut ① evicts the older whole turn and stops there. The window is derived through
+     * `ContextPolicy.hardLimit` (`hardInputLimit - hardMargin`), not the old raw profile remainder: the hard limit must
+     * clear the survivors, because otherwise cut ① would drop the pending user turn too and the frame would become a
+     * sendable empty-history request. The system slot is composed exactly as `buildFrame` composes it.
      */
     private fun windowSizedFor(vararg survivors: String): ModelProfile {
-        val system = SmartPrompts.instructions() + "\n" + SmartPrompts.MEMORY_POLICY
+        // 0.3 Task 12: the system slot is the session's profile-less WAKE catalog plan (this rig supplies no device
+        // provider and no SKILL directory).
+        val system = PromptCatalog.plan(PromptRoute.WAKE, null).systemText
         val total = 32 + measure(system) + survivors.sumOf { measure(it) }
-        val window = total + 8
-        val inputBudget = window + 32
+        val desiredHardLimit = total + 8
+        // `hardLimit = hardInput - max(1, floor(hardInput * 0.10))`; find the first hard input that keeps the survivors.
+        var hardInput = desiredHardLimit
+        while (hardInput - maxOf(1, kotlin.math.floor(hardInput * 0.10).toInt()) < desiredHardLimit) hardInput++
         return smartProfile().copy(
-            usableWindowTokens = inputBudget + 1_000 + 100,
-            inputBudgetTokens = inputBudget,
+            usableWindowTokens = hardInput + 1_000 + 100,
+            inputBudgetTokens = hardInput,
             maxOutputTokens = 1_000,
             safetyTokens = 100,
         )

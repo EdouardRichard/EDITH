@@ -240,6 +240,7 @@ internal fun scriptedToolCallArgs(
     notifyText: String? = null,
     channel: String? = null,
     appName: String? = null,
+    command: String? = null,
 ): String = buildJsonObject {
     packageName?.let { put("package", it) }
     permission?.let { put("permission", it) }
@@ -248,4 +249,5 @@ internal fun scriptedToolCallArgs(
     notifyText?.let { put("text", it) }
     channel?.let { put("channel", it) }
     appName?.let { put("name", it) }
+    command?.let { put("command", it) }
 }.toString()

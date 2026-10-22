@@ -15,6 +15,10 @@ import kotlin.test.assertIs
  * `DeviceTool.screenshot` answers an `ImageRef`, `ToolRegistry` projects the `ActionResult`, and this loop must put it
  * on the `ModelHistoryItem.ToolOutput` of the tool round it feeds back. Without that item the gateway and the plugin's
  * `TOOL_ROUND` segment have nothing to carry, which is the final review's Critical C1.
+ *
+ * Task 8 fix review: the image lives **in this run's model request only**. The stored transcript is perception content
+ * by the same C2 rule as every observation, so the artifact reference is redacted at `finish` - a successful image has no
+ * persistent store path. The in-run continuation still carries it (the assertion below is on the gateway request).
  */
 class ToolImageHistoryTest {
 
@@ -38,7 +42,7 @@ class ToolImageHistoryTest {
     )
 
     @Test
-    fun `a tool result image reaches the loop transcript and the next gateway turn`() {
+    fun `a tool result image reaches the next gateway turn but never the stored transcript`() {
         val executor = executorOf("device")
         executor.outcome = { _, _ ->
             ActionResult(ActionOutcome.Done, "captured", images = listOf(image))
@@ -52,14 +56,16 @@ class ToolImageHistoryTest {
 
         val run = loop(gateway, executor).run(request())
 
-        val carried = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
-        assertEquals("c1", carried.callId)
-        assertEquals(listOf(image), carried.images, "the loop must not drop the image on the way to the caller")
-
-        val continuation = gateway.requests.single { it.history.any { item -> item is ModelHistoryItem.ToolOutput } }
+        val continuation = gateway.requests.single { turn -> turn.history.any { it is ModelHistoryItem.ToolOutput } }
         val sent = assertIs<ModelHistoryItem.ToolOutput>(continuation.history.last())
         assertEquals(listOf(image), sent.images, "the next request's history must carry the tool image: $sent")
-        assertEquals(1, run.metrics.images, "P3_METRIC.images counts the artifact the request now carries (R78)")
+        assertEquals(1, run.metrics.images, "P3_METRIC.images counts the artifact this run's tool call produced (R78)")
+
+        // Task 8 fix review: the stored transcript is not a second image carrier. The model saw the picture and the
+        // call remains attributable by id; the artifact reference itself does not outlive the run.
+        val stored = run.transcript.filterIsInstance<ModelHistoryItem.ToolOutput>().single()
+        assertEquals("c1", stored.callId)
+        assertEquals(emptyList(), stored.images, "an image may never be stored, whatever the outcome: ${stored.output}")
     }
 
     @Test

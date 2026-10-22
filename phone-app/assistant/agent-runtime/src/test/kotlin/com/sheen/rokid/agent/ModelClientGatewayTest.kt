@@ -8,6 +8,7 @@ import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.ToolSpec
@@ -27,6 +28,7 @@ import kotlin.concurrent.thread
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertNotEquals
 import kotlin.test.assertTrue
 
 /**
@@ -65,9 +67,9 @@ class ModelClientGatewayTest {
         tools: List<ToolSpec> = emptyList(),
         deadlineNanos: Long = 1_000_000_000L,
         // Phase 5 seams, both appended with defaults so every existing positional call site keeps its meaning:
-        // `Int.MAX_VALUE` is the "no override" sentinel the gateway reads as "trim to `windowBytes(profile)`, and
+        // `Int.MAX_VALUE` is the "no override" sentinel the gateway reads as "trim to the policy's hard limit", and
         // `frame = null` is exactly today's `split(history)` behaviour. `frame` is the last parameter.
-        limitBytes: Int = Int.MAX_VALUE,
+        limitTokens: Int = Int.MAX_VALUE,
         frame: RequestFrame? = null,
         // 0.24 S4 Task 16: the streaming observer, appended so every positional call site keeps its meaning.
         onTextDelta: ((String) -> Unit)? = null,
@@ -75,7 +77,7 @@ class ModelClientGatewayTest {
         // pre-Task-27 construction and keeps every existing call site unchanged.
         userUtterance: String? = null,
     ) = GatewayTurn(
-        turnId, profileId, instructions, history, tools, deadlineNanos, limitBytes, frame, onTextDelta, userUtterance,
+        turnId, profileId, instructions, history, tools, deadlineNanos, limitTokens, frame, onTextDelta, userUtterance,
     )
 
     private fun scripted(vararg events: ModelStreamEvent) =
@@ -88,6 +90,21 @@ class ModelClientGatewayTest {
      */
     private fun terminalClient(requestId: String = "turn-7") =
         scripted(ModelStreamEvent.Terminal(requestId, ModelEnd.COMPLETED, null, null))
+
+    /** A frame whose system slot is one instruction segment; the dynamic-tail tests only care about the flow. */
+    private fun frame(vararg flow: Segment) =
+        RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow.toList(), emptyList())
+
+    /** Runs one real gateway turn over [frame] and answers the request it actually sent. */
+    private fun captureRequest(frame: RequestFrame, limitTokens: Int = 1_000_000): ModelRequest {
+        val client = terminalClient()
+        gateway(client).turn(turn(frame = frame, limitTokens = limitTokens))
+        return client.requests.single()
+    }
+
+    /** The text the adapter will render in the request tail (audio parts excluded: these frames carry none). */
+    private fun inputText(request: ModelRequest): String =
+        request.input.filterIsInstance<InputPart.Text>().joinToString("\n") { it.text }
 
     // ------------------------------------------------------------ 1. profile lookup
 
@@ -102,6 +119,53 @@ class ModelClientGatewayTest {
         assertEquals("", reply.text)
         assertTrue(reply.toolCalls.isEmpty())
         assertTrue(client.requests.isEmpty(), "a missing profile must be refused before any transport call")
+    }
+
+    @Test fun `a profile too small for a policy fails closed as PROFILE_TOO_SMALL`() {
+        // Before the final-fix wave `ContextPolicy.from` was swallowed with `getOrNull()`, the session had no manager
+        // and the turn was reported as `PROFILE_MISSING` even though the profile existed. The code must name the real
+        // condition and still refuse before the transport.
+        val tooSmall = profile.copy(inputBudgetTokens = 1, maxOutputTokens = 1, safetyTokens = 1)
+        lookup = { tooSmall }
+        val client = FakeModelClient()
+
+        val reply = gateway(client).turn(turn())
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals(ContextPolicy.PROFILE_TOO_SMALL, reply.safeCode)
+        assertTrue(client.requests.isEmpty(), "an unusable profile must be refused before any transport call")
+    }
+
+    @Test fun `an activation policy failure is reported with its own code`() {
+        // The plugin computes the policy while activating and hands the typed failure to every turn; the gateway must
+        // relay that code instead of re-deriving a generic one.
+        val client = FakeModelClient()
+
+        val reply = gateway(client).turn(turn().copy(contextFailure = ContextPolicy.PROFILE_INVALID))
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals(ContextPolicy.PROFILE_INVALID, reply.safeCode)
+        assertTrue(client.requests.isEmpty(), "a fail-closed session must never reach the transport")
+    }
+
+    @Test fun `a fixed prompt that cannot fit the hard input is PROMPT_EXCEEDS_BUDGET`() {
+        // The whole static prompt + this turn's input alone exceed the profile's hard input, so no history trim can
+        // make the request sendable. The turn must be refused with the dedicated code rather than going out and
+        // burning the overflow recoveries on an impossible shape.
+        val small = profile.copy(inputBudgetTokens = 100, maxOutputTokens = 1, safetyTokens = 1)
+        lookup = { small }
+        val frame = RequestFrame(
+            listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "i".repeat(400))),
+            listOf(Segment(SegmentOrigin.USER_INPUT, true, "你好")),
+            emptyList(),
+        )
+        val client = FakeModelClient()
+
+        val reply = gateway(client).turn(turn(profileId = small.id, frame = frame))
+
+        assertEquals(ModelEnd.FAILED, reply.terminal)
+        assertEquals(ContextPolicy.PROMPT_EXCEEDS_BUDGET, reply.safeCode)
+        assertTrue(client.requests.isEmpty(), "the impossible prompt must never reach the transport")
     }
 
     // ------------------------------------------------------------ 2. the input/history split
@@ -552,7 +616,7 @@ class ModelClientGatewayTest {
         }
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 200))
+        gateway(client).turn(turn(frame = frame, limitTokens = 200))
 
         val sent = client.requests.single()
         assertEquals(listOf("本轮到底几点了"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
@@ -569,7 +633,7 @@ class ModelClientGatewayTest {
         )
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+        gateway(client).turn(turn(frame = frame, limitTokens = 1_000_000))
 
         val sent = client.requests.single()
         assertEquals(0, sent.history.size, "runtime state is not a conversation turn")
@@ -599,7 +663,7 @@ class ModelClientGatewayTest {
         )
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+        gateway(client).turn(turn(frame = frame, limitTokens = 1_000_000))
 
         val sent = client.requests.single()
         val head = sent.history.first() as ModelHistoryItem.Text
@@ -625,7 +689,7 @@ class ModelClientGatewayTest {
         )
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+        gateway(client).turn(turn(frame = frame, limitTokens = 1_000_000))
 
         // The flow has no transcript user turn to carry the context, so it rides the request input itself (a
         // history holding only the leading context is a lone user group, which the budgeter rejects).
@@ -633,6 +697,162 @@ class ModelClientGatewayTest {
         assertTrue(input.contains(bounded), input)
         assertEquals(1, input.split(SummaryBoundary.OPEN).size - 1, "no second boundary: $input")
         assertEquals(1, input.split(SummaryBoundary.CLOSE).size - 1, "no second boundary: $input")
+    }
+
+    // ------------------------------------------------------------ 7c. the dynamic tail (0.3 Task 10)
+
+    @Test fun `memory and perception do not rewrite the first history message`() {
+        // 0.3 design §5.1/§5.3: memory evidence and perception are request-scoped tail context. They must not be folded
+        // into `history[0]` (that would rewrite the cacheable prefix on every perception tick) and must instead ride
+        // the request input ahead of the wearer's utterance.
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "memory: likes tea"),
+                Segment(SegmentOrigin.PERCEPTION, false, "foreground=com.android.settings"),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        assertEquals("old question", (request.history.first() as ModelHistoryItem.Text).text)
+        assertTrue(
+            request.history.none { it is ModelHistoryItem.Text && "memory: likes tea" in it.text },
+            "memory must never enter the history: ${request.history}",
+        )
+        assertTrue(
+            request.history.none { it is ModelHistoryItem.Text && "foreground=" in it.text },
+            "perception must never enter the history: ${request.history}",
+        )
+        val input = inputText(request)
+        assertTrue("memory: likes tea" in input && "foreground=com.android.settings" in input && "now" in input, input)
+    }
+
+    @Test fun `skill body is not in the system slot or history`() {
+        // Task 9's SKILL_BODY is dynamic, request-scoped content: a `load_skill` pull changes only the request tail, so
+        // the system slot and every history item remain byte-identical. The transcript head is deliberate — without
+        // it the old head-folding path would already place the body in the input (the empty-history branch), so the
+        // test would pin nothing.
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.SKILL_BODY, true, "skill body"),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        assertFalse("skill body" in request.instructions, request.instructions)
+        assertTrue(request.history.isEmpty() || request.history.none { it is ModelHistoryItem.Text && "skill body" in it.text })
+        assertTrue(request.input.filterIsInstance<InputPart.Text>().any { "skill body" in it.text })
+    }
+
+    @Test fun `summary remains the only head context`() {
+        // The summary is the one accepted prefix rewrite (§5.1): it stays folded into the head user turn while the
+        // dynamic origins move to the tail.
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.SUMMARY, false, "summary"),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        assertTrue((request.history.first() as ModelHistoryItem.Text).text.contains("summary"))
+    }
+
+    @Test fun `the dynamic tail reaches the request input in flow order before the utterance`() {
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "memory text"),
+                Segment(SegmentOrigin.PERCEPTION, false, "perception text"),
+                Segment(SegmentOrigin.SKILL_BODY, true, "skill body text"),
+                Segment(SegmentOrigin.RUNTIME_STATE, false, "runtime text"),
+                Segment(SegmentOrigin.RETRY, true, "retry text"),
+                Segment(SegmentOrigin.USER_INPUT, true, "the utterance"),
+            ),
+        )
+
+        val input = request.input.filterIsInstance<InputPart.Text>().single().text
+        val positions = listOf(
+            "memory text",
+            "perception text",
+            "skill body text",
+            "runtime text",
+            "retry text",
+            "the utterance",
+        ).map { marker -> input.indexOf(marker) }
+        assertTrue(positions.all { it >= 0 }, "every dynamic block and the utterance must be in the input: $input")
+        assertEquals(positions.sorted(), positions, "the dynamic tail must keep the frame's flow order: $input")
+        assertTrue(input.endsWith("the utterance"), "the wearer's turn stays last: $input")
+        assertEquals("old question", (request.history.first() as ModelHistoryItem.Text).text)
+    }
+
+    @Test fun `summary is the only dynamic text folded into the head`() {
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.SUMMARY, false, "the summary"),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "memory text"),
+                Segment(SegmentOrigin.PERCEPTION, false, "perception text"),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        val head = request.history.first() as ModelHistoryItem.Text
+        assertTrue(head.text.contains("the summary"), head.text)
+        assertTrue(head.text.endsWith("old question"), "the summary rides the oldest surviving user turn: ${head.text}")
+        assertFalse("memory text" in head.text, "memory is tail context, not head context: ${head.text}")
+        assertFalse("perception text" in head.text, "perception is tail context, not head context: ${head.text}")
+        val input = inputText(request)
+        assertTrue("memory text" in input && "perception text" in input, input)
+    }
+
+    @Test fun `a summary with no transcript user head goes into the request input`() {
+        // The empty-history behaviour is preserved: a history holding only the summary would be a lone user group the
+        // send-time budgeter rejects, so the summary rides the input instead.
+        val request = captureRequest(
+            frame(
+                Segment(SegmentOrigin.SUMMARY, false, "orphan summary"),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        assertTrue(request.history.isEmpty(), "a summary alone cannot be history: ${request.history}")
+        val input = request.input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(input.contains("orphan summary"), input)
+        assertTrue(input.endsWith("now"), "the wearer's turn stays last: $input")
+    }
+
+    @Test fun `the cacheable prefix excludes the dynamic tail while the input carries it`() {
+        fun requestFor(memory: String, perception: String, skillBody: String): ModelRequest = captureRequest(
+            frame(
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old question", SegmentRole.USER),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "old answer", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.MEMORY_EVIDENCE, false, memory),
+                Segment(SegmentOrigin.PERCEPTION, false, perception),
+                Segment(SegmentOrigin.SKILL_BODY, true, skillBody),
+                Segment(SegmentOrigin.USER_INPUT, true, "now"),
+            ),
+        )
+
+        val first = requestFor(memory = "memory A", perception = "perception A", skillBody = "skill A")
+        val second = requestFor(memory = "memory B", perception = "perception B", skillBody = "skill B")
+
+        assertEquals(
+            PrefixHash.of(first.instructions, first.tools, first.history),
+            PrefixHash.of(second.instructions, second.tools, second.history),
+            "a change in the dynamic tail must not change the cacheable prefix",
+        )
+        assertNotEquals(
+            inputText(first),
+            inputText(second),
+            "the changed dynamic tail must still reach the request input",
+        )
     }
 
     @Test fun `a frame's tool round reaches the wire as a tool call and its output`() {
@@ -665,7 +885,7 @@ class ModelClientGatewayTest {
         )
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 1_000_000))
+        gateway(client).turn(turn(frame = frame, limitTokens = 1_000_000))
 
         val sent = client.requests.single()
         assertEquals(
@@ -687,14 +907,16 @@ class ModelClientGatewayTest {
         assertEquals(listOf("把音量调小一点"), client.requests.single().input.filterIsInstance<InputPart.Text>().map { it.text })
     }
 
-    @Test fun `the compacted leading context survives while cut one can still cut an older turn`() {
+    @Test fun `the compacted memory survives in the tail while cut one can still cut an older turn`() {
         // I-3: this test previously ordered the frame `[memory, oldTurn, input]`, which production never assembles
         // (`TurnRunner`: store snapshot → perception → memory → `USER_INPUT`). In the real order the memory sits
         // **after** the last turn group, i.e. inside the ① slice of the group that precedes it — so the guard only
-        // passed because the order was inverted. Rewritten against the real order and the merged shape.
+        // passed because the order was inverted. Rewritten against the real order; 0.3 Task 10 additionally moved the
+        // surviving memory out of the head user message and into the request input tail.
         //
-        // Limit arithmetic (`TurnTrimmer.total()`, `measure = utf8 bytes + 32`, plus the fixed 32): the limit below
-        // is exactly the frame **without** the older turn, so cut ① must take that one whole group and stop.
+        // Limit arithmetic (`TurnTrimmer.total()`, `measure = TokenMeter.estimate + 32`, plus the fixed 32): the limit
+        // below is exactly the frame **without** the older turn — 32 + 33(sys) + 132(kept user) + 132(kept assistant)
+        // + 232(memory) + 36(input) = **597** token units — so cut ① must take that one whole group and stop.
         val memory = Segment(SegmentOrigin.MEMORY_EVIDENCE, false, "记".repeat(200))
         val oldUser = Segment(SegmentOrigin.TRANSCRIPT, true, "旧".repeat(300), SegmentRole.USER)
         val oldAssistant = Segment(SegmentOrigin.TRANSCRIPT, true, "答".repeat(300), SegmentRole.ASSISTANT)
@@ -707,27 +929,29 @@ class ModelClientGatewayTest {
             listOf(oldUser, oldAssistant, keptUser, keptAssistant, memory, input),
             emptyList(),
         )
-        fun bytes(segment: Segment) = segment.text.toByteArray(Charsets.UTF_8).size + 32
+        fun tokens(segment: Segment) = TokenMeter.estimate(segment.text) + 32
         val withoutTheOlderTurn =
-            FIXED_OVERHEAD + bytes(system) + bytes(keptUser) + bytes(keptAssistant) + bytes(memory) + bytes(input)
+            FIXED_OVERHEAD + tokens(system) + tokens(keptUser) + tokens(keptAssistant) + tokens(memory) + tokens(input)
         val client = terminalClient()
         val gateway = gateway(client)
 
-        gateway.turn(turn(frame = frame, limitBytes = withoutTheOlderTurn))
+        gateway.turn(turn(frame = frame, limitTokens = withoutTheOlderTurn))
 
         val counts = requireNotNull(gateway.lastTrim)
         assertEquals(1, counts.droppedTurns, "① cut exactly the older whole turn")
         assertTrue(counts.droppedOrigins.isEmpty(), "② never had to touch the memory")
         val sent = client.requests.single()
         val head = sent.history.first() as ModelHistoryItem.Text
-        assertEquals(MessageRole.USER, head.role, "the leading context is one user message")
-        assertTrue(head.text.contains(memory.text), "the compacted leading context is still on the wire")
-        assertTrue(head.text.contains(keptUser.text), "and it rides the head user turn")
+        assertEquals(MessageRole.USER, head.role, "the history opens on the surviving user turn")
+        assertEquals(keptUser.text, head.text, "the head is the transcript's own text: no dynamic context is folded in")
+        assertEquals(ModelHistoryItem.Text(MessageRole.ASSISTANT, keptAssistant.text), sent.history[1])
+        val sentInput = sent.input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(sentInput.contains(memory.text), "the compacted memory is still on the wire, in the request tail")
+        assertTrue(sentInput.endsWith("现在几点"), "the wearer's turn stays last: $sentInput")
         assertFalse(
             sent.history.any { it is ModelHistoryItem.Text && it.text.contains(oldUser.text) },
             "the older turn is gone",
         )
-        assertEquals(listOf("现在几点"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
     }
 
     @Test fun `a memory segment after the last turn leaves inside that turn's cut one slice`() {
@@ -750,12 +974,12 @@ class ModelClientGatewayTest {
             listOf(oldUser, oldAssistant, keptUser, keptAssistant, memory, input),
             emptyList(),
         )
-        fun bytes(segment: Segment) = segment.text.toByteArray(Charsets.UTF_8).size + 32
-        val onlySystemAndInput = FIXED_OVERHEAD + bytes(system) + bytes(input)
+        fun tokens(segment: Segment) = TokenMeter.estimate(segment.text) + 32
+        val onlySystemAndInput = FIXED_OVERHEAD + tokens(system) + tokens(input)
         val client = terminalClient()
         val gateway = gateway(client)
 
-        gateway.turn(turn(frame = frame, limitBytes = onlySystemAndInput))
+        gateway.turn(turn(frame = frame, limitTokens = onlySystemAndInput))
 
         val counts = requireNotNull(gateway.lastTrim)
         assertEquals(2, counts.droppedTurns, "both groups go: the tighter window cannot fit the newer turn either")
@@ -782,13 +1006,14 @@ class ModelClientGatewayTest {
         )
         val system = Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")
         val frame = RequestFrame(listOf(system), flow, emptyList())
-        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
-        // Exactly the frame without the current turn's transcript: ① has to drop that one group and then stops.
+        fun measure(text: String) = TokenMeter.estimate(text) + 32
+        // Exactly the frame without the current turn's transcript — 32 + 33(sys) + 40(cue) = **105** token units:
+        // ① has to drop that one group and then stops.
         val limit = FIXED_OVERHEAD + measure(system.text) + measure(cue)
         val client = terminalClient()
         val gateway = gateway(client)
 
-        gateway.turn(turn(frame = frame, limitBytes = limit, userUtterance = utterance))
+        gateway.turn(turn(frame = frame, limitTokens = limit, userUtterance = utterance))
 
         assertEquals(
             1,
@@ -822,11 +1047,11 @@ class ModelClientGatewayTest {
         )
         val system = Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")
         val frame = RequestFrame(listOf(system), flow, emptyList())
-        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+        fun measure(text: String) = TokenMeter.estimate(text) + 32
         val limit = FIXED_OVERHEAD + measure(system.text) + measure(state) + measure(cue)
         val client = terminalClient()
 
-        gateway(client).turn(turn(frame = frame, limitBytes = limit, userUtterance = utterance))
+        gateway(client).turn(turn(frame = frame, limitTokens = limit, userUtterance = utterance))
 
         val input = client.requests.single().input.filterIsInstance<InputPart.Text>().single().text
         assertTrue(input.startsWith(state), "the runtime state must stay ahead of the restored question: $input")
@@ -869,13 +1094,14 @@ class ModelClientGatewayTest {
             Segment(SegmentOrigin.USER_INPUT, true, input),
         )
         val frame = RequestFrame(listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")), flow, emptyList())
-        // The window fits the system slot, the pending user turn and the input — and none of the older turn: cut ①
-        // takes exactly that whole group and stops, so the surviving history is the lone user half.
-        fun measure(text: String) = text.toByteArray(Charsets.UTF_8).size + 32
+        // The window fits the system slot, the pending user turn and the input — 32 + 33(sys) + 40(pending)
+        // + 35(input) = **140** token units — and none of the older turn: cut ① takes exactly that whole group and
+        // stops, so the surviving history is the lone user half.
+        fun measure(text: String) = TokenMeter.estimate(text) + 32
         val limit = FIXED_OVERHEAD + measure("sys") + measure(pending) + measure(input)
         val gateway = gateway(client)
 
-        val reply = gateway.turn(turn(frame = frame, limitBytes = limit))
+        val reply = gateway.turn(turn(frame = frame, limitTokens = limit))
 
         assertEquals(1, requireNotNull(gateway.lastTrim).droppedTurns, "cut ① took exactly the older whole turn")
         assertEquals(ModelEnd.FAILED, reply.terminal)
@@ -900,7 +1126,7 @@ class ModelClientGatewayTest {
         )
         val gateway = gateway(client)
 
-        gateway.turn(turn(frame = frame, limitBytes = 100))
+        gateway.turn(turn(frame = frame, limitTokens = 100))
 
         val counts: TrimCounts = requireNotNull(gateway.lastTrim)
         assertEquals(1, counts.droppedTurns)
@@ -909,19 +1135,21 @@ class ModelClientGatewayTest {
         assertFalse(counts.toString().contains("旧"), "no trimmed body either: $counts")
     }
 
-    @Test fun `the trim window is the send time limit minus a deliberate safety margin`() {
-        // I-4: `TurnTrimmer.total()` and `ContextBudgeter.prepare` compute **structurally identical** totals against
-        // the same `minOf(inputBudgetTokens, usable - maxOutput - safety)` limit, so parity is exact with one shared
-        // number; the `- FIXED_OVERHEAD` is a deliberate 32-byte **safety margin** (the trimmer is stricter than the
-        // check it must satisfy), not a correction of a 32-byte disagreement. The fixture profile's window is
-        // `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, so the trimmer is handed 59_968.
-        assertEquals(59_968, ModelClientGateway.windowBytes(profile))
+    @Test fun `the trim window is the policy hard limit`() {
+        // 0.3 final-fix wave: `ContextPolicy.hardLimit`/`hardMargin` are live at send time. The frame path trims to
+        // `hardLimit = hardInputLimit - hardMargin` (a deliberate 10% reserve), not to the bare profile remainder
+        // minus a second 32-unit margin. The fixture profile's hard input is
+        // `minOf(60_000, 100_000 - 8_000 - 1_000)` = 60_000, the margin `floor(60_000 × 0.10)` = 6_000, so the
+        // trimmer is handed **54_000**.
+        assertEquals(54_000, ModelClientGateway.windowTokens(profile))
+        assertEquals(ContextPolicy.from(profile).hardLimit, ModelClientGateway.windowTokens(profile))
     }
 
     @Test fun `the frame path sends one instructions message for the whole system slot`() {
         // `frameToTranscript` must take `instructions` from the frame's whole system slot, not map each system segment
         // to its own message: the trimmer measures that slot as ONE message, so n system segments mapped as n messages
-        // would undercount by 32 bytes per extra segment and the send-time check could reject the trimmed request.
+        // would undercount by 32 token units per extra segment and the send-time check could reject the trimmed
+        // request.
         val client = terminalClient()
         val system = listOf(
             Segment(SegmentOrigin.INSTRUCTIONS, true, "base instructions"),
@@ -930,7 +1158,7 @@ class ModelClientGatewayTest {
         )
         val frame = RequestFrame(system, listOf(Segment(SegmentOrigin.USER_INPUT, true, "在吗")), emptyList())
 
-        gateway(client).turn(turn(frame = frame, limitBytes = 5_000))
+        gateway(client).turn(turn(frame = frame, limitTokens = 5_000))
 
         val sent = client.requests.single()
         assertEquals(

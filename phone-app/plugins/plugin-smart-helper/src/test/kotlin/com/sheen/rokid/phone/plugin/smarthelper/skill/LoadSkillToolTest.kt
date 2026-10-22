@@ -1,8 +1,18 @@
 package com.sheen.rokid.phone.plugin.smarthelper.skill
 
 import com.sheen.rokid.agent.SCOPE_TERMINAL
+import com.sheen.rokid.agent.ToolCall
+import com.sheen.rokid.agent.ToolRegistry
+import com.sheen.rokid.agent.ToolResult
 import com.sheen.rokid.plugin.ActionOutcome
 import com.sheen.rokid.plugin.RiskLevel
+import com.sheen.rokid.plugin.ToolExecution
+import com.sheen.rokid.plugin.ToolOutcome
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -65,6 +75,38 @@ class LoadSkillToolTest {
         assertTrue("SECRET-BODY" !in result.detail, "the body must never travel in the tool receipt")
     }
 
+    @Test fun `a successful pull states the done facts it knows and reports no observation`() {
+        // 0.3 Phase 2.2 Task 7: reading a SKILL is not a screen action, so observation is null. The pull was accepted
+        // and its body handed over. Independent verification of a later request and a device-state change are unknown
+        // here, so those tri-state facts stay null rather than being guessed.
+        val result = tool().execute("load_skill", """{"name":"alpha"}""")
+
+        assertEquals(ToolExecution(outcome = ToolOutcome.Done, accepted = true), result.execution)
+        assertNull(result.execution?.applied)
+        assertNull(result.execution?.verified)
+        assertNull(result.execution?.changed)
+        assertNull(result.observation)
+        assertEquals("loaded:1", result.detail, "the tool-specific data stays the envelope's data")
+    }
+
+    @Test fun `the model sees the envelope with a null observation and no legacy prefix`() {
+        val registry = ToolRegistry(listOf(tool()))
+
+        val result = registry.execute(
+            ToolCall("c1", "load_skill", """{"name":"alpha"}"""),
+        )
+
+        val payload = Json.parseToJsonElement(result.payload).jsonObject
+        assertEquals(setOf("execution", "observation", "data"), payload.keys)
+        val execution = payload.getValue("execution").jsonObject
+        assertEquals("done", execution.getValue("outcome").jsonPrimitive.content)
+        assertEquals(JsonPrimitive(true), execution.getValue("accepted"))
+        assertEquals(JsonNull, payload.getValue("observation"))
+        assertEquals("loaded:1", payload.getValue("data").jsonPrimitive.content)
+        assertFalse("Failed: " in result.payload, "no legacy prefix: ${result.payload}")
+        assertFalse("Refused: " in result.payload, "no legacy prefix: ${result.payload}")
+    }
+
     @Test fun `two pulls of the same name get different receipts so the guard cannot call it no-progress`() {
         val t = tool()
         val first = t.execute("load_skill", """{"name":"alpha"}""").detail
@@ -110,5 +152,62 @@ class LoadSkillToolTest {
             assertEquals(ActionOutcome.Refused, t.execute("load_skill", args).outcome, "args=$args")
         }
         assertTrue(seen.isEmpty(), "a malformed call must not load anything")
+    }
+
+    @Test fun `a missing name reaches the model as a recoverable refusal with explicit facts`() {
+        // 0.3 Phase 2.2 Task 7 fix review: a bare `ActionResult(Refused, code)` let the registry project null facts and
+        // `recoverable=false`. An unknown name is a catalog mistake the model can correct, so it is explicitly
+        // recoverable; the pull was rejected (nothing was accepted or applied) and no observation exists.
+        val registry = ToolRegistry(listOf(tool(SkillLoad.NotFound(SkillLoadReason.NOT_IN_LIBRARY))))
+
+        val result = registry.execute(ToolCall("c1", "load_skill", """{"name":"nope"}"""))
+
+        assertRefusalFacts(result, LoadSkillTool.NOT_FOUND, recoverable = true)
+    }
+
+    @Test fun `a disabled skill reaches the model as a non-recoverable refusal with explicit facts`() {
+        // The user turned this entry off: retrying the same pull cannot help until the user acts, so recoverable=false
+        // is the one difference from NOT_FOUND. The rest of the refusal facts are identical.
+        val registry = ToolRegistry(listOf(tool(SkillLoad.NotFound(SkillLoadReason.DISABLED))))
+
+        val result = registry.execute(ToolCall("c1", "load_skill", """{"name":"off"}"""))
+
+        assertRefusalFacts(result, LoadSkillTool.DISABLED, recoverable = false)
+    }
+
+    @Test fun `a structurally malformed call reaches the model with the not-found refusal facts`() {
+        // `{}` parses as JSON, so the registry dispatches it; the tool itself rejects the missing name. That is the
+        // refusal path, not the registry's pre-dispatch ARGUMENTS_INVALID path.
+        val registry = ToolRegistry(listOf(tool()))
+
+        val result = registry.execute(ToolCall("c1", "load_skill", "{}"))
+
+        assertRefusalFacts(result, LoadSkillTool.NOT_FOUND, recoverable = true)
+    }
+
+    /** Asserts both the projected [ToolResult] facts and the envelope the model actually receives. */
+    private fun assertRefusalFacts(result: ToolResult, code: String, recoverable: Boolean) {
+        assertFalse(result.ok)
+        assertEquals(ToolOutcome.Refused, result.execution.outcome)
+        assertEquals(code, result.execution.code)
+        assertEquals(false, result.execution.accepted)
+        assertEquals(false, result.execution.applied)
+        assertNull(result.execution.verified)
+        assertNull(result.execution.changed)
+        assertEquals(recoverable, result.execution.recoverable)
+        assertNull(result.observation)
+        assertEquals(code, result.data, "the stable code stays the envelope's data")
+        assertFalse("Refused: " in result.payload, "no legacy prefix: ${result.payload}")
+
+        val payload = Json.parseToJsonElement(result.payload).jsonObject
+        assertEquals(JsonNull, payload.getValue("observation"))
+        val execution = payload.getValue("execution").jsonObject
+        assertEquals("refused", execution.getValue("outcome").jsonPrimitive.content)
+        assertEquals(code, execution.getValue("code").jsonPrimitive.content)
+        assertEquals(JsonPrimitive(false), execution.getValue("accepted"))
+        assertEquals(JsonPrimitive(false), execution.getValue("applied"))
+        assertEquals(JsonPrimitive(recoverable), execution.getValue("recoverable"))
+        assertEquals(JsonNull, execution.getValue("verified"))
+        assertEquals(JsonNull, execution.getValue("changed"))
     }
 }

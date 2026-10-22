@@ -1,6 +1,7 @@
 package com.sheen.rokid.model
 
 import com.sheen.rokid.agent.CONTEXT_OVERFLOW
+import com.sheen.rokid.agent.ContextPolicy
 import com.sheen.rokid.agent.ConversationStore
 import com.sheen.rokid.agent.GatewayTurn
 import com.sheen.rokid.agent.ModelClientGateway
@@ -50,13 +51,13 @@ import kotlin.test.fail
  *
  * ## What the discriminating assertion is (I-4)
  *
- * The gate is the `budgeter.prepare(...)` call itself, not the shape of the wire. [TurnTrimmer.total] and
- * [ContextBudgeter.prepare] compute **structurally identical** totals against the same `minOf(...)` limit — the same
- * per-item `bytes + 32`, the same fixed 32, and `instructions == frame.systemText` — so parity is exact and the
- * gateway's `- 32` in `windowBytes` is a deliberate **safety margin**, not a correction. A frame trimmed to that
- * margin is therefore at least 32 bytes under the check it must pass; what these tests can still catch is a *shape*
- * drift in the mapping (for example rendering each system segment as its own message, or merging the leading context
- * in a way that inflates the cost), which is why the frame below is trimmed right up to the window.
+ * The gate is the `budgeter.prepare(...)` call itself, not the shape of the wire. [TurnTrimmer] and
+ * [ContextBudgeter.prepare] both price text with `TokenMeter` token units (0.3 design §5.2), both add the same fixed 32
+ * and the same per-message 32, and both charge the same
+ * [com.sheen.rokid.contracts.ImageBudget.UNITS_PER_IMAGE] per image. The gateway's `- 32` in its window is still a
+ * deliberate safety margin, not a unit correction: the wire rendering can fold leading context and itemise a tool
+ * round, so a request's price is not necessarily the trimmer's per-segment total. These tests pin the send-time
+ * acceptance and, where a boundary is meaningful, the exact token price of a fixture.
  *
  * The margin itself is pinned next to the code it lives in, by `ModelClientGatewayTest`'s
  * `the trim window is the send time limit minus a deliberate safety margin`.
@@ -84,8 +85,8 @@ class GatewayWindowAcceptanceTest {
 
     /**
      * A [ModelClient] that answers the provider's overflow verdict for its first [overflows] requests and completes the
-     * turn afterwards, recording every request. This is how an overflow the byte budget cannot see (the provider counts
-     * tokens, not bytes) reaches the gateway's recovery path.
+     * turn afterwards, recording every request. This is how an overflow the local estimate cannot see (the provider
+     * counts its own tokens, this project only estimates) reaches the gateway's recovery path.
      */
     private class OverflowFirstModelClient(private val overflows: Int) : ModelClient {
         val requests = mutableListOf<ModelRequest>()
@@ -125,18 +126,12 @@ class GatewayWindowAcceptanceTest {
     private fun tightProfile() = profile.copy(inputBudgetTokens = 200, maxOutputTokens = 128, safetyTokens = 128)
 
     /**
-     * The trim window the gateway uses at send time, recomputed here because `ModelClientGateway.windowBytes` is
-     * `internal` to `agent-runtime`: the send-time limit minus the deliberate 32-byte margin. The comparison in the
-     * production-shape test is a "nothing was cut" check, so sharing the send-time `prepare` limit itself would be
-     * circular; the formula above it is `ContextBudgeter`'s own.
+     * The trim window the gateway uses at send time: the session `ContextPolicy.hardLimit`
+     * (`hardInputLimit - hardMargin`), recomputed here through the real policy so a budget change cannot leave this
+     * helper behind. The comparison in the production-shape test is a "nothing was cut" check, so sharing the send-time
+     * `prepare` limit itself would be circular; the formula above it is `ContextBudgeter`'s own.
      */
-    private fun limitWindowBytes(chosen: ModelProfile): Int = maxOf(
-        0,
-        minOf(
-            chosen.inputBudgetTokens,
-            chosen.usableWindowTokens - chosen.maxOutputTokens - chosen.safetyTokens,
-        ) - 32,
-    )
+    private fun limitWindowTokens(chosen: ModelProfile): Int = ContextPolicy.from(chosen).hardLimit
 
     private fun turn(frame: RequestFrame?, chosen: ModelProfile = profile) =
         GatewayTurn("turn-7", chosen.id, "You are Edith.", emptyList(), emptyList(), 1_000_000_000L, frame = frame)
@@ -181,15 +176,15 @@ class GatewayWindowAcceptanceTest {
     )
 
     @Test fun `a frame at the trim window is accepted by the send time budgeter`() {
-        // Byte-exact, so a shape drift in the mapping shows up as a rejection rather than being swallowed:
+        // Token-exact for the trimmer and for the send-time budgeter:
         //
-        //   ContextBudgeter limit = minOf(93_000, 100_000 - 6_000 - 1_000) = **93_000**
-        //   gateway window        = 93_000 - FIXED_OVERHEAD(32)            = **92_968**
-        //   TurnTrimmer.total()   = 32 + (3 + 32) + (2_800 + 32) + (90_000 + 32) + (5 + 32) = **92_968**
+        //   ContextBudgeter limit = minOf(93_000, 100_000 - 6_000 - 1_000) = **93_000 token units**
+        //   gateway trim window   = policy hardLimit (93_000 - 9_300 margin) = **83_700 token units**
+        //   TurnTrimmer.total()   = 32 + (1 + 32) + (700 + 32) + (22_500 + 32) + (2 + 32) = **23_363 token units**
         //
-        // The frame sits exactly on the trim window, so cut ① does not fire and the whole transcript is sent. The
-        // send-time total is the same 92_968 (identical formula) against the 93_000 limit — 32 bytes of slack, all of
-        // it the deliberate margin. The discriminating assertion is that `prepare` accepts it.
+        // The frame is comfortably inside the window, so cut ① does not fire and the whole transcript is sent. The
+        // exact price is pinned by the boundary pair below: at 23_363 nothing is cut, one unit less evicts the whole
+        // oldest turn. The discriminating acceptance assertion remains the send-time `prepare` call.
         val frame = RequestFrame(
             systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "sys")),
             conversationFlow = listOf(
@@ -201,7 +196,13 @@ class GatewayWindowAcceptanceTest {
         )
 
         // The trimmer's own verdict at the window: nothing is cut, so the assertion below cannot drift from it.
-        assertEquals(frame, TurnTrimmer().trim(frame, 92_968).kept, "92_968 is the exact window: nothing is cut")
+        assertEquals(frame, TurnTrimmer().trim(frame, 83_700).kept, "83_700 is the gateway window: nothing is cut")
+        assertEquals(frame, TurnTrimmer().trim(frame, 23_363).kept, "23_363 is the frame's exact token price")
+        assertEquals(
+            1,
+            TurnTrimmer().trim(frame, 23_362).droppedTurns,
+            "one unit under the exact price must evict the oldest whole turn",
+        )
 
         gateway().turn(turn(frame))
 
@@ -219,34 +220,34 @@ class GatewayWindowAcceptanceTest {
 
     /**
      * The genuinely tight case (Task 8's flagged gap): a window so small that **only the current turn's input can
-     * survive** the trim. The other acceptance tests trim at or near a 93 000-token window and cut nothing; this one
+     * survive** the trim. The other acceptance tests trim at or near a 93 000-unit window and cut nothing; this one
      * makes cut ① fire and then hands the result to the real send-time [ContextBudgeter].
      *
-     * `tightProfile()` pins `minOf(200, 100_000 - 128 - 128)` = **200**, so the trim window is `200 - 32` = **168**:
+     * `tightProfile()` pins `minOf(200, 100_000 - 128 - 128)` = **200**, so the trim window is the policy's
+     * `hardLimit = 200 - floor(200 × 0.10)` = **180 token units**:
      *
      * ```
-     * ContextBudgeter limit = minOf(200, 100_000 - 128 - 128)                    = **200**
-     * gateway window        = 200 - FIXED_OVERHEAD(32)                           = **168**
-     * frame total           = 32 + (40 + 32) + (1 + 32) + (2 + 32) + (14 + 32)   = **217**  > 168  ⇒ ① fires
-     * kept total            = 32 + (40 + 32) + (14 + 32)                         = **150**  ≤ 168
+     * ContextBudgeter limit = minOf(200, 100_000 - 128 - 128)                 = **200 token units**
+     * gateway trim window   = policy.hardLimit (200 - 20 hard margin)         = **180 token units**
+     * frame total           = 32 + (10 + 32) + (1 + 32) + (10 + 32) + (5 + 32) = **186** > 180 ⇒ ① fires     * kept total            = 32 + (10 + 32) + (5 + 32)                       = **111** ≤ 180
      * ```
      *
      * The old turn is deliberately **two** segments (`USER` + `ASSISTANT`) so that the input sits inside cut ①'s slice:
      * with a one-segment turn the slice would stop before the input and the eviction filter would never be consulted.
-     * `prepare` re-measures the kept request with the same per-message arithmetic, so the acceptance is exact.
+     * `prepare` re-measures the kept request in the same token units, so the acceptance is exact.
      */
     @Test fun `a frame trimmed to a window that fits only the current turn input is accepted`() {
         val frame = RequestFrame(
             systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "i".repeat(40))),
             conversationFlow = listOf(
                 Segment(SegmentOrigin.TRANSCRIPT, true, "u", SegmentRole.USER),
-                Segment(SegmentOrigin.TRANSCRIPT, true, "a1", SegmentRole.ASSISTANT),
+                Segment(SegmentOrigin.TRANSCRIPT, true, "a".repeat(40), SegmentRole.ASSISTANT),
                 Segment(SegmentOrigin.USER_INPUT, true, "现在几点了"),
             ),
             tools = emptyList(),
         )
         // The window really is the tight one: the untrimmed frame does not fit, and one whole old turn is what gives way.
-        assertEquals(1, TurnTrimmer().trim(frame, 168).droppedTurns, "the whole old turn is dropped")
+        assertEquals(1, TurnTrimmer().trim(frame, 180).droppedTurns, "the whole old turn is dropped")
 
         val tightClient = RecordingModelClient()
         val tightGateway = gateway(recording = tightClient, chosen = tightProfile())
@@ -265,9 +266,50 @@ class GatewayWindowAcceptanceTest {
         assertEquals(TrimCounts(1, emptyList(), false), tightGateway.lastTrim)
     }
 
-    @Test fun `the merged leading context is accepted where the trailing memory order is rejected`() {
-        // The owner-approved design change (2026-10-16), proven against the real budgeter: the old order — transcript
-        // then a `MEMORY_EVIDENCE` user turn then the input — ends the history on a lone user group, which
+    /**
+     * The unit switch at the gateway boundary: a Chinese-only input whose UTF-8 size exceeded the tight profile's
+     * budget is priced by `TokenMeter` and accepted.
+     *
+     * The frame has no evictable transcript turn, so the trimmer leaves the input in the kept frame (its own token
+     * total, 166, is inside the 168-unit window) and the real send-time budgeter accepts the same price: **166 token
+     * units** (32 + (10 + 32) + (60 + 32)). The byte estimator charged **316** (32 + (40 + 32) + (180 + 32)) and
+     * rejected the shape. The exact value proves the text went through `TokenMeter`, not that the assertion merely got
+     * looser.
+     */
+    @Test fun `a Chinese input the byte estimator used to reject is accepted at its token price`() {
+        val frame = RequestFrame(
+            systemSegments = listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "i".repeat(40))),
+            conversationFlow = listOf(Segment(SegmentOrigin.USER_INPUT, true, "现在几点了".repeat(12))),
+            tools = emptyList(),
+        )
+
+        gateway(chosen = tightProfile()).turn(turn(frame, tightProfile()))
+
+        val sent = client.requests.single()
+        val prepared = budgeter.prepare(tightProfile(), sent)
+        assertEquals(166, prepared.estimatedInputTokens)
+    }
+
+    /**
+     * The fail-closed boundary of the new unit: one token unit over the tight profile's limit is still the dedicated
+     * overflow signal, not a request quietly sent. 95 CJK characters price at **201 units**
+     * (32 + (10 + 32) + (95 + 32)) and there is no history to evict, so nothing can make the request fit.
+     */
+    @Test fun `a request over the token limit still fails closed with the overflow signal`() {
+        val overLimit = request(
+            history = emptyList(),
+            input = listOf("现".repeat(95)),
+        ).copy(instructions = "i".repeat(40))
+
+        assertFailsWith<ContractError.ContextWindowExceeded> {
+            budgeter.prepare(tightProfile(), overLimit)
+        }
+    }
+
+    @Test fun `a tail placed memory is accepted where the trailing memory history order is rejected`() {
+        // 0.3 design §5.1/§5.3 moves `MEMORY_EVIDENCE` out of the history head and into the dynamic tail. The shape is
+        // still accepted by the real budgeter; the old order — transcript then a `MEMORY_EVIDENCE` user turn then the
+        // input — is still the counterexample, because it ends the history on a lone user group which
         // `ContextBudgeter` rejects **by design** (whole-group eviction depends on it). Every later turn would fail
         // `ConfigurationRejected` until an app restart (the 2026-10-14 incident).
         //
@@ -292,15 +334,17 @@ class GatewayWindowAcceptanceTest {
         try {
             budgeter.prepare(profile, sent)
         } catch (rejected: ContractError) {
-            fail("the merged leading context must be a sendable shape: ${rejected.message}")
+            fail("the tail placed memory must be a sendable shape: ${rejected.message}")
         }
-        // …and it really is the merged order: memory folded into the head user message, not a second user turn.
+        // …and it really is the new layout: the history head is the transcript's own user turn, the memory rides the
+        // request input ahead of the wearer's turn.
         val head = sent.history.first() as ModelHistoryItem.Text
         assertEquals(MessageRole.USER, head.role)
-        assertTrue(head.text.contains(memory), head.text)
-        assertTrue(head.text.endsWith("第一轮问"), head.text)
+        assertEquals("第一轮问", head.text, "the head must not be rewritten by request-scoped memory")
         assertEquals(ModelHistoryItem.Text(MessageRole.ASSISTANT, "第一轮答"), sent.history[1])
-        assertEquals(listOf("现在呢"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+        val input = sent.input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(input.startsWith(memory), "the memory is the input's dynamic prefix: $input")
+        assertTrue(input.endsWith("现在呢"), "the wearer's turn stays last: $input")
 
         // Counterexample: the order the plan used to specify. Built by hand, because that is exactly what the old
         // mapping produced — history ends on `Text(USER, memory)`, one user group with no reply.
@@ -372,9 +416,10 @@ class GatewayWindowAcceptanceTest {
      * rendered at insert time and the tool round is stored as `ToolCall`/`ToolOutput` (not as a plain text round).
      *
      * The window for the "nothing was trimmed" check below is written out here rather than calling the gateway's
-     * `windowBytes`: that function is `internal` to `agent-runtime`, and this module is on the other side of the
-     * boundary. It is the same formula with the same deliberate 32-byte margin, floored at 0 so a small profile cannot
-     * produce a negative limit.
+     * `windowTokens`: that function is `internal` to `agent-runtime`, and this module is on the other side of the
+     * boundary. It is the same formula with the same deliberate 32-unit margin, floored at 0 so a small profile cannot
+     * produce a negative limit. Both stages now count the same token unit, so this comparison prices the same frame
+     * the trimmer did.
      */
     @Test fun `the production shaped store backed frame is accepted by the send time budgeter`() {
         val summaryBody = "上一段对话已被压缩为摘要。"
@@ -413,7 +458,7 @@ class GatewayWindowAcceptanceTest {
         // The head really is the compressed summary, and cut ① has nothing to drop at this profile's window - so the
         // shape below is the untrimmed production frame, not a trimmer artefact.
         assertTrue(store.headIsSummary(), "the store head must be the summary this shape is about")
-        val window = limitWindowBytes(profile)
+        val window = limitWindowTokens(profile)
         assertEquals(frame, TurnTrimmer().trim(frame, window).kept)
 
         gateway().turn(turn(frame))
@@ -425,14 +470,17 @@ class GatewayWindowAcceptanceTest {
         } catch (rejected: ContractError) {
             fail("the production shaped store backed frame must be sendable: ${rejected.message}")
         }
-        // …and it is the production shape, not merely accepted: summary + memory are folded into the one leading user
-        // message, ahead of the oldest surviving turn; the current utterance is the request input; the tool round came
-        // back structured (a plain-text round would hand the endpoint an assistant message where it expects the call
-        // it produced).
+        // …and it is the production shape, not merely accepted: the summary is folded into the one leading user
+        // message, ahead of the oldest surviving turn; the memory rides the request input ahead of the current
+        // utterance; the tool round came back structured (a plain-text round would hand the endpoint an assistant
+        // message where it expects the call it produced).
         val head = sent.history.first() as ModelHistoryItem.Text
         assertEquals(MessageRole.USER, head.role)
         assertTrue(head.text.contains(SummaryBoundary.render(summaryBody)), head.text)
-        assertTrue(head.text.contains("<reference_context>"), head.text)
+        assertFalse(
+            head.text.contains("<reference_context>"),
+            "memory is request-scoped tail context, not head context: ${head.text}",
+        )
         assertTrue(head.text.endsWith("旧问题"), head.text)
         assertEquals(
             listOf(
@@ -447,9 +495,11 @@ class GatewayWindowAcceptanceTest {
             ),
             sent.history.drop(1),
         )
-        assertEquals(listOf("现在呢"), sent.input.filterIsInstance<InputPart.Text>().map { it.text })
+        val input = sent.input.filterIsInstance<InputPart.Text>().single().text
+        assertTrue(input.startsWith(memory.text), "the memory is the input's dynamic prefix: $input")
+        assertTrue(input.endsWith("现在呢"), "the wearer's turn stays last: $input")
         // The tool round survives `frameToTranscript` as **one** leading user group: the property whole-group eviction
-        // depends on, and the reason the memory cannot be a standalone user message.
+        // depends on, and the reason no request-scoped block can be emitted as its own user message.
         assertEquals(1, sent.history.count { it is ModelHistoryItem.Text && it.role == MessageRole.USER })
     }
 
@@ -482,7 +532,8 @@ class GatewayWindowAcceptanceTest {
             tools = emptyList(),
         )
 
-        // The provider reports an overflow the byte budget cannot see **twice**; the third attempt is the hard truncate.
+        // The provider reports an overflow the local estimate cannot see **twice**; the third attempt is the hard
+        // truncate.
         val overflowClient = OverflowFirstModelClient(overflows = 2)
         gateway(recording = overflowClient).turn(turn(frame))
 
@@ -517,7 +568,7 @@ class GatewayWindowAcceptanceTest {
 
 /**
  * The plugin's `toSegment` rule, mirrored here because `plugins-smart` is downstream of `model-runtime` and its own
- * private copy is not visible from this module (`SmartAssistantPlugin.kt:2336`). Kept byte-identical in intent: roles
+ * private copy is not visible from this module (`SmartAssistantPlugin.kt:2336`). Kept identical in intent: roles
  * ride along for text, and a tool item becomes a `TOOL_ROUND` segment whose text is the frame vocabulary's JSON entry,
  * so the gateway restores the round as **structured** items rather than as assistant texts.
  */

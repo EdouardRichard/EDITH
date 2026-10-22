@@ -67,6 +67,7 @@ class DebugToolCallInjector : BroadcastReceiver() {
             notifyText = intent.getStringExtra(EXTRA_SAY),
             channel = intent.getStringExtra(EXTRA_CHANNEL),
             appName = intent.getStringExtra(EXTRA_NAME),
+            command = intent.getStringExtra(EXTRA_COMMAND),
         )
         if (!root.armScriptedModelAnswer(action, args, intent.getStringExtra(EXTRA_TEXT) ?: "", times, fail)) {
             return report("refused reason=NOT_DEBUG")
@@ -81,8 +82,9 @@ class DebugToolCallInjector : BroadcastReceiver() {
             if (intent.hasExtra(EXTRA_VALUE)) "value" else null,
             intent.getStringExtra(EXTRA_SAY),
             intent.getStringExtra(EXTRA_CHANNEL),
+            intent.getStringExtra(EXTRA_COMMAND),
         ).size
-        report("armed action=${action.ifBlank { "none" }} members=$members times=$times fail=$fail args=$args")
+        report("armed action=${action.ifBlank { "none" }} members=$members times=$times fail=$fail")
     }
 
     private fun report(state: String) = P3Log.line("P3_SCRIPT state=$state")
@@ -106,5 +108,7 @@ class DebugToolCallInjector : BroadcastReceiver() {
         const val EXTRA_FAIL = "fail"
         /** The app name for `launch_app` (`--es name 音乐`). */
         const val EXTRA_NAME = "name"
+        /** The command for `shell` (`--es command 'cmd package list packages'`); B8 classifier matrix. */
+        const val EXTRA_COMMAND = "command"
     }
 }

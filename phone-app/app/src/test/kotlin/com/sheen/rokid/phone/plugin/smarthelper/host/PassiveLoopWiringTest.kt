@@ -58,6 +58,9 @@ import com.sheen.rokid.plugin.CapabilityVerification
 import com.sheen.rokid.plugin.ConfigSchema
 import com.sheen.rokid.plugin.ConfiguredPlugin
 import com.sheen.rokid.plugin.ContextSignals
+import com.sheen.rokid.plugin.DeviceProfile
+import com.sheen.rokid.plugin.DeviceState
+import com.sheen.rokid.plugin.DeviceStateProvider
 import com.sheen.rokid.plugin.ContextSnapshot
 import com.sheen.rokid.plugin.DeactivationReason
 import com.sheen.rokid.plugin.HintDevice
@@ -68,6 +71,12 @@ import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.ModelRequest
 import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.PerceptionCoverage
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
 import com.sheen.rokid.plugin.PluginConfiguration
 import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
@@ -186,6 +195,76 @@ class PassiveLoopWiringTest {
         override fun snapshot() = ContextSnapshot(0L, emptyMap())
         override fun listen(listener: (ContextSnapshot) -> Unit): CancellationHandle =
             object : CancellationHandle { override fun cancel() = Unit }
+    }
+
+    /**
+     * 0.3 Phase 1 Task 12: the smart plugin declares the static device profile channel, so every composition-shaped
+     * rig that activates it must answer `Capability.DeviceState` exactly as the App's composition does. The facts are
+     * deliberately empty (a profile with no model/version), so this rig contributes no device literal to any prompt and
+     * these tests stay about wiring rather than prompt content.
+     */
+    private class SyntheticDeviceState : DeviceStateProvider {
+        override fun profile() = DeviceProfile(
+            manufacturer = "",
+            model = "",
+            deviceName = null,
+            androidRelease = "",
+            apiLevel = 0,
+            screenWidthPx = 0,
+            screenHeightPx = 0,
+            densityDpi = 0,
+            glassesModel = null,
+            glassesFirmware = null,
+            glassesWidthPx = null,
+            glassesHeightPx = null,
+            appVersion = "",
+            locale = "",
+            timeZone = "",
+            wakeWords = emptyList(),
+            capabilities = emptySet(),
+        )
+
+        override fun state() = DeviceState(
+            capturedAtEpochMillis = 0L,
+            timeZone = "UTC",
+            localDate = "2026-10-20",
+            weekday = "星期一",
+            localTime = "00:00",
+        )
+    }
+
+    /**
+     * edith-0.3 Phase 2 Task 9: the smart plugin declares the host's per-turn perception port, so a composition-shaped
+     * rig must answer `Capability.Perception` or the host refuses activation with `CAPABILITY_MISSING`. This provider
+     * returns an all-unavailable snapshot: these tests are about wiring, so it contributes no screen text, no
+     * notification body and no device fact.
+     */
+    internal class InertPerception : PerceptionProvider {
+        private val snapshot = PerceptionSnapshot(
+            snapshotId = "snap-test",
+            capturedAtEpochMillis = 0L,
+            coverage = PerceptionCoverage(
+                screen = "unavailable(no_accessibility)",
+                notifications = "unavailable(no_access)",
+                media = "unavailable(no_session)",
+                calendar = "empty",
+                acoustic = "unavailable(no_event)",
+                clipboard = "unavailable(background_restricted)",
+                vision = "disabled",
+                glasses = "unavailable(no_state)",
+                device = "partial",
+            ),
+        )
+
+        override fun beginTurn(): PerceptionSnapshot = snapshot
+        override fun snapshot(
+            include: Set<PerceptionSource>,
+            filter: PerceptionFilter,
+            limit: Int?,
+        ): PerceptionSnapshot = snapshot
+        override fun afterAction(): PerceptionSnapshot = snapshot
+        override fun screenshot(): PerceptionScreenshotResult = PerceptionScreenshotResult.Unavailable("test")
+        override fun endTurn() = Unit
     }
 
     /**
@@ -415,6 +494,8 @@ private class NoStorageAccess : StorageAccess {
                     Capability.StorageAccess to NoStorageAccess(),
                     Capability.SystemOne to ReadySystemOne(),
                     Capability.Embedding to ReadyEmbedding(),
+                    Capability.DeviceState to SyntheticDeviceState(),
+                    Capability.Perception to InertPerception(),
                     Capability.ConversationDisplay to NoConversationDisplay(),
                 ),
                 storageFor = { StubStorage() })
@@ -817,6 +898,8 @@ private class NoStorageAccess : StorageAccess {
                 Capability.StorageAccess to NoStorageAccess(),
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
+                Capability.DeviceState to SyntheticDeviceState(),
+                Capability.Perception to InertPerception(),
                 Capability.ConversationDisplay to NoConversationDisplay(),
             ),
             storageFor = { StubStorage() })
@@ -885,7 +968,11 @@ private class NoStorageAccess : StorageAccess {
                 Capability.StorageAccess, Capability.SystemOne, Capability.Embedding,
                 // edith-0.2 Phase C: the smart plugin declares the conversation port, so the composition advertises
                 // it and this rig answers it - the two halves of the contract this test exists to keep equal.
-                Capability.ConversationDisplay), advertised)
+                Capability.ConversationDisplay,
+                // 0.3 Phase 1 Task 12: the static device profile the session pins into its prompt plan.
+                Capability.DeviceState,
+                // 0.3 Phase 2 Task 9: the per-turn perception port the request tail renders from.
+                Capability.Perception), advertised)
             val services = rig.environment.services(ResourceScope("smart-assistant", session, Generation(1)), advertised)
             advertised.forEach { capability ->
                 assertNull("$capability is advertised, so it must be answerable",
@@ -935,7 +1022,47 @@ private class NoStorageAccess : StorageAccess {
         val values = SmartSettings(profileId = "p-1").pluginConfiguration(profile("p-1")).values
 
         assertEquals(setOf("profileId", "profileRevision", "wakeWords", "maxLevel", "whitelist",
-            "proactiveCooldownMillis", "proactiveSensitivity"), values.keys)
+            "proactiveCooldownMillis", "proactiveSensitivity", "noInterception"), values.keys)
+    }
+
+    /**
+     * 0.3 Phase 4B (`D189`, spec §5.3): the persisted switch also travels in the plugin's configuration shape.
+     *
+     * The live behavior is the host gate (`NoInterceptionGate.provider()`); this key is the initial/persisted value the
+     * plugin stores, so a restarted App sends the same setting the store loaded. A missing key would make the plugin
+     * refuse the whole closed configuration, which is why the exact key-set test above pins it.
+     */
+    @Test
+    fun theNoInterceptionSettingIsSentAsThePluginsInitialValue() {
+        val off = SmartSettings(profileId = "p-1").pluginConfiguration(profile("p-1"))
+        val on = SmartSettings(profileId = "p-1", noInterception = true).pluginConfiguration(profile("p-1"))
+
+        assertEquals("false", off.values["noInterception"])
+        assertEquals("true", on.values["noInterception"])
+    }
+
+    /**
+     * 0.3 Phase 4B (`D189`, spec §5.1): the composition must pass the **live** gate, never a snapshot.
+     *
+     * The policy and shell-precheck consumers call this provider on every decision, so a wiring that passed a boolean
+     * (or read the settings object once) would leave the user's save ineffective until the next App assembly. Flipping
+     * the backing flag after construction is the proof that the plugin holds the provider itself.
+     */
+    @Test
+    fun theLiveNoInterceptionGateReachesThePluginTheWiringBuilds() {
+        val enabled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val wiring = SmartWiring(
+            SmartSettings(profileId = "p-1"), MemoryProfileRepository(), FakeClock(0), ManualScheduler(FakeClock(0)),
+            noInterception = { enabled.get() },
+        )
+        val field = wiring.plugin.javaClass.getDeclaredField("noInterception")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val provider = field.get(wiring.plugin) as () -> Boolean
+
+        assertFalse("the mode is off by default", provider())
+        enabled.set(true)
+        assertTrue("a save must be visible from the provider's next call", provider())
     }
 
     @Test
@@ -1051,6 +1178,8 @@ private class NoStorageAccess : StorageAccess {
                 Capability.StorageAccess to NoStorageAccess(),
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
+                Capability.DeviceState to SyntheticDeviceState(),
+                Capability.Perception to InertPerception(),
                 Capability.ConversationDisplay to NoConversationDisplay(),
             ),
             storageFor = { StubStorage() })
@@ -1237,6 +1366,8 @@ private class NoStorageAccess : StorageAccess {
                 Capability.StorageAccess to NoStorageAccess(),
                 Capability.SystemOne to ReadySystemOne(),
                 Capability.Embedding to ReadyEmbedding(),
+                Capability.DeviceState to SyntheticDeviceState(),
+                Capability.Perception to InertPerception(),
                 Capability.ConversationDisplay to display,
             ),
             storageFor = { StubStorage() })
@@ -1339,7 +1470,9 @@ private class NoStorageAccess : StorageAccess {
                     Capability.StorageAccess to NoStorageAccess(),
                     Capability.SystemOne to ReadySystemOne(),
                     Capability.Embedding to ReadyEmbedding(),
-                    Capability.ConversationDisplay to display,
+                    Capability.DeviceState to SyntheticDeviceState(),
+                Capability.Perception to InertPerception(),
+                Capability.ConversationDisplay to display,
                 ),
                 storageFor = { StubStorage() })
             root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),

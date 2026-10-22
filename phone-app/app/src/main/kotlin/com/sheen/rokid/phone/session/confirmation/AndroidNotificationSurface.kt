@@ -32,9 +32,30 @@ internal class AndroidNotificationSurface(private val context: Context) : Notifi
 
     private val manager: NotificationManager? = context.getSystemService(NotificationManager::class.java)
 
-    override fun available(): Boolean =
-        context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) == PackageManager.PERMISSION_GRANTED &&
-            manager?.areNotificationsEnabled() == true
+    override fun available(): Boolean = unavailableReason() == null
+
+    /**
+     * 0.3 Phase 4B (B5, spec §1.3 drift 3): the three live device answers behind [available].
+     *
+     * The channel is created lazily by [post] at [ConfirmationChannel.IMPORTANCE], so before the first post
+     * `getNotificationChannel` answers `null` - "not created yet", **not** a disable. Once it exists, the user may have
+     * turned it off; `IMPORTANCE_NONE` is Android's own "this channel does not post" and must be reported as
+     * [NotificationAvailability.CHANNEL_DISABLED] rather than hidden behind the App-level switch.
+     *
+     * The reads are device-only (`NotificationManager` cannot be instantiated on the JVM); the **decision** is the
+     * pure [NotificationAvailability] rule and is what the unit tests pin.
+     */
+    override fun unavailableReason(): String? = NotificationAvailability.unavailableReason(
+        permissionGranted = context.checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) ==
+            PackageManager.PERMISSION_GRANTED,
+        appNotificationsEnabled = manager?.areNotificationsEnabled() == true,
+        channelImportance = channelImportance(),
+    )
+
+    /** The confirmation channel's live importance, or `null` when it has not been created (or cannot be read). */
+    private fun channelImportance(): Int? = runCatching {
+        manager?.getNotificationChannel(ConfirmationChannel.ID)?.importance
+    }.getOrNull()
 
     override fun post(
         requestId: String,

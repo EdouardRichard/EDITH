@@ -35,7 +35,7 @@ class AgentMetricsTest {
         ok: Boolean = true,
         decision: String? = "allow",
         executed: Boolean = true,
-        result: String = if (ok) "ok" else "Refused: SOMETHING",
+        result: String = if (ok) "ok" else "SOMETHING_FAILED",
     ) = StepTrace(action, ok, decision, executed, result)
 
     @Test fun `a completed turn over successful tools scores completion and tool success at one`() {
@@ -67,7 +67,7 @@ class AgentMetricsTest {
     }
 
     @Test fun `a policy refusal that did not execute is not an escalation`() {
-        val metrics = agentMetrics(listOf(turn()), listOf(AuditRow("uninstall", decision = "refuse", outcome = "Refused: POLICY")))
+        val metrics = agentMetrics(listOf(turn()), listOf(AuditRow("uninstall", decision = "refuse", outcome = "Refused")))
 
         assertEquals(0, metrics.unauthorizedExecutions)
         assertEquals(0.0, metrics.privilegeEscalationRate, 1e-9)

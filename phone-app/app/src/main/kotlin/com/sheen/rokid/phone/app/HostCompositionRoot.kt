@@ -22,6 +22,8 @@ import com.sheen.rokid.phone.session.confirmation.ConfirmationGlasses
 import com.sheen.rokid.phone.model.ScriptedModelWire
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillDirectoryView
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
+import com.sheen.rokid.phone.plugin.smarthelper.host.NoInterceptionGate
+import com.sheen.rokid.phone.plugin.smarthelper.host.VisionGate
 import com.sheen.rokid.phone.actions.ExecutionChannelStatus
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.StorageAccessSkillView
 import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticRegistration
@@ -33,6 +35,10 @@ import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
 import com.sheen.rokid.phone.storage.AndroidSpeakerProfileStore
 import com.sheen.rokid.phone.context.NotificationCategoryService
+import com.sheen.rokid.phone.context.NotificationContentSource
+import com.sheen.rokid.phone.context.androidDeviceStateProvider
+import com.sheen.rokid.phone.perception.AndroidPerceptionProvider
+import com.sheen.rokid.agent.PerceptionPolicy
 import com.sheen.rokid.phone.bridge.CxrHintLink
 import com.sheen.rokid.phone.bridge.HintIdentity
 import com.sheen.rokid.phone.bridge.UiState
@@ -41,6 +47,7 @@ import com.sheen.rokid.phone.session.PlaybackGate
 import com.sheen.rokid.phone.bridge.CxrConnection
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.confirmation.ConfirmationUi
+import com.sheen.rokid.phone.session.confirmation.ConfirmationPanel
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.bridge.RokidConnection
 import com.sheen.rokid.phone.audio.AudioIngressLoop
@@ -61,7 +68,11 @@ import com.sheen.rokid.phone.bridge.ConversationWireDisplay
 import com.sheen.rokid.phone.session.ToneWakeChimeSink
 import com.sheen.rokid.phone.session.WakeChime
 import com.sheen.rokid.phone.session.confirmation.AndroidNotificationSurface
+import com.sheen.rokid.phone.session.confirmation.ConfirmationChannelKind
+import com.sheen.rokid.phone.session.confirmation.ConfirmationPhoneSurface
+import com.sheen.rokid.phone.session.confirmation.confirmationPresentationChannel
 
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import com.sheen.rokid.audio.AcousticLabeler
@@ -95,6 +106,7 @@ import com.sheen.rokid.phone.inference.laya.LayaOfficialHost
 import com.sheen.rokid.phone.inference.litert.EmbeddingGemmaLiteRTEngine
 import com.sheen.rokid.model.*
 import com.sheen.rokid.output.ConversationLog
+import com.sheen.rokid.output.PerceptionToolObservation
 import com.sheen.rokid.output.TraceRecorder
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.phone.plugin.smarthelper.SmartAssistantPlugin
@@ -106,8 +118,21 @@ import com.sheen.rokid.storage.*
 import com.sheen.rokid.phone.storage.*
 import com.sheen.rokid.phone.actions.shizuku.RootProbe
 import com.sheen.rokid.phone.actions.shizuku.RootStatus
+import com.sheen.rokid.phone.actions.shizuku.ShizukuExecutionBackend
+import com.sheen.rokid.phone.actions.shizuku.ShizukuTargetState
 import com.sheen.rokid.phone.actions.shizuku.ShizukuUserServiceShell
+import com.sheen.rokid.phone.actions.AtomicActionExecutor
+import com.sheen.rokid.phone.actions.ToolSurface
+import com.sheen.rokid.phone.actions.a11y.AccessibilityExecutionBackend
+import com.sheen.rokid.phone.actions.a11y.AccessibilityUi
+import com.sheen.rokid.phone.actions.a11y.ScreenFilter as A11yScreenFilter
+import com.sheen.rokid.phone.actions.a11y.ScreenFingerprint
+import com.sheen.rokid.phone.actions.a11y.ScreenSnapshot
+import com.sheen.rokid.phone.actions.a11y.ScrollDirection
 import com.sheen.rokid.phone.actions.a11y.EdithAccessibilityService
+import com.sheen.rokid.phone.actions.intent.IntentAtomicExecutor
+import com.sheen.rokid.phone.actions.intent.LaunchAppExecutor
+import com.sheen.rokid.phone.actions.intent.SystemActionExecutor
 import com.sheen.rokid.phone.actions.device.DeviceKernelOperations
 import com.sheen.rokid.phone.actions.device.DeviceTool
 import com.sheen.rokid.phone.actions.device.DialTool
@@ -127,6 +152,7 @@ import com.sheen.rokid.phone.lock.UnlockGate
 import com.sheen.rokid.phone.lock.UnlockOutcome
 import com.sheen.rokid.device.AccessibilityPort
 import com.sheen.rokid.device.DeviceKernel
+import com.sheen.rokid.device.Foreground
 import com.sheen.rokid.device.Gesture
 import com.sheen.rokid.device.ObservationRenderer
 import com.sheen.rokid.device.Ref
@@ -135,8 +161,12 @@ import com.sheen.rokid.phone.actions.intent.AppLaunchResolver
 import com.sheen.rokid.phone.actions.intent.ContextIntentLauncher
 import com.sheen.rokid.phone.actions.intent.IntentActionExecutor
 import com.sheen.rokid.phone.actions.intent.PackageManagerAppCatalog
+import com.sheen.rokid.phone.context.AcousticSource
 import com.sheen.rokid.phone.context.CalendarSource
+import com.sheen.rokid.phone.context.ClipboardSource
 import com.sheen.rokid.phone.context.ForegroundAppSource
+import com.sheen.rokid.phone.context.GlassesStateSource
+import com.sheen.rokid.phone.context.MediaSessionSource
 import com.sheen.rokid.phone.context.NotificationCategorySource
 import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
 import com.sheen.rokid.phone.model.ProfileProbeGate
@@ -165,6 +195,12 @@ private const val PROBE_IMAGE_BASE64 =
 private const val PROBE_IMAGE_WIDTH = 32
 private const val PROBE_IMAGE_HEIGHT = 32
 private val PROBE_IMAGE_PNG: ByteArray = Base64.getDecoder().decode(PROBE_IMAGE_BASE64)
+
+/**
+ * edith-0.3 Phase 2.2 Task 6: the reason a screen tool's production observation reports when the connected
+ * accessibility read itself fails (as opposed to the channel being off, which has its own reason).
+ */
+private const val TOOL_OBSERVATION_FAILED = "OBSERVE_FAILED"
 
 /**
  * Whether a STOP's validated identity still names the session the host is running.
@@ -255,6 +291,24 @@ class HostCompositionRoot internal constructor(
      */
     private val smartSettingsStore: SmartSettingsStore? = null,
     /**
+     * edith-0.3 Phase 2 Task 10: the **live** 「感知截图」 switch.
+     *
+     * [create] builds it from the persisted [SmartSettings.visionEnabled] and hands the same instance to the perception
+     * provider and the `device` tool, so a save on the settings screen takes effect on their very next call. A
+     * hand-built composition (tests, harnesses) keeps the default on, which is the shipped setting.
+     */
+    private val visionGate: VisionGate = VisionGate(true),
+    /**
+     * 0.3 Phase 4B (`D189`): the **live** global 「不拦截」 gate.
+     *
+     * [create] seeds it from the persisted [SmartSettings.noInterception] (default off); [saveSmartSettings] updates
+     * the same instance, and the settings page's banner reads its current value. B3 hands
+     * [NoInterceptionGate.provider] to `SmartWiring`, which passes it to the plugin's policy and shell-precheck wrapper,
+     * so the gate is consulted live by every tool call (spec §5.1). A hand-built composition (tests, harnesses) keeps
+     * the safe default (off).
+     */
+    internal val noInterceptionGate: NoInterceptionGate = NoInterceptionGate(false),
+    /**
      * `D53`② (2026-10-11): the **persisted, global** 「主动辅助」 switch - it replaced P3.2's session-scoped one.
      *
      * A stored settings value (`SmartSettings.proactiveEnabled`), **on by default**, written through the same blob as
@@ -298,6 +352,27 @@ class HostCompositionRoot internal constructor(
     /** Debug-only seam: the production catalog, so an Activity can exercise the real gate + tool body. */
     internal var toolCatalogForProbe: com.sheen.rokid.phone.actions.device.ToolCatalog? = null
 
+    /**
+     * edith-0.3 Phase 4A Task 4: the one `Capability.Actions` provider the composition hands the host, exposed for the
+     * JVM gate only. Production never reads it; it lets `ToolFaceCompositionTest` assert the **wired** 22-name face
+     * rather than a hand-built look-alike.
+     */
+    internal var toolSurfaceForProbe: com.sheen.rokid.phone.actions.ToolSurface? = null
+
+    /**
+     * edith-0.3 Phase 2.2 Task 6: the production `open` tool, exposed only so the JVM gate can prove that the
+     * composition wires the **same** `AndroidPerceptionProvider`-backed observation source into `OpenTool(observe = ...)`
+     * as into the catalog. Production never reads it; a composition built by hand leaves it `null`.
+     */
+    internal var openToolForProbe: com.sheen.rokid.phone.actions.device.OpenTool? = null
+
+    /**
+     * Debug-only seam: runs one production tool call and returns its raw [com.sheen.rokid.plugin.ActionResult].
+     *
+     * The result is **not** a rendered envelope: `observation` carries the screen, `execution` the stable facts, and
+     * `detail` is tool-specific data only. A host-started probe must read those members (the debug probes use their own
+     * `ProbeResultProjection`); parsing `detail` for an envelope silently yields no screen (Task 8 review).
+     */
     internal fun executeToolForProbe(name: String, argsJson: String) =
         toolCatalogForProbe?.execute(name, argsJson)
 
@@ -455,6 +530,11 @@ class HostCompositionRoot internal constructor(
         // edith-0.2 Phase C: the conversation view needs somewhere to be shown, so it is refused for the same reason
         // the text output is.
         Capability.ConversationDisplay -> "DISPLAY_MISSING"
+        // edith-0.3 Phase 1: the device profile/state channel; the Android provider is wired by Task 2.
+        Capability.DeviceState -> "DEVICE_STATE_PROVIDER_MISSING"
+        // edith-0.3 Phase 2 Task 7 wires the perception port; this row remains for a composition built without one
+        // (tests/harnesses). The plugin still treats absence as "no perception block", never a failed turn.
+        Capability.Perception -> "PERCEPTION_PROVIDER_MISSING"
     }
     private val mutableState =
         MutableStateFlow(
@@ -572,6 +652,15 @@ class HostCompositionRoot internal constructor(
      */
     internal var raiseConfirmationUi: (() -> Boolean)? = null
 
+    /**
+     * 0.3 Phase 4B (B5, spec §5.4): whether this build **may** raise the page, without raising it.
+     *
+     * [raiseConfirmationUi] has a side effect, so it cannot answer "would raising work?" for the availability check.
+     * Production points this at the overlay permission (`Settings.canDrawOverlays`); null (a hand-built composition or
+     * a JVM rig) means "no overlay", which is the honest answer rather than assuming the permission.
+     */
+    internal var canRaiseConfirmationUi: (() -> Boolean)? = null
+
     /** One root probe for one read, so the row and its note cannot cost two timeouts. Null when no probe is wired. */
     private fun rootStatus(): RootStatus? = rootStatusProbe?.let { probe -> runCatching { probe() }.getOrNull() }
 
@@ -676,9 +765,27 @@ class HostCompositionRoot internal constructor(
     fun storedSettings(): SmartSettings =
         requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }.load(profiles)
 
-    /** Persists one settings edit; the next App start's composition picks it up (this one never re-reads). */
+    /**
+     * Persists one settings edit; the next App start's composition picks it up (this one never re-reads).
+     *
+     * edith-0.3 Phase 2 Task 10: the 「感知截图」 switch is the exception to "next App start" - it is a live privacy
+     * control, so a successful save also applies it to [visionGate] immediately. A save that turns vision **off** is
+     * applied before the blob write and stays applied if the write fails: persistence is the durability half, while a
+     * failed save must never leave capture enabled after the user asked for off. A save that turns vision on applies
+     * only after the blob accepted it, so a failed write cannot arm capture.
+     *
+     * 0.3 Phase 4B (`D189`): the 「不拦截」 gate follows the same half-live rule for a stronger reason. Turning it
+     * **on** applies only after the blob accepted it (a failed write must not leave the process running unconfirmed
+     * by a mode the next restart will not remember); turning it **off** applies before the write and stays applied if
+     * the write fails (a failed save must never keep unconfirmed execution alive after the user disabled it).
+     */
     fun saveSmartSettings(settings: SmartSettings) {
-        requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }.save(settings)
+        val store = requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }
+        if (!settings.visionEnabled) visionGate.set(false)
+        if (!settings.noInterception) noInterceptionGate.set(false)
+        store.save(settings)
+        visionGate.set(settings.visionEnabled)
+        noInterceptionGate.set(settings.noInterception)
     }
 
     /**
@@ -763,11 +870,13 @@ class HostCompositionRoot internal constructor(
      * refuses (locked keystore, deleted payload) yields null rather than propagating: the configuration still has to
      * be built, and the plugin's own lookup finds nothing until storage answers again.
      */
-    private fun selectedProfile(pluginId: String): ModelProfile? {
-        val chosen = runCatching { (profiles as? AndroidProfileRepository)?.selections()?.get(pluginId) }.getOrNull()
-        if (chosen != null) runCatching { profiles.get(chosen) }.getOrNull()?.let { return it }
-        return if (pluginId == smartWiring?.plugin?.descriptor?.pluginId) smartWiring?.selectedProfile() else null
-    }
+    private fun selectedProfile(pluginId: String): ModelProfile? = resolveTurnProfile(
+        selection = { (profiles as? AndroidProfileRepository)?.selections()?.get(pluginId) },
+        load = profiles::get,
+        fallback = {
+            if (pluginId == smartWiring?.plugin?.descriptor?.pluginId) smartWiring?.selectedProfile() else null
+        },
+    )
 
     /** The diagnostic text plugin's own configuration shape; it refuses every key that is not one of these. */
     private fun diagnosticValues(profile: ModelProfile?): Map<String, String> = mapOf(
@@ -867,8 +976,11 @@ class HostCompositionRoot internal constructor(
     }
 
     /** P3.3: puts the question the host was asked to present on the session page - and, when nobody can see that page,
-     * both raises the page and puts the question in the notification shade. */
-    internal fun showConfirmation(requestId: String, summary: String) {
+     * runs the B5 channel ladder (glasses -> notification -> Edith page).
+     *
+     * 0.3 Phase 4B (B7): returns the rung that actually took the question (or `null` for none), so the presenter's
+     * count-only `P4_CONFIRM` line names the real channel instead of guessing between notification and dialog. */
+    internal fun showConfirmation(requestId: String, summary: String): ConfirmationChannelKind? {
         mutableState.update {
             it.copy(
                 pendingConfirmation = PendingConfirmation(
@@ -880,13 +992,71 @@ class HostCompositionRoot internal constructor(
                 ),
             )
         }
-        if (!uiIsVisible) {
-            // Loud first: the page comes to the front (owner directive), and the notification still carries the
-            // sound/vibration and stays as the fallback for a build or a device where raising is refused.
-            raiseConfirmationUi?.invoke()
-            notifier()?.post(requestId, summary)
+        return deliverToPhone(requestId, summary)
+    }
+
+    /**
+     * 0.3 Phase 4B (B5, spec §5.4/D191): the phone-side rung of the channel ladder.
+     *
+     * The order is the owner's: glasses (already announced by the presenter; read live because a refused SHOW must not
+     * suppress a fallback) -> notification action -> the Edith page as the **last** fallback. Voice is deliberately not
+     * here: it only settles a question that has already been presented, so it can never make one visible. Each rung is
+     * attempted only when its surface is live, and the first success stops the ladder - the old code posted the
+     * notification **and** raised the page on every background question, which is the "duplicate surfaces" the spec
+     * rules out.
+     */
+    private fun deliverToPhone(requestId: String, summary: String): ConfirmationChannelKind? {
+        if (uiIsVisible) return ConfirmationChannelKind.DIALOG
+        val channel = confirmationPresentationChannel(
+            glassesServing = confirmationPresenter?.isServingOnGlasses(requestId) == true,
+            notificationAvailable = notificationsCanPost(),
+            dialogAvailable = canRaiseConfirmationPage(),
+        )
+        return when (channel) {
+            ConfirmationChannelKind.GLASSES -> ConfirmationChannelKind.GLASSES  // the glasses already carry it
+            ConfirmationChannelKind.NOTIFICATION -> {
+                if (notifier()?.post(requestId, summary) == true) return ConfirmationChannelKind.NOTIFICATION
+                // A shade that became unavailable between the probe and the post degrades, it does not drop the
+                // question: the page is the last fallback.
+                raiseConfirmationPage()
+                ConfirmationChannelKind.DIALOG
+            }
+            // The notification was skipped because it cannot post; record the stable reason before degrading (§5.4:
+            // a missing channel must say why, never silently become "Edith only").
+            ConfirmationChannelKind.DIALOG -> {
+                notificationSurface?.let { notifier()?.reportUnavailable(requestId) }
+                raiseConfirmationPage()
+                ConfirmationChannelKind.DIALOG
+            }
+            ConfirmationChannelKind.VOICE, null -> null
         }
     }
+
+    /** Raises the session page over another App; a refused raise is a degradation, never a failed question. */
+    private fun raiseConfirmationPage() {
+        runCatching { raiseConfirmationUi?.invoke() }
+    }
+
+    /** Whether the page can be raised right now, from the side-effect-free probe (never by raising it to find out). */
+    private fun canRaiseConfirmationPage(): Boolean =
+        canRaiseConfirmationUi?.let { runCatching(it).getOrDefault(false) } ?: false
+
+    /** Whether the shade can post the question right now; a throwing probe is unavailable. */
+    private fun notificationsCanPost(): Boolean =
+        notificationSurface?.let { runCatching { it.available() }.getOrDefault(false) } ?: false
+
+    /**
+     * 0.3 Phase 4B (B5, spec §5.4): whether the **phone** can put a confirmation in front of the wearer right now.
+     *
+     * The B4 answer was "this composition exists", true for the whole session - so the presenter never reported
+     * unavailable and AgentLoop's early `CONFIRMATION_UNAVAILABLE` refusal was unreachable in production. This is the
+     * live three-way question ([ConfirmationPhoneSurface]): page visible, page raisable, or shade postable.
+     */
+    internal fun canPresentOnPhone(): Boolean = ConfirmationPhoneSurface.available(
+        pageVisible = uiIsVisible,
+        canRaisePage = canRaiseConfirmationPage(),
+        notificationsAvailable = notificationsCanPost(),
+    )
 
     /** P3.3: takes a question off the session page - on an answer, a timeout, 急停 or session teardown - and out of
      * the shade with it. */
@@ -911,7 +1081,9 @@ class HostCompositionRoot internal constructor(
     @Synchronized fun uiVisible(visible: Boolean) {
         uiIsVisible = visible
         val pending = state.value.pendingConfirmation ?: return
-        if (visible) notifier()?.cancel(pending.requestId) else notifier()?.post(pending.requestId, pending.summary)
+        // 0.3 Phase 4B (B5): the same ladder as `showConfirmation` - coming back to the page takes the duplicate out of
+        // the shade, leaving again chooses the highest available channel rather than always firing both.
+        if (visible) notifier()?.cancel(pending.requestId) else deliverToPhone(pending.requestId, pending.summary)
     }
 
     /** P3.3: 急停 - withdraws every open question and cancels what is in flight. */
@@ -1114,6 +1286,19 @@ class HostCompositionRoot internal constructor(
     internal fun isPanelVisible(): Boolean = hintLink?.isPanelVisible() ?: false
 
     /**
+     * The last wear-sensor value the glasses reported, or `null` before any wearing event (0.3 Phase 2, Task 2).
+     *
+     * A tri-state on purpose: the host must not turn "no event yet" into "not wearing". Set by [onWearingChanged] and
+     * cleared when the link is lost or the session ends, because the fact belongs to the session that reported it.
+     * Read-only from the outside; written only on the host-event path.
+     */
+    @Volatile
+    private var wearingState: Boolean? = null
+
+    /** The device-state provider's wearing fact; `null` until the glasses report one. */
+    internal fun glassesWearing(): Boolean? = wearingState
+
+    /**
      * True when [identity] is the pair [HostRuntime] currently accepts events for.
      *
      * The link validated an inbound event against the identity it introduced; a queued event can outlive that
@@ -1157,7 +1342,9 @@ class HostCompositionRoot internal constructor(
      * Receives `PANEL_SHOWN` from the link and hands it to [onPanelShown] on a host thread.
      *
      * The validated identity is checked against the host's current one at delivery, so a queued event from a previous
-     * session cannot start the new conversation's timer.
+     * session cannot start the new conversation's timer. 0.3 Phase 4B (B4, spec §5.4): a live confirmation question is
+     * announced to the newly laid-out panel here as well - the panel may have been created *after* `present` sent its
+     * first `SHOW`/`CONFIRM_STATE`, and that repeat must not count as settling the question.
      */
     internal fun panelShownArrived(identity: HintIdentity, route: AssistantRoute) {
         dispatchHostEvent {
@@ -1167,6 +1354,9 @@ class HostCompositionRoot internal constructor(
                 return@dispatchHostEvent
             }
             P3Log.line("P3_PANEL shown route=${route.name}")
+            // Re-announce before the turn owner starts its window: the question is on the panel by the time the
+            // wearer's listening/answer window opens.
+            confirmationPresenter?.panelShownArrived()
             onPanelShown?.invoke(identity, route)
         }
     }
@@ -1257,6 +1447,9 @@ class HostCompositionRoot internal constructor(
     internal fun onWearingChanged(wearing: Boolean) {
         dispatchHostEvent {
             if (closed) return@dispatchHostEvent
+            // 0.3 Phase 2 Task 2: the wear sensor fact is recorded for the device state. `true` and `false` are both
+            // facts; a session that has reported none stays `null` until its first event.
+            wearingState = wearing
             P3Log.line("P3_CXR glasses_event=wearing=$wearing")
             if (wearing) return@dispatchHostEvent
             val identity = runCatching { host.currentIdentity() }.getOrNull()
@@ -1288,6 +1481,8 @@ class HostCompositionRoot internal constructor(
     private fun onCxrLinkInterrupted() {
         if (closed) return
         hintLink?.linkLost()
+        // 0.3 Phase 2 Task 2: a dead link's last wearing fact must not outlive the session it described.
+        wearingState = null
         linkReady = false
         linkBuilt = false
         retriedMappingSyncId = null
@@ -1689,6 +1884,8 @@ class HostCompositionRoot internal constructor(
             host.stop()
         } finally {
             hintLink?.sessionEnded()
+            // 0.3 Phase 2 Task 2: the wearing fact belongs to the session that reported it; 停止 is that session ending.
+            wearingState = null
         }
         activatedPlugin = null
         awaitingDisplayForActivation = false
@@ -1869,9 +2066,18 @@ class HostCompositionRoot internal constructor(
             // corrupt blob leaves a configure-able, arm-able app rather than an un-activatable plugin.
             //
             // Task 14b: this is also the store the settings screen writes through, so a save and the next load read
-            // the same blob. The composition's own settings stay the ones read here; the screen's copy is explicit
-            // that only a full App restart re-reads them (this root is a process-lifetime singleton).
+            // the same blob. The composition's own settings stay the ones read here; the screen's copy says that only
+            // a full App restart re-reads them (this root is a process-lifetime singleton), with the single exception
+            // of the live vision gate built just below.
             val smartSettings = smartSettingsStore.load(profiles)
+            // Phase 2 Task 10: one live gate for the perception provider and the device tool, seeded from the stored
+            // switch. A save updates this same instance through `saveSmartSettings`; the old `{ true }` hardcodes on
+            // both consumers are gone, so the switch really is the only source of truth.
+            val visionGate = VisionGate(smartSettings.visionEnabled)
+            // 4B (`D189`): the live 「不拦截」 gate, seeded from the same persisted snapshot. B3 passes its provider to
+            // the smart plugin's policy and shell-precheck wrapper, so a save on the settings screen is consulted from
+            // the next tool call. Default off, including for a pre-4B blob and for a hand-built composition.
+            val noInterceptionGate = NoInterceptionGate(smartSettings.noInterception)
             // Task 14b: the self-audio seam. P3.1 emits no audio at all, so the gate stays open and this wiring
             // changes nothing today; it is what P3.2 hands to the speech output path. See `PlaybackGate`.
             //
@@ -1881,6 +2087,10 @@ class HostCompositionRoot internal constructor(
             // local gate here is what made `root.playbackGate.begin()` suppress nothing.
             val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
             val hostHolder = arrayOfNulls<HostRuntime>(1)
+            // 0.3 Phase 4B (B5): one monotonic revision source for the confirmation hint. The glasses update a row only
+            // for a strictly newer revision of the same hint id, so the PANEL_SHOWN re-announcement must never repeat
+            // the first send's number (two sends can share a coarse clock tick).
+            val summaryRevision = java.util.concurrent.atomic.AtomicLong(0)
             // 0.24 S2 Task 11: the production `IGlassesEventListener`. The backend registers it on every newly created
             // session **before** `connect` (official CXR-L 1.1.2 order). The listener never runs host policy on the
             // vendor thread. Task 20: screen/app events are diagnostics; wear-off cancels the turn and closes the panel.
@@ -1908,7 +2118,36 @@ class HostCompositionRoot internal constructor(
                 connected = NotificationCategoryService::isConnected,
                 latest = NotificationCategoryService::latest,
             )
+            // 0.3 Phase 2 Task 3: the same listener's in-memory content. Task 7 hands it to the perception provider;
+            // it is never logged or persisted, and a missing grant answers an honest `unavailable`.
+            val notificationContent = NotificationContentSource()
+            // 0.3 Phase 2 Task 2: the media fact. `getActiveSessions` is gated on the app's notification-listener
+            // grant, so the component the user already enabled for the category signal is the one named here; no new
+            // permission is requested or needed. The source answers `null` (never a fake state) while the grant is
+            // missing, the binder is dead, or no session reports a playback state.
+            val mediaSession = MediaSessionSource(
+                context,
+                ComponentName(context, NotificationCategoryService::class.java),
+            )
             val calendar = CalendarSource.android(context)
+            // 0.3 Phase 2 Task 4: the remaining perception sources. Each reads its fact at frame time through a late
+            // lambda, because the objects that own those facts (the host for the acoustic label, the composition for
+            // the wearing/panel state) do not exist yet when this block runs.
+            //
+            // Task 7: one foreground lambda is shared by the perception provider, the device tool's ref gate and the
+            // screen projector, so those three cannot disagree about the app in front. R7: the clipboard source gets a
+            // foreground predicate, so a known-background host never attempts a read the platform would refuse.
+            val foreground = { EdithAccessibilityService.port()?.foreground() }
+            val clipboard = ClipboardSource.android(
+                context,
+                foreground = { runCatching { foreground()?.packageName }.getOrNull()?.let { it == context.packageName } },
+            )
+            val acoustic = AcousticSource { hostHolder[0]?.lastAcousticLabel() }
+            val glassesState = GlassesStateSource(
+                connected = { hintLink.isEstablished() },
+                wearing = { rootHolder[0]?.glassesWearing() },
+                panelVisible = { rootHolder[0]?.isPanelVisible() },
+            )
             // edith-0.2 Phase B (B4): the SKILL directory grant. The implementation reads through `java.io.File`,
             // so it is stateless and cheap; the plugin points it at `/sdcard/EDITH/skills/` itself, which keeps the
             // on-device path in the module that owns the SKILL format (`StorageAccessSkillDirectory`).
@@ -2015,10 +2254,16 @@ class HostCompositionRoot internal constructor(
             val smartWiring = SmartWiring(smartSettings, profiles, clock, scheduler, { sessionId, generation, turnId ->
                 hostHolder[0]?.cancelOutputTurn(sessionId, generation, turnId)
             }, isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false },
-                speechAvailable = { speechPlayerHolder.get() != null })
+                requestPanelOpen = { route -> rootHolder[0]?.requestPanelOpen(route) ?: false },
+                speechAvailable = { speechPlayerHolder.get() != null },
+                // 0.3 Phase 4B (`D189`): the gate's **provider**, not its current value. `saveSmartSettings` updates
+                // this same instance, so the plugin's policy and shell-precheck wrapper see a save from the next call.
+                noInterception = noInterceptionGate.provider())
             // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
-            // One router is the single `Capability.Actions` provider, so the advertised tool set is exactly the set of
-            // channels that are up. Each channel is asked at read time, never cached.
+            // One `ToolSurface` is the single `Capability.Actions` provider (Phase 4A Task 4): the umbrella catalog's
+            // four verified tools plus the five atomic channel legs, 22 descriptors in all. The advertised set is fixed
+            // (A3): each channel is asked per call, never at read time, so a channel that goes down refuses rather than
+            // disappearing from the model's table.
             val shizukuShell = ShizukuUserServiceShell(context, BuildConfig.VERSION_CODE, BuildConfig.DEBUG,
                 // The bind is asynchronous, so the session's first probe can honestly read "not yet". This line is the
                 // moment the channel actually becomes usable - and it is what a device stage reads instead of guessing.
@@ -2060,16 +2305,59 @@ class HostCompositionRoot internal constructor(
             val rootProbe = RootProbe.onDevice()
             // T2.7: one package catalog for the app-name resolution and the label fallback of `open`/`list`.
             val appCatalog = PackageManagerAppCatalog(context)
-            // ---- 0.25 Task 10: the six-tool surface (spec §4.7) -------------------------------------------------------
-            // `ToolCatalog` is the single `Capability.Actions` provider: four host tools whose channels are probed at
-            // read time (device/shell/open/dial). The old 21-tool `ExecutionRouter` is deliberately no longer wired -
-            // the plugin adds `notify_user`/`load_skill` beside this catalog, which makes exactly six.
+            // 0.3 Phase 1 Task 2: the static device profile / per-request state channel. Built here, before the
+            // execution layer, because Phase 2 Task 7's perception provider and `device` tool both read it. Its
+            // capability set is a live read of gates assembled above (the Shizuku shell exists, the speech player has
+            // been decided); answering from a half-built composition would let the profile name a capability the host
+            // cannot answer. Facts are read lazily on each profile()/state() call.
+            // The wake-word source is the same registry the plugin declares its words to (`Capability.WakeWord`), so
+            // the prompt and the detector describe one word set, not two copies of the settings.
+            //
+            // 0.3 Phase 2 Task 2 completes the perception facts. Each lambda reads the object that owns the fact at
+            // frame time: the accessibility port for the foreground app and the IME window list, the media-session
+            // source, and the composition/link for the panel and both glasses facts. The composition itself is reached
+            // through `rootHolder` because the provider map is assembled before the root exists; a fact asked for
+            // before then is honestly `null` rather than a fabricated default.
+            //
+            // Task 7 moves this construction above `DeviceKernel`/`DeviceTool`; the speech player is built later, so
+            // the capability set reads the holder that `create` fills before the host exists.
+            val deviceState = androidDeviceStateProvider(
+                context = context,
+                capabilities = {
+                    buildSet {
+                        if (EdithAccessibilityService.connected()) add("a11y")
+                        if (shizukuShell.ready()) add("shizuku")
+                        if (speechPlayerHolder.get() != null) add("tts")
+                        if (notificationCategory.isConnected) add("notification_access")
+                        if (foregroundApp.isGranted) add("usage_access")
+                        if (calendar.isGranted) add("calendar")
+                        // The media session is readable only through that same notification-listener grant
+                        // (`MediaSessionManager.getActiveSessions` throws without it), so the capability follows the
+                        // grant instead of being advertised and then refused. Clipboard readability is foreground-
+                        // bound (R7), so it stays a coverage fact rather than a capability here.
+                        if (notificationCategory.isConnected) add("media_session")
+                    }
+                },
+                wakeWords = { smartWiring.wakeWords.current() },
+                foreground = { foreground() },
+                imeVisible = { EdithAccessibilityService.imeVisibleNow() },
+                media = { mediaSession.current() },
+                panelVisible = { rootHolder[0]?.isPanelVisible() },
+                glassesConnected = { hintLink.isEstablished() },
+                glassesWearing = { rootHolder[0]?.glassesWearing() },
+            )
+            // ---- 0.3 Phase 4A Task 4: the 22-host-tool surface (spec §4.1/§4.2) ---------------------------------------
+            // `ToolCatalog` is the umbrella half: four host tools (`device`/`shell`/`open`/`dial`) that stay advertised
+            // in every channel state (A3). The atomic legs built below it add the 18 fast-path tools, and the plugin
+            // adds `notify_user`/`load_skill` beside the surface - 24 model-visible tools in all. The old 21-tool
+            // `ExecutionRouter` remains retired from production.
             //
             // The accessibility port is resolved per call through the service's companion: the user can switch the
-            // service off at any moment, and `a11yAvailable` is what stops `device` being advertised while it is. A
-            // call that somehow arrives while it is down fails on the kernel's own bound gate instead of dereferencing
-            // null. The delegate must share the service's registry (R36), so the refs rendered by ScreenProjector are
-            // the refs `performNodeAction` resolves.
+            // service off at any moment. Task 7 review I2 (R11): `device` stays advertised so its `status` action can
+            // report `accessibility=false`; every other device action and every other port call still requires the
+            // live service and fails on the kernel's own bound gate instead of dereferencing null. The delegate must
+            // share the service's registry (R36), so the refs rendered by ScreenProjector are the refs
+            // `performNodeAction` resolves.
             val accessibilityPort = object : AccessibilityPort {
                 private fun live(): AccessibilityPort = EdithAccessibilityService.port()
                     ?: throw IllegalStateException("the accessibility service is not connected")
@@ -2081,7 +2369,12 @@ class HostCompositionRoot internal constructor(
                 override fun performNodeAction(ref: Ref, action: String) = live().performNodeAction(ref, action)
                 override fun dispatchGesture(gesture: Gesture) = live().dispatchGesture(gesture)
                 override fun screenshot() = live().screenshot()
-                override fun foreground() = live().foreground()
+                // Task 7 review I2 (R11): the one port call `status` makes before it reads health. An unbound service
+                // has no foreground to report - that is `null`, not a failed status call. Every other call above still
+                // requires the live service, so this fallback cannot make an unbound channel look usable.
+                override fun foreground() = EdithAccessibilityService.port()?.foreground() ?: Foreground(null, null)
+                // 0.3 Phase 2 Task 8: same unbound style - no live service means no root package to report.
+                override fun rootPackage() = EdithAccessibilityService.port()?.rootPackage()
             }
             val deviceKernel = DeviceKernel(
                 accessibility = accessibilityPort,
@@ -2094,61 +2387,231 @@ class HostCompositionRoot internal constructor(
                 // `ArtifactMediaSource` resolves, instead of the `pending` placeholder.
                 artifactStore = artifactStore,
             )
-            val screenProjector = ScreenProjector(ObservationRenderer(deviceKernel.registry), deviceKernel.registry)
-            val deviceTool = DeviceTool(DeviceKernelOperations(deviceKernel), screenProjector)
+            val screenProjector = ScreenProjector(
+                ObservationRenderer(deviceKernel.registry),
+                deviceKernel.registry,
+                foregroundActivity = { runCatching { foreground()?.activity }.getOrNull() },
+            )
+            // ---- edith-0.3 Phase 2 Task 7: perception wiring ------------------------------------------------
+            // `observe` is the kernel-backed whole-screen read: a failed envelope is thrown (the provider turns that
+            // into `screen=unavailable`), and a failed read never silently answers a pre-turn cache. The same
+            // `foreground` lambda feeds the provider, the tool and the projector, so their foreground facts agree.
+            val perceptionPolicy = PerceptionPolicy()
+            val observe = { filter: DeviceScreenFilter ->
+                val envelope = deviceKernel.observe(filter)
+                if (!envelope.ok) throw IllegalStateException(envelope.error?.code ?: "OBSERVE_FAILED")
+                deviceKernel.latestObservation ?: throw IllegalStateException("OBSERVE_NO_OBSERVATION")
+            }
+            val perception = AndroidPerceptionProvider(
+                observe = observe,
+                foreground = foreground,
+                registry = deviceKernel.registry,
+                notifications = notificationContent,
+                calendar = calendar,
+                media = mediaSession,
+                deviceState = deviceState,
+                clipboard = clipboard,
+                acoustic = acoustic,
+                glasses = glassesState,
+                policy = { perceptionPolicy },
+                // Phase 2 Task 10: the live switch, not an assembly-time copy. The provider answers `Disabled` and the
+                // injected capture is not called while it is off.
+                visionEnabled = { visionGate.enabled },
+                // 0.3 Phase 2.1 Task 4 fix: the second gate resolves the **turn's** profile, not the assembly-time
+                // settings choice. The repository selection (the same source `selectedProfile(pluginId)`/the turn
+                // configuration reads) wins; the settings profile is only the fallback. Both are read inside the lambda,
+                // so a profile selection change applies to the next capture. Null/exception reads false (no image).
+                profileSupportsImage = {
+                    autoVisionProfileSupportsImage(
+                        selection = {
+                            (profiles as? AndroidProfileRepository)?.selections()
+                                ?.get(smartWiring.plugin.descriptor.pluginId)
+                        },
+                        load = profiles::get,
+                        fallback = smartWiring::selectedProfile,
+                    )
+                },
+                // 0.3 Phase 2.1 Task 4 fix: one mapping for the kernel envelope. A `pending` placeholder (the capture
+                // worked, the artifact store did not) is `Unavailable("SCREENSHOT_PENDING")`, never an unresolvable
+                // image reference in a model request.
+                screenshot = { perceptionScreenshotResult(deviceKernel.screenshot()) },
+                latestObservation = { deviceKernel.latestObservation },
+                clock = { System.currentTimeMillis() },
+            )
+            val deviceTool = DeviceTool(
+                DeviceKernelOperations(deviceKernel),
+                screenProjector,
+                perception = perception,
+                deviceState = deviceState,
+                registry = deviceKernel.registry,
+                foreground = foreground,
+                visionEnabled = { visionGate.enabled },
+                refTtlMillis = { perceptionPolicy.refTtlMillis },
+            )
             val callAvailable: () -> Boolean = {
                 context.checkSelfPermission(android.Manifest.permission.CALL_PHONE) ==
                     android.content.pm.PackageManager.PERMISSION_GRANTED
             }
+            // ---- edith-0.3 Phase 2.2 Task 6: one host observation source for the screen tools -------------------
+            // `open`, `shell` and `dial` all describe "what the screen looks like after the call", so they share this
+            // one source instead of each growing its own read. It is a real post-call read (`refresh`), not the turn's
+            // opening cache: the whole point of a failed `open`'s observation is to show the screen the failure left
+            // behind. With the accessibility channel off there is nothing honest to read, so the source answers an
+            // explicit `unavailable/no_accessibility` observation - never an invented screen and never a silent null.
+            // It is non-throwing: a failed read degrades to `OBSERVE_FAILED` and the tool keeps its own outcome.
+            val toolObservation: () -> ToolObservation? = {
+                if (!EdithAccessibilityService.connected()) {
+                    PerceptionToolObservation.unavailable(PerceptionToolObservation.NO_ACCESSIBILITY)
+                } else {
+                    runCatching { PerceptionToolObservation.render(perception.refresh()) }
+                        .getOrElse { PerceptionToolObservation.unavailable(TOOL_OBSERVATION_FAILED) }
+                }
+            }
+            val openTool = OpenTool(
+                shell = shizukuShell,
+                catalog = appCatalog,
+                foreground = { EdithAccessibilityService.port()?.foreground()?.packageName },
+                // 0.3 Phase 2 Task 8: `am start -W`'s own `Status: ok` is not success; the tool verifies the
+                // resolved package is both the foreground app and the accessibility root.
+                foregroundActivity = { EdithAccessibilityService.port()?.foreground()?.activity },
+                rootPackage = { EdithAccessibilityService.port()?.rootPackage() },
+                // 0.3 Phase 2.1 Task 4: a verified open captures through the same provider gate as observe/act.
+                capture = { perception.screenshot() },
+                // 0.3 Phase 2.2 Task 6: the shared post-call observation, so an `open` failure tells the model what
+                // the phone is actually showing now.
+                observe = toolObservation,
+            )
             val toolCatalog = ToolCatalog(
                 device = deviceTool,
                 shell = ShellTool(shizukuShell),
-                open = OpenTool(
-                    shell = shizukuShell,
-                    catalog = appCatalog,
-                    foreground = { EdithAccessibilityService.port()?.foreground()?.packageName },
-                ),
+                open = openTool,
                 // The number validation/permission check/ACTION_CALL hand-off stay in the one executor that owns them.
                 dial = DialTool(actions, callAvailable),
                 a11yAvailable = { EdithAccessibilityService.connected() },
                 shellAvailable = { shizukuShell.ready() },
                 callAvailable = callAvailable,
                 unlock = unlockGate,
+                // Task 6: the same source and the same capture gate as `open`; `shell`/`dial` differ only in their own
+                // outcome shapes, which the catalog leaves untouched.
+                observe = toolObservation,
+                capture = { perception.screenshot() },
             )
-            val confirmationUi = object : ConfirmationUi {
-                // Through the holder: this object is built inside `create`, where no composition instance exists yet,
-                // and the question is shown only after a session starts - by which time the holder is filled.
-                override fun show(requestId: String, summary: String) {
-                    rootHolder[0]?.showConfirmation(requestId, summary)
-                }
+            // ---- edith-0.3 Phase 4A Task 4 (A4): the 22-host-tool face ------------------------------------------
+            // `toolCatalog` is the umbrella half (the verified, structured path). The five atomic backends beside it are
+            // the fast path the model may choose instead: one leg per channel, each answering its own `available()` at
+            // call time. `ToolSurface` is the **one** `Capability.Actions` provider over both halves - 18 atomic
+            // descriptors plus the catalog's four = 22 - and it refuses a duplicate name at construction, which is why
+            // the intent leg filters `dial`: the catalog's `DialTool` is that name's only advertised owner.
+            //
+            // Advertising is stable (A3): a channel that is down keeps its tools advertised and its own `execute`
+            // answers the refusal, so the schema and the cached prompt prefix cannot change under the model mid-session.
+            //
+            // The atomic a11y backend needs the live `AccessibilityUi`, and the composition is assembled before the
+            // service connects, so the adapter resolves it per call exactly as `accessibilityPort` above does. A call
+            // that passes the backend's `connected` gate finds the live instance; an unbound one is the backend's own
+            // `ACTION_CHANNEL_UNAVAILABLE` refusal, never a stale or fabricated UI.
+            val accessibilityUi = object : AccessibilityUi {
+                private fun live(): AccessibilityUi = EdithAccessibilityService.ui()
+                    ?: throw IllegalStateException("the accessibility service is not connected")
 
-                override fun hide(requestId: String) {
-                    rootHolder[0]?.hideConfirmation(requestId)
-                }
+                override fun clickText(text: String): Boolean = live().clickText(text)
+                override fun setText(text: String): Boolean = live().setText(text)
+                override fun screenFingerprint(): String = live().screenFingerprint()
+                override fun snapshot(filter: A11yScreenFilter): ScreenSnapshot = live().snapshot(filter)
+                override fun clickByIndex(snapshotId: String, index: Int): Boolean = live().clickByIndex(snapshotId, index)
+                override fun longPressByIndex(snapshotId: String, index: Int): Boolean =
+                    live().longPressByIndex(snapshotId, index)
+                override fun scroll(direction: ScrollDirection): Boolean = live().scroll(direction)
+                override fun setTextByIndex(snapshotId: String, index: Int, text: String): Boolean =
+                    live().setTextByIndex(snapshotId, index, text)
+                override fun structuralFingerprint(): ScreenFingerprint = live().structuralFingerprint()
             }
+            // `launch_app`/`list_apps` resolve spoken names against the same `appCatalog` instance the umbrella `open`
+            // tool uses. `open_app` (intent) resolves through its own executor's package catalog over the same package
+            // manager, so the three paths cannot disagree about what is installed.
+            val atomicLaunchResolver = AppLaunchResolver(appCatalog)
+            // The a11y backend owns turn-scoped state (its `read_screen` snapshot), so its adapter is the one given
+            // the turn-boundary seam: `ToolSurface.beginTurn()` then clears that snapshot at the start of every turn
+            // and the index tools can only use a snapshot read in the current turn. The other legs own no turn state.
+            val accessibilityBackend = AccessibilityExecutionBackend(
+                ui = accessibilityUi,
+                connected = { EdithAccessibilityService.connected() },
+            )
+            val atomicExecutors = listOf(
+                // accessibility: the semantic UI fast path (`read_screen`/`tap`/...)
+                AtomicActionExecutor(
+                    backend = accessibilityBackend,
+                    onTurnBoundary = accessibilityBackend::beginTurn,
+                ),
+                // intent: the L0/L1 open/alarm/note actions, without the `dial` advertisement the catalog owns
+                IntentAtomicExecutor(actions),
+                // Shizuku: the privileged four plus `set_brightness`; its own `available()` gates every call
+                AtomicActionExecutor(
+                    ShizukuExecutionBackend(
+                        shell = shizukuShell,
+                        state = ShizukuTargetState(shizukuShell),
+                        channelUp = { shizukuShell.ready() },
+                    ),
+                ),
+                // Shizuku: `launch_app`/`list_apps` (their own L0/L1 group, same binder)
+                AtomicActionExecutor(
+                    LaunchAppExecutor(
+                        resolver = atomicLaunchResolver,
+                        catalog = appCatalog,
+                        shell = shizukuShell,
+                        channelUp = { shizukuShell.ready() },
+                    ),
+                ),
+                // Shizuku: back/home/recents/notifications
+                AtomicActionExecutor(
+                    SystemActionExecutor(shell = shizukuShell, channelUp = { shizukuShell.ready() }),
+                ),
+            )
+            // The catalog is closed through the surface's `onClose` (after the atomic executors), so the composition's
+            // close path below adds the **surface** and not the catalog: one owner, one close.
+            val toolSurface = ToolSurface(
+                catalog = toolCatalog,
+                atomic = atomicExecutors,
+                onClose = { toolCatalog.close() },
+            )
+            // 0.3 Phase 4B (B5): the production phone surface, through the named seam so a JVM test drives **this**
+            // rule rather than a copy of it. It used to be `rootHolder[0] != null`, which is true for the whole
+            // session and made the presenter's aggregate dishonest.
+            val confirmationUi = phoneConfirmationUi { rootHolder[0] }
             val confirmationPresenter = ConfirmationPresenter(
-                summary = SummaryDisplayer { text, ttlMillis ->
-                    val device = hintLink.liveOutput() ?: return@SummaryDisplayer false
-                    val identity = hostHolder[0]?.currentIdentity() ?: return@SummaryDisplayer false
-                    val now = clock.nowNanos()
-                    runCatching {
-                        device.show(
-                            Assistance(
-                                hintId = "confirm-${UUID.randomUUID()}",
-                                sessionId = identity.first,
-                                generation = identity.second,
-                                sourceTurnId = null,
-                                priority = 3,
-                                text = text,
-                                // The host refuses an assistance that carries speech, and P3.3 ships no speech path.
-                                optionalSpeech = null,
-                                expiresAtNanos = now + ttlMillis * 1_000_000L,
-                            ),
-                            revision = now,
-                            listener = { },
-                        )
-                        true
-                    }.getOrDefault(false)
+                summary = object : SummaryDisplayer {
+                    // 0.3 Phase 4B (B4): SHOW needs a live clock mapping; without one the display would drop the hint
+                    // silently, so the surface reports itself unavailable instead of claiming it can present.
+                    override fun available(): Boolean = hintLink.liveOutput() != null
+
+                    override fun show(hintId: String, text: String, ttlMillis: Long): Boolean {
+                        val device = hintLink.liveOutput() ?: return false
+                        val identity = hostHolder[0]?.currentIdentity() ?: return false
+                        val now = clock.nowNanos()
+                        return runCatching {
+                            device.show(
+                                Assistance(
+                                    // 0.3 Phase 4B (B5/B4 carry-forward): the presenter's **stable per-question**
+                                    // id, passed through. Minting a fresh id here (as B4 did) made every PANEL_SHOWN
+                                    // re-announcement append a new `say-<hintId>` row on the glasses.
+                                    hintId = hintId,
+                                    sessionId = identity.first,
+                                    generation = identity.second,
+                                    sourceTurnId = null,
+                                    priority = 3,
+                                    text = text,
+                                    // The host refuses an assistance that carries speech, and P3.3 ships no speech path.
+                                    optionalSpeech = null,
+                                    expiresAtNanos = now + ttlMillis * 1_000_000L,
+                                ),
+                                // A re-announcement of the same hint must be a newer revision, or the glasses refuse it
+                                // as stale; a monotonic counter keeps that true even when two sends share a clock tick.
+                                revision = summaryRevision.incrementAndGet(),
+                                listener = { },
+                            )
+                            true
+                        }.getOrDefault(false)
+                    }
                 },
                 ui = confirmationUi,
                 // The host owns the identity: the result is rebuilt and emitted through the same path every other
@@ -2185,8 +2648,19 @@ class HostCompositionRoot internal constructor(
                 },
                 // 0.25 Task 11 (R51): the presenter announces the question to the glasses through the same link that
                 // carries hints; a link with no established session answers false, which only degrades to phone-only.
-                glasses = ConfirmationGlasses { requestId, active ->
-                    hintLink.confirmationState(requestId, active)
+                // 0.3 Phase 4B (B4): the keys can serve exactly while a session is established; that is also the
+                // condition under which the presenter asks the link to create the panel below.
+                glasses = object : ConfirmationGlasses {
+                    override fun available(): Boolean = hintLink.isEstablished()
+
+                    override fun show(requestId: String, active: Boolean): Boolean =
+                        hintLink.confirmationState(requestId, active)
+                },
+                // 0.3 Phase 4B (B4, spec §5.4): `PANEL_OPEN` creates the resident window, so the question is announced
+                // into a visible panel rather than a hidden one. The route is WAKE: a confirmation is the wake turn's
+                // decision, and a proactive turn opens its own (PROACTIVE) panel without a question.
+                panel = ConfirmationPanel {
+                    rootHolder[0]?.requestPanelOpen(AssistantRoute.WAKE) ?: false
                 },
             )
             // P5 (spec §S1/S5): construct the speech player only when the user switch is on AND the engine is ready.
@@ -2217,9 +2691,10 @@ class HostCompositionRoot internal constructor(
                     audio?.let { put(Capability.Asr, it.asrSession) }
                     // Task 12: always answerable - the five L0/L1 actions need no engine, no transport and no
                     // permission at assembly time, so the advertised set and the answerable set stay equal.
-                    // 0.25 Task 10 (R40/R47): it is now the four-tool `ToolCatalog`, whose descriptors are gated on
-                    // live channel probes; the old 21-tool router is retired from production.
-                    put(Capability.Actions, toolCatalog)
+                    // 0.3 Phase 4A Task 4: it is the one `ToolSurface` - the 18 atomic tools plus the catalog's four
+                    // (22 host descriptors). A down channel keeps its tools and answers its own refusal (A3); the
+                    // plugin adds `notify_user`/`load_skill` beside it for 24. The old 21-tool router stays retired.
+                    put(Capability.Actions, toolSurface)
                     // P3.3: the confirmation channel is answerable whenever the composition has a screen to show the
                     // question on; a host that cannot ask must refuse the action, and this provider is what lets it ask.
                     put(Capability.Confirmation, confirmationPresenter)
@@ -2233,6 +2708,15 @@ class HostCompositionRoot internal constructor(
                     // provider is the composition's own signals object, so the values a plugin reads and the events
                     // the host delivers describe one source, not two.
                     put(Capability.Context, contextSignals)
+                    // 0.3 Phase 1 Task 2: the device profile/state channel. The provider is a pure local read (no
+                    // permission, model or transport needed at assembly), so it joins the advertised set; the host can
+                    // now grant the smart plugin's `Capability.DeviceState` when Task 12 declares it.
+                    put(Capability.DeviceState, deviceState)
+                    // edith-0.3 Phase 2 Task 7: the perception port. The provider is the same instance the `device`
+                    // tool decorates its results from, and its registry is the kernel's own, so a snapshot's refs are
+                    // exactly the refs the kernel/`performNodeAction` resolves (R36). Plugins that do not declare
+                    // `Capability.Perception` are unaffected (Task 9 declares it).
+                    put(Capability.Perception, perception)
                     // edith-0.2 Phase B (B4): the user's SKILL directory. `StorageAccessServiceImpl` is pure
                     // `java.io.File` work with no Android dependency and no permission to request at assembly time,
                     // so this capability is answerable whenever the composition exists - the advertised set and the
@@ -2266,9 +2750,10 @@ class HostCompositionRoot internal constructor(
                     timer.shutdownNow(); pluginTasks.shutdownNow()
                     http.dispatcher.executorService.shutdown(); http.connectionPool.evictAll()
                 })
-                // 0.25 Task 10 (R42): closing the catalog closes the device kernel (its worker pool), so a closed
-                // composition cannot leave a device thread behind.
-                add(toolCatalog)
+                // 0.25 Task 10 (R42): closing the surface closes the device kernel (through the catalog's onClose) and
+                // any closeable atomic executor, so a closed composition cannot leave a device thread behind. The
+                // surface is added here **instead of** the catalog: one owner, so the catalog closes exactly once.
+                add(toolSurface)
                 // Closes the pipeline (and with it the native engines) with the composition that owns them.
                 audio?.let { add(it) }
                 // 0.23 P5: the chime's ToneGenerator is a native resource; release it with the composition.
@@ -2304,6 +2789,8 @@ class HostCompositionRoot internal constructor(
                 dispatchHostEvent = { task -> scheduler.at(clock.nowNanos(), task) },
                 smartWiring = smartWiring,
                 smartSettingsStore = smartSettingsStore,
+                visionGate = visionGate,
+                noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
                 playbackGate = playbackGate)
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
@@ -2313,6 +2800,11 @@ class HostCompositionRoot internal constructor(
             root.lockPinStore = lockPinStore
             root.unlockCoordinatorForProbe = unlockGate
             root.toolCatalogForProbe = toolCatalog
+            // Phase 4A Task 4: the one `Capability.Actions` provider, for the JVM gate. Production never reads it.
+            root.toolSurfaceForProbe = toolSurface
+            // Task 6: the JVM gate reads the same `open` instance the Actions capability serves, so it can prove the
+            // observation source was really wired into `OpenTool(observe = ...)`.
+            root.openToolForProbe = openTool
             root.audioChain = audio
             // P5 (spec §S5): sync the UI state with what was loaded above.
             root.speechOn.value = speechEnabledNow
@@ -2348,6 +2840,9 @@ class HostCompositionRoot internal constructor(
             root.confirmationPresenter = confirmationPresenter
             // P3.3 (§17.4): the notification shade, so a question can be answered while this App is not in front.
             root.notificationSurface = AndroidNotificationSurface(context)
+            // 0.3 Phase 4B (B5): the side-effect-free half of the overlay check. `raiseConfirmationUi` really starts the
+            // Activity, so the availability ladder must not call it to find out whether raising is possible.
+            root.canRaiseConfirmationUi = { android.provider.Settings.canDrawOverlays(context) }
             root.raiseConfirmationUi = {
                 // Owner directive 2026-10-10: a time-boxed question must reach the user as a popup. Starting an
                 // Activity from the background is allowed on Android 10+ only under an exemption, and holding the
@@ -2406,6 +2901,29 @@ class HostCompositionRoot internal constructor(
             @Volatile var composition: HostCompositionRoot? = null
             fun onSceneReady() { composition?.onSceneReady() }
         }
+
+        /**
+         * 0.3 Phase 4B (B5, spec §5.4): the **production** phone surface, as a named seam.
+         *
+         * `create` builds it through a holder because the provider map is assembled before the composition exists; a
+         * JVM test hands it an already-built composition. Either way there is one implementation of the truthfulness
+         * rule: [HostCompositionRoot.canPresentOnPhone]. B4's inline answer was `rootHolder[0] != null`, which is true
+         * for the whole session and made the presenter's aggregate dishonest.
+         */
+        internal fun phoneConfirmationUi(composition: () -> HostCompositionRoot?): ConfirmationUi =
+            object : ConfirmationUi {
+                override fun available(): Boolean = composition()?.canPresentOnPhone() == true
+
+                // Through the composition that asked: the question is shown only after a session starts, by which
+                // time the holder is filled. B7: the returned rung is the surface that really took the question, so the
+                // presenter's count-only line names it instead of assuming the dialog.
+                override fun show(requestId: String, summary: String): ConfirmationChannelKind? =
+                    composition()?.showConfirmation(requestId, summary)
+
+                override fun hide(requestId: String) {
+                    composition()?.hideConfirmation(requestId)
+                }
+            }
 
         /**
          * `D53`① (2026-10-11) and 0.25 R75: the consent the gated model client consults, and the **only** one it is given.

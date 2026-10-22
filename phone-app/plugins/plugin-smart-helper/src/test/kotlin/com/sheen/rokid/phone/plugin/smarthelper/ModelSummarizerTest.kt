@@ -11,13 +11,14 @@ import com.sheen.rokid.plugin.MessageRole
 import com.sheen.rokid.plugin.ModelHistoryItem
 import com.sheen.rokid.plugin.ModelInfo
 import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.ModelUsage
 import com.sheen.rokid.plugin.TaskScope
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextCompressor
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.context.ConversationContext
 import com.sheen.rokid.phone.plugin.smarthelper.context.ModelSummarizer
-import com.sheen.rokid.phone.plugin.smarthelper.context.TokenBudget
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptCatalog
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import kotlin.test.Test
@@ -74,6 +75,7 @@ class ModelSummarizerTest {
             client = model,
             profileLookup = { profile },
             profileId = "profile-x",
+            prompt = PromptCatalog.summarizer(),
             clock = clock,
             scheduler = SmartFakeScheduler(clock),
             envelopeFor = { requestId, startNanos, endNanos ->
@@ -104,12 +106,15 @@ class ModelSummarizerTest {
         val summarizer = newSummarizer()
         model.onRequest = answers("（此前对话摘要）")
 
-        val summary = summarizer.summarize("用户问了几点。助手回答了时间。")
+        val summary = summarizer.summarize("用户问了几点。助手回答了时间。", SUMMARY_MAX_TOKENS)
 
         assertEquals("（此前对话摘要）", summary)
         val request = model.requests.single()
         assertEquals("profile-x", request.profileId)
         assertEquals(9L, request.profileRevision)
+        // 0.3 design §5.2/§6.4: the summary's own output cap is the policy-derived allowance, not the profile's
+        // window reservation.
+        assertEquals(SUMMARY_MAX_TOKENS, request.maxOutputTokens, "the summary must declare its own output cap")
         // The gateway lifts a one-item transcript into `input` (that is what makes it last on the wire), so the
         // transcript is asserted where it actually travels rather than where a hand-built history would have put it.
         assertEquals(
@@ -121,6 +126,68 @@ class ModelSummarizerTest {
     }
 
     @Test
+    fun `the summary request carries the six-part structured template`() {
+        // 0.3 design §6.4: the summarizer's instruction is a structured six-part template authored in
+        // `prompts/summarizer.md`, not the one-sentence compression instruction of the first migration.
+        val summarizer = newSummarizer()
+        model.onRequest = answers("（摘要）")
+
+        assertEquals("（摘要）", summarizer.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
+
+        val instructions = model.requests.single().instructions
+        assertEquals(PromptCatalog.summarizer(), instructions, "the request must carry the catalog's authored prompt")
+        listOf(
+            "当前目标与约束",
+            "已确认事实与偏好",
+            "已执行动作与结果",
+            "关键实体",
+            "未完成事项与下一步",
+            "禁止",
+        ).forEach { section ->
+            assertTrue(section in instructions, "design §6.4's six-part template must name 「$section」: $instructions")
+        }
+        assertTrue(
+            "编造" in instructions && "补充建议" in instructions && "提问" in instructions,
+            "the template must keep the no-invention/no-advice/no-question prohibition: $instructions",
+        )
+    }
+
+    @Test
+    fun `a summary request reports its own P3_CACHE line when usage is reported`() {
+        // Final review I4: `P3_CACHE` is the gateway's per-request line, so it must cover the summary request too. A
+        // summary has no assembled RequestFrame and never goes through AgentLoop.onRequestBuilt, so it has no
+        // P3_PROMPT line - that asymmetry is documented in CONTRACTS.md §P3_PROMPT.
+        val summarizer = newSummarizer()
+        model.onRequest = { request, listener ->
+            listener(ModelStreamEvent.TextDelta(request.requestId, "（此前对话摘要）"))
+            listener(
+                ModelStreamEvent.Terminal(
+                    request.requestId,
+                    com.sheen.rokid.plugin.ModelEnd.COMPLETED,
+                    ModelUsage(inputTokens = 41, outputTokens = 3),
+                    null,
+                ),
+            )
+        }
+        val lines = mutableListOf<String>()
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            assertEquals("（此前对话摘要）", summarizer.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
+        } finally {
+            P3Log.sink = previous
+        }
+
+        val cache = lines.single { it.startsWith("P3_CACHE ") }
+        assertTrue(cache.contains("inputTokens=41"), "the summary's usage must reach P3_CACHE: $cache")
+        assertTrue(cache.contains("outputTokens=3"), "the summary's usage must reach P3_CACHE: $cache")
+        assertTrue(
+            lines.none { it.startsWith("P3_PROMPT ") },
+            "a summary has no assembled RequestFrame, so it emits no P3_PROMPT line: $lines",
+        )
+    }
+
+    @Test
     fun `an unavailable cloud, an empty answer or a throw all answer null and never throw`() {
         val silent = newSummarizer()
         // A transport that never answers can only end at the request's own deadline. `ModelClientGateway` polls the
@@ -128,15 +195,15 @@ class ModelSummarizerTest {
         // only moves when the test says so turns this case into an infinite loop rather than a `null`.
         model.onRequest = { _, _ -> /* no terminal at all: the transport never answered */ }
         clock.autoAdvanceNanos = 1_000_000_000L
-        assertNull(silent.summarize("要摘要的对话"), "a stream with no verdict is not a summary")
+        assertNull(silent.summarize("要摘要的对话", SUMMARY_MAX_TOKENS), "a stream with no verdict is not a summary")
 
         val empty = newSummarizer()
         model.onRequest = answers("   ")
-        assertNull(empty.summarize("要摘要的对话"), "a blank answer is not a summary")
+        assertNull(empty.summarize("要摘要的对话", SUMMARY_MAX_TOKENS), "a blank answer is not a summary")
 
         val throwing = newSummarizer()
         model.onRequest = { _, _ -> throw IllegalStateException("cloud down") }
-        assertNull(throwing.summarize("要摘要的对话"), "a failing transport must degrade, not escape")
+        assertNull(throwing.summarize("要摘要的对话", SUMMARY_MAX_TOKENS), "a failing transport must degrade, not escape")
     }
 
     @Test
@@ -151,8 +218,8 @@ class ModelSummarizerTest {
         val context: ConversationContext
         try {
             context = overflowing()
-            ContextCompressor(summarizer = summarizer, scope = tasks)
-                .compressIfNeeded(context, budgetTokens = 3)
+            ContextCompressor(historyBudgetTokens = 3, summaryMaxTokens = SUMMARY_MAX_TOKENS, summarizer = summarizer, scope = tasks)
+                .compressIfNeeded(context)
             tasks.joinAll()
         } finally {
             P3Log.sink = previous
@@ -184,8 +251,8 @@ class ModelSummarizerTest {
 
         // `compressIfNeeded` must return while the summary is still blocked inside the transport: that is the property
         // "the wearer's turn does not pay for a cloud round trip".
-        val report = ContextCompressor(summarizer = summarizer, scope = tasks)
-            .compressIfNeeded(context, budgetTokens = 3)
+        val report = ContextCompressor(historyBudgetTokens = 3, summaryMaxTokens = SUMMARY_MAX_TOKENS, summarizer = summarizer, scope = tasks)
+            .compressIfNeeded(context)
         assertEquals(true, report.summaryStarted)
         val beforeRunning = context.size()
 
@@ -206,8 +273,10 @@ class ModelSummarizerTest {
         // this proves the **production** object (not a constructor-injected fake) is the one that ran. A small history
         // allowance is injected so a handful of turns reach the compression the module-level tests above cover.
         val contexts = ContextManager(
-            budget = TokenBudget(total = 60),
-            baseInstructions = { "测试用指令" },
+            policy = smartContextPolicy(
+                smartProfile(inputBudgetTokens = 60, usableWindowTokens = 10_000, maxOutputTokens = 1, safetyTokens = 1),
+            ),
+            promptPlan = smartPromptPlan("测试用指令"),
         )
         val rig = SmartTestRig(contextForTurn = contexts)
         rig.activate(overrides = mapOf(Capability.Embedding to ScriptedEmbeddings()))
@@ -233,6 +302,12 @@ class ModelSummarizerTest {
 
         val summaryRequests = rig.model.requests.count { it.tools.isEmpty() }
         assertTrue(summaryRequests > 0, "the production compressor never asked the summarizer: ${rig.model.requests.size} requests")
+        val summaryRequest = rig.model.requests.first { it.tools.isEmpty() }
+        assertEquals(
+            PromptCatalog.summarizer(),
+            summaryRequest.instructions,
+            "the activated plugin must pass the catalog's summarizer prompt, not a compiled-in copy",
+        )
         // "Lands in exactly one place" is one placeholder **per truncating compression**, and never more: a long
         // session compresses repeatedly, and a compression whose whole transcript is anchored (`truncated=0`) starts no
         // summary at all. The count is therefore bounded by the log lines rather than assumed equal to them — an
@@ -270,7 +345,7 @@ class ModelSummarizerTest {
         var previous = P3Log.sink
         P3Log.sink = { successLines += it }
         try {
-            assertEquals(marker, succeeded.summarize("要摘要的对话"))
+            assertEquals(marker, succeeded.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
         } finally {
             P3Log.sink = previous
         }
@@ -286,7 +361,7 @@ class ModelSummarizerTest {
         previous = P3Log.sink
         P3Log.sink = { blankLines += it }
         try {
-            assertNull(blank.summarize("要摘要的对话"))
+            assertNull(blank.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
         } finally {
             P3Log.sink = previous
         }
@@ -300,7 +375,7 @@ class ModelSummarizerTest {
         previous = P3Log.sink
         P3Log.sink = { unconfiguredLines += it }
         try {
-            assertNull(unconfigured.summarize("要摘要的对话"))
+            assertNull(unconfigured.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
         } finally {
             P3Log.sink = previous
         }
@@ -315,7 +390,7 @@ class ModelSummarizerTest {
         previous = P3Log.sink
         P3Log.sink = { refusedLines += it }
         try {
-            assertNull(refused.summarize("要摘要的对话"))
+            assertNull(refused.summarize("要摘要的对话", SUMMARY_MAX_TOKENS))
         } finally {
             P3Log.sink = previous
         }
@@ -324,6 +399,9 @@ class ModelSummarizerTest {
     }
 
     private companion object {
+        /** The summary output cap the fixture hands the summarizer; the production value comes from `ContextPolicy`. */
+        const val SUMMARY_MAX_TOKENS = 64
+
         /** The request bound the fixture hands the summarizer; unrelated to the plugin's own constant. */
         const val SUMMARY_DEADLINE_NANOS = 8_000_000_000L
 

@@ -15,12 +15,67 @@ internal interface NotificationSurface {
      */
     fun available(): Boolean
 
+    /**
+     * 0.3 Phase 4B (B5, spec §1.3 drift 3): the **stable** reason [available] is false, or `null` when it is true.
+     *
+     * Android has three independent off switches - the runtime permission, the App-level notification switch and the
+     * confirmation **channel's** importance - and a question that silently never appears has to say which one it hit.
+     * The values are wire-free log tokens, not user copy: see [NotificationAvailability]. Defaults to `null` so a
+     * surface written before this check keeps its old behaviour.
+     */
+    fun unavailableReason(): String? = null
+
     /** Posts (or replaces) the one live question. `ttlMillis` is a fallback cleanup, not the decision window. */
     fun post(requestId: String, title: String, text: String, ttlMillis: Long, actions: ConfirmationActions)
 
     fun cancel(requestId: String)
 
     fun cancelAll()
+}
+
+/**
+ * 0.3 Phase 4B (B5, spec §1.3 drift 3): why the shade cannot carry a confirmation, as stable count-only reasons.
+ *
+ * Deliberately pure JVM code: the Android half (`AndroidNotificationSurface`) reads the three live device answers and
+ * this object only decides - so "a disabled channel is unavailable" is pinned by a unit test while the device read
+ * itself remains a device boundary (no JVM test can instantiate a real `NotificationManager`).
+ */
+internal object NotificationAvailability {
+    /** `POST_NOTIFICATIONS` was never granted. */
+    const val PERMISSION_DENIED = "PERMISSION_DENIED"
+
+    /** The App's own notification switch is off (`NotificationManager.areNotificationsEnabled()`). */
+    const val APP_NOTIFICATIONS_DISABLED = "APP_NOTIFICATIONS_DISABLED"
+
+    /** The confirmation channel exists and the user turned it off (`importance == IMPORTANCE_NONE`). */
+    const val CHANNEL_DISABLED = "CHANNEL_DISABLED"
+
+    /** `NotificationManager.IMPORTANCE_NONE`; duplicated here so this object stays Android-free. */
+    const val IMPORTANCE_NONE = 0
+
+    /**
+     * `null` means the shade can post; otherwise the stable reason it cannot.
+     *
+     * [channelImportance] is `null` before the channel is created (it is created on the first post at
+     * `IMPORTANCE_HIGH`), which is **not** a disable: treating "not created yet" as unavailable would make the first
+     * confirmation unable to ever post itself.
+     */
+    fun unavailableReason(
+        permissionGranted: Boolean,
+        appNotificationsEnabled: Boolean,
+        channelImportance: Int?,
+    ): String? = when {
+        !permissionGranted -> PERMISSION_DENIED
+        !appNotificationsEnabled -> APP_NOTIFICATIONS_DISABLED
+        channelImportance == IMPORTANCE_NONE -> CHANNEL_DISABLED
+        else -> null
+    }
+
+    fun available(
+        permissionGranted: Boolean,
+        appNotificationsEnabled: Boolean,
+        channelImportance: Int?,
+    ): Boolean = unavailableReason(permissionGranted, appNotificationsEnabled, channelImportance) == null
 }
 
 /** One notification button: the receiver action it carries, and the word the user reads. */
@@ -80,12 +135,24 @@ internal class ConfirmationNotifier(
     /** Returns true when the question reached the shade; false means the card is the only surface (never a refusal). */
     fun post(requestId: String, summary: String): Boolean {
         if (!surface.available()) {
-            log("P3_CONFIRM_NOTIFY posted=false request=$requestId reason=PERMISSION_DENIED")
+            reportUnavailable(requestId)
             return false
         }
         surface.post(requestId, TITLE, summary, TTL_MILLIS, ACTIONS)
         log("P3_CONFIRM_NOTIFY posted=true request=$requestId")
         return true
+    }
+
+    /**
+     * 0.3 Phase 4B (B5): records that the shade was **skipped**, with the surface's own stable reason.
+     *
+     * Used both by [post] when the surface refuses and by the host's channel ladder when a lower channel (the Edith
+     * page) has to take a question the shade cannot. One line, count-only: request id, outcome and reason, never the
+     * summary (§17.5).
+     */
+    fun reportUnavailable(requestId: String) {
+        val reason = surface.unavailableReason() ?: UNAVAILABLE
+        log("P3_CONFIRM_NOTIFY posted=false request=$requestId reason=$reason")
     }
 
     fun cancel(requestId: String) = surface.cancel(requestId)
@@ -95,6 +162,9 @@ internal class ConfirmationNotifier(
     companion object {
         /** What the user reads first. The action's own words are in the summary, exactly as on the card. */
         const val TITLE = "需要你确认的动作"
+
+        /** Fallback reason for a surface that cannot name its own (a pre-B5 implementation or a test fake). */
+        const val UNAVAILABLE = "UNAVAILABLE"
 
         /**
          * How long the question waits for an answer on the phone.

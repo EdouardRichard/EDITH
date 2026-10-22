@@ -1,9 +1,15 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextRoute
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextManager
-import com.sheen.rokid.phone.plugin.smarthelper.context.TokenBudget
 import com.sheen.rokid.phone.plugin.smarthelper.context.ContextCompressor
 import com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptKind
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptPlan
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptRoute
+import com.sheen.rokid.phone.plugin.smarthelper.prompt.PromptSection
+
+import com.sheen.rokid.agent.ContextPolicy
+import com.sheen.rokid.agent.ContextTuning
 
 import com.sheen.rokid.contracts.Assistance
 import com.sheen.rokid.contracts.AssistantRoute
@@ -16,11 +22,15 @@ import com.sheen.rokid.contracts.WakeDetected
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionPrecheck
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
 import com.sheen.rokid.plugin.ConversationDisplay
 import com.sheen.rokid.plugin.DeadlineScheduler
+import com.sheen.rokid.plugin.DeviceProfile
+import com.sheen.rokid.plugin.DeviceState
+import com.sheen.rokid.plugin.DeviceStateProvider
 import com.sheen.rokid.plugin.EmbedResult
 import com.sheen.rokid.plugin.EmbeddingService
 import com.sheen.rokid.plugin.HostServices
@@ -34,6 +44,14 @@ import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.OutputSink
 import com.sheen.rokid.plugin.OutputSubmission
+import com.sheen.rokid.plugin.PerceptionCoverage
+import com.sheen.rokid.plugin.PerceptionElement
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
+import com.sheen.rokid.plugin.PrecheckDecision
 import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.plugin.SecretHandle
 import com.sheen.rokid.plugin.StorageAccess
@@ -279,8 +297,18 @@ internal class SmartFakeActions(
     val descriptors: MutableList<ActionDescriptor> = mutableListOf(),
 ) : ActionExecutor {
     val executed = mutableListOf<Pair<String, String>>()
+
+    /** Every call the plugin's confirmation wrapper made to the host classifier, in order. */
+    val prechecks = mutableListOf<Pair<String, String>>()
     var cancellations = 0
     var outcome: (String, String) -> ActionResult = { _, _ -> ActionResult(ActionOutcome.Done, "已记录") }
+
+    /**
+     * The classifier's verdict for one call. [PrecheckDecision.Allow] keeps the pre-4B shape; a test that exercises
+     * command-level confirmation installs `RequireConfirmation` here.
+     */
+    var precheckDecision: (String, String) -> ActionPrecheck =
+        { _, _ -> ActionPrecheck(PrecheckDecision.Allow) }
 
     /** Task 12 (R59): the runtime-state line the plugin reads through the scoped executor, or `null`. */
     var runtimeStateLine: String? = null
@@ -293,6 +321,11 @@ internal class SmartFakeActions(
     }
 
     override fun cancel() { cancellations++ }
+
+    override fun precheck(name: String, argsJson: String): ActionPrecheck {
+        prechecks += name to argsJson
+        return precheckDecision(name, argsJson)
+    }
 
     override fun runtimeState(): String? = runtimeStateLine
 }
@@ -398,11 +431,15 @@ internal class OffThreadTasks : TaskScope {
     fun joinAll(millis: Long = 5_000) { workers.toList().forEach { it.join(millis) } }
 }
 
-/** Minimal but valid `ModelProfile` fixture; the plugin only reads `id`, `revision` and `timeoutMillis`. */
+/** Minimal but valid `ModelProfile` fixture; the plugin reads its window limits, `id`, `revision` and `timeoutMillis`. */
 internal fun smartProfile(
     id: String = "smart-profile",
     revision: Long = 3,
     timeoutMillis: Long = 10_000,
+    usableWindowTokens: Int = 4_000,
+    inputBudgetTokens: Int = 2_000,
+    maxOutputTokens: Int = 1_000,
+    safetyTokens: Int = 100,
 ) = ModelProfile(
     id = id,
     revision = revision,
@@ -412,15 +449,43 @@ internal fun smartProfile(
     protocolId = "fake",
     model = "fake-model",
     secret = object : SecretHandle { override val id = "fake-secret" },
-    usableWindowTokens = 4_000,
-    inputBudgetTokens = 2_000,
-    maxOutputTokens = 1_000,
-    safetyTokens = 100,
+    usableWindowTokens = usableWindowTokens,
+    inputBudgetTokens = inputBudgetTokens,
+    maxOutputTokens = maxOutputTokens,
+    safetyTokens = safetyTokens,
     timeoutMillis = timeoutMillis,
     inputs = setOf(InputModality.TEXT),
     outputs = setOf(OutputModality.TEXT),
     verifications = emptyList(),
 )
+
+/** The policy a session with [profile] and [tuning] gets, exactly as the plugin derives it in `activate`. */
+internal fun smartContextPolicy(
+    profile: ModelProfile = smartProfile(),
+    tuning: ContextTuning = ContextTuning(),
+): ContextPolicy = ContextPolicy.from(profile, tuning)
+
+/**
+ * A one-section prompt plan for a test manager. 0.3 Task 11's `ContextManager` reads its instructions from a plan, and
+ * Task 12 supplies the real `PromptCatalog` in production; a test that is not about prompt content uses this
+ * deterministic stand-in.
+ */
+internal fun smartPromptPlan(
+    systemText: (ContextRoute) -> String = { route ->
+        when (route) {
+            ContextRoute.WAKE -> "WAKE SYSTEM"
+            ContextRoute.PROACTIVE -> "PROACTIVE SYSTEM"
+        }
+    },
+): (ContextRoute) -> PromptPlan = { route ->
+    val text = systemText(route)
+    val sections = listOf(PromptSection("test-system", PromptKind.STATIC, text))
+    PromptPlan("0.3.0", sections, text, PromptPlan.hashOf(sections))
+}
+
+/** The same plan for every route, for a test that only needs one instruction text. */
+internal fun smartPromptPlan(systemText: String): (ContextRoute) -> PromptPlan =
+    smartPromptPlan { systemText }
 
 /**
  * A host `StorageAccess` grant backed by an in-memory SKILL library (Phase 6): one `.md` file per map entry.
@@ -437,6 +502,20 @@ internal class SmartFakeSkills(
 
     override fun readFile(path: String): String? = files[path]
     override fun deleteFile(path: String): Boolean = false
+}
+
+/**
+ * A mutable SKILL library for the session-pin tests: the same on-disk shape as [SmartFakeSkills], with a `files` map a
+ * test can edit **after** activation to model the user adding or editing a SKILL while the session is live.
+ */
+internal class MutableSmartFakeSkills(initial: Map<String, String?> = emptyMap()) : StorageAccess {
+    val files = LinkedHashMap(initial)
+
+    override fun listFiles(dirPath: String, suffix: String): List<String> = files.keys.toList()
+
+    override fun readFile(path: String): String? = files[path]
+
+    override fun deleteFile(path: String): Boolean = files.remove(path) != null
 }
 
 /** One SKILL `.md` file with valid front matter, as the user would write it. */
@@ -458,6 +537,10 @@ internal fun smartAction(
     requiresConfirmation: Boolean = false,
     scope: String = "app",
     title: String = "Action $name",
+    /** edith-0.3 Phase 4A A5: the model-facing prose, which must never be painted as the tool row. */
+    description: String = title,
+    /** Task 6: a fake screen tool whose failures the loop should enrich from the host observation source. */
+    screenObservation: Boolean = false,
 ) = ActionDescriptor(
     name = name,
     title = title,
@@ -467,6 +550,8 @@ internal fun smartAction(
     idempotent = true,
     reversible = true,
     scope = scope,
+    screenObservation = screenObservation,
+    description = description,
 )
 
 /** One text-delta-then-terminal stream, the shape a successful answer arrives in. */
@@ -506,10 +591,16 @@ internal class SmartTestRig(
     /** edith-0.2 Phase B (B11): the intervention gate, `null` for the pre-B11 behaviour. */
     interventionGate: com.sheen.rokid.phone.plugin.smarthelper.proactive.ProactiveGate? = null,
     /**
-     * edith-0.2 Phase B (B3): the session's token split. Defaults to the spec's own, so only a test that wants the
-     * production over-budget path reachable in a few turns injects a smaller one.
+     * edith-0.3 Phase 4A A7: the production gate form, `null` — the default — for a plugin with no gate. When set, the
+     * plugin builds a real `NoulGate`/`ChoiceGate` from the host's `SystemOneService` (the resource wiring under test).
      */
-    budget: com.sheen.rokid.phone.plugin.smarthelper.context.TokenBudget = com.sheen.rokid.phone.plugin.smarthelper.context.TokenBudget(),
+    gateForm: com.sheen.rokid.phone.plugin.smarthelper.proactive.GateForm? = null,
+    /**
+     * 0.3 design §5.2/§6.3: the tuning the plugin derives its `ContextPolicy` with. The default is production's;
+     * a test that needs the history allowance small without shrinking the profile's frame window lowers
+     * `compressionThreshold` here.
+     */
+    contextTuning: ContextTuning = ContextTuning(),
     /**
      * Phase 5: the per-route session stores the production wiring injects. `null` — the default — is the legacy shape
      * every pre-Phase-5 test uses, so those tests keep both old paths untouched.
@@ -522,6 +613,12 @@ internal class SmartTestRig(
      */
     var panelVisible: Boolean = false,
     /**
+     * 0.3 Phase 3 Task 9d: the host's readiness-aware `PANEL_OPEN` request, or `null` for a host that has no panel
+     * opening path at all (the legacy hidden submission). Production wires `HostCompositionRoot.requestPanelOpen`
+     * through `SmartWiring`; a test that drives the hidden-panel acquisition supplies its own recording seam.
+     */
+    requestPanelOpen: ((AssistantRoute) -> Boolean)? = null,
+    /**
      * 0.24 S3: continual dialogue after a displayed answer. Default `false` preserves the pre-0.24 tests, which were
      * written before an automatic next round existed; the tests about the feature opt in.
      */
@@ -532,10 +629,25 @@ internal class SmartTestRig(
      */
     val speechAvailable: Boolean = true,
     /**
+     * 0.3 Phase 4B (`D189`): the live 「不拦截」 gate this rig feeds the plugin. It is a `var` on purpose: a test can
+     * flip it between tool calls to prove the plugin reads the provider live instead of snapshotting it per turn.
+     */
+    var noInterception: Boolean = false,
+    /**
      * 0.24 S3 fix (I4): the wake cooldown. The production default (3 s) is what every pre-0.24 test expects; the
      * interleaving test needs a second wake inside the first round's 1 s close, so it opts out explicitly.
      */
     val cooldownNanos: Long = 3_000_000_000L,
+    /**
+     * 0.3 Phase 1 Task 12: the prompt-catalog seam. `null` uses the production `PromptCatalog.plan`; a test that pins
+     * "a catalog change never rewrites a live session" supplies its own observable planner instead.
+     */
+    promptCatalog: ((PromptRoute, DeviceProfile?) -> PromptPlan)? = null,
+    /**
+     * 0.3 Phase 1 Task 12: an injected `DeviceStateProvider`. `null` keeps the production resolution
+     * (`services.deviceState()` inside `activate`) under test.
+     */
+    deviceState: DeviceStateProvider? = null,
 ) {
     val clock = SmartFakeClock()
     val scheduler = SmartFakeScheduler(clock)
@@ -565,12 +677,19 @@ internal class SmartTestRig(
             contextForTurn = contextForTurn,
             compressor = compressor,
             interventionGate = interventionGate,
-            budget = budget,
+            gateForm = gateForm,
+            contextTuning = contextTuning,
             conversationStores = conversationStores,
             isPanelVisible = { panelVisible },
+            requestPanelOpen = requestPanelOpen,
             continueDialogue = { continueDialogue },
             speechAvailable = { speechAvailable },
+            noInterception = { noInterception },
+            deviceState = deviceState,
         )
+        // 0.3 Phase 3: the seam is an internal property (a public constructor must not expose the internal
+        // `PromptRoute`); a test that pins a catalog sets it here, before any activation.
+        promptCatalog?.let { plugin.promptCatalog = it }
     }
 
     fun envelope(generation: Generation = this.generation, sessionId: SessionId = this.sessionId) =
@@ -720,4 +839,126 @@ internal class SmartFakeEmbedding(private val available: Boolean = true) : Embed
     override val isAvailable: Boolean get() = available
     override val modelInfo: ModelInfo? get() = null
     override val dimensions: Int get() = 256
+}
+
+/**
+ * 0.3 Phase 1 Task 12: the host's device profile/state channel, answerable from a fixture.
+ *
+ * [profileReads] lets a test prove the session reads the device **once** at activation instead of per turn: the plan
+ * is pinned, so a second `profile()` call for a live session would be a second snapshot the spec does not allow.
+ */
+internal class SmartFakeDeviceState(
+    private val profile: DeviceProfile,
+    private val state: DeviceState = DeviceState(
+        capturedAtEpochMillis = 0L,
+        timeZone = "UTC",
+        localDate = "2026-10-20",
+        weekday = "星期一",
+        localTime = "00:00",
+    ),
+) : DeviceStateProvider {
+    var profileReads: Int = 0
+        private set
+
+    override fun profile(): DeviceProfile {
+        profileReads += 1
+        return profile
+    }
+
+    override fun state(): DeviceState = state
+}
+
+/** An all-`ok` coverage fixture; a test that is about an unavailable source overrides the one token it needs. */
+internal fun smartPerceptionCoverage(
+    screen: String = "ok",
+    notifications: String = "ok",
+    media: String = "ok",
+    calendar: String = "ok",
+    acoustic: String = "ok",
+    clipboard: String = "ok",
+    vision: String = "ok",
+    glasses: String = "ok",
+    device: String = "ok",
+) = PerceptionCoverage(
+    screen = screen,
+    notifications = notifications,
+    media = media,
+    calendar = calendar,
+    acoustic = acoustic,
+    clipboard = clipboard,
+    vision = vision,
+    glasses = glasses,
+    device = device,
+)
+
+/** One synthetic turn snapshot: one compact screen element and nothing sensitive. */
+internal fun smartPerceptionSnapshot(
+    snapshotId: String = "snap-0042",
+    elements: List<PerceptionElement> = listOf(
+        PerceptionElement(
+            ref = "#n12",
+            role = "button",
+            text = "搜索",
+            centerX = 540,
+            centerY = 320,
+            clickable = true,
+        ),
+    ),
+    coverage: PerceptionCoverage = smartPerceptionCoverage(),
+) = PerceptionSnapshot(
+    snapshotId = snapshotId,
+    capturedAtEpochMillis = 1_000_000L,
+    foregroundPackage = "com.miui.player",
+    foregroundActivity = ".PlayerActivity",
+    elements = elements,
+    coverage = coverage,
+)
+
+/**
+ * edith-0.3 Phase 2 Task 9: the host's perception port, answerable from a fixture and recording its turn boundary.
+ *
+ * The counters are how a test proves the plugin closed the turn on **every** exit path, including the early-return
+ * and failure paths; [requestedSources] proves the first request took the full snapshot and a later one asked only
+ * for the ambient device/media subset.
+ */
+internal class SmartFakePerception(
+    private val initial: PerceptionSnapshot = smartPerceptionSnapshot(),
+    private val ambient: PerceptionSnapshot = initial,
+    private val initialFailure: RuntimeException? = null,
+    private val ambientFailure: RuntimeException? = null,
+    /**
+     * edith-0.3 Phase 3 Task 3 (M4): the picture the failure-observation source receives. The default is the honest
+     * "no picture here" answer every pre-M4 fixture implied; a test that pins the image channel supplies an `Image`.
+     */
+    private val screenshotResult: PerceptionScreenshotResult = PerceptionScreenshotResult.Unavailable("test"),
+) : PerceptionProvider {
+    var beginTurns: Int = 0
+        private set
+    var endTurns: Int = 0
+        private set
+    val requestedSources = mutableListOf<Set<PerceptionSource>>()
+
+    override fun beginTurn(): PerceptionSnapshot {
+        beginTurns += 1
+        initialFailure?.let { throw it }
+        return initial
+    }
+
+    override fun snapshot(
+        include: Set<PerceptionSource>,
+        filter: PerceptionFilter,
+        limit: Int?,
+    ): PerceptionSnapshot {
+        requestedSources += include
+        ambientFailure?.let { throw it }
+        return ambient
+    }
+
+    override fun afterAction(): PerceptionSnapshot = ambient
+
+    override fun screenshot(): PerceptionScreenshotResult = screenshotResult
+
+    override fun endTurn() {
+        endTurns += 1
+    }
 }

@@ -13,8 +13,8 @@ import com.sheen.rokid.phone.plugin.smarthelper.audit.P3Log
 import com.sheen.rokid.phone.plugin.smarthelper.audit.safeFailureCode
 
 /**
- * The production [Summarizer] (spec §4.4 step 3): one request to the plugin's own configured profile, one sentence
- * back, or `null`.
+ * The production [Summarizer] (spec §4.4 step 3): one request to the plugin's own configured profile, one structured
+ * summary back (the six-part template of design §6.4), or `null`.
  *
  * It is a plain class rather than a lambda because there is something real to test — which profile the request is
  * built from, that it offers **no tools**, and that no failure escapes — while the interesting behaviour (deferring
@@ -35,11 +35,22 @@ import com.sheen.rokid.phone.plugin.smarthelper.audit.safeFailureCode
  * `ModelRequest`, owns the deadline and accumulates the stream; re-implementing that here would be a second answer
  * to "what does one request look like" and the first thing to drift. This class therefore supplies exactly the two
  * things only the plugin knows: the **profile** (its configured id) and the **transcript** to condense.
+ *
+ * **Telemetry (0.3 Phase 2 final review I4).** The gateway is built with [P3Log.line], so a summary request reports its
+ * own count-only `P3_CACHE` line whenever the provider returns usage. A summary has no assembled `RequestFrame` and
+ * does not run through `AgentLoop.onRequestBuilt`, so it emits **no** `P3_PROMPT` line; that is the documented
+ * asymmetry, not a missing line.
  */
 class ModelSummarizer(
     private val client: ModelClient,
     private val profileLookup: (String) -> ModelProfile?,
     private val profileId: String,
+    /**
+     * 0.3 design §6.4 / Phase 4A A7: the structured summary instruction. Production passes
+     * `PromptCatalog.summarizer()`; the prompt is a required constructor value rather than a compiled-in constant, so a
+     * caller cannot silently keep an older instruction and the prose lives in one authored resource.
+     */
+    private val prompt: String,
     private val clock: MonotonicClock,
     private val scheduler: DeadlineScheduler,
     private val envelopeFor: (requestId: String, startNanos: Long, endNanos: Long) -> EventEnvelope,
@@ -50,7 +61,7 @@ class ModelSummarizer(
     private val deadlineNanos: () -> Long,
 ) : Summarizer {
 
-    override fun summarize(transcript: String): String? {
+    override fun summarize(transcript: String, maxOutputTokens: Int): String? {
         val text = transcript.trim()
         if (text.isEmpty()) return null
         val startedNanos = clock.nowNanos()
@@ -63,16 +74,22 @@ class ModelSummarizer(
                 clock = clock,
                 scheduler = scheduler,
                 envelopeFor = envelopeFor,
+                // Final review I4: the summary is a model request too, so its cache accounting is reported. Without this
+                // sink the `P3_CACHE` "every request with usage" contract silently skipped the asynchronous summary.
+                metricLine = P3Log::line,
             ).turn(
                 GatewayTurn(
                     turnId = REQUEST_ID_PREFIX + clock.nowNanos(),
                     profileId = profileId,
-                    instructions = INSTRUCTIONS,
+                    instructions = prompt,
                     history = listOf(ModelHistoryItem.Text(MessageRole.USER, text)),
                     // No tools at all: a summary may produce a sentence and nothing else. `ModelClientGateway`'s
                     // `ModelRequest` requires `input` or `history` to be non-empty, and the transcript is the history.
                     tools = emptyList(),
                     deadlineNanos = deadlineNanos(),
+                    // 0.3 design §5.2/§6.4: the summary declares its own output cap rather than inheriting the
+                    // profile's window reservation, so the next turn keeps the room the summary did not spend.
+                    maxOutputTokens = maxOutputTokens,
                 ),
             )
             val summary = reply.text
@@ -107,17 +124,5 @@ class ModelSummarizer(
     private companion object {
         /** Identifies a summary request in an envelope the host also carries turns on; not a transcript. */
         const val REQUEST_ID_PREFIX = "summary-"
-
-        /**
-         * The whole instruction: one sentence, no tools, no invention. The transcript is prepended to it as the
-         * request's own history, so the model sees "怎么压缩" before "压缩什么" — the shape a summarisation prompt
-         * needs.
-         */
-        val INSTRUCTIONS = listOf(
-            "你是对话压缩器。把下面这段即将被丢弃的对话压缩成一句中文摘要。",
-            "只保留对后续对话有用的信息：用户的要求、已经完成的动作、以及结论。",
-            "不要编造没有出现过的内容，不要补充建议，不要提问。",
-            "只输出这一句摘要本身，不要任何前缀、标题或解释。",
-        ).joinToString("")
     }
 }

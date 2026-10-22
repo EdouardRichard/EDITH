@@ -218,9 +218,11 @@ class ControlledModelClientTest {
         rig.verify()
         assertFailsWith<ContractError.ConfigurationRejected> { rig.start() }
         // R101: the budget's own overflow is a dedicated signal; a plain `ConfigurationRejected` stays for every
-        // configuration refusal that a cheaper context could not fix.
+        // configuration refusal that a cheaper context could not fix. The budget is in token units, so the
+        // instructions have to exceed `profileFixture()`'s 3_000-token cap at one unit per four ASCII characters:
+        // 13_000 characters price at 3_250 units; the byte-era 5_000 characters priced at 5_000 byte units.
         assertFailsWith<ContractError.ContextWindowExceeded> {
-            rig.client.request(rig.request().copy(instructions = "x".repeat(5000)), rig::event)
+            rig.client.request(rig.request().copy(instructions = "x".repeat(13_000)), rig::event)
         }
         assertEquals(0, rig.resolutions.get())
         assertEquals(0, rig.server.requestCount)

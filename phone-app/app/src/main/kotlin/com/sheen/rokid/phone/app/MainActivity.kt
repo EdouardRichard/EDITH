@@ -5,6 +5,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.ui.AuditLogView
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.MemoryLine
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.MemoryLogView
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.NoInterceptionUi
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SmartSettingsForm
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionViewModel
@@ -139,9 +140,28 @@ class MainActivity : ComponentActivity() {
                         dismissButton = {},
                     )
                 }
-                PhoneScreen(state, root, viewModel, profileViewModel, ::requestStart,
-                    { SessionService.commandFromUi(this, it) }, notificationsGranted(),
-                    { root.storedSettings() }, { settings -> root.saveSmartSettings(settings) }, remainingSeconds)
+                // 4B (`D189`): the persistent in-App reminder. It reads the composition's live gate, which is seeded
+                // from the persisted setting and updated by `saveSmartSettings`; the save callback below refreshes this
+                // state from that same gate, so a successful save is reflected without waiting for a restart. The value
+                // is not a separate UI flag: the settings screen itself always loads its draft from the persisted store.
+                var noInterceptionOn by remember { mutableStateOf(root.noInterceptionGate.enabled) }
+                Column(Modifier.fillMaxSize()) {
+                    if (noInterceptionOn) NoInterceptionBanner()
+                    Box(Modifier.weight(1f)) {
+                        PhoneScreen(state, root, viewModel, profileViewModel, ::requestStart,
+                            { SessionService.commandFromUi(this@MainActivity, it) }, notificationsGranted(),
+                            { root.storedSettings() }, { settings ->
+                                // The live gate is the source of truth even when the write fails: `saveSmartSettings`
+                                // applies a disable before the write, so the banner must follow the gate rather than
+                                // assume the save succeeded.
+                                try {
+                                    root.saveSmartSettings(settings)
+                                } finally {
+                                    noInterceptionOn = root.noInterceptionGate.enabled
+                                }
+                            }, remainingSeconds)
+                    }
+                }
             }
         }
     }
@@ -208,6 +228,26 @@ class MainActivity : ComponentActivity() {
 }
 
 /**
+ * 0.3 Phase 4B (`D189`): the persistent in-App banner while 「不拦截」 is on.
+ *
+ * It sits above the whole page rather than inside the settings tab, so the mode cannot be forgotten after the user
+ * navigates away from the switch. The composition's live gate is its source; see the save callback in [onCreate].
+ */
+@Composable
+private fun NoInterceptionBanner() {
+    Surface(
+        color = MaterialTheme.colorScheme.errorContainer,
+        contentColor = MaterialTheme.colorScheme.onErrorContainer,
+        modifier = Modifier.fillMaxWidth(),
+    ) {
+        Column(Modifier.padding(horizontal = 16.dp, vertical = 8.dp)) {
+            Text(NoInterceptionUi.BANNER, style = MaterialTheme.typography.titleSmall)
+            Text(NoInterceptionUi.BANNER_DETAIL, style = MaterialTheme.typography.bodySmall)
+        }
+    }
+}
+
+/**
  * R109 (user report 2026-10-20, pocket false touch): a confirmation is settled **only** by its 拒绝 / 急停 / 允许
  * buttons. Material3's `AlertDialog` calls `onDismissRequest` for a tap outside the dialog (on the scrim) and for
  * system BACK; in a pocket either happens by accident, which is how the question used to vanish unasked. This handler
@@ -252,13 +292,19 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     ((expiresAtMillis - System.currentTimeMillis()) / 1000).coerceAtLeast(0L)
 
 /**
- * The minimal settings entry point (Task 14b): the three things the user can set, plus the inline errors.
+ * The minimal settings entry point (Task 14b): the values the user can set, plus the inline errors.
  *
  * Everything that can be validated lives in [SmartSettingsForm] (JVM-tested); this function only holds the text
  * fields and prints the errors, so the untested part is wiring. Two facts the copy must state truthfully
  * (Task 14b-fix item 4): the composition is a process-lifetime singleton and reads the settings **once** in
  * `HostCompositionRoot.create`, so only a full App restart re-reads them - restarting a session does not; and `L1`
  * is the ceiling the phase ships with while `L3`/`L4` are an explicit user choice.
+ *
+ * edith-0.3 Phase 2 Task 10 adds the one exception: 「感知截图」 is a **live** gate applied by a successful save, so
+ * its copy says "immediately" while everything else keeps the restart sentence. The risk paragraph next to it is the
+ * user's plain-language notice that screen/notification content (possibly passwords, OTPs, card numbers) travels to
+ * the configured model service, that logs/evidence only carry counts and ids, and that turning it off stops images
+ * only - screen text still travels.
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable internal fun SmartSettingsSection(loadSettings: () -> SmartSettings, saveSettings: (SmartSettings) -> Unit) {
@@ -266,10 +312,13 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     var errors by remember { mutableStateOf(emptyList<String>()) }
     var saved by remember { mutableStateOf(false) }
     var levelExpanded by remember { mutableStateOf(false) }
+    // 4B (`D189`): the second-confirmation dialog is only ever raised by an off -> on switch move. The switch itself
+    // does not move until the user confirms, so a stray tap cannot arm the mode.
+    var noInterceptionPending by remember { mutableStateOf(false) }
     val levels = listOf("L0", "L1", "L2", "L3", "L4")
 
     Text("唤醒与权限设置", style = MaterialTheme.typography.titleLarge)
-    Text("设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；默认上限为 L1，如需 L3/L4 请在此明确选择。",
+    Text("唤醒词、权限上限、白名单、主动辅助等设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；感知截图与不拦截开关保存后立即更新宿主状态。默认上限为 L1，如需 L3/L4 请在此明确选择。",
         style = MaterialTheme.typography.bodyMedium)
     // Task 14b-fix item 5: an edit invalidates whatever the last save reported, so the stale error text cannot
     // outlive the input it was about.
@@ -321,9 +370,51 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
             draft = draft.copy(continueDialogue = it); errors = emptyList(); saved = false
         })
     }
+    // 0.3 Phase 2 Task 10: the perception-screenshot switch. Unlike the fields above it is a **live** gate: a
+    // successful save applies it to the composition immediately (no App restart). Turning it off stops screenshot
+    // images from being captured/sent, but screen text keeps travelling with the request - the copy says both.
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text("感知截图（图片随请求发送）")
+            Text(
+                "关闭后不再截取并随请求发送屏幕图片；保存后立即生效。它不停止屏幕文字、通知等文字内容的发送。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        Switch(checked = draft.visionEnabled, onCheckedChange = {
+            draft = draft.copy(visionEnabled = it); errors = emptyList(); saved = false
+        })
+    }
+    Text(
+        "风险提示：开启后，屏幕与通知中的内容（可能包含密码、验证码、银行卡号等敏感信息）会随请求发送到你配置的模型服务；" +
+            "本机日志与证据只记录计数和标识，不记录这些内容。关闭此开关只会停止发送截图图片，不会停止发送屏幕文字。",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    // 0.3 Phase 4B (`D189`): the global 「不拦截」 switch. This is the dangerous direction of the page: off -> on needs
+    // the second confirmation below; on -> off is immediate. The draft is loaded from the persisted store at the top of
+    // this section, so the switch shows the stored mode rather than a `remember { false }` UI default.
+    HorizontalDivider()
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(NoInterceptionUi.SWITCH_TITLE)
+            Text(NoInterceptionUi.SWITCH_SUMMARY, style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(checked = draft.noInterception, onCheckedChange = { checked ->
+            if (NoInterceptionUi.requiresSecondConfirmation(draft.noInterception, checked)) {
+                noInterceptionPending = true
+            } else {
+                draft = draft.copy(noInterception = checked)
+                errors = emptyList(); saved = false
+            }
+        })
+    }
+    if (draft.noInterception) {
+        Text("当前已选择开启：保存后会立即更新宿主的「不拦截」门，并在关闭 App、被杀或重启后保持。",
+            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
+    }
     errors.forEach { Text(it, color = MaterialTheme.colorScheme.error) }
     if (saved) {
-        if (errors.isEmpty()) Text("已保存，将于下次重启 App 后生效")
+        if (errors.isEmpty()) Text("已保存：感知截图与不拦截开关会立即更新宿主状态；其余设置将在下次重启 App 后生效")
         else Text("可用字段已保存，被拒绝的输入请按上述提示修改")
     }
     Button(onClick = {
@@ -341,6 +432,30 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
             saved = false
         }
     }) { Text("保存") }
+    // 4B (`D189`): the second confirmation. It is raised by the off -> on switch move above and never by the reverse;
+    // the full risk copy lives in `NoInterceptionUi` so the JVM test can pin every consequence the user accepts.
+    if (noInterceptionPending) {
+        AlertDialog(
+            onDismissRequest = { noInterceptionPending = false },
+            title = { Text(NoInterceptionUi.CONFIRM_TITLE) },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    NoInterceptionUi.CONFIRM_LINES.forEach { line ->
+                        Text(line, style = MaterialTheme.typography.bodySmall)
+                    }
+                }
+            },
+            confirmButton = {
+                Button(onClick = {
+                    draft = draft.copy(noInterception = true)
+                    errors = emptyList(); saved = false; noInterceptionPending = false
+                }) { Text("确认开启") }
+            },
+            dismissButton = {
+                OutlinedButton(onClick = { noInterceptionPending = false }) { Text("取消") }
+            },
+        )
+    }
 }
 
 /**
@@ -520,6 +635,8 @@ internal fun capabilityLabel(capability: Capability) = when (capability) {
     Capability.Embedding -> "语义嵌入"
     Capability.StorageAccess -> "技能目录"
     Capability.ConversationDisplay -> "会话展示"
+    Capability.DeviceState -> "设备画像"
+    Capability.Perception -> "感知"
 }
 internal fun errorLabel(code: String) = when (code) {
     "BLUETOOTH_PERMISSION_DENIED" -> "蓝牙权限未获授权"

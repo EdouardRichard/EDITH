@@ -372,7 +372,7 @@ class ConversationStore(val maxItems: Int = MAX_ITEMS) {
         if (SummaryBoundary.isRendered(text)) text else SummaryBoundary.render(text)
 
     /**
-     * The text of a stored item. `estimatedText()` is `internal` to `plugins-smart`'s `TokenBudget.kt`
+     * The text of a stored item. `estimatedText()` is `internal` to `plugins-smart`'s `ContextTextMeasure.kt`
      * and is not visible to this module, so the text is taken here directly.
      */
     private fun textOf(item: ModelHistoryItem): String = when (item) {

@@ -2,7 +2,10 @@ package com.sheen.rokid.phone.bridge
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.host.HostRuntime
@@ -21,6 +24,12 @@ import com.sheen.rokid.plugin.PluginContext
 import com.sheen.rokid.plugin.PluginDescriptor
 import com.sheen.rokid.plugin.PluginLifecycle
 import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticHintPlugin
+import com.sheen.rokid.phone.session.confirmation.ConfirmationChannelKind
+import com.sheen.rokid.phone.session.confirmation.ConfirmationGlasses
+import com.sheen.rokid.phone.session.confirmation.ConfirmationPanel
+import com.sheen.rokid.phone.session.confirmation.ConfirmationPresenter
+import com.sheen.rokid.phone.session.confirmation.ConfirmationUi
+import com.sheen.rokid.phone.session.confirmation.SummaryDisplayer
 import com.sheen.rokid.transport.CxrAuthorizationOutcome
 import com.sheen.rokid.storage.MemoryProfileRepository
 import org.junit.Assert.assertEquals
@@ -1579,5 +1588,127 @@ class CxrHintLinkTest {
         val inactive = sent.mapNotNull(HintWireCodec::decode).filterIsInstance<HintCommand.ConfirmState>().last()
         assertEquals("c-1", inactive.requestId)
         assertFalse("the withdrawal names the same question", inactive.active)
+    }
+
+    // ------------------------------------------------------- 0.3 Phase 2 Task 2: the connected fact
+
+    @Test
+    fun theLinkReportsAnEstablishedSessionUntilItEnds() {
+        val link = CxrHintLink(FakeClock(), FakeScheduler(), sendJson = { _ -> true }, maxRetries = 0)
+
+        assertFalse("a link nobody introduced a session to is not connected", link.isEstablished())
+
+        link.sessionEstablished("s-1", 3)
+        assertTrue("an introduced session is the connected fact", link.isEstablished())
+
+        link.sessionEnded()
+        assertFalse("停止 ends the session the glasses were introduced to", link.isEstablished())
+    }
+
+    // ----------------------- 0.3 Phase 4B (B4): PANEL_OPEN precedes SHOW/CONFIRM_STATE and PANEL_SHOWN re-sends them
+
+    /**
+     * A presenter wired to the real link the way `HostCompositionRoot` wires it: the panel request is the link's
+     * `requestPanelOpen`, the keys are the link's `confirmationState`, and the summary is encoded onto the same
+     * connection so this test observes the actual wire order.
+     */
+    private fun confirmationPresenterOn(rig: ResidentRig): ConfirmationPresenter {
+        val identity = HintIdentity("s-1", 3)
+        var revision = 0L
+        return ConfirmationPresenter(
+            summary = SummaryDisplayer { hintId, text, _ ->
+                revision += 1
+                rig.sent += HintWireCodec.encode(
+                    HintCommand.Show(
+                        sessionId = identity.sessionId,
+                        generation = identity.generation,
+                        sequence = revision,
+                        // The presenter's own hint id, passed through: the panel replaces `say-<hintId>`, so a fresh
+                        // id per send would append a second row.
+                        hintId = hintId,
+                        revision = revision,
+                        syncId = "sync",
+                        phoneSentNanos = 0L,
+                        remainingTtlMillis = 10_000L,
+                        text = text,
+                    ),
+                )
+                true
+            },
+            ui = object : ConfirmationUi {
+                // 0.3 Phase 4B (B7): this link-focused rig has no phone surface; reporting `null` keeps the presenter's
+                // count-only line honest without touching the assertions below.
+                override fun show(requestId: String, summary: String): ConfirmationChannelKind? = null
+                override fun hide(requestId: String) = Unit
+            },
+            glasses = ConfirmationGlasses { requestId, active -> rig.link.confirmationState(requestId, active) },
+            panel = ConfirmationPanel { rig.link.requestPanelOpen(AssistantRoute.WAKE) },
+            deliver = { },
+            clock = rig.clock,
+            scheduler = rig.scheduler,
+            envelopeFor = { requestId ->
+                EventEnvelope(SessionId(identity.sessionId), Generation(identity.generation), requestId, 0, 1)
+            },
+        )
+    }
+
+    @Test
+    fun aConfirmationOpensThePanelBeforeShowingTheQuestionAndArmingTheKeys() {
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        rig.sent.clear()
+        val presenter = confirmationPresenterOn(rig)
+
+        presenter.present("c-1", "卸载探针 App", 10_000L)
+
+        val commands = rig.commands()
+        val panelOpen = commands.indexOfFirst { it is HintCommand.PanelOpen }
+        val show = commands.indexOfFirst { it is HintCommand.Show }
+        val confirmState = commands.indexOfFirst { it is HintCommand.ConfirmState }
+        assertTrue("a hidden panel must be asked to open: $commands", panelOpen >= 0)
+        assertTrue("PANEL_OPEN must precede SHOW: $commands", show > panelOpen)
+        assertTrue("PANEL_OPEN must precede CONFIRM_STATE: $commands", confirmState > panelOpen)
+        assertEquals(1, presenter.pendingCount)
+    }
+
+    @Test
+    fun aPanelShownReannouncesTheLiveQuestionWithoutWithdrawingIt() {
+        // The panel is created after the first send, so its first layout is the moment to repeat SHOW + CONFIRM_STATE.
+        // The repeat is an announcement, not a new question: the pending one must survive and still be answerable.
+        val rig = ResidentRig()
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        val presenter = confirmationPresenterOn(rig)
+        // The production composition routes the link's PANEL_SHOWN into `ConfirmationPresenter.panelShownArrived`.
+        rig.link.onPanelShown = { _, _ -> presenter.panelShownArrived() }
+        presenter.present("c-1", "卸载探针 App", 10_000L)
+        val firstShow = rig.commands().filterIsInstance<HintCommand.Show>().single()
+        rig.sent.clear()
+
+        rig.panelShown(AssistantRoute.WAKE)
+
+        val commands = rig.commands()
+        val resend = commands.filterIsInstance<HintCommand.Show>().single()
+        assertEquals("the newly visible panel must receive the question again: $commands", 1,
+            commands.count { it is HintCommand.Show })
+        assertEquals(
+            "B4 carry-forward: the re-sent SHOW must keep the question's hint id, or the panel appends a second row",
+            firstShow.hintId,
+            resend.hintId,
+        )
+        assertTrue(
+            "the re-send must be a newer revision for the same hint id, or the glasses refuse it as stale " +
+                "(first=${firstShow.revision}, resend=${resend.revision})",
+            resend.revision > firstShow.revision,
+        )
+        val states = commands.filterIsInstance<HintCommand.ConfirmState>()
+        assertEquals(1, states.size)
+        assertTrue(states.single().active)
+        assertEquals("c-1", states.single().requestId)
+        assertEquals("PANEL_SHOWN must not clear the unsettled question", 1, presenter.pendingCount)
+        assertTrue("the keys still answer the same question", presenter.answerFromGlasses("c-1", approved = true))
     }
 }

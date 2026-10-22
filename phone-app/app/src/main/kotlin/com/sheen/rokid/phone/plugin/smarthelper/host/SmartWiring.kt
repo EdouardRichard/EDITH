@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.plugin.smarthelper.host
 import com.sheen.rokid.phone.app.HostCompositionRoot
 
 import com.sheen.rokid.agent.ConversationStore
+import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.plugin.DeadlineScheduler
@@ -35,6 +36,12 @@ internal class SmartWiring(
      */
     isPanelVisible: () -> Boolean = { false },
     /**
+     * 0.3 Phase 3 Task 9d: the composition's readiness-aware `PANEL_OPEN` request (the same one the wake detector
+     * uses), or `null` for a stand-alone wiring with no panel to open. The production `create` passes
+     * `HostCompositionRoot.requestPanelOpen`, which carries the link's `appStart`/retry/readiness handshake.
+     */
+    requestPanelOpen: ((AssistantRoute) -> Boolean)? = null,
+    /**
      * 0.24 S3 Task 14 fix (C2, spec risk row 17): whether the host can actually speak a hint right now.
      *
      * The production composition builds the speech player only when「语音朗读」is on and the engine is ready, so it
@@ -43,6 +50,14 @@ internal class SmartWiring(
      * the answer's `Displayed` acknowledgement, never by a `SpeechFinished` that cannot arrive.
      */
     speechAvailable: () -> Boolean = { false },
+    /**
+     * 0.3 Phase 4B (`D189`, spec §5.1/§5.3): the composition's **live** global 「不拦截」 gate.
+     *
+     * Production passes `NoInterceptionGate.provider()`, the one instance `saveSmartSettings` updates, so the plugin's
+     * policy and confirmation wrapper observe a save from the next tool call. The default `{ false }` keeps a
+     * stand-alone wiring (tests, harnesses) in normal mode. It must never be a captured boolean.
+     */
+    noInterception: () -> Boolean = { false },
 ) {
     /** The word list the plugin declares on activation; also the `Capability.WakeWord` provider's content. */
     val wakeWords: SmartWakeWordRegistry = SmartWakeWordRegistry(settings.wakeWords)
@@ -89,11 +104,17 @@ internal class SmartWiring(
         // 0.24 S3 fix (C1): the production composition reads the link's live visibility, so a wake on an already-visible
         // panel starts the official 10 s at once instead of waiting for a `PANEL_SHOWN` that will not be repeated.
         isPanelVisible = isPanelVisible,
+        // 0.3 Phase 3 Task 9d: the proactive hint path opens a hidden panel through the same readiness-aware seam the
+        // wake detector uses, instead of submitting a hint the wearer cannot see.
+        requestPanelOpen = requestPanelOpen,
         // 0.24 S3 (spec §5.5): the persisted「持续对话」switch. Read through the wiring's settings snapshot, which is the
         // same value the settings screen writes and `create` reads once at assembly time.
         continueDialogue = { settings.continueDialogue },
         // 0.24 S3 Task 14 fix (C2): the production player's presence. With speech off (the default) no player is built,
         // so a `both`/`voice` answer is display-only and continues on its `Displayed` acknowledgement.
         speechAvailable = speechAvailable,
+        // 0.3 Phase 4B (`D189`): the live 「不拦截」 gate. A provider (not a snapshot) is what lets a settings save take
+        // effect from the next tool call; the plugin passes it to both the policy and the command-level precheck wrapper.
+        noInterception = noInterception,
     )
 }

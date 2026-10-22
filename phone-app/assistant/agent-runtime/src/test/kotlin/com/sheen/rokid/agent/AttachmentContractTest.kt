@@ -150,7 +150,7 @@ class AttachmentContractTest {
      * Sends [toolRound] through the production frame path and returns the request the gateway assembled.
      *
      * The flow mirrors a stored two-turn exchange: the older turn, then the tool round, then the pending user input.
-     * `limitBytes` is raised so the trimmer cannot remove the round under test.
+     * `limitTokens` is raised so the trimmer cannot remove the round under test.
      */
     private fun sendFrame(toolRound: String): ModelRequest {
         val clock = FakeClock()
@@ -187,7 +187,7 @@ class AttachmentContractTest {
                 history = emptyList(),
                 tools = emptyList(),
                 deadlineNanos = 1_000_000_000L,
-                limitBytes = 1_000_000,
+                limitTokens = 1_000_000,
                 frame = frame,
             ),
         )

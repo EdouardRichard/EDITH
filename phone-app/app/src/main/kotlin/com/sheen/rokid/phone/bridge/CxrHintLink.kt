@@ -674,6 +674,15 @@ class CxrHintLink(
     fun isPanelVisible(): Boolean = synchronized(handshakeGate) { panelVisible }
 
     /**
+     * True while the glasses have been introduced to a session (0.3 Phase 2, Task 2's glasses-connected fact).
+     *
+     * This is the same lifetime as the conversation channel: set by [sessionEstablished], cleared by [sessionEnded]
+     * and [linkLost]. It deliberately does **not** mean "the clock mapping is live or the panel is open" - those are
+     * narrower states with their own accessors. A read-only seam; it adds nothing to the wire.
+     */
+    fun isEstablished(): Boolean = synchronized(handshakeGate) { establishedSession != null }
+
+    /**
      * Sends the single `appStart` request for [start].
      *
      * The SDK answer is asynchronous and may be late. [onSceneStartResult] compares it with the current request

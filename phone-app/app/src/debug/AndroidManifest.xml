@@ -47,6 +47,19 @@
             </intent-filter>
         </receiver>
         <!--
+          Phase 4B B8 instrument: drives the production settings store + NoInterceptionGate so the persisted
+          「不拦截」 mode can be verified without relying on a Compose switch click. Same export rule and the same
+          reason as the instruments above: shell-driven, debug-only, never in a release build. It logs booleans only.
+        -->
+        <receiver
+            android:name=".debug.DebugNoInterceptionControl"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_NO_INTERCEPTION" />
+            </intent-filter>
+        </receiver>
+        <!--
           P3.2 Stage 0 hint-length instrument. Same reasoning as `DebugAudioInjector`: the only caller is an
           `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
           release build. It carries synthetic text only and logs counts only.

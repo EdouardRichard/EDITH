@@ -47,7 +47,15 @@ internal class ConversationCycle(
     private val scheduler: DeadlineScheduler,
     private val display: () -> ConversationDisplay?,
     private val continueDialogue: () -> Boolean,
-    private val openContinuation: (turnId: String) -> Unit,
+    /**
+     * 0.3 Phase 3 Task 7: opens the next listening round for the **route whose answer** just finished.
+     *
+     * The route is carried explicitly instead of being inferred by the opener: a PROACTIVE answer must never open a
+     * WAKE round (P3-13), and the cycle is the only component that knows which route's answer-done decision this is.
+     * The turn id is the finished turn's, so a stale continuation (the turn was stopped or replaced meanwhile) opens
+     * nothing.
+     */
+    private val openContinuation: (route: AssistantRoute, turnId: String) -> Unit,
     /**
      * Whether the panel is visible right now. A turn that opens while it is already up must start its 10 s window
      * immediately rather than wait for a `PANEL_SHOWN` the glasses will not send again (spec §5.3; Task 11 exposes the
@@ -351,7 +359,7 @@ internal class ConversationCycle(
             }
         }
         // Outside the lock: the opener re-enters the plugin and eventually this cycle's `onWake`.
-        continuation?.let(openContinuation)
+        continuation?.let { openContinuation(route, it) }
         cancelledTurn?.let { cancelTurn(route, it) }
     }
 
@@ -383,7 +391,7 @@ internal class ConversationCycle(
             log("P3_CONV speech route=${route.name} result=$result")
             continuation = settleSpokenAnswerLocked(route, current, continueOn)
         }
-        continuation?.let(openContinuation)
+        continuation?.let { openContinuation(route, it) }
     }
 
     /**
@@ -448,6 +456,68 @@ internal class ConversationCycle(
             cancelledTurn = current.turnId
             cancelAllTimersLocked(current)
             resetRouteLocked(current)
+        }
+        cancelledTurn?.let { cancelTurn(route, it) }
+    }
+
+    /**
+     * 0.3 Phase 3 Task 9d: closes the round **only if it is still [turnId]**.
+     *
+     * The proactive hint path pre-arms a hidden-panel round so the glasses' `PANEL_SHOWN` can arm the 10 s window
+     * before the hint is submitted. When that acquisition is abandoned (a refused open, a timeout, a rejected submit)
+     * the round it pre-armed must be released, but a round that was replaced by a newer attempt meanwhile belongs to
+     * that attempt and must not be closed by the old one's cleanup.
+     */
+    fun closeIfTurn(route: AssistantRoute, turnId: String) {
+        synchronized(lock) {
+            val current = state(route)
+            if (current.turnId != turnId) return
+            closeLocked(route, current)
+        }
+    }
+
+    /**
+     * 0.3 Phase 3 Task 9d: releases the round **only if it is still [turnId]**, without a display call.
+     *
+     * A hidden-panel acquisition that was refused or timed out pre-armed a round for a panel that never reported its
+     * first layout: there is no window to close, so sending `CLOSE` would be a command about a panel the phone never
+     * opened. This releases the timers and the turn identity and leaves the wire alone, while [closeIfTurn] stays the
+     * path for a round whose panel really was open.
+     */
+    fun releaseIfTurn(route: AssistantRoute, turnId: String) {
+        synchronized(lock) {
+            val current = state(route)
+            if (current.turnId != turnId) return
+            cancelAllTimersLocked(current)
+            resetRouteLocked(current)
+        }
+    }
+
+    /**
+     * 0.3 Phase 3 Task 9d fix (review Important 1): the official [onStop] for a round **only if it is still [turnId]**.
+     *
+     * A hint that acquired its panel pre-armed this round, but its plugin window does not exist until the hint's
+     * `Displayed` ACK. A STOP in that gap must not leave the pending round to time out into a `CLOSE`: when the panel
+     * really reported its first layout the official STOP applies (idle, keep the panel, cancel only this turn); while
+     * the round is still waiting for `PANEL_SHOWN` there is no panel to paint, so it is released like [releaseIfTurn].
+     * The identity check is what keeps a newer attempt's round safe from the old hint's cleanup.
+     */
+    fun stopIfTurn(route: AssistantRoute, turnId: String) {
+        var cancelledTurn: String? = null
+        synchronized(lock) {
+            val current = state(route)
+            if (current.turnId != turnId) return
+            cancelAllTimersLocked(current)
+            if (current.awaitingPanel) {
+                // No window is up yet: idle would be a command about a panel the phone never opened.
+                resetRouteLocked(current)
+            } else {
+                log("P3_CONV idle route=${route.name} reason=stop")
+                showIdleLocked(route, current)
+                current.turnId = null
+                current.awaitingPanel = false
+                cancelledTurn = turnId
+            }
         }
         cancelledTurn?.let { cancelTurn(route, it) }
     }
