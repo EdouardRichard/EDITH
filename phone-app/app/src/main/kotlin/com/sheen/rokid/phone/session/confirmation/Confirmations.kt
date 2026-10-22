@@ -272,8 +272,7 @@ class ConfirmationPresenter(
      * B5: the production phone answer now comes from [ConfirmationPhoneSurface] rather than "the composition exists",
      * which is what makes the no-surface case (`CONFIRMATION_UNAVAILABLE`) reachable without a device.
      */
-    override fun available(): Boolean = !ConfirmationSurfaceDebug.suppressPhone &&
-        (uiCanServe() || (summaryCanServe() && glassesCanServe()))
+    override fun available(): Boolean = uiCanServe() || (summaryCanServe() && glassesCanServe())
 
     /**
      * 0.3 Phase 4B (B5/B4 carry-forward): puts the same question up without a tool name. Kept because it is the
@@ -320,7 +319,7 @@ class ConfirmationPresenter(
         // 0.3 Phase 4B (B4): the panel is created by PANEL_OPEN, not by SHOW. Ask for it first when the glasses surface
         // can serve - a hidden window would otherwise receive the two announcements invisibly, and the panel's own
         // `resetForOpen` would erase them as it comes up. A refused open is a degradation, never a failed question.
-        val glassesAvailable = !ConfirmationSurfaceDebug.suppressGlasses && glassesCanServe()
+        val glassesAvailable = glassesCanServe()
         if (glassesAvailable) {
             runCatching { panel.open() }
         }

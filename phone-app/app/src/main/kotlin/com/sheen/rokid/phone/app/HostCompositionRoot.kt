@@ -70,7 +70,6 @@ import com.sheen.rokid.phone.session.WakeChime
 import com.sheen.rokid.phone.session.confirmation.AndroidNotificationSurface
 import com.sheen.rokid.phone.session.confirmation.ConfirmationChannelKind
 import com.sheen.rokid.phone.session.confirmation.ConfirmationPhoneSurface
-import com.sheen.rokid.phone.session.confirmation.ConfirmationSurfaceDebug
 import com.sheen.rokid.phone.session.confirmation.confirmationPresentationChannel
 
 import android.content.ComponentName
@@ -736,16 +735,6 @@ class HostCompositionRoot internal constructor(
         return scriptedModelWire?.arm(action, argsJson, text, calls, fail) ?: false
     }
 
-    /** Debug-only same-turn sequence (`read_screen` then `tap`); release has no caller. */
-    fun armScriptedModelSequence(
-        steps: List<Pair<String, String>>,
-        text: String,
-        fail: Boolean = false,
-    ): Boolean {
-        if (!BuildConfig.DEBUG) return false
-        return scriptedModelWire?.armSequence(steps, text, fail) ?: false
-    }
-
     /** Debug-only counterpart of [armScriptedModelAnswer]: hands the transport back to the real network. */
     fun disarmScriptedModelAnswer() {
         if (!BuildConfig.DEBUG) return
@@ -1017,11 +1006,9 @@ class HostCompositionRoot internal constructor(
      * rules out.
      */
     private fun deliverToPhone(requestId: String, summary: String): ConfirmationChannelKind? {
-        if (ConfirmationSurfaceDebug.suppressPhone) return null
         if (uiIsVisible) return ConfirmationChannelKind.DIALOG
         val channel = confirmationPresentationChannel(
-            glassesServing = !ConfirmationSurfaceDebug.suppressGlasses &&
-                confirmationPresenter?.isServingOnGlasses(requestId) == true,
+            glassesServing = confirmationPresenter?.isServingOnGlasses(requestId) == true,
             notificationAvailable = notificationsCanPost(),
             dialogAvailable = canRaiseConfirmationPage(),
         )
@@ -1065,7 +1052,7 @@ class HostCompositionRoot internal constructor(
      * unavailable and AgentLoop's early `CONFIRMATION_UNAVAILABLE` refusal was unreachable in production. This is the
      * live three-way question ([ConfirmationPhoneSurface]): page visible, page raisable, or shade postable.
      */
-    internal fun canPresentOnPhone(): Boolean = !ConfirmationSurfaceDebug.suppressPhone && ConfirmationPhoneSurface.available(
+    internal fun canPresentOnPhone(): Boolean = ConfirmationPhoneSurface.available(
         pageVisible = uiIsVisible,
         canRaisePage = canRaiseConfirmationPage(),
         notificationsAvailable = notificationsCanPost(),

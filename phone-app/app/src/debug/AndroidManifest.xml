@@ -60,32 +60,6 @@
             </intent-filter>
         </receiver>
         <!--
-          Phase 4 closure instrument: asks production `deliverToPhone` to treat the glasses rung as unavailable for this
-          process so the real notifier/no-visible rows can be reached while the CXR session remains live. Same export
-          rule and reason as the instruments above: shell-driven, debug-only, never in a release build. It logs a
-          boolean only and never fabricates a confirmation surface.
-        -->
-        <receiver
-            android:name=".debug.DebugConfirmationSurface"
-            android:enabled="true"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="edith.DEBUG_CONFIRM_SURFACE" />
-            </intent-filter>
-        </receiver>
-        <!--
-          Phase 4 closure instrument for the ceiling/whitelist rows. It writes through the production settings store,
-          not SharedPreferences directly, and logs only the committed level/count. Debug-only, shell-driven.
-        -->
-        <receiver
-            android:name=".debug.DebugSmartSettingsControl"
-            android:enabled="true"
-            android:exported="true">
-            <intent-filter>
-                <action android:name="edith.DEBUG_SMART_SETTINGS" />
-            </intent-filter>
-        </receiver>
-        <!--
           P3.2 Stage 0 hint-length instrument. Same reasoning as `DebugAudioInjector`: the only caller is an
           `adb shell am broadcast` from the host, so it must be exported, and it must therefore never exist in a
           release build. It carries synthetic text only and logs counts only.

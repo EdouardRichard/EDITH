@@ -281,54 +281,6 @@ class ConfirmationNotificationWiringTest {
     }
 
     @Test
-    fun aDebugNoSurfaceRunRefusesInsteadOfClaimingAPhoneSurface() {
-        val rig = Rig()
-        try {
-            rig.glassesAvailable = true
-            rig.glassesAccepts = true
-            rig.surface.canPost = false
-            rig.allowRaise(false)
-            ConfirmationSurfaceDebug.suppressGlasses = true
-            ConfirmationSurfaceDebug.suppressPhone = true
-            val presenter = rig.newPresenter()
-
-            assertFalse("the debug no-surface run must not claim a phone surface", presenter.available())
-            assertFalse("the production phone surface agrees", HostCompositionRoot.phoneConfirmationUi { rig.root }.available())
-        } finally {
-            ConfirmationSurfaceDebug.suppressGlasses = false
-            ConfirmationSurfaceDebug.suppressPhone = false
-            rig.close()
-        }
-    }
-
-    @Test
-    fun aDebugForcedNoGlassesRunStillUsesTheProductionShadeAndKeepsTheQuestionAnswerable() {
-        // Device closure only: when the CXR panel cannot be removed without ending the session, the debug control asks
-        // the composition to treat the glasses rung as unavailable. The rest of the ladder - the real notifier probe,
-        // the real page probe, the real answer/audit path - stays production code.
-        val rig = Rig()
-        try {
-            rig.glassesAvailable = true
-            rig.glassesAccepts = true
-            rig.allowRaise()
-            ConfirmationSurfaceDebug.suppressGlasses = true
-            rig.present("c1", "调整屏幕亮度")
-            rig.surface.posted.clear()
-
-            assertFalse("the presenter itself must also stop claiming the glasses rung",
-                requireNotNull(rig.presenter).isServingOnGlasses("c1"))
-            rig.root.uiVisible(false)
-
-            assertEquals("the forced no-glasses run must use the postable shade",
-                listOf("c1" to "调整屏幕亮度"), rig.surface.posted)
-            assertEquals("and must not drag the wearer into Edith", 0, rig.raised)
-        } finally {
-            ConfirmationSurfaceDebug.suppressGlasses = false
-            rig.close()
-        }
-    }
-
-    @Test
     fun thePhoneSurfaceIsTruthfulAboutThePageTheOverlayAndTheShade() {
         // B4 review: `ConfirmationUi.available()` was `rootHolder[0] != null`, i.e. true for the whole life of the
         // composition - so the presenter never reported unavailable and AgentLoop's early refusal was unreachable.
