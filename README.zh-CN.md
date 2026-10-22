@@ -2,6 +2,8 @@
 
 [English](README.md) | **简体中文**
 
+> **预览版状态**：EDITH 目前处于预览版阶段，功能可用，但性能、稳定性与整体体验仍需持续优化。
+
 EDITH（伊迪丝）是一个端云协同的 AI Agent：手机上的 Android 宿主 App + 眼镜端 CustomApp。
 眼镜是它的麦克风、扬声器和显示屏，手机是它的耳朵、手、记忆和大脑。眼镜麦克风音频经 Rokid AI
 APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒词检测，调用你配置的大模型，通过
@@ -169,7 +171,7 @@ adb -s $phone shell dumpsys accessibility | Select-String "Bound services|EDITH"
 
 ### 2. 模型文件（必需）
 
-**模型文件下载链接**：*（待补充）* <!-- TODO: 发布前填入网盘链接 -->
+**模型文件下载链接**：*https://pan.quark.cn/s/d53caa9e395f?pwd=veEd* <!-- TODO: 发布前填入网盘链接 -->
 
 EDITH 依赖四组端侧模型文件。它们是运行期依赖，不是可选的附加项：智能助手插件把 ASR、SystemOne
 （Laya）、Embedding、Perception 声明为必需能力，缺任何一组会导致会话激活失败。

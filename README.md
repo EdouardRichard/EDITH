@@ -2,6 +2,9 @@
 
 **English** | [简体中文](README.zh-CN.md)
 
+> **Preview status:** EDITH is currently in preview. Its features are usable, but performance,
+> stability and the overall experience still need optimization.
+
 EDITH (伊迪丝) is an end-cloud collaborative AI agent: an Android host app on your phone plus a
 custom app on Rokid Glasses. The glasses are its microphone, speaker and display; the phone is its
 ears, hands, memory and brain. Microphone audio streams from the glasses over the Rokid AI App's
@@ -181,7 +184,7 @@ serial `<glasses-serial>`.
 
 ### 2. Model files (required)
 
-**Model download link:** *to be added* <!-- TODO: fill in the cloud-drive link before publishing -->
+**Model download link:** *https://pan.quark.cn/s/d53caa9e395f?pwd=veEd* <!-- TODO: fill in the cloud-drive link before publishing -->
 
 EDITH needs four local model sets. They are runtime dependencies, not optional add-ons: the
 assistant plugin declares ASR, SystemOne (Laya), Embedding and Perception as required capabilities,
