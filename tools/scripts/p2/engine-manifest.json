@@ -34,9 +34,9 @@
       "licensePath": "licenses/Apache-2.0-standard.txt", "declarationPath": "licenses/asr-model-card.md"
     },
     {
-      "role": "decoder", "path": "decoder-epoch-99-avg-1.int8.onnx", "bytes": 13091040,
-      "sha256": "1A70C593D71E53F023F5F55B0B4CFFF5055ABB786EE3992E5F63DC2E273CC4FA",
-      "sourceUrl": "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/98590b7ed6443e77b714204da2757d75e1a642f4/decoder-epoch-99-avg-1.int8.onnx",
+      "role": "decoder", "path": "decoder-epoch-99-avg-1.onnx", "bytes": 13876452,
+      "sha256": "2E3B5EC371F8899EE6ACD829FD753BA45772DF57A91BDF37CDE3136354E7DB7D",
+      "sourceUrl": "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/98590b7ed6443e77b714204da2757d75e1a642f4/decoder-epoch-99-avg-1.onnx",
       "revision": "98590b7ed6443e77b714204da2757d75e1a642f4",
       "licensePath": "licenses/Apache-2.0-standard.txt", "declarationPath": "licenses/asr-model-card.md"
     },

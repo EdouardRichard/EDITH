@@ -115,6 +115,16 @@ internal class SmartTurn private constructor(
     /** Whether [answerEmitId] asked the host to speak (and the host could). */
     var answerEmitSpeech = false
 
+    /**
+     * Whether the host reported the end of [answerEmitSpeech]'s playback for [answerEmitId].
+     *
+     * 0.3 ASR/continuous-dialogue repair: the utterance queue refuses to treat a final as the wearer's next sentence
+     * while the assistant's own answer is still being spoken. The microphone hears that playback too, and a final
+     * produced from it is not something the wearer said. A speech-off host (the shipped default) never sets
+     * [answerEmitSpeech], so the ordinary path is unaffected.
+     */
+    var answerSpeechFinished = false
+
     /** Whether the host accepted that emit for display; a rejected submit has nothing to continue. */
     var answerEmitAccepted = false
 

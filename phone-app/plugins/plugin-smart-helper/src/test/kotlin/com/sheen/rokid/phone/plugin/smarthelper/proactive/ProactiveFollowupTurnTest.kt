@@ -792,4 +792,49 @@ class ProactiveFollowupTurnTest {
             )
         }
     }
+
+    /**
+     * 0.3 ASR/continuous-dialogue repair: the same loss the WAKE route had exists on the PROACTIVE route. A final the
+     * wearer speaks while the follow-up answer is being produced used to reach only the proactive trigger (or nothing),
+     * never the next round. It must be queued and consumed by the PROACTIVE continuation the displayed answer opens.
+     */
+    @Test
+    fun `a final during the follow-up answer becomes the proactive continuation utterance`() {
+        val tasks = OffThreadTasks()
+        val rig = rigWithDisplayedHint(continueDialogue = true, tasks = tasks)
+        val firstRequest = CountDownLatch(1)
+        val releaseFirst = CountDownLatch(1)
+        var calls = 0
+        rig.rig.model.onRequest = { request, listener ->
+            calls += 1
+            if (calls == 1) {
+                firstRequest.countDown()
+                releaseFirst.await(5, TimeUnit.SECONDS)
+                streamText(request, listener, "第一轮回答。")
+            } else {
+                streamText(request, listener, "第二轮回答。")
+            }
+        }
+
+        injectFollowup(rig, "第一句", turnId = "asr-f1", revision = 2, flush = false)
+        assertTrue(firstRequest.await(5, TimeUnit.SECONDS), "the follow-up turn must be Running")
+
+        rig.rig.plugin.handle(TranscriptEvent(rig.rig.transcript("第二句", turnId = "asr-f2", revision = 3)))
+        releaseFirst.countDown()
+        tasks.joinAll()
+        rig.rig.tick(200)
+
+        val answer = rig.rig.output.hints.last { it.route == AssistantRoute.PROACTIVE }
+        rig.rig.plugin.handle(OutputStateEvent(rig.rig.envelope(), answer.hintId, OutputStatus.Displayed))
+        tasks.joinAll()
+
+        assertEquals(2, calls, "the queued sentence opens the PROACTIVE continuation")
+        // [0] is the hint turn, [1] the follow-up answer, [2] the continuation opened by the queued sentence.
+        assertEquals("asr-f2", rig.rig.model.requests[2].turnId, "the continuation carries the queued ASR turn id")
+        assertTrue(
+            rig.rig.model.requests[2].input.filterIsInstance<com.sheen.rokid.plugin.InputPart.Text>()
+                .any { it.text == "第二句" },
+            "the PROACTIVE continuation asks the sentence spoken during the follow-up answer",
+        )
+    }
 }

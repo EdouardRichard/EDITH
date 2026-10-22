@@ -1031,6 +1031,29 @@ class SmartAssistantPlugin(
     private var lastFinalTurnId: String? = null
 
     /**
+     * 0.3 ASR/continuous-dialogue repair: the wearer's next sentence, spoken **while the current WAKE turn was still
+     * running or before its continuation opened**.
+     *
+     * The device run on 2026-10-22 lost exactly this input: a usable ASR final arrived during the wake turn's tool
+     * round, the final-review guard (`wakeOwnsFinal`) deliberately kept it out of `acceptTranscript` (it must not be
+     * replayed by `Help` or parked as a proactive hint), and no other destination existed - so the sentence vanished
+     * with no `P3_TRANSCRIPT`, no turn and no state change. The wearer experiences that as "speaking during the
+     * response does nothing".
+     *
+     * The queue is a **single slot, latest wins**: only the most recent usable final can be the wearer's next
+     * sentence, and a stale one must never be replayed after a long answer. It is consumed by the continuation the
+     * displayed answer opens (see [openContinuationTurn]) and cleared by every path that ends the conversation without
+     * one. Read and written under [gate].
+     */
+    private class QueuedUtterance(
+        val route: AssistantRoute,
+        val text: String,
+        val asrTurnId: String,
+        val capturedNanos: Long,
+    )
+    private var queuedUtterance: QueuedUtterance? = null
+
+    /**
      * 0.24 S3 (spec §5.3): the official conversation's 10 s/120 s/IDLE state machine, per route.
      *
      * It owns **all** official conversation timers: a turn itself never arms a listening deadline, so there is exactly
@@ -1484,6 +1507,7 @@ class SmartAssistantPlugin(
             // would be replayed under the new session's envelope (and its stale turn id adopted as `sourceTurnId`).
             lastFinalTranscript = null
             lastFinalTurnId = null
+            queuedUtterance = null
             // P3.2: the perception state is session state too. A label or an arming left over from the previous
             // session would let the new session perceive before the host has produced anything for it.
             resetPerception()
@@ -1664,6 +1688,7 @@ class SmartAssistantPlugin(
             // `Help` in a later session would replay it. `activate` clears it too, so both ends of the handover do.
             lastFinalTranscript = null
             lastFinalTurnId = null
+            queuedUtterance = null
             resetPerception()
             // P3.4: a session that ends takes its memory boundary with it (the namespace was scoped to it).
             memoryRetrieval = null
@@ -2081,6 +2106,7 @@ class SmartAssistantPlugin(
      */
     private fun openContinuationTurn(route: AssistantRoute, previousTurnId: String) {
         var opened: SmartTurn? = null
+        var queuedText: QueuedUtterance? = null
         synchronized(gate) {
             val current = context ?: return
             val now = clock.nowNanos()
@@ -2100,6 +2126,19 @@ class SmartAssistantPlugin(
                     openFollowupTurnLocked(now, current, runsImmediately = false, continuation = true)
                 }
             }
+            // 0.3 ASR/continuous-dialogue repair: the wearer already said the next sentence while this answer was
+            // being produced. Start the continuation's turn from it instead of presenting an empty listening round the
+            // wearer would have to fill again.
+            val created = opened
+            if (created != null) {
+                val queued = takeQueuedUtteranceLocked(route, now)
+                if (queued != null) {
+                    created.adoptTranscriptTurnId(queued.asrTurnId)
+                    created.extendDeadline(SmartTurn.saturatingAdd(now, turnBudgetNanos()))
+                    created.running()
+                    queuedText = queued
+                }
+            }
         }
         val created = opened ?: return
         // The wake line is kept byte for byte; the proactive route names itself so A-04's evidence can find it.
@@ -2110,7 +2149,24 @@ class SmartAssistantPlugin(
         }
         // Outside the lock: the cycle displays the new listening level through the host port.
         conversationCycle.onWake(route, created.turnId)
-        publishBusy()
+        val consumed = queuedText
+        if (consumed != null) {
+            // The queued sentence is this round's utterance: the official ASR levels and the wearer's row must name
+            // its own ASR turn id, and the model runs immediately rather than waiting for a second transcript.
+            conversationCycle.onAsr(route)
+            conversationCycle.onStatus(route, OfficialStatus.ASR)
+            conversationCycle.onStatus(route, OfficialStatus.ASR_END)
+            publishUserFinal(consumed.route.toContextRoute(), consumed.asrTurnId, consumed.text)
+            // Counts only, like every other conversation line.
+            P3Log.line("P3_CONV queued_consumed route=${route.name} chars=${consumed.text.length}")
+            publishBusy()
+            when (route) {
+                AssistantRoute.WAKE -> launchTurn(created, consumed.text)
+                AssistantRoute.PROACTIVE -> launchFollowupTurn(created, consumed.text)
+            }
+        } else {
+            publishBusy()
+        }
     }
 
     /**
@@ -2154,6 +2210,7 @@ class SmartAssistantPlugin(
                     if (turnMatches) {
                         cancelledTurn = detachFollowup()
                         followupBusy = false
+                        clearQueuedUtteranceLocked(AssistantRoute.PROACTIVE)
                     }
                     true
                 }
@@ -2176,6 +2233,7 @@ class SmartAssistantPlugin(
         synchronized(gate) {
             if (turn?.turnId != expectedTurnId) return
             wakeBusy = false
+            clearQueuedUtteranceLocked(AssistantRoute.WAKE)
             stopped = detach()
         }
         teardown(stopped)
@@ -2457,6 +2515,8 @@ class SmartAssistantPlugin(
                 val waitingArmed = waitingTurnId != null && conversationCycle.hasTurn(AssistantRoute.PROACTIVE)
                 var followup: FollowupUtterance? = null
                 var followupContinuation: Pair<SmartTurn, String>? = null
+                var queuedWakeFinal = false
+                var queuedProactiveFinal = false
                 val (started, proactive) = synchronized(gate) {
                     if (!matches(event.envelope)) null to null
                     else {
@@ -2523,9 +2583,40 @@ class SmartAssistantPlugin(
                                 // is the wake turn's own utterance.
                                 val wakeRunning = turn?.phase == SmartTurnPhase.Running
                                 val wakeOwnsFinal = wakeRunning && event.revision.final && usableText
+                                // The same sentence is lost in the short gap between the run ending (Idle) and the
+                                // displayed answer opening its continuation (the device run measured ~3 s on a slow
+                                // ACK). Such a final is the wearer's next sentence, not a hint trigger, provided the
+                                // answer really became the final emitted one and its own speech is not still playing.
+                                // An answer still being spoken keeps the old proactive route: the microphone is
+                                // hearing the assistant, and the existing test suite pins that behaviour.
+                                val wakeEnding = turn != null &&
+                                    turn?.phase == SmartTurnPhase.Idle &&
+                                    turn?.closed == false &&
+                                    turn?.answerEmitId != null &&
+                                    !(turn?.answerEmitSpeech == true && turn?.answerSpeechFinished == false) &&
+                                    continueDialogue() &&
+                                    event.revision.final && usableText
+                                // A usable final arriving while this turn runs is the wearer's next sentence: queue it
+                                // for the continuation instead of letting `wakeOwnsFinal` discard it.
+                                val wakeQueuesFinal = wakeOwnsFinal || wakeEnding
+                                if (wakeQueuesFinal) {
+                                    queuedWakeFinal = true
+                                    queueContinuationUtterance(AssistantRoute.WAKE, turn, event.revision)
+                                }
                                 val continuation =
                                     acceptFollowupContinuation(event.revision, waitingTurnId, waitingArmed)
                                 if (continuation != null) followupContinuation = continuation
+                                // The PROACTIVE conversation has the same loss: a usable final spoken while a
+                                // follow-up answer is running would otherwise be considered only as a hint trigger and
+                                // never as the next round's utterance. Queue it for the PROACTIVE continuation, and
+                                // keep it away from the proactive trigger while it is queued (P3-13).
+                                val proactiveRunning = followupTurn?.phase == SmartTurnPhase.Running
+                                val proactiveQueuesFinal = continuation == null && proactiveRunning &&
+                                    event.revision.final && usableText
+                                if (proactiveQueuesFinal) {
+                                    queuedProactiveFinal = true
+                                    queueContinuationUtterance(AssistantRoute.PROACTIVE, followupTurn, event.revision)
+                                }
                                 val consumed =
                                     if (continuation == null && !wakeOwnsFinal) acceptTranscript(event.revision) else null
                                 consumedFinal = consumed != null
@@ -2536,7 +2627,9 @@ class SmartAssistantPlugin(
                                     confirmation.excludeSegment(event.revision.turnId)
                                 }
                                 consumed to (
-                                    if (consumed == null && continuation == null && !wakeOwnsFinal) {
+                                    if (consumed == null && continuation == null && !wakeQueuesFinal &&
+                                        !proactiveQueuesFinal
+                                    ) {
                                         proactiveTrigger(event.revision)
                                     } else {
                                         null
@@ -2556,8 +2649,10 @@ class SmartAssistantPlugin(
                     adoptedTurnId?.let { conversationCycle.onTurnId(AssistantRoute.WAKE, it) }
                     // A blank/wake-word-only ASR deliberately publishes no status-2 row (spec §10 item 19); it still
                     // cancelled the window above, which is the official half of the behavior. A transcript consumed
-                    // by a confirmation is not the conversation's user row either.
-                    if (usableText && !consumedByConfirmation) {
+                    // by a confirmation is not the conversation's user row either. A final queued for the continuation
+                    // is also not this round's row: publishing it here would regress the panel from ANSWERING/status 5
+                    // back to ASR, and the continuation publishes it under its own turn a moment later.
+                    if (usableText && !consumedByConfirmation && !queuedWakeFinal && !queuedProactiveFinal) {
                         conversationCycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ASR)
                     }
                     if (consumedFinal) conversationCycle.onStatus(AssistantRoute.WAKE, OfficialStatus.ASR_END)
@@ -2640,6 +2735,10 @@ class SmartAssistantPlugin(
                         proactiveMine = followupTurn?.let { owned ->
                             !owned.closed && namesCurrentAnswerEmit(owned, event.hintId, event.emitId)
                         } == true
+                        // 0.3 ASR/continuous-dialogue repair: the answer's own playback is over, so a final that
+                        // reaches the running turn from now on is the wearer's, not the speaker's echo.
+                        if (wakeMine) turn?.answerSpeechFinished = true
+                        if (proactiveMine) followupTurn?.answerSpeechFinished = true
                     }
                 }
                 if (wakeMine) conversationCycle.onSpeechFinished(AssistantRoute.WAKE, event.result)
@@ -2741,7 +2840,12 @@ class SmartAssistantPlugin(
                 return null
             }
         }
-        if (!continuation) scene.noteTurn(nowNanos)
+        if (!continuation) {
+            scene.noteTurn(nowNanos)
+            // A new wake (or Help) starts a new conversation; a sentence queued for the previous answer's
+            // continuation must not be replayed into it.
+            queuedUtterance = null
+        }
         val replaced = turn?.also { it.closed = true }
         val created = buildTurn(nowNanos, current, runsImmediately, transcriptTurnId)
         turn = created
@@ -2851,6 +2955,64 @@ class SmartAssistantPlugin(
         current.extendDeadline(SmartTurn.saturatingAdd(clock.nowNanos(), turnBudgetNanos()))
         current.running()
         return current to text
+    }
+
+    /**
+     * Must hold [gate]: remembers a usable final spoken during the running wake turn (or in the brief Idle gap before
+     * its continuation opens) as the **next** utterance, latest wins.
+     *
+     * Deliberately not routed through [acceptTranscript]: that method remembers a final in `lastFinalTranscript` for
+     * `Help` **before** its phase check, and a sentence spoken during an answer must not become the manual `Help`
+     * input. The final is also kept out of the proactive trigger - the wearer is talking to the conversation, not
+     * proposing a hint.
+     *
+     * A final captured while the assistant's own answer is still being spoken is refused: the microphone hears that
+     * playback too, and it is not the wearer's next sentence. The shipped host has speech off, so this only guards the
+     * opt-in `语音朗读` path.
+     */
+    private fun queueContinuationUtterance(
+        route: AssistantRoute,
+        owned: SmartTurn?,
+        revision: TranscriptRevision,
+    ) {
+        owned ?: return
+        if (owned.closed || owned.route != route) return
+        if (owned.answerEmitSpeech && !owned.answerSpeechFinished) {
+            P3Log.line("P3_CONV queue_drop route=${route.name} reason=self_speech")
+            return
+        }
+        val text = revision.text.trim()
+        if (!isUsableUtterance(text)) return
+        queuedUtterance = QueuedUtterance(route, text, revision.turnId, clock.nowNanos())
+        // Counts only: the wearer's words are display content and never reach the log.
+        P3Log.line("P3_CONV queue route=${route.name} chars=${text.length}")
+    }
+
+    /**
+     * Must hold [gate]: the queued sentence for the continuation that was just opened, or `null` when none is fresh.
+     *
+     * A sentence that has waited longer than [CONTINUATION_QUEUE_TTL_NANOS] is dropped rather than answered: after a
+     * long turn it no longer refers to the conversation the continuation is opening, and replaying it would surprise
+     * the wearer with an answer to something they said a minute ago.
+     */
+    private fun takeQueuedUtteranceLocked(route: AssistantRoute, nowNanos: Long): QueuedUtterance? {
+        val queued = queuedUtterance ?: return null
+        if (queued.route != route) {
+            // A continuation never consumes the other conversation's sentence (P3-13), and it must not drop it either:
+            // the sibling route's continuation is the only consumer it has.
+            return null
+        }
+        queuedUtterance = null
+        if (nowNanos - queued.capturedNanos > CONTINUATION_QUEUE_TTL_NANOS) {
+            P3Log.line("P3_CONV queue_drop route=${route.name} reason=stale")
+            return null
+        }
+        return queued
+    }
+
+    /** Must hold [gate]: drops a queued sentence only when it belongs to [route] (the two routes stay independent). */
+    private fun clearQueuedUtteranceLocked(route: AssistantRoute) {
+        if (queuedUtterance?.route == route) queuedUtterance = null
     }
 
     /** Whether a trimmed final can be the utterance: not empty, and not the wake segment's own echo of the word. */
@@ -5023,6 +5185,7 @@ class SmartAssistantPlugin(
             val had = proactiveFollowup != null || followupTurnRequest != null || followupTurn != null
             proactiveFollowup = null
             followupTurnRequest = null
+            clearQueuedUtteranceLocked(AssistantRoute.PROACTIVE)
             cancelledTurn = detachFollowup()
             had
         }
@@ -5215,6 +5378,9 @@ class SmartAssistantPlugin(
                 current.cancelFallbackWait()
                 current.answerEmitId = emitId
                 current.answerEmitSpeech = speech != null
+                // A new answer emit is a new speech identity: the previous emit's playback end must not mark this one
+                // finished (and let the utterance queue treat the still-playing answer as the wearer's next sentence).
+                current.answerSpeechFinished = false
                 current.answerFinal = finalAnswer
                 current.answerTerminal = null
                 current.displayed = false
@@ -5515,6 +5681,17 @@ class SmartAssistantPlugin(
     }
 
     private companion object {
+        /**
+         * 0.3 ASR/continuous-dialogue repair: how long a sentence spoken during a running wake turn may wait for that
+         * turn's continuation to open.
+         *
+         * It follows the conversation, not the model's latency: a tool round that stops for a confirmation (the device
+         * run measured 53 s) is still the same conversation, and the wearer's sentence must survive it. The queue is
+         * cleared by every close/stop/session path, so this bound only guards a conversation that never ends; 120 s is
+         * the conversation cycle's own pinned-close horizon (D164/D169), not a new listening window.
+         */
+        const val CONTINUATION_QUEUE_TTL_NANOS = 120_000_000_000L
+
         /**
          * 0.3 Phase 2 Task 9: the sources a continuation's ambient perception block asks for. A tool round already
          * carries its own observation result, so the request tail only refreshes what changes without one.
