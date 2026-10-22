@@ -40,6 +40,7 @@ class ConfirmationGuardTest {
         val executed = mutableListOf<Pair<String, String>>()
         var cancels = 0
         var begins = 0
+        var precheckCalls = 0
         var precheckFailure: RuntimeException? = null
 
         override fun descriptors(): List<ActionDescriptor> = listOf(DESCRIPTOR)
@@ -52,6 +53,7 @@ class ConfirmationGuardTest {
         override fun cancel() { cancels++ }
         override fun beginTurn() { begins++ }
         override fun precheck(name: String, argsJson: String): ActionPrecheck {
+            precheckCalls += 1
             precheckFailure?.let { throw it }
             return precheck
         }
@@ -76,12 +78,14 @@ class ConfirmationGuardTest {
         confirmation: FakeConfirmation = FakeConfirmation(),
         canAsk: Boolean = true,
         requestIds: MutableList<String> = mutableListOf("request-1"),
+        noInterception: () -> Boolean = { false },
     ): ConfirmingActions = ConfirmingActions(
         host = actions,
         confirmation = confirmation,
         canAsk = { canAsk },
         newRequestId = { requestIds.removeFirstOrNull() ?: "request-fallback" },
         diagnostics = { },
+        noInterception = noInterception,
     )
 
     @Test
@@ -113,6 +117,33 @@ class ConfirmationGuardTest {
         assertNotNull(runCatching { UUID.fromString(requestId) }.getOrNull(),
             "R52 requires the confirmation to be addressed by a UUID, was `$requestId`")
         assertEquals("不可逆终端命令", summary)
+    }
+
+    @Test
+    fun `no interception executes directly with neither precheck nor confirmation`() {
+        val actions = FakeActions(ActionPrecheck(PrecheckDecision.RequireConfirmation, summary = "危险"))
+        val confirmation = FakeConfirmation()
+
+        val result = wrapper(actions, confirmation, canAsk = false, noInterception = { true }).execute("shell", args)
+
+        assertEquals(ActionOutcome.Done, result.outcome)
+        assertEquals(listOf("shell" to args), actions.executed)
+        assertEquals(0, actions.precheckCalls, "the mode skips the host's classifier entirely")
+        assertTrue(confirmation.requested.isEmpty(), "no-interception never raises a confirmation")
+    }
+
+    @Test
+    fun `the no interception bypass is read live on every execute`() {
+        var enabled = false
+        val actions = FakeActions(ActionPrecheck(PrecheckDecision.Allow))
+        val subject = wrapper(actions, noInterception = { enabled })
+
+        subject.execute("shell", args)
+        enabled = true
+        subject.execute("shell", args)
+
+        assertEquals(1, actions.precheckCalls, "only the gate-off call consults the classifier")
+        assertEquals(listOf("shell" to args, "shell" to args), actions.executed)
     }
 
     @Test

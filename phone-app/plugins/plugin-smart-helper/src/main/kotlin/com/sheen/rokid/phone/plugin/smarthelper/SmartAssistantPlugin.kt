@@ -250,7 +250,7 @@ internal const val PROACTIVE_ARMED_KEY = "proactive.armed"
 
 /** Configuration keys this plugin understands; anything else is refused rather than silently ignored. */
 private val KNOWN_KEYS = setOf("profileId", "profileRevision", "wakeWords", "maxLevel", "whitelist", "requestConsent",
-    "proactiveCooldownMillis", "proactiveSensitivity")
+    "proactiveCooldownMillis", "proactiveSensitivity", "noInterception")
 
 /** The fixed, honest sentence for each non-`COMPLETED` terminal state; never a success-looking hint. */
 private val FAILURE_HINTS = mapOf(
@@ -299,6 +299,13 @@ private const val DEPENDENCY_HINT = "本地模型还没准备好，暂时不能�
  * unconfirmed (R-03); the plugin's own `notify_user`/`load_skill` are not wrapped here at all. The request id is a
  * UUID because it addresses one question, not a command, and the summary is the precheck's category text - never the
  * raw command (the same no-command-text rule as the audit trail).
+ *
+ * 0.3 Phase 4B (`D189`, spec §5.1): while the host's live 「不拦截」 gate answers true, [execute] calls the host directly
+ * and never reaches [precheck] or [ConfirmationPort.request]. The classifier is skipped rather than consulted and
+ * overruled: this mode is the host's explicit removal of command-level interception, and a `Reject` (a malformed call)
+ * is not a confirmation either - the wearer chose to let calls through. The wrapper is plugin-owned and constructed
+ * only by [SmartAssistantPlugin.registryFor], so this is not a bypass other executors can opt into; `precheck` itself
+ * stays a truthful classifier for any caller that reads it.
  */
 internal class ConfirmingActions(
     private val host: ActionExecutor,
@@ -306,6 +313,7 @@ internal class ConfirmingActions(
     private val canAsk: () -> Boolean,
     private val newRequestId: () -> String = { UUID.randomUUID().toString() },
     private val diagnostics: (String) -> Unit = { P3Log.line(it) },
+    private val noInterception: () -> Boolean = { false },
 ) : ActionExecutor {
 
     override fun descriptors(): List<ActionDescriptor> = host.descriptors()
@@ -318,6 +326,10 @@ internal class ConfirmingActions(
     override fun precheck(name: String, argsJson: String): ActionPrecheck = host.precheck(name, argsJson)
 
     override fun execute(name: String, argsJson: String): ActionResult {
+        // 0.3 Phase 4B (`D189`): no-interception is checked before the classifier, so a dangerous command runs with no
+        // precheck and no question (spec §5.3). A provider that cannot answer is not an approval: fall back to the
+        // normal gate, which will ask.
+        if (runCatching(noInterception).getOrDefault(false)) return host.execute(name, argsJson)
         val precheck = runCatching { host.precheck(name, argsJson) }.getOrElse {
             // A precheck that cannot answer is not an approval. Refuse rather than fall through to executing.
             diagnostics("P3_CONFIRM action=$name outcome=unavailable reason=PRECHECK_FAILED")
@@ -544,6 +556,15 @@ class SmartAssistantPlugin(
      * without changing the provider's snapshot.
      */
     private val perceptionPolicy: PerceptionPolicy = PerceptionPolicy(),
+    /**
+     * 0.3 Phase 4B (`D189`, spec §5.1/§5.3): the **live** global 「不拦截」 gate.
+     *
+     * Production passes `NoInterceptionGate.provider()` through `SmartWiring`; the policy and the confirmation wrapper
+     * read it on **every** decision, so a settings save applies from the next tool call without restarting the App. It
+     * is a function rather than a boolean on purpose: a snapshot would pin the mode for one turn while the persisted
+     * switch is meant to be global and live. The `{ false }` default keeps every pre-4B caller in normal mode.
+     */
+    private val noInterception: () -> Boolean = { false },
 ) : PluginLifecycle, ConfiguredPlugin {
 
     init {
@@ -624,6 +645,16 @@ class SmartAssistantPlugin(
     internal val requestConsentConfigured: Boolean get() = synchronized(gate) { config?.requestConsent == true }
 
     /**
+     * Test-only observation that the persisted 「不拦截」 key was parsed.
+     *
+     * **Not** the live gate: the policy and confirmation wrapper consult the constructor `noInterception` provider, so
+     * a configuration snapshot can never re-arm the mode after the user turned it off (spec §5.1). Exposed `internal`
+     * solely so the shape test can prove the key is accepted and defaults to false.
+     */
+    internal val noInterceptionConfigured: Boolean
+        get() = synchronized(gate) { config?.noInterception == true }
+
+    /**
      * Test-only observation of the plugin's own audit trail.
      *
      * A wake the scene refuses has no turn to key an audit line by, so a JVM test can only prove the refusal was
@@ -666,6 +697,14 @@ class SmartAssistantPlugin(
         /** P3.2: how long the proactive path stays quiet after a request, and how willing it is to interrupt. */
         val proactiveCooldownMillis: Long,
         val proactiveSensitivity: ProactiveSensitivity,
+        /**
+         * 0.3 Phase 4B (`D189`): the persisted 「不拦截」 value, parsed for the closed configuration shape.
+         *
+         * It is **not** the gate the policy reads: the host passes a live provider to the constructor (spec §5.1), and a
+         * configuration snapshot must never override a mid-session save. The field keeps the key honest - the plugin
+         * accepts the value `SmartSettings.pluginValues` sends and defaults to false when it is absent.
+         */
+        val noInterception: Boolean,
     )
 
     private val gate = Any()
@@ -1284,8 +1323,12 @@ class SmartAssistantPlugin(
             require(level != null) { "proactiveSensitivity must be LOW, MEDIUM or HIGH, was '$it'" }
             level
         } ?: ProactiveSensitivity.LOW
+        val noInterception = configuration.values["noInterception"]?.let {
+            require(it == "true" || it == "false") { "noInterception must be 'true' or 'false', was '$it'" }
+            it == "true"
+        } ?: false
         return Config(profileId, revision, wakeWords, maxLevel, whitelist, consent,
-            proactiveCooldownMillis, proactiveSensitivity)
+            proactiveCooldownMillis, proactiveSensitivity, noInterception)
     }
 
     private fun parseRiskLevel(raw: String): RiskLevel {
@@ -3629,6 +3672,8 @@ class SmartAssistantPlugin(
                 host = context.services.actions(),
                 confirmation = confirmation,
                 canAsk = { confirmation.canAsk },
+                // 0.3 Phase 4B (D189): the same live provider the policy reads, so one save governs both gates.
+                noInterception = noInterception,
             ),
             // B7: `notify_user` is the model's only channel to the wearer (spec §6.1). It rides the action
             // registry rather than a new tool port, and `NotifyUserTool`'s KDoc records what that choice costs.
@@ -3900,7 +3945,7 @@ class SmartAssistantPlugin(
         AgentLoop(
             gateway = gateway,
             registry = registry,
-            policy = WhitelistActionPolicy(configured.maxLevel, configured.whitelist),
+            policy = WhitelistActionPolicy(configured.maxLevel, configured.whitelist, noInterception),
             guard = ProgressGuard(),
             audit = audit,
             clock = clock,
@@ -4434,7 +4479,7 @@ class SmartAssistantPlugin(
             val loop = AgentLoop(
                 gateway = gateway,
                 registry = ToolRegistry(listOf(tool)),
-                policy = WhitelistActionPolicy(configured.maxLevel, configured.whitelist),
+                policy = WhitelistActionPolicy(configured.maxLevel, configured.whitelist, noInterception),
                 guard = ProgressGuard(),
                 audit = audit,
                 clock = clock,

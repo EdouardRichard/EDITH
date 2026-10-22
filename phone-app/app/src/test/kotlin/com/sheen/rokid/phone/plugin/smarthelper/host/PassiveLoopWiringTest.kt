@@ -1022,7 +1022,47 @@ private class NoStorageAccess : StorageAccess {
         val values = SmartSettings(profileId = "p-1").pluginConfiguration(profile("p-1")).values
 
         assertEquals(setOf("profileId", "profileRevision", "wakeWords", "maxLevel", "whitelist",
-            "proactiveCooldownMillis", "proactiveSensitivity"), values.keys)
+            "proactiveCooldownMillis", "proactiveSensitivity", "noInterception"), values.keys)
+    }
+
+    /**
+     * 0.3 Phase 4B (`D189`, spec §5.3): the persisted switch also travels in the plugin's configuration shape.
+     *
+     * The live behavior is the host gate (`NoInterceptionGate.provider()`); this key is the initial/persisted value the
+     * plugin stores, so a restarted App sends the same setting the store loaded. A missing key would make the plugin
+     * refuse the whole closed configuration, which is why the exact key-set test above pins it.
+     */
+    @Test
+    fun theNoInterceptionSettingIsSentAsThePluginsInitialValue() {
+        val off = SmartSettings(profileId = "p-1").pluginConfiguration(profile("p-1"))
+        val on = SmartSettings(profileId = "p-1", noInterception = true).pluginConfiguration(profile("p-1"))
+
+        assertEquals("false", off.values["noInterception"])
+        assertEquals("true", on.values["noInterception"])
+    }
+
+    /**
+     * 0.3 Phase 4B (`D189`, spec §5.1): the composition must pass the **live** gate, never a snapshot.
+     *
+     * The policy and shell-precheck consumers call this provider on every decision, so a wiring that passed a boolean
+     * (or read the settings object once) would leave the user's save ineffective until the next App assembly. Flipping
+     * the backing flag after construction is the proof that the plugin holds the provider itself.
+     */
+    @Test
+    fun theLiveNoInterceptionGateReachesThePluginTheWiringBuilds() {
+        val enabled = java.util.concurrent.atomic.AtomicBoolean(false)
+        val wiring = SmartWiring(
+            SmartSettings(profileId = "p-1"), MemoryProfileRepository(), FakeClock(0), ManualScheduler(FakeClock(0)),
+            noInterception = { enabled.get() },
+        )
+        val field = wiring.plugin.javaClass.getDeclaredField("noInterception")
+        field.isAccessible = true
+        @Suppress("UNCHECKED_CAST")
+        val provider = field.get(wiring.plugin) as () -> Boolean
+
+        assertFalse("the mode is off by default", provider())
+        enabled.set(true)
+        assertTrue("a save must be visible from the provider's next call", provider())
     }
 
     @Test

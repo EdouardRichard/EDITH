@@ -140,6 +140,10 @@ data class SmartSettings(
         "whitelist" to whitelist.joinToString(","),
         "proactiveCooldownMillis" to proactiveCooldownMillis.toString(),
         "proactiveSensitivity" to effectiveProactiveSensitivity(),
+        // 0.3 Phase 4B (`D189`): the persisted 「不拦截」 value travels in the closed configuration shape. The plugin's
+        // live behavior comes from the host gate provider (spec §5.1), never from this turn snapshot; sending the key
+        // is what keeps a restarted App's configuration complete and the plugin's key set in agreement with the store.
+        "noInterception" to noInterception.toString(),
     )
 
     /** The plugin's `PluginConfiguration`, at the schema version the plugin declares. */

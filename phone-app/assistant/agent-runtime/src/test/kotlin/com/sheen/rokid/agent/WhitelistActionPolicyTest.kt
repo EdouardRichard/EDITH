@@ -181,6 +181,81 @@ class WhitelistActionPolicyTest {
         )
     }
 
+    /**
+     * 0.3 Phase 4B (`D189`, spec §5.1): the host's explicit 「不拦截」 mode is a live global gate, not a grant.
+     *
+     * It supersedes the ceiling, the whitelist and the plugin's own tightening at once: the mode exists precisely so
+     * that the wearer's explicit choice wins over every rule that would otherwise ask. This is the one place the
+     * otherwise absolute D182 L3/L4 boundary is intentionally lifted.
+     */
+    @Test fun `no interception allows every level and bypasses the ceiling`() {
+        val policy = WhitelistActionPolicy(
+            maxLevel = RiskLevel.L1,
+            whitelist = emptyList(),
+            noInterception = { true },
+        )
+
+        RiskLevel.entries.forEach { risk ->
+            assertEquals(
+                PolicyDecision.Allow,
+                policy.decide(descriptor(risk = risk)),
+                "no-interception must allow $risk without consulting the L1 ceiling",
+            )
+        }
+        assertEquals(
+            PolicyDecision.Allow,
+            policy.decide(descriptor(risk = RiskLevel.L4, requiresConfirmation = true)),
+            "the host's explicit mode supersedes a plugin's tightening (spec §5.1)",
+        )
+    }
+
+    @Test fun `the no interception gate is read live on every decision`() {
+        var enabled = false
+        val policy = WhitelistActionPolicy(
+            maxLevel = RiskLevel.L1,
+            whitelist = emptyList(),
+            noInterception = { enabled },
+        )
+
+        assertEquals(
+            PolicyDecision.RequireConfirmation("Title of message.send"),
+            policy.decide(descriptor(risk = RiskLevel.L2)),
+            "with the gate off the normal ceiling still applies",
+        )
+
+        enabled = true
+        assertEquals(
+            PolicyDecision.Allow,
+            policy.decide(descriptor(risk = RiskLevel.L4)),
+            "a saved switch must apply from the next decision, not the next App assembly",
+        )
+
+        enabled = false
+        assertEquals(
+            PolicyDecision.RequireConfirmation("Title of message.send"),
+            policy.decide(descriptor(risk = RiskLevel.L4)),
+            "turning the mode off must restore L4 confirmation immediately",
+        )
+    }
+
+    @Test fun `a snapshot keeps the live gate rather than capturing its current value`() {
+        var enabled = true
+        val policy = WhitelistActionPolicy(
+            maxLevel = RiskLevel.L1,
+            whitelist = emptyList(),
+            noInterception = { enabled },
+        )
+
+        val snapshot = policy.snapshot()
+        enabled = false
+
+        assertEquals(
+            PolicyDecision.RequireConfirmation("Title of message.send"),
+            snapshot.decide(descriptor(risk = RiskLevel.L3)),
+            "only the ceiling and grants are turn-snapshotted; the host mode is live by design",
+        )
+    }
+
     @Test fun `the constructor snapshots the whitelist collection`() {
         val entries = mutableListOf(WhitelistEntry("message.send", "contact:A"))
         val policy = WhitelistActionPolicy(maxLevel = RiskLevel.L4, whitelist = entries)

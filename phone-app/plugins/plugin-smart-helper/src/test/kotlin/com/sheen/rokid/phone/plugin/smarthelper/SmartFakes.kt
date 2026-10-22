@@ -22,6 +22,7 @@ import com.sheen.rokid.contracts.WakeDetected
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
 import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionPrecheck
 import com.sheen.rokid.plugin.ActionResult
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.Capability
@@ -50,6 +51,7 @@ import com.sheen.rokid.plugin.PerceptionProvider
 import com.sheen.rokid.plugin.PerceptionScreenshotResult
 import com.sheen.rokid.plugin.PerceptionSnapshot
 import com.sheen.rokid.plugin.PerceptionSource
+import com.sheen.rokid.plugin.PrecheckDecision
 import com.sheen.rokid.plugin.RiskLevel
 import com.sheen.rokid.plugin.SecretHandle
 import com.sheen.rokid.plugin.StorageAccess
@@ -295,8 +297,18 @@ internal class SmartFakeActions(
     val descriptors: MutableList<ActionDescriptor> = mutableListOf(),
 ) : ActionExecutor {
     val executed = mutableListOf<Pair<String, String>>()
+
+    /** Every call the plugin's confirmation wrapper made to the host classifier, in order. */
+    val prechecks = mutableListOf<Pair<String, String>>()
     var cancellations = 0
     var outcome: (String, String) -> ActionResult = { _, _ -> ActionResult(ActionOutcome.Done, "已记录") }
+
+    /**
+     * The classifier's verdict for one call. [PrecheckDecision.Allow] keeps the pre-4B shape; a test that exercises
+     * command-level confirmation installs `RequireConfirmation` here.
+     */
+    var precheckDecision: (String, String) -> ActionPrecheck =
+        { _, _ -> ActionPrecheck(PrecheckDecision.Allow) }
 
     /** Task 12 (R59): the runtime-state line the plugin reads through the scoped executor, or `null`. */
     var runtimeStateLine: String? = null
@@ -309,6 +321,11 @@ internal class SmartFakeActions(
     }
 
     override fun cancel() { cancellations++ }
+
+    override fun precheck(name: String, argsJson: String): ActionPrecheck {
+        prechecks += name to argsJson
+        return precheckDecision(name, argsJson)
+    }
 
     override fun runtimeState(): String? = runtimeStateLine
 }
@@ -612,6 +629,11 @@ internal class SmartTestRig(
      */
     val speechAvailable: Boolean = true,
     /**
+     * 0.3 Phase 4B (`D189`): the live 「不拦截」 gate this rig feeds the plugin. It is a `var` on purpose: a test can
+     * flip it between tool calls to prove the plugin reads the provider live instead of snapshotting it per turn.
+     */
+    var noInterception: Boolean = false,
+    /**
      * 0.24 S3 fix (I4): the wake cooldown. The production default (3 s) is what every pre-0.24 test expects; the
      * interleaving test needs a second wake inside the first round's 1 s close, so it opts out explicitly.
      */
@@ -662,6 +684,7 @@ internal class SmartTestRig(
             requestPanelOpen = requestPanelOpen,
             continueDialogue = { continueDialogue },
             speechAvailable = { speechAvailable },
+            noInterception = { noInterception },
             deviceState = deviceState,
         )
         // 0.3 Phase 3: the seam is an internal property (a public constructor must not expose the internal

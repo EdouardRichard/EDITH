@@ -1,8 +1,10 @@
 package com.sheen.rokid.phone.plugin.smarthelper
 
 import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.plugin.ActionPrecheck
 import com.sheen.rokid.plugin.ModelEnd
 import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.PrecheckDecision
 import com.sheen.rokid.plugin.RiskLevel
 import kotlin.test.*
 
@@ -126,5 +128,56 @@ class SmartWhitelistTest {
         )
         runOnce(rig)
         assertEquals(listOf("send_message" to "{}"), rig.actions.executed)
+    }
+
+    // ------------------------------------------------ 0.3 Phase 4B (`D189`): no-interception mode
+
+    /**
+     * The wrapper is the only place command-level confirmation exists, so a no-interception call must never reach
+     * the host's classifier at all: asking it and then ignoring the answer would still put the shell command through
+     * the confirmation path the mode exists to remove.
+     */
+    @Test fun `no interception skips the shell precheck and confirmation and runs the action`() {
+        val rig = rigWith(smartAction("shell", risk = RiskLevel.L1, scope = "device.shell"),
+            maxLevel = "L1", whitelist = null)
+        rig.actions.precheckDecision = { _, _ ->
+            ActionPrecheck(PrecheckDecision.RequireConfirmation, summary = "运行终端命令？")
+        }
+        rig.noInterception = true
+
+        runOnce(rig)
+
+        assertEquals(listOf("shell" to "{}"), rig.actions.executed,
+            "no-interception executes the action directly")
+        assertTrue(rig.actions.prechecks.isEmpty(),
+            "no-interception must not call the host's command classifier")
+    }
+
+    @Test fun `without no interception a command precheck still asks before running`() {
+        val rig = rigWith(smartAction("shell", risk = RiskLevel.L1, scope = "device.shell"),
+            maxLevel = "L1", whitelist = null)
+        rig.actions.precheckDecision = { _, _ ->
+            ActionPrecheck(PrecheckDecision.RequireConfirmation, summary = "运行终端命令？")
+        }
+
+        runOnce(rig)
+
+        assertTrue(rig.actions.executed.isEmpty(), "a RequireConfirmation precheck must not fall through to execution")
+        assertEquals(listOf("shell" to "{}"), rig.actions.prechecks,
+            "the normal mode consults the host's command classifier")
+    }
+
+    @Test fun `no interception supersedes an app requiresConfirmation declaration end to end`() {
+        val rig = rigWith(
+            smartAction("share_screen", risk = RiskLevel.L0, requiresConfirmation = true),
+            maxLevel = "L4",
+            whitelist = null,
+        )
+        rig.noInterception = true
+
+        runOnce(rig)
+
+        assertEquals(listOf("share_screen" to "{}"), rig.actions.executed,
+            "the host mode outranks the plugin's tightening (spec §5.1); no confirmation is raised")
     }
 }

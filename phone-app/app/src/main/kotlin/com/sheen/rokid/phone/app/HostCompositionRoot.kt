@@ -299,9 +299,9 @@ class HostCompositionRoot internal constructor(
      *
      * [create] seeds it from the persisted [SmartSettings.noInterception] (default off); [saveSmartSettings] updates
      * the same instance, and the settings page's banner reads its current value. B3 hands
-     * [NoInterceptionGate.provider] to the plugin/policy and shell precheck; this task deliberately does **not** wire
-     * that consumer yet, so the mode is persisted and live but not yet consulted by a tool call. A hand-built
-     * composition (tests, harnesses) keeps the safe default (off).
+     * [NoInterceptionGate.provider] to `SmartWiring`, which passes it to the plugin's policy and shell-precheck wrapper,
+     * so the gate is consulted live by every tool call (spec §5.1). A hand-built composition (tests, harnesses) keeps
+     * the safe default (off).
      */
     internal val noInterceptionGate: NoInterceptionGate = NoInterceptionGate(false),
     /**
@@ -1993,9 +1993,9 @@ class HostCompositionRoot internal constructor(
             // switch. A save updates this same instance through `saveSmartSettings`; the old `{ true }` hardcodes on
             // both consumers are gone, so the switch really is the only source of truth.
             val visionGate = VisionGate(smartSettings.visionEnabled)
-            // 4B (`D189`): the live 「不拦截」 gate, seeded from the same persisted snapshot. It is deliberately not
-            // passed to the plugin yet (B3 owns that wiring); today only `saveSmartSettings` and the settings banner
-            // read it. Default off, including for a pre-4B blob and for a hand-built composition.
+            // 4B (`D189`): the live 「不拦截」 gate, seeded from the same persisted snapshot. B3 passes its provider to
+            // the smart plugin's policy and shell-precheck wrapper, so a save on the settings screen is consulted from
+            // the next tool call. Default off, including for a pre-4B blob and for a hand-built composition.
             val noInterceptionGate = NoInterceptionGate(smartSettings.noInterception)
             // Task 14b: the self-audio seam. P3.1 emits no audio at all, so the gate stays open and this wiring
             // changes nothing today; it is what P3.2 hands to the speech output path. See `PlaybackGate`.
@@ -2170,7 +2170,10 @@ class HostCompositionRoot internal constructor(
                 hostHolder[0]?.cancelOutputTurn(sessionId, generation, turnId)
             }, isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false },
                 requestPanelOpen = { route -> rootHolder[0]?.requestPanelOpen(route) ?: false },
-                speechAvailable = { speechPlayerHolder.get() != null })
+                speechAvailable = { speechPlayerHolder.get() != null },
+                // 0.3 Phase 4B (`D189`): the gate's **provider**, not its current value. `saveSmartSettings` updates
+                // this same instance, so the plugin's policy and shell-precheck wrapper see a save from the next call.
+                noInterception = noInterceptionGate.provider())
             // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
             // One `ToolSurface` is the single `Capability.Actions` provider (Phase 4A Task 4): the umbrella catalog's
             // four verified tools plus the five atomic channel legs, 22 descriptors in all. The advertised set is fixed

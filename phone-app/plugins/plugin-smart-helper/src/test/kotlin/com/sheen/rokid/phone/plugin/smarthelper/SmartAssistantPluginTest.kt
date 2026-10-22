@@ -78,6 +78,32 @@ class SmartAssistantPluginTest {
         assertFailsWith<IllegalArgumentException> { plugin.validate(configuration(mapOf("proactiveNonsense" to "1"))) }
     }
 
+    /**
+     * 0.3 Phase 4B (`D189`, spec §5.3): the persisted mode is now part of the closed configuration shape.
+     *
+     * The key's value is accepted at its persisted spelling and defaults to **false** when absent; the live gate is the
+     * constructor provider, not this turn snapshot (spec §5.1), so this test pins only the shape and the safe default.
+     */
+    @Test fun `the no-interception configuration key is accepted and defaults to false`() {
+        val plugin = SmartAssistantPlugin()
+        fun configuration(extra: Map<String, String>) = PluginConfiguration(1,
+            mapOf("profileId" to "p-1", "profileRevision" to "1") + extra)
+
+        plugin.validate(configuration(mapOf("noInterception" to "true")))
+        plugin.validate(configuration(mapOf("noInterception" to "false")))
+        plugin.validate(configuration(emptyMap()))
+
+        assertFalse(plugin.noInterceptionConfigured, "an absent key takes the safe default (off)")
+        plugin.configure(configuration(mapOf("noInterception" to "true")))
+        assertTrue(plugin.noInterceptionConfigured)
+        plugin.configure(configuration(mapOf("noInterception" to "false")))
+        assertFalse(plugin.noInterceptionConfigured)
+
+        assertFailsWith<IllegalArgumentException> {
+            plugin.validate(configuration(mapOf("noInterception" to "yes")))
+        }
+    }
+
     @Test fun `descriptor is stable and lifecycle toggles active`() {
         val rig = SmartTestRig()
         val plugin: PluginLifecycle = rig.plugin
