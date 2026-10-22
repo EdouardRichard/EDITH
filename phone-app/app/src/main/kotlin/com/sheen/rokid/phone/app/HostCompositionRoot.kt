@@ -736,6 +736,16 @@ class HostCompositionRoot internal constructor(
         return scriptedModelWire?.arm(action, argsJson, text, calls, fail) ?: false
     }
 
+    /** Debug-only same-turn sequence (`read_screen` then `tap`); release has no caller. */
+    fun armScriptedModelSequence(
+        steps: List<Pair<String, String>>,
+        text: String,
+        fail: Boolean = false,
+    ): Boolean {
+        if (!BuildConfig.DEBUG) return false
+        return scriptedModelWire?.armSequence(steps, text, fail) ?: false
+    }
+
     /** Debug-only counterpart of [armScriptedModelAnswer]: hands the transport back to the real network. */
     fun disarmScriptedModelAnswer() {
         if (!BuildConfig.DEBUG) return

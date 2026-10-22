@@ -43,11 +43,21 @@ internal class ScriptedModelWire(private val log: (String) -> Unit = { P3Log.lin
     /** One canned answer, already serialised as the wire would deliver it. */
     internal class Answer(val body: String)
 
-    private class Script(val action: String, val argsJson: String, val text: String, val calls: Int)
+    /** One tool call in a scripted multi-step turn (read -> tap and similar same-turn sequences). */
+    internal data class Step(val action: String, val argsJson: String)
+
+    private class Script(
+        val action: String,
+        val argsJson: String,
+        val text: String,
+        val calls: Int,
+        val steps: List<Step>? = null,
+    )
 
     private val lock = Any()
     private var script: Script? = null
     private var servedCalls = 0
+    private var stepIndex = 0
     private var failAfterCalls = false
 
     /**
@@ -84,9 +94,36 @@ internal class ScriptedModelWire(private val log: (String) -> Unit = { P3Log.lin
                 calls = calls,
             )
             servedCalls = 0
+            stepIndex = 0
             failAfterCalls = fail
         }
         log("P3_SCRIPT state=armed action=${name.ifEmpty { "none" }} calls=$calls fail=$fail")
+        return true
+    }
+
+    /**
+     * Arms a **same-turn sequence** of tool calls. This is the only honest way to drive the index-based atomic tools
+     * (`tap`/`long_press`/`input_text`): their index must come from a `read_screen` earlier in the same turn, so a
+     * single-call script cannot produce a valid argument. Each step is served once, then the wire answers with [text].
+     */
+    fun armSequence(steps: List<Pair<String, String>>, text: String, fail: Boolean = false): Boolean {
+        if (steps.isEmpty()) return false
+        if (steps.any { it.first.isBlank() }) return false
+        val normalized = steps.map { (name, args) -> Step(name.trim(), args.trim().ifEmpty { "{}" }) }
+        synchronized(lock) {
+            serial += 1
+            script = Script(
+                action = "sequence",
+                argsJson = "{}",
+                text = text.ifBlank { DEFAULT_TEXT },
+                calls = normalized.size,
+                steps = normalized,
+            )
+            servedCalls = 0
+            stepIndex = 0
+            failAfterCalls = fail
+        }
+        log("P3_SCRIPT state=armed sequence=${normalized.size} fail=$fail")
         return true
     }
 
@@ -95,6 +132,7 @@ internal class ScriptedModelWire(private val log: (String) -> Unit = { P3Log.lin
         synchronized(lock) {
             script = null
             servedCalls = 0
+            stepIndex = 0
             failAfterCalls = false
         }
         log("P3_SCRIPT state=disarmed")
@@ -122,21 +160,34 @@ internal class ScriptedModelWire(private val log: (String) -> Unit = { P3Log.lin
         val current: Script
         val asToolCall: Boolean
         val callIndex: Int
+        val servedAction: String
+        val servedArgs: String
         synchronized(lock) {
             current = script ?: return null
-            val allCallsServed = servedCalls >= current.calls
-            if (allCallsServed && failAfterCalls) {
-                log("P3_SCRIPT served=failure")
-                return Answer(failureStream())
+            val step = current.steps?.getOrNull(stepIndex)
+            if (step != null) {
+                stepIndex++
+                asToolCall = true
+                callIndex = stepIndex
+                servedAction = step.action
+                servedArgs = step.argsJson
+            } else {
+                val allCallsServed = current.steps?.let { true } ?: (servedCalls >= current.calls)
+                if (allCallsServed && failAfterCalls) {
+                    log("P3_SCRIPT served=failure")
+                    return Answer(failureStream())
+                }
+                asToolCall = !allCallsServed
+                if (asToolCall) servedCalls++
+                callIndex = servedCalls
+                servedAction = current.action
+                servedArgs = current.argsJson
             }
-            asToolCall = !allCallsServed
-            if (asToolCall) servedCalls++
-            callIndex = servedCalls
         }
         return if (asToolCall) {
             val callId = "call_scripted_${serial}_$callIndex"
-            log("P3_SCRIPT served=tool_call action=${current.action} call=$callId")
-            Answer(toolCallStream(current.action, current.argsJson, callId))
+            log("P3_SCRIPT served=tool_call action=$servedAction call=$callId")
+            Answer(toolCallStream(servedAction, servedArgs, callId))
         } else {
             log("P3_SCRIPT served=text")
             Answer(textStream(current.text))

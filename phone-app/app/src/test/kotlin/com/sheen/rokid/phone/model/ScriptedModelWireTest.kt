@@ -31,6 +31,28 @@ class ScriptedModelWireTest {
 
     private fun wire() = ScriptedModelWire(log = { })
 
+    @Test fun `a sequence serves distinct actions in order, then the closing text`() {
+        val subject = wire()
+        assertTrue(
+            subject.armSequence(
+                listOf(
+                    "read_screen" to "{}",
+                    "tap" to """{"index":0}""",
+                ),
+                text = "已处理",
+            ),
+        )
+
+        val first = requireNotNull(subject.nextAnswer()).body
+        assertTrue("the first step is the read", first.contains(""""name":"read_screen""""))
+        val second = requireNotNull(subject.nextAnswer()).body
+        assertTrue("the second step is the tap", second.contains(""""name":"tap""""))
+        assertTrue("the tap carries its index", second.contains("index"))
+        val third = requireNotNull(subject.nextAnswer()).body
+        assertTrue("after the sequence the wire answers with text", third.contains("response.output_text.delta"))
+        assertFalse("and never falls through to a tool call", third.contains("function_call"))
+    }
+
     @Test fun `an unarmed wire has nothing to serve, so the real transport runs`() {
         assertNull(wire().nextAnswer())
     }

@@ -8,6 +8,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import android.util.Base64
+import org.json.JSONArray
 
 /**
  * Debug-only instrument that arms [ScriptedModelWire] from a host shell (P3.3 Stage C acceptance).
@@ -56,6 +57,25 @@ class DebugToolCallInjector : BroadcastReceiver() {
         if (intent.getBooleanExtra(EXTRA_OFF, false)) {
             root.disarmScriptedModelAnswer()
             return
+        }
+        val sequenceRaw = intent.getStringExtra(EXTRA_SEQUENCE_B64)?.let { encoded ->
+            runCatching { String(Base64.decode(encoded, Base64.NO_WRAP), Charsets.UTF_8) }
+                .getOrNull()
+                ?: return report("refused reason=SEQUENCE_B64_INVALID")
+        }
+        if (sequenceRaw != null) {
+            val steps = runCatching {
+                val array = JSONArray(sequenceRaw)
+                (0 until array.length()).map { index ->
+                    val item = array.getJSONObject(index)
+                    item.getString("action") to item.opt("args")?.toString().orEmpty().ifBlank { "{}" }
+                }
+            }.getOrNull() ?: return report("refused reason=SEQUENCE_JSON_INVALID")
+            val text = intent.getStringExtra(EXTRA_TEXT) ?: ""
+            if (!root.armScriptedModelSequence(steps, text, intent.getBooleanExtra(EXTRA_FAIL, false))) {
+                return report("refused reason=NOT_DEBUG")
+            }
+            return report("armed sequence=${steps.size} fail=${intent.getBooleanExtra(EXTRA_FAIL, false)}")
         }
         val action = intent.getStringExtra(EXTRA_ACTION) ?: ""
         val times = if (intent.hasExtra(EXTRA_TIMES)) intent.getIntExtra(EXTRA_TIMES, 1) else 1
@@ -122,5 +142,7 @@ class DebugToolCallInjector : BroadcastReceiver() {
          * The value is never logged.
          */
         const val EXTRA_ARGS_B64 = "argsB64"
+        /** Base64 JSON array `[{"action":"read_screen","args":{}}, ...]` for same-turn index tools. */
+        const val EXTRA_SEQUENCE_B64 = "sequenceB64"
     }
 }
