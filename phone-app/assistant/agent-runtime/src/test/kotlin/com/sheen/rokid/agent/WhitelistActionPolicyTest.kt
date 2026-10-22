@@ -6,8 +6,9 @@ import kotlin.test.assertEquals
 import kotlin.test.assertNotSame
 
 /**
- * [`WhitelistActionPolicy`] is the gate spec §7.2 puts in front of every tool call: a level ceiling that can refuse
- * outright, plus免确认 entries keyed on the **(action, scope)** pair — "message contact A", never "send any message".
+ * [`WhitelistActionPolicy`] is the gate spec §7.2 puts in front of every tool call: an **auto-run ceiling** that
+ * escalates anything above it to a confirmation (4B D190), plus免确认 entries keyed on the **(action, scope)** pair —
+ * "message contact A", never "send any message".
  *
  * These tests pin the three hard properties: L3/L4 are never免确认 even when whitelisted, an entry for one scope never
  * authorises another, and a plugin declaration can only tighten (never loosen) what the user must confirm.
@@ -36,24 +37,44 @@ class WhitelistActionPolicyTest {
         scope = scope,
     )
 
-    @Test fun `a tool above the configured ceiling is refused outright`() {
+    @Test fun `a tool above the configured ceiling asks for confirmation instead of being refused`() {
         val policy = WhitelistActionPolicy(maxLevel = RiskLevel.L2, whitelist = emptyList())
 
-        assertEquals(PolicyDecision.Refuse, policy.decide(descriptor(risk = RiskLevel.L3)))
-        assertEquals(PolicyDecision.Refuse, policy.decide(descriptor(risk = RiskLevel.L4)))
+        assertEquals(
+            PolicyDecision.RequireConfirmation("Title of message.send"),
+            policy.decide(descriptor(risk = RiskLevel.L3)),
+            "D190: the ceiling bounds auto-run, it is no longer a wall that refuses outright",
+        )
+        assertEquals(
+            PolicyDecision.RequireConfirmation("Title of message.send"),
+            policy.decide(descriptor(risk = RiskLevel.L4)),
+        )
     }
 
-    @Test fun `the ceiling wins over a whitelist entry and over a plugin declaration`() {
+    @Test fun `an L2 action above an L1 ceiling asks instead of being refused`() {
+        val policy = WhitelistActionPolicy(maxLevel = RiskLevel.L1, whitelist = emptyList())
+
+        assertEquals(
+            PolicyDecision.RequireConfirmation("Title of message.send"),
+            policy.decide(descriptor(risk = RiskLevel.L2)),
+        )
+    }
+
+    @Test fun `the ceiling asks before a whitelist entry or a plugin declaration can be considered`() {
         val policy = WhitelistActionPolicy(
             maxLevel = RiskLevel.L1,
             whitelist = listOf(WhitelistEntry("message.send", "contact:A")),
         )
 
-        assertEquals(PolicyDecision.Refuse, policy.decide(descriptor(risk = RiskLevel.L2)))
         assertEquals(
-            PolicyDecision.Refuse,
+            PolicyDecision.RequireConfirmation("Title of message.send"),
+            policy.decide(descriptor(risk = RiskLevel.L2)),
+            "a grant must never lift an action above the user's auto-run ceiling",
+        )
+        assertEquals(
+            PolicyDecision.RequireConfirmation("Title of message.send"),
             policy.decide(descriptor(risk = RiskLevel.L2, requiresConfirmation = true)),
-            "a declaration can only tighten; it never lifts an action over the ceiling",
+            "a declaration can only tighten; it never turns an over-ceiling action into an allow",
         )
     }
 
@@ -130,19 +151,22 @@ class WhitelistActionPolicyTest {
         // edith-0.3 Phase 4A Task 5 (A5): the description is the model's instruction prose. Once the 24 tools carry
         // real multi-sentence descriptions, reading it back as the wearer's question would show a paragraph in a
         // confirmation card. The summary is the short user-facing title, whatever the description says.
-        val policy = WhitelistActionPolicy(maxLevel = RiskLevel.L3, whitelist = emptyList())
         val longDescription = "Use this action when the wearer asks for it, never when the screen is locked. " +
             "It may fail with STATE_UNCHANGED. ".repeat(6)
         val described = descriptor(risk = RiskLevel.L2).copy(description = longDescription)
 
-        val decision = policy.decide(described)
+        // Both RequireConfirmation paths must read the title: the L2-whitelist fallback and the B1 ceiling escalation.
+        val belowCeiling = WhitelistActionPolicy(maxLevel = RiskLevel.L3, whitelist = emptyList())
+        val aboveCeiling = WhitelistActionPolicy(maxLevel = RiskLevel.L1, whitelist = emptyList())
 
-        assertEquals(PolicyDecision.RequireConfirmation("Title of message.send"), decision)
-        assertEquals(
-            "Title of message.send",
-            (decision as PolicyDecision.RequireConfirmation).summary,
-            "the confirmation card shows the user title, not the model-facing description",
-        )
+        for (decision in listOf(belowCeiling.decide(described), aboveCeiling.decide(described))) {
+            assertEquals(PolicyDecision.RequireConfirmation("Title of message.send"), decision)
+            assertEquals(
+                "Title of message.send",
+                (decision as PolicyDecision.RequireConfirmation).summary,
+                "the confirmation card shows the user title, not the model-facing description",
+            )
+        }
     }
 
     @Test fun `a whitelist entry cannot override a plugin declared confirmation requirement`() {
@@ -177,6 +201,9 @@ class WhitelistActionPolicyTest {
         assertEquals(PolicyDecision.Allow, snapshot.decide(descriptor()))
         assertEquals(PolicyDecision.Allow, policy.decide(descriptor()))
         // The ceiling travelled with the snapshot: a turn-start copy is a copy of the rule, not just of the list.
-        assertEquals(PolicyDecision.Refuse, snapshot.decide(descriptor(risk = RiskLevel.L3)))
+        assertEquals(
+            PolicyDecision.RequireConfirmation("Title of message.send"),
+            snapshot.decide(descriptor(risk = RiskLevel.L3)),
+        )
     }
 }

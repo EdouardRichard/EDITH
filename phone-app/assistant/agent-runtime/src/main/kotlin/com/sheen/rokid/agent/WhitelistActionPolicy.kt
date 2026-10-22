@@ -15,8 +15,8 @@ data class WhitelistEntry(val action: String, val scope: String)
  * The user's ceiling plus their免确认 grants, consulted before any tool runs (spec §7.2, §7.3).
  *
  * Three hard properties decide the shape of [decide]:
- * 1. the ceiling is absolute — a risk above [maxLevel] is [PolicyDecision.Refuse]d and cannot be approved at all, so
- *    the check runs first and no grant can lift it;
+ * 1. the ceiling is the **auto-run** boundary (4B D190) — a risk above [maxLevel] is escalated to
+ *    [PolicyDecision.RequireConfirmation] and can never run unasked, so the check runs first and no grant can lift it;
  * 2. **L3/L4 are never免确认**, even when a matching grant exists and even when [maxLevel] is `L4`. This is why the
  *    whitelist is consulted only for `L2`: a grant is an opt-in convenience for the reversible middle, never a way to
  *    launder a high-risk action past the user;
@@ -39,8 +39,9 @@ class WhitelistActionPolicy(
     fun snapshot(): WhitelistActionPolicy = WhitelistActionPolicy(maxLevel, whitelist)
 
     override fun decide(descriptor: ToolDescriptor): PolicyDecision {
-        // 1. Above the ceiling the action is refused outright: the user configured a level they never want crossed.
-        if (descriptor.risk.ordinal > maxLevel.ordinal) return PolicyDecision.Refuse
+        // 1. Above the ceiling the action is escalated to a question, not refused: `maxLevel` bounds what may run
+        // automatically (4B D190). The check stays first so neither a grant nor a plugin declaration can lift it.
+        if (descriptor.risk.ordinal > maxLevel.ordinal) return PolicyDecision.RequireConfirmation(descriptor.title)
         // 2. An app declaration can only tighten: it forces a question the user's grants may not answer for them.
         // edith-0.3 Phase 4A Task 5 (A5): the question shows the short user title; `description` is the model's
         // instruction prose and must never be painted as a confirmation summary.

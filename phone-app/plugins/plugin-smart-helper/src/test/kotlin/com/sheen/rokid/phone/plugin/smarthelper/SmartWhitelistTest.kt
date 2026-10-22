@@ -39,6 +39,10 @@ class SmartWhitelistTest {
         rig.tick()
     }
 
+    /** The loop's policy decision as persisted in the audit trail: the end-to-end record of what the gate did. */
+    private fun policyDecision(rig: SmartTestRig, action: String): String? =
+        rig.auditEntries.single { it.action == action }.decision
+
     @Test fun `an L0 action runs with no grant at all`() {
         val rig = rigWith(smartAction("open_app", risk = RiskLevel.L0), maxLevel = "L1", whitelist = null)
         runOnce(rig)
@@ -51,7 +55,7 @@ class SmartWhitelistTest {
         assertEquals(listOf("compose_note" to "{}"), rig.actions.executed)
     }
 
-    @Test fun `an L2 action matching the grant does not run when the ceiling is L1`() {
+    @Test fun `an L2 action matching the grant above the L1 ceiling asks and does not run without an answer`() {
         val rig = rigWith(
             smartAction("send_message", risk = RiskLevel.L2, scope = "contact:A"),
             maxLevel = "L1",
@@ -59,12 +63,18 @@ class SmartWhitelistTest {
         )
         runOnce(rig)
         assertTrue(rig.actions.executed.isEmpty(), "a grant must not lift the user's ceiling")
+        assertEquals(
+            "require_confirmation",
+            policyDecision(rig, "send_message"),
+            "D190: the ceiling escalates to a question instead of refusing outright",
+        )
     }
 
-    @Test fun `an L2 action above the ceiling is refused even when listed`() {
+    @Test fun `an L2 action above the ceiling is not allowed by a matching grant`() {
         val rig = rigWith(smartAction("send_message", risk = RiskLevel.L2), maxLevel = "L0", whitelist = "send_message|app")
         runOnce(rig)
         assertTrue(rig.actions.executed.isEmpty())
+        assertEquals("require_confirmation", policyDecision(rig, "send_message"))
     }
 
     @Test fun `an L3 action can never become an allow even with a matching grant`() {
@@ -77,10 +87,15 @@ class SmartWhitelistTest {
         assertTrue(rig.actions.executed.isEmpty(), "L3/L4 are never pre-approved")
     }
 
-    @Test fun `an L4 action at the L4 ceiling is still refused without a confirmation channel`() {
+    @Test fun `an L4 action at the L4 ceiling asks and does not run without a confirmation channel`() {
         val rig = rigWith(smartAction("wipe_device", risk = RiskLevel.L4), maxLevel = "L4", whitelist = "wipe_device|app")
         runOnce(rig)
         assertTrue(rig.actions.executed.isEmpty())
+        assertEquals(
+            "require_confirmation",
+            policyDecision(rig, "wipe_device"),
+            "L4 is never pre-approved, even when the ceiling is L4",
+        )
     }
 
     @Test fun `an app-side requiresConfirmation flag forces a question even for an L0 action`() {
