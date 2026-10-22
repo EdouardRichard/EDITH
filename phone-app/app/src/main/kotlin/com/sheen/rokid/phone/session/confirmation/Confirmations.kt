@@ -7,6 +7,7 @@ import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
+import java.util.UUID
 
 /**
  * How the action summary reaches the wearer.
@@ -16,8 +17,15 @@ import com.sheen.rokid.plugin.MonotonicClock
  * - is testable without a device.
  */
 fun interface SummaryDisplayer {
-    /** Returns `false` when nothing could be displayed; a broken display is a degradation, never a refusal. */
-    fun show(text: String, ttlMillis: Long): Boolean
+    /**
+     * Returns `false` when nothing could be displayed; a broken display is a degradation, never a refusal.
+     *
+     * [hintId] is the **confirmation's own stable identity**, minted once by the presenter when the question goes up
+     * (0.3 Phase 4B, B5/B4 carry-forward). The glasses file a SHOW under `say-${hintId}`, so re-announcing the same
+     * question after `PANEL_SHOWN` **replaces one row**; a display adapter that minted a fresh id per send would append
+     * a duplicate confirmation row. It is passed through, never invented here.
+     */
+    fun show(hintId: String, text: String, ttlMillis: Long): Boolean
 
     /**
      * 0.3 Phase 4B (B4): whether the glasses display can receive a question right now. Defaults to `true` - a display
@@ -67,8 +75,55 @@ interface ConfirmationUi {
     /**
      * 0.3 Phase 4B (B4): whether the phone card can be put in front of the wearer right now. Defaults to `true`; a host
      * whose page/surface cannot show the card overrides this with `false` so the presenter's aggregate is honest.
+     *
+     * Since B5 the production implementation answers through [ConfirmationPhoneSurface]: the composition existing is
+     * not the same fact as the wearer being reachable.
      */
     fun available(): Boolean = true
+}
+
+/**
+ * 0.3 Phase 4B (B5, spec §5.4/D191): the channels a confirmation can use, in the owner's priority order.
+ *
+ * [VOICE] is named because D191 names it, but it is an **answer** channel and never a presentation fallback: spec §5.4
+ * says a spoken phrase only settles a confirmation that has already been presented, so voice cannot make the question
+ * visible and is deliberately never selected by [confirmationPresentationChannel].
+ */
+internal enum class ConfirmationChannelKind { GLASSES, NOTIFICATION, VOICE, DIALOG }
+
+/**
+ * The channel a question that is not yet visible should go to next: glasses (panel + keys) -> notification action ->
+ * the Edith page as the last fallback. `null` means no channel can present it, which is what the loop's early refusal
+ * is for.
+ *
+ * Only available channels participate: each flag is a **live** availability answer. Voice is not a parameter for the
+ * reason on [ConfirmationChannelKind.VOICE] - listing it as a fallback would let the host count a question as presented
+ * while nothing was ever put on a screen.
+ */
+internal fun confirmationPresentationChannel(
+    glassesServing: Boolean,
+    notificationAvailable: Boolean,
+    dialogAvailable: Boolean,
+): ConfirmationChannelKind? = when {
+    glassesServing -> ConfirmationChannelKind.GLASSES
+    notificationAvailable -> ConfirmationChannelKind.NOTIFICATION
+    dialogAvailable -> ConfirmationChannelKind.DIALOG
+    else -> null
+}
+
+/**
+ * 0.3 Phase 4B (B5, spec §5.4): whether the **phone** can actually put a confirmation in front of the wearer.
+ *
+ * Three independent, live ways, in the spirit of the channel ladder: the session page is on screen (it owns the
+ * modal), the page can be raised over another App (overlay permission), or the high-priority notification can be
+ * posted. Any one is enough. Before B5 the production `ConfirmationUi.available()` answered "this composition exists",
+ * which is true for the whole session - so the presenter never reported unavailable, AgentLoop's early
+ * `CONFIRMATION_UNAVAILABLE` path was unreachable, and a locked/background phone with notifications off still spent
+ * D47's 120 s window. This is the pure rule; the composition supplies the three live answers.
+ */
+internal object ConfirmationPhoneSurface {
+    fun available(pageVisible: Boolean, canRaisePage: Boolean, notificationsAvailable: Boolean): Boolean =
+        pageVisible || canRaisePage || notificationsAvailable
 }
 
 /**
@@ -109,12 +164,26 @@ class ConfirmationPresenter(
 
     private class Pending(
         val requestId: String,
+        /**
+         * 0.3 Phase 4B (B5/B4 carry-forward): the **question's** stable identity on the glasses hint path, minted once
+         * here and reused by every announcement of the same question, so a re-send replaces `say-${hintId}` instead of
+         * appending a second confirmation row.
+         */
+        val hintId: String,
         val summary: String,
         val envelope: EventEnvelope,
         /** When the plugin's window closes, so a re-announcement carries a fresh, honest TTL rather than a new one. */
         val deadlineNanos: Long,
     ) {
         var timer: CancellationHandle? = null
+
+        /**
+         * Whether the glasses channel actually took the question: the SHOW was accepted **and** the keys were armed.
+         * The composition's fallback ladder reads this; a display that refused the text must not suppress the
+         * notification or the Edith fallback.
+         */
+        var servingOnGlasses = false
+
         /** A second `present` with a live id gets this no-op handle: it never displaces the question already up. */
         val ignoredBy = object : CancellationHandle { override fun cancel() = Unit }
     }
@@ -126,17 +195,18 @@ class ConfirmationPresenter(
     val pendingCount: Int get() = synchronized(lock) { pending.size }
 
     /**
-     * 0.3 Phase 4B (B4, spec §5.4): whether **any** of this presenter's surfaces can put the question to the wearer.
+     * 0.3 Phase 4B (B4/B5, spec §5.4): whether **any** of this presenter's surfaces can put the question to the wearer.
      *
-     * The surfaces are aggregated because the wearer may answer on any of them: the glasses display (SHOW), the phone
-     * card, or the glasses keys (CONFIRM_STATE). Each check is live and a throwing one counts as unavailable **for that
-     * surface only** - a broken display must not hide a working phone card. The panel is not aggregated: opening it is
-     * an aid to the glasses surface, not an answer path by itself.
+     * The answer paths are aggregated because the wearer may answer on any of them: the glasses (SHOW **and** the
+     * CONFIRM_STATE keys - a key map with no displayed question is not an answerable surface, so the keys alone do not
+     * count), or the phone card/dialog. Each check is live and a throwing one counts as unavailable **for that surface
+     * only** - a broken display must not hide a working phone card. The panel is not aggregated: opening it is an aid
+     * to the glasses surface, not an answer path by itself.
+     *
+     * B5: the production phone answer now comes from [ConfirmationPhoneSurface] rather than "the composition exists",
+     * which is what makes the no-surface case (`CONFIRMATION_UNAVAILABLE`) reachable without a device.
      */
-    override fun available(): Boolean =
-        runCatching { summary.available() }.getOrDefault(false) ||
-            runCatching { ui.available() }.getOrDefault(false) ||
-            runCatching { glasses.available() }.getOrDefault(false)
+    override fun available(): Boolean = uiCanServe() || (summaryCanServe() && glassesCanServe())
 
     override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle {
         require(requestId.isNotBlank()) { "confirmation request id must not be blank" }
@@ -155,30 +225,45 @@ class ConfirmationPresenter(
         // glasses hint: a second round trip, but on this same turn thread, never on the UI thread.) Deliberately
         // outside the lock: `envelopeFor` reaches back into the composition, and no lock of ours may be held across that.
         val envelope = envelopeFor(requestId)
+        // B5/B4 carry-forward: one id per question, reused by the re-announcement on PANEL_SHOWN. Minted here (not per
+        // send) so the glasses replace `say-${hintId}` instead of appending a second row when the panel appears late.
+        val hintId = "confirm-${UUID.randomUUID()}"
+        val entry = Pending(requestId, hintId, text, envelope, deadlineNanos)
         synchronized(lock) {
             val live = pending[requestId]
             if (live != null) return live.ignoredBy   // lost the race for this id: the live question keeps it
-            pending[requestId] = Pending(requestId, text, envelope, deadlineNanos)
+            pending[requestId] = entry
         }
 
         // 0.3 Phase 4B (B4): the panel is created by PANEL_OPEN, not by SHOW. Ask for it first when the glasses surface
         // can serve - a hidden window would otherwise receive the two announcements invisibly, and the panel's own
         // `resetForOpen` would erase them as it comes up. A refused open is a degradation, never a failed question.
-        if (glassesCanServe()) {
+        val glassesAvailable = glassesCanServe()
+        if (glassesAvailable) {
             runCatching { panel.open() }
         }
-        // Both screens, and neither failure is fatal: the phone is the fallback screen, and a question that cannot be
-        // displayed anywhere is still settled by the gate's timeout (as a denial).
-        runCatching { this.summary.show(text, timeoutMillis + SUMMARY_MARGIN_MILLIS) }
-        runCatching { ui.show(requestId, text) }
-        // 0.25 Task 11 (R51): after the question is up, the glasses' ENTER/BACK answer it. A send that fails (no
-        // session introduced, link down) is a degradation only: the phone and the window still settle the question.
-        tellGlasses(requestId, active = true)
+        // 0.3 Phase 4B (B5, spec §5.4): only available channels participate, in priority order. The glasses go first;
+        // the composition's own ladder (notification, then the Edith page) runs when it is told the question is up, and
+        // reads [isServingOnGlasses] so a refused SHOW cannot suppress the fallback. Neither failure is fatal: a
+        // question that cannot be displayed anywhere is still settled by the gate's timeout (as a denial).
+        val displayAccepted = summaryCanServe() &&
+            runCatching { this.summary.show(hintId, text, timeoutMillis + SUMMARY_MARGIN_MILLIS) }.getOrDefault(false)
+        val keysAccepted = displayAccepted && glassesAvailable && tellGlasses(requestId, active = true)
+        synchronized(lock) { if (pending[requestId] === entry) entry.servingOnGlasses = keysAccepted }
+        if (uiCanServe()) runCatching { ui.show(requestId, text) }
 
         val timer = scheduler.at(deadlineNanos) { withdraw(requestId) }
         synchronized(lock) { pending[requestId]?.timer = timer }
         return object : CancellationHandle { override fun cancel() = withdraw(requestId) }
     }
+
+    /**
+     * 0.3 Phase 4B (B5): whether the glasses channel has the live question — the display accepted the summary **and**
+     * the keys were armed. The composition's priority ladder reads this to decide whether the notification or the
+     * Edith page still has to run; `false` also covers an unknown/settled id.
+     */
+    fun isServingOnGlasses(requestId: String): Boolean =
+        synchronized(lock) { pending[requestId]?.servingOnGlasses == true }
 
     /**
      * 0.3 Phase 4B (B4, spec §5.4): the glasses reported that the panel's first layout completed.
@@ -190,6 +275,9 @@ class ConfirmationPresenter(
      * This is an announcement, **not** a settlement: an unsettled question keeps its slot (only an answer, a timeout or
      * an explicit withdrawal removes one), so reopening the panel can never silently drop the question the plugin is
      * blocked on. The repeat deliberately does not raise the phone card a second time.
+     *
+     * 0.3 Phase 4B (B5/B4 carry-forward): the repeat **reuses the question's hint id** ([Pending.hintId]), so the panel
+     * replaces its one row instead of appending another "确认" row.
      */
     fun panelShownArrived() {
         val live = synchronized(lock) { pending.values.toList() }
@@ -202,8 +290,14 @@ class ConfirmationPresenter(
                 ((entry.deadlineNanos - clock.nowNanos()) / 1_000_000L).coerceAtLeast(0L) +
                     SUMMARY_MARGIN_MILLIS
             }
-            runCatching { summary.show(entry.summary, remainingMillis) }
+            // The glasses surface may have become unusable while the panel was opening; only an available surface is
+            // allowed to announce (B5: "only available channels participate").
+            if (!summaryCanServe() || !glassesCanServe()) return@forEach
+            val accepted = runCatching { summary.show(entry.hintId, entry.summary, remainingMillis) }
+                .getOrDefault(false)
+            if (!accepted) return@forEach
             tellGlasses(entry.requestId, active = true)
+            synchronized(lock) { if (pending[entry.requestId] === entry) entry.servingOnGlasses = true }
         }
     }
 
@@ -248,16 +342,21 @@ class ConfirmationPresenter(
         else collapsed.take(MAX_SUMMARY_CHARS - 1) + "…"
     }
 
-    /** One glasses state change; a refused/failed send is recorded as a degradation, never as a failed question. */
-    private fun tellGlasses(requestId: String, active: Boolean) {
-        runCatching { glasses.show(requestId, active) }
-    }
+    /** One glasses state change; `true` when the link accepted it (a refused/failed send is only a degradation). */
+    private fun tellGlasses(requestId: String, active: Boolean): Boolean =
+        runCatching { glasses.show(requestId, active) }.getOrDefault(false)
 
     /**
      * 0.3 Phase 4B (B4): whether the glasses surface can carry the question now. A throwing check is `false`: the panel
      * is an aid, and a broken availability probe must not be treated as proof that a panel exists to open.
      */
     private fun glassesCanServe(): Boolean = runCatching { glasses.available() }.getOrDefault(false)
+
+    /** 0.3 Phase 4B (B5): a throwing probe is unavailable for **that surface only**. */
+    private fun summaryCanServe(): Boolean = runCatching { summary.available() }.getOrDefault(false)
+
+    /** 0.3 Phase 4B (B5): a throwing probe is unavailable for **that surface only**. */
+    private fun uiCanServe(): Boolean = runCatching { ui.available() }.getOrDefault(false)
 
     companion object {
         /** The glasses hint path clips beyond its budget; a confirmation summary is short by construction. */

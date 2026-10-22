@@ -8,6 +8,7 @@ import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -27,9 +28,12 @@ import org.junit.Test
 class ConfirmationUxTest {
 
     private class FakeSummary(private val events: MutableList<String>? = null) : SummaryDisplayer {
-        val shown = mutableListOf<Pair<String, Long>>()
-        override fun show(text: String, ttlMillis: Long): Boolean {
-            shown += text to ttlMillis
+        /** One `SHOW` the presenter asked for: the stable hint id, the text and the TTL. */
+        data class Shown(val hintId: String, val text: String, val ttlMillis: Long)
+
+        val shown = mutableListOf<Shown>()
+        override fun show(hintId: String, text: String, ttlMillis: Long): Boolean {
+            shown += Shown(hintId, text, ttlMillis)
             events?.add("show")
             return true
         }
@@ -258,7 +262,7 @@ class ConfirmationUxTest {
         )
         assertEquals("reopening must not clear an unsettled question", 1, rig.presenter.pendingCount)
         assertEquals("the phone already shows the card; a panel layout is not a second question", 1, rig.ui.shown.size)
-        assertTrue("the re-announced question is still live", rig.summary.shown.last().second > 0L)
+        assertTrue("the re-announced question is still live", rig.summary.shown.last().ttlMillis > 0L)
         assertTrue("and the keys still answer it", rig.presenter.answerFromGlasses("c1", approved = true))
         assertEquals(1, rig.delivered.size)
     }
@@ -274,6 +278,37 @@ class ConfirmationUxTest {
 
         assertEquals("a settled question must not be put back on the glasses", emptyList<String>(), rig.events)
         assertEquals(1, rig.delivered.size)
+    }
+
+    @Test
+    fun `a panel shown later re-announces the same hint id so the panel replaces its row`() {
+        // B4 carry-forward: the composition minted a fresh hint id per SHOW, so reopening the panel appended a second
+        // "确认" row. The id belongs to the *question*: every announcement of it must carry the same one.
+        val rig = Rig()
+        rig.presenter.present("c1", "卸载 App", 120_000L)
+        val first = rig.summary.shown.single().hintId
+
+        rig.presenter.panelShownArrived()
+
+        assertEquals(
+            "SHOW + the panel's re-SHOW must name one row, not two",
+            listOf(first, first),
+            rig.summary.shown.map { it.hintId },
+        )
+        assertTrue("the hint id is a real identity, not an empty placeholder", first.isNotBlank())
+    }
+
+    @Test
+    fun `two confirmations get two different stable hint ids`() {
+        val rig = Rig()
+        rig.presenter.present("c1", "动作一", 120_000L)
+        val first = rig.summary.shown.single().hintId
+        assertTrue(rig.presenter.answer("c1", approved = false))
+
+        rig.presenter.present("c2", "动作二", 120_000L)
+        val second = rig.summary.shown.last().hintId
+
+        assertNotEquals("a new question must not overwrite the previous question's row", first, second)
     }
 
     @Test

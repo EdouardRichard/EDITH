@@ -810,8 +810,24 @@ class GlassesPanelControllerTest {
     }
 
     @Test
-    fun anIdenticalSaidReplacementStillCountsAsNewContent() {
+    fun aResentConfirmationHintReplacesItsRowInsteadOfAppendingASecondOne() {
+        // 0.3 Phase 4B (B5) B4 carry-forward: the panel is created by PANEL_OPEN after the first SHOW, so the phone
+        // re-sends the question on PANEL_SHOWN. With the confirmation's stable hint id the second SHOW must replace
+        // `say-<hintId>`, not append a second "确认" row.
         val harness = Harness()
+        harness.hello()
+        harness.sync()
+        harness.show(sequence = 1, hintId = "confirm-c-1", text = "卸载探针 App", revision = 1)
+        harness.show(sequence = 2, hintId = "confirm-c-1", text = "卸载探针 App", revision = 2)
+
+        val entries = harness.port.lastModel().entries
+        assertEquals("one question is one assistant row, however often it is announced", 1,
+            entries.count { it.role == ConversationRole.ASSISTANT })
+        assertEquals("the row keeps the confirmation's stable id", "say-confirm-c-1", entries.single().entryId)
+    }
+
+    @Test
+    fun anIdenticalSaidReplacementStillCountsAsNewContent() {        val harness = Harness()
         harness.hello()
         harness.said(sequence = 1, entryId = "said-same", text = "同一句话")
         val before = harness.port.lastModel()

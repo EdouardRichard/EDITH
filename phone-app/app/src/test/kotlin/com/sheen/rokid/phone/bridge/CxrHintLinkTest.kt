@@ -1613,19 +1613,23 @@ class CxrHintLinkTest {
      */
     private fun confirmationPresenterOn(rig: ResidentRig): ConfirmationPresenter {
         val identity = HintIdentity("s-1", 3)
+        var revision = 0L
         return ConfirmationPresenter(
-            summary = SummaryDisplayer { _, _ ->
+            summary = SummaryDisplayer { hintId, text, _ ->
+                revision += 1
                 rig.sent += HintWireCodec.encode(
                     HintCommand.Show(
                         sessionId = identity.sessionId,
                         generation = identity.generation,
-                        sequence = 1L,
-                        hintId = "confirm-summary",
-                        revision = 1L,
+                        sequence = revision,
+                        // The presenter's own hint id, passed through: the panel replaces `say-<hintId>`, so a fresh
+                        // id per send would append a second row.
+                        hintId = hintId,
+                        revision = revision,
                         syncId = "sync",
                         phoneSentNanos = 0L,
                         remainingTtlMillis = 10_000L,
-                        text = "卸载探针 App",
+                        text = text,
                     ),
                 )
                 true
@@ -1678,13 +1682,25 @@ class CxrHintLinkTest {
         // The production composition routes the link's PANEL_SHOWN into `ConfirmationPresenter.panelShownArrived`.
         rig.link.onPanelShown = { _, _ -> presenter.panelShownArrived() }
         presenter.present("c-1", "卸载探针 App", 10_000L)
+        val firstShow = rig.commands().filterIsInstance<HintCommand.Show>().single()
         rig.sent.clear()
 
         rig.panelShown(AssistantRoute.WAKE)
 
         val commands = rig.commands()
-        assertEquals("the newly visible panel must receive the question again: $commands",
-            1, commands.count { it is HintCommand.Show })
+        val resend = commands.filterIsInstance<HintCommand.Show>().single()
+        assertEquals("the newly visible panel must receive the question again: $commands", 1,
+            commands.count { it is HintCommand.Show })
+        assertEquals(
+            "B4 carry-forward: the re-sent SHOW must keep the question's hint id, or the panel appends a second row",
+            firstShow.hintId,
+            resend.hintId,
+        )
+        assertTrue(
+            "the re-send must be a newer revision for the same hint id, or the glasses refuse it as stale " +
+                "(first=${firstShow.revision}, resend=${resend.revision})",
+            resend.revision > firstShow.revision,
+        )
         val states = commands.filterIsInstance<HintCommand.ConfirmState>()
         assertEquals(1, states.size)
         assertTrue(states.single().active)

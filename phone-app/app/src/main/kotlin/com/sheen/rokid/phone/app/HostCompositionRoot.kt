@@ -68,6 +68,9 @@ import com.sheen.rokid.phone.bridge.ConversationWireDisplay
 import com.sheen.rokid.phone.session.ToneWakeChimeSink
 import com.sheen.rokid.phone.session.WakeChime
 import com.sheen.rokid.phone.session.confirmation.AndroidNotificationSurface
+import com.sheen.rokid.phone.session.confirmation.ConfirmationChannelKind
+import com.sheen.rokid.phone.session.confirmation.ConfirmationPhoneSurface
+import com.sheen.rokid.phone.session.confirmation.confirmationPresentationChannel
 
 import android.content.ComponentName
 import android.content.Context
@@ -649,6 +652,15 @@ class HostCompositionRoot internal constructor(
      */
     internal var raiseConfirmationUi: (() -> Boolean)? = null
 
+    /**
+     * 0.3 Phase 4B (B5, spec §5.4): whether this build **may** raise the page, without raising it.
+     *
+     * [raiseConfirmationUi] has a side effect, so it cannot answer "would raising work?" for the availability check.
+     * Production points this at the overlay permission (`Settings.canDrawOverlays`); null (a hand-built composition or
+     * a JVM rig) means "no overlay", which is the honest answer rather than assuming the permission.
+     */
+    internal var canRaiseConfirmationUi: (() -> Boolean)? = null
+
     /** One root probe for one read, so the row and its note cannot cost two timeouts. Null when no probe is wired. */
     private fun rootStatus(): RootStatus? = rootStatusProbe?.let { probe -> runCatching { probe() }.getOrNull() }
 
@@ -964,7 +976,7 @@ class HostCompositionRoot internal constructor(
     }
 
     /** P3.3: puts the question the host was asked to present on the session page - and, when nobody can see that page,
-     * both raises the page and puts the question in the notification shade. */
+     * runs the B5 channel ladder (glasses -> notification -> Edith page). */
     internal fun showConfirmation(requestId: String, summary: String) {
         mutableState.update {
             it.copy(
@@ -977,13 +989,69 @@ class HostCompositionRoot internal constructor(
                 ),
             )
         }
-        if (!uiIsVisible) {
-            // Loud first: the page comes to the front (owner directive), and the notification still carries the
-            // sound/vibration and stays as the fallback for a build or a device where raising is refused.
-            raiseConfirmationUi?.invoke()
-            notifier()?.post(requestId, summary)
+        deliverToPhone(requestId, summary)
+    }
+
+    /**
+     * 0.3 Phase 4B (B5, spec §5.4/D191): the phone-side rung of the channel ladder.
+     *
+     * The order is the owner's: glasses (already announced by the presenter; read live because a refused SHOW must not
+     * suppress a fallback) -> notification action -> the Edith page as the **last** fallback. Voice is deliberately not
+     * here: it only settles a question that has already been presented, so it can never make one visible. Each rung is
+     * attempted only when its surface is live, and the first success stops the ladder - the old code posted the
+     * notification **and** raised the page on every background question, which is the "duplicate surfaces" the spec
+     * rules out.
+     */
+    private fun deliverToPhone(requestId: String, summary: String) {
+        if (uiIsVisible) return
+        val channel = confirmationPresentationChannel(
+            glassesServing = confirmationPresenter?.isServingOnGlasses(requestId) == true,
+            notificationAvailable = notificationsCanPost(),
+            dialogAvailable = canRaiseConfirmationPage(),
+        )
+        when (channel) {
+            ConfirmationChannelKind.GLASSES -> Unit  // the glasses already carry it
+            ConfirmationChannelKind.NOTIFICATION -> {
+                if (notifier()?.post(requestId, summary) == true) return
+                // A shade that became unavailable between the probe and the post degrades, it does not drop the
+                // question: the page is the last fallback.
+                raiseConfirmationPage()
+            }
+            // The notification was skipped because it cannot post; record the stable reason before degrading (§5.4:
+            // a missing channel must say why, never silently become "Edith only").
+            ConfirmationChannelKind.DIALOG -> {
+                notificationSurface?.let { notifier()?.reportUnavailable(requestId) }
+                raiseConfirmationPage()
+            }
+            ConfirmationChannelKind.VOICE, null -> Unit
         }
     }
+
+    /** Raises the session page over another App; a refused raise is a degradation, never a failed question. */
+    private fun raiseConfirmationPage() {
+        runCatching { raiseConfirmationUi?.invoke() }
+    }
+
+    /** Whether the page can be raised right now, from the side-effect-free probe (never by raising it to find out). */
+    private fun canRaiseConfirmationPage(): Boolean =
+        canRaiseConfirmationUi?.let { runCatching(it).getOrDefault(false) } ?: false
+
+    /** Whether the shade can post the question right now; a throwing probe is unavailable. */
+    private fun notificationsCanPost(): Boolean =
+        notificationSurface?.let { runCatching { it.available() }.getOrDefault(false) } ?: false
+
+    /**
+     * 0.3 Phase 4B (B5, spec §5.4): whether the **phone** can put a confirmation in front of the wearer right now.
+     *
+     * The B4 answer was "this composition exists", true for the whole session - so the presenter never reported
+     * unavailable and AgentLoop's early `CONFIRMATION_UNAVAILABLE` refusal was unreachable in production. This is the
+     * live three-way question ([ConfirmationPhoneSurface]): page visible, page raisable, or shade postable.
+     */
+    internal fun canPresentOnPhone(): Boolean = ConfirmationPhoneSurface.available(
+        pageVisible = uiIsVisible,
+        canRaisePage = canRaiseConfirmationPage(),
+        notificationsAvailable = notificationsCanPost(),
+    )
 
     /** P3.3: takes a question off the session page - on an answer, a timeout, 急停 or session teardown - and out of
      * the shade with it. */
@@ -1008,7 +1076,9 @@ class HostCompositionRoot internal constructor(
     @Synchronized fun uiVisible(visible: Boolean) {
         uiIsVisible = visible
         val pending = state.value.pendingConfirmation ?: return
-        if (visible) notifier()?.cancel(pending.requestId) else notifier()?.post(pending.requestId, pending.summary)
+        // 0.3 Phase 4B (B5): the same ladder as `showConfirmation` - coming back to the page takes the duplicate out of
+        // the shade, leaving again chooses the highest available channel rather than always firing both.
+        if (visible) notifier()?.cancel(pending.requestId) else deliverToPhone(pending.requestId, pending.summary)
     }
 
     /** P3.3: 急停 - withdraws every open question and cancels what is in flight. */
@@ -2012,6 +2082,10 @@ class HostCompositionRoot internal constructor(
             // local gate here is what made `root.playbackGate.begin()` suppress nothing.
             val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
             val hostHolder = arrayOfNulls<HostRuntime>(1)
+            // 0.3 Phase 4B (B5): one monotonic revision source for the confirmation hint. The glasses update a row only
+            // for a strictly newer revision of the same hint id, so the PANEL_SHOWN re-announcement must never repeat
+            // the first send's number (two sends can share a coarse clock tick).
+            val summaryRevision = java.util.concurrent.atomic.AtomicLong(0)
             // 0.24 S2 Task 11: the production `IGlassesEventListener`. The backend registers it on every newly created
             // session **before** `connect` (official CXR-L 1.1.2 order). The listener never runs host policy on the
             // vendor thread. Task 20: screen/app events are diagnostics; wear-off cancels the turn and closes the panel.
@@ -2495,35 +2569,27 @@ class HostCompositionRoot internal constructor(
                 atomic = atomicExecutors,
                 onClose = { toolCatalog.close() },
             )
-            val confirmationUi = object : ConfirmationUi {
-                // 0.3 Phase 4B (B4): the page card is a real surface once the composition exists. Before that no turn
-                // can ask a question at all, so "no root" is the only honest unavailable answer here.
-                override fun available(): Boolean = rootHolder[0] != null
-
-                // Through the holder: this object is built inside `create`, where no composition instance exists yet,
-                // and the question is shown only after a session starts - by which time the holder is filled.
-                override fun show(requestId: String, summary: String) {
-                    rootHolder[0]?.showConfirmation(requestId, summary)
-                }
-
-                override fun hide(requestId: String) {
-                    rootHolder[0]?.hideConfirmation(requestId)
-                }
-            }
+            // 0.3 Phase 4B (B5): the production phone surface, through the named seam so a JVM test drives **this**
+            // rule rather than a copy of it. It used to be `rootHolder[0] != null`, which is true for the whole
+            // session and made the presenter's aggregate dishonest.
+            val confirmationUi = phoneConfirmationUi { rootHolder[0] }
             val confirmationPresenter = ConfirmationPresenter(
                 summary = object : SummaryDisplayer {
                     // 0.3 Phase 4B (B4): SHOW needs a live clock mapping; without one the display would drop the hint
                     // silently, so the surface reports itself unavailable instead of claiming it can present.
                     override fun available(): Boolean = hintLink.liveOutput() != null
 
-                    override fun show(text: String, ttlMillis: Long): Boolean {
+                    override fun show(hintId: String, text: String, ttlMillis: Long): Boolean {
                         val device = hintLink.liveOutput() ?: return false
                         val identity = hostHolder[0]?.currentIdentity() ?: return false
                         val now = clock.nowNanos()
                         return runCatching {
                             device.show(
                                 Assistance(
-                                    hintId = "confirm-${UUID.randomUUID()}",
+                                    // 0.3 Phase 4B (B5/B4 carry-forward): the presenter's **stable per-question**
+                                    // id, passed through. Minting a fresh id here (as B4 did) made every PANEL_SHOWN
+                                    // re-announcement append a new `say-<hintId>` row on the glasses.
+                                    hintId = hintId,
                                     sessionId = identity.first,
                                     generation = identity.second,
                                     sourceTurnId = null,
@@ -2533,7 +2599,9 @@ class HostCompositionRoot internal constructor(
                                     optionalSpeech = null,
                                     expiresAtNanos = now + ttlMillis * 1_000_000L,
                                 ),
-                                revision = now,
+                                // A re-announcement of the same hint must be a newer revision, or the glasses refuse it
+                                // as stale; a monotonic counter keeps that true even when two sends share a clock tick.
+                                revision = summaryRevision.incrementAndGet(),
                                 listener = { },
                             )
                             true
@@ -2767,6 +2835,9 @@ class HostCompositionRoot internal constructor(
             root.confirmationPresenter = confirmationPresenter
             // P3.3 (§17.4): the notification shade, so a question can be answered while this App is not in front.
             root.notificationSurface = AndroidNotificationSurface(context)
+            // 0.3 Phase 4B (B5): the side-effect-free half of the overlay check. `raiseConfirmationUi` really starts the
+            // Activity, so the availability ladder must not call it to find out whether raising is possible.
+            root.canRaiseConfirmationUi = { android.provider.Settings.canDrawOverlays(context) }
             root.raiseConfirmationUi = {
                 // Owner directive 2026-10-10: a time-boxed question must reach the user as a popup. Starting an
                 // Activity from the background is allowed on Android 10+ only under an exemption, and holding the
@@ -2825,6 +2896,29 @@ class HostCompositionRoot internal constructor(
             @Volatile var composition: HostCompositionRoot? = null
             fun onSceneReady() { composition?.onSceneReady() }
         }
+
+        /**
+         * 0.3 Phase 4B (B5, spec §5.4): the **production** phone surface, as a named seam.
+         *
+         * `create` builds it through a holder because the provider map is assembled before the composition exists; a
+         * JVM test hands it an already-built composition. Either way there is one implementation of the truthfulness
+         * rule: [HostCompositionRoot.canPresentOnPhone]. B4's inline answer was `rootHolder[0] != null`, which is true
+         * for the whole session and made the presenter's aggregate dishonest.
+         */
+        internal fun phoneConfirmationUi(composition: () -> HostCompositionRoot?): ConfirmationUi =
+            object : ConfirmationUi {
+                override fun available(): Boolean = composition()?.canPresentOnPhone() == true
+
+                // Through the composition that asked: the question is shown only after a session starts, by which
+                // time the holder is filled.
+                override fun show(requestId: String, summary: String) {
+                    composition()?.showConfirmation(requestId, summary)
+                }
+
+                override fun hide(requestId: String) {
+                    composition()?.hideConfirmation(requestId)
+                }
+            }
 
         /**
          * `D53`① (2026-10-11) and 0.25 R75: the consent the gated model client consults, and the **only** one it is given.

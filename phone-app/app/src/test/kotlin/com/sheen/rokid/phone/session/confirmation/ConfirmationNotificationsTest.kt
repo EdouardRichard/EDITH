@@ -4,6 +4,7 @@ import android.app.NotificationManager
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -16,7 +17,10 @@ import org.junit.Test
  */
 class ConfirmationNotificationsTest {
 
-    private class FakeSurface(var canPost: Boolean = true) : NotificationSurface {
+    private class FakeSurface(
+        var canPost: Boolean = true,
+        var reason: String? = null,
+    ) : NotificationSurface {
         data class Posted(
             val requestId: String,
             val title: String,
@@ -30,6 +34,7 @@ class ConfirmationNotificationsTest {
         var cancelAlls = 0
 
         override fun available(): Boolean = canPost
+        override fun unavailableReason(): String? = if (canPost) null else reason
         override fun post(
             requestId: String,
             title: String,
@@ -79,7 +84,7 @@ class ConfirmationNotificationsTest {
 
     @Test
     fun aSurfaceThatCannotPostDegradesToTheCardInsteadOfRefusingTheAction() {
-        val surface = FakeSurface(canPost = false)
+        val surface = FakeSurface(canPost = false, reason = NotificationAvailability.PERMISSION_DENIED)
         val log = mutableListOf<String>()
 
         val posted = notifier(surface, log).post("c1", "调整屏幕亮度")
@@ -127,5 +132,99 @@ class ConfirmationNotificationsTest {
 
         assertEquals(listOf("c1", "c1"), surface.cancelled)
         assertEquals("a stop must be able to take every question down", 1, surface.cancelAlls)
+    }
+
+    // ---------------------- 0.3 Phase 4B (B5): the channel's own state, not just the App-level switch
+
+    @Test
+    fun `the availability rule separates permission, App switch and channel switch`() {
+        // Spec §1.3/§5.4 drift 3: the surface only asked `areNotificationsEnabled()`, so a user who turned the
+        // confirmation CHANNEL off still looked available and the question silently never reached the shade.
+        assertNull(
+            "granted + App on + channel high is the only available combination",
+            NotificationAvailability.unavailableReason(
+                permissionGranted = true,
+                appNotificationsEnabled = true,
+                channelImportance = NotificationManager.IMPORTANCE_HIGH,
+            ),
+        )
+        assertEquals(
+            NotificationAvailability.PERMISSION_DENIED,
+            NotificationAvailability.unavailableReason(
+                permissionGranted = false,
+                appNotificationsEnabled = true,
+                channelImportance = NotificationManager.IMPORTANCE_HIGH,
+            ),
+        )
+        assertEquals(
+            NotificationAvailability.APP_NOTIFICATIONS_DISABLED,
+            NotificationAvailability.unavailableReason(
+                permissionGranted = true,
+                appNotificationsEnabled = false,
+                channelImportance = NotificationManager.IMPORTANCE_HIGH,
+            ),
+        )
+        assertEquals(
+            "a channel the user turned off must not claim the shade can carry a question",
+            NotificationAvailability.CHANNEL_DISABLED,
+            NotificationAvailability.unavailableReason(
+                permissionGranted = true,
+                appNotificationsEnabled = true,
+                channelImportance = NotificationManager.IMPORTANCE_NONE,
+            ),
+        )
+        assertFalse(
+            NotificationAvailability.available(
+                permissionGranted = true,
+                appNotificationsEnabled = true,
+                channelImportance = NotificationManager.IMPORTANCE_NONE,
+            ),
+        )
+    }
+
+    @Test
+    fun `a channel that was never created yet is not a disabled channel`() {
+        // The channel is created on the first post (`AndroidNotificationSurface.post`); before that the manager answers
+        // `null`. Treating "not created" as disabled would make the first confirmation unable to ever post.
+        assertNull(
+            NotificationAvailability.unavailableReason(
+                permissionGranted = true,
+                appNotificationsEnabled = true,
+                channelImportance = null,
+            ),
+        )
+        assertNull(
+            "any importance above NONE can still post",
+            NotificationAvailability.unavailableReason(
+                permissionGranted = true,
+                appNotificationsEnabled = true,
+                channelImportance = NotificationManager.IMPORTANCE_LOW,
+            ),
+        )
+    }
+
+    @Test
+    fun `a channel-disabled surface logs the stable CHANNEL_DISABLED reason and posts nothing`() {
+        val surface = FakeSurface(canPost = false, reason = NotificationAvailability.CHANNEL_DISABLED)
+        val log = mutableListOf<String>()
+
+        assertFalse(notifier(surface, log).post("c1", "调整屏幕亮度"))
+
+        assertTrue(surface.posted.isEmpty())
+        assertTrue(
+            "the degradation must name the channel, not the old generic permission reason: $log",
+            log.any { "P3_CONFIRM_NOTIFY" in it && "reason=CHANNEL_DISABLED" in it },
+        )
+    }
+
+    @Test
+    fun `reporting a skipped shade is count-only and carries the surface's own reason`() {
+        val surface = FakeSurface(canPost = false, reason = NotificationAvailability.APP_NOTIFICATIONS_DISABLED)
+        val log = mutableListOf<String>()
+
+        notifier(surface, log).reportUnavailable("c1")
+
+        assertTrue("log: $log", log.any { "reason=APP_NOTIFICATIONS_DISABLED" in it })
+        assertTrue("no content may leak when the shade is skipped: $log", log.none { "调整" in it })
     }
 }

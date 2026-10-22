@@ -118,6 +118,21 @@ class SmartConfirmationTest {
         assertEquals(ConfirmationOutcome(false, ConfirmationSource.TIMEOUT), ask.join())
     }
 
+    @Test fun `a sentence that merely contains an answer word is not an exact answer`() {
+        // Spec §5.4: the voice channel accepts only an exact ASR-final word and never guesses from a sentence. Every
+        // one of these is a plausible reply that must leave the question open - only the exact word may settle it.
+        val subject = confirmation(FakeChannel())
+        val ask = ask(subject)
+
+        listOf("我觉得可以允许", "不允许", "拒绝吧", "好的确认一下", "允许吗").forEach { sentence ->
+            assertFalse(subject.onTranscript(revision(sentence)), "'$sentence' is not an exact answer")
+        }
+        assertNull(ask.result, "an inexact phrase must leave the question pending")
+
+        assertTrue(subject.onTranscript(revision(" 允许 ")), "the exact word still settles it")
+        assertEquals(ConfirmationOutcome(true, ConfirmationSource.VOICE), ask.join())
+    }
+
     @Test fun `the segment that carried the command cannot answer its own question`() {
         val subject = confirmation(FakeChannel())
         subject.excludeSegment("asr-1")

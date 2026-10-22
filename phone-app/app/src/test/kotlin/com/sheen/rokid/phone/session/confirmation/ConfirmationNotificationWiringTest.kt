@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.session.confirmation
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
 import com.sheen.rokid.phone.app.HostCompositionRoot
+import com.sheen.rokid.phone.withP3Sink
 
 import com.sheen.rokid.contracts.EventEnvelope
 import com.sheen.rokid.contracts.Generation
@@ -38,8 +39,10 @@ class ConfirmationNotificationWiringTest {
         val cancelled = mutableListOf<String>()
         var cancelAlls = 0
         var canPost = true
+        var reason: String? = null
 
         override fun available(): Boolean = canPost
+        override fun unavailableReason(): String? = if (canPost) null else reason
         override fun post(
             requestId: String,
             title: String,
@@ -58,6 +61,17 @@ class ConfirmationNotificationWiringTest {
         val delivered = mutableListOf<String>()
         val root: HostCompositionRoot
 
+        /** The presenter wired the way the composition wires it, kept so a test can read its live state. */
+        var presenter: ConfirmationPresenter? = null
+
+        /** How many times the composition asked the overlay path to raise the Edith page. */
+        var raised = 0
+
+        var summaryAvailable = true
+        var summaryAccepts = true
+        var glassesAvailable = false
+        var glassesAccepts = false
+
         init {
             val environment = CxrHostEnvironment(
                 clock = clock, input = RecordingInputPort(), liveOutput = { null }, scheduler = scheduler,
@@ -68,20 +82,38 @@ class ConfirmationNotificationWiringTest {
             root.notificationSurface = surface
         }
 
-        /** A question registered in the presenter (which is what the answer path goes through) and on the page. */
-        fun present(requestId: String, summary: String) {
-            root.confirmationPresenter = ConfirmationPresenter(
-                summary = { _, _ -> true },
-                ui = object : ConfirmationUi {
-                    override fun show(requestId: String, summary: String) = root.showConfirmation(requestId, summary)
-                    override fun hide(requestId: String) = root.hideConfirmation(requestId)
+        /** Makes the overlay path real: both the refusal probe and the raise action, as production wires them. */
+        fun allowRaise(accepted: Boolean = true) {
+            root.canRaiseConfirmationUi = { accepted }
+            root.raiseConfirmationUi = { raised++; accepted }
+        }
+
+        fun newPresenter(): ConfirmationPresenter {
+            val built = ConfirmationPresenter(
+                summary = object : SummaryDisplayer {
+                    override fun available(): Boolean = summaryAvailable
+                    override fun show(hintId: String, text: String, ttlMillis: Long): Boolean = summaryAccepts
+                },
+                // The **production** phone surface rule, not a copy: the whole B5 point is that the composition
+                // existing is not the same thing as the wearer being reachable.
+                ui = HostCompositionRoot.phoneConfirmationUi { root },
+                glasses = object : ConfirmationGlasses {
+                    override fun available(): Boolean = glassesAvailable
+                    override fun show(requestId: String, active: Boolean): Boolean = glassesAccepts
                 },
                 deliver = { delivered += it.requestId },
                 clock = clock,
                 scheduler = scheduler,
                 envelopeFor = { id -> EventEnvelope(SessionId("s"), Generation(1), id, 0, 1) },
             )
-            root.confirmationPresenter!!.present(requestId, summary, 10_000L)
+            presenter = built
+            root.confirmationPresenter = built
+            return built
+        }
+
+        /** A question registered in the presenter (which is what the answer path goes through) and on the page. */
+        fun present(requestId: String, summary: String) {
+            newPresenter().present(requestId, summary, 10_000L)
         }
 
         fun close() = root.close()
@@ -182,24 +214,112 @@ class ConfirmationNotificationWiringTest {
     }
 
     @Test
-    fun aQuestionNobodyCanSeeRaisesThePageAsWellAsTheShade() {
-        // Owner directive 2026-10-10: the question must reach the user like a system popup, not as a shade entry they
-        // have to go looking for. The page is raised *and* the notification posted: the popup is what makes it
-        // unmissable, the notification carries the sound/vibration and stays as the fallback.
+    fun aQuestionNobodyCanSeeChoosesTheShadeAndDoesNotDragTheWearerIntoEdith() {
+        // 0.3 Phase 4B (B5, spec §5.4/D191): the priority is glasses > notification > voice > Edith dialog. With the
+        // page hidden and the shade available, the notification is the chosen channel - the Edith page is only the
+        // fallback, so it must not be raised on top (that was the old always-raise behaviour).
         val rig = Rig()
         try {
-            var raised = 0
-            rig.root.raiseConfirmationUi = { raised++; true }
+            rig.allowRaise()
 
             rig.present("c1", "调整屏幕亮度")
-            assertEquals("with the card on screen there is nothing to raise", 0, raised)
+            assertEquals("with the card on screen there is nothing to raise", 0, rig.raised)
 
             rig.root.uiVisible(false)
-            rig.root.showConfirmation("c2", "卸载 App：probe")
 
-            assertEquals("a question the user cannot see must be raised to the front", 1, raised)
-            assertEquals("and still reach the shade as the fallback", listOf("c1" to "调整屏幕亮度", "c2" to "卸载 App：probe"),
-                rig.surface.posted)
+            assertEquals("a question the wearer cannot see goes to the shade",
+                listOf("c1" to "调整屏幕亮度"), rig.surface.posted)
+            assertEquals("the shade answered the priority question; the Edith fallback stays unused", 0, rig.raised)
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun aQuestionNobodyCanSeeFallsBackToRaisingTheEdithPageWhenTheShadeCannotPost() {
+        val rig = Rig()
+        try {
+            rig.surface.canPost = false
+            rig.surface.reason = NotificationAvailability.CHANNEL_DISABLED
+            rig.allowRaise()
+
+            rig.present("c1", "调整屏幕亮度")
+            withP3Sink { lines ->
+                rig.root.uiVisible(false)
+                assertTrue("no postable shade means no notification", rig.surface.posted.isEmpty())
+                assertEquals("the Edith page is the last fallback", 1, rig.raised)
+                assertTrue(
+                    "the degradation must name the channel switch with its stable reason: $lines",
+                    lines.any { "P3_CONFIRM_NOTIFY" in it && "reason=CHANNEL_DISABLED" in it },
+                )
+            }
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun theGlassesChannelStopsTheLadderSoTheShadeAndThePageAreNotAlsoUsed() {
+        val rig = Rig()
+        try {
+            rig.glassesAvailable = true
+            rig.glassesAccepts = true
+            rig.allowRaise()
+
+            rig.present("c1", "调整屏幕亮度")
+            rig.surface.posted.clear()
+            rig.root.uiVisible(false)
+
+            assertTrue("the glasses already carry the question: ${rig.surface.posted}", rig.surface.posted.isEmpty())
+            assertEquals("and nothing drags the wearer into Edith", 0, rig.raised)
+            assertTrue("the same question is still answerable on the glasses",
+                requireNotNull(rig.presenter).answerFromGlasses("c1", approved = true))
+            assertEquals(listOf("c1"), rig.delivered)
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun thePhoneSurfaceIsTruthfulAboutThePageTheOverlayAndTheShade() {
+        // B4 review: `ConfirmationUi.available()` was `rootHolder[0] != null`, i.e. true for the whole life of the
+        // composition - so the presenter never reported unavailable and AgentLoop's early refusal was unreachable.
+        val rig = Rig()
+        try {
+            assertTrue("the page on screen is a phone surface", rig.root.canPresentOnPhone())
+
+            rig.surface.canPost = false
+            rig.root.uiVisible(false)
+            assertFalse("hidden page, no overlay and no shade: the phone cannot show the question",
+                rig.root.canPresentOnPhone())
+
+            rig.surface.canPost = true
+            assertTrue("a postable shade reaches the wearer", rig.root.canPresentOnPhone())
+
+            rig.surface.canPost = false
+            rig.root.canRaiseConfirmationUi = { true }
+            assertTrue("a page that can be raised over another app is a surface", rig.root.canPresentOnPhone())
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun aPresenterWithNoUsableSurfaceReportsUnavailableInsteadOfClaimingTheCompositionExists() {
+        // Locked/background, notifications off, no overlay and no glasses: the production phone surface must report
+        // false, which is what makes AgentLoop refuse at once with CONFIRMATION_UNAVAILABLE (its own boundary test
+        // pins the refusal; this test pins that production can reach it).
+        val rig = Rig()
+        try {
+            rig.summaryAvailable = false
+            rig.glassesAvailable = false
+            rig.surface.canPost = false
+            rig.root.uiVisible(false)
+            val presenter = rig.newPresenter()
+
+            assertFalse("a hidden page + no shade + no overlay + no glasses is nobody to ask", presenter.available())
+            assertFalse("and the production phone surface agrees",
+                HostCompositionRoot.phoneConfirmationUi { rig.root }.available())
         } finally {
             rig.close()
         }
