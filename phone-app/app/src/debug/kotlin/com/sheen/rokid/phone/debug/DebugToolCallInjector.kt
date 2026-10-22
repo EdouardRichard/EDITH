@@ -7,6 +7,7 @@ import com.sheen.rokid.phone.app.EdithApplication
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.util.Base64
 
 /**
  * Debug-only instrument that arms [ScriptedModelWire] from a host shell (P3.3 Stage C acceptance).
@@ -59,7 +60,12 @@ class DebugToolCallInjector : BroadcastReceiver() {
         val action = intent.getStringExtra(EXTRA_ACTION) ?: ""
         val times = if (intent.hasExtra(EXTRA_TIMES)) intent.getIntExtra(EXTRA_TIMES, 1) else 1
         val fail = intent.getBooleanExtra(EXTRA_FAIL, false)
-        val args = scriptedToolCallArgs(
+        val rawArgs = intent.getStringExtra(EXTRA_ARGS_B64)?.let { encoded ->
+            runCatching { String(Base64.decode(encoded, Base64.NO_WRAP), Charsets.UTF_8) }
+                .getOrNull()
+                ?: return report("refused reason=ARGS_B64_INVALID")
+        }
+        val args = rawArgs ?: scriptedToolCallArgs(
             packageName = intent.getStringExtra(EXTRA_PACKAGE),
             permission = intent.getStringExtra(EXTRA_PERMISSION),
             granted = if (intent.hasExtra(EXTRA_GRANTED)) intent.getBooleanExtra(EXTRA_GRANTED, false) else null,
@@ -84,7 +90,7 @@ class DebugToolCallInjector : BroadcastReceiver() {
             intent.getStringExtra(EXTRA_CHANNEL),
             intent.getStringExtra(EXTRA_COMMAND),
         ).size
-        report("armed action=${action.ifBlank { "none" }} members=$members times=$times fail=$fail")
+        report("armed action=${action.ifBlank { "none" }} members=$members raw=${rawArgs != null} times=$times fail=$fail")
     }
 
     private fun report(state: String) = P3Log.line("P3_SCRIPT state=$state")
@@ -110,5 +116,11 @@ class DebugToolCallInjector : BroadcastReceiver() {
         const val EXTRA_NAME = "name"
         /** The command for `shell` (`--es command 'cmd package list packages'`); B8 classifier matrix. */
         const val EXTRA_COMMAND = "command"
+        /**
+         * Base64-encoded JSON args for any tool whose argument object is not covered by the named extras.
+         * Base64 avoids the device shell's quote stripping; the decoded value is validated by the tool itself.
+         * The value is never logged.
+         */
+        const val EXTRA_ARGS_B64 = "argsB64"
     }
 }
