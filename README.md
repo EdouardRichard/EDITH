@@ -27,8 +27,8 @@ EDITH (伊迪丝) is an end-cloud collaborative AI agent: an Android host app on
 custom app on Rokid Glasses. The glasses are its microphone, speaker and display; the phone is its
 ears, hands, memory and brain. Microphone audio streams from the glasses over the Rokid AI App's
 CXR-Link session; the phone segments and transcribes it on-device, calls the LLM you configure,
-operates Android apps through the accessibility service and Shizuku's shell, and renders the answer
-on the glasses HUD (with TTS over the glasses' Bluetooth audio).
+operates Android apps through the accessibility service and Shizuku's shell, and communicates with
+the user through text on the glasses HUD and TTS audio.
 
 - **Wake-word route** — Say “EDITH” or “伊迪丝”. The glasses panel opens, EDITH listens, recognizes
   the intent, perceives the phone (screen, notifications, media, calendar, device state), plans and
@@ -38,8 +38,7 @@ on the glasses HUD (with TTS over the glasses' Bluetooth audio).
 - **Proactive route** — After you tap “Start” once, EDITH keeps listening and watching ambient
   context. A small on-device gate model (Laya, GPU) decides whether the user needs help right now;
   if so, EDITH pushes a silent hint to the glasses **without any wake word** and opens a 10-second
-  follow-up window. You can answer directly, and a full agent turn with tools and confirmations then
-  runs. A wake word preempts the follow-up; the two routes keep separate conversation history.
+  follow-up window. After the user replies, a full agent turn runs immediately.
 
 ## Demo videos
 
@@ -58,11 +57,6 @@ on the glasses HUD (with TTS over the glasses' Bluetooth audio).
     <img src="docs/assets/videos/proactive-preview.gif" width="65%" alt="Proactive demo — click to play the full video">
   </a>
 </div>
-
-<!-- The inline previews are GIFs because GitHub strips <video> tags that point at repository
-     files. After uploading the two MP4s to GitHub (drag them into the README editor or an issue
-     comment), a preview block can be replaced with:
-     <div align="center"><video src="https://github.com/user-attachments/assets/..." controls></video></div> -->
 
 ## Compatibility and dependencies
 
@@ -85,10 +79,15 @@ All on-device model sets together take about **1.0 GiB** (1.03 GiB); see
 
 ### Wake-word route
 
-Glasses microphone → CXR audio stream → PCM ingress → wake-word spotting (KWS) → VAD and streaming
-ASR on the phone → the `WAKE` conversation route → `AgentLoop` with the configured cloud model →
-tool execution and perception → answer on the glasses panel and phone-side TTS. The same CXR session
-also carries the display commands and the follow-up audio.
+Glasses microphone → CXR audio stream → PCM ingress. The same PCM stream feeds two consumers:
+wake-word spotting (KWS) and VAD + streaming ASR. A KWS hit on “EDITH / 伊迪丝” raises a wake
+event, opens the glasses panel and opens a WAKE turn; VAD/ASR runs continuously from session start
+(it cannot wait for the wake: the wake word is usually at the start of the utterance, and the
+proactive route has no wake word at all). A final transcript is admitted into the Agent only while
+the WAKE turn is waiting for it — with no turn waiting, a final does not open a wake turn; it goes
+to the proactive trigger path instead. `AgentLoop` with the configured cloud model → tool execution
+and perception → answer on the glasses panel and phone-side TTS. The same CXR session also carries
+the display commands and the follow-up audio.
 
 ```mermaid
 flowchart LR
@@ -104,6 +103,7 @@ flowchart LR
         KWS["KWS spotter<br/>(sherpa-onnx)"]
         VAD["VAD<br/>(Silero)"]
         ASR["Streaming ASR<br/>(Zipformer zh/en)"]
+        ADMIT["Transcript admission<br/>(WAKE turn awaiting)"]
         CYCLE["Conversation cycle<br/>WAKE route"]
         LOOP["AgentLoop"]
         PERC["Perception snapshot<br/>screen · notifications · media · calendar"]
@@ -115,15 +115,17 @@ flowchart LR
 
     MIC --> CXR --> ING
     ING --> KWS
-    KWS -- "wake: EDITH / 伊迪丝" --> CYCLE
-    ING --> VAD --> ASR --> CYCLE
+    ING --> VAD --> ASR
+    ASR -- "transcript" --> ADMIT
+    ADMIT -- "admit" --> CYCLE
+    KWS -- "wake hit: EDITH / 伊迪丝" --> CYCLE
+    KWS -. "open panel" .-> HUD
     CYCLE --> LOOP
     LOOP <--> LLM
     PERC --> LOOP
     LOOP --> TOOLS
     TOOLS --> PERC
     LOOP -- "answer" --> HUD
-    CYCLE -. "open panel" .-> HUD
     LOOP --> TTS --> SPK
 ```
 

@@ -25,16 +25,14 @@ EDITH（伊迪丝）：运行在安卓端、连接 Rokid Glasses 的全时主动
 EDITH（伊迪丝）是一个端云协同的 AI Agent：手机上的 Android 宿主 App + 眼镜端 CustomApp。
 眼镜是它的麦克风、扬声器和显示屏，手机是它的耳朵、手、记忆和大脑。眼镜麦克风音频经 Rokid AI
 APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒词检测，调用你配置的大模型，通过
-无障碍服务与 Shizuku 的 shell 操作 Android 应用，最后把答案显示在眼镜 HUD 上，并通过 TTS
-经蓝牙音频朗读。
+无障碍服务与 Shizuku 的 shell 操作 Android 应用，通过眼镜 HUD 文字显示与TTS音频与用户交流。
 
 - **唤醒词唤醒**：说“EDITH”或“伊迪丝”。眼镜面板打开，EDITH 识别意图、感知手机（屏幕、通知、
   媒体、日历、设备状态），规划并执行跨应用的多步操作（打开应用/页面、点按、输入中文、滚动、拨号、
   执行 shell），然后在眼镜 HUD 上作答并朗读答案。在 10 秒监听窗口内，后续追问不需要再次唤醒。
 - **主动辅助**：点一次「开始」后，EDITH 保持常驻收音与环境感知；端侧小模型（Laya，GPU）判断
   “此时用户是否需要辅助”，需要辅助时**无需唤醒词**、静默地把提示推上眼镜，并打开 10 秒接话窗口。
-  你直接接话后，一个完整的 Agent 回合（含工具与确认）随即执行。唤醒词会抢占主动接话；两条链路
-  各自维护独立的对话历史。
+  接话后，一个完整的 Agent 回合随即执行。
 
 ## 演示视频
 
@@ -53,10 +51,6 @@ APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒�
     <img src="docs/assets/videos/proactive-preview.gif" width="65%" alt="主动辅助演示——点击播放完整视频">
   </a>
 </div>
-
-<!-- GitHub 会清洗指向仓库路径的 <video> 标签，所以这里用 GIF 做内联预览。把两个 MP4 拖进 GitHub
-     的 README 编辑器或 issue 评论框上传后，可以把上面的预览块替换为：
-     <div align="center"><video src="https://github.com/user-attachments/assets/..." controls></video></div> -->
 
 ## 适配与依赖说明
 
@@ -77,9 +71,13 @@ APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒�
 
 ### 唤醒词唤醒
 
-眼镜麦克风 → CXR 音频流 → PCM 上行 → 唤醒词检测（KWS）→ 手机端 VAD 与流式 ASR → `WAKE`
-会话链路 → `AgentLoop` + 云端大模型 → 工具执行与感知 → 答案上屏 + 手机端 TTS。同一条 CXR
-会话同时承载显示指令与后续的持续对话音频。
+眼镜麦克风 → CXR 音频流 → PCM 上行。同一路 PCM 同时送给两个消费者：唤醒词检测（KWS）与
+VAD + 流式 ASR。KWS 命中“EDITH / 伊迪丝”后产生唤醒事件、拉起眼镜面板并打开 WAKE 回合；
+VAD/ASR 从会话开始就持续工作（不能等唤醒才启动：唤醒词通常在句首，等唤醒会丢句首音频；主动辅助
+链路本来就没有唤醒词），但只有 WAKE 回合处于等待转写状态时，final 转写才会被采纳并进入
+`AgentLoop`——没有回合等待时，final 不会凭空打开唤醒回合，而是进入主动辅助触发路径。
+`AgentLoop` + 云端大模型 → 工具执行与感知 → 答案上屏 + 手机端 TTS。同一条 CXR 会话同时承载
+显示指令与后续的持续对话音频。
 
 ```mermaid
 flowchart LR
@@ -95,6 +93,7 @@ flowchart LR
         KWS["唤醒词检测 KWS<br/>（sherpa-onnx）"]
         VAD["VAD<br/>（Silero）"]
         ASR["流式 ASR<br/>（Zipformer 中英）"]
+        ADMIT["转写准入<br/>（WAKE 回合等待中）"]
         CYCLE["会话循环<br/>WAKE 链路"]
         LOOP["AgentLoop"]
         PERC["感知快照<br/>屏幕 · 通知 · 媒体 · 日历"]
@@ -106,15 +105,17 @@ flowchart LR
 
     MIC --> CXR --> ING
     ING --> KWS
-    KWS -- "唤醒词：EDITH / 伊迪丝" --> CYCLE
-    ING --> VAD --> ASR --> CYCLE
+    ING --> VAD --> ASR
+    ASR -- "转写" --> ADMIT
+    ADMIT -- "采纳" --> CYCLE
+    KWS -- "唤醒命中：EDITH / 伊迪丝" --> CYCLE
+    KWS -. "打开面板" .-> HUD
     CYCLE --> LOOP
     LOOP <--> LLM
     PERC --> LOOP
     LOOP --> TOOLS
     TOOLS --> PERC
     LOOP -- "答案" --> HUD
-    CYCLE -. "打开面板" .-> HUD
     LOOP --> TTS --> SPK
 ```
 
