@@ -17,6 +17,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -38,6 +39,10 @@ import java.util.concurrent.atomic.AtomicInteger
  *   and a recorder that cannot begin ([PhoneMicCapture.MIC_START_FAILED]) are different facts about the phone.
  * - **stop joins and is idempotent**, and nothing is offered after it returns - the thread is the only producer, so a
  *   late offer would be audio the session already released.
+ * - **a dead recorder is said out loud exactly once (spec §4.5).** A `read` error (`< 0`) or a throw is a bounded
+ *   failure: the reader exits, the recorder is released, [PhoneMicCapture.lastError] names `MIC_UNAVAILABLE`, and the
+ *   one-shot sink fires once **on the reader thread** so the owner can pause the session instead of leaving it
+ *   claiming a normal microphone. Stopping is not a failure and must not fire it.
  *
  * The device is a seam (`PcmRecordDevice`) exactly so these rules can be driven on the JVM: no `AudioRecord`, no
  * permission, no phone.
@@ -50,28 +55,37 @@ class PhoneMicCaptureTest {
 
     /**
      * A blocking `PcmRecordDevice`: [read] waits up to 5 ms for the next fed chunk, so the capture thread behaves like
-     * a real recorder waiting for samples rather than spinning.
+     * a real recorder waiting for samples rather than spinning. [failReadAt]/[throwAtRead] make an individual read
+     * fail (1 = the very first read), which is how the mid-capture interruption rules are driven.
      */
     private class FakeRecordDevice : PcmRecordDevice {
         private val chunks = LinkedBlockingQueue<ShortArray>()
         @Volatile private var stopped = false
+        @Volatile private var woken = false
         @Volatile private var started = false
         val reads = AtomicInteger()
         val starts = AtomicInteger()
         val stops = AtomicInteger()
+        val wakes = AtomicInteger()
         var startResult = true
         var startFailure: Throwable? = null
+        var failReadAt = -1
+        var throwAtRead = -1
 
         override fun start(): Boolean {
             starts.incrementAndGet()
             startFailure?.let { throw it }
+            stopped = false
+            woken = false
             started = startResult
             return startResult
         }
 
         override fun read(buffer: ShortArray): Int {
-            reads.incrementAndGet()
-            while (!stopped) {
+            val read = reads.incrementAndGet()
+            if (read == throwAtRead) throw IllegalStateException("recorder died")
+            if (read == failReadAt) return -1
+            while (!stopped && !woken) {
                 val chunk = chunks.poll(5, TimeUnit.MILLISECONDS) ?: continue
                 val count = minOf(chunk.size, buffer.size)
                 chunk.copyInto(buffer, 0, 0, count)
@@ -80,9 +94,15 @@ class PhoneMicCaptureTest {
             return 0
         }
 
+        override fun wake() {
+            wakes.incrementAndGet()
+            woken = true
+        }
+
         override fun stop() {
             stops.incrementAndGet()
             stopped = true
+            woken = true
         }
 
         fun feed(samples: ShortArray) {
@@ -95,11 +115,13 @@ class PhoneMicCaptureTest {
     private inner class Rig {
         val ingress = PcmIngress(FakeClock(0))
         val device = FakeRecordDevice()
+        val failures = CopyOnWriteArrayList<String>()
         val capture: PhoneMicCapture
 
         init {
             ingress.open(epoch, format)
-            capture = PhoneMicCapture(device, FakeClock(0), ingress, format, epoch)
+            capture = PhoneMicCapture(device, FakeClock(0), ingress, format, epoch,
+                onFailure = { code -> failures += code })
         }
 
         fun start() = capture.start()
@@ -108,6 +130,12 @@ class PhoneMicCaptureTest {
 
         /** 20 ms of 16 kHz mono PCM16 = 320 samples = 640 bytes. */
         fun chunk(value: Short = 0x1234): ShortArray = ShortArray(320) { value }
+
+        fun awaitFailures(count: Int, timeoutMillis: Long = 2_000): Boolean {
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+            while (failures.size < count && System.nanoTime() < deadline) Thread.sleep(2)
+            return failures.size >= count
+        }
 
         fun awaitChunks(count: Int, timeoutMillis: Long = 2_000): List<PcmChunk> {
             val chunks = mutableListOf<PcmChunk>()
@@ -237,6 +265,92 @@ class PhoneMicCaptureTest {
             assertTrue("a stopped capture must not offer audio the session already released", after.isEmpty())
             Thread.sleep(50)
             assertEquals("and it must not keep reading the device", readsAtStop, rig.device.reads.get())
+        } finally {
+            rig.stop()
+        }
+    }
+
+    // ---- mid-capture interruption (spec §4.5) --------------------------------------------------------------------
+
+    @Test
+    fun aReadErrorReportsOneFailureReleasesTheDeviceAndStopsOffering() {
+        val ingress = PcmIngress(clock)
+        val device = FakeRecordDevice().also { it.failReadAt = 2 }
+        val failures = CopyOnWriteArrayList<String>()
+        ingress.open(epoch, format)
+        val capture = PhoneMicCapture(device, clock, ingress, format, epoch, onFailure = { failures += it })
+        try {
+            capture.start()
+            device.feed(ShortArray(320) { 0x1234 })
+
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(2_000)
+            while (failures.isEmpty() && System.nanoTime() < deadline) Thread.sleep(2)
+
+            assertEquals("a read error must surface its one stable code exactly once",
+                listOf(PhoneMicCapture.MIC_UNAVAILABLE), failures.toList())
+            assertEquals("the code stays readable for the owner/UI",
+                PhoneMicCapture.MIC_UNAVAILABLE, capture.lastError())
+            assertNull("a dead capture must not keep pretending to own a reader", capture.captureThread())
+            assertEquals("the recorder is released on the failure exit, not left recording", 1, device.stops.get())
+
+            // The one chunk read before the failure was offered; nothing after it may be.
+            assertNotNull("audio read before the failure still belongs to the epoch", ingress.poll())
+            assertNull(ingress.poll())
+            device.feed(ShortArray(320))
+            Thread.sleep(100)
+            assertNull("no further offers after the failure", ingress.poll())
+            assertEquals("the sink is one-shot per capture", 1, failures.size)
+
+            capture.stop()
+            capture.stop()
+            assertEquals("stop after a failure is idempotent and must not release twice", 1, device.stops.get())
+        } finally {
+            capture.stop()
+        }
+    }
+
+    @Test
+    fun aThrowingReadReportsTheSameBoundedFailureOnce() {
+        val ingress = PcmIngress(clock)
+        val device = FakeRecordDevice().also { it.throwAtRead = 1 }
+        val failures = CopyOnWriteArrayList<String>()
+        ingress.open(epoch, format)
+        val capture = PhoneMicCapture(device, clock, ingress, format, epoch, onFailure = { failures += it })
+        try {
+            capture.start()
+
+            val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(2_000)
+            while (failures.isEmpty() && System.nanoTime() < deadline) Thread.sleep(2)
+
+            assertEquals("a recorder throw is the same bounded failure, not a silent death",
+                listOf(PhoneMicCapture.MIC_UNAVAILABLE), failures.toList())
+            assertEquals(PhoneMicCapture.MIC_UNAVAILABLE, capture.lastError())
+            assertNull(capture.captureThread())
+            assertEquals(1, device.stops.get())
+
+            capture.stop()
+            assertEquals(1, device.stops.get())
+            assertEquals(1, failures.size)
+        } finally {
+            capture.stop()
+        }
+    }
+
+    @Test
+    fun aStopIsNotReportedAsACaptureFailure() {
+        val rig = Rig()
+        try {
+            rig.start()
+            rig.device.feed(rig.chunk())
+            assertEquals(1, rig.awaitChunks(1).size)
+
+            rig.stop()
+
+            Thread.sleep(100)
+            assertTrue("stopping on purpose is not a microphone failure", rig.failures.isEmpty())
+            assertNull(rig.capture.lastError())
+            assertEquals("stop wakes the blocked read before releasing the recorder", 1, rig.device.wakes.get())
+            assertEquals(1, rig.device.stops.get())
         } finally {
             rig.stop()
         }

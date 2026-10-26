@@ -17,11 +17,13 @@ import com.sheen.rokid.contracts.HostEvent
 import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.contracts.OutputStatus
 import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.contracts.SpeakerAssessment
 import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.phone.app.CxrAudioChain
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.audio.PcmRecordDevice
+import com.sheen.rokid.phone.audio.PhoneMicCapture
 import com.sheen.rokid.phone.audio.PhoneMicFormat
 import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
@@ -82,6 +84,7 @@ import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
 
 /**
@@ -250,21 +253,50 @@ class DetachedAudioWiringTest {
         override fun stop(epoch: InputEpoch) { order += "stop:$name"; recorder.stop(epoch) }
     }
 
-    /** A recorder that produces no audio but records begin/release, which is what the ordering assertions need. */
+    /**
+     * A recorder that produces no audio but records begin/release, which is what the ordering assertions need.
+     *
+     * [startResult] and [failReadAt]/[throwAtRead] make the two §4.5 failures driveable: a microphone that cannot
+     * begin at arm time, and one that dies after the session already says it is listening. [failureTriggered] is the
+     * signal the test waits on before it runs the composition's queued dispatcher.
+     */
     private class FakePhoneDevice(private val order: MutableList<String>) : PcmRecordDevice {
         val starts = AtomicInteger()
         val stops = AtomicInteger()
+        val wakes = AtomicInteger()
+        val reads = AtomicInteger()
+        val failureTriggered = AtomicInteger()
         @Volatile private var recording = false
+        @Volatile var startResult = true
+        @Volatile var failReadAt = -1
+        @Volatile var throwAtRead = -1
+
         override fun start(): Boolean {
             order += "start:capture"
             starts.incrementAndGet()
-            recording = true
-            return true
+            recording = startResult
+            return startResult
         }
+
         override fun read(buffer: ShortArray): Int {
+            val read = reads.incrementAndGet()
+            if (read == throwAtRead) {
+                failureTriggered.incrementAndGet()
+                throw IllegalStateException("fake phone recorder died")
+            }
+            if (read == failReadAt) {
+                failureTriggered.incrementAndGet()
+                return -1
+            }
             while (recording) Thread.sleep(5)
             return 0
         }
+
+        override fun wake() {
+            wakes.incrementAndGet()
+            recording = false
+        }
+
         override fun stop() {
             order += "stop:capture"
             stops.incrementAndGet()
@@ -282,14 +314,24 @@ class DetachedAudioWiringTest {
      * The real `HostCompositionRoot` with a recording loop port, the real smart wiring, and - when
      * [withConnection] - a CXR connection carrying a recording transport port. The phone microphone is a fake device
      * behind the composition's own factory seam, so `armAudioEpoch` runs the production branch end to end.
+     *
+     * [queueDispatches] keeps [HostCompositionRoot]'s dispatcher seam out of the capture thread: a failure task is
+     * queued and the test runs it with [runDispatches], exactly as production's deadline scheduler would. The
+     * default inline seam stays for the success paths, where nothing is ever dispatched.
      */
-    private inner class Rig(detached: Boolean, private val withConnection: Boolean = true) {
+    private inner class Rig(
+        detached: Boolean,
+        private val withConnection: Boolean = true,
+        private val queueDispatches: Boolean = false,
+        private val configurePhoneDevice: FakePhoneDevice.() -> Unit = {},
+    ) {
         val clock = FakeClock(0)
         val order = CopyOnWriteArrayList<String>()
         val loop = OrderedPort("loop", order)
         val transport = OrderedPort("transport", order)
         val phoneIngress = PcmIngress(clock)
         val devices = CopyOnWriteArrayList<FakePhoneDevice>()
+        private val dispatchQueue = CopyOnWriteArrayList<() -> Unit>()
         val root: HostCompositionRoot
 
         init {
@@ -320,8 +362,11 @@ class DetachedAudioWiringTest {
                 smartWiring = wiring,
                 rokidConnectionFactory = if (withConnection) { { FakeTransportConnection(transport) } } else null,
                 detachGate = detachedGate(detached),
+                dispatchHostEvent = { task -> if (queueDispatches) dispatchQueue += task else task() },
                 phoneIngress = phoneIngress,
-                phoneMicDeviceFactory = { FakePhoneDevice(order).also { devices += it } })
+                phoneMicDeviceFactory = {
+                    FakePhoneDevice(order).also { devices += it; it.configurePhoneDevice() }
+                })
             root.registerPlugin(wiring.plugin)
         }
 
@@ -333,12 +378,31 @@ class DetachedAudioWiringTest {
             return root.state.value.errorCode == null && root.currentAudioEpoch() != null
         }
 
+        /** Runs the queued failure tasks in the order the production scheduler would. */
+        fun runDispatches() {
+            while (dispatchQueue.isNotEmpty()) dispatchQueue.removeAt(0).invoke()
+        }
+
+        fun pendingDispatches(): Int = dispatchQueue.size
+
         fun close() = root.close()
     }
 
-    private fun withRig(detached: Boolean, withConnection: Boolean = true, block: (Rig) -> Unit) {
-        val rig = Rig(detached, withConnection)
+    private fun withRig(
+        detached: Boolean,
+        withConnection: Boolean = true,
+        queueDispatches: Boolean = false,
+        configurePhoneDevice: FakePhoneDevice.() -> Unit = {},
+        block: (Rig) -> Unit,
+    ) {
+        val rig = Rig(detached, withConnection, queueDispatches, configurePhoneDevice)
         try { block(rig) } finally { rig.close() }
+    }
+
+    private fun awaitCondition(timeoutMillis: Long = 2_000, condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        while (!condition() && System.nanoTime() < deadline) Thread.sleep(2)
+        assertTrue("timed out waiting for the capture failure to reach the dispatcher", condition())
     }
 
     // ---- detached arm -------------------------------------------------------------------------------------------
@@ -505,6 +569,76 @@ class DetachedAudioWiringTest {
             )
         } finally {
             chain.close()
+        }
+    }
+
+    // ---- §4.5: a microphone failure must never leave a session claiming normal radio -----------------------------
+
+    @Test
+    fun aFailedPhoneCaptureStartPausesTheSessionAndReportsStartFailed() {
+        withRig(detached = true, configurePhoneDevice = { startResult = false }) { rig ->
+            val lines = withP3Sink { captured ->
+                assertFalse("a session whose detached microphone cannot start must not report itself started",
+                    rig.activate())
+                captured.toList()
+            }
+
+            assertEquals("the page must carry the recorder's stable code",
+                PhoneMicCapture.MIC_UNAVAILABLE, rig.root.state.value.errorCode)
+            assertEquals("the session may not stay Ready/Listening with no producer",
+                SessionState.Paused, rig.root.state.value.session)
+            assertNull("no epoch may survive a failed arm", rig.root.currentAudioEpoch())
+            assertTrue("the phone source never touches the CXR transport",
+                rig.transport.recorder.started.isEmpty())
+            assertTrue("the poll loop must not run with nothing producing into it",
+                rig.loop.recorder.started.isEmpty())
+            assertEquals("the arm did try the phone recorder exactly once", 1, rig.devices.single().starts.get())
+            assertEquals(
+                "the failure is an explicit START_FAILED transition for the phone source",
+                listOf("P4_AUDIO state=disarmed source=phone_mic transport=false loop=false reason=START_FAILED"),
+                lines.filter { it.startsWith("P4_AUDIO") },
+            )
+        }
+    }
+
+    @Test
+    fun aMidCaptureFailureDisarmsPausesAndReportsCaptureFailed() {
+        // The first read after a successful arm dies, which is the device-preempted shape: the session was already
+        // advertised as listening when the producer went away.
+        withRig(detached = true, queueDispatches = true, configurePhoneDevice = { failReadAt = 1 }) { rig ->
+            withP3Sink { captured ->
+                assertTrue(rig.activate())
+                val epoch = requireNotNull(rig.root.currentAudioEpoch())
+                val device = rig.devices.single()
+
+                awaitCondition { device.failureTriggered.get() == 1 }
+                awaitCondition { rig.pendingDispatches() == 1 }
+
+                // The failure is unwound on the host dispatcher, never on the capture thread (no self-join).
+                rig.runDispatches()
+
+                assertEquals("the reader's stable code reaches the page",
+                    PhoneMicCapture.MIC_UNAVAILABLE, rig.root.state.value.errorCode)
+                assertEquals("the degraded state is explicit, not a session that still looks listening",
+                    SessionState.Paused, rig.root.state.value.session)
+                assertNull("the dead epoch is released", rig.root.currentAudioEpoch())
+                assertEquals("the released phone ingress accepts no later offer", PcmOffer.STALE_EPOCH,
+                    rig.phoneIngress.offer(epoch, ByteArray(PhoneMicFormat.CHUNK_BYTES)))
+                assertEquals("the poll loop for that epoch is stopped", listOf(epoch), rig.loop.recorder.stopped)
+                assertEquals("the recorder is released exactly once", 1, device.stops.get())
+                assertTrue("a detached failure does not start the CXR transport",
+                    rig.transport.recorder.started.isEmpty())
+                assertEquals(
+                    "the arm succeeded first, then the dead reader degrades the epoch with CAPTURE_FAILED",
+                    listOf(
+                        "P4_AUDIO state=armed source=phone_mic transport=false loop=true reason=ARMED",
+                        "P4_AUDIO state=disarmed source=phone_mic transport=false loop=false reason=CAPTURE_FAILED",
+                    ),
+                    captured.filter { it.startsWith("P4_AUDIO") },
+                )
+                assertEquals("the session is not silently re-armed by the failure", 0, rig.pendingDispatches())
+                captured.toList()
+            }
         }
     }
 }

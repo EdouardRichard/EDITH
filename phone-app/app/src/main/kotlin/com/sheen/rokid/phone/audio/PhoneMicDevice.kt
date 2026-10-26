@@ -66,6 +66,15 @@ interface PcmRecordDevice {
      */
     fun read(buffer: ShortArray): Int
 
+    /**
+     * Asks a blocked [read] to return **without releasing** the recorder.
+     *
+     * [PhoneMicCapture.stop] calls this before joining the reader: a release from another thread while a read is in
+     * flight is the kind of use-after-free the capture must not risk. Releasing stays [stop]'s job, after the join.
+     * Idempotent, and safe when nothing is recording.
+     */
+    fun wake()
+
     /** Stops recording and releases the platform recorder. Idempotent. */
     fun stop()
 }
@@ -150,10 +159,16 @@ class PhoneMicDevice : PcmRecordDevice {
         return recorder.read(buffer, 0, buffer.size)
     }
 
+    override fun wake() {
+        val recorder = record ?: return
+        // Stop the stream so a blocked `read` returns, but keep the object: `stop` releases it once the reader is gone.
+        runCatching { if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) recorder.stop() }
+    }
+
     override fun stop() {
+        wake()
         val recorder = record ?: return
         record = null
-        runCatching { if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) recorder.stop() }
         runCatching { recorder.release() }
     }
 }

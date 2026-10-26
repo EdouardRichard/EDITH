@@ -1209,24 +1209,28 @@ class HostCompositionRoot internal constructor(
      * `PcmFramer`/`SpeechPipeline`/KWS path the CXR uplink feeds, so only the source changes. The glasses branch below
      * is byte-for-byte the transport-then-loop path it was; its `P3_AUDIO` lines keep their pre-0.4 shape and the new
      * 0.4 `P4_AUDIO` line records the source (`spec §7.2`).
+     *
+     * @return false only when a **detached** arm failed and has already been fully unwound (`disarm`, `host.pause`,
+     *   `errorCode`), so [activateSelected] must not go on to treat the session as started (spec §4.5). Everything the
+     *   pre-0.4 path considers a started session returns true, including "already armed" and glasses mode with no
+     *   transport yet (that one stays retryable exactly as before).
      */
-    @Synchronized fun armAudioEpoch() {
+    @Synchronized fun armAudioEpoch(): Boolean {
         val detached = detachGate.enabled.value
         if (closed || activatedPlugin == null) {
             logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
                 generation = host.currentGeneration.value, reason = "NOT_ACTIVE")
-            return
+            return false
         }
         // A second arm of a still-running epoch changes nothing, so it is not an observable event and gets no line.
-        if (runningAudioEpoch != null) return
+        if (runningAudioEpoch != null) return true
         val session = activeSessionId ?: run {
             logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
                 generation = host.currentGeneration.value, reason = "SESSION_MISSING")
-            return
+            return false
         }
         if (detached) {
-            armPhoneAudioEpoch(session)
-            return
+            return armPhoneAudioEpoch(session)
         }
         val transport = activeConnection?.inputPortOrNull()
         if (transport == null) {
@@ -1237,7 +1241,7 @@ class HostCompositionRoot internal constructor(
                 "stays disarmed (session=$session generation=${host.currentGeneration} state=${host.currentState})")
             logAudioState("disarmed", "cxr", transport = false, loop = false,
                 generation = host.currentGeneration.value, reason = "TRANSPORT_MISSING")
-            return
+            return true
         }
         // The generation is read **here**, at the moment the epoch is built, and is never passed in by the caller.
         // `activateSelected` resolves its own copy before `HostRuntime.activate`/`switchTo` runs, and `switchTo`
@@ -1270,6 +1274,7 @@ class HostCompositionRoot internal constructor(
             logAudioState("armed", "cxr", transport = true, loop = true,
                 generation = epoch.generation.value, reason = "ARMED")
         }
+        return failure == null
     }
 
     /**
@@ -1280,56 +1285,68 @@ class HostCompositionRoot internal constructor(
      * **visible** code ([PhoneMicCapture.MIC_FORMAT_UNSUPPORTED]/`MIC_UNAVAILABLE`/`MIC_START_FAILED`) plus one
      * `P4_AUDIO ... reason=START_FAILED`/`P3_AUDIO ... reason=START_FAILED` pair. It never leaves a session that says
      * it is listening with no source behind it (spec §4.5).
+     *
+     * The bad start also **pauses the session** (`host.pause`) and writes the code to the page, so a caller that sees
+     * `false` cannot mistake the still-activated plugin for a running one: the §4.5 degradation for "start failed" is
+     * an explicit Paused + error, not a session that stays Ready/Listening with a silent ingress.
+     *
+     * Mid-capture failure is the same degradation through [onPhoneMicCaptureFailed]; it cannot be handled inline here
+     * because the capture's sink runs on the reader thread and `disarmAudioEpoch` would join that thread.
      */
-    private fun armPhoneAudioEpoch(session: String) {
+    private fun armPhoneAudioEpoch(session: String): Boolean {
         val ingress = phoneIngress
         val deviceFactory = phoneMicDeviceFactory
         if (ingress == null || deviceFactory == null) {
             android.util.Log.i("EdithHost", "PHONE_MIC_UNWIRED: the detached audio source is not assembled")
+            host.pause()
             error(PhoneMicCapture.MIC_UNAVAILABLE)
             logAudioState("disarmed", "phone_mic", transport = false, loop = false,
                 generation = host.currentGeneration.value, reason = "START_FAILED")
-            return
+            return false
         }
         val epoch = InputEpoch(SessionId(session), host.currentGeneration, Math.incrementExact(inputSerial).also { inputSerial = it })
         runningAudioEpoch = epoch
         runningAudioTransport = null
         runningAudioDetached = true
+        // Held so the failure sink (which is constructed before `start` can run) can name the exact capture instance;
+        // a queued failure from an older epoch must not be allowed to tear down a newer one.
+        val captureHolder = arrayOfNulls<PhoneMicCapture>(1)
         var capture: PhoneMicCapture? = null
         val failure = runCatching {
             // Open first, so the very first offered chunk has a format and an epoch to be accepted under.
             ingress.open(epoch, PhoneMicFormat.VERIFIED)
             val built = PhoneMicCapture(deviceFactory(), clock, ingress, PhoneMicFormat.VERIFIED, epoch,
-                onOffer = { offer -> audioChain?.onOffer(offer) })
-            built.start()
+                onOffer = { offer -> audioChain?.onOffer(offer) },
+                onFailure = { code ->
+                    // Never unwind on the capture thread: `disarmAudioEpoch` joins it, so the owner's own dispatcher
+                    // (production: the deadline scheduler) must run the teardown.
+                    dispatchHostEvent { onPhoneMicCaptureFailed(captureHolder[0], code) }
+                })
+            captureHolder[0] = built
+            // Published before `start` can fail asynchronously: a read error must belong to an armed epoch, not race
+            // the assignment and be mistaken for a stale failure.
             capture = built
             runningPhoneCapture = built
+            built.start()
             // Only the loop: there is no transport port in this mode, and the ingress is already open.
             environment?.input?.start(epoch)
         }.exceptionOrNull()
         if (failure == null) {
             logAudioState("armed", "phone_mic", transport = false, loop = true,
                 generation = epoch.generation.value, reason = "ARMED")
-            return
+            return true
         }
-        runCatching { environment?.input?.stop(epoch) }
-        runCatching { runningPhoneCapture?.stop() }
-        runningPhoneCapture = null
-        runCatching { ingress.close() }
-        // The loop that would have drained the terminal gap is already stopped, so teardown drains it: one gap per
-        // failed arm in a process-lifetime ingress would otherwise accumulate until `PcmIngress.open` refuses.
-        while (ingress.pollGap() != null) { /* terminal teardown only */ }
-        runningAudioEpoch = null
-        runningAudioDetached = false
         val code = (failure as? ContractError.CapabilityMissing)?.message
             ?: capture?.lastError()
             ?: PhoneMicCapture.MIC_START_FAILED
-        // The page must say the microphone could not start; it must not show a listening session (spec §4.5).
+        // One teardown path for both failure kinds: it stops the loop before releasing the source, closes the ingress,
+        // drains the terminal gap and records this transition as START_FAILED (not as a normal DISARMED).
+        disarmAudioEpoch(reason = "START_FAILED")
+        host.pause()
         error(code)
         android.util.Log.i("EdithHost", "phone audio epoch could not start: ${failure.javaClass.name}: " +
             "${failure.message} code=$code")
-        logAudioState("disarmed", "phone_mic", transport = false, loop = false,
-            generation = epoch.generation.value, reason = "START_FAILED")
+        return false
     }
 
     /**
@@ -1338,8 +1355,12 @@ class HostCompositionRoot internal constructor(
      * The order is the reverse of the arm: the poll loop first (so it cannot read a source about to be released), then
      * the phone capture, then the phone ingress, and finally the CXR transport, which closes its own ingress and stops
      * the glasses' stream (Task 15c D1). A detached epoch has no transport, so that leg is simply absent.
+     *
+     * [reason] is the `P4_AUDIO`/`P3_AUDIO` reason on the transition: the ordinary `DISARMED` (stop/pause/switch), or
+     * the failure reason the caller is degrading for (`START_FAILED`, `CAPTURE_FAILED`). The field shape is unchanged;
+     * only the value distinguishes a normal teardown from the bounded failure the spec §4.5 evidence needs.
      */
-    @Synchronized fun disarmAudioEpoch() {
+    @Synchronized fun disarmAudioEpoch(reason: String = "DISARMED") {
         val epoch = runningAudioEpoch ?: return
         runningAudioEpoch = null
         val transport = runningAudioTransport
@@ -1360,7 +1381,31 @@ class HostCompositionRoot internal constructor(
         }
         runCatching { transport?.stop(epoch) }
         logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
-            generation = epoch.generation.value, reason = "DISARMED")
+            generation = epoch.generation.value, reason = reason)
+    }
+
+    /**
+     * Spec §4.5: a phone capture that dies mid-session must not leave a session/FGS claiming normal radio.
+     *
+     * The sink is one-shot per capture and runs on the capture's reader thread, so [armPhoneAudioEpoch] hands it to
+     * [dispatchHostEvent]; this method runs on the host's own thread. It degrades the session the same way a failed arm
+     * does: disarm the whole epoch (the line says `reason=CAPTURE_FAILED`), pause the host, and put the reader's stable
+     * code on the page. **Pause, not stop, is the chosen degradation**: the composition cannot stop `SessionService`'s
+     * foreground service from here, and a full stop would also throw away the session identity a resume needs. A
+     * Paused session with an error code is an explicit non-normal state a user can see and resume from, and the device
+     * pass (Task 9) verifies the notification follows it.
+     *
+     * @param capture the capture instance whose sink fired. A failure queued before a pause/stop/switch names an
+     *   instance that is no longer [runningPhoneCapture]; it is ignored rather than allowed to disarm the newer epoch.
+     */
+    @Synchronized
+    private fun onPhoneMicCaptureFailed(capture: PhoneMicCapture?, code: String) {
+        if (closed) return
+        if (capture == null || runningPhoneCapture !== capture) return
+        android.util.Log.i("EdithHost", "phone microphone capture failed: $code; pausing the session")
+        disarmAudioEpoch(reason = "CAPTURE_FAILED")
+        host.pause()
+        error(code)
     }
 
     /**
@@ -1993,7 +2038,12 @@ class HostCompositionRoot internal constructor(
             // plugins, which left the ears on a dead generation (Task 14a-fix2). Disarming first also makes the arm
             // read the generation that is current *after* the switch, which is the only one the host accepts.
             disarmAudioEpoch()
-            if (declares(selected, Capability.WakeWord)) armAudioEpoch()
+            if (declares(selected, Capability.WakeWord) && !armAudioEpoch()) {
+                // Spec §4.5: a failed **detached** arm has already been fully unwound inside `armAudioEpoch` -
+                // disconnected from the epoch, host paused, and the microphone code on the page. Returning here keeps
+                // this activation path from going on as if the session had a working source behind it.
+                return
+            }
         } else {
             disarmAudioEpoch()
             host.pause()
