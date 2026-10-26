@@ -98,6 +98,18 @@ internal fun PhoneScreen(
     remainingSeconds: Long,
 ) {
     var tab by remember { mutableStateOf(PhoneTab.ASSISTANT) }
+    // 0.4 Task 13e-prep: the composer state belongs to the page, not to the assistant tab. A bottom-tab switch
+    // disposes AssistantTab, which used to discard the draft — and a dictated final appended to it — even though
+    // PhoneScreen never left the composition. Hoisted here it survives every 助手/技能/记忆/设置 switch and still
+    // round-trips through rememberSaveable on an Activity recreation.
+    var typedInput by rememberSaveable(stateSaver = typedInputSaver) { mutableStateOf(TypedInputState()) }
+    // A typed result is an answer about the session that was live when the send happened. Remember the previous state
+    // so a stop or a start clears a stale 「助手正在处理」/「会话未运行」 without touching the draft or a live dictation.
+    var previousSession by remember { mutableStateOf(state.session) }
+    LaunchedEffect(state.session) {
+        typedInput = typedInput.afterSessionChange(previousSession, state.session)
+        previousSession = state.session
+    }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val plugins = pluginPickerOptions(
@@ -170,6 +182,8 @@ internal fun PhoneScreen(
                         AssistantTab(
                             log = root.conversationLog,
                             session = state.session,
+                            typedInput = typedInput,
+                            onTypedInputChange = { typedInput = it },
                             send = { root.requestTypedMessage(it) },
                             dictation = root.dictationUi,
                             startDictation = { root.startDictation() },
@@ -301,6 +315,8 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
 internal fun AssistantTab(
     log: ConversationLog,
     session: SessionState,
+    typedInput: TypedInputState,
+    onTypedInputChange: (TypedInputState) -> Unit,
     send: (String) -> TypedSendResult,
     dictation: StateFlow<DictationUiState>,
     startDictation: () -> DictationStartResult,
@@ -311,9 +327,8 @@ internal fun AssistantTab(
 ) {
     var route by remember { mutableStateOf(AssistantRoute.WAKE) }
     var revision by remember { mutableStateOf(0) }
-    // The row's draft and last result survive an Activity recreation; the send itself never spans one (it is a
-    // synchronous host call), so `sending` is not saved.
-    var typedInput by rememberSaveable(stateSaver = typedInputSaver) { mutableStateOf(TypedInputState()) }
+    // 0.4 Task 13e-prep: the draft/result are owned by PhoneScreen (a tab switch would dispose this function and take
+    // them with it); this page only reads the value and reports every change back up.
     // The dictation host is the only writer of this flow (its callbacks may arrive on the pipeline or scheduler
     // thread; StateFlow + lifecycle collection marshal them onto the main thread). The host also owns the final's
     // lifetime: it stays in the flow until this page has appended it and acknowledged it with
@@ -327,11 +342,9 @@ internal fun AssistantTab(
         if (!isNewDictationFinal(delivered, appendedDictationSequence)) return@LaunchedEffect
         appendedDictationSequence = delivered.sequence
         // 0.4 Task 12b-ii (spec §5.3): the recognized words are appended to the editable draft. Nothing is sent:
-        // the wearer can fix them and presses 发送 when ready.
-        typedInput = typedInput.copy(
-            draft = appendDictation(typedInput.draft, delivered.text),
-            result = null,
-        )
+        // the wearer can fix them and presses 发送 when ready. The transition is pure so its draft-preserving
+        // behaviour is JVM-tested (0.4 Task 13e-prep).
+        onTypedInputChange(typedInput.afterDictationFinal(delivered.text))
         // Only after the append: the host then stops handing this final to a re-created page.
         consumeDictationFinal(delivered.sequence)
     }
@@ -447,14 +460,14 @@ internal fun AssistantTab(
                     // 0.4 Task 12b-ii fix 2 (finding 2): editing is the wearer starting a newer action, so a finished
                     // dictation's no-speech/timeout/error text must not outrank what they are doing now.
                     clearDictationStatus()
-                    typedInput = typedInput.copy(draft = typedDraftAfterInput(candidate))
+                    onTypedInputChange(typedInput.copy(draft = typedDraftAfterInput(candidate)))
                 },
                 onSend = {
                     val outgoing = typedInput
                     // The button is already disabled for both facts; the check is repeated here so a queued click
                     // that lands after a state change cannot submit a second request.
                     if (canSendTyped(session, outgoing.draft.isBlank(), outgoing.sending)) {
-                        typedInput = outgoing.beginSend().finishSend(send(outgoing.draft))
+                        onTypedInputChange(outgoing.beginSend().finishSend(send(outgoing.draft)))
                     }
                 },
                 onStartDictation = { startDictation() },

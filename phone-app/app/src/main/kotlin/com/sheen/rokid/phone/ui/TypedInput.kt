@@ -83,6 +83,31 @@ fun TypedInputState.finishSend(result: TypedSendResult): TypedInputState = copy(
 )
 
 /**
+ * The composer state after the session it belongs to moved (0.4 Task 13e-prep).
+ *
+ * A [TypedInputState.result] is the answer to one send in the session that was live when it happened. Once that
+ * session stops (leaving `Ready`/`Listening`) or the next one starts (entering them), the sentence describes a session
+ * that is gone: because [typedStatusText] prefers a present result over every live fact, keeping it leaves
+ * 助手正在处理 (or 会话未运行) on screen indefinitely. [draft] is the wearer's own words and survives both directions;
+ * a move inside the live set (`Ready` <-> `Listening`) is the same session handling a wake word, so its result stays.
+ *
+ * `sending` is deliberately untouched: `requestTypedMessage` is synchronous, so a session change cannot strand a send,
+ * and the field is transient by design (see [typedInputSaveValues]).
+ */
+fun TypedInputState.afterSessionChange(previous: SessionState, current: SessionState): TypedInputState =
+    if (sessionAcceptsTypedInput(previous) == sessionAcceptsTypedInput(current)) this else copy(result = null)
+
+/**
+ * The composer state after the host delivered one dictation final (0.4 Task 13e-prep moved the transition here).
+ *
+ * The recognized words are appended to the current draft and never sent, exactly like [appendDictation]; the finished
+ * dictation is the wearer's newest action, so an older typed result no longer describes the field. The draft is owned
+ * by `PhoneScreen`, so a bottom-tab switch cannot discard either half of this transition.
+ */
+fun TypedInputState.afterDictationFinal(text: String): TypedInputState =
+    copy(draft = appendDictation(draft, text), result = null)
+
+/**
  * Applies the field's length cap to a candidate value.
  *
  * Truncating (rather than rejecting the whole edit) also keeps a long paste usable: the first 2000 characters survive.
