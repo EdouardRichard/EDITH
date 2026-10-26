@@ -65,6 +65,14 @@ class AudioIngressLoop(
     private var running: InputEpoch? = null
 
     /**
+     * The epoch this loop is polling under, or null while stopped.
+     *
+     * Exposed so the chain that caches the loop can tell "this is the loop for the epoch being stopped" from a stale
+     * stop naming an older epoch - and only drop the cache in the former case.
+     */
+    val activeEpoch: InputEpoch? get() = synchronized(lock) { running }
+
+    /**
      * The deadline of the next tick, or `null` while no loop is running.
      *
      * Kept as state rather than recomputed from [clock] on every tick: the next tick is due one cadence after

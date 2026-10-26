@@ -807,7 +807,12 @@ private class NoStorageAccess : StorageAccess {
                 root.armAudioEpoch()
                 assertEquals(
                     listOf("P3_AUDIO state=disarmed generation=0 transport=false loop=false reason=NOT_ACTIVE"),
-                    lines.toList(),
+                    audioLines(lines),
+                )
+                // 0.4 Task 6 (spec §7.2): the new evidence line names the source; the P3 line above keeps its shape.
+                assertEquals(
+                    listOf("P4_AUDIO state=disarmed source=cxr transport=false loop=false reason=NOT_ACTIVE"),
+                    lines.filter { it.startsWith("P4_AUDIO") },
                 )
             }
         } finally {

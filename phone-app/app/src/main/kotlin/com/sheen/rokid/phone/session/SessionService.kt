@@ -65,11 +65,21 @@ class SessionService : Service() {
                 return START_NOT_STICKY
             }
             try {
-                val admitted = root.dispatch(action, intent.getStringExtra(TOKEN), redelivered, bluetoothGranted(this), beforeStart = {
+                // 0.4 Task 6 (`D199`): the foreground service type and the permission gate both follow the detach
+                // gate. A detached session captures the phone microphone, so it starts as `microphone` and requires
+                // `RECORD_AUDIO` (never Bluetooth); glasses mode keeps `connectedDevice` and the existing Bluetooth
+                // gate exactly. The type is chosen inside `beforeStart`, immediately before `startForeground`, so the
+                // declaration and the running service cannot disagree about the mode.
+                val detached = root.detachGate.enabled.value
+                val admitted = root.dispatch(action, intent.getStringExtra(TOKEN), redelivered,
+                    SessionPermissions.grantedForStart(this, detached), beforeStart = {
                     val manager = getSystemService(NotificationManager::class.java)
                     manager.createNotificationChannel(NotificationChannel(CHANNEL, getString(R.string.session_channel), NotificationManager.IMPORTANCE_LOW))
                     ServiceCompat.startForeground(this, NOTIFICATION, notification(root),
-                        if (Build.VERSION.SDK_INT >= 29) ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE else 0)
+                        if (Build.VERSION.SDK_INT >= 29) {
+                            if (detached) ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
+                            else ServiceInfo.FOREGROUND_SERVICE_TYPE_CONNECTED_DEVICE
+                        } else 0)
                     ownsForeground = true
                 })
                 if (!admitted) { if (!ownsForeground) stopSelf(startId); return START_NOT_STICKY }
@@ -85,7 +95,12 @@ class SessionService : Service() {
             // Commands never build the composition: with no composition there is no running session to control.
             val root = liveRoot
             if (root == null) { stopSelf(startId); return START_NOT_STICKY }
-            root.dispatch(action, redelivered = redelivered, permissionGranted = bluetoothGranted(this), foregroundActive = ownsForeground)
+            // The mode is a property of the running session, so it is read from the live gate. A pause/stop passes the
+            // flag through unchanged; RESUME is the command that re-arms capture, so it must ask the same question a
+            // start does (a revoked microphone must not resume into a silent session).
+            root.dispatch(action, redelivered = redelivered,
+                permissionGranted = SessionPermissions.grantedForStart(this, root.detachGate.enabled.value),
+                foregroundActive = ownsForeground)
             if (action == STOP || (!ownsForeground && action != START)) {
                 if (ownsForeground) ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
                 ownsForeground = false

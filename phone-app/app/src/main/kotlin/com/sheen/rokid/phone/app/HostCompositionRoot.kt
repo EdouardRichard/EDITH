@@ -49,6 +49,7 @@ import com.sheen.rokid.phone.bridge.HintIdentity
 import com.sheen.rokid.phone.bridge.UiState
 import com.sheen.rokid.phone.bridge.UplinkReport
 import com.sheen.rokid.phone.session.PlaybackGate
+import com.sheen.rokid.phone.session.SessionPermissions
 import com.sheen.rokid.phone.bridge.CxrConnection
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.confirmation.ConfirmationUi
@@ -56,6 +57,10 @@ import com.sheen.rokid.phone.session.confirmation.ConfirmationPanel
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.bridge.RokidConnection
 import com.sheen.rokid.phone.audio.AudioIngressLoop
+import com.sheen.rokid.phone.audio.PcmRecordDevice
+import com.sheen.rokid.phone.audio.PhoneMicCapture
+import com.sheen.rokid.phone.audio.PhoneMicDevice
+import com.sheen.rokid.phone.audio.PhoneMicFormat
 import com.sheen.rokid.phone.audio.SherpaAsrSession
 import com.sheen.rokid.phone.bridge.CxrGlassesTarget
 import com.sheen.rokid.phone.bridge.UnwiredInputPort
@@ -345,6 +350,22 @@ class HostCompositionRoot internal constructor(
      * Kept **last** so positional construction of older call sites is unchanged.
      */
     internal val detachGate: DetachGate = DetachGate(),
+    /**
+     * 0.4 Task 6 (`D199`/`D200`): the one phone-microphone ingress, or null for a hand-built rig that has none.
+     *
+     * [create] builds it once and points the audio chain's ingress selector at it while the detach gate is on, so the
+     * **same** `PcmIngress` is opened by [armAudioEpoch] and polled by the chain's loop. A rig that has no chain has no
+     * use for one, which is why the default is null rather than a second instance nobody polls.
+     */
+    internal val phoneIngress: PcmIngress? = null,
+    /**
+     * 0.4 Task 6: the recorder behind the phone microphone, one per armed epoch.
+     *
+     * A factory rather than an instance because an `AudioRecord` is a session resource: arming creates one, disarming
+     * releases it, and a resumed session starts a fresh one. Production passes `{ PhoneMicDevice() }`; a JVM test
+     * passes a fake `PcmRecordDevice` and drives the same `armAudioEpoch`/`disarmAudioEpoch` branches without a phone.
+     */
+    private val phoneMicDeviceFactory: (() -> PcmRecordDevice)? = null,
 ) : AutoCloseable {
     /**
      * P5 (spec §S5): the 「语音朗读」 switch state, persisted globally and **off by default**.
@@ -1149,6 +1170,17 @@ class HostCompositionRoot internal constructor(
      * active connection has been replaced meanwhile (Task 15c D1).
      */
     private var runningAudioTransport: InputPort? = null
+
+    /**
+     * 0.4 Task 6: the phone capture [armAudioEpoch] started in detached mode, or null while no phone epoch runs.
+     *
+     * Held so `disarmAudioEpoch` releases **the** recorder the armed epoch owns (not a newly built one), and so the
+     * pause/stop/close paths all go through one idempotent release (`PhoneMicCapture.stop`).
+     */
+    private var runningPhoneCapture: PhoneMicCapture? = null
+
+    /** Whether the running epoch's source is the phone (true) or the CXR uplink (false); drives the log's `source=`. */
+    private var runningAudioDetached = false
     private var inputSerial = 0L
 
     /** The epoch currently polling the ingress, or null. Read by the App's diagnostics and by tests. */
@@ -1170,18 +1202,30 @@ class HostCompositionRoot internal constructor(
      * `audio data 0 bytes`. The transport's own [InputPort] is started first, so the loop built after it polls an open
      * ingress; both are handed the **same** epoch. With no CXR connection there is no port to open the ingress, so
      * nothing is started at all here and the display-live retry re-enters this method once the connection exists.
+     *
+     * **Detached mode (0.4 Task 6, `D199`/`D200`).** When the gate is on, the phone **is** the source: there is no
+     * transport to open anything and no `activeConnection` to require. The composition opens the phone ingress itself,
+     * starts the phone capture for that epoch, and then starts the existing loop - the same
+     * `PcmFramer`/`SpeechPipeline`/KWS path the CXR uplink feeds, so only the source changes. The glasses branch below
+     * is byte-for-byte the transport-then-loop path it was; its `P3_AUDIO` lines keep their pre-0.4 shape and the new
+     * 0.4 `P4_AUDIO` line records the source (`spec §7.2`).
      */
     @Synchronized fun armAudioEpoch() {
+        val detached = detachGate.enabled.value
         if (closed || activatedPlugin == null) {
-            P3Log.line("P3_AUDIO state=disarmed generation=${host.currentGeneration.value} " +
-                "transport=false loop=false reason=NOT_ACTIVE")
+            logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
+                generation = host.currentGeneration.value, reason = "NOT_ACTIVE")
             return
         }
         // A second arm of a still-running epoch changes nothing, so it is not an observable event and gets no line.
         if (runningAudioEpoch != null) return
         val session = activeSessionId ?: run {
-            P3Log.line("P3_AUDIO state=disarmed generation=${host.currentGeneration.value} " +
-                "transport=false loop=false reason=SESSION_MISSING")
+            logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
+                generation = host.currentGeneration.value, reason = "SESSION_MISSING")
+            return
+        }
+        if (detached) {
+            armPhoneAudioEpoch(session)
             return
         }
         val transport = activeConnection?.inputPortOrNull()
@@ -1191,8 +1235,8 @@ class HostCompositionRoot internal constructor(
             // activation retryable, and that retry runs this method again with the port present.
             android.util.Log.i("EdithHost", "AUDIO_EPOCH_TRANSPORT_MISSING: no CXR connection, the audio epoch " +
                 "stays disarmed (session=$session generation=${host.currentGeneration} state=${host.currentState})")
-            P3Log.line("P3_AUDIO state=disarmed generation=${host.currentGeneration.value} " +
-                "transport=false loop=false reason=TRANSPORT_MISSING")
+            logAudioState("disarmed", "cxr", transport = false, loop = false,
+                generation = host.currentGeneration.value, reason = "TRANSPORT_MISSING")
             return
         }
         // The generation is read **here**, at the moment the epoch is built, and is never passed in by the caller.
@@ -1204,6 +1248,7 @@ class HostCompositionRoot internal constructor(
         val epoch = InputEpoch(SessionId(session), host.currentGeneration, Math.incrementExact(inputSerial).also { inputSerial = it })
         runningAudioEpoch = epoch
         runningAudioTransport = transport
+        runningAudioDetached = false
         // Either both halves run or neither does: a transport that opened the ingress with nothing polling it leaks a
         // live stream, and a loop over an ingress the transport refused to open is the defect this fix removes.
         val failure = runCatching {
@@ -1217,28 +1262,130 @@ class HostCompositionRoot internal constructor(
             runningAudioEpoch = null
             runningAudioTransport = null
             android.util.Log.i("EdithHost", "audio epoch could not start: ${failure.javaClass.name}: ${failure.message}")
-            P3Log.line("P3_AUDIO state=disarmed generation=${epoch.generation.value} " +
-                "transport=false loop=false reason=START_FAILED")
+            logAudioState("disarmed", "cxr", transport = false, loop = false,
+                generation = epoch.generation.value, reason = "START_FAILED")
         } else {
             // Both ports are up and polling the same ingress under the same epoch (Task 15c D1), which is what the
             // two booleans let a device run check.
-            P3Log.line("P3_AUDIO state=armed generation=${epoch.generation.value} transport=true loop=true")
+            logAudioState("armed", "cxr", transport = true, loop = true,
+                generation = epoch.generation.value, reason = "ARMED")
         }
     }
 
-    /** Stops the epoch [armAudioEpoch] started, if any. Idempotent, and safe before anything was armed. */
+    /**
+     * The detached half of [armAudioEpoch]: phone ingress open, capture running, then the existing poll loop.
+     *
+     * This is an arm too, so it owes the same either-all-or-nothing guarantee: if the ingress refuses the epoch, the
+     * recorder cannot begin, or the loop cannot start, everything already started is stopped and the failure is a
+     * **visible** code ([PhoneMicCapture.MIC_FORMAT_UNSUPPORTED]/`MIC_UNAVAILABLE`/`MIC_START_FAILED`) plus one
+     * `P4_AUDIO ... reason=START_FAILED`/`P3_AUDIO ... reason=START_FAILED` pair. It never leaves a session that says
+     * it is listening with no source behind it (spec §4.5).
+     */
+    private fun armPhoneAudioEpoch(session: String) {
+        val ingress = phoneIngress
+        val deviceFactory = phoneMicDeviceFactory
+        if (ingress == null || deviceFactory == null) {
+            android.util.Log.i("EdithHost", "PHONE_MIC_UNWIRED: the detached audio source is not assembled")
+            error(PhoneMicCapture.MIC_UNAVAILABLE)
+            logAudioState("disarmed", "phone_mic", transport = false, loop = false,
+                generation = host.currentGeneration.value, reason = "START_FAILED")
+            return
+        }
+        val epoch = InputEpoch(SessionId(session), host.currentGeneration, Math.incrementExact(inputSerial).also { inputSerial = it })
+        runningAudioEpoch = epoch
+        runningAudioTransport = null
+        runningAudioDetached = true
+        var capture: PhoneMicCapture? = null
+        val failure = runCatching {
+            // Open first, so the very first offered chunk has a format and an epoch to be accepted under.
+            ingress.open(epoch, PhoneMicFormat.VERIFIED)
+            val built = PhoneMicCapture(deviceFactory(), clock, ingress, PhoneMicFormat.VERIFIED, epoch,
+                onOffer = { offer -> audioChain?.onOffer(offer) })
+            built.start()
+            capture = built
+            runningPhoneCapture = built
+            // Only the loop: there is no transport port in this mode, and the ingress is already open.
+            environment?.input?.start(epoch)
+        }.exceptionOrNull()
+        if (failure == null) {
+            logAudioState("armed", "phone_mic", transport = false, loop = true,
+                generation = epoch.generation.value, reason = "ARMED")
+            return
+        }
+        runCatching { environment?.input?.stop(epoch) }
+        runCatching { runningPhoneCapture?.stop() }
+        runningPhoneCapture = null
+        runCatching { ingress.close() }
+        // The loop that would have drained the terminal gap is already stopped, so teardown drains it: one gap per
+        // failed arm in a process-lifetime ingress would otherwise accumulate until `PcmIngress.open` refuses.
+        while (ingress.pollGap() != null) { /* terminal teardown only */ }
+        runningAudioEpoch = null
+        runningAudioDetached = false
+        val code = (failure as? ContractError.CapabilityMissing)?.message
+            ?: capture?.lastError()
+            ?: PhoneMicCapture.MIC_START_FAILED
+        // The page must say the microphone could not start; it must not show a listening session (spec §4.5).
+        error(code)
+        android.util.Log.i("EdithHost", "phone audio epoch could not start: ${failure.javaClass.name}: " +
+            "${failure.message} code=$code")
+        logAudioState("disarmed", "phone_mic", transport = false, loop = false,
+            generation = epoch.generation.value, reason = "START_FAILED")
+    }
+
+    /**
+     * Stops the epoch [armAudioEpoch] started, if any. Idempotent, and safe before anything was armed.
+     *
+     * The order is the reverse of the arm: the poll loop first (so it cannot read a source about to be released), then
+     * the phone capture, then the phone ingress, and finally the CXR transport, which closes its own ingress and stops
+     * the glasses' stream (Task 15c D1). A detached epoch has no transport, so that leg is simply absent.
+     */
     @Synchronized fun disarmAudioEpoch() {
         val epoch = runningAudioEpoch ?: return
         runningAudioEpoch = null
         val transport = runningAudioTransport
         runningAudioTransport = null
-        // The reverse of the arm order: stop the poll loop first, so it cannot poll an ingress the transport is about
-        // to close, then the transport, which closes the ingress and stops the glasses' stream (Task 15c D1).
+        val capture = runningPhoneCapture
+        runningPhoneCapture = null
+        val detached = runningAudioDetached
+        runningAudioDetached = false
+        // The reverse of the arm order: stop the poll loop first, so it cannot poll an ingress whose owner is about to
+        // release or close it, then the phone capture/ingress or the transport (Task 15c D1, 0.4 Task 6).
         runCatching { environment?.input?.stop(epoch) }
+        runCatching { capture?.stop() }
+        if (detached) {
+            runCatching { phoneIngress?.close() }
+            // The loop that would have drained the terminal SESSION_INTERRUPTED gap is already stopped; drain it here
+            // so the process-lifetime ingress cannot accumulate one gap per session.
+            while (runCatching { phoneIngress?.pollGap() }.getOrNull() != null) { /* terminal teardown only */ }
+        }
         runCatching { transport?.stop(epoch) }
-        P3Log.line("P3_AUDIO state=disarmed generation=${epoch.generation.value} " +
-            "transport=false loop=false reason=DISARMED")
+        logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
+            generation = epoch.generation.value, reason = "DISARMED")
     }
+
+    /**
+     * One audio transition, in both log vocabularies.
+     *
+     * `P3_AUDIO` keeps its **pre-0.4 shape** - `state`, `generation`, `transport`, `loop`, and a `reason` only on the
+     * refusal/disarm lines - because spec §7.2 says the existing line's semantics do not change. `P4_AUDIO` is the
+     * 0.4 evidence line and adds `source=phone_mic|cxr`, so a device run can attribute the frames without re-reading
+     * the detach gate. Both lines are state/counts only: never audio, never its content.
+     */
+    private fun logAudioState(
+        state: String,
+        source: String,
+        transport: Boolean,
+        loop: Boolean,
+        generation: Long,
+        reason: String,
+    ) {
+        val p3 = "P3_AUDIO state=$state generation=$generation transport=$transport loop=$loop"
+        P3Log.line(if (state == "armed") p3 else "$p3 reason=$reason")
+        P3Log.line("P4_AUDIO state=$state source=$source transport=$transport loop=$loop reason=$reason")
+    }
+
+    /** `phone_mic` or `cxr`: the `P4_AUDIO` source field, counts/state only - never audio. */
+    private fun sourceLabel(detached: Boolean): String = if (detached) "phone_mic" else "cxr"
 
     /**
      * The spec's explicit, non-wake entry point: raise `UserAction.Help` at the host's current identity (Task 15c D2).
@@ -1959,7 +2106,13 @@ class HostCompositionRoot internal constructor(
             val grant = pendingStart
             pendingStart = null
             if (redelivered || grant == null || token != grant.token || clock.nowNanos() >= grant.expires) return false
-            if (!permissionGranted) { host.stop(); error("BLUETOOTH_PERMISSION_DENIED"); return false }
+            if (!permissionGranted) {
+                host.stop()
+                // 0.4 Task 6 (`D199`): the required permission follows the mode. Detached capture needs the phone
+                // microphone; glasses mode keeps the pre-0.4 Bluetooth refusal verbatim.
+                error(startPermissionRefusal())
+                return false
+            }
             // 0.4 Task 3 / spec §6.3: the model gate comes **before** `beforeStart`, otherwise the foreground service
             // is already running for a session that cannot use the models. `beforeStart` is the caller's
             // `startForeground`; returning false here leaves the service to stop itself.
@@ -1977,13 +2130,24 @@ class HostCompositionRoot internal constructor(
             "edith.PAUSE" -> { pause(); true }
             "edith.RESUME" -> {
                 if (!foregroundActive) { error("FOREGROUND_UI_REQUIRED"); false }
-                else if (!permissionGranted) { pause(); error("BLUETOOTH_PERMISSION_DENIED"); false }
+                else if (!permissionGranted) { pause(); error(startPermissionRefusal()); false }
                 else { resume(); true }
             }
             else -> false
         }
     }
     internal fun error(code: String) { mutableState.update { it.copy(errorCode = code) } }
+
+    /**
+     * The refusal code a start/resume reports when the permission the **current mode** requires is missing.
+     *
+     * Detached mode captures the phone microphone and needs `RECORD_AUDIO`; glasses mode keeps the pre-0.4 Bluetooth
+     * code verbatim. Read at refusal time (not cached) so a mode change between sessions is reflected.
+     */
+    private fun startPermissionRefusal(): String =
+        if (detachGate.enabled.value) SessionPermissions.MIC_PERMISSION_MISSING
+        else SessionPermissions.BLUETOOTH_PERMISSION_DENIED
+
     @Synchronized override fun close() {
         if (closed) return
         stop()
@@ -2254,9 +2418,16 @@ class HostCompositionRoot internal constructor(
             // P5 (spec §S4): one PlaybackGate shared between the speech player, the wake/acoustic suppression, and
             // the ASR ingestion guard. Created before the audio chain so it can be passed to provisionAudioChain.
             val playbackGate = PlaybackGate()
+            // 0.4 Task 6 (`D199`/`D200`): the phone microphone is an alternative **source** on the existing loop, not a
+            // second chain. One ingress instance is created here and named by the chain's dynamic selector while the
+            // detach gate is on; `armAudioEpoch` opens it, the phone capture offers into it, and the same framer/
+            // pipeline/KWS consume it exactly as they consume the CXR uplink. It is only ever opened in detached mode,
+            // so a glasses session's ingress (the connection's) is untouched by its existence.
+            val phoneIngress = PcmIngress(clock)
             val audio = provisionAudioChain(
                 context = context,
-                clock = clock, scheduler = scheduler, ingress = { connection[0]?.ingress },
+                clock = clock, scheduler = scheduler,
+                ingress = { if (detachGate.enabled.value) phoneIngress else connection[0]?.ingress },
                 emit = { event -> hostHolder[0]?.onEvent(event) },
                 cancelTurn = { turnId ->
                     hostHolder[0]?.let { runtime ->
@@ -2870,6 +3041,9 @@ class HostCompositionRoot internal constructor(
                 noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
                 detachGate = detachGate,
+                // 0.4 Task 6: the same ingress the chain's selector names, and the production recorder factory.
+                phoneIngress = phoneIngress,
+                phoneMicDeviceFactory = { PhoneMicDevice() },
                 playbackGate = playbackGate,
                 modelReadiness = readiness,
             )
@@ -3341,6 +3515,9 @@ internal class CxrAudioChain private constructor(
     private val lock = Any()
     private var loop: AudioIngressLoop? = null
 
+    /** The ingress [loop] was built on. The selector is dynamic (0.4 Task 6), so identity decides a stale cache. */
+    private var loopIngress: PcmIngress? = null
+
     /** Outcomes observed before the first loop existed; drained into it as it is built. */
     private val pendingFaults = ArrayDeque<String>()
     private val pendingOffers = ArrayDeque<PcmOffer>()
@@ -3349,11 +3526,29 @@ internal class CxrAudioChain private constructor(
      * The host-facing input port; the host starts it for an epoch exactly as it starts any other input.
      *
      * `stop` reads the loop through the lock rather than resolving one, so stopping cannot create a loop that
-     * was never started.
+     * was never started. It also **drops the cache** for the epoch being stopped: the ingress selector is dynamic
+     * (0.4 Task 6 - detached mode selects the phone source), so a session boundary is exactly when the next start has
+     * to be free to build a loop against whatever source the mode then names. Without this, the first session's loop
+     * would keep polling the previous source for the next session too, which on a device looks like "the source
+     * changed but nobody hears anything". A stop naming some other epoch leaves the cache alone, so a late/stale stop
+     * cannot unhook a live loop.
      */
     val input: InputPort = object : InputPort {
         override fun start(epoch: InputEpoch) { resolved()?.start(epoch) }
-        override fun stop(epoch: InputEpoch) { synchronized(lock) { loop }?.stop(epoch) }
+        override fun stop(epoch: InputEpoch) {
+            // Outcomes buffered while there was no loop stay buffered: they belong to the receiver's ingress, and the
+            // next loop drains them (the buffer is only ever used before the first ingress exists).
+            val stopped = synchronized(lock) {
+                val current = loop
+                val drop = current == null || current.activeEpoch == null || current.activeEpoch == epoch
+                if (drop) {
+                    loop = null
+                    loopIngress = null
+                }
+                current
+            }
+            stopped?.stop(epoch)
+        }
     }
 
     /**
@@ -3374,21 +3569,40 @@ internal class CxrAudioChain private constructor(
     }
 
     /**
-     * The loop for the current ingress, built at most once, with any outcome that arrived before it drained
-     * into it.
+     * The loop for the current ingress, with any outcome that arrived before it drained into it.
      *
      * The `offer`/`fault` arguments are handled here rather than by the callers so that "is there a loop" and
      * "buffer this" are one atomic decision: a caller that checked and then buffered could interleave with the
      * call that builds the loop and drains the buffer, losing the outcome for good. Buffering only ever happens
      * before the first ingress exists (the CXR connection is built lazily), and the next call - a later offer,
      * or `start` - drains it.
+     *
+     * **The cache is per ingress, not per chain (0.4 Task 6).** The selector is dynamic: detached mode names the
+     * phone ingress, glasses mode the connection's. A loop built for one source must never poll the other, so a
+     * cached loop whose ingress is not the currently selected one is dropped (and stopped if it was somehow still
+     * running) and a new one is built. This is the second half of the same rule as [input.stop]'s cache drop: the
+     * session boundary usually avoids the mismatch, and this identity check makes a mode change correct even if some
+     * later offer or fault raced the boundary.
      */
     private fun resolved(offer: PcmOffer? = null, fault: String? = null): AudioIngressLoop? =
         synchronized(lock) {
-            val current = loop ?: ingress()?.let { source ->
-                AudioIngressLoop(source, framer, pipeline, wake?.detector, scheduler, clock,
+            val source = ingress()
+            var current = loop
+            if (current != null && loopIngress !== source) {
+                // The selected source changed. A mode change is only legal under a stopped session (D199), so this
+                // loop belongs to a session that has already ended; stopping it defensively would be a second stop if
+                // the epoch still ran, and the loop's own stop is idempotent.
+                val stale = current
+                stale.activeEpoch?.let { epoch -> runCatching { stale.stop(epoch) } }
+                current = null
+                loop = null
+                loopIngress = null
+            }
+            if (current == null && source != null) {
+                current = AudioIngressLoop(source, framer, pipeline, wake?.detector, scheduler, clock,
                     onFault = faultSink).also { built ->
                     loop = built
+                    loopIngress = source
                     while (pendingOffers.isNotEmpty()) built.onOffer(pendingOffers.removeFirst())
                     while (pendingFaults.isNotEmpty()) built.reportFault(pendingFaults.removeFirst())
                 }

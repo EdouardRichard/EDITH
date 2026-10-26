@@ -8,6 +8,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.NoInterceptionUi
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SmartSettingsForm
 import com.sheen.rokid.phone.session.SessionService
+import com.sheen.rokid.phone.session.SessionPermissions
 import com.sheen.rokid.phone.session.SessionViewModel
 import com.sheen.rokid.phone.lock.LockPinValidator
 
@@ -68,11 +69,30 @@ class MainActivity : ComponentActivity() {
      */
     private var attachedRoot: HostCompositionRoot? = null
     private var pendingPlugin: String? = null
+
+    /**
+     * 0.4 Task 6 (`D199`): whether the start being permission-gated was a detached one.
+     *
+     * The permission result arrives after the dialog, when the gate may in principle have changed; the mode that
+     * **asked** is the one whose grant must be checked, so it is remembered with the pending start rather than
+     * re-derived from a possibly newer gate.
+     */
+    private var pendingDetached = false
+
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         val selected = pendingPlugin
+        val detached = pendingDetached
         pendingPlugin = null
-        if (!SessionService.bluetoothGranted(this)) attachedRoot?.error("BLUETOOTH_PERMISSION_DENIED")
-        else if (selected != null && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
+        pendingDetached = false
+        // The mode decides **which** permission can refuse the start, and the refusal is the same code the service
+        // and composition would produce, so the visible reason cannot disagree with the gate.
+        val refusal = SessionPermissions.startRefusal(detached, Build.VERSION.SDK_INT) { permission ->
+            ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+        }
+        if (refusal != null) {
+            attachedRoot?.error(refusal)
+        } else if (selected != null && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
+            // Only now, after the grant, may a foreground service be started (spec §4.5).
             SessionService.startFromUi(this, selected)
         }
     }
@@ -223,12 +243,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestStart(pluginId: String) {
-        val requested = buildList {
-            if (Build.VERSION.SDK_INT >= 31) { add(Manifest.permission.BLUETOOTH_CONNECT); add(Manifest.permission.BLUETOOTH_SCAN) }
-            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
-        }.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        // 0.4 Task 6 (`D199`/spec §4.2): the **mode** chooses the requested permissions. Detached mode asks for the
+        // phone microphone and deliberately not Bluetooth; glasses mode keeps the existing Bluetooth request. The
+        // dialog is only skipped when nothing is missing, so a foreground service is never started before the result.
+        val detached = attachedRoot?.detachGate?.enabled?.value == true
+        val requested = SessionPermissions.requiredForStart(detached, Build.VERSION.SDK_INT)
+            .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
         if (requested.isEmpty()) SessionService.startFromUi(this, pluginId)
-        else { pendingPlugin = pluginId; permissions.launch(requested.toTypedArray()) }
+        else { pendingPlugin = pluginId; pendingDetached = detached; permissions.launch(requested.toTypedArray()) }
     }
 
     /**
@@ -702,6 +724,12 @@ internal fun capabilityLabel(capability: Capability) = when (capability) {
 }
 internal fun errorLabel(code: String) = when (code) {
     "BLUETOOTH_PERMISSION_DENIED" -> "蓝牙权限未获授权"
+    // 0.4 Task 6 (`D199`): the detached session's microphone gate and start failures are their own visible reasons -
+    // a user whose phone refuses the microphone must not read "会话异常".
+    "MIC_PERMISSION_MISSING" -> "麦克风权限未获授权"
+    "MIC_UNAVAILABLE" -> "麦克风不可用（可能被其他应用占用）"
+    "MIC_START_FAILED" -> "麦克风未能开始采音"
+    "MIC_FORMAT_UNSUPPORTED" -> "麦克风音频格式不受支持"
     "CAPABILITY_MISSING" -> "会话所需服务尚不可用"
     "PROFILE_MODEL_NOT_MULTIMODAL" -> "该模型档案不支持图片输入；请更换支持图片的模型/档案（本版要求 IMAGE+TEXT）"
     "FOREGROUND_START_DENIED", "FOREGROUND_UI_REQUIRED" -> "会话未能启动"
