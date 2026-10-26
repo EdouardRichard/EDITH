@@ -953,7 +953,10 @@ class HostCompositionRoot internal constructor(
         // combination's composition, so a cold start could reach `BuildingScene` and never even *attempt* a CXR
         // connection - and the ears, gated on `linkReady`, then never armed. This only adjusts **when we call** the
         // vendor transport; the call shape is unchanged (official demo).
-        ensureCxrLink()
+        // 0.4 Task 7 (`D199`, spec §4.3): detached mode is strictly local - the start must not build, connect or ask
+        // for a CXR transport, and a `P3_CXR` line would describe a link this session does not use. The session and
+        // the local readiness below (`maybeMarkSceneReady`) are the whole detached start.
+        if (!detachGate.enabled.value) ensureCxrLink()
         // A new session re-arms the clock exchange (`sessionEstablished` drops the old mapping), so the next live
         // mapping is a fresh one and must be retried against even if it somehow carried the previous identifier.
         retriedMappingSyncId = null
@@ -1144,6 +1147,10 @@ class HostCompositionRoot internal constructor(
     }
     @Synchronized fun onSceneReady() {
         if (closed) return
+        // 0.4 Task 7 (`D199`, spec §4.1 race): a detached session is **locally** ready (`maybeMarkSceneReady`), and
+        // the glasses are not part of it. A late transport callback must neither introduce a session to `hintLink`
+        // nor claim a link the composition never uses - and it must not touch the running session at all.
+        if (detachGate.enabled.value) return
         // Remembered rather than only acted on: readiness can arrive before a session is started, and the signal is
         // delivered exactly once by the transport.
         linkReady = true
@@ -1717,7 +1724,11 @@ class HostCompositionRoot internal constructor(
      * handshake. Returns whether the request was accepted for delivery (the panel may open asynchronously after an
      * `appStart`); the 10 s timer still waits for [onPanelShown].
      */
-    internal fun requestPanelOpen(route: AssistantRoute): Boolean = hintLink?.requestPanelOpen(route) ?: false
+    internal fun requestPanelOpen(route: AssistantRoute): Boolean =
+        // 0.4 Task 7 (`D201`, spec §4.3): detached mode has no glasses panel and must not fabricate a `PANEL_SHOWN` -
+        // the phone's conversation tab is the visible surface, and the cycle's visibility comes from `SmartWiring`
+        // instead. Refused before the link so no command and no `appStart` can leave the phone.
+        if (detachGate.enabled.value) false else hintLink?.requestPanelOpen(route) ?: false
 
     /**
      * One wake detector emission, as `create` delivers it (0.24 S5 final review Important #1).
@@ -1735,7 +1746,10 @@ class HostCompositionRoot internal constructor(
             // 0.24 S5 final review Important #1: a live identity is necessary but not sufficient. The plugin can still
             // refuse the wake (scene cooldown), and no turn is then installed, so the panel would have nothing to
             // close it. Ask the plugin's own admission before asking for the window.
-            if (pluginAdmitsWake()) requestPanelOpen(AssistantRoute.WAKE)
+            //
+            // 0.4 Task 7 (`D201`): detached mode has no glasses panel to open, so it asks for none - but the wake
+            // event and its chime still happen exactly as before (the phone's conversation tab is the display).
+            if (!detachGate.enabled.value && pluginAdmitsWake()) requestPanelOpen(AssistantRoute.WAKE)
         }
         emitWakeDetected(host, clock, word, confidence)
     }
@@ -1796,7 +1810,21 @@ class HostCompositionRoot internal constructor(
      * the hint link. Order matters: `HELLO` and the clock exchange must precede any hint the plugins can produce.
      */
     @Synchronized private fun maybeMarkSceneReady() {
-        if (closed || !linkReady || host.currentState != SessionState.BuildingScene) return
+        if (closed || host.currentState != SessionState.BuildingScene) return
+        // 0.4 Task 7 (`D199`/`D201`, spec §4.3): detached mode's scene is **locally** ready. There is no CXR link to
+        // wait for and no `HELLO`/clock exchange to establish, so `hintLink.sessionEstablished` is deliberately
+        // skipped - introducing this session to a glasses link would fabricate a session the wearer never asked for.
+        // The rest is the same activation path the attached branch below takes (the host's identity/generation gates
+        // included), so identity and activation are not bypassed in detached mode.
+        if (detachGate.enabled.value) {
+            host.markSceneReady()
+            runCatching { activateSelected() }.onFailure {
+                host.pause()
+                error("CAPABILITY_MISSING")
+            }
+            return
+        }
+        if (!linkReady) return
         host.markSceneReady()
         activeSessionId?.let { session -> hintLink?.sessionEstablished(session, host.currentGeneration.value) }
         // This runs on the transport's callback thread, so a failure while activating (unavailable storage, a refused
@@ -1830,6 +1858,10 @@ class HostCompositionRoot internal constructor(
      *   Activity to build it with).
      */
     @Synchronized internal fun ensureCxrLink(): Boolean {
+        // 0.4 Task 7 (`D199`, spec §4.3): detached mode never touches the vendor transport - not even one attempt
+        // line, because the line would describe a link the session does not use. Refused before the factory so no
+        // connection object (and no SDK session) can be built for a strictly-local session.
+        if (detachGate.enabled.value) return false
         // "This build has no CXR transport" is the more fundamental fact and wins the line: with no assembly, a missing
         // Activity is not the reason nothing can connect, and reporting it would hide the real gap (the very confusion
         // F17/F18 produced).
@@ -1876,6 +1908,10 @@ class HostCompositionRoot internal constructor(
      * connected, and reconnect if it is not" without a second button.
      */
     @Synchronized fun connectCxr(activity: Any): Boolean {
+        // 0.4 Task 7 (`D199`): detached mode is strictly local. An explicit connect request is refused before the
+        // Activity is remembered or a factory is called, so no vendor object and no `P3_CXR connect` line can appear
+        // for a session that does not use the glasses.
+        if (detachGate.enabled.value) return false
         pendingActivity = java.lang.ref.WeakReference(activity)
         // A new attempt invalidates the previous answer (review I-2): a cancelled prompt must not sit on the page next
         // to a link that came up afterwards, and `null` is what the render treats as "the SDK has not asked".
@@ -1910,7 +1946,11 @@ class HostCompositionRoot internal constructor(
      * so a strong Activity reference here would leak it.
      */
     @Synchronized fun attachCxrActivity(activity: Any) {
+        // Remembered even while detached: the Activity is what a later switch back to glasses mode needs, and
+        // `MainActivity.onCreate` is the only place it is offered. Remembering a weak reference is not a vendor call;
+        // 0.4 Task 7 (`D199`) only forbids **connecting** one, which is what the guard below skips.
         pendingActivity = java.lang.ref.WeakReference(activity)
+        if (detachGate.enabled.value) return
         if (!linkBuilt) ensureCxrLink()
     }
 
@@ -2213,6 +2253,23 @@ class HostCompositionRoot internal constructor(
     companion object {
         /** The debug-only diagnostic text plugin's id; its configuration shape is not the smart plugin's. */
         private const val DIAGNOSTIC_PLUGIN_ID = "p2-diagnostic"
+
+        /**
+         * 0.4 Task 7 (`D201`, spec §4.3): which display the host advertises, read per call.
+         *
+         * Detached mode has no CXR mapping, so `hintLink.liveOutput()` is null and advertising `TextOutput` from it
+         * would refuse every answer with "display missing". The phone's conversation tab **is** the display in that
+         * mode, so its ack-only [PhoneHintDevice] is offered instead; attached mode keeps the glasses link's live
+         * output exactly as before. A per-call read, because the detach gate can change between sessions and the
+         * environment derives [CxrHostEnvironment.availableCapabilities] from this lambda.
+         *
+         * One expression for `create` and the JVM rigs, so the shipped choice is what the tests drive.
+         */
+        internal fun hostLiveOutput(
+            detached: () -> Boolean,
+            phone: HintDevice,
+            glasses: () -> HintDevice?,
+        ): () -> HintDevice? = { if (detached()) phone else glasses() }
 
         fun create(
             context: Context,
@@ -2546,7 +2603,13 @@ class HostCompositionRoot internal constructor(
             val speechPlayerHolder = java.util.concurrent.atomic.AtomicReference<com.sheen.rokid.plugin.SpeechPlayer?>(null)
             val smartWiring = SmartWiring(smartSettings, profiles, clock, scheduler, { sessionId, generation, turnId ->
                 hostHolder[0]?.cancelOutputTurn(sessionId, generation, turnId)
-            }, isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false },
+            }, isPanelVisible = SmartWiring.cyclePanelVisible(
+                // 0.4 Task 7 (`D201`, spec §4.3): the phone's conversation tab is always the visible surface while
+                // detached, so the cycle starts its window at once instead of waiting for a `PANEL_SHOWN` that only
+                // the glasses can send. Glasses mode keeps the link's own live answer, unchanged.
+                detached = { detachGate.enabled.value },
+                glassesVisible = { rootHolder[0]?.isPanelVisible() == true },
+            ),
                 requestPanelOpen = { route -> rootHolder[0]?.requestPanelOpen(route) ?: false },
                 speechAvailable = { speechPlayerHolder.get() != null },
                 // 0.3 Phase 4B (`D189`): the gate's **provider**, not its current value. `saveSmartSettings` updates
@@ -2981,8 +3044,20 @@ class HostCompositionRoot internal constructor(
                 sendSaid = { route, entryId, text -> hintLink.userSaid(route, entryId, text) },
                 sendBusy = { route, busy -> hintLink.busy(route, busy) },
             )
+            // 0.4 Task 7 (`D201`, spec §4.3): the detached display. One instance for the life of the composition, so a
+            // session rebuilt while detached gets the same surface, and the phone tab's record is the one it reads
+            // (the device never writes it - the plugin's `publishAssistantFinal` owns the answer row).
+            val phoneHintDevice = PhoneHintDevice(conversationLog)
             val environment = CxrHostEnvironment(clock = clock, input = audio?.input ?: UnwiredInputPort,
-                liveOutput = hintLink::liveOutput, scheduler = scheduler, speech = speechPlayer,
+                // Detached mode has no CXR mapping, so the glasses link can never be "live"; the phone display is
+                // what keeps `Capability.TextOutput` advertised for the assistant. Glasses mode is the link's own
+                // live output, exactly as before.
+                liveOutput = hostLiveOutput(
+                    detached = { detachGate.enabled.value },
+                    phone = phoneHintDevice,
+                    glasses = hintLink::liveOutput,
+                ),
+                scheduler = scheduler, speech = speechPlayer,
                 providers = buildMap {
                     put(Capability.Model, model)
                     audio?.let { put(Capability.Asr, it.asrSession) }
