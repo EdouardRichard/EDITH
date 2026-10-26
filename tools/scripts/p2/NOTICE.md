@@ -4,7 +4,7 @@ Candidate runtime: sherpa-onnx 1.13.8, SHA256 `633C24321E06B1FE79FEAFA03EA16CBC0
 
 ## Models bundled in the 0.4 phone APK
 
-The 0.4 phone APK is not a model-free shell. It bundles four on-device model sets: ASR under `assets/models/asr/`, Laya under `assets/models/laya/`, EmbeddingGemma under `assets/models/embeddinggemma/`, and KWS under `assets/kws/`. `tools/scripts/p2/model-bundles.json` is the pinned manifest (bundleId `f06c6a5beaa21ed39dd5ed189e77bc3b078796d53a74436ce549693127455565`); it records each file's group, role, bytes, SHA-256, upstream source/revision pointer and license pointer. The APK also ships `assets/models/models-manifest.json` for the bundled subset and copies the retained texts into `assets/models/licenses/`. The model binaries themselves are not committed to this repository.
+The 0.4 phone APK is not a model-free shell. It bundles four on-device model sets: ASR under `assets/models/asr/`, Laya under `assets/models/laya/`, EmbeddingGemma under `assets/models/embeddinggemma/`, and KWS under `assets/kws/`. `tools/scripts/p2/model-bundles.json` is the pinned manifest (bundleId `f06c6a5beaa21ed39dd5ed189e77bc3b078796d53a74436ce549693127455565`; the build recomputes it from the 21 entries and refuses a mismatch); it records each file's group, role, bytes, SHA-256, upstream source/revision pointer and license pointer. The APK also ships `assets/models/models-manifest.json` for the bundled subset and copies the fifteen retained license/declaration texts into `assets/models/licenses/`. The model binaries themselves are not committed to this repository.
 
 | Set | Bundled contents and source | Revision / license evidence |
 | --- | --- | --- |

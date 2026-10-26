@@ -22,9 +22,16 @@ import java.util.UUID
  *    SHA-256 before it is renamed into place, then write a receipt naming the bundle.
  * 3. **EmbeddingGemma** - the same copy + receipt into [embeddingDirectory].
  *
- * The receipt makes the normal start cheap: when it names the manifest's `bundleId` and every target still has the
- * declared size, nothing is read. No whole-bundle re-hash runs on that path (spec §6.4); a changed APK changes the
- * `bundleId`, which forces one fresh copy.
+ * The receipt makes the normal start cheap: when it names the manifest's `bundleId` and records the same
+ * [BundledModelsManifest.manifestDigest] (a digest over every emitted file's path and SHA-256), and every target still
+ * has the declared size, nothing is read. No whole-bundle re-hash runs on that path (spec §6.4). A changed manifest
+ * changes the digest even if its id were not bumped, so an APK update always forces one fresh copy.
+ *
+ * **Migration from the pre-digest receipt.** Builds before this fix wrote the bundle id alone. Such a receipt passes
+ * the id check but cannot prove the files match, so the first start after upgrading treats it as stale, copies once,
+ * and rewrites the receipt with both values. Existing installs therefore keep working without manual action; they pay
+ * one materialization pass (the ~863 MiB Laya/Embedding copy) on the first launch after the update, documented in the
+ * 0.4 bundled-model evidence/report.
  *
  * Failures are mapped to a stable reason and never leave a half-written file behind: a source failure while copying
  * is detected while the target is still a temp file, so the old runtime files and the old receipt stay untouched.
@@ -55,6 +62,9 @@ class BundledModelProvisioner(
     /** The last bundle this instance materialized in this process; lets the defense-in-depth calls stay cheap. */
     @Volatile
     private var lastReadyBundleId: String? = null
+
+    /** The digest recorded beside the id in every receipt; see [BundledModelsManifest.manifestDigest]. */
+    private val manifestDigest: String = modelsManifest.manifestDigest()
 
     /**
      * Materializes everything needed for a session and returns the resulting state.
@@ -252,7 +262,8 @@ class BundledModelProvisioner(
         val target = File(directory, RECEIPT_FILE_NAME)
         val temp = File(directory, ".$RECEIPT_FILE_NAME.${UUID.randomUUID()}.tmp")
         try {
-            temp.writeText(modelsManifest.bundleId, Charsets.UTF_8)
+            // Two lines: the bundle id and the digest over the emitted file paths/SHA-256 values.
+            temp.writeText("${modelsManifest.bundleId}\n$manifestDigest\n", Charsets.UTF_8)
             Files.move(temp.toPath(), target.toPath(), REPLACE_EXISTING, ATOMIC_MOVE)
         } finally {
             temp.delete()
@@ -260,7 +271,10 @@ class BundledModelProvisioner(
     }
 
     private fun receiptMatches(directory: File): Boolean = runCatching {
-        File(directory, RECEIPT_FILE_NAME).readText().trim() == modelsManifest.bundleId
+        val lines = File(directory, RECEIPT_FILE_NAME).readText()
+            .lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+        // A pre-fix receipt holds only the id and is intentionally not accepted: it cannot prove the file digests.
+        lines == listOf(modelsManifest.bundleId, manifestDigest)
     }.getOrDefault(false)
 
     private fun targetMatches(directory: File, file: BundledModelFile): Boolean {
@@ -334,7 +348,7 @@ class BundledModelProvisioner(
     private enum class Stage(val logName: String) { ASR("asr"), LAYA("laya"), EMBEDDING("embedding") }
 
     companion object {
-        /** The receipt file's name inside each materialized directory; its content is the manifest's bundle id. */
+        /** The receipt file's name inside each materialized directory; it holds the bundle id then the digest. */
         const val RECEIPT_FILE_NAME = ".edith-model-bundle"
 
         const val MODELS_NO_SPACE = "MODELS_NO_SPACE"

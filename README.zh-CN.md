@@ -213,10 +213,11 @@ flowchart LR
 ### 模型内置与准备（0.4）
 
 四组模型随 APK 以 `assets/models/**` 与 `assets/kws/**` 分发，许可证/声明文本在
-`assets/models/licenses/`。首次启动（以及 APK 更新后 bundle id/文件摘要变化时），App 在允许
-会话开始前校验并准备模型：ASR 导入现有引擎 store，Laya 与 EmbeddingGemma 复制并写入 bundle
-receipt；后续启动命中 receipt 即跳过复制。会话启动被 `PREPARING`/`READY`/`FAILED` 状态门禁，
-半准备或缺失的 bundle 不能启动会话；空间不足等失败会明确显示并可重试。运行时读取路径不变。
+`assets/models/licenses/`。首次启动（以及 APK 更新后 bundle id 变化时——构建从每个固定文件摘要
+派生该 id），App 在允许会话开始前校验并准备模型：ASR 导入现有引擎 store，Laya 与
+EmbeddingGemma 复制并写入 bundle receipt；后续启动命中 receipt 即跳过复制。会话启动被
+`PREPARING`/`READY`/`FAILED` 状态门禁，半准备或缺失的 bundle 不能启动会话；空间不足等失败会
+明确显示并可重试。运行时读取路径不变。
 尺寸、耗时与开发/CI 开关见[模型文件](#2-模型文件已内置)。
 
 ## 项目结构
@@ -282,7 +283,8 @@ K40 上，首次准备约 **12.8 s**，之后冷启动复用已有副本约 **0.
 | 记忆向量模型 | EmbeddingGemma 300M `.tflite` + SentencePiece 词表 | 手机外部目录 `Android/data/com.sheen.rokid.phone/files/models/embeddinggemma/`（内部回退） |
 
 构建期会逐个校验文件 bytes/SHA-256 必须与 `tools/scripts/p2/model-bundles.json` 一致，缺失或不
-一致会构建失败。许可证/声明文本随包放在 `assets/models/licenses/`。首次启动以及 APK 更新后
+一致会构建失败；同时从固定条目派生 bundle id，声明值不匹配即失败，因此文件摘要变化必然改变
+receipt。15 份许可证/声明文本随包放在 `assets/models/licenses/`。首次启动以及 APK 更新后
 bundle 变化时，App 会重新校验并准备 asset；bundle 未变化时复用已有副本。
 
 **开发构建**

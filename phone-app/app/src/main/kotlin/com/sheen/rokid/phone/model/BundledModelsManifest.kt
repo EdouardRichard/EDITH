@@ -46,21 +46,41 @@ data class BundledModelFile(
 /**
  * The manifest the 0.4 build writes to `assets/models/models-manifest.json`.
  *
- * **`bundleId` is opaque and must stay that way.** The build's id is the canonical digest over all 21 entries of
- * `tools/scripts/p2/model-bundles.json`, while the manifest lists the 15 files the APK actually emits (KWS ships
- * under `assets/kws/` and is not part of this list). Recomputing the id from [files] would therefore disagree with
- * the value the build declared and with the receipts that record it, so [parse] returns the declared string
- * untouched.
+ * **`bundleId` is opaque at runtime and must stay that way.** The build verifies it as the canonical digest over
+ * all 21 entries of `tools/scripts/p2/model-bundles.json` (KWS included) and refuses a manifest whose declared id
+ * is not that digest, so a changed path or file digest cannot silently keep the old id. The manifest lists the 15
+ * files the APK actually emits (KWS ships under `assets/kws/` and is not part of this list); recomputing the id
+ * from [files] would therefore disagree with the value the build declared and with the receipts that record it, so
+ * [parse] returns the declared string untouched.
  *
  * [verify] is the runtime gate: it fails when a declared file is missing, larger/smaller than declared, or hashes
  * differently. Every refusal names the offending [BundledModelFile.path]. It deliberately does not require
  * [files] to be a complete set - a manifest is only ever checked against what the same build wrote.
+ *
+ * [manifestDigest] is the receipt-side digest over exactly these 15 emitted entries. It exists because receipts
+ * written by older builds contain only the id; recording this digest as well means a file-digest change forces a
+ * re-materialization even before the next build's id check (and gives the migration a one-copy upgrade path).
  */
 data class BundledModelsManifest(val bundleId: String, val files: List<BundledModelFile>) {
 
     /** Verifies every declared file against [source]; throws [IllegalArgumentException] naming the first refusal. */
     fun verify(source: ModelAssetSource) {
         files.forEach { file -> verifyFile(source, file) }
+    }
+
+    /**
+     * SHA-256 over [files], canonicalised as `group/path:sha256` lines sorted by path and joined with `\n`.
+     *
+     * The Laya/Embedding receipt records this value next to [bundleId]; a changed file digest therefore changes
+     * the receipt even if a build ever failed to update its id, and [BundledModelProvisioner] copies again.
+     */
+    fun manifestDigest(): String {
+        val canonical = files
+            .map { "${it.group}/${it.path}:${it.sha256.lowercase()}" }
+            .sorted()
+            .joinToString("\n")
+        return MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it.toInt() and 255) }
     }
 
     private fun verifyFile(source: ModelAssetSource, file: BundledModelFile) {

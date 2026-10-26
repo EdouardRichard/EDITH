@@ -92,6 +92,38 @@ class BundledModelsManifestTest {
     }
 
     @Test
+    fun theManifestDigestCoversEveryEmittedFileAndIsStableAcrossEntryOrder() {
+        val files = entries().map { BundledModelFile(it.group, it.role, it.path, it.bytes, it.sha256) }
+        val first = BundledModelsManifest("any-id", files)
+        val reordered = BundledModelsManifest("any-id", files.reversed())
+
+        assertEquals("the receipt digest must not depend on manifest array order",
+            first.manifestDigest(), reordered.manifestDigest())
+        assertEquals(64, first.manifestDigest().length)
+    }
+
+    @Test
+    fun changingAFileDigestChangesTheManifestDigestEvenWithTheSameBundleId() {
+        val original = BundledModelsManifest(
+            "unchanged-id",
+            entries().map { BundledModelFile(it.group, it.role, it.path, it.bytes, it.sha256) },
+        )
+        val changed = BundledModelsManifest(
+            "unchanged-id",
+            entries().map {
+                if (it.path == "laya/graph.tflite") {
+                    BundledModelFile(it.group, it.role, it.path, it.bytes, sha256("different bytes".toByteArray()))
+                } else {
+                    BundledModelFile(it.group, it.role, it.path, it.bytes, it.sha256)
+                }
+            },
+        )
+
+        assertTrue("a changed file digest must invalidate the receipt digest",
+            original.manifestDigest() != changed.manifestDigest())
+    }
+
+    @Test
     fun aMissingAssetIsRefusedAndThePathIsNamed() {
         val manifest = BundledModelsManifest.parse(manifestJson())
         val missing = "laya/graph.tflite"

@@ -236,13 +236,13 @@ neither path changes the existing wake route or its listening windows.
 
 The four model sets are packaged as `assets/models/**` and `assets/kws/**`, with the
 license/declaration texts under `assets/models/licenses/`. On first launch — and after an APK update
-whose bundle id or file digest differs — the app verifies and materializes them before a session may
-start: ASR is imported into the existing engine store, while Laya and EmbeddingGemma are copied
-with a bundle receipt. A matching receipt skips the copy on later launches. Session start is gated
-on a `PREPARING`/`READY`/`FAILED` state, so a partial or missing bundle cannot start a session;
-failures such as insufficient free space are explicit and retryable. The runtime read paths are
-unchanged. See [Model files](#2-model-files-bundled) for sizes, timings and the development/CI
-switch.
+whose bundle id differs (the build derives it from every pinned file digest) — the app verifies and
+materializes them before a session may start: ASR is imported into the existing engine store, while
+Laya and EmbeddingGemma are copied with a bundle receipt. A matching receipt skips the copy on later
+launches. Session start is gated on a `PREPARING`/`READY`/`FAILED` state, so a partial or missing
+bundle cannot start a session; failures such as insufficient free space are explicit and retryable.
+The runtime read paths are unchanged. See [Model files](#2-model-files-bundled) for sizes, timings
+and the development/CI switch.
 
 ## Project structure
 
@@ -311,10 +311,11 @@ preparing-local-models state and refuses to start a session rather than running 
 | Memory embedding | EmbeddingGemma 300M `.tflite` + SentencePiece vocabulary | Phone external files `Android/data/com.sheen.rokid.phone/files/models/embeddinggemma/` (internal fallback) |
 
 The build verifies every file's bytes and SHA-256 against `tools/scripts/p2/model-bundles.json`; a
-missing or mismatched file fails the build instead of shipping an incomplete bundle. The license and
-declaration texts ship under `assets/models/licenses/`. On first launch and each APK update that
-changes the bundle, the app verifies and materializes the assets again; an unchanged bundle is
-reused.
+missing or mismatched file fails the build instead of shipping an incomplete bundle. It also derives
+the bundle id from the pinned entries and refuses a manifest whose id does not match, so a changed
+file digest always changes the receipt. The license and declaration texts (15 texts) ship under
+`assets/models/licenses/`. On first launch and each APK update that changes the bundle, the app
+verifies and materializes the assets again; an unchanged bundle is reused.
 
 **Development builds.** The model binaries are not committed. To build a complete APK, stage them
 and point `-PbundledModelsDir` at the staging directory:

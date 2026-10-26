@@ -238,6 +238,20 @@ private fun resolveBundledSource(
     return root.resolve(relative)
 }
 
+/**
+ * The canonical 0.4 bundle id: SHA-256 over `group/path:sha256` for every entry, sorted by path and joined with
+ * `\n` (no trailing newline). The committed manifest reproduces `f06c6a5b...5565`; a deliberate model/path change
+ * must update `bundleId` to the newly derived value so Laya/Embedding receipts stop matching and re-materialize.
+ */
+private fun canonicalBundleId(specs: List<BundledModelSpec>): String {
+    val canonical = specs
+        .map { "${it.group}/${it.path}:${it.sha256}" }
+        .sorted()
+        .joinToString("\n")
+    val digest = MessageDigest.getInstance("SHA-256").digest(canonical.toByteArray(Charsets.UTF_8))
+    return digest.joinToString("") { "%02x".format(it.toInt() and 255) }
+}
+
 private fun readBundledModelSpecs(
     manifest: File,
     repositoryRoot: File,
@@ -299,6 +313,16 @@ private fun readBundledModelSpecs(
             "bundled model manifest has duplicate entries: ${duplicates.sorted()}: ${manifest.absolutePath}",
         )
     }
+    // The id is not just a label: Laya/Embedding receipts record it, and a digest-only file change must not reuse
+    // the same id. Verify the pinned value against the canonical digest so a stale id fails the build.
+    val derivedBundleId = canonicalBundleId(specs)
+    if (derivedBundleId != bundleId) {
+        throw GradleException(
+            "bundled model manifest bundleId does not match its ${specs.size} entries: declared=$bundleId, " +
+                "derived=$derivedBundleId. The id must change whenever a pinned path or SHA-256 changes, so " +
+                "Laya/Embedding receipts re-materialize; restore the entry or set bundleId to the derived value.",
+        )
+    }
     return bundleId to specs
 }
 
@@ -339,8 +363,11 @@ val bundledModelsDir: File = providers.gradleProperty("bundledModelsDir")
     .map { rootProject.file(it) }
     .getOrElse(rootProject.layout.projectDirectory.dir(".local/0.4-models").asFile)
 
-val bundledModelsManifest: File =
-    rootProject.layout.projectDirectory.file("tools/scripts/p2/model-bundles.json").asFile
+val bundledModelsManifest: File = providers.gradleProperty("bundledModelsManifest")
+    .map { rootProject.file(it) }
+    .getOrElse(
+        rootProject.layout.projectDirectory.file("tools/scripts/p2/model-bundles.json").asFile,
+    )
 
 val (bundledBundleId, bundledModelFiles) = readBundledModelSpecs(
     manifest = bundledModelsManifest,
@@ -353,21 +380,28 @@ val bundledLicenseFiles = readBundledLicenseSpecs(
     repositoryRoot = rootProject.layout.projectDirectory.asFile,
 )
 
-// Declaration files that are not model-binary licenses but that the 0.4 spec requires to ship
-// (Laya NOTICE reference text, Laya/KWS source-and-license declarations).
-val bundledDeclarationFiles = listOf(
-    BundledLicenseSpec(
-        file = "laya-model-card.md",
-        source = rootProject.file("tools/scripts/p2/licenses/laya-model-card.md"),
-    ),
-    BundledLicenseSpec(
-        file = "kws-model-card.md",
-        source = rootProject.file("tools/scripts/p2/licenses/kws-model-card.md"),
-    ),
-    BundledLicenseSpec(
-        file = "laya-sample-NOTICE.txt",
-        source = rootProject.file("phone-app/app/src/main/kotlin/com/laya/LICENSES/laya-sample-NOTICE.txt"),
-    ),
+/**
+ * Every text that must be packaged under `assets/models/licenses/` (spec §6.5): the ten Task 1 texts plus the five
+ * ASR/VAD/speaker declarations that had been retained in `tools/scripts/p2/licenses/` but never copied into the APK.
+ * The set is fail-closed: dropping or adding a manifest entry fails [BundleModelAssets] and
+ * [verifyBundledModelManifest] until this contract is updated.
+ */
+val requiredBundledLicenseFiles = setOf(
+    "3D-Speaker-current-project-Apache-2.0.txt",
+    "Apache-2.0-standard.txt",
+    "asr-model-card.md",
+    "asr-upstream-model-card.md",
+    "gemma-prohibited-use-policy.txt",
+    "gemma-terms-of-use.txt",
+    "kws-model-card.md",
+    "laya-model-card.md",
+    "laya-sample-NOTICE.txt",
+    "onnxruntime-v1.28.2-MIT.txt",
+    "onnxruntime-v1.28.2-ThirdPartyNotices.txt",
+    "sherpa-v1.13.8-Apache-2.0.txt",
+    "silero-v5-MIT.txt",
+    "silero-v5-model-card.md",
+    "speaker-v1.0.1-model-card.md",
 )
 
 // The audio module generates `assets/kws/**`. A complete app build must not silently package none when the
@@ -383,6 +417,9 @@ abstract class BundleModelAssets : DefaultTask() {
 
     /** [BundledLicenseSpec.encode] strings. */
     @get:Input abstract val licenseEntries: ListProperty<String>
+
+    /** The exact spec §6.5 license/declaration set this task must package. */
+    @get:Input abstract val requiredLicenseFiles: SetProperty<String>
 
     /** Every source file the entries point at, so content changes invalidate this task. */
     @get:InputFiles abstract val trackedSources: ConfigurableFileCollection
@@ -504,6 +541,23 @@ abstract class BundleModelAssets : DefaultTask() {
             source.copyTo(destination, overwrite = true)
         }
 
+        // Fail-closed delivery contract: the APK must carry exactly the spec §6.5 texts, not just whatever the
+        // tracked manifest happens to list. A silently removed entry would otherwise shrink the APK without error.
+        val missingLicenses = requiredLicenseFiles.get() - licenseNames
+        val unexpectedLicenses = licenseNames - requiredLicenseFiles.get()
+        if (missingLicenses.isNotEmpty() || unexpectedLicenses.isNotEmpty()) {
+            throw GradleException(
+                "bundled model license set does not match spec §6.5: missing=${missingLicenses.sorted()}, " +
+                    "unexpected=${unexpectedLicenses.sorted()}",
+            )
+        }
+        if (manifestFiles.size != 15) {
+            throw GradleException(
+                "bundled model asset set must contain 15 emitted model files (KWS is packaged separately under " +
+                    "assets/kws), was ${manifestFiles.size}",
+            )
+        }
+
         val manifest = linkedMapOf<String, Any>(
             "schemaVersion" to 1,
             "bundleId" to bundleId.get(),
@@ -512,7 +566,7 @@ abstract class BundleModelAssets : DefaultTask() {
         models.resolve("models-manifest.json").writeText(JsonOutput.prettyPrint(JsonOutput.toJson(manifest)) + "\n")
         logger.lifecycle(
             "BUNDLED_MODELS=true: packaged ${manifestFiles.size} model files and ${licenseNames.size} license " +
-                "texts for ${variantName.get()}",
+                "texts for ${variantName.get()} (bundle=${bundleId.get()})",
         )
     }
 
@@ -537,11 +591,11 @@ androidComponents.onVariants { variant ->
         description = "Verifies and packages the pinned 0.4 on-device models into assets/models/**."
         bundleId.set(bundledBundleId)
         entries.set(bundledModelFiles.map { it.encode() })
-        licenseEntries.set((bundledLicenseFiles + bundledDeclarationFiles).map { it.encode() })
+        licenseEntries.set(bundledLicenseFiles.map { it.encode() })
+        requiredLicenseFiles.set(requiredBundledLicenseFiles)
         trackedSources.from(
             bundledModelFiles.map { it.source },
             bundledLicenseFiles.map { it.source },
-            bundledDeclarationFiles.map { it.source },
         )
         bundlingEnabled.set(!withoutBundledModels)
         releaseVariant.set(variant.buildType == "release")
@@ -558,6 +612,47 @@ androidComponents.onVariants { variant ->
             "Whether this APK packages the verified 0.4 on-device model bundle (assets/models/**).",
         ),
     )
+}
+
+/**
+ * Fast manifest audit: no model binaries are read and no 1.1 GB asset tree is generated. It checks the canonical
+ * bundle id, the 21 pinned entries, the 15 emitted model files, and the exact 15-text spec §6.5 license set.
+ *
+ * `-PbundledModelsManifest=<path>` audits another manifest (used for the negative mutation checks) while applying
+ * the same rules. The normal build already fails at configuration when the id does not match the canonical digest;
+ * this task exists so the license/count contract can be verified and re-run cheaply.
+ */
+tasks.register("verifyBundledModelManifest") {
+    group = "verification"
+    description = "Verifies the pinned bundled-model manifest id and license contract without packaging assets."
+    doLast {
+        val derived = canonicalBundleId(bundledModelFiles)
+        val emitted = bundledModelFiles.count { it.group != "kws" }
+        val licenseNames = bundledLicenseFiles.map { it.file }.toSet()
+        val missingLicenses = requiredBundledLicenseFiles - licenseNames
+        val unexpectedLicenses = licenseNames - requiredBundledLicenseFiles
+        val missingSources = bundledLicenseFiles.filterNot { it.source.isFile }.map { it.source.absolutePath }
+        if (bundledBundleId != derived || bundledModelFiles.size != 21 || emitted != 15 ||
+            missingLicenses.isNotEmpty() || unexpectedLicenses.isNotEmpty() || missingSources.isNotEmpty()
+        ) {
+            throw GradleException(
+                "bundled model manifest audit failed: bundleId=$bundledBundleId derived=$derived " +
+                    "entries=${bundledModelFiles.size} emitted=$emitted licenses=${licenseNames.size} " +
+                    "missingLicenses=${missingLicenses.sorted()} unexpectedLicenses=${unexpectedLicenses.sorted()} " +
+                    "missingSources=$missingSources",
+            )
+        }
+        logger.lifecycle(
+            "BUNDLED_MODEL_MANIFEST entries=${bundledModelFiles.size} emitted=$emitted " +
+                "licenses=${licenseNames.size} bundleId=$bundledBundleId",
+        )
+        logger.lifecycle("BUNDLED_MODEL_MANIFEST_RESULT=PASS")
+    }
+}
+
+// Run the cheap manifest/license audit as part of the normal `check` lifecycle.
+tasks.matching { it.name == "check" }.configureEach {
+    dependsOn("verifyBundledModelManifest")
 }
 
 // Fail before a release graph starts executing, not only when the release asset task happens to run: earlier

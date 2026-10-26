@@ -201,6 +201,10 @@ class BundledModelProvisionerTest {
         assertFalse("no receipt may be written on failure", File(directory, receiptName).exists())
     }
 
+    /** The receipt is two non-blank lines: the bundle id and the digest over the emitted file paths/SHA-256 values. */
+    private fun receiptLines(directory: File): List<String> = File(directory, receiptName).readText()
+        .lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+
     private fun assertNoTempFiles(directory: File) {
         val leftovers = directory.listFiles()?.filter { it.name.endsWith(".tmp") }.orEmpty()
         assertTrue("no temp file may be left behind: $leftovers", leftovers.isEmpty())
@@ -215,8 +219,14 @@ class BundledModelProvisionerTest {
         assertEquals(ProvisioningState.Ready(bundleId), result)
         fixture.assertFiles(fixture.layaDirectory, fixture.layaBytes)
         fixture.assertFiles(fixture.embeddingDirectory, fixture.embeddingBytes)
-        assertEquals(bundleId, fixture.receipt(fixture.layaDirectory).readText().trim())
-        assertEquals(bundleId, fixture.receipt(fixture.embeddingDirectory).readText().trim())
+        assertEquals(
+            listOf(bundleId, fixture.modelsManifest().manifestDigest()),
+            receiptLines(fixture.layaDirectory),
+        )
+        assertEquals(
+            listOf(bundleId, fixture.modelsManifest().manifestDigest()),
+            receiptLines(fixture.embeddingDirectory),
+        )
         assertNotNull("the ASR half must be activated from the packaged assets", fixture.store.active())
         assertNoTempFiles(fixture.layaDirectory)
         assertNoTempFiles(fixture.embeddingDirectory)
@@ -251,8 +261,10 @@ class BundledModelProvisionerTest {
 
         assertEquals(ProvisioningState.Ready(bundleId), result)
         assertTrue("stale receipt must re-read the runtime assets", source.opened.contains("laya/${layaFileNames.first()}"))
-        assertEquals(bundleId, fixture.receipt(fixture.layaDirectory).readText().trim())
-        assertEquals(bundleId, fixture.receipt(fixture.embeddingDirectory).readText().trim())
+        assertEquals(listOf(bundleId, fixture.modelsManifest().manifestDigest()),
+            receiptLines(fixture.layaDirectory))
+        assertEquals(listOf(bundleId, fixture.modelsManifest().manifestDigest()),
+            receiptLines(fixture.embeddingDirectory))
         assertTrue("the file must have been rewritten", target.lastModified() != 1_000_000L)
     }
 
@@ -263,18 +275,73 @@ class BundledModelProvisionerTest {
         val target = File(fixture.layaDirectory, layaFileNames.first())
         assertTrue(target.setLastModified(1_000_000L))
         val source = RecordingSource(fixture.assetBytes)
+        val nextManifest = fixture.modelsManifest(bundleId = "new-bundle")
 
         val result = fixture.restarted(
             source = source,
-            modelsManifest = fixture.modelsManifest(bundleId = "new-bundle"),
+            modelsManifest = nextManifest,
         ).run()
 
         assertEquals(ProvisioningState.Ready("new-bundle"), result)
-        assertEquals("new-bundle", fixture.receipt(fixture.layaDirectory).readText().trim())
-        assertEquals("new-bundle", fixture.receipt(fixture.embeddingDirectory).readText().trim())
+        assertEquals(listOf("new-bundle", nextManifest.manifestDigest()), receiptLines(fixture.layaDirectory))
+        assertEquals(listOf("new-bundle", nextManifest.manifestDigest()), receiptLines(fixture.embeddingDirectory))
         assertTrue("an APK bundle change must re-materialize the runtime files",
             source.opened.contains("laya/${layaFileNames.first()}"))
         assertTrue(target.lastModified() != 1_000_000L)
+    }
+
+    @Test
+    fun aChangedFileDigestForcesARecopyEvenWhenTheBundleIdIsUnchanged() {
+        // The whole-branch finding: receipts used to compare only the manually pinned id, so a new APK whose file
+        // digest changed but whose id did not would silently keep the old Laya weights. The manifest digest recorded
+        // in the receipt must close that hole even independently of the build's id check.
+        val fixture = Fixture()
+        fixture.provisioner().run()
+        val name = layaFileNames.first()
+        val original = fixture.layaBytes.getValue(name)
+        val changed = original.copyOf().also { it[0] = (it[0].toInt() + 1).toByte() }
+        val changedManifest = fixture.modelsManifest().let { base ->
+            BundledModelsManifest(
+                base.bundleId,
+                base.files.map { file ->
+                    if (file.path == "laya/$name") file.copy(sha256 = sha256(changed)) else file
+                },
+            )
+        }
+        val source = RecordingSource(fixture.assetBytes, overrides = mapOf("laya/$name" to changed))
+
+        val result = fixture.restarted(source, modelsManifest = changedManifest).run()
+
+        assertEquals(ProvisioningState.Ready(bundleId), result)
+        assertTrue("a changed file digest must re-copy even when bundleId did not change: ${source.opened}",
+            source.opened.contains("laya/$name"))
+        assertEquals("the target must hold the newly pinned bytes", changed.toList(),
+            File(fixture.layaDirectory, name).readBytes().toList())
+    }
+
+    @Test
+    fun aBundleIdOnlyReceiptFromAnOlderBuildIsUpgradedByOneRecopy() {
+        val fixture = Fixture()
+        fixture.provisioner().run()
+        val name = layaFileNames.first()
+        val target = File(fixture.layaDirectory, name)
+        assertTrue(target.setLastModified(1_000_000L))
+        // Receipts written by the pre-fix build contain the bundle id alone; they cannot prove the file digests.
+        fixture.receipt(fixture.layaDirectory).writeText(bundleId)
+        fixture.receipt(fixture.embeddingDirectory).writeText(bundleId)
+        val source = RecordingSource(fixture.assetBytes)
+
+        val result = fixture.restarted(source).run()
+
+        assertEquals(ProvisioningState.Ready(bundleId), result)
+        assertTrue("a legacy id-only receipt must re-materialize once: ${source.opened}",
+            source.opened.contains("laya/$name"))
+        assertTrue("the legacy receipt's copy must be replaced", target.lastModified() != 1_000_000L)
+        assertEquals(
+            "the upgraded receipt records the id and the manifest digest",
+            listOf(bundleId, fixture.modelsManifest().manifestDigest()),
+            receiptLines(fixture.layaDirectory),
+        )
     }
 
     @Test
@@ -563,7 +630,10 @@ class BundledModelProvisionerTest {
             result,
         )
         fixture.assertFiles(embeddingDirectory, fixture.embeddingBytes)
-        assertEquals(bundleId, fixture.receipt(embeddingDirectory).readText().trim())
+        assertEquals(
+            listOf(bundleId, fixture.modelsManifest().manifestDigest()),
+            receiptLines(embeddingDirectory),
+        )
         assertNoTempFiles(embeddingDirectory)
     }
 

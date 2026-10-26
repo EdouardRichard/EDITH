@@ -236,16 +236,40 @@
               ],
     "licenses":  [
                      {
-                         "file":  "sherpa-v1.13.8-Apache-2.0.txt",
-                         "source":  "tools/scripts/p2/licenses/sherpa-v1.13.8-Apache-2.0.txt"
+                         "file":  "3D-Speaker-current-project-Apache-2.0.txt",
+                         "source":  "tools/scripts/p2/licenses/3D-Speaker-current-project-Apache-2.0.txt"
                      },
                      {
                          "file":  "Apache-2.0-standard.txt",
                          "source":  "tools/scripts/p2/licenses/Apache-2.0-standard.txt"
                      },
                      {
-                         "file":  "silero-v5-MIT.txt",
-                         "source":  "tools/scripts/p2/licenses/silero-v5-MIT.txt"
+                         "file":  "asr-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/asr-model-card.md"
+                     },
+                     {
+                         "file":  "asr-upstream-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/asr-upstream-model-card.md"
+                     },
+                     {
+                         "file":  "gemma-prohibited-use-policy.txt",
+                         "source":  "tools/scripts/p2/licenses/gemma-prohibited-use-policy.txt"
+                     },
+                     {
+                         "file":  "gemma-terms-of-use.txt",
+                         "source":  "tools/scripts/p2/licenses/gemma-terms-of-use.txt"
+                     },
+                     {
+                         "file":  "kws-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/kws-model-card.md"
+                     },
+                     {
+                         "file":  "laya-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/laya-model-card.md"
+                     },
+                     {
+                         "file":  "laya-sample-NOTICE.txt",
+                         "source":  "phone-app/app/src/main/kotlin/com/laya/LICENSES/laya-sample-NOTICE.txt"
                      },
                      {
                          "file":  "onnxruntime-v1.28.2-MIT.txt",
@@ -256,12 +280,20 @@
                          "source":  "tools/scripts/p2/licenses/onnxruntime-v1.28.2-ThirdPartyNotices.txt"
                      },
                      {
-                         "file":  "gemma-terms-of-use.txt",
-                         "source":  "tools/scripts/p2/licenses/gemma-terms-of-use.txt"
+                         "file":  "sherpa-v1.13.8-Apache-2.0.txt",
+                         "source":  "tools/scripts/p2/licenses/sherpa-v1.13.8-Apache-2.0.txt"
                      },
                      {
-                         "file":  "gemma-prohibited-use-policy.txt",
-                         "source":  "tools/scripts/p2/licenses/gemma-prohibited-use-policy.txt"
+                         "file":  "silero-v5-MIT.txt",
+                         "source":  "tools/scripts/p2/licenses/silero-v5-MIT.txt"
+                     },
+                     {
+                         "file":  "silero-v5-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/silero-v5-model-card.md"
+                     },
+                     {
+                         "file":  "speaker-v1.0.1-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/speaker-v1.0.1-model-card.md"
                      }
                  ]
 }
