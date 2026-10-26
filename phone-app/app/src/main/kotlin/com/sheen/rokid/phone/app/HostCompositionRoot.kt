@@ -2390,9 +2390,16 @@ class HostCompositionRoot internal constructor(
             val hostHolder = arrayOfNulls<HostRuntime>(1)
             // 0.4 Task 5 (`D199`): the persisted 「脱离眼镜」 gate. The stop-before-save rule uses the composition's
             // own `stop()` and the host's live state; the gate is loaded once here, before any session can start.
+            // 0.4 Task 9 fix: `stop()` only tears down the host session - `SessionService` kept its foreground
+            // notification saying 会话已开启 for an idle session. The gate's stop therefore also sends the existing UI
+            // STOP command (the same path the notification's own 停止 action uses), which stops the service and its
+            // notification. `runCatching` keeps a rig whose application is not an `EdithApplication` (JVM/Robolectric
+            // compositions) from throwing out of the switch; the service path already reports its own refusals and the
+            // gate's save is not the place that owns them.
             val detachGate = DetachGate(
                 settings = smartSettingsStore,
                 stopSession = { rootHolder[0]?.stop() },
+                stopService = { runCatching { SessionService.commandFromUi(context, SessionService.STOP) } },
                 sessionState = { hostHolder[0]?.currentState ?: SessionState.Idle },
             ).also { it.load() }
             // P3.2 / `D53`②: the arming switch and its gate. One instance for the UI, the chain's acoustic sink and the

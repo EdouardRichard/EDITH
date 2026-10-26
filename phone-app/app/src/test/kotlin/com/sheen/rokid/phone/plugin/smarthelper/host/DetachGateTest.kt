@@ -173,6 +173,62 @@ class DetachGateTest {
     }
 
     @Test
+    fun setWhileASessionRunsStopsTheCompositionThenTheHostingServiceBeforeSaving() {
+        // 0.4 Task 9 fix: `root.stop()` only ends the host session; the foreground `SessionService` (and its
+        // 「会话已开启」 notification) stayed up for an idle session. The gate's stop path is therefore two calls -
+        // composition teardown, then the existing service stop - and both must happen before the blob write, or the
+        // mode is persisted while the notification still claims a running session.
+        val blobs = RecordingBlobs()
+        val store = seeded(blobs, shipped)
+        var state = SessionState.Ready
+        val gate = DetachGate(
+            settings = store,
+            stopSession = {
+                blobs.order += "stop"
+                state = SessionState.Idle
+            },
+            stopService = { blobs.order += "stopService" },
+            sessionState = { state },
+        )
+        gate.load()
+        blobs.order.clear()
+
+        val result = gate.set(true)
+
+        assertTrue(result.saved)
+        assertTrue(result.stoppedSession)
+        assertEquals("the composition stop, then the service stop, then the write",
+            listOf("stop", "stopService", "read", "write"), blobs.order)
+        assertTrue(gate.enabled.value)
+    }
+
+    @Test
+    fun aFailedServiceStopDoesNotReportStoppedOrSavedAndDoesNotWriteTheBlob() {
+        // The service stop is part of the same stop effect: if it refuses, the session is not fully torn down (the
+        // notification can still claim it is running), so the gate must not persist the mode or report a stop.
+        val blobs = RecordingBlobs()
+        val store = seeded(blobs, shipped)
+        var state = SessionState.Ready
+        val gate = DetachGate(
+            settings = store,
+            stopSession = { state = SessionState.Idle },
+            stopService = { throw IllegalStateException("synthetic service stop failure") },
+            sessionState = { state },
+        )
+        gate.load()
+        blobs.order.clear()
+
+        val result = gate.set(true)
+
+        assertFalse("a refused service stop must not report a save", result.saved)
+        assertFalse("and must not claim the session was fully stopped", result.stoppedSession)
+        assertEquals(DetachGate.ERROR_STOP_FAILED, result.error)
+        assertFalse("the live gate must stay in the stored mode", gate.enabled.value)
+        assertFalse("the blob must be untouched", store.load().glassesDetached)
+        assertTrue("no write may happen after a failed stop", blobs.order.none { it == "write" })
+    }
+
+    @Test
     fun setWhilePausedAlsoStopsTheSessionFirst() {
         // `D199`: Paused is a live session (its audio epoch/identity exist), so changing the mode must end it too.
         val blobs = RecordingBlobs()
