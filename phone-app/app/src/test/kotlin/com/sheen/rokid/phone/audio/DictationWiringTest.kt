@@ -1,0 +1,780 @@
+package com.sheen.rokid.phone.audio
+
+import android.content.Intent
+import com.sheen.rokid.audio.AsrHypothesis
+import com.sheen.rokid.audio.PcmFramer
+import com.sheen.rokid.audio.PcmIngress
+import com.sheen.rokid.audio.SpeakerEngine
+import com.sheen.rokid.audio.StreamingAsrEngine
+import com.sheen.rokid.audio.VadDecision
+import com.sheen.rokid.audio.VadEngine
+import com.sheen.rokid.audio.WakeWordDetector
+import com.sheen.rokid.audio.WakeWordEngine
+import com.sheen.rokid.contracts.Assistance
+import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.InputEpoch
+import com.sheen.rokid.contracts.OutputStatus
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.contracts.SessionState
+import com.sheen.rokid.contracts.SpeakerAssessment
+import com.sheen.rokid.host.HostRuntime
+import com.sheen.rokid.phone.app.CxrAudioChain
+import com.sheen.rokid.phone.app.HostCompositionRoot
+import com.sheen.rokid.phone.bridge.CxrConnection
+import com.sheen.rokid.phone.bridge.CxrHostEnvironment
+import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
+import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
+import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
+import com.sheen.rokid.phone.plugin.smarthelper.host.SmartWiring
+import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.withP3Sink
+import com.sheen.rokid.plugin.ActionDescriptor
+import com.sheen.rokid.plugin.ActionExecutor
+import com.sheen.rokid.plugin.ActionOutcome
+import com.sheen.rokid.plugin.ActionResult
+import com.sheen.rokid.plugin.AsrSession
+import com.sheen.rokid.plugin.CancellationHandle
+import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.plugin.ConfirmationChannel
+import com.sheen.rokid.plugin.ContextSignals
+import com.sheen.rokid.plugin.ContextSnapshot
+import com.sheen.rokid.plugin.ConversationDisplay
+import com.sheen.rokid.plugin.DeviceProfile
+import com.sheen.rokid.plugin.DeviceState
+import com.sheen.rokid.plugin.DeviceStateProvider
+import com.sheen.rokid.plugin.EmbedResult
+import com.sheen.rokid.plugin.EmbeddingService
+import com.sheen.rokid.plugin.HintDevice
+import com.sheen.rokid.plugin.InputModality
+import com.sheen.rokid.plugin.InputPort
+import com.sheen.rokid.plugin.ModelClient
+import com.sheen.rokid.plugin.ModelInfo
+import com.sheen.rokid.plugin.ModelProfile
+import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.ModelStreamEvent
+import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.PerceptionCoverage
+import com.sheen.rokid.plugin.PerceptionFilter
+import com.sheen.rokid.plugin.PerceptionProvider
+import com.sheen.rokid.plugin.PerceptionScreenshotResult
+import com.sheen.rokid.plugin.PerceptionSnapshot
+import com.sheen.rokid.plugin.PerceptionSource
+import com.sheen.rokid.plugin.SecretHandle
+import com.sheen.rokid.plugin.SpeakerWindow
+import com.sheen.rokid.plugin.StorageAccess
+import com.sheen.rokid.plugin.StorageHandle
+import com.sheen.rokid.plugin.SystemOneAnswer
+import com.sheen.rokid.plugin.SystemOneQuestion
+import com.sheen.rokid.plugin.SystemOneResult
+import com.sheen.rokid.plugin.SystemOneService
+import com.sheen.rokid.plugin.SystemOneStatus
+import com.sheen.rokid.storage.MemoryProfileRepository
+import com.sheen.rokid.storage.ProfileRepository
+import com.sheen.rokid.testsupport.FakeClock
+import com.sheen.rokid.testsupport.ManualScheduler
+import com.sheen.rokid.testsupport.RecordingInputPort
+import com.sheen.rokid.transport.CxrAuthorizationOutcome
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertSame
+import org.junit.Assert.assertTrue
+import org.junit.Test
+import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicInteger
+
+/**
+ * 0.4 Task 12b-ii (spec §5.3, D204): the composition's phone-microphone dictation, wired through the **real**
+ * `CxrAudioChain`/`SpeechPipeline` and the real `HostCompositionRoot` methods.
+ *
+ * The chain is the production one (fake engines, real loop/pipeline); only the Android recorder and the CXR SDK are
+ * fake. That is what lets these tests pin the routing rules a device run cannot see from the screen:
+ *
+ * - **one lease, one source.** Detached dictation reuses the session's recorder/ingress/loop and never starts a second
+ *   capture; glasses dictation opens the phone source only for the dictation and closes it afterwards.
+ * - **KWS is not fed while dictating.** In detached mode the *same* loop keeps feeding the ASR turn but not the wake
+ *   detector; in glasses mode the CXR loop is paused and a phone loop with the same pipeline runs without wake input.
+ * - **the final goes to the input field only.** It reaches the host's dictation state and no model request / plugin
+ *   turn is opened; the draft is appended by the UI helper (tested separately), never sent.
+ * - **every terminal path restores the wake route.** Final, user stop, cancel, timeout and a capture failure all
+ *   put the CXR loop / KWS acceptance back, and glasses mode sends no CXR command or transport restart to do it.
+ * - **telemetry is count-only.** `P4_DICTATION` lines carry state/reason/character count and never the text.
+ */
+class DictationWiringTest {
+
+    // ---- fakes (the composition-shaped rigs' minimal set) -------------------------------------------------------
+
+    private fun profile(id: String) = ModelProfile(id, 3, "Synthetic $id", "Synthetic",
+        "https://synthetic.example/v1", "DEEPSEEK_RESPONSES", "synthetic-model",
+        object : SecretHandle { override val id = "draft-placeholder" },
+        4096, 2048, 1024, 128, 5000, setOf(InputModality.TEXT, InputModality.IMAGE),
+        setOf(OutputModality.TEXT), emptyList())
+
+    /** The pipeline's VAD: tests script whether a frame starts a turn and whether it is the endpoint. */
+    private class PipelineVad : VadEngine {
+        @Volatile var decision = VadDecision(false, false)
+        override fun accept(frame: com.sheen.rokid.audio.PcmFrame) = decision
+        override fun reset() = Unit
+        override fun close() = Unit
+    }
+
+    /** The wake detector's own VAD: always speech, so "the detector saw a frame" is observable via its engine. */
+    private class AlwaysSpeechVad : VadEngine {
+        override fun accept(frame: com.sheen.rokid.audio.PcmFrame) = VadDecision(true, false)
+        override fun reset() = Unit
+        override fun close() = Unit
+    }
+
+    private class RecordingWakeEngine : WakeWordEngine {
+        val frames = CopyOnWriteArrayList<com.sheen.rokid.audio.PcmFrame>()
+        override fun accept(frame: com.sheen.rokid.audio.PcmFrame): List<String> {
+            frames += frame
+            return emptyList()
+        }
+
+        override fun reset() = Unit
+        override fun close() = Unit
+    }
+
+    private class FinishingAsr : StreamingAsrEngine {
+        val frames = CopyOnWriteArrayList<com.sheen.rokid.audio.PcmFrame>()
+        val finishes = AtomicInteger()
+        @Volatile var finalText = "听写结果"
+
+        override fun accept(frame: com.sheen.rokid.audio.PcmFrame): List<AsrHypothesis> {
+            frames += frame
+            return emptyList()
+        }
+
+        override fun finish(): AsrHypothesis {
+            finishes.incrementAndGet()
+            return AsrHypothesis(finalText, true)
+        }
+
+        override fun reset() = Unit
+        override fun close() = Unit
+    }
+
+    private class SilentSpeaker : SpeakerEngine {
+        override fun assess(window: SpeakerWindow, listener: (SpeakerAssessment) -> Unit): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+
+        override fun reset() = Unit
+        override fun close() = Unit
+    }
+
+    private class NoActions : ActionExecutor {
+        override fun descriptors(): List<ActionDescriptor> = emptyList()
+        override fun execute(name: String, argsJson: String) = ActionResult(ActionOutcome.Refused, "UNKNOWN_ACTION")
+        override fun cancel() = Unit
+    }
+
+    private class NoConfirmations : ConfirmationChannel {
+        override fun present(requestId: String, summary: String, timeoutMillis: Long): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+    }
+
+    private class LiveDisplay : HintDevice {
+        override fun show(assistance: Assistance, revision: Long, listener: (OutputStatus) -> Unit): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+
+        override fun clear(sessionId: SessionId, generation: Generation) = Unit
+    }
+
+    private class CountingModel : ModelClient {
+        val requests = AtomicInteger()
+        override fun request(request: ModelRequest, listener: (ModelStreamEvent) -> Unit): CancellationHandle {
+            requests.incrementAndGet()
+            return object : CancellationHandle { override fun cancel() = Unit }
+        }
+    }
+
+    private class StubAsrSession : AsrSession {
+        override fun listen(listener: (com.sheen.rokid.contracts.TranscriptRevision) -> Unit): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+    }
+
+    private class EmptyContextSignals : ContextSignals {
+        override fun snapshot() = ContextSnapshot(0L, emptyMap())
+        override fun listen(listener: (ContextSnapshot) -> Unit): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+    }
+
+    private class SyntheticDeviceState : DeviceStateProvider {
+        override fun profile() = DeviceProfile("", "", null, "", 0, 0, 0, 0, null, null, null, null, "", "", "", emptyList(), emptySet())
+        override fun state() = DeviceState(0L, "UTC", "2026-10-20", "星期一", "00:00")
+    }
+
+    private class InertPerception : PerceptionProvider {
+        private val snapshot = PerceptionSnapshot("snap-test", 0L, coverage = PerceptionCoverage(
+            screen = "unavailable(no_accessibility)", notifications = "unavailable(no_access)",
+            media = "unavailable(no_session)", calendar = "empty", acoustic = "unavailable(no_event)",
+            clipboard = "unavailable(background_restricted)", vision = "disabled",
+            glasses = "unavailable(no_state)", device = "partial"))
+
+        override fun beginTurn() = snapshot
+        override fun snapshot(include: Set<PerceptionSource>, filter: PerceptionFilter, limit: Int?) = snapshot
+        override fun afterAction() = snapshot
+        override fun screenshot(): PerceptionScreenshotResult = PerceptionScreenshotResult.Unavailable("test")
+        override fun endTurn() = Unit
+    }
+
+    private class NoStorageAccess : StorageAccess {
+        override fun listFiles(dirPath: String, suffix: String): List<String> = emptyList()
+        override fun readFile(path: String): String? = null
+        override fun deleteFile(path: String): Boolean = false
+    }
+
+    private class ReadySystemOne : SystemOneService {
+        override fun ask(state: String, question: SystemOneQuestion): SystemOneResult =
+            SystemOneResult.Success(SystemOneAnswer.Noul(probability = 0.5, confidence = 0.5), latencyMs = 1.0)
+
+        override val isAvailable = true
+        override val status = SystemOneStatus.READY
+        override val modelInfo: ModelInfo? = null
+    }
+
+    private class ReadyEmbedding : EmbeddingService {
+        override fun embed(text: String): EmbedResult = EmbedResult.Success(FloatArray(256))
+        override val isAvailable = true
+        override val modelInfo: ModelInfo? = null
+        override val dimensions = 256
+    }
+
+    private class StubStorage : StorageHandle {
+        private val values = mutableMapOf<String, ByteArray>()
+        override fun read(key: String): ByteArray? = values[key]
+        override fun write(key: String, value: ByteArray) { values[key] = value }
+        override fun delete(key: String) { values.remove(key) }
+        override fun clear() { values.clear() }
+    }
+
+    private class NoConversationDisplay : ConversationDisplay {
+        override fun userMessage(route: AssistantRoute, text: String) = Unit
+        override fun assistantMessage(route: AssistantRoute, text: String) = Unit
+        override fun working(route: AssistantRoute) = Unit
+        override fun idle(route: AssistantRoute) = Unit
+    }
+
+    private class FixedProfiles(private val saved: List<ModelProfile>) : ProfileRepository {
+        constructor(profile: ModelProfile) : this(listOf(profile))
+        override fun list(): List<ModelProfile> = saved
+        override fun get(id: String): ModelProfile? = saved.firstOrNull { it.id == id }
+        override fun save(profile: ModelProfile) = profile
+        override fun delete(id: String) = Unit
+        override fun verify(id: String, result: com.sheen.rokid.plugin.CapabilityVerification) = Unit
+        override fun listenChanges(listener: (String) -> Unit): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+    }
+
+    /** The CXR connection the composition builds lazily; records every command/port call so "no CXR restart" is real. */
+    private class FakeConnection(
+        private val port: InputPort?,
+        private val commands: AtomicInteger,
+    ) : CxrConnection {
+        override var ready = true
+        override fun connect(activity: Any) = Unit
+        override fun onAuthorizationResult(resultCode: Int, data: Intent?): CxrAuthorizationOutcome? = null
+        override fun sendCommand(json: String): Boolean {
+            commands.incrementAndGet()
+            return true
+        }
+
+        override fun onInboundCommand(listener: (String) -> Unit) = Unit
+        override fun close() = Unit
+        override fun inputPortOrNull(): InputPort? = port
+    }
+
+    private class FakePhoneDevice : com.sheen.rokid.phone.audio.PcmRecordDevice {
+        val starts = AtomicInteger()
+        val stops = AtomicInteger()
+        val wakes = AtomicInteger()
+        @Volatile private var recording = false
+        @Volatile var failReadAt = -1
+        private val reads = AtomicInteger()
+
+        override fun start(): Boolean {
+            starts.incrementAndGet()
+            recording = true
+            return true
+        }
+
+        override fun read(buffer: ShortArray): Int {
+            if (reads.incrementAndGet() == failReadAt) return -1
+            while (recording) Thread.sleep(5)
+            return 0
+        }
+
+        override fun wake() {
+            wakes.incrementAndGet()
+            recording = false
+        }
+
+        override fun stop() {
+            stops.incrementAndGet()
+            recording = false
+        }
+    }
+
+    private fun detachedGate(detached: Boolean): DetachGate {
+        val store = SmartSettingsStore(TestBlobs())
+        store.save(SmartSettings(glassesDetached = detached))
+        return DetachGate(store).also { it.load() }
+    }
+
+    private inner class Rig(
+        detached: Boolean,
+        withConnection: Boolean = true,
+        private val microphoneAllowed: Boolean = true,
+        private val queueDispatches: Boolean = false,
+        private val configurePhoneDevice: FakePhoneDevice.() -> Unit = {},
+    ) {
+        val clock = FakeClock(0)
+        val scheduler = ManualScheduler(clock)
+        val pipelineVad = PipelineVad()
+        val asr = FinishingAsr()
+        val wakeEngine = RecordingWakeEngine()
+        val model = CountingModel()
+        val phoneIngress = PcmIngress(clock)
+        val cxrIngress = PcmIngress(clock)
+        val transportPort = RecordingInputPort()
+        val connectionCommands = AtomicInteger()
+        val devices = CopyOnWriteArrayList<FakePhoneDevice>()
+        private val dispatchQueue = CopyOnWriteArrayList<() -> Unit>()
+        val root: HostCompositionRoot
+        val chain: CxrAudioChain
+
+        init {
+            val chosen = profile("p-1")
+            val gate = detachedGate(detached)
+            val wiring = SmartWiring(
+                SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
+                    profileId = chosen.id, cooldownMillis = 3000L),
+                FixedProfiles(chosen), clock, ManualScheduler(clock))
+            val hostHolder = arrayOfNulls<HostRuntime>(1)
+            val wakeVad = AlwaysSpeechVad()
+            val wakeDetector = WakeWordDetector(wakeVad, wakeEngine, emit = { _, _ -> }, clock = clock)
+            chain = CxrAudioChain.assemble(
+                ingress = { if (gate.enabled.value) phoneIngress else cxrIngress },
+                framer = PcmFramer(PhoneMicFormat.VERIFIED, 20),
+                vad = pipelineVad, asr = asr, speaker = SilentSpeaker(),
+                wake = com.sheen.rokid.phone.app.WiredWakeDetector(wakeDetector, wakeVad),
+                scheduler = scheduler, clock = clock,
+                emit = { event -> hostHolder[0]?.onEvent(event) },
+                cancelTurn = { }, onFault = { }, onOffer = { })
+            val environment = CxrHostEnvironment(clock = clock, input = chain.input, liveOutput = { LiveDisplay() },
+                scheduler = scheduler,
+                providers = mapOf(
+                    Capability.Model to model,
+                    Capability.Asr to StubAsrSession(),
+                    Capability.Actions to NoActions(),
+                    Capability.Confirmation to NoConfirmations(),
+                    Capability.WakeWord to wiring.wakeWords,
+                    Capability.Context to EmptyContextSignals(),
+                    Capability.StorageAccess to NoStorageAccess(),
+                    Capability.SystemOne to ReadySystemOne(),
+                    Capability.Embedding to ReadyEmbedding(),
+                    Capability.DeviceState to SyntheticDeviceState(),
+                    Capability.Perception to InertPerception(),
+                    Capability.ConversationDisplay to NoConversationDisplay(),
+                ),
+                storageFor = { StubStorage() })
+            hostHolder[0] = HostRuntime(1, environment)
+            root = HostCompositionRoot(hostHolder[0]!!, MemoryProfileRepository(), model, environment,
+                smartWiring = wiring,
+                rokidConnectionFactory = if (withConnection) {
+                    { FakeConnection(transportPort, connectionCommands) }
+                } else null,
+                detachGate = gate,
+                dispatchHostEvent = { task -> if (queueDispatches) dispatchQueue += task else task() },
+                phoneIngress = phoneIngress,
+                phoneMicDeviceFactory = {
+                    FakePhoneDevice().also { device ->
+                        device.configurePhoneDevice()
+                        devices += device
+                    }
+                },
+                deadlineScheduler = scheduler,
+                microphoneGranted = { microphoneAllowed },
+                // The composition owns the chain in production; this rig wires the same real chain itself.
+            )
+            root.audioChain = chain
+            root.registerPlugin(wiring.plugin)
+        }
+
+        /** The production start path: attach, start, scene-ready. */
+        fun activate(): Boolean {
+            root.attachCxrActivity(Any())
+            root.start("smart-assistant")
+            root.onSceneReady()
+            val epoch = root.currentAudioEpoch()
+            if (epoch != null && !root.detachGate.enabled.value) {
+                // The fake transport does not open the real ingress; the test opens the CXR source it will feed.
+                cxrIngress.open(epoch, PhoneMicFormat.VERIFIED)
+            }
+            return root.state.value.errorCode == null && epoch != null
+        }
+
+        fun epoch(): InputEpoch = requireNotNull(root.currentAudioEpoch())
+
+        /** Offers one 20 ms chunk to the phone source and runs the next loop tick. */
+        fun feedPhone() {
+            assertEquals("the phone ingress must accept the chunk", com.sheen.rokid.audio.PcmOffer.ACCEPTED,
+                phoneIngress.offer(epoch(), ByteArray(PhoneMicFormat.CHUNK_BYTES)))
+            clock.advance(20_000_000)
+            scheduler.runDue()
+        }
+
+        /** Offers one 20 ms chunk to the CXR source and runs the next loop tick. */
+        fun feedCxr() {
+            assertEquals("the CXR ingress must accept the chunk", com.sheen.rokid.audio.PcmOffer.ACCEPTED,
+                cxrIngress.offer(epoch(), ByteArray(PhoneMicFormat.CHUNK_BYTES)))
+            clock.advance(20_000_000)
+            scheduler.runDue()
+        }
+
+        fun runDispatches() {
+            while (dispatchQueue.isNotEmpty()) dispatchQueue.removeAt(0).invoke()
+        }
+
+        fun pendingDispatches(): Int = dispatchQueue.size
+
+        fun close() = root.close()
+    }
+
+    private fun withRig(
+        detached: Boolean,
+        withConnection: Boolean = true,
+        microphoneAllowed: Boolean = true,
+        queueDispatches: Boolean = false,
+        configurePhoneDevice: FakePhoneDevice.() -> Unit = {},
+        block: (Rig) -> Unit,
+    ) {
+        val rig = Rig(detached, withConnection, microphoneAllowed, queueDispatches, configurePhoneDevice)
+        try {
+            block(rig)
+        } finally {
+            rig.close()
+        }
+    }
+
+    private fun awaitCondition(timeoutMillis: Long = 2_000, condition: () -> Boolean) {
+        val deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMillis)
+        while (!condition() && System.nanoTime() < deadline) Thread.sleep(2)
+        assertTrue("timed out waiting for the capture failure to reach the dispatcher", condition())
+    }
+
+    private fun stateOf(rig: Rig) = rig.root.dictationUi.value.state
+
+    // ---- detached mode ------------------------------------------------------------------------------------------
+
+    @Test
+    fun detachedDictationReusesTheWakeLoopDisablesKwsAndHandsTheFinalToTheUiOnly() {
+        withRig(detached = true) { rig ->
+            val text = "帮我记一条笔记"
+            rig.asr.finalText = text
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.activate())
+                assertTrue("a detached dictation starts on the armed session", rig.root.startDictation())
+                assertEquals(DictationState.Listening, stateOf(rig))
+
+                // KWS off, ASR on: the dictation frame reaches the pipeline and not the detector.
+                rig.pipelineVad.decision = VadDecision(true, false)
+                val wakeBefore = rig.wakeEngine.frames.size
+                rig.feedPhone()
+                assertEquals("KWS must not see dictation audio", wakeBefore, rig.wakeEngine.frames.size)
+                assertTrue("the shared pipeline must still transcribe it", rig.asr.frames.isNotEmpty())
+
+                // The stop button produces the final through the same forced-end path.
+                rig.root.stopDictation()
+                captured.toList()
+            }
+
+            val ui = rig.root.dictationUi.value
+            assertEquals("the final goes to the UI state", text, ui.final?.text)
+            assertEquals(DictationState.Idle, ui.state)
+            assertEquals("the final is consumed, not queued as a message", 0, rig.model.requests.get())
+            assertTrue("no plugin conversation turn is opened", rig.root.conversationLog.entries(AssistantRoute.WAKE).isEmpty())
+            assertEquals("detached dictation never creates a second recorder", 1, rig.devices.size)
+            assertEquals(1, rig.devices.single().starts.get())
+            assertEquals("the session's own capture is not stopped by dictation", 0, rig.devices.single().stops.get())
+            assertNotNull("the session's epoch survives the dictation", rig.root.currentAudioEpoch())
+
+            // Every terminal path restores wake acceptance on the same loop.
+            rig.pipelineVad.decision = VadDecision(false, false)
+            val wakeAfter = rig.wakeEngine.frames.size
+            rig.feedPhone()
+            assertEquals("wake acceptance must be restored after the final", wakeAfter + 1, rig.wakeEngine.frames.size)
+
+            assertEquals(
+                listOf("started", "final"),
+                lines.filter { it.startsWith("P4_DICTATION") }.map { it.removePrefix("P4_DICTATION state=").substringBefore(' ') },
+            )
+            assertTrue(lines.first { it.startsWith("P4_DICTATION state=final") }.contains("chars=${text.length}"))
+        }
+    }
+
+    @Test
+    fun aSecondStartWhileListeningIsRefusedAndStartsNoSecondCapture() {
+        withRig(detached = true) { rig ->
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.activate())
+                assertTrue(rig.root.startDictation())
+                val epoch = rig.epoch()
+                val captureStarts = rig.devices.single().starts.get()
+
+                assertFalse("one dictation at a time", rig.root.startDictation())
+                assertEquals(DictationState.Listening, stateOf(rig))
+                assertEquals("the refused start must not start a second recorder", captureStarts, rig.devices.single().starts.get())
+                assertSame("the same epoch owns the lease", epoch, rig.root.currentAudioEpoch())
+                captured.toList()
+            }
+            val refused = lines.single { it.startsWith("P4_DICTATION state=refused") }
+            assertTrue("the refusal names busy: $refused", "reason=busy" in refused)
+            assertTrue("no text field may appear in telemetry: $refused", "text=" !in refused)
+        }
+    }
+
+    @Test
+    fun aDictationWithoutALiveSessionIsRefusedAndNeverOpensTheMicrophone() {
+        withRig(detached = true) { rig ->
+            val lines = withP3Sink { captured ->
+                assertFalse("no session means no dictation", rig.root.startDictation())
+                captured.toList()
+            }
+            assertEquals(DictationState.Idle, stateOf(rig))
+            assertTrue("the refused start opens no recorder", rig.devices.isEmpty())
+            val refused = lines.single { it.startsWith("P4_DICTATION state=refused") }
+            assertTrue("the refusal names the missing session: $refused", "reason=no_session" in refused)
+        }
+    }
+
+    @Test
+    fun aDictationIsRefusedWhenAWakeTurnAlreadyOwnsThePipeline() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            rig.pipelineVad.decision = VadDecision(true, false)
+            rig.feedPhone() // a wake request's speech turn is now in flight
+
+            val lines = withP3Sink { captured ->
+                assertFalse("a dictation must not capture a wake request's final", rig.root.startDictation())
+                captured.toList()
+            }
+            assertEquals(DictationState.Idle, stateOf(rig))
+            assertTrue(lines.single { it.startsWith("P4_DICTATION state=refused") }.contains("reason=busy"))
+        }
+    }
+
+    @Test
+    fun aMicrophoneWithoutTheRecordPermissionIsRefused() {
+        withRig(detached = true, microphoneAllowed = false) { rig ->
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.activate())
+                assertFalse(rig.root.startDictation())
+                captured.toList()
+            }
+            assertTrue(lines.single { it.startsWith("P4_DICTATION state=refused") }.contains("reason=permission"))
+            assertTrue(rig.devices.single().starts.get() == 1) // only the arm's own capture
+        }
+    }
+
+    @Test
+    fun stoppingTheSessionEndsTheDictationSealsItsTurnAndReleasesTheRecorder() {
+        withRig(detached = true) { rig ->
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.activate())
+                assertTrue(rig.root.startDictation())
+                rig.pipelineVad.decision = VadDecision(true, false)
+                rig.feedPhone()
+                assertTrue(rig.chain.hasActiveTurn())
+
+                rig.root.stop()
+
+                assertEquals("a stopped session ends the dictation UI", DictationState.Idle, stateOf(rig))
+                assertNull("teardown delivers no dictation final", rig.root.dictationUi.value.final)
+                assertEquals("the dictation turn is sealed, not handed to the wake route", 1, rig.asr.finishes.get())
+                assertFalse(rig.chain.hasActiveTurn())
+                assertEquals("the detached recorder is released by the session teardown", 1, rig.devices.single().stops.get())
+                assertNull(rig.root.currentAudioEpoch())
+                assertEquals("no model request was opened by the dictation", 0, rig.model.requests.get())
+                captured.toList()
+            }
+            assertTrue(lines.any { it.startsWith("P4_DICTATION state=cancel") && "reason=session_end" in it })
+        }
+    }
+
+    @Test
+    fun theFifteenSecondDeadlineEndsAsTimeoutAndRestoresWakeAcceptance() {        withRig(detached = true) { rig ->
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.activate())
+                assertTrue(rig.root.startDictation())
+
+                rig.clock.advance(15_000_000_000L)
+                rig.scheduler.runDue()
+
+                assertEquals(DictationState.NoSpeech, stateOf(rig))
+                assertNull("a timeout delivers no final", rig.root.dictationUi.value.final)
+                assertEquals("the call did not produce a final", 0, rig.asr.finishes.get())
+                captured.toList()
+            }
+
+            assertEquals("timeout is its own count-only state", 1,
+                lines.count { it.startsWith("P4_DICTATION state=timeout") })
+            rig.pipelineVad.decision = VadDecision(false, false)
+            val wakeBefore = rig.wakeEngine.frames.size
+            rig.feedPhone()
+            assertEquals("timeout must give the wake route back", wakeBefore + 1, rig.wakeEngine.frames.size)
+        }
+    }
+
+    @Test
+    fun cancelEndsWithoutAFinalSealsTheTurnAndRestoresWakeAcceptance() {
+        withRig(detached = true) { rig ->
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.activate())
+                assertTrue(rig.root.startDictation())
+                rig.pipelineVad.decision = VadDecision(true, false)
+                rig.feedPhone()
+                assertTrue("a turn is open before cancel", rig.chain.hasActiveTurn())
+
+                rig.root.cancelDictation()
+
+                assertEquals(DictationState.Idle, stateOf(rig))
+                assertNull("cancel delivers no final", rig.root.dictationUi.value.final)
+                assertEquals("cancel seals the pipeline turn", 1, rig.asr.finishes.get())
+                assertFalse("no dictation turn is left in the pipeline", rig.chain.hasActiveTurn())
+                captured.toList()
+            }
+            assertEquals(1, lines.count { it.startsWith("P4_DICTATION state=cancel") })
+
+            rig.pipelineVad.decision = VadDecision(false, false)
+            val wakeBefore = rig.wakeEngine.frames.size
+            rig.feedPhone()
+            assertEquals(wakeBefore + 1, rig.wakeEngine.frames.size)
+        }
+    }
+
+    @Test
+    fun dictationTelemetryIsCountOnlyAndNeverCarriesTheText() {
+        withRig(detached = true) { rig ->
+            val secret = "这是一句绝不能进日志的听写正文"
+            rig.asr.finalText = secret
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.activate())
+                assertTrue(rig.root.startDictation())
+                rig.pipelineVad.decision = VadDecision(true, false)
+                rig.feedPhone()
+                rig.root.stopDictation()
+                captured.toList()
+            }
+
+            val dictation = lines.filter { it.startsWith("P4_DICTATION") }
+            assertTrue(dictation.isNotEmpty())
+            dictation.forEach { line ->
+                assertTrue("every line carries the count: $line", "chars=" in line)
+                assertTrue("every line carries a reason: $line", "reason=" in line)
+                assertFalse("the dictated text must never be logged: $line", secret in line)
+                assertFalse("no text field may exist: $line", "text=" in line)
+                assertFalse("no digest may exist: $line", "sha" in line.lowercase() || "hash" in line.lowercase())
+            }
+            assertEquals(
+                "the final line's count is the transcript length",
+                secret.length,
+                dictation.last { it.startsWith("P4_DICTATION state=final") }
+                    .substringAfter("chars=").substringBefore(' ').toInt(),
+            )
+            assertTrue(dictation.none { secret in it })
+        }
+    }
+
+    // ---- glasses mode -------------------------------------------------------------------------------------------
+
+    @Test
+    fun glassesDictationPausesOnlyTheFrameLoopAndRestoresItWithoutCxrCommands() {
+        withRig(detached = false) { rig ->
+            val text = "眼镜模式用手机听写"
+            rig.asr.finalText = text
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.activate())
+                assertEquals("the session's transport started once", 1, rig.transportPort.started.size)
+
+                // Silence only reaches pre-roll, but the detector's own VAD is always speech: the CXR source is live.
+                rig.feedCxr()
+                val asrBefore = rig.asr.frames.size
+                val wakeBefore = rig.wakeEngine.frames.size
+                assertEquals(0, asrBefore)
+                assertEquals(1, wakeBefore)
+
+                assertTrue(rig.root.startDictation())
+                assertEquals("a glasses dictation opens exactly one phone capture", 1, rig.devices.size)
+
+                // The CXR loop is paused: a CXR chunk stays queued, and the phone source reaches the same pipeline.
+                assertEquals(com.sheen.rokid.audio.PcmOffer.ACCEPTED,
+                    rig.cxrIngress.offer(rig.epoch(), ByteArray(PhoneMicFormat.CHUNK_BYTES)))
+                rig.clock.advance(20_000_000)
+                rig.scheduler.runDue()
+                assertEquals("the paused CXR loop must not poll", asrBefore, rig.asr.frames.size)
+                assertTrue("the CXR chunk is waiting, not consumed", rig.cxrIngress.queuedBytes > 0)
+
+                rig.pipelineVad.decision = VadDecision(true, false)
+                rig.feedPhone()
+                assertEquals("the dictation frame reaches the shared pipeline", asrBefore + 1, rig.asr.frames.size)
+                assertEquals("KWS must not see the phone dictation", wakeBefore, rig.wakeEngine.frames.size)
+
+                rig.root.stopDictation()
+
+                assertEquals("the final goes to the UI", text, rig.root.dictationUi.value.final?.text)
+                assertEquals("the dictation capture is released once", 1, rig.devices.single().stops.get())
+                assertEquals("the phone ingress is closed with the dictation", com.sheen.rokid.audio.PcmOffer.STALE_EPOCH,
+                    rig.phoneIngress.offer(rig.epoch(), ByteArray(PhoneMicFormat.CHUNK_BYTES)))
+                assertEquals("stale CXR audio is dropped on resume", 0, rig.cxrIngress.queuedBytes)
+                assertEquals("no transport restart is needed", 1, rig.transportPort.started.size)
+                assertTrue("the transport is not stopped", rig.transportPort.stopped.isEmpty())
+                assertEquals("a dictation sends no CXR command", 0, rig.connectionCommands.get())
+                captured.toList()
+            }
+
+            // The normal CXR loop and the wake route are back: a fresh CXR chunk reaches both.
+            val asrAfter = rig.asr.frames.size
+            val wakeAfter = rig.wakeEngine.frames.size
+            rig.pipelineVad.decision = VadDecision(true, false)
+            rig.feedCxr()
+            assertEquals(asrAfter + 1, rig.asr.frames.size)
+            assertEquals("wake acceptance is restored on the CXR loop", wakeAfter + 1, rig.wakeEngine.frames.size)
+            assertTrue(lines.any { it.startsWith("P4_DICTATION state=final") })
+        }
+    }
+
+    @Test
+    fun aGlassesDictationCaptureFailureEndsAsAnErrorAndRestoresTheCxrLoop() {
+        withRig(detached = false, queueDispatches = true, configurePhoneDevice = { failReadAt = 1 }) { rig ->
+            assertTrue(rig.activate())
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.root.startDictation())
+                val capture = rig.devices.single()
+                awaitCondition { rig.pendingDispatches() >= 1 }
+                rig.runDispatches()
+                captured.toList()
+            }
+
+            assertEquals(DictationState.Error(PhoneMicCapture.MIC_UNAVAILABLE), stateOf(rig))
+            assertEquals("the failed capture is released", 1, rig.devices.single().stops.get())
+            assertNull(rig.root.dictationUi.value.final)
+            assertTrue(lines.any { it.startsWith("P4_DICTATION state=error") && "reason=${PhoneMicCapture.MIC_UNAVAILABLE}" in it })
+
+            // The CXR loop is back: a fresh chunk is consumed and reaches the wake path again.
+            val asrBefore = rig.asr.frames.size
+            val wakeBefore = rig.wakeEngine.frames.size
+            rig.pipelineVad.decision = VadDecision(true, false)
+            rig.feedCxr()
+            assertEquals(asrBefore + 1, rig.asr.frames.size)
+            assertEquals(wakeBefore + 1, rig.wakeEngine.frames.size)
+            assertEquals("no transport restart from the failure", 1, rig.transportPort.started.size)
+            assertTrue(rig.transportPort.stopped.isEmpty())
+            assertEquals(0, rig.connectionCommands.get())
+        }
+    }
+}

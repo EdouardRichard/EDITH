@@ -57,6 +57,11 @@ import com.sheen.rokid.phone.session.confirmation.ConfirmationPanel
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.bridge.RokidConnection
 import com.sheen.rokid.phone.audio.AudioIngressLoop
+import com.sheen.rokid.phone.audio.DictationController
+import com.sheen.rokid.phone.audio.DictationFinal
+import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationUiState
+import com.sheen.rokid.phone.audio.SpeechPipelineDictation
 import com.sheen.rokid.phone.audio.PcmRecordDevice
 import com.sheen.rokid.phone.audio.PhoneMicCapture
 import com.sheen.rokid.phone.audio.PhoneMicDevice
@@ -209,6 +214,14 @@ private const val PROBE_IMAGE_BASE64 =
 private const val PROBE_IMAGE_WIDTH = 32
 private const val PROBE_IMAGE_HEIGHT = 32
 private val PROBE_IMAGE_PNG: ByteArray = Base64.getDecoder().decode(PROBE_IMAGE_BASE64)
+
+/**
+ * 0.4 Task 12b-ii (spec §5.3, D204): the 15 s dictation cap, in the unit the composition's monotonic clock uses.
+ *
+ * Kept as a derivation of the controller's own constant so the host's telemetry can tell "the deadline ended this"
+ * from "the user stopped it" without carrying a second number that could drift from the controller.
+ */
+private const val DICTATION_TIMEOUT_NANOS = DictationController.TIMEOUT_MILLIS * 1_000_000L
 
 /**
  * edith-0.3 Phase 2.2 Task 6: the reason a screen tool's production observation reports when the connected
@@ -387,6 +400,20 @@ class HostCompositionRoot internal constructor(
      * not be kept awake by this lock.
      */
     private val wakeLock: WakeLockHold? = null,
+    /**
+     * 0.4 Task 12b-ii (`D204`, spec §5.3): the composition's deadline scheduler, used for the 15 s dictation cap.
+     *
+     * The same single-thread executor that runs the audio loop, the hint timers and the vendor-event dispatch. Null in
+     * a hand-built rig that does not wire dictation; [startDictation] then answers `reason=no_scheduler` instead of
+     * pretending a dictation with no deadline exists.
+     */
+    private val deadlineScheduler: DeadlineScheduler? = null,
+    /**
+     * 0.4 Task 12b-ii: whether `RECORD_AUDIO` is granted, read at start time (the page may have asked the user in
+     * between sessions). Defaults to allowed for hand-built rigs; production passes the platform check. This is the
+     * spec's "仅会话运行且 mic 权限已授予时可用" gate, not a substitute for the recorder's own refusal.
+     */
+    private val microphoneGranted: () -> Boolean = { true },
 ) : AutoCloseable {
     /**
      * P5 (spec §S5): the 「语音朗读」 switch state, persisted globally and **off by default**.
@@ -610,6 +637,52 @@ class HostCompositionRoot internal constructor(
             ),
         )
     val state: StateFlow<SessionUiState> = mutableState.asStateFlow()
+
+    // ---- 0.4 Task 12b-ii: phone-microphone dictation (spec §5.3, D204) -------------------------------------------
+
+    /**
+     * What the assistant page shows for dictation: the lease state and the last delivered final.
+     *
+     * Written from the pipeline/loop/scheduler threads (the controller's callbacks are explicitly allowed to arrive
+     * off-main); `MutableStateFlow` is the marshalling seam, and Compose collects it on the main thread. The text is
+     * memory-only: it is never logged, persisted or handed to `HostRuntime`.
+     */
+    private val dictationUiState = MutableStateFlow(DictationUiState())
+    val dictationUi: StateFlow<DictationUiState> = dictationUiState.asStateFlow()
+
+    /** The live per-dictation controller, or null while no dictation lease is held. */
+    private var dictationController: DictationController? = null
+
+    /** The session epoch the active dictation was recorded under; used to restore the audio loop. */
+    private var dictationEpoch: InputEpoch? = null
+
+    /** The phone capture this composition opened **for the dictation** (glasses mode only; null in detached mode). */
+    private var dictationCapture: PhoneMicCapture? = null
+
+    /** Bumped for every start/teardown so a late callback from an older lease cannot touch a newer one. */
+    private var dictationGeneration = 0L
+
+    /** The user asked to stop this lease (distinguishes `stopped` from the 15 s `timeout` in telemetry). */
+    private var dictationStopRequested = false
+
+    /** The user/host aborted this lease (cancel telemetry, no final). */
+    private var dictationCancelRequested = false
+
+    /** Set when a dictation-owned phone capture died; the terminal state is then `Error(code)`, not `NoSpeech`. */
+    private var dictationFailureCode: String? = null
+
+    /** When the active lease began, for the timeout/no-speech reason split (the count is telemetry-only). */
+    private var dictationStartedNanos = 0L
+
+    /** One terminal cleanup task per lease, dispatched to the composition's scheduler thread. */
+    private var dictationCleanupScheduled = false
+
+    /** Monotonic across the composition so the UI can append each final exactly once. */
+    private var dictationFinalSequence = 0L
+
+    /** True only inside [abortDictation]; the controller's terminal callbacks are ignored while the host tears down. */
+    private var dictationTearingDown = false
+
     private val observation = host.observeState { session ->
         // `D53`② (2026-10-11): the 「主动辅助」 switch is a **persisted global setting**, so nothing here resets it -
         // a session ending must not disarm a feature the user asked to have on, and it must not re-arm one they turned
@@ -1406,6 +1479,9 @@ class HostCompositionRoot internal constructor(
      * only the value distinguishes a normal teardown from the bounded failure the spec §4.5 evidence needs.
      */
     @Synchronized fun disarmAudioEpoch(reason: String = "DISARMED") {
+        // 0.4 Task 12b-ii: a dictation is a lease on this epoch's source. End it first, while its controller can still
+        // seal the pipeline turn under its redirect, and before the recorder/ingress/loop this method releases.
+        abortDictation("session_end")
         val epoch = runningAudioEpoch ?: run {
             // Nothing is armed, so there is no transition line; a hold left behind by an abnormal arm attempt must
             // still not outlive the disarm.
@@ -1613,6 +1689,298 @@ class HostCompositionRoot internal constructor(
     private fun logTyped(state: String, reason: String?, eventId: String, chars: Int) {
         val reasonField = if (reason == null) "" else " reason=$reason"
         P3Log.line("P4_TYPED state=$state$reasonField turn=$eventId chars=$chars")
+    }
+
+    // ---- 0.4 Task 12b-ii: phone-microphone dictation (spec §5.3, D204) -------------------------------------------
+
+    /**
+     * Starts one phone-microphone dictation for the input row.
+     *
+     * Preconditions (spec §5.3): a live session (`Ready`/`Listening`), `RECORD_AUDIO` granted, and an armed audio
+     * epoch of this session. Only one dictation at a time, and a speech turn already in flight (a wake request being
+     * transcribed) is refused rather than stolen: its final must keep going to the LLM.
+     *
+     * Routing: **detached** reuses the session's phone recorder/ingress/loop and only switches the loop's KWS off;
+     * **glasses** opens a phone capture on the same ingress, pauses the CXR frame loop (no transport command) and runs
+     * a phone loop through the same `SpeechPipeline`. The controller redirects the pipeline's emit to the UI.
+     *
+     * @return true when listening; false with a `P4_DICTATION state=refused` line naming the reason.
+     */
+    @Synchronized fun startDictation(): Boolean {
+        if (closed) return refuseDictation("closed")
+        if (dictationController != null) return refuseDictation("busy")
+        val session = host.currentState
+        if (session != SessionState.Ready && session != SessionState.Listening) {
+            return refuseDictation("no_session")
+        }
+        if (!runCatching { microphoneGranted() }.getOrDefault(false)) return refuseDictation("permission")
+        val scheduler = deadlineScheduler ?: return refuseDictation("no_scheduler")
+        val chain = audioChain ?: return refuseDictation("no_source")
+        if (chain.hasActiveTurn()) return refuseDictation("busy")
+        val epoch = runningAudioEpoch ?: return refuseDictation("no_source")
+        val detached = runningAudioDetached
+        if (detached && runningPhoneCapture == null) return refuseDictation("no_source")
+        val ingress = phoneIngress ?: return refuseDictation("no_source")
+
+        var capture: PhoneMicCapture? = null
+        if (!detached) {
+            val factory = phoneMicDeviceFactory ?: return refuseDictation("no_source")
+            val captureHolder = arrayOfNulls<PhoneMicCapture>(1)
+            val failure = runCatching {
+                // Same geometry as the chain's framer (the phone source is the verified 16 kHz/mono/16-bit stream).
+                ingress.open(epoch, PhoneMicFormat.VERIFIED)
+                val built = PhoneMicCapture(factory(), clock, ingress, PhoneMicFormat.VERIFIED, epoch,
+                    // The offer counters belong to the dictation loop, not the paused CXR one.
+                    onOffer = { offer -> audioChain?.onDictationOffer(offer) },
+                    onFailure = { code ->
+                        // Runs on the capture's reader thread: never unwind there (the stop joins it).
+                        dispatchHostEvent { onDictationCaptureFailed(captureHolder[0], code) }
+                    })
+                captureHolder[0] = built
+                built.start()
+            }.exceptionOrNull()
+            if (failure != null) {
+                val code = (failure as? ContractError.CapabilityMissing)?.message
+                    ?: captureHolder[0]?.lastError()
+                    ?: PhoneMicCapture.MIC_START_FAILED
+                runCatching { captureHolder[0]?.stop() }
+                runCatching { ingress.close() }
+                drainIngress(ingress)
+                return refuseDictation(code)
+            }
+            capture = captureHolder[0]
+        }
+
+        if (!runCatching { chain.beginDictation(epoch, ingress) }.getOrDefault(false)) {
+            runCatching { capture?.stop() }
+            if (capture != null) {
+                runCatching { ingress.close() }
+                drainIngress(ingress)
+            }
+            // A begin that failed after pausing the CXR loop must put the normal loop back; it is still the session's
+            // only wake source and the session was never stopped.
+            runCatching { chain.endDictation(epoch) }
+            return refuseDictation("no_source")
+        }
+
+        val generation = ++dictationGeneration
+        // One controller per dictation: it owns the pipeline redirect, the 15 s deadline and the one final.
+        val controller = DictationController(
+            pipeline = chain.dictationPipeline(),
+            scheduler = scheduler,
+            clock = clock,
+            onFinal = { text -> onDictationFinal(generation, text) },
+            onState = { state -> onDictationState(generation, state) },
+            // Non-transcript events only (the controller itself drops partials): the host may route session/fault
+            // events normally, but a dictation transcript never enters HostRuntime or the plugin.
+            forward = { event -> if (event !is TranscriptEvent) host.onEvent(event) },
+        )
+        dictationController = controller
+        dictationEpoch = epoch
+        dictationCapture = capture
+        dictationStopRequested = false
+        dictationCancelRequested = false
+        dictationFailureCode = null
+        dictationStartedNanos = clock.nowNanos()
+        dictationCleanupScheduled = false
+        when (runCatching { controller.start() }.getOrDefault(DictationController.StartResult.Unavailable)) {
+            DictationController.StartResult.Accepted -> {
+                dictationUiState.value = dictationUiState.value.copy(state = DictationState.Listening)
+                logDictation("started", "user", 0)
+                return true
+            }
+            else -> {
+                dictationController = null
+                dictationEpoch = null
+                dictationCapture = null
+                runCatching { controller.close() }
+                runCatching { capture?.stop() }
+                if (capture != null) {
+                    runCatching { ingress.close() }
+                    drainIngress(ingress)
+                }
+                runCatching { chain.endDictation(epoch) }
+                return refuseDictation("start_failed")
+            }
+        }
+    }
+
+    /**
+     * Ends the active dictation through the pipeline, exactly once.
+     *
+     * The controller forces the turn's final; that final follows the redirect to [onDictationFinal] and the UI state,
+     * never the LLM. The terminal callback schedules the route/capture cleanup.
+     */
+    @Synchronized fun stopDictation() {
+        val controller = dictationController ?: return
+        dictationStopRequested = true
+        runCatching { controller.stop() }
+    }
+
+    /**
+     * Aborts the active dictation without delivering its text; the pipeline turn is sealed so a late final cannot
+     * surface on the restored wake route. The UI ends at [DictationState.Idle].
+     */
+    @Synchronized fun cancelDictation() {
+        val controller = dictationController ?: return
+        dictationCancelRequested = true
+        runCatching { controller.cancel() }
+    }
+
+    /** Records one refused start, count-only (never the reason's surrounding content - there is none). */
+    private fun refuseDictation(reason: String): Boolean {
+        logDictation("refused", reason, 0)
+        return false
+    }
+
+    /** One `P4_DICTATION` line: state/reason/character count only - never the dictation text, never its hash. */
+    private fun logDictation(state: String, reason: String?, chars: Int) {
+        P3Log.line("P4_DICTATION state=$state chars=$chars reason=${reason ?: "none"}")
+    }
+
+    /**
+     * The controller's state callback, on any thread.
+     *
+     * The terminal states first quiesce the loop that produced the event (the controller restores its emit sink before
+     * this callback, so a frame left in the same 20 ms batch must not start a new ASR turn), then schedule the slow
+     * cleanup on the composition's scheduler thread - never inline on the UI thread or the capture's reader.
+     */
+    @Synchronized private fun onDictationState(generation: Long, state: DictationState) {
+        if (closed || dictationTearingDown || generation != dictationGeneration) return
+        when (state) {
+            DictationState.Listening -> {
+                dictationUiState.value = dictationUiState.value.copy(state = DictationState.Listening)
+            }
+            DictationState.Idle, DictationState.NoSpeech, is DictationState.Error -> {
+                audioChain?.quiesceDictationInput()
+                val failure = dictationFailureCode
+                val effective = if (failure != null) DictationState.Error(failure) else state
+                dictationUiState.value = dictationUiState.value.copy(state = effective)
+                when {
+                    failure != null -> logDictation("error", failure, 0)
+                    state == DictationState.Idle && dictationCancelRequested -> logDictation("cancel", "user", 0)
+                    // A final follows on the same controller path and logs the `final` line with its count; an Idle
+                    // before that (cancel) is handled above.
+                    state == DictationState.Idle -> Unit
+                    state is DictationState.Error -> logDictation("error", state.code, 0)
+                    else -> {
+                        val timedOut = clock.nowNanos() - dictationStartedNanos >= DICTATION_TIMEOUT_NANOS
+                        if (timedOut && !dictationStopRequested) logDictation("timeout", "timeout", 0)
+                        else logDictation("stopped", "user", 0)
+                    }
+                }
+                scheduleDictationCleanup(generation)
+            }
+        }
+    }
+
+    /** The one final for the active lease; the text is handed to the UI state and nowhere else. */
+    @Synchronized private fun onDictationFinal(generation: Long, text: String) {
+        if (closed || dictationTearingDown || generation != dictationGeneration) return
+        val final = DictationFinal(++dictationFinalSequence, text)
+        dictationUiState.value = DictationUiState(DictationState.Idle, final)
+        // Count only: the wearer's words are never logged and there is no digest of them either.
+        logDictation("final", if (dictationStopRequested) "user" else "endpoint", text.length)
+    }
+
+    /** Arms the single deferred cleanup for this lease (idempotent; the state callback can fire more than once). */
+    private fun scheduleDictationCleanup(generation: Long) {
+        if (dictationCleanupScheduled) return
+        dictationCleanupScheduled = true
+        dispatchHostEvent { finishDictation(generation) }
+    }
+
+    /**
+     * Releases the dictation lease after a terminal state: restore the emit route, stop/close the dictation capture,
+     * put the normal CXR loop back (glasses) or re-enable KWS on the session's own loop (detached).
+     *
+     * Runs on the composition's scheduler/dispatch thread. Every release is guarded so a failure in one leg cannot
+     * skip the others - a route left quiesced would silence the wake word for the rest of the session.
+     */
+    @Synchronized private fun finishDictation(generation: Long) {
+        if (generation != dictationGeneration) return
+        val controller = dictationController
+        val capture = dictationCapture
+        if (controller == null && capture == null) {
+            dictationCleanupScheduled = false
+            return
+        }
+        dictationCleanupScheduled = false
+        dictationController = null
+        dictationCapture = null
+        val epoch = dictationEpoch
+        dictationEpoch = null
+        runCatching { controller?.close() }
+        runCatching { capture?.stop() }
+        if (capture != null) {
+            runCatching { phoneIngress?.close() }
+            phoneIngress?.let { drainIngress(it) }
+        }
+        epoch?.let { runCatching { audioChain?.endDictation(it) } }
+        dictationStopRequested = false
+        dictationCancelRequested = false
+        dictationFailureCode = null
+    }
+
+    /**
+     * A dictation-owned phone capture died mid-lease. The dictation ends as `Error(code)` (a capture failure is not
+     * "no speech"), its pipeline turn is sealed through the controller's cancel path, and the normal route is restored;
+     * the session itself is untouched - the CXR transport never depended on this capture.
+     */
+    @Synchronized private fun onDictationCaptureFailed(capture: PhoneMicCapture?, code: String) {
+        if (closed || dictationTearingDown) return
+        if (capture == null || dictationCapture !== capture) return
+        dictationFailureCode = code
+        val controller = dictationController
+        if (controller != null) {
+            // cancel() reports Idle; the failure flag turns that terminal into the Error state and line.
+            runCatching { controller.cancel() }
+        } else {
+            audioChain?.quiesceDictationInput()
+            dictationUiState.value = dictationUiState.value.copy(state = DictationState.Error(code))
+            logDictation("error", code, 0)
+            scheduleDictationCleanup(dictationGeneration)
+        }
+    }
+
+    /** Drops whatever a source queued while it was paused on purpose (a deliberate pause is not an audio fault). */
+    private fun drainIngress(ingress: PcmIngress) {
+        while (runCatching { ingress.poll() }.getOrNull() != null) { /* discarded on purpose */ }
+        while (runCatching { ingress.pollGap() }.getOrNull() != null) { /* stale gap */ }
+    }
+
+    /**
+     * Ends any dictation lease as part of a session teardown (0.4 Task 12b-ii).
+     *
+     * Runs **before** [disarmAudioEpoch] releases the epoch: the controller must still be able to seal its pipeline
+     * turn under its redirect (a final emitted after the source was released would otherwise reach the wake route), and
+     * the dictation-owned capture/loop must be stopped before the epoch's own resources. The normal loop is not
+     * restarted - the teardown is about to stop it.
+     */
+    @Synchronized private fun abortDictation(reason: String) {
+        if (dictationController == null && dictationCapture == null) return
+        // Invalidate queued terminal callbacks from this lease before cancel() can emit Idle.
+        ++dictationGeneration
+        dictationTearingDown = true
+        val controller = dictationController
+        dictationController = null
+        val capture = dictationCapture
+        dictationCapture = null
+        dictationEpoch = null
+        dictationCleanupScheduled = false
+        runCatching { controller?.cancel() }
+        runCatching { capture?.stop() }
+        if (capture != null) {
+            runCatching { phoneIngress?.close() }
+            phoneIngress?.let { drainIngress(it) }
+        }
+        runCatching { audioChain?.abortDictation() }
+        dictationTearingDown = false
+        dictationStopRequested = false
+        dictationCancelRequested = false
+        dictationFailureCode = null
+        dictationUiState.value = dictationUiState.value.copy(state = DictationState.Idle)
+        logDictation("cancel", reason, 0)
     }
 
     /**
@@ -3354,6 +3722,13 @@ class HostCompositionRoot internal constructor(
                 wakeLock = detachedWakeLock,
                 playbackGate = playbackGate,
                 modelReadiness = readiness,
+                // 0.4 Task 12b-ii: the dictation deadline runs on the same single-thread scheduler as the audio loop,
+                // and the page's permission is read per start (a glasses-mode session never asks for it at start).
+                deadlineScheduler = scheduler,
+                microphoneGranted = {
+                    context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                },
             )
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
             // connection that has not been built yet.
@@ -3826,6 +4201,28 @@ internal class CxrAudioChain private constructor(
     /** The ingress [loop] was built on. The selector is dynamic (0.4 Task 6), so identity decides a stale cache. */
     private var loopIngress: PcmIngress? = null
 
+    /**
+     * The phone-mic dictation loop while glasses-mode dictation runs, or null (0.4 Task 12b-ii).
+     *
+     * In detached mode this is null for the whole dictation: the normal loop already polls the phone ingress, so the
+     * host only switches its wake acceptance off. In glasses mode the normal CXR loop is stopped and this second
+     * [`AudioIngressLoop`] polls the phone ingress into the **same** pipeline - no second ASR/KWS instance is built.
+     */
+    private var dictationLoop: AudioIngressLoop? = null
+
+    /**
+     * Whether the pipeline's frames may feed the acoustic labeler/audio-segment capture (0.4 Task 12b-ii).
+     *
+     * Dictation audio is content the wearer typed with their voice, not a wake/proactive turn: while a dictation runs,
+     * the pipeline still transcribes it, but it must not produce an acoustic label that the proactive route could turn
+     * into a model request, and it must not enter the audio-segment bridge. Only the dictation overrides this flag.
+     */
+    @Volatile internal var dictationActive: Boolean = false
+        private set
+
+    /** Whether new loops start with their KWS accepted; the dictation begin/end switch it (0.4 Task 12b-ii). */
+    @Volatile private var wakeEnabled = true
+
     /** Outcomes observed before the first loop existed; drained into it as it is built. */
     private val pendingFaults = ArrayDeque<String>()
     private val pendingOffers = ArrayDeque<PcmOffer>()
@@ -3877,6 +4274,140 @@ internal class CxrAudioChain private constructor(
     }
 
     /**
+     * Dictation routing seam (0.4 Task 12b-ii, spec §5.3 D204).
+     *
+     * The host never reaches into the private loop: a dictation that runs in **detached** mode reuses the running
+     * phone loop (only its wake acceptance goes off); one that runs in **glasses** mode stops the CXR loop, drains its
+     * queue and starts a phone loop over the same [SpeechPipeline]. Either way the frames of the phone mic are framed
+     * by the chain's one [PcmFramer] and no second recognizer/detector is built.
+     */
+    internal fun dictationPipeline(): SpeechPipelineDictation = SpeechPipelineDictation(pipeline)
+
+    /** Whether the shared pipeline is already transcribing a wake request (the host refuses to steal that turn). */
+    internal fun hasActiveTurn(): Boolean = pipeline.hasActiveTurn()
+
+    /**
+     * Starts dictating on [phoneIngress].
+     *
+     * @return true when the route is ready: in detached mode the running phone loop had its wake acceptance disabled;
+     *   in glasses mode the CXR loop was stopped and a phone loop is now polling the pipeline. False means nothing was
+     *   left running by this call (the caller restores the route with [endDictation]).
+     */
+    internal fun beginDictation(epoch: InputEpoch, phoneIngress: PcmIngress): Boolean = synchronized(lock) {
+        if (dictationLoop != null) return false
+        wakeEnabled = false
+        val current = loop
+        val detachedSource = current != null && loopIngress === phoneIngress
+        if (detachedSource) {
+            // Detached: the session's own loop keeps running; only the KWS tap closes.
+            current!!.wakeEnabled = false
+            dictationActive = true
+            return true
+        }
+        // Glasses: pause the CXR frame loop (no transport/session command), then run the phone source through the
+        // same pipeline. Frames the CXR kept sending while paused are stale for the next wake turn, so drop them.
+        current?.activeEpoch?.let { current.stop(it) }
+        loop = null
+        loopIngress = null
+        val cxr = ingress()
+        if (cxr != null) drainStale(cxr)
+        val built = AudioIngressLoop(phoneIngress, framer, pipeline, wake?.detector, scheduler, clock,
+            onFault = faultSink)
+        built.wakeEnabled = false
+        dictationLoop = built
+        dictationActive = true
+        built.start(epoch)
+        true
+    }
+
+    /**
+     * Ends a dictation and restores the normal route (0.4 Task 12b-ii).
+     *
+     * Detached: re-enables the session loop's KWS. Glasses: stops and releases the phone loop, drops the CXR audio that
+     * arrived while paused, and starts the normal CXR loop again. No transport start/stop is performed - the session was
+     * never stopped - and the wake detector is reset so the frames before/after the dictation cannot be spliced into one
+     * keyword hypothesis.
+     */
+    internal fun endDictation(epoch: InputEpoch) {
+        synchronized(lock) {
+            wakeEnabled = true
+            dictationActive = false
+            val dictation = dictationLoop
+            if (dictation == null) {
+                loop?.let {
+                    it.wakeEnabled = true
+                    it.pipelineEnabled = true
+                }
+                runCatching { wake?.detector?.reset() }
+                return
+            }
+            dictation.activeEpoch?.let { dictation.stop(it) }
+            dictationLoop = null
+            val source = ingress()
+            if (source != null) {
+                drainStale(source)
+                val rebuilt = AudioIngressLoop(source, framer, pipeline, wake?.detector, scheduler, clock,
+                    onFault = faultSink)
+                rebuilt.wakeEnabled = true
+                loop = rebuilt
+                loopIngress = source
+                rebuilt.start(epoch)
+            }
+            runCatching { wake?.detector?.reset() }
+        }
+    }
+
+    /**
+     * Stops any dictation route without restarting the normal loop (0.4 Task 12b-ii).
+     *
+     * Used by the composition's teardown: `disarmAudioEpoch` is about to stop the loop/capture/ingress anyway, so a
+     * restart here would be work the very next statement undoes. The session's loop has its two acceptance flags put
+     * back so a loop that is not actually stopped (a paths race) cannot stay quiesced.
+     */
+    internal fun abortDictation() = synchronized(lock) {
+        wakeEnabled = true
+        dictationActive = false
+        dictationLoop?.activeEpoch?.let { running -> dictationLoop?.stop(running) }
+        dictationLoop = null
+        loop?.let {
+            it.wakeEnabled = true
+            it.pipelineEnabled = true
+        }
+    }
+
+    /**
+     * Stops feeding the remaining frames of the current batch as soon as a dictation reaches a terminal state.
+     *
+     * The controller restores its emit sink before it reports that state, so a frame left in the same 20 ms drain batch
+     * would otherwise start a new ASR turn whose partials reach the restored wake route. The host calls this from the
+     * terminal callback; the frames of a whole batch are then skipped until [endDictation] puts the route back.
+     */
+    internal fun quiesceDictationInput() = synchronized(lock) {
+        val dictation = dictationLoop
+        if (dictation != null) {
+            dictation.wakeEnabled = false
+            dictation.pipelineEnabled = false
+        } else {
+            loop?.let {
+                it.wakeEnabled = false
+                it.pipelineEnabled = false
+            }
+        }
+    }
+
+    /** Routes a phone-capture offer outcome to the dictation loop's counters instead of the paused CXR loop's. */
+    internal fun onDictationOffer(offer: PcmOffer) {
+        offerSink(offer)
+        synchronized(lock) { dictationLoop?.onOffer(offer) }
+    }
+
+    /** Drops queued chunks/gaps of an ingress that was paused on purpose; a deliberate pause is not an audio fault. */
+    private fun drainStale(source: PcmIngress) {
+        while (runCatching { source.poll() }.getOrNull() != null) { /* discarded on purpose */ }
+        while (runCatching { source.pollGap() }.getOrNull() != null) { /* stale gap */ }
+    }
+
+    /**
      * The loop for the current ingress, with any outcome that arrived before it drained into it.
      *
      * The `offer`/`fault` arguments are handled here rather than by the callers so that "is there a loop" and
@@ -3909,6 +4440,9 @@ internal class CxrAudioChain private constructor(
             if (current == null && source != null) {
                 current = AudioIngressLoop(source, framer, pipeline, wake?.detector, scheduler, clock,
                     onFault = faultSink).also { built ->
+                    // A loop built while a dictation is quiescing the chain must inherit the switch: the dictation
+                    // never wants KWS on its own audio even if a fault rebuilt the loop underneath it.
+                    built.wakeEnabled = wakeEnabled
                     loop = built
                     loopIngress = source
                     while (pendingOffers.isNotEmpty()) built.onOffer(pendingOffers.removeFirst())
@@ -3926,6 +4460,12 @@ internal class CxrAudioChain private constructor(
         }
 
     override fun close() {
+        synchronized(lock) {
+            dictationLoop?.activeEpoch?.let { running -> dictationLoop?.stop(running) }
+            dictationLoop = null
+            loop = null
+            loopIngress = null
+        }
         runCatching { wake?.close() }
         runCatching { pipeline.close() }
     }
@@ -3991,6 +4531,10 @@ internal class CxrAudioChain private constructor(
                     // P5 (I2 fix, spec §S4): suppress ingestion during TTS playback to prevent echo self-trigger.
                     // When the gate is closed, discard the frame entirely — don't feed VAD, ASR, labeler, or capture.
                     if (playbackGate.isPlaying) return@frameSignal
+                    // 0.4 Task 12b-ii (D204): dictation audio is not a wake/proactive turn. It may reach the ASR turn
+                    // above, but it must not produce an acoustic label (which the proactive route could turn into a
+                    // model request) and it must not be retained as an audio segment for a later turn.
+                    if (chainHolder[0]?.dictationActive == true) return@frameSignal
                     labeler.accept(frame, speech)?.let { label -> chainHolder[0]?.acousticEmit?.invoke(label) }
                     // Feed the capture with PCM bytes and VAD speech flag.
                     val pcmBytes = ByteArray(frame.samples.size * 2)

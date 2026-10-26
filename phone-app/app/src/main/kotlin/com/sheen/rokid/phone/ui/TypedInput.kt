@@ -25,16 +25,10 @@ const val TYPED_SEND_LABEL = "发送"
 const val TYPED_IDLE_LABEL = "输入后点「发送」"
 
 /**
- * The microphone's Chinese description. The control is visible but disabled in this task; the description still names
- * what it will do, so a screen reader does not meet an unlabelled dead button (Task 12b wires it).
+ * Whether the microphone is wired. True since 0.4 Task 12b-ii: the row now starts/stops a phone-microphone dictation
+ * (see `DictationInput.kt`). Kept as the one named switch so the row's history and the reserved layout stay explicit.
  */
-const val MIC_DICTATION_DESCRIPTION = "语音输入（听写功能即将提供）"
-
-/**
- * Whether the microphone is wired. False in Task 11: dictation (Task 12b) owns the listener; this task only reserves
- * the control and its accessibility label, so the row's layout does not move when it lands.
- */
-const val MIC_DICTATION_ENABLED = false
+const val MIC_DICTATION_ENABLED = true
 
 /** The input row's page-recreation state: the draft, whether the one synchronous send is running, and its result. */
 data class TypedInputState(

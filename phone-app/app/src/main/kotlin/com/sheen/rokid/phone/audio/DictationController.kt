@@ -7,7 +7,7 @@ import com.sheen.rokid.plugin.DeadlineScheduler
 import com.sheen.rokid.plugin.MonotonicClock
 
 /** 15 s cap for one phone-mic dictation (0.4 spec §5.3, D204). */
-private const val DEFAULT_TIMEOUT_MILLIS = 15_000L
+private const val DEFAULT_TIMEOUT_MILLIS = DictationController.TIMEOUT_MILLIS
 
 /**
  * The two operations the dictation controller needs from the shared speech pipeline.
@@ -335,5 +335,12 @@ class DictationController(
     companion object {
         /** Stable code for a pipeline that threw while [stop] was forcing the final. */
         const val ERROR_STOP_FAILED = "DICTATION_STOP_FAILED"
+
+        /**
+         * The 0.4 spec §5.3 cap: one dictation may listen for 15 s, then it ends as [DictationState.NoSpeech].
+         *
+         * Public so the host's telemetry can attribute a `NoSpeech` to the deadline without duplicating the number.
+         */
+        const val TIMEOUT_MILLIS = 15_000L
     }
 }

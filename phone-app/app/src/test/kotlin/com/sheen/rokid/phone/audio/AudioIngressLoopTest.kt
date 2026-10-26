@@ -179,6 +179,49 @@ class AudioIngressLoopTest {
     }
 
     @Test
+    fun disablingWakeAcceptanceKeepsThePipelineFedAndNeverFeedsTheDetector() {
+        // 0.4 Task 12b-ii (spec §5.3, D204): a phone-microphone dictation reuses one upload loop. While it listens the
+        // KWS must not see the dictation audio (a spoken wake word there is dictation content, not a request), but the
+        // pipeline still must - it is the same ASR turn that produces the final the input row appends.
+        val rig = Rig()
+        rig.open()
+        rig.loop.start(rig.epoch)
+
+        rig.loop.wakeEnabled = false
+        rig.offerWholeFrame()
+        rig.tick()
+        assertEquals("a disabled wake seam must still feed the speech pipeline", 1, rig.asr.frames.size)
+        assertEquals("KWS must not see dictation audio", 0, rig.wakeEngine.frames.size)
+
+        rig.loop.wakeEnabled = true
+        rig.offerWholeFrame()
+        rig.tick()
+        assertEquals("re-enabling restores the wake path for the same loop", 1, rig.wakeEngine.frames.size)
+        assertEquals(2, rig.asr.frames.size)
+    }
+
+    @Test
+    fun disablingPipelineAcceptanceQuiescesTheAsrWithoutSilencingTheWakePath() {
+        // The second half of the dictation quiesce seam: when a final/stop/timeout ends a dictation, the frames still
+        // drained in the same tick must not start another ASR turn whose partials would reach the restored wake route.
+        // The two switches are independent on purpose - a host can stop one consumer without touching the other.
+        val rig = Rig()
+        rig.open()
+        rig.loop.start(rig.epoch)
+
+        rig.loop.pipelineEnabled = false
+        rig.offerWholeFrame()
+        rig.tick()
+        assertEquals("a quiesced pipeline must not accept the frame", 0, rig.asr.frames.size)
+        assertEquals("the wake consumer is a separate switch and stays fed", 1, rig.wakeEngine.frames.size)
+
+        rig.loop.pipelineEnabled = true
+        rig.offerWholeFrame()
+        rig.tick()
+        assertEquals(1, rig.asr.frames.size)
+    }
+
+    @Test
     fun overflowIsReportedAndRestartsFramingInsteadOfFabricatingFrames() {
         val rig = Rig()
         rig.open()

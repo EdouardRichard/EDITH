@@ -65,6 +65,28 @@ class AudioIngressLoop(
     private var running: InputEpoch? = null
 
     /**
+     * Whether the frames of this loop are offered to the KWS as well as to the speech pipeline (0.4 Task 12b-ii).
+     *
+     * The orchestrating host disables this for the duration of a phone-microphone dictation: the same loop then keeps
+     * feeding the ASR turn that produces the dictation final, but a wake word spoken into the dictation can never
+     * become a wake request (spec §5.3: 唤醒 KWS 不把听写内容当唤醒/回合). It is a plain per-frame read rather than a
+     * constructor value, because the loop that serves a detached session is the one that later dictates.
+     *
+     * Default true: a loop that nobody told about a dictation behaves exactly as before.
+     */
+    @Volatile var wakeEnabled: Boolean = true
+
+    /**
+     * Whether the frames of this loop are offered to the speech pipeline (0.4 Task 12b-ii).
+     *
+     * A terminal dictation event can be produced in the middle of one drained frame batch. The host sets this false
+     * synchronously when the dictation ends, so the frames left in that batch cannot start a second ASR turn whose
+     * partials would reach the restored wake route. The host re-enables it when the dictation is fully cleaned up (or
+     * rebuilds the loop for glasses mode). Default true - only a dictation quiesce changes it.
+     */
+    @Volatile var pipelineEnabled: Boolean = true
+
+    /**
      * The epoch this loop is polling under, or null while stopped.
      *
      * Exposed so the chain that caches the loop can tell "this is the loop for the epoch being stopped" from a stale
@@ -250,8 +272,8 @@ class AudioIngressLoop(
         }
         faults.forEach(onFault)
         frames.forEach { frame ->
-            wake?.accept(frame)
-            pipeline.accept(frame)
+            if (wakeEnabled) wake?.accept(frame)
+            if (pipelineEnabled) pipeline.accept(frame)
         }
         // Outside the lock: the summary is an observer of the tick, never part of it.
         summary?.let { P3Log.line(it) }

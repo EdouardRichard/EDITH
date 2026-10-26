@@ -6,9 +6,11 @@ import com.sheen.rokid.phone.app.SmartSettingsSection
 
 import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -47,6 +49,8 @@ import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.app.MemorySection
 import com.sheen.rokid.phone.app.TypedSendResult
+import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationUiState
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.SessionViewModel
@@ -62,6 +66,7 @@ import com.sheen.rokid.phone.app.errorLabel
 import com.sheen.rokid.phone.actions.executionChannelLabel
 import com.sheen.rokid.phone.ui.pluginPickerOptions
 import com.sheen.rokid.plugin.Capability
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -163,6 +168,9 @@ internal fun PhoneScreen(
                             log = root.conversationLog,
                             session = state.session,
                             send = { root.requestTypedMessage(it) },
+                            dictation = root.dictationUi,
+                            startDictation = { root.startDictation() },
+                            stopDictation = { root.stopDictation() },
                             modifier = Modifier.weight(1f),
                         )
                         state.errorCode?.let {
@@ -289,6 +297,9 @@ internal fun AssistantTab(
     log: ConversationLog,
     session: SessionState,
     send: (String) -> TypedSendResult,
+    dictation: StateFlow<DictationUiState>,
+    startDictation: () -> Boolean,
+    stopDictation: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var route by remember { mutableStateOf(AssistantRoute.WAKE) }
@@ -296,6 +307,22 @@ internal fun AssistantTab(
     // The row's draft and last result survive an Activity recreation; the send itself never spans one (it is a
     // synchronous host call), so `sending` is not saved.
     var typedInput by rememberSaveable(stateSaver = typedInputSaver) { mutableStateOf(TypedInputState()) }
+    // The dictation host is the only writer of this flow (its callbacks may arrive on the pipeline or scheduler
+    // thread; StateFlow + lifecycle collection marshal them onto the main thread). The last sequence the page has
+    // appended survives recreation, so the same delivered final cannot be inserted twice.
+    val dictationUi by dictation.collectAsStateWithLifecycle()
+    var lastDictationSequence by rememberSaveable { mutableStateOf(0L) }
+    LaunchedEffect(dictationUi.final?.sequence) {
+        val delivered = dictationUi.final ?: return@LaunchedEffect
+        if (delivered.sequence <= lastDictationSequence) return@LaunchedEffect
+        lastDictationSequence = delivered.sequence
+        // 0.4 Task 12b-ii (spec §5.3): the recognized words are appended to the editable draft. Nothing is sent:
+        // the wearer can fix them and presses 发送 when ready.
+        typedInput = typedInput.copy(
+            draft = appendDictation(typedInput.draft, delivered.text),
+            result = null,
+        )
+    }
     val entries = remember(revision, route) { log.entries(route) }
     // Start the first layout at the newest entry, so the frame before the route-opening effect cannot show the oldest
     // one. The route-opening effect still owns route switches (the state is shared, not recreated).
@@ -402,6 +429,7 @@ internal fun AssistantTab(
             TypedInputRow(
                 session = session,
                 state = typedInput,
+                dictation = dictationUi.state,
                 onDraftChange = { candidate ->
                     typedInput = typedInput.copy(draft = typedDraftAfterInput(candidate))
                 },
@@ -413,6 +441,8 @@ internal fun AssistantTab(
                         typedInput = outgoing.beginSend().finishSend(send(outgoing.draft))
                     }
                 },
+                onStartDictation = { startDictation() },
+                onStopDictation = stopDictation,
             )
         }
     }
@@ -428,24 +458,35 @@ private val typedInputSaver: Saver<TypedInputState, Any> = listSaver(
 )
 
 /**
- * 0.4 Task 11 (spec §5.1): the WAKE conversation's fixed input row, below the chat frame and outside its `LazyColumn`.
+ * 0.4 Task 11 (spec §5.1) + Task 12b-ii (spec §5.3): the WAKE conversation's fixed input row, below the chat frame.
  *
  * Always rendered on WAKE (the 脱离眼镜 switch does not hide it), never on PROACTIVE. The row draws the pure decisions
- * from `TypedInput.kt` — [canSendTyped], [typedSendBlockedReason], [typedResultLabel] — and reads no identity itself.
+ * from `TypedInput.kt`/`DictationInput.kt` and reads no identity itself.
  *
- * The microphone is present but disabled: Task 12b wires dictation, and the control is reserved now so the row does not
- * change shape when it does. Its Chinese description names what it will do, and [MIC_DICTATION_ENABLED] is the single
- * switch Task 12b flips.
+ * The microphone starts a phone-microphone dictation on a tap and stops the running one on a second tap (D204). A
+ * missing `RECORD_AUDIO` grant is requested right here - glasses sessions never ask for it at start, so the dictation
+ * is the only moment the permission can be obtained - and the host re-checks the grant at start. While listening the
+ * status line shows 正在听写…; the final transcript is appended to the draft by [AssistantTab], never sent.
  */
 @Composable
 private fun TypedInputRow(
     session: SessionState,
     state: TypedInputState,
+    dictation: DictationState,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
+    onStartDictation: () -> Unit,
+    onStopDictation: () -> Unit,
 ) {
     val blank = state.draft.isBlank()
-    val failed = state.result != null && state.result != TypedSendResult.Accepted
+    val failed = (state.result != null && state.result != TypedSendResult.Accepted) ||
+        dictation is DictationState.Error
+    val listening = dictation == DictationState.Listening
+    val context = LocalContext.current
+    // The permission result is asynchronous; the start is retried only after the user grants it.
+    val requestMicrophone = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted) onStartDictation()
+    }
     Column(
         Modifier.fillMaxWidth(),
         verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -463,10 +504,24 @@ private fun TypedInputRow(
                 minLines = 1,
                 maxLines = 4,
             )
-            IconButton(onClick = { }, enabled = MIC_DICTATION_ENABLED) {
+            IconButton(
+                onClick = {
+                    when {
+                        listening -> onStopDictation()
+                        MIC_DICTATION_ENABLED && dictationMicEnabled(session) -> {
+                            val granted = ContextCompat.checkSelfPermission(
+                                context,
+                                Manifest.permission.RECORD_AUDIO,
+                            ) == PackageManager.PERMISSION_GRANTED
+                            if (granted) onStartDictation() else requestMicrophone.launch(Manifest.permission.RECORD_AUDIO)
+                        }
+                    }
+                },
+                enabled = MIC_DICTATION_ENABLED && dictationMicEnabled(session),
+            ) {
                 Icon(
                     Icons.Default.Mic,
-                    contentDescription = MIC_DICTATION_DESCRIPTION,
+                    contentDescription = dictationMicDescription(dictation),
                 )
             }
             Button(
@@ -475,7 +530,7 @@ private fun TypedInputRow(
             ) { Text(TYPED_SEND_LABEL) }
         }
         Text(
-            typedStatusText(session, state),
+            inputRowStatusText(session, state, dictation),
             style = MaterialTheme.typography.bodySmall,
             color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
         )

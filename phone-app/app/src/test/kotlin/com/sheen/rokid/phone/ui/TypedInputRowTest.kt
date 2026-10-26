@@ -142,13 +142,14 @@ class TypedInputRowTest {
     }
 
     @Test
-    fun `the dictation microphone is shown but disabled until task 12b`() {
-        assertFalse("Task 12b wires dictation; this task only reserves the control", MIC_DICTATION_ENABLED)
-        assertTrue(MIC_DICTATION_DESCRIPTION.any { it in '\u4e00'..'\u9fff' })
+    fun `the dictation microphone is enabled and described in Chinese`() {
+        assertTrue("Task 12b-ii wires dictation; the reserved control is live now", MIC_DICTATION_ENABLED)
         assertTrue(
-            "the description must say what the button will do: $MIC_DICTATION_DESCRIPTION",
-            "语音" in MIC_DICTATION_DESCRIPTION || "听写" in MIC_DICTATION_DESCRIPTION,
+            "the description must say what the button does: $DICTATION_START_DESCRIPTION",
+            "语音" in DICTATION_START_DESCRIPTION || "听写" in DICTATION_START_DESCRIPTION,
         )
+        assertTrue(DICTATION_STOP_DESCRIPTION.any { it in '\u4e00'..'\u9fff' })
+        assertEquals("停止语音输入", DICTATION_STOP_DESCRIPTION)
     }
 
     @Test

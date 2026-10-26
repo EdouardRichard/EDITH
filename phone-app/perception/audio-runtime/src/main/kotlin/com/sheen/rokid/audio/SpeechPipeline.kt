@@ -126,6 +126,16 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
         return finished
     }
 
+    /**
+     * Whether a speech turn is currently active (`accept` opened a turn and no endpoint/finish/reset closed it).
+     *
+     * The dictation host uses this before it installs its redirect: a wake request already in progress owns the turn
+     * and its final must reach the LLM route, so a phone-mic dictation is refused rather than allowed to capture that
+     * final (0.4 Task 12b-ii, spec §5.3: 唤醒后语音 ASR 直接给 LLM 的既有行为不变). Read-only - it never advances or
+     * mutates the turn.
+     */
+    fun hasActiveTurn(): Boolean = synchronized(worker) { turn != null }
+
     private fun process(frame: PcmFrame, actions: MutableList<() -> Unit>, fromDeferred: Boolean = false) {
         try {
             require(frame.sampleRateHz in 8000..192000)
