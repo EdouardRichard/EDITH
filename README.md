@@ -194,7 +194,7 @@ The **Detached from glasses** setting runs the wake route without the glasses. T
 replaces the CXR uplink: the same 16 kHz/mono PCM framing feeds the same KWS, VAD and streaming ASR,
 and a wake hit opens the same WAKE turn with the same tools, prompts, memory and confirmation flow.
 The app opens no CXR session and sends nothing to the glasses (enforced in code; the final K40
-outbound-count re-verification is still pending Task 13e). The answer is written to the phone's
+outbound count verified on K40 after detach neutralization). The answer is written to the phone's
 conversation log; the phone display device is acknowledgement-only (it does not write the log
 again), and TTS still follows the existing speech switch. Proactive assistance is effectively off
 while detached — the expression is `proactiveEnabled && !glassesDetached`, so the stored proactive

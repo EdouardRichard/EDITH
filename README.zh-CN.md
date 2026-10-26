@@ -178,8 +178,8 @@ flowchart LR
 
 「脱离眼镜」设置让唤醒链路不依赖眼镜：手机麦克风取代 CXR 上行，同一路 16 kHz/单声道 PCM 仍进入
 同一套 KWS、VAD 与流式 ASR；唤醒命中后打开同一个 WAKE 回合，沿用相同的工具、提示词、记忆与确认
-流程。App 不建立 CXR 会话、不向眼镜发送任何内容（代码层已强制；最终 K40 outbound 计数复验仍待
-Task 13e）。答案写入手机「对话上下文记录」；手机显示设备
+流程。App 不建立 CXR 会话、不向眼镜发送任何内容（代码层已强制；K40 最终矩阵在 neutralization 后
+60 s 与脱离会话窗口内均计数为零 `EdithHint: outbound`）。答案写入手机「对话上下文记录」；手机显示设备
 只做确认（不重复写记录），TTS 仍由现有「语音朗读」开关控制。脱离时主动辅助**有效关闭**——判定式
 是 `proactiveEnabled && !glassesDetached`，不修改已保存的主动辅助值。`PARTIAL_WAKE_LOCK`
 （`edith:detached-wake`）让 KWS 在息屏时继续工作；本版不主动点亮屏幕，也不承诺锁屏界面呈现。
