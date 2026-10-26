@@ -2316,6 +2316,8 @@ class HostCompositionRoot internal constructor(
      * `PcmIngress.offer`'s result used to be discarded inside the transport, so `INGRESS_OVERFLOW` and
      * `UNKNOWN_FORMAT` could never be reported. Arrives on the transport's worker thread; the chain makes the
      * "is there a loop yet" decision under its own lock, so a fault that races the first `start` is buffered, not lost.
+     * While a glasses-mode dictation owns the pipeline the chain drops the outcome instead of rebuilding the paused
+     * CXR route (Task 12b-ii fix 1); the diagnostic line is still emitted at the chain's offer sink.
      */
     internal fun onPcmOffer(offer: PcmOffer) {
         audioChain?.onOffer(offer)
@@ -4202,6 +4204,15 @@ internal class CxrAudioChain private constructor(
     private var loopIngress: PcmIngress? = null
 
     /**
+     * The cached normal loop, or null while none is built.
+     *
+     * Read-only introspection for the dictation regression (0.4 Task 12b-ii fix 1): a CXR offer that arrives while a
+     * glasses-mode dictation owns the pipeline must build nothing, and the restore must leave exactly one normal loop
+     * behind. Production never reads it.
+     */
+    internal val normalLoopForProbe: AudioIngressLoop? get() = synchronized(lock) { loop }
+
+    /**
      * The phone-mic dictation loop while glasses-mode dictation runs, or null (0.4 Task 12b-ii).
      *
      * In detached mode this is null for the whole dictation: the normal loop already polls the phone ingress, so the
@@ -4270,6 +4281,8 @@ internal class CxrAudioChain private constructor(
     /** Reports what the receiver did with one offered datagram; see [AudioIngressLoop.onOffer]. */
     fun onOffer(offer: PcmOffer) {
         offerSink(offer)
+        // [resolved] drops transport outcomes while a glasses-mode dictation owns the pipeline (fix 1); the outcome
+        // still reaches diagnostics through [offerSink] above.
         resolved(offer = offer)
     }
 
@@ -4425,6 +4438,14 @@ internal class CxrAudioChain private constructor(
      */
     private fun resolved(offer: PcmOffer? = null, fault: String? = null): AudioIngressLoop? =
         synchronized(lock) {
+            // 0.4 Task 12b-ii fix 1: a glasses-mode dictation has paused this normal route on purpose. The CXR
+            // transport keeps offering PCM into its ingress while no loop polls it, so its outcomes (ACCEPTED,
+            // OVERFLOW, a drained GAP) describe audio the dictation route does not own. Letting one through here
+            // would build a normal CXR loop; an OVERFLOW would then reset the **shared** PcmFramer under the phone
+            // dictation frames, the pipeline would see a range gap with an unchanged continuity id, and the
+            // in-flight dictation turn would be revoked. `endDictation` drains the paused ingress before the normal
+            // loop is restored, so dropping the outcome here loses no audio the restored route should hear.
+            if (dictationLoop != null) return null
             val source = ingress()
             var current = loop
             if (current != null && loopIngress !== source) {

@@ -4,6 +4,7 @@ import android.content.Intent
 import com.sheen.rokid.audio.AsrHypothesis
 import com.sheen.rokid.audio.PcmFramer
 import com.sheen.rokid.audio.PcmIngress
+import com.sheen.rokid.audio.PcmOffer
 import com.sheen.rokid.audio.SpeakerEngine
 import com.sheen.rokid.audio.StreamingAsrEngine
 import com.sheen.rokid.audio.VadDecision
@@ -343,6 +344,12 @@ class DictationWiringTest {
         val transportPort = RecordingInputPort()
         val connectionCommands = AtomicInteger()
         val devices = CopyOnWriteArrayList<FakePhoneDevice>()
+        /** Every outcome the chain forwards, as the composition's `EdithAudio` sink sees it on a device. */
+        val faults = CopyOnWriteArrayList<String>()
+        /** Every outcome the chain forwards to diagnostics, including the silent ones. */
+        val offers = CopyOnWriteArrayList<PcmOffer>()
+        /** Pipeline turns revoked by a framing gap/fault: the damage a stolen framer reset leaves behind. */
+        val revokedTurns = CopyOnWriteArrayList<String>()
         private val dispatchQueue = CopyOnWriteArrayList<() -> Unit>()
         val root: HostCompositionRoot
         val chain: CxrAudioChain
@@ -364,7 +371,8 @@ class DictationWiringTest {
                 wake = com.sheen.rokid.phone.app.WiredWakeDetector(wakeDetector, wakeVad),
                 scheduler = scheduler, clock = clock,
                 emit = { event -> hostHolder[0]?.onEvent(event) },
-                cancelTurn = { }, onFault = { }, onOffer = { })
+                cancelTurn = { turnId -> revokedTurns += turnId },
+                onFault = { code -> faults += code }, onOffer = { offer -> offers += offer })
             val environment = CxrHostEnvironment(clock = clock, input = chain.input, liveOutput = { LiveDisplay() },
                 scheduler = scheduler,
                 providers = mapOf(
@@ -430,10 +438,33 @@ class DictationWiringTest {
 
         /** Offers one 20 ms chunk to the CXR source and runs the next loop tick. */
         fun feedCxr() {
-            assertEquals("the CXR ingress must accept the chunk", com.sheen.rokid.audio.PcmOffer.ACCEPTED,
+            assertEquals("the CXR ingress must accept the chunk", PcmOffer.ACCEPTED,
                 cxrIngress.offer(epoch(), ByteArray(PhoneMicFormat.CHUNK_BYTES)))
             clock.advance(20_000_000)
             scheduler.runDue()
+        }
+
+        /**
+         * Offers one 20 ms CXR chunk and reports its outcome through the **real** transport seam.
+         *
+         * `RokidSessionTransport.received` forwards every `PcmIngress.offer` result to
+         * `HostCompositionRoot.onPcmOffer`, not just the failures, so a test that only calls the chain directly
+         * would miss the ACCEPTED outcomes that build a loop.
+         */
+        fun offerCxr(): PcmOffer {
+            val offer = cxrIngress.offer(epoch(), ByteArray(PhoneMicFormat.CHUNK_BYTES))
+            root.onPcmOffer(offer)
+            return offer
+        }
+
+        /** Fills the paused CXR ingress past its 2 s capacity; the last outcome is normally [PcmOffer.OVERFLOW]. */
+        fun offerCxrUntilOverflow(limit: Int = 400): PcmOffer {
+            var last = PcmOffer.ACCEPTED
+            for (attempt in 1..limit) {
+                last = offerCxr()
+                if (last == PcmOffer.OVERFLOW) return last
+            }
+            return last
         }
 
         fun runDispatches() {
@@ -775,6 +806,114 @@ class DictationWiringTest {
             assertEquals("no transport restart from the failure", 1, rig.transportPort.started.size)
             assertTrue(rig.transportPort.stopped.isEmpty())
             assertEquals(0, rig.connectionCommands.get())
+        }
+    }
+
+    // ---- fix 1: the paused CXR transport must not leak into a dictation ------------------------------------------
+
+    /**
+     * Fix-1 regression: the CXR transport keeps offering PCM while a glasses-mode dictation has paused its loop.
+     *
+     * Those outcomes belong to the paused route, not to the dictation. Before the fix, the first post-pause ACCEPTED
+     * offer reached `resolved()`, built a normal CXR loop, and the OVERFLOW then called `onOffer` on it - which
+     * `framer.reset()`s the **same** `PcmFramer` the phone dictation loop is framing with. The next dictation chunk
+     * was framed from offset 0 with an unchanged continuity id, so `SpeechPipeline.process` saw a range gap and
+     * revoked the in-flight turn (truncated/lost speech). This drives the real `HostCompositionRoot.onPcmOffer` seam
+     * per datagram, as `RokidSessionTransport.received` does, and asserts the whole final and its framing survive.
+     */
+    @Test
+    fun cxrOverflowDuringGlassesDictationBuildsNoLoopAndTheDictationFinalStaysIntact() {
+        withRig(detached = false) { rig ->
+            val text = "溢出之后仍要完整识别"
+            rig.asr.finalText = text
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.activate())
+                assertNotNull("the armed session runs one normal CXR loop", rig.chain.normalLoopForProbe)
+                assertTrue(rig.root.startDictation())
+                assertNull("the dictation pauses the normal CXR loop", rig.chain.normalLoopForProbe)
+
+                rig.pipelineVad.decision = VadDecision(true, false)
+                rig.feedPhone()
+                assertTrue("a dictation turn is in flight", rig.chain.hasActiveTurn())
+                val frames = rig.asr.frames
+
+                // Every datagram the transport receives while no loop polls, verbatim through the host seam.
+                assertEquals("the paused 2 s CXR ingress must overflow",
+                    PcmOffer.OVERFLOW, rig.offerCxrUntilOverflow())
+                assertTrue("the overflow stays visible to diagnostics", rig.offers.contains(PcmOffer.OVERFLOW))
+                assertNull("a CXR offer must not rebuild a loop during a dictation",
+                    rig.chain.normalLoopForProbe)
+                assertTrue("the overflow is not a fault of the dictation route",
+                    rig.faults.none { it == "INGRESS_OVERFLOW" })
+
+                // More dictation audio: the shared framer must continue at the same offset, not restart.
+                rig.feedPhone()
+                assertEquals("both dictation frames reach the recognizer", 2, frames.size)
+                assertEquals("the shared framer must not restart mid-dictation",
+                    frames[0].range.endExclusive, frames[1].range.first)
+                assertTrue("the in-flight turn must not be revoked", rig.revokedTurns.isEmpty())
+                assertTrue("the dictation turn survives the overflow", rig.chain.hasActiveTurn())
+
+                rig.root.stopDictation()
+                captured.toList()
+            }
+
+            assertEquals("the gap-reset turn must not truncate the final",
+                text, rig.root.dictationUi.value.final?.text)
+            assertEquals(DictationState.Idle, rig.root.dictationUi.value.state)
+            assertEquals("the final is forced exactly once", 1, rig.asr.finishes.get())
+            assertEquals("one final line", 1, lines.count { it.startsWith("P4_DICTATION state=final") })
+            assertNotNull("the normal CXR loop is restored", rig.chain.normalLoopForProbe)
+
+            // Restored exactly one loop: one fresh CXR chunk reaches both consumers once.
+            rig.pipelineVad.decision = VadDecision(true, false)
+            val asrBefore = rig.asr.frames.size
+            val wakeBefore = rig.wakeEngine.frames.size
+            rig.feedCxr()
+            assertEquals("the restored CXR loop polls the fresh chunk", asrBefore + 1, rig.asr.frames.size)
+            assertEquals("wake acceptance is restored on the CXR loop", wakeBefore + 1, rig.wakeEngine.frames.size)
+        }
+    }
+
+    /**
+     * Fix-1 requirement 2: ending a glasses dictation drops the CXR audio (and the OVERFLOW gap) that queued while
+     * the loop was paused, **before** the normal loop is restored. Otherwise the first tick of the restored loop
+     * drains up to [AudioIngressLoop.MAX_CHUNKS_PER_TICK] stale chunks in one batch and can open a wake-route turn
+     * from dictation-era audio. `finishDictation` closes the phone source first, then `CxrAudioChain.endDictation`
+     * drains the CXR ingress; this test pins that order and its effect.
+     */
+    @Test
+    fun endingGlassesDictationDropsQueuedCxrAudioBeforeTheNormalLoopReturns() {
+        withRig(detached = false) { rig ->
+            val text = "停止后不能补播旧音频"
+            rig.asr.finalText = text
+            assertTrue(rig.activate())
+            assertTrue(rig.root.startDictation())
+            rig.pipelineVad.decision = VadDecision(true, false)
+            rig.feedPhone()
+            assertEquals("the paused CXR ingress starts empty", 0, rig.cxrIngress.queuedBytes)
+
+            assertEquals("fill the paused ingress to its overflow point",
+                PcmOffer.OVERFLOW, rig.offerCxrUntilOverflow())
+            repeat(5) {
+                assertEquals("post-overflow CXR audio queues up", PcmOffer.ACCEPTED, rig.offerCxr())
+            }
+            assertTrue("stale CXR audio is waiting", rig.cxrIngress.queuedBytes > 0)
+
+            rig.root.stopDictation()
+
+            assertEquals("queued CXR chunks must not survive the restore", 0, rig.cxrIngress.queuedBytes)
+            assertNull("the overflow gap must be dropped with them", rig.cxrIngress.pollGap())
+            assertTrue("a deliberate pause is not a gap of the restored loop",
+                rig.faults.none { it.startsWith("GAP:") })
+
+            // Exactly one fresh chunk: no burst of the stale audio through the restored loop.
+            val asrBefore = rig.asr.frames.size
+            val wakeBefore = rig.wakeEngine.frames.size
+            rig.feedCxr()
+            assertEquals("only the fresh CXR chunk reaches the pipeline", asrBefore + 1, rig.asr.frames.size)
+            assertEquals("and reaches the wake route once", wakeBefore + 1, rig.wakeEngine.frames.size)
+            assertEquals("the final is still delivered", text, rig.root.dictationUi.value.final?.text)
         }
     }
 }
