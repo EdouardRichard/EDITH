@@ -571,6 +571,84 @@ class DetachedAudioWiringTest {
         }
     }
 
+    /**
+     * 0.4 Task 8 fix 1: Settings -> profile selection pauses the active plugin through
+     * `HostCompositionRoot.applyProfileSelection`, which used to call `host.pause()` directly. That bypassed
+     * `disarmAudioEpoch`, so a detached session's recorder, ingress, poll loop and CPU hold all outlived the pause
+     * (spec §4.5 "会话暂停/停止: 停采集、清 epoch、释放 AudioRecord" and §4.6 "release on pause"). The selection is the
+     * production seam `ProfileViewModel.select` calls, so driving it here is the user-reachable path without a UI.
+     */
+    @Test
+    fun aProfileSelectionWhileDetachedReleasesThePhoneCaptureAndTheWakeLock() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            val epoch = requireNotNull(rig.root.currentAudioEpoch())
+            val device = rig.devices.single()
+            assertTrue("an armed detached session holds the CPU awake", rig.wakeLock.isHeld())
+
+            val lines = withP3Sink { captured ->
+                rig.root.applyProfileSelection("smart-assistant", profile("p-2"))
+                captured.toList()
+            }
+
+            assertNull("a profile change must not leave the detached epoch running",
+                rig.root.currentAudioEpoch())
+            assertEquals("the phone recorder is released exactly once", 1, device.stops.get())
+            assertEquals("the poll loop for that epoch is stopped", listOf(epoch), rig.loop.recorder.stopped)
+            assertEquals("the phone ingress is closed with the epoch", PcmOffer.STALE_EPOCH,
+                rig.phoneIngress.offer(epoch, ByteArray(PhoneMicFormat.CHUNK_BYTES)))
+            assertEquals("the CPU hold is released exactly once", 1, rig.wakeBridge.releases.get())
+            assertFalse("a session paused for a profile change must not keep the CPU awake", rig.wakeLock.isHeld())
+            assertEquals("the host really paused rather than just losing its epoch",
+                SessionState.Paused, rig.root.state.value.session)
+            assertNull("the rebuilt configuration was accepted", rig.root.state.value.errorCode)
+            assertEquals(
+                "the release is the ordinary DISARMED transition of the phone source",
+                listOf(
+                    "P4_AUDIO state=disarmed source=phone_mic transport=false loop=false lockscreen_hold=false reason=DISARMED",
+                ),
+                lines.filter { it.startsWith("P4_AUDIO") },
+            )
+        }
+    }
+
+    /**
+     * 0.4 Task 8 fix 1 (audit): the permission-refused START rollback calls `host.stop()` directly. No normal UI path
+     * reaches it while an epoch is armed, but if one does, that stop must not leave the detached capture and CPU hold
+     * running with no session (the same "release on stop" rule).
+     */
+    @Test
+    fun aPermissionRefusedStartReleasesAnArmedDetachedEpoch() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            val epoch = requireNotNull(rig.root.currentAudioEpoch())
+            val device = rig.devices.single()
+            val token = rig.root.authorizeStart("smart-assistant")
+
+            val lines = withP3Sink { captured ->
+                val admitted = rig.root.dispatch("edith.START", token, permissionGranted = false)
+                assertFalse("a start without the microphone permission must be refused", admitted)
+                captured.toList()
+            }
+
+            assertEquals("the page must name the missing permission",
+                "MIC_PERMISSION_MISSING", rig.root.state.value.errorCode)
+            assertEquals("the refused start leaves no session behind", SessionState.Idle, rig.root.state.value.session)
+            assertNull("the rollback must release the armed epoch", rig.root.currentAudioEpoch())
+            assertEquals("the phone recorder is released exactly once", 1, device.stops.get())
+            assertEquals("the poll loop for that epoch is stopped", listOf(epoch), rig.loop.recorder.stopped)
+            assertEquals("the CPU hold is released exactly once", 1, rig.wakeBridge.releases.get())
+            assertFalse("no CPU hold may outlive the refused start", rig.wakeLock.isHeld())
+            assertEquals(
+                "the rollback is recorded as the ordinary DISARMED transition of the phone source",
+                listOf(
+                    "P4_AUDIO state=disarmed source=phone_mic transport=false loop=false lockscreen_hold=false reason=DISARMED",
+                ),
+                lines.filter { it.startsWith("P4_AUDIO") },
+            )
+        }
+    }
+
     // ---- mode change between sessions ----------------------------------------------------------------------------
 
     @Test

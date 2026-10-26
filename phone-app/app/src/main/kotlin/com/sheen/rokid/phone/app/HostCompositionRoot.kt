@@ -887,10 +887,23 @@ class HostCompositionRoot internal constructor(
      * `HostRuntime.configure` replaces the stored configuration, so sending only the profile selection would drop the
      * settings-derived keys the plugin runs with (Task 14a-fix item 1). A plugin that is already active must be
      * paused first, because the host refuses to configure an active plugin.
+     *
+     * 0.4 Task 8 fix 1 (spec §4.5/§4.6). This pause used to call `host.pause()` directly and so bypassed the
+     * composition's own [pause], which is the path that disarms the audio epoch. A profile change made while a
+     * **detached** session was active therefore left its phone recorder, ingress, poll loop and CPU wake lock running
+     * with the host paused until some later resume/stop/close - the "release on pause" rule violated from a
+     * user-reachable Settings action. Detached mode now disarms first (the ordinary `P4_AUDIO ... reason=DISARMED`
+     * transition, which is also where `lockscreen_hold=false` is recorded). The disarm is deliberately gated on
+     * [detachGate]: glasses mode's pre-0.4 epoch semantics on this settings path are intentionally left byte-for-byte
+     * unchanged, and this fix's scope is the detached source and its CPU hold.
      */
-    @Synchronized private fun applyProfileSelection(pluginId: String, profile: ModelProfile?) {
+    @Synchronized internal fun applyProfileSelection(pluginId: String, profile: ModelProfile?) {
         if (closed) return
-        if (activatedPlugin == pluginId) { host.pause(); activatedPlugin = null }
+        if (activatedPlugin == pluginId) {
+            if (detachGate.enabled.value) disarmAudioEpoch()
+            host.pause()
+            activatedPlugin = null
+        }
         val configuration = configurationFor(pluginId, profile) ?: return
         check(host.configure(pluginId, configuration)) { "Profile selection unavailable" }
     }
@@ -1449,11 +1462,16 @@ class HostCompositionRoot internal constructor(
      * 0.4 evidence line and adds `source=phone_mic|cxr` and (Task 8, `D199`) `lockscreen_hold=true|false`, so a device
      * run can attribute the frames and see whether the CPU hold was real without re-reading the detach gate.
      *
-     * **Field placement reconciliation (Task 8 → Task 14 docs).** Spec §4.4/§7.2 sketches `lockscreen_hold` on a
-     * `P4_DETACH` line, but that line does not exist yet and this task's plan names `P4_AUDIO`. The plan is followed:
-     * the hold is a property of the audio epoch (it is taken when the detached epoch arms and released when it
-     * disarms), so putting it on the arm/disarm transition keeps the evidence on the event it describes. Task 14's
-     * doc pass should record this choice rather than add a second line.
+     * **Field placement reconciliation (Task 8 fix 1 → Task 14 docs).** Spec §4.4/§7.2 writes `lockscreen_hold` on
+     * `P4_DETACH`, but a `P4_DETACH` line **does exist** and is emitted by `DetachGate` as
+     * `P4_DETACH state=on|off effective_proactive=... audio=phone_mic|cxr` - it carries **no** `lockscreen_hold`.
+     * The hold is emitted here instead, because it is a property of the audio epoch: it is taken when the detached
+     * epoch arms and released when it disarms, so the arm/disarm transition is the event it describes. It cannot be
+     * truthful on `P4_DETACH`: `DetachGate.set` stops the session **before** it logs (and `load()` logs with no
+     * session at all), so at gate-change time the hold is already released and the field would be permanently
+     * `false`. Task 14's doc pass must therefore amend §4.4/§7.2 to put `lockscreen_hold` on `P4_AUDIO` and leave
+     * `P4_DETACH` as the mode/effective-proactive line; adding a second field to `P4_DETACH` would document a value
+     * that can never be true.
      *
      * Both lines are state/counts only: never audio, never its content.
      */
@@ -2252,6 +2270,12 @@ class HostCompositionRoot internal constructor(
             pendingStart = null
             if (redelivered || grant == null || token != grant.token || clock.nowNanos() >= grant.expires) return false
             if (!permissionGranted) {
+                // 0.4 Task 8 fix 1 (audit): the rollback calls `host.stop()` directly instead of the composition's
+                // own [stop], so it must release the audio epoch itself - otherwise a refused START would leave an
+                // armed detached phone capture and its CPU wake lock running with no session (the same "release on
+                // stop" rule as pause). No epoch armed is a pure no-op with no log line, so a normal fresh START is
+                // unchanged; a glasses epoch, if one ever is armed here, is released too, which is what stop means.
+                disarmAudioEpoch()
                 host.stop()
                 // 0.4 Task 6 (`D199`): the required permission follows the mode. Detached capture needs the phone
                 // microphone; glasses mode keeps the pre-0.4 Bluetooth refusal verbatim.

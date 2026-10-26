@@ -128,6 +128,62 @@ class WakeLockHoldTest {
     }
 
     @Test
+    fun aThrowingBridgeRecordsAGenericFailureReason() {
+        val hold = WakeLockHold(object : WakeLockBridge {
+            override fun acquire(): Boolean = throw IllegalStateException("power manager died")
+            override fun release() = Unit
+            override fun isHeld(): Boolean = true
+        })
+
+        assertFalse(hold.acquire())
+        assertEquals("the hold's own stable reason is used when the bridge cannot give one",
+            WakeLockHold.ACQUIRE_FAILED, hold.lastFailure())
+    }
+
+    @Test
+    fun aFailedAcquireFollowedBySuccessClearsTheStaleReason() {
+        val bridge = FakeWakeLockBridge().apply { rejectAcquire = true }
+        val hold = WakeLockHold(bridge)
+        assertFalse(hold.acquire())
+        assertEquals("ACQUIRE_REFUSED", hold.lastFailure())
+
+        bridge.rejectAcquire = false
+        assertTrue("the retry must take the lock", hold.acquire())
+
+        assertTrue(hold.isHeld())
+        assertNull("a real hold must not keep the previous failure's reason", hold.lastFailure())
+    }
+
+    @Test
+    fun aHoldWithoutAPlatformLockReleasesSafely() {
+        // The same null-lock bridge shape as LOCK_UNAVAILABLE (newWakeLock threw) and POWER_MANAGER_MISSING; a
+        // teardown that releases it must be a no-op, not a crash.
+        val hold = WakeLockHold.fromPowerManager(null)
+        assertFalse(hold.acquire())
+
+        hold.release()
+        hold.release()
+
+        assertFalse(hold.isHeld())
+        assertEquals(WakeLockHold.POWER_MANAGER_MISSING, hold.lastFailure())
+    }
+
+    @Test
+    fun aThrowingPlatformReleaseDoesNotEscapeTheTeardown() {
+        val hold = WakeLockHold(object : WakeLockBridge {
+            private var held = false
+            override fun acquire(): Boolean { held = true; return true }
+            override fun release() { throw IllegalStateException("power manager died") }
+            override fun isHeld(): Boolean = held
+        })
+        assertTrue(hold.acquire())
+
+        hold.release()
+
+        assertFalse("a throwing platform release must not crash the session teardown", hold.isHeld())
+    }
+
+    @Test
     fun closeReleasesAHeldLock() {
         val bridge = FakeWakeLockBridge()
         val hold = WakeLockHold(bridge)
