@@ -99,6 +99,54 @@
         </activity>
 
         <!--
+          Task 13a text arm. Two actions, one confirmation gate: SET_TEXT writes Unicode through ACTION_SET_TEXT and
+          READ_TEXT reads the active window's field back as length/chars/SHA-256. Both are exported only so `am start`
+          can reach them; neither is a launcher and neither auto-runs. `singleTop` keeps the instance alive between the
+          set command and the read command, so the read arm can see the text the set arm wrote. Its own task affinity
+          means moving the probe's task to the back reveals the caller's app instead of another probe screen.
+
+          `Theme.Translucent.NoTitleBar` keeps the probe's window from replacing the caller's screen for the moment
+          before it moves itself to the back.
+        -->
+        <activity
+            android:name=".A11yTextActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:taskAffinity="edith.phone.a11yprobe.text"
+            android:label="EDITH P3 text"
+            android:theme="@android:style/Theme.Translucent.NoTitleBar">
+            <intent-filter>
+                <action android:name="edith.phone.a11yprobe.intent.SET_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="edith.phone.a11yprobe.intent.READ_TEXT" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!--
+          Task 13a's probe-owned test field, in its **own task affinity** so the text runner can move its task to the
+          back and read this activity across a real window boundary (and so a neighbour's `CLEAR_TASK` on the probe's
+          default task cannot take the fixture down mid-run). Explicit action + confirmation extra, same rule as every
+          other exported runner; it only displays a field and never acts on another app.
+        -->
+        <activity
+            android:name=".A11yTextFixtureActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleTop"
+            android:taskAffinity="edith.phone.a11yprobe.fixture"
+            android:label="EDITH P3 text fixture"
+            android:theme="@android:style/Theme.Material.Light.NoActionBar">
+            <intent-filter>
+                <action android:name="edith.phone.a11yprobe.intent.TEXT_FIXTURE" />
+                <category android:name="android.intent.category.DEFAULT" />
+            </intent-filter>
+        </activity>
+
+        <!--
           Enabled by the user in system settings; the probe cannot and must not enable itself. `canPerformGestures` is
           required for `dispatchGesture` (the coordinate mode), and `canRetrieveWindowContent` for the node mode.
         -->
