@@ -58,6 +58,8 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
     private val emitSink = AtomicReference(emit)
     private var closed = false
     private var paused = false
+    /** The session whose provider fault paused intake, so only a **different** session may re-arm it. */
+    private var faultedSession: Pair<SessionId, Generation>? = null
     private var identity: Identity? = null
     private var fence = 0L
     private var resetting: Long? = null
@@ -74,10 +76,63 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
     fun accept(frame: PcmFrame) {
         val actions = mutableListOf<() -> Unit>()
         synchronized(worker) {
-            if (!available()) return
+            if (!available()) {
+                // A fault is terminal for the session that produced it, but the engines are process-lifetime
+                // (rebuilding them costs a full model load). The first frame of a **different** session is the
+                // recovery boundary: re-arm instead of staying deaf until the App is force-stopped.
+                if (!rearmForNextSessionLocked(frame, actions)) return
+            }
             process(frame, actions)
         }
         actions.forEach { it() }
+    }
+
+    /**
+     * Clears a provider-fault pause and resets the engines so a **new session** can use the same pipeline.
+     *
+     * A fault pauses intake for the session that produced it ([fault]); the host keeps one pipeline per process
+     * because the ASR/VAD/speaker models are large, so without this seam a single transient provider failure
+     * silenced ASR for every later session (device evidence 2026-10-27: dictation `timeout chars=0`, a KWS-hit wake
+     * turn with no `P3_ASR`, restored only by force-stop). Recovery is deliberately session-scoped, not a retry
+     * loop: the same session keeps rejecting audio (pinned by its own test), and only a different
+     * session/generation may re-arm. Calling it on a healthy pipeline is a no-op.
+     *
+     * @return true when a paused pipeline was actually re-armed.
+     */
+    fun rearm(): Boolean {
+        val actions = mutableListOf<() -> Unit>()
+        val rearmed = synchronized(worker) { rearmLocked(actions) }
+        actions.forEach { it() }
+        return rearmed
+    }
+
+    /** Must hold [worker]: the paused-pipeline recovery; defers every callback into [actions]. */
+    private fun rearmLocked(actions: MutableList<() -> Unit>): Boolean {
+        val admitted = synchronized(admission) {
+            if (closed || !paused) {
+                false
+            } else {
+                paused = false
+                faultedSession = null
+                true
+            }
+        }
+        if (!admitted) return false
+        // Drop everything the fault left behind: the active turn, queued speaker work and deferred input. This is the
+        // same revocation a discontinuity performs, so a stale assessment cannot surface under the new session.
+        revoke(actions)
+        synchronized(admission) { resetting = null }
+        deferredInputs.clear()
+        preRoll.clear(); preRollSamples = 0; last = null
+        resetEngines(actions)
+        return true
+    }
+
+    /** Must hold [worker]: true when [frame] belongs to a session other than the one whose fault paused intake. */
+    private fun rearmForNextSessionLocked(frame: PcmFrame, actions: MutableList<() -> Unit>): Boolean {
+        val faulted = synchronized(admission) { faultedSession } ?: return false
+        if (faulted.first == frame.epoch.sessionId && faulted.second == frame.epoch.generation) return false
+        return rearmLocked(actions)
     }
 
     /**
@@ -351,7 +406,11 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
     private fun fault(envelope: EventEnvelope, code: String, actions: MutableList<() -> Unit>, request: Pending? = null) {
         val admitted = synchronized(admission) {
             if (closed || paused || (request != null && !isCurrentLocked(request))) false
-            else { paused = true; true }
+            else {
+                paused = true
+                faultedSession = envelope.sessionId to envelope.generation
+                true
+            }
         }
         if (!admitted) return
         revoke(actions)

@@ -1342,6 +1342,11 @@ class HostCompositionRoot internal constructor(
         }
         // A second arm of a still-running epoch changes nothing, so it is not an observable event and gets no line.
         if (runningAudioEpoch != null) return true
+        // 0.4 Task 13d: a new audio epoch is a new session. Re-open the transcript route a previous dictation may
+        // have closed, and re-arm the shared pipeline if a provider fault paused it (R-CD-3: only a force-stop used to
+        // bring ASR back after one transient fault, because the pipeline is process-lifetime).
+        audioChain?.openTranscriptRoute("session")
+        audioChain?.rearmPipeline("session")
         val session = activeSessionId ?: run {
             logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
                 generation = host.currentGeneration.value, reason = "SESSION_MISSING")
@@ -1616,6 +1621,8 @@ class HostCompositionRoot internal constructor(
      */
     @Synchronized fun requestHelp(): Boolean {
         if (closed) return false
+        // 0.4 Task 13d: an explicit non-wake input re-opens the transcript route a dictation closed.
+        audioChain?.openTranscriptRoute("help")
         // A host closed underneath this composition has no identity to name; "nothing to help with" is a state, not
         // an error, so it is answered rather than thrown.
         val identity = runCatching { host.currentIdentity() }.getOrNull() ?: return false
@@ -1654,6 +1661,9 @@ class HostCompositionRoot internal constructor(
             logTyped("refused", "blank", eventId, chars = 0)
             return TypedSendResult.Blank
         }
+        // 0.4 Task 13d: a typed send is an explicit input and the newer action, so it re-opens the transcript route a
+        // dictation closed: the conversation's next spoken sentence must be accepted again.
+        audioChain?.openTranscriptRoute("typed")
         if (closed) {
             logTyped("refused", "no_session", eventId, body.length)
             return TypedSendResult.NoSession
@@ -1834,7 +1844,14 @@ class HostCompositionRoot internal constructor(
             onState = { state -> onDictationState(generation, state) },
             // Non-transcript events only (the controller itself drops partials): the host may route session/fault
             // events normally, but a dictation transcript never enters HostRuntime or the plugin.
-            forward = { event -> if (event !is TranscriptEvent) host.onEvent(event) },
+            forward = { event ->
+                if (event !is TranscriptEvent) {
+                    // 0.4 Task 13d: a fault during a dictation bypasses the chain's emit route, so it is telemetered
+                    // here too - otherwise the very failure that silences later sessions would be invisible again.
+                    logPipelineFault(event)
+                    host.onEvent(event)
+                }
+            },
         )
         dictationController = controller
         dictationEpoch = epoch
@@ -1934,6 +1951,9 @@ class HostCompositionRoot internal constructor(
                 dictationUiState.update { it.copy(state = DictationState.Listening) }
             }
             DictationState.Idle, DictationState.NoSpeech, is DictationState.Error -> {
+                // 0.4 Task 13d: the dictation is over, so its audio is no longer a conversation utterance. Close the
+                // host transcript route before the wake loop is restored; only an explicit input re-opens it.
+                audioChain?.closeTranscriptRoute("dictation_end")
                 audioChain?.quiesceDictationInput()
                 val failure = dictationFailureCode
                 val effective = if (failure != null) DictationState.Error(failure) else state
@@ -1961,6 +1981,9 @@ class HostCompositionRoot internal constructor(
     /** The one final for the active lease; the text is handed to the UI state and nowhere else. */
     @Synchronized private fun onDictationFinal(generation: Long, text: String) {
         if (closed || dictationTearingDown || generation != dictationGeneration) return
+        // 0.4 Task 13d: a dictation final ends the wake route's claim on this audio. The tail that follows the final
+        // is still the wearer's dictation; keep its transcripts off the host/plugin until an explicit input.
+        audioChain?.closeTranscriptRoute("dictation_final")
         val final = DictationFinal(++dictationFinalSequence, text)
         dictationUiState.update { it.copy(state = DictationState.Idle, final = final) }
         // Count only: the wearer's words are never logged and there is no digest of them either.
@@ -2023,6 +2046,8 @@ class HostCompositionRoot internal constructor(
             // cancel() reports Idle; the failure flag turns that terminal into the Error state and line.
             runCatching { controller.cancel() }
         } else {
+            // 0.4 Task 13d: a dictation whose capture died still ends the wake route's claim on this audio.
+            audioChain?.closeTranscriptRoute("dictation_end")
             audioChain?.quiesceDictationInput()
             dictationUiState.update { it.copy(state = DictationState.Error(code)) }
             logDictation("error", code, 0)
@@ -3257,25 +3282,30 @@ class HostCompositionRoot internal constructor(
                 // emission** and from the host itself, so the only wakes that exist are the ones the host will accept
                 // - and a wake that arrives after the session ended is dropped by `onEvent` instead of opening a turn
                 // under a generation that no longer exists.
-                wakeEmit = { word, confidence -> hostHolder[0]?.let { host ->
-                    val root = rootHolder[0]
-                    if (root != null) {
-                        // 0.23 P5 (D135): a short chime, governed by the same 「语音朗读」 switch, then the wake
-                        // event. No Assistance, no conversation entry and no TTS phrase: the wearer hears that they
-                        // were heard, and nothing claims to be an answer. 0.24 S5 final review Important #1: the
-                        // composition owns the chime and the resident-panel decision together, so a wake the plugin
-                        // will refuse cannot open an overlay with no turn behind it.
-                        root.emitWake(host, word, confidence) {
-                            val outcome = wakeChime.playOutcome(
-                                clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
-                            P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
+                wakeEmit = { word, confidence ->
+                    // 0.4 Task 13d: a keyword-spotting hit is an explicit input, so it re-opens the host transcript
+                    // route a dictation closed before the wake turn's own ASR final can arrive. The detector fires on
+                    // the frame before the pipeline sees it, so the wake turn's transcript is never gated.
+                    rootHolder[0]?.audioChain?.openTranscriptRoute("wake")
+                    hostHolder[0]?.let { host ->
+                        val root = rootHolder[0]
+                        if (root != null) {
+                            // 0.23 P5 (D135): a short chime, governed by the same 「语音朗读」 switch, then the wake
+                            // event. No Assistance, no conversation entry and no TTS phrase: the wearer hears that they
+                            // were heard, and nothing claims to be an answer. 0.24 S5 final review Important #1: the
+                            // composition owns the chime and the resident-panel decision together, so a wake the plugin
+                            // will refuse cannot open an overlay with no turn behind it.
+                            root.emitWake(host, word, confidence) {
+                                val outcome = wakeChime.playOutcome(
+                                    clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
+                                P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
+                            }
+                        } else {
+                            // The composition does not exist yet (the chain is built before it): no panel can be asked
+                            // for, but the detector's evidence still has to reach the host.
+                            emitWakeDetected(host, clock, word, confidence)
                         }
-                    } else {
-                        // The composition does not exist yet (the chain is built before it): no panel can be asked
-                        // for, but the detector's evidence still has to reach the host.
-                        emitWakeDetected(host, clock, word, confidence)
-                    }
-                } },
+                    } },
                 // Task 4 (P3.2): the same per-emission identity resolution for the acoustic gate, so a label that
                 // arrives after the session ended is dropped by `onEvent` instead of opening anything under a
                 // generation that no longer exists. Task 5: the host only produces the event while 「主动辅助」 is on.
@@ -4392,6 +4422,71 @@ internal class CxrAudioChain private constructor(
     /** Whether new loops start with their KWS accepted; the dictation begin/end switch it (0.4 Task 12b-ii). */
     @Volatile private var wakeEnabled = true
 
+    /**
+     * Whether pipeline transcripts may be handed to the host/plugin (0.4 Task 13d).
+     *
+     * A phone-microphone dictation is one-shot: its final goes to the input field, and audio that follows it is still
+     * the wearer's dictation, never an implicit conversation utterance. Frames keep flowing after the final (the wake
+     * route is restored, so KWS can hear a real wake word), but the **transcripts** stay closed until an explicit
+     * input re-opens the route: a KWS wake, a typed message, `Help`, or a new session. Device evidence 2026-10-27:
+     * a dictation tail was transcribed on the restored wake route (`P3_ASR revision=0..3`, no `P3_WAKE`) and queued
+     * as the previous answer's continuation (`P3_CONV queue route=WAKE chars=18`), which then made every typed send
+     * answer `P4_TYPED refused reason=busy`. This is a host **policy** over the already-restored route; the frames,
+     * KWS and the pipeline's own state are untouched.
+     */
+    @Volatile private var transcriptRouteOpen = true
+
+    /** Why the route is closed, for the count-only drop line; only read while [transcriptRouteOpen] is false. */
+    @Volatile private var transcriptRouteReason = "dictation"
+
+    /** Partials dropped while the route was closed, reported once on the next dropped final (counts only). */
+    private val suppressedPartials = java.util.concurrent.atomic.AtomicInteger()
+
+    /**
+     * Closes the host transcript route after a dictation; idempotent, and a no-op when already closed.
+     *
+     * Called from the dictation terminal callbacks **before** the cleanup restores the wake loop, so no tail final can
+     * race the policy. The dictation's own final never passes here: it travels through the controller's redirect.
+     */
+    internal fun closeTranscriptRoute(reason: String) {
+        if (!transcriptRouteOpen) return
+        transcriptRouteReason = reason
+        transcriptRouteOpen = false
+        suppressedPartials.set(0)
+        P3Log.line("P3_TRANSCRIPT_ROUTE state=closed reason=$reason")
+    }
+
+    /** Re-opens the host transcript route for an explicit input (wake / typed / Help) or a new session. Idempotent. */
+    internal fun openTranscriptRoute(reason: String) {
+        if (transcriptRouteOpen) return
+        transcriptRouteOpen = true
+        P3Log.line("P3_TRANSCRIPT_ROUTE state=open reason=$reason")
+    }
+
+    /** Count-only record of one transcript the closed route refused; never the text, never a digest of it. */
+    private fun suppressTranscript(revision: TranscriptRevision) {
+        if (!revision.final) {
+            suppressedPartials.incrementAndGet()
+            return
+        }
+        val partials = suppressedPartials.getAndSet(0)
+        P3Log.line("P3_TRANSCRIPT_ROUTE state=drop reason=$transcriptRouteReason " +
+            "partials=$partials chars=${revision.text.trim().length}")
+    }
+
+    /**
+     * Re-arms the shared speech pipeline after a provider fault, for a **new** session (0.4 Task 13d).
+     *
+     * The pipeline is process-lifetime (its ASR/VAD/speaker models cost a full load), and a fault pauses it for the
+     * session that produced it. Without this the first transient fault silenced ASR for every later session until the
+     * App was force-stopped (device evidence 2026-10-27: dictation `timeout chars=0`, a KWS-hit wake turn with no
+     * `P3_ASR`, restored by cold launch). Called when a new audio epoch is armed.
+     */
+    internal fun rearmPipeline(reason: String) {
+        val rearmed = runCatching { pipeline.rearm() }.getOrDefault(false)
+        if (rearmed) P3Log.line("P3_PIPELINE state=rearmed reason=$reason")
+    }
+
     /** Outcomes observed before the first loop existed; drained into it as it is built. */
     private val pendingFaults = ArrayDeque<String>()
     private val pendingOffers = ArrayDeque<PcmOffer>()
@@ -4705,7 +4800,18 @@ internal class CxrAudioChain private constructor(
             val bridgeRef = java.util.concurrent.atomic.AtomicReference<AudioSegmentBridge?>(null)
             val pipeline = SpeechPipeline(vad, asr, speaker,
                 emit = { event ->
-                    holder[0]?.onEvent(event); emit(event)
+                    // 0.4 Task 13d: after a dictation final the host transcript route stays closed until an explicit
+                    // input. Frames keep flowing and the pipeline keeps its own state; only the hand-off to the
+                    // host/plugin is gated, so a dictation tail can never become a WAKE turn or a queued continuation.
+                    val chain = chainHolder[0]
+                    if (event is TranscriptEvent && chain != null && !chain.transcriptRouteOpen) {
+                        chain.suppressTranscript(event.revision)
+                    } else {
+                        // 0.4 Task 13d, R-CD-3: a provider fault pauses the shared pipeline. Surface the code and the
+                        // pause instead of a silent deafness that only a force-stop used to fix.
+                        logPipelineFault(event)
+                        holder[0]?.onEvent(event); emit(event)
+                    }
                     // Seal the audio segment when a final transcript arrives.
                     if (event is com.sheen.rokid.contracts.TranscriptEvent && event.revision.final) {
                         bridgeRef.get()?.sealForTurn(event.revision.turnId)
@@ -5039,6 +5145,21 @@ internal fun activateBundle(
     }
     android.util.Log.i("EdithHost", "ENGINE_MISSING: no active, recovered, packaged or debug-import bundle")
     return null
+}
+
+/**
+ * 0.4 Task 13d (R-CD-3): count-only telemetry for the shared pipeline's terminal states.
+ *
+ * `SpeechPipeline.fault()` pauses intake for the rest of the session; before this the fault was delivered only as a
+ * `HostEvent`, which nothing logged, so a silenced ASR looked identical to a silent room on a device run. The code and
+ * the pause are state, never audio or text.
+ */
+private fun logPipelineFault(event: HostEvent) {
+    when (event) {
+        is ServiceFaultEvent -> P3Log.line("P3_PIPELINE state=fault reason=${event.code}")
+        is SessionStateEvent -> if (event.state == SessionState.Paused) P3Log.line("P3_PIPELINE state=paused")
+        else -> Unit
+    }
 }
 
 /** A composition that was not wired for lock-screen unlock: the PIN is never configured. */

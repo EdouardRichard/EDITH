@@ -134,7 +134,11 @@ class DictationWiringTest {
          */
         @Volatile var endpointAccepts = 0
 
+        /** A scripted provider failure: one accept throws, which must pause the shared pipeline (R-CD-3). */
+        @Volatile var failure: RuntimeException? = null
+
         override fun accept(frame: com.sheen.rokid.audio.PcmFrame): VadDecision {
+            failure?.let { throw it }
             if (endpointAccepts > 0) {
                 endpointAccepts--
                 return VadDecision(true, true)
@@ -379,6 +383,8 @@ class DictationWiringTest {
         val offers = CopyOnWriteArrayList<PcmOffer>()
         /** Pipeline turns revoked by a framing gap/fault: the damage a stolen framer reset leaves behind. */
         val revokedTurns = CopyOnWriteArrayList<String>()
+        /** Every event the production chain emit hands to the host: the only observable of the transcript route. */
+        val delivered = CopyOnWriteArrayList<com.sheen.rokid.contracts.HostEvent>()
         private val dispatchQueue = CopyOnWriteArrayList<() -> Unit>()
         val root: HostCompositionRoot
         val chain: CxrAudioChain
@@ -402,7 +408,7 @@ class DictationWiringTest {
                 vad = pipelineVad, asr = asr, speaker = SilentSpeaker(),
                 wake = com.sheen.rokid.phone.app.WiredWakeDetector(wakeDetector, wakeVad),
                 scheduler = scheduler, clock = clock,
-                emit = { event -> hostHolder[0]?.onEvent(event) },
+                emit = { event -> delivered += event; hostHolder[0]?.onEvent(event) },
                 cancelTurn = { turnId -> revokedTurns += turnId },
                 onFault = { code -> faults += code }, onOffer = { offer -> offers += offer })
             val environment = CxrHostEnvironment(clock = clock, input = chain.input, liveOutput = { LiveDisplay() },
@@ -807,6 +813,124 @@ class DictationWiringTest {
                     .substringAfter("chars=").substringBefore(' ').toInt(),
             )
             assertTrue(dictation.none { secret in it })
+        }
+    }
+
+    /**
+     * 0.4 Task 13d: audio that follows a dictation final is still the wearer's dictation, not a conversation turn.
+     *
+     * Device evidence (2026-10-27 D8): after `P4_DICTATION state=final chars=14`, the restored wake route transcribed
+     * the dictation tail into a new pipeline turn (`P3_ASR revision=0..3`, no `P3_WAKE`), and the plugin queued that
+     * final as the previous answer's continuation (`P3_CONV queue route=WAKE chars=18`). The queued utterance made the
+     * typed-send predicate busy, so the next send answered `P4_TYPED refused reason=busy`. The wake **frames** stay
+     * restored (KWS must still hear a real wake word); what must not flow is the transcript, until an explicit input
+     * re-opens the route.
+     */
+    @Test
+    fun postDictationSpeechDoesNotReachThePluginUntilAnExplicitInput() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            val lines = withP3Sink { captured ->
+                dictatedFinal(rig, "这是一段听写")
+                // The dictation's own final is delivered through its redirect, so the host transcript route saw nothing.
+                assertEquals(0, rig.delivered.filterIsInstance<com.sheen.rokid.contracts.TranscriptEvent>().size)
+
+                // The wake route's frames are still polled, so a new pipeline turn really does open and finalise...
+                rig.pipelineVad.decision = VadDecision(true, true)
+                rig.feedPhone()
+                // ...but its transcript is the wearer's dictation, not a conversation turn.
+                captured.toList()
+            }
+
+            assertEquals("the dictation final itself still reaches the field", "这是一段听写",
+                rig.root.dictationUi.value.final?.text)
+            assertEquals(
+                "no dictation-tail transcript may reach the host/plugin: " +
+                    rig.delivered.filterIsInstance<com.sheen.rokid.contracts.TranscriptEvent>(),
+                0, rig.delivered.filterIsInstance<com.sheen.rokid.contracts.TranscriptEvent>().size,
+            )
+            assertTrue("the drop is visible in count-only telemetry; lines=" + lines.joinToString(" | "),
+                lines.any { it.startsWith("P3_TRANSCRIPT_ROUTE state=drop") && "reason=dictation" in it })
+            assertTrue("the live route is closed for the input row",
+                lines.any { it.startsWith("P3_TRANSCRIPT_ROUTE state=closed") && "reason=dictation" in it })
+            assertEquals("no model request may be started by dictation audio", 0, rig.model.requests.get())
+
+            // An explicit input re-opens the route: the conversation's next sentence is accepted again.
+            val after = withP3Sink { captured ->
+                assertEquals(TypedSendResult.Accepted, rig.root.requestTypedMessage("改用打字"))
+                rig.pipelineVad.decision = VadDecision(true, true)
+                rig.feedPhone()
+                captured.toList()
+            }
+            assertTrue("an explicit input must re-open the transcript route",
+                after.any { it.startsWith("P3_TRANSCRIPT_ROUTE state=open") && "reason=typed" in it })
+            assertTrue("after the explicit input the next final reaches the host/plugin",
+                rig.delivered.filterIsInstance<com.sheen.rokid.contracts.TranscriptEvent>().isNotEmpty())
+            assertTrue("and no drop is recorded against it",
+                after.none { it.startsWith("P3_TRANSCRIPT_ROUTE state=drop") })
+        }
+    }
+
+    /**
+     * 0.4 Task 13d, observation 2: a provider fault pauses the shared pipeline, and an in-process session stop/start
+     * must re-arm it instead of leaving ASR silent until the App is force-stopped.
+     *
+     * Device evidence (2026-10-27): after one in-process stop/start, two dictations ended `timeout chars=0` and a
+     * KWS-hit wake turn produced no `P3_ASR`, while frames and KWS kept working; force-stop + cold launch restored
+     * ASR. The pipeline is process-lifetime (one ~240 MB model load), and `fault()` had no re-arm path (R-CD-3), so
+     * the first `fault` after a session boundary silenced every later session.
+     */
+    @Test
+    fun aProviderFaultPausesAudioAndTheNextSessionReArmsIt() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            val firstEpoch = rig.epoch()
+
+            // One transient provider failure is enough to pause the pipeline for this session.
+            rig.pipelineVad.failure = IllegalStateException("synthetic provider failure")
+            rig.feedPhone()
+            rig.pipelineVad.failure = null
+            val acceptedAtFault = rig.asr.frames.size
+            rig.feedPhone()
+            assertEquals("a paused pipeline rejects the rest of its session's audio", acceptedAtFault, rig.asr.frames.size)
+
+            // The production stop/start paths, in-process: a new session must recover the same pipeline.
+            val recovery = withP3Sink { captured ->
+                rig.root.stop()
+                rig.root.start("smart-assistant")
+                rig.pipelineVad.decision = VadDecision(true, true)
+                rig.feedPhone()
+                captured.toList()
+            }
+            assertTrue("a start creates a new audio epoch", rig.epoch() != firstEpoch)
+            assertTrue("a session re-arm is visible as a count-only state line",
+                recovery.any { it.startsWith("P3_PIPELINE state=rearmed reason=session") })
+            assertTrue("the new session's frame must reach the shared recognizer; lines=" +
+                recovery.joinToString(" | "),
+                rig.asr.frames.isNotEmpty() && rig.delivered.filterIsInstance<
+                    com.sheen.rokid.contracts.TranscriptEvent>().isNotEmpty())
+        }
+    }
+
+    /**
+     * The keyword-spotting hit is the other explicit input that re-opens the route: the composition's `wakeEmit`
+     * calls exactly this chain method on the same frame the detector fires, before the wake turn's ASR final lands.
+     */
+    @Test
+    fun aWakeReopensTheTranscriptRouteADictationClosed() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            dictatedFinal(rig, "听写")
+            rig.pipelineVad.decision = VadDecision(true, true)
+            rig.feedPhone()
+            assertEquals("a closed route delivers nothing", 0,
+                rig.delivered.filterIsInstance<com.sheen.rokid.contracts.TranscriptEvent>().size)
+
+            rig.chain.openTranscriptRoute("wake")
+            rig.pipelineVad.decision = VadDecision(true, true)
+            rig.feedPhone()
+            assertEquals("after a wake the next final reaches the host/plugin", 1,
+                rig.delivered.filterIsInstance<com.sheen.rokid.contracts.TranscriptEvent>().size)
         }
     }
 
