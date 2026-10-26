@@ -29,7 +29,9 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.ui.StorageAccessSkillView
 import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticRegistration
 import com.sheen.rokid.phone.platform.pluginTaskThreadFactory
 import com.sheen.rokid.phone.storage.AndroidNamespaceStorage
+import com.sheen.rokid.phone.model.AssetEngineBundleProvisioning
 import com.sheen.rokid.phone.model.EngineBundleProvisioning
+import com.sheen.rokid.phone.model.ModelAssetSource
 import com.sheen.rokid.phone.storage.AndroidProfileRepository
 import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
@@ -3471,6 +3473,11 @@ private fun provisionAudioChain(
         importRoot = DebugImportDirectory.source(application),
         manifest = manifest,
         allowDebugImport = allowDebugImport,
+        // 0.4 Task 2: the APK's own ASR bundle. Wired unconditionally (not behind BuildConfig.DEBUG) because this
+        // is the only path a release build has; the store re-verifies every size and digest while it copies.
+        assetImport = {
+            AssetEngineBundleProvisioning(ModelAssetSource.from(application.assets), store, manifest).import()
+        },
         clock = clock,
         scheduler = scheduler,
         ingress = ingress,
@@ -3499,12 +3506,16 @@ private fun provisionAudioChain(
  * - a validated bundle must be active or recoverable in the App's model store, imported through
  *   `EngineBundleProvisioning` (or the P2/T17 pipeline) with every size and digest checked.
  *
- * **The debug-only import (Task 11b, Important 2).** With neither an active **nor a recoverable** bundle (Task 15c
- * D3 made `recover` the second check, so a healthy bundle is reused rather than re-imported), a debug build attempts
- * `EngineBundleProvisioning.importBundle` on [DebugImportDirectory.IMPORT_DIRECTORY]. That is what makes the
- * ratified conditional `Asr` advertisement reachable: a bundle pushed there for development is activated exactly
- * as one imported through the P2/T17 path, or nothing happens at all. A release build never reads that
- * directory, so an external bundle cannot become the product's audio engine.
+ * **The packaged bundle is the release path (0.4 Task 2).** With neither an active nor a recoverable bundle, the
+ * App imports the ASR files it ships under `assets/models/asr/` through [assetImport]. That attempt is not behind
+ * `BuildConfig.DEBUG`: a delivery APK has no other source of ASR weights, and the store re-verifies every size and
+ * digest while it copies, so an incomplete or tampered asset set is refused as `ENGINE_MISSING` rather than used.
+ *
+ * **The debug-only import (Task 11b, Important 2).** The debug drop **stays last**. A debug build whose packaged
+ * bundle could not be imported may still attempt `EngineBundleProvisioning.importBundle` on
+ * [DebugImportDirectory.IMPORT_DIRECTORY], which is what makes the ratified conditional `Asr` advertisement
+ * reachable from a pushed development bundle. A release build never reads that directory, so an external bundle
+ * cannot become the product's audio engine and cannot mask a refused packaged bundle.
  *
  * **The wake detector (Task 11b, Important 1).** When the KWS assets are packaged and a VAD-only engine can be
  * built from the same bundle, the detector is wired with its **own** VAD (the pipeline keeps the candidate's),
@@ -3557,13 +3568,21 @@ internal fun provisionAudioChainFrom(
     acousticEmit: (AcousticLabel) -> Unit = {},
     /** P5 (I2 fix): the playback gate for echo suppression during TTS. */
     playbackGate: PlaybackGate = PlaybackGate(),
+    /**
+     * 0.4 Task 2: the ASR bundle imported from the APK's own `assets/models/asr/` files.
+     *
+     * Attempted in **both** build types after `active`/`recover` and before the debug-only drop, so a release build
+     * can run ASR without any external push. Defaulted to null so the pre-0.4 harnesses keep the same branch
+     * selection (active -> recover -> debug drop) and do not need assets.
+     */
+    assetImport: (() -> ValidatedModelBundle?)? = null,
 ): CxrAudioChain? = try {
     val verified = PcmFormatEvidence.resolve(CxrGlassesTarget.GLASSES_FIRMWARE, CXR_SDK_VERSION)
     if (verified == null) {
         android.util.Log.i("EdithHost", "FORMAT_UNVERIFIED: no verified uplink format, the ASR chain stays unwired")
         null
     } else {
-        val bundle = activateBundle(store, provisioner, importRoot, allowDebugImport, manifest)
+        val bundle = activateBundle(store, provisioner, importRoot, allowDebugImport, manifest, assetImport)
         if (bundle == null) {
             android.util.Log.i("EdithHost", "ENGINE_MISSING: no validated engine bundle, the ASR chain stays unwired")
             null
@@ -3647,18 +3666,22 @@ internal class ModelStoreBundles(private val store: EngineModelStore) : EngineBu
 }
 
 /**
- * The bundle the chain is built from, reusing a validated one before importing the debug directory's.
+ * The bundle the chain is built from: reuse a validated one, then the APK's own, then the debug directory's.
  *
- * `store.active()` first, because an already-validated bundle is authoritative; then `store.recover(manifest)`, which
- * revalidates a bundle a previous process wrote and whose in-memory handle this process does not have; **only then**
- * the debug import (and only in a debug build). A refusal anywhere is `ENGINE_MISSING` - never a silently weaker
- * bundle.
+ * `store.active()` first, because an already-validated bundle is authoritative; then `store.recover(manifest)`,
+ * which revalidates a bundle a previous process wrote and whose in-memory handle this process does not have; then
+ * [assetImport] - the ASR files the APK itself ships, attempted in **release and debug alike** (0.4 Task 2); and
+ * **only then** the debug import, and only in a debug build. A refusal anywhere is `ENGINE_MISSING` - never a
+ * silently weaker bundle.
  *
  * **The order is the fix (Task 15c D3).** Importing before `recover` re-copied the whole bundle into a fresh
  * directory on every cold start and left the previous copy in place: the device evidence (2026-10-09) showed two
  * different `ENGINE_IMPORTED: ACTIVE:…` ids across two runs, ~235 MB each, plus the import directory. Checking the
- * recoverable bundle first makes a healthy bundle reused instead of re-imported; the import stays the last resort for
- * a store that genuinely has nothing, which is the only case the debug drop is for.
+ * recoverable bundle first makes a healthy bundle reused instead of re-imported.
+ *
+ * **The APK's bundle is the release path (0.4 Task 2).** A delivery build has no external drop at all, so
+ * [assetImport] must be attempted even when `allowDebugImport` is false. The debug drop stays the **last** branch:
+ * it is a development override, not a fallback that could mask a refused packaged bundle in release.
  */
 internal fun activateBundle(
     store: EngineBundleStore,
@@ -3666,6 +3689,7 @@ internal fun activateBundle(
     importRoot: File,
     allowDebugImport: Boolean,
     manifest: EngineManifest,
+    assetImport: (() -> ValidatedModelBundle?)? = null,
 ): ValidatedModelBundle? {
     // The reuse paths are logged as well as the import: without a line for them, a device run cannot tell "the
     // healthy bundle was reused" from "no bundle was found at all" - both used to be silent (Task 15b, concern 2).
@@ -3677,12 +3701,25 @@ internal fun activateBundle(
         android.util.Log.i("EdithHost", "ENGINE_REUSED: RECOVERED:${bundle.directory}")
         return bundle
     }
-    if (!allowDebugImport) return null
-    val imported = runCatching { provisioner.importBundle(importRoot) }
-    android.util.Log.i("EdithHost", imported.fold(
-        onSuccess = { "ENGINE_IMPORTED: $it" },
-        onFailure = { "ENGINE_IMPORT_FAILED: ${it.javaClass.name}: ${it.message}" }))
-    return imported.getOrNull()?.let { store.active() }
+    if (assetImport != null) {
+        val importedAssets = runCatching(assetImport)
+        importedAssets.getOrNull()?.let { bundle ->
+            android.util.Log.i("EdithHost", "ENGINE_IMPORTED_ASSET: ACTIVE:${bundle.directory}")
+            return bundle
+        }
+        android.util.Log.i("EdithHost", "ENGINE_IMPORT_FAILED: " + (
+            importedAssets.exceptionOrNull()?.let { "${it.javaClass.name}: ${it.message}" }
+                ?: "NO_PACKAGED_ASR_BUNDLE"))
+    }
+    if (allowDebugImport) {
+        val imported = runCatching { provisioner.importBundle(importRoot) }
+        android.util.Log.i("EdithHost", imported.fold(
+            onSuccess = { "ENGINE_IMPORTED: $it" },
+            onFailure = { "ENGINE_IMPORT_FAILED: ${it.javaClass.name}: ${it.message}" }))
+        imported.getOrNull()?.let { store.active() }?.let { return it }
+    }
+    android.util.Log.i("EdithHost", "ENGINE_MISSING: no active, recovered, packaged or debug-import bundle")
+    return null
 }
 
 /** A composition that was not wired for lock-screen unlock: the PIN is never configured. */
