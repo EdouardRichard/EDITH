@@ -22,6 +22,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
@@ -43,6 +46,7 @@ import com.sheen.rokid.phone.app.AuditSection
 import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.app.MemorySection
+import com.sheen.rokid.phone.app.TypedSendResult
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.SessionViewModel
@@ -155,7 +159,12 @@ internal fun PhoneScreen(
                     // U1: only the message list scrolls. The title, the route switch and the chat frame header stay
                     // outside every scroll container, so a long record cannot take the switch away from the wearer.
                     PhoneTab.ASSISTANT -> Column(body) {
-                        AssistantTab(root.conversationLog, Modifier.weight(1f))
+                        AssistantTab(
+                            log = root.conversationLog,
+                            session = state.session,
+                            send = { root.requestTypedMessage(it) },
+                            modifier = Modifier.weight(1f),
+                        )
                         state.errorCode?.let {
                             Text(
                                 errorLabel(it),
@@ -259,6 +268,12 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
  * are named as well as positioned. The avatar is decorative to a screen reader: the bubble row carries the spoken
  * "助手说：…" text.
  *
+ * 0.4 Task 11 (spec §5.1) adds the WAKE view's input row below the chat frame: text + send, with the microphone
+ * reserved (disabled) for Task 12b's dictation. The row is part of the fixed frame like the header — outside the
+ * message `LazyColumn` — is drawn only on WAKE, and never reads `currentIdentity()`: the host call it hands the text
+ * to owns that check. `send` returns the host's verdict so the row can clear on `Accepted` and keep the draft on every
+ * retryable refusal.
+ *
  * The switch is **read-only**: it changes which conversation is in front of the wearer and nothing else. It reads the
  * same `ConversationLog` the glasses render — same shape, same order, same eviction — so the two screens cannot drift
  * apart the way two implementations would. They are not the same *instance*: the phone records what the plugin said,
@@ -270,9 +285,17 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun AssistantTab(log: ConversationLog, modifier: Modifier = Modifier) {
+internal fun AssistantTab(
+    log: ConversationLog,
+    session: SessionState,
+    send: (String) -> TypedSendResult,
+    modifier: Modifier = Modifier,
+) {
     var route by remember { mutableStateOf(AssistantRoute.WAKE) }
     var revision by remember { mutableStateOf(0) }
+    // The row's draft and last result survive an Activity recreation; the send itself never spans one (it is a
+    // synchronous host call), so `sending` is not saved.
+    var typedInput by rememberSaveable(stateSaver = typedInputSaver) { mutableStateOf(TypedInputState()) }
     val entries = remember(revision, route) { log.entries(route) }
     // Start the first layout at the newest entry, so the frame before the route-opening effect cannot show the oldest
     // one. The route-opening effect still owns route switches (the state is shared, not recreated).
@@ -375,6 +398,87 @@ internal fun AssistantTab(log: ConversationLog, modifier: Modifier = Modifier) {
                 }
             }
         }
+        if (showsTypedInputRow(route)) {
+            TypedInputRow(
+                session = session,
+                state = typedInput,
+                onDraftChange = { candidate ->
+                    typedInput = typedInput.copy(draft = typedDraftAfterInput(candidate))
+                },
+                onSend = {
+                    val outgoing = typedInput
+                    // The button is already disabled for both facts; the check is repeated here so a queued click
+                    // that lands after a state change cannot submit a second request.
+                    if (canSendTyped(session, outgoing.draft.isBlank(), outgoing.sending)) {
+                        typedInput = outgoing.beginSend().finishSend(send(outgoing.draft))
+                    }
+                },
+            )
+        }
+    }
+}
+
+/**
+ * The input row's page-recreation state: the draft and the last result survive an Activity recreation. `sending` is
+ * deliberately not restored — the host call is synchronous, so there is no request left to resume.
+ */
+private val typedInputSaver: Saver<TypedInputState, Any> = listSaver(
+    save = { typedInputSaveValues(it) },
+    restore = { typedInputRestore(it) },
+)
+
+/**
+ * 0.4 Task 11 (spec §5.1): the WAKE conversation's fixed input row, below the chat frame and outside its `LazyColumn`.
+ *
+ * Always rendered on WAKE (the 脱离眼镜 switch does not hide it), never on PROACTIVE. The row draws the pure decisions
+ * from `TypedInput.kt` — [canSendTyped], [typedSendBlockedReason], [typedResultLabel] — and reads no identity itself.
+ *
+ * The microphone is present but disabled: Task 12b wires dictation, and the control is reserved now so the row does not
+ * change shape when it does. Its Chinese description names what it will do, and [MIC_DICTATION_ENABLED] is the single
+ * switch Task 12b flips.
+ */
+@Composable
+private fun TypedInputRow(
+    session: SessionState,
+    state: TypedInputState,
+    onDraftChange: (String) -> Unit,
+    onSend: () -> Unit,
+) {
+    val blank = state.draft.isBlank()
+    val failed = state.result != null && state.result != TypedSendResult.Accepted
+    Column(
+        Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(4.dp),
+    ) {
+        Row(
+            Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.Bottom,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            OutlinedTextField(
+                value = state.draft,
+                onValueChange = onDraftChange,
+                modifier = Modifier.weight(1f),
+                label = { Text(TYPED_INPUT_LABEL) },
+                minLines = 1,
+                maxLines = 4,
+            )
+            IconButton(onClick = { }, enabled = MIC_DICTATION_ENABLED) {
+                Icon(
+                    Icons.Default.Mic,
+                    contentDescription = MIC_DICTATION_DESCRIPTION,
+                )
+            }
+            Button(
+                onClick = onSend,
+                enabled = canSendTyped(session, blank, state.sending),
+            ) { Text(TYPED_SEND_LABEL) }
+        }
+        Text(
+            typedStatusText(session, state),
+            style = MaterialTheme.typography.bodySmall,
+            color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+        )
     }
 }
 
