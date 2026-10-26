@@ -8,6 +8,7 @@ import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * How much audio before the VAD's speech trigger is replayed into the ASR.
@@ -52,6 +53,9 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
     // The worker owns VAD/ASR and turn state; callbacks need only the short admission lock.
     private val worker = Any()
     private val admission = Any()
+    // The constructor sink is the production wake route. The holder only picks where later events go; with no
+    // redirect installed it reads exactly the constructor value, so the wake path is unchanged (0.4 spec §5.3).
+    private val emitSink = AtomicReference(emit)
     private var closed = false
     private var paused = false
     private var identity: Identity? = null
@@ -74,6 +78,52 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
             process(frame, actions)
         }
         actions.forEach { it() }
+    }
+
+    /**
+     * Redirects every event emitted from now on, or restores the constructor sink when [sink] is null.
+     *
+     * The dictation controller installs a UI sink while phone-mic dictation runs and restores the wake route when it
+     * ends (0.4 spec §5.3, D204). The destination is read at emission time on whichever thread emits - the pipeline
+     * worker for transcripts/faults/resets and the speaker executor for speaker assessments - so the sink itself must
+     * be safe on those threads. Redirecting changes only the destination: turn/ASR state and event ordering stay
+     * exactly as they are, and with no redirect installed events go to the constructor sink as before.
+     */
+    fun redirectEmit(sink: ((HostEvent) -> Unit)?) {
+        emitSink.set(sink ?: emit)
+    }
+
+    private fun emitCurrent(event: HostEvent) = emitSink.get()(event)
+
+    /**
+     * Forces the active turn to its final transcript - the dictation stop / end-of-utterance seam (0.4 spec §5.3,
+     * D204). A user pressing stop is not a VAD endpoint, so this runs the same finalisation the endpoint branch does:
+     * `asr.finish()` as a final revision that keeps the turn's original start and the last accepted frame's end, the
+     * speaker-window request, and the ASR/VAD resets. The final is emitted through the current [redirectEmit] sink,
+     * in the same deferred action batch as every other transcript.
+     *
+     * Returns true when an active turn was finalised and cleared. An ASR that already sealed the turn still returns
+     * true but produces no second final. Returns false when there is no active turn - after a VAD endpoint, a reset,
+     * or [close] - and when the ASR/provider fails while finishing (the normal fault path then pauses the pipeline);
+     * either way no event is emitted. Safe to call concurrently with [accept], endpoint intake and [close]: turn
+     * ownership is the worker lock, so only one caller can finalise a given turn.
+     */
+    fun finishCurrentTurn(): Boolean {
+        val actions = mutableListOf<() -> Unit>()
+        val finished = synchronized(worker) {
+            val active = turn
+            if (active == null || !available()) return@synchronized false
+            try {
+                finalizeTurn(active, Identity(active.end.epoch, active.end.range.continuityId,
+                    active.end.sampleRateHz), active.end, actions)
+                true
+            } catch (_: Exception) {
+                fault(envelope(active.end), "SPEECH_PROVIDER_FAILURE", actions)
+                false
+            }
+        }
+        actions.forEach { it() }
+        return finished
     }
 
     private fun process(frame: PcmFrame, actions: MutableList<() -> Unit>, fromDeferred: Boolean = false) {
@@ -123,17 +173,7 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
                 }
             }
             if (available() && decision.endpoint && turn != null) {
-                val active = turn!!
-                active.timeline.revise(asr.finish().copy(final = true), envelope(frame))?.let {
-                    registerTranscript(active, it)
-                    actions += { emit(TranscriptEvent(it)) }
-                }
-                requestSpeaker(active, next, actions)
-                if (available()) {
-                    turn = null
-                    asr.reset()
-                    vad.reset()
-                }
+                finalizeTurn(turn!!, next, frame, actions)
             }
             if (available()) last = frame
         } catch (_: Exception) {
@@ -188,7 +228,7 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
         asr.accept(frame).forEach { hypothesis ->
             active.timeline.revise(hypothesis, envelope(frame))?.let { revision ->
                 registerTranscript(active, revision)
-                actions += { emit(TranscriptEvent(revision)) }
+                actions += { emitCurrent(TranscriptEvent(revision)) }
             }
         }
     }
@@ -196,6 +236,24 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
     private fun registerTranscript(active: Turn, revision: TranscriptRevision) {
         timeline.registerTranscriptProvenance(active.id, active.first.epoch, active.first.range.continuityId)
         timeline.applyTranscript(revision)
+    }
+
+    /**
+     * The shared end-of-turn path: the VAD endpoint and the dictation stop ([finishCurrentTurn]) must produce the same
+     * revision shape, final flag, clock (turn start to last accepted frame end) and follow-up work.
+     */
+    private fun finalizeTurn(active: Turn, turnIdentity: Identity, end: PcmFrame,
+        actions: MutableList<() -> Unit>) {
+        active.timeline.revise(asr.finish().copy(final = true), envelope(end))?.let {
+            registerTranscript(active, it)
+            actions += { emitCurrent(TranscriptEvent(it)) }
+        }
+        requestSpeaker(active, turnIdentity, actions)
+        if (available()) {
+            turn = null
+            asr.reset()
+            vad.reset()
+        }
     }
 
     private fun remember(frame: PcmFrame) {
@@ -254,7 +312,7 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
                 }
                 if (accepted) {
                     timeline.applySpeaker(assessment, request.timelineAdmission)
-                    emit(SpeakerEvent(assessment.copy(envelope = EventEnvelope(
+                    emitCurrent(SpeakerEvent(assessment.copy(envelope = EventEnvelope(
                     request.identity.epoch.sessionId, request.identity.epoch.generation,
                     UUID.randomUUID().toString(), assessment.startNanos, assessment.endNanos))))
                 }
@@ -291,8 +349,8 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
         deferredInputs.clear()
         preRoll.clear(); preRollSamples = 0; last = null
         resetEngines(actions)
-        actions += { emit(ServiceFaultEvent(envelope, code)) }
-        actions += { emit(SessionStateEvent(envelope, SessionState.Paused)) }
+        actions += { emitCurrent(ServiceFaultEvent(envelope, code)) }
+        actions += { emitCurrent(SessionStateEvent(envelope, SessionState.Paused)) }
     }
 
     private fun reset(envelope: EventEnvelope, reason: GapReason, actions: MutableList<() -> Unit>) {
@@ -303,7 +361,7 @@ class SpeechPipeline(private val vad: VadEngine, private val asr: StreamingAsrEn
         val asrReset = runCatching { asr.reset() }.isSuccess
         // Keep intake fenced through lifecycle, external cancellation, and the gap event.
         actions.add(0) { resetSpeaker(token, envelope) }
-        actions += { emit(DiscontinuityEvent(envelope, reason)) }
+        actions += { emitCurrent(DiscontinuityEvent(envelope, reason)) }
         actions += { completeReset(token) }
         if (!vadReset || !asrReset) fault(envelope, "SPEECH_PROVIDER_FAILURE", actions)
     }
