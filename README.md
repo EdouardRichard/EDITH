@@ -193,7 +193,8 @@ When the gate declines, **zero** model requests are made. The two routes use ind
 The **Detached from glasses** setting runs the wake route without the glasses. The phone microphone
 replaces the CXR uplink: the same 16 kHz/mono PCM framing feeds the same KWS, VAD and streaming ASR,
 and a wake hit opens the same WAKE turn with the same tools, prompts, memory and confirmation flow.
-The app opens no CXR session and sends nothing to the glasses. The answer is written to the phone's
+The app opens no CXR session and sends nothing to the glasses (enforced in code; the final K40
+outbound-count re-verification is still pending Task 13e). The answer is written to the phone's
 conversation log; the phone display device is acknowledgement-only (it does not write the log
 again), and TTS still follows the existing speech switch. Proactive assistance is effectively off
 while detached — the expression is `proactiveEnabled && !glassesDetached`, so the stored proactive
@@ -299,8 +300,9 @@ Quark Drive download or an `adb push` to install or start using EDITH.
 The complete APK is about **1.1 GB** (measured debug build: 1.11 GB / 1.0347 GiB). Plan for roughly
 **2.2 GB** of free storage at install time (estimate: the APK plus the materialized copy). The four
 sets together take about **1.0 GiB** (1.03 GiB) after materialization. Measured on the K40 acceptance
-device (2026-10-26), the first materialization took about **12.8 s** and a later cold start reused the
-materialized copy in about **0.45 s**. Until preparation finishes, the app shows its
+device with the debug build (2026-10-26), the first materialization took about **12.8 s** and a later
+cold start reused the materialized copy in about **0.45 s**; the release build was not measured.
+Until preparation finishes, the app shows its
 preparing-local-models state and refuses to start a session rather than running with a partial bundle.
 
 | Model set | Contents | Runtime location after materialization |
