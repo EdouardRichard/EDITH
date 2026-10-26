@@ -811,7 +811,7 @@ private class NoStorageAccess : StorageAccess {
                 )
                 // 0.4 Task 6 (spec §7.2): the new evidence line names the source; the P3 line above keeps its shape.
                 assertEquals(
-                    listOf("P4_AUDIO state=disarmed source=cxr transport=false loop=false reason=NOT_ACTIVE"),
+                    listOf("P4_AUDIO state=disarmed source=cxr transport=false loop=false lockscreen_hold=false reason=NOT_ACTIVE"),
                     lines.filter { it.startsWith("P4_AUDIO") },
                 )
             }

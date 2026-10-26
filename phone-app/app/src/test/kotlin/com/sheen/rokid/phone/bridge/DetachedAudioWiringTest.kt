@@ -25,6 +25,8 @@ import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.audio.PcmRecordDevice
 import com.sheen.rokid.phone.audio.PhoneMicCapture
 import com.sheen.rokid.phone.audio.PhoneMicFormat
+import com.sheen.rokid.phone.audio.WakeLockBridge
+import com.sheen.rokid.phone.audio.WakeLockHold
 import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
@@ -311,6 +313,39 @@ class DetachedAudioWiringTest {
     }
 
     /**
+     * 0.4 Task 8: the platform seam of the CPU wake lock. The [root] receives the same [WakeLockHold] this bridge
+     * backs, so a test can assert both the platform call counts and what the `P4_AUDIO` evidence line reported.
+     */
+    private class RecordingWakeLockBridge(private val order: MutableList<String>? = null) : WakeLockBridge {
+        val acquires = AtomicInteger()
+        val releases = AtomicInteger()
+        @Volatile private var held = false
+        @Volatile var rejectAcquire = false
+        @Volatile var failure: String? = null
+
+        override fun acquire(): Boolean {
+            acquires.incrementAndGet()
+            order?.add("acquire:wake")
+            if (rejectAcquire) {
+                failure = "ACQUIRE_REFUSED"
+                return false
+            }
+            held = true
+            return true
+        }
+
+        override fun release() {
+            releases.incrementAndGet()
+            order?.add("release:wake")
+            held = false
+        }
+
+        override fun isHeld(): Boolean = held
+
+        override fun lastFailure(): String? = failure
+    }
+
+    /**
      * The real `HostCompositionRoot` with a recording loop port, the real smart wiring, and - when
      * [withConnection] - a CXR connection carrying a recording transport port. The phone microphone is a fake device
      * behind the composition's own factory seam, so `armAudioEpoch` runs the production branch end to end.
@@ -324,6 +359,7 @@ class DetachedAudioWiringTest {
         private val withConnection: Boolean = true,
         private val queueDispatches: Boolean = false,
         private val configurePhoneDevice: FakePhoneDevice.() -> Unit = {},
+        configureWakeBridge: RecordingWakeLockBridge.() -> Unit = {},
     ) {
         val clock = FakeClock(0)
         val order = CopyOnWriteArrayList<String>()
@@ -331,6 +367,8 @@ class DetachedAudioWiringTest {
         val transport = OrderedPort("transport", order)
         val phoneIngress = PcmIngress(clock)
         val devices = CopyOnWriteArrayList<FakePhoneDevice>()
+        val wakeBridge = RecordingWakeLockBridge(order).also(configureWakeBridge)
+        val wakeLock = WakeLockHold(wakeBridge)
         private val dispatchQueue = CopyOnWriteArrayList<() -> Unit>()
         val root: HostCompositionRoot
 
@@ -366,7 +404,10 @@ class DetachedAudioWiringTest {
                 phoneIngress = phoneIngress,
                 phoneMicDeviceFactory = {
                     FakePhoneDevice(order).also { devices += it; it.configurePhoneDevice() }
-                })
+                },
+                // 0.4 Task 8: the same hold-backed bridge is reachable from the test, so the P4 line and the platform
+                // call counts describe one lock.
+                wakeLock = wakeLock)
             root.registerPlugin(wiring.plugin)
         }
 
@@ -393,9 +434,10 @@ class DetachedAudioWiringTest {
         withConnection: Boolean = true,
         queueDispatches: Boolean = false,
         configurePhoneDevice: FakePhoneDevice.() -> Unit = {},
+        configureWakeBridge: RecordingWakeLockBridge.() -> Unit = {},
         block: (Rig) -> Unit,
     ) {
-        val rig = Rig(detached, withConnection, queueDispatches, configurePhoneDevice)
+        val rig = Rig(detached, withConnection, queueDispatches, configurePhoneDevice, configureWakeBridge)
         try { block(rig) } finally { rig.close() }
     }
 
@@ -420,15 +462,19 @@ class DetachedAudioWiringTest {
                 rig.transport.recorder.started.isEmpty())
             assertEquals("only the poll loop runs; the phone ingress is opened directly by the arm",
                 listOf(epoch), rig.loop.recorder.started)
-            assertEquals("capture must begin before the loop polls it",
-                listOf("start:capture", "start:loop"), rig.order.toList())
+            assertEquals("capture must begin before the loop polls it, and the CPU hold is taken only after both are up",
+                listOf("start:capture", "start:loop", "acquire:wake"), rig.order.toList())
             assertEquals("the phone ingress is open with the session's epoch, so its offers are accepted",
                 PcmOffer.ACCEPTED, rig.phoneIngress.offer(epoch, ByteArray(PhoneMicFormat.CHUNK_BYTES)))
             assertEquals("exactly one recorder for one epoch", 1, rig.devices.size)
             assertTrue(rig.devices.single().starts.get() == 1)
-            // 0.4 Task 6 (spec §7.2): the new evidence line attributes the audio to the phone source.
+            // 0.4 Task 8: one successful detached arm takes the CPU lock exactly once, after capture and loop are up.
+            assertEquals("one detached arm takes exactly one CPU wake lock", 1, rig.wakeBridge.acquires.get())
+            assertTrue("the lock-screen hold must be real while the epoch runs", rig.wakeLock.isHeld())
+            // 0.4 Task 6 (spec §7.2): the new evidence line attributes the audio to the phone source. Task 8 adds the
+            // lock-screen hold; this rig holds a fake platform lock, so the arm line must say the hold is real.
             assertEquals(
-                listOf("P4_AUDIO state=armed source=phone_mic transport=false loop=true reason=ARMED"),
+                listOf("P4_AUDIO state=armed source=phone_mic transport=false loop=true lockscreen_hold=true reason=ARMED"),
                 lines.filter { it.startsWith("P4_AUDIO") },
             )
         }
@@ -459,11 +505,14 @@ class DetachedAudioWiringTest {
             assertEquals(listOf(epoch), rig.loop.recorder.started)
             assertEquals(listOf("start:transport", "start:loop"), rig.order.toList())
             assertTrue("the phone microphone must not be opened in glasses mode", rig.devices.isEmpty())
+            assertEquals("the glasses path never takes the detached CPU wake lock", 0, rig.wakeBridge.acquires.get())
+            assertFalse("no CPU hold exists in glasses mode", rig.wakeLock.isHeld())
             assertEquals("the phone ingress was never opened for this epoch",
                 PcmOffer.STALE_EPOCH, rig.phoneIngress.offer(epoch, ByteArray(PhoneMicFormat.CHUNK_BYTES)))
-            // 0.4 evidence still attributes a glasses session to the CXR source (spec §7.2).
+            // 0.4 evidence still attributes a glasses session to the CXR source (spec §7.2), with no CPU hold: the
+            // glasses path never takes the detached wake lock (Task 8).
             assertEquals(
-                listOf("P4_AUDIO state=armed source=cxr transport=true loop=true reason=ARMED"),
+                listOf("P4_AUDIO state=armed source=cxr transport=true loop=true lockscreen_hold=false reason=ARMED"),
                 lines.filter { it.startsWith("P4_AUDIO") },
             )
         }
@@ -483,14 +532,16 @@ class DetachedAudioWiringTest {
                 captured.toList()
             }
 
-            assertEquals("the loop must stop before the device it was polling is released",
-                listOf("stop:loop", "stop:capture"), rig.order.toList())
+            assertEquals("the loop must stop before the device it was polling is released, and the CPU hold goes last",
+                listOf("stop:loop", "stop:capture", "release:wake"), rig.order.toList())
             assertEquals("the device is released exactly once", 1, rig.devices.single().stops.get())
             assertNull(rig.root.currentAudioEpoch())
+            assertEquals("stop releases the CPU hold exactly once", 1, rig.wakeBridge.releases.get())
+            assertFalse("no CPU hold survives a stopped session", rig.wakeLock.isHeld())
             assertEquals("a released phone ingress accepts nothing",
                 PcmOffer.STALE_EPOCH, rig.phoneIngress.offer(epoch, ByteArray(PhoneMicFormat.CHUNK_BYTES)))
             assertEquals(
-                listOf("P4_AUDIO state=disarmed source=phone_mic transport=false loop=false reason=DISARMED"),
+                listOf("P4_AUDIO state=disarmed source=phone_mic transport=false loop=false lockscreen_hold=false reason=DISARMED"),
                 lines.filter { it.startsWith("P4_AUDIO") },
             )
         }
@@ -506,6 +557,8 @@ class DetachedAudioWiringTest {
 
             assertNull("pause disarms the epoch", rig.root.currentAudioEpoch())
             assertEquals("pause must release the recorder", 1, first.stops.get())
+            assertEquals("pause must release the CPU hold", 1, rig.wakeBridge.releases.get())
+            assertFalse("a paused session must not keep the CPU awake", rig.wakeLock.isHeld())
 
             rig.root.resume()
 
@@ -513,6 +566,8 @@ class DetachedAudioWiringTest {
             assertEquals("resume must not reuse a released recorder", 2, rig.devices.size)
             assertEquals(1, rig.devices.last().starts.get())
             assertEquals("the loop starts again for the new epoch", 2, rig.loop.recorder.started.size)
+            assertEquals("resume takes a fresh CPU hold", 2, rig.wakeBridge.acquires.get())
+            assertTrue("a resumed detached session is held awake again", rig.wakeLock.isHeld())
         }
     }
 
@@ -593,9 +648,12 @@ class DetachedAudioWiringTest {
             assertTrue("the poll loop must not run with nothing producing into it",
                 rig.loop.recorder.started.isEmpty())
             assertEquals("the arm did try the phone recorder exactly once", 1, rig.devices.single().starts.get())
+            assertEquals("a failed arm never takes the CPU wake lock", 0, rig.wakeBridge.acquires.get())
+            assertEquals("a failed arm never has a hold to release", 0, rig.wakeBridge.releases.get())
+            assertFalse(rig.wakeLock.isHeld())
             assertEquals(
-                "the failure is an explicit START_FAILED transition for the phone source",
-                listOf("P4_AUDIO state=disarmed source=phone_mic transport=false loop=false reason=START_FAILED"),
+                "the failure is an explicit START_FAILED transition for the phone source, and no CPU hold survived it",
+                listOf("P4_AUDIO state=disarmed source=phone_mic transport=false loop=false lockscreen_hold=false reason=START_FAILED"),
                 lines.filter { it.startsWith("P4_AUDIO") },
             )
         }
@@ -610,6 +668,7 @@ class DetachedAudioWiringTest {
                 assertTrue(rig.activate())
                 val epoch = requireNotNull(rig.root.currentAudioEpoch())
                 val device = rig.devices.single()
+                assertTrue("an armed detached session holds the CPU awake", rig.wakeLock.isHeld())
 
                 awaitCondition { device.failureTriggered.get() == 1 }
                 awaitCondition { rig.pendingDispatches() == 1 }
@@ -626,19 +685,91 @@ class DetachedAudioWiringTest {
                     rig.phoneIngress.offer(epoch, ByteArray(PhoneMicFormat.CHUNK_BYTES)))
                 assertEquals("the poll loop for that epoch is stopped", listOf(epoch), rig.loop.recorder.stopped)
                 assertEquals("the recorder is released exactly once", 1, device.stops.get())
+                assertEquals("the CPU hold is released exactly once", 1, rig.wakeBridge.releases.get())
+                assertFalse("a degraded session must not keep the CPU awake", rig.wakeLock.isHeld())
                 assertTrue("a detached failure does not start the CXR transport",
                     rig.transport.recorder.started.isEmpty())
                 assertEquals(
-                    "the arm succeeded first, then the dead reader degrades the epoch with CAPTURE_FAILED",
+                    "the arm succeeded first, then the dead reader degrades the epoch with CAPTURE_FAILED and drops the CPU hold",
                     listOf(
-                        "P4_AUDIO state=armed source=phone_mic transport=false loop=true reason=ARMED",
-                        "P4_AUDIO state=disarmed source=phone_mic transport=false loop=false reason=CAPTURE_FAILED",
+                        "P4_AUDIO state=armed source=phone_mic transport=false loop=true lockscreen_hold=true reason=ARMED",
+                        "P4_AUDIO state=disarmed source=phone_mic transport=false loop=false lockscreen_hold=false reason=CAPTURE_FAILED",
                     ),
                     captured.filter { it.startsWith("P4_AUDIO") },
                 )
                 assertEquals("the session is not silently re-armed by the failure", 0, rig.pendingDispatches())
                 captured.toList()
             }
+        }
+    }
+
+    // ---- Task 8: the detached CPU wake lock ----------------------------------------------------------------------
+
+    @Test
+    fun aSecondArmDoesNotAcquireASecondWakeLock() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            assertTrue("a second arm of a running epoch is a no-op", rig.root.armAudioEpoch())
+            assertEquals("one logical hold means one platform acquire", 1, rig.wakeBridge.acquires.get())
+            assertTrue(rig.wakeLock.isHeld())
+        }
+    }
+
+    @Test
+    fun closeReleasesTheDetachedWakeLock() {
+        val rig = Rig(detached = true)
+        try {
+            assertTrue(rig.activate())
+            assertTrue(rig.wakeLock.isHeld())
+
+            rig.root.close()
+
+            assertEquals("close releases the CPU hold exactly once", 1, rig.wakeBridge.releases.get())
+            assertFalse("a closed composition must not keep the CPU awake", rig.wakeLock.isHeld())
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun anExplicitDisarmReleasesTheWakeLockAndTheLineSaysSo() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            assertTrue(rig.wakeLock.isHeld())
+
+            val lines = withP3Sink { captured ->
+                rig.root.disarmAudioEpoch()
+                captured.toList()
+            }
+
+            assertFalse(rig.wakeLock.isHeld())
+            assertEquals(1, rig.wakeBridge.releases.get())
+            assertEquals(
+                listOf("P4_AUDIO state=disarmed source=phone_mic transport=false loop=false lockscreen_hold=false reason=DISARMED"),
+                lines.filter { it.startsWith("P4_AUDIO") },
+            )
+        }
+    }
+
+    @Test
+    fun aRefusedWakeLockAcquireStillArmsTheSessionAndReportsNoHold() {
+        withRig(detached = true, configureWakeBridge = { rejectAcquire = true }) { rig ->
+            val lines = withP3Sink { captured ->
+                assertTrue("a CPU lock the platform refused must not fail the audio session", rig.activate())
+                captured.toList()
+            }
+
+            assertEquals("the arm still tries the lock exactly once", 1, rig.wakeBridge.acquires.get())
+            assertFalse("a refused acquire must not pretend to hold", rig.wakeLock.isHeld())
+            assertEquals("ACQUIRE_REFUSED", rig.wakeLock.lastFailure())
+            assertEquals(
+                "the evidence line must report the missing hold, not the attempted one",
+                listOf("P4_AUDIO state=armed source=phone_mic transport=false loop=true lockscreen_hold=false reason=ARMED"),
+                lines.filter { it.startsWith("P4_AUDIO") },
+            )
+
+            rig.root.stop()
+            assertEquals("there was no hold to release", 0, rig.wakeBridge.releases.get())
         }
     }
 }

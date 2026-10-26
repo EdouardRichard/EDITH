@@ -62,6 +62,7 @@ import com.sheen.rokid.phone.audio.PhoneMicCapture
 import com.sheen.rokid.phone.audio.PhoneMicDevice
 import com.sheen.rokid.phone.audio.PhoneMicFormat
 import com.sheen.rokid.phone.audio.SherpaAsrSession
+import com.sheen.rokid.phone.audio.WakeLockHold
 import com.sheen.rokid.phone.bridge.CxrGlassesTarget
 import com.sheen.rokid.phone.bridge.UnwiredInputPort
 import com.sheen.rokid.phone.bridge.ExecutorTaskScope
@@ -85,6 +86,7 @@ import com.sheen.rokid.phone.session.confirmation.confirmationPresentationChanne
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.os.PowerManager
 import com.sheen.rokid.audio.AcousticLabeler
 import com.sheen.rokid.audio.LocalSpeakerService
 import com.sheen.rokid.audio.KeywordSpotterWakeWordEngine
@@ -366,6 +368,16 @@ class HostCompositionRoot internal constructor(
      * passes a fake `PcmRecordDevice` and drives the same `armAudioEpoch`/`disarmAudioEpoch` branches without a phone.
      */
     private val phoneMicDeviceFactory: (() -> PcmRecordDevice)? = null,
+    /**
+     * 0.4 Task 8 (`D199`, spec §4.6): the CPU wake lock that keeps a **detached** session's KWS running while the
+     * phone's screen is off.
+     *
+     * Null for hand-built compositions and rigs with no platform lock (the pre-0.4 behavior); production passes the
+     * one [create] builds over the phone's `PowerManager`. Only a successful detached arm acquires it, and every
+     * teardown path (disarm/pause/stop/close) releases it - never a glasses arm, which has its own CXR uplink and must
+     * not be kept awake by this lock.
+     */
+    private val wakeLock: WakeLockHold? = null,
 ) : AutoCloseable {
     /**
      * P5 (spec §S5): the 「语音朗读」 switch state, persisted globally and **off by default**.
@@ -1339,6 +1351,10 @@ class HostCompositionRoot internal constructor(
             environment?.input?.start(epoch)
         }.exceptionOrNull()
         if (failure == null) {
+            // 0.4 Task 8: only now - loop polling and phone capture are both up - is there a running detached session
+            // whose CPU must stay awake. Acquiring before the source works would hold a lock for a session that never
+            // listened; acquiring in glasses mode would keep the phone awake for a source it does not own.
+            acquireDetachedWakeLock()
             logAudioState("armed", "phone_mic", transport = false, loop = true,
                 generation = epoch.generation.value, reason = "ARMED")
             return true
@@ -1368,7 +1384,12 @@ class HostCompositionRoot internal constructor(
      * only the value distinguishes a normal teardown from the bounded failure the spec §4.5 evidence needs.
      */
     @Synchronized fun disarmAudioEpoch(reason: String = "DISARMED") {
-        val epoch = runningAudioEpoch ?: return
+        val epoch = runningAudioEpoch ?: run {
+            // Nothing is armed, so there is no transition line; a hold left behind by an abnormal arm attempt must
+            // still not outlive the disarm.
+            releaseDetachedWakeLock()
+            return
+        }
         runningAudioEpoch = null
         val transport = runningAudioTransport
         runningAudioTransport = null
@@ -1387,6 +1408,11 @@ class HostCompositionRoot internal constructor(
             while (runCatching { phoneIngress?.pollGap() }.getOrNull() != null) { /* terminal teardown only */ }
         }
         runCatching { transport?.stop(epoch) }
+        // 0.4 Task 8: release last, after the loop and source teardown, so a join inside `capture.stop()` does not run
+        // with the CPU already free to suspend. This method is also reached from the capture-failure teardown on the
+        // host dispatcher thread; `WakeLockHold.release` only synchronizes its own state and never joins a thread, so
+        // it cannot self-join the dead capture reader.
+        releaseDetachedWakeLock()
         logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
             generation = epoch.generation.value, reason = reason)
     }
@@ -1420,8 +1446,16 @@ class HostCompositionRoot internal constructor(
      *
      * `P3_AUDIO` keeps its **pre-0.4 shape** - `state`, `generation`, `transport`, `loop`, and a `reason` only on the
      * refusal/disarm lines - because spec §7.2 says the existing line's semantics do not change. `P4_AUDIO` is the
-     * 0.4 evidence line and adds `source=phone_mic|cxr`, so a device run can attribute the frames without re-reading
-     * the detach gate. Both lines are state/counts only: never audio, never its content.
+     * 0.4 evidence line and adds `source=phone_mic|cxr` and (Task 8, `D199`) `lockscreen_hold=true|false`, so a device
+     * run can attribute the frames and see whether the CPU hold was real without re-reading the detach gate.
+     *
+     * **Field placement reconciliation (Task 8 → Task 14 docs).** Spec §4.4/§7.2 sketches `lockscreen_hold` on a
+     * `P4_DETACH` line, but that line does not exist yet and this task's plan names `P4_AUDIO`. The plan is followed:
+     * the hold is a property of the audio epoch (it is taken when the detached epoch arms and released when it
+     * disarms), so putting it on the arm/disarm transition keeps the evidence on the event it describes. Task 14's
+     * doc pass should record this choice rather than add a second line.
+     *
+     * Both lines are state/counts only: never audio, never its content.
      */
     private fun logAudioState(
         state: String,
@@ -1433,7 +1467,28 @@ class HostCompositionRoot internal constructor(
     ) {
         val p3 = "P3_AUDIO state=$state generation=$generation transport=$transport loop=$loop"
         P3Log.line(if (state == "armed") p3 else "$p3 reason=$reason")
-        P3Log.line("P4_AUDIO state=$state source=$source transport=$transport loop=$loop reason=$reason")
+        val hold = wakeLock?.isHeld() == true
+        P3Log.line("P4_AUDIO state=$state source=$source transport=$transport loop=$loop " +
+            "lockscreen_hold=$hold reason=$reason")
+    }
+
+    /**
+     * 0.4 Task 8: takes the CPU lock once the detached source is genuinely running.
+     *
+     * A refused acquisition is **not** an arm failure: the foreground service and the phone source still run, and the
+     * session can still be woken while unlocked. It is recorded as `lockscreen_hold=false` on the arm line (and the
+     * stable reason is logged) so a device pass can see the lock-screen promise is degraded instead of assuming it.
+     */
+    private fun acquireDetachedWakeLock() {
+        val hold = wakeLock ?: return
+        if (!hold.acquire()) {
+            android.util.Log.i("EdithHost", "detached wake lock not held: ${hold.lastFailure()}")
+        }
+    }
+
+    /** 0.4 Task 8: the one release used by disarm/pause/stop/close. Idempotent; never joins or blocks on a thread. */
+    private fun releaseDetachedWakeLock() {
+        wakeLock?.release()
     }
 
     /** `phone_mic` or `cxr`: the `P4_AUDIO` source field, counts/state only - never audio. */
@@ -2242,6 +2297,9 @@ class HostCompositionRoot internal constructor(
         if (closed) return
         stop()
         closed = true
+        // 0.4 Task 8: `stop()` releases through `disarmAudioEpoch`; releasing again is the belt-and-braces for an arm
+        // that never reached a disarm, and is a no-op when nothing is held.
+        releaseDetachedWakeLock()
         profileConsent(null)
         observation.cancel()
         try { host.close() } finally {
@@ -2531,6 +2589,16 @@ class HostCompositionRoot internal constructor(
             // pipeline/KWS consume it exactly as they consume the CXR uplink. It is only ever opened in detached mode,
             // so a glasses session's ingress (the connection's) is untouched by its existence.
             val phoneIngress = PcmIngress(clock)
+            // 0.4 Task 8 (`D199`, spec §4.6): the CPU hold for detached sessions. Android's `PARTIAL_WAKE_LOCK` is the
+            // platform-official way to keep KWS processing while the phone's screen is off; the vendor SDK has no
+            // CPU-hold API at all (its FAQ offers only `FLAG_KEEP_SCREEN_ON` and an un-interceptable power key), which
+            // is why this is the documented platform fallback. Created once here and owned by the composition: a
+            // successful detached arm acquires it and every teardown path releases it. It never turns the screen on.
+            // Read from this context directly - not `applicationContext`, which a JVM rig's bare `ContextWrapper(null)`
+            // cannot answer - and null is an honest "no platform lock", reported as `lockscreen_hold=false`.
+            val detachedWakeLock = WakeLockHold.fromPowerManager(
+                context.getSystemService(PowerManager::class.java),
+            )
             val audio = provisionAudioChain(
                 context = context,
                 clock = clock, scheduler = scheduler,
@@ -3169,6 +3237,8 @@ class HostCompositionRoot internal constructor(
                 // 0.4 Task 6: the same ingress the chain's selector names, and the production recorder factory.
                 phoneIngress = phoneIngress,
                 phoneMicDeviceFactory = { PhoneMicDevice() },
+                // 0.4 Task 8: the composition owns the detached session's CPU hold.
+                wakeLock = detachedWakeLock,
                 playbackGate = playbackGate,
                 modelReadiness = readiness,
             )
