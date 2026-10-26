@@ -36,8 +36,10 @@ import java.util.UUID
  * Laya copy, write their receipts, and only then fail Embedding - a `Failed` App on a volume with no room left.
  * Later updates only need the bytes of the groups they rewrite, which the per-group checks enforce.
  *
- * [freeSpace] is a callback so JVM tests can decide the answer without filling a volume; production passes
- * [File.usableSpace].
+ * [freeSpace] is a callback so JVM tests can decide the answer without filling a volume. The default is
+ * [ModelStorageSpace.usableBytes], which resolves the nearest existing ancestor: a first install's EmbeddingGemma
+ * directory does not exist until this class creates it, and `File.usableSpace` on an absent path would read 0 and
+ * refuse the install for ever. Production passes the same probe.
  */
 class BundledModelProvisioner(
     private val source: ModelAssetSource,
@@ -46,7 +48,7 @@ class BundledModelProvisioner(
     private val modelsManifest: BundledModelsManifest,
     private val layaDirectory: File,
     private val embeddingDirectory: File,
-    private val freeSpace: (File) -> Long = { it.usableSpace },
+    private val freeSpace: (File) -> Long = { ModelStorageSpace.usableBytes(it) },
     private val log: (String) -> Unit = { android.util.Log.i(TAG, it) },
 ) {
 
@@ -197,6 +199,8 @@ class BundledModelProvisioner(
         if (freeSpace(directory) < required) throw IOException(NO_SPACE_MESSAGE)
         if (!directory.isDirectory && !directory.mkdirs() && !directory.isDirectory) {
             // `mkdirs` only reports false. When the volume filled up, that false is still an ENOSPC for the user.
+            // The callback resolves the nearest existing ancestor, so a directory that is still missing after
+            // `mkdirs` failed is not itself read as zero bytes free (only a genuinely full volume becomes NO_SPACE).
             if (freeSpace(directory) < required) throw IOException(NO_SPACE_MESSAGE)
             throw IOException("model directory unavailable")
         }

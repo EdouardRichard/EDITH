@@ -8,6 +8,7 @@ import com.sheen.rokid.phone.model.BundledModelsManifest
 import com.sheen.rokid.phone.model.ModelAssetSource
 import com.sheen.rokid.phone.model.ModelReadiness
 import com.sheen.rokid.phone.model.ModelStartGate
+import com.sheen.rokid.phone.model.ModelStorageSpace
 import com.sheen.rokid.phone.model.ProvisioningState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
@@ -134,7 +135,10 @@ open class EdithApplication : Application() {
             modelsManifest = modelsManifest,
             layaDirectory = filesDir,
             embeddingDirectory = EmbeddingModelDirectory.locate(getExternalFilesDir(null), filesDir),
-            freeSpace = { directory -> directory.usableSpace },
+            // On a first install `filesDir` exists but `<externalFilesDir>/models/embeddinggemma` does not, and
+            // `File.usableSpace` on an absent path reads 0. The probe answers for the volume through the nearest
+            // existing ancestor, so the pre-write gate sees the real free bytes instead of refusing permanently.
+            freeSpace = ModelStorageSpace::usableBytes,
         )
     }
 

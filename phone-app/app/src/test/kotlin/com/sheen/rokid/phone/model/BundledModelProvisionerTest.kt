@@ -56,7 +56,10 @@ class BundledModelProvisionerTest {
     private fun entry(group: String, role: String, fileName: String, bytes: ByteArray): BundledModelFile =
         BundledModelFile(group, role, "$group/$fileName", bytes.size.toLong(), sha256(bytes))
 
-    private inner class Fixture(val id: String = bundleId) {
+    private inner class Fixture(
+        val id: String = bundleId,
+        embeddingDirectoryOverride: File? = null,
+    ) {
         val asrBytes: Map<String, ByteArray> = roles.associateWith { role -> "$role-asr-model".toByteArray() }
         val layaBytes: Map<String, ByteArray> = layaFileNames.associateWith { name -> "$name-laya".toByteArray() }
         val embeddingBytes: Map<String, ByteArray> = embeddingFileNames.associateWith { name ->
@@ -101,7 +104,12 @@ class BundledModelProvisionerTest {
         val storeRoot: Path = temporary.newFolder("asr-store").toPath()
         var store: EngineModelStore = EngineModelStore(storeRoot)
         val layaDirectory: File = temporary.newFolder("laya")
-        val embeddingDirectory: File = temporary.newFolder("embedding")
+
+        /**
+         * Normally an existing directory (the update/restart tests); a test may name a path that does not exist yet
+         * to reproduce the production first install, where only the provisioner creates it.
+         */
+        val embeddingDirectory: File = embeddingDirectoryOverride ?: temporary.newFolder("embedding")
 
         fun preimportAsr() {
             store.import(asrManifest, roles.associateWith { role ->
@@ -535,6 +543,46 @@ class BundledModelProvisionerTest {
         assertEquals(ProvisioningState.Failed("MODELS_NO_SPACE"), result)
         assertTrue("the embedding-volume refusal must precede every copy: ${source.opened}", source.opened.isEmpty())
         assertNull("a refused first run must not import or activate an ASR bundle", fixture.store.active())
+    }
+
+    @Test
+    fun aMissingEmbeddingDirectoryOnFirstRunDoesNotReadAsNoSpace() {
+        // Production on a fresh install: `filesDir` exists, but `<externalFilesDir>/models/embeddinggemma` has
+        // never been created. Only the provisioner creates it, so the space gate runs before the first `mkdirs`.
+        val embeddingDirectory = File(temporary.root, "external/models/embeddinggemma")
+        val fixture = Fixture(embeddingDirectoryOverride = embeddingDirectory)
+        assertFalse("the provisioner must create this directory itself", embeddingDirectory.exists())
+
+        // Production-shaped reading: the volume is probed from the nearest existing ancestor, never from the absent
+        // target itself.
+        val result = fixture.provisioner(freeSpace = ModelStorageSpace::usableBytes).run()
+
+        assertEquals(
+            "a target directory that does not exist yet is not a full disk",
+            ProvisioningState.Ready(bundleId),
+            result,
+        )
+        fixture.assertFiles(embeddingDirectory, fixture.embeddingBytes)
+        assertEquals(bundleId, fixture.receipt(embeddingDirectory).readText().trim())
+        assertNoTempFiles(embeddingDirectory)
+    }
+
+    @Test
+    fun aMissingEmbeddingDirectoryThatCannotBeCreatedKeepsTheGroupReason() {
+        // The parent is a regular file, so `mkdirs` fails on a directory that does not exist while the volume itself
+        // has plenty of room. That failure must stay an Embedding failure, not be blamed on free space.
+        val blockingParent = temporary.newFile("embedding-parent-is-a-file")
+        val embeddingDirectory = File(blockingParent, "models/embeddinggemma")
+        val fixture = Fixture(embeddingDirectoryOverride = embeddingDirectory)
+        assertFalse(embeddingDirectory.exists())
+
+        val result = fixture.provisioner(freeSpace = ModelStorageSpace::usableBytes).run()
+
+        assertEquals(
+            "only a genuinely full volume may be reported as MODELS_NO_SPACE",
+            ProvisioningState.Failed("MODELS_EMBEDDING_FAILED"),
+            result,
+        )
     }
 
     @Test
