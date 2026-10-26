@@ -120,4 +120,21 @@ class AssetEngineBundleProvisioningTest {
         assertFalse("a refused import must not leave an active pointer",
             Files.exists(fixture.storeRoot.resolve("active")))
     }
+
+    @Test
+    fun aNoSpaceFailureIsPropagatedInsteadOfBecomingEngineMissing() {
+        // The provisioner's only signal for MODELS_NO_SPACE is the cause chain; wrapping a full disk in the generic
+        // ENGINE_MISSING would relabel it as MODELS_ASR_FAILED. Every other refusal keeps the generic mapping.
+        val root = temporary.newFolder("engine-models-nospace").toPath()
+        val store = EngineModelStore(root)
+        val noSpace = IOException("No space left on device")
+        val source = ModelAssetSource { throw noSpace }
+
+        val thrown = runCatching { AssetEngineBundleProvisioning(source, store, manifest()).import() }
+            .exceptionOrNull()
+
+        assertSame("a full disk must stay recognizable to the caller", noSpace, thrown)
+        assertNull("a refused import must not activate anything", store.active())
+        assertFalse("a refused import must not leave an active pointer", Files.exists(root.resolve("active")))
+    }
 }

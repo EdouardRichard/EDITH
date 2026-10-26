@@ -143,6 +143,16 @@ class BundledModelProvisionerTest {
         }
 
         fun receipt(directory: File): File = File(directory, receiptName)
+
+        /**
+         * Replaces the embedding directory with a regular file, so the next materialization's `mkdirs` fails for a
+         * reason that is not "the directory already exists".
+         */
+        fun replaceEmbeddingDirectoryWithFile() {
+            embeddingDirectory.listFiles().orEmpty().forEach { it.delete() }
+            check(embeddingDirectory.delete()) { "embedding directory must be empty to replace it" }
+            embeddingDirectory.writeText("not-a-directory")
+        }
     }
 
     private class RecordingSource(
@@ -171,6 +181,13 @@ class BundledModelProvisionerTest {
         private var index = 0
         override fun read(): Int = if (index < prefix.size) prefix[index++].toInt() and 255 else throw failure
     }
+
+    /**
+     * A stand-in for `android.system.ErrnoException`: on Android a copy can fail with a bare errno-carrying
+     * exception whose class is not an `IOException` and whose message is not the English ENOSPC text, so the
+     * mapper must recognize `errno == 28` as well as the message.
+     */
+    private class ErrnoException(val errno: Int) : IOException("write failed")
 
     private fun assertNoReceipt(directory: File) {
         assertFalse("no receipt may be written on failure", File(directory, receiptName).exists())
@@ -361,6 +378,199 @@ class BundledModelProvisionerTest {
         assertEquals(ProvisioningState.Failed("MODELS_NO_SPACE"), result)
         assertNull("a no-space refusal must not activate an ASR bundle", fixture.store.active())
         assertNoReceipt(fixture.layaDirectory)
+    }
+
+    @Test
+    fun aDiskBelowTheDocumentedFirstRunTotalIsRefusedBeforeAnythingIsCopied() {
+        val fixture = Fixture()
+        val source = RecordingSource(fixture.assetBytes)
+        // 1.05 GiB: more than any single group needs, less than the documented 1.2 GiB a first run may consume.
+        val lessThanRequired = BundledModelProvisioner.TOTAL_FREE_SPACE_BYTES * 105 / 120
+
+        val result = fixture.provisioner(source = source, freeSpace = { lessThanRequired }).run()
+
+        assertEquals(ProvisioningState.Failed("MODELS_NO_SPACE"), result)
+        assertTrue("a refused first run must not open a single asset: ${source.opened}", source.opened.isEmpty())
+        assertNull("a refused first run must not import or activate an ASR bundle", fixture.store.active())
+        assertTrue("a refused first run must not create a temp file or receipt",
+            fixture.layaDirectory.listFiles().orEmpty().isEmpty())
+        assertTrue("a refused first run must not create a temp file or receipt",
+            fixture.embeddingDirectory.listFiles().orEmpty().isEmpty())
+    }
+
+    @Test
+    fun spaceForTheAsrGroupAloneIsStillRefusedBeforeAnyCopy() {
+        val fixture = Fixture()
+        val source = RecordingSource(fixture.assetBytes)
+
+        // ~242 MiB is enough for the real 241 MB ASR group but far below the whole first-run materialization.
+        val result = fixture.provisioner(source = source, freeSpace = { 242L * 1024 * 1024 }).run()
+
+        assertEquals(ProvisioningState.Failed("MODELS_NO_SPACE"), result)
+        assertTrue("the early refusal must precede the ASR import: ${source.opened}", source.opened.isEmpty())
+        assertNull("a refused first run must not import or activate an ASR bundle", fixture.store.active())
+        assertNoReceipt(fixture.layaDirectory)
+        assertNoReceipt(fixture.embeddingDirectory)
+    }
+
+    @Test
+    fun noSpaceWhileImportingTheAsrAssetsMapsToModelsNoSpace() {
+        val fixture = Fixture()
+        val source = RecordingSource(
+            files = fixture.assetBytes,
+            failMidStream = "asr/encoder.bin",
+            failure = IOException("No space left on device"),
+        )
+
+        val result = fixture.provisioner(source = source).run()
+
+        assertEquals(ProvisioningState.Failed("MODELS_NO_SPACE"), result)
+        assertNull("a full disk during the import must leave no active bundle", fixture.store.active())
+        assertTrue("the Laya stage must not run after a failed ASR import",
+            fixture.layaDirectory.listFiles().orEmpty().isEmpty())
+        assertNoReceipt(fixture.embeddingDirectory)
+    }
+
+    @Test
+    fun anErrnoNoSpaceWhileCopyingALayaFileMapsToModelsNoSpaceAndKeepsOldFiles() {
+        val fixture = Fixture()
+        val oldTarget = File(fixture.layaDirectory, layaFileNames.first())
+        oldTarget.writeText("old-working-file")
+        fixture.receipt(fixture.layaDirectory).writeText("older-bundle")
+        val source = RecordingSource(
+            files = fixture.assetBytes,
+            failMidStream = "laya/${layaFileNames[1]}",
+            failure = ErrnoException(28),
+        )
+
+        val result = fixture.provisioner(source = source).run()
+
+        assertEquals(ProvisioningState.Failed("MODELS_NO_SPACE"), result)
+        assertEquals("the old runtime file must survive a full disk", "old-working-file", oldTarget.readText())
+        assertEquals("the old receipt must survive a failed update", "older-bundle",
+            fixture.receipt(fixture.layaDirectory).readText().trim())
+        assertNoReceipt(fixture.embeddingDirectory)
+        assertNoTempFiles(fixture.layaDirectory)
+    }
+
+    @Test
+    fun anErrnoPermissionFailureIsNotReportedAsNoSpace() {
+        val fixture = Fixture()
+        val source = RecordingSource(
+            files = fixture.assetBytes,
+            failMidStream = "laya/${layaFileNames.first()}",
+            failure = ErrnoException(13),
+        )
+
+        val result = fixture.provisioner(source = source).run()
+
+        assertEquals("only ENOSPC may become MODELS_NO_SPACE", ProvisioningState.Failed("MODELS_LAYA_FAILED"), result)
+    }
+
+    @Test
+    fun noSpaceWhileCopyingAnEmbeddingFileMapsToModelsNoSpaceAndKeepsTheOldBundle() {
+        val fixture = Fixture()
+        val oldTarget = File(fixture.embeddingDirectory, embeddingFileNames.first())
+        oldTarget.writeText("old-embedding-file")
+        fixture.receipt(fixture.embeddingDirectory).writeText("older-bundle")
+        val source = RecordingSource(
+            files = fixture.assetBytes,
+            failMidStream = "embeddinggemma/${embeddingFileNames[1]}",
+            failure = IOException("No space left on device"),
+        )
+
+        // An update (a receipt exists from the previous bundle) needs only the bytes it rewrites - not the whole
+        // first-run 1.2 GiB headroom - and still maps a full disk to MODELS_NO_SPACE.
+        val result = fixture.provisioner(source = source, freeSpace = { 1_000_000_000L }).run()
+
+        assertEquals(ProvisioningState.Failed("MODELS_NO_SPACE"), result)
+        assertEquals("the old runtime file must survive a full disk", "old-embedding-file", oldTarget.readText())
+        assertEquals("the old receipt must survive a failed update", "older-bundle",
+            fixture.receipt(fixture.embeddingDirectory).readText().trim())
+        assertNoTempFiles(fixture.embeddingDirectory)
+    }
+
+    @Test
+    fun aNonNoSpaceAsrFailureStillReportsModelsAsrFailed() {
+        val fixture = Fixture()
+        val source = RecordingSource(
+            files = fixture.assetBytes,
+            failMidStream = "asr/vad.bin",
+            failure = IOException("asset stream broke"),
+        )
+
+        val result = fixture.provisioner(source = source).run()
+
+        assertEquals("a non-ENOSPC import failure must keep its group reason",
+            ProvisioningState.Failed("MODELS_ASR_FAILED"), result)
+    }
+
+    @Test
+    fun anAlreadyMaterializedBundleIsReadyEvenWithoutFreeSpace() {
+        val fixture = Fixture()
+        fixture.provisioner().run()
+        val secondSource = RecordingSource(fixture.assetBytes)
+
+        val result = fixture.restarted(source = secondSource, freeSpace = { 0L }).run()
+
+        assertEquals("a ready install must not fail because the disk later filled up",
+            ProvisioningState.Ready(bundleId), result)
+        assertTrue("a skip must not open any asset: ${secondSource.opened}", secondSource.opened.isEmpty())
+    }
+
+    @Test
+    fun aFirstRunIsAlsoGatedOnTheEmbeddingVolumeBeforeTheAsrImport() {
+        val fixture = Fixture()
+        val source = RecordingSource(fixture.assetBytes)
+        val space = { file: File ->
+            if (file == fixture.embeddingDirectory) {
+                BundledModelProvisioner.TOTAL_FREE_SPACE_BYTES * 105 / 120
+            } else {
+                Long.MAX_VALUE
+            }
+        }
+
+        val result = fixture.provisioner(source = source, freeSpace = space).run()
+
+        assertEquals(ProvisioningState.Failed("MODELS_NO_SPACE"), result)
+        assertTrue("the embedding-volume refusal must precede every copy: ${source.opened}", source.opened.isEmpty())
+        assertNull("a refused first run must not import or activate an ASR bundle", fixture.store.active())
+    }
+
+    @Test
+    fun aDirectoryCreationFailureOnAFillingVolumeMapsToModelsNoSpace() {
+        val fixture = Fixture()
+        fixture.provisioner().run()
+        fixture.replaceEmbeddingDirectoryWithFile()
+        val source = RecordingSource(fixture.assetBytes)
+        var readings = 0
+
+        // The gate and the pre-copy check see room (readings 1-2); the volume fills up before `mkdirs`, whose
+        // false return carries no cause of its own.
+        val result = fixture.restarted(source = source, freeSpace = {
+            readings++
+            if (readings <= 2) Long.MAX_VALUE else 0L
+        }).run()
+
+        assertEquals(ProvisioningState.Failed("MODELS_NO_SPACE"), result)
+        assertTrue("the unusable embedding path must stay untouched", fixture.embeddingDirectory.isFile)
+        assertEquals("an update that only needs embedding must not re-open Laya: ${source.opened}",
+            emptyList<String>(), source.opened)
+    }
+
+    @Test
+    fun aDirectoryCreationFailureWithSpaceAvailableKeepsTheGroupReason() {
+        val fixture = Fixture()
+        fixture.provisioner().run()
+        fixture.replaceEmbeddingDirectoryWithFile()
+
+        val result = fixture.restarted(freeSpace = { Long.MAX_VALUE }).run()
+
+        assertEquals(
+            "only a full volume may become MODELS_NO_SPACE",
+            ProvisioningState.Failed("MODELS_EMBEDDING_FAILED"),
+            result,
+        )
     }
 
     @Test

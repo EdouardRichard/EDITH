@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.model
 
 import com.sheen.rokid.audio.android.EngineManifest
 import com.sheen.rokid.audio.android.EngineModelStore
+import com.sheen.rokid.audio.android.ValidatedModelBundle
 import java.io.File
 import java.io.IOException
 import java.nio.file.Files
@@ -30,8 +31,13 @@ import java.util.UUID
  * The one exception is a failure *between* the renames of a multi-file group, which still writes no receipt - the
  * next attempt therefore copies the whole group again from verified assets.
  *
+ * Disk space is refused **before the first write** when a first materialization is needed (plan Step 2: less than
+ * 1.2 GiB free is `MODELS_NO_SPACE`). Without that early refusal a tight volume could accept the ASR import and the
+ * Laya copy, write their receipts, and only then fail Embedding - a `Failed` App on a volume with no room left.
+ * Later updates only need the bytes of the groups they rewrite, which the per-group checks enforce.
+ *
  * [freeSpace] is a callback so JVM tests can decide the answer without filling a volume; production passes
- * [File.usableSpace]. A group's copy requires its declared bytes to be free before the first temp file is written.
+ * [File.usableSpace].
  */
 class BundledModelProvisioner(
     private val source: ModelAssetSource,
@@ -81,8 +87,28 @@ class BundledModelProvisioner(
             return ProvisioningState.Ready(bundleId)
         }
 
+        // Decide what this pass must materialize *before* writing anything. A first run may consume the whole
+        // bundled set; failing halfway (ASR + Laya copied and receipted, Embedding refused) leaves a Failed App on
+        // a nearly full volume - exactly the state the plan's early 1.2 GiB refusal exists to prevent.
+        val reusableAsr = reusableAsrBundle()
+        val asrNeedsImport = reusableAsr == null
+        val layaNeedsWork = needsMaterialization(layaDirectory, layaFiles)
+        val embeddingNeedsWork = needsMaterialization(embeddingDirectory, embeddingFiles)
+        if ((asrNeedsImport || layaNeedsWork || embeddingNeedsWork) &&
+            !hasSpaceFor(
+                asrFiles = asrFiles,
+                layaFiles = layaFiles,
+                embeddingFiles = embeddingFiles,
+                asrNeedsImport = asrNeedsImport,
+                layaNeedsWork = layaNeedsWork,
+                embeddingNeedsWork = embeddingNeedsWork,
+            )
+        ) {
+            return refusedForSpace()
+        }
+
         try {
-            provisionAsr(asrFiles)
+            provisionAsr(asrFiles, reusableAsr)
         } catch (failure: Exception) {
             return failed(Stage.ASR, failure)
         }
@@ -104,10 +130,42 @@ class BundledModelProvisioner(
         return ProvisioningState.Ready(bundleId)
     }
 
+    /** The store's already-validated bundle, recovered from disk when this process has not activated one yet. */
+    private fun reusableAsrBundle(): ValidatedModelBundle? =
+        runCatching { store.active() }.getOrNull() ?: runCatching { store.recover(asrManifest) }.getOrNull()
+
+    /**
+     * The pre-write space gate.
+     *
+     * A first materialization (no receipt in either runtime directory) must have the plan's 1.2 GiB on the target
+     * volume, and must have it *before* the ASR import writes anything. An update only needs the groups it rewrites,
+     * so a volume with less headroom can still install a changed bundle.
+     */
+    private fun hasSpaceFor(
+        asrFiles: List<BundledModelFile>,
+        layaFiles: List<BundledModelFile>,
+        embeddingFiles: List<BundledModelFile>,
+        asrNeedsImport: Boolean,
+        layaNeedsWork: Boolean,
+        embeddingNeedsWork: Boolean,
+    ): Boolean {
+        val firstMaterialization = !hasReceipt(layaDirectory) && !hasReceipt(embeddingDirectory)
+        // The ASR store lives in the App's internal data area, the same volume as `filesDir`; ask about the Laya
+        // directory because it is the reachable representative of that volume the caller hands us.
+        val internalNeeded = (if (asrNeedsImport) asrFiles.sumOf { it.bytes } else 0L) +
+            (if (layaNeedsWork) layaFiles.sumOf { it.bytes } else 0L)
+        val internalRequired = if (firstMaterialization) TOTAL_FREE_SPACE_BYTES else internalNeeded
+        if (internalRequired > 0L && freeSpace(layaDirectory) < internalRequired) return false
+        if (embeddingNeedsWork) {
+            val embeddingRequired =
+                if (firstMaterialization) TOTAL_FREE_SPACE_BYTES else embeddingFiles.sumOf { it.bytes }
+            if (freeSpace(embeddingDirectory) < embeddingRequired) return false
+        }
+        return true
+    }
+
     /** Reuses the store's validated bundle when there is one, otherwise imports the packaged ASR files. */
-    private fun provisionAsr(asrFiles: List<BundledModelFile>) {
-        val active = runCatching { store.active() }.getOrNull()
-        val reusable = active ?: runCatching { store.recover(asrManifest) }.getOrNull()
+    private fun provisionAsr(asrFiles: List<BundledModelFile>, reusable: ValidatedModelBundle?) {
         if (reusable != null) {
             log(
                 "P4_MODELS state=preparing stage=asr bytes=${asrFiles.sumOf { it.bytes }} " +
@@ -115,10 +173,9 @@ class BundledModelProvisioner(
             )
             return
         }
-        // The ASR store lives in the App's internal data area, the same volume as `filesDir`; `freeSpace` is asked
-        // about the Laya directory because that is the reachable representative the caller hands us. Without this,
-        // a full disk would surface only as the store's generic ENGINE_MISSING.
-        if (freeSpace(layaDirectory) < asrFiles.sumOf { it.bytes }) throw IOException("ENOSPC")
+        // Kept as a per-group check for update passes; a first materialization was already gated by [hasSpaceFor].
+        // A full disk must surface as MODELS_NO_SPACE, not as the store's generic ENGINE_MISSING.
+        if (freeSpace(layaDirectory) < asrFiles.sumOf { it.bytes }) throw IOException(NO_SPACE_MESSAGE)
         AssetEngineBundleProvisioning(source, store, asrManifest).import()
         log(
             "P4_MODELS state=preparing stage=asr bytes=${asrFiles.sumOf { it.bytes }} " +
@@ -135,11 +192,14 @@ class BundledModelProvisioner(
      */
     private fun materialize(directory: File, files: List<BundledModelFile>) {
         if (receiptMatches(directory) && files.all { targetMatches(directory, it) }) return
+        val required = files.sumOf { it.bytes }
+        // Per-group check, which is what an update needs; a first materialization also passed [hasSpaceFor].
+        if (freeSpace(directory) < required) throw IOException(NO_SPACE_MESSAGE)
         if (!directory.isDirectory && !directory.mkdirs() && !directory.isDirectory) {
+            // `mkdirs` only reports false. When the volume filled up, that false is still an ENOSPC for the user.
+            if (freeSpace(directory) < required) throw IOException(NO_SPACE_MESSAGE)
             throw IOException("model directory unavailable")
         }
-        val required = files.sumOf { it.bytes }
-        if (freeSpace(directory) < required) throw IOException("ENOSPC")
 
         val staged = mutableListOf<Pair<File, File>>()
         try {
@@ -210,6 +270,13 @@ class BundledModelProvisioner(
     ): Boolean = receiptMatches(layaDirectory) && layaFiles.all { targetMatches(layaDirectory, it) } &&
         receiptMatches(embeddingDirectory) && embeddingFiles.all { targetMatches(embeddingDirectory, it) }
 
+    /** True when the receipt names the current bundle and every target file still has the declared size. */
+    private fun needsMaterialization(directory: File, files: List<BundledModelFile>): Boolean =
+        !(receiptMatches(directory) && files.all { targetMatches(directory, it) })
+
+    /** Whether the directory already carries any receipt, current or stale; a stale receipt means "update". */
+    private fun hasReceipt(directory: File): Boolean = File(directory, RECEIPT_FILE_NAME).isFile
+
     private fun targetFile(directory: File, file: BundledModelFile): File =
         File(directory, file.path.substringAfter('/'))
 
@@ -244,7 +311,7 @@ class BundledModelProvisioner(
 
     private fun failed(stage: Stage, failure: Exception): ProvisioningState.Failed {
         val reason = when {
-            noSpace(failure) -> MODELS_NO_SPACE
+            isNoSpaceFailure(failure) -> MODELS_NO_SPACE
             stage == Stage.ASR -> MODELS_ASR_FAILED
             stage == Stage.LAYA -> MODELS_LAYA_FAILED
             else -> MODELS_EMBEDDING_FAILED
@@ -254,16 +321,10 @@ class BundledModelProvisioner(
         return ProvisioningState.Failed(reason)
     }
 
-    private fun noSpace(failure: Throwable): Boolean {
-        var current: Throwable? = failure
-        while (current != null) {
-            val message = current.message?.lowercase()
-            if (message != null && ("no space" in message || "enospc" in message || "not enough space" in message)) {
-                return true
-            }
-            current = current.cause
-        }
-        return false
+    /** The pre-write refusal: nothing has been written or imported when this is returned. */
+    private fun refusedForSpace(): ProvisioningState.Failed {
+        log("P4_MODELS state=failed stage=space reason=$MODELS_NO_SPACE bundle=${modelsManifest.bundleId}")
+        return ProvisioningState.Failed(MODELS_NO_SPACE)
     }
 
     private enum class Stage(val logName: String) { ASR("asr"), LAYA("laya"), EMBEDDING("embedding") }
@@ -276,6 +337,13 @@ class BundledModelProvisioner(
         const val MODELS_ASR_FAILED = "MODELS_ASR_FAILED"
         const val MODELS_LAYA_FAILED = "MODELS_LAYA_FAILED"
         const val MODELS_EMBEDDING_FAILED = "MODELS_EMBEDDING_FAILED"
+
+        /**
+         * The free space a first materialization requires before it may write its first byte (plan Step 2: a
+         * `StatFs` reading below 1.2 GiB is `MODELS_NO_SPACE`). The bundled set is ~1.11 GiB; the rest is headroom
+         * for the temp files that coexist with the final ones and for the ASR store's own staging directory.
+         */
+        internal const val TOTAL_FREE_SPACE_BYTES = 1_288_490_189L // 1.2 GiB
 
         private const val TAG = "EdithModels"
 
