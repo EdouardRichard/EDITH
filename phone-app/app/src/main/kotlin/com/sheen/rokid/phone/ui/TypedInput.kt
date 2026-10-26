@@ -3,30 +3,39 @@ package com.sheen.rokid.phone.ui
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.phone.app.TypedSendResult
+import com.sheen.rokid.phone.audio.DictationState
 
 /**
- * The WAKE conversation input row's pure decisions (0.4 Task 11, spec §5.1).
+ * The WAKE conversation composer's pure decisions (0.4 Task 11, spec §5.1).
  *
- * The module has no Compose UI test dependency, so the row's behaviour lives here as data + functions and
+ * The module has no Compose UI test dependency, so the composer's behaviour lives here as data + functions and
  * `TypedInputRow` in `PhoneScreen.kt` only draws it. Everything in this file is JVM-testable and none of it reads the
  * session identity: the composition's `requestTypedMessage` owns the `currentIdentity()` check, the page must not.
+ *
+ * The owner's 2026-10-27 redesign (option A) replaced the old text + mic + send row with one pill and one circular
+ * action. The rules that changed are decisions, so they are pinned here: which action the slot offers
+ * ([composerActionSlot]), what its accessibility description says ([composerActionDescription]), and when the status
+ * line exists at all ([typedStatusText] - absent while there is nothing to say, unlike the old permanent hint).
  */
 
 /** The field's hard cap; the 0.4 Task 11 brief fixes the limit at 2000 characters. */
 const val TYPED_DRAFT_MAX_CHARS = 2000
 
-/** The field's label; Chinese because the whole page is (spec §5.1 可访问性). */
-const val TYPED_INPUT_LABEL = "输入消息"
+/** The composer's placeholder: the only permanent prompt in the field. */
+const val TYPED_INPUT_PLACEHOLDER = "发消息…"
 
-/** The send button's visible label. It also serves as its accessibility label, so no separate description is added. */
+/** The send action's accessibility label. The action is icon-only, so this is its only visible-to-a-reader text. */
 const val TYPED_SEND_LABEL = "发送"
 
-/** The status line when there is neither a refusal nor a blocking fact. */
-const val TYPED_IDLE_LABEL = "输入后点「发送」"
+/** The status line while the one synchronous send is in flight. */
+const val TYPED_SENDING_LABEL = "正在发送…"
+
+/** The status line while no live session can accept typed input. */
+const val TYPED_NO_SESSION_LABEL = "请先开始会话"
 
 /**
- * Whether the microphone is wired. True since 0.4 Task 12b-ii: the row now starts/stops a phone-microphone dictation
- * (see `DictationInput.kt`). Kept as the one named switch so the row's history and the reserved layout stay explicit.
+ * Whether the microphone is wired. True since 0.4 Task 12b-ii: the composer starts/stops a phone-microphone dictation
+ * (see `DictationInput.kt`). Kept as the one named switch so the composer's history stays explicit.
  */
 const val MIC_DICTATION_ENABLED = true
 
@@ -37,11 +46,26 @@ data class TypedInputState(
     val result: TypedSendResult? = null,
 )
 
+/** The one action the composer's trailing circular slot currently offers. */
+enum class ComposerAction { Microphone, Send, Stop }
+
+/**
+ * What the composer's action slot draws and whether a tap does anything.
+ *
+ * There is deliberately no `Disabled` action: the slot keeps its contextual icon (microphone for a blank draft, send
+ * arrow for text, stop square while listening) and only greys it out. That is what keeps the row to **one** control:
+ * the wearer never sees a second button appear or disappear as the session changes.
+ */
+data class ComposerActionSlot(
+    val action: ComposerAction,
+    val enabled: Boolean,
+)
+
 /**
  * The state while the host call runs, with the previous result cleared.
  *
  * `requestTypedMessage` is synchronous, so this state is visible only for that call — but it is what disables the
- * send button and says 正在发送…, and it keeps a double tap from submitting twice.
+ * send action and says 正在发送…, and it keeps a double tap from submitting twice.
  */
 fun TypedInputState.beginSend(): TypedInputState = copy(sending = true, result = null)
 
@@ -70,7 +94,7 @@ private fun sessionAcceptsTypedInput(session: SessionState): Boolean =
     session == SessionState.Ready || session == SessionState.Listening
 
 /**
- * Whether the send button is enabled: a live session, something to send, and no send already in flight.
+ * Whether the send action is enabled: a live session, something to send, and no send already in flight.
  *
  * `blank` is the caller's `draft.isBlank()`, not `isEmpty()`, so whitespace is refused locally exactly like the
  * composition's own trim-then-blank check. The composition re-checks blank and busy; this is the UI's honest pre-check.
@@ -79,16 +103,45 @@ fun canSendTyped(session: SessionState, blank: Boolean, sending: Boolean): Boole
     !sending && !blank && sessionAcceptsTypedInput(session)
 
 /**
- * Why the send button is disabled, in one short Chinese sentence, or null when it is enabled.
+ * Which single action the trailing circular slot offers, and whether it is live.
  *
- * The session reason is checked before blank: a wearer who has typed nothing and not started a session is told the
- * step that unblocks both. Sending is checked first because it is the transient, self-clearing fact.
+ * The decision order is the visual promise of the redesign:
+ *
+ * 1. a live dictation is always the filled stop square, with or without text, and stays tappable even if the session
+ *    state has already moved - a lease must never become unstoppable;
+ * 2. any non-blank draft is the send arrow;
+ * 3. a blank draft is the microphone.
+ *
+ * The icon does not vanish when the action is unavailable: a non-live session, an in-flight send, or a disabled
+ * microphone merely greys the same circle out, which is why [ComposerActionSlot.enabled] is part of the decision.
+ * Terminal dictation outcomes (`NoSpeech`/`Error`) give the microphone back: they end one attempt, not the field.
  */
-fun typedSendBlockedReason(session: SessionState, blank: Boolean, sending: Boolean): String? = when {
-    sending -> "正在发送…"
-    !sessionAcceptsTypedInput(session) -> "请先开始会话"
-    blank -> "输入内容后可发送"
-    else -> null
+fun composerActionSlot(
+    session: SessionState,
+    state: TypedInputState,
+    dictation: DictationState,
+): ComposerActionSlot = when {
+    dictation == DictationState.Listening ->
+        ComposerActionSlot(ComposerAction.Stop, enabled = true)
+
+    state.draft.isNotBlank() ->
+        ComposerActionSlot(
+            ComposerAction.Send,
+            enabled = canSendTyped(session, blank = false, sending = state.sending),
+        )
+
+    else ->
+        ComposerActionSlot(
+            ComposerAction.Microphone,
+            enabled = MIC_DICTATION_ENABLED && dictationMicEnabled(session) && !state.sending,
+        )
+}
+
+/** The Chinese accessibility description of one action-slot icon. */
+fun composerActionDescription(action: ComposerAction): String = when (action) {
+    ComposerAction.Microphone -> DICTATION_START_DESCRIPTION
+    ComposerAction.Send -> TYPED_SEND_LABEL
+    ComposerAction.Stop -> DICTATION_STOP_DESCRIPTION
 }
 
 /**
@@ -107,28 +160,34 @@ fun typedResultLabel(result: TypedSendResult?): String? = when (result) {
 }
 
 /**
- * The status line: the last send's outcome while it exists, otherwise the reason send is disabled, otherwise the idle
- * hint. A result wins over the disabled reason so a refused send's explanation is not immediately replaced by
- * "输入内容后可发送" just because the draft is still there.
+ * The composer's status line, or null when there is nothing to say.
+ *
+ * The redesign removed the old permanent 输入后点「发送」 hint: an empty or sendable draft is silent, because the
+ * placeholder and the green action already say what to do. A result, an in-flight send, or a missing session is a fact
+ * the wearer has to act on, so those still speak. Dictation and start refusals are layered on top by
+ * [inputRowStatusText] in `DictationInput.kt`.
  */
-fun typedStatusText(session: SessionState, state: TypedInputState): String =
+fun typedStatusText(session: SessionState, state: TypedInputState): String? =
     typedResultLabel(state.result)
-        ?: typedSendBlockedReason(session, state.draft.isBlank(), state.sending)
-        ?: TYPED_IDLE_LABEL
+        ?: when {
+            state.sending -> TYPED_SENDING_LABEL
+            !sessionAcceptsTypedInput(session) -> TYPED_NO_SESSION_LABEL
+            else -> null
+        }
 
 /**
- * The input row is part of the WAKE conversation view only (spec §5.1).
+ * The composer is part of the WAKE conversation view only (spec §5.1).
  *
  * It is deliberately independent of the detached switch: the requirement is that it is always rendered on WAKE, so
- * "should I show the row?" must not grow a second input that could hide it in detached mode.
+ * "should I show the composer?" must not grow a second input that could hide it in detached mode.
  */
 fun showsTypedInputRow(route: AssistantRoute): Boolean = route == AssistantRoute.WAKE
 
 /**
- * What `rememberSaveable` stores for the row: the draft and the last result's name.
+ * What `rememberSaveable` stores for the composer: the draft and the last result's name.
  *
  * `sending` is deliberately not stored: the host call is synchronous, so a recreated page can never have a send to
- * resume, and claiming one would disable the button forever.
+ * resume, and claiming one would disable the action forever.
  */
 fun typedInputSaveValues(state: TypedInputState): List<String> =
     listOf(state.draft, state.result?.name ?: "")

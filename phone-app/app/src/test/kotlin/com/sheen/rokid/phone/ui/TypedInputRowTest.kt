@@ -3,6 +3,8 @@ package com.sheen.rokid.phone.ui
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.phone.app.TypedSendResult
+import com.sheen.rokid.phone.audio.DictationStartResult
+import com.sheen.rokid.phone.audio.DictationState
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
@@ -13,11 +15,12 @@ import org.junit.Test
 import java.io.File
 
 /**
- * The WAKE conversation input row's behaviour, as pure functions (0.4 Task 11, spec §5.1).
+ * The WAKE conversation composer's behaviour, as pure functions (0.4 Task 11, spec §5.1).
  *
- * There is no Compose test dependency in this module, so the row is split: [TypedInputState] and the helpers pin the
- * decisions, and `TypedInputRow` in `PhoneScreen.kt` only draws them. The last test is a source guard for the one rule
- * a pure function cannot express on its own — the typed text never reaches a log.
+ * There is no Compose test dependency in this module, so the composer is split: [TypedInputState] and the helpers pin
+ * the decisions, and `TypedInputRow` in `PhoneScreen.kt` only draws them. The source guards cover the two rules a pure
+ * function cannot express on its own — the redesign keeps one soft field with one circular action, and typed text never
+ * reaches a log.
  */
 class TypedInputRowTest {
 
@@ -37,21 +40,73 @@ class TypedInputRowTest {
     }
 
     @Test
-    fun `a disabled send explains why in Chinese`() {
-        assertEquals("正在发送…", typedSendBlockedReason(SessionState.Ready, blank = false, sending = true))
-        assertEquals("请先开始会话", typedSendBlockedReason(SessionState.Idle, blank = false, sending = false))
-        // The session reason wins over "nothing typed": the wearer has to start a session before typing can help.
-        assertEquals("请先开始会话", typedSendBlockedReason(SessionState.Idle, blank = true, sending = false))
-        assertEquals("输入内容后可发送", typedSendBlockedReason(SessionState.Listening, blank = true, sending = false))
-        assertNull(typedSendBlockedReason(SessionState.Ready, blank = false, sending = false))
+    fun `the composer offers exactly one action of microphone, send, or stop`() {
+        // Blank + idle is the microphone.
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Microphone, enabled = true),
+            composerActionSlot(SessionState.Ready, TypedInputState(), DictationState.Idle),
+        )
+        // Text is the send arrow while no dictation owns the field.
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Send, enabled = true),
+            composerActionSlot(SessionState.Listening, TypedInputState(draft = "你好"), DictationState.Idle),
+        )
+        // A live lease is the stop square, with or without text.
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Stop, enabled = true),
+            composerActionSlot(SessionState.Listening, TypedInputState(), DictationState.Listening),
+        )
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Stop, enabled = true),
+            composerActionSlot(SessionState.Ready, TypedInputState(draft = "你好"), DictationState.Listening),
+        )
+        // A terminal dictation gives the microphone back, because the next tap may start a fresh one.
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Microphone, enabled = true),
+            composerActionSlot(SessionState.Ready, TypedInputState(), DictationState.NoSpeech),
+        )
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Microphone, enabled = true),
+            composerActionSlot(SessionState.Ready, TypedInputState(), DictationState.Error("MIC_UNAVAILABLE")),
+        )
+    }
 
-        listOf(
-            typedSendBlockedReason(SessionState.Idle, blank = false, sending = false),
-            typedSendBlockedReason(SessionState.Ready, blank = false, sending = true),
-            typedSendBlockedReason(SessionState.Ready, blank = true, sending = false),
-        ).forEach { reason ->
-            assertNotNull(reason)
-            assertTrue("reason must be Chinese: $reason", reason!!.any { it in '\u4e00'..'\u9fff' })
+    @Test
+    fun `the action slot is a muted circle when its action is unavailable`() {
+        // No live session: both the microphone and the send arrow stay in place but cannot be tapped.
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Microphone, enabled = false),
+            composerActionSlot(SessionState.Idle, TypedInputState(), DictationState.Idle),
+        )
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Send, enabled = false),
+            composerActionSlot(SessionState.Idle, TypedInputState(draft = "你好"), DictationState.Idle),
+        )
+        // One synchronous send at a time.
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Send, enabled = false),
+            composerActionSlot(
+                SessionState.Ready,
+                TypedInputState(draft = "你好", sending = true),
+                DictationState.Idle,
+            ),
+        )
+        // Stop must stay tappable even if the session state has already moved: a lease must always be stoppable.
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Stop, enabled = true),
+            composerActionSlot(SessionState.Idle, TypedInputState(), DictationState.Listening),
+        )
+    }
+
+    @Test
+    fun `every action slot icon has a short Chinese description`() {
+        assertEquals(DICTATION_START_DESCRIPTION, composerActionDescription(ComposerAction.Microphone))
+        assertEquals(TYPED_SEND_LABEL, composerActionDescription(ComposerAction.Send))
+        assertEquals(DICTATION_STOP_DESCRIPTION, composerActionDescription(ComposerAction.Stop))
+        ComposerAction.entries.forEach { action ->
+            val description = composerActionDescription(action)
+            assertTrue("description must be Chinese: $description", description.any { it in '\u4e00'..'\u9fff' })
+            assertTrue("description must stay short: $description", description.length <= 10)
         }
     }
 
@@ -88,25 +143,61 @@ class TypedInputRowTest {
     }
 
     @Test
-    fun `the status line shows the refusal reason and the idle hint only when sendable`() {
-        val blocked = TypedInputState(draft = "帮我看看", result = TypedSendResult.Busy)
-        assertEquals(typedResultLabel(TypedSendResult.Busy), typedStatusText(SessionState.Ready, blocked))
+    fun `the status line is absent when there is nothing to say`() {
+        // The old row printed 「输入后点『发送』」 permanently. The composer must stay quiet while it is usable:
+        // neither an empty draft nor a sendable draft has anything to report.
+        assertNull(typedStatusText(SessionState.Ready, TypedInputState()))
+        assertNull(typedStatusText(SessionState.Ready, TypedInputState(draft = "帮我看看")))
+        assertNull(inputRowStatusText(SessionState.Ready, TypedInputState(), DictationState.Idle, null))
+        assertNull(inputRowStatusText(SessionState.Ready, TypedInputState(draft = "帮我看看"), DictationState.Idle, null))
 
-        // No result: the reason the button is disabled is the status.
+        // A refusal or a busy/no-session reason is something the wearer needs to read.
+        val refused = TypedInputState(draft = "帮我看看", result = TypedSendResult.Busy)
+        assertEquals(typedResultLabel(TypedSendResult.Busy), typedStatusText(SessionState.Ready, refused))
         assertEquals(
             "请先开始会话",
             typedStatusText(SessionState.Idle, TypedInputState(draft = "帮我看看")),
         )
         assertEquals(
-            "输入内容后可发送",
-            typedStatusText(SessionState.Ready, TypedInputState()),
+            "正在发送…",
+            typedStatusText(SessionState.Ready, TypedInputState(draft = "帮我看看", sending = true)),
         )
-        // An accepted send is reported while the cleared draft would otherwise say "type something".
         assertEquals("已发送", typedStatusText(SessionState.Ready, TypedInputState(result = TypedSendResult.Accepted)))
 
-        val idle = typedStatusText(SessionState.Ready, TypedInputState(draft = "帮我看看"))
-        assertEquals(TYPED_IDLE_LABEL, idle)
-        assertTrue("idle hint must be Chinese: $idle", idle.any { it in '\u4e00'..'\u9fff' })
+        listOf(
+            typedStatusText(SessionState.Idle, TypedInputState()),
+            typedStatusText(SessionState.Ready, TypedInputState(sending = true)),
+        ).forEach { status ->
+            assertNotNull(status)
+            assertTrue("status must be Chinese: $status", status!!.any { it in '\u4e00'..'\u9fff' })
+        }
+    }
+
+    @Test
+    fun `the status line covers live dictation, its terminal outcomes and a refused start`() {
+        val typed = TypedInputState(draft = "帮我看看")
+        assertEquals(
+            DICTATION_LISTENING_LABEL,
+            inputRowStatusText(SessionState.Ready, typed, DictationState.Listening),
+        )
+        assertEquals(
+            DICTATION_NO_SPEECH_LABEL,
+            inputRowStatusText(SessionState.Ready, typed, DictationState.NoSpeech),
+        )
+        assertEquals(
+            DICTATION_FAILED_LABEL,
+            inputRowStatusText(SessionState.Ready, typed, DictationState.Error("MIC_UNAVAILABLE")),
+        )
+        assertEquals(
+            dictationStartStatusText(DictationStartResult.NoScheduler),
+            inputRowStatusText(SessionState.Ready, typed, DictationState.Idle, DictationStartResult.NoScheduler),
+        )
+    }
+
+    @Test
+    fun `the placeholder is the only permanent prompt and it is Chinese`() {
+        assertEquals("发消息…", TYPED_INPUT_PLACEHOLDER)
+        assertTrue(TYPED_INPUT_PLACEHOLDER.any { it in '\u4e00'..'\u9fff' })
     }
 
     @Test
@@ -161,6 +252,22 @@ class TypedInputRowTest {
         // A removed/renamed enum value must not crash a restored page.
         assertEquals(TypedInputState(draft = "旧结果"), typedInputRestore(listOf("旧结果", "NoSuchResult")))
         assertEquals(TypedInputState(), typedInputRestore(emptyList()))
+    }
+
+    @Test
+    fun `the composer is one soft filled field with a single circular action`() {
+        val source = mainSource("src/main/kotlin/com/sheen/rokid/phone/ui/PhoneScreen.kt").readText()
+
+        // The owner's redesign (option A): a single pill, no outline, no floating label, no second button.
+        assertTrue("the composer must be a borderless BasicTextField", "BasicTextField(" in source)
+        assertTrue("the composer must sit above the keyboard", "imePadding()" in source)
+        assertTrue("the pill's radius is fixed by the design", "RoundedCornerShape(28.dp)" in source)
+        assertTrue("one circular icon action", "FilledIconButton(" in source && "CircleShape" in source)
+        assertTrue("the only persistent prompt is the placeholder", "TYPED_INPUT_PLACEHOLDER" in source)
+        assertFalse("no outlined field remains", "OutlinedTextField" in source)
+        assertFalse("no floating field label remains", "TYPED_INPUT_LABEL" in source)
+        assertFalse("no permanent idle helper remains", "TYPED_IDLE_LABEL" in source)
+        assertFalse("no rounded-outline shape remains", "OutlinedTextFieldDefaults" in source)
     }
 
     @Test

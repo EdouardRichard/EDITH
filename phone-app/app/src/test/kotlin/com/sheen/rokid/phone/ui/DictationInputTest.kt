@@ -80,9 +80,8 @@ class DictationInputTest {
             DICTATION_NO_SPEECH_LABEL,
             inputRowStatusText(SessionState.Listening, typed, DictationState.NoSpeech),
         )
-        assertEquals(
-            "回到普通输入状态",
-            typedStatusText(SessionState.Listening, typed),
+        assertNull(
+            "with nothing left to report, the composer stays quiet",
             inputRowStatusText(SessionState.Listening, typed, DictationState.Idle),
         )
     }
@@ -145,9 +144,8 @@ class DictationInputTest {
             dictationStartStatusText(DictationStartResult.NoScheduler),
             inputRowStatusText(SessionState.Listening, typed, DictationState.Idle, DictationStartResult.NoScheduler),
         )
-        assertEquals(
-            "once dismissed the ordinary typed status is back",
-            typedStatusText(SessionState.Listening, typed),
+        assertNull(
+            "once dismissed there is nothing to report until the next action",
             inputRowStatusText(SessionState.Listening, typed, DictationState.Idle, null),
         )
         assertEquals(

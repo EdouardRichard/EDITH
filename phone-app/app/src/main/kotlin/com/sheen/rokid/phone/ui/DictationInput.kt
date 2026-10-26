@@ -118,17 +118,18 @@ fun dictationStartStatusText(result: DictationStartResult?): String? = when (res
 }
 
 /**
- * The row's one status line: a live/terminal dictation state, then a refused start's explanation, then the typed send
- * status.
+ * The composer's one status line, or null when there is nothing to say.
  *
- * A dictation result is transient and about the last action; showing "输入后点「发送」" over it would hide the one
- * outcome the wearer needs to see. A refusal is equally transient: it explains the tap that did nothing, and once the
- * host dismisses it (the next draft edit, send or session change) the ordinary row status is correct again.
+ * Precedence: a live/terminal dictation state, then a refused start's explanation, then the typed send status. A
+ * dictation result is transient and about the last action; a refusal is equally transient: it explains the tap that
+ * did nothing, and once the host dismisses it (the next draft edit, send or session change) the ordinary status is
+ * correct again. The redesign removed the old always-on idle hint, so this can now return null while the composer is
+ * usable and quiet.
  */
 fun inputRowStatusText(
     session: SessionState,
     typed: TypedInputState,
     dictation: DictationState,
     refusal: DictationStartResult? = null,
-): String =
+): String? =
     dictationStatusText(dictation) ?: dictationStartStatusText(refusal) ?: typedStatusText(session, typed)

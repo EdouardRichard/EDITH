@@ -19,6 +19,7 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
@@ -30,6 +31,7 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
@@ -279,11 +281,11 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
  * are named as well as positioned. The avatar is decorative to a screen reader: the bubble row carries the spoken
  * "助手说：…" text.
  *
- * 0.4 Task 11 (spec §5.1) adds the WAKE view's input row below the chat frame: text + send, with the microphone
- * reserved (disabled) for Task 12b's dictation. The row is part of the fixed frame like the header — outside the
- * message `LazyColumn` — is drawn only on WAKE, and never reads `currentIdentity()`: the host call it hands the text
- * to owns that check. `send` returns the host's verdict so the row can clear on `Accepted` and keep the draft on every
- * retryable refusal.
+ * 0.4 Task 11 (spec §5.1) adds the WAKE view's composer below the chat frame; the owner's 2026-10-27 redesign made it
+ * one soft pill with a single circular action (mic/send/stop). It is part of the fixed frame like the header — outside
+ * the message `LazyColumn` — is drawn only on WAKE, and never reads `currentIdentity()`: the host call it hands the
+ * text to owns that check. `send` returns the host's verdict so the composer can clear on `Accepted` and keep the
+ * draft on every retryable refusal.
  *
  * The switch is **read-only**: it changes which conversation is in front of the wearer and nothing else. It reads the
  * same `ConversationLog` the glasses render — same shape, same order, same eviction — so the two screens cannot drift
@@ -472,10 +474,17 @@ private val typedInputSaver: Saver<TypedInputState, Any> = listSaver(
 )
 
 /**
- * 0.4 Task 11 (spec §5.1) + Task 12b-ii (spec §5.3): the WAKE conversation's fixed input row, below the chat frame.
+ * 0.4 Task 11 (spec §5.1) + Task 12b-ii (spec §5.3): the WAKE conversation's composer, below the chat frame.
  *
- * Always rendered on WAKE (the 脱离眼镜 switch does not hide it), never on PROACTIVE. The row draws the pure decisions
- * from `TypedInput.kt`/`DictationInput.kt` and reads no identity itself.
+ * Always rendered on WAKE (the 脱离眼镜 switch does not hide it), never on PROACTIVE. The composer draws the pure
+ * decisions from `TypedInput.kt`/`DictationInput.kt` and reads no identity itself.
+ *
+ * The owner's 2026-10-27 redesign (option A) replaced the outlined field + microphone icon + text button row with one
+ * cohesive pill and **one** circular action: `BasicTextField` on a soft `surfaceContainerHigh` fill, 28 dp corners, no
+ * outline and no floating label; the action is a `FilledIconButton` clipped to [CircleShape] and is green while live
+ * (EDITH's primary), muted grey when the same action is unavailable. The slot's icon follows the draft and the
+ * dictation lease ([composerActionSlot]); it is never a second, disappearing button. The status line is drawn only when
+ * [inputRowStatusText] has something to say.
  *
  * The microphone starts a phone-microphone dictation on a tap and stops the running one on a second tap (D204). A
  * missing `RECORD_AUDIO` grant is requested right here - glasses sessions never ask for it at start, so the dictation
@@ -495,63 +504,104 @@ private fun TypedInputRow(
     onStartDictation: () -> DictationStartResult,
     onStopDictation: () -> Unit,
 ) {
-    val blank = state.draft.isBlank()
+    val slot = composerActionSlot(session, state, dictation)
+    val status = inputRowStatusText(session, state, dictation, refusal)
     val failed = (state.result != null && state.result != TypedSendResult.Accepted) ||
         dictation is DictationState.Error
-    val listening = dictation == DictationState.Listening
     val context = LocalContext.current
     // The permission result is asynchronous. On a denial the host is still asked once: it re-checks the grant and
-    // publishes the retryable explanation (需要麦克风权限…), so the row says what to do instead of the tap being silent.
+    // publishes the retryable explanation (需要麦克风权限…), so the composer says what to do instead of the tap being
+    // silent.
     val requestMicrophone = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
         onStartDictation()
     }
     Column(
         Modifier.fillMaxWidth(),
-        verticalArrangement = Arrangement.spacedBy(4.dp),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
     ) {
-        Row(
-            Modifier.fillMaxWidth(),
-            verticalAlignment = Alignment.Bottom,
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        // One surface, one action. imePadding keeps the pill above the keyboard instead of letting the IME cover it.
+        Surface(
+            modifier = Modifier.fillMaxWidth().imePadding(),
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.72f),
+            tonalElevation = 0.dp,
+            shadowElevation = 0.dp,
         ) {
-            OutlinedTextField(
-                value = state.draft,
-                onValueChange = onDraftChange,
-                modifier = Modifier.weight(1f),
-                label = { Text(TYPED_INPUT_LABEL) },
-                minLines = 1,
-                maxLines = 4,
-            )
-            IconButton(
-                onClick = {
-                    when {
-                        listening -> onStopDictation()
-                        MIC_DICTATION_ENABLED && dictationMicEnabled(session) -> {
-                            val granted = ContextCompat.checkSelfPermission(
-                                context,
-                                Manifest.permission.RECORD_AUDIO,
-                            ) == PackageManager.PERMISSION_GRANTED
-                            if (granted) onStartDictation() else requestMicrophone.launch(Manifest.permission.RECORD_AUDIO)
-                        }
-                    }
-                },
-                enabled = MIC_DICTATION_ENABLED && dictationMicEnabled(session),
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Icon(
-                    Icons.Default.Mic,
-                    contentDescription = dictationMicDescription(dictation),
+                BasicTextField(
+                    value = state.draft,
+                    onValueChange = onDraftChange,
+                    modifier = Modifier.weight(1f).padding(vertical = 6.dp),
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                    minLines = 1,
+                    maxLines = 4,
+                    decorationBox = { innerTextField ->
+                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
+                            if (state.draft.isEmpty()) {
+                                Text(
+                                    TYPED_INPUT_PLACEHOLDER,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                                    maxLines = 1,
+                                )
+                            }
+                            innerTextField()
+                        }
+                    },
                 )
+                FilledIconButton(
+                    onClick = {
+                        when (slot.action) {
+                            ComposerAction.Microphone -> {
+                                val granted = ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.RECORD_AUDIO,
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (granted) {
+                                    onStartDictation()
+                                } else {
+                                    requestMicrophone.launch(Manifest.permission.RECORD_AUDIO)
+                                }
+                            }
+                            ComposerAction.Send -> onSend()
+                            ComposerAction.Stop -> onStopDictation()
+                        }
+                    },
+                    modifier = Modifier.size(46.dp),
+                    enabled = slot.enabled,
+                    shape = CircleShape,
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                        disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+                    ),
+                ) {
+                    Icon(
+                        imageVector = when (slot.action) {
+                            ComposerAction.Microphone -> Icons.Default.Mic
+                            ComposerAction.Send -> Icons.Default.ArrowUpward
+                            ComposerAction.Stop -> Icons.Default.Stop
+                        },
+                        contentDescription = composerActionDescription(slot.action),
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
             }
-            Button(
-                onClick = onSend,
-                enabled = canSendTyped(session, blank, state.sending),
-            ) { Text(TYPED_SEND_LABEL) }
         }
-        Text(
-            inputRowStatusText(session, state, dictation, refusal),
-            style = MaterialTheme.typography.bodySmall,
-            color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
-        )
+        status?.let { text ->
+            Text(
+                text,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 8.dp),
+            )
+        }
     }
 }
 
