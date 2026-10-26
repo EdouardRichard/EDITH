@@ -230,6 +230,15 @@ internal fun stopSessionMatches(
     sessionId: String,
 ): Boolean = current != null && current.first.value == sessionId
 
+/**
+ * 0.4 Task 10 (`D203`, spec §5.2): how [HostCompositionRoot.requestTypedMessage] ended.
+ *
+ * An enum rather than a boolean because the input row has to tell "nothing to send" (blank), "no session"
+ * ([NoSession]), "the assistant is still working" ([Busy]) and "the session moved on" ([Stale]) apart without reading
+ * a sticky `SessionUiState.errorCode` off the page. [Accepted] means only that the host took the event for delivery.
+ */
+enum class TypedSendResult { Accepted, Blank, NoSession, Busy, Stale }
+
 class HostCompositionRoot internal constructor(
     val host: HostRuntime,
     val profiles: ProfileRepository,
@@ -1535,6 +1544,75 @@ class HostCompositionRoot internal constructor(
             EventEnvelope(identity.first, identity.second, "help-${UUID.randomUUID()}", now, now),
             UserAction.Action.Help,
         ))
+    }
+
+    /**
+     * 0.4 Task 10 (`D203`, spec §5.2): submit the phone's typed input as a WAKE-route message.
+     *
+     * Mirrors [requestHelp]: the identity is read from the host at call time, the event is submitted only through
+     * `HostRuntime.onEvent`, and a composition with nothing live answers a result instead of throwing. The
+     * differences are the typed-path rules:
+     * - **blank** is refused first, locally, and never becomes an event
+     * - the plugin exposes [SmartAssistantPlugin.canAcceptTypedMessage] as a pre-check; the plugin re-checks the same
+     *   predicate under its own lock when it handles the event, so a stale pre-check cannot open a second turn
+     * - a host refusal is reported as [TypedSendResult.Stale] (the identity moved between the read and the submit)
+     *
+     * The evidence line is `P4_TYPED state=accepted|refused reason=... turn=typed-... chars=N`: state, a reason, the
+     * turn id this request names and a character count - **never** the text and never a digest of it.
+     *
+     * @return [TypedSendResult.Accepted] when the host took the event for delivery to the active plugin; the specific
+     *   refusal otherwise.
+     */
+    @Synchronized fun requestTypedMessage(text: String): TypedSendResult {
+        val body = text.trim()
+        // The turn id is minted before any refusal so every outcome can name the request it refused.
+        val eventId = "typed-${UUID.randomUUID()}"
+        if (body.isEmpty()) {
+            logTyped("refused", "blank", eventId, chars = 0)
+            return TypedSendResult.Blank
+        }
+        if (closed) {
+            logTyped("refused", "no_session", eventId, body.length)
+            return TypedSendResult.NoSession
+        }
+        val identity = runCatching { host.currentIdentity() }.getOrNull()
+            ?: run {
+                logTyped("refused", "no_session", eventId, body.length)
+                return TypedSendResult.NoSession
+            }
+        // A harness without the smart wiring keeps only the host's answer; production always has the plugin pre-check.
+        if (smartWiring?.plugin?.canAcceptTypedMessage() == false) {
+            logTyped("refused", "busy", eventId, body.length)
+            return TypedSendResult.Busy
+        }
+        val now = clock.nowNanos()
+        val event = UserAction(
+            EventEnvelope(identity.first, identity.second, eventId, now, now),
+            UserAction.Action.Typed,
+            body,
+        )
+        val accepted = typedSubmitForProbe?.invoke(event) ?: host.onEvent(event)
+        if (!accepted) {
+            logTyped("refused", "stale", eventId, body.length)
+            return TypedSendResult.Stale
+        }
+        logTyped("accepted", null, eventId, body.length)
+        return TypedSendResult.Accepted
+    }
+
+    /**
+     * Task 10 test seam for the submit half of [requestTypedMessage]; `null` uses the host.
+     *
+     * [TypedSendResult.Stale] is a real host refusal (the identity moved between `currentIdentity()` and `onEvent`),
+     * and the two calls read one atomic identity, so a JVM test cannot place that transition between them without a
+     * race. The seam pins the mapping; no production code assigns it.
+     */
+    internal var typedSubmitForProbe: ((HostEvent) -> Boolean)? = null
+
+    /** One `P4_TYPED` evidence line: state/reason/turn/count only - never the typed text, never its hash. */
+    private fun logTyped(state: String, reason: String?, eventId: String, chars: Int) {
+        val reasonField = if (reason == null) "" else " reason=$reason"
+        P3Log.line("P4_TYPED state=$state$reasonField turn=$eventId chars=$chars")
     }
 
     /**

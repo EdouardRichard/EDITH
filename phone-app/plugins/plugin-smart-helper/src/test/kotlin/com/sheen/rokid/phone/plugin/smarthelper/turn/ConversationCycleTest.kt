@@ -240,6 +240,38 @@ class ConversationCycleTest {
         assertEquals(0, rig.display.closed)
     }
 
+    /**
+     * 0.4 Task 10 (`D203`, spec §5.2): a typed message releases **only** the WAKE route's round.
+     *
+     * Unlike `Help`'s session-wide [ConversationCycle.reset], the typed path must leave the PROACTIVE conversation -
+     * including a pending hint panel - exactly as it was. The cycle is the component that owns the two routes' timers,
+     * so the isolation is pinned here, at the one place that can prove it.
+     */
+    @Test
+    fun `a route reset releases only that route's round`() {
+        val rig = rig()
+        rig.cycle.onWake(AssistantRoute.WAKE, "wake-1")
+        rig.cycle.onWake(AssistantRoute.PROACTIVE, "hint-1")
+        assertEquals(2, rig.scheduler.pending(), "a hidden panel arms both routes' bounded waits")
+        assertTrue(rig.cycle.hasTurn(AssistantRoute.WAKE))
+        assertTrue(rig.cycle.hasTurn(AssistantRoute.PROACTIVE))
+
+        rig.cycle.reset(AssistantRoute.WAKE)
+
+        assertFalse(rig.cycle.hasTurn(AssistantRoute.WAKE), "the WAKE round is released")
+        assertTrue(rig.cycle.hasTurn(AssistantRoute.PROACTIVE), "the PROACTIVE round is not")
+        assertEquals(1, rig.scheduler.pending(), "the PROACTIVE bounded wait survives the WAKE reset")
+
+        rig.advance(3_000)
+
+        assertEquals(
+            listOf(AssistantRoute.PROACTIVE),
+            rig.display.calls.filterIsInstance<RecordingDisplay.Call.Close>().map { it.route },
+            "only the PROACTIVE round's own bound fires",
+        )
+        assertEquals(listOf(AssistantRoute.PROACTIVE to "hint-1"), rig.cancelled)
+    }
+
     @Test
     fun `an idle panel with no turn is not closed by the defensive bound`() {
         val rig = rig(panelVisible = true)

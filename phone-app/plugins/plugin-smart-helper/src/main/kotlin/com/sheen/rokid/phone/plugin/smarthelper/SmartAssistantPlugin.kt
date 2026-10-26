@@ -168,6 +168,9 @@ private const val DEFAULT_MAX_LEVEL = "L1"
 private const val HINT_LIFETIME_MILLIS = 5_000L
 private const val DEFAULT_HINT_GRACE_MILLIS = 5_000L
 
+/** 0.4 Task 10: the turn/event-id prefix of the phone's typed-input path (spec §5.2/D203). */
+private const val TYPED_TURN_PREFIX = "typed-"
+
 /** The `catalogHash`/`deviceHash` value that says "the source was absent", never an invented digest. */
 private const val SKILL_HASH_NONE = "none"
 
@@ -2085,6 +2088,27 @@ class SmartAssistantPlugin(
     }
 
     /**
+     * 0.4 Task 10 (`D203`, spec §5.2): whether a typed message would be accepted right now.
+     *
+     * The composition pre-checks this before building the event; [handleTyped] re-checks it under [gate] atomically
+     * with the open, so a stale pre-check cannot install a second turn. The rule is the busy predicate the spec pins:
+     * no queued utterance, and either no turn or an **Idle** one whose answer was already settled. A running, an
+     * awaiting-transcript, or an Idle turn whose answer is not settled yet is busy - and the query is read-only, so it
+     * never cancels, replaces or settles any of them. It is independent of the display mode: detached mode is the
+     * phone's own panel and the typed path works there exactly as on the glasses.
+     */
+    fun canAcceptTypedMessage(): Boolean = synchronized(gate) { active && canAcceptTypedLocked() }
+
+    /** Must hold [gate]: the typed-message busy predicate [canAcceptTypedMessage] and [handleTyped] share. */
+    private fun canAcceptTypedLocked(): Boolean {
+        if (context == null) return false
+        // A sentence already queued for a continuation is the wearer's next turn; a typed message must not race it.
+        if (queuedUtterance != null) return false
+        val current = turn ?: return true
+        return !current.closed && current.phase == SmartTurnPhase.Idle && current.answerNotified
+    }
+
+    /**
      * 0.24 S3 (spec §5.4): `UI_CLOSED` / the panel went hidden.
      *
      * A hidden panel cannot be listening, so the cycle releases its deadlines and the turn behind it is cancelled. No
@@ -2791,6 +2815,9 @@ class SmartAssistantPlugin(
             is UserAction -> when (event.action) {
                 UserAction.Action.Stop -> stopAll(event.envelope)
                 UserAction.Action.Help -> handleHelp(event.envelope)
+                // 0.4 Task 10 (spec §5.2): the phone's typed input enters the WAKE route. A Typed action with no body
+                // is refused by `handleTyped`, so the event shape cannot smuggle a blank turn into the loop.
+                UserAction.Action.Typed -> event.text?.let { handleTyped(event.envelope, it) }
                 UserAction.Action.Pause, UserAction.Action.Resume -> Unit
             }
 
@@ -2831,6 +2858,17 @@ class SmartAssistantPlugin(
          * listening, with the official 10 s armed by the conversation cycle.
          */
         continuation: Boolean = false,
+        /**
+         * 0.4 Task 10 (`D203`, spec §5.2): the turn id the caller wants. The typed path passes the `typed-<uuid>` the
+         * composition put on its envelope, so the log line, the row and the hint all name one identity. The default
+         * preserves the wake/Help placeholder minting every pre-0.4 caller relies on.
+         */
+        turnId: String = "smart-${UUID.randomUUID()}",
+        /**
+         * 0.4 Task 10 (`D203`, spec §5.2): whether this turn starts the 3 s scene cooldown. A typed message is not a
+         * wake, so it must not delay the next wake; the default keeps every pre-0.4 caller byte-for-byte.
+         */
+        startsCooldown: Boolean = true,
     ): SmartTurn? {
         val current = context ?: return null
         if (!bypassWakeGates) {
@@ -2843,13 +2881,13 @@ class SmartAssistantPlugin(
             }
         }
         if (!continuation) {
-            scene.noteTurn(nowNanos)
+            if (startsCooldown) scene.noteTurn(nowNanos)
             // A new wake (or Help) starts a new conversation; a sentence queued for the previous answer's
             // continuation must not be replayed into it.
             queuedUtterance = null
         }
         val replaced = turn?.also { it.closed = true }
-        val created = buildTurn(nowNanos, current, runsImmediately, transcriptTurnId)
+        val created = buildTurn(nowNanos, current, runsImmediately, transcriptTurnId, turnId = turnId)
         turn = created
         // 0.24 S3: a continuation replaces the finished turn but must **not** cancel its output - the answer is exactly
         // what the next round continues, and the official status 5→1 keeps it on the panel.
@@ -5600,32 +5638,93 @@ class SmartAssistantPlugin(
         // 0.3 Phase 3 Task 9d: a hint still waiting for the panel cannot submit into the turn Help is opening.
         cancelPendingHintPanel(HintPanelAcquisition.CANCELLED)
         conversationCycle.reset()
-        val started = synchronized(gate) {
+        val text = synchronized(gate) {
             if (!matches(envelope)) return
-            val text = lastFinalTranscript?.takeIf { it.isNotBlank() } ?: return
-            // The reused turn keeps the transcript's own turn id, exactly as a wake-opened turn does.
+            lastFinalTranscript?.takeIf { it.isNotBlank() }
+        } ?: return
+        // The reused turn keeps the transcript's own turn id, exactly as a wake-opened turn does.
+        startManualTurn(envelope, text, transcriptTurnId = lastFinalTurnId)
+    }
+
+    /**
+     * 0.4 Task 10 (`D203`, spec §5.2): the phone's typed input, through the WAKE route.
+     *
+     * The body is not a transcript: it deliberately skips [isUsableUtterance] (a wake-word-only body is a real request
+     * when the wearer typed it) and is never stored as [lastFinalTranscript] (Help must keep replaying the last thing
+     * that was **said**). Only the WAKE route's conversation cycle is released - `Help`'s session-wide reset would also
+     * discard a pending PROACTIVE hint panel that this message has nothing to do with.
+     */
+    private fun handleTyped(envelope: EventEnvelope, text: String) {
+        val body = text.trim()
+        if (body.isEmpty()) return
+        // Refuse before touching anything: a foreign or busy message must not release the live WAKE round.
+        if (!synchronized(gate) { matches(envelope) && canAcceptTypedLocked() }) return
+        conversationCycle.reset(AssistantRoute.WAKE)
+        startManualTurn(
+            envelope,
+            body,
+            turnId = typedTurnId(envelope),
+            startsCooldown = false,
+            // Re-checked inside the same gate as `openTurn`: the acceptance look above and the open are one decision.
+            admissibleLocked = { canAcceptTypedLocked() },
+        )
+    }
+
+    /**
+     * The tail both manual WAKE entries share (`Help` and `Typed`): open an immediate, gate-free WAKE turn, raise the
+     * working level, publish the wearer's row and launch the run.
+     *
+     * Must be called without [gate] held.
+     *
+     * @param transcriptTurnId the ASR turn `Help` reuses; null for the typed path and for a legacy final with no id.
+     * @param turnId the turn id the caller minted, or null to let this method mint the usual `smart-<uuid>` one.
+     * @param startsCooldown false for the typed path: typing is not a wake, so it must not start the scene cooldown.
+     * @param admissibleLocked a final acceptance predicate re-checked **inside the same [gate] as `openTurn`**, so a
+     *   turn that became busy between the caller's first look and the open is still refused.
+     * @return true when a turn was opened; false for a blank body, a foreign envelope or a refused acceptance.
+     */
+    private fun startManualTurn(
+        envelope: EventEnvelope,
+        text: String,
+        transcriptTurnId: String? = null,
+        turnId: String? = null,
+        startsCooldown: Boolean = true,
+        admissibleLocked: (() -> Boolean)? = null,
+    ): Boolean {
+        if (text.isBlank()) return false
+        val resolvedTurnId = turnId ?: "smart-${UUID.randomUUID()}"
+        val opened = synchronized(gate) {
+            if (!matches(envelope)) return false
+            if (admissibleLocked != null && !admissibleLocked()) return false
             openTurn(
                 clock.nowNanos(),
                 envelope,
                 runsImmediately = true,
-                transcriptTurnId = lastFinalTurnId,
+                transcriptTurnId = transcriptTurnId,
                 bypassWakeGates = true,
-            )?.let { Triple(it, text, lastFinalTurnId) }
-        } ?: return
-        // Phase C: Help opens a real turn and must raise the same level a wake does, or the ring never starts on a
-        // path that is an acceptance row - and the idle emit reports at the end would be an unpaired report. Outside
-        // the lock, as publishBusy requires.
+                turnId = resolvedTurnId,
+                startsCooldown = startsCooldown,
+            )
+        } ?: return false
+        // Phase C: a manual turn is still a real turn and must raise the same level a wake does, or the ring never
+        // starts on an acceptance path and the idle emits at the end would be unpaired. Outside the lock, as
+        // `publishBusy` requires.
         publishBusy()
-        // The reused transcript keeps its `asr-${turnId}` identity, so Help replaces the row instead of adding a
-        // duplicate. A legacy final with no turn id keeps the old path.
-        val turnId = started.third
-        if (turnId == null) {
-            publishUserMessage(ContextRoute.WAKE, started.second)
+        // The row identity is the one the conversation already uses: Help's ASR turn, or the typed turn. A legacy Help
+        // final with no turn id keeps the pre-0.24 message path.
+        val rowTurnId = turnId ?: transcriptTurnId
+        if (rowTurnId == null) {
+            publishUserMessage(ContextRoute.WAKE, text)
         } else {
-            publishUserFinal(ContextRoute.WAKE, turnId, started.second)
+            publishUserFinal(ContextRoute.WAKE, rowTurnId, text)
         }
-        launchTurn(started.first, started.second)
+        launchTurn(opened, text)
+        return true
     }
+
+    /** The typed turn id: the composition's `typed-<uuid>` event id when it is one, otherwise a fresh one. */
+    private fun typedTurnId(envelope: EventEnvelope): String =
+        envelope.eventId.takeIf { it.startsWith(TYPED_TURN_PREFIX) } ?: "$TYPED_TURN_PREFIX${UUID.randomUUID()}"
 
     /** Detaches the current turn: marks it closed and hands it to the caller for teardown. Must hold [gate]. */
     private fun detach(): SmartTurn? = turn?.also {

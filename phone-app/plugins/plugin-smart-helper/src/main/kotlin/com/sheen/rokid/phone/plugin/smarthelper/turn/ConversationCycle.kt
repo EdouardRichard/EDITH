@@ -532,6 +532,22 @@ internal class ConversationCycle(
         }
     }
 
+    /**
+     * 0.4 Task 10 (`D203`, spec §5.2): release **one** route's deadline and forget its round, leaving the other route
+     * untouched.
+     *
+     * `Help`'s session-wide [reset] is not what a typed message needs: the typed path is a WAKE turn only, and a
+     * pending PROACTIVE round (its window and its not-yet-shown hint panel) belongs to a different conversation that
+     * the wearer's typing had nothing to do with.
+     */
+    fun reset(route: AssistantRoute) {
+        synchronized(lock) {
+            val current = state(route)
+            cancelAllTimersLocked(current)
+            resetRouteLocked(current)
+        }
+    }
+
     fun isPinned(route: AssistantRoute): Boolean = synchronized(lock) { state(route).pinned }
 
     /**

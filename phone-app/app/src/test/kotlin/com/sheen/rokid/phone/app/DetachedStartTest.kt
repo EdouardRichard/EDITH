@@ -63,6 +63,7 @@ import com.sheen.rokid.plugin.SystemOneQuestion
 import com.sheen.rokid.plugin.SystemOneResult
 import com.sheen.rokid.plugin.SystemOneService
 import com.sheen.rokid.plugin.SystemOneStatus
+import com.sheen.rokid.plugin.TaskScope
 import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.storage.ProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
@@ -208,6 +209,13 @@ class DetachedStartTest {
         override fun closePanel(route: AssistantRoute) { closes += route }
     }
 
+    /** 0.4 Task 10: accepts a typed turn's loop without running it - this rig asserts delivery, not the agent loop. */
+    private object InertTasks : TaskScope {
+        override fun launch(block: () -> Unit): CancellationHandle =
+            object : CancellationHandle { override fun cancel() = Unit }
+        override fun cancelAll() = Unit
+    }
+
     /**
      * The phone microphone as the capture sees it: produces no audio, blocks in [read] like a real `AudioRecord` does,
      * and records that it was released. The detached arm starts one of these per epoch.
@@ -301,6 +309,7 @@ class DetachedStartTest {
                     glasses = link::liveOutput,
                 ),
                 scheduler = scheduler,
+                taskScope = InertTasks,
                 providers = mapOf(
                     Capability.Model to InertModel(),
                     Capability.Asr to StubAsrSession(),
@@ -461,6 +470,42 @@ class DetachedStartTest {
             assertTrue("the round stays open", rig.display.closes.isEmpty())
             assertTrue("no panel/show command may leave the phone", rig.connection.sent.isEmpty())
             assertEquals("and no glasses scene may be started", 0, rig.appStarts.get())
+        }
+    }
+
+    /**
+     * 0.4 Task 10 (`D203`, spec §5.2): the phone's typed input is available in **both** display modes.
+     *
+     * Detached mode is the harder half: there is no glasses panel and no CXR link, and the typed path must not consult
+     * either. The accepted request is delivered at the detached session's identity, the count-only line names its turn,
+     * the text never reaches the log, and the plugin takes it into a WAKE turn (the slot is busy afterwards). The
+     * glasses half is pinned by `PassiveLoopWiringTest.aTypedMessageIsDeliveredAsATypedUserActionAtTheCurrentIdentity`.
+     */
+    @Test
+    fun aDetachedSessionAcceptsATypedMessage() {
+        Rig(detached = true).use { rig ->
+            rig.attach()
+            rig.start()
+            assertEquals(SessionState.Ready, rig.root.host.currentState)
+
+            val lines = withP3Sink { captured ->
+                assertEquals(
+                    "detached mode must not gate the typed path",
+                    TypedSendResult.Accepted,
+                    rig.root.requestTypedMessage("帮我记一条笔记"),
+                )
+                rig.root.host.currentState
+                captured.toList()
+            }
+
+            val typed = lines.filter { it.startsWith("P4_TYPED") }.single()
+            assertTrue("the accepted line is count-only and names its turn: $typed",
+                typed.startsWith("P4_TYPED state=accepted turn=typed-"))
+            assertTrue("the count is the body's: $typed", typed.endsWith(" chars=7"))
+            assertTrue("the typed text must never reach the log: $lines",
+                lines.none { it.contains("帮我记一条笔记") })
+            assertFalse("the detached plugin must take the message into a WAKE turn",
+                rig.wiring.plugin.canAcceptTypedMessage())
         }
     }
 
