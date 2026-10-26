@@ -68,6 +68,11 @@ internal class DetachGate(
     private val stopService: () -> Boolean = { true },
     /** The live session state, read once per change. Defaults to idle for a rig with no host. */
     private val sessionState: () -> SessionState = { SessionState.Idle },
+    /**
+     * The mode's CXR side effect: called once, after a change was persisted, with the new value. Production wires it to
+     * [com.sheen.rokid.phone.app.HostCompositionRoot.onDetachModeChanged]; a rig with no host keeps the default.
+     */
+    private val onModeChanged: (Boolean) -> Unit = {},
 ) {
     private val detached = MutableStateFlow(false)
 
@@ -141,6 +146,13 @@ internal class DetachGate(
             android.util.Log.i("EdithHost", "detach gate: settings save failed")
             return DetachSetResult(saved = false, stoppedSession = stopped, error = ERROR_SAVE_FAILED)
         }
+
+        // 0.4 strict-local fix (`D199`): the mode change is two effects plus the link transition. The side effect runs
+        // **after** the write - a refused stop/save returned above, and running it against an unpersisted mode would
+        // leave the CXR link neutralized while the store (and the next restart) still says glasses mode. It runs
+        // **before** the live flow moves, so no reader can start a detached session on a link that has not been
+        // neutralized yet.
+        onModeChanged(enabled)
 
         detached.value = enabled
         logState(enabled, updated)

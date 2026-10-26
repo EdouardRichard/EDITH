@@ -237,24 +237,30 @@ class DetachedStartTest {
     private class HintConnection(private val port: InputPort) : CxrConnection {
         @Volatile override var ready = false
         val sent = CopyOnWriteArrayList<String>()
+
+        /**
+         * Every app-level command the link **offered** to the transport, even the ones a closed/not-ready connection
+         * refused. A detached link must not even attempt one, and a closed transport would otherwise hide the attempt.
+         */
+        val attempts = CopyOnWriteArrayList<String>()
+        val closes = AtomicInteger()
+        @Volatile var closed = false
         private var inbound: ((String) -> Unit)? = null
-        override fun connect(activity: Any) = Unit
+        override fun connect(activity: Any) { closed = false }
         override fun onAuthorizationResult(resultCode: Int, data: android.content.Intent?): CxrAuthorizationOutcome? = null
         override fun sendCommand(json: String): Boolean {
-            if (!ready) return false
+            attempts += json
+            if (closed || !ready) return false
             sent += json
             return true
         }
         override fun onInboundCommand(listener: (String) -> Unit) { inbound = listener }
-        override fun close() = Unit
+        override fun close() {
+            closed = true
+            closes.incrementAndGet()
+        }
         override fun inputPortOrNull(): InputPort = port
         fun answer(json: String) { requireNotNull(inbound).invoke(json) }
-    }
-
-    private fun detachedGate(detached: Boolean): DetachGate {
-        val store = SmartSettingsStore(TestBlobs())
-        store.save(SmartSettings(glassesDetached = detached))
-        return DetachGate(store).also { it.load() }
     }
 
     /**
@@ -273,7 +279,26 @@ class DetachedStartTest {
         val devices = CopyOnWriteArrayList<NullPhoneDevice>()
         val display = RecordingConversationDisplay()
         val phoneIngress = PcmIngress(clock)
-        val gate = detachedGate(detached)
+        val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
+
+        /** Everything the link reports, so "no handshake restarted after detach" is observable, not just implied. */
+        val diagnostics = CopyOnWriteArrayList<String>()
+
+        /**
+         * The production gate shape: its stop-before-save rule drives this composition's own `stop()`, and its mode
+         * side effect is the seam that neutralizes (or re-arms) the CXR link. Wiring it here - rather than a bare
+         * `DetachGate(store)` - is what makes the composition-level detach regression drive the shipped path.
+         */
+        val gate: DetachGate = SmartSettingsStore(TestBlobs()).let { store ->
+            store.save(SmartSettings(glassesDetached = detached))
+            DetachGate(
+                settings = store,
+                stopSession = { rootHolder[0]?.stop() },
+                sessionState = { rootHolder[0]?.host?.currentState ?: SessionState.Idle },
+                onModeChanged = { enabled -> rootHolder[0]?.onDetachModeChanged(enabled) },
+            ).also { it.load() }
+        }
+
         val link: CxrHintLink
         val panelVisible: () -> Boolean
         val wiring: SmartWiring
@@ -282,11 +307,11 @@ class DetachedStartTest {
         val root: HostCompositionRoot
 
         init {
-            val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
             val holder = arrayOfNulls<CxrConnection>(1)
             link = CxrHintLink(
                 clock, scheduler,
                 sendJson = { json -> holder[0]?.sendCommand(json) ?: false },
+                diagnostics = { message -> diagnostics += message },
                 startGlassesApp = { onResult -> appStarts.incrementAndGet(); onResult(true); true },
             )
             panelVisible = SmartWiring.cyclePanelVisible(
@@ -550,6 +575,142 @@ class DetachedStartTest {
             assertEquals("the live output is still the glasses link's device", 1, shows.size)
             assertFalse("nothing may be claimed displayed before the glasses acknowledge it",
                 statuses.contains(OutputStatus.Displayed))
+        }
+    }
+
+    // ---- strict-local detach: a same-process live glasses link must go quiet ------------------------------
+
+    /**
+     * 0.4 strict-local fix (`D199`/`D201`): detaching after a **live** glasses session in the same process.
+     *
+     * The Task 13b device log showed `EdithHint: outbound: Ping` and `Sync` 8 s after `P4_DETACH`, because the gate
+     * only stopped the host session: `sessionEnded()` cleared the link's session identity but left the clock mapping,
+     * its renewal and the connection alive. This drives the real `DetachGate` -> `HostCompositionRoot.stop()` ->
+     * `CxrHintLink` path over the composition's own seams and asserts that the transition leaves the link inert:
+     * timers cancelled, mapping/session/panel cleared, the vendor connection dropped, and no app-level command (not
+     * even a refused/attempted one) after the mode is persisted.
+     */
+    @Test
+    fun detachingFromALiveGlassesSessionNeutralizesTheLinkAndSendsNothingAfterwards() {
+        Rig(detached = false).use { rig ->
+            rig.attach()
+            rig.connection.ready = true
+            rig.start()
+            rig.sceneReady()
+            rig.establishMapping()
+            assertTrue("precondition: the glasses session is live", rig.link.isEstablished())
+            assertNotNull("precondition: the clock mapping makes the display real", rig.link.liveOutput())
+
+            val result = rig.gate.set(true)
+
+            assertTrue("the detach mode must persist", result.saved)
+            assertTrue("the running session is stopped before the mode is saved", result.stoppedSession)
+            assertTrue("the vendor connection must be dropped", rig.connection.closed)
+            assertEquals("exactly once", 1, rig.connection.closes.get())
+            assertNull("no clock mapping may survive detach", rig.link.liveSyncId())
+            assertNull("no display may be advertised while detached", rig.link.liveOutput())
+            assertFalse("the glasses session is no longer established", rig.link.isEstablished())
+            assertFalse("nor is the resident panel visible", rig.link.isPanelVisible())
+            assertFalse("the host must stop claiming a CXR link", rig.root.state.value.cxrLinkReady)
+
+            val sentAtDetach = rig.connection.sent.size
+            val attemptsAtDetach = rig.connection.attempts.size
+            rig.diagnostics.clear()
+
+            // Every renewal/PING timeout/grace deadline armed before the change is now in the past.
+            rig.clock.nowNanos += 120_000_000_000L
+            rig.scheduler.runDue()
+
+            assertTrue("no handshake may restart after detach: ${rig.diagnostics.toList()}",
+                rig.diagnostics.none { it.startsWith("handshake: ping") || it.startsWith("outbound:") })
+            assertEquals("no CXR command may leave after detach: " +
+                rig.connection.sent.drop(sentAtDetach).mapNotNull { HintWireCodec.decode(it) },
+                sentAtDetach, rig.connection.sent.size)
+            assertEquals("not even attempt one", attemptsAtDetach, rig.connection.attempts.size)
+
+            // Stale-link entry points (the confirmation SHOW path and the wear-off CLOSE path) are inert.
+            assertFalse("a detached confirmation state is refused", rig.link.confirmationState("c-1", true))
+            assertFalse("a detached close-all is refused", rig.link.closeAll())
+            assertFalse("a detached utterance is refused",
+                rig.link.userSaid(AssistantRoute.WAKE, "asr-1", "text"))
+            assertEquals("and none of them reaches the transport", attemptsAtDetach, rig.connection.attempts.size)
+        }
+    }
+
+    /**
+     * 0.4 strict-local fix (`D199`): a stale vendor wear-off must not touch a detached session.
+     *
+     * The old `onWearingChanged` cancelled the current turn and sent `closeAll()` on the old link. After a detach in
+     * the same process, that callback can still be delivered from the dying connection; it must be recognized as a
+     * stale glasses fact and neither command the (dead) link nor cancel the strictly-local session.
+     */
+    @Test
+    fun aStaleWearOffCannotCancelOrCommandADetachedSession() {
+        Rig(detached = false).use { rig ->
+            rig.attach()
+            rig.connection.ready = true
+            rig.start()
+            rig.sceneReady()
+            rig.establishMapping()
+            assertTrue(rig.gate.set(true).saved)
+
+            // A strictly-local session is running when the stale callback arrives.
+            rig.start()
+            assertEquals("the detached session must be ready", SessionState.Ready, rig.root.host.currentState)
+            val identity = rig.root.host.currentIdentity()
+            assertNotNull("with its own local identity", identity)
+            val sentBefore = rig.connection.sent.size
+            val attemptsBefore = rig.connection.attempts.size
+            rig.diagnostics.clear()
+
+            val lines = withP3Sink { captured ->
+                rig.root.onWearingChanged(false)
+                captured.toList()
+            }
+
+            assertEquals("the detached session keeps its identity", identity, rig.root.host.currentIdentity())
+            assertEquals("and keeps running", SessionState.Ready, rig.root.host.currentState)
+            assertEquals("no CLOSE/STOP command may be attempted", attemptsBefore, rig.connection.attempts.size)
+            assertEquals("and nothing may be sent", sentBefore, rig.connection.sent.size)
+            assertNull("the stale glasses wear fact is not this session's state", rig.root.glassesWearing())
+            assertTrue("the callback is recorded as ignored: $lines",
+                lines.any { it.contains("ignored=detached") })
+            assertTrue("the old wear path must not run: $lines", lines.none { it.contains("wear=off") })
+            assertTrue("and the link must stay neutralized: ${rig.diagnostics.toList()}",
+                rig.diagnostics.none { it.startsWith("outbound:") || it.startsWith("handshake: ping") })
+        }
+    }
+
+    /**
+     * 0.4 strict-local fix (`D199`, spec §4.1): switching detach off again must re-arm a clean glasses link.
+     *
+     * The detach transition closes the vendor connection (its transport refuses to reconnect once closed), so the
+     * composition must forget that connection: the next `开始` builds a fresh one and the link is allowed to introduce
+     * the session again. A link left neutralized would silently refuse every glasses session after reattaching.
+     */
+    @Test
+    fun switchingDetachOffRebuildsTheCxrLinkForTheNextGlassesSession() {
+        Rig(detached = false).use { rig ->
+            rig.attach()
+            rig.connection.ready = true
+            rig.start()
+            rig.sceneReady()
+            rig.establishMapping()
+            assertTrue(rig.gate.set(true).saved)
+            assertTrue("the detach closed the vendor connection", rig.connection.closed)
+
+            assertTrue("switching detach off must persist", rig.gate.set(false).saved)
+
+            rig.start()
+            rig.sceneReady()
+
+            assertEquals("a fresh connection must be built, not the closed one reused", 2, rig.factoryCalls.get())
+            assertTrue("the re-armed link introduces the new session",
+                rig.link.isEstablished())
+            assertTrue("with a fresh HELLO: " +
+                rig.connection.sent.mapNotNull { HintWireCodec.decode(it) },
+                rig.connection.sent.any { HintWireCodec.decode(it) is HintCommand.Hello })
+            assertTrue("and the host reports a live link again", rig.root.state.value.cxrLinkReady)
         }
     }
 }

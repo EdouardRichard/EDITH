@@ -313,6 +313,48 @@ class DetachGateTest {
         assertTrue("no write may happen after a failed stop", blobs.order.none { it == "write" })
     }
 
+    // ---- set: the CXR link side effect (0.4 strict-local fix) -----------------------------------------------------
+
+    @Test
+    fun aSavedChangeReportsThePersistedModeToTheLinkSideEffectAfterTheWrite() {
+        // The gate itself owns no transport. Its mode side effect is what neutralizes the CXR link on detach (and
+        // re-arms it on reattach), and it must run **after** the blob write, with the value the store now holds: running
+        // it before the write would let a refused save leave a detached link behind an attached gate.
+        val blobs = RecordingBlobs()
+        val store = seeded(blobs, shipped)
+        val modes = mutableListOf<Boolean>()
+        val gate = DetachGate(
+            settings = store,
+            onModeChanged = { enabled ->
+                modes += enabled
+                blobs.order += "link"
+            },
+        )
+
+        val result = gate.set(true)
+
+        assertTrue("the save must succeed", result.saved)
+        assertEquals("the side effect runs once, with the persisted mode", listOf(true), modes)
+        assertEquals("and only after the blob write", listOf("read", "write", "link"), blobs.order)
+        assertTrue(gate.enabled.value)
+    }
+
+    @Test
+    fun aRefusedSaveNeverTouchesTheLinkSideEffect() {
+        // The half-written/refused save must leave the CXR link exactly as it was: a link neutralized while the store
+        // still says "attached" (or vice versa) is a state no later read can repair.
+        val blobs = RecordingBlobs()
+        val store = seeded(blobs, shipped)
+        blobs.failWrite = true
+        val modes = mutableListOf<Boolean>()
+
+        val result = DetachGate(settings = store, onModeChanged = { modes += it }).set(true)
+
+        assertFalse("a refused write must not report a save", result.saved)
+        assertTrue("and must not touch the link", modes.isEmpty())
+        assertFalse("the stored mode is still attached", store.load().glassesDetached)
+    }
+
     // ---- set: visible failures ------------------------------------------------------------------------------------
 
     @Test

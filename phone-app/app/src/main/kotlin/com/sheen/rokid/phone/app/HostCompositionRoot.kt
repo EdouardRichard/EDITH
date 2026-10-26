@@ -2280,6 +2280,14 @@ class HostCompositionRoot internal constructor(
     internal fun onWearingChanged(wearing: Boolean) {
         dispatchHostEvent {
             if (closed) return@dispatchHostEvent
+            // 0.4 strict-local fix (`D199`): the wear sensor is a glasses fact. Once the App is detached, a callback
+            // from the connection that was just closed is stale - it must not cancel the strictly-local session, and
+            // must not send `closeAll()`/`STOP` on a link that was neutralized for the mode. It is recorded as ignored
+            // rather than as this session's wearing state.
+            if (detachGate.enabled.value) {
+                P3Log.line("P3_CXR glasses_event=wearing=$wearing ignored=detached")
+                return@dispatchHostEvent
+            }
             // 0.3 Phase 2 Task 2: the wear sensor fact is recorded for the device state. `true` and `false` are both
             // facts; a session that has reported none stays `null` until its first event.
             wearingState = wearing
@@ -2783,6 +2791,56 @@ class HostCompositionRoot internal constructor(
         notifier()?.cancelAll()
         mutableState.update { it.copy(errorCode = null, pendingConfirmation = null) }
     }
+    /**
+     * The `DetachGate` mode side effect (0.4 strict-local fix, `D199`): a **same-process** mode change must take the
+     * CXR link with it.
+     *
+     * The gate stops the host session first, but `stop()` only calls `sessionEnded()`: that clears the session identity
+     * while the clock mapping and its renewal stay live, and the vendor connection stays built. The Task 13b device log
+     * therefore recorded `EdithHint: outbound: Ping` and `Sync` seconds **after** `P4_DETACH`. This method closes the
+     * remaining halves without putting one app-level command on the wire:
+     *
+     * 1. `hintLink.detach()` cancels the clock renewal/timeout and clears session, mapping and panel state silently
+     *    ([CxrHintLink.detach] refuses every later send as a second line of defence);
+     * 2. the composition forgets and closes the vendor connection. Closing an SDK session is a transport teardown, not
+     *    a CXR command - no `HELLO`/`PING`/`SYNC`/`SHOW`/`CLEAR` is sent by this path. It must also forget the
+     *    connection: a closed transport refuses to reconnect, so a reattach needs a fresh build.
+     *
+     * Switching detach off only re-arms the link; the next 开始 builds the fresh connection and introduces the session
+     * as usual ([attach]).
+     */
+    @Synchronized internal fun onDetachModeChanged(detached: Boolean) {
+        if (closed) return
+        if (!detached) {
+            hintLink?.attach()
+            retriedMappingSyncId = null
+            P3Log.line("P4_DETACH_LINK state=reattached")
+            return
+        }
+        // Block and clear the link before touching the transport, so a timer or vendor callback that is in flight can
+        // no longer send, and a detached confirmation cannot find a live mapping.
+        hintLink?.detach()
+        // 0.3 Phase 2 Task 2: the last wearing fact described the glasses session that just ended.
+        wearingState = null
+        // A closed transport refuses to reconnect (`TRANSPORT_ALREADY_CONNECTED_OR_CLOSED`), so the next glasses
+        // session must build a new one instead of reusing this object.
+        val connection = activeConnection
+        activeConnection = null
+        linkBuilt = false
+        linkReady = false
+        retriedMappingSyncId = null
+        mutableState.update { it.copy(cxrLinkReady = false) }
+        val closeResult = connection?.let { runCatching { it.close() }.isSuccess }
+        P3Log.line(
+            "P4_DETACH_LINK state=neutralized session=cleared connection=" +
+                when {
+                    connection == null -> "none"
+                    closeResult == true -> "closed"
+                    else -> "close_failed"
+                },
+        )
+    }
+
     @Synchronized fun selectPlugin(pluginId: String) {
         if (closed || state.value.selectedPluginId == pluginId) return
         mutableState.update { it.copy(selectedPluginId = pluginId, errorCode = null) }
@@ -2940,6 +2998,10 @@ class HostCompositionRoot internal constructor(
                 stopSession = { rootHolder[0]?.stop() },
                 stopService = { context.stopService(Intent(context, SessionService::class.java)) },
                 sessionState = { hostHolder[0]?.currentState ?: SessionState.Idle },
+                // 0.4 strict-local fix (`D199`): stopping the session is not enough - the CXR mapping, its renewal and
+                // the vendor connection outlive `stop()`, so a detach must neutralize them in the same change. A
+                // reattach re-arms the link; the next 开始 rebuilds the connection.
+                onModeChanged = { detached -> rootHolder[0]?.onDetachModeChanged(detached) },
             ).also { it.load() }
             // P3.2 / `D53`②: the arming switch and its gate. One instance for the UI, the chain's acoustic sink and the
             // settings store. It is **persisted** (default on) and loaded once here, at assembly time. 0.4 Task 5: its
