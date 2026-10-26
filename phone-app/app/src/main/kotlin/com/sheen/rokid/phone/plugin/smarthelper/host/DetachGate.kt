@@ -11,9 +11,10 @@ import kotlinx.coroutines.flow.asStateFlow
  *
  * A change is **two** effects - stop the running session (if any) and persist the new mode - and either can refuse. A
  * boolean would have made "the stop failed" and "the blob refused the write" indistinguishable in the UI, so [saved]
- * says whether the mode was actually persisted, [stoppedSession] says whether an already-running session had to be
- * ended first, and [error] is the stable code the settings page turns into visible Chinese copy. There is deliberately
- * no `restarted` member: the gate never auto-restarts (spec §4.1).
+ * says whether the mode was actually persisted, [stoppedSession] says whether the host session was ended first (true
+ * even when the following service stop refused, because that side effect is real), and [error] is the stable code the
+ * settings page turns into visible Chinese copy. There is deliberately no `restarted` member: the gate never
+ * auto-restarts (spec §4.1).
  */
 internal data class DetachSetResult(
     val saved: Boolean,
@@ -28,9 +29,10 @@ internal data class DetachSetResult(
  *
  * - the persisted value, written through a load -> copy -> save of the whole settings blob so every other setting is
  *   carried through untouched;
- * - the **stop-before-save** rule: when the composition is running (`Ready`/`Listening`/`Paused`), a change first
- *   stops that session through the composition's existing `stop()` **and** stops the foreground service that hosted
- *   it (`Context.stopService`), and does **not** restart it. Changing the audio source or display target under a live
+ * - the **stop-before-save** rule: whenever the composition has any non-`Idle` session state (including the CXR
+ *   startup states `Authorizing`/`Connecting`/`BuildingScene` and the interrupted/retry states), a change first stops
+ *   that session through the composition's existing `stop()` **and** stops the foreground service that hosted it
+ *   (`Context.stopService`), and does **not** restart it. Changing the audio source or display target under a live
  *   session is exactly the hot switch the owner ruled out; leaving the service foreground would keep a 「会话已开启」
  *   notification for an idle session. An idle composition stops nothing;
  * - the live [enabled] flow the host reads at runtime (the `D202` effective arming value follows it without a App
@@ -115,19 +117,26 @@ internal class DetachGate(
         var stopped = false
         if (sessionState() in RUNNING_STATES) {
             try {
-                // Both calls are the one stop effect: end the host session, then stop the foreground service that
-                // hosted it and whose notification claims the session is running. `stopped` stays false until the
-                // service stop proves it actually stopped something, so an unproven stop is not reported as a stopped
-                // session (the notification may still be there) and never persists the mode.
+                // The two calls are separate effects: end the host session, then stop the foreground service that
+                // hosted it and whose notification claims the session is running. Set `stopped` as soon as the first
+                // succeeds - if the service stop then refuses, the mode is still not persisted, but the session side
+                // effect is real and the result must disclose it rather than claim "会话未能先停止".
                 stopSession()
-                if (!stopService()) {
-                    android.util.Log.i("EdithHost", "detach gate: hosting service was not running, not persisting the mode")
-                    return DetachSetResult(saved = false, error = ERROR_STOP_FAILED)
-                }
                 stopped = true
             } catch (failure: Exception) {
                 android.util.Log.i("EdithHost", "detach gate: session stop failed, not persisting the mode")
                 return DetachSetResult(saved = false, error = ERROR_STOP_FAILED)
+            }
+
+            // A false/throw here is a refusal of the service teardown, not of the already-completed session stop.
+            val serviceStopped = try {
+                stopService()
+            } catch (failure: Exception) {
+                false
+            }
+            if (!serviceStopped) {
+                android.util.Log.i("EdithHost", "detach gate: hosting service stop refused, not persisting the mode")
+                return DetachSetResult(saved = false, stoppedSession = stopped, error = ERROR_STOP_FAILED)
             }
         }
 
@@ -187,9 +196,12 @@ internal class DetachGate(
         const val ERROR_SAVE_FAILED = "SAVE_FAILED"
 
         /**
-         * The states the owner's ruling calls "a session is running" (`D199`): a ready, listening or paused session
-         * has a live identity/epoch, so changing the audio source or display target under it must stop first.
+         * Every state in which a session (and the foreground `SessionService` hosting it) can exist: all entries
+         * except [SessionState.Idle]. The service starts foreground before the CXR scene reaches Ready, so
+         * `Authorizing`/`Connecting`/`BuildingScene` need the same stop as `Ready`/`Listening`/`Paused`; a session
+         * that is `Interrupted`, `Reconnecting` or `Error` still owns that service too. Only Idle means there is
+         * nothing to stop (the current enum has no Closed entry).
          */
-        private val RUNNING_STATES = setOf(SessionState.Ready, SessionState.Listening, SessionState.Paused)
+        private val RUNNING_STATES = SessionState.entries.toSet() - SessionState.Idle
     }
 }
