@@ -48,6 +48,7 @@ import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.SessionViewModel
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillContent
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillListing
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.DetachUi
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.app.capabilityLabel
 import com.sheen.rokid.phone.ui.capabilityReasonLabel
@@ -604,10 +605,46 @@ private fun LocalModelStatus(state: SessionUiState) {
 @Composable
 private fun SmartToggles(root: HostCompositionRoot) {
     val proactiveArmed by root.proactiveArming.enabled.collectAsStateWithLifecycle()
+    val detached by root.detachGate.enabled.collectAsStateWithLifecycle()
+    var detachNotice by remember { mutableStateOf<String?>(null) }
+    var detachFailed by remember { mutableStateOf(false) }
+
+    // 0.4 Task 5 (`D199`): the host-only mode switch. Its change goes through `DetachGate`, not the settings form and
+    // not the settings blob directly: the gate stops a running session first and refuses visibly if it cannot persist.
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(DetachUi.SWITCH_TITLE)
+            Text(DetachUi.SWITCH_SUMMARY, style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(checked = detached, onCheckedChange = { wanted ->
+            val result = root.detachGate.set(wanted)
+            detachFailed = !result.saved
+            detachNotice = if (result.saved) {
+                DetachUi.successText(result.stoppedSession)
+            } else {
+                DetachUi.errorText(requireNotNull(result.error), result.stoppedSession)
+            }
+        })
+    }
+    detachNotice?.let { notice ->
+        Text(
+            notice,
+            style = MaterialTheme.typography.bodySmall,
+            color = if (detachFailed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+        )
+    }
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Switch(checked = proactiveArmed, onCheckedChange = { root.proactiveArming.set(it) })
+        Switch(
+            checked = proactiveArmed,
+            enabled = DetachUi.proactiveSwitchEnabled(detached),
+            onCheckedChange = { root.proactiveArming.set(it) },
+        )
         Spacer(Modifier.width(8.dp))
         Text("主动辅助（未唤醒时给一句短提示）")
+    }
+    if (detached) {
+        Text(DetachUi.PROACTIVE_DETACHED_NOTE, style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error)
     }
     Text(
         "一次配置、长期生效：跨会话、重连、重启 App 或手机都保持；关掉后不会被任何路径自动打开。",

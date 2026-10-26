@@ -1,0 +1,79 @@
+package com.sheen.rokid.phone.plugin.smarthelper.host.ui
+
+import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * 0.4 Task 5: the settings page's detach copy and switch state, extracted from Compose so the JVM pins the parts the
+ * owner ruled on. The layout itself is a device check; these are the words and the enabled/disabled rule.
+ */
+class DetachUiTest {
+
+    @Test
+    fun theSwitchTitleNamesTheDetachedMode() {
+        assertTrue(DetachUi.SWITCH_TITLE.contains("脱离眼镜"))
+        assertTrue(DetachUi.SWITCH_TITLE.contains("手机麦克风"))
+        assertTrue(DetachUi.SWITCH_TITLE.contains("屏幕"))
+    }
+
+    @Test
+    fun theExplanationStatesEveryConsequenceTheOwnerNamed() {
+        // D199/D202/D53: no glasses/CXR, proactive inactive, not an upload consent, a running session is stopped, and
+        // the change takes effect on the next start. If one of these sentences disappears, the switch is misleading.
+        listOf("不连接眼镜", "主动辅助", "不是上传授权", "先停止", "下次开始会话").forEach { phrase ->
+            assertTrue("the detach explanation must state '$phrase'", DetachUi.SWITCH_SUMMARY.contains(phrase))
+        }
+    }
+
+    @Test
+    fun theProactiveSwitchIsDisabledOnlyWhileDetached() {
+        assertTrue("glasses mode keeps the proactive switch usable", DetachUi.proactiveSwitchEnabled(false))
+        assertFalse("detached mode disables it", DetachUi.proactiveSwitchEnabled(true))
+        assertTrue("and the annotation names the mode", DetachUi.PROACTIVE_DETACHED_NOTE.contains("脱离眼镜模式下不生效"))
+        assertTrue("and says the persisted value is unchanged",
+            DetachUi.PROACTIVE_DETACHED_NOTE.contains("持久值不变"))
+    }
+
+    @Test
+    fun aSuccessfulSaveSaysWhenItTakesEffectAndWhetherTheSessionWasStopped() {
+        val idle = DetachUi.successText(stoppedSession = false)
+        assertTrue(idle.contains("已保存"))
+        assertTrue(idle.contains("下次开始会话"))
+        assertFalse("nothing was stopped, so the notice must not claim it was", idle.contains("停止"))
+
+        val stopped = DetachUi.successText(stoppedSession = true)
+        assertTrue(stopped.contains("已先停止"))
+        assertTrue(stopped.contains("下次开始会话"))
+    }
+
+    @Test
+    fun everyGateFailureHasVisibleChineseCopyAndNeverClaimsSaved() {
+        listOf(
+            DetachGate.ERROR_STORE_UNAVAILABLE,
+            DetachGate.ERROR_STOP_FAILED,
+            DetachGate.ERROR_SETTINGS_UNREADABLE,
+            DetachGate.ERROR_SAVE_FAILED,
+        ).forEach { code ->
+            val text = DetachUi.errorText(code)
+            assertTrue("$code must be visible", text.isNotBlank())
+            assertTrue("$code must not look like success", text.contains("未保存") || text.contains("未覆盖"))
+            assertFalse("$code must not say saved", text.contains("已保存"))
+        }
+
+        val unknown = DetachUi.errorText("SOMETHING_ELSE")
+        assertTrue("an unknown code is still surfaced", unknown.contains("SOMETHING_ELSE"))
+        assertTrue(unknown.contains("保存失败"))
+    }
+
+    @Test
+    fun aFailureAfterTheGateStoppedTheSessionDisclosesThatSideEffect() {
+        // Saving can fail **after** the stop (an unreadable blob, a refused write). The change was not saved, but the
+        // session is already gone; the user must not have to infer that from a bare failure sentence.
+        val text = DetachUi.errorText(DetachGate.ERROR_SAVE_FAILED, stoppedSession = true)
+        assertTrue(text.contains("未保存"))
+        assertTrue("the stop is a real side effect and must be stated", text.contains("会话已先停止"))
+        assertFalse(text.contains("已保存"))
+    }
+}

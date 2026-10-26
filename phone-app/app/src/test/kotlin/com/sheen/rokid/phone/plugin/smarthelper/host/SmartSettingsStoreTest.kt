@@ -17,6 +17,7 @@ import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -402,6 +403,117 @@ class SmartSettingsStoreTest {
         assertFalse(reloaded.noInterception)
         assertEquals("L2", reloaded.maxLevel)
         assertEquals(5000L, reloaded.cooldownMillis)
+    }
+
+    // ---- 0.4 Task 5 (`D199`/`D202`): the host-only 「脱离眼镜」 setting ---------------------------
+
+    @Test
+    fun glassesDetachDefaultsToGlassesModeWhenTheKeyIsMissing() {
+        // A fresh store, and a blob written before 0.4, both mean "glasses mode" - the existing behaviour. Detaching
+        // must be the user's explicit act, never an upgrade side effect.
+        assertFalse("a fresh store must play through the glasses", SmartSettingsStore(TestBlobs()).load().glassesDetached)
+
+        val blobs = TestBlobs()
+        writeJson(blobs, SmartSettingsStore.BLOB_ID, buildJsonObject {
+            put("version", 1)
+            put("wakeWords", buildJsonArray { add("伊迪丝") })
+            put("maxLevel", "L2")
+            put("whitelist", buildJsonArray {})
+            put("cooldownMillis", 4500L)
+            put("proactiveEnabled", true)
+        })
+
+        val loaded = SmartSettingsStore(blobs).load()
+
+        assertFalse("a pre-0.4 blob must not come up detached", loaded.glassesDetached)
+        assertEquals("the rest of the old blob must still load", "L2", loaded.maxLevel)
+        assertTrue("detaching is not a way to disable the stored proactive switch", loaded.proactiveEnabled)
+    }
+
+    @Test
+    fun glassesDetachSurvivesASaveAndLoadInBothDirections() {
+        val blobs = TestBlobs()
+        SmartSettingsStore(blobs).save(SmartSettings(glassesDetached = true))
+        assertTrue("an explicit detach must persist", SmartSettingsStore(blobs).load().glassesDetached)
+
+        SmartSettingsStore(blobs).save(SmartSettings(glassesDetached = false))
+        assertFalse("closing detach must persist too", SmartSettingsStore(blobs).load().glassesDetached)
+    }
+
+    @Test
+    fun savingDetachKeepsEveryOtherStoredField() {
+        // The gate does load -> copy(glassesDetached) -> save. A save that dropped the user's other choices would be
+        // the same silent wipe `ProactiveArming.set` documents; this pins that the detach write is one field only.
+        val blobs = TestBlobs()
+        val store = SmartSettingsStore(blobs)
+        val original = SmartSettings(
+            wakeWords = listOf("伊迪丝", "edith", "小助手"),
+            maxLevel = "L2",
+            whitelist = listOf("open_app|navigation"),
+            profileId = "p-1",
+            cooldownMillis = 4500L,
+            proactiveCooldownMillis = 300_000L,
+            proactiveSensitivity = "HIGH",
+            proactiveEnabled = false,
+            speechEnabled = true,
+            continueDialogue = false,
+            visionEnabled = false,
+            noInterception = true,
+        )
+        store.save(original)
+
+        store.save(store.load().copy(glassesDetached = true))
+
+        val reloaded = store.load()
+        assertTrue(reloaded.glassesDetached)
+        assertEquals("detaching must not rewrite the user's proactive choice",
+            false, reloaded.proactiveEnabled)
+        assertEquals(original.copy(glassesDetached = true), reloaded)
+    }
+
+    @Test
+    fun aCorruptGlassesDetachValueFallsBackToGlassesMode() {
+        val blobs = TestBlobs()
+        writeJson(blobs, SmartSettingsStore.BLOB_ID, buildJsonObject {
+            put("version", 1)
+            put("wakeWords", buildJsonArray { add("伊迪丝") })
+            put("maxLevel", "L1")
+            put("whitelist", buildJsonArray {})
+            put("cooldownMillis", 3000L)
+            put("glassesDetached", JsonPrimitive("true"))
+        })
+
+        assertFalse("a string must not be coerced into a detach",
+            SmartSettingsStore(blobs).load().glassesDetached)
+    }
+
+    @Test
+    fun aMissingBlobIsSafeToWriteButAnUnreadableOneIsNot() {
+        // The gate's write-modify-write path needs to distinguish "first install" (defaults may be saved) from "the
+        // user's blob exists but cannot be read" (saving defaults would erase every other setting).
+        assertNotNull("a missing blob is a first-install default, not a failure",
+            SmartSettingsStore(TestBlobs()).loadForWrite())
+
+        val corrupt = TestBlobs()
+        corrupt.values[SmartSettingsStore.BLOB_ID] = "{ not json".toByteArray()
+        assertNull("a corrupt blob must not be overwritten through the gate",
+            SmartSettingsStore(corrupt).loadForWrite())
+
+        val unreadable = TestBlobs().also { it.failReadId = SmartSettingsStore.BLOB_ID }
+        assertNull("an unreadable blob must not be overwritten through the gate",
+            SmartSettingsStore(unreadable).loadForWrite())
+    }
+
+    @Test
+    fun loadForWriteStillResolvesTheStoredFields() {
+        val blobs = TestBlobs()
+        SmartSettingsStore(blobs).save(SmartSettings(maxLevel = "L2", proactiveEnabled = false))
+
+        val stored = SmartSettingsStore(blobs).loadForWrite()
+
+        assertNotNull(stored)
+        assertEquals("L2", stored!!.maxLevel)
+        assertFalse(stored.proactiveEnabled)
     }
 
     @Test

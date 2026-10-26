@@ -175,6 +175,7 @@ import com.sheen.rokid.phone.context.GlassesStateSource
 import com.sheen.rokid.phone.context.MediaSessionSource
 import com.sheen.rokid.phone.context.NotificationCategorySource
 import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
+import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.model.ProfileProbeGate
 import com.sheen.rokid.phone.model.profileStartupError
 import com.sheen.rokid.phone.artifacts.FileArtifactStore
@@ -335,6 +336,15 @@ class HostCompositionRoot internal constructor(
      * to assemble unless it is Ready.
      */
     val modelReadiness: ModelReadiness? = null,
+    /**
+     * 0.4 Task 5 (`D199`/`D202`): the **live** 「脱离眼镜」 gate.
+     *
+     * [create] seeds it from the persisted [SmartSettings.glassesDetached] (default off), wires its stop-before-save
+     * rule to this composition's own `stop()` and the host's live state, and hands the same instance to the settings
+     * page and to [ProactiveArming]'s detached predicate. A hand-built composition keeps the shipped glasses mode.
+     * Kept **last** so positional construction of older call sites is unchanged.
+     */
+    internal val detachGate: DetachGate = DetachGate(),
 ) : AutoCloseable {
     /**
      * P5 (spec §S5): the 「语音朗读」 switch state, persisted globally and **off by default**.
@@ -2021,9 +2031,22 @@ class HostCompositionRoot internal constructor(
             // Task 14a/14b: the one settings store, built here rather than further down because the arming switch
             // below persists through it. A save and the next load therefore read the same blob.
             val smartSettingsStore = SmartSettingsStore(blobs)
+            // The composition itself and its host are created after the chain (the chain is built before the root),
+            // so both are reached through holders. Declared here because the 0.4 detach gate below needs them.
+            val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
+            val hostHolder = arrayOfNulls<HostRuntime>(1)
+            // 0.4 Task 5 (`D199`): the persisted 「脱离眼镜」 gate. The stop-before-save rule uses the composition's
+            // own `stop()` and the host's live state; the gate is loaded once here, before any session can start.
+            val detachGate = DetachGate(
+                settings = smartSettingsStore,
+                stopSession = { rootHolder[0]?.stop() },
+                sessionState = { hostHolder[0]?.currentState ?: SessionState.Idle },
+            ).also { it.load() }
             // P3.2 / `D53`②: the arming switch and its gate. One instance for the UI, the chain's acoustic sink and the
-            // settings store. It is **persisted** (default on) and loaded once here, at assembly time.
-            val proactiveArming = ProactiveArming(smartSettingsStore).also { it.load() }
+            // settings store. It is **persisted** (default on) and loaded once here, at assembly time. 0.4 Task 5: its
+            // effective value is `stored && !detached` (`D202`), so the detach gate is the second input.
+            val proactiveArming = ProactiveArming(smartSettingsStore, detached = { detachGate.enabled.value })
+                .also { it.load() }
             // The model request had no production line before the P3.1 wrap-up: the client was built with no
             // interceptor, so a successful request was silent and that hop rested on its effects. This is the one line
             // that closes the gap, and it carries nothing but method, status and duration (`ModelHttpLog`).
@@ -2132,8 +2155,6 @@ class HostCompositionRoot internal constructor(
             // the detector reads it through this holder. `create` provisions the chain before the composition exists,
             // so the holder is how the same instance reaches both the detector and the exposed accessor; a second,
             // local gate here is what made `root.playbackGate.begin()` suppress nothing.
-            val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
-            val hostHolder = arrayOfNulls<HostRuntime>(1)
             // 0.3 Phase 4B (B5): one monotonic revision source for the confirmation hint. The glasses update a row only
             // for a strictly newer revision of the same hint id, so the PANEL_SHOWN re-announcement must never repeat
             // the first send's number (two sends can share a coarse clock tick).
@@ -2848,6 +2869,7 @@ class HostCompositionRoot internal constructor(
                 visionGate = visionGate,
                 noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
+                detachGate = detachGate,
                 playbackGate = playbackGate,
                 modelReadiness = readiness,
             )
@@ -3069,7 +3091,7 @@ class HostCompositionRoot internal constructor(
 
         /**
          * The **arming gate**: the acoustic sink the chain is assembled with, which produces nothing unless
-         * [ProactiveArming.enabled] is on (P3.2, spec §16.2).
+         * [ProactiveArming.effectiveProactiveArmed] is true (P3.2, spec §16.2; 0.4 Task 5 adds `D202`'s detach term).
          *
          * A named production seam rather than a lambda inside `create`, for the same reason as [playbackSuppression]:
          * the gate is the whole mechanism by which the switch works, so a JVM test drives **this** function instead of
@@ -3081,7 +3103,7 @@ class HostCompositionRoot internal constructor(
          */
         internal fun armedAcousticSink(host: () -> HostRuntime?, clock: MonotonicClock,
             arming: ProactiveArming): (AcousticLabel) -> Unit =
-            { label -> if (arming.enabled.value) host()?.let { emitAcoustic(it, clock, label) } }
+            { label -> if (arming.effectiveProactiveArmed) host()?.let { emitAcoustic(it, clock, label) } }
 
         /**
          * Turns one context change into the event the host delivers (Task 6).
@@ -3102,13 +3124,13 @@ class HostCompositionRoot internal constructor(
         }
 
         /**
-         * The arming gate for context, exactly as [armedAcousticSink] is for the acoustic labels: with 「主动辅助」 off
-         * the composition produces no `ContextChanged`, so a plugin receives no context signal (spec §16.2, pre-flight
-         * P4).
+         * The arming gate for context, exactly as [armedAcousticSink] is for the acoustic labels: with 「主动辅助」 off -
+         * or with 0.4's 「脱离眼镜」 mode on (`D202`) - the composition produces no `ContextChanged`, so a plugin
+         * receives no context signal (spec §16.2, pre-flight P4).
          */
         internal fun armedContextSink(host: () -> HostRuntime?, clock: MonotonicClock,
             arming: ProactiveArming): (ContextSnapshot) -> Unit =
-            { snapshot -> if (arming.enabled.value) host()?.let { emitContextChanged(it, clock, snapshot) } }
+            { snapshot -> if (arming.effectiveProactiveArmed) host()?.let { emitContextChanged(it, clock, snapshot) } }
     }
 }
 

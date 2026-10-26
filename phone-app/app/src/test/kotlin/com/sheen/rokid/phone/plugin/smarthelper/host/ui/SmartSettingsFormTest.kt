@@ -373,4 +373,19 @@ class SmartSettingsFormTest {
 
         assertFalse("a save from the form must not re-arm it", result.settings.proactiveEnabled)
     }
+
+    @Test
+    fun theFormKeepsThePersistedGlassesDetachFlag() {
+        // 0.4 Task 5: the detach switch is a host-only setting owned by `DetachGate`, not a field of this form. A save
+        // of the form's own fields must still carry the persisted flag through; otherwise the next App start would
+        // silently return to glasses mode (or worse, detach) because the form rebuilt a default value.
+        val base = settings().copy(glassesDetached = true)
+
+        val result = SmartSettingsForm.toSettings(
+            SmartSettingsForm.fromSettings(base).copy(maxLevel = "L2"), base)
+
+        assertTrue(result.errors.toString(), result.errors.isEmpty())
+        assertTrue("the form must not drop the detach flag", result.settings.glassesDetached)
+        assertEquals("L2", result.settings.maxLevel)
+    }
 }
