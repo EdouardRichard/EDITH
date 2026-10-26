@@ -22,13 +22,19 @@ import com.sheen.rokid.contracts.SpeakerAssessment
 import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.phone.app.CxrAudioChain
 import com.sheen.rokid.phone.app.HostCompositionRoot
+import com.sheen.rokid.phone.app.TypedSendResult
 import com.sheen.rokid.phone.bridge.CxrConnection
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
 import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartWiring
+import com.sheen.rokid.phone.ui.TypedInputState
+import com.sheen.rokid.phone.ui.dictationStartStatusText
+import com.sheen.rokid.phone.ui.inputRowStatusText
+import com.sheen.rokid.phone.ui.isNewDictationFinal
 import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.ui.typedResultLabel
 import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
@@ -85,7 +91,9 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 /**
  * 0.4 Task 12b-ii (spec §5.3, D204): the composition's phone-microphone dictation, wired through the **real**
@@ -117,7 +125,23 @@ class DictationWiringTest {
     /** The pipeline's VAD: tests script whether a frame starts a turn and whether it is the endpoint. */
     private class PipelineVad : VadEngine {
         @Volatile var decision = VadDecision(false, false)
-        override fun accept(frame: com.sheen.rokid.audio.PcmFrame) = decision
+
+        /**
+         * When positive, this many of the next accepts report a speech endpoint (then [decision] applies again).
+         *
+         * Lets one multi-frame batch contain the endpoint that ends the dictation, with more frames behind it in the
+         * same batch - the tail the quiesce has to stop (fix 2, finding 4b).
+         */
+        @Volatile var endpointAccepts = 0
+
+        override fun accept(frame: com.sheen.rokid.audio.PcmFrame): VadDecision {
+            if (endpointAccepts > 0) {
+                endpointAccepts--
+                return VadDecision(true, true)
+            }
+            return decision
+        }
+
         override fun reset() = Unit
         override fun close() = Unit
     }
@@ -145,6 +169,9 @@ class DictationWiringTest {
         val finishes = AtomicInteger()
         @Volatile var finalText = "听写结果"
 
+        /** Runs inside [finish], i.e. while the controller is forcing the final (fix 2, finding 4b ordering probe). */
+        @Volatile var onFinish: (() -> Unit)? = null
+
         override fun accept(frame: com.sheen.rokid.audio.PcmFrame): List<AsrHypothesis> {
             frames += frame
             return emptyList()
@@ -152,6 +179,7 @@ class DictationWiringTest {
 
         override fun finish(): AsrHypothesis {
             finishes.incrementAndGet()
+            onFinish?.invoke()
             return AsrHypothesis(finalText, true)
         }
 
@@ -332,6 +360,7 @@ class DictationWiringTest {
         private val microphoneAllowed: Boolean = true,
         private val queueDispatches: Boolean = false,
         private val configurePhoneDevice: FakePhoneDevice.() -> Unit = {},
+        private val withScheduler: Boolean = true,
     ) {
         val clock = FakeClock(0)
         val scheduler = ManualScheduler(clock)
@@ -353,6 +382,9 @@ class DictationWiringTest {
         private val dispatchQueue = CopyOnWriteArrayList<() -> Unit>()
         val root: HostCompositionRoot
         val chain: CxrAudioChain
+
+        /** Runs on the thread opening a dictation capture, after the fake device exists (fix 2 ordering assertions). */
+        var onPhoneDeviceCreated: (() -> Unit)? = null
 
         init {
             val chosen = profile("p-1")
@@ -403,9 +435,10 @@ class DictationWiringTest {
                     FakePhoneDevice().also { device ->
                         device.configurePhoneDevice()
                         devices += device
+                        onPhoneDeviceCreated?.invoke()
                     }
                 },
-                deadlineScheduler = scheduler,
+                deadlineScheduler = if (withScheduler) scheduler else null,
                 microphoneGranted = { microphoneAllowed },
                 // The composition owns the chain in production; this rig wires the same real chain itself.
             )
@@ -482,9 +515,10 @@ class DictationWiringTest {
         microphoneAllowed: Boolean = true,
         queueDispatches: Boolean = false,
         configurePhoneDevice: FakePhoneDevice.() -> Unit = {},
+        withScheduler: Boolean = true,
         block: (Rig) -> Unit,
     ) {
-        val rig = Rig(detached, withConnection, microphoneAllowed, queueDispatches, configurePhoneDevice)
+        val rig = Rig(detached, withConnection, microphoneAllowed, queueDispatches, configurePhoneDevice, withScheduler)
         try {
             block(rig)
         } finally {
@@ -500,6 +534,18 @@ class DictationWiringTest {
 
     private fun stateOf(rig: Rig) = rig.root.dictationUi.value.state
 
+    /** Runs one whole dictation to its final (start, one speech frame, stop) and returns the delivered final. */
+    private fun dictatedFinal(rig: Rig, text: String): DictationFinal {
+        rig.asr.finalText = text
+        assertEquals("the dictation starts on the armed session", DictationStartResult.Accepted, rig.root.startDictation())
+        rig.pipelineVad.decision = VadDecision(true, false)
+        rig.feedPhone()
+        rig.root.stopDictation()
+        rig.pipelineVad.decision = VadDecision(false, false)
+        return requireNotNull(rig.root.dictationUi.value.final) { "the stop must deliver a final" }
+    }
+
+
     // ---- detached mode ------------------------------------------------------------------------------------------
 
     @Test
@@ -509,7 +555,7 @@ class DictationWiringTest {
             rig.asr.finalText = text
             val lines = withP3Sink { captured ->
                 assertTrue(rig.activate())
-                assertTrue("a detached dictation starts on the armed session", rig.root.startDictation())
+                assertEquals("a detached dictation starts on the armed session", DictationStartResult.Accepted, rig.root.startDictation())
                 assertEquals(DictationState.Listening, stateOf(rig))
 
                 // KWS off, ASR on: the dictation frame reaches the pipeline and not the detector.
@@ -553,11 +599,12 @@ class DictationWiringTest {
         withRig(detached = true) { rig ->
             val lines = withP3Sink { captured ->
                 assertTrue(rig.activate())
-                assertTrue(rig.root.startDictation())
+                assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
                 val epoch = rig.epoch()
                 val captureStarts = rig.devices.single().starts.get()
 
-                assertFalse("one dictation at a time", rig.root.startDictation())
+                assertEquals("one dictation at a time", DictationStartResult.Busy, rig.root.startDictation())
+                assertEquals("the reason reaches the page as a retryable status", DictationStartResult.Busy, rig.root.dictationUi.value.refusal)
                 assertEquals(DictationState.Listening, stateOf(rig))
                 assertEquals("the refused start must not start a second recorder", captureStarts, rig.devices.single().starts.get())
                 assertSame("the same epoch owns the lease", epoch, rig.root.currentAudioEpoch())
@@ -573,9 +620,10 @@ class DictationWiringTest {
     fun aDictationWithoutALiveSessionIsRefusedAndNeverOpensTheMicrophone() {
         withRig(detached = true) { rig ->
             val lines = withP3Sink { captured ->
-                assertFalse("no session means no dictation", rig.root.startDictation())
+                assertEquals("no session means no dictation", DictationStartResult.NoSession, rig.root.startDictation())
                 captured.toList()
             }
+            assertEquals("the refusal is published for the input row", DictationStartResult.NoSession, rig.root.dictationUi.value.refusal)
             assertEquals(DictationState.Idle, stateOf(rig))
             assertTrue("the refused start opens no recorder", rig.devices.isEmpty())
             val refused = lines.single { it.startsWith("P4_DICTATION state=refused") }
@@ -591,9 +639,10 @@ class DictationWiringTest {
             rig.feedPhone() // a wake request's speech turn is now in flight
 
             val lines = withP3Sink { captured ->
-                assertFalse("a dictation must not capture a wake request's final", rig.root.startDictation())
+                assertEquals("a dictation must not capture a wake request's final", DictationStartResult.Busy, rig.root.startDictation())
                 captured.toList()
             }
+            assertEquals(DictationStartResult.Busy, rig.root.dictationUi.value.refusal)
             assertEquals(DictationState.Idle, stateOf(rig))
             assertTrue(lines.single { it.startsWith("P4_DICTATION state=refused") }.contains("reason=busy"))
         }
@@ -604,11 +653,51 @@ class DictationWiringTest {
         withRig(detached = true, microphoneAllowed = false) { rig ->
             val lines = withP3Sink { captured ->
                 assertTrue(rig.activate())
-                assertFalse(rig.root.startDictation())
+                assertEquals("a missing grant is surfaced, not silently ignored", DictationStartResult.Permission, rig.root.startDictation())
                 captured.toList()
             }
+            assertEquals(DictationStartResult.Permission, rig.root.dictationUi.value.refusal)
             assertTrue(lines.single { it.startsWith("P4_DICTATION state=refused") }.contains("reason=permission"))
             assertTrue(rig.devices.single().starts.get() == 1) // only the arm's own capture
+        }
+    }
+
+    @Test
+    fun aMissingDeadlineSchedulerIsSurfacedAsNotReadyInsteadOfPretendingToListen() {
+        withRig(detached = true, withScheduler = false) { rig ->
+            assertTrue(rig.activate())
+
+            assertEquals("no deadline scheduler means no dictation", DictationStartResult.NoScheduler, rig.root.startDictation())
+
+            assertEquals(DictationStartResult.NoScheduler, rig.root.dictationUi.value.refusal)
+            assertEquals(DictationState.Idle, stateOf(rig))
+            assertEquals("the refused start must not open the microphone", 1, rig.devices.single().starts.get())
+        }
+    }
+
+    /**
+     * Review finding 4c: the start result is returned **and** published so the row can show a retryable Chinese
+     * status; a newer action (the send) clears it. The permission line names the permission to grant.
+     */
+    @Test
+    fun aRefusedStartIsRetryableOnThePageAndDismissedByTheNextAction() {
+        withRig(detached = true, microphoneAllowed = false) { rig ->
+            assertTrue(rig.activate())
+
+            assertEquals(DictationStartResult.Permission, rig.root.startDictation())
+            val refusal = rig.root.dictationUi.value.refusal
+            assertEquals(DictationStartResult.Permission, refusal)
+            val explanation = requireNotNull(dictationStartStatusText(refusal))
+            assertTrue("the page explains which permission is missing: $explanation", "麦克风" in explanation && "权限" in explanation)
+            assertEquals(
+                "the refusal owns the row status until dismissed",
+                explanation,
+                inputRowStatusText(SessionState.Listening, TypedInputState(), stateOf(rig), refusal),
+            )
+
+            // Any newer action dismisses it; here the wearer sends a typed message instead.
+            assertEquals(TypedSendResult.Accepted, rig.root.requestTypedMessage("改用打字"))
+            assertNull("the refusal must not outlive the next action", rig.root.dictationUi.value.refusal)
         }
     }
 
@@ -617,7 +706,7 @@ class DictationWiringTest {
         withRig(detached = true) { rig ->
             val lines = withP3Sink { captured ->
                 assertTrue(rig.activate())
-                assertTrue(rig.root.startDictation())
+                assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
                 rig.pipelineVad.decision = VadDecision(true, false)
                 rig.feedPhone()
                 assertTrue(rig.chain.hasActiveTurn())
@@ -641,7 +730,7 @@ class DictationWiringTest {
     fun theFifteenSecondDeadlineEndsAsTimeoutAndRestoresWakeAcceptance() {        withRig(detached = true) { rig ->
             val lines = withP3Sink { captured ->
                 assertTrue(rig.activate())
-                assertTrue(rig.root.startDictation())
+                assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
 
                 rig.clock.advance(15_000_000_000L)
                 rig.scheduler.runDue()
@@ -666,7 +755,7 @@ class DictationWiringTest {
         withRig(detached = true) { rig ->
             val lines = withP3Sink { captured ->
                 assertTrue(rig.activate())
-                assertTrue(rig.root.startDictation())
+                assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
                 rig.pipelineVad.decision = VadDecision(true, false)
                 rig.feedPhone()
                 assertTrue("a turn is open before cancel", rig.chain.hasActiveTurn())
@@ -695,7 +784,7 @@ class DictationWiringTest {
             rig.asr.finalText = secret
             val lines = withP3Sink { captured ->
                 assertTrue(rig.activate())
-                assertTrue(rig.root.startDictation())
+                assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
                 rig.pipelineVad.decision = VadDecision(true, false)
                 rig.feedPhone()
                 rig.root.stopDictation()
@@ -739,7 +828,7 @@ class DictationWiringTest {
                 assertEquals(0, asrBefore)
                 assertEquals(1, wakeBefore)
 
-                assertTrue(rig.root.startDictation())
+                assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
                 assertEquals("a glasses dictation opens exactly one phone capture", 1, rig.devices.size)
 
                 // The CXR loop is paused: a CXR chunk stays queued, and the phone source reaches the same pipeline.
@@ -784,7 +873,7 @@ class DictationWiringTest {
         withRig(detached = false, queueDispatches = true, configurePhoneDevice = { failReadAt = 1 }) { rig ->
             assertTrue(rig.activate())
             val lines = withP3Sink { captured ->
-                assertTrue(rig.root.startDictation())
+                assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
                 val capture = rig.devices.single()
                 awaitCondition { rig.pendingDispatches() >= 1 }
                 rig.runDispatches()
@@ -829,7 +918,7 @@ class DictationWiringTest {
             val lines = withP3Sink { captured ->
                 assertTrue(rig.activate())
                 assertNotNull("the armed session runs one normal CXR loop", rig.chain.normalLoopForProbe)
-                assertTrue(rig.root.startDictation())
+                assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
                 assertNull("the dictation pauses the normal CXR loop", rig.chain.normalLoopForProbe)
 
                 rig.pipelineVad.decision = VadDecision(true, false)
@@ -888,7 +977,7 @@ class DictationWiringTest {
             val text = "停止后不能补播旧音频"
             rig.asr.finalText = text
             assertTrue(rig.activate())
-            assertTrue(rig.root.startDictation())
+            assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
             rig.pipelineVad.decision = VadDecision(true, false)
             rig.feedPhone()
             assertEquals("the paused CXR ingress starts empty", 0, rig.cxrIngress.queuedBytes)
@@ -914,6 +1003,311 @@ class DictationWiringTest {
             assertEquals("only the fresh CXR chunk reaches the pipeline", asrBefore + 1, rig.asr.frames.size)
             assertEquals("and reaches the wake route once", wakeBefore + 1, rig.wakeEngine.frames.size)
             assertEquals("the final is still delivered", text, rig.root.dictationUi.value.final?.text)
+        }
+    }
+
+    // ---- fix 2: the final's lifetime is the host's, not the page's ------------------------------------------------
+
+    /**
+     * The page acknowledges a delivered final instead of remembering a raw sequence. Once the host has cleared it, a
+     * returning/recreated page has nothing to append; the sequence nonetheless stays monotonic for the next final.
+     */
+    @Test
+    fun aConsumedFinalIsClearedHostOwnedAndTheNextDictationGetsANewSequence() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+
+            val first = dictatedFinal(rig, "第一次")
+            assertEquals("the first final of a composition is sequence 1", 1L, first.sequence)
+            assertEquals("a final stays available until the page appends it", first, rig.root.dictationUi.value.final)
+
+            rig.root.consumeDictationFinal(first.sequence)
+            assertNull("the host must not hand the appended final out again", rig.root.dictationUi.value.final)
+
+            // A repeated acknowledgement (a recomposition collecting a stale value, a second page) is a no-op.
+            rig.root.consumeDictationFinal(first.sequence)
+            assertNull(rig.root.dictationUi.value.final)
+
+            val second = dictatedFinal(rig, "第二次")
+            assertEquals("the sequence keeps counting across dictations", 2L, second.sequence)
+            rig.root.consumeDictationFinal(first.sequence)
+            assertEquals("a stale acknowledgement must not clear a newer final", second, rig.root.dictationUi.value.final)
+            rig.root.consumeDictationFinal(second.sequence)
+            assertNull(rig.root.dictationUi.value.final)
+        }
+    }
+
+    /**
+     * Tab switch (review finding 1a): the assistant page is disposed while the host keeps its flow. A final that
+     * arrives while the page is away is delivered **once** to the fresh page that returns - not again on the next
+     * return, because the host cleared it when that page acknowledged it.
+     */
+    @Test
+    fun aFinalDeliveredWhileTheAssistantPageIsAwayIsAppendedOnceWhenAPageReturns() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+
+            // No page is composed for the assistant tab when the final arrives; nothing consumes it yet.
+            val delivered = dictatedFinal(rig, "切走之后说的话")
+            assertEquals(delivered, rig.root.dictationUi.value.final)
+
+            // Returning creates a fresh page: its own counter starts at zero, and the host's final is still the one
+            // value it may append.
+            assertTrue(isNewDictationFinal(rig.root.dictationUi.value.final, 0L))
+            rig.root.consumeDictationFinal(delivered.sequence)
+
+            // Switching away and back again must not insert the same words twice: a fresh page sees no final.
+            assertFalse(isNewDictationFinal(rig.root.dictationUi.value.final, 0L))
+            assertNull(rig.root.dictationUi.value.final)
+        }
+    }
+
+    /**
+     * Process death (review finding 1b): a new composition restarts the sequence at 1. The fixed page keeps no restored
+     * raw sequence, so it appends the new lifetime's final; comparing against a restored old N is what used to drop
+     * finals silently.
+     */
+    @Test
+    fun aFreshCompositionRestartsTheSequenceAtOneSoThePageMustNotRestoreIt() {
+        val firstLifetime = firstFinalOfAFreshComposition()
+        val secondLifetime = firstFinalOfAFreshComposition()
+
+        assertEquals("each composition's sequence is its own, starting at 1", 1L, firstLifetime.sequence)
+        assertEquals("a restarted composition does not continue the dead one's count", 1L, secondLifetime.sequence)
+        assertTrue(
+            "the page after a process death has no restored counter, so it appends the new final",
+            isNewDictationFinal(secondLifetime, 0L),
+        )
+        assertFalse(
+            "a page that restored the dead composition's sequence would silently drop the final",
+            isNewDictationFinal(secondLifetime, 1L),
+        )
+    }
+
+    private fun firstFinalOfAFreshComposition(): DictationFinal {
+        val rig = Rig(detached = true)
+        try {
+            assertTrue(rig.activate())
+            return dictatedFinal(rig, "新进程的第一条")
+        } finally {
+            rig.close()
+        }
+    }
+
+    // ---- fix 2: a terminal status is about one action, not a permanent label --------------------------------------
+
+    /**
+     * Review finding 2: a timeout/error status belongs to the action that produced it. It must be dismissable by the
+     * wearer's next action instead of outranking every later result. The host clears it on a send (the page also calls
+     * [HostCompositionRoot.clearDictationStatus] on a draft edit); the row then shows the newer typed result.
+     */
+    @Test
+    fun aTimeoutStatusIsDismissedByTheNextSendAndTheTypedResultWins() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
+            rig.clock.advance(15_000_000_000L)
+            rig.scheduler.runDue()
+            assertEquals(DictationState.NoSpeech, stateOf(rig))
+
+            // The wearer types/sends instead of retrying the microphone. The send is the newer action, so its
+            // result takes the row's one status line; the timeout must not outrank it any more.
+            assertEquals(TypedSendResult.Accepted, rig.root.requestTypedMessage("改用打字"))
+
+            assertEquals("the terminal dictation state must not survive the send", DictationState.Idle, stateOf(rig))
+            assertEquals(
+                "the typed result now owns the row status",
+                typedResultLabel(TypedSendResult.Accepted),
+                inputRowStatusText(SessionState.Listening, TypedInputState(result = TypedSendResult.Accepted), stateOf(rig)),
+            )
+        }
+    }
+
+    @Test
+    fun anExplicitDismissTurnsATerminalOutcomeBackToIdleWithoutTouchingALiveLease() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+
+            // While a dictation is listening, its status is live information: dismissing cannot silence it.
+            assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
+            rig.root.clearDictationStatus()
+            assertEquals("a live lease keeps its listening status", DictationState.Listening, stateOf(rig))
+
+            // A stop with no speech is terminal; the wearer's next action (a draft edit in the page) dismisses it.
+            rig.root.stopDictation()
+            assertEquals(DictationState.NoSpeech, stateOf(rig))
+            rig.root.clearDictationStatus()
+            assertEquals("the dismissed status falls back to the ordinary row status", DictationState.Idle, stateOf(rig))
+
+            // The 15 s deadline is the other terminal non-result; it is dismissable the same way.
+            assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
+            rig.clock.advance(15_000_000_000L)
+            rig.scheduler.runDue()
+            assertEquals(DictationState.NoSpeech, stateOf(rig))
+            rig.root.clearDictationStatus()
+            assertEquals(DictationState.Idle, stateOf(rig))
+        }
+    }
+
+    /**
+     * Review finding 2, error half + session change: a capture failure's [DictationState.Error] must not outlive the
+     * session it happened in. Stopping the session clears it (the component observes the session change).
+     */
+    @Test
+    fun aTerminalErrorIsDismissedWhenTheSessionChanges() {
+        withRig(detached = false, queueDispatches = true, configurePhoneDevice = { failReadAt = 1 }) { rig ->
+            assertTrue(rig.activate())
+            withP3Sink { captured ->
+                assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
+                awaitCondition { rig.pendingDispatches() >= 1 }
+                rig.runDispatches()
+                captured.toList()
+            }
+            assertEquals(DictationState.Error(PhoneMicCapture.MIC_UNAVAILABLE), stateOf(rig))
+
+            rig.root.stop()
+
+            assertEquals("an error of the stopped session must not remain on the page", DictationState.Idle, stateOf(rig))
+        }
+    }
+
+    /** A still-unconsumed final is a delivery, not a status: dismissing the status must not lose the words. */
+    @Test
+    fun dismissingAStatusDoesNotConsumeAPendingFinal() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            val delivered = dictatedFinal(rig, "先说完再改字")
+            rig.root.clearDictationStatus()
+            assertEquals("the final is still there for the page to append", delivered, rig.root.dictationUi.value.final)
+            rig.root.consumeDictationFinal(delivered.sequence)
+        }
+    }
+
+    // ---- fix 2: the lease transition must not let a CXR tail steal a wake turn --------------------------------
+
+    /**
+     * Review finding 4a: the CXR route is paused **before** the dictation opens the phone capture, and the old loop's
+     * two consumer taps are closed before it is stopped. Otherwise a CXR tick already in flight (the loop delivers its
+     * frames outside the loop lock) could open a wake turn while the dictation is switching sources, and the redirect
+     * installed for the dictation would then capture that turn's final into the input field.
+     *
+     * The hook runs on the thread opening the capture, i.e. exactly between "route switched" and "dictation source
+     * live", which is the window the fix closes.
+     */
+    @Test
+    fun aGlassesDictationPausesTheCxrLoopBeforeItOpensThePhoneCapture() {
+        withRig(detached = false) { rig ->
+            assertTrue(rig.activate())
+            val oldLoop = requireNotNull(rig.chain.normalLoopForProbe)
+            assertTrue("the CXR loop is polling the session source", oldLoop.wakeEnabled)
+            assertTrue(oldLoop.pipelineEnabled)
+
+            val loopAtCaptureOpen = AtomicReference(oldLoop)
+            val oldWakeAtCaptureOpen = AtomicBoolean(true)
+            val oldPipelineAtCaptureOpen = AtomicBoolean(true)
+            rig.onPhoneDeviceCreated = {
+                loopAtCaptureOpen.set(rig.chain.normalLoopForProbe)
+                oldWakeAtCaptureOpen.set(oldLoop.wakeEnabled)
+                oldPipelineAtCaptureOpen.set(oldLoop.pipelineEnabled)
+            }
+
+            assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
+
+            assertNull("the CXR loop must be paused before the dictation capture opens", loopAtCaptureOpen.get())
+            assertFalse("the old loop's KWS tap must be closed before it is stopped", oldWakeAtCaptureOpen.get())
+            assertFalse("and so must its pipeline feed", oldPipelineAtCaptureOpen.get())
+            assertNotNull("the phone dictation loop owns the route", rig.chain.dictationLoopForProbe)
+
+            rig.pipelineVad.decision = VadDecision(true, false)
+            rig.feedPhone()
+            rig.root.stopDictation()
+            assertNull("the dictation loop is released with the lease", rig.chain.dictationLoopForProbe)
+            assertNotNull("the normal CXR loop is restored", rig.chain.normalLoopForProbe)
+        }
+    }
+
+    // ---- fix 2: quiesce the tail before the forced final ------------------------------------------------------
+
+    /**
+     * Review finding 4b: stop quiesces the loop **before** the controller forces the final. The ordering is observed
+     * from inside `asr.finish()` - the exact moment the forced final is produced. Without the fix the loop is still
+     * accepting frames then, so a frame from the same drained batch could start a second ASR turn after the final and
+     * leak its partials onto the restored wake route.
+     */
+    @Test
+    fun stoppingADictationQuiescesTheLoopBeforeTheFinalIsForced() {
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
+            rig.pipelineVad.decision = VadDecision(true, false)
+            rig.feedPhone()
+            assertTrue(rig.chain.hasActiveTurn())
+
+            val enabledWhileFinishing = AtomicBoolean(true)
+            rig.asr.onFinish = {
+                val loop = rig.chain.dictationLoopForProbe ?: rig.chain.normalLoopForProbe
+                enabledWhileFinishing.set(loop?.pipelineEnabled == true)
+            }
+
+            rig.root.stopDictation()
+
+            assertFalse("the loop must stop feeding the pipeline before the final is forced", enabledWhileFinishing.get())
+            assertEquals(DictationState.Idle, stateOf(rig))
+        }
+    }
+
+    /** Cancel seals the turn instead of finalising it, but the tail must be quiesced for the same reason. */
+    @Test
+    fun cancellingADictationQuiescesTheLoopBeforeSealingTheTurn() {
+        withRig(detached = false) { rig ->
+            assertTrue(rig.activate())
+            assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
+            rig.pipelineVad.decision = VadDecision(true, false)
+            rig.feedPhone()
+            assertTrue(rig.chain.hasActiveTurn())
+
+            val enabledWhileFinishing = AtomicBoolean(true)
+            rig.asr.onFinish = {
+                enabledWhileFinishing.set(rig.chain.dictationLoopForProbe?.pipelineEnabled == true)
+            }
+
+            rig.root.cancelDictation()
+
+            assertFalse("a cancelled dictation must not accept tail frames while sealing", enabledWhileFinishing.get())
+            assertNull("cancel delivers no final", rig.root.dictationUi.value.final)
+            assertEquals(DictationState.Idle, stateOf(rig))
+        }
+    }
+
+    /**
+     * One scheduled tick drains a whole multi-frame batch and delivers it outside the loop lock. When that batch's
+     * first frame is the endpoint, the dictation ends there: the frames behind it belong to no turn and must not open
+     * a second one on the route the terminal callback is restoring. The deferred cleanup keeps the quiesce window
+     * observable in this rig.
+     */
+    @Test
+    fun aMultiFrameBatchEndsAtItsFirstFinalAndTheTailFramesStartNoSecondTurn() {
+        withRig(detached = true, queueDispatches = true) { rig ->
+            assertTrue(rig.activate())
+            assertEquals(DictationStartResult.Accepted, rig.root.startDictation())
+            rig.asr.finalText = "批次里的第一句"
+            rig.pipelineVad.decision = VadDecision(true, false)
+            rig.pipelineVad.endpointAccepts = 1
+            repeat(3) {
+                assertEquals(PcmOffer.ACCEPTED, rig.phoneIngress.offer(rig.epoch(), ByteArray(PhoneMicFormat.CHUNK_BYTES)))
+            }
+
+            rig.clock.advance(20_000_000)
+            rig.scheduler.runDue()
+
+            assertEquals("the endpoint ends the turn on the batch's first frame", 1, rig.asr.frames.size)
+            assertEquals("exactly one final is produced", 1, rig.asr.finishes.get())
+            assertEquals("批次里的第一句", rig.root.dictationUi.value.final?.text)
+            assertFalse("the tail frames must not open a second turn", rig.chain.hasActiveTurn())
+            assertEquals("the endpoint ended the dictation", DictationState.Idle, stateOf(rig))
+            assertTrue("the cleanup is deferred by this rig", rig.pendingDispatches() >= 1)
+            rig.runDispatches()
+            assertNotNull("the normal route is back after the deferred cleanup", rig.chain.normalLoopForProbe)
         }
     }
 }

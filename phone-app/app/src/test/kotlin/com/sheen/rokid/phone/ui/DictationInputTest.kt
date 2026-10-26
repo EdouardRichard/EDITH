@@ -1,9 +1,13 @@
 package com.sheen.rokid.phone.ui
 
 import com.sheen.rokid.contracts.SessionState
+import com.sheen.rokid.phone.audio.DictationFinal
+import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.app.TypedSendResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -80,6 +84,76 @@ class DictationInputTest {
             "回到普通输入状态",
             typedStatusText(SessionState.Listening, typed),
             inputRowStatusText(SessionState.Listening, typed, DictationState.Idle),
+        )
+    }
+
+    // ---- finding 1: the final's lifetime is the host's, not the page's --------------------------------------------
+
+    @Test
+    fun `a final is appended only for the next host sequence and never for a consumed one`() {
+        // A page re-created by a tab switch or an Activity recreation starts its counter at zero. If the host still
+        // holds the final (nobody appended it yet), it is delivered once; once consumed the host clears it, so a
+        // returning page has nothing to append even though its own counter is zero again.
+        assertFalse("a consumed final is gone, not re-delivered", isNewDictationFinal(null, 0L))
+        assertTrue(isNewDictationFinal(DictationFinal(1, "离开页面时说的话"), 0L))
+        assertFalse("the same delivered value collected again is appended once", isNewDictationFinal(DictationFinal(3, "三"), 3L))
+        assertFalse(isNewDictationFinal(DictationFinal(2, "旧"), 3L))
+        assertTrue(isNewDictationFinal(DictationFinal(4, "四"), 3L))
+    }
+
+    @Test
+    fun `a process restart's sequence starting at one is appended by a fresh page and not dropped`() {
+        // A new host lifetime starts its monotonic sequence at 1 again. The fixed page never restores the old raw
+        // sequence, so its counter is zero and the new lifetime's first final is appended. A page that restored the
+        // previous lifetime's N would silently ignore the next N finals (the data loss this fix removes).
+        assertTrue("a fresh page accepts the restarted sequence", isNewDictationFinal(DictationFinal(1, "新进程的第一条"), 0L))
+        assertFalse("a page that restored the dead host's counter would drop it", isNewDictationFinal(DictationFinal(1, "新进程的第一条"), 1L))
+        assertTrue(isNewDictationFinal(DictationFinal(2, "新进程的第二条"), 1L))
+    }
+
+    // ---- finding 4c: a refused start is explained on the row, not ignored ----------------------------------------
+
+    @Test
+    fun `every refused start has a retryable Chinese explanation and an accepted start has none`() {
+        assertNull("nothing to say when no start was refused", dictationStartStatusText(null))
+        assertNull("a started dictation speaks through its Listening state", dictationStartStatusText(DictationStartResult.Accepted))
+
+        val refused = DictationStartResult.entries.filter { it != DictationStartResult.Accepted }
+        assertTrue("the host's refusal vocabulary must stay covered", refused.size >= 5)
+        refused.forEach { result ->
+            val label = dictationStartStatusText(result)
+            assertNotNull("refusal $result needs a status line", label)
+            assertTrue("label must be Chinese: $label", label!!.any { it in '\u4e00'..'\u9fff' })
+            assertTrue("label must stay short: $label", label.length <= 30)
+            assertTrue("a refusal is retryable, so it asks the wearer to try again: $label", "重试" in label || "稍后" in label || "重新" in label)
+        }
+
+        val permission = requireNotNull(dictationStartStatusText(DictationStartResult.Permission))
+        assertTrue("the permission refusal names the permission: $permission", "麦克风" in permission && "权限" in permission)
+    }
+
+    @Test
+    fun `a start refusal is shown after listening and before the typed status`() {
+        val typed = TypedInputState(draft = "已输入")
+        assertEquals(
+            "a live lease outranks an older refusal",
+            DICTATION_LISTENING_LABEL,
+            inputRowStatusText(SessionState.Listening, typed, DictationState.Listening, DictationStartResult.Busy),
+        )
+        assertEquals(
+            "the refusal explains why the tap did nothing",
+            dictationStartStatusText(DictationStartResult.NoScheduler),
+            inputRowStatusText(SessionState.Listening, typed, DictationState.Idle, DictationStartResult.NoScheduler),
+        )
+        assertEquals(
+            "once dismissed the ordinary typed status is back",
+            typedStatusText(SessionState.Listening, typed),
+            inputRowStatusText(SessionState.Listening, typed, DictationState.Idle, null),
+        )
+        assertEquals(
+            "a terminal dictation state still outranks a refusal",
+            DICTATION_NO_SPEECH_LABEL,
+            inputRowStatusText(SessionState.Listening, typed, DictationState.NoSpeech, DictationStartResult.Busy),
         )
     }
 

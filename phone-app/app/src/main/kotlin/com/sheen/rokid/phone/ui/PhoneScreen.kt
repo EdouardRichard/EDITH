@@ -49,6 +49,7 @@ import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.app.MemorySection
 import com.sheen.rokid.phone.app.TypedSendResult
+import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
 import com.sheen.rokid.phone.audio.DictationUiState
 import com.sheen.rokid.phone.session.SessionService
@@ -171,6 +172,8 @@ internal fun PhoneScreen(
                             dictation = root.dictationUi,
                             startDictation = { root.startDictation() },
                             stopDictation = { root.stopDictation() },
+                            clearDictationStatus = { root.clearDictationStatus() },
+                            consumeDictationFinal = { root.consumeDictationFinal(it) },
                             modifier = Modifier.weight(1f),
                         )
                         state.errorCode?.let {
@@ -298,8 +301,10 @@ internal fun AssistantTab(
     session: SessionState,
     send: (String) -> TypedSendResult,
     dictation: StateFlow<DictationUiState>,
-    startDictation: () -> Boolean,
+    startDictation: () -> DictationStartResult,
     stopDictation: () -> Unit,
+    clearDictationStatus: () -> Unit,
+    consumeDictationFinal: (Long) -> Unit,
     modifier: Modifier = Modifier,
 ) {
     var route by remember { mutableStateOf(AssistantRoute.WAKE) }
@@ -308,20 +313,25 @@ internal fun AssistantTab(
     // synchronous host call), so `sending` is not saved.
     var typedInput by rememberSaveable(stateSaver = typedInputSaver) { mutableStateOf(TypedInputState()) }
     // The dictation host is the only writer of this flow (its callbacks may arrive on the pipeline or scheduler
-    // thread; StateFlow + lifecycle collection marshal them onto the main thread). The last sequence the page has
-    // appended survives recreation, so the same delivered final cannot be inserted twice.
+    // thread; StateFlow + lifecycle collection marshal them onto the main thread). The host also owns the final's
+    // lifetime: it stays in the flow until this page has appended it and acknowledged it with
+    // `consumeDictationFinal`, so the page's own counter is deliberately **not** saved across compositions
+    // (0.4 Task 12b-ii fix 2, finding 1). Saving a raw sequence would make a tab switch reset it to 0 (duplicate
+    // append) and a process restart restore an old N (the new host's first N finals silently dropped).
     val dictationUi by dictation.collectAsStateWithLifecycle()
-    var lastDictationSequence by rememberSaveable { mutableStateOf(0L) }
+    var appendedDictationSequence by remember { mutableStateOf(0L) }
     LaunchedEffect(dictationUi.final?.sequence) {
         val delivered = dictationUi.final ?: return@LaunchedEffect
-        if (delivered.sequence <= lastDictationSequence) return@LaunchedEffect
-        lastDictationSequence = delivered.sequence
+        if (!isNewDictationFinal(delivered, appendedDictationSequence)) return@LaunchedEffect
+        appendedDictationSequence = delivered.sequence
         // 0.4 Task 12b-ii (spec §5.3): the recognized words are appended to the editable draft. Nothing is sent:
         // the wearer can fix them and presses 发送 when ready.
         typedInput = typedInput.copy(
             draft = appendDictation(typedInput.draft, delivered.text),
             result = null,
         )
+        // Only after the append: the host then stops handing this final to a re-created page.
+        consumeDictationFinal(delivered.sequence)
     }
     val entries = remember(revision, route) { log.entries(route) }
     // Start the first layout at the newest entry, so the frame before the route-opening effect cannot show the oldest
@@ -430,7 +440,11 @@ internal fun AssistantTab(
                 session = session,
                 state = typedInput,
                 dictation = dictationUi.state,
+                refusal = dictationUi.refusal,
                 onDraftChange = { candidate ->
+                    // 0.4 Task 12b-ii fix 2 (finding 2): editing is the wearer starting a newer action, so a finished
+                    // dictation's no-speech/timeout/error text must not outrank what they are doing now.
+                    clearDictationStatus()
                     typedInput = typedInput.copy(draft = typedDraftAfterInput(candidate))
                 },
                 onSend = {
@@ -466,16 +480,19 @@ private val typedInputSaver: Saver<TypedInputState, Any> = listSaver(
  * The microphone starts a phone-microphone dictation on a tap and stops the running one on a second tap (D204). A
  * missing `RECORD_AUDIO` grant is requested right here - glasses sessions never ask for it at start, so the dictation
  * is the only moment the permission can be obtained - and the host re-checks the grant at start. While listening the
- * status line shows 正在听写…; the final transcript is appended to the draft by [AssistantTab], never sent.
+ * status line shows 正在听写…; the final transcript is appended to the draft by [AssistantTab], never sent. A refused
+ * start (`refusal`) shows its retryable Chinese reason in the same one status line, so a tap that does nothing is
+ * explained rather than silent (0.4 Task 12b-ii fix 2, finding 4c).
  */
 @Composable
 private fun TypedInputRow(
     session: SessionState,
     state: TypedInputState,
     dictation: DictationState,
+    refusal: DictationStartResult?,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
-    onStartDictation: () -> Unit,
+    onStartDictation: () -> DictationStartResult,
     onStopDictation: () -> Unit,
 ) {
     val blank = state.draft.isBlank()
@@ -483,9 +500,10 @@ private fun TypedInputRow(
         dictation is DictationState.Error
     val listening = dictation == DictationState.Listening
     val context = LocalContext.current
-    // The permission result is asynchronous; the start is retried only after the user grants it.
-    val requestMicrophone = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
-        if (granted) onStartDictation()
+    // The permission result is asynchronous. On a denial the host is still asked once: it re-checks the grant and
+    // publishes the retryable explanation (需要麦克风权限…), so the row says what to do instead of the tap being silent.
+    val requestMicrophone = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        onStartDictation()
     }
     Column(
         Modifier.fillMaxWidth(),
@@ -530,7 +548,7 @@ private fun TypedInputRow(
             ) { Text(TYPED_SEND_LABEL) }
         }
         Text(
-            inputRowStatusText(session, state, dictation),
+            inputRowStatusText(session, state, dictation, refusal),
             style = MaterialTheme.typography.bodySmall,
             color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
         )

@@ -1,6 +1,8 @@
 package com.sheen.rokid.phone.ui
 
 import com.sheen.rokid.contracts.SessionState
+import com.sheen.rokid.phone.audio.DictationFinal
+import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
 
 /**
@@ -30,6 +32,27 @@ const val DICTATION_NO_SPEECH_LABEL = "没有听到内容，请重试"
 /** Status when the dictation failed (for example the recorder died); the stable code is not shown on the page. */
 const val DICTATION_FAILED_LABEL = "听写失败，请重试"
 
+/** Status when a start was refused because a dictation/wake turn still owns the source. */
+const val DICTATION_BUSY_LABEL = "上一段语音还没结束，请稍后再试"
+
+/** Status when a start was refused because there is no live session under which to record. */
+const val DICTATION_NO_SESSION_LABEL = "会话未开始，请开始会话后重试"
+
+/** Status when `RECORD_AUDIO` is missing; it names the permission so the wearer knows what to allow. */
+const val DICTATION_PERMISSION_LABEL = "需要麦克风权限，请在系统设置中允许后重试"
+
+/** Status when no armed phone source exists or the capture refused to start. */
+const val DICTATION_NO_SOURCE_LABEL = "麦克风暂不可用，请稍后重试"
+
+/** Status when the composition cannot guarantee the 15 s cap because it has no deadline scheduler. */
+const val DICTATION_NOT_READY_LABEL = "听写服务未就绪，请稍后重试"
+
+/** Status when the controller failed to install the redirect/deadline after the route was prepared. */
+const val DICTATION_START_FAILED_LABEL = "语音输入启动失败，请重试"
+
+/** Status when the composition is already shut down. */
+const val DICTATION_CLOSED_LABEL = "应用已关闭，请重新打开"
+
 /**
  * Appends one delivered final to the editable draft (spec §5.3: 最终 transcript 追加到输入框，已有文字后空格分隔).
  *
@@ -46,6 +69,19 @@ fun appendDictation(draft: String, text: String): String {
 /** Whether the session is live enough to dictate: the same two states that enable 发送. */
 fun canDictate(session: SessionState): Boolean =
     session == SessionState.Ready || session == SessionState.Listening
+
+/**
+ * Whether [delivered] is a final this page has not appended yet (0.4 Task 12b-ii fix 2, finding 1).
+ *
+ * [lastAppendedSequence] is the page's **own** counter, reset whenever the page is re-created. The page deliberately
+ * does not save it: the host owns the final's lifetime and clears it once consumed, so
+ *
+ * - `delivered == null` means nothing to append (a consumed final, or a page returning to the tab);
+ * - a host that restarted starts its sequence at 1 again, and a fresh page's counter of 0 accepts that final;
+ * - the same delivered value collected twice compares equal, so it is appended exactly once.
+ */
+fun isNewDictationFinal(delivered: DictationFinal?, lastAppendedSequence: Long): Boolean =
+    delivered != null && delivered.sequence > lastAppendedSequence
 
 /** Whether the row's microphone button is enabled. Kept as its own name so the UI states the rule once. */
 fun dictationMicEnabled(session: SessionState): Boolean = canDictate(session)
@@ -65,10 +101,34 @@ fun dictationStatusText(state: DictationState): String? = when (state) {
 }
 
 /**
- * The row's one status line: the dictation state wins while it exists, otherwise the typed send status.
+ * The Chinese, retryable status for a refused start, or null while nothing was refused (0.4 Task 12b-ii fix 2,
+ * finding 4c).
+ *
+ * [DictationStartResult.Accepted] is the listening case and has no refusal text - the Listening state speaks for it.
+ */
+fun dictationStartStatusText(result: DictationStartResult?): String? = when (result) {
+    null, DictationStartResult.Accepted -> null
+    DictationStartResult.Busy -> DICTATION_BUSY_LABEL
+    DictationStartResult.NoSession -> DICTATION_NO_SESSION_LABEL
+    DictationStartResult.Permission -> DICTATION_PERMISSION_LABEL
+    DictationStartResult.NoSource -> DICTATION_NO_SOURCE_LABEL
+    DictationStartResult.NoScheduler -> DICTATION_NOT_READY_LABEL
+    DictationStartResult.StartFailed -> DICTATION_START_FAILED_LABEL
+    DictationStartResult.Closed -> DICTATION_CLOSED_LABEL
+}
+
+/**
+ * The row's one status line: a live/terminal dictation state, then a refused start's explanation, then the typed send
+ * status.
  *
  * A dictation result is transient and about the last action; showing "输入后点「发送」" over it would hide the one
- * outcome the wearer needs to see. Once the state is [DictationState.Idle] the ordinary row status is correct again.
+ * outcome the wearer needs to see. A refusal is equally transient: it explains the tap that did nothing, and once the
+ * host dismisses it (the next draft edit, send or session change) the ordinary row status is correct again.
  */
-fun inputRowStatusText(session: SessionState, typed: TypedInputState, dictation: DictationState): String =
-    dictationStatusText(dictation) ?: typedStatusText(session, typed)
+fun inputRowStatusText(
+    session: SessionState,
+    typed: TypedInputState,
+    dictation: DictationState,
+    refusal: DictationStartResult? = null,
+): String =
+    dictationStatusText(dictation) ?: dictationStartStatusText(refusal) ?: typedStatusText(session, typed)
