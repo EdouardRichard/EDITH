@@ -187,7 +187,7 @@ class DetachGateTest {
                 blobs.order += "stop"
                 state = SessionState.Idle
             },
-            stopService = { blobs.order += "stopService" },
+            stopService = { blobs.order += "stopService"; true },
             sessionState = { state },
         )
         gate.load()
@@ -203,9 +203,11 @@ class DetachGateTest {
     }
 
     @Test
-    fun aFailedServiceStopDoesNotReportStoppedOrSavedAndDoesNotWriteTheBlob() {
-        // The service stop is part of the same stop effect: if it refuses, the session is not fully torn down (the
-        // notification can still claim it is running), so the gate must not persist the mode or report a stop.
+    fun aThrowingServiceStopDoesNotReportStoppedOrSavedAndDoesNotWriteTheBlob() {
+        // Production wiring is the unwrapped `Context.stopService` call, which throws on a platform refusal
+        // (SecurityException) instead of being swallowed by a `runCatching`. The gate must treat a throw as a failed
+        // stop: the session is not fully torn down (the notification can still claim it is running), so it must not
+        // persist the mode or report a stop.
         val blobs = RecordingBlobs()
         val store = seeded(blobs, shipped)
         var state = SessionState.Ready
@@ -221,6 +223,34 @@ class DetachGateTest {
         val result = gate.set(true)
 
         assertFalse("a refused service stop must not report a save", result.saved)
+        assertFalse("and must not claim the session was fully stopped", result.stoppedSession)
+        assertEquals(DetachGate.ERROR_STOP_FAILED, result.error)
+        assertFalse("the live gate must stay in the stored mode", gate.enabled.value)
+        assertFalse("the blob must be untouched", store.load().glassesDetached)
+        assertTrue("no write may happen after a failed stop", blobs.order.none { it == "write" })
+    }
+
+    @Test
+    fun aServiceStopThatReportsNoRunningServiceRefusesTheSave() {
+        // Production wiring is a direct `Context.stopService(...)`, whose own contract returns **false when no
+        // matching service was running**. The gate must not read that as "the notification is gone": a session it
+        // believes is running without a hosting service is an inconsistent state the gate cannot verify, so it
+        // refuses the save visibly instead of persisting a mode over a notification it never proved removed.
+        val blobs = RecordingBlobs()
+        val store = seeded(blobs, shipped)
+        var state = SessionState.Ready
+        val gate = DetachGate(
+            settings = store,
+            stopSession = { state = SessionState.Idle },
+            stopService = { false },
+            sessionState = { state },
+        )
+        gate.load()
+        blobs.order.clear()
+
+        val result = gate.set(true)
+
+        assertFalse("an unproven service stop must not report a save", result.saved)
         assertFalse("and must not claim the session was fully stopped", result.stoppedSession)
         assertEquals(DetachGate.ERROR_STOP_FAILED, result.error)
         assertFalse("the live gate must stay in the stored mode", gate.enabled.value)
@@ -247,13 +277,20 @@ class DetachGateTest {
     fun setWhileIdleDoesNotStopAnything() {
         val store = seeded(RecordingBlobs(), shipped)
         var stops = 0
-        val gate = DetachGate(store, stopSession = { stops++ }, sessionState = { SessionState.Idle })
+        var serviceStops = 0
+        val gate = DetachGate(
+            store,
+            stopSession = { stops++ },
+            stopService = { serviceStops++; true },
+            sessionState = { SessionState.Idle },
+        )
 
         val result = gate.set(true)
 
         assertTrue(result.saved)
         assertFalse(result.stoppedSession)
-        assertEquals(0, stops)
+        assertEquals("an idle composition has no session to stop", 0, stops)
+        assertEquals("and no hosting service to stop", 0, serviceStops)
     }
 
     @Test

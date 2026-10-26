@@ -2469,15 +2469,19 @@ class HostCompositionRoot internal constructor(
             // 0.4 Task 5 (`D199`): the persisted 「脱离眼镜」 gate. The stop-before-save rule uses the composition's
             // own `stop()` and the host's live state; the gate is loaded once here, before any session can start.
             // 0.4 Task 9 fix: `stop()` only tears down the host session - `SessionService` kept its foreground
-            // notification saying 会话已开启 for an idle session. The gate's stop therefore also sends the existing UI
-            // STOP command (the same path the notification's own 停止 action uses), which stops the service and its
-            // notification. `runCatching` keeps a rig whose application is not an `EdithApplication` (JVM/Robolectric
-            // compositions) from throwing out of the switch; the service path already reports its own refusals and the
-            // gate's save is not the place that owns them.
+            // notification saying 会话已开启 for an idle session. The gate's stop therefore also stops the hosting
+            // service directly; that call is deliberately **not** wrapped in `runCatching` and its result is returned
+            // to the gate, so a refusal refuses the save instead of being swallowed while the mode is persisted.
+            // `Context.stopService` answers true only when it stopped a running service, so false surfaces as the
+            // gate's `SESSION_STOP_FAILED`; it throws on a platform refusal, which the gate also answers as a failed
+            // stop. `SessionService.onDestroy` cancels its state collector and its notification id directly, so a
+            // queued state update cannot leave a stale 「会话已开启」 record behind (device evidence on the K40: the
+            // service was gone while the notification record survived a `stopForeground(REMOVE)` attempt). No UI STOP
+            // command is re-dispatched.
             val detachGate = DetachGate(
                 settings = smartSettingsStore,
                 stopSession = { rootHolder[0]?.stop() },
-                stopService = { runCatching { SessionService.commandFromUi(context, SessionService.STOP) } },
+                stopService = { context.stopService(Intent(context, SessionService::class.java)) },
                 sessionState = { hostHolder[0]?.currentState ?: SessionState.Idle },
             ).also { it.load() }
             // P3.2 / `D53`②: the arming switch and its gate. One instance for the UI, the chain's acoustic sink and the

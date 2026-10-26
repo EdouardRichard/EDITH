@@ -130,8 +130,25 @@ class SessionService : Service() {
 
     override fun onDestroy() {
         serviceScope.cancel()
-        if (ownsForeground) liveRoot?.stop()
+        val wasForeground = ownsForeground
         ownsForeground = false
+        if (wasForeground) {
+            // 0.4 Task 9 fix round 2: a destroyed foreground service must not leave its notification behind. The detach
+            // gate's stop path now destroys the service directly (`Context.stopService`) instead of sending the STOP
+            // command, so this destroy path must remove the notification itself. Device evidence caught two reasons it
+            // cannot be left to the platform: a state change queued on the collector below re-posted 「会话已开启」
+            // just after the gate's stop, and by the time `onDestroy` runs the system has already detached the
+            // foreground state, so `stopForeground(REMOVE)` alone did not remove that later re-post (K40,
+            // 2026-10-26: service gone from `dumpsys activity services` while the notification record survived).
+            // Cancelling the scope first stops further updates; the direct notification cancel is what removes a
+            // record that was posted after the system's own foreground cancel.
+            ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+            getSystemService(NotificationManager::class.java).cancel(NOTIFICATION)
+            // A service destroyed while it still owned the foreground is the only destroy path that did not already
+            // tear the host session down; a STOP command sets `ownsForeground` false before `stopSelf`, so it does not
+            // run `stop()` a second time.
+            liveRoot?.stop()
+        }
         super.onDestroy()
     }
 

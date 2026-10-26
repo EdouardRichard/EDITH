@@ -29,10 +29,10 @@ internal data class DetachSetResult(
  * - the persisted value, written through a load -> copy -> save of the whole settings blob so every other setting is
  *   carried through untouched;
  * - the **stop-before-save** rule: when the composition is running (`Ready`/`Listening`/`Paused`), a change first
- *   stops that session through the composition's existing `stop()` **and** ends its foreground service through the
- *   existing UI STOP command, and does **not** restart it. Changing the audio source or display target under a live
+ *   stops that session through the composition's existing `stop()` **and** stops the foreground service that hosted
+ *   it (`Context.stopService`), and does **not** restart it. Changing the audio source or display target under a live
  *   session is exactly the hot switch the owner ruled out; leaving the service foreground would keep a 「会话已开启」
- *   notification for an idle session;
+ *   notification for an idle session. An idle composition stops nothing;
  * - the live [enabled] flow the host reads at runtime (the `D202` effective arming value follows it without a App
  *   restart).
  *
@@ -49,15 +49,23 @@ internal class DetachGate(
      * the change visibly rather than keeping an in-memory mode no restart will remember.
      */
     private val settings: SmartSettingsStore? = null,
-    /** The composition's existing stop path. Injected so the ordering rule is testable without a device. */
+    /**
+     * The composition's existing stop path. Injected so the ordering rule is testable without a device.
+     */
     private val stopSession: () -> Unit = {},
     /**
-     * Ends the foreground service/notification that hosted the stopped session (0.4 Task 9 fix), through the same
-     * UI stop command the notification's own 停止 action uses. `stopSession()` only tears down the host session;
-     * without this the service stayed foreground and its notification kept saying 会话已开启 for an idle session.
-     * A no-op for a hand-built rig with no service; injected so the stop -> service stop -> persist order is testable.
+     * Ends the foreground service that hosted the stopped session (0.4 Task 9 fix) by stopping the service directly
+     * (`Context.stopService`). `stopSession()` only tears down the host session; without this the service stayed
+     * foreground and its notification kept saying 会话已开启 for an idle session. The service's own destroy path removes
+     * the foreground notification, so the stop is not silent.
+     *
+     * Returns **true only when a matching running service was stopped** - the same contract as
+     * `Context.stopService`, which answers false when nothing was running. A false is a refusal, not a success: the
+     * gate cannot prove the notification is gone, so it must not persist a mode over it. A throw (a permission or
+     * state refusal) is the same refusal. The production wiring passes `Context.stopService` unwrapped, so this
+     * failure really reaches the switch instead of being swallowed by a `runCatching`.
      */
-    private val stopService: () -> Unit = {},
+    private val stopService: () -> Boolean = { true },
     /** The live session state, read once per change. Defaults to idle for a rig with no host. */
     private val sessionState: () -> SessionState = { SessionState.Idle },
 ) {
@@ -102,11 +110,15 @@ internal class DetachGate(
         var stopped = false
         if (sessionState() in RUNNING_STATES) {
             try {
-                // Both calls are the one stop effect: end the host session, then end the foreground service/notification
-                // that hosted it. `stopped` stays false until both return, so a refused service stop is not reported as
-                // a stopped session (the notification can still claim one) and never persists the mode.
+                // Both calls are the one stop effect: end the host session, then stop the foreground service that
+                // hosted it and whose notification claims the session is running. `stopped` stays false until the
+                // service stop proves it actually stopped something, so an unproven stop is not reported as a stopped
+                // session (the notification may still be there) and never persists the mode.
                 stopSession()
-                stopService()
+                if (!stopService()) {
+                    android.util.Log.i("EdithHost", "detach gate: hosting service was not running, not persisting the mode")
+                    return DetachSetResult(saved = false, error = ERROR_STOP_FAILED)
+                }
                 stopped = true
             } catch (failure: Exception) {
                 android.util.Log.i("EdithHost", "detach gate: session stop failed, not persisting the mode")
@@ -153,7 +165,7 @@ internal class DetachGate(
         /** A change cannot be persisted because the composition has no store (a hand-built rig). */
         const val ERROR_STORE_UNAVAILABLE = "SETTINGS_STORE_UNAVAILABLE"
 
-        /** The composition's own `stop()` refused; nothing was persisted. */
+        /** The composition's own `stop()` or the hosting service's stop refused; nothing was persisted. */
         const val ERROR_STOP_FAILED = "SESSION_STOP_FAILED"
 
         /** The blob exists but cannot be read/parsed; writing defaults over it would erase the user's settings. */
