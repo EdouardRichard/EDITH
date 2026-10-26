@@ -48,6 +48,9 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.phone.model.ModelReadiness
+import com.sheen.rokid.phone.model.ModelStartGate
+import com.sheen.rokid.phone.model.ProvisioningState
 import com.sheen.rokid.phone.ui.PhoneDetailPage
 import com.sheen.rokid.phone.ui.PhoneScreen
 import kotlinx.coroutines.delay
@@ -58,12 +61,17 @@ class MainActivity : ComponentActivity() {
         const val ACTION_SHOW_CONFIRMATION = "edith.phone.SHOW_CONFIRMATION"
     }
 
-    private val root get() = (application as EdithApplication).composition
+    /**
+     * The composition, only once the page has entered the ready UI. 0.4 Task 3 / spec §6.3: while the bundled models
+     * are preparing or failed this stays null, so no lifecycle callback or permission result can build a composition
+     * before the readiness gate is passed.
+     */
+    private var attachedRoot: HostCompositionRoot? = null
     private var pendingPlugin: String? = null
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         val selected = pendingPlugin
         pendingPlugin = null
-        if (!SessionService.bluetoothGranted(this)) root.error("BLUETOOTH_PERMISSION_DENIED")
+        if (!SessionService.bluetoothGranted(this)) attachedRoot?.error("BLUETOOTH_PERMISSION_DENIED")
         else if (selected != null && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
             SessionService.startFromUi(this, selected)
         }
@@ -79,9 +87,31 @@ class MainActivity : ComponentActivity() {
             setTurnScreenOn(true)
             raisedForConfirmation = true
         }
+        val app = application as EdithApplication
+        if (ModelStartGate.refusal(app.modelReadiness.state.value) != null) {
+            // No composition, no ViewModel, no CXR attach: the only thing this page can honestly do while the ~1 GiB
+            // bundle is being materialized is show progress (or the failure and a retry). Ready re-enters `onCreate`
+            // through `recreate()`, which then takes the normal path.
+            setContent {
+                MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF126B50), secondary = Color(0xFF405B79))) {
+                    ModelPreparationScreen(
+                        readiness = app.modelReadiness,
+                        onRetry = { app.retryModelProvisioning() },
+                        onReady = { recreate() },
+                    )
+                }
+            }
+            return
+        }
+        enterReadyUi(app)
+    }
+
+    private fun enterReadyUi(app: EdithApplication) {
         // W1 (F17/F18): the vendor SDK's `connect` needs an Activity, and only this page has one. Handing it over here
         // is what lets the session start path (which runs inside `SessionService`) establish the CXR link itself
         // instead of depending on one UI combination happening to be composed. Held weakly by the composition.
+        val root = app.composition
+        attachedRoot = root
         root.attachCxrActivity(this)
         val viewModel = ViewModelProvider(this, object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = SessionViewModel(root) as T
@@ -170,12 +200,12 @@ class MainActivity : ComponentActivity() {
      */
     override fun onStart() {
         super.onStart()
-        root.uiVisible(true)
+        attachedRoot?.uiVisible(true)
     }
 
     override fun onStop() {
         super.onStop()
-        root.uiVisible(false)
+        attachedRoot?.uiVisible(false)
     }
 
     /**
@@ -209,7 +239,7 @@ class MainActivity : ComponentActivity() {
     @Deprecated("SDK authorization uses startActivityForResult; the transport is the only consumer")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        root.onCxrAuthorizationResult(resultCode, data)
+        attachedRoot?.onCxrAuthorizationResult(resultCode, data)
     }
 
     private fun notificationsGranted() = Build.VERSION.SDK_INT < 33 ||
@@ -222,6 +252,62 @@ class MainActivity : ComponentActivity() {
  * The mode's risk copy stays on the settings page, before the switch and in the second confirmation; the banner
  * repeated it above every page, which the owner asked to stop. See [NoInterceptionUi] for the remaining copy.
  */
+
+/**
+ * 0.4 Task 3 / spec §6.3: the only screen while the bundled models are not ready.
+ *
+ * It deliberately shows **nothing from the composition** - the composition does not exist yet. Preparing shows the
+ * one honest fact (first start copies about 1.0 GiB); failed shows a stable reason and a retry. A READY transition
+ * re-enters the Activity so the normal UI and its composition are built from the main thread exactly once.
+ */
+@Composable
+private fun ModelPreparationScreen(
+    readiness: ModelReadiness,
+    onRetry: () -> Unit,
+    onReady: () -> Unit,
+) {
+    val state by readiness.state.collectAsStateWithLifecycle()
+    LaunchedEffect(state) {
+        if (state is ProvisioningState.Ready) onReady()
+    }
+    Column(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        when (val current = state) {
+            ProvisioningState.Preparing -> {
+                Text("正在准备本地模型", style = MaterialTheme.typography.headlineSmall)
+                Spacer(Modifier.height(16.dp))
+                CircularProgressIndicator()
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    "首次启动需要把内置模型复制到本机（约 1.0 GiB），请保持充足电量与存储空间。",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+
+            is ProvisioningState.Failed -> {
+                Text("本地模型准备失败", style = MaterialTheme.typography.headlineSmall)
+                Spacer(Modifier.height(12.dp))
+                Text(modelFailureText(current.reason), style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(20.dp))
+                Button(onClick = onRetry) { Text("重试") }
+            }
+
+            is ProvisioningState.Ready -> Unit
+        }
+    }
+}
+
+/** Stable failure code to short Chinese copy; the code itself is safe to show (no path, no content). */
+private fun modelFailureText(reason: String): String = when (reason) {
+    "MODELS_NO_SPACE" -> "设备存储空间不足，需要约 1.0 GiB 可用空间。"
+    "MODELS_ASR_FAILED" -> "语音识别模型准备失败。"
+    "MODELS_LAYA_FAILED" -> "本地决策模型准备失败。"
+    "MODELS_EMBEDDING_FAILED" -> "本地向量模型准备失败。"
+    else -> "模型准备失败（$reason）。"
+}
 
 /**
  * R109 (user report 2026-10-20, pocket false touch): a confirmation is settled **only** by its 拒绝 / 急停 / 允许

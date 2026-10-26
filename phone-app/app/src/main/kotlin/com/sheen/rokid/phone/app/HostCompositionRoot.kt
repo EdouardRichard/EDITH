@@ -32,6 +32,8 @@ import com.sheen.rokid.phone.storage.AndroidNamespaceStorage
 import com.sheen.rokid.phone.model.AssetEngineBundleProvisioning
 import com.sheen.rokid.phone.model.EngineBundleProvisioning
 import com.sheen.rokid.phone.model.ModelAssetSource
+import com.sheen.rokid.phone.model.ModelReadiness
+import com.sheen.rokid.phone.model.ModelStartGate
 import com.sheen.rokid.phone.storage.AndroidProfileRepository
 import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
@@ -327,6 +329,12 @@ class HostCompositionRoot internal constructor(
     internal val proactiveArming: ProactiveArming = ProactiveArming(),
     /** P5 (spec §S4): shared gate between speech player and wake/acoustic suppression. */
     val playbackGate: PlaybackGate = PlaybackGate(),
+    /**
+     * 0.4 Task 3 (spec §6.3): the bundled-model readiness this session must be gated on. Null keeps the pre-0.4
+     * behavior for hand-built compositions and tests; production passes the App's one instance and [create] refuses
+     * to assemble unless it is Ready.
+     */
+    val modelReadiness: ModelReadiness? = null,
 ) : AutoCloseable {
     /**
      * P5 (spec §S5): the 「语音朗读」 switch state, persisted globally and **off by default**.
@@ -891,6 +899,12 @@ class HostCompositionRoot internal constructor(
 
     @Synchronized fun start(pluginId: String) {
         if (closed) return
+        // Defense in depth (spec §6.3): the service and `dispatch` already refuse before reaching here, but a direct
+        // caller must not start a half-capability session either.
+        ModelStartGate.refusal(modelReadiness?.state?.value)?.let { refusal ->
+            error(refusal)
+            return
+        }
         pendingStart = null
         mutableState.update { it.copy(selectedPluginId = pluginId, errorCode = null) }
         // 0.25 Task 14 (R74): the assistant is TEXT+IMAGE. A profile that does not declare IMAGE refuses the session
@@ -1768,6 +1782,14 @@ class HostCompositionRoot internal constructor(
     }
 
     private fun activateSelected() {
+        // Every activation path (resume, select, scene-ready retry) refuses without ready models, so a session can
+        // never be advertised with a missing ASR/Laya/Embedding bundle behind it.
+        ModelStartGate.refusal(modelReadiness?.state?.value)?.let { refusal ->
+            disarmAudioEpoch()
+            host.pause()
+            error(refusal)
+            return
+        }
         val selected = state.value.selectedPluginId ?: return
         // 0.25 Task 14 (R74): the same startup gate on every activation path (resume included), so a profile edited
         // back to text-only between sessions is refused visibly instead of starting a request the gate would deny.
@@ -1928,6 +1950,13 @@ class HostCompositionRoot internal constructor(
             pendingStart = null
             if (redelivered || grant == null || token != grant.token || clock.nowNanos() >= grant.expires) return false
             if (!permissionGranted) { host.stop(); error("BLUETOOTH_PERMISSION_DENIED"); return false }
+            // 0.4 Task 3 / spec §6.3: the model gate comes **before** `beforeStart`, otherwise the foreground service
+            // is already running for a session that cannot use the models. `beforeStart` is the caller's
+            // `startForeground`; returning false here leaves the service to stop itself.
+            ModelStartGate.refusal(modelReadiness?.state?.value)?.let { refusal ->
+                error(refusal)
+                return false
+            }
             beforeStart()
             start(grant.pluginId)
             return true
@@ -1961,7 +1990,21 @@ class HostCompositionRoot internal constructor(
         /** The debug-only diagnostic text plugin's id; its configuration shape is not the smart plugin's. */
         private const val DIAGNOSTIC_PLUGIN_ID = "p2-diagnostic"
 
-        fun create(context: Context, initialObserver: (ByteArray) -> Unit = {}): HostCompositionRoot {
+        fun create(
+            context: Context,
+            initialObserver: (ByteArray) -> Unit = {},
+            readiness: ModelReadiness? = null,
+            provision: (() -> Unit)? = null,
+        ): HostCompositionRoot {
+            // 0.4 Task 3 / spec §6.3: the composition is only ever assembled from ready models. Production's
+            // `EdithApplication` already gates on this, and the assertion here keeps a future/hand-written call path
+            // from building a half-capability session (a missing ASR bundle means no `Capability.Asr`, a missing Laya
+            // graph means a plugin that cannot activate).
+            if (readiness != null) {
+                ModelStartGate.refusal(readiness.state.value)?.let { refusal ->
+                    throw IllegalStateException("HostCompositionRoot.create requires ready models: $refusal")
+                }
+            }
             // Transport, audio engines and glasses output remain separate device gates.
             val clock = object : MonotonicClock { override fun nowNanos() = System.nanoTime().coerceAtLeast(0) }
             val timer = Executors.newSingleThreadScheduledExecutor { Thread(it, "edith-phone-deadlines").apply { isDaemon = true } }
@@ -2162,6 +2205,9 @@ class HostCompositionRoot internal constructor(
             val systemOne = SystemOneServiceImpl(
                 modelPath = File(context.filesDir, LAYA_MAIN_GRAPH).absolutePath,
                 engine = LayaInferenceEngineImpl(context),
+                // Defense in depth (0.4 Task 3): the first-start materialization normally already ran; this lets a
+                // file deleted between then and this loader thread be repaired before the existence check.
+                provision = provision,
             )
             // edith-0.2 Phase B (C4/B5): the embedding service gets the LiteRT engine and the directory the
             // artifacts are actually provisioned to. Both halves were wrong before: no engine was passed, so the
@@ -2175,6 +2221,7 @@ class HostCompositionRoot internal constructor(
                     context.filesDir,
                 ).absolutePath,
                 engine = EmbeddingGemmaLiteRTEngine(),
+                provision = provision,
             )
             val contextSignals = CxrContextSignals(clock, listOf(
                 CxrContextSignals.armingSource(proactiveArming),
@@ -2801,7 +2848,9 @@ class HostCompositionRoot internal constructor(
                 visionGate = visionGate,
                 noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
-                playbackGate = playbackGate)
+                playbackGate = playbackGate,
+                modelReadiness = readiness,
+            )
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
             // connection that has not been built yet.
             root.observerHolder = observerHolder
@@ -3110,18 +3159,16 @@ internal object EmbeddingModelDirectory {
      *        threw `NullPointerException: getFilesDir(...) must not be null` out of `create()` and the app could not
      *        assemble, which is worse than a refusal.
      *
-     *        The fallback is deliberately a path that cannot exist rather than the internal `filesDir`: falling back
-     *        to a directory that might hold something else would answer "the model is here" with whatever happened to
-     *        be there, and refusing the turn is the honest state when the artifacts are unreachable.
+     *        **0.4 Task 3:** the external directory stays primary, but when it is absent the fallback is the
+     *        reachable internal `filesDir/models/embeddinggemma` the provisioner writes to (spec §6.3). Only when
+     *        both directories are absent does this return a path that cannot exist, so a context-less JVM rig keeps
+     *        degrading to a refusal instead of reading whatever happens to be there.
      */
-    fun locate(externalFilesDir: File?, internalFilesDir: File?): File =
-        if (externalFilesDir != null) {
-            File(externalFilesDir, RELATIVE_PATH)
-        } else {
-            // `File("")` keeps the result relative when even the internal directory is absent; it still cannot exist,
-            // which is the property that matters.
-            File(File(internalFilesDir ?: File(""), UNREACHABLE_PREFIX), RELATIVE_PATH)
-        }
+    fun locate(externalFilesDir: File?, internalFilesDir: File?): File = when {
+        externalFilesDir != null -> File(externalFilesDir, RELATIVE_PATH)
+        internalFilesDir != null -> File(internalFilesDir, RELATIVE_PATH)
+        else -> File(File(""), UNREACHABLE_PREFIX).resolve(RELATIVE_PATH)
+    }
 }
 
 internal object DebugImportDirectory {    const val STORE_DIRECTORY = "engine-models"
