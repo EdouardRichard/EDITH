@@ -72,8 +72,9 @@ class AudioIngressLoopTest {
 
     private class RecordingWakeEngine : WakeWordEngine {
         val frames = mutableListOf<PcmFrame>()
+        var resetCount = 0
         override fun accept(frame: PcmFrame): List<String> { frames += frame; return emptyList() }
-        override fun reset() = Unit
+        override fun reset() { resetCount++ }
         override fun close() = Unit
     }
 
@@ -163,6 +164,26 @@ class AudioIngressLoopTest {
             rig.asr.frames.size,
         )
         assertEquals(0, rig.ingress.queuedBytes)
+    }
+
+    @Test
+    fun startingAFreshEpochResetsTheWakeStreams() {
+        // 0.4 final K40 acceptance: after a live glasses session, switching to detached reuses the same input loop and
+        // wake detector; the eight native KWS streams still held the CXR stream state, and five synthetic wake plays
+        // produced no hit until an explicit detector reset/cold start. A new epoch is a new source boundary, so the
+        // wake engine must be re-staggered rather than continue the old stream.
+        val rig = Rig()
+        rig.open()
+        rig.loop.start(rig.epoch)
+        assertEquals("a fresh epoch must reset the KWS streams", 1, rig.wakeEngine.resetCount)
+
+        rig.loop.start(rig.epoch)
+        assertEquals("starting the same epoch again is the documented no-op", 1, rig.wakeEngine.resetCount)
+
+        rig.loop.stop(rig.epoch)
+        val next = InputEpoch(SessionId("s-2"), Generation(2), 1)
+        rig.loop.start(next)
+        assertEquals("a different epoch must reset again", 2, rig.wakeEngine.resetCount)
     }
 
     @Test

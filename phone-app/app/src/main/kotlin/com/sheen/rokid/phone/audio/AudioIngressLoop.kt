@@ -147,6 +147,11 @@ class AudioIngressLoop(
             handle = schedule(epoch, clock.nowNanos() + cadenceMillis * 1_000_000L)
         }
         replaced?.cancel()
+        // A new epoch is a new audio source/session boundary. The eight native KWS streams otherwise keep the
+        // previous source's decoder state; on the K40 a glasses→detached switch then missed every synthetic wake
+        // until the detector was reset by a dictation or a cold start. Re-stagger the streams here, where every
+        // start (including resume) already resets the framer.
+        wake?.reset()
     }
 
     /** Clears the `P3_FRAME` counters for a fresh epoch and anchors the time interval on the start moment. */
