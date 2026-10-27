@@ -83,6 +83,7 @@ import com.sheen.rokid.phone.session.confirmation.ConfirmationNotifier
 import com.sheen.rokid.phone.session.confirmation.ConfirmationPresenter
 import com.sheen.rokid.phone.bridge.ConversationWireDisplay
 import com.sheen.rokid.phone.session.ToneWakeChimeSink
+import com.sheen.rokid.phone.session.EchoMuteWindow
 import com.sheen.rokid.phone.session.WakeChime
 import com.sheen.rokid.phone.session.confirmation.AndroidNotificationSurface
 import com.sheen.rokid.phone.session.confirmation.ConfirmationChannelKind
@@ -2369,6 +2370,11 @@ class HostCompositionRoot internal constructor(
         // instead. Refused before the link so no command and no `appStart` can leave the phone.
         if (detachGate.enabled.value) false else hintLink?.requestPanelOpen(route) ?: false
 
+    private var wakeAckPlayer: AndroidSpeechPlayer? = null
+
+    /** The detached acknowledgement's echo-mute window; [create] builds the one instance the loops consult. */
+    private var echoMute: EchoMuteWindow? = null
+
     /**
      * One wake detector emission, as `create` delivers it (0.24 S5 final review Important #1).
      *
@@ -2377,11 +2383,23 @@ class HostCompositionRoot internal constructor(
      * and the smart plugin's own scene admission - so it lives here rather than in a lambda a test cannot drive.
      *
      * @param chime the wearer-facing acknowledgement, played only for a wake that has a live identity.
+     * @param ack detached mode's fixed spoken acknowledgement; true means it was accepted and the beep is skipped.
      */
-    internal fun emitWake(host: HostRuntime, word: String, confidence: Double, chime: () -> Unit = {}) {
+    internal fun emitWake(
+        host: HostRuntime,
+        word: String,
+        confidence: Double,
+        ack: (String) -> Boolean = { false },
+        chime: () -> Unit = {},
+    ) {
         val identity = runCatching { host.currentIdentity() }.getOrNull()
         if (identity != null) {
-            chime()
+            // 0.4 detached wake acknowledgement (owner 2026-10-27): in detached mode the fixed spoken phrase
+            // replaces the beep. The wake event is NOT deferred - the WAKE turn and its ASR open at once, and the
+            // acknowledgement's own echo is kept out of them by the [EchoMuteWindow] the ack opens over the capture.
+            val acknowledged = detachGate.enabled.value &&
+                runCatching { ack(DETACHED_WAKE_ACK_TEXT) }.getOrDefault(false)
+            if (!acknowledged) chime()
             // 0.24 S5 final review Important #1: a live identity is necessary but not sufficient. The plugin can still
             // refuse the wake (scene cooldown), and no turn is then installed, so the panel would have nothing to
             // close it. Ask the plugin's own admission before asking for the window.
@@ -2391,6 +2409,38 @@ class HostCompositionRoot internal constructor(
             if (!detachGate.enabled.value && pluginAdmitsWake()) requestPanelOpen(AssistantRoute.WAKE)
         }
         emitWakeDetected(host, clock, word, confidence)
+    }
+
+    /**
+     * Detached-only fixed acknowledgement. It is not a turn, not a hint and never reaches the CXR link.
+     *
+     * The [EchoMuteWindow] opens **before** the utterance is requested and closes one reverb tail after the player
+     * reports it finished or failed, so the phone microphone's ASR/VAD/KWS never see the phrase. The TTS engine may
+     * lazily await initialization for up to 3 s, so the utterance runs on its own daemon thread; a blocking await
+     * here would stall the wake pipeline.
+     */
+    internal fun speakDetachedWakeAck(text: String): Boolean {
+        if (!detachGate.enabled.value || !speechEnabled.value) return false
+        val player = wakeAckPlayer ?: return false
+        val mute = echoMute ?: return false
+        mute.open()
+        P3Log.line("P4_WAKE_ACK state=requested")
+        runCatching {
+            Thread({
+                val accepted = runCatching {
+                    player.speakText(text, "detached-wake-ack") { state ->
+                        if (state == com.sheen.rokid.plugin.SpeechPlayback.FINISHED ||
+                            state == com.sheen.rokid.plugin.SpeechPlayback.FAILED) mute.close()
+                    }
+                }.getOrDefault(false)
+                if (!accepted) mute.close()
+                P3Log.line("P4_WAKE_ACK state=${if (accepted) "accepted" else "unavailable"}")
+            }, "edith-wake-ack").apply { isDaemon = true }.start()
+        }.onFailure {
+            mute.close()
+            P3Log.line("P4_WAKE_ACK state=unavailable")
+        }
+        return true
     }
 
     /**
@@ -2951,6 +3001,9 @@ class HostCompositionRoot internal constructor(
         }
     }
     companion object {
+        /** Detached mode's one fixed wake acknowledgement (owner decision 2026-10-27). */
+        internal const val DETACHED_WAKE_ACK_TEXT = "我在"
+
         /** The debug-only diagnostic text plugin's id; its configuration shape is not the smart plugin's. */
         private const val DIAGNOSTIC_PLUGIN_ID = "p2-diagnostic"
 
@@ -3240,6 +3293,10 @@ class HostCompositionRoot internal constructor(
             // P5 (spec §S4): one PlaybackGate shared between the speech player, the wake/acoustic suppression, and
             // the ASR ingestion guard. Created before the audio chain so it can be passed to provisionAudioChain.
             val playbackGate = PlaybackGate()
+            // 0.4 detached wake acknowledgement (owner 2026-10-27): the half-duplex window that keeps the spoken
+            //「我在」out of the phone microphone's ASR/VAD/KWS. Created with the gate because both are driven by the
+            // same playback callbacks, and handed to the audio chain so every loop it builds consults one instance.
+            val echoMute = EchoMuteWindow(clock)
             // 0.4 Task 6 (`D199`/`D200`): the phone microphone is an alternative **source** on the existing loop, not a
             // second chain. One ingress instance is created here and named by the chain's dynamic selector while the
             // detach gate is on; `armAudioEpoch` opens it, the phone capture offers into it, and the same framer/
@@ -3295,11 +3352,14 @@ class HostCompositionRoot internal constructor(
                             // were heard, and nothing claims to be an answer. 0.24 S5 final review Important #1: the
                             // composition owns the chime and the resident-panel decision together, so a wake the plugin
                             // will refuse cannot open an overlay with no turn behind it.
-                            root.emitWake(host, word, confidence) {
-                                val outcome = wakeChime.playOutcome(
-                                    clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
-                                P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
-                            }
+                            root.emitWake(host, word, confidence,
+                                chime = {
+                                    val outcome = wakeChime.playOutcome(
+                                        clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
+                                    P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
+                                },
+                                ack = { text -> root.speakDetachedWakeAck(text) },
+                            )
                         } else {
                             // The composition does not exist yet (the chain is built before it): no panel can be asked
                             // for, but the detector's evidence still has to reach the host.
@@ -3312,7 +3372,9 @@ class HostCompositionRoot internal constructor(
                 acousticEmit = armedAcousticSink({ hostHolder[0] }, clock, proactiveArming),
                 cooldownNanos = smartSettings.cooldownNanos,
                 suppressWhile = playbackSuppression { rootHolder[0] },
-                playbackGate = playbackGate)
+                playbackGate = playbackGate,
+                muteWindow = echoMute,
+            )
             // P5 (C1+C2+C3 fix): bridge audio capture → segment source → media source.
             val audioBridge = audio?.let { AudioSegmentBridge(it.audioCapture) }
             audioBridge?.let {
@@ -3914,6 +3976,8 @@ class HostCompositionRoot internal constructor(
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
             // connection that has not been built yet.
             root.observerHolder = observerHolder
+            root.wakeAckPlayer = speechPlayer as? AndroidSpeechPlayer
+            root.echoMute = echoMute
             root.armObserver(initialObserver)
             root.lockPinStore = lockPinStore
             root.unlockCoordinatorForProbe = unlockGate
@@ -4374,6 +4438,12 @@ internal class CxrAudioChain private constructor(
     val audioCapture: AudioSegmentCapture = AudioSegmentCapture(),
     /** P5 (C3 fix): the bridge ref shared with the pipeline's emit callback. Set after construction. */
     internal var bridgeRef: java.util.concurrent.atomic.AtomicReference<AudioSegmentBridge?>? = null,
+    /**
+     * 0.4 detached wake acknowledgement: the echo-mute window every loop this chain builds consults. Null keeps
+     * every frame untouched (glasses-only harnesses, pre-ack behavior); production passes the composition's one
+     * instance, and only a detached acknowledgement ever opens it.
+     */
+    private val muteWindow: EchoMuteWindow? = null,
 ) : AutoCloseable {
 
     private val lock = Any()
@@ -4583,7 +4653,7 @@ internal class CxrAudioChain private constructor(
         val cxr = ingress()
         if (cxr != null) drainStale(cxr)
         val built = AudioIngressLoop(phoneIngress, framer, pipeline, wake?.detector, scheduler, clock,
-            onFault = faultSink)
+            onFault = faultSink, muteWindow = muteWindow)
         built.wakeEnabled = false
         dictationLoop = built
         dictationActive = true
@@ -4618,7 +4688,7 @@ internal class CxrAudioChain private constructor(
             if (source != null) {
                 drainStale(source)
                 val rebuilt = AudioIngressLoop(source, framer, pipeline, wake?.detector, scheduler, clock,
-                    onFault = faultSink)
+                    onFault = faultSink, muteWindow = muteWindow)
                 rebuilt.wakeEnabled = true
                 loop = rebuilt
                 loopIngress = source
@@ -4718,7 +4788,7 @@ internal class CxrAudioChain private constructor(
             }
             if (current == null && source != null) {
                 current = AudioIngressLoop(source, framer, pipeline, wake?.detector, scheduler, clock,
-                    onFault = faultSink).also { built ->
+                    onFault = faultSink, muteWindow = muteWindow).also { built ->
                     // A loop built while a dictation is quiescing the chain must inherit the switch: the dictation
                     // never wants KWS on its own audio even if a fault rebuilt the loop underneath it.
                     built.wakeEnabled = wakeEnabled
@@ -4785,6 +4855,8 @@ internal class CxrAudioChain private constructor(
             acousticEmit: (AcousticLabel) -> Unit = {},
             /** P5 (I2 fix): playback gate for echo suppression during TTS. */
             playbackGate: PlaybackGate = PlaybackGate(),
+            /** 0.4 detached wake acknowledgement: the echo-mute window the loops consult; null mutes nothing. */
+            muteWindow: EchoMuteWindow? = null,
         ): CxrAudioChain {
             // The session needs the pipeline and the pipeline's emit needs the session: the holder breaks the cycle
             // so both the host's delivery and the plugin-facing provider see every revision, in order.
@@ -4841,7 +4913,7 @@ internal class CxrAudioChain private constructor(
             val session = SherpaAsrSession(pipeline)
             holder[0] = session
             return CxrAudioChain(ingress, framer, pipeline, wake, scheduler, clock, onFault, onOffer, session,
-                wakeEmit, acousticEmit, audioCapture).also {
+                wakeEmit, acousticEmit, audioCapture, muteWindow = muteWindow).also {
                     chainHolder[0] = it
                     it.bridgeRef = bridgeRef
                 }
@@ -4888,6 +4960,7 @@ private fun provisionAudioChain(
     cooldownNanos: Long,
     suppressWhile: () -> Boolean,
     playbackGate: PlaybackGate = PlaybackGate(),
+    muteWindow: EchoMuteWindow? = null,
 ): CxrAudioChain? = try {
     val application = requireNotNull(context.applicationContext) { "APPLICATION_CONTEXT_UNAVAILABLE" }
     val store = DebugImportDirectory.store(application)
@@ -4915,6 +4988,7 @@ private fun provisionAudioChain(
         wakeEmit = wakeEmit,
         acousticEmit = acousticEmit,
         playbackGate = playbackGate,
+        muteWindow = muteWindow,
     )
 } catch (unavailable: Exception) {
     android.util.Log.i("EdithHost", "audio chain unavailable: ${unavailable.javaClass.name}: ${unavailable.message}")
@@ -4993,6 +5067,8 @@ internal fun provisionAudioChainFrom(
     acousticEmit: (AcousticLabel) -> Unit = {},
     /** P5 (I2 fix): the playback gate for echo suppression during TTS. */
     playbackGate: PlaybackGate = PlaybackGate(),
+    /** 0.4 detached wake acknowledgement: the echo-mute window the chain's loops consult. */
+    muteWindow: EchoMuteWindow? = null,
     /**
      * 0.4 Task 2: the ASR bundle imported from the APK's own `assets/models/asr/` files.
      *
@@ -5052,7 +5128,8 @@ internal fun provisionAudioChainFrom(
                         vad = candidate.vad, asr = candidate.asr, speaker = candidate.speaker,
                         wake = wake, scheduler = scheduler, clock = clock, emit = emit, cancelTurn = cancelTurn,
                         onFault = onFault, onOffer = onOffer, wakeEmit = wakeEmit,
-                        acousticEmit = acousticEmit, playbackGate = playbackGate).also { chainHolder[0] = it }
+                        acousticEmit = acousticEmit, playbackGate = playbackGate,
+                        muteWindow = muteWindow).also { chainHolder[0] = it }
                 } catch (unavailable: Throwable) {
                     runCatching { candidate.vad.close() }
                     runCatching { candidate.asr.close() }

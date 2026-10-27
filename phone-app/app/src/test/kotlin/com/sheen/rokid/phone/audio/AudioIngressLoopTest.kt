@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.audio
+import com.sheen.rokid.phone.session.EchoMuteWindow
 import com.sheen.rokid.phone.withP3Sink
 
 import com.sheen.rokid.audio.PcmFramer
@@ -78,7 +79,7 @@ class AudioIngressLoopTest {
         override fun close() = Unit
     }
 
-    private class Rig {
+    private class Rig(muteWindow: EchoMuteWindow? = null) {
         val epoch = InputEpoch(SessionId("s-1"), Generation(1), 0)
         val clock = FakeClock(0)
         val scheduler = ManualScheduler(clock)
@@ -90,11 +91,13 @@ class AudioIngressLoopTest {
         val wakeEngine = RecordingWakeEngine()
         val wake = WakeWordDetector(LoudVad(), wakeEngine, emit = { _, _ -> }, clock = clock)
         val faults = mutableListOf<String>()
+        val mute = muteWindow ?: EchoMuteWindow(clock)
         val loop = AudioIngressLoop(ingress, framer, pipeline, wake, scheduler, clock,
-            cadenceMillis = 20, onFault = { faults += it })
+            cadenceMillis = 20, onFault = { faults += it }, muteWindow = mute)
 
         fun open() = ingress.open(epoch, verified)
         fun offer(bytes: Int) = ingress.offer(epoch, ByteArray(bytes))
+        fun offerLoud() = ingress.offer(epoch, ByteArray(640) { 0x3F })
         fun tick() { clock.advance(20_000_000); scheduler.runDue() }
     }
 
@@ -119,6 +122,43 @@ class AudioIngressLoopTest {
         rig.offerWholeFrame()
         rig.tick()
         assertEquals("a stopped loop must not poll", 3, rig.asr.frames.size)
+    }
+
+    @Test
+    fun framesInsideTheEchoMuteWindowReachBothConsumersSilenced() {
+        val rig = Rig()
+        rig.open()
+        rig.loop.start(rig.epoch)
+
+        rig.offerLoud()
+        rig.tick()
+        assertTrue("outside the window the real samples reach the ASR",
+            rig.asr.frames.last().samples.any { it != 0f })
+        assertTrue("and the wake engine", rig.wakeEngine.frames.last().samples.any { it != 0f })
+
+        rig.mute.open()
+        rig.offerLoud()
+        rig.tick()
+        assertTrue("inside the window the ASR receives silence",
+            rig.asr.frames.last().samples.all { it == 0f })
+        assertTrue("and so does the wake engine", rig.wakeEngine.frames.last().samples.all { it == 0f })
+        assertTrue("the timeline stays contiguous through the muted frames",
+            rig.asr.frames.zipWithNext().all { (a, b) -> a.range.endExclusive == b.range.first })
+
+        rig.mute.close()
+        rig.offerLoud()
+        rig.tick()
+        assertTrue("audio captured inside the reverb tail stays muted",
+            rig.asr.frames.last().samples.all { it == 0f })
+        // The frame timeline advances with offered audio, not with the wall clock: drain until it passes the tail.
+        var drained = 0
+        while (rig.asr.frames.last().samples.all { it == 0f } && drained < 32) {
+            rig.offerLoud()
+            rig.tick()
+            drained++
+        }
+        assertTrue("after the reverb tail the real samples return",
+            rig.asr.frames.last().samples.any { it != 0f })
     }
 
     @Test

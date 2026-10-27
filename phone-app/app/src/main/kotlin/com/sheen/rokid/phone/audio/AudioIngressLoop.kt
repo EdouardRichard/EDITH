@@ -6,6 +6,8 @@ import com.sheen.rokid.audio.PcmIngress
 import com.sheen.rokid.audio.PcmOffer
 import com.sheen.rokid.audio.SpeechPipeline
 import com.sheen.rokid.audio.WakeWordDetector
+import com.sheen.rokid.phone.session.EchoMuteWindow
+import com.sheen.rokid.phone.session.silenced
 import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
@@ -58,6 +60,12 @@ class AudioIngressLoop(
     private val clock: MonotonicClock,
     private val cadenceMillis: Long = 20,
     private val onFault: (String) -> Unit = {},
+    /**
+     * 0.4 detached wake acknowledgement: while this window is open the loop's frames are replaced by silence before
+     * they reach the wake detector and the speech pipeline, so the phone's own acknowledgement can never become a
+     * transcript. Null keeps every frame untouched (glasses mode, dictation loops, all pre-0.4 behavior).
+     */
+    private val muteWindow: EchoMuteWindow? = null,
 ) : InputPort {
 
     private val lock = Any()
@@ -276,7 +284,8 @@ class AudioIngressLoop(
             handle = schedule(epoch, requireNotNull(dueNanos) + cadenceMillis * 1_000_000L)
         }
         faults.forEach(onFault)
-        frames.forEach { frame ->
+        frames.forEach { raw ->
+            val frame = if (muteWindow?.covers(raw.endNanos) == true) raw.silenced() else raw
             if (wakeEnabled) wake?.accept(frame)
             if (pipelineEnabled) pipeline.accept(frame)
         }
