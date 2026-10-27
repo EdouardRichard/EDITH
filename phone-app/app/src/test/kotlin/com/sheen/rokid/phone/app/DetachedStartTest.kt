@@ -481,11 +481,16 @@ class DetachedStartTest {
 
             var chimes = 0
             val acks = mutableListOf<String>()
+            var finishAck: (() -> Unit)? = null
             val lines = withP3Sink { captured ->
                 rig.root.emitWake(rig.host, "伊迪丝", 1.0,
                     chime = { chimes++ },
-                    ack = { text -> acks += text; true })
+                    ack = { text, done -> acks += text; finishAck = done; true })
                 // Reading a host command is a barrier that proves the dispatcher drain ran.
+                rig.host.currentState
+                assertTrue("the turn waits until the spoken acknowledgement finishes: $captured",
+                    captured.none { it.startsWith("P3_WAKE") })
+                finishAck?.invoke()
                 rig.host.currentState
                 captured.toList()
             }
@@ -597,7 +602,7 @@ class DetachedStartTest {
             val acks = mutableListOf<String>()
             rig.root.emitWake(rig.host, "伊迪丝", 1.0,
                 chime = { chimes++ },
-                ack = { text -> acks += text; true })
+                ack = { text, _ -> acks += text; true })
 
             assertEquals("glasses mode must not speak the detached acknowledgement", emptyList<String>(), acks)
             assertEquals("glasses mode keeps its existing beep", 1, chimes)

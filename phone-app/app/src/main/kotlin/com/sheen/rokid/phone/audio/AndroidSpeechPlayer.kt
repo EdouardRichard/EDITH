@@ -107,9 +107,13 @@ internal class AndroidSpeechPlayer(
      *
      * @return false when the engine is unavailable or rejected the utterance; the caller may fall back.
      */
-    internal fun speakText(text: String, utteranceId: String): Boolean {
-        if (!ensureAvailable(utteranceId) {}) return false
-        return startUtterance(text, utteranceId) {}
+    internal fun speakText(
+        text: String,
+        utteranceId: String,
+        onState: (SpeechPlayback) -> Unit = {},
+    ): Boolean {
+        if (!ensureAvailable(utteranceId, onState)) return false
+        return startUtterance(text, utteranceId, onState)
     }
 
     private fun ensureAvailable(utteranceId: String, onState: (SpeechPlayback) -> Unit): Boolean {

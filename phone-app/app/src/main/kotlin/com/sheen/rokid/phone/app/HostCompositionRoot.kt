@@ -2385,14 +2385,23 @@ class HostCompositionRoot internal constructor(
         host: HostRuntime,
         word: String,
         confidence: Double,
-        ack: (String) -> Boolean = { false },
+        ack: (String, () -> Unit) -> Boolean = { _, _ -> false },
         chime: () -> Unit = {},
     ) {
         val identity = runCatching { host.currentIdentity() }.getOrNull()
+        var delivered = false
+        fun deliver() {
+            if (delivered) return
+            delivered = true
+            emitWakeDetected(host, clock, word, confidence)
+        }
+        var ackPending = false
         if (identity != null) {
-            val acknowledged = detachGate.enabled.value &&
-                runCatching { ack(DETACHED_WAKE_ACK_TEXT) }.getOrDefault(false)
-            if (!acknowledged) chime()
+            ackPending = detachGate.enabled.value &&
+                runCatching {
+                    ack(DETACHED_WAKE_ACK_TEXT) { dispatchHostEvent { deliver() } }
+                }.getOrDefault(false)
+            if (!ackPending) chime()
             // 0.24 S5 final review Important #1: a live identity is necessary but not sufficient. The plugin can still
             // refuse the wake (scene cooldown), and no turn is then installed, so the panel would have nothing to
             // close it. Ask the plugin's own admission before asking for the window.
@@ -2401,14 +2410,16 @@ class HostCompositionRoot internal constructor(
             // event and its chime still happen exactly as before (the phone's conversation tab is the display).
             if (!detachGate.enabled.value && pluginAdmitsWake()) requestPanelOpen(AssistantRoute.WAKE)
         }
-        emitWakeDetected(host, clock, word, confidence)
+        // Detached acknowledgement: open the WAKE turn only after the fixed phrase has finished, so ASR cannot
+        // transcribe "我在" and the wearer's first command is not masked by the acknowledgement.
+        if (!ackPending) deliver()
     }
 
     /**
      * Detached-only fixed acknowledgement. It is not a turn, not a hint and never reaches the CXR link; the shared
-     * [PlaybackGate] keeps the microphone from re-detecting it. Failure is honest and falls back to the beep.
+     * [PlaybackGate] keeps the microphone from re-detecting it. [onDone] runs once when playback finishes or fails.
      */
-    internal fun speakDetachedWakeAck(text: String): Boolean {
+    internal fun speakDetachedWakeAck(text: String, onDone: () -> Unit): Boolean {
         if (!detachGate.enabled.value || !speechEnabled.value) return false
         val player = wakeAckPlayer ?: return false
         P3Log.line("P4_WAKE_ACK state=requested")
@@ -2416,11 +2427,23 @@ class HostCompositionRoot internal constructor(
         // acknowledgement is spoken off-thread; a blocking await here would stall the wake pipeline.
         runCatching {
             Thread({
-                val accepted = runCatching { player.speakText(text, "detached-wake-ack") }
-                    .getOrDefault(false)
+                val finished = java.util.concurrent.atomic.AtomicBoolean(false)
+                fun done() {
+                    if (finished.compareAndSet(false, true)) onDone()
+                }
+                val accepted = runCatching {
+                    player.speakText(text, "detached-wake-ack") { state ->
+                        if (state == com.sheen.rokid.plugin.SpeechPlayback.FINISHED ||
+                            state == com.sheen.rokid.plugin.SpeechPlayback.FAILED) done()
+                    }
+                }.getOrDefault(false)
+                if (!accepted) done()
                 P3Log.line("P4_WAKE_ACK state=${if (accepted) "accepted" else "unavailable"}")
             }, "edith-wake-ack").apply { isDaemon = true }.start()
-        }.onFailure { P3Log.line("P4_WAKE_ACK state=unavailable") }
+        }.onFailure {
+            P3Log.line("P4_WAKE_ACK state=unavailable")
+            onDone()
+        }
         return true
     }
 
@@ -3335,7 +3358,7 @@ class HostCompositionRoot internal constructor(
                                         clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
                                     P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
                                 },
-                                ack = { text -> root.speakDetachedWakeAck(text) },
+                                ack = { text, done -> root.speakDetachedWakeAck(text, done) },
                             )
                         } else {
                             // The composition does not exist yet (the chain is built before it): no panel can be asked
