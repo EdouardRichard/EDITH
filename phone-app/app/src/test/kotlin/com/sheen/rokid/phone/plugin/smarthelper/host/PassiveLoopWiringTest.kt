@@ -12,6 +12,8 @@ import com.sheen.rokid.phone.bridge.RokidConnection
 import com.sheen.rokid.phone.app.AudioChainEngines
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
 import com.sheen.rokid.phone.app.HostCompositionRoot
+import com.sheen.rokid.phone.app.TypedSendResult
+import com.sheen.rokid.phone.bridge.UnavailableTaskScope
 
 import com.sheen.rokid.audio.AsrHypothesis
 import com.sheen.rokid.audio.PcmFramer
@@ -90,6 +92,7 @@ import com.sheen.rokid.plugin.SystemOneQuestion
 import com.sheen.rokid.plugin.SystemOneResult
 import com.sheen.rokid.plugin.SystemOneService
 import com.sheen.rokid.plugin.SystemOneStatus
+import com.sheen.rokid.plugin.TaskScope
 import com.sheen.rokid.plugin.EmbedResult
 import com.sheen.rokid.plugin.EmbeddingService
 import com.sheen.rokid.plugin.ModelInfo
@@ -403,6 +406,22 @@ private class NoStorageAccess : StorageAccess {
         val recorder = RecordingInputPort()
         override fun start(epoch: InputEpoch) { order += "start:$name"; recorder.start(epoch) }
         override fun stop(epoch: InputEpoch) { order += "stop:$name"; recorder.stop(epoch) }
+    }
+
+    /**
+     * 0.4 Task 10: a task scope that takes the typed turn's loop and never runs it.
+     *
+     * The composition tests assert **delivery and the result vocabulary**, not the agent loop (that is the plugin
+     * module's `TypedMessageTurnTest`). A never-run block keeps the typed turn installed without needing a model
+     * stream, so `canAcceptTypedMessage()` is false after the request and the root can be closed cleanly.
+     */
+    private class NeverRunsTasks : TaskScope {
+        val launched = CopyOnWriteArrayList<() -> Unit>()
+        override fun launch(block: () -> Unit): CancellationHandle {
+            launched += block
+            return object : CancellationHandle { override fun cancel() = Unit }
+        }
+        override fun cancelAll() = Unit
     }
 
     /**
@@ -807,7 +826,12 @@ private class NoStorageAccess : StorageAccess {
                 root.armAudioEpoch()
                 assertEquals(
                     listOf("P3_AUDIO state=disarmed generation=0 transport=false loop=false reason=NOT_ACTIVE"),
-                    lines.toList(),
+                    audioLines(lines),
+                )
+                // 0.4 Task 6 (spec §7.2): the new evidence line names the source; the P3 line above keeps its shape.
+                assertEquals(
+                    listOf("P4_AUDIO state=disarmed source=cxr transport=false loop=false lockscreen_hold=false reason=NOT_ACTIVE"),
+                    lines.filter { it.startsWith("P4_AUDIO") },
                 )
             }
         } finally {
@@ -862,6 +886,161 @@ private class NoStorageAccess : StorageAccess {
         assertFalse("a closed composition must answer, not throw", root.requestHelp())
     }
 
+    // ---- 0.4 Task 10 (D203): the production typed-message entry point --------------------------------------------
+
+    @Test
+    fun aTypedMessageIsDeliveredAsATypedUserActionAtTheCurrentIdentity() {
+        val rig = androidRoot(RecordingInputPort(), taskScope = NeverRunsTasks()) { wiring ->
+            RecordingConfiguredSmart(wiring.plugin)
+        }
+        try {
+            rig.root.start("smart-assistant")
+            rig.root.connectCxr(activity = Any())
+            rig.root.onSceneReady()
+            assertNull("the plugin must be active for a typed message to reach it", rig.root.state.value.errorCode)
+            val identity = requireNotNull(rig.root.host.currentIdentity())
+
+            val lines = withP3Sink { captured ->
+                assertEquals(
+                    "a live, idle session must accept the typed message",
+                    TypedSendResult.Accepted,
+                    rig.root.requestTypedMessage("  帮我记一条笔记  "),
+                )
+                // Reading a host command is a barrier that proves the dispatcher drain ran.
+                rig.root.host.currentState
+                captured.toList()
+            }
+
+            val typed = rig.recorded.handled.filterIsInstance<UserAction>()
+                .single { it.action == UserAction.Action.Typed }
+            assertEquals("the typed body is trimmed once, at the composition", "帮我记一条笔记", typed.text)
+            assertEquals("the event names the identity the host accepts", identity.first, typed.envelope.sessionId)
+            assertEquals(identity.second, typed.envelope.generation)
+            assertTrue(
+                "the event id names the typed turn and is unique per request: ${typed.envelope.eventId}",
+                typed.envelope.eventId.startsWith("typed-"),
+            )
+            assertEquals(
+                "the accepted line is count-only and names the turn",
+                listOf("P4_TYPED state=accepted turn=${typed.envelope.eventId} chars=7"),
+                lines.filter { it.startsWith("P4_TYPED") },
+            )
+            assertTrue(
+                "the typed text must never be logged: $lines",
+                lines.none { it.contains("帮我记一条笔记") },
+            )
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun aTypedRequestWithoutASessionIsAnsweredAndBlankIsCheckedFirst() {
+        val root = compositionRoot(RecordingInputPort())
+        try {
+            val lines = withP3Sink { captured ->
+                assertEquals(
+                    "a blank body is a local refusal even before an identity is consulted",
+                    TypedSendResult.Blank,
+                    root.requestTypedMessage("   "),
+                )
+                assertEquals(
+                    "nothing is active, so there is no identity to name",
+                    TypedSendResult.NoSession,
+                    root.requestTypedMessage("帮我记一条笔记"),
+                )
+                captured.toList()
+            }
+            val refused = lines.filter { it.startsWith("P4_TYPED") }
+            assertEquals("each request logs exactly one P4_TYPED line: $lines", 2, refused.size)
+            assertTrue("blank is the first reason: ${refused[0]}",
+                refused[0].startsWith("P4_TYPED state=refused reason=blank turn=typed-"))
+            assertTrue("a blank body has zero characters: ${refused[0]}", refused[0].endsWith(" chars=0"))
+            assertTrue("no identity is named as no_session: ${refused[1]}",
+                refused[1].startsWith("P4_TYPED state=refused reason=no_session turn=typed-"))
+            assertTrue("the count is the body's: ${refused[1]}", refused[1].endsWith(" chars=7"))
+        } finally {
+            root.close()
+        }
+        assertEquals(
+            "a closed composition must answer, not throw",
+            TypedSendResult.NoSession,
+            root.requestTypedMessage("帮我记一条笔记"),
+        )
+        assertEquals(
+            "blank stays the first refusal after close, so the result vocabulary is order-stable",
+            TypedSendResult.Blank,
+            root.requestTypedMessage("  "),
+        )
+    }
+
+    @Test
+    fun aTypedRequestDuringAWakeTurnIsReportedBusyAndKeepsTheTurn() {
+        val rig = androidRoot(RecordingInputPort(), taskScope = NeverRunsTasks()) { wiring ->
+            RecordingConfiguredSmart(wiring.plugin)
+        }
+        try {
+            rig.root.start("smart-assistant")
+            rig.root.connectCxr(activity = Any())
+            rig.root.onSceneReady()
+            // A wake opens a turn that is waiting for its transcript: the one condition the typed path must not touch.
+            rig.root.emitWake(rig.root.host, "小艾", 0.9)
+            rig.root.host.currentState
+            assertFalse(
+                "the wake turn must own the slot before the typed request is made",
+                requireNotNull(rig.root.smartPluginForProbe).canAcceptTypedMessage(),
+            )
+
+            val lines = withP3Sink { captured ->
+                assertEquals(TypedSendResult.Busy, rig.root.requestTypedMessage("帮我记一条笔记"))
+                captured.toList()
+            }
+            val refused = lines.single { it.startsWith("P4_TYPED") }
+            assertTrue("the busy reason is named: $refused",
+                refused.startsWith("P4_TYPED state=refused reason=busy turn=typed-"))
+            assertTrue("the count is the body's: $refused", refused.endsWith(" chars=7"))
+            assertTrue(
+                "a refused typed message must not reach the plugin",
+                rig.recorded.handled.filterIsInstance<UserAction>().none { it.action == UserAction.Action.Typed },
+            )
+            assertFalse(
+                "the refusal must not cancel or settle the awaiting wake turn",
+                requireNotNull(rig.root.smartPluginForProbe).canAcceptTypedMessage(),
+            )
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun aTypedRequestTheHostRefusesIsReportedStale() {
+        val rig = androidRoot(RecordingInputPort(), taskScope = NeverRunsTasks()) { wiring ->
+            RecordingConfiguredSmart(wiring.plugin)
+        }
+        try {
+            rig.root.start("smart-assistant")
+            rig.root.connectCxr(activity = Any())
+            rig.root.onSceneReady()
+            // The identity moved between the read and the submit: the host's own answer is what the result reports.
+            rig.root.typedSubmitForProbe = { false }
+
+            val lines = withP3Sink { captured ->
+                assertEquals(TypedSendResult.Stale, rig.root.requestTypedMessage("帮我记一条笔记"))
+                captured.toList()
+            }
+            val refused = lines.single { it.startsWith("P4_TYPED") }
+            assertTrue("the stale reason is named: $refused",
+                refused.startsWith("P4_TYPED state=refused reason=stale turn=typed-"))
+            assertTrue("the count is the body's: $refused", refused.endsWith(" chars=7"))
+            assertTrue(
+                "a stale submission must not reach the plugin",
+                rig.recorded.handled.filterIsInstance<UserAction>().isEmpty(),
+            )
+        } finally {
+            rig.close()
+        }
+    }
+
     /**
      * The real `HostCompositionRoot` with an injected recording input port and the real smart wiring, so the epoch
      * arming runs on the production path (`HostCompositionRoot.start` -> `activateSelected`) rather than in a harness.
@@ -878,6 +1057,11 @@ private class NoStorageAccess : StorageAccess {
         transport: InputPort = RecordingInputPort(),
         withConnection: Boolean = true,
         profile: ModelProfile = profile("p-1"),
+        /**
+         * 0.4 Task 10: the plugin's background work. The shipped default is the environment's own refusal; a typed
+         * message test passes [NeverRunsTasks] so the delivered turn needs no model stream.
+         */
+        taskScope: TaskScope = UnavailableTaskScope,
         register: (HostCompositionRoot) -> Unit = {},
     ): HostCompositionRoot {
         val wiring = SmartWiring(SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1",
@@ -886,6 +1070,7 @@ private class NoStorageAccess : StorageAccess {
             FakeClock(0), ManualScheduler(FakeClock(0)))
         val environment = CxrHostEnvironment(clock = FakeClock(0), input = input, liveOutput = { LiveDisplay() },
             scheduler = ManualScheduler(FakeClock(0)),
+            taskScope = taskScope,
             providers = mapOf(
                 Capability.Model to InertModel(),
                 Capability.Asr to StubAsrSession(),
@@ -1156,6 +1341,8 @@ private class NoStorageAccess : StorageAccess {
     }
 
     private fun androidRoot(input: InputPort, transport: InputPort = RecordingInputPort(),
+        /** 0.4 Task 10: see [compositionRoot]'s same parameter. */
+        taskScope: TaskScope = UnavailableTaskScope,
         registered: (SmartWiring) -> PluginLifecycle = { it.plugin }): AndroidRoot {
         val blobs = TestBlobs()
         val repository = AndroidProfileRepository(blobs, KeystoreVault(blobs))
@@ -1166,6 +1353,7 @@ private class NoStorageAccess : StorageAccess {
             repository, FakeClock(0), ManualScheduler(FakeClock(0)))
         val environment = CxrHostEnvironment(clock = FakeClock(0), input = input, liveOutput = { LiveDisplay() },
             scheduler = ManualScheduler(FakeClock(0)),
+            taskScope = taskScope,
             providers = mapOf(
                 Capability.Model to InertModel(),
                 Capability.Asr to StubAsrSession(),

@@ -205,6 +205,39 @@ class SpeechPipelineTest {
         assertEquals(1, f.cancelled.size)
     }
 
+    @Test fun `a provider fault pauses the pipeline and the next session re-arms it`() = Fixture().use { f ->
+        f.pipeline.accept(frame(0))
+        assertEquals(1, f.asr.accepted.size)
+        val faultedTurn = f.transcripts.single().turnId
+
+        // One transient provider failure is enough to pause the shared pipeline for the rest of the process
+        // (R-CD-3: `fault()` had no re-arm path, so only a force-stop brought ASR back).
+        f.asr.failure = IllegalStateException("PRIVATE PROVIDER FAILURE")
+        f.pipeline.accept(frame(1))
+        assertEquals("SPEECH_PROVIDER_FAILURE", f.events.filterIsInstance<ServiceFaultEvent>().single().code)
+        assertEquals(SessionState.Paused, f.events.filterIsInstance<SessionStateEvent>().single().state)
+        assertTrue(faultedTurn in f.cancelled, "the faulted session's turn is revoked")
+
+        // The same session keeps rejecting audio: recovery is a session boundary, not a retry loop.
+        f.asr.failure = null
+        val pausedTranscripts = f.transcripts.size
+        val pausedEvents = f.events.size
+        f.pipeline.accept(frame(2))
+        assertEquals(pausedTranscripts, f.transcripts.size)
+        assertEquals(pausedEvents, f.events.size)
+
+        // A new session is exactly the boundary the host already treats as a fresh start. Its first frame must
+        // re-arm the pipeline instead of being silently dropped until the App is force-stopped.
+        val nextSession = InputEpoch(SessionId("next-session"), Generation(1), 2)
+        f.pipeline.accept(frame(0, "next", nextSession))
+        assertEquals(2, f.asr.accepted.size, "the new session's frame reaches the recognizer")
+        assertEquals(SampleRange("next", 0, 320), f.asr.accepted.last())
+        assertEquals(1, f.transcripts.size - pausedTranscripts, "the new session's turn is not the faulted one")
+        assertNotEquals(faultedTurn, f.transcripts.last().turnId)
+        assertEquals(1,
+            f.events.filterIsInstance<SessionStateEvent>().count { it.state == SessionState.Paused })
+    }
+
     @Test fun `speaker provider exception pauses and fences subsequent PCM`() = Fixture().use { f ->
         val fault = CountDownLatch(1)
         val pipeline = SpeechPipeline(f.vad, f.asr, PendingSpeaker().apply {

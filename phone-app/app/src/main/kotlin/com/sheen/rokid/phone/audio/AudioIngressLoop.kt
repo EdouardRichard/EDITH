@@ -6,6 +6,8 @@ import com.sheen.rokid.audio.PcmIngress
 import com.sheen.rokid.audio.PcmOffer
 import com.sheen.rokid.audio.SpeechPipeline
 import com.sheen.rokid.audio.WakeWordDetector
+import com.sheen.rokid.phone.session.EchoMuteWindow
+import com.sheen.rokid.phone.session.silenced
 import com.sheen.rokid.contracts.InputEpoch
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.DeadlineScheduler
@@ -58,11 +60,47 @@ class AudioIngressLoop(
     private val clock: MonotonicClock,
     private val cadenceMillis: Long = 20,
     private val onFault: (String) -> Unit = {},
+    /**
+     * 0.4 detached wake acknowledgement: while this window is open the loop's frames are replaced by silence before
+     * they reach the wake detector and the speech pipeline, so the phone's own acknowledgement can never become a
+     * transcript. Null keeps every frame untouched (glasses mode, dictation loops, all pre-0.4 behavior).
+     */
+    private val muteWindow: EchoMuteWindow? = null,
 ) : InputPort {
 
     private val lock = Any()
     private var handle: CancellationHandle? = null
     private var running: InputEpoch? = null
+
+    /**
+     * Whether the frames of this loop are offered to the KWS as well as to the speech pipeline (0.4 Task 12b-ii).
+     *
+     * The orchestrating host disables this for the duration of a phone-microphone dictation: the same loop then keeps
+     * feeding the ASR turn that produces the dictation final, but a wake word spoken into the dictation can never
+     * become a wake request (spec §5.3: 唤醒 KWS 不把听写内容当唤醒/回合). It is a plain per-frame read rather than a
+     * constructor value, because the loop that serves a detached session is the one that later dictates.
+     *
+     * Default true: a loop that nobody told about a dictation behaves exactly as before.
+     */
+    @Volatile var wakeEnabled: Boolean = true
+
+    /**
+     * Whether the frames of this loop are offered to the speech pipeline (0.4 Task 12b-ii).
+     *
+     * A terminal dictation event can be produced in the middle of one drained frame batch. The host sets this false
+     * synchronously when the dictation ends, so the frames left in that batch cannot start a second ASR turn whose
+     * partials would reach the restored wake route. The host re-enables it when the dictation is fully cleaned up (or
+     * rebuilds the loop for glasses mode). Default true - only a dictation quiesce changes it.
+     */
+    @Volatile var pipelineEnabled: Boolean = true
+
+    /**
+     * The epoch this loop is polling under, or null while stopped.
+     *
+     * Exposed so the chain that caches the loop can tell "this is the loop for the epoch being stopped" from a stale
+     * stop naming an older epoch - and only drop the cache in the former case.
+     */
+    val activeEpoch: InputEpoch? get() = synchronized(lock) { running }
 
     /**
      * The deadline of the next tick, or `null` while no loop is running.
@@ -117,6 +155,11 @@ class AudioIngressLoop(
             handle = schedule(epoch, clock.nowNanos() + cadenceMillis * 1_000_000L)
         }
         replaced?.cancel()
+        // A new epoch is a new audio source/session boundary. The eight native KWS streams otherwise keep the
+        // previous source's decoder state; on the K40 a glasses→detached switch then missed every synthetic wake
+        // until the detector was reset by a dictation or a cold start. Re-stagger the streams here, where every
+        // start (including resume) already resets the framer.
+        wake?.reset()
     }
 
     /** Clears the `P3_FRAME` counters for a fresh epoch and anchors the time interval on the start moment. */
@@ -241,9 +284,10 @@ class AudioIngressLoop(
             handle = schedule(epoch, requireNotNull(dueNanos) + cadenceMillis * 1_000_000L)
         }
         faults.forEach(onFault)
-        frames.forEach { frame ->
-            wake?.accept(frame)
-            pipeline.accept(frame)
+        frames.forEach { raw ->
+            val frame = if (muteWindow?.covers(raw.endNanos) == true) raw.silenced() else raw
+            if (wakeEnabled) wake?.accept(frame)
+            if (pipelineEnabled) pipeline.accept(frame)
         }
         // Outside the lock: the summary is an observer of the tick, never part of it.
         summary?.let { P3Log.line(it) }

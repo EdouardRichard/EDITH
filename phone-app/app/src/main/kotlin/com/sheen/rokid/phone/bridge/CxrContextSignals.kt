@@ -80,14 +80,16 @@ internal class CxrContextSignals(
         fun timeOnly(clock: MonotonicClock): CxrContextSignals = CxrContextSignals(clock)
 
         /**
-         * The host's own 「主动辅助」 state, as one context source.
+         * The host's own **effective** 「主动辅助」 state, as one context source.
          *
          * The composition appends this to the Stage A sources, so the arming switch is readable at request time by the
-         * plugin that has to honour it (see [com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming.CONTEXT_KEY]). It is a source rather
-         * than a fourth constructor parameter so the plugin-facing key set stays one flat projection.
+         * plugin that has to honour it (see [com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming.CONTEXT_KEY]). 0.4 Task 5:
+         * the value is `stored && !detached` (`D202`), so a detached session publishes `false` without rewriting the
+         * user's stored switch. It is a source rather than a fourth constructor parameter so the plugin-facing key set
+         * stays one flat projection.
          */
         fun armingSource(arming: com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming): () -> Map<String, String> =
-            { mapOf(com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming.CONTEXT_KEY to arming.enabled.value.toString()) }
+            { mapOf(com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming.CONTEXT_KEY to arming.effectiveProactiveArmed.toString()) }
     }
 }
 

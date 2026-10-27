@@ -29,7 +29,11 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.ui.StorageAccessSkillView
 import com.sheen.rokid.phone.plugin.diagnostic.DiagnosticRegistration
 import com.sheen.rokid.phone.platform.pluginTaskThreadFactory
 import com.sheen.rokid.phone.storage.AndroidNamespaceStorage
+import com.sheen.rokid.phone.model.AssetEngineBundleProvisioning
 import com.sheen.rokid.phone.model.EngineBundleProvisioning
+import com.sheen.rokid.phone.model.ModelAssetSource
+import com.sheen.rokid.phone.model.ModelReadiness
+import com.sheen.rokid.phone.model.ModelStartGate
 import com.sheen.rokid.phone.storage.AndroidProfileRepository
 import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
@@ -45,6 +49,7 @@ import com.sheen.rokid.phone.bridge.HintIdentity
 import com.sheen.rokid.phone.bridge.UiState
 import com.sheen.rokid.phone.bridge.UplinkReport
 import com.sheen.rokid.phone.session.PlaybackGate
+import com.sheen.rokid.phone.session.SessionPermissions
 import com.sheen.rokid.phone.bridge.CxrConnection
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.confirmation.ConfirmationUi
@@ -52,7 +57,18 @@ import com.sheen.rokid.phone.session.confirmation.ConfirmationPanel
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.bridge.RokidConnection
 import com.sheen.rokid.phone.audio.AudioIngressLoop
+import com.sheen.rokid.phone.audio.DictationController
+import com.sheen.rokid.phone.audio.DictationFinal
+import com.sheen.rokid.phone.audio.DictationStartResult
+import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationUiState
+import com.sheen.rokid.phone.audio.SpeechPipelineDictation
+import com.sheen.rokid.phone.audio.PcmRecordDevice
+import com.sheen.rokid.phone.audio.PhoneMicCapture
+import com.sheen.rokid.phone.audio.PhoneMicDevice
+import com.sheen.rokid.phone.audio.PhoneMicFormat
 import com.sheen.rokid.phone.audio.SherpaAsrSession
+import com.sheen.rokid.phone.audio.WakeLockHold
 import com.sheen.rokid.phone.bridge.CxrGlassesTarget
 import com.sheen.rokid.phone.bridge.UnwiredInputPort
 import com.sheen.rokid.phone.bridge.ExecutorTaskScope
@@ -67,6 +83,7 @@ import com.sheen.rokid.phone.session.confirmation.ConfirmationNotifier
 import com.sheen.rokid.phone.session.confirmation.ConfirmationPresenter
 import com.sheen.rokid.phone.bridge.ConversationWireDisplay
 import com.sheen.rokid.phone.session.ToneWakeChimeSink
+import com.sheen.rokid.phone.session.EchoMuteWindow
 import com.sheen.rokid.phone.session.WakeChime
 import com.sheen.rokid.phone.session.confirmation.AndroidNotificationSurface
 import com.sheen.rokid.phone.session.confirmation.ConfirmationChannelKind
@@ -76,6 +93,7 @@ import com.sheen.rokid.phone.session.confirmation.confirmationPresentationChanne
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
+import android.os.PowerManager
 import com.sheen.rokid.audio.AcousticLabeler
 import com.sheen.rokid.audio.LocalSpeakerService
 import com.sheen.rokid.audio.KeywordSpotterWakeWordEngine
@@ -171,6 +189,7 @@ import com.sheen.rokid.phone.context.GlassesStateSource
 import com.sheen.rokid.phone.context.MediaSessionSource
 import com.sheen.rokid.phone.context.NotificationCategorySource
 import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
+import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.model.ProfileProbeGate
 import com.sheen.rokid.phone.model.profileStartupError
 import com.sheen.rokid.phone.artifacts.FileArtifactStore
@@ -199,6 +218,14 @@ private const val PROBE_IMAGE_HEIGHT = 32
 private val PROBE_IMAGE_PNG: ByteArray = Base64.getDecoder().decode(PROBE_IMAGE_BASE64)
 
 /**
+ * 0.4 Task 12b-ii (spec §5.3, D204): the 15 s dictation cap, in the unit the composition's monotonic clock uses.
+ *
+ * Kept as a derivation of the controller's own constant so the host's telemetry can tell "the deadline ended this"
+ * from "the user stopped it" without carrying a second number that could drift from the controller.
+ */
+private const val DICTATION_TIMEOUT_NANOS = DictationController.TIMEOUT_MILLIS * 1_000_000L
+
+/**
  * edith-0.3 Phase 2.2 Task 6: the reason a screen tool's production observation reports when the connected
  * accessibility read itself fails (as opposed to the channel being off, which has its own reason).
  */
@@ -217,6 +244,15 @@ internal fun stopSessionMatches(
     current: Pair<com.sheen.rokid.contracts.SessionId, com.sheen.rokid.contracts.Generation>?,
     sessionId: String,
 ): Boolean = current != null && current.first.value == sessionId
+
+/**
+ * 0.4 Task 10 (`D203`, spec §5.2): how [HostCompositionRoot.requestTypedMessage] ended.
+ *
+ * An enum rather than a boolean because the input row has to tell "nothing to send" (blank), "no session"
+ * ([NoSession]), "the assistant is still working" ([Busy]) and "the session moved on" ([Stale]) apart without reading
+ * a sticky `SessionUiState.errorCode` off the page. [Accepted] means only that the host took the event for delivery.
+ */
+enum class TypedSendResult { Accepted, Blank, NoSession, Busy, Stale }
 
 class HostCompositionRoot internal constructor(
     val host: HostRuntime,
@@ -325,6 +361,61 @@ class HostCompositionRoot internal constructor(
     internal val proactiveArming: ProactiveArming = ProactiveArming(),
     /** P5 (spec §S4): shared gate between speech player and wake/acoustic suppression. */
     val playbackGate: PlaybackGate = PlaybackGate(),
+    /**
+     * 0.4 Task 3 (spec §6.3): the bundled-model readiness this session must be gated on. Null keeps the pre-0.4
+     * behavior for hand-built compositions and tests; production passes the App's one instance and [create] refuses
+     * to assemble unless it is Ready.
+     */
+    val modelReadiness: ModelReadiness? = null,
+    /**
+     * 0.4 Task 5 (`D199`/`D202`): the **live** 「脱离眼镜」 gate.
+     *
+     * [create] seeds it from the persisted [SmartSettings.glassesDetached] (default off), wires its stop-before-save
+     * rule to this composition's own `stop()` and the host's live state, and hands the same instance to the settings
+     * page and to [ProactiveArming]'s detached predicate. A hand-built composition keeps the shipped glasses mode.
+     * Kept **last** so positional construction of older call sites is unchanged.
+     */
+    internal val detachGate: DetachGate = DetachGate(),
+    /**
+     * 0.4 Task 6 (`D199`/`D200`): the one phone-microphone ingress, or null for a hand-built rig that has none.
+     *
+     * [create] builds it once and points the audio chain's ingress selector at it while the detach gate is on, so the
+     * **same** `PcmIngress` is opened by [armAudioEpoch] and polled by the chain's loop. A rig that has no chain has no
+     * use for one, which is why the default is null rather than a second instance nobody polls.
+     */
+    internal val phoneIngress: PcmIngress? = null,
+    /**
+     * 0.4 Task 6: the recorder behind the phone microphone, one per armed epoch.
+     *
+     * A factory rather than an instance because an `AudioRecord` is a session resource: arming creates one, disarming
+     * releases it, and a resumed session starts a fresh one. Production passes `{ PhoneMicDevice() }`; a JVM test
+     * passes a fake `PcmRecordDevice` and drives the same `armAudioEpoch`/`disarmAudioEpoch` branches without a phone.
+     */
+    private val phoneMicDeviceFactory: (() -> PcmRecordDevice)? = null,
+    /**
+     * 0.4 Task 8 (`D199`, spec §4.6): the CPU wake lock that keeps a **detached** session's KWS running while the
+     * phone's screen is off.
+     *
+     * Null for hand-built compositions and rigs with no platform lock (the pre-0.4 behavior); production passes the
+     * one [create] builds over the phone's `PowerManager`. Only a successful detached arm acquires it, and every
+     * teardown path (disarm/pause/stop/close) releases it - never a glasses arm, which has its own CXR uplink and must
+     * not be kept awake by this lock.
+     */
+    private val wakeLock: WakeLockHold? = null,
+    /**
+     * 0.4 Task 12b-ii (`D204`, spec §5.3): the composition's deadline scheduler, used for the 15 s dictation cap.
+     *
+     * The same single-thread executor that runs the audio loop, the hint timers and the vendor-event dispatch. Null in
+     * a hand-built rig that does not wire dictation; [startDictation] then answers `reason=no_scheduler` instead of
+     * pretending a dictation with no deadline exists.
+     */
+    private val deadlineScheduler: DeadlineScheduler? = null,
+    /**
+     * 0.4 Task 12b-ii: whether `RECORD_AUDIO` is granted, read at start time (the page may have asked the user in
+     * between sessions). Defaults to allowed for hand-built rigs; production passes the platform check. This is the
+     * spec's "仅会话运行且 mic 权限已授予时可用" gate, not a substitute for the recorder's own refusal.
+     */
+    private val microphoneGranted: () -> Boolean = { true },
 ) : AutoCloseable {
     /**
      * P5 (spec §S5): the 「语音朗读」 switch state, persisted globally and **off by default**.
@@ -548,11 +639,60 @@ class HostCompositionRoot internal constructor(
             ),
         )
     val state: StateFlow<SessionUiState> = mutableState.asStateFlow()
+
+    // ---- 0.4 Task 12b-ii: phone-microphone dictation (spec §5.3, D204) -------------------------------------------
+
+    /**
+     * What the assistant page shows for dictation: the lease state and the last delivered final.
+     *
+     * Written from the pipeline/loop/scheduler threads (the controller's callbacks are explicitly allowed to arrive
+     * off-main); `MutableStateFlow` is the marshalling seam, and Compose collects it on the main thread. The text is
+     * memory-only: it is never logged, persisted or handed to `HostRuntime`.
+     */
+    private val dictationUiState = MutableStateFlow(DictationUiState())
+    val dictationUi: StateFlow<DictationUiState> = dictationUiState.asStateFlow()
+
+    /** The live per-dictation controller, or null while no dictation lease is held. */
+    private var dictationController: DictationController? = null
+
+    /** The session epoch the active dictation was recorded under; used to restore the audio loop. */
+    private var dictationEpoch: InputEpoch? = null
+
+    /** The phone capture this composition opened **for the dictation** (glasses mode only; null in detached mode). */
+    private var dictationCapture: PhoneMicCapture? = null
+
+    /** Bumped for every start/teardown so a late callback from an older lease cannot touch a newer one. */
+    private var dictationGeneration = 0L
+
+    /** The user asked to stop this lease (distinguishes `stopped` from the 15 s `timeout` in telemetry). */
+    private var dictationStopRequested = false
+
+    /** The user/host aborted this lease (cancel telemetry, no final). */
+    private var dictationCancelRequested = false
+
+    /** Set when a dictation-owned phone capture died; the terminal state is then `Error(code)`, not `NoSpeech`. */
+    private var dictationFailureCode: String? = null
+
+    /** When the active lease began, for the timeout/no-speech reason split (the count is telemetry-only). */
+    private var dictationStartedNanos = 0L
+
+    /** One terminal cleanup task per lease, dispatched to the composition's scheduler thread. */
+    private var dictationCleanupScheduled = false
+
+    /** Monotonic across the composition so the UI can append each final exactly once. */
+    private var dictationFinalSequence = 0L
+
+    /** True only inside [abortDictation]; the controller's terminal callbacks are ignored while the host tears down. */
+    private var dictationTearingDown = false
+
     private val observation = host.observeState { session ->
         // `D53`② (2026-10-11): the 「主动辅助」 switch is a **persisted global setting**, so nothing here resets it -
         // a session ending must not disarm a feature the user asked to have on, and it must not re-arm one they turned
         // off either. There is deliberately no `deactivate()` call on this path any more.
         mutableState.update { it.copy(session = session, capabilityReasons = capabilityReasons(), executionChannels = executionChannels()) }
+        // 0.4 Task 12b-ii fix 2 (finding 2): a terminal dictation status belongs to the session action that produced
+        // it, so a session change dismisses it. Lock-free, like the other dictation-flow writers.
+        clearDictationStatus()
         // 0.24 S5 Task 20: `HostRuntime.interrupt()` is what the transport's `onInterrupted` does for a CXR close
         // (`onSessionClosed`/session-terminating/audio failure). The link state must not outlive the session it names.
         if (session == SessionState.Interrupted) onCxrLinkInterrupted()
@@ -834,10 +974,23 @@ class HostCompositionRoot internal constructor(
      * `HostRuntime.configure` replaces the stored configuration, so sending only the profile selection would drop the
      * settings-derived keys the plugin runs with (Task 14a-fix item 1). A plugin that is already active must be
      * paused first, because the host refuses to configure an active plugin.
+     *
+     * 0.4 Task 8 fix 1 (spec §4.5/§4.6). This pause used to call `host.pause()` directly and so bypassed the
+     * composition's own [pause], which is the path that disarms the audio epoch. A profile change made while a
+     * **detached** session was active therefore left its phone recorder, ingress, poll loop and CPU wake lock running
+     * with the host paused until some later resume/stop/close - the "release on pause" rule violated from a
+     * user-reachable Settings action. Detached mode now disarms first (the ordinary `P4_AUDIO ... reason=DISARMED`
+     * transition, which is also where `lockscreen_hold=false` is recorded). The disarm is deliberately gated on
+     * [detachGate]: glasses mode's pre-0.4 epoch semantics on this settings path are intentionally left byte-for-byte
+     * unchanged, and this fix's scope is the detached source and its CPU hold.
      */
-    @Synchronized private fun applyProfileSelection(pluginId: String, profile: ModelProfile?) {
+    @Synchronized internal fun applyProfileSelection(pluginId: String, profile: ModelProfile?) {
         if (closed) return
-        if (activatedPlugin == pluginId) { host.pause(); activatedPlugin = null }
+        if (activatedPlugin == pluginId) {
+            if (detachGate.enabled.value) disarmAudioEpoch()
+            host.pause()
+            activatedPlugin = null
+        }
         val configuration = configurationFor(pluginId, profile) ?: return
         check(host.configure(pluginId, configuration)) { "Profile selection unavailable" }
     }
@@ -889,6 +1042,12 @@ class HostCompositionRoot internal constructor(
 
     @Synchronized fun start(pluginId: String) {
         if (closed) return
+        // Defense in depth (spec §6.3): the service and `dispatch` already refuse before reaching here, but a direct
+        // caller must not start a half-capability session either.
+        ModelStartGate.refusal(modelReadiness?.state?.value)?.let { refusal ->
+            error(refusal)
+            return
+        }
         pendingStart = null
         mutableState.update { it.copy(selectedPluginId = pluginId, errorCode = null) }
         // 0.25 Task 14 (R74): the assistant is TEXT+IMAGE. A profile that does not declare IMAGE refuses the session
@@ -906,7 +1065,10 @@ class HostCompositionRoot internal constructor(
         // combination's composition, so a cold start could reach `BuildingScene` and never even *attempt* a CXR
         // connection - and the ears, gated on `linkReady`, then never armed. This only adjusts **when we call** the
         // vendor transport; the call shape is unchanged (official demo).
-        ensureCxrLink()
+        // 0.4 Task 7 (`D199`, spec §4.3): detached mode is strictly local - the start must not build, connect or ask
+        // for a CXR transport, and a `P3_CXR` line would describe a link this session does not use. The session and
+        // the local readiness below (`maybeMarkSceneReady`) are the whole detached start.
+        if (!detachGate.enabled.value) ensureCxrLink()
         // A new session re-arms the clock exchange (`sessionEstablished` drops the old mapping), so the next live
         // mapping is a fresh one and must be retried against even if it somehow carried the previous identifier.
         retriedMappingSyncId = null
@@ -1097,6 +1259,10 @@ class HostCompositionRoot internal constructor(
     }
     @Synchronized fun onSceneReady() {
         if (closed) return
+        // 0.4 Task 7 (`D199`, spec §4.1 race): a detached session is **locally** ready (`maybeMarkSceneReady`), and
+        // the glasses are not part of it. A late transport callback must neither introduce a session to `hintLink`
+        // nor claim a link the composition never uses - and it must not touch the running session at all.
+        if (detachGate.enabled.value) return
         // Remembered rather than only acted on: readiness can arrive before a session is started, and the signal is
         // delivered exactly once by the transport.
         linkReady = true
@@ -1123,6 +1289,17 @@ class HostCompositionRoot internal constructor(
      * active connection has been replaced meanwhile (Task 15c D1).
      */
     private var runningAudioTransport: InputPort? = null
+
+    /**
+     * 0.4 Task 6: the phone capture [armAudioEpoch] started in detached mode, or null while no phone epoch runs.
+     *
+     * Held so `disarmAudioEpoch` releases **the** recorder the armed epoch owns (not a newly built one), and so the
+     * pause/stop/close paths all go through one idempotent release (`PhoneMicCapture.stop`).
+     */
+    private var runningPhoneCapture: PhoneMicCapture? = null
+
+    /** Whether the running epoch's source is the phone (true) or the CXR uplink (false); drives the log's `source=`. */
+    private var runningAudioDetached = false
     private var inputSerial = 0L
 
     /** The epoch currently polling the ingress, or null. Read by the App's diagnostics and by tests. */
@@ -1144,19 +1321,40 @@ class HostCompositionRoot internal constructor(
      * `audio data 0 bytes`. The transport's own [InputPort] is started first, so the loop built after it polls an open
      * ingress; both are handed the **same** epoch. With no CXR connection there is no port to open the ingress, so
      * nothing is started at all here and the display-live retry re-enters this method once the connection exists.
+     *
+     * **Detached mode (0.4 Task 6, `D199`/`D200`).** When the gate is on, the phone **is** the source: there is no
+     * transport to open anything and no `activeConnection` to require. The composition opens the phone ingress itself,
+     * starts the phone capture for that epoch, and then starts the existing loop - the same
+     * `PcmFramer`/`SpeechPipeline`/KWS path the CXR uplink feeds, so only the source changes. The glasses branch below
+     * is byte-for-byte the transport-then-loop path it was; its `P3_AUDIO` lines keep their pre-0.4 shape and the new
+     * 0.4 `P4_AUDIO` line records the source (`spec §7.2`).
+     *
+     * @return false only when a **detached** arm failed and has already been fully unwound (`disarm`, `host.pause`,
+     *   `errorCode`), so [activateSelected] must not go on to treat the session as started (spec §4.5). Everything the
+     *   pre-0.4 path considers a started session returns true, including "already armed" and glasses mode with no
+     *   transport yet (that one stays retryable exactly as before).
      */
-    @Synchronized fun armAudioEpoch() {
+    @Synchronized fun armAudioEpoch(): Boolean {
+        val detached = detachGate.enabled.value
         if (closed || activatedPlugin == null) {
-            P3Log.line("P3_AUDIO state=disarmed generation=${host.currentGeneration.value} " +
-                "transport=false loop=false reason=NOT_ACTIVE")
-            return
+            logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
+                generation = host.currentGeneration.value, reason = "NOT_ACTIVE")
+            return false
         }
         // A second arm of a still-running epoch changes nothing, so it is not an observable event and gets no line.
-        if (runningAudioEpoch != null) return
+        if (runningAudioEpoch != null) return true
+        // 0.4 Task 13d: a new audio epoch is a new session. Re-open the transcript route a previous dictation may
+        // have closed, and re-arm the shared pipeline if a provider fault paused it (R-CD-3: only a force-stop used to
+        // bring ASR back after one transient fault, because the pipeline is process-lifetime).
+        audioChain?.openTranscriptRoute("session")
+        audioChain?.rearmPipeline("session")
         val session = activeSessionId ?: run {
-            P3Log.line("P3_AUDIO state=disarmed generation=${host.currentGeneration.value} " +
-                "transport=false loop=false reason=SESSION_MISSING")
-            return
+            logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
+                generation = host.currentGeneration.value, reason = "SESSION_MISSING")
+            return false
+        }
+        if (detached) {
+            return armPhoneAudioEpoch(session)
         }
         val transport = activeConnection?.inputPortOrNull()
         if (transport == null) {
@@ -1165,9 +1363,9 @@ class HostCompositionRoot internal constructor(
             // activation retryable, and that retry runs this method again with the port present.
             android.util.Log.i("EdithHost", "AUDIO_EPOCH_TRANSPORT_MISSING: no CXR connection, the audio epoch " +
                 "stays disarmed (session=$session generation=${host.currentGeneration} state=${host.currentState})")
-            P3Log.line("P3_AUDIO state=disarmed generation=${host.currentGeneration.value} " +
-                "transport=false loop=false reason=TRANSPORT_MISSING")
-            return
+            logAudioState("disarmed", "cxr", transport = false, loop = false,
+                generation = host.currentGeneration.value, reason = "TRANSPORT_MISSING")
+            return true
         }
         // The generation is read **here**, at the moment the epoch is built, and is never passed in by the caller.
         // `activateSelected` resolves its own copy before `HostRuntime.activate`/`switchTo` runs, and `switchTo`
@@ -1178,6 +1376,7 @@ class HostCompositionRoot internal constructor(
         val epoch = InputEpoch(SessionId(session), host.currentGeneration, Math.incrementExact(inputSerial).also { inputSerial = it })
         runningAudioEpoch = epoch
         runningAudioTransport = transport
+        runningAudioDetached = false
         // Either both halves run or neither does: a transport that opened the ingress with nothing polling it leaks a
         // live stream, and a loop over an ingress the transport refused to open is the defect this fix removes.
         val failure = runCatching {
@@ -1191,28 +1390,222 @@ class HostCompositionRoot internal constructor(
             runningAudioEpoch = null
             runningAudioTransport = null
             android.util.Log.i("EdithHost", "audio epoch could not start: ${failure.javaClass.name}: ${failure.message}")
-            P3Log.line("P3_AUDIO state=disarmed generation=${epoch.generation.value} " +
-                "transport=false loop=false reason=START_FAILED")
+            logAudioState("disarmed", "cxr", transport = false, loop = false,
+                generation = epoch.generation.value, reason = "START_FAILED")
         } else {
             // Both ports are up and polling the same ingress under the same epoch (Task 15c D1), which is what the
             // two booleans let a device run check.
-            P3Log.line("P3_AUDIO state=armed generation=${epoch.generation.value} transport=true loop=true")
+            logAudioState("armed", "cxr", transport = true, loop = true,
+                generation = epoch.generation.value, reason = "ARMED")
         }
+        return failure == null
     }
 
-    /** Stops the epoch [armAudioEpoch] started, if any. Idempotent, and safe before anything was armed. */
-    @Synchronized fun disarmAudioEpoch() {
-        val epoch = runningAudioEpoch ?: return
+    /**
+     * The detached half of [armAudioEpoch]: phone ingress open, capture running, then the existing poll loop.
+     *
+     * This is an arm too, so it owes the same either-all-or-nothing guarantee: if the ingress refuses the epoch, the
+     * recorder cannot begin, or the loop cannot start, everything already started is stopped and the failure is a
+     * **visible** code ([PhoneMicCapture.MIC_FORMAT_UNSUPPORTED]/`MIC_UNAVAILABLE`/`MIC_START_FAILED`) plus one
+     * `P4_AUDIO ... reason=START_FAILED`/`P3_AUDIO ... reason=START_FAILED` pair. It never leaves a session that says
+     * it is listening with no source behind it (spec §4.5).
+     *
+     * The bad start also **pauses the session** (`host.pause`) and writes the code to the page, so a caller that sees
+     * `false` cannot mistake the still-activated plugin for a running one: the §4.5 degradation for "start failed" is
+     * an explicit Paused + error, not a session that stays Ready/Listening with a silent ingress.
+     *
+     * Mid-capture failure is the same degradation through [onPhoneMicCaptureFailed]; it cannot be handled inline here
+     * because the capture's sink runs on the reader thread and `disarmAudioEpoch` would join that thread.
+     */
+    private fun armPhoneAudioEpoch(session: String): Boolean {
+        val ingress = phoneIngress
+        val deviceFactory = phoneMicDeviceFactory
+        if (ingress == null || deviceFactory == null) {
+            android.util.Log.i("EdithHost", "PHONE_MIC_UNWIRED: the detached audio source is not assembled")
+            host.pause()
+            error(PhoneMicCapture.MIC_UNAVAILABLE)
+            logAudioState("disarmed", "phone_mic", transport = false, loop = false,
+                generation = host.currentGeneration.value, reason = "START_FAILED")
+            return false
+        }
+        val epoch = InputEpoch(SessionId(session), host.currentGeneration, Math.incrementExact(inputSerial).also { inputSerial = it })
+        runningAudioEpoch = epoch
+        runningAudioTransport = null
+        runningAudioDetached = true
+        // Held so the failure sink (which is constructed before `start` can run) can name the exact capture instance;
+        // a queued failure from an older epoch must not be allowed to tear down a newer one.
+        val captureHolder = arrayOfNulls<PhoneMicCapture>(1)
+        var capture: PhoneMicCapture? = null
+        val failure = runCatching {
+            // Open first, so the very first offered chunk has a format and an epoch to be accepted under.
+            ingress.open(epoch, PhoneMicFormat.VERIFIED)
+            val built = PhoneMicCapture(deviceFactory(), clock, ingress, PhoneMicFormat.VERIFIED, epoch,
+                onOffer = { offer -> audioChain?.onOffer(offer) },
+                onFailure = { code ->
+                    // Never unwind on the capture thread: `disarmAudioEpoch` joins it, so the owner's own dispatcher
+                    // (production: the deadline scheduler) must run the teardown.
+                    dispatchHostEvent { onPhoneMicCaptureFailed(captureHolder[0], code) }
+                })
+            captureHolder[0] = built
+            // Published before `start` can fail asynchronously: a read error must belong to an armed epoch, not race
+            // the assignment and be mistaken for a stale failure.
+            capture = built
+            runningPhoneCapture = built
+            built.start()
+            // Only the loop: there is no transport port in this mode, and the ingress is already open.
+            environment?.input?.start(epoch)
+        }.exceptionOrNull()
+        if (failure == null) {
+            // 0.4 Task 8: only now - loop polling and phone capture are both up - is there a running detached session
+            // whose CPU must stay awake. Acquiring before the source works would hold a lock for a session that never
+            // listened; acquiring in glasses mode would keep the phone awake for a source it does not own.
+            acquireDetachedWakeLock()
+            logAudioState("armed", "phone_mic", transport = false, loop = true,
+                generation = epoch.generation.value, reason = "ARMED")
+            return true
+        }
+        val code = (failure as? ContractError.CapabilityMissing)?.message
+            ?: capture?.lastError()
+            ?: PhoneMicCapture.MIC_START_FAILED
+        // One teardown path for both failure kinds: it stops the loop before releasing the source, closes the ingress,
+        // drains the terminal gap and records this transition as START_FAILED (not as a normal DISARMED).
+        disarmAudioEpoch(reason = "START_FAILED")
+        host.pause()
+        error(code)
+        android.util.Log.i("EdithHost", "phone audio epoch could not start: ${failure.javaClass.name}: " +
+            "${failure.message} code=$code")
+        return false
+    }
+
+    /**
+     * Stops the epoch [armAudioEpoch] started, if any. Idempotent, and safe before anything was armed.
+     *
+     * The order is the reverse of the arm: the poll loop first (so it cannot read a source about to be released), then
+     * the phone capture, then the phone ingress, and finally the CXR transport, which closes its own ingress and stops
+     * the glasses' stream (Task 15c D1). A detached epoch has no transport, so that leg is simply absent.
+     *
+     * [reason] is the `P4_AUDIO`/`P3_AUDIO` reason on the transition: the ordinary `DISARMED` (stop/pause/switch), or
+     * the failure reason the caller is degrading for (`START_FAILED`, `CAPTURE_FAILED`). The field shape is unchanged;
+     * only the value distinguishes a normal teardown from the bounded failure the spec §4.5 evidence needs.
+     */
+    @Synchronized fun disarmAudioEpoch(reason: String = "DISARMED") {
+        // 0.4 Task 12b-ii: a dictation is a lease on this epoch's source. End it first, while its controller can still
+        // seal the pipeline turn under its redirect, and before the recorder/ingress/loop this method releases.
+        abortDictation("session_end")
+        val epoch = runningAudioEpoch ?: run {
+            // Nothing is armed, so there is no transition line; a hold left behind by an abnormal arm attempt must
+            // still not outlive the disarm.
+            releaseDetachedWakeLock()
+            return
+        }
         runningAudioEpoch = null
         val transport = runningAudioTransport
         runningAudioTransport = null
-        // The reverse of the arm order: stop the poll loop first, so it cannot poll an ingress the transport is about
-        // to close, then the transport, which closes the ingress and stops the glasses' stream (Task 15c D1).
+        val capture = runningPhoneCapture
+        runningPhoneCapture = null
+        val detached = runningAudioDetached
+        runningAudioDetached = false
+        // The reverse of the arm order: stop the poll loop first, so it cannot poll an ingress whose owner is about to
+        // release or close it, then the phone capture/ingress or the transport (Task 15c D1, 0.4 Task 6).
         runCatching { environment?.input?.stop(epoch) }
+        runCatching { capture?.stop() }
+        if (detached) {
+            runCatching { phoneIngress?.close() }
+            // The loop that would have drained the terminal SESSION_INTERRUPTED gap is already stopped; drain it here
+            // so the process-lifetime ingress cannot accumulate one gap per session.
+            while (runCatching { phoneIngress?.pollGap() }.getOrNull() != null) { /* terminal teardown only */ }
+        }
         runCatching { transport?.stop(epoch) }
-        P3Log.line("P3_AUDIO state=disarmed generation=${epoch.generation.value} " +
-            "transport=false loop=false reason=DISARMED")
+        // 0.4 Task 8: release last, after the loop and source teardown, so a join inside `capture.stop()` does not run
+        // with the CPU already free to suspend. This method is also reached from the capture-failure teardown on the
+        // host dispatcher thread; `WakeLockHold.release` only synchronizes its own state and never joins a thread, so
+        // it cannot self-join the dead capture reader.
+        releaseDetachedWakeLock()
+        logAudioState("disarmed", sourceLabel(detached), transport = false, loop = false,
+            generation = epoch.generation.value, reason = reason)
     }
+
+    /**
+     * Spec §4.5: a phone capture that dies mid-session must not leave a session/FGS claiming normal radio.
+     *
+     * The sink is one-shot per capture and runs on the capture's reader thread, so [armPhoneAudioEpoch] hands it to
+     * [dispatchHostEvent]; this method runs on the host's own thread. It degrades the session the same way a failed arm
+     * does: disarm the whole epoch (the line says `reason=CAPTURE_FAILED`), pause the host, and put the reader's stable
+     * code on the page. **Pause, not stop, is the chosen degradation**: the composition cannot stop `SessionService`'s
+     * foreground service from here, and a full stop would also throw away the session identity a resume needs. A
+     * Paused session with an error code is an explicit non-normal state a user can see and resume from, and the device
+     * pass (Task 9) verifies the notification follows it.
+     *
+     * @param capture the capture instance whose sink fired. A failure queued before a pause/stop/switch names an
+     *   instance that is no longer [runningPhoneCapture]; it is ignored rather than allowed to disarm the newer epoch.
+     */
+    @Synchronized
+    private fun onPhoneMicCaptureFailed(capture: PhoneMicCapture?, code: String) {
+        if (closed) return
+        if (capture == null || runningPhoneCapture !== capture) return
+        android.util.Log.i("EdithHost", "phone microphone capture failed: $code; pausing the session")
+        disarmAudioEpoch(reason = "CAPTURE_FAILED")
+        host.pause()
+        error(code)
+    }
+
+    /**
+     * One audio transition, in both log vocabularies.
+     *
+     * `P3_AUDIO` keeps its **pre-0.4 shape** - `state`, `generation`, `transport`, `loop`, and a `reason` only on the
+     * refusal/disarm lines - because spec §7.2 says the existing line's semantics do not change. `P4_AUDIO` is the
+     * 0.4 evidence line and adds `source=phone_mic|cxr` and (Task 8, `D199`) `lockscreen_hold=true|false`, so a device
+     * run can attribute the frames and see whether the CPU hold was real without re-reading the detach gate.
+     *
+     * **Field placement reconciliation (Task 8 fix 1 → Task 14 docs).** Spec §4.4/§7.2 writes `lockscreen_hold` on
+     * `P4_DETACH`, but a `P4_DETACH` line **does exist** and is emitted by `DetachGate` as
+     * `P4_DETACH state=on|off effective_proactive=... audio=phone_mic|cxr` - it carries **no** `lockscreen_hold`.
+     * The hold is emitted here instead, because it is a property of the audio epoch: it is taken when the detached
+     * epoch arms and released when it disarms, so the arm/disarm transition is the event it describes. It cannot be
+     * truthful on `P4_DETACH`: `DetachGate.set` stops the session **before** it logs (and `load()` logs with no
+     * session at all), so at gate-change time the hold is already released and the field would be permanently
+     * `false`. Task 14's doc pass must therefore amend §4.4/§7.2 to put `lockscreen_hold` on `P4_AUDIO` and leave
+     * `P4_DETACH` as the mode/effective-proactive line; adding a second field to `P4_DETACH` would document a value
+     * that can never be true.
+     *
+     * Both lines are state/counts only: never audio, never its content.
+     */
+    private fun logAudioState(
+        state: String,
+        source: String,
+        transport: Boolean,
+        loop: Boolean,
+        generation: Long,
+        reason: String,
+    ) {
+        val p3 = "P3_AUDIO state=$state generation=$generation transport=$transport loop=$loop"
+        P3Log.line(if (state == "armed") p3 else "$p3 reason=$reason")
+        val hold = wakeLock?.isHeld() == true
+        P3Log.line("P4_AUDIO state=$state source=$source transport=$transport loop=$loop " +
+            "lockscreen_hold=$hold reason=$reason")
+    }
+
+    /**
+     * 0.4 Task 8: takes the CPU lock once the detached source is genuinely running.
+     *
+     * A refused acquisition is **not** an arm failure: the foreground service and the phone source still run, and the
+     * session can still be woken while unlocked. It is recorded as `lockscreen_hold=false` on the arm line (and the
+     * stable reason is logged) so a device pass can see the lock-screen promise is degraded instead of assuming it.
+     */
+    private fun acquireDetachedWakeLock() {
+        val hold = wakeLock ?: return
+        if (!hold.acquire()) {
+            android.util.Log.i("EdithHost", "detached wake lock not held: ${hold.lastFailure()}")
+        }
+    }
+
+    /** 0.4 Task 8: the one release used by disarm/pause/stop/close. Idempotent; never joins or blocks on a thread. */
+    private fun releaseDetachedWakeLock() {
+        wakeLock?.release()
+    }
+
+    /** `phone_mic` or `cxr`: the `P4_AUDIO` source field, counts/state only - never audio. */
+    private fun sourceLabel(detached: Boolean): String = if (detached) "phone_mic" else "cxr"
 
     /**
      * The spec's explicit, non-wake entry point: raise `UserAction.Help` at the host's current identity (Task 15c D2).
@@ -1229,6 +1622,8 @@ class HostCompositionRoot internal constructor(
      */
     @Synchronized fun requestHelp(): Boolean {
         if (closed) return false
+        // 0.4 Task 13d: an explicit non-wake input re-opens the transcript route a dictation closed.
+        audioChain?.openTranscriptRoute("help")
         // A host closed underneath this composition has no identity to name; "nothing to help with" is a state, not
         // an error, so it is answered rather than thrown.
         val identity = runCatching { host.currentIdentity() }.getOrNull() ?: return false
@@ -1237,6 +1632,468 @@ class HostCompositionRoot internal constructor(
             EventEnvelope(identity.first, identity.second, "help-${UUID.randomUUID()}", now, now),
             UserAction.Action.Help,
         ))
+    }
+
+    /**
+     * 0.4 Task 10 (`D203`, spec §5.2): submit the phone's typed input as a WAKE-route message.
+     *
+     * Mirrors [requestHelp]: the identity is read from the host at call time, the event is submitted only through
+     * `HostRuntime.onEvent`, and a composition with nothing live answers a result instead of throwing. The
+     * differences are the typed-path rules:
+     * - **blank** is refused first, locally, and never becomes an event
+     * - the plugin exposes [SmartAssistantPlugin.canAcceptTypedMessage] as a pre-check; the plugin re-checks the same
+     *   predicate under its own lock when it handles the event, so a stale pre-check cannot open a second turn
+     * - a host refusal is reported as [TypedSendResult.Stale] (the identity moved between the read and the submit)
+     *
+     * The evidence line is `P4_TYPED state=accepted|refused reason=... turn=typed-... chars=N`: state, a reason, the
+     * turn id this request names and a character count - **never** the text and never a digest of it.
+     *
+     * @return [TypedSendResult.Accepted] when the host took the event for delivery to the active plugin; the specific
+     *   refusal otherwise.
+     */
+    @Synchronized fun requestTypedMessage(text: String): TypedSendResult {
+        // 0.4 Task 12b-ii fix 2 (finding 2): a send is a newer action than a finished dictation, so its result takes
+        // the row's one status line instead of the timeout/error text that would otherwise outrank it.
+        clearDictationStatus()
+        val body = text.trim()
+        // The turn id is minted before any refusal so every outcome can name the request it refused.
+        val eventId = "typed-${UUID.randomUUID()}"
+        if (body.isEmpty()) {
+            logTyped("refused", "blank", eventId, chars = 0)
+            return TypedSendResult.Blank
+        }
+        // 0.4 Task 13d: a typed send is an explicit input and the newer action, so it re-opens the transcript route a
+        // dictation closed: the conversation's next spoken sentence must be accepted again.
+        audioChain?.openTranscriptRoute("typed")
+        if (closed) {
+            logTyped("refused", "no_session", eventId, body.length)
+            return TypedSendResult.NoSession
+        }
+        val identity = runCatching { host.currentIdentity() }.getOrNull()
+            ?: run {
+                logTyped("refused", "no_session", eventId, body.length)
+                return TypedSendResult.NoSession
+            }
+        // A harness without the smart wiring keeps only the host's answer; production always has the plugin pre-check.
+        if (smartWiring?.plugin?.canAcceptTypedMessage() == false) {
+            logTyped("refused", "busy", eventId, body.length)
+            return TypedSendResult.Busy
+        }
+        val now = clock.nowNanos()
+        val event = UserAction(
+            EventEnvelope(identity.first, identity.second, eventId, now, now),
+            UserAction.Action.Typed,
+            body,
+        )
+        val accepted = typedSubmitForProbe?.invoke(event) ?: host.onEvent(event)
+        if (!accepted) {
+            logTyped("refused", "stale", eventId, body.length)
+            return TypedSendResult.Stale
+        }
+        logTyped("accepted", null, eventId, body.length)
+        return TypedSendResult.Accepted
+    }
+
+    /**
+     * Task 10 test seam for the submit half of [requestTypedMessage]; `null` uses the host.
+     *
+     * [TypedSendResult.Stale] is a real host refusal (the identity moved between `currentIdentity()` and `onEvent`),
+     * and the two calls read one atomic identity, so a JVM test cannot place that transition between them without a
+     * race. The seam pins the mapping; no production code assigns it.
+     */
+    internal var typedSubmitForProbe: ((HostEvent) -> Boolean)? = null
+
+    /** One `P4_TYPED` evidence line: state/reason/turn/count only - never the typed text, never its hash. */
+    private fun logTyped(state: String, reason: String?, eventId: String, chars: Int) {
+        val reasonField = if (reason == null) "" else " reason=$reason"
+        P3Log.line("P4_TYPED state=$state$reasonField turn=$eventId chars=$chars")
+    }
+
+    // ---- 0.4 Task 12b-ii: phone-microphone dictation (spec §5.3, D204) -------------------------------------------
+
+    /**
+     * Acknowledges that the assistant page appended [sequence] to its draft, clearing the host-owned final.
+     *
+     * The host is the final's owner (0.4 Task 12b-ii fix 2, finding 1): it keeps the last delivered [DictationFinal]
+     * in [dictationUi] until the page that appended it says so, so a page disposed by a tab switch or recreated after
+     * process death never has to carry a raw sequence across host lifetimes. A stale acknowledgement (not the
+     * currently pending sequence) or a second one is a no-op - it must never clear a newer final.
+     *
+     * Called from the main thread by `AssistantTab`, right after the append; lock-free so it cannot contend with the
+     * controller's pipeline/scheduler-thread callbacks.
+     */
+    fun consumeDictationFinal(sequence: Long) {
+        dictationUiState.update { current ->
+            if (current.final?.sequence == sequence) current.copy(final = null) else current
+        }
+    }
+
+    /**
+     * Dismisses a **terminal** dictation status (no speech, timeout, error) and any refused-start explanation once the
+     * wearer acts again.
+     *
+     * The status is about one action, not a permanent label on the row (0.4 Task 12b-ii fix 2, finding 2). Before this
+     * the timeout/error text outranked every later typed result and survived a session stop/start. The page calls this
+     * on a draft edit, [requestTypedMessage] calls it on a send, and the session observer calls it on a session change.
+     *
+     * Lock-free on purpose: those callers run on the main page thread and on the host's observation thread, while the
+     * terminal state itself is written from the controller's pipeline/scheduler threads. A live
+     * [DictationState.Listening] lease is **not** silenced by a dismissal - it describes what is happening now - and a
+     * pending [DictationFinal] is a delivery, not a status, so it is left for [consumeDictationFinal].
+     */
+    fun clearDictationStatus() {
+        dictationUiState.update { current ->
+            val state = if (current.state == DictationState.Listening) DictationState.Listening else DictationState.Idle
+            if (state == current.state && current.refusal == null) current
+            else current.copy(state = state, refusal = null)
+        }
+    }
+
+    /**
+     * Starts one phone-microphone dictation for the input row.
+     *
+     * Preconditions (spec §5.3): a live session (`Ready`/`Listening`), `RECORD_AUDIO` granted, and an armed audio
+     * epoch of this session. Only one dictation at a time, and a speech turn already in flight (a wake request being
+     * transcribed) is refused rather than stolen: its final must keep going to the LLM.
+     *
+     * Routing: **detached** reuses the session's phone recorder/ingress/loop and only switches the loop's KWS off;
+     * **glasses** pauses the CXR frame loop (no transport command) and then opens a phone capture on the same ingress,
+     * running a phone loop through the same `SpeechPipeline`. The pause comes **first** so a CXR tail frame cannot open
+     * a wake turn while the dictation is already switching sources; a turn that still opens in the tiny transition
+     * window is re-checked and the start refused rather than stealing its final. The controller redirects the
+     * pipeline's emit to the UI.
+     *
+     * @return [DictationStartResult.Accepted] when listening; the retryable refusal otherwise, with a
+     *   `P4_DICTATION state=refused` line naming the same reason.
+     */
+    @Synchronized fun startDictation(): DictationStartResult {
+        if (closed) return refuseDictation("closed", DictationStartResult.Closed)
+        if (dictationController != null) return refuseDictation("busy", DictationStartResult.Busy)
+        val session = host.currentState
+        if (session != SessionState.Ready && session != SessionState.Listening) {
+            return refuseDictation("no_session", DictationStartResult.NoSession)
+        }
+        if (!runCatching { microphoneGranted() }.getOrDefault(false)) {
+            return refuseDictation("permission", DictationStartResult.Permission)
+        }
+        val scheduler = deadlineScheduler ?: return refuseDictation("no_scheduler", DictationStartResult.NoScheduler)
+        val chain = audioChain ?: return refuseDictation("no_source", DictationStartResult.NoSource)
+        if (chain.hasActiveTurn()) return refuseDictation("busy", DictationStartResult.Busy)
+        val epoch = runningAudioEpoch ?: return refuseDictation("no_source", DictationStartResult.NoSource)
+        val detached = runningAudioDetached
+        if (detached && runningPhoneCapture == null) return refuseDictation("no_source", DictationStartResult.NoSource)
+        val ingress = phoneIngress ?: return refuseDictation("no_source", DictationStartResult.NoSource)
+
+        // 0.4 Task 12b-ii fix 2 (finding 4a): switch the route **before** the phone capture can deliver a frame.
+        // Opening the capture first left the CXR loop polling while the dictation source was already live, so a CXR
+        // tail frame could open a wake turn; the redirect installed below would then capture that turn's final into the
+        // input field. `beginDictation` also closes the old loop's KWS tap before it stops the loop.
+        if (!runCatching { chain.beginDictation(epoch, ingress) }.getOrDefault(false)) {
+            // A begin that failed after pausing the CXR loop must put the normal loop back; it is still the session's
+            // only wake source and the session was never stopped.
+            runCatching { chain.endDictation(epoch) }
+            return refuseDictation("no_source", DictationStartResult.NoSource)
+        }
+        // Defense in depth for a wake turn that opened in the few instructions between the pre-check above and the
+        // pause: a dictation must never steal its final, so hand the normal route back and refuse instead.
+        if (chain.hasActiveTurn()) {
+            runCatching { chain.endDictation(epoch) }
+            return refuseDictation("busy", DictationStartResult.Busy)
+        }
+
+        var capture: PhoneMicCapture? = null
+        if (!detached) {
+            val factory = phoneMicDeviceFactory ?: run {
+                runCatching { chain.endDictation(epoch) }
+                return refuseDictation("no_source", DictationStartResult.NoSource)
+            }
+            val captureHolder = arrayOfNulls<PhoneMicCapture>(1)
+            val failure = runCatching {
+                // Same geometry as the chain's framer (the phone source is the verified 16 kHz/mono/16-bit stream).
+                ingress.open(epoch, PhoneMicFormat.VERIFIED)
+                val built = PhoneMicCapture(factory(), clock, ingress, PhoneMicFormat.VERIFIED, epoch,
+                    // The offer counters belong to the dictation loop, not the paused CXR one.
+                    onOffer = { offer -> audioChain?.onDictationOffer(offer) },
+                    onFailure = { code ->
+                        // Runs on the capture's reader thread: never unwind there (the stop joins it).
+                        dispatchHostEvent { onDictationCaptureFailed(captureHolder[0], code) }
+                    })
+                captureHolder[0] = built
+                built.start()
+            }.exceptionOrNull()
+            if (failure != null) {
+                val code = (failure as? ContractError.CapabilityMissing)?.message
+                    ?: captureHolder[0]?.lastError()
+                    ?: PhoneMicCapture.MIC_START_FAILED
+                runCatching { captureHolder[0]?.stop() }
+                runCatching { ingress.close() }
+                drainIngress(ingress)
+                // The normal route was already paused for the dictation; put it back before the refusal returns.
+                runCatching { chain.endDictation(epoch) }
+                return refuseDictation(code, DictationStartResult.NoSource)
+            }
+            capture = captureHolder[0]
+        }
+
+        val generation = ++dictationGeneration
+        // One controller per dictation: it owns the pipeline redirect, the 15 s deadline and the one final.
+        val controller = DictationController(
+            pipeline = chain.dictationPipeline(),
+            scheduler = scheduler,
+            clock = clock,
+            onFinal = { text -> onDictationFinal(generation, text) },
+            onState = { state -> onDictationState(generation, state) },
+            // Non-transcript events only (the controller itself drops partials): the host may route session/fault
+            // events normally, but a dictation transcript never enters HostRuntime or the plugin.
+            forward = { event ->
+                if (event !is TranscriptEvent) {
+                    // 0.4 Task 13d: a fault during a dictation bypasses the chain's emit route, so it is telemetered
+                    // here too - otherwise the very failure that silences later sessions would be invisible again.
+                    logPipelineFault(event)
+                    host.onEvent(event)
+                }
+            },
+        )
+        dictationController = controller
+        dictationEpoch = epoch
+        dictationCapture = capture
+        dictationStopRequested = false
+        dictationCancelRequested = false
+        dictationFailureCode = null
+        dictationStartedNanos = clock.nowNanos()
+        dictationCleanupScheduled = false
+        when (runCatching { controller.start() }.getOrDefault(DictationController.StartResult.Unavailable)) {
+            DictationController.StartResult.Accepted -> {
+                dictationUiState.update { it.copy(state = DictationState.Listening, refusal = null) }
+                logDictation("started", "user", 0)
+                return DictationStartResult.Accepted
+            }
+            else -> {
+                dictationController = null
+                dictationEpoch = null
+                dictationCapture = null
+                runCatching { controller.close() }
+                runCatching { capture?.stop() }
+                if (capture != null) {
+                    runCatching { ingress.close() }
+                    drainIngress(ingress)
+                }
+                runCatching { chain.endDictation(epoch) }
+                return refuseDictation("start_failed", DictationStartResult.StartFailed)
+            }
+        }
+    }
+
+    /**
+     * Ends the active dictation through the pipeline, exactly once.
+     *
+     * The controller forces the turn's final; that final follows the redirect to [onDictationFinal] and the UI state,
+     * never the LLM. The terminal callback schedules the route/capture cleanup.
+     *
+     * 0.4 Task 12b-ii fix 2 (finding 4b): the loop is quiesced **before** the final is forced. The loop drains a
+     * multi-frame batch and delivers it outside its own lock, so a frame still in that batch must not be accepted
+     * after the positive endpoint: it would open a second ASR turn whose partials reach the restored wake route.
+     */
+    @Synchronized fun stopDictation() {
+        val controller = dictationController ?: return
+        dictationStopRequested = true
+        runCatching { audioChain?.quiesceDictationInput() }
+        runCatching { controller.stop() }
+    }
+
+    /**
+     * Aborts the active dictation without delivering its text; the pipeline turn is sealed so a late final cannot
+     * surface on the restored wake route. The UI ends at [DictationState.Idle].
+     *
+     * Quiesced before sealing for the same reason as [stopDictation]: the discarded tail of the current frame batch
+     * must not start a new turn after the redirect is restored.
+     */
+    @Synchronized fun cancelDictation() {
+        val controller = dictationController ?: return
+        dictationCancelRequested = true
+        runCatching { audioChain?.quiesceDictationInput() }
+        runCatching { controller.cancel() }
+    }
+
+    /**
+     * Records one refused start, publishes its retryable reason for the row, and returns it.
+     *
+     * The refusal is the **newer action**, so it dismisses the previous terminal state (for example a timeout from an
+     * earlier attempt): the row must explain why this tap did nothing instead of showing stale text. Count-only
+     * telemetry keeps the same `P4_DICTATION state=refused reason=...` shape.
+     */
+    private fun refuseDictation(reason: String, result: DictationStartResult): DictationStartResult {
+        logDictation("refused", reason, 0)
+        // Atomic update, not `.value =`: the page's dismissals are lock-free, so a read-modify-write here could
+        // otherwise resurrect a status the wearer already dismissed.
+        dictationUiState.update { current ->
+            val state = if (current.state == DictationState.Listening) DictationState.Listening else DictationState.Idle
+            current.copy(state = state, refusal = result)
+        }
+        return result
+    }
+
+    /** One `P4_DICTATION` line: state/reason/character count only - never the dictation text, never its hash. */
+    private fun logDictation(state: String, reason: String?, chars: Int) {
+        P3Log.line("P4_DICTATION state=$state chars=$chars reason=${reason ?: "none"}")
+    }
+
+    /**
+     * The controller's state callback, on any thread.
+     *
+     * The terminal states first quiesce the loop that produced the event (the controller restores its emit sink before
+     * this callback, so a frame left in the same 20 ms batch must not start a new ASR turn), then schedule the slow
+     * cleanup on the composition's scheduler thread - never inline on the UI thread or the capture's reader.
+     */
+    @Synchronized private fun onDictationState(generation: Long, state: DictationState) {
+        if (closed || dictationTearingDown || generation != dictationGeneration) return
+        when (state) {
+            DictationState.Listening -> {
+                dictationUiState.update { it.copy(state = DictationState.Listening) }
+            }
+            DictationState.Idle, DictationState.NoSpeech, is DictationState.Error -> {
+                // 0.4 Task 13d: the dictation is over, so its audio is no longer a conversation utterance. Close the
+                // host transcript route before the wake loop is restored; only an explicit input re-opens it.
+                audioChain?.closeTranscriptRoute("dictation_end")
+                audioChain?.quiesceDictationInput()
+                val failure = dictationFailureCode
+                val effective = if (failure != null) DictationState.Error(failure) else state
+                // Atomic update, not `.value =`: the page's dismissal/consumption are lock-free writers of the same
+                // flow, and a read-modify-write here could otherwise resurrect a final the page already appended.
+                dictationUiState.update { it.copy(state = effective) }
+                when {
+                    failure != null -> logDictation("error", failure, 0)
+                    state == DictationState.Idle && dictationCancelRequested -> logDictation("cancel", "user", 0)
+                    // A final follows on the same controller path and logs the `final` line with its count; an Idle
+                    // before that (cancel) is handled above.
+                    state == DictationState.Idle -> Unit
+                    state is DictationState.Error -> logDictation("error", state.code, 0)
+                    else -> {
+                        val timedOut = clock.nowNanos() - dictationStartedNanos >= DICTATION_TIMEOUT_NANOS
+                        if (timedOut && !dictationStopRequested) logDictation("timeout", "timeout", 0)
+                        else logDictation("stopped", "user", 0)
+                    }
+                }
+                scheduleDictationCleanup(generation)
+            }
+        }
+    }
+
+    /** The one final for the active lease; the text is handed to the UI state and nowhere else. */
+    @Synchronized private fun onDictationFinal(generation: Long, text: String) {
+        if (closed || dictationTearingDown || generation != dictationGeneration) return
+        // 0.4 Task 13d: a dictation final ends the wake route's claim on this audio. The tail that follows the final
+        // is still the wearer's dictation; keep its transcripts off the host/plugin until an explicit input.
+        audioChain?.closeTranscriptRoute("dictation_final")
+        val final = DictationFinal(++dictationFinalSequence, text)
+        dictationUiState.update { it.copy(state = DictationState.Idle, final = final) }
+        // Count only: the wearer's words are never logged and there is no digest of them either.
+        logDictation("final", if (dictationStopRequested) "user" else "endpoint", text.length)
+    }
+
+    /** Arms the single deferred cleanup for this lease (idempotent; the state callback can fire more than once). */
+    private fun scheduleDictationCleanup(generation: Long) {
+        if (dictationCleanupScheduled) return
+        dictationCleanupScheduled = true
+        dispatchHostEvent { finishDictation(generation) }
+    }
+
+    /**
+     * Releases the dictation lease after a terminal state: restore the emit route, stop/close the dictation capture,
+     * put the normal CXR loop back (glasses) or re-enable KWS on the session's own loop (detached).
+     *
+     * Runs on the composition's scheduler/dispatch thread. Every release is guarded so a failure in one leg cannot
+     * skip the others - a route left quiesced would silence the wake word for the rest of the session.
+     */
+    @Synchronized private fun finishDictation(generation: Long) {
+        if (generation != dictationGeneration) return
+        val controller = dictationController
+        val capture = dictationCapture
+        if (controller == null && capture == null) {
+            dictationCleanupScheduled = false
+            return
+        }
+        dictationCleanupScheduled = false
+        dictationController = null
+        dictationCapture = null
+        val epoch = dictationEpoch
+        dictationEpoch = null
+        runCatching { controller?.close() }
+        runCatching { capture?.stop() }
+        if (capture != null) {
+            runCatching { phoneIngress?.close() }
+            phoneIngress?.let { drainIngress(it) }
+        }
+        epoch?.let { runCatching { audioChain?.endDictation(it) } }
+        dictationStopRequested = false
+        dictationCancelRequested = false
+        dictationFailureCode = null
+    }
+
+    /**
+     * A dictation-owned phone capture died mid-lease. The dictation ends as `Error(code)` (a capture failure is not
+     * "no speech"), its pipeline turn is sealed through the controller's cancel path, and the normal route is restored;
+     * the session itself is untouched - the CXR transport never depended on this capture.
+     */
+    @Synchronized private fun onDictationCaptureFailed(capture: PhoneMicCapture?, code: String) {
+        if (closed || dictationTearingDown) return
+        if (capture == null || dictationCapture !== capture) return
+        dictationFailureCode = code
+        val controller = dictationController
+        if (controller != null) {
+            // Quiesce before the cancel seals the turn, like the user's own cancel: a tail frame of the capture's last
+            // batch belongs to the failed dictation, not to the wake route it is about to be restored to.
+            audioChain?.quiesceDictationInput()
+            // cancel() reports Idle; the failure flag turns that terminal into the Error state and line.
+            runCatching { controller.cancel() }
+        } else {
+            // 0.4 Task 13d: a dictation whose capture died still ends the wake route's claim on this audio.
+            audioChain?.closeTranscriptRoute("dictation_end")
+            audioChain?.quiesceDictationInput()
+            dictationUiState.update { it.copy(state = DictationState.Error(code)) }
+            logDictation("error", code, 0)
+            scheduleDictationCleanup(dictationGeneration)
+        }
+    }
+
+    /** Drops whatever a source queued while it was paused on purpose (a deliberate pause is not an audio fault). */
+    private fun drainIngress(ingress: PcmIngress) {
+        while (runCatching { ingress.poll() }.getOrNull() != null) { /* discarded on purpose */ }
+        while (runCatching { ingress.pollGap() }.getOrNull() != null) { /* stale gap */ }
+    }
+
+    /**
+     * Ends any dictation lease as part of a session teardown (0.4 Task 12b-ii).
+     *
+     * Runs **before** [disarmAudioEpoch] releases the epoch: the controller must still be able to seal its pipeline
+     * turn under its redirect (a final emitted after the source was released would otherwise reach the wake route), and
+     * the dictation-owned capture/loop must be stopped before the epoch's own resources. The normal loop is not
+     * restarted - the teardown is about to stop it.
+     */
+    @Synchronized private fun abortDictation(reason: String) {
+        if (dictationController == null && dictationCapture == null) return
+        // Invalidate queued terminal callbacks from this lease before cancel() can emit Idle.
+        ++dictationGeneration
+        dictationTearingDown = true
+        val controller = dictationController
+        dictationController = null
+        val capture = dictationCapture
+        dictationCapture = null
+        dictationEpoch = null
+        dictationCleanupScheduled = false
+        runCatching { controller?.cancel() }
+        runCatching { capture?.stop() }
+        if (capture != null) {
+            runCatching { phoneIngress?.close() }
+            phoneIngress?.let { drainIngress(it) }
+        }
+        runCatching { audioChain?.abortDictation() }
+        dictationTearingDown = false
+        dictationStopRequested = false
+        dictationCancelRequested = false
+        dictationFailureCode = null
+        dictationUiState.update { it.copy(state = DictationState.Idle) }
+        logDictation("cancel", reason, 0)
     }
 
     /**
@@ -1449,6 +2306,14 @@ class HostCompositionRoot internal constructor(
     internal fun onWearingChanged(wearing: Boolean) {
         dispatchHostEvent {
             if (closed) return@dispatchHostEvent
+            // 0.4 strict-local fix (`D199`): the wear sensor is a glasses fact. Once the App is detached, a callback
+            // from the connection that was just closed is stale - it must not cancel the strictly-local session, and
+            // must not send `closeAll()`/`STOP` on a link that was neutralized for the mode. It is recorded as ignored
+            // rather than as this session's wearing state.
+            if (detachGate.enabled.value) {
+                P3Log.line("P3_CXR glasses_event=wearing=$wearing ignored=detached")
+                return@dispatchHostEvent
+            }
             // 0.3 Phase 2 Task 2: the wear sensor fact is recorded for the device state. `true` and `false` are both
             // facts; a session that has reported none stays `null` until its first event.
             wearingState = wearing
@@ -1499,7 +2364,16 @@ class HostCompositionRoot internal constructor(
      * handshake. Returns whether the request was accepted for delivery (the panel may open asynchronously after an
      * `appStart`); the 10 s timer still waits for [onPanelShown].
      */
-    internal fun requestPanelOpen(route: AssistantRoute): Boolean = hintLink?.requestPanelOpen(route) ?: false
+    internal fun requestPanelOpen(route: AssistantRoute): Boolean =
+        // 0.4 Task 7 (`D201`, spec §4.3): detached mode has no glasses panel and must not fabricate a `PANEL_SHOWN` -
+        // the phone's conversation tab is the visible surface, and the cycle's visibility comes from `SmartWiring`
+        // instead. Refused before the link so no command and no `appStart` can leave the phone.
+        if (detachGate.enabled.value) false else hintLink?.requestPanelOpen(route) ?: false
+
+    private var wakeAckPlayer: AndroidSpeechPlayer? = null
+
+    /** The detached acknowledgement's echo-mute window; [create] builds the one instance the loops consult. */
+    private var echoMute: EchoMuteWindow? = null
 
     /**
      * One wake detector emission, as `create` delivers it (0.24 S5 final review Important #1).
@@ -1509,17 +2383,64 @@ class HostCompositionRoot internal constructor(
      * and the smart plugin's own scene admission - so it lives here rather than in a lambda a test cannot drive.
      *
      * @param chime the wearer-facing acknowledgement, played only for a wake that has a live identity.
+     * @param ack detached mode's fixed spoken acknowledgement; true means it was accepted and the beep is skipped.
      */
-    internal fun emitWake(host: HostRuntime, word: String, confidence: Double, chime: () -> Unit = {}) {
+    internal fun emitWake(
+        host: HostRuntime,
+        word: String,
+        confidence: Double,
+        ack: (String) -> Boolean = { false },
+        chime: () -> Unit = {},
+    ) {
         val identity = runCatching { host.currentIdentity() }.getOrNull()
         if (identity != null) {
-            chime()
+            // 0.4 detached wake acknowledgement (owner 2026-10-27): in detached mode the fixed spoken phrase
+            // replaces the beep. The wake event is NOT deferred - the WAKE turn and its ASR open at once, and the
+            // acknowledgement's own echo is kept out of them by the [EchoMuteWindow] the ack opens over the capture.
+            val acknowledged = detachGate.enabled.value &&
+                runCatching { ack(DETACHED_WAKE_ACK_TEXT) }.getOrDefault(false)
+            if (!acknowledged) chime()
             // 0.24 S5 final review Important #1: a live identity is necessary but not sufficient. The plugin can still
             // refuse the wake (scene cooldown), and no turn is then installed, so the panel would have nothing to
             // close it. Ask the plugin's own admission before asking for the window.
-            if (pluginAdmitsWake()) requestPanelOpen(AssistantRoute.WAKE)
+            //
+            // 0.4 Task 7 (`D201`): detached mode has no glasses panel to open, so it asks for none - but the wake
+            // event and its chime still happen exactly as before (the phone's conversation tab is the display).
+            if (!detachGate.enabled.value && pluginAdmitsWake()) requestPanelOpen(AssistantRoute.WAKE)
         }
         emitWakeDetected(host, clock, word, confidence)
+    }
+
+    /**
+     * Detached-only fixed acknowledgement. It is not a turn, not a hint and never reaches the CXR link.
+     *
+     * The [EchoMuteWindow] opens **before** the utterance is requested and closes one reverb tail after the player
+     * reports it finished or failed, so the phone microphone's ASR/VAD/KWS never see the phrase. The TTS engine may
+     * lazily await initialization for up to 3 s, so the utterance runs on its own daemon thread; a blocking await
+     * here would stall the wake pipeline.
+     */
+    internal fun speakDetachedWakeAck(text: String): Boolean {
+        if (!detachGate.enabled.value || !speechEnabled.value) return false
+        val player = wakeAckPlayer ?: return false
+        val mute = echoMute ?: return false
+        mute.open()
+        P3Log.line("P4_WAKE_ACK state=requested")
+        runCatching {
+            Thread({
+                val accepted = runCatching {
+                    player.speakText(text, "detached-wake-ack") { state ->
+                        if (state == com.sheen.rokid.plugin.SpeechPlayback.FINISHED ||
+                            state == com.sheen.rokid.plugin.SpeechPlayback.FAILED) mute.close()
+                    }
+                }.getOrDefault(false)
+                if (!accepted) mute.close()
+                P3Log.line("P4_WAKE_ACK state=${if (accepted) "accepted" else "unavailable"}")
+            }, "edith-wake-ack").apply { isDaemon = true }.start()
+        }.onFailure {
+            mute.close()
+            P3Log.line("P4_WAKE_ACK state=unavailable")
+        }
+        return true
     }
 
     /**
@@ -1565,6 +2486,8 @@ class HostCompositionRoot internal constructor(
      * `PcmIngress.offer`'s result used to be discarded inside the transport, so `INGRESS_OVERFLOW` and
      * `UNKNOWN_FORMAT` could never be reported. Arrives on the transport's worker thread; the chain makes the
      * "is there a loop yet" decision under its own lock, so a fault that races the first `start` is buffered, not lost.
+     * While a glasses-mode dictation owns the pipeline the chain drops the outcome instead of rebuilding the paused
+     * CXR route (Task 12b-ii fix 1); the diagnostic line is still emitted at the chain's offer sink.
      */
     internal fun onPcmOffer(offer: PcmOffer) {
         audioChain?.onOffer(offer)
@@ -1578,7 +2501,21 @@ class HostCompositionRoot internal constructor(
      * the hint link. Order matters: `HELLO` and the clock exchange must precede any hint the plugins can produce.
      */
     @Synchronized private fun maybeMarkSceneReady() {
-        if (closed || !linkReady || host.currentState != SessionState.BuildingScene) return
+        if (closed || host.currentState != SessionState.BuildingScene) return
+        // 0.4 Task 7 (`D199`/`D201`, spec §4.3): detached mode's scene is **locally** ready. There is no CXR link to
+        // wait for and no `HELLO`/clock exchange to establish, so `hintLink.sessionEstablished` is deliberately
+        // skipped - introducing this session to a glasses link would fabricate a session the wearer never asked for.
+        // The rest is the same activation path the attached branch below takes (the host's identity/generation gates
+        // included), so identity and activation are not bypassed in detached mode.
+        if (detachGate.enabled.value) {
+            host.markSceneReady()
+            runCatching { activateSelected() }.onFailure {
+                host.pause()
+                error("CAPABILITY_MISSING")
+            }
+            return
+        }
+        if (!linkReady) return
         host.markSceneReady()
         activeSessionId?.let { session -> hintLink?.sessionEstablished(session, host.currentGeneration.value) }
         // This runs on the transport's callback thread, so a failure while activating (unavailable storage, a refused
@@ -1612,6 +2549,10 @@ class HostCompositionRoot internal constructor(
      *   Activity to build it with).
      */
     @Synchronized internal fun ensureCxrLink(): Boolean {
+        // 0.4 Task 7 (`D199`, spec §4.3): detached mode never touches the vendor transport - not even one attempt
+        // line, because the line would describe a link the session does not use. Refused before the factory so no
+        // connection object (and no SDK session) can be built for a strictly-local session.
+        if (detachGate.enabled.value) return false
         // "This build has no CXR transport" is the more fundamental fact and wins the line: with no assembly, a missing
         // Activity is not the reason nothing can connect, and reporting it would hide the real gap (the very confusion
         // F17/F18 produced).
@@ -1658,6 +2599,10 @@ class HostCompositionRoot internal constructor(
      * connected, and reconnect if it is not" without a second button.
      */
     @Synchronized fun connectCxr(activity: Any): Boolean {
+        // 0.4 Task 7 (`D199`): detached mode is strictly local. An explicit connect request is refused before the
+        // Activity is remembered or a factory is called, so no vendor object and no `P3_CXR connect` line can appear
+        // for a session that does not use the glasses.
+        if (detachGate.enabled.value) return false
         pendingActivity = java.lang.ref.WeakReference(activity)
         // A new attempt invalidates the previous answer (review I-2): a cancelled prompt must not sit on the page next
         // to a link that came up afterwards, and `null` is what the render treats as "the SDK has not asked".
@@ -1692,7 +2637,11 @@ class HostCompositionRoot internal constructor(
      * so a strong Activity reference here would leak it.
      */
     @Synchronized fun attachCxrActivity(activity: Any) {
+        // Remembered even while detached: the Activity is what a later switch back to glasses mode needs, and
+        // `MainActivity.onCreate` is the only place it is offered. Remembering a weak reference is not a vendor call;
+        // 0.4 Task 7 (`D199`) only forbids **connecting** one, which is what the guard below skips.
         pendingActivity = java.lang.ref.WeakReference(activity)
+        if (detachGate.enabled.value) return
         if (!linkBuilt) ensureCxrLink()
     }
 
@@ -1766,6 +2715,14 @@ class HostCompositionRoot internal constructor(
     }
 
     private fun activateSelected() {
+        // Every activation path (resume, select, scene-ready retry) refuses without ready models, so a session can
+        // never be advertised with a missing ASR/Laya/Embedding bundle behind it.
+        ModelStartGate.refusal(modelReadiness?.state?.value)?.let { refusal ->
+            disarmAudioEpoch()
+            host.pause()
+            error(refusal)
+            return
+        }
         val selected = state.value.selectedPluginId ?: return
         // 0.25 Task 14 (R74): the same startup gate on every activation path (resume included), so a profile edited
         // back to text-only between sessions is refused visibly instead of starting a request the gate would deny.
@@ -1812,7 +2769,12 @@ class HostCompositionRoot internal constructor(
             // plugins, which left the ears on a dead generation (Task 14a-fix2). Disarming first also makes the arm
             // read the generation that is current *after* the switch, which is the only one the host accepts.
             disarmAudioEpoch()
-            if (declares(selected, Capability.WakeWord)) armAudioEpoch()
+            if (declares(selected, Capability.WakeWord) && !armAudioEpoch()) {
+                // Spec §4.5: a failed **detached** arm has already been fully unwound inside `armAudioEpoch` -
+                // disconnected from the epoch, host paused, and the microphone code on the page. Returning here keeps
+                // this activation path from going on as if the session had a working source behind it.
+                return
+            }
         } else {
             disarmAudioEpoch()
             host.pause()
@@ -1904,6 +2866,56 @@ class HostCompositionRoot internal constructor(
         notifier()?.cancelAll()
         mutableState.update { it.copy(errorCode = null, pendingConfirmation = null) }
     }
+    /**
+     * The `DetachGate` mode side effect (0.4 strict-local fix, `D199`): a **same-process** mode change must take the
+     * CXR link with it.
+     *
+     * The gate stops the host session first, but `stop()` only calls `sessionEnded()`: that clears the session identity
+     * while the clock mapping and its renewal stay live, and the vendor connection stays built. The Task 13b device log
+     * therefore recorded `EdithHint: outbound: Ping` and `Sync` seconds **after** `P4_DETACH`. This method closes the
+     * remaining halves without putting one app-level command on the wire:
+     *
+     * 1. `hintLink.detach()` cancels the clock renewal/timeout and clears session, mapping and panel state silently
+     *    ([CxrHintLink.detach] refuses every later send as a second line of defence);
+     * 2. the composition forgets and closes the vendor connection. Closing an SDK session is a transport teardown, not
+     *    a CXR command - no `HELLO`/`PING`/`SYNC`/`SHOW`/`CLEAR` is sent by this path. It must also forget the
+     *    connection: a closed transport refuses to reconnect, so a reattach needs a fresh build.
+     *
+     * Switching detach off only re-arms the link; the next 开始 builds the fresh connection and introduces the session
+     * as usual ([attach]).
+     */
+    @Synchronized internal fun onDetachModeChanged(detached: Boolean) {
+        if (closed) return
+        if (!detached) {
+            hintLink?.attach()
+            retriedMappingSyncId = null
+            P3Log.line("P4_DETACH_LINK state=reattached")
+            return
+        }
+        // Block and clear the link before touching the transport, so a timer or vendor callback that is in flight can
+        // no longer send, and a detached confirmation cannot find a live mapping.
+        hintLink?.detach()
+        // 0.3 Phase 2 Task 2: the last wearing fact described the glasses session that just ended.
+        wearingState = null
+        // A closed transport refuses to reconnect (`TRANSPORT_ALREADY_CONNECTED_OR_CLOSED`), so the next glasses
+        // session must build a new one instead of reusing this object.
+        val connection = activeConnection
+        activeConnection = null
+        linkBuilt = false
+        linkReady = false
+        retriedMappingSyncId = null
+        mutableState.update { it.copy(cxrLinkReady = false) }
+        val closeResult = connection?.let { runCatching { it.close() }.isSuccess }
+        P3Log.line(
+            "P4_DETACH_LINK state=neutralized session=cleared connection=" +
+                when {
+                    connection == null -> "none"
+                    closeResult == true -> "closed"
+                    else -> "close_failed"
+                },
+        )
+    }
+
     @Synchronized fun selectPlugin(pluginId: String) {
         if (closed || state.value.selectedPluginId == pluginId) return
         mutableState.update { it.copy(selectedPluginId = pluginId, errorCode = null) }
@@ -1925,7 +2937,26 @@ class HostCompositionRoot internal constructor(
             val grant = pendingStart
             pendingStart = null
             if (redelivered || grant == null || token != grant.token || clock.nowNanos() >= grant.expires) return false
-            if (!permissionGranted) { host.stop(); error("BLUETOOTH_PERMISSION_DENIED"); return false }
+            if (!permissionGranted) {
+                // 0.4 Task 8 fix 1 (audit): the rollback calls `host.stop()` directly instead of the composition's
+                // own [stop], so it must release the audio epoch itself - otherwise a refused START would leave an
+                // armed detached phone capture and its CPU wake lock running with no session (the same "release on
+                // stop" rule as pause). No epoch armed is a pure no-op with no log line, so a normal fresh START is
+                // unchanged; a glasses epoch, if one ever is armed here, is released too, which is what stop means.
+                disarmAudioEpoch()
+                host.stop()
+                // 0.4 Task 6 (`D199`): the required permission follows the mode. Detached capture needs the phone
+                // microphone; glasses mode keeps the pre-0.4 Bluetooth refusal verbatim.
+                error(startPermissionRefusal())
+                return false
+            }
+            // 0.4 Task 3 / spec §6.3: the model gate comes **before** `beforeStart`, otherwise the foreground service
+            // is already running for a session that cannot use the models. `beforeStart` is the caller's
+            // `startForeground`; returning false here leaves the service to stop itself.
+            ModelStartGate.refusal(modelReadiness?.state?.value)?.let { refusal ->
+                error(refusal)
+                return false
+            }
             beforeStart()
             start(grant.pluginId)
             return true
@@ -1936,17 +2967,31 @@ class HostCompositionRoot internal constructor(
             "edith.PAUSE" -> { pause(); true }
             "edith.RESUME" -> {
                 if (!foregroundActive) { error("FOREGROUND_UI_REQUIRED"); false }
-                else if (!permissionGranted) { pause(); error("BLUETOOTH_PERMISSION_DENIED"); false }
+                else if (!permissionGranted) { pause(); error(startPermissionRefusal()); false }
                 else { resume(); true }
             }
             else -> false
         }
     }
     internal fun error(code: String) { mutableState.update { it.copy(errorCode = code) } }
+
+    /**
+     * The refusal code a start/resume reports when the permission the **current mode** requires is missing.
+     *
+     * Detached mode captures the phone microphone and needs `RECORD_AUDIO`; glasses mode keeps the pre-0.4 Bluetooth
+     * code verbatim. Read at refusal time (not cached) so a mode change between sessions is reflected.
+     */
+    private fun startPermissionRefusal(): String =
+        if (detachGate.enabled.value) SessionPermissions.MIC_PERMISSION_MISSING
+        else SessionPermissions.BLUETOOTH_PERMISSION_DENIED
+
     @Synchronized override fun close() {
         if (closed) return
         stop()
         closed = true
+        // 0.4 Task 8: `stop()` releases through `disarmAudioEpoch`; releasing again is the belt-and-braces for an arm
+        // that never reached a disarm, and is a no-op when nothing is held.
+        releaseDetachedWakeLock()
         profileConsent(null)
         observation.cancel()
         try { host.close() } finally {
@@ -1956,10 +3001,44 @@ class HostCompositionRoot internal constructor(
         }
     }
     companion object {
+        /** Detached mode's one fixed wake acknowledgement (owner decision 2026-10-27). */
+        internal const val DETACHED_WAKE_ACK_TEXT = "我在"
+
         /** The debug-only diagnostic text plugin's id; its configuration shape is not the smart plugin's. */
         private const val DIAGNOSTIC_PLUGIN_ID = "p2-diagnostic"
 
-        fun create(context: Context, initialObserver: (ByteArray) -> Unit = {}): HostCompositionRoot {
+        /**
+         * 0.4 Task 7 (`D201`, spec §4.3): which display the host advertises, read per call.
+         *
+         * Detached mode has no CXR mapping, so `hintLink.liveOutput()` is null and advertising `TextOutput` from it
+         * would refuse every answer with "display missing". The phone's conversation tab **is** the display in that
+         * mode, so its ack-only [PhoneHintDevice] is offered instead; attached mode keeps the glasses link's live
+         * output exactly as before. A per-call read, because the detach gate can change between sessions and the
+         * environment derives [CxrHostEnvironment.availableCapabilities] from this lambda.
+         *
+         * One expression for `create` and the JVM rigs, so the shipped choice is what the tests drive.
+         */
+        internal fun hostLiveOutput(
+            detached: () -> Boolean,
+            phone: HintDevice,
+            glasses: () -> HintDevice?,
+        ): () -> HintDevice? = { if (detached()) phone else glasses() }
+
+        fun create(
+            context: Context,
+            initialObserver: (ByteArray) -> Unit = {},
+            readiness: ModelReadiness? = null,
+            provision: (() -> Unit)? = null,
+        ): HostCompositionRoot {
+            // 0.4 Task 3 / spec §6.3: the composition is only ever assembled from ready models. Production's
+            // `EdithApplication` already gates on this, and the assertion here keeps a future/hand-written call path
+            // from building a half-capability session (a missing ASR bundle means no `Capability.Asr`, a missing Laya
+            // graph means a plugin that cannot activate).
+            if (readiness != null) {
+                ModelStartGate.refusal(readiness.state.value)?.let { refusal ->
+                    throw IllegalStateException("HostCompositionRoot.create requires ready models: $refusal")
+                }
+            }
             // Transport, audio engines and glasses output remain separate device gates.
             val clock = object : MonotonicClock { override fun nowNanos() = System.nanoTime().coerceAtLeast(0) }
             val timer = Executors.newSingleThreadScheduledExecutor { Thread(it, "edith-phone-deadlines").apply { isDaemon = true } }
@@ -1976,9 +3055,37 @@ class HostCompositionRoot internal constructor(
             // Task 14a/14b: the one settings store, built here rather than further down because the arming switch
             // below persists through it. A save and the next load therefore read the same blob.
             val smartSettingsStore = SmartSettingsStore(blobs)
+            // The composition itself and its host are created after the chain (the chain is built before the root),
+            // so both are reached through holders. Declared here because the 0.4 detach gate below needs them.
+            val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
+            val hostHolder = arrayOfNulls<HostRuntime>(1)
+            // 0.4 Task 5 (`D199`): the persisted 「脱离眼镜」 gate. The stop-before-save rule uses the composition's
+            // own `stop()` and the host's live state; the gate is loaded once here, before any session can start.
+            // 0.4 Task 9 fix: `stop()` only tears down the host session - `SessionService` kept its foreground
+            // notification saying 会话已开启 for an idle session. The gate's stop therefore also stops the hosting
+            // service directly; that call is deliberately **not** wrapped in `runCatching` and its result is returned
+            // to the gate, so a refusal refuses the save instead of being swallowed while the mode is persisted.
+            // `Context.stopService` answers true only when it stopped a running service, so false surfaces as the
+            // gate's `SESSION_STOP_FAILED`; it throws on a platform refusal, which the gate also answers as a failed
+            // stop. `SessionService.onDestroy` cancels its state collector and its notification id directly, so a
+            // queued state update cannot leave a stale 「会话已开启」 record behind (device evidence on the K40: the
+            // service was gone while the notification record survived a `stopForeground(REMOVE)` attempt). No UI STOP
+            // command is re-dispatched.
+            val detachGate = DetachGate(
+                settings = smartSettingsStore,
+                stopSession = { rootHolder[0]?.stop() },
+                stopService = { context.stopService(Intent(context, SessionService::class.java)) },
+                sessionState = { hostHolder[0]?.currentState ?: SessionState.Idle },
+                // 0.4 strict-local fix (`D199`): stopping the session is not enough - the CXR mapping, its renewal and
+                // the vendor connection outlive `stop()`, so a detach must neutralize them in the same change. A
+                // reattach re-arms the link; the next 开始 rebuilds the connection.
+                onModeChanged = { detached -> rootHolder[0]?.onDetachModeChanged(detached) },
+            ).also { it.load() }
             // P3.2 / `D53`②: the arming switch and its gate. One instance for the UI, the chain's acoustic sink and the
-            // settings store. It is **persisted** (default on) and loaded once here, at assembly time.
-            val proactiveArming = ProactiveArming(smartSettingsStore).also { it.load() }
+            // settings store. It is **persisted** (default on) and loaded once here, at assembly time. 0.4 Task 5: its
+            // effective value is `stored && !detached` (`D202`), so the detach gate is the second input.
+            val proactiveArming = ProactiveArming(smartSettingsStore, detached = { detachGate.enabled.value })
+                .also { it.load() }
             // The model request had no production line before the P3.1 wrap-up: the client was built with no
             // interceptor, so a successful request was silent and that hop rested on its effects. This is the one line
             // that closes the gap, and it carries nothing but method, status and duration (`ModelHttpLog`).
@@ -2087,8 +3194,6 @@ class HostCompositionRoot internal constructor(
             // the detector reads it through this holder. `create` provisions the chain before the composition exists,
             // so the holder is how the same instance reaches both the detector and the exposed accessor; a second,
             // local gate here is what made `root.playbackGate.begin()` suppress nothing.
-            val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
-            val hostHolder = arrayOfNulls<HostRuntime>(1)
             // 0.3 Phase 4B (B5): one monotonic revision source for the confirmation hint. The glasses update a row only
             // for a strictly newer revision of the same hint id, so the PANEL_SHOWN re-announcement must never repeat
             // the first send's number (two sends can share a coarse clock tick).
@@ -2160,6 +3265,9 @@ class HostCompositionRoot internal constructor(
             val systemOne = SystemOneServiceImpl(
                 modelPath = File(context.filesDir, LAYA_MAIN_GRAPH).absolutePath,
                 engine = LayaInferenceEngineImpl(context),
+                // Defense in depth (0.4 Task 3): the first-start materialization normally already ran; this lets a
+                // file deleted between then and this loader thread be repaired before the existence check.
+                provision = provision,
             )
             // edith-0.2 Phase B (C4/B5): the embedding service gets the LiteRT engine and the directory the
             // artifacts are actually provisioned to. Both halves were wrong before: no engine was passed, so the
@@ -2173,6 +3281,7 @@ class HostCompositionRoot internal constructor(
                     context.filesDir,
                 ).absolutePath,
                 engine = EmbeddingGemmaLiteRTEngine(),
+                provision = provision,
             )
             val contextSignals = CxrContextSignals(clock, listOf(
                 CxrContextSignals.armingSource(proactiveArming),
@@ -2184,9 +3293,30 @@ class HostCompositionRoot internal constructor(
             // P5 (spec §S4): one PlaybackGate shared between the speech player, the wake/acoustic suppression, and
             // the ASR ingestion guard. Created before the audio chain so it can be passed to provisionAudioChain.
             val playbackGate = PlaybackGate()
+            // 0.4 detached wake acknowledgement (owner 2026-10-27): the half-duplex window that keeps the spoken
+            //「我在」out of the phone microphone's ASR/VAD/KWS. Created with the gate because both are driven by the
+            // same playback callbacks, and handed to the audio chain so every loop it builds consults one instance.
+            val echoMute = EchoMuteWindow(clock)
+            // 0.4 Task 6 (`D199`/`D200`): the phone microphone is an alternative **source** on the existing loop, not a
+            // second chain. One ingress instance is created here and named by the chain's dynamic selector while the
+            // detach gate is on; `armAudioEpoch` opens it, the phone capture offers into it, and the same framer/
+            // pipeline/KWS consume it exactly as they consume the CXR uplink. It is only ever opened in detached mode,
+            // so a glasses session's ingress (the connection's) is untouched by its existence.
+            val phoneIngress = PcmIngress(clock)
+            // 0.4 Task 8 (`D199`, spec §4.6): the CPU hold for detached sessions. Android's `PARTIAL_WAKE_LOCK` is the
+            // platform-official way to keep KWS processing while the phone's screen is off; the vendor SDK has no
+            // CPU-hold API at all (its FAQ offers only `FLAG_KEEP_SCREEN_ON` and an un-interceptable power key), which
+            // is why this is the documented platform fallback. Created once here and owned by the composition: a
+            // successful detached arm acquires it and every teardown path releases it. It never turns the screen on.
+            // Read from this context directly - not `applicationContext`, which a JVM rig's bare `ContextWrapper(null)`
+            // cannot answer - and null is an honest "no platform lock", reported as `lockscreen_hold=false`.
+            val detachedWakeLock = WakeLockHold.fromPowerManager(
+                context.getSystemService(PowerManager::class.java),
+            )
             val audio = provisionAudioChain(
                 context = context,
-                clock = clock, scheduler = scheduler, ingress = { connection[0]?.ingress },
+                clock = clock, scheduler = scheduler,
+                ingress = { if (detachGate.enabled.value) phoneIngress else connection[0]?.ingress },
                 emit = { event -> hostHolder[0]?.onEvent(event) },
                 cancelTurn = { turnId ->
                     hostHolder[0]?.let { runtime ->
@@ -2209,32 +3339,42 @@ class HostCompositionRoot internal constructor(
                 // emission** and from the host itself, so the only wakes that exist are the ones the host will accept
                 // - and a wake that arrives after the session ended is dropped by `onEvent` instead of opening a turn
                 // under a generation that no longer exists.
-                wakeEmit = { word, confidence -> hostHolder[0]?.let { host ->
-                    val root = rootHolder[0]
-                    if (root != null) {
-                        // 0.23 P5 (D135): a short chime, governed by the same 「语音朗读」 switch, then the wake
-                        // event. No Assistance, no conversation entry and no TTS phrase: the wearer hears that they
-                        // were heard, and nothing claims to be an answer. 0.24 S5 final review Important #1: the
-                        // composition owns the chime and the resident-panel decision together, so a wake the plugin
-                        // will refuse cannot open an overlay with no turn behind it.
-                        root.emitWake(host, word, confidence) {
-                            val outcome = wakeChime.playOutcome(
-                                clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
-                            P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
+                wakeEmit = { word, confidence ->
+                    // 0.4 Task 13d: a keyword-spotting hit is an explicit input, so it re-opens the host transcript
+                    // route a dictation closed before the wake turn's own ASR final can arrive. The detector fires on
+                    // the frame before the pipeline sees it, so the wake turn's transcript is never gated.
+                    rootHolder[0]?.audioChain?.openTranscriptRoute("wake")
+                    hostHolder[0]?.let { host ->
+                        val root = rootHolder[0]
+                        if (root != null) {
+                            // 0.23 P5 (D135): a short chime, governed by the same 「语音朗读」 switch, then the wake
+                            // event. No Assistance, no conversation entry and no TTS phrase: the wearer hears that they
+                            // were heard, and nothing claims to be an answer. 0.24 S5 final review Important #1: the
+                            // composition owns the chime and the resident-panel decision together, so a wake the plugin
+                            // will refuse cannot open an overlay with no turn behind it.
+                            root.emitWake(host, word, confidence,
+                                chime = {
+                                    val outcome = wakeChime.playOutcome(
+                                        clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
+                                    P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
+                                },
+                                ack = { text -> root.speakDetachedWakeAck(text) },
+                            )
+                        } else {
+                            // The composition does not exist yet (the chain is built before it): no panel can be asked
+                            // for, but the detector's evidence still has to reach the host.
+                            emitWakeDetected(host, clock, word, confidence)
                         }
-                    } else {
-                        // The composition does not exist yet (the chain is built before it): no panel can be asked
-                        // for, but the detector's evidence still has to reach the host.
-                        emitWakeDetected(host, clock, word, confidence)
-                    }
-                } },
+                    } },
                 // Task 4 (P3.2): the same per-emission identity resolution for the acoustic gate, so a label that
                 // arrives after the session ended is dropped by `onEvent` instead of opening anything under a
                 // generation that no longer exists. Task 5: the host only produces the event while 「主动辅助」 is on.
                 acousticEmit = armedAcousticSink({ hostHolder[0] }, clock, proactiveArming),
                 cooldownNanos = smartSettings.cooldownNanos,
                 suppressWhile = playbackSuppression { rootHolder[0] },
-                playbackGate = playbackGate)
+                playbackGate = playbackGate,
+                muteWindow = echoMute,
+            )
             // P5 (C1+C2+C3 fix): bridge audio capture → segment source → media source.
             val audioBridge = audio?.let { AudioSegmentBridge(it.audioCapture) }
             audioBridge?.let {
@@ -2255,7 +3395,13 @@ class HostCompositionRoot internal constructor(
             val speechPlayerHolder = java.util.concurrent.atomic.AtomicReference<com.sheen.rokid.plugin.SpeechPlayer?>(null)
             val smartWiring = SmartWiring(smartSettings, profiles, clock, scheduler, { sessionId, generation, turnId ->
                 hostHolder[0]?.cancelOutputTurn(sessionId, generation, turnId)
-            }, isPanelVisible = { rootHolder[0]?.isPanelVisible() ?: false },
+            }, isPanelVisible = SmartWiring.cyclePanelVisible(
+                // 0.4 Task 7 (`D201`, spec §4.3): the phone's conversation tab is always the visible surface while
+                // detached, so the cycle starts its window at once instead of waiting for a `PANEL_SHOWN` that only
+                // the glasses can send. Glasses mode keeps the link's own live answer, unchanged.
+                detached = { detachGate.enabled.value },
+                glassesVisible = { rootHolder[0]?.isPanelVisible() == true },
+            ),
                 requestPanelOpen = { route -> rootHolder[0]?.requestPanelOpen(route) ?: false },
                 speechAvailable = { speechPlayerHolder.get() != null },
                 // 0.3 Phase 4B (`D189`): the gate's **provider**, not its current value. `saveSmartSettings` updates
@@ -2690,8 +3836,20 @@ class HostCompositionRoot internal constructor(
                 sendSaid = { route, entryId, text -> hintLink.userSaid(route, entryId, text) },
                 sendBusy = { route, busy -> hintLink.busy(route, busy) },
             )
+            // 0.4 Task 7 (`D201`, spec §4.3): the detached display. One instance for the life of the composition, so a
+            // session rebuilt while detached gets the same surface, and the phone tab's record is the one it reads
+            // (the device never writes it - the plugin's `publishAssistantFinal` owns the answer row).
+            val phoneHintDevice = PhoneHintDevice(conversationLog)
             val environment = CxrHostEnvironment(clock = clock, input = audio?.input ?: UnwiredInputPort,
-                liveOutput = hintLink::liveOutput, scheduler = scheduler, speech = speechPlayer,
+                // Detached mode has no CXR mapping, so the glasses link can never be "live"; the phone display is
+                // what keeps `Capability.TextOutput` advertised for the assistant. Glasses mode is the link's own
+                // live output, exactly as before.
+                liveOutput = hostLiveOutput(
+                    detached = { detachGate.enabled.value },
+                    phone = phoneHintDevice,
+                    glasses = hintLink::liveOutput,
+                ),
+                scheduler = scheduler, speech = speechPlayer,
                 providers = buildMap {
                     put(Capability.Model, model)
                     audio?.let { put(Capability.Asr, it.asrSession) }
@@ -2799,10 +3957,27 @@ class HostCompositionRoot internal constructor(
                 visionGate = visionGate,
                 noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
-                playbackGate = playbackGate)
+                detachGate = detachGate,
+                // 0.4 Task 6: the same ingress the chain's selector names, and the production recorder factory.
+                phoneIngress = phoneIngress,
+                phoneMicDeviceFactory = { PhoneMicDevice() },
+                // 0.4 Task 8: the composition owns the detached session's CPU hold.
+                wakeLock = detachedWakeLock,
+                playbackGate = playbackGate,
+                modelReadiness = readiness,
+                // 0.4 Task 12b-ii: the dictation deadline runs on the same single-thread scheduler as the audio loop,
+                // and the page's permission is read per start (a glasses-mode session never asks for it at start).
+                deadlineScheduler = scheduler,
+                microphoneGranted = {
+                    context.checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) ==
+                        android.content.pm.PackageManager.PERMISSION_GRANTED
+                },
+            )
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
             // connection that has not been built yet.
             root.observerHolder = observerHolder
+            root.wakeAckPlayer = speechPlayer as? AndroidSpeechPlayer
+            root.echoMute = echoMute
             root.armObserver(initialObserver)
             root.lockPinStore = lockPinStore
             root.unlockCoordinatorForProbe = unlockGate
@@ -3018,7 +4193,7 @@ class HostCompositionRoot internal constructor(
 
         /**
          * The **arming gate**: the acoustic sink the chain is assembled with, which produces nothing unless
-         * [ProactiveArming.enabled] is on (P3.2, spec §16.2).
+         * [ProactiveArming.effectiveProactiveArmed] is true (P3.2, spec §16.2; 0.4 Task 5 adds `D202`'s detach term).
          *
          * A named production seam rather than a lambda inside `create`, for the same reason as [playbackSuppression]:
          * the gate is the whole mechanism by which the switch works, so a JVM test drives **this** function instead of
@@ -3030,7 +4205,7 @@ class HostCompositionRoot internal constructor(
          */
         internal fun armedAcousticSink(host: () -> HostRuntime?, clock: MonotonicClock,
             arming: ProactiveArming): (AcousticLabel) -> Unit =
-            { label -> if (arming.enabled.value) host()?.let { emitAcoustic(it, clock, label) } }
+            { label -> if (arming.effectiveProactiveArmed) host()?.let { emitAcoustic(it, clock, label) } }
 
         /**
          * Turns one context change into the event the host delivers (Task 6).
@@ -3051,13 +4226,13 @@ class HostCompositionRoot internal constructor(
         }
 
         /**
-         * The arming gate for context, exactly as [armedAcousticSink] is for the acoustic labels: with 「主动辅助」 off
-         * the composition produces no `ContextChanged`, so a plugin receives no context signal (spec §16.2, pre-flight
-         * P4).
+         * The arming gate for context, exactly as [armedAcousticSink] is for the acoustic labels: with 「主动辅助」 off -
+         * or with 0.4's 「脱离眼镜」 mode on (`D202`) - the composition produces no `ContextChanged`, so a plugin
+         * receives no context signal (spec §16.2, pre-flight P4).
          */
         internal fun armedContextSink(host: () -> HostRuntime?, clock: MonotonicClock,
             arming: ProactiveArming): (ContextSnapshot) -> Unit =
-            { snapshot -> if (arming.enabled.value) host()?.let { emitContextChanged(it, clock, snapshot) } }
+            { snapshot -> if (arming.effectiveProactiveArmed) host()?.let { emitContextChanged(it, clock, snapshot) } }
     }
 }
 
@@ -3108,18 +4283,16 @@ internal object EmbeddingModelDirectory {
      *        threw `NullPointerException: getFilesDir(...) must not be null` out of `create()` and the app could not
      *        assemble, which is worse than a refusal.
      *
-     *        The fallback is deliberately a path that cannot exist rather than the internal `filesDir`: falling back
-     *        to a directory that might hold something else would answer "the model is here" with whatever happened to
-     *        be there, and refusing the turn is the honest state when the artifacts are unreachable.
+     *        **0.4 Task 3:** the external directory stays primary, but when it is absent the fallback is the
+     *        reachable internal `filesDir/models/embeddinggemma` the provisioner writes to (spec §6.3). Only when
+     *        both directories are absent does this return a path that cannot exist, so a context-less JVM rig keeps
+     *        degrading to a refusal instead of reading whatever happens to be there.
      */
-    fun locate(externalFilesDir: File?, internalFilesDir: File?): File =
-        if (externalFilesDir != null) {
-            File(externalFilesDir, RELATIVE_PATH)
-        } else {
-            // `File("")` keeps the result relative when even the internal directory is absent; it still cannot exist,
-            // which is the property that matters.
-            File(File(internalFilesDir ?: File(""), UNREACHABLE_PREFIX), RELATIVE_PATH)
-        }
+    fun locate(externalFilesDir: File?, internalFilesDir: File?): File = when {
+        externalFilesDir != null -> File(externalFilesDir, RELATIVE_PATH)
+        internalFilesDir != null -> File(internalFilesDir, RELATIVE_PATH)
+        else -> File(File(""), UNREACHABLE_PREFIX).resolve(RELATIVE_PATH)
+    }
 }
 
 internal object DebugImportDirectory {    const val STORE_DIRECTORY = "engine-models"
@@ -3265,10 +4438,124 @@ internal class CxrAudioChain private constructor(
     val audioCapture: AudioSegmentCapture = AudioSegmentCapture(),
     /** P5 (C3 fix): the bridge ref shared with the pipeline's emit callback. Set after construction. */
     internal var bridgeRef: java.util.concurrent.atomic.AtomicReference<AudioSegmentBridge?>? = null,
+    /**
+     * 0.4 detached wake acknowledgement: the echo-mute window every loop this chain builds consults. Null keeps
+     * every frame untouched (glasses-only harnesses, pre-ack behavior); production passes the composition's one
+     * instance, and only a detached acknowledgement ever opens it.
+     */
+    private val muteWindow: EchoMuteWindow? = null,
 ) : AutoCloseable {
 
     private val lock = Any()
     private var loop: AudioIngressLoop? = null
+
+    /** The ingress [loop] was built on. The selector is dynamic (0.4 Task 6), so identity decides a stale cache. */
+    private var loopIngress: PcmIngress? = null
+
+    /**
+     * The cached normal loop, or null while none is built.
+     *
+     * Read-only introspection for the dictation regression (0.4 Task 12b-ii fix 1): a CXR offer that arrives while a
+     * glasses-mode dictation owns the pipeline must build nothing, and the restore must leave exactly one normal loop
+     * behind. Production never reads it.
+     */
+    internal val normalLoopForProbe: AudioIngressLoop? get() = synchronized(lock) { loop }
+
+    /**
+     * The phone-mic dictation loop while a glasses-mode dictation owns the route, or null (0.4 Task 12b-ii fix 2).
+     *
+     * Read-only introspection for the lease-transition and tail-quiesce regressions: the host must pause the CXR loop
+     * before the phone capture opens, and it must quiesce this loop before the controller forces the final.
+     * Production never reads it.
+     */
+    internal val dictationLoopForProbe: AudioIngressLoop? get() = synchronized(lock) { dictationLoop }
+
+    /**
+     * The phone-mic dictation loop while glasses-mode dictation runs, or null (0.4 Task 12b-ii).
+     *
+     * In detached mode this is null for the whole dictation: the normal loop already polls the phone ingress, so the
+     * host only switches its wake acceptance off. In glasses mode the normal CXR loop is stopped and this second
+     * [`AudioIngressLoop`] polls the phone ingress into the **same** pipeline - no second ASR/KWS instance is built.
+     */
+    private var dictationLoop: AudioIngressLoop? = null
+
+    /**
+     * Whether the pipeline's frames may feed the acoustic labeler/audio-segment capture (0.4 Task 12b-ii).
+     *
+     * Dictation audio is content the wearer typed with their voice, not a wake/proactive turn: while a dictation runs,
+     * the pipeline still transcribes it, but it must not produce an acoustic label that the proactive route could turn
+     * into a model request, and it must not enter the audio-segment bridge. Only the dictation overrides this flag.
+     */
+    @Volatile internal var dictationActive: Boolean = false
+        private set
+
+    /** Whether new loops start with their KWS accepted; the dictation begin/end switch it (0.4 Task 12b-ii). */
+    @Volatile private var wakeEnabled = true
+
+    /**
+     * Whether pipeline transcripts may be handed to the host/plugin (0.4 Task 13d).
+     *
+     * A phone-microphone dictation is one-shot: its final goes to the input field, and audio that follows it is still
+     * the wearer's dictation, never an implicit conversation utterance. Frames keep flowing after the final (the wake
+     * route is restored, so KWS can hear a real wake word), but the **transcripts** stay closed until an explicit
+     * input re-opens the route: a KWS wake, a typed message, `Help`, or a new session. Device evidence 2026-10-27:
+     * a dictation tail was transcribed on the restored wake route (`P3_ASR revision=0..3`, no `P3_WAKE`) and queued
+     * as the previous answer's continuation (`P3_CONV queue route=WAKE chars=18`), which then made every typed send
+     * answer `P4_TYPED refused reason=busy`. This is a host **policy** over the already-restored route; the frames,
+     * KWS and the pipeline's own state are untouched.
+     */
+    @Volatile private var transcriptRouteOpen = true
+
+    /** Why the route is closed, for the count-only drop line; only read while [transcriptRouteOpen] is false. */
+    @Volatile private var transcriptRouteReason = "dictation"
+
+    /** Partials dropped while the route was closed, reported once on the next dropped final (counts only). */
+    private val suppressedPartials = java.util.concurrent.atomic.AtomicInteger()
+
+    /**
+     * Closes the host transcript route after a dictation; idempotent, and a no-op when already closed.
+     *
+     * Called from the dictation terminal callbacks **before** the cleanup restores the wake loop, so no tail final can
+     * race the policy. The dictation's own final never passes here: it travels through the controller's redirect.
+     */
+    internal fun closeTranscriptRoute(reason: String) {
+        if (!transcriptRouteOpen) return
+        transcriptRouteReason = reason
+        transcriptRouteOpen = false
+        suppressedPartials.set(0)
+        P3Log.line("P3_TRANSCRIPT_ROUTE state=closed reason=$reason")
+    }
+
+    /** Re-opens the host transcript route for an explicit input (wake / typed / Help) or a new session. Idempotent. */
+    internal fun openTranscriptRoute(reason: String) {
+        if (transcriptRouteOpen) return
+        transcriptRouteOpen = true
+        P3Log.line("P3_TRANSCRIPT_ROUTE state=open reason=$reason")
+    }
+
+    /** Count-only record of one transcript the closed route refused; never the text, never a digest of it. */
+    private fun suppressTranscript(revision: TranscriptRevision) {
+        if (!revision.final) {
+            suppressedPartials.incrementAndGet()
+            return
+        }
+        val partials = suppressedPartials.getAndSet(0)
+        P3Log.line("P3_TRANSCRIPT_ROUTE state=drop reason=$transcriptRouteReason " +
+            "partials=$partials chars=${revision.text.trim().length}")
+    }
+
+    /**
+     * Re-arms the shared speech pipeline after a provider fault, for a **new** session (0.4 Task 13d).
+     *
+     * The pipeline is process-lifetime (its ASR/VAD/speaker models cost a full load), and a fault pauses it for the
+     * session that produced it. Without this the first transient fault silenced ASR for every later session until the
+     * App was force-stopped (device evidence 2026-10-27: dictation `timeout chars=0`, a KWS-hit wake turn with no
+     * `P3_ASR`, restored by cold launch). Called when a new audio epoch is armed.
+     */
+    internal fun rearmPipeline(reason: String) {
+        val rearmed = runCatching { pipeline.rearm() }.getOrDefault(false)
+        if (rearmed) P3Log.line("P3_PIPELINE state=rearmed reason=$reason")
+    }
 
     /** Outcomes observed before the first loop existed; drained into it as it is built. */
     private val pendingFaults = ArrayDeque<String>()
@@ -3278,11 +4565,29 @@ internal class CxrAudioChain private constructor(
      * The host-facing input port; the host starts it for an epoch exactly as it starts any other input.
      *
      * `stop` reads the loop through the lock rather than resolving one, so stopping cannot create a loop that
-     * was never started.
+     * was never started. It also **drops the cache** for the epoch being stopped: the ingress selector is dynamic
+     * (0.4 Task 6 - detached mode selects the phone source), so a session boundary is exactly when the next start has
+     * to be free to build a loop against whatever source the mode then names. Without this, the first session's loop
+     * would keep polling the previous source for the next session too, which on a device looks like "the source
+     * changed but nobody hears anything". A stop naming some other epoch leaves the cache alone, so a late/stale stop
+     * cannot unhook a live loop.
      */
     val input: InputPort = object : InputPort {
         override fun start(epoch: InputEpoch) { resolved()?.start(epoch) }
-        override fun stop(epoch: InputEpoch) { synchronized(lock) { loop }?.stop(epoch) }
+        override fun stop(epoch: InputEpoch) {
+            // Outcomes buffered while there was no loop stay buffered: they belong to the receiver's ingress, and the
+            // next loop drains them (the buffer is only ever used before the first ingress exists).
+            val stopped = synchronized(lock) {
+                val current = loop
+                val drop = current == null || current.activeEpoch == null || current.activeEpoch == epoch
+                if (drop) {
+                    loop = null
+                    loopIngress = null
+                }
+                current
+            }
+            stopped?.stop(epoch)
+        }
     }
 
     /**
@@ -3299,25 +4604,196 @@ internal class CxrAudioChain private constructor(
     /** Reports what the receiver did with one offered datagram; see [AudioIngressLoop.onOffer]. */
     fun onOffer(offer: PcmOffer) {
         offerSink(offer)
+        // [resolved] drops transport outcomes while a glasses-mode dictation owns the pipeline (fix 1); the outcome
+        // still reaches diagnostics through [offerSink] above.
         resolved(offer = offer)
     }
 
     /**
-     * The loop for the current ingress, built at most once, with any outcome that arrived before it drained
-     * into it.
+     * Dictation routing seam (0.4 Task 12b-ii, spec §5.3 D204).
+     *
+     * The host never reaches into the private loop: a dictation that runs in **detached** mode reuses the running
+     * phone loop (only its wake acceptance goes off); one that runs in **glasses** mode stops the CXR loop, drains its
+     * queue and starts a phone loop over the same [SpeechPipeline]. Either way the frames of the phone mic are framed
+     * by the chain's one [PcmFramer] and no second recognizer/detector is built.
+     */
+    internal fun dictationPipeline(): SpeechPipelineDictation = SpeechPipelineDictation(pipeline)
+
+    /** Whether the shared pipeline is already transcribing a wake request (the host refuses to steal that turn). */
+    internal fun hasActiveTurn(): Boolean = pipeline.hasActiveTurn()
+
+    /**
+     * Starts dictating on [phoneIngress].
+     *
+     * @return true when the route is ready: in detached mode the running phone loop had its wake acceptance disabled;
+     *   in glasses mode the CXR loop was stopped and a phone loop is now polling the pipeline. False means nothing was
+     *   left running by this call (the caller restores the route with [endDictation]).
+     */
+    internal fun beginDictation(epoch: InputEpoch, phoneIngress: PcmIngress): Boolean = synchronized(lock) {
+        if (dictationLoop != null) return false
+        wakeEnabled = false
+        val current = loop
+        val detachedSource = current != null && loopIngress === phoneIngress
+        if (detachedSource) {
+            // Detached: the session's own loop keeps running; only the KWS tap closes.
+            current!!.wakeEnabled = false
+            dictationActive = true
+            return true
+        }
+        // Glasses: pause the CXR frame loop (no transport/session command), then run the phone source through the
+        // same pipeline. Frames the CXR kept sending while paused are stale for the next wake turn, so drop them.
+        // 0.4 Task 12b-ii fix 2 (finding 4a): close both consumer taps **before** the stop. A tick that has already
+        // drained its chunks delivers them outside the loop lock, so without this a CXR tail frame could still reach
+        // KWS/ASR after the route switched and open a wake turn that the dictation's redirect would then capture.
+        current?.wakeEnabled = false
+        current?.pipelineEnabled = false
+        current?.activeEpoch?.let { current.stop(it) }
+        loop = null
+        loopIngress = null
+        val cxr = ingress()
+        if (cxr != null) drainStale(cxr)
+        val built = AudioIngressLoop(phoneIngress, framer, pipeline, wake?.detector, scheduler, clock,
+            onFault = faultSink, muteWindow = muteWindow)
+        built.wakeEnabled = false
+        dictationLoop = built
+        dictationActive = true
+        built.start(epoch)
+        true
+    }
+
+    /**
+     * Ends a dictation and restores the normal route (0.4 Task 12b-ii).
+     *
+     * Detached: re-enables the session loop's KWS. Glasses: stops and releases the phone loop, drops the CXR audio that
+     * arrived while paused, and starts the normal CXR loop again. No transport start/stop is performed - the session was
+     * never stopped - and the wake detector is reset so the frames before/after the dictation cannot be spliced into one
+     * keyword hypothesis.
+     */
+    internal fun endDictation(epoch: InputEpoch) {
+        synchronized(lock) {
+            wakeEnabled = true
+            dictationActive = false
+            val dictation = dictationLoop
+            if (dictation == null) {
+                loop?.let {
+                    it.wakeEnabled = true
+                    it.pipelineEnabled = true
+                }
+                runCatching { wake?.detector?.reset() }
+                return
+            }
+            dictation.activeEpoch?.let { dictation.stop(it) }
+            dictationLoop = null
+            val source = ingress()
+            if (source != null) {
+                drainStale(source)
+                val rebuilt = AudioIngressLoop(source, framer, pipeline, wake?.detector, scheduler, clock,
+                    onFault = faultSink, muteWindow = muteWindow)
+                rebuilt.wakeEnabled = true
+                loop = rebuilt
+                loopIngress = source
+                rebuilt.start(epoch)
+            }
+            runCatching { wake?.detector?.reset() }
+        }
+    }
+
+    /**
+     * Stops any dictation route without restarting the normal loop (0.4 Task 12b-ii).
+     *
+     * Used by the composition's teardown: `disarmAudioEpoch` is about to stop the loop/capture/ingress anyway, so a
+     * restart here would be work the very next statement undoes. The session's loop has its two acceptance flags put
+     * back so a loop that is not actually stopped (a paths race) cannot stay quiesced.
+     */
+    internal fun abortDictation() = synchronized(lock) {
+        wakeEnabled = true
+        dictationActive = false
+        dictationLoop?.activeEpoch?.let { running -> dictationLoop?.stop(running) }
+        dictationLoop = null
+        loop?.let {
+            it.wakeEnabled = true
+            it.pipelineEnabled = true
+        }
+    }
+
+    /**
+     * Stops feeding the remaining frames of the current batch as soon as a dictation reaches a terminal state.
+     *
+     * The controller restores its emit sink before it reports that state, so a frame left in the same 20 ms drain batch
+     * would otherwise start a new ASR turn whose partials reach the restored wake route. The host calls this from the
+     * terminal callback; the frames of a whole batch are then skipped until [endDictation] puts the route back.
+     */
+    internal fun quiesceDictationInput() = synchronized(lock) {
+        val dictation = dictationLoop
+        if (dictation != null) {
+            dictation.wakeEnabled = false
+            dictation.pipelineEnabled = false
+        } else {
+            loop?.let {
+                it.wakeEnabled = false
+                it.pipelineEnabled = false
+            }
+        }
+    }
+
+    /** Routes a phone-capture offer outcome to the dictation loop's counters instead of the paused CXR loop's. */
+    internal fun onDictationOffer(offer: PcmOffer) {
+        offerSink(offer)
+        synchronized(lock) { dictationLoop?.onOffer(offer) }
+    }
+
+    /** Drops queued chunks/gaps of an ingress that was paused on purpose; a deliberate pause is not an audio fault. */
+    private fun drainStale(source: PcmIngress) {
+        while (runCatching { source.poll() }.getOrNull() != null) { /* discarded on purpose */ }
+        while (runCatching { source.pollGap() }.getOrNull() != null) { /* stale gap */ }
+    }
+
+    /**
+     * The loop for the current ingress, with any outcome that arrived before it drained into it.
      *
      * The `offer`/`fault` arguments are handled here rather than by the callers so that "is there a loop" and
      * "buffer this" are one atomic decision: a caller that checked and then buffered could interleave with the
      * call that builds the loop and drains the buffer, losing the outcome for good. Buffering only ever happens
      * before the first ingress exists (the CXR connection is built lazily), and the next call - a later offer,
      * or `start` - drains it.
+     *
+     * **The cache is per ingress, not per chain (0.4 Task 6).** The selector is dynamic: detached mode names the
+     * phone ingress, glasses mode the connection's. A loop built for one source must never poll the other, so a
+     * cached loop whose ingress is not the currently selected one is dropped (and stopped if it was somehow still
+     * running) and a new one is built. This is the second half of the same rule as [input.stop]'s cache drop: the
+     * session boundary usually avoids the mismatch, and this identity check makes a mode change correct even if some
+     * later offer or fault raced the boundary.
      */
     private fun resolved(offer: PcmOffer? = null, fault: String? = null): AudioIngressLoop? =
         synchronized(lock) {
-            val current = loop ?: ingress()?.let { source ->
-                AudioIngressLoop(source, framer, pipeline, wake?.detector, scheduler, clock,
-                    onFault = faultSink).also { built ->
+            // 0.4 Task 12b-ii fix 1: a glasses-mode dictation has paused this normal route on purpose. The CXR
+            // transport keeps offering PCM into its ingress while no loop polls it, so its outcomes (ACCEPTED,
+            // OVERFLOW, a drained GAP) describe audio the dictation route does not own. Letting one through here
+            // would build a normal CXR loop; an OVERFLOW would then reset the **shared** PcmFramer under the phone
+            // dictation frames, the pipeline would see a range gap with an unchanged continuity id, and the
+            // in-flight dictation turn would be revoked. `endDictation` drains the paused ingress before the normal
+            // loop is restored, so dropping the outcome here loses no audio the restored route should hear.
+            if (dictationLoop != null) return null
+            val source = ingress()
+            var current = loop
+            if (current != null && loopIngress !== source) {
+                // The selected source changed. A mode change is only legal under a stopped session (D199), so this
+                // loop belongs to a session that has already ended; stopping it defensively would be a second stop if
+                // the epoch still ran, and the loop's own stop is idempotent.
+                val stale = current
+                stale.activeEpoch?.let { epoch -> runCatching { stale.stop(epoch) } }
+                current = null
+                loop = null
+                loopIngress = null
+            }
+            if (current == null && source != null) {
+                current = AudioIngressLoop(source, framer, pipeline, wake?.detector, scheduler, clock,
+                    onFault = faultSink, muteWindow = muteWindow).also { built ->
+                    // A loop built while a dictation is quiescing the chain must inherit the switch: the dictation
+                    // never wants KWS on its own audio even if a fault rebuilt the loop underneath it.
+                    built.wakeEnabled = wakeEnabled
                     loop = built
+                    loopIngress = source
                     while (pendingOffers.isNotEmpty()) built.onOffer(pendingOffers.removeFirst())
                     while (pendingFaults.isNotEmpty()) built.reportFault(pendingFaults.removeFirst())
                 }
@@ -3333,6 +4809,12 @@ internal class CxrAudioChain private constructor(
         }
 
     override fun close() {
+        synchronized(lock) {
+            dictationLoop?.activeEpoch?.let { running -> dictationLoop?.stop(running) }
+            dictationLoop = null
+            loop = null
+            loopIngress = null
+        }
         runCatching { wake?.close() }
         runCatching { pipeline.close() }
     }
@@ -3373,6 +4855,8 @@ internal class CxrAudioChain private constructor(
             acousticEmit: (AcousticLabel) -> Unit = {},
             /** P5 (I2 fix): playback gate for echo suppression during TTS. */
             playbackGate: PlaybackGate = PlaybackGate(),
+            /** 0.4 detached wake acknowledgement: the echo-mute window the loops consult; null mutes nothing. */
+            muteWindow: EchoMuteWindow? = null,
         ): CxrAudioChain {
             // The session needs the pipeline and the pipeline's emit needs the session: the holder breaks the cycle
             // so both the host's delivery and the plugin-facing provider see every revision, in order.
@@ -3388,7 +4872,18 @@ internal class CxrAudioChain private constructor(
             val bridgeRef = java.util.concurrent.atomic.AtomicReference<AudioSegmentBridge?>(null)
             val pipeline = SpeechPipeline(vad, asr, speaker,
                 emit = { event ->
-                    holder[0]?.onEvent(event); emit(event)
+                    // 0.4 Task 13d: after a dictation final the host transcript route stays closed until an explicit
+                    // input. Frames keep flowing and the pipeline keeps its own state; only the hand-off to the
+                    // host/plugin is gated, so a dictation tail can never become a WAKE turn or a queued continuation.
+                    val chain = chainHolder[0]
+                    if (event is TranscriptEvent && chain != null && !chain.transcriptRouteOpen) {
+                        chain.suppressTranscript(event.revision)
+                    } else {
+                        // 0.4 Task 13d, R-CD-3: a provider fault pauses the shared pipeline. Surface the code and the
+                        // pause instead of a silent deafness that only a force-stop used to fix.
+                        logPipelineFault(event)
+                        holder[0]?.onEvent(event); emit(event)
+                    }
                     // Seal the audio segment when a final transcript arrives.
                     if (event is com.sheen.rokid.contracts.TranscriptEvent && event.revision.final) {
                         bridgeRef.get()?.sealForTurn(event.revision.turnId)
@@ -3398,6 +4893,10 @@ internal class CxrAudioChain private constructor(
                     // P5 (I2 fix, spec §S4): suppress ingestion during TTS playback to prevent echo self-trigger.
                     // When the gate is closed, discard the frame entirely — don't feed VAD, ASR, labeler, or capture.
                     if (playbackGate.isPlaying) return@frameSignal
+                    // 0.4 Task 12b-ii (D204): dictation audio is not a wake/proactive turn. It may reach the ASR turn
+                    // above, but it must not produce an acoustic label (which the proactive route could turn into a
+                    // model request) and it must not be retained as an audio segment for a later turn.
+                    if (chainHolder[0]?.dictationActive == true) return@frameSignal
                     labeler.accept(frame, speech)?.let { label -> chainHolder[0]?.acousticEmit?.invoke(label) }
                     // Feed the capture with PCM bytes and VAD speech flag.
                     val pcmBytes = ByteArray(frame.samples.size * 2)
@@ -3414,7 +4913,7 @@ internal class CxrAudioChain private constructor(
             val session = SherpaAsrSession(pipeline)
             holder[0] = session
             return CxrAudioChain(ingress, framer, pipeline, wake, scheduler, clock, onFault, onOffer, session,
-                wakeEmit, acousticEmit, audioCapture).also {
+                wakeEmit, acousticEmit, audioCapture, muteWindow = muteWindow).also {
                     chainHolder[0] = it
                     it.bridgeRef = bridgeRef
                 }
@@ -3461,6 +4960,7 @@ private fun provisionAudioChain(
     cooldownNanos: Long,
     suppressWhile: () -> Boolean,
     playbackGate: PlaybackGate = PlaybackGate(),
+    muteWindow: EchoMuteWindow? = null,
 ): CxrAudioChain? = try {
     val application = requireNotNull(context.applicationContext) { "APPLICATION_CONTEXT_UNAVAILABLE" }
     val store = DebugImportDirectory.store(application)
@@ -3471,6 +4971,11 @@ private fun provisionAudioChain(
         importRoot = DebugImportDirectory.source(application),
         manifest = manifest,
         allowDebugImport = allowDebugImport,
+        // 0.4 Task 2: the APK's own ASR bundle. Wired unconditionally (not behind BuildConfig.DEBUG) because this
+        // is the only path a release build has; the store re-verifies every size and digest while it copies.
+        assetImport = {
+            AssetEngineBundleProvisioning(ModelAssetSource.from(application.assets), store, manifest).import()
+        },
         clock = clock,
         scheduler = scheduler,
         ingress = ingress,
@@ -3483,6 +4988,7 @@ private fun provisionAudioChain(
         wakeEmit = wakeEmit,
         acousticEmit = acousticEmit,
         playbackGate = playbackGate,
+        muteWindow = muteWindow,
     )
 } catch (unavailable: Exception) {
     android.util.Log.i("EdithHost", "audio chain unavailable: ${unavailable.javaClass.name}: ${unavailable.message}")
@@ -3499,12 +5005,16 @@ private fun provisionAudioChain(
  * - a validated bundle must be active or recoverable in the App's model store, imported through
  *   `EngineBundleProvisioning` (or the P2/T17 pipeline) with every size and digest checked.
  *
- * **The debug-only import (Task 11b, Important 2).** With neither an active **nor a recoverable** bundle (Task 15c
- * D3 made `recover` the second check, so a healthy bundle is reused rather than re-imported), a debug build attempts
- * `EngineBundleProvisioning.importBundle` on [DebugImportDirectory.IMPORT_DIRECTORY]. That is what makes the
- * ratified conditional `Asr` advertisement reachable: a bundle pushed there for development is activated exactly
- * as one imported through the P2/T17 path, or nothing happens at all. A release build never reads that
- * directory, so an external bundle cannot become the product's audio engine.
+ * **The packaged bundle is the release path (0.4 Task 2).** With neither an active nor a recoverable bundle, the
+ * App imports the ASR files it ships under `assets/models/asr/` through [assetImport]. That attempt is not behind
+ * `BuildConfig.DEBUG`: a delivery APK has no other source of ASR weights, and the store re-verifies every size and
+ * digest while it copies, so an incomplete or tampered asset set is refused as `ENGINE_MISSING` rather than used.
+ *
+ * **The debug-only import (Task 11b, Important 2).** The debug drop **stays last**. A debug build whose packaged
+ * bundle could not be imported may still attempt `EngineBundleProvisioning.importBundle` on
+ * [DebugImportDirectory.IMPORT_DIRECTORY], which is what makes the ratified conditional `Asr` advertisement
+ * reachable from a pushed development bundle. A release build never reads that directory, so an external bundle
+ * cannot become the product's audio engine and cannot mask a refused packaged bundle.
  *
  * **The wake detector (Task 11b, Important 1).** When the KWS assets are packaged and a VAD-only engine can be
  * built from the same bundle, the detector is wired with its **own** VAD (the pipeline keeps the candidate's),
@@ -3557,13 +5067,23 @@ internal fun provisionAudioChainFrom(
     acousticEmit: (AcousticLabel) -> Unit = {},
     /** P5 (I2 fix): the playback gate for echo suppression during TTS. */
     playbackGate: PlaybackGate = PlaybackGate(),
+    /** 0.4 detached wake acknowledgement: the echo-mute window the chain's loops consult. */
+    muteWindow: EchoMuteWindow? = null,
+    /**
+     * 0.4 Task 2: the ASR bundle imported from the APK's own `assets/models/asr/` files.
+     *
+     * Attempted in **both** build types after `active`/`recover` and before the debug-only drop, so a release build
+     * can run ASR without any external push. Defaulted to null so the pre-0.4 harnesses keep the same branch
+     * selection (active -> recover -> debug drop) and do not need assets.
+     */
+    assetImport: (() -> ValidatedModelBundle?)? = null,
 ): CxrAudioChain? = try {
     val verified = PcmFormatEvidence.resolve(CxrGlassesTarget.GLASSES_FIRMWARE, CXR_SDK_VERSION)
     if (verified == null) {
         android.util.Log.i("EdithHost", "FORMAT_UNVERIFIED: no verified uplink format, the ASR chain stays unwired")
         null
     } else {
-        val bundle = activateBundle(store, provisioner, importRoot, allowDebugImport, manifest)
+        val bundle = activateBundle(store, provisioner, importRoot, allowDebugImport, manifest, assetImport)
         if (bundle == null) {
             android.util.Log.i("EdithHost", "ENGINE_MISSING: no validated engine bundle, the ASR chain stays unwired")
             null
@@ -3608,7 +5128,8 @@ internal fun provisionAudioChainFrom(
                         vad = candidate.vad, asr = candidate.asr, speaker = candidate.speaker,
                         wake = wake, scheduler = scheduler, clock = clock, emit = emit, cancelTurn = cancelTurn,
                         onFault = onFault, onOffer = onOffer, wakeEmit = wakeEmit,
-                        acousticEmit = acousticEmit, playbackGate = playbackGate).also { chainHolder[0] = it }
+                        acousticEmit = acousticEmit, playbackGate = playbackGate,
+                        muteWindow = muteWindow).also { chainHolder[0] = it }
                 } catch (unavailable: Throwable) {
                     runCatching { candidate.vad.close() }
                     runCatching { candidate.asr.close() }
@@ -3647,18 +5168,22 @@ internal class ModelStoreBundles(private val store: EngineModelStore) : EngineBu
 }
 
 /**
- * The bundle the chain is built from, reusing a validated one before importing the debug directory's.
+ * The bundle the chain is built from: reuse a validated one, then the APK's own, then the debug directory's.
  *
- * `store.active()` first, because an already-validated bundle is authoritative; then `store.recover(manifest)`, which
- * revalidates a bundle a previous process wrote and whose in-memory handle this process does not have; **only then**
- * the debug import (and only in a debug build). A refusal anywhere is `ENGINE_MISSING` - never a silently weaker
- * bundle.
+ * `store.active()` first, because an already-validated bundle is authoritative; then `store.recover(manifest)`,
+ * which revalidates a bundle a previous process wrote and whose in-memory handle this process does not have; then
+ * [assetImport] - the ASR files the APK itself ships, attempted in **release and debug alike** (0.4 Task 2); and
+ * **only then** the debug import, and only in a debug build. A refusal anywhere is `ENGINE_MISSING` - never a
+ * silently weaker bundle.
  *
  * **The order is the fix (Task 15c D3).** Importing before `recover` re-copied the whole bundle into a fresh
  * directory on every cold start and left the previous copy in place: the device evidence (2026-10-09) showed two
  * different `ENGINE_IMPORTED: ACTIVE:…` ids across two runs, ~235 MB each, plus the import directory. Checking the
- * recoverable bundle first makes a healthy bundle reused instead of re-imported; the import stays the last resort for
- * a store that genuinely has nothing, which is the only case the debug drop is for.
+ * recoverable bundle first makes a healthy bundle reused instead of re-imported.
+ *
+ * **The APK's bundle is the release path (0.4 Task 2).** A delivery build has no external drop at all, so
+ * [assetImport] must be attempted even when `allowDebugImport` is false. The debug drop stays the **last** branch:
+ * it is a development override, not a fallback that could mask a refused packaged bundle in release.
  */
 internal fun activateBundle(
     store: EngineBundleStore,
@@ -3666,6 +5191,7 @@ internal fun activateBundle(
     importRoot: File,
     allowDebugImport: Boolean,
     manifest: EngineManifest,
+    assetImport: (() -> ValidatedModelBundle?)? = null,
 ): ValidatedModelBundle? {
     // The reuse paths are logged as well as the import: without a line for them, a device run cannot tell "the
     // healthy bundle was reused" from "no bundle was found at all" - both used to be silent (Task 15b, concern 2).
@@ -3677,12 +5203,40 @@ internal fun activateBundle(
         android.util.Log.i("EdithHost", "ENGINE_REUSED: RECOVERED:${bundle.directory}")
         return bundle
     }
-    if (!allowDebugImport) return null
-    val imported = runCatching { provisioner.importBundle(importRoot) }
-    android.util.Log.i("EdithHost", imported.fold(
-        onSuccess = { "ENGINE_IMPORTED: $it" },
-        onFailure = { "ENGINE_IMPORT_FAILED: ${it.javaClass.name}: ${it.message}" }))
-    return imported.getOrNull()?.let { store.active() }
+    if (assetImport != null) {
+        val importedAssets = runCatching(assetImport)
+        importedAssets.getOrNull()?.let { bundle ->
+            android.util.Log.i("EdithHost", "ENGINE_IMPORTED_ASSET: ACTIVE:${bundle.directory}")
+            return bundle
+        }
+        android.util.Log.i("EdithHost", "ENGINE_IMPORT_FAILED: " + (
+            importedAssets.exceptionOrNull()?.let { "${it.javaClass.name}: ${it.message}" }
+                ?: "NO_PACKAGED_ASR_BUNDLE"))
+    }
+    if (allowDebugImport) {
+        val imported = runCatching { provisioner.importBundle(importRoot) }
+        android.util.Log.i("EdithHost", imported.fold(
+            onSuccess = { "ENGINE_IMPORTED: $it" },
+            onFailure = { "ENGINE_IMPORT_FAILED: ${it.javaClass.name}: ${it.message}" }))
+        imported.getOrNull()?.let { store.active() }?.let { return it }
+    }
+    android.util.Log.i("EdithHost", "ENGINE_MISSING: no active, recovered, packaged or debug-import bundle")
+    return null
+}
+
+/**
+ * 0.4 Task 13d (R-CD-3): count-only telemetry for the shared pipeline's terminal states.
+ *
+ * `SpeechPipeline.fault()` pauses intake for the rest of the session; before this the fault was delivered only as a
+ * `HostEvent`, which nothing logged, so a silenced ASR looked identical to a silent room on a device run. The code and
+ * the pause are state, never audio or text.
+ */
+private fun logPipelineFault(event: HostEvent) {
+    when (event) {
+        is ServiceFaultEvent -> P3Log.line("P3_PIPELINE state=fault reason=${event.code}")
+        is SessionStateEvent -> if (event.state == SessionState.Paused) P3Log.line("P3_PIPELINE state=paused")
+        else -> Unit
+    }
 }
 
 /** A composition that was not wired for lock-screen unlock: the PIN is never configured. */

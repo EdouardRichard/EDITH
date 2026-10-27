@@ -46,8 +46,22 @@ data class TranscriptEvent(val revision: TranscriptRevision) : HostEvent { overr
 data class SpeakerEvent(val assessment: SpeakerAssessment) : HostEvent { override val envelope = assessment.envelope }
 data class AudioEvent(val segment: AudioSegment) : HostEvent { override val envelope = segment.envelope }
 
-data class UserAction(override val envelope: EventEnvelope, val action: Action) : HostEvent {
-    enum class Action { Pause, Resume, Stop, Help }
+/**
+ * 0.4 Task 10 (`D203`, spec §5.2): a wearer action, optionally carrying a **typed** body.
+ *
+ * [Typed][Action.Typed] is the phone's text input. It is deliberately additive: every pre-0.4 action keeps its meaning
+ * and no codec is involved - this type is phone-internal, never serialised and never on the CXR wire. The smart plugin
+ * is the only exhaustive `when` over [Action], so the compiler forces the new branch there.
+ *
+ * [text] is meaningful only for [Action.Typed] and defaults to null so every positional construction that predates the
+ * typed path still compiles. Callers must not log it (it is the wearer's content, counts only).
+ */
+data class UserAction(
+    override val envelope: EventEnvelope,
+    val action: Action,
+    val text: String? = null,
+) : HostEvent {
+    enum class Action { Pause, Resume, Stop, Help, Typed }
 }
 
 data class WakeDetected(

@@ -75,6 +75,9 @@ class CxrHintLinkTest {
                 next.task()
             }
         }
+
+        /** How many timers are still armed. A cancelled entry is dead weight the real scheduler drops as well. */
+        fun pendingCount(): Int = tasks.count { !it.cancelled }
     }
 
     private class FakeConnection : CxrConnection {
@@ -1710,5 +1713,73 @@ class CxrHintLinkTest {
         assertEquals("c-1", states.single().requestId)
         assertEquals("PANEL_SHOWN must not clear the unsettled question", 1, presenter.pendingCount)
         assertTrue("the keys still answer the same question", presenter.answerFromGlasses("c-1", approved = true))
+    }
+
+    // ------------------------------------------ 0.4 strict-local fix: detach neutralizes the link
+
+    /**
+     * 0.4 strict-local fix (`D199`/`D201`): the link itself must become inert when the App detaches.
+     *
+     * A live mapping keeps a clock renewal armed, and every conversation/confirmation send is stamped with the
+     * session that mapping belongs to. Closing only the composition session (the old `sessionEnded()` path) left the
+     * mapping, the renewal and the send paths exactly as they were, so a detached App kept sending `PING`/`SYNC` and
+     * a late confirmation could still send `SHOW` - the defect the Task 13b device log showed after `P4_DETACH`.
+     *
+     * `detach()` must therefore cancel every timer it owns (here: the mapping renewal and the UI_READY grace are both
+     * gone, so the scheduler is empty), clear the mapping/session/panel state, and refuse every outbound path while
+     * remaining a no-command operation itself. `attach()` is the explicit reverse used when the user switches the
+     * glasses back on; the next `sessionEstablished` then works normally.
+     */
+    @Test
+    fun detachCancelsTheClockAndRefusesEverySendAfterALiveMapping() {
+        val diagnostics = mutableListOf<String>()
+        val rig = ResidentRig { message -> diagnostics += message }
+        rig.establish()
+        rig.completeExchange()
+        rig.uiReady()
+        assertNotNull("precondition: the display is live", rig.link.liveOutput())
+        assertEquals("precondition: the mapping renewal is the only timer left", 1,
+            rig.scheduler.pendingCount())
+        rig.sent.clear()
+        diagnostics.clear()
+
+        rig.link.detach()
+
+        assertEquals("detach must cancel the clock renewal and the link's timers", 0,
+            rig.scheduler.pendingCount())
+        assertNull("no clock mapping may survive detach", rig.link.liveSyncId())
+        assertNull("no display may be advertised while detached", rig.link.liveOutput())
+        assertFalse("the glasses session is no longer established", rig.link.isEstablished())
+        assertFalse("a sticky UI_READY must not survive", rig.link.hasUiReady())
+        assertFalse("nor a visible panel", rig.link.isPanelVisible())
+
+        rig.advance(120_000)
+        assertTrue("no HELLO/PING/SYNC/SHOW/CLEAR may leave after detach: ${rig.commands()}",
+            rig.sent.isEmpty())
+        assertTrue("and no handshake may restart: $diagnostics",
+            diagnostics.none { it.startsWith("handshake: ping") || it.startsWith("outbound:") })
+
+        assertFalse("a conversation send is refused",
+            rig.link.userSaid(AssistantRoute.WAKE, "asr-1", "text"))
+        assertFalse("a confirmation state is refused", rig.link.confirmationState("c-1", true))
+        assertFalse("a CLOSE is refused", rig.link.closeAll())
+        assertFalse("a PANEL_OPEN is refused", rig.link.requestPanelOpen(AssistantRoute.WAKE))
+        assertTrue("nothing may leave the phone after detach: ${rig.commands()}", rig.sent.isEmpty())
+
+        var stops = 0
+        rig.link.onStopRequest = { _, _ -> stops++ }
+        assertFalse("a stale STOP from the old link is refused",
+            rig.link.onInbound(HintWireCodec.encode(HintCommand.Stop("s-1", 3))))
+        assertEquals("and reaches no host callback", 0, stops)
+
+        rig.link.sessionEstablished("s-2", 4)
+        assertFalse("a stale session introduction must not re-establish the link", rig.link.isEstablished())
+        assertTrue("and sends nothing", rig.sent.isEmpty())
+
+        rig.link.attach()
+        rig.link.sessionEstablished("s-2", 4)
+        assertTrue("attach() must let the next glasses session introduce itself", rig.link.isEstablished())
+        assertTrue("with a fresh HELLO: ${rig.commands()}",
+            rig.commands().any { it is HintCommand.Hello })
     }
 }

@@ -20,15 +20,17 @@ EDITH: An Always-On Proactive AI Agent on Android, Connected to Rokid Glasses
   <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-> **Preview status:** EDITH is currently in preview. Its features are usable, but performance,
-> stability and the overall experience still need optimization.
+> **Preview status:** EDITH is currently in preview (version `0.4.0-preview`). Its features are
+> usable, but performance, stability and the overall experience still need optimization.
 
 EDITH (伊迪丝) is an end-cloud collaborative AI agent: an Android host app on your phone plus a
 custom app on Rokid Glasses. The glasses are its microphone, speaker and display; the phone is its
 ears, hands, memory and brain. Microphone audio streams from the glasses over the Rokid AI App's
 CXR-Link session; the phone segments and transcribes it on-device, calls the LLM you configure,
 operates Android apps through the accessibility service and Shizuku's shell, and communicates with
-the user through text on the glasses HUD and TTS audio.
+the user through text on the glasses HUD and TTS audio. From 0.4 the phone can also run **detached
+from the glasses**, using its own microphone and screen, and its conversation log accepts typed and
+dictated input.
 
 - **Wake-word route** — Say “EDITH” or “伊迪丝”. The glasses panel opens, EDITH listens, recognizes
   the intent, perceives the phone (screen, notifications, media, calendar, device state), plans and
@@ -58,6 +60,16 @@ the user through text on the glasses HUD and TTS audio.
   </a>
 </div>
 
+**Agent capability detached from glasses (0.4)** — no glasses link; wake-word wake only.
+
+<div align="center">
+  <a href="docs/assets/videos/detached-wake.mp4">
+    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="Detached wake demo — click to play the full video">
+  </a>
+</div>
+
+> Note: the clip includes **automatic screen unlock**; the execution is **sped up** — real time is a little over **one minute**.
+
 ## Compatibility and dependencies
 
 The versions below are the configuration EDITH is developed and tested against. Newer firmware or
@@ -72,10 +84,14 @@ app versions may work, but they are not part of the validated baseline.
 | Shizuku | `13.5.4+` (built against API `13.1.5`; device-tested with `13.6.0`) |
 | Build toolchain | JDK 17, Android SDK Platform 35, Gradle wrapper 9.4.1 |
 
-All on-device model sets together take about **1.0 GiB** (1.03 GiB); see
-[Model files](#2-model-files-required) below.
+All four on-device model sets are bundled inside the phone APK (about **1.1 GB**); the first
+launch materializes about **1.0 GiB** (1.03 GiB). See [Model files](#2-model-files-bundled) below.
 
 ## Technical routes
+
+0.4 keeps both routes and adds a phone-only detached variant of the wake route, a text/dictation
+input row on the phone, and model provisioning from APK assets. The default glasses configuration
+described first is unchanged.
 
 ### Wake-word route
 
@@ -87,7 +103,13 @@ proactive route has no wake word at all). A final transcript is admitted into th
 the WAKE turn is waiting for it — with no turn waiting, a final does not open a wake turn; it goes
 to the proactive trigger path instead. `AgentLoop` with the configured cloud model → tool execution
 and perception → answer on the glasses panel and phone-side TTS. The same CXR session also carries
-the display commands and the follow-up audio.
+the display commands and the follow-up audio. With detached mode on, this chain starts at the phone
+microphone instead of the CXR uplink; KWS, VAD, ASR and everything after transcript admission are
+the same (see below). The detached variant also wakes with the screen off or locked (foreground
+service + `PARTIAL_WAKE_LOCK`) and answers every accepted wake with a fixed spoken acknowledgement
+「我在」 inside an echo-mute window: microphone frames are silenced while the phone speaks, so the
+acknowledgement never reaches the ASR or corrupts the user's next command, and the WAKE turn opens
+without waiting for the acknowledgement to finish (zero added latency).
 
 ```mermaid
 flowchart LR
@@ -180,6 +202,26 @@ tool face as the wake route for FOLLOWUP_TURN · glasses overlay panel via CXR c
 When the gate declines, **zero** model requests are made. The two routes use independent
 `ConversationStore`s.
 
+### Detached mode (0.4)
+
+The **Detached from glasses** setting makes the wake route independent of the glasses.
+
+```mermaid
+flowchart LR
+    MIC["Phone microphone"] --> ING["PCM ingress<br/>16 kHz mono"]
+    ING --> KWS["KWS spotter"]
+    ING --> VAD["VAD"] --> ASR["Streaming ASR"]
+    KWS -- "wake hit: EDITH / 伊迪丝" --> CYCLE["WAKE route<br/>same turns, tools, prompts"]
+    ASR -- "final transcript" --> ADMIT["Transcript admission"] --> CYCLE
+    CYCLE -- "answer" --> LOG["Phone conversation log"]
+    LOCK["PARTIAL_WAKE_LOCK<br/>edith:detached-wake"] -. "keeps KWS running<br/>with the screen off" .-> ING
+    STORED["Stored proactive switch"] -. "effective off while detached" .-> CYCLE
+```
+
+With the setting off, the glasses routes above are unchanged: CXR connection, glasses wake, panel
+display and follow-up behavior keep their existing semantics. Detached mode is a local
+input/display choice, not a second CXR protocol.
+
 ## Project structure
 
 - `phone-app/` — Android phone host: session and plugin host, perception, speech, model runtime, native action channels (accessibility / Shizuku)
@@ -226,60 +268,55 @@ Use the same pattern on the glasses with component
 `com.sheen.rokid.glasses/com.sheen.rokid.glasses.accessibility.GlassesAccessibilityService` and
 serial `<glasses-serial>`.
 
-### 2. Model files (required)
+### 2. Model files (bundled)
 
-**Model download link:** [Quark Drive](https://pan.quark.cn/s/d53caa9e395f?pwd=veEd)
+The four on-device model sets — ASR engine bundle, wake-word (KWS), proactive gate (Laya) and memory
+embedding (EmbeddingGemma) — are **bundled inside the phone APK**. Users do not need a separate
+Quark Drive download or an `adb push` to install or start using EDITH.
 
-EDITH needs four local model sets. They are runtime dependencies, not optional add-ons: the
-assistant plugin declares ASR, SystemOne (Laya), Embedding and Perception as required capabilities,
-so a missing model set fails session activation.
+The complete APK is about **1.1 GB** (measured debug build: 1.11 GB / 1.0347 GiB). Plan for roughly
+**2.2 GB** of free storage at install time (estimate: the APK plus the materialized copy). The four
+sets together take about **1.0 GiB** (1.03 GiB) after materialization. Measured on the K40 acceptance
+device with the debug build (2026-10-26), the first materialization took about **12.8 s** and a later
+cold start reused the materialized copy in about **0.45 s**; the release build was not measured.
+Until preparation finishes, the app shows its
+preparing-local-models state and refuses to start a session rather than running with a partial bundle.
 
-| Model set | Contents | Where it goes |
+| Model set | Contents | Runtime location after materialization |
 | --- | --- | --- |
-| ASR engine bundle | encoder / decoder / joiner (ONNX), tokens, Silero VAD, speaker model, plus `engine-manifest.json` | Phone app-private `no_backup/engine-models-import/`, imported on cold start (debug build) |
-| Wake-word (KWS) model | sherpa-onnx KWS Zipformer zh/en 3M: 5 files | Build machine: `.local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/`; packaged into the APK as `assets/kws/` |
-| Proactive gate (Laya) | Laya-Multilingual-LiteRT set: 7 files | Phone app-internal `files/` |
-| Memory embedding | EmbeddingGemma 300M `.tflite` + SentencePiece vocabulary | Phone external files `Android/data/com.sheen.rokid.phone/files/models/embeddinggemma/` |
+| ASR engine bundle | encoder / decoder / joiner (ONNX), tokens, Silero VAD, speaker model, plus `engine-manifest.json` | Phone app-private `no_backup/engine-models/` |
+| Wake-word (KWS) model | sherpa-onnx KWS Zipformer zh/en 3M: 5 runtime files + `keywords.txt` | APK assets `assets/kws/` (read in place, no separate copy) |
+| Proactive gate (Laya) | Laya-Multilingual-LiteRT: 6 runtime files | Phone app-internal `files/` (6 files + bundle receipt) |
+| Memory embedding | EmbeddingGemma 300M `.tflite` + SentencePiece vocabulary | Phone external files `Android/data/com.sheen.rokid.phone/files/models/embeddinggemma/` (internal fallback) |
 
-**ASR engine bundle** (push the whole bundle, then cold-start the app; `logcat` should print
-`EdithHost: ENGINE_IMPORTED`):
+The build verifies every file's bytes and SHA-256 against `tools/scripts/p2/model-bundles.json`; a
+missing or mismatched file fails the build instead of shipping an incomplete bundle. It also derives
+the bundle id from the pinned entries and refuses a manifest whose id does not match, so a changed
+file digest always changes the receipt. The license and declaration texts (15 texts) ship under
+`assets/models/licenses/`. On first launch and each APK update that changes the bundle, the app
+verifies and materializes the assets again; an unchanged bundle is reused.
 
-```powershell
-$phone = "<phone-serial>"
-adb -s $phone push <models>/asr /data/local/tmp/edith-asr
-adb -s $phone shell "run-as com.sheen.rokid.phone mkdir -p no_backup/engine-models-import"
-
-# Repeat for engine-manifest.json and every artifact it declares (encoder/decoder/joiner/tokens/vad/speaker):
-adb -s $phone shell "cat /data/local/tmp/edith-asr/<file> | run-as com.sheen.rokid.phone sh -c 'cat > no_backup/engine-models-import/<file>'"
-
-adb -s $phone shell am force-stop com.sheen.rokid.phone   # then reopen the app once
-```
-
-**Laya gate** (seven files into the app's internal `files/`):
+**Development builds.** The model binaries are not committed. To build a complete APK, stage them
+and point `-PbundledModelsDir` at the staging directory:
 
 ```powershell
-$phone = "<phone-serial>"
-adb -s $phone push <models>/laya /data/local/tmp/edith-laya
-adb -s $phone shell "run-as com.sheen.rokid.phone mkdir -p files"
-
-# Repeat for each of the seven files:
-adb -s $phone shell "cat /data/local/tmp/edith-laya/<file> | run-as com.sheen.rokid.phone sh -c 'cat > files/<file>'"
+.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=E:\edith-0.4-models
 ```
 
-**Memory embedding**:
+The default is `<repo>/.local/0.4-models`, with `asr/`, `laya/` and `embeddinggemma/`
+subdirectories. The KWS files are read from
+`.local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/` and the tracked
+`keywords.txt`. A complete build requires every file; a missing or mismatched file fails the build.
 
-```powershell
-adb -s $phone shell "mkdir -p /sdcard/Android/data/com.sheen.rokid.phone/files/models"
-adb -s $phone push <models>/embeddinggemma /sdcard/Android/data/com.sheen.rokid.phone/files/models/
-```
+For development/CI only, `-PwithoutBundledModels=true` omits `assets/models/**` and sets
+`BuildConfig.BUNDLED_MODELS=false`. **Release variants reject this switch**; it must never produce
+a shipped APK.
 
-**KWS model**: the Gradle build reads the five files from the `.local/...` path above, verifies their
-SHA-256, and packages them as `assets/kws/` (together with the tracked `keywords.txt`). If the
-directory is absent the build still succeeds, but the APK ships no wake-word model and the app
-reports `KWS_MODEL_MISSING`.
-
-Model files are subject to their upstream licenses (Apache-2.0 / MIT / Gemma terms depending on the
-set); they are not part of this repository.
+Model files are subject to their upstream licenses (Apache-2.0 for ASR/KWS/Laya, MIT for Silero,
+Gemma Terms of Use for EmbeddingGemma) and are not part of this repository. The pinned
+sources/revisions and retained license/declaration texts are listed in
+`tools/scripts/p2/NOTICE.md` and `tools/scripts/p2/licenses/`; `distributionReview` remains
+Incomplete.
 
 ### 3. Glasses-side ADB permissions
 

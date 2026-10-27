@@ -8,6 +8,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.NoInterceptionUi
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SmartSettingsForm
 import com.sheen.rokid.phone.session.SessionService
+import com.sheen.rokid.phone.session.SessionPermissions
 import com.sheen.rokid.phone.session.SessionViewModel
 import com.sheen.rokid.phone.lock.LockPinValidator
 
@@ -48,6 +49,9 @@ import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.plugin.Capability
+import com.sheen.rokid.phone.model.ModelReadiness
+import com.sheen.rokid.phone.model.ModelStartGate
+import com.sheen.rokid.phone.model.ProvisioningState
 import com.sheen.rokid.phone.ui.PhoneDetailPage
 import com.sheen.rokid.phone.ui.PhoneScreen
 import kotlinx.coroutines.delay
@@ -58,13 +62,37 @@ class MainActivity : ComponentActivity() {
         const val ACTION_SHOW_CONFIRMATION = "edith.phone.SHOW_CONFIRMATION"
     }
 
-    private val root get() = (application as EdithApplication).composition
+    /**
+     * The composition, only once the page has entered the ready UI. 0.4 Task 3 / spec §6.3: while the bundled models
+     * are preparing or failed this stays null, so no lifecycle callback or permission result can build a composition
+     * before the readiness gate is passed.
+     */
+    private var attachedRoot: HostCompositionRoot? = null
     private var pendingPlugin: String? = null
+
+    /**
+     * 0.4 Task 6 (`D199`): whether the start being permission-gated was a detached one.
+     *
+     * The permission result arrives after the dialog, when the gate may in principle have changed; the mode that
+     * **asked** is the one whose grant must be checked, so it is remembered with the pending start rather than
+     * re-derived from a possibly newer gate.
+     */
+    private var pendingDetached = false
+
     private val permissions = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
         val selected = pendingPlugin
+        val detached = pendingDetached
         pendingPlugin = null
-        if (!SessionService.bluetoothGranted(this)) root.error("BLUETOOTH_PERMISSION_DENIED")
-        else if (selected != null && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
+        pendingDetached = false
+        // The mode decides **which** permission can refuse the start, and the refusal is the same code the service
+        // and composition would produce, so the visible reason cannot disagree with the gate.
+        val refusal = SessionPermissions.startRefusal(detached, Build.VERSION.SDK_INT) { permission ->
+            ContextCompat.checkSelfPermission(this, permission) == PackageManager.PERMISSION_GRANTED
+        }
+        if (refusal != null) {
+            attachedRoot?.error(refusal)
+        } else if (selected != null && lifecycle.currentState.isAtLeast(androidx.lifecycle.Lifecycle.State.RESUMED)) {
+            // Only now, after the grant, may a foreground service be started (spec §4.5).
             SessionService.startFromUi(this, selected)
         }
     }
@@ -79,9 +107,31 @@ class MainActivity : ComponentActivity() {
             setTurnScreenOn(true)
             raisedForConfirmation = true
         }
+        val app = application as EdithApplication
+        if (ModelStartGate.refusal(app.modelReadiness.state.value) != null) {
+            // No composition, no ViewModel, no CXR attach: the only thing this page can honestly do while the ~1 GiB
+            // bundle is being materialized is show progress (or the failure and a retry). Ready re-enters `onCreate`
+            // through `recreate()`, which then takes the normal path.
+            setContent {
+                MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF126B50), secondary = Color(0xFF405B79))) {
+                    ModelPreparationScreen(
+                        readiness = app.modelReadiness,
+                        onRetry = { app.retryModelProvisioning() },
+                        onReady = { recreate() },
+                    )
+                }
+            }
+            return
+        }
+        enterReadyUi(app)
+    }
+
+    private fun enterReadyUi(app: EdithApplication) {
         // W1 (F17/F18): the vendor SDK's `connect` needs an Activity, and only this page has one. Handing it over here
         // is what lets the session start path (which runs inside `SessionService`) establish the CXR link itself
         // instead of depending on one UI combination happening to be composed. Held weakly by the composition.
+        val root = app.composition
+        attachedRoot = root
         root.attachCxrActivity(this)
         val viewModel = ViewModelProvider(this, object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = SessionViewModel(root) as T
@@ -170,12 +220,12 @@ class MainActivity : ComponentActivity() {
      */
     override fun onStart() {
         super.onStart()
-        root.uiVisible(true)
+        attachedRoot?.uiVisible(true)
     }
 
     override fun onStop() {
         super.onStop()
-        root.uiVisible(false)
+        attachedRoot?.uiVisible(false)
     }
 
     /**
@@ -193,12 +243,14 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestStart(pluginId: String) {
-        val requested = buildList {
-            if (Build.VERSION.SDK_INT >= 31) { add(Manifest.permission.BLUETOOTH_CONNECT); add(Manifest.permission.BLUETOOTH_SCAN) }
-            if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
-        }.filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
+        // 0.4 Task 6 (`D199`/spec §4.2): the **mode** chooses the requested permissions. Detached mode asks for the
+        // phone microphone and deliberately not Bluetooth; glasses mode keeps the existing Bluetooth request. The
+        // dialog is only skipped when nothing is missing, so a foreground service is never started before the result.
+        val detached = attachedRoot?.detachGate?.enabled?.value == true
+        val requested = SessionPermissions.requiredForStart(detached, Build.VERSION.SDK_INT)
+            .filter { ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED }
         if (requested.isEmpty()) SessionService.startFromUi(this, pluginId)
-        else { pendingPlugin = pluginId; permissions.launch(requested.toTypedArray()) }
+        else { pendingPlugin = pluginId; pendingDetached = detached; permissions.launch(requested.toTypedArray()) }
     }
 
     /**
@@ -209,7 +261,7 @@ class MainActivity : ComponentActivity() {
     @Deprecated("SDK authorization uses startActivityForResult; the transport is the only consumer")
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: android.content.Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-        root.onCxrAuthorizationResult(resultCode, data)
+        attachedRoot?.onCxrAuthorizationResult(resultCode, data)
     }
 
     private fun notificationsGranted() = Build.VERSION.SDK_INT < 33 ||
@@ -222,6 +274,62 @@ class MainActivity : ComponentActivity() {
  * The mode's risk copy stays on the settings page, before the switch and in the second confirmation; the banner
  * repeated it above every page, which the owner asked to stop. See [NoInterceptionUi] for the remaining copy.
  */
+
+/**
+ * 0.4 Task 3 / spec §6.3: the only screen while the bundled models are not ready.
+ *
+ * It deliberately shows **nothing from the composition** - the composition does not exist yet. Preparing shows the
+ * one honest fact (first start copies about 1.0 GiB); failed shows a stable reason and a retry. A READY transition
+ * re-enters the Activity so the normal UI and its composition are built from the main thread exactly once.
+ */
+@Composable
+private fun ModelPreparationScreen(
+    readiness: ModelReadiness,
+    onRetry: () -> Unit,
+    onReady: () -> Unit,
+) {
+    val state by readiness.state.collectAsStateWithLifecycle()
+    LaunchedEffect(state) {
+        if (state is ProvisioningState.Ready) onReady()
+    }
+    Column(
+        modifier = Modifier.fillMaxSize().padding(24.dp),
+        verticalArrangement = Arrangement.Center,
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        when (val current = state) {
+            ProvisioningState.Preparing -> {
+                Text("正在准备本地模型", style = MaterialTheme.typography.headlineSmall)
+                Spacer(Modifier.height(16.dp))
+                CircularProgressIndicator()
+                Spacer(Modifier.height(16.dp))
+                Text(
+                    "首次启动需要把内置模型复制到本机（约 1.0 GiB），请保持充足电量与存储空间。",
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+            }
+
+            is ProvisioningState.Failed -> {
+                Text("本地模型准备失败", style = MaterialTheme.typography.headlineSmall)
+                Spacer(Modifier.height(12.dp))
+                Text(modelFailureText(current.reason), style = MaterialTheme.typography.bodyMedium)
+                Spacer(Modifier.height(20.dp))
+                Button(onClick = onRetry) { Text("重试") }
+            }
+
+            is ProvisioningState.Ready -> Unit
+        }
+    }
+}
+
+/** Stable failure code to short Chinese copy; the code itself is safe to show (no path, no content). */
+private fun modelFailureText(reason: String): String = when (reason) {
+    "MODELS_NO_SPACE" -> "设备存储空间不足，需要约 1.0 GiB 可用空间。"
+    "MODELS_ASR_FAILED" -> "语音识别模型准备失败。"
+    "MODELS_LAYA_FAILED" -> "本地决策模型准备失败。"
+    "MODELS_EMBEDDING_FAILED" -> "本地向量模型准备失败。"
+    else -> "模型准备失败（$reason）。"
+}
 
 /**
  * R109 (user report 2026-10-20, pocket false touch): a confirmation is settled **only** by its 拒绝 / 急停 / 允许
@@ -294,7 +402,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     val levels = listOf("L0", "L1", "L2", "L3", "L4")
 
     Text("唤醒与权限设置", style = MaterialTheme.typography.titleLarge)
-    Text("唤醒词、权限上限、白名单、主动辅助等设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；感知截图与不拦截开关保存后立即更新宿主状态。默认上限为 L1，如需 L3/L4 请在此明确选择。",
+    Text("唤醒词、权限上限、白名单、主动辅助等设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；感知截图与不拦截开关保存后立即更新宿主状态。默认上限为 L1，如需 L3/L4 请在此明确选择。「脱离眼镜」在设置页下方单独切换（运行中会先停止会话），下次开始会话生效；本页保存不会改写它。",
         style = MaterialTheme.typography.bodyMedium)
     // Task 14b-fix item 5: an edit invalidates whatever the last save reported, so the stale error text cannot
     // outlive the input it was about.
@@ -390,7 +498,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     }
     errors.forEach { Text(it, color = MaterialTheme.colorScheme.error) }
     if (saved) {
-        if (errors.isEmpty()) Text("已保存：感知截图与不拦截开关会立即更新宿主状态；其余设置将在下次重启 App 后生效")
+        if (errors.isEmpty()) Text("已保存：感知截图与不拦截开关会立即更新宿主状态；其余设置将在下次重启 App 后生效。「脱离眼镜」开关单独保存，本按钮不会改写它")
         else Text("可用字段已保存，被拒绝的输入请按上述提示修改")
     }
     Button(onClick = {
@@ -616,6 +724,12 @@ internal fun capabilityLabel(capability: Capability) = when (capability) {
 }
 internal fun errorLabel(code: String) = when (code) {
     "BLUETOOTH_PERMISSION_DENIED" -> "蓝牙权限未获授权"
+    // 0.4 Task 6 (`D199`): the detached session's microphone gate and start failures are their own visible reasons -
+    // a user whose phone refuses the microphone must not read "会话异常".
+    "MIC_PERMISSION_MISSING" -> "麦克风权限未获授权"
+    "MIC_UNAVAILABLE" -> "麦克风不可用（可能被其他应用占用）"
+    "MIC_START_FAILED" -> "麦克风未能开始采音"
+    "MIC_FORMAT_UNSUPPORTED" -> "麦克风音频格式不受支持"
     "CAPABILITY_MISSING" -> "会话所需服务尚不可用"
     "PROFILE_MODEL_NOT_MULTIMODAL" -> "该模型档案不支持图片输入；请更换支持图片的模型/档案（本版要求 IMAGE+TEXT）"
     "FOREGROUND_START_DENIED", "FOREGROUND_UI_REQUIRED" -> "会话未能启动"

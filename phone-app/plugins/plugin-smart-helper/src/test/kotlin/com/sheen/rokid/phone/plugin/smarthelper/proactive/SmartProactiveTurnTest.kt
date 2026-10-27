@@ -524,6 +524,27 @@ class SmartProactiveTurnTest {
     // ---- the review pass: the switch must be able to disarm, and the ACK/TTL races ---------------------------------
 
     @Test
+    fun `a detached session publishing proactive_armed false admits no proactive turn`() {
+        // 0.4 Task 5 (`D202`): 「脱离眼镜」 makes the host publish `proactive.armed=false` while the user's stored
+        // switch stays on. The plugin needs no new branch: false already means DISARMED, so the detached session can
+        // receive transcripts and still never produce a proactive request or hint.
+        val signals = MutableContextSignals(mapOf("proactive.armed" to "false"))
+        val rig = SmartTestRig()
+        rig.activate(overrides = mapOf(com.sheen.rokid.plugin.Capability.Context to signals))
+        rig.model.onRequest = proposing()
+
+        arm(rig)
+        withLines { lines ->
+            rig.plugin.handle(TranscriptEvent(rig.transcript("第一句值得提醒的话是什么呢", turnId = "asr-detached")))
+
+            assertEquals(0, rig.model.requests.size)
+            assertTrue(lines.any { it == "P3_PROACTIVE skip reason=DISARMED" },
+                "the refusal is the existing DISARMED path, not a new one: $lines")
+            assertTrue(rig.output.hints.isEmpty(), "no proactive hint may be submitted")
+        }
+    }
+
+    @Test
     fun `turning the arming switch off mid session stops the next proactive request`() {
         val signals = MutableContextSignals(mapOf("proactive.armed" to "true"))
         val rig = SmartTestRig()

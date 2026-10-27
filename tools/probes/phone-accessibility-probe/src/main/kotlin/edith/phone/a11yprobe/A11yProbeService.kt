@@ -5,6 +5,7 @@ import android.accessibilityservice.AccessibilityService.GestureResultCallback
 import android.accessibilityservice.GestureDescription
 import android.graphics.Path
 import android.graphics.Rect
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -39,6 +40,36 @@ data class CoordinateTap(val dispatched: Boolean, val hit: NodeInTree?)
  * the same discipline as [CoordinateTap]'s `dispatched`, with the missing half named.
  */
 data class GestureOutcome(val accepted: Boolean, val completed: Boolean)
+
+/**
+ * One active-window node paired with the plain-value facts the text arm's selector decides from (Task 13a).
+ *
+ * The pairing exists because the decision is a JVM-tested pure function while the action needs the platform handle.
+ * [facts] is the only part [chooseTextTarget] may see, which keeps "which node did the probe aim at" reviewable
+ * without a device and without a log line carrying the node's text.
+ */
+data class TextNodeCandidate(val node: AccessibilityNodeInfo, val facts: TextCandidateFacts)
+
+/**
+ * Structural shape of the active window's tree for the text arm's timeout diagnosis (Task 13a): how many nodes were
+ * walked, how many the platform called visible, how many were editable, and the editable class names. No text.
+ */
+data class TextTreeShape(
+    val walked: Int,
+    val visible: Int,
+    val editable: Int,
+    val editableClasses: List<String>,
+)
+
+/**
+ * The active window's package and the visible nodes read from **that same root** (Task 13a).
+ *
+ * They are returned together because reading them separately races a window transition: `activePackage()` followed by
+ * a separate tree read can name the app that was in front a frame ago while the candidates come from the app that just
+ * came forward (the K40 produced exactly that during the first cross-window read). A verdict whose `pkg=` and target
+ * came from different windows is not reviewable, so the package is taken from the root that produced the candidates.
+ */
+data class ActiveTextTree(val pkg: String, val candidates: List<TextNodeCandidate>)
 
 /**
  * P3.0 T3b: the two cross-app UI mechanisms, measured on the same target.
@@ -377,6 +408,104 @@ class A11yProbeService : AccessibilityService() {
             depth += 1
         }
         return false
+    }
+
+    // ----------------------------------------------------------------------------------------------
+    // Task 13a (`A11yTextActivity`) additions. The text SET/READ arm needs the active window's editable
+    // nodes and two platform actions, and nothing else: no text is stored, uploaded or written to logcat
+    // by these methods. Callers only ever log a TextFingerprint (length/chars/SHA-256).
+    // ----------------------------------------------------------------------------------------------
+
+    /**
+     * The package name and **visible** nodes of the active window, read from one root (Task 13a).
+     *
+     * The node itself is kept next to its plain-value facts so the selector can be a JVM test and the action still has
+     * the platform handle. Text/hint/contentDescription are read into memory here; the caller is responsible for never
+     * putting them in a log line (Task 13a's verdict carries only [TextFingerprint]).
+     *
+     * `hintText` exists on API 26+ and this probe's `minSdk` is 28, so the read is safe across the supported range; the
+     * walk is bounded by [MAX_DEPTH] like every other tree read in this service.
+     */
+    fun activeTextTree(): ActiveTextTree {
+        val root = runCatching { rootInActiveWindow }.getOrNull()
+            ?: return ActiveTextTree("unknown", emptyList())
+        val pkg = runCatching { root.packageName?.toString() }.getOrNull() ?: "unknown"
+        val candidates = mutableListOf<TextNodeCandidate>()
+        fun walk(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > MAX_DEPTH) return
+            if (runCatching { node.isVisibleToUser }.getOrDefault(false)) {
+                val facts = TextCandidateFacts(
+                    key = candidates.size,
+                    viewId = runCatching { node.viewIdResourceName }.getOrNull(),
+                    text = runCatching { node.text?.toString() }.getOrNull(),
+                    hint = runCatching { node.hintText?.toString() }.getOrNull(),
+                    contentDescription = runCatching { node.contentDescription?.toString() }.getOrNull(),
+                    className = runCatching { node.className?.toString() }.getOrNull(),
+                    editable = runCatching { node.isEditable }.getOrDefault(false),
+                    focused = runCatching { node.isFocused }.getOrDefault(false),
+                    visible = true,
+                )
+                candidates += TextNodeCandidate(node, facts)
+            }
+            val childCount = runCatching { node.childCount }.getOrDefault(0)
+            for (index in 0 until childCount) {
+                walk(runCatching { node.getChild(index) }.getOrNull(), depth + 1)
+            }
+        }
+        walk(root, 0)
+        return ActiveTextTree(pkg, candidates)
+    }
+
+    /**
+     * `ACTION_FOCUS` on the selected node (Task 13a). The arm performs it even though S1 A05 measured that
+     * `ACTION_SET_TEXT` works on an unfocused field: the acceptance asks for the focus-first order, and the returned
+     * boolean makes a focus the platform refused visible in the verdict instead of silent.
+     */
+    fun focusNode(node: AccessibilityNodeInfo): Boolean =
+        runCatching { node.performAction(AccessibilityNodeInfo.ACTION_FOCUS) }.getOrDefault(false)
+
+    /**
+     * `ACTION_SET_TEXT` on the selected node (Task 13a). `true` means only that the platform accepted the action:
+     * S1 A09 measured a field that returns true and keeps its own text, so the caller reads the value back and reports
+     * the match separately rather than treating this boolean as "the text was written".
+     */
+    fun setText(node: AccessibilityNodeInfo, text: String): Boolean {
+        val arguments = Bundle().apply {
+            putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, text)
+        }
+        return runCatching { node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, arguments) }
+            .getOrDefault(false)
+    }
+
+    /**
+     * The shape of the active window's tree, for the text arm's `no_field` diagnosis (Task 13a).
+     *
+     * When a real screen is in front and the selector still finds nothing, the only question worth answering is whether
+     * the *tree* was unreadable or the *matching* was wrong. This reports counts and class names (structural facts), not
+     * any node's text, hint or description: it is a diagnostic, not a second read path.
+     */
+    fun textTreeShape(): TextTreeShape {
+        val root = runCatching { rootInActiveWindow }.getOrNull() ?: return TextTreeShape(0, 0, 0, emptyList())
+        var walked = 0
+        var visible = 0
+        var editable = 0
+        val editableClasses = mutableListOf<String>()
+        fun walk(node: AccessibilityNodeInfo?, depth: Int) {
+            if (node == null || depth > MAX_DEPTH) return
+            walked += 1
+            if (runCatching { node.isVisibleToUser }.getOrDefault(false)) visible += 1
+            if (runCatching { node.isEditable }.getOrDefault(false)) {
+                editable += 1
+                runCatching { node.className?.toString()?.substringAfterLast('.') }
+                    .getOrNull()?.takeIf { it.isNotEmpty() }?.let { editableClasses += it }
+            }
+            val childCount = runCatching { node.childCount }.getOrDefault(0)
+            for (index in 0 until childCount) {
+                walk(runCatching { node.getChild(index) }.getOrNull(), depth + 1)
+            }
+        }
+        walk(root, 0)
+        return TextTreeShape(walked, visible, editable, editableClasses.take(12))
     }
 
     /**

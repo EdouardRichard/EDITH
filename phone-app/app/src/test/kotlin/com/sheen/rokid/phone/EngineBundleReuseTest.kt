@@ -169,6 +169,119 @@ class EngineBundleReuseTest {
         }
     }
 
+    // ---- 0.4 Task 2: the APK's own ASR bundle is the last automatic path before the debug drop -------------------
+
+    @Test
+    fun anActiveBundleWinsWithoutAttemptingTheAssetImport() {
+        val active = validatedBundle()
+        val store = FakeStore(activeBundle = active)
+        val provisioner = ImportingProvisioner(store, validatedBundle())
+        var assetCalls = 0
+
+        val resolved = activateBundle(
+            store, provisioner, importRoot(), allowDebugImport = true, manifest = manifest(),
+            assetImport = { assetCalls++; validatedBundle() })
+
+        assertSame("an already-validated bundle is authoritative", active, resolved)
+        assertEquals("the packaged assets are not even opened when a bundle is active", 0, assetCalls)
+        assertEquals("nor is the debug drop read", 0, provisioner.calls)
+    }
+
+    @Test
+    fun aRecoverableBundleWinsOverTheAssetImport() {
+        val recovered = validatedBundle()
+        val store = FakeStore(recoverable = recovered)
+        val provisioner = ImportingProvisioner(store, validatedBundle())
+        var assetCalls = 0
+
+        val resolved = activateBundle(
+            store, provisioner, importRoot(), allowDebugImport = true, manifest = manifest(),
+            assetImport = { assetCalls++; validatedBundle() })
+
+        assertSame("a bundle a previous process activated is reused before re-importing assets", recovered, resolved)
+        assertEquals(1, store.recoverCalls)
+        assertEquals("recovering beats materializing the packaged copy", 0, assetCalls)
+        assertEquals(0, provisioner.calls)
+    }
+
+    @Test
+    fun theAssetImportIsUsedWhenTheStoreIsEmptyEvenWhenDebugImportIsDisabled() {
+        // This is the release path: `allowDebugImport=false`, the store has nothing, and the only bundle left is
+        // the one the APK ships. Release must import it rather than report ENGINE_MISSING.
+        val asset = validatedBundle()
+        val store = FakeStore()
+        val provisioner = ImportingProvisioner(store, validatedBundle())
+        var assetCalls = 0
+
+        val resolved = activateBundle(
+            store, provisioner, importRoot(), allowDebugImport = false, manifest = manifest(),
+            assetImport = { assetCalls++; asset })
+
+        assertSame("the packaged ASR bundle must be used in release", asset, resolved)
+        assertEquals(1, assetCalls)
+        assertEquals("recovery is still attempted first", 1, store.recoverCalls)
+        assertEquals("a release build must never read the debug import drop", 0, provisioner.calls)
+    }
+
+    @Test
+    fun theAssetImportRunsAfterRecoveryAndBeforeTheDebugDrop() {
+        val asset = validatedBundle()
+        val store = FakeStore()
+        val provisioner = ImportingProvisioner(store, validatedBundle())
+        var assetCalls = 0
+
+        val resolved = activateBundle(
+            store, provisioner, importRoot(), allowDebugImport = true, manifest = manifest(),
+            assetImport = { assetCalls++; asset })
+
+        assertSame("the packaged bundle is preferred over a pushed debug bundle", asset, resolved)
+        assertEquals("recovery had its chance before the asset copy", 1, store.recoverCalls)
+        assertEquals(1, assetCalls)
+        assertEquals("the debug drop is only the last resort", 0, provisioner.calls)
+    }
+
+    @Test
+    fun whenTheAssetImportFailsTheDebugDropIsTriedInDebug() {
+        val debugBundle = validatedBundle()
+        val store = FakeStore()
+        val provisioner = ImportingProvisioner(store, debugBundle)
+
+        val resolved = activateBundle(
+            store, provisioner, importRoot(), allowDebugImport = true, manifest = manifest(),
+            assetImport = { throw ContractError.CapabilityMissing("ENGINE_MISSING") })
+
+        assertSame("a refused asset copy falls through to the debug drop in a debug build", debugBundle, resolved)
+        assertEquals(1, provisioner.calls)
+    }
+
+    @Test
+    fun whenTheAssetImportFailsAReleaseBuildActivatesNothing() {
+        val store = FakeStore()
+        val provisioner = ImportingProvisioner(store, validatedBundle())
+
+        val resolved = activateBundle(
+            store, provisioner, importRoot(), allowDebugImport = false, manifest = manifest(),
+            assetImport = { throw ContractError.CapabilityMissing("ENGINE_MISSING") })
+
+        assertNull("a release build has no fallback after a refused asset copy", resolved)
+        assertEquals("the debug drop must not be read in release", 0, provisioner.calls)
+        assertNull("nothing may be activated", store.activeBundle)
+    }
+
+    @Test
+    fun anAssetImportThatFindsNothingAlsoFallsThroughToTheDebugDropInDebug() {
+        val debugBundle = validatedBundle()
+        val store = FakeStore()
+        val provisioner = ImportingProvisioner(store, debugBundle)
+
+        val resolved = activateBundle(
+            store, provisioner, importRoot(), allowDebugImport = true, manifest = manifest(),
+            assetImport = { null })
+
+        assertSame("no packaged model means the debug drop is still usable", debugBundle, resolved)
+        assertEquals(1, provisioner.calls)
+    }
+
     // ---- engine stubs, so the provision path is exercised without the JNI libraries ---------------------------------
 
     private class StubEngines : AudioChainEngines() {

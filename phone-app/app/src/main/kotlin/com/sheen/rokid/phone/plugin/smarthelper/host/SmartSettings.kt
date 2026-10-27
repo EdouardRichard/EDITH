@@ -92,9 +92,20 @@ data class SmartSettings(
      * 4B lacks this key and takes the default (off) - the only safe upgrade path for a switch that removes confirmations.
      *
      * This field is the persisted half only; `HostCompositionRoot` owns the live gate and updates it on a successful
-     * save. Kept as the **last** field so positional construction of older call sites is unchanged.
+     * save.
      */
     val noInterception: Boolean = false,
+    /**
+     * 0.4 Task 5 (`D199`/`D202`): the host-only 「脱离眼镜」 switch, persisted and **off by default**.
+     *
+     * It is not a plugin setting and deliberately does not appear in [pluginValues]: the plugin only ever sees the
+     * **effective** arming value derived from it (`proactiveEnabled && !glassesDetached`), never the mode itself. A
+     * blob written before 0.4 lacks the key and plays through the glasses, the existing behaviour; once the user
+     * detaches, no path may re-attach them automatically.
+     *
+     * Kept as the **last** field so positional construction of older call sites is unchanged.
+     */
+    val glassesDetached: Boolean = false,
 ) {
     /**
      * The plugin's own cooldown parameter.
@@ -217,14 +228,38 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
             put("continueDialogue", settings.continueDialogue)
             put("visionEnabled", settings.visionEnabled)
             put("noInterception", settings.noInterception)
+            // 0.4 Task 5 (`D199`): host-only; never part of `pluginValues()`.
+            put("glassesDetached", settings.glassesDetached)
         })
     }
 
-    private fun safelyRead(): SmartSettings? {
-        val json = runCatching { readJson(blobs, BLOB_ID) }.getOrNull() ?: return null
-        return runCatching {
-            require(json["version"]?.jsonPrimitive?.int == VERSION) { "unsupported settings version" }
-            SmartSettings(
+    /**
+     * The value a **write-modify-write** may safely build on (0.4 Task 5).
+     *
+     * [load] answers with the defaults for every failure, which is right for a reader that must keep the App
+     * configurable - but wrong for a writer: saving `load().copy(one field)` over a blob that exists and cannot be
+     * read would silently erase the user's other choices. This variant therefore distinguishes the two cases:
+     * a **missing** blob is a first install and yields the defaults; a blob that exists but cannot be read or parsed
+     * yields `null`, and the caller must refuse the write.
+     */
+    internal fun loadForWrite(): SmartSettings? {
+        val bytes = try { blobs.read(BLOB_ID) } catch (_: Exception) { return null }
+            ?: return SmartSettings()
+        return try {
+            parseJson(Json.parseToJsonElement(bytes.toString(Charsets.UTF_8)).jsonObject)
+        } catch (_: Exception) {
+            null
+        } finally {
+            bytes.fill(0)
+        }
+    }
+
+    private fun safelyRead(): SmartSettings? =
+        runCatching { readJson(blobs, BLOB_ID) }.getOrNull()?.let(::parseJson)
+
+    private fun parseJson(json: JsonObject): SmartSettings? = runCatching {
+        require(json["version"]?.jsonPrimitive?.int == VERSION) { "unsupported settings version" }
+        SmartSettings(
                 wakeWords = strings(json, "wakeWords") ?: SmartSettings().wakeWords,
                 maxLevel = json["maxLevel"]?.jsonPrimitive?.content ?: SmartSettings().maxLevel,
                 whitelist = strings(json, "whitelist") ?: emptyList(),
@@ -258,9 +293,12 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
                 // arm the mode. A non-primitive still fails the whole read, the store's existing wrong-shape rule.
                 noInterception = strictBoolean(json, "noInterception")
                     ?: SmartSettings().noInterception,
+                // 0.4 Task 5 (`D199`): absent in a blob written before 0.4, which must keep playing through the
+                // glasses. `strictBoolean` keeps a string "true"/"false" from being coerced into a mode change.
+                glassesDetached = strictBoolean(json, "glassesDetached")
+                    ?: SmartSettings().glassesDetached,
             )
         }.getOrNull()
-    }
 
     /** A field that is absent takes its default; a field of the wrong shape is a corrupt blob and fails the whole read. */
     private fun strings(json: JsonObject, key: String): List<String>? {

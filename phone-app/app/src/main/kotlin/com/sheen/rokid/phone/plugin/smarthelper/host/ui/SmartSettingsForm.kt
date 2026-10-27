@@ -108,6 +108,9 @@ object SmartSettingsForm {
                 continueDialogue = draft.continueDialogue,
                 visionEnabled = draft.visionEnabled,
                 noInterception = draft.noInterception,
+                // 0.4 Task 5: host-only and owned by `DetachGate`, never edited by this form. It must be carried
+                // through wholesale or a save of the form's own fields would silently change the audio/display mode.
+                glassesDetached = base.glassesDetached,
             ),
             errors = errors,
         )

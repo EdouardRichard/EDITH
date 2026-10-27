@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.bridge
 import com.sheen.rokid.phone.app.HostCompositionRoot
+import com.sheen.rokid.phone.withP3Sink
 
 import com.sheen.rokid.contracts.ContextChanged
 import com.sheen.rokid.contracts.HostEvent
@@ -150,6 +151,25 @@ class CxrContextSignalsTest {
         assertEquals("true", signals.snapshot().values[ProactiveArming.CONTEXT_KEY])
     }
 
+    // ---- 0.4 Task 5 (`D202`): the key publishes the EFFECTIVE value ----------------------------------------------
+
+    @Test
+    fun theArmingKeyReportsTheEffectiveValueWhileDetachedButKeepsTheStoredSwitch() {
+        var detached = true
+        val arming = ProactiveArming(detached = { detached })
+        val signals = CxrContextSignals(clock, listOf(CxrContextSignals.armingSource(arming)),
+            localTime = { LocalTime.of(9, 0) })
+
+        assertTrue("the user's stored switch is untouched", arming.enabled.value)
+        assertEquals("D202: the plugin must read the effective value", "false",
+            signals.snapshot().values[ProactiveArming.CONTEXT_KEY])
+
+        detached = false
+        assertEquals("closing detach restores the stored choice", "true",
+            signals.snapshot().values[ProactiveArming.CONTEXT_KEY])
+        assertTrue(arming.enabled.value)
+    }
+
     // ---- the delivered event, behind the arming gate ---------------------------------------------------------------
 
     private class Rig(arming: ProactiveArming, session: SessionId, clock: FakeClock) {
@@ -207,6 +227,37 @@ class CxrContextSignalsTest {
 
             assertTrue("a disarmed composition must not deliver context at all",
                 rig.plugin.handled.none { it is ContextChanged })
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun aDetachedChangeProducesNoContextChangedEvenWithTheStoredSwitchOn() {
+        // 0.4 Task 5 (`D202`): detaching suppresses the context signal too. The stored switch stays on, so this test
+        // proves the gate reads the *effective* value rather than the user's stored one.
+        var detached = true
+        val arming = ProactiveArming(detached = { detached })
+        assertTrue(arming.enabled.value)
+        val rig = Rig(arming, session, clock)
+        try {
+            withP3Sink { lines ->
+                rig.changeAndSettle()
+
+                assertTrue("a detached composition must not deliver context at all",
+                    rig.plugin.handled.none { it is ContextChanged })
+                assertTrue("and no P3_CONTEXT line may claim it was emitted",
+                    lines.none { it.startsWith("P3_CONTEXT") })
+            }
+
+            detached = false
+            // A fresh value, because the first suppressed change already moved the source to "2"; the listener only
+            // reports a *change*, so the restored gate needs a new one to observe.
+            rig.source = mapOf("k" to "3")
+            rig.signals.snapshot()
+            rig.host.currentState
+            assertEquals("closing detach restores the glasses-mode behaviour",
+                1, rig.plugin.handled.filterIsInstance<ContextChanged>().size)
         } finally {
             rig.close()
         }

@@ -34,11 +34,29 @@ internal class ProactiveArming(
      * switch in memory only, which is what a test rig without storage wants - it does not make the switch default off.
      */
     private val store: SmartSettingsStore? = null,
+    /**
+     * 0.4 Task 5 (`D202`): whether the user is running detached from the glasses.
+     *
+     * The stored switch remains the user's value; this predicate is the **second input** the host combines into
+     * [effectiveProactiveArmed]. It is a provider rather than a captured boolean so a detach change takes effect on
+     * the very next event without an App restart. Production passes `{ detachGate.enabled.value }`; a rig without a
+     * gate keeps the shipped glasses mode.
+     */
+    private val detached: () -> Boolean = { false },
 ) {
     private val on = MutableStateFlow(true)
 
     /** What the 会话 page's switch shows; a flow so the Compose layer follows a load that happened outside it. */
     val enabled: StateFlow<Boolean> = on.asStateFlow()
+
+    /**
+     * `D202`: the value every proactive **producer** must read - `stored && !detached`.
+     *
+     * The host's acoustic/context sinks and the `proactive.armed` context key all use this; the plugin needs no
+     * change because it already treats `false` as DISARMED. Reading it never writes the stored value, so closing
+     * detach restores the user's own choice.
+     */
+    val effectiveProactiveArmed: Boolean get() = on.value && !detached()
 
     /**
      * Reads the persisted answer. Called once by `create` at assembly time.
@@ -49,7 +67,7 @@ internal class ProactiveArming(
      */
     fun load() {
         val target = store ?: return
-        val stored = runCatching { target.load() }.onFailure {
+        val stored = runCatching { target.loadForWrite() }.onFailure {
             android.util.Log.i("EdithHost", "proactive switch: settings unreadable, keeping the current value")
         }.getOrNull() ?: return
         on.value = stored.proactiveEnabled
@@ -59,16 +77,17 @@ internal class ProactiveArming(
      * The user's switch. Turning it on is the only way perception events are produced, and it is also the only writer
      * of the persisted value.
      *
-     * **A failed read aborts the write.** [SmartSettingsStore.load] answers with the **defaults** when the blob is
-     * missing or unreadable, so saving `load().copy(one field)` would quietly persist those defaults over the user's
-     * real settings - wake words, risk ceiling, whitelist, profile, cooldowns, sensitivity. The switch still moves in
-     * memory (the UI must respond), and the next successful read reconciles; losing one preference change is
-     * recoverable, silently wiping the rest is not.
+     * **A failed read aborts the write.** [SmartSettingsStore.loadForWrite] answers `null` when the blob exists but
+     * cannot be read, and is read-only for a missing one. Saving `load().copy(one field)` would otherwise quietly
+     * persist the store's defaults - wake words, risk ceiling, whitelist, profile, cooldowns, sensitivity, **and since
+     * 0.4 the detach mode** - over the user's real settings. The switch still moves in memory (the UI must respond),
+     * and the next successful read reconciles; losing one preference change is recoverable, silently wiping the rest
+     * is not.
      */
     fun set(enabled: Boolean) {
         on.value = enabled
         val target = store ?: return
-        runCatching { target.load() }.onFailure {
+        runCatching { target.loadForWrite() }.onFailure {
             android.util.Log.i("EdithHost", "proactive switch: settings unreadable, not persisting this change")
         }.getOrNull()?.let { stored -> runCatching { target.save(stored.copy(proactiveEnabled = enabled)) } }
     }

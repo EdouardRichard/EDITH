@@ -20,12 +20,14 @@ EDITH（伊迪丝）：运行在安卓端、连接 Rokid Glasses 的全时主动
   <a href="README.md">English</a> | <strong>简体中文</strong>
 </p>
 
-> **预览版状态**：EDITH 目前处于预览版阶段，功能可用，但性能、稳定性与整体体验仍需持续优化。
+> **预览版状态**：EDITH 目前处于预览版阶段（版本 `0.4.0-preview`），功能可用，但性能、稳定性与整体体验仍需持续优化。
 
 EDITH（伊迪丝）是一个端云协同的 AI Agent：手机上的 Android 宿主 App + 眼镜端 CustomApp。
 眼镜是它的麦克风、扬声器和显示屏，手机是它的耳朵、手、记忆和大脑。眼镜麦克风音频经 Rokid AI
 APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒词检测，调用你配置的大模型，通过
 无障碍服务与 Shizuku 的 shell 操作 Android 应用，通过眼镜 HUD 文字显示与TTS音频与用户交流。
+0.4 起，手机也可以**脱离眼镜**运行，改用自己的麦克风和屏幕；手机「对话上下文记录」页还提供
+文字与语音输入。
 
 - **唤醒词唤醒**：说“EDITH”或“伊迪丝”。眼镜面板打开，EDITH 识别意图、感知手机（屏幕、通知、
   媒体、日历、设备状态），规划并执行跨应用的多步操作（打开应用/页面、点按、输入中文、滚动、拨号、
@@ -52,6 +54,16 @@ APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒�
   </a>
 </div>
 
+**Agent能力脱离眼镜（0.4）**——不依赖眼镜链路，只支持唤醒词唤醒。
+
+<div align="center">
+  <a href="docs/assets/videos/detached-wake.mp4">
+    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="脱离眼镜唤醒演示——点击播放完整视频">
+  </a>
+</div>
+
+> 说明：视频包含**自动解锁**；执行过程有**加速**，实际执行约**一分多钟**。
+
 ## 适配与依赖说明
 
 下表是 EDITH 开发与实测所依据的配置。更新版本的固件或 APP 可能可用，但不在已验证基线内。
@@ -65,9 +77,13 @@ APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒�
 | Shizuku | `13.5.4+`（构建时 API `13.1.5`；设备实测 `13.6.0`） |
 | 构建工具链 | JDK 17、Android SDK Platform 35、Gradle wrapper 9.4.1 |
 
-全部端侧模型文件合计约 **1.0 GiB（1.03 GiB）**，放置位置见下文[模型文件](#2-模型文件必需)。
+四组端侧模型全部内置在手机 APK 中（约 **1.1 GB**）；首次启动会准备约 **1.0 GiB（1.03 GiB）**。
+运行期位置见下文[模型文件](#2-模型文件已内置)。
 
 ## 技术路线
+
+0.4 保留原有两条链路，并新增三块能力：只依赖手机的「脱离眼镜」唤醒变体、手机端文字/听写输入行，
+以及从 APK 资产准备模型。默认眼镜配置与下面描述的链路不变。
 
 ### 唤醒词唤醒
 
@@ -77,7 +93,11 @@ VAD/ASR 从会话开始就持续工作（不能等唤醒才启动：唤醒词通
 链路本来就没有唤醒词），但只有 WAKE 回合处于等待转写状态时，final 转写才会被采纳并进入
 `AgentLoop`——没有回合等待时，final 不会凭空打开唤醒回合，而是进入主动辅助触发路径。
 `AgentLoop` + 云端大模型 → 工具执行与感知 → 答案上屏 + 手机端 TTS。同一条 CXR 会话同时承载
-显示指令与后续的持续对话音频。
+显示指令与后续的持续对话音频。打开「脱离眼镜」后，这条链路改从手机麦克风起头，不再经过 CXR
+上行；其后的 KWS、VAD、ASR 与转写准入之后的处理完全相同（见下文）。脱离变体还支持**锁屏/息屏唤醒**
+（前台服务 + `PARTIAL_WAKE_LOCK`），并对每次被接受的唤醒在**回声静默窗口**内播固定确认「我在」：
+窗口内麦克风帧置静音，确认音不会进入 ASR，也不会污染用户随后指令的识别；WAKE 回合不等待确认播完，
+零新增延迟。
 
 ```mermaid
 flowchart LR
@@ -167,6 +187,25 @@ flowchart LR
 唤醒链路相同的工具面 · 眼镜悬浮面板（经 CXR 自定义命令）。闸门拒绝时**不产生任何模型请求**；
 两条链路使用各自独立的 `ConversationStore`。
 
+### 脱离眼镜模式（0.4）
+
+「脱离眼镜」设置让唤醒链路不依赖眼镜
+
+```mermaid
+flowchart LR
+    MIC["手机麦克风"] --> ING["PCM 上行<br/>16 kHz 单声道"]
+    ING --> KWS["唤醒词检测 KWS"]
+    ING --> VAD["VAD"] --> ASR["流式 ASR"]
+    KWS -- "唤醒命中：EDITH / 伊迪丝" --> CYCLE["WAKE 链路<br/>相同回合、工具、提示词"]
+    ASR -- "final 转写" --> ADMIT["转写准入"] --> CYCLE
+    CYCLE -- "答案" --> LOG["手机对话上下文记录"]
+    LOCK["PARTIAL_WAKE_LOCK<br/>edith:detached-wake"] -. "息屏时维持 KWS" .-> ING
+    STORED["已保存的主动辅助开关"] -. "脱离时有效值关闭" .-> CYCLE
+```
+
+关闭该开关时，上面的眼镜链路保持不变：CXR 连接、眼镜唤醒、面板显示与接话语义都不变。脱离模式
+只是本机采音/显示选择，不是第二套 CXR 协议。
+
 ## 项目结构
 
 - `phone-app/` — Android 手机宿主：会话与插件宿主、感知、语音、模型运行时、原生动作通道（无障碍 / Shizuku）
@@ -212,56 +251,47 @@ adb -s $phone shell dumpsys accessibility | Select-String "Bound services|EDITH"
 `com.sheen.rokid.glasses/com.sheen.rokid.glasses.accessibility.GlassesAccessibilityService`，
 序列号换成 `<眼镜序列号>`。
 
-### 2. 模型文件（必需）
+### 2. 模型文件（已内置）
 
-**模型文件下载链接**：[夸克网盘](https://pan.quark.cn/s/d53caa9e395f?pwd=veEd)
+四组端侧模型——ASR 引擎包、唤醒词（KWS）、主动闸门（Laya）与记忆向量（EmbeddingGemma）——全部
+**内置在手机 APK 中**。用户不需要另外从夸克网盘下载，也不需要 `adb push` 才能安装或开始使用 EDITH。
 
-EDITH 依赖四组端侧模型文件。它们是运行期依赖，不是可选的附加项：智能助手插件把 ASR、SystemOne
-（Laya）、Embedding、Perception 声明为必需能力，缺任何一组会导致会话激活失败。
+完整 APK 约 **1.1 GB**（实测 debug 构建：1.11 GB / 1.0347 GiB）。安装时建议预留约 **2.2 GB**
+空闲空间（估算：APK 加准备后的副本）。四组模型准备后合计约 **1.0 GiB（1.03 GiB）**。在验收设备
+K40 的 debug 构建上，首次准备约 **12.8 s**，之后冷启动复用已有副本约 **0.45 s**
+（均为 2026-10-26 设备实测；release 未测）。
+准备完成前，App 显示准备本地模型状态，并拒绝以半套模型启动会话。
 
-| 模型组 | 内容 | 放置位置 |
+| 模型组 | 内容 | 准备后的运行期位置 |
 | --- | --- | --- |
-| ASR 引擎包 | encoder / decoder / joiner（ONNX）、tokens、Silero VAD、声纹模型，外加 `engine-manifest.json` | 手机 App 私有目录 `no_backup/engine-models-import/`，冷启动时导入（debug 构建） |
-| 唤醒词（KWS）模型 | sherpa-onnx KWS Zipformer 中英 3M：5 个文件 | 构建机 `.local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/`，构建时打进 APK 的 `assets/kws/` |
-| 主动闸门（Laya） | Laya-Multilingual-LiteRT 七件套 | 手机 App 内部 `files/` 目录 |
-| 记忆向量模型 | EmbeddingGemma 300M `.tflite` + SentencePiece 词表 | 手机外部目录 `Android/data/com.sheen.rokid.phone/files/models/embeddinggemma/` |
+| ASR 引擎包 | encoder / decoder / joiner（ONNX）、tokens、Silero VAD、声纹模型，外加 `engine-manifest.json` | 手机 App 私有目录 `no_backup/engine-models/` |
+| 唤醒词（KWS）模型 | sherpa-onnx KWS Zipformer 中英 3M：5 个运行期文件 + `keywords.txt` | APK 资产 `assets/kws/`（原地读取，不单独复制） |
+| 主动闸门（Laya） | Laya-Multilingual-LiteRT：6 个运行期文件 | 手机 App 内部 `files/`（6 个文件 + bundle receipt） |
+| 记忆向量模型 | EmbeddingGemma 300M `.tflite` + SentencePiece 词表 | 手机外部目录 `Android/data/com.sheen.rokid.phone/files/models/embeddinggemma/`（内部回退） |
 
-**ASR 引擎包**（整包推入后冷启动 App；`logcat` 应出现 `EdithHost: ENGINE_IMPORTED`）：
+构建期会逐个校验文件 bytes/SHA-256 必须与 `tools/scripts/p2/model-bundles.json` 一致，缺失或不
+一致会构建失败；同时从固定条目派生 bundle id，声明值不匹配即失败，因此文件摘要变化必然改变
+receipt。15 份许可证/声明文本随包放在 `assets/models/licenses/`。首次启动以及 APK 更新后
+bundle 变化时，App 会重新校验并准备 asset；bundle 未变化时复用已有副本。
 
-```powershell
-$phone = "<手机序列号>"
-adb -s $phone push <模型目录>/asr /data/local/tmp/edith-asr
-adb -s $phone shell "run-as com.sheen.rokid.phone mkdir -p no_backup/engine-models-import"
+**开发构建**
 
-# 对 engine-manifest.json 以及它声明的每个文件（encoder/decoder/joiner/tokens/vad/speaker）重复：
-adb -s $phone shell "cat /data/local/tmp/edith-asr/<文件名> | run-as com.sheen.rokid.phone sh -c 'cat > no_backup/engine-models-import/<文件名>'"
-
-adb -s $phone shell am force-stop com.sheen.rokid.phone   # 然后重新打开一次 App
-```
-
-**Laya 闸门**（七个文件放进 App 内部 `files/`）：
+模型二进制不提交仓库。要构建完整 APK，先准备 staging 目录，再用 `-PbundledModelsDir` 指定：
 
 ```powershell
-$phone = "<手机序列号>"
-adb -s $phone push <模型目录>/laya /data/local/tmp/edith-laya
-adb -s $phone shell "run-as com.sheen.rokid.phone mkdir -p files"
-
-# 对七个文件逐个重复：
-adb -s $phone shell "cat /data/local/tmp/edith-laya/<文件名> | run-as com.sheen.rokid.phone sh -c 'cat > files/<文件名>'"
+.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=E:\edith-0.4-models
 ```
 
-**记忆向量模型**：
+默认目录是 `<仓库>/.local/0.4-models`，下面放 `asr/`、`laya/` 与 `embeddinggemma/`。KWS 文件
+从 `.local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/` 与仓库内 `keywords.txt`
+读取。完整构建要求每个文件都存在且校验通过；缺失或不一致会构建失败。
 
-```powershell
-adb -s $phone shell "mkdir -p /sdcard/Android/data/com.sheen.rokid.phone/files/models"
-adb -s $phone push <模型目录>/embeddinggemma /sdcard/Android/data/com.sheen.rokid.phone/files/models/
-```
+仅开发/CI 可使用 `-PwithoutBundledModels=true` 跳过 `assets/models/**` 并设置
+`BuildConfig.BUNDLED_MODELS=false`。**release 变体会拒绝该开关**，它绝不能产出交付 APK。
 
-**KWS 模型**：Gradle 构建从上面的 `.local/...` 路径读取这五个文件、校验 SHA-256 后连同仓库内的
-`keywords.txt` 一起打包为 `assets/kws/`。该目录缺失时构建仍会成功，但 APK 内没有唤醒词模型，
-App 会报告 `KWS_MODEL_MISSING`。
-
-模型文件遵循各自上游许可证（按模型组分别为 Apache-2.0 / MIT / Gemma 条款），不随本仓库分发。
+模型文件遵循各自上游许可证（ASR/KWS/Laya 为 Apache-2.0，Silero 为 MIT，EmbeddingGemma 为
+Gemma 条款），不随本仓库分发。固定来源/revision 与保留的许可证/声明文本见
+`tools/scripts/p2/NOTICE.md` 与 `tools/scripts/p2/licenses/`；`distributionReview` 仍为 Incomplete。
 
 ### 3. 眼镜端要用 ADB 开启的权限
 

@@ -72,6 +72,15 @@ class DebugProfileCreator : BroadcastReceiver() {
 
             android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE: created profile id=${saved.id} protocol=$protocolId inputs=$inputs revision=${saved.revision}")
 
+            // 0.4 Task 9: the profile list's own 「选择」 control is a Compose tap the installed probe cannot reach
+            // either, so the debug creator can make the same repository selection the page makes (`ProfileViewModel
+            // .select` -> `AndroidProfileRepository.select`). Optional, so every existing caller is unchanged; the
+            // log names the id only, never the secret.
+            if (intent.getBooleanExtra(EXTRA_SELECT, false)) {
+                repo.select(PLUGIN_ID, saved.id)
+                android.util.Log.i("EdithP5", "DEBUG_CREATE_PROFILE: selected id=${saved.id} plugin=$PLUGIN_ID")
+            }
+
             // Optionally run a text probe to verify connectivity
             if (intent.getBooleanExtra(EXTRA_PROBE, false)) {
                 root.profileTester?.let { tester ->
@@ -100,5 +109,8 @@ class DebugProfileCreator : BroadcastReceiver() {
         const val ACTION = "edith.DEBUG_CREATE_PROFILE"
         const val EXTRA_PATH = "path"
         const val EXTRA_PROBE = "probe"
+        /** 0.4 Task 9: also select the saved profile for the smart assistant (`--ez select true`). */
+        const val EXTRA_SELECT = "select"
+        private const val PLUGIN_ID = "smart-assistant"
     }
 }

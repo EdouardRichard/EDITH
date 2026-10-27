@@ -11,6 +11,12 @@
   injection from a host shell.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!--
+      0.4 Task 9: lets `DebugWakeAudioPlayer` put the media stream at its maximum so the phone's own speaker can reach
+      its own microphone. A normal install-time permission, declared only for the debug variant; a release build has
+      neither the receiver nor this line.
+    -->
+    <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <application>
         <receiver
             android:name=".debug.DebugAudioInjector"
@@ -293,5 +299,35 @@
             android:label="EDITH T6 click probe"
             android:theme="@android:style/Theme.Translucent.NoTitleBar"
             android:excludeFromRecents="true" />
+        <!--
+          0.4 Task 9 acoustic driver. The detached wake route listens to the **phone** microphone, so this is how the
+          phone's own speaker plays the synthetic wake word. Same export rule and the same reason as the instruments
+          above: the only caller is an `adb shell am broadcast` from the host, so it must be exported and must never
+          exist in a release build. It plays a WAV at the media stream's maximum volume and logs counts only.
+        -->
+        <receiver
+            android:name=".debug.DebugWakeAudioPlayer"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_WAKE_AUDIO" />
+            </intent-filter>
+        </receiver>
+        <!--
+          0.4 Task 9 「脱离眼镜」 fallback gate + readback. The settings switch sits below the fold of a long Compose
+          page that the installed accessibility probe cannot scroll; the Task 9 run reached it by temporarily enlarging
+          the logical display and toggled it with the probe itself, and used this receiver for **readback only**. It
+          remains available as the labelled fallback that drives the production `DetachGate.set(...)` for downstream
+          work. It is explicitly **not** a UI verification and its lines are prefixed
+          `P4_DETACH_DEBUG`/`P4_*_READBACK`. Same export rule and the same reason as the instruments above.
+        -->
+        <receiver
+            android:name=".debug.DebugDetachControl"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_DETACH" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

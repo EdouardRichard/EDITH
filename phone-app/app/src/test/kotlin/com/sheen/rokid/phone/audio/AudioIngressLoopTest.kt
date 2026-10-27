@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.audio
+import com.sheen.rokid.phone.session.EchoMuteWindow
 import com.sheen.rokid.phone.withP3Sink
 
 import com.sheen.rokid.audio.PcmFramer
@@ -72,12 +73,13 @@ class AudioIngressLoopTest {
 
     private class RecordingWakeEngine : WakeWordEngine {
         val frames = mutableListOf<PcmFrame>()
+        var resetCount = 0
         override fun accept(frame: PcmFrame): List<String> { frames += frame; return emptyList() }
-        override fun reset() = Unit
+        override fun reset() { resetCount++ }
         override fun close() = Unit
     }
 
-    private class Rig {
+    private class Rig(muteWindow: EchoMuteWindow? = null) {
         val epoch = InputEpoch(SessionId("s-1"), Generation(1), 0)
         val clock = FakeClock(0)
         val scheduler = ManualScheduler(clock)
@@ -89,11 +91,13 @@ class AudioIngressLoopTest {
         val wakeEngine = RecordingWakeEngine()
         val wake = WakeWordDetector(LoudVad(), wakeEngine, emit = { _, _ -> }, clock = clock)
         val faults = mutableListOf<String>()
+        val mute = muteWindow ?: EchoMuteWindow(clock)
         val loop = AudioIngressLoop(ingress, framer, pipeline, wake, scheduler, clock,
-            cadenceMillis = 20, onFault = { faults += it })
+            cadenceMillis = 20, onFault = { faults += it }, muteWindow = mute)
 
         fun open() = ingress.open(epoch, verified)
         fun offer(bytes: Int) = ingress.offer(epoch, ByteArray(bytes))
+        fun offerLoud() = ingress.offer(epoch, ByteArray(640) { 0x3F })
         fun tick() { clock.advance(20_000_000); scheduler.runDue() }
     }
 
@@ -118,6 +122,43 @@ class AudioIngressLoopTest {
         rig.offerWholeFrame()
         rig.tick()
         assertEquals("a stopped loop must not poll", 3, rig.asr.frames.size)
+    }
+
+    @Test
+    fun framesInsideTheEchoMuteWindowReachBothConsumersSilenced() {
+        val rig = Rig()
+        rig.open()
+        rig.loop.start(rig.epoch)
+
+        rig.offerLoud()
+        rig.tick()
+        assertTrue("outside the window the real samples reach the ASR",
+            rig.asr.frames.last().samples.any { it != 0f })
+        assertTrue("and the wake engine", rig.wakeEngine.frames.last().samples.any { it != 0f })
+
+        rig.mute.open()
+        rig.offerLoud()
+        rig.tick()
+        assertTrue("inside the window the ASR receives silence",
+            rig.asr.frames.last().samples.all { it == 0f })
+        assertTrue("and so does the wake engine", rig.wakeEngine.frames.last().samples.all { it == 0f })
+        assertTrue("the timeline stays contiguous through the muted frames",
+            rig.asr.frames.zipWithNext().all { (a, b) -> a.range.endExclusive == b.range.first })
+
+        rig.mute.close()
+        rig.offerLoud()
+        rig.tick()
+        assertTrue("audio captured inside the reverb tail stays muted",
+            rig.asr.frames.last().samples.all { it == 0f })
+        // The frame timeline advances with offered audio, not with the wall clock: drain until it passes the tail.
+        var drained = 0
+        while (rig.asr.frames.last().samples.all { it == 0f } && drained < 32) {
+            rig.offerLoud()
+            rig.tick()
+            drained++
+        }
+        assertTrue("after the reverb tail the real samples return",
+            rig.asr.frames.last().samples.any { it != 0f })
     }
 
     @Test
@@ -166,6 +207,26 @@ class AudioIngressLoopTest {
     }
 
     @Test
+    fun startingAFreshEpochResetsTheWakeStreams() {
+        // 0.4 final K40 acceptance: after a live glasses session, switching to detached reuses the same input loop and
+        // wake detector; the eight native KWS streams still held the CXR stream state, and five synthetic wake plays
+        // produced no hit until an explicit detector reset/cold start. A new epoch is a new source boundary, so the
+        // wake engine must be re-staggered rather than continue the old stream.
+        val rig = Rig()
+        rig.open()
+        rig.loop.start(rig.epoch)
+        assertEquals("a fresh epoch must reset the KWS streams", 1, rig.wakeEngine.resetCount)
+
+        rig.loop.start(rig.epoch)
+        assertEquals("starting the same epoch again is the documented no-op", 1, rig.wakeEngine.resetCount)
+
+        rig.loop.stop(rig.epoch)
+        val next = InputEpoch(SessionId("s-2"), Generation(2), 1)
+        rig.loop.start(next)
+        assertEquals("a different epoch must reset again", 2, rig.wakeEngine.resetCount)
+    }
+
+    @Test
     fun acceptedFramesReachTheWakeDetectorAndThePipelineInOrder() {
         val rig = Rig()
         rig.open()
@@ -176,6 +237,49 @@ class AudioIngressLoopTest {
 
         assertEquals(listOf(0L, 320L, 640L), rig.asr.frames.map { it.range.first })
         assertEquals(listOf(0L, 320L, 640L), rig.wakeEngine.frames.map { it.range.first })
+    }
+
+    @Test
+    fun disablingWakeAcceptanceKeepsThePipelineFedAndNeverFeedsTheDetector() {
+        // 0.4 Task 12b-ii (spec §5.3, D204): a phone-microphone dictation reuses one upload loop. While it listens the
+        // KWS must not see the dictation audio (a spoken wake word there is dictation content, not a request), but the
+        // pipeline still must - it is the same ASR turn that produces the final the input row appends.
+        val rig = Rig()
+        rig.open()
+        rig.loop.start(rig.epoch)
+
+        rig.loop.wakeEnabled = false
+        rig.offerWholeFrame()
+        rig.tick()
+        assertEquals("a disabled wake seam must still feed the speech pipeline", 1, rig.asr.frames.size)
+        assertEquals("KWS must not see dictation audio", 0, rig.wakeEngine.frames.size)
+
+        rig.loop.wakeEnabled = true
+        rig.offerWholeFrame()
+        rig.tick()
+        assertEquals("re-enabling restores the wake path for the same loop", 1, rig.wakeEngine.frames.size)
+        assertEquals(2, rig.asr.frames.size)
+    }
+
+    @Test
+    fun disablingPipelineAcceptanceQuiescesTheAsrWithoutSilencingTheWakePath() {
+        // The second half of the dictation quiesce seam: when a final/stop/timeout ends a dictation, the frames still
+        // drained in the same tick must not start another ASR turn whose partials would reach the restored wake route.
+        // The two switches are independent on purpose - a host can stop one consumer without touching the other.
+        val rig = Rig()
+        rig.open()
+        rig.loop.start(rig.epoch)
+
+        rig.loop.pipelineEnabled = false
+        rig.offerWholeFrame()
+        rig.tick()
+        assertEquals("a quiesced pipeline must not accept the frame", 0, rig.asr.frames.size)
+        assertEquals("the wake consumer is a separate switch and stays fed", 1, rig.wakeEngine.frames.size)
+
+        rig.loop.pipelineEnabled = true
+        rig.offerWholeFrame()
+        rig.tick()
+        assertEquals(1, rig.asr.frames.size)
     }
 
     @Test

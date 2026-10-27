@@ -6,9 +6,11 @@ import com.sheen.rokid.phone.app.SmartSettingsSection
 
 import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.provider.Settings
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -17,14 +19,19 @@ import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.text.BasicTextField
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.Saver
+import androidx.compose.runtime.saveable.listSaver
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.contentDescription
@@ -43,11 +50,16 @@ import com.sheen.rokid.phone.app.AuditSection
 import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.app.MemorySection
+import com.sheen.rokid.phone.app.TypedSendResult
+import com.sheen.rokid.phone.audio.DictationStartResult
+import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationUiState
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.SessionViewModel
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillContent
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SkillListing
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.DetachUi
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.app.capabilityLabel
 import com.sheen.rokid.phone.ui.capabilityReasonLabel
@@ -57,6 +69,7 @@ import com.sheen.rokid.phone.app.errorLabel
 import com.sheen.rokid.phone.actions.executionChannelLabel
 import com.sheen.rokid.phone.ui.pluginPickerOptions
 import com.sheen.rokid.plugin.Capability
+import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
 
 /**
@@ -85,6 +98,18 @@ internal fun PhoneScreen(
     remainingSeconds: Long,
 ) {
     var tab by remember { mutableStateOf(PhoneTab.ASSISTANT) }
+    // 0.4 Task 13e-prep: the composer state belongs to the page, not to the assistant tab. A bottom-tab switch
+    // disposes AssistantTab, which used to discard the draft — and a dictated final appended to it — even though
+    // PhoneScreen never left the composition. Hoisted here it survives every 助手/技能/记忆/设置 switch and still
+    // round-trips through rememberSaveable on an Activity recreation.
+    var typedInput by rememberSaveable(stateSaver = typedInputSaver) { mutableStateOf(TypedInputState()) }
+    // A typed result is an answer about the session that was live when the send happened. Remember the previous state
+    // so a stop or a start clears a stale 「助手正在处理」/「会话未运行」 without touching the draft or a live dictation.
+    var previousSession by remember { mutableStateOf(state.session) }
+    LaunchedEffect(state.session) {
+        typedInput = typedInput.afterSessionChange(previousSession, state.session)
+        previousSession = state.session
+    }
     val drawerState = rememberDrawerState(DrawerValue.Closed)
     val scope = rememberCoroutineScope()
     val plugins = pluginPickerOptions(
@@ -154,7 +179,19 @@ internal fun PhoneScreen(
                     // U1: only the message list scrolls. The title, the route switch and the chat frame header stay
                     // outside every scroll container, so a long record cannot take the switch away from the wearer.
                     PhoneTab.ASSISTANT -> Column(body) {
-                        AssistantTab(root.conversationLog, Modifier.weight(1f))
+                        AssistantTab(
+                            log = root.conversationLog,
+                            session = state.session,
+                            typedInput = typedInput,
+                            onTypedInputChange = { typedInput = it },
+                            send = { root.requestTypedMessage(it) },
+                            dictation = root.dictationUi,
+                            startDictation = { root.startDictation() },
+                            stopDictation = { root.stopDictation() },
+                            clearDictationStatus = { root.clearDictationStatus() },
+                            consumeDictationFinal = { root.consumeDictationFinal(it) },
+                            modifier = Modifier.weight(1f),
+                        )
                         state.errorCode?.let {
                             Text(
                                 errorLabel(it),
@@ -258,6 +295,12 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
  * are named as well as positioned. The avatar is decorative to a screen reader: the bubble row carries the spoken
  * "助手说：…" text.
  *
+ * 0.4 Task 11 (spec §5.1) adds the WAKE view's composer below the chat frame; the owner's 2026-10-27 redesign made it
+ * one soft pill with a single circular action (mic/send/stop). It is part of the fixed frame like the header — outside
+ * the message `LazyColumn` — is drawn only on WAKE, and never reads `currentIdentity()`: the host call it hands the
+ * text to owns that check. `send` returns the host's verdict so the composer can clear on `Accepted` and keep the
+ * draft on every retryable refusal.
+ *
  * The switch is **read-only**: it changes which conversation is in front of the wearer and nothing else. It reads the
  * same `ConversationLog` the glasses render — same shape, same order, same eviction — so the two screens cannot drift
  * apart the way two implementations would. They are not the same *instance*: the phone records what the plugin said,
@@ -269,9 +312,42 @@ private fun iconFor(tab: PhoneTab) = when (tab) {
  */
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-internal fun AssistantTab(log: ConversationLog, modifier: Modifier = Modifier) {
+internal fun AssistantTab(
+    log: ConversationLog,
+    session: SessionState,
+    typedInput: TypedInputState,
+    onTypedInputChange: (TypedInputState) -> Unit,
+    send: (String) -> TypedSendResult,
+    dictation: StateFlow<DictationUiState>,
+    startDictation: () -> DictationStartResult,
+    stopDictation: () -> Unit,
+    clearDictationStatus: () -> Unit,
+    consumeDictationFinal: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+) {
     var route by remember { mutableStateOf(AssistantRoute.WAKE) }
     var revision by remember { mutableStateOf(0) }
+    // 0.4 Task 13e-prep: the draft/result are owned by PhoneScreen (a tab switch would dispose this function and take
+    // them with it); this page only reads the value and reports every change back up.
+    // The dictation host is the only writer of this flow (its callbacks may arrive on the pipeline or scheduler
+    // thread; StateFlow + lifecycle collection marshal them onto the main thread). The host also owns the final's
+    // lifetime: it stays in the flow until this page has appended it and acknowledged it with
+    // `consumeDictationFinal`, so the page's own counter is deliberately **not** saved across compositions
+    // (0.4 Task 12b-ii fix 2, finding 1). Saving a raw sequence would make a tab switch reset it to 0 (duplicate
+    // append) and a process restart restore an old N (the new host's first N finals silently dropped).
+    val dictationUi by dictation.collectAsStateWithLifecycle()
+    var appendedDictationSequence by remember { mutableStateOf(0L) }
+    LaunchedEffect(dictationUi.final?.sequence) {
+        val delivered = dictationUi.final ?: return@LaunchedEffect
+        if (!isNewDictationFinal(delivered, appendedDictationSequence)) return@LaunchedEffect
+        appendedDictationSequence = delivered.sequence
+        // 0.4 Task 12b-ii (spec §5.3): the recognized words are appended to the editable draft. Nothing is sent:
+        // the wearer can fix them and presses 发送 when ready. The transition is pure so its draft-preserving
+        // behaviour is JVM-tested (0.4 Task 13e-prep).
+        onTypedInputChange(typedInput.afterDictationFinal(delivered.text))
+        // Only after the append: the host then stops handing this final to a re-created page.
+        consumeDictationFinal(delivered.sequence)
+    }
     val entries = remember(revision, route) { log.entries(route) }
     // Start the first layout at the newest entry, so the frame before the route-opening effect cannot show the oldest
     // one. The route-opening effect still owns route switches (the state is shared, not recreated).
@@ -373,6 +449,171 @@ internal fun AssistantTab(log: ConversationLog, modifier: Modifier = Modifier) {
                     }
                 }
             }
+        }
+        if (showsTypedInputRow(route)) {
+            TypedInputRow(
+                session = session,
+                state = typedInput,
+                dictation = dictationUi.state,
+                refusal = dictationUi.refusal,
+                onDraftChange = { candidate ->
+                    // 0.4 Task 12b-ii fix 2 (finding 2): editing is the wearer starting a newer action, so a finished
+                    // dictation's no-speech/timeout/error text must not outrank what they are doing now.
+                    clearDictationStatus()
+                    onTypedInputChange(typedInput.copy(draft = typedDraftAfterInput(candidate)))
+                },
+                onSend = {
+                    val outgoing = typedInput
+                    // The button is already disabled for both facts; the check is repeated here so a queued click
+                    // that lands after a state change cannot submit a second request.
+                    if (canSendTyped(session, outgoing.draft.isBlank(), outgoing.sending)) {
+                        onTypedInputChange(outgoing.beginSend().finishSend(send(outgoing.draft)))
+                    }
+                },
+                onStartDictation = { startDictation() },
+                onStopDictation = stopDictation,
+            )
+        }
+    }
+}
+
+/**
+ * The input row's page-recreation state: the draft and the last result survive an Activity recreation. `sending` is
+ * deliberately not restored — the host call is synchronous, so there is no request left to resume.
+ */
+private val typedInputSaver: Saver<TypedInputState, Any> = listSaver(
+    save = { typedInputSaveValues(it) },
+    restore = { typedInputRestore(it) },
+)
+
+/**
+ * 0.4 Task 11 (spec §5.1) + Task 12b-ii (spec §5.3): the WAKE conversation's composer, below the chat frame.
+ *
+ * Always rendered on WAKE (the 脱离眼镜 switch does not hide it), never on PROACTIVE. The composer draws the pure
+ * decisions from `TypedInput.kt`/`DictationInput.kt` and reads no identity itself.
+ *
+ * The owner's 2026-10-27 redesign (option A) replaced the outlined field + microphone icon + text button row with one
+ * cohesive pill and **one** circular action: `BasicTextField` on a soft `surfaceContainerHigh` fill, 28 dp corners, no
+ * outline and no floating label; the action is a `FilledIconButton` clipped to [CircleShape] and is green while live
+ * (EDITH's primary), muted grey when the same action is unavailable. The slot's icon follows the draft and the
+ * dictation lease ([composerActionSlot]); it is never a second, disappearing button. The status line is drawn only when
+ * [inputRowStatusText] has something to say.
+ *
+ * The microphone starts a phone-microphone dictation on a tap and stops the running one on a second tap (D204). A
+ * missing `RECORD_AUDIO` grant is requested right here - glasses sessions never ask for it at start, so the dictation
+ * is the only moment the permission can be obtained - and the host re-checks the grant at start. While listening the
+ * status line shows 正在听写…; the final transcript is appended to the draft by [AssistantTab], never sent. A refused
+ * start (`refusal`) shows its retryable Chinese reason in the same one status line, so a tap that does nothing is
+ * explained rather than silent (0.4 Task 12b-ii fix 2, finding 4c).
+ */
+@Composable
+private fun TypedInputRow(
+    session: SessionState,
+    state: TypedInputState,
+    dictation: DictationState,
+    refusal: DictationStartResult?,
+    onDraftChange: (String) -> Unit,
+    onSend: () -> Unit,
+    onStartDictation: () -> DictationStartResult,
+    onStopDictation: () -> Unit,
+) {
+    val slot = composerActionSlot(session, state, dictation)
+    val status = inputRowStatusText(session, state, dictation, refusal)
+    val failed = (state.result != null && state.result != TypedSendResult.Accepted) ||
+        dictation is DictationState.Error
+    val context = LocalContext.current
+    // The permission result is asynchronous. On a denial the host is still asked once: it re-checks the grant and
+    // publishes the retryable explanation (需要麦克风权限…), so the composer says what to do instead of the tap being
+    // silent.
+    val requestMicrophone = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        onStartDictation()
+    }
+    Column(
+        Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(6.dp),
+    ) {
+        // One surface, one action. imePadding keeps the pill above the keyboard instead of letting the IME cover it.
+        Surface(
+            modifier = Modifier.fillMaxWidth().imePadding(),
+            shape = RoundedCornerShape(28.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh.copy(alpha = 0.72f),
+            tonalElevation = 0.dp,
+            shadowElevation = 0.dp,
+        ) {
+            Row(
+                Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 6.dp),
+                verticalAlignment = Alignment.Bottom,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                BasicTextField(
+                    value = state.draft,
+                    onValueChange = onDraftChange,
+                    modifier = Modifier.weight(1f).padding(vertical = 6.dp),
+                    textStyle = MaterialTheme.typography.bodyLarge.copy(color = MaterialTheme.colorScheme.onSurface),
+                    cursorBrush = SolidColor(MaterialTheme.colorScheme.primary),
+                    minLines = 1,
+                    maxLines = 4,
+                    decorationBox = { innerTextField ->
+                        Box(Modifier.fillMaxWidth(), contentAlignment = Alignment.CenterStart) {
+                            if (state.draft.isEmpty()) {
+                                Text(
+                                    TYPED_INPUT_PLACEHOLDER,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.72f),
+                                    maxLines = 1,
+                                )
+                            }
+                            innerTextField()
+                        }
+                    },
+                )
+                FilledIconButton(
+                    onClick = {
+                        when (slot.action) {
+                            ComposerAction.Microphone -> {
+                                val granted = ContextCompat.checkSelfPermission(
+                                    context,
+                                    Manifest.permission.RECORD_AUDIO,
+                                ) == PackageManager.PERMISSION_GRANTED
+                                if (granted) {
+                                    onStartDictation()
+                                } else {
+                                    requestMicrophone.launch(Manifest.permission.RECORD_AUDIO)
+                                }
+                            }
+                            ComposerAction.Send -> onSend()
+                            ComposerAction.Stop -> onStopDictation()
+                        }
+                    },
+                    modifier = Modifier.size(46.dp),
+                    enabled = slot.enabled,
+                    shape = CircleShape,
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = MaterialTheme.colorScheme.primary,
+                        contentColor = MaterialTheme.colorScheme.onPrimary,
+                        disabledContainerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
+                        disabledContentColor = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f),
+                    ),
+                ) {
+                    Icon(
+                        imageVector = when (slot.action) {
+                            ComposerAction.Microphone -> Icons.Default.Mic
+                            ComposerAction.Send -> Icons.Default.ArrowUpward
+                            ComposerAction.Stop -> Icons.Default.Stop
+                        },
+                        contentDescription = composerActionDescription(slot.action),
+                        modifier = Modifier.size(22.dp),
+                    )
+                }
+            }
+        }
+        status?.let { text ->
+            Text(
+                text,
+                style = MaterialTheme.typography.bodySmall,
+                color = if (failed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(horizontal = 8.dp),
+            )
         }
     }
 }
@@ -604,10 +845,46 @@ private fun LocalModelStatus(state: SessionUiState) {
 @Composable
 private fun SmartToggles(root: HostCompositionRoot) {
     val proactiveArmed by root.proactiveArming.enabled.collectAsStateWithLifecycle()
+    val detached by root.detachGate.enabled.collectAsStateWithLifecycle()
+    var detachNotice by remember { mutableStateOf<String?>(null) }
+    var detachFailed by remember { mutableStateOf(false) }
+
+    // 0.4 Task 5 (`D199`): the host-only mode switch. Its change goes through `DetachGate`, not the settings form and
+    // not the settings blob directly: the gate stops a running session first and refuses visibly if it cannot persist.
+    Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+        Column(Modifier.weight(1f)) {
+            Text(DetachUi.SWITCH_TITLE)
+            Text(DetachUi.SWITCH_SUMMARY, style = MaterialTheme.typography.bodySmall)
+        }
+        Switch(checked = detached, onCheckedChange = { wanted ->
+            val result = root.detachGate.set(wanted)
+            detachFailed = !result.saved
+            detachNotice = if (result.saved) {
+                DetachUi.successText(result.stoppedSession)
+            } else {
+                DetachUi.errorText(requireNotNull(result.error), result.stoppedSession)
+            }
+        })
+    }
+    detachNotice?.let { notice ->
+        Text(
+            notice,
+            style = MaterialTheme.typography.bodySmall,
+            color = if (detachFailed) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.primary,
+        )
+    }
     Row(verticalAlignment = Alignment.CenterVertically) {
-        Switch(checked = proactiveArmed, onCheckedChange = { root.proactiveArming.set(it) })
+        Switch(
+            checked = proactiveArmed,
+            enabled = DetachUi.proactiveSwitchEnabled(detached),
+            onCheckedChange = { root.proactiveArming.set(it) },
+        )
         Spacer(Modifier.width(8.dp))
         Text("主动辅助（未唤醒时给一句短提示）")
+    }
+    if (detached) {
+        Text(DetachUi.PROACTIVE_DETACHED_NOTE, style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.error)
     }
     Text(
         "一次配置、长期生效：跨会话、重连、重启 App 或手机都保持；关掉后不会被任何路径自动打开。",

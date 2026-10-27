@@ -1,6 +1,19 @@
 # Public Engine Candidate Attribution
 
-Candidate runtime: sherpa-onnx1.13.8, SHA256633C24321E06B1FE79FEAFA03EA16CBC0F8A286641E2DA3559BAC91BDB13BD96. Full source licenses and model declarations are retained in licenses/. No models or credentials are bundled in the App.
+Candidate runtime: sherpa-onnx 1.13.8, SHA256 `633C24321E06B1FE79FEAFA03EA16CBC0F8A286641E2DA3559BAC91BDB13BD96`. Full source licenses and model declarations are retained in `licenses/` (`tools/scripts/p2/licenses/`). No service credentials are bundled in the App.
+
+## Models bundled in the 0.4 phone APK
+
+The 0.4 phone APK is not a model-free shell. It bundles four on-device model sets: ASR under `assets/models/asr/`, Laya under `assets/models/laya/`, EmbeddingGemma under `assets/models/embeddinggemma/`, and KWS under `assets/kws/`. `tools/scripts/p2/model-bundles.json` is the pinned manifest (bundleId `f06c6a5beaa21ed39dd5ed189e77bc3b078796d53a74436ce549693127455565`; the build recomputes it from the 21 entries and refuses a mismatch); it records each file's group, role, bytes, SHA-256, upstream source/revision pointer and license pointer. The APK also ships `assets/models/models-manifest.json` for the bundled subset and copies the fifteen retained license/declaration texts into `assets/models/licenses/`. The model binaries themselves are not committed to this repository.
+
+| Set | Bundled contents and source | Revision / license evidence |
+| --- | --- | --- |
+| ASR engine bundle | Seven files: streaming Zipformer zh/en encoder, fp32 decoder, joiner, `tokens.txt`, Silero VAD v5, 3D-Speaker speaker model, and `engine-manifest.json`. Sources: `csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20` at revision `98590b7ed6443e77b714204da2757d75e1a642f4`; `snakers4/silero-vad` at `5cd2ba54db059f961e7545d4f211b44f005a6dfb`; the 3D-Speaker speaker-model release. | Apache-2.0 for the ASR and 3D-Speaker artifacts; MIT for Silero. Declarations/texts: `licenses/asr-model-card.md`, `licenses/asr-upstream-model-card.md`, `licenses/silero-v5-model-card.md`, `licenses/silero-v5-MIT.txt`, `licenses/speaker-v1.0.1-model-card.md`, `licenses/3D-Speaker-current-project-Apache-2.0.txt`. |
+| KWS | Five runtime files from `sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20` plus the project-authored `keywords.txt`, packaged as `assets/kws/`. | Apache-2.0 for the upstream sherpa-onnx model set; no separate LICENSE file was present in the downloaded directory, so the declaration is source-based. `licenses/kws-model-card.md` records the release URL, 2026-10-26 download evidence and per-file SHA-256. |
+| Laya | Six runtime files from `litert-community/Laya-Multilingual-LiteRT` (Android sample Apache-2.0; upstream base `convaiinnovations/laya`). The 7-file staging set's `tokenizer_config.json` is not read and not packaged. | Publisher declares Apache-2.0; checkpoint revision `1c5edc17a7acd8701df6fc341c0d179f1c62c982` is recorded in the retained NOTICE. Texts: `licenses/laya-model-card.md`, `phone-app/app/src/main/kotlin/com/laya/LICENSES/laya-sample-NOTICE.txt` (copied into the APK). |
+| EmbeddingGemma | `embeddinggemma-300M_seq256_mixed-precision.tflite` + `sentencepiece.model`; the source path and exact bytes/SHA-256 are pinned in `model-bundles.json`. | **Gemma Terms of Use** (including the Section 3.2 use restrictions) and the Gemma Prohibited Use Policy; texts: `licenses/gemma-terms-of-use.txt`, `licenses/gemma-prohibited-use-policy.txt`. |
+
+Bundling these sets adds their attribution texts to the APK; it does **not** complete the distribution review. `distributionReview` remains **Incomplete** (also recorded as `runtime.distributionReview` in `tools/scripts/p2/engine-manifest.json`). This section is provenance and attribution evidence, **not** a legal conclusion and not a completed audit of the bundled weights or their upstream data.
 
 The four embedded ONNX Runtime binaries contain VERS_1.28.2; exact per-ABI hashes are in runtime-binary-evidence.json. Include the v1.28.2 MIT license and complete upstream ThirdPartyNotices. This binary inspection establishes version evidence, not a complete build SBOM.
 

@@ -117,4 +117,19 @@ internal class SmartWiring(
         // effect from the next tool call; the plugin passes it to both the policy and the command-level precheck wrapper.
         noInterception = noInterception,
     )
+
+    companion object {
+        /**
+         * 0.4 Task 7 (`D201`, spec §4.3): what the conversation cycle reads as "the panel is visible".
+         *
+         * Detached mode's surface is the phone's own conversation tab, so the cycle must treat the panel as visible
+         * and start its listening window immediately; no `PANEL_SHOWN` will ever arrive for a display that is not on
+         * the glasses, and waiting for one would leave every detached turn stuck. Attached mode keeps the link's own
+         * fact unchanged.
+         *
+         * One expression for `create` and the JVM rigs, so the shipped rule is what the tests drive.
+         */
+        fun cyclePanelVisible(detached: () -> Boolean, glassesVisible: () -> Boolean): () -> Boolean =
+            { detached() || glassesVisible() }
+    }
 }

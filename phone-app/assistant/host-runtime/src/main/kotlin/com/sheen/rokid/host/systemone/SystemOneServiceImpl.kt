@@ -30,10 +30,13 @@ import java.util.concurrent.atomic.AtomicReference
  *   by an engine parameter.
  * @param engine Inference engine implementation (defaults to [StubLayaEngine] for JVM tests; production injects an
  *   engine backed by the publisher's host from phone-app)
+ * @param provision Optional defense-in-depth materializer, run on the loader thread before [ModelLoader.load] checks
+ *   the path. Production passes the App's bundled-model provisioner; `null` keeps the pre-0.4 behavior.
  */
 class SystemOneServiceImpl(
     private val modelPath: String,
     private val engine: LayaInferenceEngine = StubLayaEngine(),
+    private val provision: (() -> Unit)? = null,
 ) : SystemOneService {
 
     private val _status = AtomicReference(SystemOneStatus.LOADING)
@@ -53,6 +56,9 @@ class SystemOneServiceImpl(
 
     private fun loadModel() {
         try {
+            // 0.4 Task 3: readiness normally already guarantees the files; this is the last-resort materializer for a
+            // file deleted between the first-start copy and this loader thread. It runs before the existence check.
+            provision?.invoke()
             val loaded = ModelLoader.load(modelPath)
             if (loaded == null) {
                 _status.set(SystemOneStatus.UNAVAILABLE)
