@@ -2369,6 +2369,8 @@ class HostCompositionRoot internal constructor(
         // instead. Refused before the link so no command and no `appStart` can leave the phone.
         if (detachGate.enabled.value) false else hintLink?.requestPanelOpen(route) ?: false
 
+    private var wakeAckPlayer: AndroidSpeechPlayer? = null
+
     /**
      * One wake detector emission, as `create` delivers it (0.24 S5 final review Important #1).
      *
@@ -2377,11 +2379,20 @@ class HostCompositionRoot internal constructor(
      * and the smart plugin's own scene admission - so it lives here rather than in a lambda a test cannot drive.
      *
      * @param chime the wearer-facing acknowledgement, played only for a wake that has a live identity.
+     * @param ack detached mode's fixed spoken acknowledgement; true means it was accepted and the beep is skipped.
      */
-    internal fun emitWake(host: HostRuntime, word: String, confidence: Double, chime: () -> Unit = {}) {
+    internal fun emitWake(
+        host: HostRuntime,
+        word: String,
+        confidence: Double,
+        ack: (String) -> Boolean = { false },
+        chime: () -> Unit = {},
+    ) {
         val identity = runCatching { host.currentIdentity() }.getOrNull()
         if (identity != null) {
-            chime()
+            val acknowledged = detachGate.enabled.value &&
+                runCatching { ack(DETACHED_WAKE_ACK_TEXT) }.getOrDefault(false)
+            if (!acknowledged) chime()
             // 0.24 S5 final review Important #1: a live identity is necessary but not sufficient. The plugin can still
             // refuse the wake (scene cooldown), and no turn is then installed, so the panel would have nothing to
             // close it. Ask the plugin's own admission before asking for the window.
@@ -2391,6 +2402,26 @@ class HostCompositionRoot internal constructor(
             if (!detachGate.enabled.value && pluginAdmitsWake()) requestPanelOpen(AssistantRoute.WAKE)
         }
         emitWakeDetected(host, clock, word, confidence)
+    }
+
+    /**
+     * Detached-only fixed acknowledgement. It is not a turn, not a hint and never reaches the CXR link; the shared
+     * [PlaybackGate] keeps the microphone from re-detecting it. Failure is honest and falls back to the beep.
+     */
+    internal fun speakDetachedWakeAck(text: String): Boolean {
+        if (!detachGate.enabled.value || !speechEnabled.value) return false
+        val player = wakeAckPlayer ?: return false
+        P3Log.line("P4_WAKE_ACK state=requested")
+        // The TTS engine may lazily await initialization for up to 3 s. This runs on the detector's thread, so the
+        // acknowledgement is spoken off-thread; a blocking await here would stall the wake pipeline.
+        runCatching {
+            Thread({
+                val accepted = runCatching { player.speakText(text, "detached-wake-ack") }
+                    .getOrDefault(false)
+                P3Log.line("P4_WAKE_ACK state=${if (accepted) "accepted" else "unavailable"}")
+            }, "edith-wake-ack").apply { isDaemon = true }.start()
+        }.onFailure { P3Log.line("P4_WAKE_ACK state=unavailable") }
+        return true
     }
 
     /**
@@ -2951,6 +2982,9 @@ class HostCompositionRoot internal constructor(
         }
     }
     companion object {
+        /** Detached mode's one fixed wake acknowledgement (owner decision 2026-10-27). */
+        internal const val DETACHED_WAKE_ACK_TEXT = "我在"
+
         /** The debug-only diagnostic text plugin's id; its configuration shape is not the smart plugin's. */
         private const val DIAGNOSTIC_PLUGIN_ID = "p2-diagnostic"
 
@@ -3295,11 +3329,14 @@ class HostCompositionRoot internal constructor(
                             // were heard, and nothing claims to be an answer. 0.24 S5 final review Important #1: the
                             // composition owns the chime and the resident-panel decision together, so a wake the plugin
                             // will refuse cannot open an overlay with no turn behind it.
-                            root.emitWake(host, word, confidence) {
-                                val outcome = wakeChime.playOutcome(
-                                    clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
-                                P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
-                            }
+                            root.emitWake(host, word, confidence,
+                                chime = {
+                                    val outcome = wakeChime.playOutcome(
+                                        clock.nowNanos(), root.speechEnabled.value, wakeChimeSink)
+                                    P3Log.line("P5_CHIME state=${outcome.name.lowercase()}")
+                                },
+                                ack = { text -> root.speakDetachedWakeAck(text) },
+                            )
                         } else {
                             // The composition does not exist yet (the chain is built before it): no panel can be asked
                             // for, but the detector's evidence still has to reach the host.
@@ -3914,6 +3951,7 @@ class HostCompositionRoot internal constructor(
             // Keep the instance field and the holder pointing at the same observer, so installRawPcmObserver affects a
             // connection that has not been built yet.
             root.observerHolder = observerHolder
+            root.wakeAckPlayer = speechPlayer as? AndroidSpeechPlayer
             root.armObserver(initialObserver)
             root.lockPinStore = lockPinStore
             root.unlockCoordinatorForProbe = unlockGate
