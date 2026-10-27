@@ -96,35 +96,14 @@ internal class AndroidSpeechPlayer(
     private var availabilityChecked = false
 
     override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit): CancellationHandle {
-        if (!ensureAvailable(assistance.hintId, onState)) return noOpHandle()
-        startUtterance(assistance.text, assistance.hintId, onState)
-        return cancellationHandle(assistance.hintId, assistance.text.length, onState)
-    }
-
-    /**
-     * Speaks one fixed, host-owned phrase outside the output arbiter (the detached wake acknowledgement).
-     * Uses the same lazy availability check, engine listener and [PlaybackGate] as normal answers.
-     *
-     * @return false when the engine is unavailable or rejected the utterance; the caller may fall back.
-     */
-    internal fun speakText(
-        text: String,
-        utteranceId: String,
-        onState: (SpeechPlayback) -> Unit = {},
-    ): Boolean {
-        if (!ensureAvailable(utteranceId, onState)) return false
-        return startUtterance(text, utteranceId, onState)
-    }
-
-    private fun ensureAvailable(utteranceId: String, onState: (SpeechPlayback) -> Unit): Boolean {
         // Lazy availability check: the TTS engine may not have finished initializing at create() time.
         if (!availabilityChecked) {
             availabilityChecked = true
             val eng = engine as? PlatformTtsEngine
             if (eng != null && !eng.awaitInit(3000)) {
-                P3Log.line("P5_SPEECH state=failed hintId=$utteranceId reason=INIT_TIMEOUT")
+                P3Log.line("P5_SPEECH state=failed hintId=${assistance.hintId} reason=INIT_TIMEOUT")
                 onState(SpeechPlayback.FAILED)
-                return false
+                return object : CancellationHandle { override fun cancel() = Unit }
             }
             val avail = availability(
                 enginePresent = engine.initStatus == TextToSpeech.SUCCESS || engine.initStatus == 0,
@@ -132,20 +111,13 @@ internal class AndroidSpeechPlayer(
                 initSucceeded = engine.initStatus == TextToSpeech.SUCCESS,
             )
             if (avail != TtsAvailability.READY) {
-                P3Log.line("P5_SPEECH state=failed hintId=$utteranceId reason=$avail")
+                P3Log.line("P5_SPEECH state=failed hintId=${assistance.hintId} reason=$avail")
                 onState(SpeechPlayback.FAILED)
-                return false
+                return object : CancellationHandle { override fun cancel() = Unit }
             }
         }
-        return true
-    }
-
-    private fun startUtterance(
-        text: String,
-        utteranceId: String,
-        onState: (SpeechPlayback) -> Unit,
-    ): Boolean {
-        val charCount = text.length
+        val utteranceId = assistance.hintId
+        val charCount = assistance.text.length
         engine.setOnProgressListener(object : UtteranceProgressListener() {
             override fun onStart(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(false, true)) {
@@ -154,7 +126,6 @@ internal class AndroidSpeechPlayer(
                     onState(SpeechPlayback.STARTED)
                 }
             }
-
             override fun onDone(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(true, false)) {
                     gate.end()
@@ -162,7 +133,6 @@ internal class AndroidSpeechPlayer(
                     onState(SpeechPlayback.FINISHED)
                 }
             }
-
             @Suppress("DEPRECATION")
             override fun onError(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(true, false)) {
@@ -172,29 +142,20 @@ internal class AndroidSpeechPlayer(
                 }
             }
         })
-        return engine.speak(text, utteranceId)
-    }
-
-    private fun cancellationHandle(
-        utteranceId: String,
-        charCount: Int,
-        onState: (SpeechPlayback) -> Unit,
-    ): CancellationHandle = object : CancellationHandle {
-        private val cancelled = AtomicBoolean(false)
-        override fun cancel() {
-            if (cancelled.compareAndSet(false, true)) {
-                engine.stop()
-                if (active.compareAndSet(true, false)) {
-                    gate.end()
-                    P3Log.line("P5_SPEECH state=cancelled hintId=$utteranceId chars=$charCount")
-                    onState(SpeechPlayback.FINISHED)
+        engine.speak(assistance.text, utteranceId)
+        return object : CancellationHandle {
+            private val cancelled = AtomicBoolean(false)
+            override fun cancel() {
+                if (cancelled.compareAndSet(false, true)) {
+                    engine.stop()
+                    if (active.compareAndSet(true, false)) {
+                        gate.end()
+                        P3Log.line("P5_SPEECH state=cancelled hintId=$utteranceId chars=$charCount")
+                        onState(SpeechPlayback.FINISHED)
+                    }
                 }
             }
         }
-    }
-
-    private fun noOpHandle(): CancellationHandle = object : CancellationHandle {
-        override fun cancel() = Unit
     }
 
     override fun close() {

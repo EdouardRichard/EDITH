@@ -480,26 +480,16 @@ class DetachedStartTest {
             assertTrue("the phone's conversation is the visible surface", rig.panelVisible())
 
             var chimes = 0
-            val acks = mutableListOf<String>()
-            var finishAck: (() -> Unit)? = null
             val lines = withP3Sink { captured ->
-                rig.root.emitWake(rig.host, "伊迪丝", 1.0,
-                    chime = { chimes++ },
-                    ack = { text, done -> acks += text; finishAck = done; true })
+                rig.root.emitWake(rig.host, "伊迪丝", 1.0) { chimes++ }
                 // Reading a host command is a barrier that proves the dispatcher drain ran.
-                rig.host.currentState
-                assertTrue("the turn waits until the spoken acknowledgement finishes: $captured",
-                    captured.none { it.startsWith("P3_WAKE") })
-                finishAck?.invoke()
                 rig.host.currentState
                 captured.toList()
             }
 
             assertEquals("the wake must still be delivered on the phone", 1,
                 lines.count { it.startsWith("P3_WAKE") })
-            assertEquals("detached mode speaks its fixed acknowledgement instead of the beep",
-                listOf("我在"), acks)
-            assertEquals("the detached acknowledgement replaces the chime", 0, chimes)
+            assertEquals("an accepted wake keeps its chime", 1, chimes)
             assertEquals("the visible phone panel starts the listening round at once",
                 listOf(AssistantRoute.WAKE to OfficialStatus.LISTENING.wire), rig.display.states)
             assertTrue("the round stays open", rig.display.closes.isEmpty())
@@ -585,27 +575,6 @@ class DetachedStartTest {
             assertEquals("the live output is still the glasses link's device", 1, shows.size)
             assertFalse("nothing may be claimed displayed before the glasses acknowledge it",
                 statuses.contains(OutputStatus.Displayed))
-        }
-    }
-
-    @Test
-    fun glassesWakeKeepsTheBeepAndNeverSpeaksTheDetachedAcknowledgement() {
-        Rig(detached = false).use { rig ->
-            rig.attach()
-            rig.connection.ready = true
-            rig.start()
-            rig.sceneReady()
-            rig.establishMapping()
-            assertEquals(SessionState.Ready, rig.root.host.currentState)
-
-            var chimes = 0
-            val acks = mutableListOf<String>()
-            rig.root.emitWake(rig.host, "伊迪丝", 1.0,
-                chime = { chimes++ },
-                ack = { text, _ -> acks += text; true })
-
-            assertEquals("glasses mode must not speak the detached acknowledgement", emptyList<String>(), acks)
-            assertEquals("glasses mode keeps its existing beep", 1, chimes)
         }
     }
 
