@@ -60,6 +60,16 @@ dictated input.
   </a>
 </div>
 
+**Detached wake (0.4)** — no glasses link: the phone microphone wakes EDITH and executes the request, including automatic screen unlock and tool execution.
+
+<div align="center">
+  <a href="docs/assets/videos/detached-wake.mp4">
+    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="Detached wake demo — click to play the full video">
+  </a>
+</div>
+
+> Note: the clip includes **automatic screen unlock**; the execution is **sped up** — real time is a little over **one minute**.
+
 ## Compatibility and dependencies
 
 The versions below are the configuration EDITH is developed and tested against. Newer firmware or
@@ -95,7 +105,11 @@ to the proactive trigger path instead. `AgentLoop` with the configured cloud mod
 and perception → answer on the glasses panel and phone-side TTS. The same CXR session also carries
 the display commands and the follow-up audio. With detached mode on, this chain starts at the phone
 microphone instead of the CXR uplink; KWS, VAD, ASR and everything after transcript admission are
-the same (see below).
+the same (see below). The detached variant also wakes with the screen off or locked (foreground
+service + `PARTIAL_WAKE_LOCK`) and answers every accepted wake with a fixed spoken acknowledgement
+「我在」 inside an echo-mute window: microphone frames are silenced while the phone speaks, so the
+acknowledgement never reaches the ASR or corrupts the user's next command, and the WAKE turn opens
+without waiting for the acknowledgement to finish (zero added latency).
 
 ```mermaid
 flowchart LR
