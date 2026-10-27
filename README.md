@@ -60,7 +60,7 @@ dictated input.
   </a>
 </div>
 
-**Detached wake (0.4)** — no glasses link: the phone microphone wakes EDITH and executes the request, including automatic screen unlock and tool execution.
+**Agent capability detached from glasses (0.4)** — no glasses link; wake-word wake only.
 
 <div align="center">
   <a href="docs/assets/videos/detached-wake.mp4">
@@ -204,22 +204,7 @@ When the gate declines, **zero** model requests are made. The two routes use ind
 
 ### Detached mode (0.4)
 
-The **Detached from glasses** setting runs the wake route without the glasses. The phone microphone
-replaces the CXR uplink: the same 16 kHz/mono PCM framing feeds the same KWS, VAD and streaming ASR,
-and a wake hit opens the same WAKE turn with the same tools, prompts, memory and confirmation flow.
-The app opens no CXR session and sends nothing to the glasses (enforced in code; verified on the K40
-after detach neutralization — 60 s with zero `EdithHint: outbound:` and zero `P3_CXR`, and no
-inbound command on the glasses; a detached session also shows 30 s with zero outbound. The stop of an
-existing session before neutralization may still emit `Clear`/`Busy`/`Close`, which the measurement
-window excludes). The answer is written to the phone's
-conversation log; the phone display device is acknowledgement-only (it does not write the log
-again), and TTS still follows the existing speech switch. Proactive assistance is effectively off
-while detached — the expression is `proactiveEnabled && !glassesDetached`, so the stored proactive
-switch is not changed. A `PARTIAL_WAKE_LOCK` (`edith:detached-wake`) keeps KWS running while the
-screen is off; the app does not turn the screen on and makes no lock-screen presentation promise.
-The switch is off by default, takes effect on the next session, and saving it while a session is
-running stops that session first. Detached start asks for `RECORD_AUDIO` and runs the session
-service as a microphone foreground service.
+The **Detached from glasses** setting makes the wake route independent of the glasses.
 
 ```mermaid
 flowchart LR
@@ -236,31 +221,6 @@ flowchart LR
 With the setting off, the glasses routes above are unchanged: CXR connection, glasses wake, panel
 display and follow-up behavior keep their existing semantics. Detached mode is a local
 input/display choice, not a second CXR protocol.
-
-### Input row (0.4)
-
-The phone's conversation log has an input row for text and one-shot dictation. A **typed message**
-is sent as `UserAction.Action.Typed` and enters the same WAKE-turn downstream path as an accepted
-wake transcript — one WAKE turn, no PROACTIVE gate, no 10-second wake cooldown, and it does not
-replace the last wake transcript. The row stays visible regardless of the detached switch; when no
-session is running or the WAKE turn is busy it is disabled or refuses with a visible reason.
-**Dictation** captures the phone microphone once, runs the same ASR engine/pipeline and appends the
-editable transcript to the field (space-separated after existing text); it never sends
-automatically, and dictation text does not enter the plugin or `HostRuntime`.
-A wake-word utterance still goes directly from ASR to the LLM and never through the input field;
-neither path changes the existing wake route or its listening windows.
-
-### Model provisioning (0.4)
-
-The four model sets are packaged as `assets/models/**` and `assets/kws/**`, with the
-license/declaration texts under `assets/models/licenses/`. On first launch — and after an APK update
-whose bundle id differs (the build derives it from every pinned file digest) — the app verifies and
-materializes them before a session may start: ASR is imported into the existing engine store, while
-Laya and EmbeddingGemma are copied with a bundle receipt. A matching receipt skips the copy on later
-launches. Session start is gated on a `PREPARING`/`READY`/`FAILED` state, so a partial or missing
-bundle cannot start a session; failures such as insufficient free space are explicit and retryable.
-The runtime read paths are unchanged. See [Model files](#2-model-files-bundled) for sizes, timings
-and the development/CI switch.
 
 ## Project structure
 
