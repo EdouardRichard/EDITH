@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.plugin.smarthelper.host
 import com.sheen.rokid.phone.withP3Sink
+import com.sheen.rokid.phone.ui.profile.TestBlobs
 import com.sheen.rokid.phone.app.CxrAudioChain
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
 import com.sheen.rokid.phone.app.HostCompositionRoot
@@ -262,6 +263,87 @@ class ProactiveArmingTest {
             assertFalse("D53-②: 关掉后不得被任何路径自动打开", arming.enabled.value)
         } finally {
             root.close()
+        }
+    }
+
+    // ---- 0.4 Task 5 (`D202`): detaching suppresses proactive assistance effectively --------------------------------
+
+    @Test
+    fun detachMakesEffectiveProactiveFalseWhileTheStoredSwitchStaysOn() {
+        var detached = true
+        val arming = ProactiveArming(detached = { detached })
+
+        assertTrue("the stored/user switch is untouched", arming.enabled.value)
+        assertFalse("D202: effective = stored && !detached", arming.effectiveProactiveArmed)
+
+        detached = false
+        assertTrue("closing detach restores the user's stored choice", arming.effectiveProactiveArmed)
+    }
+
+    @Test
+    fun aStoredOffSwitchStaysEffectivelyOffInGlassesModeToo() {
+        var detached = false
+        val arming = ProactiveArming(detached = { detached })
+        arming.set(false)
+
+        assertFalse("effective is still the stored value AND-ed with the mode", arming.effectiveProactiveArmed)
+        detached = true
+        assertFalse(arming.effectiveProactiveArmed)
+    }
+
+    @Test
+    fun aDetachedCompositionProducesNoAcousticEventEvenWithTheStoredSwitchOn() {
+        // The store says 「主动辅助」 on; only the detach mode is suppressing. No event may reach the plugin, and no
+        // P3_ACOUSTIC line may claim the label was emitted.
+        val blobs = TestBlobs()
+        val store = SmartSettingsStore(blobs)
+        store.save(SmartSettings(proactiveEnabled = true))
+        val arming = ProactiveArming(store, detached = { true }).also { it.load() }
+        assertTrue("the stored switch must still read on", arming.enabled.value)
+
+        val rig = Rig(arming, session, verified)
+        try {
+            assertEquals(ActivationResult.Activated, rig.activate())
+            withP3Sink { lines ->
+                rig.feedFrames(12)
+
+                assertTrue("a detached composition must deliver no acoustic event",
+                    rig.plugin.handled.none { it is AcousticEvent })
+                assertTrue("and it must not even reach the emission line",
+                    lines.none { it.startsWith("P3_ACOUSTIC") })
+            }
+            assertEquals("the gate must not write the stored proactive value back",
+                true, store.load().proactiveEnabled)
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun closingDetachRestoresTheAcousticGateWithoutReWritingSettings() {
+        val blobs = TestBlobs()
+        val store = SmartSettingsStore(blobs)
+        store.save(SmartSettings(proactiveEnabled = true))
+        var detached = true
+        val arming = ProactiveArming(store, detached = { detached }).also { it.load() }
+
+        val rig = Rig(arming, session, verified)
+        try {
+            assertEquals(ActivationResult.Activated, rig.activate())
+            rig.feedFrames(12)
+            assertTrue(rig.plugin.handled.none { it is AcousticEvent })
+
+            detached = false
+            // The chain reports each transition once; closing detach makes the **next** transition (another 12 frames
+            // start a fresh speech segment) observable again.
+            rig.feedFrames(12)
+
+            assertEquals("glasses mode is unchanged: the same frames produce their label again",
+                listOf(AcousticLabel.Speech),
+                rig.plugin.handled.filterIsInstance<AcousticEvent>().map { it.label })
+            assertEquals("the stored switch is still the user's on value", true, store.load().proactiveEnabled)
+        } finally {
+            rig.close()
         }
     }
 }

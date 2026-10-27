@@ -3,6 +3,8 @@ package com.sheen.rokid.contracts
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
+import kotlin.test.assertNotEquals
+import kotlin.test.assertNull
 import kotlin.test.assertSame
 
 class P3EventsTest {
@@ -40,6 +42,36 @@ class P3EventsTest {
 
     @Test fun `confirmation result rejects a blank request id`() {
         assertFailsWith<IllegalArgumentException> { ConfirmationResult(envelope, "", true) }
+    }
+
+    /**
+     * 0.4 Task 10 (`D203`, spec §5.2): the typed-input action is **appended**, so every existing action keeps its
+     * meaning and the one exhaustive `when` in the smart plugin is the only place the compiler forces a branch.
+     */
+    @Test fun `user action keeps the existing actions and appends Typed`() {
+        assertEquals(
+            listOf(
+                UserAction.Action.Pause,
+                UserAction.Action.Resume,
+                UserAction.Action.Stop,
+                UserAction.Action.Help,
+                UserAction.Action.Typed,
+            ),
+            UserAction.Action.entries.toList(),
+        )
+    }
+
+    /**
+     * 0.4 Task 10: the typed body rides the action as a defaulted last field, so every positional construction that
+     * predates it still compiles and no non-typed action carries text.
+     */
+    @Test fun `user action carries the typed text and defaults it to null`() {
+        val typed = UserAction(envelope, UserAction.Action.Typed, "帮我记一条笔记")
+
+        assertEquals("帮我记一条笔记", typed.text)
+        assertEquals("帮我记一条笔记", typed.copy().text)
+        assertNull(UserAction(envelope, UserAction.Action.Help).text, "a non-typed action carries no text")
+        assertNotEquals(typed, typed.copy(text = "另一条"), "the typed body is part of the action's identity")
     }
 
     @Test fun `new events are host events that expose their envelope`() {

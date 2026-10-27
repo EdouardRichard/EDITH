@@ -24,4 +24,7 @@
     <item name="survey_secure_edit" type="id" />
     <item name="survey_normal_text" type="id" />
     <item name="survey_noimportant" type="id" />
+    <!-- Task 13a: the probe-owned EditText the text arm's selftest writes and reads back. A resource id (not
+         generateViewId) so the id extra can address it through findAccessibilityNodeInfosByViewId. -->
+    <item name="probe_text_fixture" type="id" />
 </resources>

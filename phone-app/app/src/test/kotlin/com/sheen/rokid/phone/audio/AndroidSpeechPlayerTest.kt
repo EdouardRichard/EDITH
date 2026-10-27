@@ -68,6 +68,20 @@ class AndroidSpeechPlayerTest {
         assertEquals(listOf(SpeechPlayback.STARTED, SpeechPlayback.FAILED), events)
     }
 
+    @Test fun `speakText speaks the exact detached acknowledgement and gates it`() {
+        val engine = FakeTtsEngine()
+        val gate = com.sheen.rokid.phone.session.PlaybackGate()
+        val player = AndroidSpeechPlayer(engine, gate)
+        val events = mutableListOf<SpeechPlayback>()
+        assertTrue(player.speakText("我在", "detached-wake-ack") { events += it })
+        assertEquals(listOf("我在"), engine.spoken)
+        engine.fireStart("detached-wake-ack")
+        assertTrue(gate.isPlaying)
+        engine.fireDone("detached-wake-ack")
+        assertTrue(!gate.isPlaying)
+        assertEquals(listOf(SpeechPlayback.STARTED, SpeechPlayback.FINISHED), events)
+    }
+
     @Test fun `close stops and shuts down the engine`() {
         val engine = FakeTtsEngine()
         val player = AndroidSpeechPlayer(engine)

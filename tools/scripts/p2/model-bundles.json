@@ -1,0 +1,299 @@
+{
+    "schemaVersion":  1,
+    "bundleId":  "f06c6a5beaa21ed39dd5ed189e77bc3b078796d53a74436ce549693127455565",
+    "files":  [
+                  {
+                      "group":  "asr",
+                      "role":  "speaker",
+                      "path":  "3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+                      "sourcePath":  "asr/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+                      "bytes":  39593761,
+                      "sha256":  "1a331345f04805badbb495c775a6ddffcdd1a732567d5ec8b3d5749e3c7a5e4b",
+                      "source":  "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+                      "license":  "licenses/Apache-2.0-standard.txt",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/asr"
+                  },
+                  {
+                      "group":  "asr",
+                      "role":  "decoder",
+                      "path":  "decoder-epoch-99-avg-1.onnx",
+                      "sourcePath":  "asr/decoder-epoch-99-avg-1.onnx",
+                      "bytes":  13876452,
+                      "sha256":  "2e3b5ec371f8899ee6acd829fd753ba45772df57a91bdf37cde3136354e7db7d",
+                      "source":  "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/98590b7ed6443e77b714204da2757d75e1a642f4/decoder-epoch-99-avg-1.onnx",
+                      "license":  "licenses/Apache-2.0-standard.txt",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/asr"
+                  },
+                  {
+                      "group":  "asr",
+                      "role":  "encoder",
+                      "path":  "encoder-epoch-99-avg-1.int8.onnx",
+                      "sourcePath":  "asr/encoder-epoch-99-avg-1.int8.onnx",
+                      "bytes":  181895032,
+                      "sha256":  "8fa764187a261844f859d7143ebaa563af5d10adfece4c18a8f414c88cba2a9b",
+                      "source":  "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/98590b7ed6443e77b714204da2757d75e1a642f4/encoder-epoch-99-avg-1.int8.onnx",
+                      "license":  "licenses/Apache-2.0-standard.txt",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/asr"
+                  },
+                  {
+                      "group":  "asr",
+                      "role":  "manifest",
+                      "path":  "engine-manifest.json",
+                      "sourcePath":  "asr/engine-manifest.json",
+                      "bytes":  4474,
+                      "sha256":  "1a94586a0f35fe1bef4941416e547d0d30835d0b416db5fad25686bf5d2d2571",
+                      "source":  "tools/scripts/p2/engine-manifest.json",
+                      "license":  "licenses/Apache-2.0-standard.txt",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/asr"
+                  },
+                  {
+                      "group":  "asr",
+                      "role":  "joiner",
+                      "path":  "joiner-epoch-99-avg-1.int8.onnx",
+                      "sourcePath":  "asr/joiner-epoch-99-avg-1.int8.onnx",
+                      "bytes":  3228404,
+                      "sha256":  "1ed689c5ed19dbaa725d9d191bb4822b5f4855a39e1ffd28cbc1f340d25b2ee0",
+                      "source":  "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/98590b7ed6443e77b714204da2757d75e1a642f4/joiner-epoch-99-avg-1.int8.onnx",
+                      "license":  "licenses/Apache-2.0-standard.txt",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/asr"
+                  },
+                  {
+                      "group":  "asr",
+                      "role":  "vad",
+                      "path":  "silero_vad.onnx",
+                      "sourcePath":  "asr/silero_vad.onnx",
+                      "bytes":  2313101,
+                      "sha256":  "6b99cbfd39246b6706f98ec13c7c50c6b299181f2474fa05cbc8046acc274396",
+                      "source":  "https://raw.githubusercontent.com/snakers4/silero-vad/5cd2ba54db059f961e7545d4f211b44f005a6dfb/files/silero_vad.onnx",
+                      "license":  "licenses/silero-v5-MIT.txt",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/asr"
+                  },
+                  {
+                      "group":  "asr",
+                      "role":  "tokens",
+                      "path":  "tokens.txt",
+                      "sourcePath":  "asr/tokens.txt",
+                      "bytes":  56317,
+                      "sha256":  "a8e0e4ec53810e433789b54a5c0134a7eaa2ffca595a6334d54c00da858841d3",
+                      "source":  "https://huggingface.co/csukuangfj/sherpa-onnx-streaming-zipformer-bilingual-zh-en-2023-02-20/resolve/98590b7ed6443e77b714204da2757d75e1a642f4/tokens.txt",
+                      "license":  "licenses/Apache-2.0-standard.txt",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/asr"
+                  },
+                  {
+                      "group":  "embeddinggemma",
+                      "role":  "embeddinggemma-300M_seq256_mixed-precision",
+                      "path":  "embeddinggemma-300M_seq256_mixed-precision.tflite",
+                      "sourcePath":  "embeddinggemma/embeddinggemma-300M_seq256_mixed-precision.tflite",
+                      "bytes":  179131736,
+                      "sha256":  "37115ef7bff76cd37dd86abe503ff511b1032bf85fc624a85c49c84899e92bc5",
+                      "source":  "K40 external files/models/embeddinggemma",
+                      "license":  "Gemma Terms of Use",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/embeddinggemma"
+                  },
+                  {
+                      "group":  "embeddinggemma",
+                      "role":  "sentencepiece",
+                      "path":  "sentencepiece.model",
+                      "sourcePath":  "embeddinggemma/sentencepiece.model",
+                      "bytes":  4683319,
+                      "sha256":  "d6daa52d93d7aad10e8388bd526c4e501d914b47177398d1d9621f1fe48438c7",
+                      "source":  "K40 external files/models/embeddinggemma",
+                      "license":  "Gemma Terms of Use",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/embeddinggemma"
+                  },
+                  {
+                      "group":  "kws",
+                      "role":  "decoder-epoch-13-avg-2-chunk-8-left-64",
+                      "path":  "decoder-epoch-13-avg-2-chunk-8-left-64.onnx",
+                      "sourcePath":  "kws/decoder-epoch-13-avg-2-chunk-8-left-64.onnx",
+                      "bytes":  759829,
+                      "sha256":  "63a22dd60f40fff082ac3e09afa507f6787da36df76ded2fbe145fa233e22c21",
+                      "source":  "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  ".local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+                  },
+                  {
+                      "group":  "kws",
+                      "role":  "en",
+                      "path":  "en.phone",
+                      "sourcePath":  "kws/en.phone",
+                      "bytes":  3330061,
+                      "sha256":  "f7000ec3a90544c0c7c16090d8951779c2b322e14dad5006290f498567d439ea",
+                      "source":  "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  ".local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+                  },
+                  {
+                      "group":  "kws",
+                      "role":  "encoder-epoch-13-avg-2-chunk-8-left-64",
+                      "path":  "encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx",
+                      "sourcePath":  "kws/encoder-epoch-13-avg-2-chunk-8-left-64.int8.onnx",
+                      "bytes":  4600657,
+                      "sha256":  "2ca84d6bfe73e1ea3c9c49f600f7cad1c9ddd423c53c906b8bfe802444dd78d5",
+                      "source":  "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  ".local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+                  },
+                  {
+                      "group":  "kws",
+                      "role":  "joiner-epoch-13-avg-2-chunk-8-left-64",
+                      "path":  "joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx",
+                      "sourcePath":  "kws/joiner-epoch-13-avg-2-chunk-8-left-64.int8.onnx",
+                      "bytes":  86629,
+                      "sha256":  "190d4067b4cc20b72a42a1916e69d92052000fb7051a427ebb1bc72a69207dc1",
+                      "source":  "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  ".local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+                  },
+                  {
+                      "group":  "kws",
+                      "role":  "keywords",
+                      "path":  "keywords.txt",
+                      "sourcePath":  "kws/keywords.txt",
+                      "bytes":  46,
+                      "sha256":  "4f74ca4656092de75ee4e7fb1f43ccd570ef7f4eb90e7272e040f2b3adec1fbb",
+                      "source":  "tracked keywords",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  "phone-app/perception/audio-android/kws"
+                  },
+                  {
+                      "group":  "kws",
+                      "role":  "tokens",
+                      "path":  "tokens.txt",
+                      "sourcePath":  "kws/tokens.txt",
+                      "bytes":  1928,
+                      "sha256":  "2d3f32311f9b692b964da3c90e830258d3e78e013cb0c992dbfb15cd5a1a71b0",
+                      "source":  "sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  ".local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20"
+                  },
+                  {
+                      "group":  "laya",
+                      "role":  "laya_ml_act_head_fp32",
+                      "path":  "laya_ml_act_head_fp32.tflite",
+                      "sourcePath":  "laya/laya_ml_act_head_fp32.tflite",
+                      "bytes":  795816,
+                      "sha256":  "30da532a8b752fdc82351740b0194d440a13d342ed77b9f8848978f1a96cf16d",
+                      "source":  "E:\\layaft\\artifacts\\laya-ml-embeds-bnd-seed20261014",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/laya"
+                  },
+                  {
+                      "group":  "laya",
+                      "role":  "laya_ml_calibration",
+                      "path":  "laya_ml_calibration.json",
+                      "sourcePath":  "laya/laya_ml_calibration.json",
+                      "bytes":  1108,
+                      "sha256":  "2e7b10ce9a882b814d39827c40e3f1b3bfa6e7018c857e3b3f20e045ecfa09be",
+                      "source":  "E:\\layaft\\artifacts\\laya-ml-embeds-bnd-seed20261014",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/laya"
+                  },
+                  {
+                      "group":  "laya",
+                      "role":  "laya_ml_s256_embeds_wfp16",
+                      "path":  "laya_ml_s256_embeds_wfp16.tflite",
+                      "sourcePath":  "laya/laya_ml_s256_embeds_wfp16.tflite",
+                      "bytes":  250889040,
+                      "sha256":  "f19f70f6309264f93d337ca68d385a3b9673238e1e6e083e4d6c339dee8f1771",
+                      "source":  "E:\\layaft\\artifacts\\laya-ml-embeds-bnd-seed20261014",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/laya"
+                  },
+                  {
+                      "group":  "laya",
+                      "role":  "token_embeddings",
+                      "path":  "token_embeddings.json",
+                      "sourcePath":  "laya/token_embeddings.json",
+                      "bytes":  844,
+                      "sha256":  "afcda57527406bcab8cccab61ffd3530b88394d6485b625cfa870dc1c4f89e7b",
+                      "source":  "E:\\layaft\\artifacts\\laya-ml-embeds-bnd-seed20261014",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/laya"
+                  },
+                  {
+                      "group":  "laya",
+                      "role":  "token_embeddings_fp16",
+                      "path":  "token_embeddings_fp16.bin",
+                      "sourcePath":  "laya/token_embeddings_fp16.bin",
+                      "bytes":  393216000,
+                      "sha256":  "339c9ebf138861bb367bd8783c4db9de44e6e18a602699e4069ba244ca59822b",
+                      "source":  "E:\\layaft\\artifacts\\laya-ml-embeds-bnd-seed20261014",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/laya"
+                  },
+                  {
+                      "group":  "laya",
+                      "role":  "tokenizer",
+                      "path":  "tokenizer.json",
+                      "sourcePath":  "laya/tokenizer.json",
+                      "bytes":  34363188,
+                      "sha256":  "609d8f4c067cd3950f88594c5a802616cea245823836ef5848ee4fc40aab5b6f",
+                      "source":  "E:\\layaft\\artifacts\\laya-ml-embeds-bnd-seed20261014",
+                      "license":  "Apache-2.0",
+                      "sourceRoot":  "\u003cbundledModelsDir\u003e/laya"
+                  }
+              ],
+    "licenses":  [
+                     {
+                         "file":  "3D-Speaker-current-project-Apache-2.0.txt",
+                         "source":  "tools/scripts/p2/licenses/3D-Speaker-current-project-Apache-2.0.txt"
+                     },
+                     {
+                         "file":  "Apache-2.0-standard.txt",
+                         "source":  "tools/scripts/p2/licenses/Apache-2.0-standard.txt"
+                     },
+                     {
+                         "file":  "asr-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/asr-model-card.md"
+                     },
+                     {
+                         "file":  "asr-upstream-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/asr-upstream-model-card.md"
+                     },
+                     {
+                         "file":  "gemma-prohibited-use-policy.txt",
+                         "source":  "tools/scripts/p2/licenses/gemma-prohibited-use-policy.txt"
+                     },
+                     {
+                         "file":  "gemma-terms-of-use.txt",
+                         "source":  "tools/scripts/p2/licenses/gemma-terms-of-use.txt"
+                     },
+                     {
+                         "file":  "kws-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/kws-model-card.md"
+                     },
+                     {
+                         "file":  "laya-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/laya-model-card.md"
+                     },
+                     {
+                         "file":  "laya-sample-NOTICE.txt",
+                         "source":  "phone-app/app/src/main/kotlin/com/laya/LICENSES/laya-sample-NOTICE.txt"
+                     },
+                     {
+                         "file":  "onnxruntime-v1.28.2-MIT.txt",
+                         "source":  "tools/scripts/p2/licenses/onnxruntime-v1.28.2-MIT.txt"
+                     },
+                     {
+                         "file":  "onnxruntime-v1.28.2-ThirdPartyNotices.txt",
+                         "source":  "tools/scripts/p2/licenses/onnxruntime-v1.28.2-ThirdPartyNotices.txt"
+                     },
+                     {
+                         "file":  "sherpa-v1.13.8-Apache-2.0.txt",
+                         "source":  "tools/scripts/p2/licenses/sherpa-v1.13.8-Apache-2.0.txt"
+                     },
+                     {
+                         "file":  "silero-v5-MIT.txt",
+                         "source":  "tools/scripts/p2/licenses/silero-v5-MIT.txt"
+                     },
+                     {
+                         "file":  "silero-v5-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/silero-v5-model-card.md"
+                     },
+                     {
+                         "file":  "speaker-v1.0.1-model-card.md",
+                         "source":  "tools/scripts/p2/licenses/speaker-v1.0.1-model-card.md"
+                     }
+                 ]
+}

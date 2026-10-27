@@ -16,10 +16,13 @@ import java.util.concurrent.atomic.AtomicReference
  * @param modelPath Path to the EmbeddingGemma model file on disk
  * @param engine Inference engine implementation (defaults to StubEmbeddingEngine for JVM tests;
  *        production injects LiteRT-backed engine from phone-app)
+ * @param provision Optional defense-in-depth materializer, run on the loader thread before the path exists check.
+ *        Production passes the App's bundled-model provisioner; `null` keeps the pre-0.4 behavior.
  */
 class EmbeddingServiceImpl(
     private val modelPath: String,
     private val engine: EmbeddingInferenceEngine = StubEmbeddingEngine(OUTPUT_DIMENSIONS),
+    private val provision: (() -> Unit)? = null,
 ) : EmbeddingService {
 
     companion object {
@@ -43,6 +46,8 @@ class EmbeddingServiceImpl(
 
     private fun loadModel() {
         try {
+            // 0.4 Task 3: last-resort materialization before the check the service has always done.
+            provision?.invoke()
             val file = java.io.File(modelPath)
             // A model may be one file or a directory of artifacts (EmbeddingGemma ships a graph plus its
             // SentencePiece model), so the check is "the path the engine will load from exists", not "it is a file".

@@ -76,4 +76,21 @@ class ProactiveArmingPersistenceTest {
         arming.set(false)
         assertFalse(arming.enabled.value)
     }
+
+    @Test
+    fun anUnreadableBlobIsNotOverwrittenWithDefaultsByTheProactiveSwitch() {
+        // 0.4 Task 5: the blob now also carries `glassesDetached`. The switch's write-modify-write must not build on
+        // the reader's defaults, or a temporarily unreadable blob would silently wipe the detach mode (and every other
+        // stored setting) while the user was only toggling 「主动辅助」.
+        val blobs = TestBlobs()
+        SmartSettingsStore(blobs).save(SmartSettings(glassesDetached = true, maxLevel = "L2"))
+        blobs.failReadId = SmartSettingsStore.BLOB_ID
+
+        ProactiveArming(SmartSettingsStore(blobs)).set(false)
+
+        blobs.failReadId = null
+        val after = SmartSettingsStore(blobs).load()
+        assertTrue("the detach mode must survive a failed proactive write", after.glassesDetached)
+        assertEquals("and so must every other field", "L2", after.maxLevel)
+    }
 }

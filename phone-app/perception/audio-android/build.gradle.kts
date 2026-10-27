@@ -112,6 +112,10 @@ abstract class KwsModelAssets : DefaultTask() {
     /** The tracked keyword lines (`kws/keywords.txt`), copied only together with the model. */
     @get:InputFile abstract val keywordsTemplate: RegularFileProperty
     @get:Input abstract val pinnedDigests: MapProperty<String, String>
+    /** Set by the app's complete build: KWS is part of the 0.4 delivery bundle, not optional there. */
+    @get:Input abstract val requireBundledModels: Property<Boolean>
+    /** Human-readable source directory, used only in the failure message. */
+    @get:Input abstract val expectedDirectory: Property<String>
     /** Guard so the stale-output cleanup below can never walk outside the build directory. */
     @get:Internal abstract val buildDirectory: DirectoryProperty
     @get:OutputDirectory abstract val outputDirectory: DirectoryProperty
@@ -125,6 +129,13 @@ abstract class KwsModelAssets : DefaultTask() {
         val files = modelFiles.files
         val missing = files.filterNot { it.isFile }
         if (missing.isNotEmpty()) {
+            if (requireBundledModels.get()) {
+                throw GradleException(
+                    "the KWS model bundle is required for this build but ${expectedDirectory.get()} is " +
+                        "missing ${missing.map { it.name }.sorted()}. Provision the five pinned files there, " +
+                        "or use -PwithoutBundledModels=true for a development/CI build without bundled models",
+                )
+            }
             check(missing.size == files.size) {
                 "the local KWS model bundle is incomplete; missing ${missing.map { it.name }.sorted()}"
             }
@@ -162,6 +173,12 @@ val kwsModelAssets = tasks.register<KwsModelAssets>("generateKwsModelAssets") {
     modelFiles.from(kwsPinnedFiles.keys.map { kwsModelDirectory.file(it) })
     keywordsTemplate.set(layout.projectDirectory.file("kws/keywords.txt"))
     pinnedDigests.set(kwsPinnedFiles)
+    // The app's complete build sets this root property; a standalone audio-module build keeps the old
+    // optional behaviour. Evaluated lazily so it is read after every project (including the app) is configured.
+    requireBundledModels.set(project.provider {
+        project.rootProject.findProperty("edithRequireBundledModels")?.toString()?.toBoolean() ?: false
+    })
+    expectedDirectory.set(kwsModelDirectory.asFile.absolutePath)
     buildDirectory.set(layout.buildDirectory)
     outputDirectory.set(layout.buildDirectory.dir("generated/kwsAssets"))
 }

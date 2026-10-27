@@ -95,12 +95,27 @@ class CxrHintLink(
     }
 
     /**
+     * 0.4 strict-local fix (`D199`): the App's mode, as this link must honour it.
+     *
+     * Volatile because the send path is reached from the vendor callback thread, the scheduler thread and the host.
+     * Every outbound command checks it **before** touching the transport: once detached, no app-level CXR command may
+     * leave the phone, even from a timer whose cancellation raced this flag. [detach] sets it, [attach] clears it.
+     */
+    @Volatile private var detached = false
+
+    /**
      * Every outbound command goes through here.
      *
      * Logged because "the wearer saw nothing" cannot be attributed between "the phone never sent a usable `SHOW`" and
      * "the glasses refused it" without both halves: the glasses report their refusals, this reports what left the phone.
+     * The detached check is deliberately **before** the log and the transport: a detached App must not even attempt a
+     * command on a dying connection, and "suppressed" is not the same fact as "the transport refused it".
      */
-    private val outbound: (String) -> Boolean = { json ->
+    private val outbound: (String) -> Boolean = outbound@ { json ->
+        if (detached) {
+            diagnostics("outbound suppressed: detached mode")
+            return@outbound false
+        }
         diagnostics("outbound: ${HintWireCodec.decode(json)?.let(::describe) ?: "undecodable (${json.length} chars)"}")
         sendJson(json)
     }
@@ -198,7 +213,7 @@ class CxrHintLink(
      * per mapping - the App's activation retry, which receives both [onDisplayBecameLive] and [onMappingLive] for the
      * same exchange - can use it to tell "the same sync, reported twice" from "a later renewal".
      */
-    fun liveSyncId(): String? = synchronized(handshakeGate) { clockSync.syncId() }
+    fun liveSyncId(): String? = synchronized(handshakeGate) { if (detached) null else clockSync.syncId() }
 
     private var displayWasLive = false
 
@@ -477,12 +492,18 @@ class CxrHintLink(
      * the `SHOW`. Before the exchange completes, advertising a display would let a plugin start and then lose hints.
      */
     fun liveOutput(): HintDevice? = synchronized(handshakeGate) {
-        if (clockSync.hasLiveMapping()) rokidDevice else null
+        if (detached) null else if (clockSync.hasLiveMapping()) rokidDevice else null
     }
 
     /** Establishes the session on the glasses and starts the clock exchange. */
     fun sessionEstablished(sessionId: String, generation: Long) {
         synchronized(handshakeGate) {
+            // 0.4 strict-local fix: detached mode has no glasses session. A late scene-ready or a stale recovery
+            // callback must not introduce one (and must not send its HELLO/PING) after `detach()`.
+            if (detached) {
+                diagnostics("handshake: detached - session is not introduced")
+                return
+            }
             openingSession = sessionId
             openingGeneration = generation
             // Phase C: the conversation's own idea of "there is a session to talk to", which outlives the handshake.
@@ -523,6 +544,10 @@ class CxrHintLink(
      */
     fun reintroduce() {
         synchronized(handshakeGate) {
+            if (detached) {
+                diagnostics("handshake: detached - reintroduce ignored")
+                return
+            }
             val session = establishedSession ?: run {
                 diagnostics("handshake: reintroduce ignored - no established session")
                 return
@@ -550,7 +575,8 @@ class CxrHintLink(
      * Delegation only: deciding *when* the scene is needed belongs to the composition, which knows whether
      * `UI_READY`/`PONG` is missing. The injected seam keeps this link transport-free and testable.
      */
-    fun openGlassesApp(onResult: (Boolean) -> Unit): Boolean = startGlassesApp(onResult)
+    fun openGlassesApp(onResult: (Boolean) -> Unit): Boolean =
+        if (detached) false else startGlassesApp(onResult)
 
     /**
      * Opens the conversation panel for [route] if it is not already visible (0.24 spec §5.5, §5.7).
@@ -580,6 +606,12 @@ class CxrHintLink(
      * `PANEL_SHOWN` the phone could never correlate.
      */
     fun requestPanelOpen(route: AssistantRoute): Boolean {
+        // 0.4 strict-local fix: a detached App has no glasses panel. Refused before the handshake state and before any
+        // command, so a stale wake/turn cannot open a window on a link that was neutralized for the mode.
+        if (detached) {
+            diagnostics("panel: detached - PANEL_OPEN is not sent")
+            return false
+        }
         val start: SceneStart?
         synchronized(handshakeGate) {
             val session = establishedSession ?: run {
@@ -668,10 +700,10 @@ class CxrHintLink(
     }
 
     /** True once the resident service answered `UI_READY` for the current session. */
-    fun hasUiReady(): Boolean = synchronized(handshakeGate) { uiReadyForSession }
+    fun hasUiReady(): Boolean = synchronized(handshakeGate) { !detached && uiReadyForSession }
 
     /** True after a matching `PANEL_SHOWN`, false after `UI_CLOSED` or a session end. Read-only Task 12 seam. */
-    fun isPanelVisible(): Boolean = synchronized(handshakeGate) { panelVisible }
+    fun isPanelVisible(): Boolean = synchronized(handshakeGate) { !detached && panelVisible }
 
     /**
      * True while the glasses have been introduced to a session (0.3 Phase 2, Task 2's glasses-connected fact).
@@ -680,7 +712,7 @@ class CxrHintLink(
      * and [linkLost]. It deliberately does **not** mean "the clock mapping is live or the panel is open" - those are
      * narrower states with their own accessors. A read-only seam; it adds nothing to the wire.
      */
-    fun isEstablished(): Boolean = synchronized(handshakeGate) { establishedSession != null }
+    fun isEstablished(): Boolean = synchronized(handshakeGate) { !detached && establishedSession != null }
 
     /**
      * Sends the single `appStart` request for [start].
@@ -838,35 +870,49 @@ class CxrHintLink(
      */
     fun sessionEnded() {
         synchronized(handshakeGate) {
-            // 0.23 P5 review: state both routes idle **before** the identity is cleared. The phone's own 停止 otherwise
-            // left the glasses spinning until the local 60 s bound, and a STOP could no longer be sent for a dead
-            // session.
-            val session = establishedSession
-            if (session != null) {
-                AssistantRoute.entries.forEach { route -> runCatching { busy(route, false) } }
-                // 0.24 S2 Task 11: 停止 also closes the panel. There is deliberately no new `SESSION_END` command -
-                // `CLOSE` already means "hide this window and drop its cache", and the resident service keeps its
-                // session identity only until this link clears it below. A hidden panel clears on the same command.
-                AssistantRoute.entries.forEach { route -> runCatching { close(route) } }
-            }
-            openingSession = null
-            // Phase C: a stopped session must not keep accepting conversation traffic - the glasses will refuse it,
-            // and sending it would put the wearer's words on a wire for a session that is over.
-            establishedSession = null
-            cancelOpeningRetryLocked()
-            cancelUiReadyGraceLocked()
-            uiReadyForSession = false
-            panelVisible = false
-            panelVisibleSinceNanos = 0
-            panelRoutePending = null
-            panelOpenAwaitingShown = false
-            panelOpenRoute = null
-            panelOpenRetries = 0
-            cancelPanelOpenRetryLocked()
-            // Dropping the request makes its late appStart answer inert (the callback compares by reference).
-            sceneStart = null
-            sceneReadyDeadlineNanos = 0
+            endSessionLocked(notifyGlasses = true)
         }
+    }
+
+    /**
+     * The shared session teardown; [notifyGlasses] is the one difference between a normal 停止 and a detach.
+     *
+     * A normal stop still speaks to the glasses (both routes idle, then `CLOSE` for the panel) exactly as before -
+     * that is what `D15`/0.23 P5 fixed and what a wearer expects from 停止. A detach must be **silent**: the mode is
+     * strictly local, so the same state is cleared with no app-level command at all (the vendor connection is closed by
+     * the composition separately, which is a transport teardown rather than a command).
+     *
+     * Caller holds [handshakeGate].
+     */
+    private fun endSessionLocked(notifyGlasses: Boolean) {
+        // 0.23 P5 review: state both routes idle **before** the identity is cleared. The phone's own 停止 otherwise
+        // left the glasses spinning until the local 60 s bound, and a STOP could no longer be sent for a dead
+        // session.
+        val session = establishedSession
+        if (notifyGlasses && session != null) {
+            AssistantRoute.entries.forEach { route -> runCatching { busy(route, false) } }
+            // 0.24 S2 Task 11: 停止 also closes the panel. There is deliberately no new `SESSION_END` command -
+            // `CLOSE` already means "hide this window and drop its cache", and the resident service keeps its
+            // session identity only until this link clears it below. A hidden panel clears on the same command.
+            AssistantRoute.entries.forEach { route -> runCatching { close(route) } }
+        }
+        openingSession = null
+        // Phase C: a stopped session must not keep accepting conversation traffic - the glasses will refuse it,
+        // and sending it would put the wearer's words on a wire for a session that is over.
+        establishedSession = null
+        cancelOpeningRetryLocked()
+        cancelUiReadyGraceLocked()
+        uiReadyForSession = false
+        panelVisible = false
+        panelVisibleSinceNanos = 0
+        panelRoutePending = null
+        panelOpenAwaitingShown = false
+        panelOpenRoute = null
+        panelOpenRetries = 0
+        cancelPanelOpenRetryLocked()
+        // Dropping the request makes its late appStart answer inert (the callback compares by reference).
+        sceneStart = null
+        sceneReadyDeadlineNanos = 0
     }
 
     /** Cancels a scheduled repeat, if any. Idempotent; caller holds [handshakeGate]. */
@@ -944,6 +990,12 @@ class CxrHintLink(
 
     /** Handles one inbound message; returns true when it was understood. */
     fun onInbound(json: String): Boolean {
+        // 0.4 strict-local fix: a reply/callback from the connection the detach closed must not reach host callbacks
+        // (STOP/PIN/CONFIRM_DECISION) or update the handshake of a link that is intentionally inert.
+        if (detached) {
+            diagnostics("inbound ignored: detached mode")
+            return false
+        }
         val command = HintWireCodec.decode(json) ?: run {
             diagnostics("inbound: undecodable (${json.length} chars)")
             return false
@@ -1108,6 +1160,49 @@ class CxrHintLink(
     }
 
     override fun close() = linkLost()
+
+    /**
+     * 0.4 strict-local fix (`D199`/`D201`): makes the link permanently inert while the App is detached.
+     *
+     * Called by the composition exactly once per switch-to-detached, after the running session has been stopped. It is
+     * deliberately **not** [linkLost] or [sessionEnded]: both end the session the normal way, and a normal stop sends
+     * both routes idle and `CLOSE`. A detach must put nothing on the CXR wire, so the state is cleared silently and the
+     * clock handshake is dropped through [HintClockSync.linkLost] - which cancels the mapping renewal and the
+     * outstanding-`PING` timeout. Without that, the old session's renewal kept sending `PING`/`SYNC` after the mode
+     * change (the Task 13b device log: `outbound: Ping` 8 s after `P4_DETACH`).
+     *
+     * The link also remembers the mode: every outbound path (conversation, confirmation, `CLOSE`/`PANEL_OPEN`, the
+     * opening handshake) is refused until [attach], so even a vendor callback or timer racing this call cannot put an
+     * app-level command on the wire. Closing the vendor connection itself is the composition's job and is not an
+     * app-level command.
+     */
+    fun detach() {
+        synchronized(handshakeGate) {
+            detached = true
+            // Silent teardown: no `BUSY=false` and no `CLOSE` may be sent for a mode that is strictly local.
+            endSessionLocked(notifyGlasses = false)
+            // Drops the mapping, the renewal and any outstanding-PING timeout. A mapping is an identity the glasses
+            // could still accept a `SHOW` against; keeping it would make a detached confirmation able to display.
+            clockSync.linkLost()
+            displayWasLive = false
+        }
+        diagnostics("detach: CXR link neutralized (session, mapping, panel and timers cleared; no command sent)")
+    }
+
+    /**
+     * Re-arms the link after the user switches detach off (0.4 strict-local fix, `D199`).
+     *
+     * The next session introduction is what really restores traffic (`sessionEstablished` sends `HELLO`/`PING`); this
+     * only stops refusing it. Deliberately not doing anything else: a connection the detach closed is rebuilt by the
+     * composition, and the link must not reuse the cleared session identity.
+     */
+    fun attach() {
+        synchronized(handshakeGate) {
+            detached = false
+            displayWasLive = false
+        }
+        diagnostics("detach: CXR link re-armed for a new glasses session")
+    }
 
     /** Enough of a command to tell a usable `SHOW` from an unusable one in a log. */
     private fun describe(command: HintCommand): String = when (command) {

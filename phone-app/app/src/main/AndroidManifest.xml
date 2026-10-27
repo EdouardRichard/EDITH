@@ -24,6 +24,13 @@
         android:maxSdkVersion="32" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
+    <!-- 0.4 Task 6 (`D199`, spec §4.2): detached mode captures the phone microphone, so the session foreground
+         service runs as a `microphone` service. That is the Android-14+ permission for the type; the type itself is
+         requested at runtime only in detached mode (`SessionService`), and glasses mode keeps `connectedDevice`. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- 0.4 Task 6: the detached session's audio source. A runtime permission, requested from the session page only
+         when 「脱离眼镜」 is on (spec §4.2, §4.5); glasses mode never asks for it. -->
+    <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Lock-screen unlock keeps the display interactive for the bounded duration of a device tool call. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.BLUETOOTH" android:maxSdkVersion="30" />
@@ -84,7 +91,11 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
-        <service android:name=".session.SessionService" android:exported="false" android:foregroundServiceType="connectedDevice" />
+        <!-- 0.4 Task 6 (`D199`): both types are declared; the **running** type follows the detach gate at
+             `startForeground` (microphone when detached, connectedDevice against the glasses). Declaring both is what
+             the platform requires for a service that may serve either mode. -->
+        <service android:name=".session.SessionService" android:exported="false"
+            android:foregroundServiceType="connectedDevice|microphone" />
         <!-- P3.3 (§17.4): the notification's three buttons (允许/拒绝/急停). `exported="false"` is load-bearing, not a
              formality: an exported receiver would let any App on the phone answer a confirmation on the user's behalf.
              The PendingIntents that reach it are explicit and immutable. -->
