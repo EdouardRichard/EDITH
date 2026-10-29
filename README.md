@@ -32,12 +32,20 @@ the user through text on the glasses HUD and TTS audio. From 0.4 the phone can a
 **phone-only mode**, using its own microphone and screen; 0.5 adds a draggable EDITH-icon floating
 ball on the home screen and independent translucent message bubbles for replies and tool steps.
 
-- **Phone-only mode (0.5)** — Enable it in Settings and an EDITH-icon ball appears on the home
+- **Phone-only mode (0.5; corrected in 0.5.1)** — Enable it in Settings and an EDITH-icon ball appears on the home
   screen. Drag it to an edge and it snaps there, half hidden. Long-press to show the microphone and
   dictate; the transcript is sent to the agent. Replies and tool calls appear as separate translucent
-  bubbles (tool information matches the glasses); old bubbles fade and disappear after 2 s. Both the
-  ball and the bubbles have adjustable opacity, and a dynamic light ring around the ball shows when
-  the AI is thinking.
+  bubbles (tool information matches the glasses): at most two (newest + one old), with the whole
+  bubble — card and text — following the opacity slider; the old bubble fades and disappears after
+  2 s. In phone-only mode the answer is **not** followed by the automatic 10 s listening window;
+  long-press the ball to speak the next turn. The ball and the bubbles have separate opacity
+  settings, and a dynamic light ring shows when the AI is thinking.
+
+  > **0.5.1 correction checkpoint:** the 0.5 delivery was re-opened and corrected (C1–C16), with the
+  > full JVM gate and a K40 device matrix recorded in the [0.5.1 evidence](docs/project/evidence/2026-10-29-0.5.1-correction.md).
+  > It is a **checkpoint, not a version-level release**: live permission revoke, long-press/drag/slider
+  > touch, the settings-page render, the 20%/30% opacity extremes and the model's real screen-reading
+  > behaviour remain `NotMeasured`/`Partial`.
 
 - **Wake-word route** — Say “EDITH” or “伊迪丝”. The glasses panel opens, EDITH listens, recognizes
   the intent, perceives the phone (screen, notifications, media, calendar, device state), plans and
@@ -209,11 +217,11 @@ tool face as the wake route for FOLLOWUP_TURN · glasses overlay panel via CXR c
 When the gate declines, **zero** model requests are made. The two routes use independent
 `ConversationStore`s.
 
-### Phone-only mode (0.4; renamed in 0.5)
+### Phone-only mode (0.4; renamed and corrected in 0.5.1)
 
-The **phone-only mode** setting makes the wake route independent of the glasses. Since 0.5 it also shows the EDITH-icon floating ball and the separate translucent message bubbles described above: drag and edge snap, long-press dictation, a thinking light ring, adjustable opacity, and old bubbles that fade away after 2 s.
+The **phone-only mode** setting makes the wake route independent of the glasses. Since 0.5 it also shows the EDITH-icon floating ball and the separate translucent message bubbles described above: drag and edge snap, long-press dictation, a thinking light ring, adjustable opacity, at most two bubbles at a time (whole bubble, text included, follows the slider), and old bubbles that fade away after 2 s. In phone-only mode an answer no longer opens the automatic 10 s continuation; the next turn is dictated by long-pressing the ball.
 
-Since 0.5.1 the user-visible Chinese name is 「纯手机模式」 (0.5 preview builds said 「纯手机模型」). The internal `DetachGate` / `glassesDetached` identifiers and the `phone_only_overlay` notification channel id are unchanged.
+Since 0.5.1 the user-visible Chinese name is 「纯手机模式」 (0.5 preview builds said 「纯手机模型」). The internal `DetachGate` / `glassesDetached` identifiers and the `phone_only_overlay` notification channel id are unchanged. The 0.5.1 correction is a checkpoint: see the [0.5.1 evidence](docs/project/evidence/2026-10-29-0.5.1-correction.md) for the JVM/device readings and the remaining `NotMeasured` items.
 
 ```mermaid
 flowchart LR
