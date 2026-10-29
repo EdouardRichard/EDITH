@@ -2554,8 +2554,12 @@ class HostCompositionRoot internal constructor(
      * The **players** own opening/closing it (at the audible onset and one reverb tail after the end/failure, or on
      * close); the root keeps the reference only to construct them - and, from 0.5.1 Task 2 on, to clear it explicitly
      * on a manual dictation/stop. The wake acknowledgement reads no window of its own: a second owner was the bug.
+     *
+     * Internal rather than private so [com.sheen.rokid.phone.audio.SpeechRoutingTest] can bind the window the player
+     * owns and prove this root never opens it itself. With a null field a reintroduced root-side `open()` would silently
+     * no-op and the "nothing is muted before the onset" assertion would pass without testing anything.
      */
-    private var echoMute: EchoMuteWindow? = null
+    internal var echoMute: EchoMuteWindow? = null
 
     /**
      * One wake detector emission, as `create` delivers it (0.24 S5 final review Important #1).
@@ -2578,7 +2582,8 @@ class HostCompositionRoot internal constructor(
         if (identity != null) {
             // 0.4 detached wake acknowledgement (owner 2026-10-27): in detached mode the fixed spoken phrase
             // replaces the beep. The wake event is NOT deferred - the WAKE turn and its ASR open at once, and the
-            // acknowledgement's own echo is kept out of them by the [EchoMuteWindow] the ack opens over the capture.
+            // acknowledgement's own echo is kept out of them by the [EchoMuteWindow] the installed player opens at the
+            // audible onset (0.5.1 C5: the ack must not open it itself - the player is the single owner).
             val acknowledged = detachGate.enabled.value &&
                 runCatching { ack(DETACHED_WAKE_ACK_TEXT) }.getOrDefault(false)
             if (!acknowledged) chime()

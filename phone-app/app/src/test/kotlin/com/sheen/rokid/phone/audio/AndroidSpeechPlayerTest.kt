@@ -20,13 +20,14 @@ class AndroidSpeechPlayerTest {
         val spoken = mutableListOf<String>()
         var stopCount = 0
         var shutdownCount = 0
+        var speakResult = true
         var listener: UtteranceProgressListener? = null
         override var isLanguageAvailable: Int = 0
         override var initStatus: Int = 0
 
         override fun speak(text: String, utteranceId: String): Boolean {
             spoken += text
-            return true
+            return speakResult
         }
         override fun stop() { stopCount++ }
         override fun shutdown() { shutdownCount++ }
@@ -179,6 +180,33 @@ class AndroidSpeechPlayerTest {
             listOf(SpeechPlayback.STARTED),
             events,
         )
+    }
+
+    @Test fun `a start the engine rejects reports failed exactly once`() {
+        // 0.5.1 C5: `engine.speak` returning false is a start that never reached PLAYING - no audible interval began
+        // and no engine callback will ever arrive. The port still requires exactly one terminal, or the arbiter holds
+        // the hint/turn for its 120 s grace.
+        val engine = FakeTtsEngine().apply { speakResult = false }
+        val gate = PlaybackGate()
+        val player = AndroidSpeechPlayer(engine, gate)
+        val events = mutableListOf<SpeechPlayback>()
+
+        val handle = player.play(hint()) { events += it }
+
+        assertEquals(
+            "a start that never reached PLAYING still owes its caller a terminal exactly once",
+            listOf(SpeechPlayback.FAILED),
+            events,
+        )
+        assertFalse("no audible interval began, so the gate must stay open", gate.isPlaying)
+
+        handle.cancel()
+        // A misbehaving engine that still delivers a late onset/end must not turn the rejected start into a second
+        // terminal: the guard has already settled this playback.
+        engine.fireStart("h")
+        engine.fireDone("h")
+        assertEquals("the terminal is reported once", listOf(SpeechPlayback.FAILED), events)
+        assertFalse("and the late callback cannot leave the gate closed", gate.isPlaying)
     }
 
     @Test fun `a late onset after close cannot reopen the echo window`() {

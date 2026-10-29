@@ -68,8 +68,8 @@ internal class PlatformTtsEngine(context: Context) : TtsEngine {
  * System-TTS implementation of [SpeechPlayer] (spec §S1).
  *
  * Uses only the generic Android `android.speech.tts.TextToSpeech` API; no vendor engine package name is referenced.
- * The playback gate (`begin`/`end`) wraps the **actual audible interval** (`onStart` → `onDone`/`onError`), not the
- * synthesis preparation time.
+ * The playback gate (`begin`/`end`) wraps the **actual audible interval** (`onStart` → `onDone`/`onError`, and also
+ * `onStop`, a handle cancel, or `close()`), not the synthesis preparation time.
  */
 internal class AndroidSpeechPlayer(
     private val engine: TtsEngine,
@@ -77,10 +77,11 @@ internal class AndroidSpeechPlayer(
     /**
      * 0.5 (`D213` fix): the half-duplex window over the phone microphone.
      *
-     * The detached wake ack already opened this window, but the final answer's playback did not, so with the phone-only
-     * model's speaker output the phone mic heard the answer and the ASR transcribed it as a user turn, which the
-     * continuous-dialogue path then answered - an echo loop. Every playback through this player now mutes the capture
-     * from the audible onset until one reverb tail after the end/failure/cancel.
+     * 0.5.1 C5: this player is the window's **single owner**. It opens the window at the audible onset and closes it one
+     * reverb tail after the end/failure/cancel, or on [close]. The detached wake ack must not open or close it: the root
+     * doing so made a second owner, opened the window twice, and could leave it open forever when the engine never
+     * started. The window exists because, with the phone-only model's speaker output, the phone mic heard the answer and
+     * the ASR transcribed it as a user turn, which the continuous-dialogue path then answered - an echo loop.
      */
     private val echoMute: EchoMuteWindow? = null,
 ) : SpeechPlayer, AutoCloseable {
@@ -135,8 +136,36 @@ internal class AndroidSpeechPlayer(
 
     override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit): CancellationHandle {
         if (!ensureAvailable(assistance.hintId, onState)) return noOpHandle()
-        startUtterance(assistance.text, assistance.hintId, onState)
-        return cancellationHandle(assistance.hintId, assistance.text.length, onState)
+        // 0.5.1 C5: one terminal per request. An engine that rejects the utterance returns false and will never deliver
+        // a callback, so the port's "exactly one FINISHED/FAILED even when cancelled" would otherwise be silent.
+        val report = exactlyOnceTerminal(onState)
+        if (!startUtterance(assistance.text, assistance.hintId, report)) {
+            P3Log.line(
+                "P5_SPEECH state=failed hintId=${assistance.hintId} chars=${assistance.text.length} reason=ENGINE_REFUSED",
+            )
+            report(SpeechPlayback.FAILED)
+            return noOpHandle()
+        }
+        return cancellationHandle(assistance.hintId, assistance.text.length, report)
+    }
+
+    /**
+     * Wraps [onState] so a playback reports **at most one** terminal (`FINISHED`/`FAILED`), even when the engine or one
+     * of this player's own settle paths delivers more than one. `STARTED` is forwarded only before the terminal.
+     *
+     * The [SpeechPlayer] port promises exactly one terminal per playback, cancelled or not; the wrapper turns that
+     * promise into an invariant of this implementation instead of trusting every engine callback sequence.
+     */
+    private fun exactlyOnceTerminal(onState: (SpeechPlayback) -> Unit): (SpeechPlayback) -> Unit {
+        val settled = AtomicBoolean(false)
+        return { playback ->
+            when {
+                settled.get() -> Unit
+                playback == SpeechPlayback.STARTED -> onState(playback)
+                settled.compareAndSet(false, true) -> onState(playback)
+                else -> Unit
+            }
+        }
     }
 
     /**

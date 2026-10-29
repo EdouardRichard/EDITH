@@ -4,6 +4,7 @@ import com.sheen.rokid.contracts.Assistance
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.SpeechPlayback
 import com.sheen.rokid.plugin.SpeechPlayer
+import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -20,7 +21,8 @@ import java.util.concurrent.atomic.AtomicReference
  * handle still tracked" - the hole the review found between `target.get()` and `active.set(handle)` when the switch was
  * turned off during `play()`: that handle was never tracked and its utterance (and echo window) survived the off.
  * [stopCurrent] and [install]`(null)` therefore cancel what they remove, and a `play()` whose platform call was already
- * running publishes nothing once its generation is stale - it cancels its own handle instead.
+ * running publishes nothing once its generation is stale - it cancels its own handle and settles the caller with
+ * `FAILED` unless the player's own cancel already reported a terminal (the port owes exactly one even when cancelled).
  *
  * **Closing a player is the composition owner's job, not this router's.** The router only forgets and cancels; the
  * root that created the player through its factory closes it (which is what releases the echo window).
@@ -44,8 +46,10 @@ class SpeechPlayerRouter : SpeechPlayer {
      * Installs [player] as the current target; null detaches.
      *
      * A detach also cancels and forgets the tracked utterance: leaving it tracked against a null target is exactly the
-     * untracked-handle state the ownership fix removes. Installing a player does not stop the previous target's
-     * utterance - the caller (the composition's switch) stops first, then detaches, then closes.
+     * untracked-handle state the ownership fix removes. Installing a **different** player does the same with the old
+     * target's handle - the new target cannot own the previous target's utterance, so carrying it across would make it
+     * unstoppable through the router (the orphan-handle invariant). Re-installing the same player is an idempotent
+     * "on": nothing was replaced, so its in-flight utterance keeps playing.
      */
     fun install(player: SpeechPlayer?) {
         if (player == null) {
@@ -54,7 +58,12 @@ class SpeechPlayerRouter : SpeechPlayer {
         }
         while (true) {
             val current = state.get()
-            if (state.compareAndSet(current, State(player, current.active, current.generation))) return
+            if (current.target === player) return
+            val next = State(player, null, current.generation + 1)
+            if (state.compareAndSet(current, next)) {
+                current.active?.let { cancelQuietly(it) }
+                return
+            }
         }
     }
 
@@ -73,7 +82,20 @@ class SpeechPlayerRouter : SpeechPlayer {
             runCatching { onState(SpeechPlayback.FAILED) }
             return NoopHandle
         }
-        val handle = player.play(assistance, onState)
+        // The port owes its caller exactly one terminal (FINISHED or FAILED) even when the utterance is cancelled. The
+        // platform player normally reports it, but a cancel that lands before the onset reports nothing, and the stale
+        // branch below cancels the handle itself. The tracker forwards at most one terminal to the caller and lets the
+        // stale branch tell whether the platform player's cancel already settled the playback.
+        val terminal = AtomicBoolean(false)
+        val report: (SpeechPlayback) -> Unit = { playback ->
+            when {
+                terminal.get() -> Unit
+                playback == SpeechPlayback.STARTED -> onState(playback)
+                terminal.compareAndSet(false, true) -> onState(playback)
+                else -> Unit
+            }
+        }
+        val handle = player.play(assistance, report)
         while (true) {
             val current = state.get()
             if (current.target !== player || current.generation != start.generation) {
@@ -81,6 +103,10 @@ class SpeechPlayerRouter : SpeechPlayer {
                 // nothing and cancel what it returned: an untracked handle would keep speaking with nobody able to
                 // stop it, and its echo window would stay open.
                 cancelQuietly(handle)
+                // And settle this play: the platform's cancel may have reported nothing (it never reached PLAYING, or a
+                // close won the race). Without a terminal the arbiter keeps the hint and the turn waiting for
+                // SPEECH_EXPIRY_GRACE (120 s) after the display budget.
+                if (terminal.compareAndSet(false, true)) runCatching { onState(SpeechPlayback.FAILED) }
                 return NoopHandle
             }
             if (state.compareAndSet(current, State(player, handle, current.generation))) {

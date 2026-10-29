@@ -12,6 +12,7 @@ import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
+import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger
@@ -56,7 +57,7 @@ class SpeechPlayerRouterTest {
      * A player whose [play] blocks, so the test can drive an off/stop in the window between the router reading its
      * target and the platform player returning a handle. That window is where the review found the untracked handle.
      */
-    private class BlockingPlayer : SpeechPlayer, AutoCloseable {
+    private class BlockingPlayer(private val reportOnCancel: Boolean = false) : SpeechPlayer, AutoCloseable {
         val entered = CountDownLatch(1)
         val release = CountDownLatch(1)
         val cancels = AtomicInteger(0)
@@ -66,7 +67,10 @@ class SpeechPlayerRouterTest {
             entered.countDown()
             release.await(5, TimeUnit.SECONDS)
             return object : CancellationHandle {
-                override fun cancel() { cancels.incrementAndGet() }
+                override fun cancel() {
+                    cancels.incrementAndGet()
+                    if (reportOnCancel) onState(SpeechPlayback.FINISHED)
+                }
             }
         }
 
@@ -143,11 +147,14 @@ class SpeechPlayerRouterTest {
     fun detachingWhilePlayIsInFlightCancelsTheHandleInsteadOfTrackingIt() {
         // The review's race: `play` read the target, then `setSpeechEnabled(false)` ran before the handle was
         // published. The old code stored that handle as `active` with no player left to stop it, so disabling speech
-        // left an utterance running and an echo window open.
+        // left an utterance running and an echo window open. The stale play must also settle its caller: the platform
+        // player's cancel reports nothing when it never reached PLAYING, and without a terminal the arbiter holds the
+        // hint/turn for its 120 s grace.
         val router = SpeechPlayerRouter()
         val player = BlockingPlayer()
         router.install(player)
-        val caller = thread(name = "router-play") { router.play(assistance()) { } }
+        val states = CopyOnWriteArrayList<SpeechPlayback>()
+        val caller = thread(name = "router-play") { router.play(assistance()) { states += it } }
 
         assertTrue("the player must be inside play() before the detach", player.entered.await(2, TimeUnit.SECONDS))
         router.install(null)
@@ -157,6 +164,11 @@ class SpeechPlayerRouterTest {
         assertFalse("play must not stay blocked after the detach released the player", caller.isAlive)
         assertEquals("the raced handle must be cancelled exactly once", 1, player.cancels.get())
         assertEquals("the router must never close a player - its composition owner does", 0, player.closes)
+        assertEquals(
+            "a stale play still owes its caller exactly one terminal",
+            listOf(SpeechPlayback.FAILED),
+            states.toList(),
+        )
         router.stopCurrent()
         assertEquals("the raced handle must not be left tracked for a later stop", 1, player.cancels.get())
         var state: SpeechPlayback? = null
@@ -169,7 +181,8 @@ class SpeechPlayerRouterTest {
         val router = SpeechPlayerRouter()
         val player = BlockingPlayer()
         router.install(player)
-        val caller = thread(name = "router-play") { router.play(assistance()) { } }
+        val states = CopyOnWriteArrayList<SpeechPlayback>()
+        val caller = thread(name = "router-play") { router.play(assistance()) { states += it } }
 
         assertTrue("the player must be inside play() before the stop", player.entered.await(2, TimeUnit.SECONDS))
         router.stopCurrent()
@@ -179,8 +192,71 @@ class SpeechPlayerRouterTest {
         assertFalse("play must not stay blocked after the stop released the player", caller.isAlive)
         assertEquals("the raced handle must be cancelled exactly once", 1, player.cancels.get())
         assertEquals("the router must never close a player - its composition owner does", 0, player.closes)
+        assertEquals(
+            "a stale play still owes its caller exactly one terminal",
+            listOf(SpeechPlayback.FAILED),
+            states.toList(),
+        )
         router.stopCurrent()
         assertEquals("a second stop must not cancel it again", 1, player.cancels.get())
         assertEquals("the target itself is still installed", player, router.current())
+    }
+
+    @Test
+    fun aPlayerThatReportsItsOwnTerminalWhileCancelledIsNotFailedAgain() {
+        // The other half of exactly-once: when the platform player's cancel does report its terminal, the router must
+        // forward that one and not add its own FAILED fallback.
+        val router = SpeechPlayerRouter()
+        val player = BlockingPlayer(reportOnCancel = true)
+        router.install(player)
+        val states = CopyOnWriteArrayList<SpeechPlayback>()
+        val caller = thread(name = "router-play") { router.play(assistance()) { states += it } }
+
+        assertTrue("the player must be inside play() before the detach", player.entered.await(2, TimeUnit.SECONDS))
+        router.install(null)
+        player.release.countDown()
+        caller.join(2_000)
+
+        assertFalse("play must not stay blocked after the detach released the player", caller.isAlive)
+        assertEquals(
+            "the player's terminal is forwarded exactly once and no router fallback is added",
+            listOf(SpeechPlayback.FINISHED),
+            states.toList(),
+        )
+    }
+
+    @Test
+    fun installingAReplacementPlayerCancelsTheOldTargetsTrackedUtterance() {
+        // A future direct replacement must not recreate the orphan-handle invariant: the new target cannot own the old
+        // target's utterance, so carrying the tracked handle across would make it unstoppable through the router.
+        val router = SpeechPlayerRouter()
+        val first = FakePlayer()
+        val second = FakePlayer()
+        router.install(first)
+        router.play(assistance()) { }
+
+        router.install(second)
+
+        assertEquals("the previous target's tracked handle is cancelled, not carried over", 1, first.cancels)
+        assertEquals(second, router.current())
+        router.stopCurrent()
+        assertEquals("and it must not stay tracked behind the new target", 1, first.cancels)
+        assertEquals("a replacement is not itself played", 0, second.plays)
+    }
+
+    @Test
+    fun reinstallingTheSamePlayerKeepsItsUtteranceInFlight() {
+        // `setSpeechEnabled(true)` can be called again while the switch is already on; that is an idempotent on, not
+        // a replacement, and it must not stop the utterance it re-installs.
+        val router = SpeechPlayerRouter()
+        val player = FakePlayer()
+        router.install(player)
+        router.play(assistance()) { }
+
+        router.install(player)
+
+        assertEquals("an idempotent on must not cancel the utterance it re-installs", 0, player.cancels)
+        router.stopCurrent()
+        assertEquals("the utterance is still tracked and can be stopped", 1, player.cancels)
     }
 }

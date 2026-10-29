@@ -192,8 +192,8 @@ class SpeechRoutingTest {
     @Test
     fun `the wake ack opens the echo window only at the player's audible onset`() {
         // C5: the ack used to call `echoMute.open()` itself and the player's `onStart` opened it again. The player is
-        // now the single owner: the root has no echo window of its own in this rig, and the ack still mutes exactly
-        // the audible interval the player reports.
+        // now the single owner, and the root is given the same window through the test seam below so a reintroduced
+        // root-side open cannot silently no-op on a null field.
         val clock = FakeClock()
         val window = EchoMuteWindow(clock)
         val engine = RecordingTtsEngine()
@@ -202,6 +202,10 @@ class SpeechRoutingTest {
         val speech = AndroidSpeechPlayer(engine, PlaybackGate(), window)
         val gate = DetachGate(settings = SmartSettingsStore(blobs), sessionState = { SessionState.Idle })
         val root = composition(router, blobs, gate) { speech }
+        // Test seam: production sets this field only from `create`. Binding the player's window here makes a
+        // reintroduced root-side `echoMute.open()` observable; with the field left null that call would no-op and the
+        // "nothing is muted before the onset" assertion below would pass without testing ownership at all.
+        root.echoMute = window
         try {
             assertTrue("the phone-only mode must be on", gate.set(true).saved)
             root.setSpeechEnabled(true)
