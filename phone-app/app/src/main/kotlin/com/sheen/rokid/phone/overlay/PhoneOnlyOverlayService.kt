@@ -488,12 +488,21 @@ class PhoneOnlyOverlayService : Service() {
         private const val PRESS_MILLIS = 120L
 
         /**
-         * Starts or stops the overlay to match the gate and the permission. Only the production composition may start
+         * Starts or stops the overlay to match the mode and the permission. Only the production composition may start
          * it; the model must already be ready because the overlay only draws a host that exists.
+         *
+         * [requestedEnabled] is the mode transition's **requested** value. The detach gate invokes its mode-changed
+         * callback while `enabled` still holds the old value (it updates after the save), so reading the gate here on
+         * an enable transition stopped the service instead of starting it. `MainActivity.onResume` passes null and the
+         * gate is read, which is correct at resume time.
          */
-        fun sync(context: Context, composition: HostCompositionRoot?) {
+        fun sync(
+            context: Context,
+            composition: HostCompositionRoot?,
+            requestedEnabled: Boolean? = null,
+        ) {
             val intent = Intent(context, PhoneOnlyOverlayService::class.java)
-            val enabled = composition?.detachGate?.enabled?.value == true
+            val enabled = requestedEnabled ?: (composition?.detachGate?.enabled?.value == true)
             val permitted = Settings.canDrawOverlays(context)
             if (composition == null || !enabled || !permitted) {
                 P3Log.line(

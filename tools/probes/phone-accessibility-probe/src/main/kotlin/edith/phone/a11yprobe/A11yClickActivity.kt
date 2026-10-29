@@ -70,10 +70,16 @@ class A11yClickActivity : Activity() {
         if (rawX != null || rawY != null) {
             val x = intExtraOrNull(rawX)
             val y = intExtraOrNull(rawY)
+            // 0.5 phone-only ball: the coordinate arm can hold or drag, not only tap. The same gesture injection is used,
+            // so the ball's production Compose gesture receives a real touch; the extras are the only difference.
+            val holdMillis = intent.longExtraOr(EXTRA_HOLD_MILLIS, 0L)
+            val x2 = intExtraOrNull(intent.rawExtra(EXTRA_X2))
+            val y2 = intExtraOrNull(intent.rawExtra(EXTRA_Y2))
             val marker = intent.getStringExtra(EXTRA_LABEL)?.trim()?.takeIf { it.isNotEmpty() }
             val requireOutside = intent.getBooleanExtra(EXTRA_REQUIRE_OUTSIDE, false)
-            status.text = "EDITH P3 CLICK\n\n坐标点击 x=${x ?: "none"} y=${y ?: "none"}\n\n进行中…"
-            Thread { runCoordinateClick(x, y, marker, requireOutside, waitMillis) }.start()
+            val mode = if (x2 != null && y2 != null) "drag" else if (holdMillis > 0L) "hold" else "tap"
+            status.text = "EDITH P3 CLICK\n\n坐标 $mode x=${x ?: "none"} y=${y ?: "none"}\n\n进行中…"
+            Thread { runCoordinateClick(x, y, x2, y2, holdMillis, marker, requireOutside, waitMillis) }.start()
             return
         }
 
@@ -172,7 +178,16 @@ class A11yClickActivity : Activity() {
      * back separately by the caller: a probe that called a completed touch "the dialog ignored it" would be reporting a
      * result it never measured.
      */
-    private fun runCoordinateClick(x: Int?, y: Int?, marker: String?, requireOutside: Boolean, waitMillis: Long) {
+    private fun runCoordinateClick(
+        x: Int?,
+        y: Int?,
+        x2: Int?,
+        y2: Int?,
+        holdMillis: Long,
+        marker: String?,
+        requireOutside: Boolean,
+        waitMillis: Long,
+    ) {
         val screen = screenSize()
         val service = service
         if (service == null) {
@@ -213,11 +228,24 @@ class A11yClickActivity : Activity() {
         ) == "clicked"
         var dispatched = false
         var completed = false
-        if (inputsValid) {
-            val tap = service.tapAt(x!!, y!!)
-            dispatched = tap.accepted
-            completed = tap.completed
+        val mode = if (x2 != null && y2 != null) "drag" else if (holdMillis > 0L) "hold" else "tap"
+        val endInScreen = x2 == null || y2 == null ||
+            (x2 >= 0 && y2 >= 0 && x2 < screen.width && y2 < screen.height)
+        if (inputsValid && endInScreen) {
+            val gesture = when (mode) {
+                "drag" -> service.dragAt(x!!, y!!, x2!!, y2!!, holdMillis.takeIf { it > 0L } ?: 800L)
+                "hold" -> service.longPressAt(x!!, y!!, holdMillis)
+                else -> service.tapAt(x!!, y!!)
+            }
+            dispatched = gesture.accepted
+            completed = gesture.completed
         }
+        Log.i(
+            A11yProbeService.TAG,
+            "A1GESTURE_AT mode=$mode x=${x ?: "none"} y=${y ?: "none"} x2=${x2 ?: "none"} " +
+                "y2=${y2 ?: "none"} holdMillis=$holdMillis endInScreen=$endInScreen " +
+                "dispatched=$dispatched completed=$completed",
+        )
         emitCoordinateVerdict(
             x = x, y = y, screen = screen, markerRequired = marker != null, dialogBounds = bounds,
             requireOutside = requireOutside, dispatched = dispatched, completed = completed, serviceEnabled = true,
@@ -288,6 +316,14 @@ class A11yClickActivity : Activity() {
          */
         const val EXTRA_X = "x"
         const val EXTRA_Y = "y"
+
+        /**
+         * 0.5 phone-only ball: hold for this many milliseconds (`--el holdMillis 900`) or, together with [EXTRA_X2]/
+         * [EXTRA_Y2], use it as the drag duration. An absent value keeps the old tap arm exactly as it was.
+         */
+        const val EXTRA_HOLD_MILLIS = "holdMillis"
+        const val EXTRA_X2 = "x2"
+        const val EXTRA_Y2 = "y2"
 
         /**
          * The label the caller expects to see before the tap (the confirmation dialog's title, for the outside-tap

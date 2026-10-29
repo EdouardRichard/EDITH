@@ -391,11 +391,12 @@ class HostCompositionRoot internal constructor(
      */
     internal val detachGate: DetachGate = DetachGate(),
     /**
-     * 0.5 (`D214`): starts/stops the phone-only overlay when the mode changes. `create` passes the production service
-     * sync; a hand-built composition gets a no-op (there is no real overlay to start). The callback reads the gate
-     * itself, so both the on and off transitions use the same entry.
+     * 0.5 (`D214`): starts/stops the phone-only overlay when the mode changes. The argument is the **requested**
+     * mode, not a read of `detachGate.enabled`: the gate invokes the callback while the live value is still the old
+     * one (it updates after the save), so a read here saw `false` on the enable transition and stopped the service
+     * instead of starting it. `create` passes the production service sync; a hand-built composition gets a no-op.
      */
-    private val syncPhoneOnlyOverlay: () -> Unit = {},
+    private val syncPhoneOnlyOverlay: (Boolean) -> Unit = {},
     /**
      * 0.5 (`D213`): the stable speech router the environment and the output arbiter hold.
      *
@@ -3059,7 +3060,7 @@ class HostCompositionRoot internal constructor(
             hintLink?.attach()
             retriedMappingSyncId = null
             P3Log.line("P4_DETACH_LINK state=reattached")
-            syncPhoneOnlyOverlay()
+            syncPhoneOnlyOverlay(false)
             return
         }
         // Block and clear the link before touching the transport, so a timer or vendor callback that is in flight can
@@ -3095,7 +3096,7 @@ class HostCompositionRoot internal constructor(
         }
         // 0.5 (`D214`): the ball/bubbles follow the mode; a missing overlay permission is refused visibly in the
         // settings page (the service logs `NO_OVERLAY_PERMISSION` and stops itself).
-        syncPhoneOnlyOverlay()
+        syncPhoneOnlyOverlay(true)
     }
 
     @Synchronized fun selectPlugin(pluginId: String) {
@@ -4151,8 +4152,8 @@ class HostCompositionRoot internal constructor(
                 noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
                 detachGate = detachGate,
-                // 0.5 (`D214`): the overlay follows the mode; `sync` reads the gate and the overlay permission.
-                syncPhoneOnlyOverlay = { PhoneOnlyOverlayService.sync(context, rootHolder[0]) },
+                // 0.5 (`D214`): the overlay follows the requested mode; the permission is checked by `sync`.
+                syncPhoneOnlyOverlay = { enabled -> PhoneOnlyOverlayService.sync(context, rootHolder[0], enabled) },
                 // 0.5 (`D213`): the runtime speech router/factory/holder. The factory is the same platform player the
                 // assembly uses, so enabling the switch later creates the exact same implementation.
                 speechRouter = speechRouter,

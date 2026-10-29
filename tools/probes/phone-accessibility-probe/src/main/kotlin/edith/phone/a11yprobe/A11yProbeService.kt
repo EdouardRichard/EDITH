@@ -335,7 +335,34 @@ class A11yProbeService : AccessibilityService() {
      * one answers "did the platform take and complete the touch" for a point the caller already validated. Both report
      * the two halves separately, because an accepted gesture with no completion callback is not a landing.
      */
-    fun tapAt(x: Int, y: Int): GestureOutcome {
+    fun tapAt(x: Int, y: Int): GestureOutcome =
+        gestureAt(Path().apply { moveTo(x.toFloat(), y.toFloat()) }, TAP_MILLIS)
+
+    /**
+     * 0.5 phone-only ball evidence: a **long press** is the same point held past the ball's 500 ms threshold. The injected
+     * stroke is what the production Compose gesture sees, so this exercises the real long-press path (not `adb input`).
+     */
+    fun longPressAt(x: Int, y: Int, holdMillis: Long): GestureOutcome =
+        gestureAt(
+            Path().apply { moveTo(x.toFloat(), y.toFloat()) },
+            holdMillis.coerceIn(LONG_PRESS_MIN_MILLIS, LONG_PRESS_MAX_MILLIS),
+        )
+
+    /**
+     * 0.5 phone-only ball evidence: a drag from one screen point to another. The stroke's duration is the gesture's
+     * duration; the ball moves the overlay window under the finger and snaps on release.
+     */
+    fun dragAt(x1: Int, y1: Int, x2: Int, y2: Int, durationMillis: Long): GestureOutcome =
+        gestureAt(
+            Path().apply {
+                moveTo(x1.toFloat(), y1.toFloat())
+                lineTo(x2.toFloat(), y2.toFloat())
+            },
+            durationMillis.coerceIn(DRAG_MIN_MILLIS, DRAG_MAX_MILLIS),
+        )
+
+    /** Dispatch one arbitrary stroke and report the platform's accepted/completed halves. */
+    private fun gestureAt(path: Path, durationMillis: Long): GestureOutcome {
         val completed = AtomicReference(false)
         val latch = CountDownLatch(1)
         val callback = object : GestureResultCallback() {
@@ -348,14 +375,15 @@ class A11yProbeService : AccessibilityService() {
                 latch.countDown()
             }
         }
-        val path = Path().apply { moveTo(x.toFloat(), y.toFloat()) }
         val gesture = GestureDescription.Builder()
-            .addStroke(GestureDescription.StrokeDescription(path, 0L, TAP_MILLIS))
+            .addStroke(GestureDescription.StrokeDescription(path, 0L, durationMillis))
             .build()
         val accepted = runCatching { dispatchGesture(gesture, callback, Handler(Looper.getMainLooper())) }
             .getOrDefault(false)
         if (!accepted) return GestureOutcome(accepted = false, completed = false)
-        runCatching { latch.await(GESTURE_READ_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS) }
+        // A hold/drag is deliberately longer than a tap; the wait must cover the stroke itself or a completed gesture
+        // would be reported as "never completed" just because the probe stopped reading too early.
+        runCatching { latch.await(durationMillis + GESTURE_READ_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS) }
         return GestureOutcome(accepted = true, completed = completed.get())
     }
 
@@ -535,6 +563,14 @@ class A11yProbeService : AccessibilityService() {
             private set
 
         private const val TAP_MILLIS = 60L
+
+        /** 0.5 ball: a long press must outlast the 500 ms Compose threshold; the cap keeps a bad extra bounded. */
+        private const val LONG_PRESS_MIN_MILLIS = 700L
+        private const val LONG_PRESS_MAX_MILLIS = 5_000L
+
+        /** 0.5 ball: enough samples for the Compose pointer to see a drag; the cap keeps a bad extra bounded. */
+        private const val DRAG_MIN_MILLIS = 300L
+        private const val DRAG_MAX_MILLIS = 3_000L
 
         /**
          * Bound on waiting for a dispatched gesture's completion callback before giving up on the read-back (A1). The
