@@ -184,12 +184,12 @@ class DictationOwnerTest {
         // Consequently the composer's one action is not Stop while another surface owns the lease.
         assertEquals(
             ComposerAction.Microphone,
-            composerActionSlot(SessionState.Listening, TypedInputState(), view.state).action,
+            composerActionSlot(SessionState.Listening, TypedInputState(), view.state, owner = ballOwned.owner).action,
         )
         assertNotEquals(
             "the composer must never offer a Stop for someone else's lease",
             ComposerAction.Stop,
-            composerActionSlot(SessionState.Listening, TypedInputState(), view.state).action,
+            composerActionSlot(SessionState.Listening, TypedInputState(), view.state, owner = ballOwned.owner).action,
         )
 
         // A COMPOSER lease is passed through untouched, including its Stop action.
@@ -197,7 +197,12 @@ class DictationOwnerTest {
         assertEquals(DictationState.Listening, composerDictationView(composerOwned).state)
         assertEquals(
             ComposerAction.Stop,
-            composerActionSlot(SessionState.Listening, TypedInputState(), composerDictationView(composerOwned).state).action,
+            composerActionSlot(
+                SessionState.Listening,
+                TypedInputState(),
+                composerDictationView(composerOwned).state,
+                owner = composerOwned.owner,
+            ).action,
         )
 
         // A terminal composer state after the lease settled (owner cleared by the host's cleanup) is still the page's:
@@ -227,7 +232,7 @@ class DictationOwnerTest {
             assertNull(view.final)
             assertNotEquals(
                 ComposerAction.Stop,
-                composerActionSlot(SessionState.Listening, TypedInputState(), view.state).action,
+                composerActionSlot(SessionState.Listening, TypedInputState(), view.state, owner = ui.owner).action,
             )
 
             rig.asr.finalText = "球的听写"
@@ -273,6 +278,67 @@ class DictationOwnerTest {
             val notice = ballDictationRefusalNotice(result)
             assertTrue("refusal $result needs a notice", notice.isNotBlank())
             assertTrue("the notice must stay short: $notice", notice.length <= 30)
+        }
+    }
+
+    @Test
+    fun `a BALL lease that ends without speech clears its owner and leaves nothing on the composer page`() {
+        // The controller's stop with no speech is a terminal NoSpeech and delivers no final. When that lease belongs to
+        // the ball, `finishDictation` must clear the owner and reset the shared state: the ratified `owner == null`
+        // projection rule only stays safe because a settled BALL lease carries no BALL state or final into the composer.
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            assertEquals(DictationStartResult.Accepted, rig.root.startDictation(DictationTarget.BALL))
+            assertEquals(DictationTarget.BALL, rig.root.dictationUi.value.owner)
+            assertEquals(DictationState.Listening, stateOf(rig))
+
+            // Release the ball with no speech: no transcript, so no final; the lease still settles and is cleaned up.
+            rig.root.stopDictation(DictationTarget.BALL)
+
+            val settled = rig.root.dictationUi.value
+            assertNull("a settled BALL lease must release the flow's owner", settled.owner)
+            assertEquals(
+                "the BALL terminal state belongs to its local notice, not the shared flow",
+                DictationState.Idle,
+                settled.state,
+            )
+            assertNull("a BALL lease never publishes a draft final", settled.final)
+            val view = composerDictationView(settled)
+            assertEquals("the composer page sees the settled lease as idle", DictationState.Idle, view.state)
+            assertNull("and has no stale BALL final to append", view.final)
+            assertNull("and no BALL refusal to explain", view.refusal)
+            assertEquals(
+                "the composer's action is the microphone again, never a Stop for a BALL lease",
+                ComposerAction.Microphone,
+                composerActionSlot(SessionState.Listening, TypedInputState(), view.state, owner = settled.owner).action,
+            )
+        }
+    }
+
+    @Test
+    fun `aborting the session clears the BALL owner and the composer page sees an idle flow`() {
+        // Session teardown aborts the lease without a final. The owner must go with it: a stale BALL marker would make
+        // the page ignore a later composer final, and a stale Listening would offer it a Stop that owns nothing.
+        withRig(detached = true) { rig ->
+            assertTrue(rig.activate())
+            assertEquals(DictationStartResult.Accepted, rig.root.startDictation(DictationTarget.BALL))
+            assertEquals(DictationTarget.BALL, rig.root.dictationUi.value.owner)
+
+            rig.root.stop()
+
+            val settled = rig.root.dictationUi.value
+            assertNull("aborting the session must clear the lease's owner", settled.owner)
+            assertEquals("an aborted lease ends idle", DictationState.Idle, settled.state)
+            assertNull("an aborted BALL lease delivers no final", settled.final)
+            val view = composerDictationView(settled)
+            assertEquals(DictationState.Idle, view.state)
+            assertNull(view.final)
+            assertNull(view.refusal)
+            assertEquals(
+                "the settled flow gives the composer its microphone back, never a Stop",
+                ComposerAction.Microphone,
+                composerActionSlot(SessionState.Listening, TypedInputState(), view.state, owner = settled.owner).action,
+            )
         }
     }
 }

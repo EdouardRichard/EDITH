@@ -462,6 +462,7 @@ internal fun AssistantTab(
                 session = session,
                 state = typedInput,
                 dictation = composerDictation.state,
+                dictationOwner = dictationUi.owner,
                 refusal = composerDictation.refusal,
                 onDraftChange = { candidate ->
                     // 0.4 Task 12b-ii fix 2 (finding 2): editing is the wearer starting a newer action, so a finished
@@ -518,13 +519,14 @@ private fun TypedInputRow(
     session: SessionState,
     state: TypedInputState,
     dictation: DictationState,
+    dictationOwner: DictationTarget?,
     refusal: DictationStartResult?,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
     onStartDictation: () -> DictationStartResult,
     onStopDictation: () -> Unit,
 ) {
-    val slot = composerActionSlot(session, state, dictation)
+    val slot = composerActionSlot(session, state, dictation, dictationOwner)
     val status = inputRowStatusText(session, state, dictation, refusal)
     val failed = (state.result != null && state.result != TypedSendResult.Accepted) ||
         dictation is DictationState.Error

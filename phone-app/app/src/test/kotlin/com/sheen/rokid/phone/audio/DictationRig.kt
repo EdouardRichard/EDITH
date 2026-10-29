@@ -85,7 +85,6 @@ import com.sheen.rokid.testsupport.RecordingInputPort
 import com.sheen.rokid.transport.CxrAuthorizationOutcome
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
-import org.junit.Test
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicInteger

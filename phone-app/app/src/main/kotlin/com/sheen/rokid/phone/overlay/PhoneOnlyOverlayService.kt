@@ -132,9 +132,12 @@ class PhoneOnlyOverlayService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
 
     override fun onDestroy() {
-        // 0.5.1 C3 (T2 handoff): a service teardown owns the BALL lease this press acquired, so it ends that lease and
-        // never the composer's. A refused press has nothing to stop and must not touch the composer's lease.
-        if (ballPress.end()) root?.stopDictation(DictationTarget.BALL)
+        // 0.5.1 C3/T8 handoff: a service teardown owns the BALL lease this press acquired, so it ends that lease and
+        // never the composer's. It must **cancel**, not stop: a stop forces the turn's final and `onDictationFinal(BALL)`
+        // sends it through `requestTypedMessage`, so a shutdown would publish a user turn the wearer never finished.
+        // A refused press has nothing to stop and must not touch the composer's lease. T8 still owns the bubble clear
+        // and Notice expiry here; this only releases the dictation lease.
+        if (ballPress.end()) root?.cancelDictation(DictationTarget.BALL)
         scope.cancel()
         ballView?.let { runCatching { windowManager?.removeView(it) } }
         bubbleView?.let { runCatching { windowManager?.removeView(it) } }
