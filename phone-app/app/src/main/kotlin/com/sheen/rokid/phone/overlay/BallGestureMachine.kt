@@ -123,3 +123,25 @@ class BallGestureMachine(
         return kotlin.math.hypot(dx, dy)
     }
 }
+
+/**
+ * 0.5.1 (review Important #2 / C4): settles one ball pointer sequence when it ends without a lift.
+ *
+ * Compose's `awaitEachGesture` cancels its block when the pointer is cancelled - a focus change, a system gesture, the
+ * overlay window being torn down - so the composable's normal `up()` path never runs. The composable calls this from its
+ * `finally`, which is also the exit used when the pointer's change vanishes from the event stream (`break`). Without it
+ * the machine stayed PRESSED/LONG_PRESSED/DRAGGING and the drag controller kept its baseline: the service never received
+ * [BallGestureAction.LongPressEnd], and the BALL press it had accepted stayed open - dictation kept listening, the
+ * microphone indicator stayed visible, and a late ambient final could still be sent - until the dictation deadline.
+ *
+ * The cleanup is deliberately [BallGestureMachine.cancel], never `up()`: a cancelled pointer is not a lift, so it must
+ * not open the App or snap/dock the ball. It is a no-op after a normal `up()` (the machine is already IDLE), so the
+ * `finally` cannot report the lift twice.
+ */
+internal fun cancelBallPointerSequence(
+    gesture: BallGestureMachine,
+    drag: BallDragController,
+): List<BallGestureAction> {
+    drag.onPointerUp()
+    return gesture.cancel()
+}

@@ -16,13 +16,14 @@ import java.util.concurrent.atomic.AtomicReference
  * caller closes the player. The plugin's own `speechAvailable` gate (the holder) and the environment's capability
  * predicate both read the same live presence, so no request is made while the target is absent.
  *
- * **0.5.1 C5: the router owns the active handle, not the platform player.** The target, the tracked handle and a
+ * **0.5.1 C5: the router owns the active playback, not the platform player.** The target, the tracked [Playback] and a
  * generation are one immutable [State] replaced by compare-and-set, so no transition can observe "target detached but
  * handle still tracked" - the hole the review found between `target.get()` and `active.set(handle)` when the switch was
  * turned off during `play()`: that handle was never tracked and its utterance (and echo window) survived the off.
- * [stopCurrent] and [install]`(null)` therefore cancel what they remove, and a `play()` whose platform call was already
- * running publishes nothing once its generation is stale - it cancels its own handle and settles the caller with
- * `FAILED` unless the player's own cancel already reported a terminal (the port owes exactly one even when cancelled).
+ * **Every** router-initiated cancel (the returned handle, [stopCurrent], detach, a replacement) goes through
+ * [Playback.cancel], which cancels the platform handle and supplies the terminal the player did not report: the port owes
+ * exactly one FINISHED/FAILED even when cancelled, and the arbiter otherwise waits its 120 s grace. A `play()` whose
+ * platform call was already running publishes nothing once its generation is stale and settles its caller the same way.
  *
  * **Closing a player is the composition owner's job, not this router's.** The router only forgets and cancels; the
  * root that created the player through its factory closes it (which is what releases the echo window).
@@ -33,10 +34,30 @@ import java.util.concurrent.atomic.AtomicReference
  */
 class SpeechPlayerRouter : SpeechPlayer {
 
-    /** One atomic snapshot: the installed target, the tracked handle and the generation that invalidates stale plays. */
+    /**
+     * One playback the router owns: the platform handle plus the exactly-once terminal it owes the caller.
+     *
+     * 0.5.1 (review Important #1): a tracked handle's cancel only cancelled. When the platform player reports no terminal
+     * - a cancel that lands before its audible onset reaches no PLAYING state, or `close()` won the race - the caller
+     * (the `OutputArbiter`) waited for `SPEECH_EXPIRY_GRACE` (120 s). [cancel] therefore settles the request itself when
+     * the player did not, mirroring the stale-play branch.
+     */
+    private class Playback(
+        val handle: CancellationHandle,
+        private val terminal: AtomicBoolean,
+        private val onState: (SpeechPlayback) -> Unit,
+    ) {
+        /** Cancels the platform utterance and reports FAILED only if no terminal was forwarded already. */
+        fun cancel() {
+            runCatching { handle.cancel() }
+            if (terminal.compareAndSet(false, true)) runCatching { onState(SpeechPlayback.FAILED) }
+        }
+    }
+
+    /** One atomic snapshot: the installed target, the tracked playback and the generation that invalidates stale plays. */
     private class State(
         val target: SpeechPlayer? = null,
-        val active: CancellationHandle? = null,
+        val active: Playback? = null,
         val generation: Long = 0,
     )
 
@@ -61,7 +82,7 @@ class SpeechPlayerRouter : SpeechPlayer {
             if (current.target === player) return
             val next = State(player, null, current.generation + 1)
             if (state.compareAndSet(current, next)) {
-                current.active?.let { cancelQuietly(it) }
+                current.active?.cancel()
                 return
             }
         }
@@ -83,9 +104,9 @@ class SpeechPlayerRouter : SpeechPlayer {
             return NoopHandle
         }
         // The port owes its caller exactly one terminal (FINISHED or FAILED) even when the utterance is cancelled. The
-        // platform player normally reports it, but a cancel that lands before the onset reports nothing, and the stale
-        // branch below cancels the handle itself. The tracker forwards at most one terminal to the caller and lets the
-        // stale branch tell whether the platform player's cancel already settled the playback.
+        // platform player normally reports it, but a cancel that lands before the onset reports nothing. The tracker
+        // forwards at most one terminal to the caller; [Playback.cancel] uses the same flag to tell whether the platform
+        // player's cancel already settled the playback, and only supplies the missing terminal when it did not.
         val terminal = AtomicBoolean(false)
         val report: (SpeechPlayback) -> Unit = { playback ->
             when {
@@ -96,22 +117,21 @@ class SpeechPlayerRouter : SpeechPlayer {
             }
         }
         val handle = player.play(assistance, report)
+        val playback = Playback(handle, terminal, onState)
         while (true) {
             val current = state.get()
             if (current.target !== player || current.generation != start.generation) {
                 // Off/stop (or a replacement player) went through while the platform player was starting. Publish
                 // nothing and cancel what it returned: an untracked handle would keep speaking with nobody able to
-                // stop it, and its echo window would stay open.
-                cancelQuietly(handle)
-                // And settle this play: the platform's cancel may have reported nothing (it never reached PLAYING, or a
-                // close won the race). Without a terminal the arbiter keeps the hint and the turn waiting for
-                // SPEECH_EXPIRY_GRACE (120 s) after the display budget.
-                if (terminal.compareAndSet(false, true)) runCatching { onState(SpeechPlayback.FAILED) }
+                // stop it, and its echo window would stay open. `Playback.cancel` also settles this play when the
+                // platform's cancel reports nothing (it never reached PLAYING, or a close won the race); without a
+                // terminal the arbiter keeps the hint and the turn waiting for SPEECH_EXPIRY_GRACE (120 s).
+                playback.cancel()
                 return NoopHandle
             }
-            if (state.compareAndSet(current, State(player, handle, current.generation))) {
+            if (state.compareAndSet(current, State(player, playback, current.generation))) {
                 return object : CancellationHandle {
-                    override fun cancel() = release(handle)
+                    override fun cancel() = release(playback)
                 }
             }
         }
@@ -125,7 +145,7 @@ class SpeechPlayerRouter : SpeechPlayer {
             // must not publish its handle after this stop.
             val next = State(current.target, null, current.generation + 1)
             if (state.compareAndSet(current, next)) {
-                current.active?.let { cancelQuietly(it) }
+                current.active?.cancel()
                 return
             }
         }
@@ -136,27 +156,23 @@ class SpeechPlayerRouter : SpeechPlayer {
             val current = state.get()
             val next = State(null, null, current.generation + 1)
             if (state.compareAndSet(current, next)) {
-                current.active?.let { cancelQuietly(it) }
+                current.active?.cancel()
                 return
             }
         }
     }
 
-    /** Clears this handle if it is still the tracked one, then cancels it once; a late cancel is a no-op. */
-    private fun release(handle: CancellationHandle) {
+    /** Clears this playback if it is still the tracked one, then cancels it once; a late cancel is a no-op. */
+    private fun release(playback: Playback) {
         while (true) {
             val current = state.get()
-            if (current.active !== handle) return
+            if (current.active !== playback) return
             val next = State(current.target, null, current.generation + 1)
             if (state.compareAndSet(current, next)) {
-                cancelQuietly(handle)
+                playback.cancel()
                 return
             }
         }
-    }
-
-    private fun cancelQuietly(handle: CancellationHandle) {
-        runCatching { handle.cancel() }
     }
 
     private object NoopHandle : CancellationHandle {

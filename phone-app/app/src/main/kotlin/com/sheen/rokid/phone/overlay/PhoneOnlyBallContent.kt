@@ -94,42 +94,51 @@ fun PhoneOnlyBallContent(
                         val gesture = BallGestureMachine(slopPx = 12.dp.toPx(), longPressMillis = 500L)
                         val drag = BallDragController()
                         val origin = currentWindowOrigin()
-                        // The gesture machine decides tap/long/snap from the absolute (screen) pointer position, so a
-                        // window move under the finger cannot turn one gesture into another.
-                        gesture.down(origin.x + down.position.x, origin.y + down.position.y, nowMillis())
-                        drag.onPointerDown(down.position.x, down.position.y, origin.x, origin.y)
-                        var timer: Job? = launch {
-                            delay(500L)
-                            gesture.longPressStart(nowMillis()).forEach { currentAction(it) }
-                        }
-                        while (true) {
-                            val event = awaitPointerEvent()
-                            val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                            if (change.changedToUp()) {
-                                timer?.cancel()
-                                drag.onPointerUp()
-                                gesture.up(nowMillis()).forEach { currentAction(it) }
-                                change.consume()
-                                break
+                        var timer: Job? = null
+                        try {
+                            // The gesture machine decides tap/long/snap from the absolute (screen) pointer position,
+                            // so a window move under the finger cannot turn one gesture into another.
+                            gesture.down(origin.x + down.position.x, origin.y + down.position.y, nowMillis())
+                            drag.onPointerDown(down.position.x, down.position.y, origin.x, origin.y)
+                            timer = launch {
+                                delay(500L)
+                                gesture.longPressStart(nowMillis()).forEach { currentAction(it) }
                             }
-                            if (change.positionChanged()) {
-                                val at = currentWindowOrigin()
-                                val screenX = at.x + change.position.x
-                                val screenY = at.y + change.position.y
-                                gesture.move(screenX, screenY, nowMillis())
-                                // The controller reports the finger's screen-space movement; the local
-                                // `positionChange()` would shrink to zero (or invert) once the window follows.
-                                val delta = drag.onPointerMove(change.position.x, change.position.y, at.x, at.y)
-                                if (gesture.phase == BallGestureMachine.Phase.DRAGGING) {
-                                    val motion = if (drag.isDragging) delta else drag.beginDrag()
-                                    if (motion != null && (motion.dx != 0f || motion.dy != 0f)) {
-                                        currentAction(BallGestureAction.Drag(motion.dx, motion.dy))
-                                    }
+                            while (true) {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if (change.changedToUp()) {
+                                    timer?.cancel()
+                                    drag.onPointerUp()
+                                    gesture.up(nowMillis()).forEach { currentAction(it) }
+                                    change.consume()
+                                    break
                                 }
-                                change.consume()
+                                if (change.positionChanged()) {
+                                    val at = currentWindowOrigin()
+                                    val screenX = at.x + change.position.x
+                                    val screenY = at.y + change.position.y
+                                    gesture.move(screenX, screenY, nowMillis())
+                                    // The controller reports the finger's screen-space movement; the local
+                                    // `positionChange()` would shrink to zero (or invert) once the window follows.
+                                    val delta = drag.onPointerMove(change.position.x, change.position.y, at.x, at.y)
+                                    if (gesture.phase == BallGestureMachine.Phase.DRAGGING) {
+                                        val motion = if (drag.isDragging) delta else drag.beginDrag()
+                                        if (motion != null && (motion.dx != 0f || motion.dy != 0f)) {
+                                            currentAction(BallGestureAction.Drag(motion.dx, motion.dy))
+                                        }
+                                    }
+                                    change.consume()
+                                }
                             }
+                        } finally {
+                            timer?.cancel()
+                            // 0.5.1 (review Important #2): this `finally` also runs when Compose cancels the pointer
+                            // (`awaitEachGesture` unwinds the block with a CancellationException), where the normal
+                            // `up()` path never executes. Ending an open long press here is what stops the service's
+                            // accepted BALL lease; a cancelled drag is not snapped and a cancelled press is not a tap.
+                            cancelBallPointerSequence(gesture, drag).forEach { currentAction(it) }
                         }
-                        timer?.cancel()
                     }
                 }
             },

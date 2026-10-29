@@ -204,9 +204,46 @@ class AndroidSpeechPlayerTest {
         // A misbehaving engine that still delivers a late onset/end must not turn the rejected start into a second
         // terminal: the guard has already settled this playback.
         engine.fireStart("h")
+        assertFalse("a late onset of a refused start must not close the gate", gate.isPlaying)
         engine.fireDone("h")
         assertEquals("the terminal is reported once", listOf(SpeechPlayback.FAILED), events)
         assertFalse("and the late callback cannot leave the gate closed", gate.isPlaying)
+    }
+
+    @Test fun `a pre-onset cancel settles once and a late onset cannot reopen the gate or echo`() {
+        // Review Important #1: a handle cancel landing before the engine's `onStart` used to call finish() while the
+        // audible state was still IDLE, so it reported no terminal and marked nothing cancelled. A late `onStart` then
+        // CASed IDLE -> PLAYING, closed the wake gate and reopened the echo window for a playback nobody waits for; the
+        // next takeover lost its first words and the arbiter could wait SPEECH_EXPIRY_GRACE (120 s).
+        val clock = FakeClock()
+        val mute = EchoMuteWindow(clock)
+        val gate = PlaybackGate()
+        val engine = FakeTtsEngine()
+        val player = AndroidSpeechPlayer(engine, gate, mute)
+        val events = mutableListOf<SpeechPlayback>()
+        val handle = player.play(hint()) { events += it }
+
+        handle.cancel()
+        handle.cancel() // the handle stays idempotent
+
+        assertEquals(
+            "a cancel before the audible onset still owes the caller exactly one terminal",
+            listOf(SpeechPlayback.FINISHED),
+            events,
+        )
+        assertFalse("nothing became audible, so the gate must stay open", gate.isPlaying)
+        assertFalse("and no echo window may be armed", mute.covers(clock.nowNanos()))
+
+        engine.fireStart("h")
+        engine.fireDone("h")
+
+        assertEquals(
+            "a late onset/done after the cancel must not report anything",
+            listOf(SpeechPlayback.FINISHED),
+            events,
+        )
+        assertFalse("a late onset must not close the gate", gate.isPlaying)
+        assertFalse("a late onset must not reopen the echo window", mute.covers(clock.nowNanos()))
     }
 
     @Test fun `a cancelled utterance keeps the reverb tail and then releases the window`() {

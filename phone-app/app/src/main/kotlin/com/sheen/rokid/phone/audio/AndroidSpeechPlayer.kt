@@ -122,6 +122,26 @@ internal class AndroidSpeechPlayer(
     private val active = AtomicInteger(IDLE)
 
     /**
+     * 0.5.1 (review Important #1): one playback request's own lifecycle.
+     *
+     * The player-wide [active] state cannot say **which** request was cancelled. A cancel before the audible onset left
+     * the player [IDLE], so "the CAS found nothing to settle" was also indistinguishable from "nothing was cancelled",
+     * and a late `onStart` for that request could still win IDLE -> PLAYING - re-arming the gate and the echo window
+     * for a playback whose caller had already been told it was over. Each request now carries `cancelled` (latched by
+     * the handle's `cancel()`, and by a start the engine refuses), `started` (it owns the PLAYING state) and
+     * `terminated` (the one terminal it owes its caller). All three are created per request and captured by that
+     * request's listener, so a late callback can only ever be inert.
+     */
+    private class Utterance(val utteranceId: String, val charCount: Int) {
+        val cancelled = AtomicBoolean(false)
+        val started = AtomicBoolean(false)
+        private val terminated = AtomicBoolean(false)
+
+        /** True exactly once: whichever settle path (cancel or engine callback) gets here first owns the terminal. */
+        fun claimTerminal(): Boolean = terminated.compareAndSet(false, true)
+    }
+
+    /**
      * Serializes the gate/echo transitions of `onStart`, `finish` and `close`.
      *
      * The callback side runs on the TTS engine's thread and `close()` on the composition's, so "CAS the state, then
@@ -139,14 +159,15 @@ internal class AndroidSpeechPlayer(
         // 0.5.1 C5: one terminal per request. An engine that rejects the utterance returns false and will never deliver
         // a callback, so the port's "exactly one FINISHED/FAILED even when cancelled" would otherwise be silent.
         val report = exactlyOnceTerminal(onState)
-        if (!startUtterance(assistance.text, assistance.hintId, report)) {
+        val utterance = Utterance(assistance.hintId, assistance.text.length)
+        if (!startUtterance(assistance.text, utterance, report)) {
             P3Log.line(
                 "P5_SPEECH state=failed hintId=${assistance.hintId} chars=${assistance.text.length} reason=ENGINE_REFUSED",
             )
             report(SpeechPlayback.FAILED)
             return noOpHandle()
         }
-        return cancellationHandle(assistance.hintId, assistance.text.length, report)
+        return cancellationHandle(utterance, report)
     }
 
     /**
@@ -182,7 +203,7 @@ internal class AndroidSpeechPlayer(
         onState: (SpeechPlayback) -> Unit = {},
     ): Boolean {
         if (!ensureAvailable(utteranceId, onState)) return false
-        return startUtterance(text, utteranceId, onState)
+        return startUtterance(text, Utterance(utteranceId, text.length), onState)
     }
 
     private fun ensureAvailable(utteranceId: String, onState: (SpeechPlayback) -> Unit): Boolean {
@@ -211,20 +232,29 @@ internal class AndroidSpeechPlayer(
 
     private fun startUtterance(
         text: String,
-        utteranceId: String,
+        utterance: Utterance,
         onState: (SpeechPlayback) -> Unit,
     ): Boolean {
-        val charCount = text.length
+        val utteranceId = utterance.utteranceId
+        val charCount = utterance.charCount
         engine.setOnProgressListener(object : UtteranceProgressListener() {
             override fun onStart(uid: String) {
                 if (uid != utteranceId) return
                 val started = synchronized(transition) {
-                    active.compareAndSet(IDLE, PLAYING).also { won ->
-                        if (won) {
-                            gate.begin()
-                            // 0.5: the phone mic must not hear the start of our own utterance; open before the first
-                            // sample.
-                            echoMute?.open()
+                    // 0.5.1 (review Important #1): the cancelled check is inside the lock so it cannot race cancel()'s
+                    // settle; cancel latches the flag before asking the engine to stop. A request that was cancelled
+                    // (or refused by the engine) before its onset therefore never reopens the gate or the echo window.
+                    if (utterance.cancelled.get()) {
+                        false
+                    } else {
+                        active.compareAndSet(IDLE, PLAYING).also { won ->
+                            if (won) {
+                                utterance.started.set(true)
+                                gate.begin()
+                                // 0.5: the phone mic must not hear the start of our own utterance; open before the
+                                // first sample.
+                                echoMute?.open()
+                            }
                         }
                     }
                 }
@@ -233,11 +263,11 @@ internal class AndroidSpeechPlayer(
                 onState(SpeechPlayback.STARTED)
             }
             override fun onDone(uid: String) {
-                if (uid == utteranceId) finish(SpeechPlayback.FINISHED, uid, charCount, onState, "end")
+                if (uid == utteranceId) finish(SpeechPlayback.FINISHED, utterance, onState, "end")
             }
             @Suppress("DEPRECATION")
             override fun onError(uid: String) {
-                if (uid == utteranceId) finish(SpeechPlayback.FAILED, uid, charCount, onState, "failed")
+                if (uid == utteranceId) finish(SpeechPlayback.FAILED, utterance, onState, "failed")
             }
             /**
              * 0.5.1 C5: `TextToSpeech.stop()`/an interruption delivers `onStop`, not `onDone`/`onError`. Without this
@@ -245,47 +275,83 @@ internal class AndroidSpeechPlayer(
              * is not overridden".
              */
             override fun onStop(uid: String, interrupted: Boolean) {
-                if (uid == utteranceId) finish(SpeechPlayback.FINISHED, uid, charCount, onState, "stopped")
+                if (uid == utteranceId) finish(SpeechPlayback.FINISHED, utterance, onState, "stopped")
             }
         })
-        return engine.speak(text, utteranceId)
+        val accepted = engine.speak(text, utteranceId)
+        // The engine rejects the request with false and normally delivers no callback. A misbehaving engine might still
+        // deliver a late onset; latching the request cancelled keeps that onset from arming a gate/echo that no
+        // callback will release (the same inertness a pre-onset cancel needs).
+        if (!accepted) utterance.cancelled.set(true)
+        return accepted
     }
 
     /**
      * The one terminal transition of the audible interval: close the gate, close the echo window with its reverb tail,
      * log and report - exactly once, whichever callback arrives first.
+     *
+     * A callback for an utterance that was cancelled is inert: it must not report after the cancel, and it must not
+     * touch a gate/echo that [cancellationHandle] already released. The PLAYING -> IDLE CAS (rather than an
+     * utterance-scoped "did it start" test) is deliberately kept as the recovery path for an utterance whose onset was
+     * never reported: the engine has already told us this playback is over, so leaving the gate/echo armed would be the
+     * permanent mute 0.5.1 removed the watchdog for.
      */
     private fun finish(
         playback: SpeechPlayback,
-        utteranceId: String,
-        charCount: Int,
+        utterance: Utterance,
         onState: (SpeechPlayback) -> Unit,
         logState: String,
     ) {
         val finished = synchronized(transition) {
-            active.compareAndSet(PLAYING, IDLE).also { won ->
-                if (won) {
-                    gate.end()
-                    echoMute?.close()
+            if (utterance.cancelled.get()) {
+                false
+            } else {
+                active.compareAndSet(PLAYING, IDLE).also { won ->
+                    if (won) {
+                        // Clear the per-request marker under the same lock that closes the audible interval.
+                        utterance.started.set(false)
+                        gate.end()
+                        echoMute?.close()
+                    }
                 }
             }
         }
         if (!finished) return
-        P3Log.line("P5_SPEECH state=$logState hintId=$utteranceId chars=$charCount")
+        reportTerminal(utterance, playback, onState, logState)
+    }
+
+    /** Reports one terminal, whichever settle path gets here first; a later path is a no-op. */
+    private fun reportTerminal(
+        utterance: Utterance,
+        playback: SpeechPlayback,
+        onState: (SpeechPlayback) -> Unit,
+        logState: String,
+    ) {
+        if (!utterance.claimTerminal()) return
+        P3Log.line("P5_SPEECH state=$logState hintId=${utterance.utteranceId} chars=${utterance.charCount}")
         onState(playback)
     }
 
     private fun cancellationHandle(
-        utteranceId: String,
-        charCount: Int,
+        utterance: Utterance,
         onState: (SpeechPlayback) -> Unit,
     ): CancellationHandle = object : CancellationHandle {
-        private val cancelled = AtomicBoolean(false)
         override fun cancel() {
-            if (cancelled.compareAndSet(false, true)) {
-                engine.stop()
-                finish(SpeechPlayback.FINISHED, utteranceId, charCount, onState, "cancelled")
+            // Latch first: from this point on a late `onStart`/`onDone`/`onStop` is inert, and a second cancel is a
+            // no-op.
+            if (!utterance.cancelled.compareAndSet(false, true)) return
+            engine.stop()
+            synchronized(transition) {
+                // Only a request that actually owns the audible interval may release the gate/echo; a pre-onset cancel
+                // has nothing to release, and `close()` already released a closed player.
+                if (utterance.started.compareAndSet(true, false) && active.compareAndSet(PLAYING, IDLE)) {
+                    gate.end()
+                    echoMute?.close()
+                }
             }
+            // Report a terminal even when the request never reached PLAYING (or close() won the race): the cancel is the
+            // caller's only settle, and without it the arbiter holds the hint/turn for SPEECH_EXPIRY_GRACE (120 s).
+            reportTerminal(utterance, SpeechPlayback.FINISHED, onState, "cancelled")
         }
     }
 

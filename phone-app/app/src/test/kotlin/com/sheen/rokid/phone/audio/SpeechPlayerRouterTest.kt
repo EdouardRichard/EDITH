@@ -54,6 +54,22 @@ class SpeechPlayerRouterTest {
     }
 
     /**
+     * A player whose cancel reports nothing, like a platform player cancelled before its audible onset (review
+     * Important #1). The router still owes the caller one terminal; without its fallback the arbiter waits 120 s.
+     */
+    private class SilentCancelPlayer : SpeechPlayer {
+        var plays = 0
+        var cancels = 0
+
+        override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit): CancellationHandle {
+            plays++
+            return object : CancellationHandle {
+                override fun cancel() { cancels++ }
+            }
+        }
+    }
+
+    /**
      * A player whose [play] blocks, so the test can drive an off/stop in the window between the router reading its
      * target and the platform player returning a handle. That window is where the review found the untracked handle.
      */
@@ -258,5 +274,55 @@ class SpeechPlayerRouterTest {
         assertEquals("an idempotent on must not cancel the utterance it re-installs", 0, player.cancels)
         router.stopCurrent()
         assertEquals("the utterance is still tracked and can be stopped", 1, player.cancels)
+    }
+
+    @Test
+    fun cancellingTheTrackedHandleSettlesThePlaybackWhenThePlayerReportsNoTerminal() {
+        // Review Important #1: the returned handle's cancel only cancelled. A cancel that lands before the onset
+        // reaches no PLAYING state, so the platform player reports nothing; without a fallback the arbiter held the
+        // hint/turn for SPEECH_EXPIRY_GRACE (120 s). This mirrors the stale-play branch's terminal.
+        val router = SpeechPlayerRouter()
+        val player = SilentCancelPlayer()
+        router.install(player)
+        val states = CopyOnWriteArrayList<SpeechPlayback>()
+        val handle = router.play(assistance()) { states += it }
+
+        handle.cancel()
+        handle.cancel()
+
+        assertEquals("the tracked handle is cancelled exactly once", 1, player.cancels)
+        assertEquals("the caller gets exactly one terminal", listOf(SpeechPlayback.FAILED), states.toList())
+    }
+
+    @Test
+    fun cancellingTheTrackedHandleForwardsThePlayersTerminalWithoutAddingOne() {
+        // The other half of exactly-once: a player whose cancel does report a terminal (AndroidSpeechPlayer after the
+        // onset) must have that FINISHED forwarded, with no router fallback added on top.
+        val router = SpeechPlayerRouter()
+        val player = FakePlayer()
+        router.install(player)
+        val states = CopyOnWriteArrayList<SpeechPlayback>()
+        val handle = router.play(assistance()) { states += it }
+
+        handle.cancel()
+        handle.cancel()
+
+        assertEquals("the player's own terminal is forwarded exactly once", listOf(SpeechPlayback.FINISHED), states.toList())
+    }
+
+    @Test
+    fun stopCurrentSettlesThePlaybackWhenThePlayerReportsNoTerminal() {
+        // `stopCurrent` is the long-press takeover path (HostCompositionRoot.stopCurrentSpeechForBall). A player that
+        // reports nothing on cancel must not leave that takeover waiting on the arbiter's 120 s grace either.
+        val router = SpeechPlayerRouter()
+        val player = SilentCancelPlayer()
+        router.install(player)
+        val states = CopyOnWriteArrayList<SpeechPlayback>()
+        router.play(assistance()) { states += it }
+
+        router.stopCurrent()
+
+        assertEquals("the tracked utterance is stopped", 1, player.cancels)
+        assertEquals("the stop owes exactly one terminal", listOf(SpeechPlayback.FAILED), states.toList())
     }
 }
