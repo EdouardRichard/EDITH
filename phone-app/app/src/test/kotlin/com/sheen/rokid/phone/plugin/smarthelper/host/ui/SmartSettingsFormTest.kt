@@ -390,6 +390,17 @@ class SmartSettingsFormTest {
     }
 
     @Test
+    fun theSettingsPageNamesThePhoneOnlyMode() {
+        // 0.5.1 (`C1`, spec §3.1): the plan names this suite alongside `DetachUiTest` as the pin for the user-visible
+        // 「纯手机模式」 copy. `DetachUiTest` owns the full copy (old names absent, consequence text); this test is the
+        // settings-form suite's mode-name check, kept separate from the flag-retention test above so a rename cannot
+        // pass by only preserving `glassesDetached`.
+        assertEquals("纯手机模式", DetachUi.SWITCH_TITLE)
+        assertTrue("the proactive note must name the same mode",
+            DetachUi.PROACTIVE_DETACHED_NOTE.contains("纯手机模式"))
+    }
+
+    @Test
     fun theFormKeepsThePersistedPhoneOnlyAppearanceAndSpeechFlag() {
         // 0.5: the two opacities and the explicit-speech flag are host-only settings, not fields of this form. A save of
         // the form's own fields must carry them through; otherwise the next start would silently reset the user's look
