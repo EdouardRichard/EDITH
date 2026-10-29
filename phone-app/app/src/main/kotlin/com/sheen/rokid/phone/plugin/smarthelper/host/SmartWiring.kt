@@ -116,6 +116,11 @@ internal class SmartWiring(
         // 0.24 S3 (spec §5.5): the persisted「持续对话」switch. Read through the wiring's settings snapshot, which is the
         // same value the settings screen writes and `create` reads once at assembly time.
         continueDialogue = { settings.continueDialogue },
+        // 0.5.1 (`C2`, spec §3.2): phone-only mode disables **only** the post-answer automatic continuation. The stored
+        // switch still travels above (glasses mode and the plugin's queued-utterance seam read it); this seam is the
+        // live `!phoneOnly()` multiplied in, so the phone's next sentence is the user's long-press ball ASR while the
+        // initial wake window, the queued utterance and glasses mode are unchanged.
+        continueAfterAnswer = { settings.continueDialogue && !phoneOnly() },
         // 0.24 S3 Task 14 fix (C2): the production player's presence. With speech off (the default) no player is built,
         // so a `both`/`voice` answer is display-only and continues on its `Displayed` acknowledgement.
         speechAvailable = speechAvailable,

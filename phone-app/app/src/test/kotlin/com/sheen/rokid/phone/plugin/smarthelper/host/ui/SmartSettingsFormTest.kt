@@ -107,6 +107,16 @@ class SmartSettingsFormTest {
         assertFalse("saving an untouched form must not re-enable it", result.settings.continueDialogue)
     }
 
+    @Test
+    fun theContinueDialogueSwitchCarriesThePhoneOnlyNote() {
+        // 0.5.1 (`C2`, spec §3.2): the switch and its stored value stay - glasses mode still uses them - but phone-only
+        // mode never opens the post-answer round. The page must say what the user does instead: long-press the ball.
+        assertEquals(
+            "纯手机模式下不生效；下一句长按悬浮球",
+            SmartSettingsForm.CONTINUE_DIALOGUE_PHONE_ONLY_NOTE,
+        )
+    }
+
     // ---- P3.2: the proactive cooldown and sensitivity fields ----------------------------------------
 
     @Test

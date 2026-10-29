@@ -624,6 +624,13 @@ internal class SmartTestRig(
      */
     var continueDialogue: Boolean = false,
     /**
+     * 0.5.1 (`C2`, spec §3.2): whether a **displayed answer** opens the automatic next round. `null` — the default —
+     * follows [continueDialogue], which is the plugin's own pre-0.5.1 default, so every existing test keeps its old
+     * behaviour. The phone-only tests set `false` while [continueDialogue] stays on: that is the production split (the
+     * stored switch still gates the queued-utterance path and glasses mode, only the post-answer round is gated).
+     */
+    var continueAfterAnswer: Boolean? = null,
+    /**
      * 0.24 S3 Task 14 fix (C2): whether the host can actually speak. Default `true` keeps every pre-fix test on the
      * official-shaped host (which always has TTS); the speech-off tests opt out explicitly.
      */
@@ -688,6 +695,9 @@ internal class SmartTestRig(
             isPanelVisible = { panelVisible },
             requestPanelOpen = requestPanelOpen,
             continueDialogue = { continueDialogue },
+            // `null` models the plugin's own `= continueDialogue` default: a caller that never heard of the 0.5.1 seam
+            // keeps the old glasses/continual-dialogue behaviour.
+            continueAfterAnswer = { continueAfterAnswer ?: continueDialogue },
             speechAvailable = { speechAvailable },
             phoneOnly = { phoneOnly },
             noInterception = { noInterception },

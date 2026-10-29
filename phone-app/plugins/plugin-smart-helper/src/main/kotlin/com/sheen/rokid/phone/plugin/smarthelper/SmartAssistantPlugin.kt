@@ -539,6 +539,21 @@ class SmartAssistantPlugin(
      */
     private val continueDialogue: () -> Boolean = { true },
     /**
+     * 0.5.1 (`C2`, spec §3.2): whether a **displayed answer** opens the automatic next listening round.
+     *
+     * Phone-only mode has no HUD to keep reading and no glasses conversation to continue: the next sentence is the
+     * user's long-press on the floating ball, so the production wiring passes
+     * `{ settings.continueDialogue && !phoneOnly() }`. This seam deliberately gates **only** the post-answer decision
+     * (`ConversationCycle.onAnswerDone`/`onSpeechFinished`):
+     * - the initial wake window (`onWake`/`armListening`) is not a continuation and stays;
+     * - the queued-utterance seam keeps reading [continueDialogue], so a sentence said during the answer is still
+     *   remembered for the continuation that glasses mode opens;
+     * - `armContinueOffLocked` is the official off branch this seam merely selects, never a behaviour of its own.
+     *
+     * The default follows [continueDialogue], which is the pre-0.5.1 shape every glasses caller and test rig keeps.
+     */
+    private val continueAfterAnswer: () -> Boolean = continueDialogue,
+    /**
      * 0.24 S3 Task 14 fix round (C2, spec risk row 17): whether the host can actually speak a hint right now.
      *
      * Production builds the speech player **only when「语音朗读」is on** and the engine is ready, so a `both`/`voice`
@@ -1082,6 +1097,9 @@ class SmartAssistantPlugin(
         scheduler = scheduler,
         display = { conversation() },
         continueDialogue = continueDialogue,
+        // 0.5.1 (`C2`): the cycle's post-answer decisions read the split seam, not the stored switch. The cycle keeps
+        // the old parameter as the default for direct callers/tests; production names both explicitly.
+        continueAfterAnswer = continueAfterAnswer,
         openContinuation = { route, previousTurnId -> openContinuationTurn(route, previousTurnId) },
         isPanelVisible = isPanelVisible,
         cancelTurn = { route, expectedTurnId -> cancelConversationTurn(route, expectedTurnId) },

@@ -463,6 +463,12 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
                 "答案显示/播报结束后自动进入下一轮聆听；关闭后答案结束约 1 秒关闭面板，不发 status 5。",
                 style = MaterialTheme.typography.bodySmall,
             )
+            // 0.5.1 (C2, spec §3.2): the stored switch and its value are kept for glasses mode, but phone-only mode
+            // never opens the post-answer round - state what the user does instead (long-press the floating ball).
+            Text(
+                SmartSettingsForm.CONTINUE_DIALOGUE_PHONE_ONLY_NOTE,
+                style = MaterialTheme.typography.bodySmall,
+            )
         }
         Switch(checked = draft.continueDialogue, onCheckedChange = {
             draft = draft.copy(continueDialogue = it); errors = emptyList(); saved = false

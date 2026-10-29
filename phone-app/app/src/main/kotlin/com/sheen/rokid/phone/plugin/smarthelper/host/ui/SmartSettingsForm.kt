@@ -24,6 +24,16 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
  */
 object SmartSettingsForm {
 
+    /**
+     * 0.5.1 (`C2`, spec §3.2): the note next to the 「持续对话」 switch.
+     *
+     * The switch and its stored value stay - glasses mode still opens its automatic next round, and the plugin's
+     * queued-utterance seam still reads the value - but phone-only mode never opens the post-answer round. What the
+     * user does instead is long-press the floating ball; saying it here is the only place the page can explain why a
+     * switch that looks on does nothing in that mode.
+     */
+    const val CONTINUE_DIALOGUE_PHONE_ONLY_NOTE = "纯手机模式下不生效；下一句长按悬浮球"
+
     /** The editable text, exactly as typed. */
     data class Draft(
         val wakeWords: String,
