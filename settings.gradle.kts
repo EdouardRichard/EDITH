@@ -17,26 +17,15 @@ dependencyResolutionManagement {
     repositories {
         google()
         mavenCentral()
+        // Standard Android flat local repositories for the two vendored AAR sets (no Maven metadata is published):
+        // CXR in `third_party/cxr/vendor`, sherpa-onnx in the audio-android module's `libs/`. Exclusive content pins
+        // these groups to the flat directories so the remote Maven repositories are never asked for them.
         exclusiveContent {
-            forRepository {
-                ivy {
-                    name = "verifiedCxrRuntime"
-                    url = uri(verifiedCxrDir)
-                    patternLayout { artifact("[artifact]-[revision].[ext]") }
-                    metadataSources { artifact() }
-                }
-            }
+            forRepository { flatDir { dirs(verifiedCxrDir) } }
             filter { includeGroup("edith.vendor.cxr") }
         }
         exclusiveContent {
-            forRepository {
-                ivy {
-                    name = "verifiedSherpaRuntime"
-                    url = uri("phone-app/perception/audio-android/libs")
-                    patternLayout { artifact("[artifact]-[revision].[ext]") }
-                    metadataSources { artifact() }
-                }
-            }
+            forRepository { flatDir { dirs(rootDir.resolve("phone-app/perception/audio-android/libs")) } }
             filter { includeModule("edith.vendor.sherpa", "sherpa-onnx") }
         }
         exclusiveContent {
