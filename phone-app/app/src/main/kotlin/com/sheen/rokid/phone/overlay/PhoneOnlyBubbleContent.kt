@@ -40,16 +40,18 @@ import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.collect
 
 /**
- * 0.5 (`D211`/`D215`/`D217`): the independent message bubbles above the floating ball.
+ * 0.5 (`D211`/`D215`/`D217`), corrected by 0.5.1 (`C6`/`C7`/`C13`): the independent message bubbles above the ball.
  *
  * The whole window is transparent and non-touchable; this composable only draws. Each message is its own Material card
- * (system `Surface`, `MaterialTheme.typography`, default content colors). The card background uses the user's configured
- * bubble opacity; the text stays fully opaque. A superseded message is one alpha layer at the model's fixed ratio, so
- * the whole card **and** its text fade together - the owner's "old message is a faded dialog box" rule.
+ * (system `Surface`, `MaterialTheme.typography`, default content colors). The card's base color is the **opaque**
+ * [androidx.compose.material3.MaterialTheme.colorScheme.surface], and the whole bubble - card, text, tail and shadow -
+ * sits in one [Modifier.alpha] layer: the newest message renders at the configured bubble opacity, a superseded one at
+ * `oldMessageAlpha` times its removal fade. System fonts and content colors are unchanged.
  *
  * The stack is bottom-aligned to the ball's top edge; the newest card carries the small tail (right or left, following
- * the docked edge). There is no touch handling here: the window is `FLAG_NOT_TOUCHABLE`, and the ball's small window is
- * the only touch surface.
+ * the docked edge). Its anchor, available height, width and 8-line text cap come from the pure [BubbleLayout], the same
+ * numbers the JVM tests pin and T7 reuses for the ball's top-dock reserve. There is no touch handling here: the window
+ * is `FLAG_NOT_TOUCHABLE`, and the ball's small window is the only touch surface.
  */
 @Composable
 fun PhoneOnlyBubbleContent(
@@ -66,7 +68,8 @@ fun PhoneOnlyBubbleContent(
     var snapshot by remember { mutableStateOf(repository.snapshotNow()) }
 
     // Event-driven updates (a new message, a tool phase, idle) plus a frame loop for the 2 s/3 s fades. The loop is
-    // keyed on "is anything visible" so it stops when the stack is gone instead of spinning forever.
+    // keyed on "is anything visible" so it stops when the stack is gone instead of spinning forever. A local Notice
+    // owns its own deadline in the model, so the same loop is what makes it disappear without a `TurnIdle`.
     LaunchedEffect(repository) {
         repository.snapshots.collect { snapshot = repository.snapshotNow() }
     }
@@ -82,10 +85,17 @@ fun PhoneOnlyBubbleContent(
     val density = LocalDensity.current
     val gap = 8.dp
     val tailSize = 10.dp
-    val maxBubbleWidth = with(density) { (screenWidthPx * 0.72f).toDp() }
-    val maxStackHeight = with(density) { (screenHeightPx * 0.45f).toDp() }
-    val anchorBottom = ballCenterY - radiusPx - with(density) { 8.dp.toPx() }
-    val bottomPad = with(density) { (screenHeightPx - anchorBottom).toDp() }
+    val gapPx = with(density) { gap.toPx() }
+    val anchorBottomPx = BubbleLayout.anchorBottomPx(ballCenterY, radiusPx, gapPx)
+    val availableHeightPx = BubbleLayout.availableHeightPx(screenHeightPx, anchorBottomPx)
+    val maxBubbleWidth = with(density) { BubbleLayout.availableWidthPx(screenWidthPx).toDp() }
+    val maxStackHeight = with(density) { availableHeightPx.toDp() }
+    val bottomPad = with(density) { (screenHeightPx - anchorBottomPx).toDp() }
+    // The 8-line clamp is BubbleLayout's rule; a large font scale or a short stack lowers it below 8.
+    val maxLines = BubbleLayout.maxLines(
+        availableHeightPx,
+        with(density) { MaterialTheme.typography.bodyLarge.lineHeight.toPx() },
+    )
     // Right edge of the bubble sits 14 dp in from the ball's left edge (mirrored for a left-edge ball).
     val sidePad = if (ballEdge == BallEdge.RIGHT) {
         with(density) { (screenWidthPx - (ballCenterX - radiusPx - 14.dp.toPx())).toDp() }
@@ -109,14 +119,13 @@ fun PhoneOnlyBubbleContent(
             horizontalAlignment = if (ballEdge == BallEdge.RIGHT) Alignment.End else Alignment.Start,
             verticalArrangement = Arrangement.spacedBy(gap),
         ) {
-            snapshot.messages.forEachIndexed { index, message ->
-                val newest = index == snapshot.messages.lastIndex
+            snapshot.messages.forEach { message ->
                 MessageBubble(
                     message = message,
-                    newest = newest,
+                    appearance = appearance,
                     tailOnRight = ballEdge == BallEdge.RIGHT,
-                    bubbleAlpha = appearance.bubbleAlpha,
-                    speaking = speaking && newest && message.kind == BubbleKind.ANSWER,
+                    speaking = speaking && message.newest && message.kind == BubbleKind.ANSWER,
+                    maxLines = maxLines,
                     tailSize = tailSize,
                 )
             }
@@ -127,19 +136,27 @@ fun PhoneOnlyBubbleContent(
 @Composable
 private fun MessageBubble(
     message: VisibleBubble,
-    newest: Boolean,
+    appearance: PhoneOnlyAppearance,
     tailOnRight: Boolean,
-    bubbleAlpha: Float,
     speaking: Boolean,
+    maxLines: Int,
     tailSize: Dp,
 ) {
     val scheme = MaterialTheme.colorScheme
+    // 0.5.1 C7: one alpha layer around card + text + tail + shadow. The card base stays the opaque system surface
+    // inside the layer, so the rendered card and text both equal the layer's value.
+    val layerAlpha = BubbleRenderMath.layerAlpha(
+        newest = message.newest,
+        bubbleAlpha = appearance.bubbleAlpha,
+        fade = BubbleRenderMath.fade(message.newest, message.relativeAlpha),
+        oldMessageAlpha = appearance.oldMessageAlpha,
+    )
 
-    Box(Modifier.alpha(if (newest) 1f else message.relativeAlpha)) {
+    Box(Modifier.alpha(layerAlpha)) {
         Surface(
-            modifier = Modifier.padding(bottom = if (newest) 4.dp else 0.dp),
+            modifier = Modifier.padding(bottom = if (message.newest) 4.dp else 0.dp),
             shape = RoundedCornerShape(12.dp),
-            color = scheme.surface.copy(alpha = bubbleAlpha),
+            color = scheme.surface,
             contentColor = scheme.onSurface,
             shadowElevation = 3.dp,
             tonalElevation = 0.dp,
@@ -149,13 +166,13 @@ private fun MessageBubble(
                     start = 14.dp,
                     end = 14.dp,
                     top = 10.dp,
-                    bottom = 10.dp + if (newest) 6.dp else 0.dp,
+                    bottom = 10.dp + if (message.newest) 6.dp else 0.dp,
                 ),
             ) {
-                MessageRow(message, speaking)
+                MessageRow(message, speaking, maxLines)
             }
         }
-        if (newest) {
+        if (message.newest) {
             Canvas(
                 modifier = Modifier
                     .align(if (tailOnRight) Alignment.BottomEnd else Alignment.BottomStart)
@@ -174,19 +191,19 @@ private fun MessageBubble(
                     path.lineTo(w * 0.75f, h)
                 }
                 path.close()
-                drawPath(path, scheme.surface.copy(alpha = bubbleAlpha))
+                drawPath(path, scheme.surface)
             }
         }
     }
 }
 
 @Composable
-private fun MessageRow(message: VisibleBubble, speaking: Boolean) {
+private fun MessageRow(message: VisibleBubble, speaking: Boolean, maxLines: Int) {
     when (message.kind) {
         BubbleKind.USER -> Text(
             text = message.text,
             style = MaterialTheme.typography.bodyMedium,
-            maxLines = 8,
+            maxLines = maxLines,
             overflow = TextOverflow.Ellipsis,
         )
         BubbleKind.THINKING -> Row(verticalAlignment = Alignment.CenterVertically) {
@@ -213,7 +230,7 @@ private fun MessageRow(message: VisibleBubble, speaking: Boolean) {
             Text(
                 text = message.text,
                 style = MaterialTheme.typography.bodyLarge,
-                maxLines = 8,
+                maxLines = maxLines,
                 overflow = TextOverflow.Ellipsis,
                 modifier = Modifier.weight(1f, fill = false),
             )

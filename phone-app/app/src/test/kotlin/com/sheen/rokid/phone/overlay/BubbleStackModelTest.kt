@@ -8,10 +8,18 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 0.5 (`D211`/`D215`/`D216`/`D217`): the bubble timing rules, as pure JVM behaviour.
+ * 0.5.1 (`C6`/`C10`): the bubble timing rules, as pure JVM behaviour.
  *
- * The model returns a **relative** alpha (1.0 current, 0.42 superseded); the UI multiplies the old value by the user's
- * configured bubble opacity. These tests therefore pin the relation, not a rendered alpha.
+ * The stack shows at most [BubbleStackModel.MAX_VISIBLE] messages: the newest plus one old one. A third message drops
+ * the existing old one immediately and turns the previous newest into the old one. Per the owner's "其余逻辑不变" the
+ * old message keeps the 0.5 hold/fade/removal rules and there is **no** extra accelerated fade.
+ *
+ * The model still returns a **relative** alpha (1.0 current, 0.42 old); `BubbleRenderMath` turns it into the
+ * whole-bubble alpha the renderer applies. [VisibleBubble.newest] is the model's own answer to "which message carries
+ * the tail", so the UI cannot disagree about it.
+ *
+ * A local Notice owns a 3–4 s lifetime in the model itself, not a `TurnIdle`: the overlay must expire refusals even
+ * when no turn ever started.
  */
 class BubbleStackModelTest {
 
@@ -33,9 +41,14 @@ class BubbleStackModelTest {
     private fun final(text: String, hint: String = "h1") =
         model.onEvent(PhoneBubbleEvent.AnswerFinal(AssistantRoute.WAKE, "t1", hint, text), now)
 
+    private fun notice(text: String = "还没有开始会话") =
+        model.onEvent(PhoneBubbleEvent.Notice(AssistantRoute.WAKE, text), now)
+
     private fun idle() = model.onEvent(PhoneBubbleEvent.TurnIdle(AssistantRoute.WAKE), now)
 
     private fun visible() = model.snapshot(now).messages
+
+    private fun newestFlags() = visible().map { it.newest }
 
     @Test
     fun aMessageIsItsOwnBubble() {
@@ -47,6 +60,7 @@ class BubbleStackModelTest {
         assertEquals(1, messages.size)
         assertEquals(BubbleKind.USER, messages.single().kind)
         assertEquals(1f, messages.single().relativeAlpha, 0.0001f)
+        assertTrue("a lone message is the newest and carries the tail", messages.single().newest)
     }
 
     @Test
@@ -80,13 +94,13 @@ class BubbleStackModelTest {
         user(); now = 100; thinking(); now = 200
         tool("读取屏幕内容", ToolPhase.START)
         now = 300
-        assertEquals(3, visible().size)
+        assertEquals("the user line is already the old one and has been dropped", 2, visible().size)
         assertEquals(BubbleKind.TOOL_RUNNING, visible().last().kind)
 
         tool("读取屏幕内容", ToolPhase.END)
         now = 400
         val messages = visible()
-        assertEquals("END must not add a fourth bubble", 3, messages.size)
+        assertEquals("END must not add a third bubble", 2, messages.size)
         assertEquals(BubbleKind.TOOL_DONE, messages.last().kind)
         assertEquals("读取屏幕内容", messages.last().text)
     }
@@ -96,15 +110,15 @@ class BubbleStackModelTest {
         user(); now = 100; thinking(); now = 200
         partial("这是一张")
         now = 300
-        assertEquals("the answer joins the faded user and thinking bubbles", 3, visible().size)
+        assertEquals("the answer joins the faded thinking bubble", 2, visible().size)
         partial("这是一张外卖订单")
         now = 400
-        assertEquals("a partial must not add a bubble", 3, visible().size)
+        assertEquals("a partial must not add a bubble", 2, visible().size)
         assertEquals("这是一张外卖订单", visible().last().text)
 
         final("这是一张外卖订单：预计 12:30 送达。")
         now = 500
-        assertEquals(3, visible().size)
+        assertEquals(2, visible().size)
         assertEquals(BubbleKind.ANSWER, visible().last().kind)
         assertEquals("这是一张外卖订单：预计 12:30 送达。", visible().last().text)
     }
@@ -118,31 +132,85 @@ class BubbleStackModelTest {
         now = 400
 
         val messages = visible()
-        assertEquals(3, messages.size)
+        assertEquals(2, messages.size)
+        assertEquals(BubbleKind.ANSWER, messages[0].kind)
+        assertEquals("第一条回答", messages[0].text)
         assertEquals(BubbleKind.ANSWER, messages[1].kind)
-        assertEquals("第一条回答", messages[1].text)
-        assertEquals(BubbleKind.ANSWER, messages[2].kind)
-        assertEquals("第二条通知", messages[2].text)
+        assertEquals("第二条通知", messages[1].text)
     }
 
     @Test
-    fun atMostThreeBubblesAreKeptAndTheOldestIsDropped() {
+    fun `at most two messages survive and the third drops the old one`() {
         user("one"); now = 100
-        thinking(); now = 200
-        tool("读取屏幕内容", ToolPhase.START); now = 300
-        final("answer one"); now = 400
-        assertEquals(3, visible().size)
-
+        thinking(); now = 300
+        tool("读取屏幕内容", ToolPhase.START)
         now = 500
-        model.onEvent(PhoneBubbleEvent.Notice(AssistantRoute.WAKE, "notice"), now)
-        // Give the new bubble its 200 ms entry fade before asserting what is on screen; at the exact creation instant its
-        // alpha is 0 by design.
-        now = 700
 
         val messages = visible()
-        assertEquals(3, messages.size)
-        assertEquals("the oldest bubble is gone", "读取屏幕内容", messages[0].text)
-        assertEquals("notice", messages[2].text)
+        assertEquals("the stack keeps the newest plus one old", 2, messages.size)
+        assertEquals("the existing old (the wearer's line) is dropped immediately", "正在思考", messages[0].text)
+        assertEquals("the previous newest becomes the old one", 0.42f, messages[0].relativeAlpha, 0.0001f)
+        assertEquals(BubbleKind.TOOL_RUNNING, messages[1].kind)
+        assertEquals("only the newest carries the tail", listOf(false, true), messages.map { it.newest })
+
+        // The new old message keeps the unchanged 2 s + 250 ms removal clock.
+        now = 300 + BubbleStackModel.KEEP_MILLIS + BubbleStackModel.FADE_MILLIS + 1
+        val remaining = visible()
+        assertEquals("the old one is removed on the 0.5 clock", 1, remaining.size)
+        assertEquals(BubbleKind.TOOL_RUNNING, remaining.single().kind)
+        assertTrue(remaining.single().newest)
+    }
+
+    @Test
+    fun `a new message is in the snapshot at its creation instant`() {
+        notice()
+
+        // The newest renders at the configured opacity without waiting for the entry ramp, but the row must already be
+        // in the snapshot: for a local Notice that snapshot is the only signal the overlay ever gets (C10).
+        val messages = visible()
+
+        assertEquals(1, messages.size)
+        assertTrue(messages.single().newest)
+        assertEquals(0f, messages.single().relativeAlpha, 0.0001f)
+    }
+
+    @Test
+    fun `notice disappears after its lifetime without TurnIdle`() {
+        notice()
+        now = 300
+        assertEquals("the local notice is visible while it lasts", 1, visible().size)
+
+        now = BubbleStackModel.NOTICE_DISMISS_AFTER_MILLIS - 1
+        assertEquals("the notice is still there just before its lifetime", 1, visible().size)
+
+        // No TurnIdle is emitted: the notice's own deadline is what removes it.
+        now = BubbleStackModel.NOTICE_DISMISS_AFTER_MILLIS + 1
+        assertTrue("the notice expires without any TurnIdle", visible().isEmpty())
+        assertTrue(
+            "the local Notice lifetime is 3–4 s",
+            BubbleStackModel.NOTICE_DISMISS_AFTER_MILLIS in 3_000L..4_000L,
+        )
+    }
+
+    @Test
+    fun `old message two second removal and newest-only tail are unchanged`() {
+        user("one"); now = 100
+        thinking()
+        now = 300
+
+        var messages = visible()
+        assertEquals(2, messages.size)
+        assertEquals(listOf("one", BubbleStackModel.THINKING_TEXT), messages.map { it.text })
+        assertEquals("only the newest message is flagged for the tail", listOf(false, true), newestFlags())
+        assertEquals(0.42f, messages[0].relativeAlpha, 0.0001f)
+
+        now = 100 + BubbleStackModel.KEEP_MILLIS
+        assertEquals("the old message is still retained at 2 s", 2, visible().size)
+
+        now = 100 + BubbleStackModel.KEEP_MILLIS + BubbleStackModel.FADE_MILLIS + 1
+        messages = visible()
+        assertEquals("the old message is removed after the 250 ms fade", 1, messages.size)
+        assertTrue("the survivor is the newest", messages.single().newest)
     }
 
     @Test
@@ -162,7 +230,7 @@ class BubbleStackModelTest {
         idle()
         now = 1_500
         model.onEvent(PhoneBubbleEvent.Notice(AssistantRoute.WAKE, "still here"), now)
-        now = 5_000
+        now = 2_500
         assertTrue("the new message must cancel the dismissal", visible().isNotEmpty())
     }
 

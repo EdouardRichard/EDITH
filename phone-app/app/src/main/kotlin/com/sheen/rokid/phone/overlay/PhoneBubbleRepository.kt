@@ -17,6 +17,10 @@ import kotlinx.coroutines.flow.asStateFlow
  * Only the WAKE route is accepted. The phone-only model has no proactive assistance (0.4/D202), and mixing a proactive
  * hint into this stack would show the wearer a message that has no bubble surface or dismissal contract.
  *
+ * 0.5.1 (`C10`): a local Notice (no session, refused dictation, …) is added to the same model and carries its own
+ * 3–4 s deadline. It therefore expires from [snapshotNow] on the injected clock without a `TurnIdle`, and the overlay's
+ * frame loop is what paints the disappearance.
+ *
  * The clock is injected and monotonic-millisecond based. Production passes `SystemClock.elapsedRealtime()`; JVM tests
  * pass a mutable fake.
  */

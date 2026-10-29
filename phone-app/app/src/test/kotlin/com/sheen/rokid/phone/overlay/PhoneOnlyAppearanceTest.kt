@@ -41,6 +41,21 @@ class PhoneOnlyAppearanceTest {
         assertEquals(0.42f, SmartSettings.OLD_MESSAGE_ALPHA_RATIO, 0.0001f)
     }
 
+    /**
+     * 0.5.1 (`C7`): the two numbers the renderer must produce from the settings. New messages are the configured
+     * bubble opacity; old messages are 0.42 × that opacity, whole bubble (card, text, tail, shadow).
+     */
+    @Test
+    fun theSliderDefaultsAndMinimumsProduceTheDocumentedWholeBubbleAlphas() {
+        val defaults = PhoneOnlyAppearance.DEFAULT
+        assertEquals(0.75f, defaults.bubbleAlpha, 0.0001f)
+        assertEquals(0.315f, defaults.oldMessageAlpha, 0.0001f)
+
+        val minimum = PhoneOnlyAppearance(bubbleOpacityPercent = SmartSettings.MIN_BUBBLE_OPACITY)
+        assertEquals(0.30f, minimum.bubbleAlpha, 0.0001f)
+        assertEquals(0.126f, minimum.oldMessageAlpha, 0.0001f)
+    }
+
     @Test
     fun fromSettingsTakesThePersistedValuesAndClampsThem() {
         val appearance = PhoneOnlyAppearance.fromSettings(

@@ -81,4 +81,33 @@ class PhoneBubbleRepositoryTest {
         assertTrue(repository.snapshotNow().messages.isEmpty())
         assertFalse(repository.isAgentWorking())
     }
+
+    /**
+     * 0.5.1 (`C10`): a local Notice is a short-lived overlay message, not a turn artifact. The repository's own clock
+     * expires it, so no `TurnIdle` (and no second event) is needed for it to disappear.
+     */
+    @Test
+    fun aLocalNoticeExpiresWithoutAnyFurtherEvent() {
+        repository.onEvent(PhoneBubbleEvent.Notice(AssistantRoute.WAKE, "还没有开始会话，打开 App 开始"))
+        now = 300
+        assertTrue(repository.snapshotNow().messages.isNotEmpty())
+
+        now = BubbleStackModel.NOTICE_DISMISS_AFTER_MILLIS + 1
+        assertTrue(repository.snapshotNow().messages.isEmpty())
+    }
+
+    /**
+     * 0.5.1 (`C10`): the published snapshot must contain the row at the same instant it arrives. The overlay's frame
+     * loop starts from a non-empty snapshot, and a lone local Notice has no later event to restart it.
+     */
+    @Test
+    fun aLocalNoticeIsPublishedInTheSameInstantSnapshot() {
+        repository.onEvent(PhoneBubbleEvent.Notice(AssistantRoute.WAKE, "还没有开始会话，打开 App 开始"))
+
+        val published = repository.snapshots.value.messages
+
+        assertEquals(1, published.size)
+        assertTrue(published.single().newest)
+        assertEquals(BubbleKind.NOTICE, published.single().kind)
+    }
 }
