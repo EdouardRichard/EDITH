@@ -76,6 +76,7 @@ import com.sheen.rokid.phone.bridge.CxrContextSignals
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
 import com.sheen.rokid.phone.audio.AudioSegmentBridge
 import com.sheen.rokid.phone.audio.AndroidSpeechPlayer
+import com.sheen.rokid.phone.overlay.PhoneOnlyAppearance
 import com.sheen.rokid.phone.session.confirmation.NotificationSurface
 import com.sheen.rokid.phone.session.PendingConfirmation
 import com.sheen.rokid.phone.audio.AudioSegmentCapture
@@ -425,6 +426,19 @@ class HostCompositionRoot internal constructor(
     internal val speechEnabled: StateFlow<Boolean> = speechOn.asStateFlow()
 
     /**
+     * 0.5 (`D210`/`D211`): the live appearance of the phone-only overlay. Seeded from the persisted settings in
+     * [create], updated by the settings sliders (preview while dragging, persist on release) and read by the overlay
+     * service, so a change is visible without restarting the App.
+     */
+    private val phoneOnlyAppearanceState = MutableStateFlow(PhoneOnlyAppearance())
+    val phoneOnlyAppearance: StateFlow<PhoneOnlyAppearance> = phoneOnlyAppearanceState.asStateFlow()
+
+    /** Seeds the live appearance from the settings the composition was assembled with (called once by [create]). */
+    internal fun seedPhoneOnlyAppearance(settings: SmartSettings) {
+        phoneOnlyAppearanceState.value = PhoneOnlyAppearance.fromSettings(settings)
+    }
+
+    /**
      * The lock-screen PIN store. Production replaces the no-op in [create] with the Keystore-backed store; a test
      * composition keeps the no-op, so no test can accidentally write a real credential.
      */
@@ -501,6 +515,46 @@ class HostCompositionRoot internal constructor(
         runCatching { target.load() }.onFailure {
             android.util.Log.i("EdithHost", "speech toggle: settings unreadable, not persisting this change")
         }.getOrNull()?.let { stored -> runCatching { target.save(stored.copy(speechEnabled = enabled)) } }
+    }
+
+    /** One opacity save's outcome: [saved] is the blob's verdict, [error] a stable code for the settings copy. */
+    data class PhoneOnlyOpacityResult(val saved: Boolean, val error: String? = null)
+
+    /**
+     * 0.5 (`D210`/`D211`): the live preview while a slider is dragged. It changes only the in-memory appearance, so the
+     * overlay follows the finger; the durable write happens once on release in [setPhoneOnlyOpacity].
+     */
+    fun previewPhoneOnlyOpacity(ballPercent: Int, bubblePercent: Int) {
+        phoneOnlyAppearanceState.value = PhoneOnlyAppearance.normalized(ballPercent, bubblePercent)
+    }
+
+    /**
+     * Persists both opacities through a full load-copy-save, so the form's other fields are carried through untouched.
+     *
+     * A refused read is not guessed around and a refused write rolls the live appearance back to the stored values:
+     * the overlay must not keep showing a value the next App start will not remember. The values are clamped by
+     * [PhoneOnlyAppearance.normalized], so a slider bug cannot persist an out-of-range number.
+     */
+    fun setPhoneOnlyOpacity(ballPercent: Int, bubblePercent: Int): PhoneOnlyOpacityResult {
+        val target = PhoneOnlyAppearance.normalized(ballPercent, bubblePercent)
+        val store = smartSettingsStore
+            ?: return PhoneOnlyOpacityResult(saved = false, error = "SETTINGS_STORE_UNAVAILABLE")
+        val stored = runCatching { store.loadForWrite() }.getOrNull()
+            ?: return PhoneOnlyOpacityResult(saved = false, error = "SETTINGS_UNREADABLE")
+        val updated = stored.copy(
+            ballOpacityPercent = target.ballOpacityPercent,
+            bubbleOpacityPercent = target.bubbleOpacityPercent,
+        )
+        return try {
+            store.save(updated)
+            phoneOnlyAppearanceState.value = target
+            P3Log.line("P5_OPACITY ball=${target.ballOpacityPercent} bubble=${target.bubbleOpacityPercent}")
+            PhoneOnlyOpacityResult(saved = true)
+        } catch (_: Exception) {
+            phoneOnlyAppearanceState.value = PhoneOnlyAppearance.fromSettings(stored)
+            P3Log.line("P5_OPACITY state=failed")
+            PhoneOnlyOpacityResult(saved = false, error = "SAVE_FAILED")
+        }
     }
     /**
      * RAM-only tee of the live CXR PCM used by the T17 controlled format bring-up. Defaulted to a no-op
@@ -928,6 +982,9 @@ class HostCompositionRoot internal constructor(
         store.save(settings)
         visionGate.set(settings.visionEnabled)
         noInterceptionGate.set(settings.noInterception)
+        // 0.5: the form carries the two appearance values through untouched; keep the live overlay in step with a
+        // successful save so a form save cannot leave it showing a stale opacity.
+        phoneOnlyAppearanceState.value = PhoneOnlyAppearance.fromSettings(settings)
     }
 
     /**
@@ -3990,6 +4047,8 @@ class HostCompositionRoot internal constructor(
             root.audioChain = audio
             // P5 (spec §S5): sync the UI state with what was loaded above.
             root.speechOn.value = speechEnabledNow
+            // 0.5 (`D210`/`D211`): the overlay reads the persisted opacities through this flow.
+            root.seedPhoneOnlyAppearance(smartSettings)
             root.foregroundAppSource = foregroundApp
             root.notificationCategorySource = notificationCategory
             root.calendarSource = calendar

@@ -388,4 +388,21 @@ class SmartSettingsFormTest {
         assertTrue("the form must not drop the detach flag", result.settings.glassesDetached)
         assertEquals("L2", result.settings.maxLevel)
     }
+
+    @Test
+    fun theFormKeepsThePersistedPhoneOnlyAppearanceAndSpeechFlag() {
+        // 0.5: the two opacities and the explicit-speech flag are host-only settings, not fields of this form. A save of
+        // the form's own fields must carry them through; otherwise the next start would silently reset the user's look
+        // (or re-open the speech default by dropping `speechConfigured`).
+        val base = settings().copy(ballOpacityPercent = 41, bubbleOpacityPercent = 57, speechConfigured = true)
+
+        val result = SmartSettingsForm.toSettings(
+            SmartSettingsForm.fromSettings(base).copy(maxLevel = "L2"), base)
+
+        assertTrue(result.errors.toString(), result.errors.isEmpty())
+        assertEquals(41, result.settings.ballOpacityPercent)
+        assertEquals(57, result.settings.bubbleOpacityPercent)
+        assertTrue("the explicit speech choice must survive a form save", result.settings.speechConfigured)
+        assertEquals("L2", result.settings.maxLevel)
+    }
 }

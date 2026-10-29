@@ -71,6 +71,7 @@ import com.sheen.rokid.phone.ui.pluginPickerOptions
 import com.sheen.rokid.plugin.Capability
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 /**
  * The phone's whole page (spec §6.7): a top bar that names the plugin, a left-hand menu, and the assistant's four tabs.
@@ -890,6 +891,62 @@ private fun SmartToggles(root: HostCompositionRoot) {
         "一次配置、长期生效：跨会话、重连、重启 App 或手机都保持；关掉后不会被任何路径自动打开。",
         style = MaterialTheme.typography.bodySmall,
     )
+    // 0.5 (D210/D211): the phone-only overlay's two opacities. The slider previews live through the host flow; the
+    // blob write happens once on release, so dragging does not hammer the encrypted store. Old messages have no
+    // separate setting: their whole-card alpha is the bubble opacity times the fixed ratio in SmartSettings.
+    val appearance by root.phoneOnlyAppearance.collectAsStateWithLifecycle()
+    var ballOpacity by remember { mutableFloatStateOf(appearance.ballOpacityPercent.toFloat()) }
+    var bubbleOpacity by remember { mutableFloatStateOf(appearance.bubbleOpacityPercent.toFloat()) }
+    var opacityNotice by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(appearance.ballOpacityPercent, appearance.bubbleOpacityPercent) {
+        ballOpacity = appearance.ballOpacityPercent.toFloat()
+        bubbleOpacity = appearance.bubbleOpacityPercent.toFloat()
+    }
+    fun saveOpacity() {
+        val result = root.setPhoneOnlyOpacity(ballOpacity.roundToInt(), bubbleOpacity.roundToInt())
+        opacityNotice = if (result.saved) {
+            "已保存：悬浮球 ${ballOpacity.roundToInt()}% / 气泡 ${bubbleOpacity.roundToInt()}%，立即生效。"
+        } else {
+            "保存失败（${result.error ?: "UNKNOWN"}），未保存。"
+        }
+    }
+    if (detached) {
+        Text("悬浮球透明度", style = MaterialTheme.typography.titleSmall)
+        Text("${ballOpacity.roundToInt()}%", style = MaterialTheme.typography.bodySmall)
+        Slider(
+            value = ballOpacity,
+            onValueChange = {
+                ballOpacity = it
+                root.previewPhoneOnlyOpacity(it.roundToInt(), bubbleOpacity.roundToInt())
+            },
+            onValueChangeFinished = { saveOpacity() },
+            valueRange = SmartSettings.MIN_BALL_OPACITY.toFloat()..SmartSettings.MAX_OPACITY.toFloat(),
+        )
+        Text("气泡透明度", style = MaterialTheme.typography.titleSmall)
+        Text("${bubbleOpacity.roundToInt()}%", style = MaterialTheme.typography.bodySmall)
+        Slider(
+            value = bubbleOpacity,
+            onValueChange = {
+                bubbleOpacity = it
+                root.previewPhoneOnlyOpacity(ballOpacity.roundToInt(), it.roundToInt())
+            },
+            onValueChangeFinished = { saveOpacity() },
+            valueRange = SmartSettings.MIN_BUBBLE_OPACITY.toFloat()..SmartSettings.MAX_OPACITY.toFloat(),
+        )
+        Text(
+            "旧消息不单独配置：整条气泡（卡片+文字）按气泡透明度的 " +
+                "${(SmartSettings.OLD_MESSAGE_ALPHA_RATIO * 100).roundToInt()}% 再淡化，2s 后消失。",
+            style = MaterialTheme.typography.bodySmall,
+        )
+        TextButton(onClick = {
+            ballOpacity = SmartSettings.DEFAULT_BALL_OPACITY.toFloat()
+            bubbleOpacity = SmartSettings.DEFAULT_BUBBLE_OPACITY.toFloat()
+            saveOpacity()
+        }) { Text("恢复默认透明度") }
+        opacityNotice?.let { notice ->
+            Text(notice, style = MaterialTheme.typography.bodySmall)
+        }
+    }
     val speechOn by root.speechEnabled.collectAsStateWithLifecycle()
     Row(verticalAlignment = Alignment.CenterVertically) {
         Switch(checked = speechOn, onCheckedChange = { root.setSpeechEnabled(it) })
