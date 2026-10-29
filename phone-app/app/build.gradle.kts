@@ -1,4 +1,4 @@
-import com.android.build.api.variant.BuildConfigField
+﻿import com.android.build.api.variant.BuildConfigField
 import groovy.json.JsonOutput
 import groovy.json.JsonSlurper
 import java.security.MessageDigest
@@ -14,7 +14,7 @@ plugins {
  * **Opt-in, and the reason is a crash rather than taste.** D64 made the GPU the runtime backend and left the NPU
  * diagnostic-only. Shipping its runtime unconditionally also breaks every non-MediaTek device: LiteRT loads the
  * bundled `libLiteRtCompilerPlugin_MediaTek.so` on a Qualcomm SoC and the process dies inside
- * `LiteRtCreateCompiledModel` for **every** graph — GPU and CPU alike — so neither Laya nor the embedding engine can
+ * `LiteRtCreateCompiledModel` for **every** graph 鈥?GPU and CPU alike 鈥?so neither Laya nor the embedding engine can
  * start. Measured on the K40 (Snapdragon 870) on 2026-10-15; the same combination is recorded as D64 finding 3.
  * Enable it for NPU work on the MediaTek delivery target:
  * `gradlew -PwithMediaTekNpu=true :phone-app:assembleDebug`.
@@ -32,7 +32,7 @@ android {
         minSdk = 28
         targetSdk = 34
         versionCode = 5
-        versionName = "0.5.0-preview"
+        versionName = "0.5.1"
         testInstrumentationRunner = "com.sheen.rokid.phone.PhoneTestRunner"
     }
     signingConfigs {
@@ -67,7 +67,7 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     testOptions { unitTests.isReturnDefaultValues = true }
-    // The MediaTek NeuroPilot **adapter** (`libneuronusdk_adapter.mtk.so`) is not on Maven — it comes from the
+    // The MediaTek NeuroPilot **adapter** (`libneuronusdk_adapter.mtk.so`) is not on Maven 鈥?it comes from the
     // NeuroPilot SDK's `usdk/lib64`. It is provisioned under `.local/` (like the model files and the signing
     // key) rather than committed, and this source set points at it. Leaving the directory absent is not an
     // error: the APK then simply has no bundled adapter, and the plugin resolves the device's own
@@ -110,7 +110,7 @@ dependencies {
     implementation(libs.kotlinx.serialization.json)
     implementation(project(":common:presentation:output-runtime"))
     implementation(project(":phone-app:plugins:plugin-smart-helper"))
-    // P3.3 Task 1: the shell-UID execution channel (spec §17.2). `provider` is what the `api` binds to at runtime.
+    // P3.3 Task 1: the shell-UID execution channel (spec 搂17.2). `provider` is what the `api` binds to at runtime.
     implementation(libs.shizuku.api)
     implementation(libs.shizuku.provider)
     // edith-0.2 Phase A: LiteRT for on-device Laya + EmbeddingGemma inference. 2.3.0 as of 2026-10-14, because
@@ -135,7 +135,7 @@ dependencies {
     implementation(libs.androidx.lifecycle.runtime.compose)
     // 0.5.1 (C14): the phone-only overlay hosts Compose in a Service, whose custom owner needs the lifecycle/savedstate
     // ViewTree classes at runtime. These explicit declarations keep the versions the rest of the graph then resolves at
-    // 2.10.0 / 1.4.0 instead of the older Compose/Activity defaults; DECISIONS §21.1 records why they are kept.
+    // 2.10.0 / 1.4.0 instead of the older Compose/Activity defaults; DECISIONS 搂21.1 records why they are kept.
     //
     // They do NOT put `ViewTreeLifecycleOwner` on Kotlin's compile classpath in this KMP variant graph (measured
     // 2026-10-29: a direct import is an unresolved reference), so the service still installs both ViewTree owners
@@ -158,8 +158,8 @@ dependencies {
 // minified debug build the work-runtime androidx.startup initializer **crashes the process**:
 // Room's generated `WorkDatabase_Impl` is stripped by R8, so `Room.getGeneratedImplementation` throws inside
 // `ContentProvider.attachInfo` (measured on the K70, 2026-10-14: "Process crashed before executing the
-// test(s)"). Excluding on the `litert` declaration is no longer enough on 2.3.0 — the same dependency also
-// arrives through `litert-api`, which `litert-gpu` reaches on its own path — so the exclusion is
+// test(s)"). Excluding on the `litert` declaration is no longer enough on 2.3.0 鈥?the same dependency also
+// arrives through `litert-api`, which `litert-gpu` reaches on its own path 鈥?so the exclusion is
 // configuration-wide. Re-check this on the next LiteRT bump: if Play's AI-Pack delivery is ever wanted, these
 // two are exactly what has to come back, together with the R8 keep rule for Room's generated database.
 configurations.configureEach {
@@ -396,7 +396,7 @@ val bundledLicenseFiles = readBundledLicenseSpecs(
 )
 
 /**
- * Every text that must be packaged under `assets/models/licenses/` (spec §6.5): the ten Task 1 texts plus the five
+ * Every text that must be packaged under `assets/models/licenses/` (spec 搂6.5): the ten Task 1 texts plus the five
  * ASR/VAD/speaker declarations that had been retained in `tools/scripts/p2/licenses/` but never copied into the APK.
  * The set is fail-closed: dropping or adding a manifest entry fails [BundleModelAssets] and
  * [verifyBundledModelManifest] until this contract is updated.
@@ -433,7 +433,7 @@ abstract class BundleModelAssets : DefaultTask() {
     /** [BundledLicenseSpec.encode] strings. */
     @get:Input abstract val licenseEntries: ListProperty<String>
 
-    /** The exact spec §6.5 license/declaration set this task must package. */
+    /** The exact spec 搂6.5 license/declaration set this task must package. */
     @get:Input abstract val requiredLicenseFiles: SetProperty<String>
 
     /** Every source file the entries point at, so content changes invalidate this task. */
@@ -556,13 +556,13 @@ abstract class BundleModelAssets : DefaultTask() {
             source.copyTo(destination, overwrite = true)
         }
 
-        // Fail-closed delivery contract: the APK must carry exactly the spec §6.5 texts, not just whatever the
+        // Fail-closed delivery contract: the APK must carry exactly the spec 搂6.5 texts, not just whatever the
         // tracked manifest happens to list. A silently removed entry would otherwise shrink the APK without error.
         val missingLicenses = requiredLicenseFiles.get() - licenseNames
         val unexpectedLicenses = licenseNames - requiredLicenseFiles.get()
         if (missingLicenses.isNotEmpty() || unexpectedLicenses.isNotEmpty()) {
             throw GradleException(
-                "bundled model license set does not match spec §6.5: missing=${missingLicenses.sorted()}, " +
+                "bundled model license set does not match spec 搂6.5: missing=${missingLicenses.sorted()}, " +
                     "unexpected=${unexpectedLicenses.sorted()}",
             )
         }
@@ -631,7 +631,7 @@ androidComponents.onVariants { variant ->
 
 /**
  * Fast manifest audit: no model binaries are read and no 1.1 GB asset tree is generated. It checks the canonical
- * bundle id, the 21 pinned entries, the 15 emitted model files, and the exact 15-text spec §6.5 license set.
+ * bundle id, the 21 pinned entries, the 15 emitted model files, and the exact 15-text spec 搂6.5 license set.
  *
  * `-PbundledModelsManifest=<path>` audits another manifest (used for the negative mutation checks) while applying
  * the same rules. The normal build already fails at configuration when the id does not match the canonical digest;
