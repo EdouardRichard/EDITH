@@ -566,12 +566,18 @@ class HostCompositionRoot internal constructor(
                     P3Log.line("P5_TTS state=on player=created")
                 }
             if (player != null) {
+                // In production the factory is `create`'s, which binds the composition's one echo-mute window to every
+                // player it builds, so an assembly-time player and a runtime-created one mute the same window.
                 speechRouter.install(player)
                 wakeAckPlayer = player as? AndroidSpeechPlayer
             } else {
                 P3Log.line("P5_TTS state=on player=unavailable")
             }
         } else {
+            // 0.5.1 C5: stop the utterance while the target is still installed - the router cancels a play() that is
+            // inside the platform player instead of letting it publish an untracked handle - then detach, then close.
+            // The close is what releases the echo window (with the 150 ms reverb tail), so the off switch cannot leave
+            // the phone mic muted after Task 2 removes the 120 s watchdog.
             speechRouter.stopCurrent()
             speechRouter.install(null)
             val released = speechPlayerHolder.getAndSet(null)
@@ -2542,7 +2548,13 @@ class HostCompositionRoot internal constructor(
 
     private var wakeAckPlayer: AndroidSpeechPlayer? = null
 
-    /** The detached acknowledgement's echo-mute window; [create] builds the one instance the loops consult. */
+    /**
+     * 0.5.1 C5: the composition's one echo-mute window, handed to every player [create] and [setSpeechEnabled] build.
+     *
+     * The **players** own opening/closing it (at the audible onset and one reverb tail after the end/failure, or on
+     * close); the root keeps the reference only to construct them - and, from 0.5.1 Task 2 on, to clear it explicitly
+     * on a manual dictation/stop. The wake acknowledgement reads no window of its own: a second owner was the bug.
+     */
     private var echoMute: EchoMuteWindow? = null
 
     /**
@@ -2584,30 +2596,24 @@ class HostCompositionRoot internal constructor(
     /**
      * Detached-only fixed acknowledgement. It is not a turn, not a hint and never reaches the CXR link.
      *
-     * The [EchoMuteWindow] opens **before** the utterance is requested and closes one reverb tail after the player
-     * reports it finished or failed, so the phone microphone's ASR/VAD/KWS never see the phrase. The TTS engine may
-     * lazily await initialization for up to 3 s, so the utterance runs on its own daemon thread; a blocking await
-     * here would stall the wake pipeline.
+     * 0.5.1 C5: the **player** is the single owner of the [EchoMuteWindow]. It opens the window at the audible onset
+     * (`onStart`) and closes it one reverb tail after the end/failure, so this method must not open or close it: doing
+     * so made the wake ack open the window twice (once here, once in the player) and, if the engine never started,
+     * left it open with no owner to close it. The TTS engine may lazily await initialization for up to 3 s, so the
+     * utterance runs on its own daemon thread; a blocking await here would stall the wake pipeline.
      */
     internal fun speakDetachedWakeAck(text: String): Boolean {
         if (!detachGate.enabled.value || !speechEnabled.value) return false
         val player = wakeAckPlayer ?: return false
-        val mute = echoMute ?: return false
-        mute.open()
         P3Log.line("P4_WAKE_ACK state=requested")
         runCatching {
             Thread({
                 val accepted = runCatching {
-                    player.speakText(text, "detached-wake-ack") { state ->
-                        if (state == com.sheen.rokid.plugin.SpeechPlayback.FINISHED ||
-                            state == com.sheen.rokid.plugin.SpeechPlayback.FAILED) mute.close()
-                    }
+                    player.speakText(text, "detached-wake-ack")
                 }.getOrDefault(false)
-                if (!accepted) mute.close()
                 P3Log.line("P4_WAKE_ACK state=${if (accepted) "accepted" else "unavailable"}")
             }, "edith-wake-ack").apply { isDaemon = true }.start()
         }.onFailure {
-            mute.close()
             P3Log.line("P4_WAKE_ACK state=unavailable")
         }
         return true

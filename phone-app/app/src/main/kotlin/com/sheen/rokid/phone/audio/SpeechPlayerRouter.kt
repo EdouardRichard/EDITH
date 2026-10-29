@@ -15,28 +15,58 @@ import java.util.concurrent.atomic.AtomicReference
  * caller closes the player. The plugin's own `speechAvailable` gate (the holder) and the environment's capability
  * predicate both read the same live presence, so no request is made while the target is absent.
  *
- * Threading: `play` can be called from the arbiter's serial executor and `install`/`stopCurrent` from the UI thread. The
- * references are atomic; the returned handle is idempotent (the wrapped player is required to be), so an install/stop
- * racing a play cannot throw.
+ * **0.5.1 C5: the router owns the active handle, not the platform player.** The target, the tracked handle and a
+ * generation are one immutable [State] replaced by compare-and-set, so no transition can observe "target detached but
+ * handle still tracked" - the hole the review found between `target.get()` and `active.set(handle)` when the switch was
+ * turned off during `play()`: that handle was never tracked and its utterance (and echo window) survived the off.
+ * [stopCurrent] and [install]`(null)` therefore cancel what they remove, and a `play()` whose platform call was already
+ * running publishes nothing once its generation is stale - it cancels its own handle instead.
+ *
+ * **Closing a player is the composition owner's job, not this router's.** The router only forgets and cancels; the
+ * root that created the player through its factory closes it (which is what releases the echo window).
+ *
+ * Threading: `play` can be called from the arbiter's serial executor and `install`/`stopCurrent` from the UI thread. All
+ * state transitions are compare-and-set on one atomic; the returned handle is idempotent (the wrapped player is
+ * required to be), so an install/stop racing a play cannot throw. `play` calls are serialized by the output arbiter.
  */
 class SpeechPlayerRouter : SpeechPlayer {
 
-    private val target = AtomicReference<SpeechPlayer?>(null)
-    private val active = AtomicReference<CancellationHandle?>(null)
+    /** One atomic snapshot: the installed target, the tracked handle and the generation that invalidates stale plays. */
+    private class State(
+        val target: SpeechPlayer? = null,
+        val active: CancellationHandle? = null,
+        val generation: Long = 0,
+    )
 
-    /** Installs [player] as the current target (null detaches). Does not stop an utterance; callers pair it with [stopCurrent]. */
+    private val state = AtomicReference(State())
+
+    /**
+     * Installs [player] as the current target; null detaches.
+     *
+     * A detach also cancels and forgets the tracked utterance: leaving it tracked against a null target is exactly the
+     * untracked-handle state the ownership fix removes. Installing a player does not stop the previous target's
+     * utterance - the caller (the composition's switch) stops first, then detaches, then closes.
+     */
     fun install(player: SpeechPlayer?) {
-        target.set(player)
+        if (player == null) {
+            detach()
+            return
+        }
+        while (true) {
+            val current = state.get()
+            if (state.compareAndSet(current, State(player, current.active, current.generation))) return
+        }
     }
 
     /** The current platform player, or null while 「语音朗读」 is off / unavailable. */
-    fun current(): SpeechPlayer? = target.get()
+    fun current(): SpeechPlayer? = state.get().target
 
     /** True while a player is installed; the host advertises `SpeechOutput` on this fact. */
-    fun isAvailable(): Boolean = target.get() != null
+    fun isAvailable(): Boolean = state.get().target != null
 
     override fun play(assistance: Assistance, onState: (SpeechPlayback) -> Unit): CancellationHandle {
-        val player = target.get()
+        val start = state.get()
+        val player = start.target
         if (player == null) {
             // A request that races the off switch is reported as a failed playback, not silently accepted: the arbiter
             // then releases the speech wait and the conversation cycle continues instead of holding the display open.
@@ -44,18 +74,63 @@ class SpeechPlayerRouter : SpeechPlayer {
             return NoopHandle
         }
         val handle = player.play(assistance, onState)
-        active.set(handle)
-        return object : CancellationHandle {
-            override fun cancel() {
-                active.compareAndSet(handle, null)
-                runCatching { handle.cancel() }
+        while (true) {
+            val current = state.get()
+            if (current.target !== player || current.generation != start.generation) {
+                // Off/stop (or a replacement player) went through while the platform player was starting. Publish
+                // nothing and cancel what it returned: an untracked handle would keep speaking with nobody able to
+                // stop it, and its echo window would stay open.
+                cancelQuietly(handle)
+                return NoopHandle
+            }
+            if (state.compareAndSet(current, State(player, handle, current.generation))) {
+                return object : CancellationHandle {
+                    override fun cancel() = release(handle)
+                }
             }
         }
     }
 
     /** Stops the utterance in flight (if any) and forgets it; the platform player itself is closed by the caller. */
     fun stopCurrent() {
-        active.getAndSet(null)?.let { runCatching { it.cancel() } }
+        while (true) {
+            val current = state.get()
+            // Bump the generation even when nothing is tracked: a play() that is currently inside the platform player
+            // must not publish its handle after this stop.
+            val next = State(current.target, null, current.generation + 1)
+            if (state.compareAndSet(current, next)) {
+                current.active?.let { cancelQuietly(it) }
+                return
+            }
+        }
+    }
+
+    private fun detach() {
+        while (true) {
+            val current = state.get()
+            val next = State(null, null, current.generation + 1)
+            if (state.compareAndSet(current, next)) {
+                current.active?.let { cancelQuietly(it) }
+                return
+            }
+        }
+    }
+
+    /** Clears this handle if it is still the tracked one, then cancels it once; a late cancel is a no-op. */
+    private fun release(handle: CancellationHandle) {
+        while (true) {
+            val current = state.get()
+            if (current.active !== handle) return
+            val next = State(current.target, null, current.generation + 1)
+            if (state.compareAndSet(current, next)) {
+                cancelQuietly(handle)
+                return
+            }
+        }
+    }
+
+    private fun cancelQuietly(handle: CancellationHandle) {
+        runCatching { handle.cancel() }
     }
 
     private object NoopHandle : CancellationHandle {

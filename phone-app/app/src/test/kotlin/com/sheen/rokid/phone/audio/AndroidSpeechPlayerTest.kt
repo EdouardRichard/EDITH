@@ -7,6 +7,8 @@ import com.sheen.rokid.contracts.SessionId
 import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.SpeechPlayback
 import com.sheen.rokid.phone.session.EchoMuteWindow
+import com.sheen.rokid.phone.session.PlaybackGate
+import com.sheen.rokid.testsupport.FakeClock
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -32,6 +34,7 @@ class AndroidSpeechPlayerTest {
 
         fun fireStart(utteranceId: String) { listener?.onStart(utteranceId) }
         fun fireDone(utteranceId: String) { listener?.onDone(utteranceId) }
+        fun fireStop(utteranceId: String, interrupted: Boolean = false) { listener?.onStop(utteranceId, interrupted) }
         @Suppress("DEPRECATION")
         fun fireError(utteranceId: String) { listener?.onError(utteranceId) }
     }
@@ -73,7 +76,7 @@ class AndroidSpeechPlayerTest {
 
     @Test fun `speakText speaks the exact detached acknowledgement and gates it`() {
         val engine = FakeTtsEngine()
-        val gate = com.sheen.rokid.phone.session.PlaybackGate()
+        val gate = PlaybackGate()
         val player = AndroidSpeechPlayer(engine, gate)
         val events = mutableListOf<SpeechPlayback>()
         assertTrue(player.speakText("我在", "detached-wake-ack") { events += it })
@@ -112,5 +115,87 @@ class AndroidSpeechPlayerTest {
         player.close()
         assertTrue(engine.stopCount >= 1)
         assertEquals(1, engine.shutdownCount)
+    }
+
+    @Test fun `close closes the echo window after the reverb tail`() {
+        // 0.5.1 C5: the player owns the echo window, so closing it must release the phone microphone. The 150 ms
+        // reverb tail is kept (`close()`, not an immediate clear): audio already left the speaker may still be in the
+        // room. Before the fix a closed player left the window open for the 120 s watchdog, which Task 2 removes.
+        val clock = FakeClock()
+        val mute = EchoMuteWindow(clock)
+        val engine = FakeTtsEngine()
+        val player = AndroidSpeechPlayer(engine, echoMute = mute)
+        player.play(hint()) { }
+        engine.fireStart("h")
+        assertTrue("the audible interval is muted", mute.covers(clock.nowNanos()))
+
+        player.close()
+        clock.advance(151_000_000L)
+
+        assertFalse("closing the player must leave the mic live after the tail", mute.covers(clock.nowNanos()))
+    }
+
+    @Test fun `the engine stopping the utterance ends the playback like a completion`() {
+        // `TextToSpeech.stop()`/an interruption delivers `onStop`, not `onDone`/`onError`. Without the override the
+        // gate stayed closed and the echo window stayed open (the review's "TTS onStop is not overridden").
+        val clock = FakeClock()
+        val mute = EchoMuteWindow(clock)
+        val gate = PlaybackGate()
+        val engine = FakeTtsEngine()
+        val player = AndroidSpeechPlayer(engine, gate, mute)
+        val events = mutableListOf<SpeechPlayback>()
+        player.play(hint()) { events += it }
+        engine.fireStart("h")
+
+        engine.fireStop("h", interrupted = true)
+
+        assertEquals(
+            "an engine stop is a terminal playback state",
+            listOf(SpeechPlayback.STARTED, SpeechPlayback.FINISHED),
+            events,
+        )
+        assertFalse("the playback gate must reopen", gate.isPlaying)
+        clock.advance(151_000_000L)
+        assertFalse("the echo window must close with its reverb tail", mute.covers(clock.nowNanos()))
+    }
+
+    @Test fun `close during playback ends the gate and a late engine stop is inert`() {
+        val engine = FakeTtsEngine()
+        val gate = PlaybackGate()
+        val player = AndroidSpeechPlayer(engine, gate)
+        val events = mutableListOf<SpeechPlayback>()
+        player.play(hint()) { events += it }
+        engine.fireStart("h")
+        assertTrue(gate.isPlaying)
+
+        player.close()
+        assertFalse("closing the player must not leave the wake gate closed", gate.isPlaying)
+
+        // A platform engine may deliver its own stop after `TextToSpeech.stop()`; the closed player must not report a
+        // second completion for an utterance it can no longer own.
+        engine.fireStop("h")
+        assertEquals(
+            "a late engine callback for a closed player is inert",
+            listOf(SpeechPlayback.STARTED),
+            events,
+        )
+    }
+
+    @Test fun `a late onset after close cannot reopen the echo window`() {
+        // The engine delivers `onStart` from its own thread. An utterance requested just before the off switch can have
+        // its onset land after `close()`; re-arming the window there would leave it open with no callback left to close
+        // it - the permanent mute the 120 s watchdog currently hides and Task 2 removes.
+        val clock = FakeClock()
+        val mute = EchoMuteWindow(clock)
+        val gate = PlaybackGate()
+        val engine = FakeTtsEngine()
+        val player = AndroidSpeechPlayer(engine, gate, mute)
+        player.play(hint()) { }
+
+        player.close()
+        engine.fireStart("h")
+
+        assertFalse("a closed player must ignore a late onset", mute.covers(clock.nowNanos()))
+        assertFalse("and must not close the wake gate", gate.isPlaying)
     }
 }

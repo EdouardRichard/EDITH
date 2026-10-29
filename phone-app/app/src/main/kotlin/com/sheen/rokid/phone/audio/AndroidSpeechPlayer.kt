@@ -14,6 +14,7 @@ import com.sheen.rokid.plugin.SpeechPlayback
 import com.sheen.rokid.plugin.SpeechPlayer
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 
 /**
  * Seamed TTS engine so [AndroidSpeechPlayer] can be tested without the real Android framework.
@@ -85,6 +86,11 @@ internal class AndroidSpeechPlayer(
 ) : SpeechPlayer, AutoCloseable {
 
     companion object {
+        /** The audible-interval states of [active]: idle, a playback owns the gate/window, or the player is closed. */
+        private const val IDLE = 0
+        private const val PLAYING = 1
+        private const val CLOSED = 2
+
         /**
          * Factory that builds an [AndroidSpeechPlayer] from the platform TTS, or returns null when the engine is not
          * available. The caller decides what to do with the null (typically: leave [HostEnvironment.speech] as null so
@@ -105,7 +111,25 @@ internal class AndroidSpeechPlayer(
         }
     }
 
-    private val active = AtomicBoolean(false)
+    /**
+     * 0.5.1 C5: the audible-interval state, one atomic machine rather than two flags.
+     *
+     * [PLAYING] means a playback owns the gate and the echo window; [CLOSED] is terminal, so a late `onStart` delivered
+     * by the engine after `close()` can never re-arm them (it would leave the window open with no callback left to
+     * close it).
+     */
+    private val active = AtomicInteger(IDLE)
+
+    /**
+     * Serializes the gate/echo transitions of `onStart`, `finish` and `close`.
+     *
+     * The callback side runs on the TTS engine's thread and `close()` on the composition's, so "CAS the state, then
+     * begin/open" and "set CLOSED, then close the window" can otherwise interleave: an `onStart` that won the CAS just
+     * before `close()` could open the window **after** close had already closed it, leaving the mic muted with no
+     * callback left to release it. Holding this lock across the state change *and* the gate/window effects makes each
+     * transition atomic; the listener callbacks are invoked outside it.
+     */
+    private val transition = Any()
 
     private var availabilityChecked = false
 
@@ -117,8 +141,9 @@ internal class AndroidSpeechPlayer(
 
     /**
      * Speaks one fixed, host-owned phrase outside the output arbiter (the detached wake acknowledgement).
-     * Uses the same lazy availability check, engine listener and [PlaybackGate] as normal answers; [onState] lets
-     * the caller close its echo-mute window exactly when the audible interval ends.
+     * Uses the same lazy availability check, engine listener and [PlaybackGate] as normal answers. 0.5.1 C5: this
+     * player - not the caller - opens the echo window at the audible onset and closes it one reverb tail after the
+     * end/failure, so the caller must not manage the window around this call.
      *
      * @return false when the engine is unavailable or rejected the utterance; the caller may then fall back.
      */
@@ -163,33 +188,62 @@ internal class AndroidSpeechPlayer(
         val charCount = text.length
         engine.setOnProgressListener(object : UtteranceProgressListener() {
             override fun onStart(uid: String) {
-                if (uid == utteranceId && active.compareAndSet(false, true)) {
-                    gate.begin()
-                    // 0.5: the phone mic must not hear the start of our own utterance; open before the first sample.
-                    echoMute?.open()
-                    P3Log.line("P5_SPEECH state=start hintId=$uid chars=$charCount")
-                    onState(SpeechPlayback.STARTED)
+                if (uid != utteranceId) return
+                val started = synchronized(transition) {
+                    active.compareAndSet(IDLE, PLAYING).also { won ->
+                        if (won) {
+                            gate.begin()
+                            // 0.5: the phone mic must not hear the start of our own utterance; open before the first
+                            // sample.
+                            echoMute?.open()
+                        }
+                    }
                 }
+                if (!started) return
+                P3Log.line("P5_SPEECH state=start hintId=$uid chars=$charCount")
+                onState(SpeechPlayback.STARTED)
             }
             override fun onDone(uid: String) {
-                if (uid == utteranceId && active.compareAndSet(true, false)) {
-                    gate.end()
-                    echoMute?.close()
-                    P3Log.line("P5_SPEECH state=end hintId=$uid chars=$charCount")
-                    onState(SpeechPlayback.FINISHED)
-                }
+                if (uid == utteranceId) finish(SpeechPlayback.FINISHED, uid, charCount, onState, "end")
             }
             @Suppress("DEPRECATION")
             override fun onError(uid: String) {
-                if (uid == utteranceId && active.compareAndSet(true, false)) {
-                    gate.end()
-                    echoMute?.close()
-                    P3Log.line("P5_SPEECH state=failed hintId=$uid chars=$charCount")
-                    onState(SpeechPlayback.FAILED)
-                }
+                if (uid == utteranceId) finish(SpeechPlayback.FAILED, uid, charCount, onState, "failed")
+            }
+            /**
+             * 0.5.1 C5: `TextToSpeech.stop()`/an interruption delivers `onStop`, not `onDone`/`onError`. Without this
+             * override the playback gate stayed closed and the echo window stayed open - the review's "TTS `onStop`
+             * is not overridden".
+             */
+            override fun onStop(uid: String, interrupted: Boolean) {
+                if (uid == utteranceId) finish(SpeechPlayback.FINISHED, uid, charCount, onState, "stopped")
             }
         })
         return engine.speak(text, utteranceId)
+    }
+
+    /**
+     * The one terminal transition of the audible interval: close the gate, close the echo window with its reverb tail,
+     * log and report - exactly once, whichever callback arrives first.
+     */
+    private fun finish(
+        playback: SpeechPlayback,
+        utteranceId: String,
+        charCount: Int,
+        onState: (SpeechPlayback) -> Unit,
+        logState: String,
+    ) {
+        val finished = synchronized(transition) {
+            active.compareAndSet(PLAYING, IDLE).also { won ->
+                if (won) {
+                    gate.end()
+                    echoMute?.close()
+                }
+            }
+        }
+        if (!finished) return
+        P3Log.line("P5_SPEECH state=$logState hintId=$utteranceId chars=$charCount")
+        onState(playback)
     }
 
     private fun cancellationHandle(
@@ -201,12 +255,7 @@ internal class AndroidSpeechPlayer(
         override fun cancel() {
             if (cancelled.compareAndSet(false, true)) {
                 engine.stop()
-                if (active.compareAndSet(true, false)) {
-                    gate.end()
-                    echoMute?.close()
-                    P3Log.line("P5_SPEECH state=cancelled hintId=$utteranceId chars=$charCount")
-                    onState(SpeechPlayback.FINISHED)
-                }
+                finish(SpeechPlayback.FINISHED, utteranceId, charCount, onState, "cancelled")
             }
         }
     }
@@ -215,7 +264,25 @@ internal class AndroidSpeechPlayer(
         override fun cancel() = Unit
     }
 
+    /**
+     * Closes the player. 0.5.1 C5: this player is the owner of the echo window, so closing it must release the phone
+     * microphone even when the platform never delivered the end callback that would have done it.
+     *
+     * `close()` - not an immediate clear - keeps the existing 150 ms reverb tail: audio that already left the speaker
+     * may still be in the room. The audible-interval state is reset **before** the engine is shut down, so a late
+     * `onStop` produced by `engine.stop()` cannot report a second completion for a player that no longer exists.
+     */
     override fun close() {
+        synchronized(transition) {
+            // The state change and the window close are one critical section: an `onStart` that won the CAS already
+            // opened the window and closed the gate, so both are undone here; one that lost can never open it after.
+            val wasPlaying = active.getAndSet(CLOSED) == PLAYING
+            // The window close is inside the critical section (see the KDoc): it keeps the existing tail.
+            echoMute?.close()
+            // The gate is a counter, so it is only decremented for a playback this player actually started; an
+            // unmatched `end` would leave a credit that swallows one later wake suppression.
+            if (wasPlaying) gate.end()
+        }
         engine.stop()
         engine.shutdown()
     }
