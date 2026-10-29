@@ -544,12 +544,29 @@ class PhoneOnlyOverlayService : Service() {
 
     private fun onBallAction(action: BallGestureAction) {
         when (action) {
-            BallGestureAction.Tap -> openApp()
+            BallGestureAction.Tap -> P3Log.line("P5_BALL event=tap")
             is BallGestureAction.Drag -> dragBy(action.dx, action.dy)
+            is BallGestureAction.DragTo -> dragTo(action.x, action.y)
             BallGestureAction.Snap -> snap()
             BallGestureAction.LongPressStart -> beginLongPress()
             BallGestureAction.LongPressEnd -> endLongPress()
         }
+    }
+
+    private fun dragTo(screenX: Float, screenY: Float) {
+        moveJob?.cancel()
+        val current = position.value ?: return
+        val (x, y) = BallPlacement.clampDragCenter(
+            screenX, screenY,
+            screenWidthPx, screenHeightPx, radiusPx, gapPx, topInsetPx, bottomInsetPx,
+        )
+        position.value = current.copy(
+            centerX = x,
+            centerY = y,
+            edge = BallPlacement.nearestEdge(x, screenWidthPx),
+        )
+        updateBallWindow()
+        P3Log.line("P5_BALL event=drag x=${x.roundToInt()} y=${y.roundToInt()}")
     }
 
     private fun dragBy(dx: Float, dy: Float) {
@@ -613,15 +630,6 @@ class PhoneOnlyOverlayService : Service() {
         micVisible.value = ballPress.micVisible(listening.value)
         snap()
         P3Log.line("P5_BALL event=long_press_end")
-    }
-
-    private fun openApp() {
-        runCatching {
-            startActivity(
-                Intent(this, MainActivity::class.java).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-            )
-        }
-        P3Log.line("P5_BALL event=tap")
     }
 
     private fun animateTo(target: BallPosition, durationMillis: Long) {

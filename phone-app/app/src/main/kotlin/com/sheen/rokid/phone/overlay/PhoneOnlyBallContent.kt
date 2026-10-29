@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.overlay
 
+import android.view.MotionEvent
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.RepeatMode
 import androidx.compose.animation.core.animateFloat
@@ -9,8 +10,6 @@ import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
-import androidx.compose.foundation.gestures.awaitEachGesture
-import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.size
@@ -20,7 +19,10 @@ import androidx.compose.material.icons.filled.Mic
 import androidx.compose.material3.Icon
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.ExperimentalComposeUiApi
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -33,16 +35,14 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.rotate
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.input.pointer.changedToUp
-import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.input.pointer.positionChanged
+import androidx.compose.ui.input.pointer.pointerInteropFilter
 import androidx.compose.ui.layout.ContentScale
-import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import com.sheen.rokid.phone.R
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
-import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlin.math.min
@@ -55,16 +55,16 @@ enum class BallHalo { NONE, WORKING, SPEAKING }
  *
  * The window is three radii square (the icon is one diameter, the light rings live in the margin). The whole window is
  * the touch target; [onAction] receives the pure [BallGestureMachine]'s decisions, and the service turns them into
- * window moves/dictation/app-open actions.
+ * window moves/dictation actions.
  *
  * 0.5.1 (`C9`): the shadow, the white base, the EDITH icon and the microphone scrim all sit inside **one**
  * `graphicsLayer { alpha }`, so the ball opacity fades the whole ball. The green working/speaking halo and the listening
  * ring are outside that layer and keep their own strength; they do not fade with the ball.
  *
- * 0.5.1 (`C11`): the drag delta is **screen space**. The content reads the ball view's **actual** on-screen origin
- * (`getLocationOnScreen`) for every pointer sample; the service's requested layout params lag `updateViewLayout`, and
- * using them made the ball jump. [BallDragController] combines the actual origin with the local pointer position
- * instead of the local `positionChange()`, which goes stale as soon as the window follows the finger.
+ * 0.5.1 (`C11`): the drag delta is **screen space**. The pointer stream comes from the raw `MotionEvent`
+ * (`rawX`/`rawY`), so a window move under the finger cannot shift the event coordinates; the ball's centre follows the
+ * finger's absolute screen position (`DragTo`). The earlier local-position-plus-window-origin approach still jittered
+ * because the origin and the local sample were taken at different moments.
  *
  * 0.5.1 (`C15`): the ring animation exists only while [halo] is not [BallHalo.NONE] (and the listening pulse only while
  * listening), so an idle ball does not keep a frame clock running.
@@ -72,6 +72,7 @@ enum class BallHalo { NONE, WORKING, SPEAKING }
  * Fonts/colors: there is no text here; the icon is the app's own launcher foreground on a white circle, and the
  * thinking light is the approved EDITH-green effect. Nothing in this composable changes the system typography.
  */
+@OptIn(ExperimentalComposeUiApi::class)
 @Composable
 fun PhoneOnlyBallContent(
     diameterDp: Int,
@@ -82,73 +83,17 @@ fun PhoneOnlyBallContent(
     onAction: (BallGestureAction) -> Unit,
 ) {
     val currentAction by rememberUpdatedState(onAction)
-    val view = LocalView.current
-    // The requested layout params lag the window's real position; the view's location is the actual origin.
-    val actualWindowOrigin = {
-        val location = IntArray(2)
-        view.getLocationOnScreen(location)
-        Offset(location[0].toFloat(), location[1].toFloat())
+    val scope = rememberCoroutineScope()
+    val slopPx = with(LocalDensity.current) { 12.dp.toPx() }
+    val ballPointer = remember(scope, slopPx) {
+        BallPointerInput(scope, slopPx, 500L) { currentAction(it) }
     }
     val green = Color(0xFF40FF5E)
 
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .pointerInput(Unit) {
-                coroutineScope {
-                    awaitEachGesture {
-                        val down = awaitFirstDown(requireUnconsumed = false)
-                        val gesture = BallGestureMachine(slopPx = 12.dp.toPx(), longPressMillis = 500L)
-                        val drag = BallDragController()
-                        val origin = actualWindowOrigin()
-                        var timer: Job? = null
-                        try {
-                            // The gesture machine decides tap/long/snap from the absolute (screen) pointer position,
-                            // so a window move under the finger cannot turn one gesture into another.
-                            gesture.down(origin.x + down.position.x, origin.y + down.position.y, nowMillis())
-                            drag.onPointerDown(down.position.x, down.position.y, origin.x, origin.y)
-                            timer = launch {
-                                delay(500L)
-                                gesture.longPressStart(nowMillis()).forEach { currentAction(it) }
-                            }
-                            while (true) {
-                                val event = awaitPointerEvent()
-                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
-                                if (change.changedToUp()) {
-                                    timer?.cancel()
-                                    drag.onPointerUp()
-                                    gesture.up(nowMillis()).forEach { currentAction(it) }
-                                    change.consume()
-                                    break
-                                }
-                                if (change.positionChanged()) {
-                                    val at = actualWindowOrigin()
-                                    val screenX = at.x + change.position.x
-                                    val screenY = at.y + change.position.y
-                                    gesture.move(screenX, screenY, nowMillis())
-                                    // The controller reports the finger's screen-space movement; the local
-                                    // `positionChange()` would shrink to zero (or invert) once the window follows.
-                                    val delta = drag.onPointerMove(change.position.x, change.position.y, at.x, at.y)
-                                    if (gesture.phase == BallGestureMachine.Phase.DRAGGING) {
-                                        val motion = if (drag.isDragging) delta else drag.beginDrag()
-                                        if (motion != null && (motion.dx != 0f || motion.dy != 0f)) {
-                                            currentAction(BallGestureAction.Drag(motion.dx, motion.dy))
-                                        }
-                                    }
-                                    change.consume()
-                                }
-                            }
-                        } finally {
-                            timer?.cancel()
-                            // 0.5.1 (review Important #2): this `finally` also runs when Compose cancels the pointer
-                            // (`awaitEachGesture` unwinds the block with a CancellationException), where the normal
-                            // `up()` path never executes. Ending an open long press here is what stops the service's
-                            // accepted BALL lease; a cancelled drag is not snapped and a cancelled press is not a tap.
-                            cancelBallPointerSequence(gesture, drag).forEach { currentAction(it) }
-                        }
-                    }
-                }
-            },
+            .pointerInteropFilter { event -> ballPointer.onTouchEvent(event) },
         contentAlignment = Alignment.Center,
     ) {
         // The green rings are drawn outside the ball's alpha layer: they keep their strength at any ball opacity.
@@ -271,6 +216,73 @@ private fun ListeningPulse() {
             center = center,
             style = Stroke(width = 2.dp.toPx()),
         )
+    }
+}
+
+/**
+ * 0.5.1 (`C11` defect fix): the ball's pointer stream uses the raw `MotionEvent` screen coordinates.
+ *
+ * The Compose pointer's local position is relative to the window at dispatch time, while the window moves under the
+ * finger through `updateViewLayout`; pairing the local sample with a later `getLocationOnScreen()` still jittered. The
+ * raw position is the finger's screen point regardless of where the window currently is, and the service places the
+ * ball's centre there (`DragTo`), so the ball stays under the finger instead of accumulating a grab offset.
+ */
+private class BallPointerInput(
+    private val scope: CoroutineScope,
+    private val slopPx: Float,
+    private val longPressMillis: Long,
+    private val action: (BallGestureAction) -> Unit,
+) {
+    private var gesture: BallGestureMachine? = null
+    private var timer: Job? = null
+
+    fun onTouchEvent(event: MotionEvent): Boolean {
+        when (event.actionMasked) {
+            MotionEvent.ACTION_DOWN -> start(event.rawX, event.rawY)
+            MotionEvent.ACTION_MOVE -> move(event.rawX, event.rawY)
+            MotionEvent.ACTION_UP -> finish()
+            MotionEvent.ACTION_CANCEL -> cancel()
+        }
+        return true
+    }
+
+    private fun start(x: Float, y: Float) {
+        cancel()
+        val machine = BallGestureMachine(slopPx = slopPx, longPressMillis = longPressMillis)
+        gesture = machine
+        machine.down(x, y, nowMillis())
+        action(BallGestureAction.DragTo(x, y))
+        timer = scope.launch {
+            delay(longPressMillis)
+            machine.longPressStart(nowMillis()).forEach(action)
+        }
+    }
+
+    private fun move(x: Float, y: Float) {
+        val machine = gesture ?: return
+        machine.move(x, y, nowMillis())
+        if (machine.phase == BallGestureMachine.Phase.DRAGGING) {
+            action(BallGestureAction.DragTo(x, y))
+        }
+    }
+
+    private fun finish() {
+        val machine = gesture ?: return
+        timer?.cancel()
+        machine.up(nowMillis()).forEach(action)
+        clear()
+    }
+
+    private fun cancel() {
+        val machine = gesture ?: return
+        timer?.cancel()
+        machine.cancel().forEach(action)
+        clear()
+    }
+
+    private fun clear() {
+        gesture = null
+        timer = null
     }
 }
 

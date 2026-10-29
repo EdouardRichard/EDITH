@@ -8,11 +8,14 @@ sealed interface BallGestureAction {
     /** The long-press finger lifted (or was cancelled): stop the ASR lease. */
     data object LongPressEnd : BallGestureAction
 
-    /** A short press with no drag: open the App. */
+    /** A short press with no drag: no app action (the owner did not design tap-to-open). */
     data object Tap : BallGestureAction
 
     /** One drag delta in screen pixels; the service moves the window by it. */
     data class Drag(val dx: Float, val dy: Float) : BallGestureAction
+
+    /** The finger's absolute screen position; the ball's centre follows it while dragging. */
+    data class DragTo(val x: Float, val y: Float) : BallGestureAction
 
     /** The dragged finger lifted: dock to the nearest edge, half hidden. */
     data object Snap : BallGestureAction
