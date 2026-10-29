@@ -2124,6 +2124,10 @@ class SmartAssistantPlugin(
      * awaiting-transcript, or an Idle turn whose answer is not settled yet is busy - and the query is read-only, so it
      * never cancels, replaces or settles any of them. It is independent of the display mode: detached mode is the
      * phone's own panel and the typed path works there exactly as on the glasses.
+     *
+     * 0.5.1 fix round (review Important): in phone-only mode the post-answer continuation is off, so a sentence queued
+     * by a late final can never be consumed; it is treated as absent here rather than making the wearer's BALL/typed
+     * sentence busy until a new wake or STOP.
      */
     fun canAcceptTypedMessage(): Boolean = synchronized(gate) { active && canAcceptTypedLocked() }
 
@@ -2131,10 +2135,22 @@ class SmartAssistantPlugin(
     private fun canAcceptTypedLocked(): Boolean {
         if (context == null) return false
         // A sentence already queued for a continuation is the wearer's next turn; a typed message must not race it.
-        if (queuedUtterance != null) return false
+        // Unless no continuation can ever consume it (phone-only mode's post-answer seam is off): then keeping the
+        // typed/BALL path busy would strand the wearer until a new wake or STOP.
+        if (queuedUtterance != null && !postAnswerContinuationOff()) return false
         val current = turn ?: return true
         return !current.closed && current.phase == SmartTurnPhase.Idle && current.answerNotified
     }
+
+    /**
+     * 0.5.1 fix round (review Important): whether phone-only mode has turned the post-answer continuation off.
+     *
+     * This is the composition's exact split (`settings.continueDialogue && !phoneOnly()`), read through the live
+     * providers. When it is true no answer continuation can open for either route, so a queued utterance is dead: the
+     * typed/BALL admission may ignore it, and a transcript arriving after the answer settled must not cancel the
+     * continue-off close that releases it. Glasses mode is not affected (`phoneOnly()` is false there).
+     */
+    private fun postAnswerContinuationOff(): Boolean = phoneOnly() && !continueAfterAnswer()
 
     /**
      * 0.24 S3 (spec §5.4): `UI_CLOSED` / the panel went hidden.
@@ -2571,6 +2587,10 @@ class SmartAssistantPlugin(
                 var followupContinuation: Pair<SmartTurn, String>? = null
                 var queuedWakeFinal = false
                 var queuedProactiveFinal = false
+                // 0.5.1 fix round (review Important): the answer was already settled on the continue-off branch and
+                // phone-only mode can open no continuation for this transcript. Such a message must not cancel the 1 s
+                // close (the release path for the dead queue) or regress the panel from ANSWERING back to ASR.
+                var settledPhoneOnlyAnswer = false
                 val (started, proactive) = synchronized(gate) {
                     if (!matches(event.envelope)) null to null
                     else {
@@ -2578,6 +2598,10 @@ class SmartAssistantPlugin(
                         // 0.24 S3: the official `AsrMessageHandler` removes the timeout before it checks what the
                         // payload says, so a blank or wake-word-only revision cancels the 10 s window too.
                         usableText = isUsableUtterance(event.revision.text.trim())
+                        settledPhoneOnlyAnswer = postAnswerContinuationOff() &&
+                            turn?.let {
+                                !it.closed && it.phase == SmartTurnPhase.Idle && it.answerNotified
+                            } == true
                         // P3.3: a final that answers a live question is consumed here and nowhere else - it must not
                         // open a wake turn or be reconsidered by the proactive path.
                         consumedByConfirmation = confirmation.onTranscript(event.revision)
@@ -2697,7 +2721,7 @@ class SmartAssistantPlugin(
                 // listening window (P3-13). The window is closed first, then the PROACTIVE turn is started.
                 val acceptedFollowup = followup
                 val continuation = followupContinuation
-                if (matched && acceptedFollowup == null && continuation == null) {
+                if (matched && acceptedFollowup == null && continuation == null && !settledPhoneOnlyAnswer) {
                     // Outside the lock: the cycle displays the official levels through the host port.
                     conversationCycle.onAsr(AssistantRoute.WAKE)
                     adoptedTurnId?.let { conversationCycle.onTurnId(AssistantRoute.WAKE, it) }

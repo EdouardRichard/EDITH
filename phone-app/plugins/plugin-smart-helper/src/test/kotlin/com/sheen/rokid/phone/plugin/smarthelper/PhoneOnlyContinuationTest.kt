@@ -3,7 +3,10 @@ package com.sheen.rokid.phone.plugin.smarthelper
 import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.OutputStateEvent
 import com.sheen.rokid.contracts.OutputStatus
+import com.sheen.rokid.contracts.SpeechFinished
+import com.sheen.rokid.contracts.SpeechResult
 import com.sheen.rokid.contracts.TranscriptEvent
+import com.sheen.rokid.contracts.UserAction
 import com.sheen.rokid.output.OfficialConversation
 import com.sheen.rokid.output.OfficialStatus
 import com.sheen.rokid.plugin.Capability
@@ -38,6 +41,7 @@ class PhoneOnlyContinuationTest {
         continueDialogue: Boolean = true,
         continueAfterAnswer: Boolean? = false,
         phoneOnly: Boolean = true,
+        speechAvailable: Boolean = false,
     ): Pair<SmartTestRig, SmartRecordingDisplay> {
         val display = SmartRecordingDisplay()
         val rig = SmartTestRig(
@@ -45,7 +49,7 @@ class PhoneOnlyContinuationTest {
             continueDialogue = continueDialogue,
             continueAfterAnswer = continueAfterAnswer,
             phoneOnly = phoneOnly,
-            speechAvailable = false,
+            speechAvailable = speechAvailable,
         )
         rig.activate(overrides = mapOf(Capability.ConversationDisplay to display))
         return rig to display
@@ -93,6 +97,113 @@ class PhoneOnlyContinuationTest {
             rig.model.requests.size,
             "the next sentence is the user's long-press ball ASR, not a model turn opened by the answer",
         )
+    }
+
+    /**
+     * 0.5.1 fix round (review Important): a final that arrives **after** the `Displayed` acknowledgement.
+     *
+     * The answer is already settled on the continue-off branch when that final arrives, so phone-only mode can never
+     * open the continuation the sentence is queued for. The queue is therefore dead: it must not make the BALL/typed
+     * admission busy (`canAcceptTypedMessage` is exactly the host's pre-check), and it must not cancel the 1 s
+     * continue-off close - the close is what idles the answer bubble at ~4 s and releases the dead queue.
+     */
+    @Test
+    fun `a final after Displayed is admitted and does not cancel the continue-off close`() {
+        val (rig, display) = rig(continueDialogue = true, continueAfterAnswer = false, phoneOnly = true)
+        val hintId = displayedAnswer(rig)
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+        assertTrue(rig.plugin.canAcceptTypedMessage(), "the settled answer leaves the typed/BALL slot open")
+        assertTrue(display.closes.isEmpty(), "the continue-off close is one second away")
+
+        // Post-ACK late final: phone-only never opens the continuation this sentence is queued for. The stored
+        // 「持续对话」 switch still queues it (that seam is unchanged); the queue is what the fix must neutralise.
+        val lines = java.util.Collections.synchronizedList(mutableListOf<String>())
+        val previous = P3Log.sink
+        P3Log.sink = { lines += it }
+        try {
+            rig.plugin.handle(TranscriptEvent(rig.transcript("第二句", turnId = "asr-2", revision = 2)))
+        } finally {
+            P3Log.sink = previous
+        }
+        assertTrue(
+            lines.any { it.startsWith("P3_CONV queue route=WAKE") },
+            "the stored switch still queues a post-ACK final; the dead-queue fix must not change that seam: $lines",
+        )
+
+        assertTrue(
+            rig.plugin.canAcceptTypedMessage(),
+            "a queued utterance no continuation can consume must not make the BALL/typed path busy",
+        )
+        rig.tick(999)
+        assertTrue(display.closes.isEmpty(), "999 ms is still inside the official scheduleExit(1000)")
+        rig.tick(1)
+        assertEquals(
+            listOf(AssistantRoute.WAKE),
+            display.closes,
+            "the post-ACK final must not cancel the continue-off close",
+        )
+        assertTrue(
+            OfficialStatus.AUDIO_FINISHED.wire !in display.statuses,
+            "phone-only mode still sends no status 5: ${display.statuses}",
+        )
+        assertEquals(1, display.statuses.count { it == OfficialStatus.LISTENING.wire })
+        assertEquals(1, rig.model.requests.size, "the dead queue must not run a hidden model turn")
+
+        // The next sentence is the wearer's BALL/typed input, and it is admitted once the dead queue is released.
+        rig.plugin.handle(UserAction(rig.envelope(), UserAction.Action.Typed, "下一句"))
+        assertEquals(2, rig.model.requests.size, "the typed/BALL path is admitted after the dead queue is released")
+    }
+
+    /**
+     * 0.5.1 fix round (review Minor 1): the `onSpeechFinished` half of the seam is behavior, not just a constructor
+     * default.
+     *
+     * Every earlier rig ran with `speechAvailable = false`, so `ConversationCycle.onSpeechFinished` could have been
+     * reverted to `continueDialogue()` and the rest of this file would still be green. This answer is actually spoken
+     * (phone-only + a live player), so the `Displayed` acknowledgement must wait; only the matching `SpeechFinished`
+     * may settle it, and it must settle on the continue-off close exactly 1 000 ms after the speech.
+     */
+    @Test
+    fun `phone-only speech end closes on the continue-off path`() {
+        val (rig, display) = rig(
+            continueDialogue = true,
+            continueAfterAnswer = false,
+            phoneOnly = true,
+            speechAvailable = true,
+        )
+        val hintId = displayedAnswer(rig)
+
+        rig.plugin.handle(OutputStateEvent(rig.envelope(), hintId, OutputStatus.Displayed))
+        // The answer is still being spoken, so the display ACK may not settle it on the continue-off branch.
+        rig.tick(5_000)
+        assertTrue(display.closes.isEmpty(), "a spoken answer must wait for SpeechFinished")
+        assertTrue(
+            OfficialStatus.AUDIO_FINISHED.wire !in display.statuses,
+            "no status 5 may be sent while the speech wait is live: ${display.statuses}",
+        )
+
+        rig.plugin.handle(SpeechFinished(rig.envelope(), hintId, SpeechResult.FINISHED))
+
+        assertTrue(display.closes.isEmpty(), "the continue-off close is armed one second after the speech end")
+        rig.tick(999)
+        assertTrue(display.closes.isEmpty(), "999 ms after the speech end is inside scheduleExit(1000)")
+        rig.tick(1)
+        assertEquals(
+            listOf(AssistantRoute.WAKE),
+            display.closes,
+            "the speech-end seam selects the continue-off close, not a continuation",
+        )
+        assertTrue(
+            OfficialStatus.AUDIO_FINISHED.wire !in display.statuses,
+            "phone-only mode must send no status 5 after the speech ends: ${display.statuses}",
+        )
+        assertEquals(
+            1,
+            display.statuses.count { it == OfficialStatus.LISTENING.wire },
+            "only the wake's initial window may be listening: ${display.statuses}",
+        )
+        assertEquals(1, rig.model.requests.size, "the answer opens no automatic next round")
     }
 
     @Test
@@ -168,6 +279,10 @@ class PhoneOnlyContinuationTest {
         assertEquals(1, display.statuses.count { it == OfficialStatus.LISTENING.wire })
         rig.tick(1_000)
         assertEquals(listOf(AssistantRoute.WAKE), display.closes)
+        assertTrue(
+            rig.plugin.canAcceptTypedMessage(),
+            "the close releases the queued sentence with the round, so the next BALL/typed sentence is admitted",
+        )
         assertEquals(
             1,
             rig.model.requests.size,
