@@ -32,20 +32,11 @@ the user through text on the glasses HUD and TTS audio. From 0.4 the phone can a
 **phone-only mode**, using its own microphone and screen; 0.5 adds a draggable EDITH-icon floating
 ball on the home screen and independent translucent message bubbles for replies and tool steps.
 
-- **Phone-only mode (0.5; corrected in 0.5.1)** — Enable it in Settings and an EDITH-icon ball appears on the home
+- **Phone-only mode** — Enable it in Settings and a draggable EDITH-icon ball appears on the home
   screen. Drag it to an edge and it snaps there, half hidden. Long-press to show the microphone and
-  dictate; the transcript is sent to the agent. Replies and tool calls appear as separate translucent
-  bubbles (tool information matches the glasses): at most two (newest + one old), with the whole
-  bubble — card and text — following the opacity slider; the old bubble fades and disappears after
-  2 s. In phone-only mode the answer is **not** followed by the automatic 10 s listening window;
-  long-press the ball to speak the next turn. The ball and the bubbles have separate opacity
-  settings, and a dynamic light ring shows when the AI is thinking.
-
-  > **0.5.1 correction checkpoint:** the 0.5 delivery was re-opened and corrected (C1–C16), with the
-  > full JVM gate and a K40 device matrix recorded in the [0.5.1 evidence](docs/project/evidence/2026-10-29-0.5.1-correction.md).
-  > It is a **checkpoint, not a version-level release**: live permission revoke, long-press/drag/slider
-  > touch, the settings-page render, the 20%/30% opacity extremes and the model's real screen-reading
-  > behaviour remain `NotMeasured`/`Partial`.
+  dictate; the transcript is sent to the agent. The ball and the bubbles have separate opacity
+  settings. In phone-only mode the answer is **not** followed by the automatic 10 s listening
+  window; long-press the ball to speak the next turn.
 
 - **Wake-word route** — Say “EDITH” or “伊迪丝”. The glasses panel opens, EDITH listens, recognizes
   the intent, perceives the phone (screen, notifications, media, calendar, device state), plans and
@@ -83,7 +74,7 @@ ball on the home screen and independent translucent message bubbles for replies 
   </a>
 </div>
 
-> Note: the clip includes **automatic screen unlock**; the execution is **sped up** — real time is a little over **one minute**.
+> Note: the execution is **sped up** — real time is a little over **one minute**.
 
 ## Compatibility and dependencies
 
@@ -105,7 +96,8 @@ launch materializes about **1.0 GiB** (1.03 GiB). See [Model files](#2-model-fil
 ## Technical routes
 
 0.4 keeps both routes and adds a phone-only mode variant of the wake route, a text/dictation
-input row on the phone, and model provisioning from APK assets. The default glasses configuration
+input row on the phone, and model provisioning from APK assets. 0.5 adds the home-screen floating
+ball and independent message bubbles to phone-only mode. The default glasses configuration
 described first is unchanged.
 
 ### Wake-word route
