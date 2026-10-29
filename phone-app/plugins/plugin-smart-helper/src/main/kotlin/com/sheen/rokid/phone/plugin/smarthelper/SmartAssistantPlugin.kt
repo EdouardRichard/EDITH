@@ -554,6 +554,16 @@ class SmartAssistantPlugin(
      */
     private val speechAvailable: () -> Boolean = { true },
     /**
+     * 0.5 (`D213`): whether this session runs the phone-only model.
+     *
+     * The phone-only final answer has no HUD to read, so the closing answer requests speech whenever the host can play
+     * it. Glasses mode deliberately keeps the 0.4 behavior: the answer is read on the HUD and the final answer is not
+     * spoken (a `notify_user` voice/both request still is). Changing the glasses conversation cycle's completion
+     * semantics is a separate behavior change, not part of the 0.5 phone-only fix. `SmartWiring` passes the live
+     * detach-gate value; the default `{ false }` is glasses mode and keeps every pre-0.5 test rig on its old path.
+     */
+    private val phoneOnly: () -> Boolean = { false },
+    /**
      * edith-0.3 Phase 2 Task 9: the bounds the perception block renders under (element cap, notification cap, title
      * cap). The production default is the host's Phase 2 policy; the constructor seam exists so a test can pin a cap
      * without changing the provider's snapshot.
@@ -2928,13 +2938,17 @@ class SmartAssistantPlugin(
             deadlineNanos = SmartTurn.saturatingAdd(nowNanos, turnBudgetNanos()),
             hintGraceNanos = DEFAULT_HINT_GRACE_MILLIS * 1_000_000L,
             hintId = "hint-${UUID.randomUUID()}",
-            // 0.5 (`D213`): the assembler's answer is the turn's final answer. It used to be emitted with no
-            // `optionalSpeech`, so 「语音朗读」 could only ever read `notify_user` hints - the final answer was silent
-            // even with the switch on. The gate below still decides whether a player can actually play it; when speech
-            // is off/unavailable the hint is display-only, exactly as before.
+            // 0.5 (`D213`): the assembler's answer is the turn's final answer. In the phone-only model there is no HUD,
+            // so the closing answer requests speech whenever a player exists; glasses mode keeps the 0.4 display-only
+            // final answer (the HUD is the surface), while `notify_user` voice/both still speaks in both modes. The
+            // speechAvailable gate is what makes a host without TTS settle on Displayed as before.
             onEmit = { text ->
                 created?.let {
-                    emit(it, text, optionalSpeech = if (speechAvailable()) SpeechRequest() else null)
+                    emit(
+                        it,
+                        text,
+                        optionalSpeech = if (phoneOnly() && speechAvailable()) SpeechRequest() else null,
+                    )
                 }
             },
             route = route,

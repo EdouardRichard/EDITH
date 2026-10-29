@@ -51,6 +51,12 @@ internal class SmartWiring(
      */
     speechAvailable: () -> Boolean = { false },
     /**
+     * 0.5 (`D213`): whether the session runs the phone-only model. The plugin's closing answer requests speech only
+     * there (no HUD to read); glasses mode keeps the 0.4 display-only final answer. The default `{ false }` is glasses
+     * mode and keeps the pre-0.5 rigs on their original path.
+     */
+    phoneOnly: () -> Boolean = { false },
+    /**
      * 0.3 Phase 4B (`D189`, spec §5.1/§5.3): the composition's **live** global 「不拦截」 gate.
      *
      * Production passes `NoInterceptionGate.provider()`, the one instance `saveSmartSettings` updates, so the plugin's
@@ -113,6 +119,8 @@ internal class SmartWiring(
         // 0.24 S3 Task 14 fix (C2): the production player's presence. With speech off (the default) no player is built,
         // so a `both`/`voice` answer is display-only and continues on its `Displayed` acknowledgement.
         speechAvailable = speechAvailable,
+        // 0.5 (`D213`): the phone-only model's final answer has no HUD, so it is spoken when a player exists.
+        phoneOnly = phoneOnly,
         // 0.3 Phase 4B (`D189`): the live 「不拦截」 gate. A provider (not a snapshot) is what lets a settings save take
         // effect from the next tool call; the plugin passes it to both the policy and the command-level precheck wrapper.
         noInterception = noInterception,

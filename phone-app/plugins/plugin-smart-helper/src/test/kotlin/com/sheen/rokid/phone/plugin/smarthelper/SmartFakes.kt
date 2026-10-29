@@ -629,6 +629,11 @@ internal class SmartTestRig(
      */
     val speechAvailable: Boolean = true,
     /**
+     * 0.5 (`D213`): whether this rig runs the phone-only model. Only there does the closing answer request speech;
+     * the default false is glasses mode, whose final answer stays display-only (the HUD is its surface).
+     */
+    val phoneOnly: Boolean = false,
+    /**
      * 0.3 Phase 4B (`D189`): the live 「不拦截」 gate this rig feeds the plugin. It is a `var` on purpose: a test can
      * flip it between tool calls to prove the plugin reads the provider live instead of snapshotting it per turn.
      */
@@ -684,6 +689,7 @@ internal class SmartTestRig(
             requestPanelOpen = requestPanelOpen,
             continueDialogue = { continueDialogue },
             speechAvailable = { speechAvailable },
+            phoneOnly = { phoneOnly },
             noInterception = { noInterception },
             deviceState = deviceState,
         )

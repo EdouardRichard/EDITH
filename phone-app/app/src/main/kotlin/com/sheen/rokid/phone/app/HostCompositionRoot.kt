@@ -78,8 +78,11 @@ import com.sheen.rokid.phone.bridge.CxrContextSignals
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
 import com.sheen.rokid.phone.audio.AudioSegmentBridge
 import com.sheen.rokid.phone.audio.AndroidSpeechPlayer
+import com.sheen.rokid.phone.audio.SpeechPlayerRouter
 import com.sheen.rokid.phone.overlay.PhoneBubbleRepository
 import com.sheen.rokid.phone.overlay.PhoneOnlyAppearance
+import com.sheen.rokid.plugin.SpeechPlayer
+import java.util.concurrent.atomic.AtomicReference
 import com.sheen.rokid.phone.session.confirmation.NotificationSurface
 import com.sheen.rokid.phone.session.PendingConfirmation
 import com.sheen.rokid.phone.audio.AudioSegmentCapture
@@ -387,6 +390,20 @@ class HostCompositionRoot internal constructor(
      */
     internal val detachGate: DetachGate = DetachGate(),
     /**
+     * 0.5 (`D213`): the stable speech router the environment and the output arbiter hold.
+     *
+     * The platform player behind it can be installed/released by [setSpeechEnabled] while the composition runs, so
+     * 「语音朗读」 no longer needs an App restart. A hand-built composition gets an empty router (no player).
+     */
+    private val speechRouter: SpeechPlayerRouter = SpeechPlayerRouter(),
+    /** 0.5: builds the platform player on a runtime enable; null for hand-built rigs and harnesses. */
+    private val speechPlayerFactory: (() -> SpeechPlayer?)? = null,
+    /**
+     * 0.5: the live player-presence holder shared with the smart wiring's `speechAvailable`, the environment's
+     * capability predicate and the device-state `tts` fact. It is the one authority for "can a hint be spoken now".
+     */
+    private val speechPlayerHolder: AtomicReference<SpeechPlayer?> = AtomicReference(null),
+    /**
      * 0.4 Task 6 (`D199`/`D200`): the one phone-microphone ingress, or null for a hand-built rig that has none.
      *
      * [create] builds it once and points the audio chain's ingress selector at it while the detach gate is on, so the
@@ -514,16 +531,58 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
-     * P5 (spec §S5): the user's switch for 「语音朗读」. Writes through [smartSettingsStore] so the choice persists.
-     * A failed read aborts the write (same pattern as [ProactiveArming.set]): the UI still moves, but the blob is not
-     * silently overwritten with defaults.
+     * P5 (spec §S5) + 0.5 (`D213`): the user's switch for 「语音朗读」, now **effective immediately**.
+     *
+     * 0.4 only flipped the flow and persisted the boolean; the player had already been fixed at composition assembly,
+     * so turning the switch on did nothing until the App restarted (turning it off did not stop playback either). The
+     * runtime path:
+     *
+     * - **on**: install an existing player, or create one through the injected factory, into [speechRouter]; the
+     *   holder the plugin/env read is updated in the same step, so the next answer can actually be spoken;
+     * - **off**: stop the utterance in flight, detach and close the player, clear the holder. A later answer is
+     *   display-only (the plugin's `speechAvailable` sees the empty holder);
+     * - **persist**: a full load-copy-save with `speechConfigured = true`. A blob that cannot be read refuses the
+     *   write rather than overwriting the user's other settings; the live change still happened and is logged, and the
+     *   next start will read whatever the blob still says.
+     *
+     * `speechOn` is the user's intent and can stay on while no player exists (the engine is missing); the capability
+     * and every speech request are gated on the holder, not on this flow.
      */
-    internal fun setSpeechEnabled(enabled: Boolean) {
+    @Synchronized internal fun setSpeechEnabled(enabled: Boolean) {
         speechOn.value = enabled
-        val target = smartSettingsStore ?: return
-        runCatching { target.load() }.onFailure {
-            android.util.Log.i("EdithHost", "speech toggle: settings unreadable, not persisting this change")
-        }.getOrNull()?.let { stored -> runCatching { target.save(stored.copy(speechEnabled = enabled)) } }
+        val state = if (enabled) "on" else "off"
+        if (enabled) {
+            val player = speechPlayerHolder.get() ?: runCatching { speechPlayerFactory?.invoke() }.getOrNull()
+                ?.also {
+                    speechPlayerHolder.set(it)
+                    P3Log.line("P5_TTS state=on player=created")
+                }
+            if (player != null) {
+                speechRouter.install(player)
+                wakeAckPlayer = player as? AndroidSpeechPlayer
+            } else {
+                P3Log.line("P5_TTS state=on player=unavailable")
+            }
+        } else {
+            speechRouter.stopCurrent()
+            speechRouter.install(null)
+            val released = speechPlayerHolder.getAndSet(null)
+            (released as? AutoCloseable)?.let { runCatching { it.close() } }
+            wakeAckPlayer = null
+            P3Log.line("P5_TTS state=off")
+        }
+        val target = smartSettingsStore
+        if (target == null) {
+            P3Log.line("P5_TTS state=$state persisted=false reason=SETTINGS_STORE_UNAVAILABLE")
+            return
+        }
+        val stored = runCatching { target.loadForWrite() }.getOrNull()
+        if (stored == null) {
+            P3Log.line("P5_TTS state=$state persisted=false reason=SETTINGS_UNREADABLE")
+            return
+        }
+        runCatching { target.save(stored.copy(speechEnabled = enabled, speechConfigured = true)) }
+            .onFailure { P3Log.line("P5_TTS state=$state persisted=false reason=SAVE_FAILED") }
     }
 
     /** One opacity save's outcome: [saved] is the blob's verdict, [error] a stable code for the settings copy. */
@@ -3017,6 +3076,15 @@ class HostCompositionRoot internal constructor(
                     else -> "close_failed"
                 },
         )
+        // 0.5 (`D213`): the phone-only model's first activation turns「语音朗读」on when the user has never made an
+        // explicit speech choice. `speechConfigured` is the D53② same-shape guard: once the user has turned it off, a
+        // later detach never re-enables it. A store that cannot be read is treated as "already configured" so an
+        // unreadable blob cannot silently create a new consent-shaped default.
+        val speechAlreadyConfigured = runCatching { storedSettings().speechConfigured }.getOrDefault(true)
+        if (!speechAlreadyConfigured) {
+            P3Log.line("P5_TTS state=default_on reason=phone_only")
+            setSpeechEnabled(true)
+        }
     }
 
     @Synchronized fun selectPlugin(pluginId: String) {
@@ -3507,6 +3575,8 @@ class HostCompositionRoot internal constructor(
             ),
                 requestPanelOpen = { route -> rootHolder[0]?.requestPanelOpen(route) ?: false },
                 speechAvailable = { speechPlayerHolder.get() != null },
+                // 0.5 (`D213`): the closing answer is spoken only in the phone-only model; glasses mode keeps the HUD.
+                phoneOnly = { detachGate.enabled.value },
                 // 0.3 Phase 4B (`D189`): the gate's **provider**, not its current value. `saveSmartSettings` updates
                 // this same instance, so the plugin's policy and shell-precheck wrapper see a save from the next call.
                 noInterception = noInterceptionGate.provider())
@@ -3928,6 +3998,9 @@ class HostCompositionRoot internal constructor(
             // a switch that is on but whose engine failed to create still produces no SpeechFinished. Set before the
             // host is built/activated so the value the plugin reads is the one the arbiter will honour.
             speechPlayerHolder.set(speechPlayer)
+            // 0.5 (`D213`): the stable router the environment and the arbiter hold; the player behind it can be
+            // replaced at runtime by `setSpeechEnabled` without rebuilding the composition.
+            val speechRouter = SpeechPlayerRouter().also { it.install(speechPlayer) }
             // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
             // assistant tab reads it. It has to be created here because the provider map is built before the root.
             val conversationLog = ConversationLog()
@@ -3956,7 +4029,8 @@ class HostCompositionRoot internal constructor(
                     phone = phoneHintDevice,
                     glasses = hintLink::liveOutput,
                 ),
-                scheduler = scheduler, speech = speechPlayer,
+                scheduler = scheduler, speech = speechRouter,
+                speechAvailable = { speechPlayerHolder.get() != null },
                 providers = buildMap {
                     put(Capability.Model, model)
                     audio?.let { put(Capability.Asr, it.asrSession) }
@@ -4066,6 +4140,11 @@ class HostCompositionRoot internal constructor(
                 noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
                 detachGate = detachGate,
+                // 0.5 (`D213`): the runtime speech router/factory/holder. The factory is the same platform player the
+                // assembly uses, so enabling the switch later creates the exact same implementation.
+                speechRouter = speechRouter,
+                speechPlayerFactory = { AndroidSpeechPlayer.create(context, playbackGate) },
+                speechPlayerHolder = speechPlayerHolder,
                 // 0.4 Task 6: the same ingress the chain's selector names, and the production recorder factory.
                 phoneIngress = phoneIngress,
                 phoneMicDeviceFactory = { PhoneMicDevice() },

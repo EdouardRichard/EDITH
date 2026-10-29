@@ -140,6 +140,28 @@ class CxrHostEnvironmentTest {
     }
 
     @Test
+    fun theSpeechCapabilityFollowsTheLivePredicateNotTheAssemblySnapshot() {
+        // 0.5 (D213): the 0.4 environment read `speech != null` once, so toggling 语音朗读 could not add or remove
+        // SpeechOutput without a restart. The router is always present; the predicate is the live player presence.
+        var available = false
+        val player = object : com.sheen.rokid.plugin.SpeechPlayer {
+            override fun play(
+                assistance: com.sheen.rokid.contracts.Assistance,
+                onState: (com.sheen.rokid.plugin.SpeechPlayback) -> Unit,
+            ): com.sheen.rokid.plugin.CancellationHandle =
+                object : com.sheen.rokid.plugin.CancellationHandle { override fun cancel() = Unit }
+        }
+        val env = CxrHostEnvironment(clock = clock, input = input, liveOutput = { FakeHintDevice() },
+            scheduler = scheduler, speech = player, speechAvailable = { available })
+
+        assertFalse("no player yet", Capability.SpeechOutput in env.availableCapabilities)
+
+        available = true
+
+        assertTrue("the runtime switch must advertise it", Capability.SpeechOutput in env.availableCapabilities)
+    }
+
+    @Test
     fun anUnwiredOutputIsRefusedRatherThanSilentlyDroppingAHint() {
         // Before the connection is up there is nowhere to show a hint. Throwing keeps the existing contract (the
         // missing environment behaves the same way); a silent no-op would look like success and lose the hint.
