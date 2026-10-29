@@ -329,5 +329,20 @@
                 <action android:name="edith.DEBUG_DETACH" />
             </intent-filter>
         </receiver>
+        <!--
+          0.5 phone-only message-stack visual instrument. Pushes the production `PhoneBubbleEvent`s into the same
+          repository the overlay reads, so the bubble card, old-message fade and 2 s removal can be screenshotted; the
+          production path is separately exercised by a real phone-only turn (the repository's `P5_BUBBLE` line). Same
+          export rule and the same reason as the instruments above: shell-driven, debug-only, never in a release build.
+          It logs the scenario name only, never the text.
+        -->
+        <receiver
+            android:name=".debug.DebugPhoneBubble"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_BUBBLE" />
+            </intent-filter>
+        </receiver>
     </application>
 </manifest>

@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.app
+import com.sheen.rokid.phone.overlay.PhoneOnlyOverlayService
 import com.sheen.rokid.phone.ui.profile.ProfileListScreen
 import com.sheen.rokid.phone.ui.profile.ProfileViewModel
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.AuditLogView
@@ -124,6 +125,19 @@ class MainActivity : ComponentActivity() {
             return
         }
         enterReadyUi(app)
+    }
+
+    /**
+     * 0.5 (`D214`): re-syncs the phone-only overlay whenever the page comes back to the foreground.
+     *
+     * The mode can be turned on/off here, and the overlay permission is granted in a system screen, so returning is the
+     * one moment both facts may have changed. `sync` reads the gate and the permission itself and stops the service when
+     * either says no; a composition that was never built has no overlay to start.
+     */
+    override fun onResume() {
+        super.onResume()
+        val app = application as EdithApplication
+        PhoneOnlyOverlayService.sync(this, app.liveComposition)
     }
 
     private fun enterReadyUi(app: EdithApplication) {

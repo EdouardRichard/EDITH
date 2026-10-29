@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.audio
 import com.sheen.rokid.phone.platform.P3Log
+import com.sheen.rokid.phone.session.EchoMuteWindow
 import com.sheen.rokid.phone.session.PlaybackGate
 
 import android.content.Context
@@ -72,6 +73,15 @@ internal class PlatformTtsEngine(context: Context) : TtsEngine {
 internal class AndroidSpeechPlayer(
     private val engine: TtsEngine,
     private val gate: PlaybackGate = PlaybackGate(),
+    /**
+     * 0.5 (`D213` fix): the half-duplex window over the phone microphone.
+     *
+     * The detached wake ack already opened this window, but the final answer's playback did not, so with the phone-only
+     * model's speaker output the phone mic heard the answer and the ASR transcribed it as a user turn, which the
+     * continuous-dialogue path then answered - an echo loop. Every playback through this player now mutes the capture
+     * from the audible onset until one reverb tail after the end/failure/cancel.
+     */
+    private val echoMute: EchoMuteWindow? = null,
 ) : SpeechPlayer, AutoCloseable {
 
     companion object {
@@ -80,14 +90,18 @@ internal class AndroidSpeechPlayer(
          * available. The caller decides what to do with the null (typically: leave [HostEnvironment.speech] as null so
          * [Capability.SpeechOutput] is not advertised).
          */
-        fun create(context: Context, gate: PlaybackGate = PlaybackGate()): AndroidSpeechPlayer? {
+        fun create(
+            context: Context,
+            gate: PlaybackGate = PlaybackGate(),
+            echoMute: EchoMuteWindow? = null,
+        ): AndroidSpeechPlayer? {
             val engine = PlatformTtsEngine(context)
             // On MIUI/K40 the TTS onInit callback may be delayed by heavy Compose rendering during app startup.
             // Rather than blocking (which deadlocks on the main thread or times out on a background thread), we
             // create the player optimistically and let the first play() call verify readiness. If the engine never
             // initializes, play() will report FAILED and the gate stays open.
             android.util.Log.i("EdithSpeech", "TTS engine created, deferring availability check to first play()")
-            return AndroidSpeechPlayer(engine, gate)
+            return AndroidSpeechPlayer(engine, gate, echoMute)
         }
     }
 
@@ -151,6 +165,8 @@ internal class AndroidSpeechPlayer(
             override fun onStart(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(false, true)) {
                     gate.begin()
+                    // 0.5: the phone mic must not hear the start of our own utterance; open before the first sample.
+                    echoMute?.open()
                     P3Log.line("P5_SPEECH state=start hintId=$uid chars=$charCount")
                     onState(SpeechPlayback.STARTED)
                 }
@@ -158,6 +174,7 @@ internal class AndroidSpeechPlayer(
             override fun onDone(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(true, false)) {
                     gate.end()
+                    echoMute?.close()
                     P3Log.line("P5_SPEECH state=end hintId=$uid chars=$charCount")
                     onState(SpeechPlayback.FINISHED)
                 }
@@ -166,6 +183,7 @@ internal class AndroidSpeechPlayer(
             override fun onError(uid: String) {
                 if (uid == utteranceId && active.compareAndSet(true, false)) {
                     gate.end()
+                    echoMute?.close()
                     P3Log.line("P5_SPEECH state=failed hintId=$uid chars=$charCount")
                     onState(SpeechPlayback.FAILED)
                 }
@@ -185,6 +203,7 @@ internal class AndroidSpeechPlayer(
                 engine.stop()
                 if (active.compareAndSet(true, false)) {
                     gate.end()
+                    echoMute?.close()
                     P3Log.line("P5_SPEECH state=cancelled hintId=$utteranceId chars=$charCount")
                     onState(SpeechPlayback.FINISHED)
                 }

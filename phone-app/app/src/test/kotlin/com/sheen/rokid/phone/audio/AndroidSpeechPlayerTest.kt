@@ -4,8 +4,11 @@ import android.speech.tts.UtteranceProgressListener
 import com.sheen.rokid.contracts.Assistance
 import com.sheen.rokid.contracts.Generation
 import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.plugin.MonotonicClock
 import com.sheen.rokid.plugin.SpeechPlayback
+import com.sheen.rokid.phone.session.EchoMuteWindow
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -80,6 +83,27 @@ class AndroidSpeechPlayerTest {
         engine.fireDone("detached-wake-ack")
         assertTrue(!gate.isPlaying)
         assertEquals(listOf(SpeechPlayback.STARTED, SpeechPlayback.FINISHED), events)
+    }
+
+    @Test fun `every playback mutes the phone microphone from onset through the reverb tail`() {
+        // 0.5: the answer's speech (not just the wake ack) must be kept out of the phone mic, or the ASR transcribes
+        // the assistant's own voice and the continuous-dialogue path answers it in a loop.
+        val clock = object : MonotonicClock {
+            var now = 0L
+            override fun nowNanos(): Long = now
+        }
+        val mute = EchoMuteWindow(clock)
+        val engine = FakeTtsEngine()
+        val player = AndroidSpeechPlayer(engine, echoMute = mute)
+        player.play(hint()) { }
+        assertFalse("nothing is muted before the audible onset", mute.covers(clock.now))
+
+        engine.fireStart("h")
+        assertTrue("the audible interval is muted", mute.covers(clock.now))
+
+        engine.fireDone("h")
+        clock.now += 151_000_000L
+        assertFalse("one reverb tail after the end, the mic is live again", mute.covers(clock.now))
     }
 
     @Test fun `close stops and shuts down the engine`() {

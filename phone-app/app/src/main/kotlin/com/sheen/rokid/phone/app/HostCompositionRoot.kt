@@ -81,6 +81,7 @@ import com.sheen.rokid.phone.audio.AndroidSpeechPlayer
 import com.sheen.rokid.phone.audio.SpeechPlayerRouter
 import com.sheen.rokid.phone.overlay.PhoneBubbleRepository
 import com.sheen.rokid.phone.overlay.PhoneOnlyAppearance
+import com.sheen.rokid.phone.overlay.PhoneOnlyOverlayService
 import com.sheen.rokid.plugin.SpeechPlayer
 import java.util.concurrent.atomic.AtomicReference
 import com.sheen.rokid.phone.session.confirmation.NotificationSurface
@@ -389,6 +390,12 @@ class HostCompositionRoot internal constructor(
      * Kept **last** so positional construction of older call sites is unchanged.
      */
     internal val detachGate: DetachGate = DetachGate(),
+    /**
+     * 0.5 (`D214`): starts/stops the phone-only overlay when the mode changes. `create` passes the production service
+     * sync; a hand-built composition gets a no-op (there is no real overlay to start). The callback reads the gate
+     * itself, so both the on and off transitions use the same entry.
+     */
+    private val syncPhoneOnlyOverlay: () -> Unit = {},
     /**
      * 0.5 (`D213`): the stable speech router the environment and the output arbiter hold.
      *
@@ -3052,6 +3059,7 @@ class HostCompositionRoot internal constructor(
             hintLink?.attach()
             retriedMappingSyncId = null
             P3Log.line("P4_DETACH_LINK state=reattached")
+            syncPhoneOnlyOverlay()
             return
         }
         // Block and clear the link before touching the transport, so a timer or vendor callback that is in flight can
@@ -3085,6 +3093,9 @@ class HostCompositionRoot internal constructor(
             P3Log.line("P5_TTS state=default_on reason=phone_only")
             setSpeechEnabled(true)
         }
+        // 0.5 (`D214`): the ball/bubbles follow the mode; a missing overlay permission is refused visibly in the
+        // settings page (the service logs `NO_OVERLAY_PERMISSION` and stops itself).
+        syncPhoneOnlyOverlay()
     }
 
     @Synchronized fun selectPlugin(pluginId: String) {
@@ -3992,7 +4003,7 @@ class HostCompositionRoot internal constructor(
             // The player is passed to the environment so OutputArbiter can use it; null means no speech capability.
             val speechEnabledNow = runCatching { smartSettingsStore.load().speechEnabled }.getOrNull() ?: false
             val speechPlayer: com.sheen.rokid.plugin.SpeechPlayer? = if (speechEnabledNow) {
-                AndroidSpeechPlayer.create(context, playbackGate)
+                AndroidSpeechPlayer.create(context, playbackGate, echoMute)
             } else null
             // 0.24 S3 Task 14 fix (C2): the plugin's speech gate is the **player's presence**, not the stored switch:
             // a switch that is on but whose engine failed to create still produces no SpeechFinished. Set before the
@@ -4140,10 +4151,12 @@ class HostCompositionRoot internal constructor(
                 noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
                 detachGate = detachGate,
+                // 0.5 (`D214`): the overlay follows the mode; `sync` reads the gate and the overlay permission.
+                syncPhoneOnlyOverlay = { PhoneOnlyOverlayService.sync(context, rootHolder[0]) },
                 // 0.5 (`D213`): the runtime speech router/factory/holder. The factory is the same platform player the
                 // assembly uses, so enabling the switch later creates the exact same implementation.
                 speechRouter = speechRouter,
-                speechPlayerFactory = { AndroidSpeechPlayer.create(context, playbackGate) },
+                speechPlayerFactory = { AndroidSpeechPlayer.create(context, playbackGate, echoMute) },
                 speechPlayerHolder = speechPlayerHolder,
                 // 0.4 Task 6: the same ingress the chain's selector names, and the production recorder factory.
                 phoneIngress = phoneIngress,

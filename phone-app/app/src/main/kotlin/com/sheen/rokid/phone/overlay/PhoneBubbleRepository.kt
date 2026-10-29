@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.overlay
 
 import com.sheen.rokid.contracts.AssistantRoute
+import com.sheen.rokid.phone.platform.P3Log
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -45,6 +46,12 @@ class PhoneBubbleRepository(
                 else -> model.onEvent(event, now)
             }
             state.value = model.snapshot(now)
+            // 0.5 evidence line: which event reached the stack and how many messages the model now shows. Never the
+            // message text; this is what tells the device run whether the plugin's display is feeding the overlay.
+            P3Log.line(
+                "P5_BUBBLE event=${event.javaClass.simpleName} route=${event.route.name} " +
+                    "visible=${state.value.messages.size}",
+            )
         }
     }
 

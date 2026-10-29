@@ -5,6 +5,7 @@ import com.sheen.rokid.phone.app.LockPinSection
 import com.sheen.rokid.phone.app.SmartSettingsSection
 
 import android.Manifest
+import android.net.Uri
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.provider.Settings
@@ -911,6 +912,35 @@ private fun SmartToggles(root: HostCompositionRoot) {
         }
     }
     if (detached) {
+        // 0.5 (`D214`): the overlay is a separate window permission. Without it the service refuses to start, so the
+        // settings page must say why and offer the system grant; returning from that screen re-syncs via MainActivity.
+        val context = LocalContext.current
+        var overlayGranted by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+        val lifecycleOwner = LocalLifecycleOwner.current
+        DisposableEffect(lifecycleOwner) {
+            val observer = LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) overlayGranted = Settings.canDrawOverlays(context)
+            }
+            lifecycleOwner.lifecycle.addObserver(observer)
+            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        }
+        if (overlayGranted) {
+            Text("桌面悬浮球已启用；长按悬浮球开始说话。", style = MaterialTheme.typography.bodySmall)
+        } else {
+            Text(
+                "悬浮球需要「显示在其他应用上层」权限；授予后返回 App 即会出现。",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.error,
+            )
+            TextButton(onClick = {
+                context.startActivity(
+                    Intent(
+                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                        Uri.parse("package:${context.packageName}"),
+                    ),
+                )
+            }) { Text("授予悬浮窗权限") }
+        }
         Text("悬浮球透明度", style = MaterialTheme.typography.titleSmall)
         Text("${ballOpacity.roundToInt()}%", style = MaterialTheme.typography.bodySmall)
         Slider(

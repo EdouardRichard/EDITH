@@ -11,8 +11,8 @@ android {
         // The glasses run Android 12 (YodaOS-Sprite); the CXR-S bridge requires minSdk >= 28.
         minSdk = 28
         targetSdk = 33
-        versionCode = 4
-        versionName = "0.4.0-preview"
+        versionCode = 5
+        versionName = "0.5.0-preview"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 

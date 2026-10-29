@@ -56,7 +56,14 @@ class EchoMuteWindow(
         /** Room reverb after the speaker stops; measured conservatively for a phone on a desk or in a hand. */
         const val DEFAULT_TAIL_NANOS: Long = 150_000_000L
 
-        /** Hard bound when the TTS engine never reports an end; a mute longer than this is always a bug. */
-        const val DEFAULT_WATCHDOG_NANOS: Long = 5_000_000_000L
+        /**
+         * Hard bound when the TTS engine never reports an end.
+         *
+         * 0.4 sized this for the short detached acknowledgement (5 s). 0.5's final answers go through the same window,
+         * and an answer may legitimately speak for far longer than 5 s; a 5 s bound would unmute the phone mic halfway
+         * through the answer and the ASR would transcribe our own voice. The bound is therefore the same 120 s the
+         * conversation cycle allows a missing `SpeechFinished`, which is the failure this watchdog covers.
+         */
+        const val DEFAULT_WATCHDOG_NANOS: Long = 120_000_000_000L
     }
 }

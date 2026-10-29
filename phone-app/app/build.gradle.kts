@@ -31,8 +31,8 @@ android {
         applicationId = "com.sheen.rokid.phone"
         minSdk = 28
         targetSdk = 34
-        versionCode = 4
-        versionName = "0.4.0-preview"
+        versionCode = 5
+        versionName = "0.5.0-preview"
         testInstrumentationRunner = "com.sheen.rokid.phone.PhoneTestRunner"
     }
     signingConfigs {
@@ -133,6 +133,11 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
+    // 0.5: the phone-only overlay hosts Compose in a Service, which needs the ViewTree owners directly. The resolved
+    // lifecycle/savedstate versions come from the Compose/Activity graph; naming them here keeps their AAR classes on
+    // the compile classpath instead of only the KMP metadata artifact.
+    implementation("androidx.lifecycle:lifecycle-runtime:2.10.0")
+    implementation("androidx.savedstate:savedstate:1.4.0")
     implementation(platform("androidx.compose:compose-bom:2024.09.03"))
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
