@@ -4,6 +4,8 @@ import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.phone.audio.DictationFinal
 import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationTarget
+import com.sheen.rokid.phone.audio.DictationUiState
 
 /**
  * 0.4 Task 12b-ii (spec §5.3, D204): the WAKE input row's dictation decisions, as pure functions.
@@ -35,8 +37,13 @@ const val DICTATION_FAILED_LABEL = "听写失败，请重试"
 /** Status when a start was refused because a dictation/wake turn still owns the source. */
 const val DICTATION_BUSY_LABEL = "上一段语音还没结束，请稍后再试"
 
-/** Status when a start was refused because there is no live session under which to record. */
-const val DICTATION_NO_SESSION_LABEL = "会话未开始，请开始会话后重试"
+/**
+ * Status when a start was refused because there is no live session under which to record.
+ *
+ * 0.5.1 C15: the wording points at the App, because the floating ball's no-session refusal tells the wearer to open it
+ * (the composer's own row already lives in the App; the sentence stays actionable there too).
+ */
+const val DICTATION_NO_SESSION_LABEL = "打开 App 开始会话后重试"
 
 /** Status when `RECORD_AUDIO` is missing; it names the permission so the wearer knows what to allow. */
 const val DICTATION_PERMISSION_LABEL = "需要麦克风权限，请在系统设置中允许后重试"
@@ -99,6 +106,38 @@ fun dictationStatusText(state: DictationState): String? = when (state) {
     DictationState.NoSpeech -> DICTATION_NO_SPEECH_LABEL
     is DictationState.Error -> DICTATION_FAILED_LABEL
 }
+
+/**
+ * What the composer page may render from the shared dictation flow (0.5.1 C3, `review Important #2`).
+ *
+ * The host keeps **one** dictation lease and publishes it through **one** `DictationUiState` because the overlay and
+ * the composer are two views of the same host. That sharing must not let one surface drive the other: a BALL lease's
+ * listening/terminal state, final or refusal belongs to the ball, and the composer page must not show its
+ * 「正在听写…」, offer its Stop action, append its words to the draft or explain its refusal - the overlay has its own
+ * microphone and local notice.
+ */
+data class ComposerDictationView(
+    val state: DictationState,
+    val final: DictationFinal?,
+    val refusal: DictationStartResult?,
+)
+
+/**
+ * Projects the host's shared dictation flow onto what the **composer page** owns (0.5.1 C3).
+ *
+ * Only an explicit [DictationTarget.BALL] owner is foreign. A `null` owner is the settled state of an ended lease: the
+ * host clears it in its cleanup, while the composer's terminal status/final deliberately stay in the flow until the
+ * page dismisses/appends them (0.4 Task 12b-ii fix 2, finding 1). The BALL path never publishes a draft final and its
+ * terminal state is reset when its lease ends, so a `null` owner cannot carry ball content. Filtering on
+ * `owner == COMPOSER` alone would instead drop the composer's own final/status the moment its cleanup clears the owner,
+ * which is the opposite of the delivery contract this page relies on.
+ */
+fun composerDictationView(ui: DictationUiState): ComposerDictationView =
+    if (ui.owner == DictationTarget.BALL) {
+        ComposerDictationView(state = DictationState.Idle, final = null, refusal = null)
+    } else {
+        ComposerDictationView(state = ui.state, final = ui.final, refusal = ui.refusal)
+    }
 
 /**
  * The Chinese, retryable status for a refused start, or null while nothing was refused (0.4 Task 12b-ii fix 2,

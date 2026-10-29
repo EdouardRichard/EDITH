@@ -7,7 +7,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
 /**
- * The result of one 「脱离眼镜」 switch change (0.4 Task 5).
+ * The result of one 「纯手机模式」 switch change (0.4 Task 5).
  *
  * A change is **two** effects - stop the running session (if any) and persist the new mode - and either can refuse. A
  * boolean would have made "the stop failed" and "the blob refused the write" indistinguishable in the UI, so [saved]
@@ -23,7 +23,7 @@ internal data class DetachSetResult(
 )
 
 /**
- * The host-only 「脱离眼镜」 gate (`D199`, spec §4.1; owner-approved save semantics).
+ * The host-only 「纯手机模式」 gate (`D199`, spec §4.1; owner-approved save semantics).
  *
  * This is the **only** writer of [SmartSettings.glassesDetached]. It owns:
  *

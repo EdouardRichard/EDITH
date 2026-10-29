@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.app
 import com.sheen.rokid.phone.ui.profile.ProbeConsent
 import com.sheen.rokid.phone.ui.profile.ProfileViewModel
+import com.sheen.rokid.phone.ui.typedResultLabel
 import com.sheen.rokid.phone.R
 import com.sheen.rokid.phone.actions.intent.CallPermission
 import com.sheen.rokid.phone.BuildConfig
@@ -61,6 +62,7 @@ import com.sheen.rokid.phone.audio.DictationController
 import com.sheen.rokid.phone.audio.DictationFinal
 import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationTarget
 import com.sheen.rokid.phone.audio.DictationUiState
 import com.sheen.rokid.phone.audio.SpeechPipelineDictation
 import com.sheen.rokid.phone.audio.PcmRecordDevice
@@ -76,6 +78,12 @@ import com.sheen.rokid.phone.bridge.CxrContextSignals
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
 import com.sheen.rokid.phone.audio.AudioSegmentBridge
 import com.sheen.rokid.phone.audio.AndroidSpeechPlayer
+import com.sheen.rokid.phone.audio.SpeechPlayerRouter
+import com.sheen.rokid.phone.overlay.PhoneBubbleRepository
+import com.sheen.rokid.phone.overlay.PhoneOnlyAppearance
+import com.sheen.rokid.phone.overlay.PhoneOnlyOverlayService
+import com.sheen.rokid.plugin.SpeechPlayer
+import java.util.concurrent.atomic.AtomicReference
 import com.sheen.rokid.phone.session.confirmation.NotificationSurface
 import com.sheen.rokid.phone.session.PendingConfirmation
 import com.sheen.rokid.phone.audio.AudioSegmentCapture
@@ -297,6 +305,12 @@ class HostCompositionRoot internal constructor(
      */
     internal val conversationDisplay: ConversationWireDisplay? = null,
     /**
+     * 0.5: the phone-only message stack's repository. `create` builds one instance, feeds it from the production
+     * [conversationDisplay] and hands the same object to the overlay service; a hand-built composition gets an empty
+     * one, so no test has to construct a CXR display to exercise the bubble model.
+     */
+    internal val phoneBubble: PhoneBubbleRepository = PhoneBubbleRepository(),
+    /**
      * Marshals a vendor-thread callback onto a host-owned thread.
      *
      * `IGlassesEventListener`/inbound custom-command callbacks arrive on the vendor's own thread; host policy
@@ -368,7 +382,7 @@ class HostCompositionRoot internal constructor(
      */
     val modelReadiness: ModelReadiness? = null,
     /**
-     * 0.4 Task 5 (`D199`/`D202`): the **live** 「脱离眼镜」 gate.
+     * 0.4 Task 5 (`D199`/`D202`): the **live** 「纯手机模式」 gate.
      *
      * [create] seeds it from the persisted [SmartSettings.glassesDetached] (default off), wires its stop-before-save
      * rule to this composition's own `stop()` and the host's live state, and hands the same instance to the settings
@@ -376,6 +390,27 @@ class HostCompositionRoot internal constructor(
      * Kept **last** so positional construction of older call sites is unchanged.
      */
     internal val detachGate: DetachGate = DetachGate(),
+    /**
+     * 0.5 (`D214`): starts/stops the phone-only overlay when the mode changes. The argument is the **requested**
+     * mode, not a read of `detachGate.enabled`: the gate invokes the callback while the live value is still the old
+     * one (it updates after the save), so a read here saw `false` on the enable transition and stopped the service
+     * instead of starting it. `create` passes the production service sync; a hand-built composition gets a no-op.
+     */
+    private val syncPhoneOnlyOverlay: (Boolean) -> Unit = {},
+    /**
+     * 0.5 (`D213`): the stable speech router the environment and the output arbiter hold.
+     *
+     * The platform player behind it can be installed/released by [setSpeechEnabled] while the composition runs, so
+     * 「语音朗读」 no longer needs an App restart. A hand-built composition gets an empty router (no player).
+     */
+    private val speechRouter: SpeechPlayerRouter = SpeechPlayerRouter(),
+    /** 0.5: builds the platform player on a runtime enable; null for hand-built rigs and harnesses. */
+    private val speechPlayerFactory: (() -> SpeechPlayer?)? = null,
+    /**
+     * 0.5: the live player-presence holder shared with the smart wiring's `speechAvailable`, the environment's
+     * capability predicate and the device-state `tts` fact. It is the one authority for "can a hint be spoken now".
+     */
+    private val speechPlayerHolder: AtomicReference<SpeechPlayer?> = AtomicReference(null),
     /**
      * 0.4 Task 6 (`D199`/`D200`): the one phone-microphone ingress, or null for a hand-built rig that has none.
      *
@@ -423,6 +458,19 @@ class HostCompositionRoot internal constructor(
      */
     private val speechOn = MutableStateFlow(false)
     internal val speechEnabled: StateFlow<Boolean> = speechOn.asStateFlow()
+
+    /**
+     * 0.5 (`D210`/`D211`): the live appearance of the phone-only overlay. Seeded from the persisted settings in
+     * [create], updated by the settings sliders (preview while dragging, persist on release) and read by the overlay
+     * service, so a change is visible without restarting the App.
+     */
+    private val phoneOnlyAppearanceState = MutableStateFlow(PhoneOnlyAppearance())
+    val phoneOnlyAppearance: StateFlow<PhoneOnlyAppearance> = phoneOnlyAppearanceState.asStateFlow()
+
+    /** Seeds the live appearance from the settings the composition was assembled with (called once by [create]). */
+    internal fun seedPhoneOnlyAppearance(settings: SmartSettings) {
+        phoneOnlyAppearanceState.value = PhoneOnlyAppearance.fromSettings(settings)
+    }
 
     /**
      * The lock-screen PIN store. Production replaces the no-op in [create] with the Keystore-backed store; a test
@@ -491,16 +539,108 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
-     * P5 (spec §S5): the user's switch for 「语音朗读」. Writes through [smartSettingsStore] so the choice persists.
-     * A failed read aborts the write (same pattern as [ProactiveArming.set]): the UI still moves, but the blob is not
-     * silently overwritten with defaults.
+     * P5 (spec §S5) + 0.5 (`D213`): the user's switch for 「语音朗读」, now **effective immediately**.
+     *
+     * 0.4 only flipped the flow and persisted the boolean; the player had already been fixed at composition assembly,
+     * so turning the switch on did nothing until the App restarted (turning it off did not stop playback either). The
+     * runtime path:
+     *
+     * - **on**: install an existing player, or create one through the injected factory, into [speechRouter]; the
+     *   holder the plugin/env read is updated in the same step, so the next answer can actually be spoken;
+     * - **off**: stop the utterance in flight, detach and close the player, clear the holder. A later answer is
+     *   display-only (the plugin's `speechAvailable` sees the empty holder);
+     * - **persist**: a full load-copy-save with `speechConfigured = true`. A blob that cannot be read refuses the
+     *   write rather than overwriting the user's other settings; the live change still happened and is logged, and the
+     *   next start will read whatever the blob still says.
+     *
+     * `speechOn` is the user's intent and can stay on while no player exists (the engine is missing); the capability
+     * and every speech request are gated on the holder, not on this flow.
      */
-    internal fun setSpeechEnabled(enabled: Boolean) {
+    @Synchronized internal fun setSpeechEnabled(enabled: Boolean) {
         speechOn.value = enabled
-        val target = smartSettingsStore ?: return
-        runCatching { target.load() }.onFailure {
-            android.util.Log.i("EdithHost", "speech toggle: settings unreadable, not persisting this change")
-        }.getOrNull()?.let { stored -> runCatching { target.save(stored.copy(speechEnabled = enabled)) } }
+        val state = if (enabled) "on" else "off"
+        if (enabled) {
+            val player = speechPlayerHolder.get() ?: runCatching { speechPlayerFactory?.invoke() }.getOrNull()
+                ?.also {
+                    speechPlayerHolder.set(it)
+                    P3Log.line("P5_TTS state=on player=created")
+                }
+            if (player != null) {
+                // In production the factory is `create`'s, which binds the composition's one echo-mute window to every
+                // player it builds, so an assembly-time player and a runtime-created one mute the same window.
+                speechRouter.install(player)
+                wakeAckPlayer = player as? AndroidSpeechPlayer
+            } else {
+                P3Log.line("P5_TTS state=on player=unavailable")
+            }
+        } else {
+            // 0.5.1 C5: stop the utterance while the target is still installed - the router cancels a play() that is
+            // inside the platform player instead of letting it publish an untracked handle - then detach, then close.
+            // The close is what releases the echo window (with the 150 ms reverb tail); the explicit clear below drops
+            // that tail too, so the off switch cannot leave the phone mic muted now that the 120 s watchdog is gone.
+            speechRouter.stopCurrent()
+            speechRouter.install(null)
+            val released = speechPlayerHolder.getAndSet(null)
+            (released as? AutoCloseable)?.let { runCatching { it.close() } }
+            wakeAckPlayer = null
+            // 0.5.1 C5: the player's own close keeps the 150 ms reverb tail. The off switch means "stop muting the phone
+            // mic", so the tail is dropped too; otherwise a lost end callback could leave the only mute source behind now
+            // that the 120 s watchdog is gone.
+            echoMute?.clear()
+            P3Log.line("P5_TTS state=off")
+        }
+        val target = smartSettingsStore
+        if (target == null) {
+            P3Log.line("P5_TTS state=$state persisted=false reason=SETTINGS_STORE_UNAVAILABLE")
+            return
+        }
+        val stored = runCatching { target.loadForWrite() }.getOrNull()
+        if (stored == null) {
+            P3Log.line("P5_TTS state=$state persisted=false reason=SETTINGS_UNREADABLE")
+            return
+        }
+        runCatching { target.save(stored.copy(speechEnabled = enabled, speechConfigured = true)) }
+            .onFailure { P3Log.line("P5_TTS state=$state persisted=false reason=SAVE_FAILED") }
+    }
+
+    /** One opacity save's outcome: [saved] is the blob's verdict, [error] a stable code for the settings copy. */
+    data class PhoneOnlyOpacityResult(val saved: Boolean, val error: String? = null)
+
+    /**
+     * 0.5 (`D210`/`D211`): the live preview while a slider is dragged. It changes only the in-memory appearance, so the
+     * overlay follows the finger; the durable write happens once on release in [setPhoneOnlyOpacity].
+     */
+    fun previewPhoneOnlyOpacity(ballPercent: Int, bubblePercent: Int) {
+        phoneOnlyAppearanceState.value = PhoneOnlyAppearance.normalized(ballPercent, bubblePercent)
+    }
+
+    /**
+     * Persists both opacities through a full load-copy-save, so the form's other fields are carried through untouched.
+     *
+     * A refused read is not guessed around and a refused write rolls the live appearance back to the stored values:
+     * the overlay must not keep showing a value the next App start will not remember. The values are clamped by
+     * [PhoneOnlyAppearance.normalized], so a slider bug cannot persist an out-of-range number.
+     */
+    fun setPhoneOnlyOpacity(ballPercent: Int, bubblePercent: Int): PhoneOnlyOpacityResult {
+        val target = PhoneOnlyAppearance.normalized(ballPercent, bubblePercent)
+        val store = smartSettingsStore
+            ?: return PhoneOnlyOpacityResult(saved = false, error = "SETTINGS_STORE_UNAVAILABLE")
+        val stored = runCatching { store.loadForWrite() }.getOrNull()
+            ?: return PhoneOnlyOpacityResult(saved = false, error = "SETTINGS_UNREADABLE")
+        val updated = stored.copy(
+            ballOpacityPercent = target.ballOpacityPercent,
+            bubbleOpacityPercent = target.bubbleOpacityPercent,
+        )
+        return try {
+            store.save(updated)
+            phoneOnlyAppearanceState.value = target
+            P3Log.line("P5_OPACITY ball=${target.ballOpacityPercent} bubble=${target.bubbleOpacityPercent}")
+            PhoneOnlyOpacityResult(saved = true)
+        } catch (_: Exception) {
+            phoneOnlyAppearanceState.value = PhoneOnlyAppearance.fromSettings(stored)
+            P3Log.line("P5_OPACITY state=failed")
+            PhoneOnlyOpacityResult(saved = false, error = "SAVE_FAILED")
+        }
     }
     /**
      * RAM-only tee of the live CXR PCM used by the T17 controlled format bring-up. Defaulted to a no-op
@@ -651,6 +791,18 @@ class HostCompositionRoot internal constructor(
      */
     private val dictationUiState = MutableStateFlow(DictationUiState())
     val dictationUi: StateFlow<DictationUiState> = dictationUiState.asStateFlow()
+
+    /**
+     * 0.5 (`D212`): a one-shot, UI-facing explanation for the floating ball's dictation. The ball cannot show the
+     * composer's inline status line, so a refused send/no-speech/error is published here and the overlay turns it into a
+     * local notice bubble. The text is copy only (never the transcript); [clearBallDictationNotice] acknowledges it.
+     */
+    private val ballDictationNoticeState = MutableStateFlow<String?>(null)
+    val ballDictationNotice: StateFlow<String?> = ballDictationNoticeState.asStateFlow()
+
+    fun clearBallDictationNotice() {
+        ballDictationNoticeState.value = null
+    }
 
     /** The live per-dictation controller, or null while no dictation lease is held. */
     private var dictationController: DictationController? = null
@@ -928,6 +1080,9 @@ class HostCompositionRoot internal constructor(
         store.save(settings)
         visionGate.set(settings.visionEnabled)
         noInterceptionGate.set(settings.noInterception)
+        // 0.5: the form carries the two appearance values through untouched; keep the live overlay in step with a
+        // successful save so a form save cannot leave it showing a stale opacity.
+        phoneOnlyAppearanceState.value = PhoneOnlyAppearance.fromSettings(settings)
     }
 
     /**
@@ -1766,23 +1921,29 @@ class HostCompositionRoot internal constructor(
      * @return [DictationStartResult.Accepted] when listening; the retryable refusal otherwise, with a
      *   `P4_DICTATION state=refused` line naming the same reason.
      */
-    @Synchronized fun startDictation(): DictationStartResult {
-        if (closed) return refuseDictation("closed", DictationStartResult.Closed)
-        if (dictationController != null) return refuseDictation("busy", DictationStartResult.Busy)
+    @Synchronized fun startDictation(target: DictationTarget = DictationTarget.COMPOSER): DictationStartResult {
+        if (closed) return refuseDictation("closed", DictationStartResult.Closed, target)
+        // 0.5.1 C4/C5: a manual BALL press is the wearer taking the microphone. The answer may still be speaking, or its
+        // TTS end callback may have been lost (there is no time bound any more), so drop the half-duplex window before
+        // the lease is validated: otherwise the first frames of the manual dictation are replaced by silence. The
+        // service stops the playback itself first ([stopCurrentSpeechForBall]); this is the safety net for every caller
+        // of the BALL target, including one whose start is about to be refused.
+        if (target == DictationTarget.BALL) echoMute?.clear()
+        if (dictationController != null) return refuseDictation("busy", DictationStartResult.Busy, target)
         val session = host.currentState
         if (session != SessionState.Ready && session != SessionState.Listening) {
-            return refuseDictation("no_session", DictationStartResult.NoSession)
+            return refuseDictation("no_session", DictationStartResult.NoSession, target)
         }
         if (!runCatching { microphoneGranted() }.getOrDefault(false)) {
-            return refuseDictation("permission", DictationStartResult.Permission)
+            return refuseDictation("permission", DictationStartResult.Permission, target)
         }
-        val scheduler = deadlineScheduler ?: return refuseDictation("no_scheduler", DictationStartResult.NoScheduler)
-        val chain = audioChain ?: return refuseDictation("no_source", DictationStartResult.NoSource)
-        if (chain.hasActiveTurn()) return refuseDictation("busy", DictationStartResult.Busy)
-        val epoch = runningAudioEpoch ?: return refuseDictation("no_source", DictationStartResult.NoSource)
+        val scheduler = deadlineScheduler ?: return refuseDictation("no_scheduler", DictationStartResult.NoScheduler, target)
+        val chain = audioChain ?: return refuseDictation("no_source", DictationStartResult.NoSource, target)
+        if (chain.hasActiveTurn()) return refuseDictation("busy", DictationStartResult.Busy, target)
+        val epoch = runningAudioEpoch ?: return refuseDictation("no_source", DictationStartResult.NoSource, target)
         val detached = runningAudioDetached
-        if (detached && runningPhoneCapture == null) return refuseDictation("no_source", DictationStartResult.NoSource)
-        val ingress = phoneIngress ?: return refuseDictation("no_source", DictationStartResult.NoSource)
+        if (detached && runningPhoneCapture == null) return refuseDictation("no_source", DictationStartResult.NoSource, target)
+        val ingress = phoneIngress ?: return refuseDictation("no_source", DictationStartResult.NoSource, target)
 
         // 0.4 Task 12b-ii fix 2 (finding 4a): switch the route **before** the phone capture can deliver a frame.
         // Opening the capture first left the CXR loop polling while the dictation source was already live, so a CXR
@@ -1792,20 +1953,20 @@ class HostCompositionRoot internal constructor(
             // A begin that failed after pausing the CXR loop must put the normal loop back; it is still the session's
             // only wake source and the session was never stopped.
             runCatching { chain.endDictation(epoch) }
-            return refuseDictation("no_source", DictationStartResult.NoSource)
+            return refuseDictation("no_source", DictationStartResult.NoSource, target)
         }
         // Defense in depth for a wake turn that opened in the few instructions between the pre-check above and the
         // pause: a dictation must never steal its final, so hand the normal route back and refuse instead.
         if (chain.hasActiveTurn()) {
             runCatching { chain.endDictation(epoch) }
-            return refuseDictation("busy", DictationStartResult.Busy)
+            return refuseDictation("busy", DictationStartResult.Busy, target)
         }
 
         var capture: PhoneMicCapture? = null
         if (!detached) {
             val factory = phoneMicDeviceFactory ?: run {
                 runCatching { chain.endDictation(epoch) }
-                return refuseDictation("no_source", DictationStartResult.NoSource)
+                return refuseDictation("no_source", DictationStartResult.NoSource, target)
             }
             val captureHolder = arrayOfNulls<PhoneMicCapture>(1)
             val failure = runCatching {
@@ -1830,7 +1991,7 @@ class HostCompositionRoot internal constructor(
                 drainIngress(ingress)
                 // The normal route was already paused for the dictation; put it back before the refusal returns.
                 runCatching { chain.endDictation(epoch) }
-                return refuseDictation(code, DictationStartResult.NoSource)
+                return refuseDictation(code, DictationStartResult.NoSource, target)
             }
             capture = captureHolder[0]
         }
@@ -1841,8 +2002,8 @@ class HostCompositionRoot internal constructor(
             pipeline = chain.dictationPipeline(),
             scheduler = scheduler,
             clock = clock,
-            onFinal = { text -> onDictationFinal(generation, text) },
-            onState = { state -> onDictationState(generation, state) },
+            onFinal = { text -> onDictationFinal(generation, target, text) },
+            onState = { state -> onDictationState(generation, target, state) },
             // Non-transcript events only (the controller itself drops partials): the host may route session/fault
             // events normally, but a dictation transcript never enters HostRuntime or the plugin.
             forward = { event ->
@@ -1864,7 +2025,7 @@ class HostCompositionRoot internal constructor(
         dictationCleanupScheduled = false
         when (runCatching { controller.start() }.getOrDefault(DictationController.StartResult.Unavailable)) {
             DictationController.StartResult.Accepted -> {
-                dictationUiState.update { it.copy(state = DictationState.Listening, refusal = null) }
+                dictationUiState.update { it.copy(state = DictationState.Listening, refusal = null, owner = target) }
                 logDictation("started", "user", 0)
                 return DictationStartResult.Accepted
             }
@@ -1879,22 +2040,28 @@ class HostCompositionRoot internal constructor(
                     drainIngress(ingress)
                 }
                 runCatching { chain.endDictation(epoch) }
-                return refuseDictation("start_failed", DictationStartResult.StartFailed)
+                return refuseDictation("start_failed", DictationStartResult.StartFailed, target)
             }
         }
     }
 
     /**
-     * Ends the active dictation through the pipeline, exactly once.
+     * Ends the active dictation through the pipeline, exactly once - and only when [target] is the lease's owner.
      *
      * The controller forces the turn's final; that final follows the redirect to [onDictationFinal] and the UI state,
      * never the LLM. The terminal callback schedules the route/capture cleanup.
+     *
+     * 0.5.1 C3 (`review Important #2`): the composer page and the floating ball share one lease. A stop addressed to a
+     * surface that does **not** hold it is a no-op - the ball's release must never truncate the composer's lease/draft,
+     * and the page's Stop must never end the ball's lease. The owner is the one the live lease published in
+     * [dictationUi] (0.5 `D212`), so this check adds no second owner field.
      *
      * 0.4 Task 12b-ii fix 2 (finding 4b): the loop is quiesced **before** the final is forced. The loop drains a
      * multi-frame batch and delivers it outside its own lock, so a frame still in that batch must not be accepted
      * after the positive endpoint: it would open a second ASR turn whose partials reach the restored wake route.
      */
-    @Synchronized fun stopDictation() {
+    @Synchronized fun stopDictation(target: DictationTarget) {
+        if (dictationUiState.value.owner != target) return
         val controller = dictationController ?: return
         dictationStopRequested = true
         runCatching { audioChain?.quiesceDictationInput() }
@@ -1905,10 +2072,13 @@ class HostCompositionRoot internal constructor(
      * Aborts the active dictation without delivering its text; the pipeline turn is sealed so a late final cannot
      * surface on the restored wake route. The UI ends at [DictationState.Idle].
      *
+     * 0.5.1 C3: owner-aware like [stopDictation]; a cancel for the surface that does not hold the lease is a no-op.
+     *
      * Quiesced before sealing for the same reason as [stopDictation]: the discarded tail of the current frame batch
      * must not start a new turn after the redirect is restored.
      */
-    @Synchronized fun cancelDictation() {
+    @Synchronized fun cancelDictation(target: DictationTarget) {
+        if (dictationUiState.value.owner != target) return
         val controller = dictationController ?: return
         dictationCancelRequested = true
         runCatching { audioChain?.quiesceDictationInput() }
@@ -1916,14 +2086,25 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
-     * Records one refused start, publishes its retryable reason for the row, and returns it.
+     * Records one refused start, publishes its retryable reason for the **composer's** row when the caller owns that
+     * row, and returns it.
      *
-     * The refusal is the **newer action**, so it dismisses the previous terminal state (for example a timeout from an
-     * earlier attempt): the row must explain why this tap did nothing instead of showing stale text. Count-only
-     * telemetry keeps the same `P4_DICTATION state=refused reason=...` shape.
+     * The refusal is the **newer action**, so a composer refusal dismisses the previous terminal state (for example a
+     * timeout from an earlier attempt): the row must explain why this tap did nothing instead of showing stale text.
+     * Count-only telemetry keeps the same `P4_DICTATION state=refused reason=...` shape.
+     *
+     * 0.5.1 C3 (`review Important #2`): a BALL refusal is **not** published into the shared [dictationUi]. That flow is
+     * the composer's status line, and a refused long press - most importantly the `busy` refusal while the composer
+     * itself is listening - would otherwise make the page explain a press it never made. The overlay turns the
+     * returned [DictationStartResult] into its own local notice, which is the only surface the ball has.
      */
-    private fun refuseDictation(reason: String, result: DictationStartResult): DictationStartResult {
+    private fun refuseDictation(
+        reason: String,
+        result: DictationStartResult,
+        target: DictationTarget,
+    ): DictationStartResult {
         logDictation("refused", reason, 0)
+        if (target == DictationTarget.BALL) return result
         // Atomic update, not `.value =`: the page's dismissals are lock-free, so a read-modify-write here could
         // otherwise resurrect a status the wearer already dismissed.
         dictationUiState.update { current ->
@@ -1945,11 +2126,11 @@ class HostCompositionRoot internal constructor(
      * this callback, so a frame left in the same 20 ms batch must not start a new ASR turn), then schedule the slow
      * cleanup on the composition's scheduler thread - never inline on the UI thread or the capture's reader.
      */
-    @Synchronized private fun onDictationState(generation: Long, state: DictationState) {
+    @Synchronized private fun onDictationState(generation: Long, target: DictationTarget, state: DictationState) {
         if (closed || dictationTearingDown || generation != dictationGeneration) return
         when (state) {
             DictationState.Listening -> {
-                dictationUiState.update { it.copy(state = DictationState.Listening) }
+                dictationUiState.update { it.copy(state = DictationState.Listening, owner = target) }
             }
             DictationState.Idle, DictationState.NoSpeech, is DictationState.Error -> {
                 // 0.4 Task 13d: the dictation is over, so its audio is no longer a conversation utterance. Close the
@@ -1961,6 +2142,15 @@ class HostCompositionRoot internal constructor(
                 // Atomic update, not `.value =`: the page's dismissal/consumption are lock-free writers of the same
                 // flow, and a read-modify-write here could otherwise resurrect a final the page already appended.
                 dictationUiState.update { it.copy(state = effective) }
+                // 0.5 (D212): the ball has no inline status line, so a no-speech/error terminal state becomes a local
+                // notice. An Idle here precedes the final on the controller path; the final branch decides its notice.
+                if (target == DictationTarget.BALL) {
+                    when {
+                        failure != null -> ballDictationNoticeState.value = "识别失败（$failure），请重试"
+                        state == DictationState.NoSpeech -> ballDictationNoticeState.value = "没有听到内容，请重试"
+                        else -> Unit
+                    }
+                }
                 when {
                     failure != null -> logDictation("error", failure, 0)
                     state == DictationState.Idle && dictationCancelRequested -> logDictation("cancel", "user", 0)
@@ -1979,12 +2169,26 @@ class HostCompositionRoot internal constructor(
         }
     }
 
-    /** The one final for the active lease; the text is handed to the UI state and nowhere else. */
-    @Synchronized private fun onDictationFinal(generation: Long, text: String) {
+    /** The one final for the active lease; the text is handed to the UI state (composer) or sent (ball) and nowhere else. */
+    @Synchronized private fun onDictationFinal(generation: Long, target: DictationTarget, text: String) {
         if (closed || dictationTearingDown || generation != dictationGeneration) return
         // 0.4 Task 13d: a dictation final ends the wake route's claim on this audio. The tail that follows the final
         // is still the wearer's dictation; keep its transcripts off the host/plugin until an explicit input.
         audioChain?.closeTranscriptRoute("dictation_final")
+        if (target == DictationTarget.BALL) {
+            // 0.5 (D212): the ball's transcript is a user message, not a draft. `requestTypedMessage` is the same
+            // production entry the composer uses, so the plugin's typed admission, the conversation display and the
+            // bubble feed all run unchanged. A refusal is published as a local notice instead of silently dropping the
+            // words.
+            val result = requestTypedMessage(text)
+            ballDictationNoticeState.value =
+                if (result == TypedSendResult.Accepted) null else typedResultLabel(result)
+            // 0.5.1 C3: no DictationFinal - the composer must never append the ball's words. A composer final still
+            // waiting for its page is deliberately left untouched: this lease never owned it.
+            dictationUiState.update { it.copy(state = DictationState.Idle) }
+            logDictation("final", if (dictationStopRequested) "user" else "endpoint", text.length)
+            return
+        }
         val final = DictationFinal(++dictationFinalSequence, text)
         dictationUiState.update { it.copy(state = DictationState.Idle, final = final) }
         // Count only: the wearer's words are never logged and there is no digest of them either.
@@ -2028,6 +2232,17 @@ class HostCompositionRoot internal constructor(
         dictationStopRequested = false
         dictationCancelRequested = false
         dictationFailureCode = null
+        // 0.5 (D212) / 0.5.1 C3: the lease is gone, so the overlay may no longer claim it. A COMPOSER terminal state
+        // stays for its page to dismiss (and a pending final for it to append). A BALL terminal state is reset here:
+        // the ball's explanation lives in its own local notice, and leaving it in the shared flow would make the
+        // composer page inherit the ball's no-speech/error after the owner is cleared.
+        dictationUiState.update { current ->
+            if (current.owner == DictationTarget.BALL) {
+                current.copy(state = DictationState.Idle, owner = null)
+            } else {
+                current.copy(owner = null)
+            }
+        }
     }
 
     /**
@@ -2092,7 +2307,9 @@ class HostCompositionRoot internal constructor(
         dictationStopRequested = false
         dictationCancelRequested = false
         dictationFailureCode = null
-        dictationUiState.update { it.copy(state = DictationState.Idle) }
+        // 0.5.1 C3: the aborted lease released the flow, so the owner goes with it - a stale BALL/COMPOSER marker would
+        // otherwise decide a later unrelated stop and keep a pending composer final hidden from its page.
+        dictationUiState.update { it.copy(state = DictationState.Idle, owner = null) }
         logDictation("cancel", reason, 0)
     }
 
@@ -2372,8 +2589,18 @@ class HostCompositionRoot internal constructor(
 
     private var wakeAckPlayer: AndroidSpeechPlayer? = null
 
-    /** The detached acknowledgement's echo-mute window; [create] builds the one instance the loops consult. */
-    private var echoMute: EchoMuteWindow? = null
+    /**
+     * 0.5.1 C5: the composition's one echo-mute window, handed to every player [create] and [setSpeechEnabled] build.
+     *
+     * The **players** own opening/closing it (at the audible onset and one reverb tail after the end/failure, or on
+     * close); the root keeps the reference only to construct them - and, from 0.5.1 Task 2 on, to clear it explicitly
+     * on a manual dictation/stop. The wake acknowledgement reads no window of its own: a second owner was the bug.
+     *
+     * Internal rather than private so [com.sheen.rokid.phone.audio.SpeechRoutingTest] can bind the window the player
+     * owns and prove this root never opens it itself. With a null field a reintroduced root-side `open()` would silently
+     * no-op and the "nothing is muted before the onset" assertion would pass without testing anything.
+     */
+    internal var echoMute: EchoMuteWindow? = null
 
     /**
      * One wake detector emission, as `create` delivers it (0.24 S5 final review Important #1).
@@ -2396,7 +2623,8 @@ class HostCompositionRoot internal constructor(
         if (identity != null) {
             // 0.4 detached wake acknowledgement (owner 2026-10-27): in detached mode the fixed spoken phrase
             // replaces the beep. The wake event is NOT deferred - the WAKE turn and its ASR open at once, and the
-            // acknowledgement's own echo is kept out of them by the [EchoMuteWindow] the ack opens over the capture.
+            // acknowledgement's own echo is kept out of them by the [EchoMuteWindow] the installed player opens at the
+            // audible onset (0.5.1 C5: the ack must not open it itself - the player is the single owner).
             val acknowledged = detachGate.enabled.value &&
                 runCatching { ack(DETACHED_WAKE_ACK_TEXT) }.getOrDefault(false)
             if (!acknowledged) chime()
@@ -2414,33 +2642,47 @@ class HostCompositionRoot internal constructor(
     /**
      * Detached-only fixed acknowledgement. It is not a turn, not a hint and never reaches the CXR link.
      *
-     * The [EchoMuteWindow] opens **before** the utterance is requested and closes one reverb tail after the player
-     * reports it finished or failed, so the phone microphone's ASR/VAD/KWS never see the phrase. The TTS engine may
-     * lazily await initialization for up to 3 s, so the utterance runs on its own daemon thread; a blocking await
-     * here would stall the wake pipeline.
+     * 0.5.1 C5: the **player** is the single owner of the [EchoMuteWindow]. It opens the window at the audible onset
+     * (`onStart`) and closes it one reverb tail after the end/failure, so this method must not open or close it: doing
+     * so made the wake ack open the window twice (once here, once in the player) and, if the engine never started,
+     * left it open with no owner to close it. The TTS engine may lazily await initialization for up to 3 s, so the
+     * utterance runs on its own daemon thread; a blocking await here would stall the wake pipeline.
      */
     internal fun speakDetachedWakeAck(text: String): Boolean {
         if (!detachGate.enabled.value || !speechEnabled.value) return false
         val player = wakeAckPlayer ?: return false
-        val mute = echoMute ?: return false
-        mute.open()
         P3Log.line("P4_WAKE_ACK state=requested")
         runCatching {
             Thread({
                 val accepted = runCatching {
-                    player.speakText(text, "detached-wake-ack") { state ->
-                        if (state == com.sheen.rokid.plugin.SpeechPlayback.FINISHED ||
-                            state == com.sheen.rokid.plugin.SpeechPlayback.FAILED) mute.close()
-                    }
+                    player.speakText(text, "detached-wake-ack")
                 }.getOrDefault(false)
-                if (!accepted) mute.close()
                 P3Log.line("P4_WAKE_ACK state=${if (accepted) "accepted" else "unavailable"}")
             }, "edith-wake-ack").apply { isDaemon = true }.start()
         }.onFailure {
-            mute.close()
             P3Log.line("P4_WAKE_ACK state=unavailable")
         }
         return true
+    }
+
+    /**
+     * 0.5.1 C4: the BALL long press takes the microphone back from an answer that is still speaking.
+     *
+     * The manual dictation is the phone-only model's only next-sentence entry point (C2), so it must work mid-answer:
+     * the router stops the arbiter-tracked playback, and the half-duplex window is dropped immediately (the player's
+     * cancel only schedules its 150 ms reverb tail). Without both, the echo filter - or the answer still playing over
+     * the wearer - would swallow the takeover.
+     *
+     * **Boundary / residual (accepted for 0.5.1 Task 2).** A detached wake acknowledgement is played directly on the
+     * wake-ack player ([wakeAckPlayer] `speakText`), not through [speechRouter], so [speechRouter.stopCurrent] cannot
+     * stop it and the [echoMute] clear below releases only its half-duplex window. An acknowledgement that is still
+     * audible therefore keeps playing over the first words of the takeover; [startDictation]'s BALL clear does not stop
+     * it either. The residual is one short phrase, and the T12 device case covers long-press-during-ack. Do not read
+     * this method as "the acknowledgement was stopped".
+     */
+    internal fun stopCurrentSpeechForBall() {
+        speechRouter.stopCurrent()
+        echoMute?.clear()
     }
 
     /**
@@ -2847,6 +3089,11 @@ class HostCompositionRoot internal constructor(
         try {
             host.stop()
         } finally {
+            // 0.5.1 C5: the session is over even when `host.stop()` throws, so the half-duplex window is dropped here
+            // rather than after the teardown below. It still runs only after the stop attempt, so a playback cancelled
+            // by the teardown cannot schedule its 150 ms tail behind this clear; a lost TTS end callback must not mute
+            // the first words of the next session (the 120 s watchdog is gone).
+            echoMute?.clear()
             hintLink?.sessionEnded()
             // 0.3 Phase 2 Task 2: the wearing fact belongs to the session that reported it; 停止 is that session ending.
             wearingState = null
@@ -2890,6 +3137,7 @@ class HostCompositionRoot internal constructor(
             hintLink?.attach()
             retriedMappingSyncId = null
             P3Log.line("P4_DETACH_LINK state=reattached")
+            syncPhoneOnlyOverlay(false)
             return
         }
         // Block and clear the link before touching the transport, so a timer or vendor callback that is in flight can
@@ -2914,6 +3162,18 @@ class HostCompositionRoot internal constructor(
                     else -> "close_failed"
                 },
         )
+        // 0.5 (`D213`): the phone-only model's first activation turns「语音朗读」on when the user has never made an
+        // explicit speech choice. `speechConfigured` is the D53② same-shape guard: once the user has turned it off, a
+        // later detach never re-enables it. A store that cannot be read is treated as "already configured" so an
+        // unreadable blob cannot silently create a new consent-shaped default.
+        val speechAlreadyConfigured = runCatching { storedSettings().speechConfigured }.getOrDefault(true)
+        if (!speechAlreadyConfigured) {
+            P3Log.line("P5_TTS state=default_on reason=phone_only")
+            setSpeechEnabled(true)
+        }
+        // 0.5 (`D214`): the ball/bubbles follow the mode; a missing overlay permission is refused visibly in the
+        // settings page (the service logs `NO_OVERLAY_PERMISSION` and stops itself).
+        syncPhoneOnlyOverlay(true)
     }
 
     @Synchronized fun selectPlugin(pluginId: String) {
@@ -2987,16 +3247,23 @@ class HostCompositionRoot internal constructor(
 
     @Synchronized override fun close() {
         if (closed) return
-        stop()
-        closed = true
-        // 0.4 Task 8: `stop()` releases through `disarmAudioEpoch`; releasing again is the belt-and-braces for an arm
-        // that never reached a disarm, and is a no-op when nothing is held.
-        releaseDetachedWakeLock()
-        profileConsent(null)
-        observation.cancel()
-        try { host.close() } finally {
-            try { (model as? AutoCloseable)?.close() } finally {
-                resources.asReversed().forEach { runCatching { it.close() } }
+        // 0.5.1 T8 (the T2 out-of-scope finding): `stop()` used to run before `closed = true` and outside try/finally, so
+        // a throwing stop (the host closed by another path answers `HOST_CLOSED`) aborted the whole teardown and left
+        // the composition "open". Closing is a terminal transition: the stop is attempted exactly as before, and the
+        // rest of the teardown - including the host/model/resource release - runs even when it throws.
+        try {
+            stop()
+        } finally {
+            closed = true
+            // 0.4 Task 8: `stop()` releases through `disarmAudioEpoch`; releasing again is the belt-and-braces for an
+            // arm that never reached a disarm, and is a no-op when nothing is held.
+            releaseDetachedWakeLock()
+            profileConsent(null)
+            observation.cancel()
+            try { host.close() } finally {
+                try { (model as? AutoCloseable)?.close() } finally {
+                    resources.asReversed().forEach { runCatching { it.close() } }
+                }
             }
         }
     }
@@ -3059,7 +3326,7 @@ class HostCompositionRoot internal constructor(
             // so both are reached through holders. Declared here because the 0.4 detach gate below needs them.
             val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
             val hostHolder = arrayOfNulls<HostRuntime>(1)
-            // 0.4 Task 5 (`D199`): the persisted 「脱离眼镜」 gate. The stop-before-save rule uses the composition's
+            // 0.4 Task 5 (`D199`): the persisted 「纯手机模式」 gate. The stop-before-save rule uses the composition's
             // own `stop()` and the host's live state; the gate is loaded once here, before any session can start.
             // 0.4 Task 9 fix: `stop()` only tears down the host session - `SessionService` kept its foreground
             // notification saying 会话已开启 for an idle session. The gate's stop therefore also stops the hosting
@@ -3404,6 +3671,8 @@ class HostCompositionRoot internal constructor(
             ),
                 requestPanelOpen = { route -> rootHolder[0]?.requestPanelOpen(route) ?: false },
                 speechAvailable = { speechPlayerHolder.get() != null },
+                // 0.5 (`D213`): the closing answer is spoken only in the phone-only model; glasses mode keeps the HUD.
+                phoneOnly = { detachGate.enabled.value },
                 // 0.3 Phase 4B (`D189`): the gate's **provider**, not its current value. `saveSmartSettings` updates
                 // this same instance, so the plugin's policy and shell-precheck wrapper see a save from the next call.
                 noInterception = noInterceptionGate.provider())
@@ -3819,15 +4088,21 @@ class HostCompositionRoot internal constructor(
             // The player is passed to the environment so OutputArbiter can use it; null means no speech capability.
             val speechEnabledNow = runCatching { smartSettingsStore.load().speechEnabled }.getOrNull() ?: false
             val speechPlayer: com.sheen.rokid.plugin.SpeechPlayer? = if (speechEnabledNow) {
-                AndroidSpeechPlayer.create(context, playbackGate)
+                AndroidSpeechPlayer.create(context, playbackGate, echoMute)
             } else null
             // 0.24 S3 Task 14 fix (C2): the plugin's speech gate is the **player's presence**, not the stored switch:
             // a switch that is on but whose engine failed to create still produces no SpeechFinished. Set before the
             // host is built/activated so the value the plugin reads is the one the arbiter will honour.
             speechPlayerHolder.set(speechPlayer)
+            // 0.5 (`D213`): the stable router the environment and the arbiter hold; the player behind it can be
+            // replaced at runtime by `setSpeechEnabled` without rebuilding the composition.
+            val speechRouter = SpeechPlayerRouter().also { it.install(speechPlayer) }
             // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
             // assistant tab reads it. It has to be created here because the provider map is built before the root.
             val conversationLog = ConversationLog()
+            // 0.5: the phone-only bubble feed. One repository for the composition; the production display feeds it and
+            // the overlay service reads it through the same root. The monotonic clock is the one the bubble timers use.
+            val phoneBubble = PhoneBubbleRepository(nowMillis = { android.os.SystemClock.elapsedRealtime() })
             // 0.24 S2 Task 11 / Task 6 review: the production display must send through the **real** CXR link, not the
             // silent 3-arg constructor. Built here because the provider map is assembled before the composition exists.
             val conversationDisplay = ConversationWireDisplay(
@@ -3835,6 +4110,7 @@ class HostCompositionRoot internal constructor(
                 wire = hintLink,
                 sendSaid = { route, entryId, text -> hintLink.userSaid(route, entryId, text) },
                 sendBusy = { route, busy -> hintLink.busy(route, busy) },
+                bubbleFeed = phoneBubble,
             )
             // 0.4 Task 7 (`D201`, spec §4.3): the detached display. One instance for the life of the composition, so a
             // session rebuilt while detached gets the same surface, and the phone tab's record is the one it reads
@@ -3849,7 +4125,8 @@ class HostCompositionRoot internal constructor(
                     phone = phoneHintDevice,
                     glasses = hintLink::liveOutput,
                 ),
-                scheduler = scheduler, speech = speechPlayer,
+                scheduler = scheduler, speech = speechRouter,
+                speechAvailable = { speechPlayerHolder.get() != null },
                 providers = buildMap {
                     put(Capability.Model, model)
                     audio?.let { put(Capability.Asr, it.asrSession) }
@@ -3948,6 +4225,7 @@ class HostCompositionRoot internal constructor(
                 hintLink = hintLink,
                 conversationLog = conversationLog,
                 conversationDisplay = conversationDisplay,
+                phoneBubble = phoneBubble,
                 // Vendor callbacks (PIN / PANEL_SHOWN / UI state / scene events) are marshalled onto the composition's
                 // own scheduler thread; the timer is already the host's off-main executor, and a late task after close
                 // is inert in the receiving method.
@@ -3958,6 +4236,13 @@ class HostCompositionRoot internal constructor(
                 noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
                 detachGate = detachGate,
+                // 0.5 (`D214`): the overlay follows the requested mode; the permission is checked by `sync`.
+                syncPhoneOnlyOverlay = { enabled -> PhoneOnlyOverlayService.sync(context, rootHolder[0], enabled) },
+                // 0.5 (`D213`): the runtime speech router/factory/holder. The factory is the same platform player the
+                // assembly uses, so enabling the switch later creates the exact same implementation.
+                speechRouter = speechRouter,
+                speechPlayerFactory = { AndroidSpeechPlayer.create(context, playbackGate, echoMute) },
+                speechPlayerHolder = speechPlayerHolder,
                 // 0.4 Task 6: the same ingress the chain's selector names, and the production recorder factory.
                 phoneIngress = phoneIngress,
                 phoneMicDeviceFactory = { PhoneMicDevice() },
@@ -3990,6 +4275,8 @@ class HostCompositionRoot internal constructor(
             root.audioChain = audio
             // P5 (spec §S5): sync the UI state with what was loaded above.
             root.speechOn.value = speechEnabledNow
+            // 0.5 (`D210`/`D211`): the overlay reads the persisted opacities through this flow.
+            root.seedPhoneOnlyAppearance(smartSettings)
             root.foregroundAppSource = foregroundApp
             root.notificationCategorySource = notificationCategory
             root.calendarSource = calendar
@@ -4227,7 +4514,7 @@ class HostCompositionRoot internal constructor(
 
         /**
          * The arming gate for context, exactly as [armedAcousticSink] is for the acoustic labels: with 「主动辅助」 off -
-         * or with 0.4's 「脱离眼镜」 mode on (`D202`) - the composition produces no `ContextChanged`, so a plugin
+         * or with 0.4's 「纯手机模式」 mode on (`D202`) - the composition produces no `ContextChanged`, so a plugin
          * receives no context signal (spec §16.2, pre-flight P4).
          */
         internal fun armedContextSink(host: () -> HostRuntime?, clock: MonotonicClock,

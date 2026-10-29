@@ -107,6 +107,16 @@ class SmartSettingsFormTest {
         assertFalse("saving an untouched form must not re-enable it", result.settings.continueDialogue)
     }
 
+    @Test
+    fun theContinueDialogueSwitchCarriesThePhoneOnlyNote() {
+        // 0.5.1 (`C2`, spec §3.2): the switch and its stored value stay - glasses mode still uses them - but phone-only
+        // mode never opens the post-answer round. The page must say what the user does instead: long-press the ball.
+        assertEquals(
+            "纯手机模式下不生效；下一句长按悬浮球",
+            SmartSettingsForm.CONTINUE_DIALOGUE_PHONE_ONLY_NOTE,
+        )
+    }
+
     // ---- P3.2: the proactive cooldown and sensitivity fields ----------------------------------------
 
     @Test
@@ -386,6 +396,34 @@ class SmartSettingsFormTest {
 
         assertTrue(result.errors.toString(), result.errors.isEmpty())
         assertTrue("the form must not drop the detach flag", result.settings.glassesDetached)
+        assertEquals("L2", result.settings.maxLevel)
+    }
+
+    @Test
+    fun theSettingsPageNamesThePhoneOnlyMode() {
+        // 0.5.1 (`C1`, spec §3.1): the plan names this suite alongside `DetachUiTest` as the pin for the user-visible
+        // 「纯手机模式」 copy. `DetachUiTest` owns the full copy (old names absent, consequence text); this test is the
+        // settings-form suite's mode-name check, kept separate from the flag-retention test above so a rename cannot
+        // pass by only preserving `glassesDetached`.
+        assertEquals("纯手机模式", DetachUi.SWITCH_TITLE)
+        assertTrue("the proactive note must name the same mode",
+            DetachUi.PROACTIVE_DETACHED_NOTE.contains("纯手机模式"))
+    }
+
+    @Test
+    fun theFormKeepsThePersistedPhoneOnlyAppearanceAndSpeechFlag() {
+        // 0.5: the two opacities and the explicit-speech flag are host-only settings, not fields of this form. A save of
+        // the form's own fields must carry them through; otherwise the next start would silently reset the user's look
+        // (or re-open the speech default by dropping `speechConfigured`).
+        val base = settings().copy(ballOpacityPercent = 41, bubbleOpacityPercent = 57, speechConfigured = true)
+
+        val result = SmartSettingsForm.toSettings(
+            SmartSettingsForm.fromSettings(base).copy(maxLevel = "L2"), base)
+
+        assertTrue(result.errors.toString(), result.errors.isEmpty())
+        assertEquals(41, result.settings.ballOpacityPercent)
+        assertEquals(57, result.settings.bubbleOpacityPercent)
+        assertTrue("the explicit speech choice must survive a form save", result.settings.speechConfigured)
         assertEquals("L2", result.settings.maxLevel)
     }
 }

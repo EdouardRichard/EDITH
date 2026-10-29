@@ -4,6 +4,7 @@ import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.phone.audio.DictationFinal
 import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationTarget
 import com.sheen.rokid.phone.app.TypedSendResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
@@ -54,6 +55,46 @@ class DictationInputTest {
             assertEquals("session=$session", live, canDictate(session))
             assertEquals("session=$session", live, dictationMicEnabled(session))
         }
+    }
+
+    @Test
+    fun `the composer microphone is disabled while the ball owns the one lease`() {
+        // One lease, two surfaces: a BALL lease cannot be stolen, so a tap would only produce a Busy refusal that the
+        // composer page itself filters out as a BALL-owned value - a control that silently does nothing. Keep the one
+        // circular action visible and greyed out, exactly like every other unavailable action.
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Microphone, enabled = false),
+            composerActionSlot(
+                SessionState.Listening,
+                TypedInputState(),
+                DictationState.Idle,
+                owner = DictationTarget.BALL,
+            ),
+        )
+        // A settled lease (null owner) and a composer-owned lease leave the microphone tappable.
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Microphone, enabled = true),
+            composerActionSlot(SessionState.Listening, TypedInputState(), DictationState.Idle, owner = null),
+        )
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Microphone, enabled = true),
+            composerActionSlot(
+                SessionState.Listening,
+                TypedInputState(),
+                DictationState.Idle,
+                owner = DictationTarget.COMPOSER,
+            ),
+        )
+        // Only the microphone is unavailable: the draft can still be sent while the ball holds the lease.
+        assertEquals(
+            ComposerActionSlot(ComposerAction.Send, enabled = true),
+            composerActionSlot(
+                SessionState.Listening,
+                TypedInputState(draft = "你好"),
+                DictationState.Idle,
+                owner = DictationTarget.BALL,
+            ),
+        )
     }
 
     @Test

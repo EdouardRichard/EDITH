@@ -20,7 +20,7 @@ EDITH: An Always-On Proactive AI Agent on Android, Connected to Rokid Glasses
   <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-> **Preview status:** EDITH is currently in preview (version `0.4.0-preview`). Its features are
+> **Preview status:** EDITH is currently in preview (version `0.5.0-preview`). Its features are
 > usable, but performance, stability and the overall experience still need optimization.
 
 EDITH (伊迪丝) is an end-cloud collaborative AI agent: an Android host app on your phone plus a
@@ -28,9 +28,24 @@ custom app on Rokid Glasses. The glasses are its microphone, speaker and display
 ears, hands, memory and brain. Microphone audio streams from the glasses over the Rokid AI App's
 CXR-Link session; the phone segments and transcribes it on-device, calls the LLM you configure,
 operates Android apps through the accessibility service and Shizuku's shell, and communicates with
-the user through text on the glasses HUD and TTS audio. From 0.4 the phone can also run **detached
-from the glasses**, using its own microphone and screen, and its conversation log accepts typed and
-dictated input.
+the user through text on the glasses HUD and TTS audio. From 0.4 the phone can also run in
+**phone-only mode**, using its own microphone and screen; 0.5 adds a draggable EDITH-icon floating
+ball on the home screen and independent translucent message bubbles for replies and tool steps.
+
+- **Phone-only mode (0.5; corrected in 0.5.1)** — Enable it in Settings and an EDITH-icon ball appears on the home
+  screen. Drag it to an edge and it snaps there, half hidden. Long-press to show the microphone and
+  dictate; the transcript is sent to the agent. Replies and tool calls appear as separate translucent
+  bubbles (tool information matches the glasses): at most two (newest + one old), with the whole
+  bubble — card and text — following the opacity slider; the old bubble fades and disappears after
+  2 s. In phone-only mode the answer is **not** followed by the automatic 10 s listening window;
+  long-press the ball to speak the next turn. The ball and the bubbles have separate opacity
+  settings, and a dynamic light ring shows when the AI is thinking.
+
+  > **0.5.1 correction checkpoint:** the 0.5 delivery was re-opened and corrected (C1–C16), with the
+  > full JVM gate and a K40 device matrix recorded in the [0.5.1 evidence](docs/project/evidence/2026-10-29-0.5.1-correction.md).
+  > It is a **checkpoint, not a version-level release**: live permission revoke, long-press/drag/slider
+  > touch, the settings-page render, the 20%/30% opacity extremes and the model's real screen-reading
+  > behaviour remain `NotMeasured`/`Partial`.
 
 - **Wake-word route** — Say “EDITH” or “伊迪丝”. The glasses panel opens, EDITH listens, recognizes
   the intent, perceives the phone (screen, notifications, media, calendar, device state), plans and
@@ -60,11 +75,11 @@ dictated input.
   </a>
 </div>
 
-**Agent capability detached from glasses (0.4)** — no glasses link; wake-word wake only.
+**Phone-only mode (0.4; renamed and extended in 0.5)** — no glasses link; wake-word wake and floating-ball dictation.
 
 <div align="center">
   <a href="docs/assets/videos/detached-wake.mp4">
-    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="Detached wake demo — click to play the full video">
+    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="Phone-only wake demo — click to play the full video">
   </a>
 </div>
 
@@ -89,7 +104,7 @@ launch materializes about **1.0 GiB** (1.03 GiB). See [Model files](#2-model-fil
 
 ## Technical routes
 
-0.4 keeps both routes and adds a phone-only detached variant of the wake route, a text/dictation
+0.4 keeps both routes and adds a phone-only mode variant of the wake route, a text/dictation
 input row on the phone, and model provisioning from APK assets. The default glasses configuration
 described first is unchanged.
 
@@ -103,9 +118,9 @@ proactive route has no wake word at all). A final transcript is admitted into th
 the WAKE turn is waiting for it — with no turn waiting, a final does not open a wake turn; it goes
 to the proactive trigger path instead. `AgentLoop` with the configured cloud model → tool execution
 and perception → answer on the glasses panel and phone-side TTS. The same CXR session also carries
-the display commands and the follow-up audio. With detached mode on, this chain starts at the phone
+the display commands and the follow-up audio. With phone-only mode on, this chain starts at the phone
 microphone instead of the CXR uplink; KWS, VAD, ASR and everything after transcript admission are
-the same (see below). The detached variant also wakes with the screen off or locked (foreground
+the same (see below). It also wakes with the screen off or locked (foreground
 service + `PARTIAL_WAKE_LOCK`) and answers every accepted wake with a fixed spoken acknowledgement
 「我在」 inside an echo-mute window: microphone frames are silenced while the phone speaks, so the
 acknowledgement never reaches the ASR or corrupts the user's next command, and the WAKE turn opens
@@ -202,9 +217,11 @@ tool face as the wake route for FOLLOWUP_TURN · glasses overlay panel via CXR c
 When the gate declines, **zero** model requests are made. The two routes use independent
 `ConversationStore`s.
 
-### Detached mode (0.4)
+### Phone-only mode (0.4; renamed and corrected in 0.5.1)
 
-The **Detached from glasses** setting makes the wake route independent of the glasses.
+The **phone-only mode** setting makes the wake route independent of the glasses. Since 0.5 it also shows the EDITH-icon floating ball and the separate translucent message bubbles described above: drag and edge snap, long-press dictation, a thinking light ring, adjustable opacity, at most two bubbles at a time (whole bubble, text included, follows the slider), and old bubbles that fade away after 2 s. In phone-only mode an answer no longer opens the automatic 10 s continuation; the next turn is dictated by long-pressing the ball.
+
+Since 0.5.1 the user-visible Chinese name is 「纯手机模式」 (0.5 preview builds said 「纯手机模型」). The internal `DetachGate` / `glassesDetached` identifiers and the `phone_only_overlay` notification channel id are unchanged. The 0.5.1 correction is a checkpoint: see the [0.5.1 evidence](docs/project/evidence/2026-10-29-0.5.1-correction.md) for the JVM/device readings and the remaining `NotMeasured` items.
 
 ```mermaid
 flowchart LR
@@ -215,11 +232,11 @@ flowchart LR
     ASR -- "final transcript" --> ADMIT["Transcript admission"] --> CYCLE
     CYCLE -- "answer" --> LOG["Phone conversation log"]
     LOCK["PARTIAL_WAKE_LOCK<br/>edith:detached-wake"] -. "keeps KWS running<br/>with the screen off" .-> ING
-    STORED["Stored proactive switch"] -. "effective off while detached" .-> CYCLE
+    STORED["Stored proactive switch"] -. "effective off in phone-only mode" .-> CYCLE
 ```
 
 With the setting off, the glasses routes above are unchanged: CXR connection, glasses wake, panel
-display and follow-up behavior keep their existing semantics. Detached mode is a local
+display and follow-up behavior keep their existing semantics. Phone-only mode is a local
 input/display choice, not a second CXR protocol.
 
 ## Project structure
@@ -300,13 +317,13 @@ verifies and materializes the assets again; an unchanged bundle is reused.
 and point `-PbundledModelsDir` at the staging directory:
 
 ```powershell
-.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=E:\edith-0.4-models
+.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=D:\Project_new\EDITH_model\k40
 ```
 
-The default is `<repo>/.local/0.4-models`, with `asr/`, `laya/` and `embeddinggemma/`
-subdirectories. The KWS files are read from
-`.local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/` and the tracked
-`keywords.txt`. A complete build requires every file; a missing or mismatched file fails the build.
+The default is `<repo>/../EDITH_model/k40` (the K40 bundle), with `engine-models-import/`, `files/`
+and `embeddinggemma/` subdirectories plus `kws/` for the KWS models. The tracked `keywords.txt`
+stays in `phone-app/perception/audio-android/kws/`. A complete build requires every file; a missing
+or mismatched file fails the build.
 
 For development/CI only, `-PwithoutBundledModels=true` omits `assets/models/**` and sets
 `BuildConfig.BUNDLED_MODELS=false`. **Release variants reject this switch**; it must never produce

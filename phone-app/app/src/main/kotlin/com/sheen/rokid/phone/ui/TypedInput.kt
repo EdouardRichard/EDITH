@@ -4,6 +4,7 @@ import com.sheen.rokid.contracts.AssistantRoute
 import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.phone.app.TypedSendResult
 import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationTarget
 
 /**
  * The WAKE conversation composer's pure decisions (0.4 Task 11, spec §5.1).
@@ -140,11 +141,20 @@ fun canSendTyped(session: SessionState, blank: Boolean, sending: Boolean): Boole
  * The icon does not vanish when the action is unavailable: a non-live session, an in-flight send, or a disabled
  * microphone merely greys the same circle out, which is why [ComposerActionSlot.enabled] is part of the decision.
  * Terminal dictation outcomes (`NoSpeech`/`Error`) give the microphone back: they end one attempt, not the field.
+ *
+ * 0.5.1 C3 (`review Important #2`): [dictation] must be the **composer's** view of the shared host flow
+ * (`composerDictationView` in `DictationInput.kt`), not the raw `DictationUiState.state`. A BALL lease's Listening state
+ * would otherwise turn this slot into Stop and let the page stop a lease it does not own.
+ *
+ * [owner] is the shared flow's raw owner, passed for the one case the filtered [dictation] cannot express: while the
+ * ball holds the lease the microphone stays visible (one control) but is disabled. A tap would only be refused `Busy`,
+ * and the page filters BALL-owned refusals, so the wearer would see a control that silently does nothing.
  */
 fun composerActionSlot(
     session: SessionState,
     state: TypedInputState,
     dictation: DictationState,
+    owner: DictationTarget?,
 ): ComposerActionSlot = when {
     dictation == DictationState.Listening ->
         ComposerActionSlot(ComposerAction.Stop, enabled = true)
@@ -158,7 +168,10 @@ fun composerActionSlot(
     else ->
         ComposerActionSlot(
             ComposerAction.Microphone,
-            enabled = MIC_DICTATION_ENABLED && dictationMicEnabled(session) && !state.sending,
+            enabled = MIC_DICTATION_ENABLED &&
+                dictationMicEnabled(session) &&
+                owner != DictationTarget.BALL &&
+                !state.sending,
         )
 }
 

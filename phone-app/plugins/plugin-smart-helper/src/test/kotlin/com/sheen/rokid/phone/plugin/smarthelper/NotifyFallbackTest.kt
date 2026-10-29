@@ -42,14 +42,40 @@ class NotifyFallbackTest {
     }
 
     @Test
-    fun `a completed turn that never notified is followed by a screen notification`() {
+    fun `a glasses-mode completed turn keeps its final answer display-only`() {
         val rig = rigThatAnswersOnly()
 
         rig.wakeAndFinal("帮我看看")
 
         assertEquals(listOf("已经帮你办好了。"), rig.hintTexts)
-        // §6.2's fallback uses `screen`: the model forgot to notify, so the system says it quietly rather than
-        // speaking something the model never chose to say out loud.
+        // 0.5 (`D213`): glasses mode keeps 0.4's HUD-only final answer. The spoken-answer change is scoped to the
+        // phone-only model, where there is no HUD to read (see the next test).
+        assertEquals(null, rig.output.hints.single().optionalSpeech)
+    }
+
+    @Test
+    fun `a phone-only completed turn speaks its final answer`() {
+        val rig = SmartTestRig(phoneOnly = true)
+        rig.activate(overrides = mapOf(Capability.Storage to SmartFakeStorage()))
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "已经帮你办好了。") }
+
+        rig.wakeAndFinal("帮我看看")
+
+        assertEquals(listOf("已经帮你办好了。"), rig.hintTexts)
+        // 0.5 (`D213`): this fallback IS the phone-only turn's final answer. 0.24 made it display-only, which meant
+        // 「语音朗读」 could never read a final answer; that is the defect this version fixes.
+        assertEquals(SpeechRequest(), rig.output.hints.single().optionalSpeech)
+    }
+
+    @Test
+    fun `a phone-only turn with no speech player keeps the final answer display-only`() {
+        val rig = SmartTestRig(phoneOnly = true, speechAvailable = false)
+        rig.activate(overrides = mapOf(Capability.Storage to SmartFakeStorage()))
+        rig.model.onRequest = { request, listener -> streamText(request, listener, "已经帮你办好了。") }
+
+        rig.wakeAndFinal("帮我看看")
+
+        assertEquals(listOf("已经帮你办好了。"), rig.hintTexts)
         assertEquals(null, rig.output.hints.single().optionalSpeech)
     }
 

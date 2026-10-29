@@ -9,6 +9,7 @@ route.proactive-hint	route/proactive-hint.md	STATIC	2	主动提示路由姿态
 route.proactive-followup	route/proactive-followup.md	STATIC	2	主动追问路由姿态
 context.device-profile	context/device-profile.md	SESSION_STATIC	1	设备画像模板（只允许 DeviceProfile 占位符）
 context.runtime-state	context/runtime-state.md	DYNAMIC	2	每请求动态运行块模板
+phone-only.overlay	phone-only/overlay.md	STATIC	1	纯手机模式：EDITH 自身悬浮球与气泡的归属说明
 loop.retry	loop/retry.md	STATIC	1	循环：空回合重试指令
 loop.plan-nudge	loop/plan-nudge.md	STATIC	1	循环：计划未执行纠偏指令
 loop.timeout	loop/timeout.md	STATIC	1	循环：工具超时后的观察指令

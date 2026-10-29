@@ -11,7 +11,7 @@ import org.junit.Test
 import java.io.IOException
 
 /**
- * 0.4 Task 5 (`D199`/`D202`): the 「脱离眼镜」 gate - persistence, the stop-before-save rule and the live value.
+ * 0.4 Task 5 (`D199`/`D202`): the 「纯手机模式」 gate - persistence, the stop-before-save rule and the live value.
  *
  * `DetachGate` is the **only** writer of [SmartSettings.glassesDetached]. Its contract is deliberately narrow but
  * has one hard ordering rule (spec §4.1): a switch change while a session is running stops that session **first**;

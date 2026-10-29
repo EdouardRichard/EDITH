@@ -5,6 +5,8 @@ import com.sheen.rokid.contracts.ToolPhase
 import com.sheen.rokid.output.ConversationEntry
 import com.sheen.rokid.output.ConversationLog
 import com.sheen.rokid.output.ConversationRole
+import com.sheen.rokid.phone.overlay.PhoneBubbleEvent
+import com.sheen.rokid.phone.overlay.PhoneBubbleFeed
 import com.sheen.rokid.plugin.ConversationDisplay
 import java.util.UUID
 import java.util.concurrent.ConcurrentHashMap
@@ -109,6 +111,11 @@ class ConversationWireDisplay(
     internal val wire: ConversationWire,
     private val sendSaid: (AssistantRoute, String, String) -> Boolean,
     private val sendBusy: (AssistantRoute, Boolean) -> Boolean,
+    /**
+     * 0.5: the phone-only message stack's hook. App-internal (not part of the plugin contract); the default is the
+     * pre-0.5 behavior, so every existing construction and test keeps working without a feed.
+     */
+    private val bubbleFeed: PhoneBubbleFeed = PhoneBubbleFeed.NONE,
 ) : ConversationDisplay {
 
     /**
@@ -186,6 +193,7 @@ class ConversationWireDisplay(
             markFinalized(finalizedUserEntries, route, entry.entryId)
             log.append(entry)
             sendSaid(route, entry.entryId, text)
+            bubbleFeed.onEvent(PhoneBubbleEvent.User(route, entry.turnId, text))
         }
     }
 
@@ -202,6 +210,7 @@ class ConversationWireDisplay(
             markFinalized(finalizedUserEntries, route, entryId)
             log.append(ConversationEntry(entryId, route, ConversationRole.USER, text, turnId))
             sendSaid(route, entryId, text)
+            bubbleFeed.onEvent(PhoneBubbleEvent.User(route, turnId, text))
         }
     }
 
@@ -222,6 +231,7 @@ class ConversationWireDisplay(
             }
             markFinalized(finalizedAnswerEntries, route, entry.entryId)
             log.append(entry)
+            bubbleFeed.onEvent(PhoneBubbleEvent.AnswerFinal(route, null, null, text))
         }
     }
 
@@ -237,6 +247,7 @@ class ConversationWireDisplay(
             openAnswerEntry.remove(route)
             markFinalized(finalizedAnswerEntries, route, "say-$hintId")
             log.append(ConversationEntry("say-$hintId", route, ConversationRole.ASSISTANT, text, turnId))
+            bubbleFeed.onEvent(PhoneBubbleEvent.AnswerFinal(route, turnId, hintId, text))
         }
     }
 
@@ -264,6 +275,7 @@ class ConversationWireDisplay(
         if (text.isBlank()) return
         synchronized(lockFor(route)) {
             log.append(ConversationEntry("say-${UUID.randomUUID()}", route, ConversationRole.ASSISTANT, text))
+            bubbleFeed.onEvent(PhoneBubbleEvent.Notice(route, text))
         }
     }
 
@@ -284,6 +296,7 @@ class ConversationWireDisplay(
 
     override fun showIdle(route: AssistantRoute, sequence: Long) {
         wire.idle(route, sequence)
+        bubbleFeed.onEvent(PhoneBubbleEvent.TurnIdle(route))
     }
 
     override fun userPartial(route: AssistantRoute, turnId: String, revision: Long, text: String) {
@@ -314,11 +327,14 @@ class ConversationWireDisplay(
             log.append(ConversationEntry(entryId, route, ConversationRole.ASSISTANT, text, turnId))
             openAnswerEntry[route] = OpenEntry(entryId, turnId)
             wire.answer(route, turnId, hintId, revision, text)
+            bubbleFeed.onEvent(PhoneBubbleEvent.AnswerPartial(route, turnId, hintId, text))
         }
     }
 
     override fun toolStatus(route: AssistantRoute, turnId: String, phase: ToolPhase, label: String) {
         wire.tool(route, turnId, phase, label)
+        // A blank label is not a row the wearer can read; the wire still receives it unchanged (existing behavior).
+        if (label.isNotBlank()) bubbleFeed.onEvent(PhoneBubbleEvent.Tool(route, turnId, label, phase))
     }
 
     override fun panelOpen(route: AssistantRoute) {
@@ -332,6 +348,7 @@ class ConversationWireDisplay(
             openUserEntry.remove(route)
             openAnswerEntry.remove(route)
             wire.close(route)
+            bubbleFeed.onEvent(PhoneBubbleEvent.TurnIdle(route))
         }
     }
 

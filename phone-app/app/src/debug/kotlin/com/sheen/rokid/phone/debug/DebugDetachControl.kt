@@ -9,7 +9,7 @@ import com.sheen.rokid.phone.platform.P3Log
 import com.sheen.rokid.phone.storage.AndroidProfileRepository
 
 /**
- * Debug-only 「脱离眼镜」 gate setter and state readback (0.4 Task 9).
+ * Debug-only 「纯手机模式」 gate setter and state readback (0.4 Task 9).
  *
  * The switch itself lives at the bottom of a long Compose settings page. The installed accessibility probe can click a
  * visible label, but it has no "scroll the current app" primitive, so at the native 1080×2400 viewport the switch is

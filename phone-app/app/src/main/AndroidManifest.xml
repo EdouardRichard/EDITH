@@ -28,8 +28,11 @@
          service runs as a `microphone` service. That is the Android-14+ permission for the type; the type itself is
          requested at runtime only in detached mode (`SessionService`), and glasses mode keeps `connectedDevice`. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <!-- 0.5 (`D214`): the phone-only model's floating ball is a persistent overlay with no session; the service is a
+         `specialUse` foreground service on API 34+ (the platform requires a declared type). -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- 0.4 Task 6: the detached session's audio source. A runtime permission, requested from the session page only
-         when 「脱离眼镜」 is on (spec §4.2, §4.5); glasses mode never asks for it. -->
+         when 「纯手机模式」 is on (spec §4.2, §4.5); glasses mode never asks for it. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Lock-screen unlock keeps the display interactive for the bounded duration of a device tool call. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
@@ -96,6 +99,15 @@
              the platform requires for a service that may serve either mode. -->
         <service android:name=".session.SessionService" android:exported="false"
             android:foregroundServiceType="connectedDevice|microphone" />
+        <!-- 0.5 (`D214`): the pure-phone model's floating ball/bubbles. It is not a session host; it only draws and
+             translates touches into production host calls. `specialUse` is the honest type for a persistent overlay,
+             and the subtype property is what API 34+ shows in the FGS audit. -->
+        <service android:name=".overlay.PhoneOnlyOverlayService" android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="phone-only floating assistant overlay" />
+        </service>
         <!-- P3.3 (§17.4): the notification's three buttons (允许/拒绝/急停). `exported="false"` is load-bearing, not a
              formality: an exported receiver would let any App on the phone answer a confirmation on the user's behalf.
              The PendingIntents that reach it are explicit and immutable. -->

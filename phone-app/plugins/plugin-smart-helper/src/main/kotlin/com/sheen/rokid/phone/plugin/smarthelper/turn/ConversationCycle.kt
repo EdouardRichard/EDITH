@@ -48,6 +48,17 @@ internal class ConversationCycle(
     private val display: () -> ConversationDisplay?,
     private val continueDialogue: () -> Boolean,
     /**
+     * 0.5.1 (`C2`, spec §3.2): whether a **displayed answer** opens the next listening round.
+     *
+     * This is the only continuation this class decides (`onAnswerDone`/`onSpeechFinished` -> `AudioFinishedHandler`).
+     * The initial 10 s window (`onWake`/`armListening`) and the continue-off exit (`armContinueOffLocked`) are
+     * untouched: the former is not a post-answer continuation, and the latter is its own official branch.
+     *
+     * Defaults to [continueDialogue] so every pre-0.5.1 direct caller - including this package's own tests - keeps the
+     * old behaviour byte for byte. Production passes the split seam (`settings.continueDialogue && !phoneOnly()`).
+     */
+    private val continueAfterAnswer: () -> Boolean = continueDialogue,
+    /**
      * 0.3 Phase 3 Task 7: opens the next listening round for the **route whose answer** just finished.
      *
      * The route is carried explicitly instead of being inferred by the opener: a PROACTIVE answer must never open a
@@ -325,7 +336,7 @@ internal class ConversationCycle(
          */
         answerVisibleUntilNanos: Long = 0L,
     ) {
-        val continueOn = continueDialogue()
+        val continueOn = continueAfterAnswer()
         var continuation: String? = null
         var cancelledTurn: String? = null
         synchronized(lock) {
@@ -372,7 +383,7 @@ internal class ConversationCycle(
      * glasses' acknowledgement reaches this state machine. A result for an already-settled answer is stale and ignored.
      */
     fun onSpeechFinished(route: AssistantRoute, result: SpeechResult) {
-        val continueOn = continueDialogue()
+        val continueOn = continueAfterAnswer()
         var continuation: String? = null
         synchronized(lock) {
             val current = state(route)

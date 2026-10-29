@@ -32,6 +32,7 @@ class PromptHardcodeGuardTest {
         "loop/timeout.md",
         "pinned/proactive-gate.md",
         "pinned/proactive-gate-options.md",
+        "phone-only/overlay.md",
         "summarizer.md",
     )
 

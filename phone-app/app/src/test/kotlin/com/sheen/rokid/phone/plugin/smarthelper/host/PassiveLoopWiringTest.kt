@@ -1285,6 +1285,42 @@ private class NoStorageAccess : StorageAccess {
     }
 
     /**
+     * 0.5.1 (`C2`, spec §3.2): phone-only mode disables **only** the post-answer continuation the composition wires.
+     *
+     * The stored 「持续对话」 value still travels to the plugin (glasses mode and the queued-utterance seam read it);
+     * the new seam multiplies it by the live `!phoneOnly()`. A wiring that forgot the mode, or snapshotted it, would
+     * either keep the 10 s continuation on the phone or leave glasses mode unchanged only by accident.
+     */
+    @Test
+    fun thePhoneOnlyModeGatesThePostAnswerContinuationTheWiringBuilds() {
+        val detached = java.util.concurrent.atomic.AtomicBoolean(false)
+
+        fun wiredSwitch(settings: SmartSettings): () -> Boolean {
+            val wiring = SmartWiring(
+                settings, MemoryProfileRepository(), FakeClock(0), ManualScheduler(FakeClock(0)),
+                phoneOnly = { detached.get() },
+            )
+            val field = wiring.plugin.javaClass.getDeclaredField("continueAfterAnswer")
+            field.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            return field.get(wiring.plugin) as () -> Boolean
+        }
+
+        val storedOn = wiredSwitch(SmartSettings(continueDialogue = true))
+        val storedOff = wiredSwitch(SmartSettings(continueDialogue = false))
+
+        assertTrue("glasses mode with the stored switch on still continues", storedOn())
+        assertFalse("the stored switch still gates glasses mode", storedOff())
+
+        // The provider is read live: a save/mode change after assembly must apply without rebuilding the plugin.
+        detached.set(true)
+        assertFalse(
+            "phone-only mode must disable the post-answer continuation even with the stored switch on",
+            storedOn(),
+        )
+    }
+
+    /**
      * 0.24 S3 Task 14 fix round (C2): whether a player exists must reach the plugin.
      *
      * With「语音朗读」off (the shipped default) production builds no player, so a `both`/`voice` answer has no
