@@ -124,9 +124,9 @@ class PromptArchitectureTest {
         val helperRoot = File(root, "phone-app/plugins/plugin-smart-helper/src/main/resources/prompts")
         assertTrue(helperRoot.isDirectory, "the product prompt root must exist")
         assertEquals(
-            setOf("manifest.tsv", "summarizer.md", "core", "route", "context", "loop", "pinned"),
+            setOf("manifest.tsv", "summarizer.md", "core", "route", "context", "loop", "pinned", "phone-only"),
             helperRoot.listFiles()!!.map { it.name }.toSet(),
-            "the catalog root may contain only the manifest, the summarizer and the five authored folders",
+            "the catalog root may contain only the manifest, the summarizer and the six authored folders",
         )
         val declared = PromptCatalog.manifest().map { it.file }.toSet()
         val authored = helperRoot.walkTopDown()

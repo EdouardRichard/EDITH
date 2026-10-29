@@ -816,9 +816,13 @@ class SmartAssistantPlugin(
      * and a public constructor must not expose it. Production never touches it: the default is the shipped
      * `PromptCatalog`, and the seam exists so a test can observe **when** a plan is loaded (once per activation, never
      * per request) and prove that a catalog change cannot rewrite a live session. A test sets it before [activate].
+     *
+     * 0.5.1 (C8, spec §3.6): the default also reads the live [phoneOnly] flag, so a phone-only session pins the section
+     * that tells the model its own floating ball and bubbles are EDITH's overlay, not the target App's content. Glasses
+     * mode passes `false` and keeps the pre-0.5.1 plan and hash exactly.
      */
     internal var promptCatalog: (PromptRoute, DeviceProfile?) -> PromptPlan = { route, profile ->
-        PromptCatalog.plan(route, profile)
+        PromptCatalog.plan(route, profile, phoneOnly())
     }
 
     /**
