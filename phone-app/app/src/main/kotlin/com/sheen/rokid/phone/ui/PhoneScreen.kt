@@ -56,6 +56,9 @@ import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
 import com.sheen.rokid.phone.audio.DictationTarget
 import com.sheen.rokid.phone.audio.DictationUiState
+import com.sheen.rokid.phone.overlay.PhoneOnlyOverlayService
+import com.sheen.rokid.phone.overlay.PhoneOnlyStartStopPolicy
+import com.sheen.rokid.phone.overlay.phoneOnlyStartFailureText
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.SessionViewModel
@@ -922,8 +925,10 @@ private fun SmartToggles(root: HostCompositionRoot) {
         }
     }
     if (detached) {
-        // 0.5 (`D214`): the overlay is a separate window permission. Without it the service refuses to start, so the
-        // settings page must say why and offer the system grant; returning from that screen re-syncs via MainActivity.
+        // 0.5 (`D214`), corrected by 0.5.1 (`C12`/`C14`): the overlay is a separate window permission **and** a live
+        // foreground service. 「已启用」 must mean the service really reached its running state - a granted permission
+        // with no ball (a refused/failed start) is not enabled. A start failure shows its reason and a retry instead of
+        // only being logged; returning from the system grant screen re-syncs through MainActivity.onResume.
         val context = LocalContext.current
         var overlayGranted by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
         val lifecycleOwner = LocalLifecycleOwner.current
@@ -934,22 +939,55 @@ private fun SmartToggles(root: HostCompositionRoot) {
             lifecycleOwner.lifecycle.addObserver(observer)
             onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
         }
-        if (overlayGranted) {
-            Text("桌面悬浮球已启用；长按悬浮球开始说话。", style = MaterialTheme.typography.bodySmall)
-        } else {
-            Text(
-                "悬浮球需要「显示在其他应用上层」权限；授予后返回 App 即会出现。",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.error,
-            )
-            TextButton(onClick = {
-                context.startActivity(
-                    Intent(
-                        Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                        Uri.parse("package:${context.packageName}"),
-                    ),
+        val overlayRunning by PhoneOnlyOverlayService.isRunning.collectAsStateWithLifecycle()
+        val overlayFailure by PhoneOnlyOverlayService.startFailure.collectAsStateWithLifecycle()
+        // A runtime revoke (C12) can happen while this page stays composed; the service's state change is what re-reads
+        // the grant, so the page does not keep claiming the old permission until the next resume.
+        LaunchedEffect(overlayRunning, overlayFailure) {
+            overlayGranted = Settings.canDrawOverlays(context)
+        }
+        when (
+            val overlayStatus =
+                PhoneOnlyStartStopPolicy.settingsStatus(overlayGranted, overlayRunning, overlayFailure)
+        ) {
+            PhoneOnlyStartStopPolicy.Status.Running ->
+                Text("桌面悬浮球已启用；长按悬浮球开始说话。", style = MaterialTheme.typography.bodySmall)
+            PhoneOnlyStartStopPolicy.Status.PermissionMissing -> {
+                Text(
+                    "悬浮球需要「显示在其他应用上层」权限；授予后返回 App 即会出现。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
                 )
-            }) { Text("授予悬浮窗权限") }
+                TextButton(onClick = {
+                    context.startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:${context.packageName}"),
+                        ),
+                    )
+                }) { Text("授予悬浮窗权限") }
+            }
+            is PhoneOnlyStartStopPolicy.Status.Failed -> {
+                Text(
+                    "悬浮球启动失败：${phoneOnlyStartFailureText(overlayStatus.failure)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                TextButton(onClick = {
+                    // Re-read the real grant before syncing: a revoke made while this page stayed composed (e.g. from
+                    // adb during T12) must not leave the page acting on the stale value, and sync refuses without the
+                    // grant anyway.
+                    overlayGranted = Settings.canDrawOverlays(context)
+                    PhoneOnlyOverlayService.sync(context, root, requestedEnabled = true)
+                }) { Text("重试启动悬浮球") }
+            }
+            PhoneOnlyStartStopPolicy.Status.NotRunning -> {
+                Text("悬浮球尚未运行（若刚开启模式，可能还在启动）。", style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = {
+                    overlayGranted = Settings.canDrawOverlays(context)
+                    PhoneOnlyOverlayService.sync(context, root, requestedEnabled = true)
+                }) { Text("启动悬浮球") }
+            }
         }
     }
     // 0.5.1 (C15): the two opacity sliders stay visible while the mode is off, with a note that they only take effect

@@ -337,6 +337,24 @@ class SpeechRoutingTest {
         }
     }
 
+    /**
+     * 0.5.1 T8 (the T2 out-of-scope finding): `close()` called `stop()` **before** setting `closed`, outside any
+     * try/finally, so a throwing stop aborted the whole teardown and left the composition "open". The host is closed by
+     * another path here, which is the existing throwing seam: `stop()` propagates `HOST_CLOSED`. The composition must
+     * still be closed and torn down - observable as the second `close()` being a no-op instead of another `HOST_CLOSED`.
+     */
+    @Test
+    fun `a throwing host stop cannot skip the composition close`() {
+        val blobs = RecordingBlobs()
+        val root = composition(SpeechPlayerRouter(), blobs) { FakePlayer() }
+        root.host.close()
+
+        val failure = assertThrows(IllegalStateException::class.java) { root.close() }
+        assertEquals("the host must have thrown where the test intended", "HOST_CLOSED", failure.message)
+
+        root.close() // must be a no-op: the composition is closed even though its stop threw
+    }
+
     @Test
     fun `long press on the ball stops the speaking answer before the manual dictation`() {
         // C4: the ball long press is the takeover path. The answer must stop and its echo window must go before the BALL

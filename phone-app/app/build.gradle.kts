@@ -133,9 +133,13 @@ dependencies {
     implementation("androidx.activity:activity-compose:1.9.2")
     implementation("androidx.lifecycle:lifecycle-viewmodel-ktx:2.8.6")
     implementation("androidx.lifecycle:lifecycle-runtime-compose:2.8.6")
-    // 0.5: the phone-only overlay hosts Compose in a Service, which needs the ViewTree owners directly. The resolved
-    // lifecycle/savedstate versions come from the Compose/Activity graph; naming them here keeps their AAR classes on
-    // the compile classpath instead of only the KMP metadata artifact.
+    // 0.5.1 (C14): the phone-only overlay hosts Compose in a Service, whose custom owner needs the lifecycle/savedstate
+    // ViewTree classes at runtime. These explicit declarations keep the versions the rest of the graph then resolves at
+    // 2.10.0 / 1.4.0 instead of the older Compose/Activity defaults; DECISIONS §21.1 records why they are kept.
+    //
+    // They do NOT put `ViewTreeLifecycleOwner` on Kotlin's compile classpath in this KMP variant graph (measured
+    // 2026-10-29: a direct import is an unresolved reference), so the service still installs both ViewTree owners
+    // reflectively and surfaces an install failure as a visible start failure.
     implementation("androidx.lifecycle:lifecycle-runtime:2.10.0")
     implementation("androidx.savedstate:savedstate:1.4.0")
     implementation(platform("androidx.compose:compose-bom:2024.09.03"))

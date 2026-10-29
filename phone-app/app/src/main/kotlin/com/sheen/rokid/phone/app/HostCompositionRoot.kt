@@ -3247,16 +3247,23 @@ class HostCompositionRoot internal constructor(
 
     @Synchronized override fun close() {
         if (closed) return
-        stop()
-        closed = true
-        // 0.4 Task 8: `stop()` releases through `disarmAudioEpoch`; releasing again is the belt-and-braces for an arm
-        // that never reached a disarm, and is a no-op when nothing is held.
-        releaseDetachedWakeLock()
-        profileConsent(null)
-        observation.cancel()
-        try { host.close() } finally {
-            try { (model as? AutoCloseable)?.close() } finally {
-                resources.asReversed().forEach { runCatching { it.close() } }
+        // 0.5.1 T8 (the T2 out-of-scope finding): `stop()` used to run before `closed = true` and outside try/finally, so
+        // a throwing stop (the host closed by another path answers `HOST_CLOSED`) aborted the whole teardown and left
+        // the composition "open". Closing is a terminal transition: the stop is attempted exactly as before, and the
+        // rest of the teardown - including the host/model/resource release - runs even when it throws.
+        try {
+            stop()
+        } finally {
+            closed = true
+            // 0.4 Task 8: `stop()` releases through `disarmAudioEpoch`; releasing again is the belt-and-braces for an
+            // arm that never reached a disarm, and is a no-op when nothing is held.
+            releaseDetachedWakeLock()
+            profileConsent(null)
+            observation.cancel()
+            try { host.close() } finally {
+                try { (model as? AutoCloseable)?.close() } finally {
+                    resources.asReversed().forEach { runCatching { it.close() } }
+                }
             }
         }
     }

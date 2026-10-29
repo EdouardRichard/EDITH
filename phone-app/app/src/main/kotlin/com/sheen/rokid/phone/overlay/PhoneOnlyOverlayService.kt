@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.overlay
 
+import android.app.AppOpsManager
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
@@ -40,7 +41,10 @@ import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.drop
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
@@ -65,6 +69,13 @@ import kotlin.math.roundToInt
  *
  * Lifecycle: started/stopped only by [sync] when the mode is on and the overlay permission is granted; `START_NOT_STICKY`
  * (a killed process does not resurrect a ball in the background); a mode-off or permission loss stops it immediately.
+ *
+ * 0.5.1 (`C12`/`C14`/`C15`): the live permission is watched with `AppOpsManager.startWatchingMode(SYSTEM_ALERT_WINDOW)`
+ * so a **runtime revoke** removes the windows, drops the notification and stops the service (unregistered in
+ * [onDestroy]); the service publishes [isRunning]/[startFailure] for the settings page instead of letting the page infer
+ * 「已启用」 from `Settings.canDrawOverlays`; a start failure (owner install, window add, foreground) is published for a
+ * visible retry rather than only logged; and teardown cancels the BALL dictation (no final) and clears the bubble stack
+ * so a re-enabled overlay never replays old messages.
  */
 class PhoneOnlyOverlayService : Service() {
 
@@ -102,52 +113,82 @@ class PhoneOnlyOverlayService : Service() {
     private var moveJob: Job? = null
     private var foregroundStarted = false
 
+    /** 0.5.1 C12: the live overlay-permission watcher; registered when the overlay starts, unregistered in [onDestroy]. */
+    private var appOps: AppOpsManager? = null
+    private var overlayWatcher: AppOpsManager.OnOpChangedListener? = null
+
+    /** One service instance performs its start once, in the first [onStartCommand]. */
+    private var startAttempted = false
+
+    /**
+     * 0.5.1 C15: true only once this instance published `state=on`. A refused or failed instance must not log
+     * `state=off` on destroy - that line means "the running overlay stopped", not "a start was refused".
+     */
+    private var started = false
+
     override fun onBind(intent: Intent?): IBinder? = null
 
-    override fun onCreate() {
-        super.onCreate()
+    /**
+     * 0.5.1 (`C15`): the start work runs in [onStartCommand], not `onCreate`, because this is the only place a `Service`
+     * receives its start intent - and that intent carries [sync]'s **explicit** requested value. The 0.5 half-fix taught
+     * `sync` to use the requested value, but the service still re-read the live gate in `onCreate`: the detach gate
+     * invokes its callback before it publishes the new value, so on the off -> on transition the service could see
+     * `false` and stop the ball the user had just asked for. The live gate stays the fallback for a start that did not
+     * come through sync. `onStartCommand` runs before the foreground-service deadline, so promoting here is safe.
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        if (!startAttempted) {
+            startAttempted = true
+            startOverlay(intent)
+        }
+        return START_NOT_STICKY
+    }
+
+    private fun startOverlay(intent: Intent?) {
         val composition = app.liveComposition
         if (composition == null) {
-            P3Log.line("P5_PHONE_ONLY state=refused reason=NO_COMPOSITION")
-            stopSelf()
+            refuseStart(PhoneOnlyStartStopPolicy.Reason.NO_COMPOSITION)
             return
         }
-        if (!composition.detachGate.enabled.value) {
-            P3Log.line("P5_PHONE_ONLY state=refused reason=MODE_OFF")
-            stopSelf()
+        val explicitlyRequested = intent?.getBooleanExtra(EXTRA_REQUESTED_ENABLED, false) == true
+        if (!explicitlyRequested && !composition.detachGate.enabled.value) {
+            refuseStart(PhoneOnlyStartStopPolicy.Reason.MODE_OFF)
             return
         }
         if (!Settings.canDrawOverlays(this)) {
-            P3Log.line("P5_PHONE_ONLY state=refused reason=NO_OVERLAY_PERMISSION")
-            stopSelf()
+            refuseStart(PhoneOnlyStartStopPolicy.Reason.NO_OVERLAY_PERMISSION)
             return
         }
         root = composition
         if (!startForegroundNotification()) {
-            stopSelf()
+            failStart(PhoneOnlyStartFailure.FOREGROUND)
             return
         }
+        // 0.5.1 C12: a revoke after this point stops the overlay immediately, without waiting for a resume.
+        registerOverlayWatcher()
         windowManager = getSystemService(WindowManager::class.java)
         measure()
-        addWindows()
+        if (!addWindows(composition)) return
         collectState(composition)
+        started = true
+        PhoneOnlyOverlayRuntime.running()
         P3Log.line("P5_PHONE_ONLY state=on")
     }
 
-    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
-
     override fun onDestroy() {
+        // 0.5.1 C12: unregister first, so a callback racing the teardown cannot touch removed windows.
+        unregisterOverlayWatcher()
         // 0.5.1 C3/T8 handoff: a service teardown owns the BALL lease this press acquired, so it ends that lease and
         // never the composer's. It must **cancel**, not stop: a stop forces the turn's final and `onDictationFinal(BALL)`
         // sends it through `requestTypedMessage`, so a shutdown would publish a user turn the wearer never finished.
-        // A refused press has nothing to stop and must not touch the composer's lease. T8 still owns the bubble clear
-        // and Notice expiry here; this only releases the dictation lease.
+        // A refused press has nothing to stop and must not touch the composer's lease.
         if (ballPress.end()) root?.cancelDictation(DictationTarget.BALL)
+        // 0.5.1 C15: drop the stack after the dictation is cancelled (so no final message is published); a re-enabled
+        // overlay must not replay the previous instance's bubbles.
+        root?.phoneBubble?.clear()
+        PhoneOnlyOverlayRuntime.stopped()
         scope.cancel()
-        ballView?.let { runCatching { windowManager?.removeView(it) } }
-        bubbleView?.let { runCatching { windowManager?.removeView(it) } }
-        ballView = null
-        bubbleView = null
+        removeOverlayViews()
         lifecycleOwner?.let {
             it.onPause(); it.onStop(); it.onDestroy()
         }
@@ -156,8 +197,106 @@ class PhoneOnlyOverlayService : Service() {
             runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
             foregroundStarted = false
         }
-        P3Log.line("P5_PHONE_ONLY state=off")
+        // 0.5.1 C15: `state=off` means "the running overlay stopped". A refused/failed start already logged its own
+        // line and must not masquerade as a normal stop.
+        if (started) P3Log.line("P5_PHONE_ONLY state=off")
         super.onDestroy()
+    }
+
+    // ---- lifecycle of the start decision -------------------------------------------------------------------------
+
+    /** 0.5.1 C15: the service was asked to run but cannot; this is a refusal, not a stop of a running overlay. */
+    private fun refuseStart(reason: PhoneOnlyStartStopPolicy.Reason) {
+        P3Log.line("P5_PHONE_ONLY state=refused reason=$reason")
+        PhoneOnlyOverlayRuntime.stopped()
+        stopSelf()
+    }
+
+    /**
+     * 0.5.1 C12/C14: this instance cannot reach `state=on`. The reason is published for the settings page (visible
+     * with a retry) instead of only being written to logcat.
+     */
+    private fun failStart(failure: PhoneOnlyStartFailure, detail: String? = null) {
+        val suffix = if (detail == null) "" else " reason=$detail"
+        P3Log.line("P5_PHONE_ONLY state=failed start_failure=$failure$suffix")
+        PhoneOnlyOverlayRuntime.failed(failure)
+        stopSelf()
+    }
+
+    // ---- overlay permission watcher ------------------------------------------------------------------------------
+
+    /**
+     * 0.5.1 C12: watch `SYSTEM_ALERT_WINDOW` for **this package** while the overlay runs.
+     *
+     * `AppOpsManager.startWatchingMode` is the platform's runtime-revoke channel for a special app-op: without it the
+     * ball would stay on screen (and the foreground notification would keep claiming it is running) until the next
+     * resume. The listener re-reads `Settings.canDrawOverlays`, because the same watcher also fires for a re-grant.
+     */
+    private fun registerOverlayWatcher() {
+        val manager = getSystemService(AppOpsManager::class.java)
+        if (manager == null) {
+            P3Log.line("P5_PHONE_ONLY state=watcher_failed reason=NO_APP_OPS")
+            return
+        }
+        val listener = AppOpsManager.OnOpChangedListener { op, changedPackage ->
+            // AppOpsManager invokes its watcher from a Binder thread; the window removal and foreground teardown must
+            // run on the service's main thread (and the scope is cancelled on destroy, so a late callback is dropped).
+            scope.launch {
+                val change = PhoneOnlyStartStopPolicy.onAppOpChanged(
+                    op = op,
+                    changedPackage = changedPackage,
+                    packageName = packageName,
+                    permissionGranted = Settings.canDrawOverlays(this@PhoneOnlyOverlayService),
+                )
+                if (change == PhoneOnlyStartStopPolicy.AppOpChange.STOP) stopForPermissionLoss()
+            }
+        }
+        val watching = runCatching {
+            manager.startWatchingMode(AppOpsManager.OPSTR_SYSTEM_ALERT_WINDOW, packageName, listener)
+        }.isSuccess
+        if (!watching) {
+            // The overlay still runs; only the runtime-revoke half is unavailable. T12 records the real K40 callback.
+            P3Log.line("P5_PHONE_ONLY state=watcher_failed reason=START_WATCHING")
+            return
+        }
+        appOps = manager
+        overlayWatcher = listener
+    }
+
+    private fun unregisterOverlayWatcher() {
+        val manager = appOps
+        val listener = overlayWatcher
+        appOps = null
+        overlayWatcher = null
+        if (manager != null && listener != null) {
+            runCatching { manager.stopWatchingMode(listener) }
+        }
+    }
+
+    /**
+     * 0.5.1 C12: the user revoked 「显示在其他应用上层」 while the overlay was running.
+     *
+     * Remove the windows and the notification now, and stop the service; [onDestroy] unregisters the watcher and logs
+     * the running state's `state=off`. The settings page sees `PermissionMissing` (the grant is the action it needs).
+     */
+    private fun stopForPermissionLoss() {
+        P3Log.line("P5_PHONE_ONLY state=revoked reason=PERMISSION_REVOKED")
+        PhoneOnlyOverlayRuntime.stopped()
+        removeOverlayViews()
+        if (foregroundStarted) {
+            runCatching { stopForeground(STOP_FOREGROUND_REMOVE) }
+            foregroundStarted = false
+        }
+        stopSelf()
+    }
+
+    /** Removes both overlay windows; idempotent so revoke, a half-added window and `onDestroy` can all call it. */
+    private fun removeOverlayViews() {
+        ballView?.let { runCatching { windowManager?.removeView(it) } }
+        bubbleView?.let { runCatching { windowManager?.removeView(it) } }
+        ballView = null
+        bubbleView = null
+        ballParams = null
     }
 
     // ---- window setup -------------------------------------------------------------------------------------------
@@ -206,12 +345,18 @@ class PhoneOnlyOverlayService : Service() {
         return if (id > 0) resources.getDimensionPixelSize(id).toFloat() else 0f
     }
 
-    private fun ComposeView.installLifecycle(owner: OverlayLifecycleOwner) {
-        // A ComposeView in a Service has no Activity; the ViewTree owner is what gives its recomposer a lifecycle. The
-        // class is present in the APK (the app's own lifecycle observers run) but the lifecycle-runtime AAR does not
-        // expose it to Kotlin's compile classpath in this KMP-variant graph, so it is resolved reflectively here. The
-        // alternative would be a plain-View rewrite of the whole overlay.
-        runCatching {
+    /**
+     * 0.5.1 (`C14`): installs the ViewTree owners a `ComposeView` in a Service needs, and reports success.
+     *
+     * Both owners stay reflective. `C14` asks for a direct import "where possible"; a direct
+     * `import androidx.lifecycle.ViewTreeLifecycleOwner` was tried and does **not** compile in this graph - the Kotlin
+     * compile classpath exposes the lifecycle KMP metadata artifact, not the Android AAR's `androidMain` class (recorded
+     * in `DECISIONS` §21.1 / `CONTRACTS` §8). The install is no longer best-effort, though: a failure means Compose
+     * cannot attach, so it is returned and surfaced as a visible [PhoneOnlyStartFailure.LIFECYCLE_OWNER] start failure
+     * (the 0.5 build only logged it).
+     */
+    private fun ComposeView.installLifecycle(owner: OverlayLifecycleOwner): Boolean {
+        val lifecycleOwnerSet = runCatching {
             val cls = Class.forName("androidx.lifecycle.ViewTreeLifecycleOwner")
             cls.getMethod(
                 "set",
@@ -220,10 +365,10 @@ class PhoneOnlyOverlayService : Service() {
             ).invoke(null, this, owner)
         }.onFailure {
             P3Log.line("P5_PHONE_ONLY state=viewtree_lifecycle_failed reason=${it.javaClass.simpleName}")
-        }
-        // Compose also refuses to attach unless the view propagates a SavedStateRegistryOwner; the overlay's content
+        }.isSuccess
+        // Compose refuses to attach unless the view also propagates a SavedStateRegistryOwner; the overlay's content
         // uses no `rememberSaveable`, but AndroidComposeView checks the owner unconditionally on attach.
-        runCatching {
+        val savedStateOwnerSet = runCatching {
             val cls = Class.forName("androidx.savedstate.ViewTreeSavedStateRegistryOwner")
             cls.getMethod(
                 "set",
@@ -232,12 +377,17 @@ class PhoneOnlyOverlayService : Service() {
             ).invoke(null, this, owner)
         }.onFailure {
             P3Log.line("P5_PHONE_ONLY state=viewtree_savedstate_failed reason=${it.javaClass.simpleName}")
-        }
+        }.isSuccess
+        return lifecycleOwnerSet && savedStateOwnerSet
     }
 
-    private fun addWindows() {
-        val manager = windowManager ?: return
-        val composition = root ?: return
+    /** Adds the bubble and ball windows; false means this instance cannot run and has published its failure. */
+    private fun addWindows(composition: HostCompositionRoot): Boolean {
+        val manager = windowManager
+        if (manager == null) {
+            failStart(PhoneOnlyStartFailure.WINDOW, detail = "NO_WINDOW_MANAGER")
+            return false
+        }
         val owner = OverlayLifecycleOwner().also {
             it.onCreate(); it.onStart(); it.onResume()
         }
@@ -245,7 +395,6 @@ class PhoneOnlyOverlayService : Service() {
 
         val bubble = ComposeView(this).apply {
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
-            installLifecycle(owner)
             isFocusable = false
             importantForAccessibility = android.view.View.IMPORTANT_FOR_ACCESSIBILITY_NO
             setContent {
@@ -269,6 +418,12 @@ class PhoneOnlyOverlayService : Service() {
                 }
             }
         }
+        // C14: a missing ViewTree owner means Compose cannot attach; surface it as a visible start failure instead of
+        // letting `addView` fail later with an opaque IllegalStateException.
+        if (!bubble.installLifecycle(owner)) {
+            failStart(PhoneOnlyStartFailure.LIFECYCLE_OWNER)
+            return false
+        }
         val bubbleParams = WindowManager.LayoutParams(
             WindowManager.LayoutParams.MATCH_PARENT,
             WindowManager.LayoutParams.MATCH_PARENT,
@@ -283,7 +438,6 @@ class PhoneOnlyOverlayService : Service() {
 
         val ball = ComposeView(this).apply {
             setViewCompositionStrategy(ViewCompositionStrategy.DisposeOnViewTreeLifecycleDestroyed)
-            installLifecycle(owner)
             isFocusable = false
             setContent {
                 val appearance by composition.phoneOnlyAppearance.collectAsState()
@@ -308,6 +462,10 @@ class PhoneOnlyOverlayService : Service() {
                 }
             }
         }
+        if (!ball.installLifecycle(owner)) {
+            failStart(PhoneOnlyStartFailure.LIFECYCLE_OWNER)
+            return false
+        }
         val params = WindowManager.LayoutParams(
             windowSizePx,
             windowSizePx,
@@ -321,16 +479,19 @@ class PhoneOnlyOverlayService : Service() {
             gravity = Gravity.TOP or Gravity.START
         }
 
-        try {
+        return try {
             manager.addView(bubble, bubbleParams)
             bubbleView = bubble
             manager.addView(ball, params)
             ballView = ball
             ballParams = params
             updateBallWindow()
+            true
         } catch (failure: Exception) {
-            P3Log.line("P5_PHONE_ONLY state=refused reason=WINDOW_${failure.javaClass.simpleName}")
-            stopSelf()
+            // A half-added pair must not stay on screen (the bubble may already be attached when the ball is refused).
+            removeOverlayViews()
+            failStart(PhoneOnlyStartFailure.WINDOW, detail = failure.javaClass.simpleName)
+            false
         }
     }
 
@@ -348,7 +509,11 @@ class PhoneOnlyOverlayService : Service() {
 
     private fun collectState(composition: HostCompositionRoot) {
         scope.launch {
-            composition.detachGate.enabled.collect { enabled ->
+            // 0.5.1 C15: skip the collector's initial value. On the off -> on transition the explicit start can reach
+            // here while the gate still holds its old `false` (it publishes after its mode-changed callback); treating
+            // that first emission as "mode off" would stop the ball the user just enabled. A later false is a real
+            // mode-off transition and stops the overlay.
+            composition.detachGate.enabled.drop(1).collect { enabled ->
                 if (!enabled) stopSelf()
             }
         }
@@ -509,7 +674,9 @@ class PhoneOnlyOverlayService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+            // 0.5.1 C15: an app-owned monochrome icon instead of `android.R.drawable` (OEM framework icons vary, and the
+            // platform renders this as an alpha mask).
+            .setSmallIcon(R.drawable.ic_edith_notification)
             .setContentTitle("纯手机模式")
             .setContentText("EDITH 悬浮球正在运行")
             .setContentIntent(open)
@@ -547,13 +714,30 @@ class PhoneOnlyOverlayService : Service() {
         private const val PRESS_MILLIS = 120L
 
         /**
-         * Starts or stops the overlay to match the mode and the permission. Only the production composition may start
-         * it; the model must already be ready because the overlay only draws a host that exists.
+         * 0.5.1 C15: the explicit requested value `sync` hands to the service.
          *
-         * [requestedEnabled] is the mode transition's **requested** value. The detach gate invokes its mode-changed
-         * callback while `enabled` still holds the old value (it updates after the save), so reading the gate here on
-         * an enable transition stopped the service instead of starting it. `MainActivity.onResume` passes null and the
-         * gate is read, which is correct at resume time.
+         * Without it the service re-read the live gate when it started. The detach gate invokes its mode-changed
+         * callback **before** it publishes the new `enabled` value, so on the off -> on transition the service could
+         * still see `false` and stop the ball the user had just asked for.
+         */
+        private const val EXTRA_REQUESTED_ENABLED = "com.sheen.rokid.phone.overlay.EXTRA_REQUESTED_ENABLED"
+
+        /**
+         * 0.5.1 C12/C14: the service's real run state, for the settings page.
+         *
+         * Only this service publishes it; the settings page reads it instead of inferring 「已启用」 from
+         * `Settings.canDrawOverlays`.
+         */
+        internal val isRunning: StateFlow<Boolean> get() = PhoneOnlyOverlayRuntime.isRunning
+        internal val startFailure: StateFlow<PhoneOnlyStartFailure?> get() = PhoneOnlyOverlayRuntime.startFailure
+
+        /**
+         * Starts, stops or leaves the overlay running to match the mode, the permission and the service's real state.
+         *
+         * [requestedEnabled] is the mode transition's **explicit** value; null means the caller only has the live gate
+         * (`MainActivity.onResume`). The decision itself lives in [PhoneOnlyStartStopPolicy] (JVM-tested); this function
+         * is the adapter that performs it, and its log distinguishes a **refused** requested start from an ordinary
+         * **stopped** overlay (`C15`).
          */
         fun sync(
             context: Context,
@@ -561,21 +745,38 @@ class PhoneOnlyOverlayService : Service() {
             requestedEnabled: Boolean? = null,
         ) {
             val intent = Intent(context, PhoneOnlyOverlayService::class.java)
-            val enabled = requestedEnabled ?: (composition?.detachGate?.enabled?.value == true)
-            val permitted = Settings.canDrawOverlays(context)
-            if (composition == null || !enabled || !permitted) {
-                P3Log.line(
-                    "P5_PHONE_ONLY state=stop reason=" + when {
-                        composition == null -> "NO_COMPOSITION"
-                        !enabled -> "MODE_OFF"
-                        else -> "NO_OVERLAY_PERMISSION"
-                    },
+            when (
+                val decision = PhoneOnlyStartStopPolicy.sync(
+                    requestedEnabled = requestedEnabled,
+                    gateEnabled = composition?.detachGate?.enabled?.value == true,
+                    hasComposition = composition != null,
+                    permissionGranted = Settings.canDrawOverlays(context),
+                    running = isRunning.value,
                 )
-                runCatching { context.stopService(intent) }
-                return
+            ) {
+                PhoneOnlyStartStopPolicy.Decision.Start -> {
+                    PhoneOnlyOverlayRuntime.startRequested()
+                    val start = intent.putExtra(EXTRA_REQUESTED_ENABLED, true)
+                    runCatching { ContextCompat.startForegroundService(context, start) }
+                        .onFailure {
+                            // The foreground start itself was refused (background limits / OEM). Publish it so the
+                            // settings page can show the reason and offer the retry, not just write a log line.
+                            P3Log.line(
+                                "P5_PHONE_ONLY state=failed start_failure=FOREGROUND " +
+                                    "reason=${it.javaClass.simpleName}",
+                            )
+                            PhoneOnlyOverlayRuntime.failed(PhoneOnlyStartFailure.FOREGROUND)
+                        }
+                }
+                is PhoneOnlyStartStopPolicy.Decision.Stop -> {
+                    P3Log.line(
+                        "P5_PHONE_ONLY state=${if (decision.refused) "refused" else "stopped"} " +
+                            "reason=${decision.reason}",
+                    )
+                    runCatching { context.stopService(intent) }
+                }
+                PhoneOnlyStartStopPolicy.Decision.KeepRunning -> Unit
             }
-            runCatching { ContextCompat.startForegroundService(context, intent) }
-                .onFailure { P3Log.line("P5_PHONE_ONLY state=start_failed reason=${it.javaClass.simpleName}") }
         }
     }
 }
