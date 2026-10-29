@@ -149,6 +149,7 @@ class BubbleStackModelTest {
         val messages = visible()
         assertEquals("the stack keeps the newest plus one old", 2, messages.size)
         assertEquals("the existing old (the wearer's line) is dropped immediately", "正在思考", messages[0].text)
+        assertFalse("the dropped old line is gone, not just reordered", messages.any { it.text == "one" })
         assertEquals("the previous newest becomes the old one", 0.42f, messages[0].relativeAlpha, 0.0001f)
         assertEquals(BubbleKind.TOOL_RUNNING, messages[1].kind)
         assertEquals("only the newest carries the tail", listOf(false, true), messages.map { it.newest })
@@ -229,8 +230,10 @@ class BubbleStackModelTest {
         user()
         idle()
         now = 1_500
-        model.onEvent(PhoneBubbleEvent.Notice(AssistantRoute.WAKE, "still here"), now)
-        now = 2_500
+        // A non-expiring user line: the assertion must land after the 3 s dismissal clock (4,000) and still have a row
+        // to see. A local Notice here would die on its own 3.5 s deadline and mask a broken cancellation.
+        user("still here")
+        now = 5_000
         assertTrue("the new message must cancel the dismissal", visible().isNotEmpty())
     }
 

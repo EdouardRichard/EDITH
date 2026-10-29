@@ -31,6 +31,14 @@ class BubbleRenderMathTest {
             BubbleRenderMath.layerAlpha(false, appearance.bubbleAlpha, 1f, appearance.oldMessageAlpha),
             0.0001f,
         )
+
+        // A distinct old base must be used as-is, not recomputed from bubbleAlpha: this fails if the fourth parameter
+        // is ignored, which the equality above cannot catch (both sides are the same product there).
+        assertEquals(
+            0.5f,
+            BubbleRenderMath.layerAlpha(newest = false, bubbleAlpha = 0.75f, fade = 1f, oldMessageAlpha = 0.5f),
+            0.0001f,
+        )
     }
 
     @Test

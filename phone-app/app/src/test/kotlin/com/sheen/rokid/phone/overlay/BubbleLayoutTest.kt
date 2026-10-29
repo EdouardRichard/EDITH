@@ -7,9 +7,10 @@ import org.junit.Test
  * 0.5.1 (`C6`/`C13`): the pure geometry of the bubble stack above the ball.
  *
  * The stack is bottom-anchored one gap above the ball's top edge, never wider than 72% of the screen and never taller
- * than 45% of it. The 45% is also the vertical reserve the ball must keep free: [BubbleLayout.reserveTopPx] is the
- * line T7 clamps the ball to, and at that line the stack still gets its full height. A tower of one bubble may show at
- * most eight text lines, and fewer when the space cannot fit that many.
+ * than 45% of it. The gap is [BubbleLayout.GAP_DP], the same value the renderer uses and the one T7's `BallPlacement`
+ * must consume for its vertical reserve. The 45% is also the vertical reserve the ball must keep free:
+ * [BubbleLayout.reserveTopPx] is the line T7 clamps the ball to, and at that line the stack still gets its full height.
+ * A tower of one bubble may show at most eight text lines, and fewer when the space cannot fit that many.
  */
 class BubbleLayoutTest {
 
@@ -17,7 +18,8 @@ class BubbleLayoutTest {
     fun `a top-docked ball still gets a usable bubble stack height`() {
         val screenHeightPx = 2_400
         val radiusPx = 84f
-        val gapPx = 24f
+        // The exposed gap at a 3x density: the test follows BubbleLayout.GAP_DP instead of restating 24 px.
+        val gapPx = BubbleLayout.GAP_DP * 3f
 
         val ballTopPx = BubbleLayout.reserveTopPx(screenHeightPx, gapPx)
         assertEquals("the reserved line is the 45% stack plus the gap", 1_104f, ballTopPx, 0.01f)

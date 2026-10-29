@@ -11,6 +11,15 @@ package com.sheen.rokid.phone.overlay
  */
 object BubbleLayout {
 
+    /**
+     * The one gap between the ball's top edge and the bubble stack's bottom (the same gap separates two bubbles).
+     *
+     * T7's `BallPlacement` must take its vertical reserve gap from this constant through [reserveTopPx] instead of
+     * restating `8.dp`, so the ball clamp and the stack anchor cannot drift apart. Defined in dp because the callers
+     * convert it with the current density; this object stays free of Compose types/pixels.
+     */
+    const val GAP_DP = 8
+
     /** The design's per-message text cap (`D217`); an over-long answer is ellipsized. */
     const val MAX_LINES = 8
 

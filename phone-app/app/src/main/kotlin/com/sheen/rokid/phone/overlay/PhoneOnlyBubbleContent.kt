@@ -83,7 +83,8 @@ fun PhoneOnlyBubbleContent(
     if (appearance.bubbleAlpha <= 0.001f) return
 
     val density = LocalDensity.current
-    val gap = 8.dp
+    // The gap is BubbleLayout's single value: T7's BallPlacement consumes the same constant for its top reserve.
+    val gap = BubbleLayout.GAP_DP.dp
     val tailSize = 10.dp
     val gapPx = with(density) { gap.toPx() }
     val anchorBottomPx = BubbleLayout.anchorBottomPx(ballCenterY, radiusPx, gapPx)
