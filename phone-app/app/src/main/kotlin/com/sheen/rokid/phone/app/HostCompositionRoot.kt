@@ -2640,8 +2640,14 @@ class HostCompositionRoot internal constructor(
      * The manual dictation is the phone-only model's only next-sentence entry point (C2), so it must work mid-answer:
      * the router stops the arbiter-tracked playback, and the half-duplex window is dropped immediately (the player's
      * cancel only schedules its 150 ms reverb tail). Without both, the echo filter - or the answer still playing over
-     * the wearer - would swallow the takeover. A detached wake acknowledgement is not tracked by the router; it is one
-     * short phrase, and [startDictation]'s BALL clear releases its tail before listening.
+     * the wearer - would swallow the takeover.
+     *
+     * **Boundary / residual (accepted for 0.5.1 Task 2).** A detached wake acknowledgement is played directly on the
+     * wake-ack player ([wakeAckPlayer] `speakText`), not through [speechRouter], so [speechRouter.stopCurrent] cannot
+     * stop it and the [echoMute] clear below releases only its half-duplex window. An acknowledgement that is still
+     * audible therefore keeps playing over the first words of the takeover; [startDictation]'s BALL clear does not stop
+     * it either. The residual is one short phrase, and the T12 device case covers long-press-during-ack. Do not read
+     * this method as "the acknowledgement was stopped".
      */
     internal fun stopCurrentSpeechForBall() {
         speechRouter.stopCurrent()
@@ -3052,6 +3058,11 @@ class HostCompositionRoot internal constructor(
         try {
             host.stop()
         } finally {
+            // 0.5.1 C5: the session is over even when `host.stop()` throws, so the half-duplex window is dropped here
+            // rather than after the teardown below. It still runs only after the stop attempt, so a playback cancelled
+            // by the teardown cannot schedule its 150 ms tail behind this clear; a lost TTS end callback must not mute
+            // the first words of the next session (the 120 s watchdog is gone).
+            echoMute?.clear()
             hintLink?.sessionEnded()
             // 0.3 Phase 2 Task 2: the wearing fact belongs to the session that reported it; 停止 is that session ending.
             wearingState = null
@@ -3070,10 +3081,6 @@ class HostCompositionRoot internal constructor(
         confirmationPresenter?.withdrawAll()
         notifier()?.cancelAll()
         mutableState.update { it.copy(errorCode = null, pendingConfirmation = null) }
-        // 0.5.1 C5: the session is over, so there is nothing left for the half-duplex window to protect. Cleared after
-        // `host.stop()` so a playback cancelled by the teardown cannot schedule its 150 ms tail behind this clear; a lost
-        // TTS end callback must not mute the first words of the next session (the 120 s watchdog is gone).
-        echoMute?.clear()
     }
     /**
      * The `DetachGate` mode side effect (0.4 strict-local fix, `D199`): a **same-process** mode change must take the

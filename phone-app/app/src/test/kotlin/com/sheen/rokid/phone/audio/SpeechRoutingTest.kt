@@ -23,6 +23,7 @@ import com.sheen.rokid.testsupport.FakeClock
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
 import java.io.IOException
@@ -301,6 +302,38 @@ class SpeechRoutingTest {
             assertFalse("a stopped session must release the echo window", window.covers(clock.nowNanos()))
         } finally {
             root.close()
+        }
+    }
+
+    @Test
+    fun `a throwing host stop cannot skip the echo window clear`() {
+        // C5: `host.stop()` can throw (here: a host closed by another path answers HOST_CLOSED), and the session is
+        // over either way. The explicit clear must therefore live where it runs on both exits - if it stays after the
+        // try/finally, a failed stop silently leaves the window armed and the next session's first words muted.
+        val blobs = RecordingBlobs()
+        val router = SpeechPlayerRouter()
+        val clock = FakeClock()
+        val window = EchoMuteWindow(clock)
+        val root = composition(router, blobs) { FakePlayer() }
+        root.echoMute = window
+        try {
+            window.open()
+            assertTrue("the window starts armed", window.covers(clock.nowNanos()))
+
+            // The existing throwing seam: HostRuntime refuses every command once it is closed, so `root.stop()`
+            // propagates HOST_CLOSED instead of returning normally.
+            root.host.close()
+            val failure = assertThrows(IllegalStateException::class.java) { root.stop() }
+            assertEquals("the host must have thrown where the test intended", "HOST_CLOSED", failure.message)
+
+            assertFalse(
+                "a failed host stop must still release the echo window",
+                window.covers(clock.nowNanos()),
+            )
+        } finally {
+            // The root never reached its own `closed = true` (stop threw first) and the host is already closed;
+            // cleanup must not turn the synthetic failure into a test failure.
+            runCatching { root.close() }
         }
     }
 

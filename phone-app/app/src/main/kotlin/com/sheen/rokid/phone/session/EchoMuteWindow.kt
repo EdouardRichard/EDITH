@@ -21,9 +21,10 @@ internal fun PcmFrame.silenced(): PcmFrame = copy(samples = FloatArray(samples.s
  *
  * 0.5.1 C5 removed the 120 s watchdog. A lost end callback no longer expires by time - the old bound silently unmuted
  * the phone mic halfway through a long answer and the ASR transcribed the App's own voice - so recovery is explicit:
- * [clear] on the next manual BALL dictation, speech-off, session stop or long-press takeover, and [close] (with its
- * reverb tail) on every playback end/close. A lost callback may therefore outlive its answer, but never the next user
- * action.
+ * exactly four actions call [clear] - starting a manual BALL dictation, turning speech off, stopping the session and
+ * the long-press takeover - while [close] (with its reverb tail) marks every playback end/close. A lost callback may
+ * outlive its answer and stays muted through any other action (a plain voice wake does not clear it); only one of
+ * those four releases it. Do not read the bound as "the next user action".
  *
  * Content-independent by construction: a different phrase, voice, language or volume changes only the callback
  * times, and the window follows them.
@@ -38,7 +39,8 @@ class EchoMuteWindow(
 
     /**
      * Starts muting from the audible onset. There is deliberately no time bound (0.5.1 C5 removed the watchdog):
-     * an end callback that never arrives is released by [clear] on the next user action, not by the clock.
+     * an end callback that never arrives is released only by [clear] on one of its four explicit actions, not by the
+     * clock and not by a later voice wake.
      */
     fun open() {
         openAtNanos = clock.nowNanos()
@@ -60,10 +62,11 @@ class EchoMuteWindow(
     /**
      * Drops the window **immediately**, including a reverb tail [close] has already scheduled.
      *
-     * This is 0.5.1 C5's explicit recovery for a lost end callback: the next manual BALL dictation, speech-off, session
-     * stop or long-press takeover calls it, so a missing callback can outlive its answer but never the next user action.
-     * Both bounds are reset, not just [endAtNanos]: an already-ended window must stay a true no-op, and a late [close]
-     * must not re-arm it (that is what `openAtNanos < 0` means to [close]).
+     * This is 0.5.1 C5's explicit recovery for a lost end callback: starting a manual BALL dictation, turning speech
+     * off, stopping the session or the long-press takeover calls it. A missing callback therefore outlives its answer
+     * until one of those four actions runs - a voice wake does not release it, so the bound is not "the next user
+     * action". Both bounds are reset, not just [endAtNanos]: an already-ended window must stay a true no-op, and a late
+     * [close] must not re-arm it (that is what `openAtNanos < 0` means to [close]).
      */
     fun clear() {
         openAtNanos = -1L
