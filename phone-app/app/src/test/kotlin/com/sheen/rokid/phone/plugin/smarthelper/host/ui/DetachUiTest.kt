@@ -7,15 +7,19 @@ import org.junit.Assert.assertTrue
 import org.junit.Test
 
 /**
- * 0.5: the settings page's 纯手机模型 copy and switch state, extracted from Compose so the JVM pins the parts the owner
+ * 0.5: the settings page's phone-only copy and switch state, extracted from Compose so the JVM pins the parts the owner
  * ruled on. The layout itself is a device check; these are the words and the enabled/disabled rule.
+ *
+ * 0.5.1 (`C1`): the user-visible name is 「纯手机模式」; the internal `DetachGate`/`glassesDetached` identifiers are
+ * deliberately unchanged.
  */
 class DetachUiTest {
 
     @Test
     fun theSwitchTitleNamesTheDetachedMode() {
-        assertEquals("纯手机模型", DetachUi.SWITCH_TITLE)
+        assertEquals("纯手机模式", DetachUi.SWITCH_TITLE)
         assertFalse("the old user-facing name is gone", DetachUi.SWITCH_TITLE.contains("脱离眼镜"))
+        assertFalse("the 0.5 name is gone too", DetachUi.SWITCH_TITLE.contains("纯手机模型"))
     }
 
     @Test
@@ -30,8 +34,10 @@ class DetachUiTest {
     @Test
     fun theProactiveSwitchIsDisabledOnlyWhileDetached() {
         assertTrue("glasses mode keeps the proactive switch usable", DetachUi.proactiveSwitchEnabled(false))
-        assertFalse("the phone-only model disables it", DetachUi.proactiveSwitchEnabled(true))
-        assertTrue("and the annotation names the mode", DetachUi.PROACTIVE_DETACHED_NOTE.contains("纯手机模型下不生效"))
+        assertFalse("the phone-only mode disables it", DetachUi.proactiveSwitchEnabled(true))
+        assertTrue("and the annotation names the mode", DetachUi.PROACTIVE_DETACHED_NOTE.contains("纯手机模式下不生效"))
+        assertFalse("the annotation does not keep the 0.5 name",
+            DetachUi.PROACTIVE_DETACHED_NOTE.contains("纯手机模型"))
         assertTrue("and says the persisted value is unchanged",
             DetachUi.PROACTIVE_DETACHED_NOTE.contains("持久值不变"))
     }

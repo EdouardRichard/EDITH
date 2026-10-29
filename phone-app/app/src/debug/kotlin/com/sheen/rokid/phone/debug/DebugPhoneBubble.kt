@@ -35,7 +35,7 @@ class DebugPhoneBubble : BroadcastReceiver() {
         val scenario = intent.getStringExtra(EXTRA_SCENARIO) ?: SCENARIO_TURN
         when (scenario) {
             SCENARIO_ANSWER -> root.phoneBubble.onEvent(
-                PhoneBubbleEvent.AnswerFinal(route, turn, "debug-hint", "这是纯手机模型的消息气泡。"),
+                PhoneBubbleEvent.AnswerFinal(route, turn, "debug-hint", "这是纯手机模式的消息气泡。"),
             )
             SCENARIO_TURN -> {
                 root.phoneBubble.onEvent(PhoneBubbleEvent.User(route, turn, "帮我看看明天的安排"))

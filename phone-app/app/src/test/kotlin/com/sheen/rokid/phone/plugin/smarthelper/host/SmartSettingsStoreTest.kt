@@ -405,7 +405,7 @@ class SmartSettingsStoreTest {
         assertEquals(5000L, reloaded.cooldownMillis)
     }
 
-    // ---- 0.4 Task 5 (`D199`/`D202`): the host-only 「纯手机模型」 setting ---------------------------
+    // ---- 0.4 Task 5 (`D199`/`D202`): the host-only 「纯手机模式」 setting ---------------------------
 
     @Test
     fun glassesDetachDefaultsToGlassesModeWhenTheKeyIsMissing() {

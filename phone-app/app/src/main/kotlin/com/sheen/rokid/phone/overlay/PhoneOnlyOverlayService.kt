@@ -44,7 +44,7 @@ import kotlinx.coroutines.launch
 import kotlin.math.roundToInt
 
 /**
- * 0.5 (`D210`/`D214`): the phone-only model's floating ball and message bubbles, as two overlay windows.
+ * 0.5 (`D210`/`D214`): the phone-only mode's floating ball and message bubbles, as two overlay windows.
  *
  * Why a foreground service: the ball must outlive the App being backgrounded (it is the phone-only interaction surface,
  * and the owner's requirement is that it appears on the desktop as soon as the mode is on). The service owns no session
@@ -453,7 +453,7 @@ class PhoneOnlyOverlayService : Service() {
             manager.createNotificationChannel(
                 NotificationChannel(
                     CHANNEL_ID,
-                    "纯手机模型悬浮球",
+                    "纯手机模式悬浮球",
                     NotificationManager.IMPORTANCE_LOW,
                 ).apply {
                     setShowBadge(false)
@@ -469,7 +469,7 @@ class PhoneOnlyOverlayService : Service() {
         )
         val notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("纯手机模型")
+            .setContentTitle("纯手机模式")
             .setContentText("EDITH 悬浮球正在运行")
             .setContentIntent(open)
             .setOngoing(true)

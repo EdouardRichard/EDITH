@@ -3,10 +3,11 @@ package com.sheen.rokid.phone.plugin.smarthelper.host.ui
 import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 
 /**
- * 0.5: the settings page's 「纯手机模型」 copy and switch state (renamed from 0.4's 「脱离眼镜」).
+ * 0.5: the settings page's 「纯手机模式」 copy and switch state (renamed from 0.4's 「脱离眼镜」; the 0.5 preview name
+ * 「纯手机模型」 was retired in 0.5.1, `C1`).
  *
  * Pure by construction (no Compose, no Android types) so the JVM pins the parts the owner ruled on: what the switch
- * promises, that 「主动辅助」 is disabled only while the phone-only model is on, and that every gate failure is visible
+ * promises, that 「主动辅助」 is disabled only while the phone-only mode is on, and that every gate failure is visible
  * copy which never claims the change was saved. The Composable around it only lays these strings out.
  *
  * The internal `DetachGate`/`glassesDetached` identifiers are deliberately unchanged (D209): they are not user copy, and
@@ -14,8 +15,8 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
  */
 internal object DetachUi {
 
-    /** Owner wording (2026-10-29): the mode's user-facing name, used verbatim by the settings switch. */
-    const val SWITCH_TITLE = "纯手机模型"
+    /** Owner wording (2026-10-29 / 0.5.1 `C1`): the mode's user-facing name, used verbatim by the settings switch. */
+    const val SWITCH_TITLE = "纯手机模式"
 
     /**
      * Every consequence in one inline explanation (`D199`, `D202`, `D53`, D209/D210).
@@ -31,8 +32,8 @@ internal object DetachUi {
             "这是采音与显示方式的选择，不是上传授权——会话运行时仍会按既有规则把转写与当回合上下文发送给所配置的模型服务；" +
             "会话运行中修改会先停止会话且不自动重启；下次开始会话生效。"
 
-    /** Shown next to the (disabled) 「主动辅助」 switch while the phone-only model is on. */
-    const val PROACTIVE_DETACHED_NOTE = "纯手机模型下不生效（主动辅助的持久值不变）"
+    /** Shown next to the (disabled) 「主动辅助」 switch while the phone-only mode is on. */
+    const val PROACTIVE_DETACHED_NOTE = "纯手机模式下不生效（主动辅助的持久值不变）"
 
     /** `D202`: the persisted proactive switch stays visible, but is not operable in detached mode. */
     fun proactiveSwitchEnabled(detached: Boolean): Boolean = !detached

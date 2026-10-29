@@ -382,7 +382,7 @@ class HostCompositionRoot internal constructor(
      */
     val modelReadiness: ModelReadiness? = null,
     /**
-     * 0.4 Task 5 (`D199`/`D202`): the **live** 「纯手机模型」 gate.
+     * 0.4 Task 5 (`D199`/`D202`): the **live** 「纯手机模式」 gate.
      *
      * [create] seeds it from the persisted [SmartSettings.glassesDetached] (default off), wires its stop-before-save
      * rule to this composition's own `stop()` and the host's live state, and hands the same instance to the settings
@@ -3319,7 +3319,7 @@ class HostCompositionRoot internal constructor(
             // so both are reached through holders. Declared here because the 0.4 detach gate below needs them.
             val rootHolder = arrayOfNulls<HostCompositionRoot>(1)
             val hostHolder = arrayOfNulls<HostRuntime>(1)
-            // 0.4 Task 5 (`D199`): the persisted 「纯手机模型」 gate. The stop-before-save rule uses the composition's
+            // 0.4 Task 5 (`D199`): the persisted 「纯手机模式」 gate. The stop-before-save rule uses the composition's
             // own `stop()` and the host's live state; the gate is loaded once here, before any session can start.
             // 0.4 Task 9 fix: `stop()` only tears down the host session - `SessionService` kept its foreground
             // notification saying 会话已开启 for an idle session. The gate's stop therefore also stops the hosting
@@ -4507,7 +4507,7 @@ class HostCompositionRoot internal constructor(
 
         /**
          * The arming gate for context, exactly as [armedAcousticSink] is for the acoustic labels: with 「主动辅助」 off -
-         * or with 0.4's 「纯手机模型」 mode on (`D202`) - the composition produces no `ContextChanged`, so a plugin
+         * or with 0.4's 「纯手机模式」 mode on (`D202`) - the composition produces no `ContextChanged`, so a plugin
          * receives no context signal (spec §16.2, pre-flight P4).
          */
         internal fun armedContextSink(host: () -> HostRuntime?, clock: MonotonicClock,

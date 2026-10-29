@@ -213,6 +213,8 @@ When the gate declines, **zero** model requests are made. The two routes use ind
 
 The **phone-only mode** setting makes the wake route independent of the glasses. Since 0.5 it also shows the EDITH-icon floating ball and the separate translucent message bubbles described above: drag and edge snap, long-press dictation, a thinking light ring, adjustable opacity, and old bubbles that fade away after 2 s.
 
+Since 0.5.1 the user-visible Chinese name is 「纯手机模式」 (0.5 preview builds said 「纯手机模型」). The internal `DetachGate` / `glassesDetached` identifiers and the `phone_only_overlay` notification channel id are unchanged.
+
 ```mermaid
 flowchart LR
     MIC["Phone microphone"] --> ING["PCM ingress<br/>16 kHz mono"]

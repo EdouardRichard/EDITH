@@ -32,7 +32,7 @@
          `specialUse` foreground service on API 34+ (the platform requires a declared type). -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <!-- 0.4 Task 6: the detached session's audio source. A runtime permission, requested from the session page only
-         when 「纯手机模型」 is on (spec §4.2, §4.5); glasses mode never asks for it. -->
+         when 「纯手机模式」 is on (spec §4.2, §4.5); glasses mode never asks for it. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Lock-screen unlock keeps the display interactive for the bounded duration of a device tool call. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
