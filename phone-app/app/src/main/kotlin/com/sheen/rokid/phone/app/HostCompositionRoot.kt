@@ -76,6 +76,7 @@ import com.sheen.rokid.phone.bridge.CxrContextSignals
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
 import com.sheen.rokid.phone.audio.AudioSegmentBridge
 import com.sheen.rokid.phone.audio.AndroidSpeechPlayer
+import com.sheen.rokid.phone.overlay.PhoneBubbleRepository
 import com.sheen.rokid.phone.overlay.PhoneOnlyAppearance
 import com.sheen.rokid.phone.session.confirmation.NotificationSurface
 import com.sheen.rokid.phone.session.PendingConfirmation
@@ -297,6 +298,12 @@ class HostCompositionRoot internal constructor(
      * look wired. `create` builds this with `wire = hintLink`; a composition built by hand may pass its own display.
      */
     internal val conversationDisplay: ConversationWireDisplay? = null,
+    /**
+     * 0.5: the phone-only message stack's repository. `create` builds one instance, feeds it from the production
+     * [conversationDisplay] and hands the same object to the overlay service; a hand-built composition gets an empty
+     * one, so no test has to construct a CXR display to exercise the bubble model.
+     */
+    internal val phoneBubble: PhoneBubbleRepository = PhoneBubbleRepository(),
     /**
      * Marshals a vendor-thread callback onto a host-owned thread.
      *
@@ -3885,6 +3892,9 @@ class HostCompositionRoot internal constructor(
             // Phase C: one conversation record, shared by the provider built just below and by the root instance whose
             // assistant tab reads it. It has to be created here because the provider map is built before the root.
             val conversationLog = ConversationLog()
+            // 0.5: the phone-only bubble feed. One repository for the composition; the production display feeds it and
+            // the overlay service reads it through the same root. The monotonic clock is the one the bubble timers use.
+            val phoneBubble = PhoneBubbleRepository(nowMillis = { android.os.SystemClock.elapsedRealtime() })
             // 0.24 S2 Task 11 / Task 6 review: the production display must send through the **real** CXR link, not the
             // silent 3-arg constructor. Built here because the provider map is assembled before the composition exists.
             val conversationDisplay = ConversationWireDisplay(
@@ -3892,6 +3902,7 @@ class HostCompositionRoot internal constructor(
                 wire = hintLink,
                 sendSaid = { route, entryId, text -> hintLink.userSaid(route, entryId, text) },
                 sendBusy = { route, busy -> hintLink.busy(route, busy) },
+                bubbleFeed = phoneBubble,
             )
             // 0.4 Task 7 (`D201`, spec §4.3): the detached display. One instance for the life of the composition, so a
             // session rebuilt while detached gets the same surface, and the phone tab's record is the one it reads
@@ -4005,6 +4016,7 @@ class HostCompositionRoot internal constructor(
                 hintLink = hintLink,
                 conversationLog = conversationLog,
                 conversationDisplay = conversationDisplay,
+                phoneBubble = phoneBubble,
                 // Vendor callbacks (PIN / PANEL_SHOWN / UI state / scene events) are marshalled onto the composition's
                 // own scheduler thread; the timer is already the host's off-main executor, and a late task after close
                 // is inert in the receiving method.
