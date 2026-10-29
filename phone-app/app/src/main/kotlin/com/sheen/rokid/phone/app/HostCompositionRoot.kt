@@ -1,6 +1,7 @@
 package com.sheen.rokid.phone.app
 import com.sheen.rokid.phone.ui.profile.ProbeConsent
 import com.sheen.rokid.phone.ui.profile.ProfileViewModel
+import com.sheen.rokid.phone.ui.typedResultLabel
 import com.sheen.rokid.phone.R
 import com.sheen.rokid.phone.actions.intent.CallPermission
 import com.sheen.rokid.phone.BuildConfig
@@ -61,6 +62,7 @@ import com.sheen.rokid.phone.audio.DictationController
 import com.sheen.rokid.phone.audio.DictationFinal
 import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationTarget
 import com.sheen.rokid.phone.audio.DictationUiState
 import com.sheen.rokid.phone.audio.SpeechPipelineDictation
 import com.sheen.rokid.phone.audio.PcmRecordDevice
@@ -712,6 +714,18 @@ class HostCompositionRoot internal constructor(
      */
     private val dictationUiState = MutableStateFlow(DictationUiState())
     val dictationUi: StateFlow<DictationUiState> = dictationUiState.asStateFlow()
+
+    /**
+     * 0.5 (`D212`): a one-shot, UI-facing explanation for the floating ball's dictation. The ball cannot show the
+     * composer's inline status line, so a refused send/no-speech/error is published here and the overlay turns it into a
+     * local notice bubble. The text is copy only (never the transcript); [clearBallDictationNotice] acknowledges it.
+     */
+    private val ballDictationNoticeState = MutableStateFlow<String?>(null)
+    val ballDictationNotice: StateFlow<String?> = ballDictationNoticeState.asStateFlow()
+
+    fun clearBallDictationNotice() {
+        ballDictationNoticeState.value = null
+    }
 
     /** The live per-dictation controller, or null while no dictation lease is held. */
     private var dictationController: DictationController? = null
@@ -1830,7 +1844,7 @@ class HostCompositionRoot internal constructor(
      * @return [DictationStartResult.Accepted] when listening; the retryable refusal otherwise, with a
      *   `P4_DICTATION state=refused` line naming the same reason.
      */
-    @Synchronized fun startDictation(): DictationStartResult {
+    @Synchronized fun startDictation(target: DictationTarget = DictationTarget.COMPOSER): DictationStartResult {
         if (closed) return refuseDictation("closed", DictationStartResult.Closed)
         if (dictationController != null) return refuseDictation("busy", DictationStartResult.Busy)
         val session = host.currentState
@@ -1905,8 +1919,8 @@ class HostCompositionRoot internal constructor(
             pipeline = chain.dictationPipeline(),
             scheduler = scheduler,
             clock = clock,
-            onFinal = { text -> onDictationFinal(generation, text) },
-            onState = { state -> onDictationState(generation, state) },
+            onFinal = { text -> onDictationFinal(generation, target, text) },
+            onState = { state -> onDictationState(generation, target, state) },
             // Non-transcript events only (the controller itself drops partials): the host may route session/fault
             // events normally, but a dictation transcript never enters HostRuntime or the plugin.
             forward = { event ->
@@ -1928,7 +1942,7 @@ class HostCompositionRoot internal constructor(
         dictationCleanupScheduled = false
         when (runCatching { controller.start() }.getOrDefault(DictationController.StartResult.Unavailable)) {
             DictationController.StartResult.Accepted -> {
-                dictationUiState.update { it.copy(state = DictationState.Listening, refusal = null) }
+                dictationUiState.update { it.copy(state = DictationState.Listening, refusal = null, owner = target) }
                 logDictation("started", "user", 0)
                 return DictationStartResult.Accepted
             }
@@ -2009,11 +2023,11 @@ class HostCompositionRoot internal constructor(
      * this callback, so a frame left in the same 20 ms batch must not start a new ASR turn), then schedule the slow
      * cleanup on the composition's scheduler thread - never inline on the UI thread or the capture's reader.
      */
-    @Synchronized private fun onDictationState(generation: Long, state: DictationState) {
+    @Synchronized private fun onDictationState(generation: Long, target: DictationTarget, state: DictationState) {
         if (closed || dictationTearingDown || generation != dictationGeneration) return
         when (state) {
             DictationState.Listening -> {
-                dictationUiState.update { it.copy(state = DictationState.Listening) }
+                dictationUiState.update { it.copy(state = DictationState.Listening, owner = target) }
             }
             DictationState.Idle, DictationState.NoSpeech, is DictationState.Error -> {
                 // 0.4 Task 13d: the dictation is over, so its audio is no longer a conversation utterance. Close the
@@ -2025,6 +2039,15 @@ class HostCompositionRoot internal constructor(
                 // Atomic update, not `.value =`: the page's dismissal/consumption are lock-free writers of the same
                 // flow, and a read-modify-write here could otherwise resurrect a final the page already appended.
                 dictationUiState.update { it.copy(state = effective) }
+                // 0.5 (D212): the ball has no inline status line, so a no-speech/error terminal state becomes a local
+                // notice. An Idle here precedes the final on the controller path; the final branch decides its notice.
+                if (target == DictationTarget.BALL) {
+                    when {
+                        failure != null -> ballDictationNoticeState.value = "识别失败（$failure），请重试"
+                        state == DictationState.NoSpeech -> ballDictationNoticeState.value = "没有听到内容，请重试"
+                        else -> Unit
+                    }
+                }
                 when {
                     failure != null -> logDictation("error", failure, 0)
                     state == DictationState.Idle && dictationCancelRequested -> logDictation("cancel", "user", 0)
@@ -2043,12 +2066,25 @@ class HostCompositionRoot internal constructor(
         }
     }
 
-    /** The one final for the active lease; the text is handed to the UI state and nowhere else. */
-    @Synchronized private fun onDictationFinal(generation: Long, text: String) {
+    /** The one final for the active lease; the text is handed to the UI state (composer) or sent (ball) and nowhere else. */
+    @Synchronized private fun onDictationFinal(generation: Long, target: DictationTarget, text: String) {
         if (closed || dictationTearingDown || generation != dictationGeneration) return
         // 0.4 Task 13d: a dictation final ends the wake route's claim on this audio. The tail that follows the final
         // is still the wearer's dictation; keep its transcripts off the host/plugin until an explicit input.
         audioChain?.closeTranscriptRoute("dictation_final")
+        if (target == DictationTarget.BALL) {
+            // 0.5 (D212): the ball's transcript is a user message, not a draft. `requestTypedMessage` is the same
+            // production entry the composer uses, so the plugin's typed admission, the conversation display and the
+            // bubble feed all run unchanged. A refusal is published as a local notice instead of silently dropping the
+            // words.
+            val result = requestTypedMessage(text)
+            ballDictationNoticeState.value =
+                if (result == TypedSendResult.Accepted) null else typedResultLabel(result)
+            // No DictationFinal: the composer must never append the ball's words to its draft.
+            dictationUiState.update { it.copy(state = DictationState.Idle, final = null) }
+            logDictation("final", if (dictationStopRequested) "user" else "endpoint", text.length)
+            return
+        }
         val final = DictationFinal(++dictationFinalSequence, text)
         dictationUiState.update { it.copy(state = DictationState.Idle, final = final) }
         // Count only: the wearer's words are never logged and there is no digest of them either.
@@ -2092,6 +2128,9 @@ class HostCompositionRoot internal constructor(
         dictationStopRequested = false
         dictationCancelRequested = false
         dictationFailureCode = null
+        // 0.5 (D212): the lease is gone, so the overlay may no longer claim it. The terminal state/final have already
+        // been published; clearing the owner here keeps a stale BALL/COMPOSER marker out of the next start.
+        dictationUiState.update { it.copy(owner = null) }
     }
 
     /**

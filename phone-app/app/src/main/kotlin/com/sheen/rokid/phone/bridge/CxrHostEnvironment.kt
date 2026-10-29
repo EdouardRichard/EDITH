@@ -62,6 +62,14 @@ class CxrHostEnvironment(
     private val taskScope: TaskScope = UnavailableTaskScope,
     /** P5 (spec §S1): the speech player, or null when TTS is unavailable or the user switch is off. */
     override val speech: com.sheen.rokid.plugin.SpeechPlayer? = null,
+    /**
+     * 0.5 (`D213`): whether a player is actually installed **now**.
+     *
+     * The 0.4 field was read once at assembly, so toggling 「语音朗读」 could not add or remove
+     * `Capability.SpeechOutput` without a restart. Production passes the same live predicate the plugin's
+     * `speechAvailable` uses; a hand-built environment keeps the old `speech != null` meaning.
+     */
+    private val speechAvailable: () -> Boolean = { speech != null },
     /** P5 (C2 fix): audio segment source for the direct-audio path, or null when not wired. */
     override val audioSegmentSource: com.sheen.rokid.plugin.AudioSegmentSource? = null,
 ) : ScheduledHostEnvironment {
@@ -89,7 +97,8 @@ class CxrHostEnvironment(
             if (storageFor != null) add(Capability.Storage)
             if (liveOutput() != null) add(Capability.TextOutput)
             // P5 (spec §S1): SpeechOutput is advertised only when the player exists (engine ready AND switch on).
-            if (speech != null) add(Capability.SpeechOutput)
+            // 0.5: the predicate is live, so a runtime switch changes the advertised set without a composition rebuild.
+            if (speechAvailable()) add(Capability.SpeechOutput)
         }
 
     /**

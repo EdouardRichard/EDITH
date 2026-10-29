@@ -555,6 +555,39 @@ class DictationWiringTest {
     // ---- detached mode ------------------------------------------------------------------------------------------
 
     @Test
+    fun ballDictationSendsTheFinalAsAUserMessageAndLeavesTheDraftAlone() {
+        withRig(detached = true) { rig ->
+            val text = "帮我看看这个页面"
+            rig.asr.finalText = text
+            val lines = withP3Sink { captured ->
+                assertTrue(rig.activate())
+                assertEquals(
+                    "a BALL dictation starts on the same leased session",
+                    DictationStartResult.Accepted,
+                    rig.root.startDictation(DictationTarget.BALL),
+                )
+                assertEquals(DictationState.Listening, stateOf(rig))
+                assertEquals("the overlay owns this lease", DictationTarget.BALL, rig.root.dictationUi.value.owner)
+
+                rig.pipelineVad.decision = VadDecision(true, false)
+                rig.feedPhone()
+                rig.root.stopDictation()
+                captured.toList()
+            }
+
+            val ui = rig.root.dictationUi.value
+            assertNull("a ball final must not enter the composer draft", ui.final)
+            assertEquals(DictationState.Idle, ui.state)
+            assertTrue(
+                "the final must enter the production typed path: $lines",
+                lines.any { it.startsWith("P4_TYPED state=accepted") },
+            )
+            // The conversation record is the plugin's typed-turn behavior (covered by the plugin's own tests); what this
+            // host-level test proves is that the ball's final went to the typed path and not to the composer draft above.
+        }
+    }
+
+    @Test
     fun detachedDictationReusesTheWakeLoopDisablesKwsAndHandsTheFinalToTheUiOnly() {
         withRig(detached = true) { rig ->
             val text = "帮我记一条笔记"

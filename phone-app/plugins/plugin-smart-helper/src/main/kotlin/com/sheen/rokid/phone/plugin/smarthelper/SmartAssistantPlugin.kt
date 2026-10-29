@@ -2928,7 +2928,15 @@ class SmartAssistantPlugin(
             deadlineNanos = SmartTurn.saturatingAdd(nowNanos, turnBudgetNanos()),
             hintGraceNanos = DEFAULT_HINT_GRACE_MILLIS * 1_000_000L,
             hintId = "hint-${UUID.randomUUID()}",
-            onEmit = { text -> created?.let { emit(it, text) } },
+            // 0.5 (`D213`): the assembler's answer is the turn's final answer. It used to be emitted with no
+            // `optionalSpeech`, so 「语音朗读」 could only ever read `notify_user` hints - the final answer was silent
+            // even with the switch on. The gate below still decides whether a player can actually play it; when speech
+            // is off/unavailable the hint is display-only, exactly as before.
+            onEmit = { text ->
+                created?.let {
+                    emit(it, text, optionalSpeech = if (speechAvailable()) SpeechRequest() else null)
+                }
+            },
             route = route,
             promptRoute = promptRoute,
         )
