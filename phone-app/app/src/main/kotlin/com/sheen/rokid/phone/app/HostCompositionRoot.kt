@@ -1922,28 +1922,28 @@ class HostCompositionRoot internal constructor(
      *   `P4_DICTATION state=refused` line naming the same reason.
      */
     @Synchronized fun startDictation(target: DictationTarget = DictationTarget.COMPOSER): DictationStartResult {
-        if (closed) return refuseDictation("closed", DictationStartResult.Closed)
+        if (closed) return refuseDictation("closed", DictationStartResult.Closed, target)
         // 0.5.1 C4/C5: a manual BALL press is the wearer taking the microphone. The answer may still be speaking, or its
         // TTS end callback may have been lost (there is no time bound any more), so drop the half-duplex window before
         // the lease is validated: otherwise the first frames of the manual dictation are replaced by silence. The
         // service stops the playback itself first ([stopCurrentSpeechForBall]); this is the safety net for every caller
         // of the BALL target, including one whose start is about to be refused.
         if (target == DictationTarget.BALL) echoMute?.clear()
-        if (dictationController != null) return refuseDictation("busy", DictationStartResult.Busy)
+        if (dictationController != null) return refuseDictation("busy", DictationStartResult.Busy, target)
         val session = host.currentState
         if (session != SessionState.Ready && session != SessionState.Listening) {
-            return refuseDictation("no_session", DictationStartResult.NoSession)
+            return refuseDictation("no_session", DictationStartResult.NoSession, target)
         }
         if (!runCatching { microphoneGranted() }.getOrDefault(false)) {
-            return refuseDictation("permission", DictationStartResult.Permission)
+            return refuseDictation("permission", DictationStartResult.Permission, target)
         }
-        val scheduler = deadlineScheduler ?: return refuseDictation("no_scheduler", DictationStartResult.NoScheduler)
-        val chain = audioChain ?: return refuseDictation("no_source", DictationStartResult.NoSource)
-        if (chain.hasActiveTurn()) return refuseDictation("busy", DictationStartResult.Busy)
-        val epoch = runningAudioEpoch ?: return refuseDictation("no_source", DictationStartResult.NoSource)
+        val scheduler = deadlineScheduler ?: return refuseDictation("no_scheduler", DictationStartResult.NoScheduler, target)
+        val chain = audioChain ?: return refuseDictation("no_source", DictationStartResult.NoSource, target)
+        if (chain.hasActiveTurn()) return refuseDictation("busy", DictationStartResult.Busy, target)
+        val epoch = runningAudioEpoch ?: return refuseDictation("no_source", DictationStartResult.NoSource, target)
         val detached = runningAudioDetached
-        if (detached && runningPhoneCapture == null) return refuseDictation("no_source", DictationStartResult.NoSource)
-        val ingress = phoneIngress ?: return refuseDictation("no_source", DictationStartResult.NoSource)
+        if (detached && runningPhoneCapture == null) return refuseDictation("no_source", DictationStartResult.NoSource, target)
+        val ingress = phoneIngress ?: return refuseDictation("no_source", DictationStartResult.NoSource, target)
 
         // 0.4 Task 12b-ii fix 2 (finding 4a): switch the route **before** the phone capture can deliver a frame.
         // Opening the capture first left the CXR loop polling while the dictation source was already live, so a CXR
@@ -1953,20 +1953,20 @@ class HostCompositionRoot internal constructor(
             // A begin that failed after pausing the CXR loop must put the normal loop back; it is still the session's
             // only wake source and the session was never stopped.
             runCatching { chain.endDictation(epoch) }
-            return refuseDictation("no_source", DictationStartResult.NoSource)
+            return refuseDictation("no_source", DictationStartResult.NoSource, target)
         }
         // Defense in depth for a wake turn that opened in the few instructions between the pre-check above and the
         // pause: a dictation must never steal its final, so hand the normal route back and refuse instead.
         if (chain.hasActiveTurn()) {
             runCatching { chain.endDictation(epoch) }
-            return refuseDictation("busy", DictationStartResult.Busy)
+            return refuseDictation("busy", DictationStartResult.Busy, target)
         }
 
         var capture: PhoneMicCapture? = null
         if (!detached) {
             val factory = phoneMicDeviceFactory ?: run {
                 runCatching { chain.endDictation(epoch) }
-                return refuseDictation("no_source", DictationStartResult.NoSource)
+                return refuseDictation("no_source", DictationStartResult.NoSource, target)
             }
             val captureHolder = arrayOfNulls<PhoneMicCapture>(1)
             val failure = runCatching {
@@ -1991,7 +1991,7 @@ class HostCompositionRoot internal constructor(
                 drainIngress(ingress)
                 // The normal route was already paused for the dictation; put it back before the refusal returns.
                 runCatching { chain.endDictation(epoch) }
-                return refuseDictation(code, DictationStartResult.NoSource)
+                return refuseDictation(code, DictationStartResult.NoSource, target)
             }
             capture = captureHolder[0]
         }
@@ -2040,22 +2040,28 @@ class HostCompositionRoot internal constructor(
                     drainIngress(ingress)
                 }
                 runCatching { chain.endDictation(epoch) }
-                return refuseDictation("start_failed", DictationStartResult.StartFailed)
+                return refuseDictation("start_failed", DictationStartResult.StartFailed, target)
             }
         }
     }
 
     /**
-     * Ends the active dictation through the pipeline, exactly once.
+     * Ends the active dictation through the pipeline, exactly once - and only when [target] is the lease's owner.
      *
      * The controller forces the turn's final; that final follows the redirect to [onDictationFinal] and the UI state,
      * never the LLM. The terminal callback schedules the route/capture cleanup.
+     *
+     * 0.5.1 C3 (`review Important #2`): the composer page and the floating ball share one lease. A stop addressed to a
+     * surface that does **not** hold it is a no-op - the ball's release must never truncate the composer's lease/draft,
+     * and the page's Stop must never end the ball's lease. The owner is the one the live lease published in
+     * [dictationUi] (0.5 `D212`), so this check adds no second owner field.
      *
      * 0.4 Task 12b-ii fix 2 (finding 4b): the loop is quiesced **before** the final is forced. The loop drains a
      * multi-frame batch and delivers it outside its own lock, so a frame still in that batch must not be accepted
      * after the positive endpoint: it would open a second ASR turn whose partials reach the restored wake route.
      */
-    @Synchronized fun stopDictation() {
+    @Synchronized fun stopDictation(target: DictationTarget) {
+        if (dictationUiState.value.owner != target) return
         val controller = dictationController ?: return
         dictationStopRequested = true
         runCatching { audioChain?.quiesceDictationInput() }
@@ -2066,10 +2072,13 @@ class HostCompositionRoot internal constructor(
      * Aborts the active dictation without delivering its text; the pipeline turn is sealed so a late final cannot
      * surface on the restored wake route. The UI ends at [DictationState.Idle].
      *
+     * 0.5.1 C3: owner-aware like [stopDictation]; a cancel for the surface that does not hold the lease is a no-op.
+     *
      * Quiesced before sealing for the same reason as [stopDictation]: the discarded tail of the current frame batch
      * must not start a new turn after the redirect is restored.
      */
-    @Synchronized fun cancelDictation() {
+    @Synchronized fun cancelDictation(target: DictationTarget) {
+        if (dictationUiState.value.owner != target) return
         val controller = dictationController ?: return
         dictationCancelRequested = true
         runCatching { audioChain?.quiesceDictationInput() }
@@ -2077,14 +2086,25 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
-     * Records one refused start, publishes its retryable reason for the row, and returns it.
+     * Records one refused start, publishes its retryable reason for the **composer's** row when the caller owns that
+     * row, and returns it.
      *
-     * The refusal is the **newer action**, so it dismisses the previous terminal state (for example a timeout from an
-     * earlier attempt): the row must explain why this tap did nothing instead of showing stale text. Count-only
-     * telemetry keeps the same `P4_DICTATION state=refused reason=...` shape.
+     * The refusal is the **newer action**, so a composer refusal dismisses the previous terminal state (for example a
+     * timeout from an earlier attempt): the row must explain why this tap did nothing instead of showing stale text.
+     * Count-only telemetry keeps the same `P4_DICTATION state=refused reason=...` shape.
+     *
+     * 0.5.1 C3 (`review Important #2`): a BALL refusal is **not** published into the shared [dictationUi]. That flow is
+     * the composer's status line, and a refused long press - most importantly the `busy` refusal while the composer
+     * itself is listening - would otherwise make the page explain a press it never made. The overlay turns the
+     * returned [DictationStartResult] into its own local notice, which is the only surface the ball has.
      */
-    private fun refuseDictation(reason: String, result: DictationStartResult): DictationStartResult {
+    private fun refuseDictation(
+        reason: String,
+        result: DictationStartResult,
+        target: DictationTarget,
+    ): DictationStartResult {
         logDictation("refused", reason, 0)
+        if (target == DictationTarget.BALL) return result
         // Atomic update, not `.value =`: the page's dismissals are lock-free, so a read-modify-write here could
         // otherwise resurrect a status the wearer already dismissed.
         dictationUiState.update { current ->
@@ -2163,8 +2183,9 @@ class HostCompositionRoot internal constructor(
             val result = requestTypedMessage(text)
             ballDictationNoticeState.value =
                 if (result == TypedSendResult.Accepted) null else typedResultLabel(result)
-            // No DictationFinal: the composer must never append the ball's words to its draft.
-            dictationUiState.update { it.copy(state = DictationState.Idle, final = null) }
+            // 0.5.1 C3: no DictationFinal - the composer must never append the ball's words. A composer final still
+            // waiting for its page is deliberately left untouched: this lease never owned it.
+            dictationUiState.update { it.copy(state = DictationState.Idle) }
             logDictation("final", if (dictationStopRequested) "user" else "endpoint", text.length)
             return
         }
@@ -2211,9 +2232,17 @@ class HostCompositionRoot internal constructor(
         dictationStopRequested = false
         dictationCancelRequested = false
         dictationFailureCode = null
-        // 0.5 (D212): the lease is gone, so the overlay may no longer claim it. The terminal state/final have already
-        // been published; clearing the owner here keeps a stale BALL/COMPOSER marker out of the next start.
-        dictationUiState.update { it.copy(owner = null) }
+        // 0.5 (D212) / 0.5.1 C3: the lease is gone, so the overlay may no longer claim it. A COMPOSER terminal state
+        // stays for its page to dismiss (and a pending final for it to append). A BALL terminal state is reset here:
+        // the ball's explanation lives in its own local notice, and leaving it in the shared flow would make the
+        // composer page inherit the ball's no-speech/error after the owner is cleared.
+        dictationUiState.update { current ->
+            if (current.owner == DictationTarget.BALL) {
+                current.copy(state = DictationState.Idle, owner = null)
+            } else {
+                current.copy(owner = null)
+            }
+        }
     }
 
     /**
@@ -2278,7 +2307,9 @@ class HostCompositionRoot internal constructor(
         dictationStopRequested = false
         dictationCancelRequested = false
         dictationFailureCode = null
-        dictationUiState.update { it.copy(state = DictationState.Idle) }
+        // 0.5.1 C3: the aborted lease released the flow, so the owner goes with it - a stale BALL/COMPOSER marker would
+        // otherwise decide a later unrelated stop and keep a pending composer final hidden from its page.
+        dictationUiState.update { it.copy(state = DictationState.Idle, owner = null) }
         logDictation("cancel", reason, 0)
     }
 

@@ -140,6 +140,10 @@ fun canSendTyped(session: SessionState, blank: Boolean, sending: Boolean): Boole
  * The icon does not vanish when the action is unavailable: a non-live session, an in-flight send, or a disabled
  * microphone merely greys the same circle out, which is why [ComposerActionSlot.enabled] is part of the decision.
  * Terminal dictation outcomes (`NoSpeech`/`Error`) give the microphone back: they end one attempt, not the field.
+ *
+ * 0.5.1 C3 (`review Important #2`): [dictation] must be the **composer's** view of the shared host flow
+ * (`composerDictationView` in `DictationInput.kt`), not the raw `DictationUiState.state`. A BALL lease's Listening state
+ * would otherwise turn this slot into Stop and let the page stop a lease it does not own.
  */
 fun composerActionSlot(
     session: SessionState,

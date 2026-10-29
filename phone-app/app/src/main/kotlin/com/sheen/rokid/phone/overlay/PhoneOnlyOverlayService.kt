@@ -26,6 +26,7 @@ import com.sheen.rokid.phone.R
 import com.sheen.rokid.phone.app.EdithApplication
 import com.sheen.rokid.phone.app.HostCompositionRoot
 import com.sheen.rokid.phone.app.MainActivity
+import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
 import com.sheen.rokid.phone.audio.DictationTarget
 import com.sheen.rokid.phone.platform.P3Log
@@ -87,7 +88,12 @@ class PhoneOnlyOverlayService : Service() {
     private var screenHeightPx = 0
     private var topInsetPx = 0f
     private var bottomInsetPx = 0f
-    private var longPressActive = false
+
+    /**
+     * 0.5.1 C3: whether the current long press really acquired the BALL lease. Only that press may stop it on release;
+     * a refused press must leave the composer's live lease alone. Also decides the microphone indicator.
+     */
+    private val ballPress = BallPressLease()
     private var moveJob: Job? = null
     private var foregroundStarted = false
 
@@ -126,6 +132,9 @@ class PhoneOnlyOverlayService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int = START_NOT_STICKY
 
     override fun onDestroy() {
+        // 0.5.1 C3 (T2 handoff): a service teardown owns the BALL lease this press acquired, so it ends that lease and
+        // never the composer's. A refused press has nothing to stop and must not touch the composer's lease.
+        if (ballPress.end()) root?.stopDictation(DictationTarget.BALL)
         scope.cancel()
         ballView?.let { runCatching { windowManager?.removeView(it) } }
         bubbleView?.let { runCatching { windowManager?.removeView(it) } }
@@ -303,7 +312,9 @@ class PhoneOnlyOverlayService : Service() {
             composition.dictationUi.collect { ui ->
                 val ownsBall = ui.owner == DictationTarget.BALL
                 listening.value = ownsBall && ui.state == DictationState.Listening
-                micVisible.value = longPressActive || listening.value
+                // 0.5.1 C3: only a BALL listening lease (or the accepted press that owns it) shows the microphone. A
+                // refused press must not, and neither must the composer's listening state.
+                micVisible.value = ballPress.micVisible(listening.value)
             }
         }
         scope.launch {
@@ -367,8 +378,6 @@ class PhoneOnlyOverlayService : Service() {
 
     private fun beginLongPress() {
         val composition = root ?: return
-        longPressActive = true
-        micVisible.value = true
         val current = position.value ?: return
         val target = current.copy(
             centerX = BallPlacement.visibleCenterX(current.edge, screenWidthPx, radiusPx, 8f * resources.displayMetrics.density),
@@ -379,21 +388,26 @@ class PhoneOnlyOverlayService : Service() {
         // drop its echo window before asking for the BALL lease; otherwise the answer's own voice and the half-duplex
         // filter would swallow the manual dictation that is now the phone-only model's next-sentence entry point.
         composition.stopCurrentSpeechForBall()
-        when (val result = composition.startDictation(DictationTarget.BALL)) {
-            com.sheen.rokid.phone.audio.DictationStartResult.Accepted -> Unit
-            else -> {
-                val copy = dictationStartStatusText(result) ?: "无法开始听写"
-                composition.phoneBubble.onEvent(PhoneBubbleEvent.Notice(AssistantRoute.WAKE, copy))
-                P3Log.line("P5_BALL event=dictation_refused reason=$result")
-            }
+        val result = composition.startDictation(DictationTarget.BALL)
+        // 0.5.1 C3 (`review Important #2`): record whether this press really acquired the lease. The microphone is only
+        // shown for an accepted press (or a live BALL lease); and only an accepted press may stop the lease on release.
+        // A refused press - most importantly `busy` while the composer is listening - owns nothing.
+        ballPress.begin(result)
+        micVisible.value = ballPress.micVisible(listening.value)
+        if (result != DictationStartResult.Accepted) {
+            val copy = ballDictationRefusalNotice(result)
+            composition.phoneBubble.onEvent(PhoneBubbleEvent.Notice(AssistantRoute.WAKE, copy))
+            P3Log.line("P5_BALL event=dictation_refused reason=$result")
         }
     }
 
     private fun endLongPress() {
         val composition = root ?: return
-        longPressActive = false
-        micVisible.value = listening.value
-        composition.stopDictation()
+        // 0.5.1 C3: release stops the BALL lease only if this press acquired it; an owner-aware stop for a lease the
+        // ball never held is a no-op by contract, but the overlay must not even ask. A refused press therefore leaves
+        // the composer's live lease, its final and the draft alone.
+        if (ballPress.end()) composition.stopDictation(DictationTarget.BALL)
+        micVisible.value = ballPress.micVisible(listening.value)
         snap()
         P3Log.line("P5_BALL event=long_press_end")
     }
@@ -524,3 +538,56 @@ class PhoneOnlyOverlayService : Service() {
         }
     }
 }
+
+/**
+ * 0.5.1 C3 (`review Important #2`): one long press's record of whether it really owns the BALL dictation lease.
+ *
+ * The composer page and the floating ball share the host's one dictation lease. A long press that is **refused** -
+ * `busy` because the composer is already listening, `no_session`, or any other retryable cause - owns nothing: its
+ * release must not stop the composer's lease, and its microphone indicator must not appear. Only a press whose
+ * `startDictation(BALL)` returned `Accepted` may stop the BALL lease, exactly once, on release or service teardown.
+ *
+ * Live on the service's main thread only (like the gesture callbacks that drive it), so it needs no lock.
+ */
+internal class BallPressLease {
+    private var pressed = false
+    private var accepted = false
+
+    /** Records one start result; returns whether this press acquired the BALL lease. */
+    fun begin(result: DictationStartResult): Boolean {
+        pressed = true
+        accepted = result == DictationStartResult.Accepted
+        return accepted
+    }
+
+    /**
+     * Ends the press and returns whether the BALL lease must be stopped.
+     *
+     * True only once, and only for an accepted press. A refused press answers false, so its release leaves the
+     * composer's live lease (and its final/draft) untouched.
+     */
+    fun end(): Boolean {
+        val stop = pressed && accepted
+        pressed = false
+        accepted = false
+        return stop
+    }
+
+    /**
+     * Whether the ball's microphone indicator may be shown: an accepted press, or a live BALL listening state.
+     *
+     * A refused press shows no microphone; the composer's own listening state is never a BALL state, because the
+     * service only passes the `owner == BALL && Listening` observation in.
+     */
+    fun micVisible(ballListening: Boolean): Boolean = ballListening || (pressed && accepted)
+}
+
+/**
+ * 0.5.1 C15: the ball's local notice for a refused start.
+ *
+ * The overlay cannot show the composer's inline status line, so it turns the returned result into a short local
+ * notice. The wording comes from the same [dictationStartStatusText] the composer row uses; the fallback is only for a
+ * result that has no copy (which cannot be a refusal).
+ */
+internal fun ballDictationRefusalNotice(result: DictationStartResult): String =
+    dictationStartStatusText(result) ?: "无法开始听写"

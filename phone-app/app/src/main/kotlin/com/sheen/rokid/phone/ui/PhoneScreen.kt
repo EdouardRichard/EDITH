@@ -54,6 +54,7 @@ import com.sheen.rokid.phone.app.MemorySection
 import com.sheen.rokid.phone.app.TypedSendResult
 import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationTarget
 import com.sheen.rokid.phone.audio.DictationUiState
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionUiState
@@ -189,7 +190,7 @@ internal fun PhoneScreen(
                             send = { root.requestTypedMessage(it) },
                             dictation = root.dictationUi,
                             startDictation = { root.startDictation() },
-                            stopDictation = { root.stopDictation() },
+                            stopDictation = { root.stopDictation(DictationTarget.COMPOSER) },
                             clearDictationStatus = { root.clearDictationStatus() },
                             consumeDictationFinal = { root.consumeDictationFinal(it) },
                             modifier = Modifier.weight(1f),
@@ -338,9 +339,13 @@ internal fun AssistantTab(
     // (0.4 Task 12b-ii fix 2, finding 1). Saving a raw sequence would make a tab switch reset it to 0 (duplicate
     // append) and a process restart restore an old N (the new host's first N finals silently dropped).
     val dictationUi by dictation.collectAsStateWithLifecycle()
+    // 0.5.1 C3 (`review Important #2`): the flow is shared with the floating ball. Only the values this page owns may
+    // drive its draft, its status line and its one action slot; a BALL lease's listening/terminal state, final or
+    // refusal is the ball's and renders as nothing here. See `composerDictationView`.
+    val composerDictation = composerDictationView(dictationUi)
     var appendedDictationSequence by remember { mutableStateOf(0L) }
-    LaunchedEffect(dictationUi.final?.sequence) {
-        val delivered = dictationUi.final ?: return@LaunchedEffect
+    LaunchedEffect(composerDictation.final?.sequence) {
+        val delivered = composerDictation.final ?: return@LaunchedEffect
         if (!isNewDictationFinal(delivered, appendedDictationSequence)) return@LaunchedEffect
         appendedDictationSequence = delivered.sequence
         // 0.4 Task 12b-ii (spec §5.3): the recognized words are appended to the editable draft. Nothing is sent:
@@ -456,8 +461,8 @@ internal fun AssistantTab(
             TypedInputRow(
                 session = session,
                 state = typedInput,
-                dictation = dictationUi.state,
-                refusal = dictationUi.refusal,
+                dictation = composerDictation.state,
+                refusal = composerDictation.refusal,
                 onDraftChange = { candidate ->
                     // 0.4 Task 12b-ii fix 2 (finding 2): editing is the wearer starting a newer action, so a finished
                     // dictation's no-speech/timeout/error text must not outrank what they are doing now.

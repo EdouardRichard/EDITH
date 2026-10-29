@@ -62,6 +62,12 @@ enum class DictationTarget { COMPOSER, BALL }
  * the page consumes it (see [DictationFinal]); [refusal] is the retryable reason of the last refused start, cleared by
  * the next start attempt, send, draft edit or session change (`HostCompositionRoot.clearDictationStatus`); [owner] says
  * which surface holds (or last held) the lease (0.5). The text is in memory only.
+ *
+ * 0.5.1 C3 (`review Important #2`): the composer page and the floating ball share this one value, so a reader must
+ * respect [owner]. Only the owning surface may stop/cancel the lease; the composer page renders a BALL-owned
+ * state/final/refusal as nothing of its own (`composerDictationView`), and a BALL final never becomes [final] (it is
+ * sent as a user message). A null owner is the settled state of an ended lease: the host clears it when the lease
+ * settles, while the composer's own terminal status/final stay until the page consumes/dismisses them.
  */
 data class DictationUiState(
     val state: DictationState = DictationState.Idle,
