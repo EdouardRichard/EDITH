@@ -15,6 +15,10 @@ data class DragDelta(val dx: Float, val dy: Float)
  * [beginDrag] in one delta, so the first drag includes every pixel travelled since the finger touched down instead of
  * dropping the sub-slop part. [BallGestureMachine] still owns tap/long-press/snap decisions; this class only reports
  * motion.
+ *
+ * The origin passed for every sample must be the view's **actual** on-screen location (`getLocationOnScreen`), not the
+ * requested `WindowManager.LayoutParams`: the requested layout origin lags `updateViewLayout`, and a stale origin makes
+ * the computed screen position (and therefore the ball) jump.
  */
 class BallDragController {
 

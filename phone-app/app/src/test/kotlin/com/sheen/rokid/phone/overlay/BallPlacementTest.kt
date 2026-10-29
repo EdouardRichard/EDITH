@@ -141,6 +141,19 @@ class BallPlacementTest {
     }
 
     @Test
+    fun `a release near an edge snaps and a middle release stays`() {
+        val near = BallPlacement.snapAfterDrag(60f, 1_200f, width, height, radiusPx = 84f, gapPx = gapPx,
+            snapThresholdPx = 100f)
+        assertEquals(BallEdge.LEFT, near.edge)
+        assertEquals(0f, near.centerX, 0f)
+
+        val middle = BallPlacement.snapAfterDrag(500f, 1_200f, width, height, radiusPx = 84f, gapPx = gapPx,
+            snapThresholdPx = 100f)
+        assertEquals(BallEdge.LEFT, middle.edge)
+        assertEquals("a release in the middle keeps the dragged centre", 500f, middle.centerX, 0f)
+    }
+
+    @Test
     fun `a drag keeps the whole ball on screen`() {
         val reserve = height * BubbleLayout.STACK_FRACTION + gapPx
         val (x, y) = BallPlacement.clampDragCenter(-50f, 10_000f, width, height, radiusPx = 84f, gapPx = gapPx)

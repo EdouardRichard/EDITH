@@ -18,7 +18,6 @@ import android.view.WindowManager
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
-import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.core.app.NotificationCompat
@@ -451,12 +450,6 @@ class PhoneOnlyOverlayService : Service() {
                         micVisible = mic,
                         listening = listeningState,
                         halo = haloState,
-                        // C11: the service records the ball window's origin; the content adds the event's local
-                        // position to get the screen-space pointer position the drag controller consumes.
-                        windowOrigin = {
-                            val params = ballParams
-                            if (params == null) Offset.Zero else Offset(params.x.toFloat(), params.y.toFloat())
-                        },
                         onAction = ::onBallAction,
                     )
                 }
@@ -580,6 +573,7 @@ class PhoneOnlyOverlayService : Service() {
         val target = BallPlacement.snapAfterDrag(
             current.centerX, current.centerY,
             screenWidthPx, screenHeightPx, radiusPx, gapPx, topInsetPx, bottomInsetPx,
+            snapThresholdPx = SNAP_THRESHOLD_DP * resources.displayMetrics.density,
         )
         animateTo(target, BallPlacement.SNAP_DURATION_MILLIS)
         P3Log.line("P5_BALL event=snap edge=${target.edge} x=${target.centerX.roundToInt()} y=${target.centerY.roundToInt()}")
@@ -709,6 +703,7 @@ class PhoneOnlyOverlayService : Service() {
         private const val CHANNEL_ID = "phone_only_overlay"
         private const val NOTIFICATION_ID = 0x0E11
         private const val BALL_DIAMETER_DP = 56
+        private const val SNAP_THRESHOLD_DP = 24f
         private const val WINDOW_FACTOR = 3.6f
         private const val HALO_POLL_MILLIS = 250L
         private const val PRESS_MILLIS = 120L

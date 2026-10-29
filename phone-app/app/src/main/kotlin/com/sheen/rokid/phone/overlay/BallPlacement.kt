@@ -1,5 +1,7 @@
 package com.sheen.rokid.phone.overlay
 
+import kotlin.math.abs
+
 /** Which screen edge a docked floating ball is attached to. */
 enum class BallEdge { LEFT, RIGHT }
 
@@ -95,8 +97,9 @@ object BallPlacement {
     )
 
     /**
-     * Where a released drag lands: the nearest edge, half hidden, at the dragged vertical position (clamped). The caller
-     * animates from [draggedX]/[draggedY] to the returned position.
+     * Where a released drag lands. It snaps to the nearest edge only when the released centre is within
+     * [snapThresholdPx] of that edge; a release in the middle keeps the dragged centre (fully visible) with the
+     * nearest edge label. The caller animates from [draggedX]/[draggedY] to the returned position.
      */
     fun snapAfterDrag(
         draggedX: Float,
@@ -107,11 +110,18 @@ object BallPlacement {
         gapPx: Float,
         topInsetPx: Float = 0f,
         bottomInsetPx: Float = 0f,
+        snapThresholdPx: Float = Float.MAX_VALUE,
     ): BallPosition {
         val edge = nearestEdge(draggedX, screenWidthPx)
+        val docked = dockedCenterX(edge, screenWidthPx)
+        val centerX = if (abs(draggedX - docked) <= snapThresholdPx) {
+            docked
+        } else {
+            draggedX.coerceIn(radiusPx, screenWidthPx - radiusPx)
+        }
         return BallPosition(
             edge = edge,
-            centerX = dockedCenterX(edge, screenWidthPx),
+            centerX = centerX,
             centerY = clampCenterY(draggedY, screenHeightPx, radiusPx, gapPx, topInsetPx, bottomInsetPx),
         )
     }

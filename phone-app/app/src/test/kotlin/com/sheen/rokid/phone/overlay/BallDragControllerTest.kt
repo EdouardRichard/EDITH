@@ -58,6 +58,20 @@ class BallDragControllerTest {
     }
 
     @Test
+    fun `the actual origin is required, a stale requested origin jumps`() {
+        val actual = BallDragController()
+        actual.onPointerDown(localX = 10f, localY = 10f, windowOriginX = 0f, windowOriginY = 0f)
+        actual.onPointerMove(localX = 15f, localY = 10f, windowOriginX = 5f, windowOriginY = 0f)
+        assertEquals("with the actual 5px window move the finger moved 10px", DragDelta(10f, 0f), actual.beginDrag())
+
+        val stale = BallDragController()
+        stale.onPointerDown(localX = 10f, localY = 10f, windowOriginX = 0f, windowOriginY = 0f)
+        stale.onPointerMove(localX = 15f, localY = 10f, windowOriginX = 10f, windowOriginY = 0f)
+        assertEquals("a stale 10px origin plus the 15px local reports 15px, not the finger's 10px",
+            DragDelta(15f, 0f), stale.beginDrag())
+    }
+
+    @Test
     fun `a new press starts a fresh baseline and a move without a down is ignored`() {
         val controller = BallDragController()
         assertNull("no pointer is down", controller.onPointerMove(50f, 50f, 10f, 10f))

@@ -37,6 +37,7 @@ import androidx.compose.ui.input.pointer.changedToUp
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.unit.dp
 import com.sheen.rokid.phone.R
@@ -60,9 +61,10 @@ enum class BallHalo { NONE, WORKING, SPEAKING }
  * `graphicsLayer { alpha }`, so the ball opacity fades the whole ball. The green working/speaking halo and the listening
  * ring are outside that layer and keep their own strength; they do not fade with the ball.
  *
- * 0.5.1 (`C11`): the drag delta is **screen space**. The service records the ball window's origin and supplies it
- * through [windowOrigin]; [BallDragController] combines it with the local pointer position instead of reading the
- * local `positionChange()`, which goes stale as soon as the window follows the finger.
+ * 0.5.1 (`C11`): the drag delta is **screen space**. The content reads the ball view's **actual** on-screen origin
+ * (`getLocationOnScreen`) for every pointer sample; the service's requested layout params lag `updateViewLayout`, and
+ * using them made the ball jump. [BallDragController] combines the actual origin with the local pointer position
+ * instead of the local `positionChange()`, which goes stale as soon as the window follows the finger.
  *
  * 0.5.1 (`C15`): the ring animation exists only while [halo] is not [BallHalo.NONE] (and the listening pulse only while
  * listening), so an idle ball does not keep a frame clock running.
@@ -77,11 +79,16 @@ fun PhoneOnlyBallContent(
     micVisible: Boolean,
     listening: Boolean,
     halo: BallHalo,
-    windowOrigin: () -> Offset,
     onAction: (BallGestureAction) -> Unit,
 ) {
     val currentAction by rememberUpdatedState(onAction)
-    val currentWindowOrigin by rememberUpdatedState(windowOrigin)
+    val view = LocalView.current
+    // The requested layout params lag the window's real position; the view's location is the actual origin.
+    val actualWindowOrigin = {
+        val location = IntArray(2)
+        view.getLocationOnScreen(location)
+        Offset(location[0].toFloat(), location[1].toFloat())
+    }
     val green = Color(0xFF40FF5E)
 
     Box(
@@ -93,7 +100,7 @@ fun PhoneOnlyBallContent(
                         val down = awaitFirstDown(requireUnconsumed = false)
                         val gesture = BallGestureMachine(slopPx = 12.dp.toPx(), longPressMillis = 500L)
                         val drag = BallDragController()
-                        val origin = currentWindowOrigin()
+                        val origin = actualWindowOrigin()
                         var timer: Job? = null
                         try {
                             // The gesture machine decides tap/long/snap from the absolute (screen) pointer position,
@@ -115,7 +122,7 @@ fun PhoneOnlyBallContent(
                                     break
                                 }
                                 if (change.positionChanged()) {
-                                    val at = currentWindowOrigin()
+                                    val at = actualWindowOrigin()
                                     val screenX = at.x + change.position.x
                                     val screenY = at.y + change.position.y
                                     gesture.move(screenX, screenY, nowMillis())
