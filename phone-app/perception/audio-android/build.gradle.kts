@@ -86,11 +86,11 @@ androidComponents.onVariants { variant ->
 // --- KWS model assets: optional but verified ---------------------------------------------------------
 // `javap -p` on the pinned AAR shows the only public constructor is
 // `KeywordSpotter(AssetManager, KeywordSpotterConfig)` and that the file-based `newFromFile` is private
-// native, so the KWS model has to be read from `assets/`. The user-approved download lives OUTSIDE version
-// control under the git-ignored `.local/`; when it is absent this task packages nothing and a fresh clone
-// still builds and tests (the app then reports `KWS_MODEL_MISSING`).
+// native, so the KWS model has to be read from `assets/`. The model lives OUTSIDE version control in the
+// migrated `EDITH_model` tree; when it is absent this task packages nothing and a fresh clone still builds and
+// tests (the app then reports `KWS_MODEL_MISSING`).
 val kwsModelDirectory = rootProject.layout.projectDirectory
-    .dir(".local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20")
+    .dir("../EDITH_model/k40/kws")
 
 /** The five files to ship and their measured SHA-256 (2026-10-09); any mismatch fails the build. */
 val kwsPinnedFiles = mapOf(
