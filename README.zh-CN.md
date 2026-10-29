@@ -300,12 +300,12 @@ bundle 变化时，App 会重新校验并准备 asset；bundle 未变化时复�
 模型二进制不提交仓库。要构建完整 APK，先准备 staging 目录，再用 `-PbundledModelsDir` 指定：
 
 ```powershell
-.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=E:\edith-0.4-models
+.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=D:\Project_new\EDITH_model\k40
 ```
 
-默认目录是 `<仓库>/.local/0.4-models`，下面放 `asr/`、`laya/` 与 `embeddinggemma/`。KWS 文件
-从 `.local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/` 与仓库内 `keywords.txt`
-读取。完整构建要求每个文件都存在且校验通过；缺失或不一致会构建失败。
+默认目录是 `<仓库>/../EDITH_model/k40`（K40 模型包），下面放 `engine-models-import/`、`files/` 与
+`embeddinggemma/`；KWS 模型放 `kws/`，仓库内 `keywords.txt` 仍在
+`phone-app/perception/audio-android/kws/`。完整构建要求每个文件都存在且校验通过；缺失或不一致会构建失败。
 
 仅开发/CI 可使用 `-PwithoutBundledModels=true` 跳过 `assets/models/**` 并设置
 `BuildConfig.BUNDLED_MODELS=false`。**release 变体会拒绝该开关**，它绝不能产出交付 APK。

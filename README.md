@@ -317,13 +317,13 @@ verifies and materializes the assets again; an unchanged bundle is reused.
 and point `-PbundledModelsDir` at the staging directory:
 
 ```powershell
-.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=E:\edith-0.4-models
+.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=D:\Project_new\EDITH_model\k40
 ```
 
-The default is `<repo>/.local/0.4-models`, with `asr/`, `laya/` and `embeddinggemma/`
-subdirectories. The KWS files are read from
-`.local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/` and the tracked
-`keywords.txt`. A complete build requires every file; a missing or mismatched file fails the build.
+The default is `<repo>/../EDITH_model/k40` (the K40 bundle), with `engine-models-import/`, `files/`
+and `embeddinggemma/` subdirectories plus `kws/` for the KWS models. The tracked `keywords.txt`
+stays in `phone-app/perception/audio-android/kws/`. A complete build requires every file; a missing
+or mismatched file fails the build.
 
 For development/CI only, `-PwithoutBundledModels=true` omits `assets/models/**` and sets
 `BuildConfig.BUNDLED_MODELS=false`. **Release variants reject this switch**; it must never produce
