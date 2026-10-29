@@ -40,7 +40,7 @@ internal data class PromptManifestEntry(
 object PromptCatalog {
 
     /** Catalog semver; a session pins the plan it loaded, it never mixes versions (spec §4.1). */
-    const val VERSION: String = "0.4.1"
+    const val VERSION: String = "0.5.1"
 
     private const val PROMPTS_DIR = "prompts/"
     private const val MANIFEST_FILE = "manifest.tsv"

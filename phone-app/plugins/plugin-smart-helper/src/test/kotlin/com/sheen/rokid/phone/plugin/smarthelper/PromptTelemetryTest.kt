@@ -216,7 +216,7 @@ class PromptTelemetryTest {
         val plan = PromptCatalog.plan(PromptRoute.WAKE, profile)
         assertTrue(
             Regex(
-                """^P3_PROMPT version=0\.4\.1 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
+                """^P3_PROMPT version=0\.5\.1 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
                     """catalogHash=(?:[0-9a-f]{64}|none) route=WAKE staticChars=\d+ dynamicChars=\d+$""",
             ).matches(line),
             "the line must carry exactly the pinned plan's identity, route and sizes: $line",
@@ -348,7 +348,7 @@ class PromptTelemetryTest {
         val plan = PromptCatalog.plan(PromptRoute.PROACTIVE_HINT, profile)
         assertTrue(
             Regex(
-                """^P3_PROMPT version=0\.4\.1 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
+                """^P3_PROMPT version=0\.5\.1 hash=[0-9a-f]{64} deviceHash=[0-9a-f]{64} """ +
                     """catalogHash=(?:[0-9a-f]{64}|none) route=PROACTIVE_HINT staticChars=\d+ dynamicChars=0$""",
             ).matches(line),
             "the proactive line must carry exactly the same pinned field list as the wake line: $line",
