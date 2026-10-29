@@ -402,7 +402,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     val levels = listOf("L0", "L1", "L2", "L3", "L4")
 
     Text("唤醒与权限设置", style = MaterialTheme.typography.titleLarge)
-    Text("唤醒词、权限上限、白名单、主动辅助等设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；感知截图与不拦截开关保存后立即更新宿主状态。默认上限为 L1，如需 L3/L4 请在此明确选择。「脱离眼镜」在设置页下方单独切换（运行中会先停止会话），下次开始会话生效；本页保存不会改写它。",
+    Text("唤醒词、权限上限、白名单、主动辅助等设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；感知截图与不拦截开关保存后立即更新宿主状态。默认上限为 L1，如需 L3/L4 请在此明确选择。「纯手机模型」在设置页下方单独切换（运行中会先停止会话），下次开始会话生效；本页保存不会改写它。",
         style = MaterialTheme.typography.bodyMedium)
     // Task 14b-fix item 5: an edit invalidates whatever the last save reported, so the stale error text cannot
     // outlive the input it was about.
@@ -498,7 +498,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     }
     errors.forEach { Text(it, color = MaterialTheme.colorScheme.error) }
     if (saved) {
-        if (errors.isEmpty()) Text("已保存：感知截图与不拦截开关会立即更新宿主状态；其余设置将在下次重启 App 后生效。「脱离眼镜」开关单独保存，本按钮不会改写它")
+        if (errors.isEmpty()) Text("已保存：感知截图与不拦截开关会立即更新宿主状态；其余设置将在下次重启 App 后生效。「纯手机模型」开关单独保存，本按钮不会改写它")
         else Text("可用字段已保存，被拒绝的输入请按上述提示修改")
     }
     Button(onClick = {

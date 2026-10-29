@@ -20,7 +20,7 @@ EDITH: An Always-On Proactive AI Agent on Android, Connected to Rokid Glasses
   <strong>English</strong> | <a href="README.zh-CN.md">简体中文</a>
 </p>
 
-> **Preview status:** EDITH is currently in preview (version `0.4.0-preview`). Its features are
+> **Preview status:** EDITH is currently in preview (version `0.5.0-preview`). Its features are
 > usable, but performance, stability and the overall experience still need optimization.
 
 EDITH (伊迪丝) is an end-cloud collaborative AI agent: an Android host app on your phone plus a
@@ -28,9 +28,16 @@ custom app on Rokid Glasses. The glasses are its microphone, speaker and display
 ears, hands, memory and brain. Microphone audio streams from the glasses over the Rokid AI App's
 CXR-Link session; the phone segments and transcribes it on-device, calls the LLM you configure,
 operates Android apps through the accessibility service and Shizuku's shell, and communicates with
-the user through text on the glasses HUD and TTS audio. From 0.4 the phone can also run **detached
-from the glasses**, using its own microphone and screen, and its conversation log accepts typed and
-dictated input.
+the user through text on the glasses HUD and TTS audio. From 0.4 the phone can also run in
+**phone-only mode**, using its own microphone and screen; 0.5 adds a draggable EDITH-icon floating
+ball on the home screen and independent translucent message bubbles for replies and tool steps.
+
+- **Phone-only mode (0.5)** — Enable it in Settings and an EDITH-icon ball appears on the home
+  screen. Drag it to an edge and it snaps there, half hidden. Long-press to show the microphone and
+  dictate; the transcript is sent to the agent. Replies and tool calls appear as separate translucent
+  bubbles (tool information matches the glasses); old bubbles fade and disappear after 2 s. Both the
+  ball and the bubbles have adjustable opacity, and a dynamic light ring around the ball shows when
+  the AI is thinking.
 
 - **Wake-word route** — Say “EDITH” or “伊迪丝”. The glasses panel opens, EDITH listens, recognizes
   the intent, perceives the phone (screen, notifications, media, calendar, device state), plans and
@@ -60,11 +67,11 @@ dictated input.
   </a>
 </div>
 
-**Agent capability detached from glasses (0.4)** — no glasses link; wake-word wake only.
+**Phone-only mode (0.4; renamed and extended in 0.5)** — no glasses link; wake-word wake and floating-ball dictation.
 
 <div align="center">
   <a href="docs/assets/videos/detached-wake.mp4">
-    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="Detached wake demo — click to play the full video">
+    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="Phone-only wake demo — click to play the full video">
   </a>
 </div>
 
@@ -89,7 +96,7 @@ launch materializes about **1.0 GiB** (1.03 GiB). See [Model files](#2-model-fil
 
 ## Technical routes
 
-0.4 keeps both routes and adds a phone-only detached variant of the wake route, a text/dictation
+0.4 keeps both routes and adds a phone-only mode variant of the wake route, a text/dictation
 input row on the phone, and model provisioning from APK assets. The default glasses configuration
 described first is unchanged.
 
@@ -103,9 +110,9 @@ proactive route has no wake word at all). A final transcript is admitted into th
 the WAKE turn is waiting for it — with no turn waiting, a final does not open a wake turn; it goes
 to the proactive trigger path instead. `AgentLoop` with the configured cloud model → tool execution
 and perception → answer on the glasses panel and phone-side TTS. The same CXR session also carries
-the display commands and the follow-up audio. With detached mode on, this chain starts at the phone
+the display commands and the follow-up audio. With phone-only mode on, this chain starts at the phone
 microphone instead of the CXR uplink; KWS, VAD, ASR and everything after transcript admission are
-the same (see below). The detached variant also wakes with the screen off or locked (foreground
+the same (see below). It also wakes with the screen off or locked (foreground
 service + `PARTIAL_WAKE_LOCK`) and answers every accepted wake with a fixed spoken acknowledgement
 「我在」 inside an echo-mute window: microphone frames are silenced while the phone speaks, so the
 acknowledgement never reaches the ASR or corrupts the user's next command, and the WAKE turn opens
@@ -202,9 +209,9 @@ tool face as the wake route for FOLLOWUP_TURN · glasses overlay panel via CXR c
 When the gate declines, **zero** model requests are made. The two routes use independent
 `ConversationStore`s.
 
-### Detached mode (0.4)
+### Phone-only mode (0.4; renamed in 0.5)
 
-The **Detached from glasses** setting makes the wake route independent of the glasses.
+The **phone-only mode** setting makes the wake route independent of the glasses. Since 0.5 it also shows the EDITH-icon floating ball and the separate translucent message bubbles described above: drag and edge snap, long-press dictation, a thinking light ring, adjustable opacity, and old bubbles that fade away after 2 s.
 
 ```mermaid
 flowchart LR
@@ -215,11 +222,11 @@ flowchart LR
     ASR -- "final transcript" --> ADMIT["Transcript admission"] --> CYCLE
     CYCLE -- "answer" --> LOG["Phone conversation log"]
     LOCK["PARTIAL_WAKE_LOCK<br/>edith:detached-wake"] -. "keeps KWS running<br/>with the screen off" .-> ING
-    STORED["Stored proactive switch"] -. "effective off while detached" .-> CYCLE
+    STORED["Stored proactive switch"] -. "effective off in phone-only mode" .-> CYCLE
 ```
 
 With the setting off, the glasses routes above are unchanged: CXR connection, glasses wake, panel
-display and follow-up behavior keep their existing semantics. Detached mode is a local
+display and follow-up behavior keep their existing semantics. Phone-only mode is a local
 input/display choice, not a second CXR protocol.
 
 ## Project structure

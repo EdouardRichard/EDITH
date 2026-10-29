@@ -314,7 +314,7 @@
             </intent-filter>
         </receiver>
         <!--
-          0.4 Task 9 「脱离眼镜」 fallback gate + readback. The settings switch sits below the fold of a long Compose
+          0.4 Task 9 「纯手机模型」 fallback gate + readback. The settings switch sits below the fold of a long Compose
           page that the installed accessibility probe cannot scroll; the Task 9 run reached it by temporarily enlarging
           the logical display and toggled it with the probe itself, and used this receiver for **readback only**. It
           remains available as the labelled fallback that drives the production `DetachGate.set(...)` for downstream

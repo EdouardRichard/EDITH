@@ -96,7 +96,7 @@ data class SmartSettings(
      */
     val noInterception: Boolean = false,
     /**
-     * 0.4 Task 5 (`D199`/`D202`): the host-only 「脱离眼镜」 switch, persisted and **off by default**.
+     * 0.4 Task 5 (`D199`/`D202`): the host-only 「纯手机模型」 switch, persisted and **off by default**.
      *
      * It is not a plugin setting and deliberately does not appear in [pluginValues]: the plugin only ever sees the
      * **effective** arming value derived from it (`proactiveEnabled && !glassesDetached`), never the mode itself. A

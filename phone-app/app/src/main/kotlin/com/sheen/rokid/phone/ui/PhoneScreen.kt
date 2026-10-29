@@ -489,7 +489,7 @@ private val typedInputSaver: Saver<TypedInputState, Any> = listSaver(
 /**
  * 0.4 Task 11 (spec §5.1) + Task 12b-ii (spec §5.3): the WAKE conversation's composer, below the chat frame.
  *
- * Always rendered on WAKE (the 脱离眼镜 switch does not hide it), never on PROACTIVE. The composer draws the pure
+ * Always rendered on WAKE (the 纯手机模型 switch does not hide it), never on PROACTIVE. The composer draws the pure
  * decisions from `TypedInput.kt`/`DictationInput.kt` and reads no identity itself.
  *
  * The owner's 2026-10-27 redesign (option A) replaced the outlined field + microphone icon + text button row with one

@@ -29,7 +29,7 @@
          requested at runtime only in detached mode (`SessionService`), and glasses mode keeps `connectedDevice`. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
     <!-- 0.4 Task 6: the detached session's audio source. A runtime permission, requested from the session page only
-         when 「脱离眼镜」 is on (spec §4.2, §4.5); glasses mode never asks for it. -->
+         when 「纯手机模型」 is on (spec §4.2, §4.5); glasses mode never asks for it. -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <!-- Lock-screen unlock keeps the display interactive for the bounded duration of a device tool call. -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
