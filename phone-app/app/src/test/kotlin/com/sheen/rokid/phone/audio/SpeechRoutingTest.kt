@@ -252,4 +252,81 @@ class SpeechRoutingTest {
             root.close()
         }
     }
+
+    @Test
+    fun `setSpeechEnabled off drops the echo window immediately`() {
+        // C5: the player's close keeps the 150 ms reverb tail, but an off switch is the user saying "no more muting".
+        // With the 120 s watchdog gone, leaving the tail behind is the only mute source left; off must clear it.
+        val blobs = RecordingBlobs()
+        val router = SpeechPlayerRouter()
+        val clock = FakeClock()
+        val window = EchoMuteWindow(clock)
+        val created = mutableListOf<FakePlayer>()
+        val root = composition(router, blobs) { FakePlayer().also { created += it } }
+        root.echoMute = window
+        try {
+            root.setSpeechEnabled(true)
+            router.play(assistance()) { }
+            window.open() // what the player's audible onset does
+            assertTrue("the answer is speaking", window.covers(clock.nowNanos()))
+
+            root.setSpeechEnabled(false)
+
+            assertFalse(
+                "turning speech off must release the microphone now, not after a reverb tail",
+                window.covers(clock.nowNanos()),
+            )
+        } finally {
+            root.close()
+        }
+    }
+
+    @Test
+    fun `stopping the session drops the echo window`() {
+        // C5: a stopped session must not leave the next session's first words muted; the lost end callback is released
+        // by the explicit clear on the stop path (the watchdog used to be the fallback and is now removed).
+        val blobs = RecordingBlobs()
+        val router = SpeechPlayerRouter()
+        val clock = FakeClock()
+        val window = EchoMuteWindow(clock)
+        val root = composition(router, blobs) { FakePlayer() }
+        root.echoMute = window
+        try {
+            window.open()
+            clock.advance(121_000_000_000L)
+            assertTrue("a lost end callback keeps the window open", window.covers(clock.nowNanos()))
+
+            root.stop()
+
+            assertFalse("a stopped session must release the echo window", window.covers(clock.nowNanos()))
+        } finally {
+            root.close()
+        }
+    }
+
+    @Test
+    fun `long press on the ball stops the speaking answer before the manual dictation`() {
+        // C4: the ball long press is the takeover path. The answer must stop and its echo window must go before the BALL
+        // lease is requested, or the answer's own echo (or its NoSpeech) would swallow the wearer's first words.
+        val blobs = RecordingBlobs()
+        val router = SpeechPlayerRouter()
+        val clock = FakeClock()
+        val window = EchoMuteWindow(clock)
+        val created = mutableListOf<FakePlayer>()
+        val root = composition(router, blobs) { FakePlayer().also { created += it } }
+        root.echoMute = window
+        try {
+            root.setSpeechEnabled(true)
+            router.play(assistance()) { }
+            window.open() // the player's audible onset
+            assertTrue("the answer is speaking", window.covers(clock.nowNanos()))
+
+            root.stopCurrentSpeechForBall()
+
+            assertEquals("the speaking answer is stopped before the takeover", 1, created[0].cancels)
+            assertFalse("the takeover must not leave the phone mic muted", window.covers(clock.nowNanos()))
+        } finally {
+            root.close()
+        }
+    }
 }

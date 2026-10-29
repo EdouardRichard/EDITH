@@ -121,7 +121,7 @@ class AndroidSpeechPlayerTest {
     @Test fun `close closes the echo window after the reverb tail`() {
         // 0.5.1 C5: the player owns the echo window, so closing it must release the phone microphone. The 150 ms
         // reverb tail is kept (`close()`, not an immediate clear): audio already left the speaker may still be in the
-        // room. Before the fix a closed player left the window open for the 120 s watchdog, which Task 2 removes.
+        // room. Before the fix a closed player left the window open for the 120 s watchdog, which 0.5.1 Task 2 removed.
         val clock = FakeClock()
         val mute = EchoMuteWindow(clock)
         val engine = FakeTtsEngine()
@@ -209,10 +209,45 @@ class AndroidSpeechPlayerTest {
         assertFalse("and the late callback cannot leave the gate closed", gate.isPlaying)
     }
 
+    @Test fun `a cancelled utterance keeps the reverb tail and then releases the window`() {
+        // 0.5.1 C5/T2: a handle cancel (the router's stop path, e.g. the long-press takeover) settles the playback like
+        // an end callback - one reverb tail, then live again. The 120 s watchdog no longer exists to hide a missed close.
+        val clock = FakeClock()
+        val mute = EchoMuteWindow(clock)
+        val gate = PlaybackGate()
+        val engine = FakeTtsEngine()
+        val player = AndroidSpeechPlayer(engine, gate, mute)
+        val handle = player.play(hint()) { }
+        engine.fireStart("h")
+        assertTrue("the audible interval is muted", mute.covers(clock.nowNanos()))
+
+        handle.cancel()
+        assertTrue("audio already in the room is still covered by the tail", mute.covers(clock.nowNanos()))
+        clock.advance(151_000_000L)
+        assertFalse("after the tail the microphone is live again", mute.covers(clock.nowNanos()))
+    }
+
+    @Test fun `an explicit clear releases the reverb tail immediately`() {
+        // 0.5.1 C5: `close()` deliberately keeps the 150 ms tail; turning speech off (or the next manual dictation) must
+        // not inherit it, so those paths call `clear()` right after close. This pins the primitive they rely on.
+        val clock = FakeClock()
+        val mute = EchoMuteWindow(clock)
+        val engine = FakeTtsEngine()
+        val player = AndroidSpeechPlayer(engine, echoMute = mute)
+        player.play(hint()) { }
+        engine.fireStart("h")
+
+        player.close()
+        assertTrue("close keeps the 150 ms reverb tail", mute.covers(clock.nowNanos()))
+
+        mute.clear()
+        assertFalse("an explicit clear must not wait for the tail", mute.covers(clock.nowNanos()))
+    }
+
     @Test fun `a late onset after close cannot reopen the echo window`() {
         // The engine delivers `onStart` from its own thread. An utterance requested just before the off switch can have
         // its onset land after `close()`; re-arming the window there would leave it open with no callback left to close
-        // it - the permanent mute the 120 s watchdog currently hides and Task 2 removes.
+        // it - the permanent mute the 120 s watchdog used to hide and 0.5.1 Task 2 removed.
         val clock = FakeClock()
         val mute = EchoMuteWindow(clock)
         val gate = PlaybackGate()

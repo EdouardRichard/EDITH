@@ -576,13 +576,17 @@ class HostCompositionRoot internal constructor(
         } else {
             // 0.5.1 C5: stop the utterance while the target is still installed - the router cancels a play() that is
             // inside the platform player instead of letting it publish an untracked handle - then detach, then close.
-            // The close is what releases the echo window (with the 150 ms reverb tail), so the off switch cannot leave
-            // the phone mic muted after Task 2 removes the 120 s watchdog.
+            // The close is what releases the echo window (with the 150 ms reverb tail); the explicit clear below drops
+            // that tail too, so the off switch cannot leave the phone mic muted now that the 120 s watchdog is gone.
             speechRouter.stopCurrent()
             speechRouter.install(null)
             val released = speechPlayerHolder.getAndSet(null)
             (released as? AutoCloseable)?.let { runCatching { it.close() } }
             wakeAckPlayer = null
+            // 0.5.1 C5: the player's own close keeps the 150 ms reverb tail. The off switch means "stop muting the phone
+            // mic", so the tail is dropped too; otherwise a lost end callback could leave the only mute source behind now
+            // that the 120 s watchdog is gone.
+            echoMute?.clear()
             P3Log.line("P5_TTS state=off")
         }
         val target = smartSettingsStore
@@ -1919,6 +1923,12 @@ class HostCompositionRoot internal constructor(
      */
     @Synchronized fun startDictation(target: DictationTarget = DictationTarget.COMPOSER): DictationStartResult {
         if (closed) return refuseDictation("closed", DictationStartResult.Closed)
+        // 0.5.1 C4/C5: a manual BALL press is the wearer taking the microphone. The answer may still be speaking, or its
+        // TTS end callback may have been lost (there is no time bound any more), so drop the half-duplex window before
+        // the lease is validated: otherwise the first frames of the manual dictation are replaced by silence. The
+        // service stops the playback itself first ([stopCurrentSpeechForBall]); this is the safety net for every caller
+        // of the BALL target, including one whose start is about to be refused.
+        if (target == DictationTarget.BALL) echoMute?.clear()
         if (dictationController != null) return refuseDictation("busy", DictationStartResult.Busy)
         val session = host.currentState
         if (session != SessionState.Ready && session != SessionState.Listening) {
@@ -2625,6 +2635,20 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
+     * 0.5.1 C4: the BALL long press takes the microphone back from an answer that is still speaking.
+     *
+     * The manual dictation is the phone-only model's only next-sentence entry point (C2), so it must work mid-answer:
+     * the router stops the arbiter-tracked playback, and the half-duplex window is dropped immediately (the player's
+     * cancel only schedules its 150 ms reverb tail). Without both, the echo filter - or the answer still playing over
+     * the wearer - would swallow the takeover. A detached wake acknowledgement is not tracked by the router; it is one
+     * short phrase, and [startDictation]'s BALL clear releases its tail before listening.
+     */
+    internal fun stopCurrentSpeechForBall() {
+        speechRouter.stopCurrent()
+        echoMute?.clear()
+    }
+
+    /**
      * The plugin half of the wake-panel decision (0.24 S5 final review Important #1).
      *
      * A composition built without the smart wiring (a harness) has no scene policy to ask and keeps the identity-only
@@ -3046,6 +3070,10 @@ class HostCompositionRoot internal constructor(
         confirmationPresenter?.withdrawAll()
         notifier()?.cancelAll()
         mutableState.update { it.copy(errorCode = null, pendingConfirmation = null) }
+        // 0.5.1 C5: the session is over, so there is nothing left for the half-duplex window to protect. Cleared after
+        // `host.stop()` so a playback cancelled by the teardown cannot schedule its 150 ms tail behind this clear; a lost
+        // TTS end callback must not mute the first words of the next session (the 120 s watchdog is gone).
+        echoMute?.clear()
     }
     /**
      * The `DetachGate` mode side effect (0.4 strict-local fix, `D199`): a **same-process** mode change must take the

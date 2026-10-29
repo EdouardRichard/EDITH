@@ -375,6 +375,10 @@ class PhoneOnlyOverlayService : Service() {
         )
         animateTo(target, PRESS_MILLIS)
         P3Log.line("P5_BALL event=long_press edge=${current.edge}")
+        // 0.5.1 C4: a long press is the wearer taking the microphone back. If an answer is still speaking, stop it and
+        // drop its echo window before asking for the BALL lease; otherwise the answer's own voice and the half-duplex
+        // filter would swallow the manual dictation that is now the phone-only model's next-sentence entry point.
+        composition.stopCurrentSpeechForBall()
         when (val result = composition.startDictation(DictationTarget.BALL)) {
             com.sheen.rokid.phone.audio.DictationStartResult.Accepted -> Unit
             else -> {

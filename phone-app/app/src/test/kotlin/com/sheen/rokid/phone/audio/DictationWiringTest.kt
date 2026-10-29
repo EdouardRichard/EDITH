@@ -29,6 +29,7 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartWiring
+import com.sheen.rokid.phone.session.EchoMuteWindow
 import com.sheen.rokid.phone.ui.TypedInputState
 import com.sheen.rokid.phone.ui.dictationStartStatusText
 import com.sheen.rokid.phone.ui.inputRowStatusText
@@ -584,6 +585,34 @@ class DictationWiringTest {
             )
             // The conversation record is the plugin's typed-turn behavior (covered by the plugin's own tests); what this
             // host-level test proves is that the ball's final went to the typed path and not to the composer draft above.
+        }
+    }
+
+    /**
+     * 0.5.1 C4/C5: the manual BALL dictation is the phone-only model's next-sentence entry point, and the half-duplex
+     * window is the one thing that can silently swallow its first frames. A lost TTS end callback no longer has a 120 s
+     * watchdog, so `startDictation(BALL)` must drop the stale window before it listens.
+     */
+    @Test
+    fun manualBallDictationClearsAStaleEchoWindowBeforeListening() {
+        withRig(detached = true) { rig ->
+            val window = EchoMuteWindow(rig.clock)
+            rig.root.echoMute = window
+            window.open()
+            rig.clock.advance(121_000_000_000L)
+            assertTrue("a lost end callback keeps the window open", window.covers(rig.clock.nowNanos()))
+
+            assertTrue(rig.activate())
+            assertEquals(
+                "the BALL lease starts on the live session",
+                DictationStartResult.Accepted,
+                rig.root.startDictation(DictationTarget.BALL),
+            )
+
+            assertFalse(
+                "a manual BALL dictation must not be swallowed by a stale echo window",
+                window.covers(rig.clock.nowNanos()),
+            )
         }
     }
 
