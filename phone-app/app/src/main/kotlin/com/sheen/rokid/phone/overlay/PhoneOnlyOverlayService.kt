@@ -12,10 +12,12 @@ import android.os.Build
 import android.os.IBinder
 import android.provider.Settings
 import android.view.Gravity
+import android.view.WindowInsets
 import android.view.WindowManager
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.platform.ComposeView
 import androidx.compose.ui.platform.ViewCompositionStrategy
 import androidx.core.app.NotificationCompat
@@ -86,6 +88,9 @@ class PhoneOnlyOverlayService : Service() {
     private var windowSizePx = 0
     private var screenWidthPx = 0
     private var screenHeightPx = 0
+
+    /** `BubbleLayout.GAP_DP` at the display density; the one gap shared by the bubble anchor and the ball reserve. */
+    private var gapPx = 0f
     private var topInsetPx = 0f
     private var bottomInsetPx = 0f
 
@@ -164,11 +169,41 @@ class PhoneOnlyOverlayService : Service() {
         val density = metrics.density
         radiusPx = BALL_DIAMETER_DP / 2f * density
         windowSizePx = (radiusPx * WINDOW_FACTOR).roundToInt()
-        topInsetPx = TOP_INSET_DP * density
-        bottomInsetPx = BOTTOM_INSET_DP * density
+        gapPx = BubbleLayout.GAP_DP * density
+        val insets = readSystemBarInsets()
+        topInsetPx = insets.first
+        bottomInsetPx = insets.second
         position.value = BallPlacement.initial(
-            screenWidthPx, screenHeightPx, radiusPx, topInsetPx, bottomInsetPx,
+            screenWidthPx, screenHeightPx, radiusPx, gapPx, topInsetPx, bottomInsetPx,
         )
+    }
+
+    /**
+     * 0.5.1 (`C15`): the live status-bar/navigation-bar insets, replacing the 0.5 build's 48 dp / 96 dp constants.
+     *
+     * `WindowMetrics` is the platform source on API 30+. A service context has no window of its own, so a vendor build
+     * can refuse or zero the metrics; the system's own `status_bar_height`/`navigation_bar_height` resources are the
+     * fallback (still live platform values, and the only source below API 30). T12 records the actual K40 values.
+     */
+    private fun readSystemBarInsets(): Pair<Float, Float> {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            val metrics = runCatching {
+                (getSystemService(WINDOW_SERVICE) as? WindowManager)?.currentWindowMetrics
+            }.getOrNull()
+            val bars = metrics?.windowInsets?.getInsets(
+                WindowInsets.Type.statusBars() or WindowInsets.Type.navigationBars(),
+            )
+            if (bars != null && (bars.top > 0 || bars.bottom > 0)) {
+                return bars.top.toFloat() to bars.bottom.toFloat()
+            }
+        }
+        return systemDimenPx("status_bar_height") to systemDimenPx("navigation_bar_height")
+    }
+
+    /** One of Android's own navigation/status bar dimensions in pixels; zero when the platform does not define it. */
+    private fun systemDimenPx(name: String): Float {
+        val id = resources.getIdentifier(name, "dimen", "android")
+        return if (id > 0) resources.getDimensionPixelSize(id).toFloat() else 0f
     }
 
     private fun ComposeView.installLifecycle(owner: OverlayLifecycleOwner) {
@@ -262,6 +297,12 @@ class PhoneOnlyOverlayService : Service() {
                         micVisible = mic,
                         listening = listeningState,
                         halo = haloState,
+                        // C11: the service records the ball window's origin; the content adds the event's local
+                        // position to get the screen-space pointer position the drag controller consumes.
+                        windowOrigin = {
+                            val params = ballParams
+                            if (params == null) Offset.Zero else Offset(params.x.toFloat(), params.y.toFloat())
+                        },
                         onAction = ::onBallAction,
                     )
                 }
@@ -358,7 +399,7 @@ class PhoneOnlyOverlayService : Service() {
         val current = position.value ?: return
         val (x, y) = BallPlacement.clampDragCenter(
             current.centerX + dx, current.centerY + dy,
-            screenWidthPx, screenHeightPx, radiusPx, topInsetPx, bottomInsetPx,
+            screenWidthPx, screenHeightPx, radiusPx, gapPx, topInsetPx, bottomInsetPx,
         )
         position.value = current.copy(
             centerX = x,
@@ -373,9 +414,9 @@ class PhoneOnlyOverlayService : Service() {
         val current = position.value ?: return
         val target = BallPlacement.snapAfterDrag(
             current.centerX, current.centerY,
-            screenWidthPx, screenHeightPx, radiusPx, topInsetPx, bottomInsetPx,
+            screenWidthPx, screenHeightPx, radiusPx, gapPx, topInsetPx, bottomInsetPx,
         )
-        animateTo(target, SNAP_MILLIS)
+        animateTo(target, BallPlacement.SNAP_DURATION_MILLIS)
         P3Log.line("P5_BALL event=snap edge=${target.edge} x=${target.centerX.roundToInt()} y=${target.centerY.roundToInt()}")
     }
 
@@ -502,10 +543,7 @@ class PhoneOnlyOverlayService : Service() {
         private const val NOTIFICATION_ID = 0x0E11
         private const val BALL_DIAMETER_DP = 56
         private const val WINDOW_FACTOR = 3.6f
-        private const val TOP_INSET_DP = 48f
-        private const val BOTTOM_INSET_DP = 96f
         private const val HALO_POLL_MILLIS = 250L
-        private const val SNAP_MILLIS = 220L
         private const val PRESS_MILLIS = 120L
 
         /**
