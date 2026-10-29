@@ -46,15 +46,32 @@ enum class DictationStartResult {
 }
 
 /**
+ * 0.5 (`D212`): which surface asked for the one dictation lease.
+ *
+ * [COMPOSER] is the 0.4 behavior - the final goes to the input row's draft. [BALL] is the phone-only floating ball: the
+ * final is sent to the agent as a user message (`requestTypedMessage`) and never becomes a draft. The owner is published
+ * in [DictationUiState] so the overlay can show its own listening/mic state without guessing whether a composer
+ * dictation is running.
+ */
+enum class DictationTarget { COMPOSER, BALL }
+
+/**
  * The dictation state the assistant page renders (0.4 Task 12b-ii, spec §5.3 D204).
  *
  * [state] is the [DictationState] the controller leases through; [final] keeps the most recent delivered final until
  * the page consumes it (see [DictationFinal]); [refusal] is the retryable reason of the last refused start, cleared by
- * the next start attempt, send, draft edit or session change (`HostCompositionRoot.clearDictationStatus`). The text is
- * in memory only.
+ * the next start attempt, send, draft edit or session change (`HostCompositionRoot.clearDictationStatus`); [owner] says
+ * which surface holds (or last held) the lease (0.5). The text is in memory only.
+ *
+ * 0.5.1 C3 (`review Important #2`): the composer page and the floating ball share this one value, so a reader must
+ * respect [owner]. Only the owning surface may stop/cancel the lease; the composer page renders a BALL-owned
+ * state/final/refusal as nothing of its own (`composerDictationView`), and a BALL final never becomes [final] (it is
+ * sent as a user message). A null owner is the settled state of an ended lease: the host clears it when the lease
+ * settles, while the composer's own terminal status/final stay until the page consumes/dismisses them.
  */
 data class DictationUiState(
     val state: DictationState = DictationState.Idle,
     val final: DictationFinal? = null,
     val refusal: DictationStartResult? = null,
+    val owner: DictationTarget? = null,
 )

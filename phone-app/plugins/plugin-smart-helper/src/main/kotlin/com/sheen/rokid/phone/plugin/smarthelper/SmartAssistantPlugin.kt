@@ -539,6 +539,21 @@ class SmartAssistantPlugin(
      */
     private val continueDialogue: () -> Boolean = { true },
     /**
+     * 0.5.1 (`C2`, spec §3.2): whether a **displayed answer** opens the automatic next listening round.
+     *
+     * Phone-only mode has no HUD to keep reading and no glasses conversation to continue: the next sentence is the
+     * user's long-press on the floating ball, so the production wiring passes
+     * `{ settings.continueDialogue && !phoneOnly() }`. This seam deliberately gates **only** the post-answer decision
+     * (`ConversationCycle.onAnswerDone`/`onSpeechFinished`):
+     * - the initial wake window (`onWake`/`armListening`) is not a continuation and stays;
+     * - the queued-utterance seam keeps reading [continueDialogue], so a sentence said during the answer is still
+     *   remembered for the continuation that glasses mode opens;
+     * - `armContinueOffLocked` is the official off branch this seam merely selects, never a behaviour of its own.
+     *
+     * The default follows [continueDialogue], which is the pre-0.5.1 shape every glasses caller and test rig keeps.
+     */
+    private val continueAfterAnswer: () -> Boolean = continueDialogue,
+    /**
      * 0.24 S3 Task 14 fix round (C2, spec risk row 17): whether the host can actually speak a hint right now.
      *
      * Production builds the speech player **only when「语音朗读」is on** and the engine is ready, so a `both`/`voice`
@@ -553,6 +568,16 @@ class SmartAssistantPlugin(
      * the pre-fix test rigs behaving as before.
      */
     private val speechAvailable: () -> Boolean = { true },
+    /**
+     * 0.5 (`D213`): whether this session runs the phone-only model.
+     *
+     * The phone-only final answer has no HUD to read, so the closing answer requests speech whenever the host can play
+     * it. Glasses mode deliberately keeps the 0.4 behavior: the answer is read on the HUD and the final answer is not
+     * spoken (a `notify_user` voice/both request still is). Changing the glasses conversation cycle's completion
+     * semantics is a separate behavior change, not part of the 0.5 phone-only fix. `SmartWiring` passes the live
+     * detach-gate value; the default `{ false }` is glasses mode and keeps every pre-0.5 test rig on its old path.
+     */
+    private val phoneOnly: () -> Boolean = { false },
     /**
      * edith-0.3 Phase 2 Task 9: the bounds the perception block renders under (element cap, notification cap, title
      * cap). The production default is the host's Phase 2 policy; the constructor seam exists so a test can pin a cap
@@ -791,9 +816,13 @@ class SmartAssistantPlugin(
      * and a public constructor must not expose it. Production never touches it: the default is the shipped
      * `PromptCatalog`, and the seam exists so a test can observe **when** a plan is loaded (once per activation, never
      * per request) and prove that a catalog change cannot rewrite a live session. A test sets it before [activate].
+     *
+     * 0.5.1 (C8, spec §3.6): the default also reads the live [phoneOnly] flag, so a phone-only session pins the section
+     * that tells the model its own floating ball and bubbles are EDITH's overlay, not the target App's content. Glasses
+     * mode passes `false` and keeps the pre-0.5.1 plan and hash exactly.
      */
     internal var promptCatalog: (PromptRoute, DeviceProfile?) -> PromptPlan = { route, profile ->
-        PromptCatalog.plan(route, profile)
+        PromptCatalog.plan(route, profile, phoneOnly())
     }
 
     /**
@@ -1072,6 +1101,9 @@ class SmartAssistantPlugin(
         scheduler = scheduler,
         display = { conversation() },
         continueDialogue = continueDialogue,
+        // 0.5.1 (`C2`): the cycle's post-answer decisions read the split seam, not the stored switch. The cycle keeps
+        // the old parameter as the default for direct callers/tests; production names both explicitly.
+        continueAfterAnswer = continueAfterAnswer,
         openContinuation = { route, previousTurnId -> openContinuationTurn(route, previousTurnId) },
         isPanelVisible = isPanelVisible,
         cancelTurn = { route, expectedTurnId -> cancelConversationTurn(route, expectedTurnId) },
@@ -2096,6 +2128,10 @@ class SmartAssistantPlugin(
      * awaiting-transcript, or an Idle turn whose answer is not settled yet is busy - and the query is read-only, so it
      * never cancels, replaces or settles any of them. It is independent of the display mode: detached mode is the
      * phone's own panel and the typed path works there exactly as on the glasses.
+     *
+     * 0.5.1 fix round (review Important): in phone-only mode the post-answer continuation is off, so a sentence queued
+     * by a late final can never be consumed; it is treated as absent here rather than making the wearer's BALL/typed
+     * sentence busy until a new wake or STOP.
      */
     fun canAcceptTypedMessage(): Boolean = synchronized(gate) { active && canAcceptTypedLocked() }
 
@@ -2103,10 +2139,22 @@ class SmartAssistantPlugin(
     private fun canAcceptTypedLocked(): Boolean {
         if (context == null) return false
         // A sentence already queued for a continuation is the wearer's next turn; a typed message must not race it.
-        if (queuedUtterance != null) return false
+        // Unless no continuation can ever consume it (phone-only mode's post-answer seam is off): then keeping the
+        // typed/BALL path busy would strand the wearer until a new wake or STOP.
+        if (queuedUtterance != null && !postAnswerContinuationOff()) return false
         val current = turn ?: return true
         return !current.closed && current.phase == SmartTurnPhase.Idle && current.answerNotified
     }
+
+    /**
+     * 0.5.1 fix round (review Important): whether phone-only mode has turned the post-answer continuation off.
+     *
+     * This is the composition's exact split (`settings.continueDialogue && !phoneOnly()`), read through the live
+     * providers. When it is true no answer continuation can open for either route, so a queued utterance is dead: the
+     * typed/BALL admission may ignore it, and a transcript arriving after the answer settled must not cancel the
+     * continue-off close that releases it. Glasses mode is not affected (`phoneOnly()` is false there).
+     */
+    private fun postAnswerContinuationOff(): Boolean = phoneOnly() && !continueAfterAnswer()
 
     /**
      * 0.24 S3 (spec §5.4): `UI_CLOSED` / the panel went hidden.
@@ -2543,6 +2591,10 @@ class SmartAssistantPlugin(
                 var followupContinuation: Pair<SmartTurn, String>? = null
                 var queuedWakeFinal = false
                 var queuedProactiveFinal = false
+                // 0.5.1 fix round (review Important): the answer was already settled on the continue-off branch and
+                // phone-only mode can open no continuation for this transcript. Such a message must not cancel the 1 s
+                // close (the release path for the dead queue) or regress the panel from ANSWERING back to ASR.
+                var settledPhoneOnlyAnswer = false
                 val (started, proactive) = synchronized(gate) {
                     if (!matches(event.envelope)) null to null
                     else {
@@ -2550,6 +2602,10 @@ class SmartAssistantPlugin(
                         // 0.24 S3: the official `AsrMessageHandler` removes the timeout before it checks what the
                         // payload says, so a blank or wake-word-only revision cancels the 10 s window too.
                         usableText = isUsableUtterance(event.revision.text.trim())
+                        settledPhoneOnlyAnswer = postAnswerContinuationOff() &&
+                            turn?.let {
+                                !it.closed && it.phase == SmartTurnPhase.Idle && it.answerNotified
+                            } == true
                         // P3.3: a final that answers a live question is consumed here and nowhere else - it must not
                         // open a wake turn or be reconsidered by the proactive path.
                         consumedByConfirmation = confirmation.onTranscript(event.revision)
@@ -2669,7 +2725,7 @@ class SmartAssistantPlugin(
                 // listening window (P3-13). The window is closed first, then the PROACTIVE turn is started.
                 val acceptedFollowup = followup
                 val continuation = followupContinuation
-                if (matched && acceptedFollowup == null && continuation == null) {
+                if (matched && acceptedFollowup == null && continuation == null && !settledPhoneOnlyAnswer) {
                     // Outside the lock: the cycle displays the official levels through the host port.
                     conversationCycle.onAsr(AssistantRoute.WAKE)
                     adoptedTurnId?.let { conversationCycle.onTurnId(AssistantRoute.WAKE, it) }
@@ -2928,7 +2984,19 @@ class SmartAssistantPlugin(
             deadlineNanos = SmartTurn.saturatingAdd(nowNanos, turnBudgetNanos()),
             hintGraceNanos = DEFAULT_HINT_GRACE_MILLIS * 1_000_000L,
             hintId = "hint-${UUID.randomUUID()}",
-            onEmit = { text -> created?.let { emit(it, text) } },
+            // 0.5 (`D213`): the assembler's answer is the turn's final answer. In the phone-only model there is no HUD,
+            // so the closing answer requests speech whenever a player exists; glasses mode keeps the 0.4 display-only
+            // final answer (the HUD is the surface), while `notify_user` voice/both still speaks in both modes. The
+            // speechAvailable gate is what makes a host without TTS settle on Displayed as before.
+            onEmit = { text ->
+                created?.let {
+                    emit(
+                        it,
+                        text,
+                        optionalSpeech = if (phoneOnly() && speechAvailable()) SpeechRequest() else null,
+                    )
+                }
+            },
             route = route,
             promptRoute = promptRoute,
         )

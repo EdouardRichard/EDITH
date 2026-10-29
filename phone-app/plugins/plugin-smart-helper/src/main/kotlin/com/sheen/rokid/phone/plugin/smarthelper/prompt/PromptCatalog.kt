@@ -27,7 +27,9 @@ internal data class PromptManifestEntry(
  * Layout produced by [plan], from spec §4.2 and the Phase 3 brief:
  * 1. the core sections in filename order (00-identity … 50-memory-policy);
  * 2. the route posture (`route/wake.md`, `route/proactive-hint.md` or `route/proactive-followup.md`);
- * 3. `context/device-profile.md`, rendered from the live [DeviceProfile], only when a profile exists.
+ * 3. `context/device-profile.md`, rendered from the live [DeviceProfile], only when a profile exists;
+ * 4. in phone-only mode only, `phone-only/overlay.md`: the note that EDITH's own floating ball and message bubbles are
+ *    its surface, not the target App's content (0.5.1 spec §3.6). Glasses plans keep their pre-0.5.1 shape.
  *
  * The per-request block ([dynamicTemplate]) is deliberately **not** part of a plan: dynamic values
  * in the system prompt would break the cache boundary in spec §4.4. The `loop/`, `pinned/` and
@@ -38,16 +40,17 @@ internal data class PromptManifestEntry(
 object PromptCatalog {
 
     /** Catalog semver; a session pins the plan it loaded, it never mixes versions (spec §4.1). */
-    const val VERSION: String = "0.4.1"
+    const val VERSION: String = "0.5.1"
 
     private const val PROMPTS_DIR = "prompts/"
     private const val MANIFEST_FILE = "manifest.tsv"
     private const val DEVICE_PROFILE_FILE = "context/device-profile.md"
     private const val RUNTIME_STATE_FILE = "context/runtime-state.md"
+    private const val PHONE_ONLY_OVERLAY_FILE = "phone-only/overlay.md"
     private const val SUMMARIZER_FILE = "summarizer.md"
 
     /** The only directories a manifest file may live in. */
-    private val RESOURCE_FOLDERS = setOf("core", "route", "context", "loop", "pinned")
+    private val RESOURCE_FOLDERS = setOf("core", "route", "context", "loop", "pinned", "phone-only")
 
     /**
      * Every prompt route's posture resource (0.3 Phase 3 spec §5.1). The follow-up route is a separate posture from
@@ -139,8 +142,12 @@ object PromptCatalog {
      * The result is deterministic for the same route + profile: sections keep the authored order and
      * [PromptPlan.hash] fingerprints the rendered texts, so `P3_PROMPT` can prove which prompt ran.
      * The plan never contains a `DYNAMIC` section and never keeps a `{{slot}}`.
+     *
+     * [phoneOnly] appends `phone-only/overlay.md` (0.5.1 spec §3.6): on the phone the model's own screen observations can
+     * include EDITH's floating ball and message bubbles, and it must not treat them as the target App's content. The
+     * default `false` is glasses mode and leaves that plan and its hash exactly as before 0.5.1.
      */
-    internal fun plan(route: PromptRoute, profile: DeviceProfile?): PromptPlan {
+    internal fun plan(route: PromptRoute, profile: DeviceProfile?, phoneOnly: Boolean = false): PromptPlan {
         val sections = mutableListOf<PromptSection>()
         val entries = manifest()
 
@@ -158,6 +165,11 @@ object PromptCatalog {
             renderDeviceProfile(profile)?.let {
                 sections += PromptSection(deviceEntry.id, PromptKind.SESSION_STATIC, it)
             }
+        }
+
+        if (phoneOnly) {
+            val overlayEntry = entries.first { it.file == PHONE_ONLY_OVERLAY_FILE }
+            sections += PromptSection(overlayEntry.id, overlayEntry.kind, sectionText(overlayEntry))
         }
 
         val systemText = sections.joinToString("\n\n") { it.text }
@@ -214,8 +226,8 @@ object PromptCatalog {
      * loudly instead of shipping a session with a silently missing section.
      *
      * Validation rules: five tab-separated columns, legal [PromptKind], unique id and file, a file
-     * under `core/`, `route/`, `context/`, `loop/` or `pinned/` (or the root `summarizer.md`), and
-     * content that respects its kind's slot contract
+     * under `core/`, `route/`, `context/`, `loop/`, `pinned/` or `phone-only/` (or the root
+     * `summarizer.md`), and content that respects its kind's slot contract
      * (`STATIC` has no placeholders, `SESSION_STATIC` uses exactly the device-profile slots,
      * `DYNAMIC` uses exactly the runtime slots). Internal with an injectable loader so the rejection
      * paths are testable without shipping a broken resource.
@@ -267,8 +279,8 @@ object PromptCatalog {
     }
 
     /**
-     * Cross-entry invariants: the core sections are STATIC, every [PromptRoute] has its posture file, and there is
-     * exactly one device-profile template and one runtime-state template.
+     * Cross-entry invariants: the core sections are STATIC, every [PromptRoute] has its posture file, the phone-only
+     * overlay is a STATIC section, and there is exactly one device-profile template and one runtime-state template.
      *
      * Internal (rather than private) so the rejection path for a missing route is testable from a manifest fixture,
      * exactly like [parseManifest].
@@ -288,6 +300,11 @@ object PromptCatalog {
             val routeEntry = byFile[routeFile]
                 ?: throw IllegalArgumentException("the manifest must list the route resource '$routeFile'")
             require(routeEntry.kind == PromptKind.STATIC) { "route section '${routeEntry.id}' must be STATIC" }
+        }
+
+        val overlayEntry = byFile[PHONE_ONLY_OVERLAY_FILE]
+        require(overlayEntry != null && overlayEntry.kind == PromptKind.STATIC) {
+            "the manifest must list the phone-only overlay resource '$PHONE_ONLY_OVERLAY_FILE' as STATIC"
         }
 
         val deviceEntries = entries.filter { it.kind == PromptKind.SESSION_STATIC }

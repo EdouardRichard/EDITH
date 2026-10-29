@@ -96,6 +96,7 @@ class PromptCatalogTest {
         assertEquals(PromptKind.STATIC, kindOf["route/proactive-followup.md"])
         assertEquals(PromptKind.SESSION_STATIC, kindOf["context/device-profile.md"])
         assertEquals(PromptKind.DYNAMIC, kindOf["context/runtime-state.md"])
+        assertEquals(PromptKind.STATIC, kindOf["phone-only/overlay.md"], "the phone-only note is a fixed section")
         listOf("loop/retry.md", "loop/plan-nudge.md", "loop/timeout.md", "summarizer.md").forEach {
             assertEquals(PromptKind.STATIC, kindOf[it], "$it must be a static fragment")
         }
@@ -105,7 +106,7 @@ class PromptCatalogTest {
             kindOf["pinned/proactive-gate-options.md"],
             "the gate options are frozen with the question they belong to",
         )
-        assertEquals(17, entries.size, "the Phase 4A catalog has exactly seventeen resources")
+        assertEquals(18, entries.size, "the 0.5.1 catalog has exactly eighteen resources")
     }
 
     @Test

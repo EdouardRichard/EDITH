@@ -1,4 +1,5 @@
 package com.sheen.rokid.phone.app
+import com.sheen.rokid.phone.overlay.PhoneOnlyOverlayService
 import com.sheen.rokid.phone.ui.profile.ProfileListScreen
 import com.sheen.rokid.phone.ui.profile.ProfileViewModel
 import com.sheen.rokid.phone.plugin.smarthelper.host.ui.AuditLogView
@@ -124,6 +125,19 @@ class MainActivity : ComponentActivity() {
             return
         }
         enterReadyUi(app)
+    }
+
+    /**
+     * 0.5 (`D214`): re-syncs the phone-only overlay whenever the page comes back to the foreground.
+     *
+     * The mode can be turned on/off here, and the overlay permission is granted in a system screen, so returning is the
+     * one moment both facts may have changed. `sync` reads the gate and the permission itself and stops the service when
+     * either says no; a composition that was never built has no overlay to start.
+     */
+    override fun onResume() {
+        super.onResume()
+        val app = application as EdithApplication
+        PhoneOnlyOverlayService.sync(this, app.liveComposition)
     }
 
     private fun enterReadyUi(app: EdithApplication) {
@@ -402,7 +416,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     val levels = listOf("L0", "L1", "L2", "L3", "L4")
 
     Text("唤醒与权限设置", style = MaterialTheme.typography.titleLarge)
-    Text("唤醒词、权限上限、白名单、主动辅助等设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；感知截图与不拦截开关保存后立即更新宿主状态。默认上限为 L1，如需 L3/L4 请在此明确选择。「脱离眼镜」在设置页下方单独切换（运行中会先停止会话），下次开始会话生效；本页保存不会改写它。",
+    Text("唤醒词、权限上限、白名单、主动辅助等设置仅在 App 启动时读取一次（组合为进程级单例），修改后需完全重启 App 才会生效，重新开始会话不会重新读取；感知截图与不拦截开关保存后立即更新宿主状态。默认上限为 L1，如需 L3/L4 请在此明确选择。「纯手机模式」在设置页下方单独切换（运行中会先停止会话），下次开始会话生效；本页保存不会改写它。",
         style = MaterialTheme.typography.bodyMedium)
     // Task 14b-fix item 5: an edit invalidates whatever the last save reported, so the stale error text cannot
     // outlive the input it was about.
@@ -447,6 +461,12 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
             Text("持续对话")
             Text(
                 "答案显示/播报结束后自动进入下一轮聆听；关闭后答案结束约 1 秒关闭面板，不发 status 5。",
+                style = MaterialTheme.typography.bodySmall,
+            )
+            // 0.5.1 (C2, spec §3.2): the stored switch and its value are kept for glasses mode, but phone-only mode
+            // never opens the post-answer round - state what the user does instead (long-press the floating ball).
+            Text(
+                SmartSettingsForm.CONTINUE_DIALOGUE_PHONE_ONLY_NOTE,
                 style = MaterialTheme.typography.bodySmall,
             )
         }
@@ -498,7 +518,7 @@ private fun secondsLeft(expiresAtMillis: Long): Long =
     }
     errors.forEach { Text(it, color = MaterialTheme.colorScheme.error) }
     if (saved) {
-        if (errors.isEmpty()) Text("已保存：感知截图与不拦截开关会立即更新宿主状态；其余设置将在下次重启 App 后生效。「脱离眼镜」开关单独保存，本按钮不会改写它")
+        if (errors.isEmpty()) Text("已保存：感知截图与不拦截开关会立即更新宿主状态；其余设置将在下次重启 App 后生效。「纯手机模式」开关单独保存，本按钮不会改写它")
         else Text("可用字段已保存，被拒绝的输入请按上述提示修改")
     }
     Button(onClick = {

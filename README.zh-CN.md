@@ -20,14 +20,28 @@ EDITH（伊迪丝）：运行在安卓端、连接 Rokid Glasses 的全时主动
   <a href="README.md">English</a> | <strong>简体中文</strong>
 </p>
 
-> **预览版状态**：EDITH 目前处于预览版阶段（版本 `0.4.0-preview`），功能可用，但性能、稳定性与整体体验仍需持续优化。
+> **预览版状态**：EDITH 目前处于预览版阶段（版本 `0.5.0-preview`），功能可用，但性能、稳定性与整体体验仍需持续优化。
 
 EDITH（伊迪丝）是一个端云协同的 AI Agent：手机上的 Android 宿主 App + 眼镜端 CustomApp。
 眼镜是它的麦克风、扬声器和显示屏，手机是它的耳朵、手、记忆和大脑。眼镜麦克风音频经 Rokid AI
 APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒词检测，调用你配置的大模型，通过
 无障碍服务与 Shizuku 的 shell 操作 Android 应用，通过眼镜 HUD 文字显示与TTS音频与用户交流。
-0.4 起，手机也可以**脱离眼镜**运行，改用自己的麦克风和屏幕；手机「对话上下文记录」页还提供
-文字与语音输入。
+0.4 起，手机也可以以**纯手机模式**运行，改用自己的麦克风和屏幕；0.5 起桌面还会出现 EDITH 图标
+悬浮球，长按说话、用半透明消息气泡显示回复与过程提示；手机「对话上下文记录」页继续提供文字与语音输入。
+
+> 命名说明：本模式在 0.5 预览期的用户可见名是「纯手机模型」；**0.5.1 起改为「纯手机模式」**。内部标识
+> （`DetachGate`/`glassesDetached`、设置 JSON 键、日志事件名、通知 channel id `phone_only_overlay`）不变。
+
+- **纯手机模式（0.5；0.5.1 更正）**：设置里打开「纯手机模式」后，桌面出现可拖动的 EDITH 图标悬浮球；拖到边框
+  自动吸附并隐藏一半；长按球内出现麦克风并进入 ASR，识别结果直接发给 Agent；AI 回复与工具调用
+  以独立半透明气泡显示，**最多 2 条**（最新 + 1 条旧），整泡（卡片+文字+尾巴）随透明度滑块变淡，
+  旧消息淡化后自动消失；悬浮球与气泡的透明度都可调；AI 思考时球外出现动态光影线条。纯手机模式下
+  回答后**不再自动续聊 10s**，下一句长按悬浮球手动说。
+
+  > **0.5.1 更正 checkpoint**：0.5 交付已被重新审查并更正（C1–C16）；全量 JVM 门禁与 K40 设备矩阵见
+  > [0.5.1 证据](docs/project/evidence/2026-10-29-0.5.1-correction.md)。它是 **checkpoint、不是版本级发布通过**：
+  > 运行中权限撤销、长按/拖拽/滑块触摸、设置页渲染、20%/30% 透明度极值与模型真实读屏行为仍为
+  > `NotMeasured`/`Partial`。
 
 - **唤醒词唤醒**：说“EDITH”或“伊迪丝”。眼镜面板打开，EDITH 识别意图、感知手机（屏幕、通知、
   媒体、日历、设备状态），规划并执行跨应用的多步操作（打开应用/页面、点按、输入中文、滚动、拨号、
@@ -54,11 +68,11 @@ APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒�
   </a>
 </div>
 
-**Agent能力脱离眼镜（0.4）**——不依赖眼镜链路，只支持唤醒词唤醒。
+**纯手机模式（0.4 起；0.5 加入悬浮球/气泡，0.5.1 更名）**——不依赖眼镜链路，支持唤醒词唤醒与悬浮球长按说话。
 
 <div align="center">
   <a href="docs/assets/videos/detached-wake.mp4">
-    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="脱离眼镜唤醒演示——点击播放完整视频">
+    <img src="docs/assets/videos/detached-wake-preview.gif" width="65%" alt="纯手机模式唤醒演示——点击播放完整视频">
   </a>
 </div>
 
@@ -82,8 +96,9 @@ APP 的 CXR-Link 会话上行到手机；手机端侧完成 VAD、ASR 与唤醒�
 
 ## 技术路线
 
-0.4 保留原有两条链路，并新增三块能力：只依赖手机的「脱离眼镜」唤醒变体、手机端文字/听写输入行，
-以及从 APK 资产准备模型。默认眼镜配置与下面描述的链路不变。
+0.4 保留原有两条链路，并新增三块能力：只依赖手机的「纯手机模式」唤醒变体、手机端文字/听写输入行，
+以及从 APK 资产准备模型。0.5 在纯手机模式上增加桌面悬浮球、独立消息气泡与语音朗读修复。
+默认眼镜配置与下面描述的链路不变。
 
 ### 唤醒词唤醒
 
@@ -93,8 +108,8 @@ VAD/ASR 从会话开始就持续工作（不能等唤醒才启动：唤醒词通
 链路本来就没有唤醒词），但只有 WAKE 回合处于等待转写状态时，final 转写才会被采纳并进入
 `AgentLoop`——没有回合等待时，final 不会凭空打开唤醒回合，而是进入主动辅助触发路径。
 `AgentLoop` + 云端大模型 → 工具执行与感知 → 答案上屏 + 手机端 TTS。同一条 CXR 会话同时承载
-显示指令与后续的持续对话音频。打开「脱离眼镜」后，这条链路改从手机麦克风起头，不再经过 CXR
-上行；其后的 KWS、VAD、ASR 与转写准入之后的处理完全相同（见下文）。脱离变体还支持**锁屏/息屏唤醒**
+显示指令与后续的持续对话音频。打开「纯手机模式」后，这条链路改从手机麦克风起头，不再经过 CXR
+上行；其后的 KWS、VAD、ASR 与转写准入之后的处理完全相同（见下文）。纯手机模式还支持**锁屏/息屏唤醒**
 （前台服务 + `PARTIAL_WAKE_LOCK`），并对每次被接受的唤醒在**回声静默窗口**内播固定确认「我在」：
 窗口内麦克风帧置静音，确认音不会进入 ASR，也不会污染用户随后指令的识别；WAKE 回合不等待确认播完，
 零新增延迟。
@@ -187,9 +202,15 @@ flowchart LR
 唤醒链路相同的工具面 · 眼镜悬浮面板（经 CXR 自定义命令）。闸门拒绝时**不产生任何模型请求**；
 两条链路使用各自独立的 `ConversationStore`。
 
-### 脱离眼镜模式（0.4）
+### 纯手机模式（0.4 起；0.5 加入悬浮球/气泡，0.5.1 更名并更正）
 
-「脱离眼镜」设置让唤醒链路不依赖眼镜
+「纯手机模式」设置让唤醒链路不依赖眼镜。0.5 起，开启后桌面会出现 EDITH 图标悬浮球：可拖动、吸附
+左右边框并隐藏一半；长按球内显示麦克风并进入 ASR，识别结果直接发给 Agent；AI 回复与工具调用以
+独立半透明消息气泡显示（工具信息与眼镜端一致，最多 2 条，整泡随透明度滑块变淡），旧消息淡化后 2s 消失；
+AI 思考时球外显示动态光影线条；悬浮球与气泡的透明度可在设置中分别调整。纯手机模式下「语音朗读」修复后，
+最终回答会在开关打开时朗读（眼镜模式保持 HUD 显示）；开关运行中即时生效、关闭即停，无需重启 App。
+回答后不再自动开 10s 续聊窗口，下一句长按悬浮球说。0.5.1 更正是 checkpoint：JVM/设备读数与剩余
+`NotMeasured` 项见 [0.5.1 证据](docs/project/evidence/2026-10-29-0.5.1-correction.md)。
 
 ```mermaid
 flowchart LR
@@ -200,10 +221,10 @@ flowchart LR
     ASR -- "final 转写" --> ADMIT["转写准入"] --> CYCLE
     CYCLE -- "答案" --> LOG["手机对话上下文记录"]
     LOCK["PARTIAL_WAKE_LOCK<br/>edith:detached-wake"] -. "息屏时维持 KWS" .-> ING
-    STORED["已保存的主动辅助开关"] -. "脱离时有效值关闭" .-> CYCLE
+    STORED["已保存的主动辅助开关"] -. "纯手机模式下有效值关闭" .-> CYCLE
 ```
 
-关闭该开关时，上面的眼镜链路保持不变：CXR 连接、眼镜唤醒、面板显示与接话语义都不变。脱离模式
+关闭该开关时，上面的眼镜链路保持不变：CXR 连接、眼镜唤醒、面板显示与接话语义都不变。纯手机模式
 只是本机采音/显示选择，不是第二套 CXR 协议。
 
 ## 项目结构
@@ -279,12 +300,12 @@ bundle 变化时，App 会重新校验并准备 asset；bundle 未变化时复�
 模型二进制不提交仓库。要构建完整 APK，先准备 staging 目录，再用 `-PbundledModelsDir` 指定：
 
 ```powershell
-.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=E:\edith-0.4-models
+.\gradlew.bat :phone-app:app:assembleDebug -PbundledModelsDir=D:\Project_new\EDITH_model\k40
 ```
 
-默认目录是 `<仓库>/.local/0.4-models`，下面放 `asr/`、`laya/` 与 `embeddinggemma/`。KWS 文件
-从 `.local/p3-kws-model/sherpa-onnx-kws-zipformer-zh-en-3M-2025-12-20/` 与仓库内 `keywords.txt`
-读取。完整构建要求每个文件都存在且校验通过；缺失或不一致会构建失败。
+默认目录是 `<仓库>/../EDITH_model/k40`（K40 模型包），下面放 `engine-models-import/`、`files/` 与
+`embeddinggemma/`；KWS 模型放 `kws/`，仓库内 `keywords.txt` 仍在
+`phone-app/perception/audio-android/kws/`。完整构建要求每个文件都存在且校验通过；缺失或不一致会构建失败。
 
 仅开发/CI 可使用 `-PwithoutBundledModels=true` 跳过 `assets/models/**` 并设置
 `BuildConfig.BUNDLED_MODELS=false`。**release 变体会拒绝该开关**，它绝不能产出交付 APK。

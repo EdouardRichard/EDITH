@@ -5,6 +5,7 @@ import com.sheen.rokid.phone.app.LockPinSection
 import com.sheen.rokid.phone.app.SmartSettingsSection
 
 import android.Manifest
+import android.net.Uri
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.provider.Settings
@@ -53,7 +54,11 @@ import com.sheen.rokid.phone.app.MemorySection
 import com.sheen.rokid.phone.app.TypedSendResult
 import com.sheen.rokid.phone.audio.DictationStartResult
 import com.sheen.rokid.phone.audio.DictationState
+import com.sheen.rokid.phone.audio.DictationTarget
 import com.sheen.rokid.phone.audio.DictationUiState
+import com.sheen.rokid.phone.overlay.PhoneOnlyOverlayService
+import com.sheen.rokid.phone.overlay.PhoneOnlyStartStopPolicy
+import com.sheen.rokid.phone.overlay.phoneOnlyStartFailureText
 import com.sheen.rokid.phone.session.SessionService
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.session.SessionViewModel
@@ -71,6 +76,7 @@ import com.sheen.rokid.phone.ui.pluginPickerOptions
 import com.sheen.rokid.plugin.Capability
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.launch
+import kotlin.math.roundToInt
 
 /**
  * The phone's whole page (spec §6.7): a top bar that names the plugin, a left-hand menu, and the assistant's four tabs.
@@ -187,7 +193,7 @@ internal fun PhoneScreen(
                             send = { root.requestTypedMessage(it) },
                             dictation = root.dictationUi,
                             startDictation = { root.startDictation() },
-                            stopDictation = { root.stopDictation() },
+                            stopDictation = { root.stopDictation(DictationTarget.COMPOSER) },
                             clearDictationStatus = { root.clearDictationStatus() },
                             consumeDictationFinal = { root.consumeDictationFinal(it) },
                             modifier = Modifier.weight(1f),
@@ -336,9 +342,13 @@ internal fun AssistantTab(
     // (0.4 Task 12b-ii fix 2, finding 1). Saving a raw sequence would make a tab switch reset it to 0 (duplicate
     // append) and a process restart restore an old N (the new host's first N finals silently dropped).
     val dictationUi by dictation.collectAsStateWithLifecycle()
+    // 0.5.1 C3 (`review Important #2`): the flow is shared with the floating ball. Only the values this page owns may
+    // drive its draft, its status line and its one action slot; a BALL lease's listening/terminal state, final or
+    // refusal is the ball's and renders as nothing here. See `composerDictationView`.
+    val composerDictation = composerDictationView(dictationUi)
     var appendedDictationSequence by remember { mutableStateOf(0L) }
-    LaunchedEffect(dictationUi.final?.sequence) {
-        val delivered = dictationUi.final ?: return@LaunchedEffect
+    LaunchedEffect(composerDictation.final?.sequence) {
+        val delivered = composerDictation.final ?: return@LaunchedEffect
         if (!isNewDictationFinal(delivered, appendedDictationSequence)) return@LaunchedEffect
         appendedDictationSequence = delivered.sequence
         // 0.4 Task 12b-ii (spec §5.3): the recognized words are appended to the editable draft. Nothing is sent:
@@ -454,8 +464,9 @@ internal fun AssistantTab(
             TypedInputRow(
                 session = session,
                 state = typedInput,
-                dictation = dictationUi.state,
-                refusal = dictationUi.refusal,
+                dictation = composerDictation.state,
+                dictationOwner = dictationUi.owner,
+                refusal = composerDictation.refusal,
                 onDraftChange = { candidate ->
                     // 0.4 Task 12b-ii fix 2 (finding 2): editing is the wearer starting a newer action, so a finished
                     // dictation's no-speech/timeout/error text must not outrank what they are doing now.
@@ -489,7 +500,7 @@ private val typedInputSaver: Saver<TypedInputState, Any> = listSaver(
 /**
  * 0.4 Task 11 (spec §5.1) + Task 12b-ii (spec §5.3): the WAKE conversation's composer, below the chat frame.
  *
- * Always rendered on WAKE (the 脱离眼镜 switch does not hide it), never on PROACTIVE. The composer draws the pure
+ * Always rendered on WAKE (the 纯手机模式 switch does not hide it), never on PROACTIVE. The composer draws the pure
  * decisions from `TypedInput.kt`/`DictationInput.kt` and reads no identity itself.
  *
  * The owner's 2026-10-27 redesign (option A) replaced the outlined field + microphone icon + text button row with one
@@ -511,13 +522,14 @@ private fun TypedInputRow(
     session: SessionState,
     state: TypedInputState,
     dictation: DictationState,
+    dictationOwner: DictationTarget?,
     refusal: DictationStartResult?,
     onDraftChange: (String) -> Unit,
     onSend: () -> Unit,
     onStartDictation: () -> DictationStartResult,
     onStopDictation: () -> Unit,
 ) {
-    val slot = composerActionSlot(session, state, dictation)
+    val slot = composerActionSlot(session, state, dictation, dictationOwner)
     val status = inputRowStatusText(session, state, dictation, refusal)
     val failed = (state.result != null && state.result != TypedSendResult.Accepted) ||
         dictation is DictationState.Error
@@ -890,6 +902,138 @@ private fun SmartToggles(root: HostCompositionRoot) {
         "一次配置、长期生效：跨会话、重连、重启 App 或手机都保持；关掉后不会被任何路径自动打开。",
         style = MaterialTheme.typography.bodySmall,
     )
+    // 0.5 (D210/D211), corrected by 0.5.1 (C7/C15): the phone-only overlay's two opacities. The slider previews live
+    // through the host flow; the blob write happens once on release, so dragging does not hammer the encrypted store.
+    // The bubble slider is the **whole** bubble (card + text + tail + shadow), not just the card; old messages have no
+    // separate setting - their whole-bubble alpha is the bubble opacity times the fixed ratio in SmartSettings. The
+    // sliders stay visible while the mode is off and say so, instead of disappearing with the mode.
+    val appearance by root.phoneOnlyAppearance.collectAsStateWithLifecycle()
+    var ballOpacity by remember { mutableFloatStateOf(appearance.ballOpacityPercent.toFloat()) }
+    var bubbleOpacity by remember { mutableFloatStateOf(appearance.bubbleOpacityPercent.toFloat()) }
+    var opacityNotice by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(appearance.ballOpacityPercent, appearance.bubbleOpacityPercent) {
+        ballOpacity = appearance.ballOpacityPercent.toFloat()
+        bubbleOpacity = appearance.bubbleOpacityPercent.toFloat()
+    }
+    fun saveOpacity() {
+        val result = root.setPhoneOnlyOpacity(ballOpacity.roundToInt(), bubbleOpacity.roundToInt())
+        val effect = if (detached) "立即生效" else "模式开启后生效"
+        opacityNotice = if (result.saved) {
+            "已保存：悬浮球 ${ballOpacity.roundToInt()}% / 气泡 ${bubbleOpacity.roundToInt()}%，$effect。"
+        } else {
+            "保存失败（${result.error ?: "UNKNOWN"}），未保存。"
+        }
+    }
+    if (detached) {
+        // 0.5 (`D214`), corrected by 0.5.1 (`C12`/`C14`): the overlay is a separate window permission **and** a live
+        // foreground service. 「已启用」 must mean the service really reached its running state - a granted permission
+        // with no ball (a refused/failed start) is not enabled. A start failure shows its reason and a retry instead of
+        // only being logged; returning from the system grant screen re-syncs through MainActivity.onResume.
+        val context = LocalContext.current
+        var overlayGranted by remember { mutableStateOf(Settings.canDrawOverlays(context)) }
+        val lifecycleOwner = LocalLifecycleOwner.current
+        DisposableEffect(lifecycleOwner) {
+            val observer = LifecycleEventObserver { _, event ->
+                if (event == Lifecycle.Event.ON_RESUME) overlayGranted = Settings.canDrawOverlays(context)
+            }
+            lifecycleOwner.lifecycle.addObserver(observer)
+            onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
+        }
+        val overlayRunning by PhoneOnlyOverlayService.isRunning.collectAsStateWithLifecycle()
+        val overlayFailure by PhoneOnlyOverlayService.startFailure.collectAsStateWithLifecycle()
+        // A runtime revoke (C12) can happen while this page stays composed; the service's state change is what re-reads
+        // the grant, so the page does not keep claiming the old permission until the next resume.
+        LaunchedEffect(overlayRunning, overlayFailure) {
+            overlayGranted = Settings.canDrawOverlays(context)
+        }
+        when (
+            val overlayStatus =
+                PhoneOnlyStartStopPolicy.settingsStatus(overlayGranted, overlayRunning, overlayFailure)
+        ) {
+            PhoneOnlyStartStopPolicy.Status.Running ->
+                Text("桌面悬浮球已启用；长按悬浮球开始说话。", style = MaterialTheme.typography.bodySmall)
+            PhoneOnlyStartStopPolicy.Status.PermissionMissing -> {
+                Text(
+                    "悬浮球需要「显示在其他应用上层」权限；授予后返回 App 即会出现。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                TextButton(onClick = {
+                    context.startActivity(
+                        Intent(
+                            Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                            Uri.parse("package:${context.packageName}"),
+                        ),
+                    )
+                }) { Text("授予悬浮窗权限") }
+            }
+            is PhoneOnlyStartStopPolicy.Status.Failed -> {
+                Text(
+                    "悬浮球启动失败：${phoneOnlyStartFailureText(overlayStatus.failure)}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.error,
+                )
+                TextButton(onClick = {
+                    // Re-read the real grant before syncing: a revoke made while this page stayed composed (e.g. from
+                    // adb during T12) must not leave the page acting on the stale value, and sync refuses without the
+                    // grant anyway.
+                    overlayGranted = Settings.canDrawOverlays(context)
+                    PhoneOnlyOverlayService.sync(context, root, requestedEnabled = true)
+                }) { Text("重试启动悬浮球") }
+            }
+            PhoneOnlyStartStopPolicy.Status.NotRunning -> {
+                Text("悬浮球尚未运行（若刚开启模式，可能还在启动）。", style = MaterialTheme.typography.bodySmall)
+                TextButton(onClick = {
+                    overlayGranted = Settings.canDrawOverlays(context)
+                    PhoneOnlyOverlayService.sync(context, root, requestedEnabled = true)
+                }) { Text("启动悬浮球") }
+            }
+        }
+    }
+    // 0.5.1 (C15): the two opacity sliders stay visible while the mode is off, with a note that they only take effect
+    // once the overlay runs; hiding them made the setting undiscoverable before the mode was first enabled.
+    Text("悬浮球透明度", style = MaterialTheme.typography.titleSmall)
+    Text("${ballOpacity.roundToInt()}%", style = MaterialTheme.typography.bodySmall)
+    Slider(
+        value = ballOpacity,
+        onValueChange = {
+            ballOpacity = it
+            root.previewPhoneOnlyOpacity(it.roundToInt(), bubbleOpacity.roundToInt())
+        },
+        onValueChangeFinished = { saveOpacity() },
+        valueRange = SmartSettings.MIN_BALL_OPACITY.toFloat()..SmartSettings.MAX_OPACITY.toFloat(),
+    )
+    Text("气泡透明度（整泡含文字）", style = MaterialTheme.typography.titleSmall)
+    Text("${bubbleOpacity.roundToInt()}%", style = MaterialTheme.typography.bodySmall)
+    Slider(
+        value = bubbleOpacity,
+        onValueChange = {
+            bubbleOpacity = it
+            root.previewPhoneOnlyOpacity(ballOpacity.roundToInt(), it.roundToInt())
+        },
+        onValueChangeFinished = { saveOpacity() },
+        valueRange = SmartSettings.MIN_BUBBLE_OPACITY.toFloat()..SmartSettings.MAX_OPACITY.toFloat(),
+    )
+    if (!detached) {
+        Text(
+            "模式开启后生效：纯手机模式关闭中，滑块只预览数值并保存设置。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+        )
+    }
+    Text(
+        "旧消息不单独配置：整条气泡（卡片+文字）按气泡透明度的 " +
+            "${(SmartSettings.OLD_MESSAGE_ALPHA_RATIO * 100).roundToInt()}% 再淡化，2s 后消失。",
+        style = MaterialTheme.typography.bodySmall,
+    )
+    TextButton(onClick = {
+        ballOpacity = SmartSettings.DEFAULT_BALL_OPACITY.toFloat()
+        bubbleOpacity = SmartSettings.DEFAULT_BUBBLE_OPACITY.toFloat()
+        saveOpacity()
+    }) { Text("恢复默认透明度") }
+    opacityNotice?.let { notice ->
+        Text(notice, style = MaterialTheme.typography.bodySmall)
+    }
     val speechOn by root.speechEnabled.collectAsStateWithLifecycle()
     Row(verticalAlignment = Alignment.CenterVertically) {
         Switch(checked = speechOn, onCheckedChange = { root.setSpeechEnabled(it) })

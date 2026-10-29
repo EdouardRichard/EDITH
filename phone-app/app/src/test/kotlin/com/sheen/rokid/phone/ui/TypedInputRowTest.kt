@@ -44,30 +44,30 @@ class TypedInputRowTest {
         // Blank + idle is the microphone.
         assertEquals(
             ComposerActionSlot(ComposerAction.Microphone, enabled = true),
-            composerActionSlot(SessionState.Ready, TypedInputState(), DictationState.Idle),
+            composerActionSlot(SessionState.Ready, TypedInputState(), DictationState.Idle, owner = null),
         )
         // Text is the send arrow while no dictation owns the field.
         assertEquals(
             ComposerActionSlot(ComposerAction.Send, enabled = true),
-            composerActionSlot(SessionState.Listening, TypedInputState(draft = "你好"), DictationState.Idle),
+            composerActionSlot(SessionState.Listening, TypedInputState(draft = "你好"), DictationState.Idle, owner = null),
         )
         // A live lease is the stop square, with or without text.
         assertEquals(
             ComposerActionSlot(ComposerAction.Stop, enabled = true),
-            composerActionSlot(SessionState.Listening, TypedInputState(), DictationState.Listening),
+            composerActionSlot(SessionState.Listening, TypedInputState(), DictationState.Listening, owner = null),
         )
         assertEquals(
             ComposerActionSlot(ComposerAction.Stop, enabled = true),
-            composerActionSlot(SessionState.Ready, TypedInputState(draft = "你好"), DictationState.Listening),
+            composerActionSlot(SessionState.Ready, TypedInputState(draft = "你好"), DictationState.Listening, owner = null),
         )
         // A terminal dictation gives the microphone back, because the next tap may start a fresh one.
         assertEquals(
             ComposerActionSlot(ComposerAction.Microphone, enabled = true),
-            composerActionSlot(SessionState.Ready, TypedInputState(), DictationState.NoSpeech),
+            composerActionSlot(SessionState.Ready, TypedInputState(), DictationState.NoSpeech, owner = null),
         )
         assertEquals(
             ComposerActionSlot(ComposerAction.Microphone, enabled = true),
-            composerActionSlot(SessionState.Ready, TypedInputState(), DictationState.Error("MIC_UNAVAILABLE")),
+            composerActionSlot(SessionState.Ready, TypedInputState(), DictationState.Error("MIC_UNAVAILABLE"), owner = null),
         )
     }
 
@@ -76,11 +76,11 @@ class TypedInputRowTest {
         // No live session: both the microphone and the send arrow stay in place but cannot be tapped.
         assertEquals(
             ComposerActionSlot(ComposerAction.Microphone, enabled = false),
-            composerActionSlot(SessionState.Idle, TypedInputState(), DictationState.Idle),
+            composerActionSlot(SessionState.Idle, TypedInputState(), DictationState.Idle, owner = null),
         )
         assertEquals(
             ComposerActionSlot(ComposerAction.Send, enabled = false),
-            composerActionSlot(SessionState.Idle, TypedInputState(draft = "你好"), DictationState.Idle),
+            composerActionSlot(SessionState.Idle, TypedInputState(draft = "你好"), DictationState.Idle, owner = null),
         )
         // One synchronous send at a time.
         assertEquals(
@@ -89,12 +89,13 @@ class TypedInputRowTest {
                 SessionState.Ready,
                 TypedInputState(draft = "你好", sending = true),
                 DictationState.Idle,
+                owner = null,
             ),
         )
         // Stop must stay tappable even if the session state has already moved: a lease must always be stoppable.
         assertEquals(
             ComposerActionSlot(ComposerAction.Stop, enabled = true),
-            composerActionSlot(SessionState.Idle, TypedInputState(), DictationState.Listening),
+            composerActionSlot(SessionState.Idle, TypedInputState(), DictationState.Listening, owner = null),
         )
     }
 

@@ -314,7 +314,7 @@
             </intent-filter>
         </receiver>
         <!--
-          0.4 Task 9 「脱离眼镜」 fallback gate + readback. The settings switch sits below the fold of a long Compose
+          0.4 Task 9 「纯手机模式」 fallback gate + readback. The settings switch sits below the fold of a long Compose
           page that the installed accessibility probe cannot scroll; the Task 9 run reached it by temporarily enlarging
           the logical display and toggled it with the probe itself, and used this receiver for **readback only**. It
           remains available as the labelled fallback that drives the production `DetachGate.set(...)` for downstream
@@ -327,6 +327,21 @@
             android:exported="true">
             <intent-filter>
                 <action android:name="edith.DEBUG_DETACH" />
+            </intent-filter>
+        </receiver>
+        <!--
+          0.5 phone-only message-stack visual instrument. Pushes the production `PhoneBubbleEvent`s into the same
+          repository the overlay reads, so the bubble card, old-message fade and 2 s removal can be screenshotted; the
+          production path is separately exercised by a real phone-only turn (the repository's `P5_BUBBLE` line). Same
+          export rule and the same reason as the instruments above: shell-driven, debug-only, never in a release build.
+          It logs the scenario name only, never the text.
+        -->
+        <receiver
+            android:name=".debug.DebugPhoneBubble"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="edith.DEBUG_BUBBLE" />
             </intent-filter>
         </receiver>
     </application>

@@ -96,7 +96,7 @@ data class SmartSettings(
      */
     val noInterception: Boolean = false,
     /**
-     * 0.4 Task 5 (`D199`/`D202`): the host-only 「脱离眼镜」 switch, persisted and **off by default**.
+     * 0.4 Task 5 (`D199`/`D202`): the host-only 「纯手机模式」 switch, persisted and **off by default**.
      *
      * It is not a plugin setting and deliberately does not appear in [pluginValues]: the plugin only ever sees the
      * **effective** arming value derived from it (`proactiveEnabled && !glassesDetached`), never the mode itself. A
@@ -106,6 +106,29 @@ data class SmartSettings(
      * Kept as the **last** field so positional construction of older call sites is unchanged.
      */
     val glassesDetached: Boolean = false,
+    /**
+     * 0.5 (`D210`): the floating ball's opacity in percent, persisted globally.
+     *
+     * The ball is a translucent EDITH-icon overlay; the owner asked for it to be adjustable. [clampedBallOpacity]
+     * enforces the shipped 20–100 range at every use site (the stored value is clamped on read as well), because a
+     * 0% ball would be invisible and unusable rather than merely transparent. Kept after [glassesDetached] so older
+     * positional construction of this data class stays valid.
+     */
+    val ballOpacityPercent: Int = DEFAULT_BALL_OPACITY,
+    /**
+     * 0.5 (`D211`): the message bubble's card opacity in percent, persisted globally.
+     *
+     * Only the card background uses this value; the system-default text stays fully opaque. Old messages multiply
+     * this by a fixed [OLD_MESSAGE_ALPHA_RATIO] - there is deliberately no separate old-message setting.
+     */
+    val bubbleOpacityPercent: Int = DEFAULT_BUBBLE_OPACITY,
+    /**
+     * 0.5 (`D213`): whether the user has ever explicitly changed 「语音朗读」.
+     *
+     * The phone-only model turns speech on by default, but only while this is false: a user who turned speech off
+     * must never have it silently re-enabled (the `D53`② same-shape rule). [setSpeechEnabled] sets it true.
+     */
+    val speechConfigured: Boolean = false,
 ) {
     /**
      * The plugin's own cooldown parameter.
@@ -115,6 +138,12 @@ data class SmartSettings(
      * configuration at all.
      */
     val cooldownNanos: Long get() = (if (cooldownMillis > 0) cooldownMillis else 0L) * 1_000_000L
+
+    /** The ball opacity every renderer must use; a stored value outside the shipped range is clamped, never trusted. */
+    fun clampedBallOpacity(): Int = ballOpacityPercent.coerceIn(MIN_BALL_OPACITY, MAX_OPACITY)
+
+    /** The bubble card opacity every renderer must use; see [clampedBallOpacity] for the same clamp rule. */
+    fun clampedBubbleOpacity(): Int = bubbleOpacityPercent.coerceIn(MIN_BUBBLE_OPACITY, MAX_OPACITY)
 
     /**
      * The profile this configuration should name: the stored choice while it still exists, otherwise the first
@@ -195,6 +224,22 @@ data class SmartSettings(
 
         /** The three levels the plugin's own enum names; kept here so the store never sends a fourth. */
         val SENSITIVITIES = listOf("LOW", "MEDIUM", "HIGH")
+
+        /** 0.5 (`D210`): the shipped ball opacity and the bounds the slider/renderer enforce. */
+        const val DEFAULT_BALL_OPACITY = 82
+        const val MIN_BALL_OPACITY = 20
+        const val MAX_OPACITY = 100
+
+        /** 0.5 (`D211`): the shipped bubble card opacity and its minimum. */
+        const val DEFAULT_BUBBLE_OPACITY = 75
+        const val MIN_BUBBLE_OPACITY = 30
+
+        /**
+         * 0.5 (`D211`): the fixed extra fade applied to a superseded message, multiplied by the configured bubble
+         * opacity. Deliberately a constant rather than a setting - the owner ruled that old messages do not get their
+         * own configuration.
+         */
+        const val OLD_MESSAGE_ALPHA_RATIO = 0.42f
     }
 }
 
@@ -230,6 +275,11 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
             put("noInterception", settings.noInterception)
             // 0.4 Task 5 (`D199`): host-only; never part of `pluginValues()`.
             put("glassesDetached", settings.glassesDetached)
+            // 0.5 (`D210`/`D211`/`D213`): host-only appearance and the explicit-speech flag. The opacity values are
+            // clamped on write so a hand-edited blob cannot store a value the renderers would then have to trust.
+            put("ballOpacityPercent", settings.clampedBallOpacity())
+            put("bubbleOpacityPercent", settings.clampedBubbleOpacity())
+            put("speechConfigured", settings.speechConfigured)
         })
     }
 
@@ -297,6 +347,17 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
                 // glasses. `strictBoolean` keeps a string "true"/"false" from being coerced into a mode change.
                 glassesDetached = strictBoolean(json, "glassesDetached")
                     ?: SmartSettings().glassesDetached,
+                // 0.5 (`D210`/`D211`): absent in a pre-0.5 blob takes the shipped defaults. A present value is kept raw
+                // here and clamped by `clampedBallOpacity()`/`clampedBubbleOpacity()` at every use site, so an
+                // out-of-range blob still loads (the store's "missing/bad key takes a default" rule).
+                ballOpacityPercent = json["ballOpacityPercent"]?.jsonPrimitive?.intOrNull
+                    ?: SmartSettings().ballOpacityPercent,
+                bubbleOpacityPercent = json["bubbleOpacityPercent"]?.jsonPrimitive?.intOrNull
+                    ?: SmartSettings().bubbleOpacityPercent,
+                // 0.5 (`D213`): absent means the user never touched the speech switch, so the phone-only model may turn
+                // it on once. `strictBoolean` keeps a string from being coerced into "already configured".
+                speechConfigured = strictBoolean(json, "speechConfigured")
+                    ?: SmartSettings().speechConfigured,
             )
         }.getOrNull()
 

@@ -405,7 +405,7 @@ class SmartSettingsStoreTest {
         assertEquals(5000L, reloaded.cooldownMillis)
     }
 
-    // ---- 0.4 Task 5 (`D199`/`D202`): the host-only 「脱离眼镜」 setting ---------------------------
+    // ---- 0.4 Task 5 (`D199`/`D202`): the host-only 「纯手机模式」 setting ---------------------------
 
     @Test
     fun glassesDetachDefaultsToGlassesModeWhenTheKeyIsMissing() {
@@ -438,6 +438,46 @@ class SmartSettingsStoreTest {
 
         SmartSettingsStore(blobs).save(SmartSettings(glassesDetached = false))
         assertFalse("closing detach must persist too", SmartSettingsStore(blobs).load().glassesDetached)
+    }
+
+    // ---- 0.5 (`D210`/`D211`/`D213`): the phone-only appearance and explicit-speech flag -----------------
+
+    @Test
+    fun phoneOnlyAppearanceDefaultsWhenTheKeysAreMissing() {
+        // A fresh store and a pre-0.5 blob both mean the shipped preview values; nothing detaches or silences by upgrade.
+        val loaded = SmartSettingsStore(TestBlobs()).load()
+        assertEquals(SmartSettings.DEFAULT_BALL_OPACITY, loaded.ballOpacityPercent)
+        assertEquals(SmartSettings.DEFAULT_BUBBLE_OPACITY, loaded.bubbleOpacityPercent)
+        assertFalse("a fresh store has no explicit speech choice yet", loaded.speechConfigured)
+        assertEquals(82, loaded.clampedBallOpacity())
+        assertEquals(75, loaded.clampedBubbleOpacity())
+    }
+
+    @Test
+    fun phoneOnlyAppearanceAndSpeechConfiguredRoundTrip() {
+        val blobs = TestBlobs()
+        val store = SmartSettingsStore(blobs)
+        store.save(SmartSettings(ballOpacityPercent = 40, bubbleOpacityPercent = 55, speechConfigured = true))
+
+        val loaded = store.load()
+
+        assertEquals(40, loaded.ballOpacityPercent)
+        assertEquals(55, loaded.bubbleOpacityPercent)
+        assertTrue("the explicit speech choice must persist", loaded.speechConfigured)
+    }
+
+    @Test
+    fun savingAnOutOfRangeOpacityStoresTheClampedValue() {
+        val blobs = TestBlobs()
+        val store = SmartSettingsStore(blobs)
+        store.save(SmartSettings(ballOpacityPercent = 0, bubbleOpacityPercent = 1_000))
+
+        val loaded = store.load()
+
+        assertEquals(SmartSettings.MIN_BALL_OPACITY, loaded.ballOpacityPercent)
+        assertEquals(SmartSettings.MAX_OPACITY, loaded.bubbleOpacityPercent)
+        assertEquals(SmartSettings.MIN_BALL_OPACITY, loaded.clampedBallOpacity())
+        assertEquals(SmartSettings.MAX_OPACITY, loaded.clampedBubbleOpacity())
     }
 
     @Test
