@@ -2,6 +2,7 @@ package com.sheen.rokid.phone.plugin.smarthelper.host
 import com.sheen.rokid.phone.storage.TestBlobs
 
 import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SettingsSaveResult
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
@@ -32,7 +33,7 @@ class ProactiveArmingPersistenceTest {
 
         assertTrue("D53-②: 默认开", arming.enabled.value)
 
-        arming.set(false)
+        assertTrue("the persisted write must report success", arming.set(false).saved)
         val reloaded = ProactiveArming(store)
         reloaded.load()
         assertFalse("关掉后跨加载保持关闭", reloaded.enabled.value)
@@ -58,7 +59,7 @@ class ProactiveArmingPersistenceTest {
         val arming = ProactiveArming(store)
         arming.load()
 
-        arming.set(false)
+        assertTrue("the field-preserving write must report success", arming.set(false).saved)
 
         val after = store.load()
         assertEquals(12_000L, after.proactiveCooldownMillis)
@@ -73,8 +74,10 @@ class ProactiveArmingPersistenceTest {
         val arming = ProactiveArming()
 
         assertTrue(arming.enabled.value)
-        arming.set(false)
+        val result = arming.set(false)
         assertFalse(arming.enabled.value)
+        assertFalse("a hand-built rig has nothing to persist", result.saved)
+        assertEquals(SettingsSaveResult.ERROR_STORE_UNAVAILABLE, result.errorCode)
     }
 
     @Test
@@ -86,11 +89,27 @@ class ProactiveArmingPersistenceTest {
         SmartSettingsStore(blobs).save(SmartSettings(glassesDetached = true, maxLevel = "L2"))
         blobs.failReadId = SmartSettingsStore.BLOB_ID
 
-        ProactiveArming(SmartSettingsStore(blobs)).set(false)
+        val result = ProactiveArming(SmartSettingsStore(blobs)).set(false)
+        assertFalse("an unreadable blob must not be reported as saved", result.saved)
+        assertEquals(SettingsSaveResult.ERROR_SETTINGS_UNREADABLE, result.errorCode)
 
         blobs.failReadId = null
         val after = SmartSettingsStore(blobs).load()
         assertTrue("the detach mode must survive a failed proactive write", after.glassesDetached)
         assertEquals("and so must every other field", "L2", after.maxLevel)
+    }
+
+    @Test
+    fun aRefusedWriteIsReportedInsteadOfHiddenInTheLog() {
+        val blobs = TestBlobs()
+        val store = SmartSettingsStore(blobs)
+        store.save(SmartSettings(proactiveEnabled = true))
+        blobs.failId = SmartSettingsStore.BLOB_ID
+
+        val result = ProactiveArming(store).set(false)
+
+        assertFalse(result.saved)
+        assertEquals(SettingsSaveResult.ERROR_SAVE_FAILED, result.errorCode)
+        assertTrue("the refused value was not persisted", store.load().proactiveEnabled)
     }
 }

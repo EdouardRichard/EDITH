@@ -7,6 +7,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
@@ -14,6 +15,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sheen.rokid.phone.BuildConfig
 import com.sheen.rokid.phone.app.HostCompositionRoot
+import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
+import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SettingsSaveResult
 import com.sheen.rokid.phone.session.SessionUiState
 import com.sheen.rokid.phone.ui.PhoneDetailPage
 
@@ -68,8 +71,43 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
     SettingsShellContent(
         homeModel = home,
         auditLines = { root.auditLog?.lines().orEmpty() },
+        assistantBehavior = { requestPop, registerBackGuard ->
+            AssistantBehaviorScreen(
+                // The page reads the persisted snapshot once (design §4.4). A store that cannot even answer gets the
+                // shipped defaults so the page renders; a following save reports the real refusal inline.
+                load = { runCatching { root.storedSettings() }.getOrElse { SmartSettings() } },
+                save = { settings -> saveThroughHost(root, settings) },
+                // Immediate and outside the form; the gate's own result drives the inline failure line.
+                setProactive = { enabled -> root.proactiveArming.set(enabled) },
+                help = rememberHelpState(),
+                requestPop = requestPop,
+                registerBackGuard = registerBackGuard,
+            )
+        },
     )
 }
+
+/**
+ * Adapts the host's throwing save to [SettingsSaveResult] (0.52 design §4.2).
+ *
+ * The page deliberately does not `try/catch`: the host knows which refusal happened, and the mapped code is what the
+ * inline error shows. `saveSmartSettings` can only refuse with the store-unavailable contract at this layer; every
+ * other exception is the blob write refusing, which the page must still see rather than lose in a log.
+ */
+private fun saveThroughHost(root: HostCompositionRoot, settings: SmartSettings): SettingsSaveResult =
+    runCatching { root.saveSmartSettings(settings) }.fold(
+        onSuccess = { SettingsSaveResult(saved = true) },
+        onFailure = { failure ->
+            SettingsSaveResult(
+                saved = false,
+                errorCode = if (failure.message == SettingsSaveResult.ERROR_STORE_UNAVAILABLE) {
+                    SettingsSaveResult.ERROR_STORE_UNAVAILABLE
+                } else {
+                    SettingsSaveResult.ERROR_SAVE_FAILED
+                },
+            )
+        },
+    )
 
 /**
  * The host-free core of the settings shell: the route stack, the home and the page dialog.
@@ -82,18 +120,32 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
  *
  * Host-derived input (the [SettingsHomeModel] and the audit loader) stays in [SettingsShell]; this composable has no
  * host dependency, which lets a Compose test drive the page push and back directly.
+ *
+ * [assistantBehavior] is the page seam Task 9 adds without changing the shell's existing contract: when it is null (all
+ * Task 7 call sites, including the home/scroll tests) the route keeps its placeholder. When the host wires it, the page
+ * receives a `requestPop` that closes the route and a `registerBackGuard` that installs a guarded back action. The
+ * header arrow and the dialog's dismiss/back path both run `pageBackGuard ?: requestPop`, so a page can intercept the
+ * one shared exit with its 「放弃修改？」 confirmation and then call `requestPop` itself. The stack is a state list so
+ * pop does not depend on a stale captured `List` instance.
  */
 @Composable
 internal fun SettingsShellContent(
     homeModel: SettingsHomeModel,
     auditLines: () -> List<String> = { emptyList() },
     homeScrollState: ScrollState = rememberScrollState(),
+    assistantBehavior: (@Composable (requestPop: () -> Unit, registerBackGuard: (() -> Unit) -> Unit) -> Unit)? = null,
 ) {
-    var stack by remember { mutableStateOf(emptyList<SettingsRoute>()) }
+    val stack = remember { mutableStateListOf<SettingsRoute>() }
+    var pageBackGuard by remember { mutableStateOf<(() -> Unit)?>(null) }
+
+    fun closePage() {
+        pageBackGuard = null
+        if (stack.isNotEmpty()) stack.removeAt(stack.lastIndex)
+    }
 
     SettingsHomeScreen(
         model = homeModel,
-        onOpen = { stack = stack + it },
+        onOpen = { stack.add(it) },
         auditLines = auditLines,
         scrollState = homeScrollState,
     )
@@ -101,20 +153,35 @@ internal fun SettingsShellContent(
     val route = stack.lastOrNull() ?: return
     PhoneDetailPage(
         title = route.title,
-        onBack = { stack = stack.dropLast(1) },
+        // One guarded exit for the arrow and for the dialog's own system-back dismissal. The page registers the
+        // guard; a page without one (About/placeholders) closes directly.
+        onBack = { pageBackGuard?.invoke() ?: closePage() },
+        // A form page must not wrap its text fields in the detail page's text-selection container.
+        selectionEnabled = route != SettingsRoute.AssistantBehavior,
     ) {
         when (route) {
             SettingsRoute.About -> AboutScreen(
-                onOpenModelService = { stack = stack + SettingsRoute.ModelService },
+                onOpenModelService = { stack.add(SettingsRoute.ModelService) },
             )
-            else -> {
-                Text(route.title, style = MaterialTheme.typography.titleLarge)
-                Text(
-                    "后续任务接入",
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                )
+            SettingsRoute.AssistantBehavior -> {
+                if (assistantBehavior == null) {
+                    PlaceholderPage(route)
+                } else {
+                    assistantBehavior({ closePage() }) { guard -> pageBackGuard = guard }
+                }
             }
+            else -> PlaceholderPage(route)
         }
     }
+}
+
+/** Task 7's placeholder for routes later tasks have not filled yet. */
+@Composable
+private fun PlaceholderPage(route: SettingsRoute) {
+    Text(route.title, style = MaterialTheme.typography.titleLarge)
+    Text(
+        "后续任务接入",
+        style = MaterialTheme.typography.bodyMedium,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
 }

@@ -92,6 +92,23 @@ object SmartSettingsForm {
     )
 
     /**
+     * How many of the four launch-read fields actually changed between [before] and [after] (0.52 design §3.3).
+     *
+     * The composition is assembled once per process, so the plugin sees these fields only after a full App restart:
+     * `wakeWords`, `continueDialogue`, `proactiveCooldownMillis` and `proactiveSensitivity`. The two live switches -
+     * `visionEnabled` (the host's vision gate) and `proactiveEnabled` (the immediate arming gate) - deliberately do
+     * not count, and neither do the fields this page does not edit (`maxLevel`, `whitelist`, `cooldownMillis`,
+     * `noInterception`, `glassesDetached`, appearance). The value is what the page shows after a successful save
+     * ([SettingsFeedback.savedRestartText]); comparing the stored fields directly is the only honest count.
+     */
+    fun needsRestartCount(before: SmartSettings, after: SmartSettings): Int = listOf(
+        before.wakeWords != after.wakeWords,
+        before.continueDialogue != after.continueDialogue,
+        before.proactiveCooldownMillis != after.proactiveCooldownMillis,
+        before.proactiveSensitivity != after.proactiveSensitivity,
+    ).count { it }
+
+    /**
      * Parses one edit against [base].
      *
      * Wake words are separated by half- or full-width commas, trimmed, and de-duplicated case-insensitively in the
