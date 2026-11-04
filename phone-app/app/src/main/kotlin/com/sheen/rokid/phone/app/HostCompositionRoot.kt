@@ -35,7 +35,7 @@ import com.sheen.rokid.phone.model.EngineBundleProvisioning
 import com.sheen.rokid.phone.model.ModelAssetSource
 import com.sheen.rokid.phone.model.ModelReadiness
 import com.sheen.rokid.phone.model.ModelStartGate
-import com.sheen.rokid.phone.storage.AndroidProfileRepository
+import com.sheen.rokid.phone.model.catalog.ModelCatalogRepository
 import com.sheen.rokid.phone.actions.executionChannelStatuses
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
 import com.sheen.rokid.phone.storage.AndroidSpeakerProfileStore
@@ -387,9 +387,19 @@ class HostCompositionRoot internal constructor(
      * [create] seeds it from the persisted [SmartSettings.glassesDetached] (default off), wires its stop-before-save
      * rule to this composition's own `stop()` and the host's live state, and hands the same instance to the settings
      * page and to [ProactiveArming]'s detached predicate. A hand-built composition keeps the shipped glasses mode.
-     * Kept **last** so positional construction of older call sites is unchanged.
      */
     internal val detachGate: DetachGate = DetachGate(),
+    /**
+     * 0.52 (design §5.8): the encrypted model catalog, when this composition owns one.
+     *
+     * Production [create] passes the same `AndroidModelCatalogRepository` that backs [profiles], so
+     * [activeCatalogProfile] is the live projection rather than an assembly-time snapshot. A hand-built composition
+     * leaves it null; [activeCatalogProfile] then answers the first profile its repository lists, which keeps the
+     * pre-0.52 rigs meaningful without constructing a second owner of the model configuration.
+     *
+     * Appended after [detachGate] per the 0.52 plan; all call sites pass it by name.
+     */
+    private val modelCatalog: ModelCatalogRepository? = null,
     /**
      * 0.5 (`D214`): starts/stops the phone-only overlay when the mode changes. The argument is the **requested**
      * mode, not a read of `detachGate.enabled`: the gate invokes the callback while the live value is still the old
@@ -1057,7 +1067,58 @@ class HostCompositionRoot internal constructor(
      * deliberately unaffected until the next assembly - which is what the screen's copy says.
      */
     fun storedSettings(): SmartSettings =
-        requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }.load(profiles)
+        requireNotNull(smartSettingsStore) { "SETTINGS_STORE_UNAVAILABLE" }.load()
+
+    /**
+     * 0.52 design §5.8: the model profile the encrypted catalog currently projects, or null when none is configured.
+     *
+     * Production reads the live catalog on every call, so a provider/model switch made after assembly applies to the
+     * next configuration and turn. A hand-built composition without a catalog falls back to the first profile its
+     * repository lists - the 0.52 test seam - and any refusal (locked keystore, deleted payload, unreadable catalog) is
+     * answered as null rather than an exception: the configuration still has to be built, and the plugin's own lookup
+     * is the fail-closed point.
+     */
+    fun activeCatalogProfile(): ModelProfile? {
+        val catalog = modelCatalog
+        if (catalog != null) return runCatching { catalog.catalog() }.getOrNull()?.activeProfile()
+        return runCatching { profiles.list().firstOrNull() }.getOrNull()
+    }
+
+    /**
+     * 0.52 design §5.8 / ruling R18: stops the running session **before** a model selection is written.
+     *
+     * The split from [onCatalogSelectionChanged] is deliberate. Stopping after the catalog write would leave a session
+     * briefly running under the new selection while the plugin still holds the old configuration; Task 13's view model
+     * therefore calls this first, writes `activeProviderId`/`selectedModelId` second and reconfigures third. A failure
+     * here propagates, so the selection is not persisted and the old session keeps running.
+     *
+     * A session with no activated plugin (idle/paused, or one refused for missing capabilities) needs no stop, and the
+     * host's configure path already accepts a paused/ready host. A pending START grant is dropped with the stop, so a
+     * token authorized before the switch cannot start a session under the selection being replaced. The audio epoch is
+     * disarmed before the pause for the same reason [pause] does it: a detached session's recorder, ingress, poll loop
+     * and CPU hold must not survive it.
+     */
+    @Synchronized fun stopForModelSwitch() {
+        if (closed || activatedPlugin == null) return
+        pendingStart = null
+        disarmAudioEpoch()
+        host.pause()
+        activatedPlugin = null
+    }
+
+    /**
+     * 0.52 design §5.8: applies the active catalog projection to the smart plugin's stored configuration.
+     *
+     * Only `configurationFor` + `host.configure` - the session stop belongs to [stopForModelSwitch] and the caller runs
+     * it **before** writing the selection. Configuring while a plugin is active is refused by the host, which is the
+     * truthful answer for a caller that skipped the stop rather than a silently dropped selection.
+     */
+    @Synchronized fun onCatalogSelectionChanged(profile: ModelProfile?) {
+        if (closed) return
+        val pluginId = smartWiring?.plugin?.descriptor?.pluginId ?: return
+        val configuration = configurationFor(pluginId, profile) ?: return
+        check(host.configure(pluginId, configuration)) { "Model selection unavailable" }
+    }
 
     /**
      * Persists one settings edit; the next App start's composition picks it up (this one never re-reads).
@@ -1114,38 +1175,35 @@ class HostCompositionRoot internal constructor(
     private data class StartGrant(val token: String, val pluginId: String, val expires: Long)
     private var pendingStart: StartGrant? = null
     private val clock = environment?.clock ?: object : MonotonicClock { override fun nowNanos() = System.nanoTime().coerceAtLeast(0) }
-    fun profileViewModel(): ProfileViewModel? {
-        val repository = profiles as? AndroidProfileRepository ?: return null
-        return ProfileViewModel(repository, profileTester ?: return null, profileConsent, ::applyProfileSelection)
-    }
+    /**
+     * 0.52: the legacy profile editor is retired with the catalog; the production path has no view model to offer.
+     *
+     * `MainActivity`/`PhoneScreen` keep the nullable parameter until Task 7 deletes the old profile UI, and the page
+     * shows its 「模型服务不可用」 branch when this is null. Returning null here is also what guarantees no production
+     * path can construct the legacy `AndroidProfileRepository` or write an old profile selection.
+     */
+    fun profileViewModel(): ProfileViewModel? = null
+
     fun namespace(pluginId: String): StorageHandle {
         require(pluginId in setOf("smart-assistant", "interview-assistant") || (BuildConfig.DEBUG && pluginId == DIAGNOSTIC_PLUGIN_ID))
         return namespaceFactory?.invoke(pluginId) ?: throw ContractError.CapabilityMissing("Persistent storage unavailable")
     }
     /**
-     * Applies a profile selection the user made to the plugin it belongs to.
+     * Applies a profile selection the **legacy** profile UI made, until Task 7 deletes that screen.
+     *
+     * 0.52 moved the model selection into the catalog; this shim exists only so the old `ProfileViewModel` and its
+     * test keep compiling. Production never reaches it ([profileViewModel] returns null), and Task 7 removes it in
+     * favour of [onCatalogSelectionChanged].
      *
      * The configuration is rebuilt whole ([configurationFor]) rather than patched with the profile fields:
      * `HostRuntime.configure` replaces the stored configuration, so sending only the profile selection would drop the
-     * settings-derived keys the plugin runs with (Task 14a-fix item 1). A plugin that is already active must be
-     * paused first, because the host refuses to configure an active plugin.
-     *
-     * 0.4 Task 8 fix 1 (spec §4.5/§4.6). This pause used to call `host.pause()` directly and so bypassed the
-     * composition's own [pause], which is the path that disarms the audio epoch. A profile change made while a
-     * **detached** session was active therefore left its phone recorder, ingress, poll loop and CPU wake lock running
-     * with the host paused until some later resume/stop/close - the "release on pause" rule violated from a
-     * user-reachable Settings action. Detached mode now disarms first (the ordinary `P4_AUDIO ... reason=DISARMED`
-     * transition, which is also where `lockscreen_hold=false` is recorded). The disarm is deliberately gated on
-     * [detachGate]: glasses mode's pre-0.4 epoch semantics on this settings path are intentionally left byte-for-byte
-     * unchanged, and this fix's scope is the detached source and its CPU hold.
+     * settings-derived keys the plugin runs with (Task 14a-fix item 1). The stop-first rule is shared with the catalog
+     * path ([stopForModelSwitch]), which is what keeps a detached session's recorder, ingress, poll loop and CPU hold
+     * from surviving the pause (0.4 Task 8 fix 1, spec §4.5/§4.6).
      */
     @Synchronized internal fun applyProfileSelection(pluginId: String, profile: ModelProfile?) {
         if (closed) return
-        if (activatedPlugin == pluginId) {
-            if (detachGate.enabled.value) disarmAudioEpoch()
-            host.pause()
-            activatedPlugin = null
-        }
+        stopForModelSwitch()
         val configuration = configurationFor(pluginId, profile) ?: return
         check(host.configure(pluginId, configuration)) { "Profile selection unavailable" }
     }
@@ -1173,20 +1231,17 @@ class HostCompositionRoot internal constructor(
     /**
      * The profile that applies to [pluginId].
      *
-     * The App stores one selection per plugin, so that selection wins where this composition has such a store (the
-     * Android repository). Without one - a JVM harness, or a plugin the user never selected for - the smart plugin
-     * falls back to the settings' own resolved choice, because that is the profile the settings name; any other
-     * plugin gets no profile, and its own shape fills in the contract-valid placeholder it needs. A repository that
-     * refuses (locked keystore, deleted payload) yields null rather than propagating: the configuration still has to
-     * be built, and the plugin's own lookup finds nothing until storage answers again.
+     * 0.52 design §5.8: the catalog is the only selection source. The smart plugin's role is answered by the wiring's
+     * live `activeProfile()` (production wires it to [activeCatalogProfile]); the host's own projection is the
+     * fallback for a rig whose wiring was built without a catalog source. Any other plugin gets no profile, so its own
+     * configuration shape fills in the contract-valid placeholder it needs - the smart keys are never sent to it.
      */
-    private fun selectedProfile(pluginId: String): ModelProfile? = resolveTurnProfile(
-        selection = { (profiles as? AndroidProfileRepository)?.selections()?.get(pluginId) },
-        load = profiles::get,
-        fallback = {
-            if (pluginId == smartWiring?.plugin?.descriptor?.pluginId) smartWiring?.selectedProfile() else null
-        },
-    )
+    private fun selectedProfile(pluginId: String): ModelProfile? =
+        if (pluginId == smartWiring?.plugin?.descriptor?.pluginId) {
+            smartWiring.activeProfile() ?: activeCatalogProfile()
+        } else {
+            null
+        }
 
     /** The diagnostic text plugin's own configuration shape; it refuses every key that is not one of these. */
     private fun diagnosticValues(profile: ModelProfile?): Map<String, String> = mapOf(
@@ -3317,7 +3372,14 @@ class HostCompositionRoot internal constructor(
             }
             val blobs = AndroidEncryptedBlobStore(context)
             val resolver = KeystoreVault(blobs)
-            val profiles = AndroidProfileRepository(blobs, resolver)
+            // 0.52 design §5.8: the encrypted catalog is the only model-configuration owner. The projected profiles
+            // keep the existing `ProfileRepository` contract for the controlled client, the probe gate, the tester and
+            // the plugin's lookup, so everything downstream reads one derived view of the catalog.
+            val catalog = AndroidModelCatalogRepository(blobs, KeystoreCatalogCredentialStore(resolver))
+            // Ruling R13: the vault admits only handles the catalog currently references. Without this authority the
+            // projected `SecretHandle` is rejected by `withSecret` before the request reaches HTTP.
+            resolver.authorize(catalog::isCredentialReferenced)
+            val profiles = CatalogProfileRepository(catalog)
             val probeGate = ProfileProbeGate(profiles)
             // Task 14a/14b: the one settings store, built here rather than further down because the arming switch
             // below persists through it. A save and the next load therefore read the same blob.
@@ -3445,7 +3507,7 @@ class HostCompositionRoot internal constructor(
             // the same blob. The composition's own settings stay the ones read here; the screen's copy says that only
             // a full App restart re-reads them (this root is a process-lifetime singleton), with the single exception
             // of the live vision gate built just below.
-            val smartSettings = smartSettingsStore.load(profiles)
+            val smartSettings = smartSettingsStore.load()
             // Phase 2 Task 10: one live gate for the perception provider and the device tool, seeded from the stored
             // switch. A save updates this same instance through `saveSmartSettings`; the old `{ true }` hardcodes on
             // both consumers are gone, so the switch really is the only source of truth.
@@ -3675,7 +3737,11 @@ class HostCompositionRoot internal constructor(
                 phoneOnly = { detachGate.enabled.value },
                 // 0.3 Phase 4B (`D189`): the gate's **provider**, not its current value. `saveSmartSettings` updates
                 // this same instance, so the plugin's policy and shell-precheck wrapper see a save from the next call.
-                noInterception = noInterceptionGate.provider())
+                noInterception = noInterceptionGate.provider(),
+                // 0.52: the live catalog projection. Read through the root holder because the composition instance is
+                // built after this wiring; the host's own `activeCatalogProfile()` is the single answer to "which
+                // model is active now", so a provider/model switch needs no re-assembly.
+                activeProfile = { rootHolder[0]?.activeCatalogProfile() })
             // ---- P3.3: the execution layer (spec §17.2/§17.4) ------------------------------------------------------
             // One `ToolSurface` is the single `Capability.Actions` provider (Phase 4A Task 4): the umbrella catalog's
             // four verified tools plus the five atomic channel legs, 22 descriptors in all. The advertised set is fixed
@@ -3842,18 +3908,15 @@ class HostCompositionRoot internal constructor(
                 // Phase 2 Task 10: the live switch, not an assembly-time copy. The provider answers `Disabled` and the
                 // injected capture is not called while it is off.
                 visionEnabled = { visionGate.enabled },
-                // 0.3 Phase 2.1 Task 4 fix: the second gate resolves the **turn's** profile, not the assembly-time
-                // settings choice. The repository selection (the same source `selectedProfile(pluginId)`/the turn
-                // configuration reads) wins; the settings profile is only the fallback. Both are read inside the lambda,
-                // so a profile selection change applies to the next capture. Null/exception reads false (no image).
+                // 0.52: the turn's profile is the **active catalog projection** - the same source
+                // `selectedProfile(pluginId)` and the turn configuration read. Resolved inside the lambda, so a
+                // provider/model switch applies to the next capture instead of being frozen at assembly.
+                // Null/exception reads false (no image).
                 profileSupportsImage = {
                     autoVisionProfileSupportsImage(
-                        selection = {
-                            (profiles as? AndroidProfileRepository)?.selections()
-                                ?.get(smartWiring.plugin.descriptor.pluginId)
-                        },
+                        selection = { rootHolder[0]?.activeCatalogProfile()?.id },
                         load = profiles::get,
-                        fallback = smartWiring::selectedProfile,
+                        fallback = { null },
                     )
                 },
                 // 0.3 Phase 2.1 Task 4 fix: one mapping for the kernel envelope. A `pending` placeholder (the capture
@@ -4236,6 +4299,8 @@ class HostCompositionRoot internal constructor(
                 noInterceptionGate = noInterceptionGate,
                 proactiveArming = proactiveArming,
                 detachGate = detachGate,
+                // 0.52: the same catalog behind `profiles`, so the runtime switch reads the live projection.
+                modelCatalog = catalog,
                 // 0.5 (`D214`): the overlay follows the requested mode; the permission is checked by `sync`.
                 syncPhoneOnlyOverlay = { enabled -> PhoneOnlyOverlayService.sync(context, rootHolder[0], enabled) },
                 // 0.5 (`D213`): the runtime speech router/factory/holder. The factory is the same platform player the

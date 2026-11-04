@@ -13,8 +13,9 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
  *   lose the level they chose in the same edit, so [toSettings] returns a usable [SmartSettings] *and* the list of
  *   problems; nothing is silently coerced. The only field that keeps its previous value wholesale is the one whose
  *   entry was rejected (an unknown level, or a wake-word list where nothing survived validation).
- * - **The fields this form does not own survive.** `profileId` and `cooldownMillis` are not text fields here, so
- *   they are copied from `base` untouched.
+ * - **The fields this form does not own survive.** `cooldownMillis` is not a text field here, so it is copied from
+ *   `base` untouched. (The model selection is not part of this form or of [SmartSettings] at all: 0.52 moved it into the
+ *   model catalog.)
  * - **The all-invalid asymmetry (deliberate, stated here so it is not mistaken for a bug).** When nothing in the
  *   wake-word field survives validation, the previous words are kept: wake words are not optional (the plugin
  *   refuses a configuration with an empty word list), so falling back is the only usable answer. When nothing in

@@ -301,7 +301,7 @@ class AnswerEmitIdentityIntegrationTest {
         )
         val settings = SmartSettings(
             wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
-            profileId = "p-1", cooldownMillis = 0L, continueDialogue = true,
+            cooldownMillis = 0L, continueDialogue = true,
         )
         val host: HostRuntime
         val plugin: SmartAssistantPlugin
@@ -320,6 +320,7 @@ class AnswerEmitIdentityIntegrationTest {
                 cancelOutputTurn = { s, g, t -> hostHolder[0]?.cancelOutputTurn(s, g, t) },
                 isPanelVisible = { true },
                 speechAvailable = { speechAvailable },
+                activeProfile = { profile },
             )
             plugin = wiring.plugin
             val environment = CxrHostEnvironment(
@@ -353,7 +354,7 @@ class AnswerEmitIdentityIntegrationTest {
             host = HostRuntime(1, environment)
             hostHolder[0] = host
             host.register(plugin)
-            host.configure("smart-assistant", wiring.configuration(wiring.selectedProfile()))
+            host.configure("smart-assistant", wiring.configuration(wiring.activeProfile()))
             host.startSession(session)
             host.markSceneReady()
             assertEquals(ActivationResult.Activated, host.activate("smart-assistant"))

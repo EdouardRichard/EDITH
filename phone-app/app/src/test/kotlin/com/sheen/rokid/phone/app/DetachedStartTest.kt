@@ -64,7 +64,6 @@ import com.sheen.rokid.plugin.SystemOneResult
 import com.sheen.rokid.plugin.SystemOneService
 import com.sheen.rokid.plugin.SystemOneStatus
 import com.sheen.rokid.plugin.TaskScope
-import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.storage.ProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
@@ -320,10 +319,11 @@ class DetachedStartTest {
             )
             wiring = SmartWiring(
                 SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
-                    profileId = profile.id, cooldownMillis = 3000L),
+                    cooldownMillis = 3000L),
                 FixedProfiles(profile), clock, scheduler,
                 isPanelVisible = panelVisible,
                 requestPanelOpen = { route -> rootHolder[0]?.requestPanelOpen(route) ?: false },
+                activeProfile = { profile },
             )
             environment = CxrHostEnvironment(
                 clock = clock,
@@ -353,7 +353,7 @@ class DetachedStartTest {
             )
             host = HostRuntime(1, environment)
             root = HostCompositionRoot(
-                host, MemoryProfileRepository(), InertModel(), environment,
+                host, FixedProfiles(profile), InertModel(), environment,
                 hintLink = link,
                 smartWiring = wiring,
                 rokidConnectionFactory = { factoryCalls.incrementAndGet(); connection.also { holder[0] = it } },

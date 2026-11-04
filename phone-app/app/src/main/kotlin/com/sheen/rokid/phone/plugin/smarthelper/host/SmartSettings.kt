@@ -1,8 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.host
 import kotlinx.serialization.json.JsonObject
-import com.sheen.rokid.phone.storage.unavailable
-import com.sheen.rokid.phone.plugin.smarthelper.host.ProactiveArming
-import com.sheen.rokid.phone.storage.AndroidProfileRepository
 
 import com.sheen.rokid.phone.storage.EncryptedBlobStore
 import com.sheen.rokid.phone.storage.readJson
@@ -10,7 +7,6 @@ import com.sheen.rokid.phone.storage.writeJson
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.PluginConfiguration
 import com.sheen.rokid.plugin.RiskLevel
-import com.sheen.rokid.storage.ProfileRepository
 import kotlinx.serialization.json.*
 
 /**
@@ -20,12 +16,14 @@ import kotlinx.serialization.json.*
  * wake words are the ones the smart plugin itself defaults to. The store is deliberately a **value snapshot** - a
  * settings screen writes it (Task 14b), the composition reads it at assembly time - so no plugin ever observes the
  * store changing underneath it.
+ *
+ * 0.52 design §5.2: the model selection is **not** stored here any more. The encrypted model catalog owns the
+ * provider/model choice, and [pluginValues] receives the active [ModelProfile] projection explicitly.
  */
 data class SmartSettings(
     val wakeWords: List<String> = listOf("伊迪丝", "edith"),
     val maxLevel: String = "L1",
     val whitelist: List<String> = emptyList(),
-    val profileId: String? = null,
     val cooldownMillis: Long = 3000L,
     /**
      * P3.2: the proactive cooldown and sensitivity (spec §16.1#4).
@@ -146,34 +144,18 @@ data class SmartSettings(
     fun clampedBubbleOpacity(): Int = bubbleOpacityPercent.coerceIn(MIN_BUBBLE_OPACITY, MAX_OPACITY)
 
     /**
-     * The profile this configuration should name: the stored choice while it still exists, otherwise the first
-     * available profile.
-     *
-     * A profile can be deleted while the App is closed, and the plugin's configuration contract requires a non-blank
-     * `profileId`, so falling back rather than refusing is what keeps the passive loop arm-able after a deletion. With
-     * no profiles at all the answer is null, and the caller substitutes the contract-valid placeholder.
-     */
-    fun resolveProfileId(profiles: ProfileRepository): String? {
-        // The repository can refuse outright: `AndroidProfileRepository.list()` throws
-        // `ContractError.ConfigurationRejected("Storage unavailable; reconfigure")` when the keystore cannot be
-        // opened. The composition reads the settings while it builds the plugin, so letting that propagate would take
-        // the entire composition - and with it the passive loop - down over a fallback the plugin does not need.
-        // Keeping the stored choice is the honest answer: the profile is still the user's selection, and
-        // `profileLookup` finds nothing for it until storage returns.
-        val available = runCatching { profiles.list() }.getOrNull() ?: return profileId
-        profileId?.let { chosen -> if (available.any { it.id == chosen }) return chosen }
-        return available.firstOrNull()?.id
-    }
-
-    /**
      * The values the smart plugin parses, with both profile fields filled in by [profile].
      *
      * `profileRevision` is the real revision so a profile swap is visible to the plugin, and `0` when the profile is
      * absent because the revision must still be a non-negative integer. The whitelist is sent even when empty: the
      * plugin's known key set is closed, so leaving a key out is allowed, but sending it pins "no grants" explicitly.
+     *
+     * 0.52 design §5.2: the profile is the **active catalog projection** supplied by the host; this settings value no
+     * longer stores a selection of its own. With no active provider/model the contract-valid [UNRESOLVED_PROFILE]
+     * placeholder keeps the configuration parseable and the plugin simply finds no profile for a turn.
      */
     fun pluginValues(profile: ModelProfile?): Map<String, String> = mapOf(
-        "profileId" to (profile?.id ?: profileId ?: UNRESOLVED_PROFILE),
+        "profileId" to (profile?.id ?: UNRESOLVED_PROFILE),
         "profileRevision" to (profile?.revision ?: 0L).toString(),
         "wakeWords" to wakeWords.joinToString(","),
         "maxLevel" to effectiveMaxLevel(),
@@ -252,11 +234,14 @@ data class SmartSettings(
  */
 class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
 
-    fun load(profiles: ProfileRepository? = null): SmartSettings {
-        val parsed = safelyRead() ?: SmartSettings()
-        val resolved = if (profiles == null) parsed.profileId else parsed.resolveProfileId(profiles)
-        return parsed.copy(profileId = resolved)
-    }
+    /**
+     * The persisted settings, or the defaults.
+     *
+     * 0.52 design §5.2: there is no repository parameter any more - the model selection lives in the catalog. A blob
+     * written before this version still carries a `profileId` key and is read through the v1 compatibility path; the
+     * key is ignored because the catalog is the only selection owner now.
+     */
+    fun load(): SmartSettings = safelyRead() ?: SmartSettings()
 
     fun save(settings: SmartSettings) {
         writeJson(blobs, BLOB_ID, buildJsonObject {
@@ -264,7 +249,6 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
             put("wakeWords", buildJsonArray { settings.wakeWords.forEach(::add) })
             put("maxLevel", settings.maxLevel)
             put("whitelist", buildJsonArray { settings.whitelist.forEach(::add) })
-            settings.profileId?.let { put("profileId", it) }
             put("cooldownMillis", settings.cooldownMillis)
             put("proactiveCooldownMillis", settings.proactiveCooldownMillis)
             put("proactiveSensitivity", settings.effectiveProactiveSensitivity())
@@ -308,12 +292,14 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
         runCatching { readJson(blobs, BLOB_ID) }.getOrNull()?.let(::parseJson)
 
     private fun parseJson(json: JsonObject): SmartSettings? = runCatching {
-        require(json["version"]?.jsonPrimitive?.int == VERSION) { "unsupported settings version" }
+        // 0.52 design §5.2 / ruling R7: v1 blobs (which still carried `profileId`) keep loading, so an upgrade does not
+        // silently reset every other assistant setting. The removed key is simply not read.
+        val version = json["version"]?.jsonPrimitive?.int
+        require(version == LEGACY_VERSION || version == VERSION) { "unsupported settings version" }
         SmartSettings(
                 wakeWords = strings(json, "wakeWords") ?: SmartSettings().wakeWords,
                 maxLevel = json["maxLevel"]?.jsonPrimitive?.content ?: SmartSettings().maxLevel,
                 whitelist = strings(json, "whitelist") ?: emptyList(),
-                profileId = json["profileId"]?.jsonPrimitive?.contentOrNull,
                 cooldownMillis = json["cooldownMillis"]?.jsonPrimitive?.longOrNull ?: SmartSettings().cooldownMillis,
                 // Absent in a blob written before P3.2: the field takes its default, exactly like every other
                 // missing key, so an old store keeps loading instead of being treated as corrupt.
@@ -384,6 +370,9 @@ class SmartSettingsStore(private val blobs: EncryptedBlobStore) {
 
     companion object {
         const val BLOB_ID = "smart-settings"
-        private const val VERSION = 1
+
+        /** 0.52 design §5.2: profiles were removed from this blob; v1 stays readable for the upgrade (ruling R7). */
+        private const val VERSION = 2
+        private const val LEGACY_VERSION = 1
     }
 }

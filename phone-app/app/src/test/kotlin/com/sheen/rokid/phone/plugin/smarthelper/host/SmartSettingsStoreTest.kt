@@ -1,20 +1,21 @@
 package com.sheen.rokid.phone.plugin.smarthelper.host
 import com.sheen.rokid.phone.ui.profile.TestBlobs
-import com.sheen.rokid.phone.storage.unavailable
 
 import com.sheen.rokid.phone.storage.writeJson
-import com.sheen.rokid.plugin.CancellationHandle
-import com.sheen.rokid.plugin.CapabilityVerification
 import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.ModelProfile
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.SecretHandle
-import com.sheen.rokid.storage.ProfileRepository
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
@@ -33,17 +34,8 @@ import org.junit.Test
  */
 class SmartSettingsStoreTest {
 
-    private class Repo(private val profiles: List<ModelProfile>) : ProfileRepository {
-        override fun list(): List<ModelProfile> = profiles
-        override fun get(id: String): ModelProfile? = profiles.firstOrNull { it.id == id }
-        override fun save(profile: ModelProfile) = profile
-        override fun delete(id: String) = Unit
-        override fun verify(id: String, result: CapabilityVerification) = Unit
-        override fun listenChanges(listener: (String) -> Unit): CancellationHandle =
-            object : CancellationHandle { override fun cancel() = Unit }
-    }
-
-    private fun profile(id: String) = ModelProfile(id, 7, "Synthetic $id", "Synthetic",
+    private fun profile(id: String) = ModelProfile(
+        id, 7, "Synthetic $id", "Synthetic",
         "https://synthetic.example/v1", "DEEPSEEK_RESPONSES", "synthetic-model",
         object : SecretHandle { override val id = "draft-placeholder" },
         4096, 2048, 1024, 128, 5000, setOf(InputModality.TEXT), setOf(OutputModality.TEXT), emptyList())
@@ -55,7 +47,6 @@ class SmartSettingsStoreTest {
         assertEquals(listOf("伊迪丝", "edith"), settings.wakeWords)
         assertEquals("L1", settings.maxLevel)
         assertTrue(settings.whitelist.isEmpty())
-        assertNull("no profile is chosen until one exists", settings.profileId)
         assertEquals(3000L, settings.cooldownMillis)
     }
 
@@ -67,7 +58,6 @@ class SmartSettingsStoreTest {
             wakeWords = listOf("伊迪丝", "edith", "小助手"),
             maxLevel = "L2",
             whitelist = listOf("open_app|navigation"),
-            profileId = "p-1",
             cooldownMillis = 4500L,
         )
 
@@ -77,51 +67,19 @@ class SmartSettingsStoreTest {
     }
 
     @Test
-    fun anEmptyStoreLoadsTheDefaultsWithTheFirstAvailableProfile() {
-        val store = SmartSettingsStore(TestBlobs())
-
-        val loaded = store.load(Repo(listOf(profile("first"), profile("second"))))
-
-        assertEquals(listOf("伊迪丝", "edith"), loaded.wakeWords)
-        assertEquals("L1", loaded.maxLevel)
-        assertEquals("first", loaded.profileId)
-        assertEquals(3000L, loaded.cooldownMillis)
-    }
-
-    @Test
     fun aCorruptStoreLoadsTheDefaultsInsteadOfFailingValidation() {
         val blobs = TestBlobs()
         blobs.values[SmartSettingsStore.BLOB_ID] = "{ not json".toByteArray()
 
-        val loaded = SmartSettingsStore(blobs).load(Repo(listOf(profile("only"))))
+        val loaded = SmartSettingsStore(blobs).load()
 
-        assertEquals(SmartSettings().copy(profileId = "only"), loaded)
-    }
-
-    @Test
-    fun aStoredBlobWithAProfileThatNoLongerExistsFallsBackToTheAvailableOne() {
-        val blobs = TestBlobs()
-        SmartSettingsStore(blobs).save(SmartSettings(profileId = "deleted"))
-
-        val loaded = SmartSettingsStore(blobs).load(Repo(listOf(profile("available"))))
-
-        assertEquals("available", loaded.profileId)
-    }
-
-    @Test
-    fun anExplicitlyChosenProfileIsKeptWhenItStillExists() {
-        val blobs = TestBlobs()
-        SmartSettingsStore(blobs).save(SmartSettings(profileId = "chosen"))
-
-        val loaded = SmartSettingsStore(blobs).load(Repo(listOf(profile("available"), profile("chosen"))))
-
-        assertEquals("chosen", loaded.profileId)
+        assertEquals(SmartSettings(), loaded)
     }
 
     @Test
     fun theConfigurationValuesUseTheKeyNamesThePluginKnows() {
         val settings = SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
-            profileId = "p-1", cooldownMillis = 3000L)
+            cooldownMillis = 3000L)
 
         val values = settings.pluginValues(profile("p-1"))
 
@@ -490,7 +448,6 @@ class SmartSettingsStoreTest {
             wakeWords = listOf("伊迪丝", "edith", "小助手"),
             maxLevel = "L2",
             whitelist = listOf("open_app|navigation"),
-            profileId = "p-1",
             cooldownMillis = 4500L,
             proactiveCooldownMillis = 300_000L,
             proactiveSensitivity = "HIGH",
@@ -556,28 +513,80 @@ class SmartSettingsStoreTest {
         assertFalse(stored.proactiveEnabled)
     }
 
+    /**
+     * 0.52 design §5.2 / ruling R7: the model selection moved into the catalog, so a blob written before this version
+     * still carries a `profileId` key. The store must load every other key and simply ignore it - refusing the old blob
+     * would silently reset all of the user's assistant settings on upgrade.
+     */
     @Test
-    fun anUnreadableProfileRepositoryDoesNotStopTheSettingsFromResolving() {
-        // The composition reads the settings while it assembles the plugin. The profile repository can genuinely
-        // refuse (`ContractError.ConfigurationRejected("Storage unavailable; reconfigure")` when the keystore cannot
-        // be opened), and an exception here would take the whole composition - and with it the passive loop - down.
-        // The shape must stay usable so the caller can still build an accepted configuration.
-        val refusing = object : ProfileRepository {
-            override fun list(): List<ModelProfile> = throw com.sheen.rokid.contracts.ContractError.ConfigurationRejected("no storage")
-            override fun get(id: String): ModelProfile? = throw com.sheen.rokid.contracts.ContractError.ConfigurationRejected("no storage")
-            override fun save(profile: ModelProfile) = profile
-            override fun delete(id: String) = Unit
-            override fun verify(id: String, result: CapabilityVerification) = Unit
-            override fun listenChanges(listener: (String) -> Unit): CancellationHandle =
-                object : CancellationHandle { override fun cancel() = Unit }
-        }
+    fun aV1BlobLoadsEveryOtherKeyAndIgnoresProfileId() {
+        val blobs = TestBlobs()
+        writeJson(blobs, SmartSettingsStore.BLOB_ID, buildJsonObject {
+            put("version", 1)
+            put("wakeWords", buildJsonArray { add("伊迪丝"); add("edith") })
+            put("maxLevel", "L3")
+            put("whitelist", buildJsonArray { add("launch|app") })
+            // The removed field: written by every pre-0.52 install, ignored rather than treated as corrupt.
+            put("profileId", "legacy-profile")
+            put("cooldownMillis", 4500L)
+            put("proactiveCooldownMillis", 120_000L)
+            put("proactiveSensitivity", "high")
+            put("proactiveEnabled", false)
+            put("speechEnabled", true)
+            put("continueDialogue", false)
+            put("visionEnabled", false)
+            put("noInterception", true)
+            put("glassesDetached", true)
+            put("ballOpacityPercent", 41)
+            put("bubbleOpacityPercent", 57)
+            put("speechConfigured", true)
+        })
 
-        val settings = SmartSettings(profileId = "chosen")
+        val loaded = SmartSettingsStore(blobs).load()
 
-        val resolved = settings.resolveProfileId(refusing)
+        assertEquals(listOf("伊迪丝", "edith"), loaded.wakeWords)
+        assertEquals("L3", loaded.maxLevel)
+        assertEquals(listOf("launch|app"), loaded.whitelist)
+        assertEquals(4500L, loaded.cooldownMillis)
+        assertEquals(120_000L, loaded.proactiveCooldownMillis)
+        assertEquals("HIGH", loaded.effectiveProactiveSensitivity())
+        assertFalse(loaded.proactiveEnabled)
+        assertTrue(loaded.speechEnabled)
+        assertFalse(loaded.continueDialogue)
+        assertFalse(loaded.visionEnabled)
+        assertTrue(loaded.noInterception)
+        assertTrue(loaded.glassesDetached)
+        assertEquals(41, loaded.ballOpacityPercent)
+        assertEquals(57, loaded.bubbleOpacityPercent)
+        assertTrue(loaded.speechConfigured)
+    }
 
-        assertEquals("the stored choice is kept when the repository cannot answer", "chosen", resolved)
-        assertTrue("the configuration shape must still validate",
-            settings.pluginValues(null).getValue("profileId").isNotBlank())
+    /**
+     * 0.52 design §5.2: the store writes `version: 2` and no longer persists a profile selection. The catalog is the
+     * only owner of that choice, so a `profileId` key in the settings blob would be a second, stale source.
+     */
+    @Test
+    fun saveWritesVersionTwoAndNoProfileIdKey() {
+        val blobs = TestBlobs()
+        val settings = SmartSettings(
+            wakeWords = listOf("伊迪丝"),
+            maxLevel = "L2",
+            whitelist = listOf("launch|app"),
+            cooldownMillis = 4200L,
+            proactiveEnabled = false,
+        )
+
+        SmartSettingsStore(blobs).save(settings)
+
+        val json = Json.parseToJsonElement(
+            blobs.values.getValue(SmartSettingsStore.BLOB_ID).toString(Charsets.UTF_8),
+        ).jsonObject
+        assertEquals(2, json.getValue("version").jsonPrimitive.int)
+        assertFalse("the catalog owns the selection; the settings blob must not carry a profileId",
+            "profileId" in json)
+        assertEquals("L2", json.getValue("maxLevel").jsonPrimitive.content)
+        assertEquals(listOf("伊迪丝"), json.getValue("wakeWords").jsonArray.map { it.jsonPrimitive.content })
+        // And the written blob still loads back as the same settings.
+        assertEquals(settings, SmartSettingsStore(blobs).load())
     }
 }

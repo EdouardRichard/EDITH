@@ -150,9 +150,10 @@ class MainActivity : ComponentActivity() {
         val viewModel = ViewModelProvider(this, object : ViewModelProvider.Factory {
             @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = SessionViewModel(root) as T
         })[SessionViewModel::class.java]
-        val profileViewModel = if (root.profileTester != null) ViewModelProvider(this, object : ViewModelProvider.Factory {
-            @Suppress("UNCHECKED_CAST") override fun <T : ViewModel> create(modelClass: Class<T>): T = requireNotNull(root.profileViewModel()) as T
-        })[ProfileViewModel::class.java] else null
+        // 0.52: the model catalog owns the model configuration; the legacy profile editor is retired with it (Task 7
+        // deletes the page). The parameter is kept nullable so `PhoneScreen` compiles and shows its
+        // 「模型服务不可用」 branch until then; production must not construct the old repository or view model.
+        val profileViewModel: ProfileViewModel? = root.profileViewModel()
         setContent {
             MaterialTheme(colorScheme = lightColorScheme(primary = Color(0xFF126B50), secondary = Color(0xFF405B79))) {
                 val state by viewModel.state.collectAsStateWithLifecycle()

@@ -14,9 +14,9 @@ import org.junit.Test
  * 0.3 Phase 2.1 Task 4 fix + final whole-branch fix: the automatic-vision profile gate.
  *
  * Two properties are pinned here:
- * 1. The gate resolves the profile the **turn** is configured with, not the assembly-time settings choice. The turn
- *    configuration reads the repository's per-plugin selection first (`AndroidProfileRepository.selections()`) and only
- *    falls back to the settings-resolved profile when there is no usable selection.
+ * 1. The gate resolves the profile the **turn** is configured with, not an assembly-time snapshot. 0.52 collapsed the
+ *    old two-source rule into the active catalog projection, so this suite now pins the generic resolution mechanics
+ *    (`selection` first, `fallback` only when it is absent/unreadable) the production call site still uses.
  * 2. Declaring `IMAGE` is necessary but not sufficient: the profile's latest `IMAGE_REQUEST` verification for its
  *    **current revision** must be `Verified`, because `CapabilityGate` rejects any request carrying an image otherwise
  *    and that rejection ends the whole turn. The selection rule is copied from `CapabilityGate` (same revision, max

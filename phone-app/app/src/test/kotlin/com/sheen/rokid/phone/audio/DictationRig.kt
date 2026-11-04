@@ -77,7 +77,6 @@ import com.sheen.rokid.plugin.SystemOneQuestion
 import com.sheen.rokid.plugin.SystemOneResult
 import com.sheen.rokid.plugin.SystemOneService
 import com.sheen.rokid.plugin.SystemOneStatus
-import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.storage.ProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
@@ -372,8 +371,8 @@ internal class DictationRig(
         val gate = detachedGate(detached)
         val wiring = SmartWiring(
             SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
-                profileId = chosen.id, cooldownMillis = 3000L),
-            FixedProfiles(chosen), clock, ManualScheduler(clock))
+                cooldownMillis = 3000L),
+            FixedProfiles(chosen), clock, ManualScheduler(clock), activeProfile = { chosen })
         val hostHolder = arrayOfNulls<HostRuntime>(1)
         val wakeVad = AlwaysSpeechVad()
         val wakeDetector = WakeWordDetector(wakeVad, wakeEngine, emit = { _, _ -> }, clock = clock)
@@ -404,7 +403,7 @@ internal class DictationRig(
             ),
             storageFor = { StubStorage() })
         hostHolder[0] = HostRuntime(1, environment)
-        root = HostCompositionRoot(hostHolder[0]!!, MemoryProfileRepository(), model, environment,
+        root = HostCompositionRoot(hostHolder[0]!!, FixedProfiles(chosen), model, environment,
             smartWiring = wiring,
             rokidConnectionFactory = if (withConnection) {
                 { FakeConnection(transportPort, connectionCommands) }

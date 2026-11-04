@@ -31,7 +31,6 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.DetachGate
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettings
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartSettingsStore
 import com.sheen.rokid.phone.plugin.smarthelper.host.SmartWiring
-import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.phone.ui.profile.TestBlobs
 import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.ActionDescriptor
@@ -376,8 +375,8 @@ class DetachedAudioWiringTest {
             val chosen = profile("p-1")
             val wiring = SmartWiring(
                 SmartSettings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L1", whitelist = emptyList(),
-                    profileId = chosen.id, cooldownMillis = 3000L),
-                FixedProfiles(chosen), clock, ManualScheduler(clock))
+                    cooldownMillis = 3000L),
+                FixedProfiles(chosen), clock, ManualScheduler(clock), activeProfile = { chosen })
             val environment = CxrHostEnvironment(clock = clock, input = loop, liveOutput = { LiveDisplay() },
                 scheduler = ManualScheduler(clock),
                 providers = mapOf(
@@ -395,7 +394,7 @@ class DetachedAudioWiringTest {
                     Capability.ConversationDisplay to NoConversationDisplay(),
                 ),
                 storageFor = { StubStorage() })
-            root = HostCompositionRoot(HostRuntime(1, environment), MemoryProfileRepository(), InertModel(),
+            root = HostCompositionRoot(HostRuntime(1, environment), FixedProfiles(chosen), InertModel(),
                 environment,
                 smartWiring = wiring,
                 rokidConnectionFactory = if (withConnection) { { FakeTransportConnection(transport) } } else null,

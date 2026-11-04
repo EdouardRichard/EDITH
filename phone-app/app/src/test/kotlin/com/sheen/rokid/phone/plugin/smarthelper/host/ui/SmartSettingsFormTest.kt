@@ -20,7 +20,6 @@ class SmartSettingsFormTest {
         wakeWords: List<String> = listOf("伊迪丝", "edith"),
         maxLevel: String = "L1",
         whitelist: List<String> = emptyList(),
-        profileId: String? = null,
         cooldownMillis: Long = 3000L,
         proactiveCooldownMillis: Long = 60_000L,
         proactiveSensitivity: String = "LOW",
@@ -28,7 +27,7 @@ class SmartSettingsFormTest {
         continueDialogue: Boolean = true,
         visionEnabled: Boolean = true,
         noInterception: Boolean = false,
-    ) = SmartSettings(wakeWords, maxLevel, whitelist, profileId, cooldownMillis,
+    ) = SmartSettings(wakeWords, maxLevel, whitelist, cooldownMillis,
         proactiveCooldownMillis, proactiveSensitivity, proactiveEnabled, continueDialogue = continueDialogue,
         visionEnabled = visionEnabled, noInterception = noInterception)
 
@@ -171,7 +170,7 @@ class SmartSettingsFormTest {
     @Test
     fun fromSettingsFormatsEveryFieldAndToSettingsRebuildsTheSameSettings() {
         val original = settings(wakeWords = listOf("伊迪丝", "edith"), maxLevel = "L2",
-            whitelist = listOf("launch|app", "note|storage"), profileId = "p-1", cooldownMillis = 2500L)
+            whitelist = listOf("launch|app", "note|storage"), cooldownMillis = 2500L)
 
         val draft = SmartSettingsForm.fromSettings(original)
         assertEquals("伊迪丝,edith", draft.wakeWords)
@@ -184,15 +183,14 @@ class SmartSettingsFormTest {
         assertEquals(listOf("伊迪丝", "edith"), result.settings.wakeWords)
         assertEquals("L2", result.settings.maxLevel)
         assertEquals(listOf("launch|app", "note|storage"), result.settings.whitelist)
-        // The profile selection and the cooldown are not fields of this form: they must survive untouched.
-        assertEquals("p-1", result.settings.profileId)
+        // The cooldown is not a field of this form: it must survive untouched.
         assertEquals(2500L, result.settings.cooldownMillis)
     }
 
     @Test
     fun fromSettingsAndToSettingsRoundTripAFullSettingsValue() {
         val original = settings(wakeWords = listOf("小艾"), maxLevel = "L4",
-            whitelist = listOf("call|contacts"), profileId = "p-2", cooldownMillis = 1500L)
+            whitelist = listOf("call|contacts"), cooldownMillis = 1500L)
 
         // The form owns three of the five fields; the other two are the base's, so a real round trip starts from
         // the value being edited (which is what the screen does: it loads the stored settings as the base).
@@ -363,12 +361,11 @@ class SmartSettingsFormTest {
 
     @Test
     fun aDraftAlwaysProducesUsableSettings() {
-        val base = settings(profileId = "p-1", cooldownMillis = 7000L)
+        val base = settings(cooldownMillis = 7000L)
 
         val result = SmartSettingsForm.toSettings(SmartSettingsForm.Draft("1234", "L9", "launch"), base)
 
         assertNotEquals("a rejected level must not become a level the plugin refuses", "L9", result.settings.maxLevel)
-        assertEquals("p-1", result.settings.profileId)
         assertEquals(7000L, result.settings.cooldownMillis)
     }
 
