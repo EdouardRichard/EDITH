@@ -1,5 +1,4 @@
 package com.sheen.rokid.phone.storage
-import kotlinx.serialization.json.JsonObject
 import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.storage.ProfileRepository
@@ -138,15 +137,6 @@ class AndroidProfileRepository(private val blobs: EncryptedBlobStore, private va
     }
 }
 
-internal inline fun <T> safely(block: () -> T): T = try { block() } catch (_: Exception) { unavailable() }
-internal fun readJson(blobs: EncryptedBlobStore, id: String): JsonObject? {
-    val bytes = safely { blobs.read(id) } ?: return null
-    return try { safely { Json.parseToJsonElement(bytes.toString(Charsets.UTF_8)).jsonObject } } finally { bytes.fill(0) }
-}
-internal fun writeJson(blobs: EncryptedBlobStore, id: String, value: JsonObject) {
-    val bytes = value.toString().toByteArray(Charsets.UTF_8)
-    try { safely { blobs.write(id, bytes) } } finally { bytes.fill(0) }
-}
 private fun JsonObject.strings() = mapValues { it.value.jsonPrimitive.content }
 private fun JsonObject.text(key: String) = getValue(key).jsonPrimitive.content
 private fun JsonObject.int(key: String) = getValue(key).jsonPrimitive.int
