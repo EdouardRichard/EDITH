@@ -154,6 +154,37 @@ class AndroidModelCatalogRepositoryTest {
         assertFalse(repository.isCredentialReferenced(credentials.revoked.single().id))
     }
 
+    @Test fun `a catalog read failure zeros the new key and revokes the staged credential`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        val old = repository.saveProvider(provider(), "synthetic-old-key".toCharArray())
+        val storedBefore = bytes(blobs, ModelCatalogJson.BLOB_ID)
+        blobs.failReadId = ModelCatalogJson.BLOB_ID
+        val newKey = "synthetic-new-key".toCharArray()
+
+        val error = assertThrows(ContractError.ConfigurationRejected::class.java) {
+            repository.saveProvider(old.copy(name = "Renamed provider"), newKey)
+        }
+
+        assertEquals("Storage unavailable; reconfigure", error.message)
+        // R15: the credential store owns the caller's buffer as soon as it is staged, even when the read fails first.
+        assertTrue(newKey.all { it == '\u0000' })
+        assertEquals(2, credentials.stageCalls)
+        val stagedNow = credentials.stagedIds.last()
+        assertEquals(listOf(stagedNow), credentials.revoked.map { it.id })
+        assertFalse(credentials.revoked.any { it.id == old.secretHandleId })
+        assertFalse(credentials.staged.containsKey(stagedNow))
+        assertEquals(storedBefore, bytes(blobs, ModelCatalogJson.BLOB_ID))
+
+        // Once the catalog is readable again, the failed save left no trace: no handle is referenced by it.
+        blobs.failReadId = null
+        assertEquals(listOf(old), repository.catalog().providers)
+        assertEquals(old.secretHandleId, repository.providerSecret("provider-1")?.id)
+        assertTrue(repository.isCredentialReferenced(old.secretHandleId!!))
+        assertFalse(repository.isCredentialReferenced(stagedNow))
+    }
+
     @Test fun `the derived profile secret is admitted by the vault authority predicate`() {
         val blobs = Blobs()
         val credentials = Credentials()

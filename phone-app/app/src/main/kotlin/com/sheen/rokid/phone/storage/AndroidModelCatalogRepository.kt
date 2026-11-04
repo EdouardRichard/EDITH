@@ -41,11 +41,13 @@ class AndroidModelCatalogRepository(
         val deliveries: List<Subscription>
         try {
             synchronized(lock) {
+                // R15: stage before the read. The credential store owns the caller's buffer, so a read failure must not
+                // leave it unzeroed; the catch below revokes this pending handle when the read rejects.
+                if (newSecret != null) staged = credentials.stage(newSecret)
                 val previous = load()
                 val index = previous.providers.indexOfFirst { it.id == provider.id }
                 val old = previous.providers.getOrNull(index)
                 oldHandleId = old?.secretHandleId
-                if (newSecret != null) staged = credentials.stage(newSecret)
                 val revision = if (old == null) 1L else Math.addExact(old.revision, 1L)
                 saved = provider.copy(
                     secretHandleId = staged?.id ?: oldHandleId,
