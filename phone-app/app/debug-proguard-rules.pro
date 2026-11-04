@@ -17,6 +17,17 @@
 -keep class androidx.compose.ui.platform.InfiniteAnimationPolicy$DefaultImpls { *; }
 -keep class androidx.compose.ui.platform.InfiniteAnimationPolicyKt { *; }
 
+# Compose test runtime ABI (round 2). The instrumentation `ComposeRootRegistry` calls
+# `ViewRootForTest.Companion.setOnViewCreatedCallback`, a member production never touches, so R8
+# kept the class and the getter but stripped the setter. Every Compose test then died before its
+# body with
+# `NoSuchMethodError: No virtual method setOnViewCreatedCallback(Lkotlin/jvm/functions/Function1;)V
+# in class Landroidx/compose/ui/platform/ViewRootForTest$Companion;`.
+# Keep the whole `androidx.compose.ui.platform` package and its members in debug instead of naming
+# one member at a time: compose-ui-test reaches directly into this package's internal ABI, so the
+# next stripped member would fail the same way. Debug-only, like the rules above.
+-keep class androidx.compose.ui.platform.** { *; }
+
 # edith-0.2: the publisher's Laya host (vendored under com.laya) and our wrapper over it are exercised by
 # instrumentation and, so far, by nothing in production — the proactive gate that calls them lands in
 # Phase B. Without these rules R8 strips both and the smoke test fails with
