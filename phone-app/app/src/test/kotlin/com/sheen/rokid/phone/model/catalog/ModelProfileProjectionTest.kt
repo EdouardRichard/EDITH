@@ -4,6 +4,7 @@ import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.OutputModality
 import com.sheen.rokid.plugin.ThinkingEffort
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -26,6 +27,7 @@ class ModelProfileProjectionTest {
         output: Int = 8_192,
         thinkingEnabled: Boolean = false,
         thinkingEffort: ThinkingEffort = ThinkingEffort.LOW,
+        thinkingSupported: Boolean = true,
     ): ModelEntry = ModelEntry(
         id = id,
         displayName = "Model $id",
@@ -35,7 +37,7 @@ class ModelProfileProjectionTest {
         outputs = setOf(OutputModality.TEXT),
         thinkingEnabled = thinkingEnabled,
         thinkingEffort = thinkingEffort,
-        thinkingSupported = true,
+        thinkingSupported = thinkingSupported,
         origin = ModelOrigin.GATEWAY,
     )
 
@@ -77,6 +79,13 @@ class ModelProfileProjectionTest {
         )
         assertTrue(p.thinkingEnabled)
         assertEquals(ThinkingEffort.MAX, p.thinkingEffort)
+        assertTrue(p.thinkingSupported)
+    }
+
+    @Test fun `a projected profile propagates the thinking capability of its model`() {
+        // R21: the adapter gate consumes this bit, so a non-DeepSeek entry must project as unsupported.
+        assertTrue(ModelProfileProjection.toProfile(provider(), entry(thinkingSupported = true)).thinkingSupported)
+        assertFalse(ModelProfileProjection.toProfile(provider(), entry(thinkingSupported = false)).thinkingSupported)
     }
 
     @Test fun `a catalog projects only its active provider and selected model`() {

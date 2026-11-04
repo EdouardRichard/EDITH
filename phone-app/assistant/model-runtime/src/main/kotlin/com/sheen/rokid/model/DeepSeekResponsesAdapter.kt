@@ -40,10 +40,14 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             put("instructions", frame.systemText)
             put("stream", true)
             put("max_output_tokens", profile.maxOutputTokens)
-            // 0.52 design §5.7: state reasoning explicitly even when it is off — DeepSeek defaults thinking on, so an
-            // absent field is not the same request. A tool request is always `none` (measured: otherwise the
-            // deliberation is charged against the output budget and the tool call never arrives).
-            put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile, tools.isNotEmpty())) })
+            // 0.52 design §5.7 + R21: state reasoning explicitly when the model is DeepSeek-family — it defaults
+            // thinking on, so an absent field is not the same request. A non-DeepSeek OpenAI-compatible gateway may
+            // reject the native field, so a text-only request to one keeps the pre-0.5.2 body. A tool request keeps
+            // the explicit `none` on every protocol (measured: otherwise the deliberation is charged against the
+            // output budget and the tool call never arrives).
+            if (tools.isNotEmpty() || profile.thinkingSupported) {
+                put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile, tools.isNotEmpty())) })
+            }
             if (tools.isNotEmpty()) {
                 put("tool_choice", "auto")
                 put("tools", buildJsonArray { tools.forEach(::add) })
@@ -121,9 +125,12 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
             // when the request declares no cap of its own (every pre-0.3 caller).
             put("max_output_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
-            // 0.52 design §5.7: both overloads write the same mapping, including the explicit `none` for a text-only
-            // request (DeepSeek defaults thinking on). A tool request forces `none` — see the legacy overload.
-            put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile, tools.isNotEmpty())) })
+            // 0.52 design §5.7 + R21: both overloads write the same gated mapping — the explicit `none` for a
+            // supported text-only request, the pre-0.5.2 omission for an unsupported text-only one, and `none` for
+            // every tool request (see the legacy overload).
+            if (tools.isNotEmpty() || profile.thinkingSupported) {
+                put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile, tools.isNotEmpty())) })
+            }
             if (tools.isNotEmpty()) {
                 // Measured, not guessed (T4 + the T5 ten-step run). Without `reasoning.effort = "none"` the turn comes
                 // back `incomplete/max_output_tokens`: the deliberation is charged against the output budget and the
@@ -214,7 +221,7 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
     /**
      * 0.52 design §5.7: the Responses `reasoning.effort` wire value. A tool request is always `none` (the measured
      * tool turn needs it), and a disabled profile is stated as `none` rather than omitted because DeepSeek defaults
-     * thinking on.
+     * thinking on. Only called when the model is DeepSeek-family (R21) or the request is a tool request.
      */
     private fun reasoningEffort(profile: ModelProfile, toolRequest: Boolean): String =
         if (toolRequest || !profile.thinkingEnabled) "none"

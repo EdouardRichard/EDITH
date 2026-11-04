@@ -246,7 +246,7 @@ data: {"type":"response.completed","sequence_number":1,"response":{"id":"r","sta
 
     @Test fun `text only request keeps P2 key set without tool keys`() {
         val body = encodedBody(requestFixture())
-        assertEquals(setOf("model", "instructions", "stream", "max_output_tokens", "reasoning", "input"), body.keys)
+        assertEquals(setOf("model", "instructions", "stream", "max_output_tokens", "input"), body.keys)
     }
 
     @Test fun `tool history encodes echoed function call then its output`() {

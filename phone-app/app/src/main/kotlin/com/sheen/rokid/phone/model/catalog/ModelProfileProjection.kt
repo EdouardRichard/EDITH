@@ -56,6 +56,8 @@ object ModelProfileProjection {
             verifications = entry.verifications,
             thinkingEnabled = entry.thinkingEnabled,
             thinkingEffort = entry.thinkingEffort,
+            // R21: the adapter gate is a projection of the catalog capability, never a name/vendor heuristic.
+            thinkingSupported = entry.thinkingSupported,
         )
     }
 }

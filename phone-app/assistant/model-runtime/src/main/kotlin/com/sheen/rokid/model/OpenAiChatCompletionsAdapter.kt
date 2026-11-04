@@ -50,12 +50,15 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             put("stream_options", buildJsonObject { put("include_usage", true) })
             put("modalities", buildJsonArray { add("text") })
             put("max_tokens", profile.maxOutputTokens)
-            // 0.52 design §5.7: Chat Completions spells the switch as `thinking.type` plus a top-level
+            // 0.52 design §5.7 + R21: Chat Completions spells the switch as `thinking.type` plus a top-level
             // `reasoning_effort`; the vendor-only `enable_thinking` and a reasoning token budget are not used. A tool
             // request always turns thinking off — the measured tool turn needs `none` to keep the output budget for
-            // the call itself.
-            put("thinking", buildJsonObject { put("type", thinkingType(profile, frame.tools.isNotEmpty())) })
-            put("reasoning_effort", reasoningEffort(profile, frame.tools.isNotEmpty()))
+            // the call itself. Both fields are DeepSeek-native: an OpenAI-compatible non-DeepSeek endpoint may reject
+            // them, so they are sent only when the projected model declares support (the pre-0.5.2 body otherwise).
+            if (profile.thinkingSupported) {
+                put("thinking", buildJsonObject { put("type", thinkingType(profile, frame.tools.isNotEmpty())) })
+                put("reasoning_effort", reasoningEffort(profile, frame.tools.isNotEmpty()))
+            }
             if (frame.tools.isNotEmpty()) {
                 put("tools", buildJsonArray { frame.tools.forEach { add(toolDescriptor(it)) } })
                 put("tool_choice", "auto")
@@ -209,11 +212,14 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
             // when the request declares no cap of its own (every pre-0.3 caller).
             put("max_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
-            // 0.52 design §5.7: the same mapping as the legacy overload; the live path must not drift from it.
-            put("thinking", buildJsonObject {
-                put("type", thinkingType(profile, budgeted.request.tools.isNotEmpty()))
-            })
-            put("reasoning_effort", reasoningEffort(profile, budgeted.request.tools.isNotEmpty()))
+            // 0.52 design §5.7 + R21: the same gated mapping as the legacy overload; the live path must not drift.
+            // A non-DeepSeek profile keeps the pre-0.5.2 body: neither native field is sent.
+            if (profile.thinkingSupported) {
+                put("thinking", buildJsonObject {
+                    put("type", thinkingType(profile, budgeted.request.tools.isNotEmpty()))
+                })
+                put("reasoning_effort", reasoningEffort(profile, budgeted.request.tools.isNotEmpty()))
+            }
             if (budgeted.request.tools.isNotEmpty()) {
                 // 0.52 live-path repair: the budgeted overload dropped the tool table that the legacy frame overload
                 // always sent, so a live Chat tool turn reached the endpoint unable to call anything.

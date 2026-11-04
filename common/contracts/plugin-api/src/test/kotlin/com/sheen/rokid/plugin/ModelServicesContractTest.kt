@@ -116,10 +116,17 @@ class ModelServicesContractTest {
         val profile = profile()
         assertFalse(profile.thinkingEnabled)
         assertEquals(ThinkingEffort.LOW, profile.thinkingEffort)
+        // R21: the DeepSeek-native thinking fields are gated on this capability bit, so it defaults off and safe.
+        assertFalse(profile.thinkingSupported)
 
-        val enabled = profile.copy(thinkingEnabled = true, thinkingEffort = ThinkingEffort.MAX)
+        val enabled = profile.copy(
+            thinkingEnabled = true,
+            thinkingEffort = ThinkingEffort.MAX,
+            thinkingSupported = true,
+        )
         assertTrue(enabled.thinkingEnabled)
         assertEquals(ThinkingEffort.MAX, enabled.thinkingEffort)
+        assertTrue(enabled.thinkingSupported)
         assertFalse(enabled.toString().contains("thinking", ignoreCase = true))
         assertFalse(enabled.toString().contains("MAX"))
     }

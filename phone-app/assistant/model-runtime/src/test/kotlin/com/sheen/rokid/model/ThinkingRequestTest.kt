@@ -39,14 +39,25 @@ class ThinkingRequestTest {
     )
 
     private fun responsesProfile(enabled: Boolean = false, effort: ThinkingEffort = ThinkingEffort.LOW) =
-        profileFixture().copy(thinkingEnabled = enabled, thinkingEffort = effort)
+        profileFixture().copy(thinkingEnabled = enabled, thinkingEffort = effort, thinkingSupported = true)
 
     private fun chatProfile(enabled: Boolean = false, effort: ThinkingEffort = ThinkingEffort.LOW) =
         profileFixture().copy(
             protocolId = "OPENAI_CHAT_COMPLETIONS",
             thinkingEnabled = enabled,
             thinkingEffort = effort,
+            thinkingSupported = true,
         )
+
+    /**
+     * A non-DeepSeek family model. Thinking is even switched on to prove the gate wins: the native fields are never
+     * sent based on the profile's own choice, only on the model's capability bit (R21).
+     */
+    private fun nonDeepSeekResponsesProfile() = responsesProfile(enabled = true, effort = ThinkingEffort.MAX)
+        .copy(thinkingSupported = false)
+
+    private fun nonDeepSeekChatProfile() = chatProfile(enabled = true, effort = ThinkingEffort.MAX)
+        .copy(thinkingSupported = false)
 
     private fun frame(tools: List<ToolSpec>) = RequestFrame(
         listOf(Segment(SegmentOrigin.INSTRUCTIONS, true, "synthetic instructions")),
@@ -140,6 +151,51 @@ class ThinkingRequestTest {
             assertEquals("record_note", body.getValue("tools").jsonArray.single().jsonObject
                 .getValue("function").jsonObject.getValue("name").jsonPrimitive.content, path)
             assertEquals("auto", body.getValue("tool_choice").jsonPrimitive.content, path)
+        }
+    }
+
+    @Test fun `responses text only omits reasoning for a non deepseek model`() {
+        for ((path, body) in responsesBodies(nonDeepSeekResponsesProfile())) {
+            assertEquals(
+                setOf("model", "instructions", "stream", "max_output_tokens", "input"),
+                body.keys,
+                "$path must restore the pre-0.5.2 text-only shape for a non-DeepSeek model",
+            )
+            assertFalse("reasoning" in body, "$path must not send a DeepSeek-native reasoning field")
+        }
+    }
+
+    @Test fun `responses tool requests keep explicit effort none for a non deepseek model`() {
+        // The measured tool turn needs `none` on every protocol, so the tool path keeps the field even when the
+        // model is not DeepSeek: the ruling gates only the text-only shape.
+        for ((path, body) in responsesBodies(nonDeepSeekResponsesProfile(), tools)) {
+            assertEquals("none", body.reasoningEffort(), path)
+        }
+    }
+
+    @Test fun `chat text only omits the native thinking fields for a non deepseek model`() {
+        for ((path, body) in chatBodies(nonDeepSeekChatProfile())) {
+            assertEquals(
+                setOf("model", "stream", "stream_options", "modalities", "max_tokens", "messages"),
+                body.keys,
+                "$path must restore the pre-0.5.2 text-only shape for a non-DeepSeek model",
+            )
+            assertFalse("thinking" in body, "$path must omit thinking")
+            assertFalse("reasoning_effort" in body, "$path must omit reasoning_effort")
+            assertFalse("enable_thinking" in body, "$path must not use the vendor-only enable_thinking switch")
+        }
+    }
+
+    @Test fun `chat tool requests omit the native thinking fields for a non deepseek model`() {
+        for ((path, body) in chatBodies(nonDeepSeekChatProfile(), tools)) {
+            assertEquals(
+                setOf("model", "stream", "stream_options", "modalities", "max_tokens", "tools", "tool_choice", "messages"),
+                body.keys,
+                "$path must keep the tool table while omitting the DeepSeek-native fields",
+            )
+            assertFalse("thinking" in body, "$path must omit thinking")
+            assertFalse("reasoning_effort" in body, "$path must omit reasoning_effort")
+            assertFalse("enable_thinking" in body, "$path must not use the vendor-only enable_thinking switch")
         }
     }
 

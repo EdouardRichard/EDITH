@@ -45,6 +45,13 @@ data class ModelProfile(
     /** 0.52 design §5.7: reasoning is off by default so a catalog projection leaves existing latency unchanged. */
     val thinkingEnabled: Boolean = false,
     val thinkingEffort: ThinkingEffort = ThinkingEffort.LOW,
+    /**
+     * R21: whether the selected model belongs to the DeepSeek family and accepts its native thinking fields. The
+     * adapters send those fields only when this is true (plus the measured tool-request rule); an OpenAI-compatible
+     * non-DeepSeek gateway may answer HTTP 400 to `thinking`/`reasoning`, so the default is false — the pre-0.5.2 wire
+     * shape — until the catalog knows the model supports them.
+     */
+    val thinkingSupported: Boolean = false,
 ) {
     init {
         require(listOf(id, name, service, baseUrl, protocolId, model, secret.id).all { it.isNotBlank() })
