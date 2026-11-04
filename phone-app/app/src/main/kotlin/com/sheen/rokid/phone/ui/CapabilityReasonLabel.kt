@@ -15,7 +15,7 @@ package com.sheen.rokid.phone.ui
 internal fun capabilityReasonLabel(reason: String): String = when (reason) {
     "TRANSPORT_MISSING" -> "眼镜未连接"
     "ENGINE_MISSING" -> "本机引擎未装配"
-    "MODEL_OPERATION_UNAVAILABLE" -> "模型档案不可用"
+    "MODEL_OPERATION_UNAVAILABLE" -> "模型配置不可用"
     "DISPLAY_MISSING" -> "眼镜显示未就绪"
     "SPEECH_OUTPUT_MISSING" -> "语音输出未装配"
     "HOST_STORAGE_PROVIDER_MISSING" -> "持久存储未装配"

@@ -7,9 +7,9 @@ import kotlinx.serialization.json.jsonObject
 /**
  * The encrypted-blob JSON helpers shared by every storage component in this module.
  *
- * 0.52 Task 2 extracted these from `AndroidProfileRepository.kt` (which Task 7 deletes) so the catalog repository, the
- * namespace store and the legacy janitor all read and write the same way: a read failure or an unparseable document
- * becomes [unavailable], and the plaintext buffer is zeroed after the store copies it.
+ * 0.52 Task 2 extracted these from the profile repository so the catalog repository, the namespace store and the legacy
+ * janitor all read and write the same way: a read failure or an unparseable document becomes [unavailable], and the
+ * plaintext buffer is zeroed after the store copies it.
  */
 internal inline fun <T> safely(block: () -> T): T = try {
     block()

@@ -1,6 +1,6 @@
 package com.sheen.rokid.phone.plugin.smarthelper.host
 import com.sheen.rokid.phone.withP3Sink
-import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.phone.app.CxrAudioChain
 import com.sheen.rokid.phone.bridge.CxrHostEnvironment
 import com.sheen.rokid.phone.app.HostCompositionRoot

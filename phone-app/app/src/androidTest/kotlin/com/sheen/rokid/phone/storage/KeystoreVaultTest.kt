@@ -5,6 +5,9 @@ import android.content.pm.ApplicationInfo
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.phone.model.catalog.ModelEntry
+import com.sheen.rokid.phone.model.catalog.ModelOrigin
+import com.sheen.rokid.phone.model.catalog.Provider
 import com.sheen.rokid.plugin.*
 import org.junit.Assert.*
 import org.junit.Test
@@ -22,7 +25,7 @@ class KeystoreVaultTest {
         val keys = AndroidBlobKeys()
         val prefix = "edith.v1.${dummyDigest(directory.absolutePath)}."
         try {
-            for (manifest in listOf("profiles-manifest", "vault-manifest")) {
+            for (manifest in listOf(ModelCatalogJson.BLOB_ID, "vault-manifest")) {
                 val targetName = dummyDigest(manifest)
                 var failNext = true
                 val blobs = AndroidEncryptedBlobStore({ directory }, keys) { file ->
@@ -40,19 +43,26 @@ class KeystoreVaultTest {
                         }
                     }
                 }
-                val vault = KeystoreVault(blobs); val repo = AndroidProfileRepository(blobs, vault)
+                val vault = KeystoreVault(blobs)
+                val catalog = AndroidModelCatalogRepository(blobs, KeystoreCatalogCredentialStore(vault))
                 assertThrows(ContractError.ConfigurationRejected::class.java) {
-                    if (manifest == "profiles-manifest") repo.saveWithSecret(dummyProfile(), "synthetic-dummy-secret".toCharArray())
+                    if (manifest == ModelCatalogJson.BLOB_ID) catalog.saveProvider(dummyProvider(), "synthetic-dummy-secret".toCharArray())
                     else vault.putSecret("dummy-direct", "synthetic-dummy-secret".toCharArray())
                 }
                 assertFalse(keys.contains(prefix + targetName))
                 assertNull(AndroidEncryptedBlobStore(fixture.context).read(manifest))
-                val handle = if (manifest == "profiles-manifest") repo.saveWithSecret(dummyProfile(), "synthetic-retry".toCharArray()).secret
-                    else vault.putSecret("dummy-direct", "synthetic-retry".toCharArray())
+                val handle = if (manifest == ModelCatalogJson.BLOB_ID) {
+                    val saved = catalog.saveProvider(dummyProvider(), "synthetic-retry".toCharArray())
+                    requireNotNull(catalog.providerSecret(saved.id))
+                } else {
+                    vault.putSecret("dummy-direct", "synthetic-retry".toCharArray())
+                }
                 val restoredBlobs = AndroidEncryptedBlobStore(fixture.context)
                 val restoredVault = KeystoreVault(restoredBlobs)
-                val restoredRepo = AndroidProfileRepository(restoredBlobs, restoredVault)
-                if (manifest == "profiles-manifest") assertEquals(1L, restoredRepo.get("dummy-retry")!!.revision)
+                if (manifest == ModelCatalogJson.BLOB_ID) {
+                    val restored = AndroidModelCatalogRepository(restoredBlobs, KeystoreCatalogCredentialStore(restoredVault))
+                    assertEquals(1L, restored.catalog().providers.single().revision)
+                }
                 restoredVault.withSecret(handle) { assertEquals("synthetic-retry", String(it)) }
             }
             assertEquals("AndroidKeyStore", keys.providerName)
@@ -96,24 +106,74 @@ class KeystoreVaultTest {
         assertThrows(ContractError.ConfigurationRejected::class.java) { KeystoreVault(fixture.blobs).withSecret(ref) { fail("missing manifest accepted") } }
         }
     }
-    @Test fun profileModalitySelectionAndSpeakerDeletionSurviveReconstruction() = DummyVaultFixture().use { fixture ->
-        val repo = AndroidProfileRepository(fixture.blobs, KeystoreVault(fixture.blobs))
-        val draft = ModelProfile("dummy-a", 0, "Synthetic", "Synthetic", "https://synthetic.example/v1", "CUSTOM", "synthetic-model", opaqueSecret("placeholder"),
-            4096, 2048, 1024, 128, 5000, InputModality.entries.toSet(), OutputModality.entries.toSet(), emptyList())
-        val saved = repo.saveWithSecret(draft, "synthetic-dummy-secret".toCharArray()); repo.select("interview-assistant", saved.id)
-        val restored = AndroidProfileRepository(fixture.blobs, KeystoreVault(fixture.blobs))
-        assertEquals(InputModality.entries.toSet(), restored.get(saved.id)!!.inputs)
-        assertEquals(OutputModality.entries.toSet(), restored.get(saved.id)!!.outputs)
-        assertEquals(mapOf("interview-assistant" to saved.id), restored.selections())
+
+    /**
+     * 0.52: the catalog is the only persisted model configuration. A saved provider keeps its model modalities and its
+     * global active selection across a vault reconstruction, and deleting it removes only the catalog's own rows - the
+     * speaker store is another owner and survives.
+     */
+    @Test fun catalogModalitiesSelectionAndSpeakerDeletionSurviveReconstruction() = DummyVaultFixture().use { fixture ->
+        val vault = KeystoreVault(fixture.blobs)
+        val catalog = AndroidModelCatalogRepository(fixture.blobs, KeystoreCatalogCredentialStore(vault))
+        val inputs = setOf(InputModality.TEXT, InputModality.IMAGE, InputModality.AUDIO)
+        val outputs = setOf(OutputModality.TEXT, OutputModality.AUDIO)
+        val saved = catalog.saveProvider(
+            Provider(
+                id = "dummy-a",
+                name = "Synthetic",
+                baseUrl = "https://synthetic.example/v1",
+                protocolId = "CUSTOM",
+                models = listOf(
+                    ModelEntry(
+                        id = "m-a",
+                        displayName = "Synthetic m-a",
+                        contextWindowTokens = 131_072,
+                        maxOutputTokens = 8_192,
+                        inputs = inputs,
+                        outputs = outputs,
+                        origin = ModelOrigin.MANUAL,
+                    ),
+                ),
+            ),
+            "synthetic-dummy-secret".toCharArray(),
+        )
+        catalog.setActiveProvider(saved.id)
+        catalog.selectModel("m-a")
+
+        val restored = AndroidModelCatalogRepository(fixture.blobs, KeystoreCatalogCredentialStore(KeystoreVault(fixture.blobs)))
+        assertEquals(inputs, restored.catalog().providers.single().models.single().inputs)
+        assertEquals(outputs, restored.catalog().providers.single().models.single().outputs)
+        assertEquals(saved.id, restored.catalog().activeProviderId)
+        assertEquals("m-a", restored.catalog().selectedModelId)
+
         val speakers = AndroidSpeakerProfileStore(fixture.blobs); val ref = speakers.save(floatArrayOf(1f, 2f, 3f))
         speakers.delete(SpeakerProfileRef(ref.id, 1)); assertNotNull(speakers.load(ref)); speakers.delete(ref)
         assertNull(AndroidSpeakerProfileStore(fixture.blobs).load(ref))
-        restored.delete(saved.id); assertTrue(AndroidProfileRepository(fixture.blobs, KeystoreVault(fixture.blobs)).selections().isEmpty())
+
+        restored.deleteProvider(saved.id)
+        assertTrue(
+            AndroidModelCatalogRepository(fixture.blobs, KeystoreCatalogCredentialStore(KeystoreVault(fixture.blobs)))
+                .catalog().providers.isEmpty(),
+        )
     }
 }
 
-private fun dummyProfile() = ModelProfile("dummy-retry", 0, "Synthetic", "Synthetic", "https://synthetic.example/v1", "CUSTOM", "synthetic-model", opaqueSecret("placeholder"),
-    4096, 2048, 1024, 128, 5000, setOf(InputModality.TEXT), setOf(OutputModality.TEXT), emptyList())
+private fun dummyProvider() = Provider(
+    id = "dummy-retry",
+    name = "Synthetic",
+    baseUrl = "https://synthetic.example/v1",
+    protocolId = "CUSTOM",
+    models = listOf(
+        ModelEntry(
+            id = "synthetic-model",
+            displayName = "Synthetic",
+            contextWindowTokens = 4096,
+            maxOutputTokens = 1024,
+            origin = ModelOrigin.MANUAL,
+        ),
+    ),
+)
+
 private fun dummyDigest(value: String) = MessageDigest.getInstance("SHA-256").digest(value.toByteArray()).joinToString("") { "%02x".format(it) }
 
 internal class DummyVaultFixture : AutoCloseable {

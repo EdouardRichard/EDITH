@@ -8,7 +8,7 @@ import com.sheen.rokid.phone.model.catalog.ModelOrigin
 import com.sheen.rokid.phone.model.catalog.Provider
 import com.sheen.rokid.phone.storage.AndroidModelCatalogRepository
 import com.sheen.rokid.phone.storage.CatalogProfileRepository
-import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.ModelClient

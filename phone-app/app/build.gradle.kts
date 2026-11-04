@@ -146,8 +146,13 @@ dependencies {
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
     implementation("androidx.compose.ui:ui")
+    // 0.52 Task 7: Compose UI tests. `ui-test-manifest` publishes the host Activity the test rule launches, so it is a
+    // debug/implementation dependency of the app variant, while the JUnit4 rule itself only belongs to the test APK.
+    debugImplementation("androidx.compose.ui:ui-test-manifest")
     testImplementation(libs.junit)
     testImplementation(project(":common:testkit:test-support"))
+    androidTestImplementation(platform(libs.androidx.compose.bom))
+    androidTestImplementation("androidx.compose.ui:ui-test-junit4")
     androidTestImplementation(libs.androidx.test.runner)
     androidTestImplementation(libs.androidx.test.rules)
     androidTestImplementation(libs.androidx.test.ext.junit)

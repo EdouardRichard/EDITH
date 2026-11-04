@@ -7,6 +7,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import org.junit.Assume
 import org.junit.Test
 import org.junit.runner.RunWith
+import org.json.JSONObject
 import java.io.File
 import java.io.RandomAccessFile
 import kotlin.math.abs
@@ -184,8 +185,6 @@ class LayaQuantDeviceTest {
                 com.google.ai.edge.litert.Environment.Option.CompilerPluginLibraryDir to libDir,
             ),
         )
-        var model: com.google.ai.edge.litert.CompiledModel? = null
-        val buffers = mutableListOf<com.google.ai.edge.litert.TensorBuffer>()
         RandomAccessFile(tableFile, "r").use { table ->
             for (accelerator in accelerators) {
             var model: com.google.ai.edge.litert.CompiledModel? = null
@@ -270,6 +269,7 @@ class LayaQuantDeviceTest {
             } finally {
                 buffers.forEach { runCatching { it.close() } }
                 runCatching { model?.close() }
+            }
             }
         }
     }

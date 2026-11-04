@@ -11,12 +11,9 @@ import com.sheen.rokid.model.ProfileProbeTransport
 import com.sheen.rokid.model.ProfileTester
 import com.sheen.rokid.model.RequestConsent
 import com.sheen.rokid.phone.app.HostCompositionRoot
-import com.sheen.rokid.phone.storage.AndroidProfileRepository
-import com.sheen.rokid.phone.storage.KeystoreVault
-import com.sheen.rokid.phone.ui.profile.ProbeConsent
-import com.sheen.rokid.phone.ui.profile.ProfileViewModel
-import com.sheen.rokid.phone.ui.profile.TestBlobs
-import com.sheen.rokid.phone.ui.profile.profile as profileFixture
+import com.sheen.rokid.phone.app.errorLabel
+import com.sheen.rokid.phone.model.ProbeConsent
+import com.sheen.rokid.phone.storage.profile as profileFixture
 import com.sheen.rokid.plugin.*
 import com.sheen.rokid.storage.MemoryProfileRepository
 import com.sheen.rokid.testsupport.FakeClock
@@ -45,7 +42,7 @@ class ProfileImageGateTest {
         assertNull("an image-capable profile starts", profileStartupError(imageProfile()))
         assertNull("an absent profile is a different failure", profileStartupError(null))
 
-        val message = profileFormErrorMessage("PROFILE_MODEL_NOT_MULTIMODAL")
+        val message = errorLabel("PROFILE_MODEL_NOT_MULTIMODAL")
         assertTrue("the prompt must name images: $message", message.contains("图片"))
         assertTrue("the prompt must tell the user to change the profile: $message", message.contains("更换"))
     }
@@ -186,33 +183,6 @@ class ProfileImageGateTest {
         assertFalse("audio is not granted by this version", source(image).audio)
     }
 
-    // ---------------------------------------------------------------- R76: UI trigger
-
-    @Test
-    fun profileViewModelTriggersTheImageProbeOnlyForImageCapableProfiles() {
-        val blobs = TestBlobs()
-        val repository = AndroidProfileRepository(blobs, KeystoreVault(blobs))
-        val tester = RecordingImageTester()
-        val viewModel = ProfileViewModel(repository, tester)
-        try {
-            val image = repository.saveWithSecret(imageProfile("image"), "synthetic-dummy-secret".toCharArray())
-            viewModel.testImage(image.id)
-            assertEquals(image.id, viewModel.state.value.confirmation?.id)
-            assertTrue("the confirmation must name an image probe", viewModel.state.value.confirmation?.image == true)
-            viewModel.confirmTest()
-            assertEquals(1, tester.imageCalls)
-            assertEquals(0, tester.textCalls)
-            assertNull(viewModel.state.value.loadingId)
-
-            val textOnly = repository.saveWithSecret(profileFixture("text"), "synthetic-dummy-secret".toCharArray())
-            viewModel.testImage(textOnly.id)
-            assertEquals("CAPABILITY_MISSING", viewModel.state.value.error)
-            assertEquals("a refused probe never reaches the transport", 1, tester.imageCalls)
-        } finally {
-            viewModel.close()
-        }
-    }
-
     // ---------------------------------------------------------------- fixtures
 
     private fun imageProfile(id: String = "image") =
@@ -233,20 +203,6 @@ class ProfileImageGateTest {
         override fun probe(request: ModelRequest, listener: (ModelStreamEvent) -> Unit): CancellationHandle {
             requests += request
             listener(ModelStreamEvent.Terminal(request.requestId, end, ModelUsage(7, 3), null))
-            return NoCancellation
-        }
-    }
-
-    private class RecordingImageTester : ProfileTester {
-        var imageCalls = 0
-        var textCalls = 0
-        override fun testText(profileId: String, listener: (ModelStreamEvent) -> Unit): CancellationHandle {
-            textCalls++
-            return NoCancellation
-        }
-        override fun testImage(profileId: String, listener: (ModelStreamEvent) -> Unit): CancellationHandle {
-            imageCalls++
-            listener(ModelStreamEvent.Terminal("synthetic-image-probe", ModelEnd.COMPLETED, null, null))
             return NoCancellation
         }
     }

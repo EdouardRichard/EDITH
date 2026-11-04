@@ -1,14 +1,18 @@
 package com.sheen.rokid.phone.model
-import com.sheen.rokid.phone.ui.profile.profile
-import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.phone.storage.BlobKeys
 import com.sheen.rokid.phone.storage.BlobFile
 import com.sheen.rokid.phone.storage.BlobCipher
 import com.sheen.rokid.phone.storage.KeystoreVault
 import com.sheen.rokid.phone.storage.AndroidNamespaceStorage
-import com.sheen.rokid.phone.storage.AndroidProfileRepository
+import com.sheen.rokid.phone.storage.AndroidModelCatalogRepository
 import com.sheen.rokid.phone.storage.AndroidEncryptedBlobStore
 import com.sheen.rokid.phone.storage.AndroidSpeakerProfileStore
+import com.sheen.rokid.phone.storage.KeystoreCatalogCredentialStore
+import com.sheen.rokid.phone.storage.ModelCatalogJson
+import com.sheen.rokid.phone.model.catalog.ModelEntry
+import com.sheen.rokid.phone.model.catalog.ModelOrigin
+import com.sheen.rokid.phone.model.catalog.Provider
 
 import com.sheen.rokid.contracts.ContractError
 import com.sheen.rokid.phone.storage.*
@@ -35,24 +39,40 @@ class EncryptedStorageTest {
     @Test fun firstManifestFinishWriteFailureCanBeRetriedAndReconstructed() = initialManifestFailure(PublicationFailure.FINISH)
     @Test fun keyCreationFailureAfterAliasInstallationCanBeRetriedAndReconstructed() = initialManifestFailure(PublicationFailure.CREATE)
 
+    /**
+     * The two owners of the shared encrypted blob layer: the catalog (0.52's only model configuration document) and the
+     * Keystore vault's own manifest. A failed first publication must leave neither a blob nor a credential behind, and a
+     * retry must reconstruct both.
+     */
     private fun initialManifestFailure(phase: PublicationFailure) {
-        for (manifest in listOf("profiles-manifest", "vault-manifest")) {
+        for (manifest in listOf(ModelCatalogJson.BLOB_ID, "vault-manifest")) {
             val fixture = PublicationFixture(temporary.newFolder())
-            val blobs = fixture.store(); val vault = KeystoreVault(blobs); val repo = AndroidProfileRepository(blobs, vault)
+            val blobs = fixture.store(); val vault = KeystoreVault(blobs)
+            val catalog = AndroidModelCatalogRepository(blobs, KeystoreCatalogCredentialStore(vault))
             fixture.fail(manifest, phase)
             assertThrows(ContractError.ConfigurationRejected::class.java) {
-                if (manifest == "profiles-manifest") repo.saveWithSecret(profile("a"), "synthetic-dummy-secret".toCharArray())
-                else vault.putSecret("a", "synthetic-dummy-secret".toCharArray())
+                if (manifest == ModelCatalogJson.BLOB_ID) {
+                    catalog.saveProvider(catalogProvider(), "synthetic-dummy-secret".toCharArray())
+                } else {
+                    vault.putSecret("a", "synthetic-dummy-secret".toCharArray())
+                }
             }
             assertNull("failed initial publication must remain absent: $manifest/$phase", blobs.read(manifest))
             val restoredBlobs = fixture.store(); val restoredVault = KeystoreVault(restoredBlobs)
-            if (manifest == "profiles-manifest") {
-                assertTrue(AndroidProfileRepository(restoredBlobs, restoredVault).list().isEmpty())
-                val saved = repo.saveWithSecret(profile("a"), "synthetic-retry".toCharArray())
+            if (manifest == ModelCatalogJson.BLOB_ID) {
+                val restored = AndroidModelCatalogRepository(restoredBlobs, KeystoreCatalogCredentialStore(restoredVault))
+                assertTrue(restored.catalog().providers.isEmpty())
+                val saved = catalog.saveProvider(catalogProvider(), "synthetic-retry".toCharArray())
                 val finalVault = KeystoreVault(fixture.store())
-                val reconstructed = AndroidProfileRepository(fixture.store(), finalVault)
-                assertEquals(1L, reconstructed.get("a")!!.revision)
-                finalVault.withSecret(saved.secret) { assertEquals("synthetic-retry", String(it)) }
+                val reconstructed = AndroidModelCatalogRepository(
+                    fixture.store(), KeystoreCatalogCredentialStore(finalVault),
+                )
+                // R13: the vault only admits handles the catalog still references.
+                finalVault.authorize(reconstructed::isCredentialReferenced)
+                assertEquals(1L, reconstructed.catalog().providers.single().revision)
+                finalVault.withSecret(reconstructed.providerSecret(saved.id)!!) {
+                    assertEquals("synthetic-retry", String(it))
+                }
             } else {
                 assertTrue(restoredVault.directHandles().isEmpty())
                 val saved = vault.putSecret("a", "synthetic-retry".toCharArray())
@@ -62,26 +82,39 @@ class EncryptedStorageTest {
     }
 
     @Test fun replacementFailurePreservesCommittedManifestCiphertextAndKeys() {
-        for (manifest in listOf("profiles-manifest", "vault-manifest")) {
+        for (manifest in listOf(ModelCatalogJson.BLOB_ID, "vault-manifest")) {
             for (phase in listOf(PublicationFailure.ENCRYPT, PublicationFailure.START, PublicationFailure.WRITE, PublicationFailure.FINISH)) {
                 val fixture = PublicationFixture(temporary.newFolder())
-                val blobs = fixture.store(); val vault = KeystoreVault(blobs); val repo = AndroidProfileRepository(blobs, vault)
-                val handle = if (manifest == "profiles-manifest") repo.saveWithSecret(profile("a"), "synthetic-original".toCharArray()).secret
-                    else vault.putSecret("a", "synthetic-original".toCharArray())
+                val blobs = fixture.store(); val vault = KeystoreVault(blobs)
+                val catalog = AndroidModelCatalogRepository(blobs, KeystoreCatalogCredentialStore(vault))
+                val handle = if (manifest == ModelCatalogJson.BLOB_ID) {
+                    val provider = catalog.saveProvider(catalogProvider(), "synthetic-original".toCharArray())
+                    catalog.providerSecret(provider.id)!!
+                } else {
+                    vault.putSecret("a", "synthetic-original".toCharArray())
+                }
                 val ciphertext = fixture.file(manifest).readBytes()
                 val key = fixture.keys.get(fixture.alias(manifest))
                 fixture.fail(manifest, phase)
                 assertThrows(ContractError.ConfigurationRejected::class.java) {
                     if (phase == PublicationFailure.ENCRYPT) blobs.write(manifest, ByteArray(BlobCipher.MAX_BYTES + 1))
-                    else if (manifest == "profiles-manifest") repo.saveWithSecret(profile("a"), "synthetic-replacement".toCharArray())
-                    else vault.putSecret("a", "synthetic-replacement".toCharArray())
+                    else if (manifest == ModelCatalogJson.BLOB_ID) {
+                        catalog.saveProvider(
+                            catalogProvider(baseUrl = "https://other.example/v1"),
+                            "synthetic-replacement".toCharArray(),
+                        )
+                    } else vault.putSecret("a", "synthetic-replacement".toCharArray())
                 }
                 assertArrayEquals(ciphertext, fixture.file(manifest).readBytes())
                 assertSame(key, fixture.keys.get(fixture.alias(manifest)))
                 val restoredVault = KeystoreVault(fixture.store())
-                if (manifest == "profiles-manifest") {
-                    val restored = AndroidProfileRepository(fixture.store(), restoredVault)
-                    assertEquals(1L, restored.get("a")!!.revision)
+                if (manifest == ModelCatalogJson.BLOB_ID) {
+                    val restored = AndroidModelCatalogRepository(
+                        fixture.store(), KeystoreCatalogCredentialStore(restoredVault),
+                    )
+                    // R13: the vault only admits handles the catalog still references.
+                    restoredVault.authorize(restored::isCredentialReferenced)
+                    assertEquals(1L, restored.catalog().providers.single().revision)
                 }
                 restoredVault.withSecret(handle) { assertEquals("synthetic-original", String(it)) }
             }
@@ -90,20 +123,20 @@ class EncryptedStorageTest {
 
     @Test fun missingOrCorruptCommittedCiphertextAndMissingKeyRemainRejected() {
         val fixture = PublicationFixture(temporary.newFolder()); val blobs = fixture.store()
-        blobs.write("profiles-manifest", byteArrayOf(1, 2, 3))
-        val original = fixture.file("profiles-manifest").readBytes()
-        fixture.file("profiles-manifest").writeBytes(original.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() })
-        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.read("profiles-manifest") }
-        fixture.file("profiles-manifest").delete()
-        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.read("profiles-manifest") }
-        fixture.fail("profiles-manifest", PublicationFailure.START)
-        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.write("profiles-manifest", byteArrayOf(4)) }
-        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.read("profiles-manifest") }
-        fixture.file("profiles-manifest").writeBytes(original)
-        fixture.keys.delete(fixture.alias("profiles-manifest"))
-        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.read("profiles-manifest") }
-        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.write("profiles-manifest", byteArrayOf(4)) }
-        assertArrayEquals(original, fixture.file("profiles-manifest").readBytes())
+        blobs.write(ModelCatalogJson.BLOB_ID, byteArrayOf(1, 2, 3))
+        val original = fixture.file(ModelCatalogJson.BLOB_ID).readBytes()
+        fixture.file(ModelCatalogJson.BLOB_ID).writeBytes(original.copyOf().also { it[it.lastIndex] = (it.last().toInt() xor 1).toByte() })
+        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.read(ModelCatalogJson.BLOB_ID) }
+        fixture.file(ModelCatalogJson.BLOB_ID).delete()
+        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.read(ModelCatalogJson.BLOB_ID) }
+        fixture.fail(ModelCatalogJson.BLOB_ID, PublicationFailure.START)
+        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.write(ModelCatalogJson.BLOB_ID, byteArrayOf(4)) }
+        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.read(ModelCatalogJson.BLOB_ID) }
+        fixture.file(ModelCatalogJson.BLOB_ID).writeBytes(original)
+        fixture.keys.delete(fixture.alias(ModelCatalogJson.BLOB_ID))
+        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.read(ModelCatalogJson.BLOB_ID) }
+        assertThrows(ContractError.ConfigurationRejected::class.java) { blobs.write(ModelCatalogJson.BLOB_ID, byteArrayOf(4)) }
+        assertArrayEquals(original, fixture.file(ModelCatalogJson.BLOB_ID).readBytes())
     }
 
     @Test fun encryptedNamespacesKeepIndependentDurableCopiesAndClearOnlyTheirOwner() {
@@ -145,6 +178,21 @@ class EncryptedStorageTest {
         assertThrows(ContractError.ConfigurationRejected::class.java) { store.load(ref) }
     }
 }
+
+private fun catalogProvider(baseUrl: String = "https://synthetic.example/v1") = Provider(
+    id = "provider-1",
+    name = "Synthetic",
+    baseUrl = baseUrl,
+    models = listOf(
+        ModelEntry(
+            id = "m-1",
+            displayName = "Model m-1",
+            contextWindowTokens = 131_072,
+            maxOutputTokens = 8_192,
+            origin = ModelOrigin.MANUAL,
+        ),
+    ),
+)
 
 private enum class PublicationFailure { CREATE, ENCRYPT, START, WRITE, FINISH }
 

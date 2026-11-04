@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.host
-import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.storage.TestBlobs
 
 import com.sheen.rokid.phone.storage.writeJson
 import com.sheen.rokid.plugin.InputModality

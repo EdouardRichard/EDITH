@@ -2,7 +2,7 @@ package com.sheen.rokid.phone.plugin.smarthelper.host
 
 import com.sheen.rokid.host.HostRuntime
 import com.sheen.rokid.phone.app.HostCompositionRoot
-import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.ModelClient
 import com.sheen.rokid.plugin.ModelRequest

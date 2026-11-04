@@ -1,89 +1,152 @@
 package com.sheen.rokid.phone.model
-import com.sheen.rokid.phone.ui.profile.profile
-import com.sheen.rokid.phone.ui.profile.TestBlobs
-import com.sheen.rokid.phone.ui.profile.ProbeConsent
-import com.sheen.rokid.phone.storage.KeystoreVault
-import com.sheen.rokid.phone.storage.AndroidProfileRepository
 
-import com.sheen.rokid.contracts.*
-import com.sheen.rokid.model.*
-import com.sheen.rokid.phone.storage.*
-import com.sheen.rokid.plugin.*
+import com.sheen.rokid.contracts.ContractError
+import com.sheen.rokid.contracts.EventEnvelope
+import com.sheen.rokid.contracts.Generation
+import com.sheen.rokid.contracts.SessionId
+import com.sheen.rokid.model.CapabilityGate
+import com.sheen.rokid.model.ContextBudgeter
+import com.sheen.rokid.model.ControlledModelClient
+import com.sheen.rokid.model.ControlledProfileTester
+import com.sheen.rokid.model.RequestConsent
+import com.sheen.rokid.phone.model.catalog.CatalogCredentialStore
+import com.sheen.rokid.phone.model.catalog.ModelCatalogRepository
+import com.sheen.rokid.phone.model.catalog.ModelEntry
+import com.sheen.rokid.phone.model.catalog.ModelOrigin
+import com.sheen.rokid.phone.model.catalog.Provider
+import com.sheen.rokid.phone.storage.AndroidModelCatalogRepository
+import com.sheen.rokid.phone.storage.CatalogProfileRepository
+import com.sheen.rokid.phone.storage.TestBlobs
+import com.sheen.rokid.plugin.InputPart
+import com.sheen.rokid.plugin.ModelRequest
+import com.sheen.rokid.plugin.OutputModality
+import com.sheen.rokid.plugin.SecretHandle
 import com.sheen.rokid.storage.SecretResolver
 import com.sheen.rokid.testsupport.FakeClock
 import com.sheen.rokid.testsupport.ManualScheduler
 import okhttp3.OkHttpClient
-import org.junit.Assert.*
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertThrows
 import org.junit.Test
-import java.util.concurrent.CountDownLatch
-import java.util.concurrent.Executors
-import java.util.concurrent.TimeUnit
+import java.util.UUID
 
+/**
+ * The storage/probe boundary the settings pages drive, now over the catalog.
+ *
+ * 0.52 moved the persisted model configuration from the retired profile repository into the encrypted catalog, whose
+ * `ModelProfile` is derived. These two contracts still have to hold for the production probe gate and the controlled
+ * client: a profile cannot change between the user's confirmation and the probe's admission, and an unsupported
+ * protocol refuses before any secret is resolved or any HTTP request is sent.
+ */
 class ProfileStorageContractTest {
-    @Test fun profileChangingBetweenProbeConfirmationAndClientAdmissionCannotUpload() {
-        val blobs = TestBlobs(); val repo = AndroidProfileRepository(blobs, KeystoreVault(blobs))
-        val original = repo.saveWithSecret(profile("a"), "synthetic-dummy-secret".toCharArray()); val gate = ProfileProbeGate(repo)
-        gate.grant(ProbeConsent(original.id, original.revision, "synthetic.example"))
-        val tester = object : ProfileTester {
-            override fun testText(profileId: String, listener: (ModelStreamEvent) -> Unit): CancellationHandle {
-                repo.save(original.copy(baseUrl = "https://changed.example/v1"))
-                assertFalse(gate.requestConsent().text); assertFalse(gate.requestConsent().syntheticProbe)
-                return object : CancellationHandle { override fun cancel() = Unit }
+
+    private class Credentials : CatalogCredentialStore {
+        override fun stage(value: CharArray): SecretHandle {
+            val id = "credential-${UUID.randomUUID()}"
+            value.fill('\u0000')
+            return object : SecretHandle {
+                override val id = id
+                override fun toString() = "SecretHandle(redacted)"
             }
         }
-        gate.test(tester, original.id) {}; assertFalse(gate.requestConsent().text)
+
+        override fun revoke(handle: SecretHandle) = Unit
     }
-    @Test fun directVaultHandleSavesAndRepositoryCopiesCallerCollections() {
-        val blobs = TestBlobs(); val vault = KeystoreVault(blobs); val repo = AndroidProfileRepository(blobs, vault)
-        val inputs = mutableSetOf(InputModality.TEXT); val outputs = mutableSetOf(OutputModality.TEXT)
-        val key = vault.putSecret("a", "synthetic-dummy-secret".toCharArray())
-        val saved = repo.save(profile("a").copy(secret = key, inputs = inputs, outputs = outputs))
-        inputs += InputModality.IMAGE; outputs += OutputModality.AUDIO
-        assertEquals(setOf(InputModality.TEXT), saved.inputs); assertEquals(setOf(OutputModality.TEXT), repo.get("a")!!.outputs)
-        vault.withSecret(saved.secret) { assertEquals("synthetic-dummy-secret", String(it)) }
+
+    private fun repository(): ModelCatalogRepository =
+        AndroidModelCatalogRepository(TestBlobs(), Credentials())
+
+    private fun provider(
+        id: String = "provider-1",
+        baseUrl: String = "https://synthetic.example/v1",
+        protocolId: String = "DEEPSEEK_RESPONSES",
+    ) = Provider(
+        id = id,
+        name = "Synthetic",
+        baseUrl = baseUrl,
+        protocolId = protocolId,
+        models = listOf(
+            ModelEntry(
+                id = "m-1",
+                displayName = "Model m-1",
+                contextWindowTokens = 131_072,
+                maxOutputTokens = 8_192,
+                outputs = setOf(OutputModality.TEXT),
+                origin = ModelOrigin.MANUAL,
+            ),
+        ),
+    )
+
+    @Test
+    fun profileChangingBetweenProbeConfirmationAndClientAdmissionCannotUpload() {
+        val catalog = repository()
+        val saved = catalog.saveProvider(provider(), "synthetic-dummy-secret".toCharArray())
+        val profiles = CatalogProfileRepository(catalog)
+        val profile = requireNotNull(profiles.get("${saved.id}:m-1"))
+        val gate = ProfileProbeGate(profiles)
+
+        gate.grant(ProbeConsent(profile.id, profile.revision, "synthetic.example"))
+        // A provider edit bumps the revision (and clears evidence); the pending consent must stop matching.
+        catalog.saveProvider(saved.copy(baseUrl = "https://changed.example/v1"), null)
+
+        assertFalse(gate.requestConsent().text)
+        assertFalse(gate.requestConsent().syntheticProbe)
     }
-    @Test fun concurrentVerificationCannotSurviveEditOrRecreateDeletedProfile() {
-        val executor = Executors.newFixedThreadPool(2)
-        try {
-            val blobs = TestBlobs(); val repo = AndroidProfileRepository(blobs, KeystoreVault(blobs))
-            val old = repo.saveWithSecret(profile("a"), "synthetic-dummy-secret".toCharArray())
-            val begin = CountDownLatch(1)
-            val verification = executor.submit { begin.await(); repo.verify("a", CapabilityVerification(old.revision, "TEXT_REQUEST", VerificationState.Verified, 1)) }
-            val edit = executor.submit { begin.await(); repo.save(old.copy(model = "edited")) }
-            begin.countDown(); verification.get(3, TimeUnit.SECONDS); edit.get(3, TimeUnit.SECONDS)
-            assertEquals("edited", repo.get("a")!!.model); assertTrue(repo.get("a")!!.verifications.isEmpty())
-            val current = repo.get("a")!!; val again = CountDownLatch(1)
-            val late = executor.submit { again.await(); repo.verify("a", CapabilityVerification(current.revision, "TEXT_REQUEST", VerificationState.Verified, 2)) }
-            val deletion = executor.submit { again.await(); repo.delete("a") }
-            again.countDown(); late.get(3, TimeUnit.SECONDS); deletion.get(3, TimeUnit.SECONDS); assertNull(repo.get("a"))
-        } finally { executor.shutdownNow() }
-    }
-    @Test fun cancelledAndThrowingListenersDoNotSuppressOtherRequestCancellation() {
-        val blobs = TestBlobs(); val repo = AndroidProfileRepository(blobs, KeystoreVault(blobs))
-        val saved = repo.saveWithSecret(profile("a"), "synthetic-dummy-secret".toCharArray())
-        val failure = IllegalStateException("synthetic listener"); var delivered = 0
-        val cancelled = repo.listenChanges { fail("cancelled listener admitted") }; cancelled.cancel()
-        repo.listenChanges { throw failure }; repo.listenChanges { throw failure }; repo.listenChanges { delivered++ }
-        assertSame(failure, assertThrows(IllegalStateException::class.java) { repo.save(saved.copy(model = "edited")) })
-        assertEquals(1, delivered); assertEquals("edited", repo.get("a")!!.model)
-    }
-    @Test fun unsupportedSavedProtocolFailsBothProbeAndBusinessBeforeSecretOrTransport() {
-        val blobs = TestBlobs(); val vault = KeystoreVault(blobs); val repo = AndroidProfileRepository(blobs, vault)
-        val saved = repo.saveWithSecret(profile("a").copy(protocolId = "CUSTOM"), "synthetic-dummy-secret".toCharArray())
-        var resolutions = 0; var sends = 0
+
+    @Test
+    fun unsupportedSavedProtocolFailsBothProbeAndBusinessBeforeSecretOrTransport() {
+        val catalog = repository()
+        val saved = catalog.saveProvider(provider(protocolId = "CUSTOM"), "synthetic-dummy-secret".toCharArray())
+        val profiles = CatalogProfileRepository(catalog)
+        val profileId = "${saved.id}:m-1"
+        var resolutions = 0
+        var sends = 0
         val resolver = object : SecretResolver {
-            override fun withSecret(handle: SecretHandle, block: (CharArray) -> Unit) { resolutions++; fail("unsupported credential admitted") }
+            override fun withSecret(handle: SecretHandle, block: (CharArray) -> Unit) {
+                resolutions++
+                throw AssertionError("unsupported credential admitted")
+            }
+
             override fun revoke(handle: SecretHandle) = Unit
         }
-        val http = OkHttpClient.Builder().addInterceptor { sends++; throw AssertionError("unsupported request sent") }.build()
-        val clock = FakeClock(); val client = ControlledModelClient(http, repo, resolver, CapabilityGate(), ContextBudgeter(), clock,
-            ManualScheduler(clock), { RequestConsent(true, true, true, true) })
+        val http = OkHttpClient.Builder()
+            .addInterceptor { sends++; throw AssertionError("unsupported request sent") }
+            .build()
+        val clock = FakeClock()
+        val client = ControlledModelClient(
+            http,
+            profiles,
+            resolver,
+            CapabilityGate(),
+            ContextBudgeter(),
+            clock,
+            ManualScheduler(clock),
+            { RequestConsent(true, true, true, true) },
+        )
         try {
-            val request = ModelRequest(EventEnvelope(SessionId("synthetic"), Generation(1), "synthetic-event", 0, 0), "synthetic-request", "synthetic-turn", saved.id, saved.revision,
-                "synthetic instructions", listOf(InputPart.Text("synthetic text")), emptyList(), OutputModality.TEXT, Long.MAX_VALUE)
+            val request = ModelRequest(
+                EventEnvelope(SessionId("synthetic"), Generation(1), "synthetic-event", 0, 0),
+                "synthetic-request",
+                "synthetic-turn",
+                profileId,
+                saved.revision,
+                "synthetic instructions",
+                listOf(InputPart.Text("synthetic text")),
+                emptyList(),
+                OutputModality.TEXT,
+                Long.MAX_VALUE,
+            )
             assertThrows(ContractError.CapabilityMissing::class.java) { client.request(request) {} }
-            assertThrows(ContractError.CapabilityMissing::class.java) { ControlledProfileTester(client, repo, clock).testText(saved.id) {} }
-            assertEquals(0, resolutions); assertEquals(0, sends)
-        } finally { client.close(); http.dispatcher.executorService.shutdown(); http.connectionPool.evictAll() }
+            assertThrows(ContractError.CapabilityMissing::class.java) {
+                ControlledProfileTester(client, profiles, clock).testText(profileId) {}
+            }
+            assertEquals(0, resolutions)
+            assertEquals(0, sends)
+        } finally {
+            client.close()
+            http.dispatcher.executorService.shutdown()
+            http.connectionPool.evictAll()
+        }
     }
 }

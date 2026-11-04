@@ -1,6 +1,5 @@
 package com.sheen.rokid.phone.app
-import com.sheen.rokid.phone.ui.profile.ProbeConsent
-import com.sheen.rokid.phone.ui.profile.ProfileViewModel
+import com.sheen.rokid.phone.model.ProbeConsent
 import com.sheen.rokid.phone.ui.typedResultLabel
 import com.sheen.rokid.phone.R
 import com.sheen.rokid.phone.actions.intent.CallPermission
@@ -1093,6 +1092,15 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
+     * 0.52: the encrypted catalog itself, for the settings home's read-only summary and the debug seeding instrument.
+     *
+     * Internal rather than a public host surface: the catalog is an App-storage concern and Task 13's model-service view
+     * model owns every user-visible mutation. The debug receiver writes through it because it seeds a provider without
+     * the Compose form; the settings shell only calls [ModelCatalogRepository.catalog].
+     */
+    internal val modelCatalogRepository: ModelCatalogRepository? get() = modelCatalog
+
+    /**
      * 0.52 design §5.8 / ruling R18: stops the running session **before** a model selection is written.
      *
      * The split from [onCatalogSelectionChanged] is deliberate. Stopping after the catalog write would leave a session
@@ -1183,37 +1191,10 @@ class HostCompositionRoot internal constructor(
     private data class StartGrant(val token: String, val pluginId: String, val expires: Long)
     private var pendingStart: StartGrant? = null
     private val clock = environment?.clock ?: object : MonotonicClock { override fun nowNanos() = System.nanoTime().coerceAtLeast(0) }
-    /**
-     * 0.52: the legacy profile editor is retired with the catalog; the production path has no view model to offer.
-     *
-     * `MainActivity`/`PhoneScreen` keep the nullable parameter until Task 7 deletes the old profile UI, and the page
-     * shows its 「模型服务不可用」 branch when this is null. Returning null here is also what guarantees no production
-     * path can construct the legacy `AndroidProfileRepository` or write an old profile selection.
-     */
-    fun profileViewModel(): ProfileViewModel? = null
 
     fun namespace(pluginId: String): StorageHandle {
         require(pluginId in setOf("smart-assistant", "interview-assistant") || (BuildConfig.DEBUG && pluginId == DIAGNOSTIC_PLUGIN_ID))
         return namespaceFactory?.invoke(pluginId) ?: throw ContractError.CapabilityMissing("Persistent storage unavailable")
-    }
-    /**
-     * Applies a profile selection the **legacy** profile UI made, until Task 7 deletes that screen.
-     *
-     * 0.52 moved the model selection into the catalog; this shim exists only so the old `ProfileViewModel` and its
-     * test keep compiling. Production never reaches it ([profileViewModel] returns null), and Task 7 removes it in
-     * favour of [onCatalogSelectionChanged].
-     *
-     * The configuration is rebuilt whole ([configurationFor]) rather than patched with the profile fields:
-     * `HostRuntime.configure` replaces the stored configuration, so sending only the profile selection would drop the
-     * settings-derived keys the plugin runs with (Task 14a-fix item 1). The stop-first rule is shared with the catalog
-     * path ([stopForModelSwitch]), which is what keeps a detached session's recorder, ingress, poll loop and CPU hold
-     * from surviving the pause (0.4 Task 8 fix 1, spec §4.5/§4.6).
-     */
-    @Synchronized internal fun applyProfileSelection(pluginId: String, profile: ModelProfile?) {
-        if (closed) return
-        stopForModelSwitch()
-        val configuration = configurationFor(pluginId, profile) ?: return
-        check(host.configure(pluginId, configuration)) { "Profile selection unavailable" }
     }
 
     /**

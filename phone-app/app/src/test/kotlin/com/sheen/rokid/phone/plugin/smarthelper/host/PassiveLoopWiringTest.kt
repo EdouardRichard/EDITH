@@ -1,5 +1,5 @@
 package com.sheen.rokid.phone.plugin.smarthelper.host
-import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.phone.withP3Sink
 import com.sheen.rokid.plugin.ConfirmationChannel
 import com.sheen.rokid.phone.storage.unavailable
@@ -47,7 +47,9 @@ import com.sheen.rokid.output.HintCommand
 import com.sheen.rokid.output.HintWireCodec
 import com.sheen.rokid.output.OfficialConversation
 import com.sheen.rokid.output.OfficialStatus
-import com.sheen.rokid.phone.storage.AndroidProfileRepository
+import com.sheen.rokid.phone.storage.AndroidModelCatalogRepository
+import com.sheen.rokid.phone.storage.CatalogProfileRepository
+import com.sheen.rokid.phone.storage.KeystoreCatalogCredentialStore
 import com.sheen.rokid.phone.storage.KeystoreVault
 import com.sheen.rokid.plugin.ActionDescriptor
 import com.sheen.rokid.plugin.ActionExecutor
@@ -1365,12 +1367,11 @@ private class NoStorageAccess : StorageAccess {
     // ---- fix items 1-3: one configuration, for the plugin it belongs to, and an honest epoch ---------------------
 
     /**
-     * A root over a real `AndroidProfileRepository`.
+     * A root over the real encrypted catalog projection.
      *
-     * This is the repository the legacy profile UI wrote through, and the one whose per-plugin `selections()` used to
-     * make the activation path take the branch these fix items are about. 0.52 removes that source: the host now reads
-     * `profiles.list()` (the repository fallback for a rig without a catalog) and the first profile is the one the
-     * configuration names, which is what these tests still pin.
+     * 0.52 replaced the per-plugin profile selection with one global catalog selection. The host reads
+     * `profiles.list()` (the production projection over the catalog) and the first profile is the one the configuration
+     * names, which is what these tests pin.
      */
     private class AndroidRoot(
         val root: HostCompositionRoot,
@@ -1386,8 +1387,29 @@ private class NoStorageAccess : StorageAccess {
         taskScope: TaskScope = UnavailableTaskScope,
         registered: (SmartWiring) -> PluginLifecycle = { it.plugin }): AndroidRoot {
         val blobs = TestBlobs()
-        val repository = AndroidProfileRepository(blobs, KeystoreVault(blobs))
-        repository.saveWithSecret(profile("p-1"), "synthetic-dummy-secret".toCharArray())
+        val catalog = AndroidModelCatalogRepository(blobs, KeystoreCatalogCredentialStore(KeystoreVault(blobs)))
+        catalog.saveProvider(
+            com.sheen.rokid.phone.model.catalog.Provider(
+                id = "p-1",
+                name = "Synthetic",
+                baseUrl = "https://synthetic.example/v1",
+                protocolId = "DEEPSEEK_RESPONSES",
+                models = listOf(
+                    com.sheen.rokid.phone.model.catalog.ModelEntry(
+                        id = "m-1",
+                        displayName = "Synthetic m-1",
+                        contextWindowTokens = 4096,
+                        maxOutputTokens = 1024,
+                        inputs = setOf(InputModality.TEXT, InputModality.IMAGE),
+                        outputs = setOf(OutputModality.TEXT),
+                        origin = com.sheen.rokid.phone.model.catalog.ModelOrigin.MANUAL,
+                    ),
+                ),
+            ),
+            "synthetic-dummy-secret".toCharArray(),
+        )
+        catalog.setActiveProvider("p-1")
+        val repository = CatalogProfileRepository(catalog)
         val wiring = SmartWiring(SmartSettings(wakeWords = listOf("小艾"), maxLevel = "L0",
             whitelist = listOf("launch|app"), cooldownMillis = 3000L),
             repository, FakeClock(0), ManualScheduler(FakeClock(0)),
@@ -1436,7 +1458,7 @@ private class NoStorageAccess : StorageAccess {
             // replaces the stored configuration, so a second call with only the profile selection would leave the
             // plugin on its own defaults for every other key.
             val effective = rig.recorded.configurations.last()
-            assertEquals("p-1", effective.values["profileId"])
+            assertEquals("p-1:m-1", effective.values["profileId"])
             assertEquals("1", effective.values["profileRevision"])
             assertEquals("the user's risk ceiling must not fall back to the plugin's own L1 default",
                 "L0", effective.values["maxLevel"])

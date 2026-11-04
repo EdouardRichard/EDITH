@@ -2,7 +2,7 @@ package com.sheen.rokid.phone.plugin.smarthelper.host
 
 import com.sheen.rokid.contracts.SessionState
 import com.sheen.rokid.phone.storage.EncryptedBlobStore
-import com.sheen.rokid.phone.ui.profile.TestBlobs
+import com.sheen.rokid.phone.storage.TestBlobs
 import com.sheen.rokid.phone.withP3Sink
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
