@@ -123,6 +123,35 @@ class CatalogWiringTest {
         override fun handle(event: HostEvent) = Unit
     }
 
+    /**
+     * The debug diagnostic text plugin's shape: its own closed key set, no capabilities the rig has to provide.
+     *
+     * It is registered beside the smart plugin so a test can drive the host's diagnostic branch - the configuration
+     * `diagnosticValues` builds - rather than the smart wiring's.
+     */
+    private class RecordingDiagnostic : PluginLifecycle, ConfiguredPlugin {
+        val configurations = CopyOnWriteArrayList<PluginConfiguration>()
+        override val descriptor = PluginDescriptor(
+            "p2-diagnostic", "1.0.0", 1, "P2 Diagnostic",
+            listOf(Capability.TextOutput), ConfigSchema(1),
+        )
+
+        override fun validate(configuration: PluginConfiguration) {
+            require(configuration.schemaVersion == 1)
+            require(configuration.values.keys.all { it in setOf("profileId", "profileRevision", "requestConsent", "inputMode") })
+            require(!configuration.values["profileId"].isNullOrBlank())
+            require((configuration.values["profileRevision"]?.toLongOrNull() ?: -1) >= 0)
+        }
+
+        override fun configure(configuration: PluginConfiguration) {
+            configurations += configuration
+        }
+
+        override fun activate(context: PluginContext) = Unit
+        override fun deactivate(reason: DeactivationReason) = Unit
+        override fun handle(event: HostEvent) = Unit
+    }
+
     private class InertModel : ModelClient {
         override fun request(request: ModelRequest, listener: (ModelStreamEvent) -> Unit): CancellationHandle =
             object : CancellationHandle { override fun cancel() = Unit }
@@ -150,6 +179,7 @@ class CatalogWiringTest {
         val scheduler = ManualScheduler(clock)
         val profiles = CatalogProfileRepository(catalog)
         val plugin = RecordingSmart()
+        val diagnostic = RecordingDiagnostic()
         private val environment = CxrHostEnvironment(
             clock = clock,
             input = RecordingInputPort(),
@@ -173,12 +203,13 @@ class CatalogWiringTest {
         ).also { root ->
             plugin.stateOfHost = { root.state.value.session }
             root.registerPlugin(plugin)
+            root.registerPlugin(diagnostic)
         }
 
         /** The production start path: the Activity is attached first, then the session start, then readiness. */
-        fun start() {
+        fun start(pluginId: String = "smart-assistant") {
             root.attachCxrActivity(Any())
-            root.start("smart-assistant")
+            root.start(pluginId)
             root.onSceneReady()
         }
 
@@ -289,6 +320,70 @@ class CatalogWiringTest {
             assertEquals("the plugin is reconfigured only after the session was stopped",
                 SessionState.Paused, rig.plugin.statesAtConfigure.last())
             assertNull("a reconfigure after the stop must be accepted", rig.root.state.value.errorCode)
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun `the diagnostic plugin receives the active catalog model too`() {
+        val catalog = catalog()
+        save(catalog, provider("provider-1", "m-1"))
+        catalog.setActiveProvider("provider-1")
+        val rig = Rig(catalog)
+        try {
+            rig.start("p2-diagnostic")
+
+            val configuration = requireNotNull(rig.diagnostic.configurations.lastOrNull()) {
+                "the host must configure the diagnostic plugin from the catalog projection"
+            }
+            // The catalog is global (design §5.8): the diagnostic plugin's profile lookup must be able to resolve the
+            // model by the id the configuration names, instead of keeping the contract-valid `__unselected__` forever.
+            assertEquals("provider-1:m-1", configuration.values["profileId"])
+            assertEquals("1", configuration.values["profileRevision"])
+            assertEquals("the diagnostic plugin's closed key set is unchanged",
+                setOf("profileId", "profileRevision", "requestConsent", "inputMode"), configuration.values.keys)
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun `a text-only active model refuses the interview start before a session exists`() {
+        val catalog = catalog()
+        val textOnly = Provider(
+            id = "provider-1",
+            name = "Provider provider-1",
+            baseUrl = "https://synthetic.example/v1",
+            models = listOf(entry("m-text").copy(inputs = setOf(InputModality.TEXT))),
+        )
+        save(catalog, textOnly)
+        catalog.setActiveProvider("provider-1")
+        val rig = Rig(catalog)
+        try {
+            rig.root.attachCxrActivity(Any())
+            rig.root.start("interview-assistant")
+
+            // The image gate is a property of the one active model, not of the smart plugin's id: the interview
+            // activation path must refuse the same text-only selection instead of starting a session under it.
+            assertEquals("PROFILE_MODEL_NOT_MULTIMODAL", rig.root.state.value.errorCode)
+            assertEquals("a refused start begins no session", SessionState.Idle, rig.root.host.currentState)
+        } finally {
+            rig.close()
+        }
+    }
+
+    @Test
+    fun `the diagnostic plugin keeps its placeholder with no active model`() {
+        val rig = Rig(catalog())
+        try {
+            rig.start("p2-diagnostic")
+
+            val configuration = requireNotNull(rig.diagnostic.configurations.lastOrNull()) {
+                "the host must configure the diagnostic plugin even without a catalog model"
+            }
+            assertEquals("__unselected__", configuration.values["profileId"])
+            assertEquals("0", configuration.values["profileRevision"])
         } finally {
             rig.close()
         }

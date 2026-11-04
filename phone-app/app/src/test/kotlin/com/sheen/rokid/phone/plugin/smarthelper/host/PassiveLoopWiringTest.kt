@@ -1465,9 +1465,13 @@ private class NoStorageAccess : StorageAccess {
 
             assertNull("the diagnostic plugin's own configuration must be accepted, not refused",
                 root.state.value.errorCode)
+            val configuration = diagnostic.configurations.last()
             assertEquals("no smart key may be sent to a plugin whose configuration is not the smart one",
-                setOf("profileId", "profileRevision", "requestConsent", "inputMode"),
-                diagnostic.configurations.last().values.keys)
+                setOf("profileId", "profileRevision", "requestConsent", "inputMode"), configuration.values.keys)
+            assertEquals("the one global active model must reach the diagnostic plugin's lookup",
+                "p-1", configuration.values["profileId"])
+            assertEquals("with the active revision, so its model request can be resolved", "3",
+                configuration.values["profileRevision"])
             assertNull("the previous plugin's epoch must not stay armed while another plugin is active",
                 root.currentAudioEpoch())
             assertEquals(listOf(smartEpoch), input.stopped)

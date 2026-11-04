@@ -1229,19 +1229,17 @@ class HostCompositionRoot internal constructor(
     }
 
     /**
-     * The profile that applies to [pluginId].
+     * The profile that applies to every plugin.
      *
-     * 0.52 design §5.8: the catalog is the only selection source. The smart plugin's role is answered by the wiring's
-     * live `activeProfile()` (production wires it to [activeCatalogProfile]); the host's own projection is the
-     * fallback for a rig whose wiring was built without a catalog source. Any other plugin gets no profile, so its own
-     * configuration shape fills in the contract-valid placeholder it needs - the smart keys are never sent to it.
+     * 0.52 design §5.8: the catalog is the only selection source and it is global - there is one active provider/model
+     * for the whole app, not one per plugin. The question is therefore answered without looking at [pluginId]. The
+     * smart plugin's role is answered by the wiring's live `activeProfile()` (production wires it to
+     * [activeCatalogProfile]); the host's own projection is the fallback for a rig whose wiring was built without a
+     * catalog source. A plugin that still receives null (no catalog configured) fills in the contract-valid placeholder
+     * its own configuration shape needs - the smart keys are never sent to it.
      */
     private fun selectedProfile(pluginId: String): ModelProfile? =
-        if (pluginId == smartWiring?.plugin?.descriptor?.pluginId) {
-            smartWiring.activeProfile() ?: activeCatalogProfile()
-        } else {
-            null
-        }
+        smartWiring?.activeProfile() ?: activeCatalogProfile()
 
     /** The diagnostic text plugin's own configuration shape; it refuses every key that is not one of these. */
     private fun diagnosticValues(profile: ModelProfile?): Map<String, String> = mapOf(
