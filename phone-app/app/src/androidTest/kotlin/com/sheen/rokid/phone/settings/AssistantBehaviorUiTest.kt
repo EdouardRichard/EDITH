@@ -56,6 +56,10 @@ import org.junit.Test
  * Activity start; see `SettingsHomeTest`). Content is installed on the real foreground MainActivity. The two system-back
  * cases compose the production shape instead — the page inside the shell's `PhoneDetailPage` dialog — and inject a real
  * BACK key so the dialog window, not the Activity dispatcher, owns the event.
+ *
+ * The system-back cases never focus a text field: while the soft keyboard is open the platform delivers BACK to the
+ * IME (it just hides the keyboard), so the page dialog never sees the key. A text-field edit would therefore measure
+ * the IME, not the guard; the dirty draft is made through a switch instead.
  */
 class AssistantBehaviorUiTest {
 
@@ -170,6 +174,9 @@ class AssistantBehaviorUiTest {
      * input pipeline); Espresso itself is only a runtime dependency of this test APK, so the injection is used
      * directly. Calling `MainActivity.onBackPressedDispatcher.onBackPressed()` instead addresses the Activity's
      * dispatcher and never the dialog's own, which is the dispatcher production system back reaches.
+     *
+     * Callers must leave the IME closed: when a text field has focus the platform gives BACK to the IME, which hides
+     * the keyboard, and the dialog's dispatcher never runs.
      */
     private fun pressBackOnFocusedWindow() {
         InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
@@ -341,8 +348,14 @@ class AssistantBehaviorUiTest {
     @Test
     fun systemBackAsksBeforeDiscarding() {
         setShellPage()
-        compose.onNodeWithContentDescription("唤醒词输入").performTextReplacement("EDITH")
+
+        // Dirty the form through a non-text control on purpose. Focusing a text field raises the soft keyboard, and
+        // the platform then routes BACK to the IME (it only closes the keyboard), so the page dialog's dispatcher
+        // never sees the key — the K40 failure this case fixes. The switch dirties the same form draft without an IME.
+        compose.onNodeWithContentDescription("持续对话").performScrollTo().performClick()
         compose.waitForIdle()
+        compose.onNodeWithContentDescription("持续对话").assertIsOff()
+        compose.onNodeWithText(AssistantBehaviorUi.SAVE).assertIsEnabled()
 
         pressBackOnFocusedWindow()
 
@@ -351,7 +364,7 @@ class AssistantBehaviorUiTest {
         compose.waitForIdle()
         compose.onNodeWithText(AssistantBehaviorUi.DISCARD_TITLE).assertDoesNotExist()
         compose.onNodeWithContentDescription("返回").assertExists("继续编辑 must keep the page open")
-        compose.onNodeWithContentDescription("唤醒词输入").assertTextContains("EDITH")
+        compose.onNodeWithContentDescription("持续对话").assertIsOff()
 
         pressBackOnFocusedWindow()
 
@@ -359,7 +372,7 @@ class AssistantBehaviorUiTest {
         compose.onNodeWithText(AssistantBehaviorUi.DISCARD_CONFIRM).performClick()
         compose.waitForIdle()
         compose.onNodeWithContentDescription("返回").assertDoesNotExist()
-        compose.onNodeWithContentDescription("唤醒词输入").assertDoesNotExist()
+        compose.onNodeWithContentDescription("持续对话").assertDoesNotExist()
         // The shell is still composed on its home: 放弃 closed the page, not the Activity.
         compose.onNodeWithText("设置").assertExists()
     }
