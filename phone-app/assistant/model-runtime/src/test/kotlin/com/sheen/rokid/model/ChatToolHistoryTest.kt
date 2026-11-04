@@ -60,9 +60,10 @@ class ChatToolHistoryTest {
             ),
         )
 
-        assertEquals(5, messages.size, "user, assistant(tool_calls=[a,b]), tool a, tool b, current user: $messages")
+        assertEquals(6, messages.size, "system, user, assistant(tool_calls=[a,b]), tool a, tool b, current user: $messages")
 
-        val assistant = messages[1].jsonObject
+        assertEquals("system", messages[0].jsonObject.role(), "the live path keeps the system slot")
+        val assistant = messages[2].jsonObject
         assertEquals("assistant", assistant.role())
         assertEquals("Checking.", assistant.getValue("content").jsonPrimitive.content)
         val calls = assistant.getValue("tool_calls").jsonArray
@@ -78,17 +79,17 @@ class ChatToolHistoryTest {
         )
         assertEquals("get_time", calls[1].jsonObject.getValue("function").jsonObject.getValue("name").jsonPrimitive.content)
 
-        val toolA = messages[2].jsonObject
+        val toolA = messages[3].jsonObject
         assertEquals("tool", toolA.role())
         assertEquals("call_a", toolA.getValue("tool_call_id").jsonPrimitive.content)
         assertEquals("sunny 25C", toolA.getValue("content").jsonPrimitive.content)
 
-        val toolB = messages[3].jsonObject
+        val toolB = messages[4].jsonObject
         assertEquals("tool", toolB.role())
         assertEquals("call_b", toolB.getValue("tool_call_id").jsonPrimitive.content)
         assertEquals("10:00", toolB.getValue("content").jsonPrimitive.content)
 
-        assertEquals("user", messages[4].jsonObject.role(), "the current turn stays last")
+        assertEquals("user", messages[5].jsonObject.role(), "the current turn stays last")
     }
 
     @Test
@@ -112,7 +113,7 @@ class ChatToolHistoryTest {
             ),
         )
 
-        val tool = messages[2].jsonObject
+        val tool = messages[3].jsonObject
         assertEquals("tool", tool.role())
         assertEquals("call_1", tool.getValue("tool_call_id").jsonPrimitive.content)
         assertEquals(envelope, tool.getValue("content").jsonPrimitive.content, "the payload is forwarded byte for byte")
@@ -132,12 +133,12 @@ class ChatToolHistoryTest {
             ),
         )
 
-        val assistant = messages[1].jsonObject
+        val assistant = messages[2].jsonObject
         assertEquals("assistant", assistant.role())
         assertTrue(assistant.getValue("content") is JsonNull, "content is null when the round carried no text")
         assertEquals("call_shot", assistant.getValue("tool_calls").jsonArray[0].jsonObject.getValue("id").jsonPrimitive.content)
-        assertEquals("tool", messages[2].jsonObject.role())
-        assertEquals("call_shot", messages[2].jsonObject.getValue("tool_call_id").jsonPrimitive.content)
+        assertEquals("tool", messages[3].jsonObject.role())
+        assertEquals("call_shot", messages[3].jsonObject.getValue("tool_call_id").jsonPrimitive.content)
     }
 
     @Test
@@ -149,12 +150,13 @@ class ChatToolHistoryTest {
             ),
         )
 
-        assertEquals(3, messages.size, "user, assistant, then the current user turn: $messages")
-        assertEquals("user", messages[0].jsonObject.role())
-        assertEquals("first question", messages[0].jsonObject.getValue("content").jsonPrimitive.content)
-        assertEquals("assistant", messages[1].jsonObject.role())
-        assertEquals("first answer", messages[1].jsonObject.getValue("content").jsonPrimitive.content)
-        assertEquals("user", messages[2].jsonObject.role())
+        assertEquals(4, messages.size, "system, user, assistant, then the current user turn: $messages")
+        assertEquals("system", messages[0].jsonObject.role())
+        assertEquals("user", messages[1].jsonObject.role())
+        assertEquals("first question", messages[1].jsonObject.getValue("content").jsonPrimitive.content)
+        assertEquals("assistant", messages[2].jsonObject.role())
+        assertEquals("first answer", messages[2].jsonObject.getValue("content").jsonPrimitive.content)
+        assertEquals("user", messages[3].jsonObject.role())
     }
 
     @Test
@@ -169,7 +171,7 @@ class ChatToolHistoryTest {
             input = emptyList(),
         )
 
-        assertEquals(3, messages.size, "user, assistant(tool_calls), tool: $messages")
+        assertEquals(4, messages.size, "system, user, assistant(tool_calls), tool: $messages")
         assertEquals("tool", messages.last().jsonObject.role(), "the tool output stays last on the wire")
         assertTrue(
             messages.none {

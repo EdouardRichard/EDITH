@@ -50,6 +50,12 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             put("stream_options", buildJsonObject { put("include_usage", true) })
             put("modalities", buildJsonArray { add("text") })
             put("max_tokens", profile.maxOutputTokens)
+            // 0.52 design §5.7: Chat Completions spells the switch as `thinking.type` plus a top-level
+            // `reasoning_effort`; the vendor-only `enable_thinking` and a reasoning token budget are not used. A tool
+            // request always turns thinking off — the measured tool turn needs `none` to keep the output budget for
+            // the call itself.
+            put("thinking", buildJsonObject { put("type", thinkingType(profile, frame.tools.isNotEmpty())) })
+            put("reasoning_effort", reasoningEffort(profile, frame.tools.isNotEmpty()))
             if (frame.tools.isNotEmpty()) {
                 put("tools", buildJsonArray { frame.tools.forEach { add(toolDescriptor(it)) } })
                 put("tool_choice", "auto")
@@ -146,6 +152,25 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
         result
     } catch (_: Exception) { null }
 
+    /**
+     * 0.52 design §5.7: Chat Completions' switch. Thinking is enabled only when the profile asks for it and the request
+     * carries no tools; a tool request always disables it so the output budget stays with the call.
+     */
+    private fun thinkingType(profile: ModelProfile, toolRequest: Boolean): String =
+        if (profile.thinkingEnabled && !toolRequest) "enabled" else "disabled"
+
+    /**
+     * 0.52 design §5.7: Chat Completions' top-level effort. A tool request and a disabled profile map to `none`; a
+     * text-only enabled profile maps the three catalog levels onto the wire names.
+     */
+    private fun reasoningEffort(profile: ModelProfile, toolRequest: Boolean): String =
+        if (toolRequest || !profile.thinkingEnabled) "none"
+        else when (profile.thinkingEffort) {
+            ThinkingEffort.LOW -> "low"
+            ThinkingEffort.HIGH -> "high"
+            ThinkingEffort.MAX -> "max"
+        }
+
     private fun toolDescriptor(spec: ToolSpec) = buildJsonObject {
         put("type", "function")
         put("function", buildJsonObject {
@@ -184,7 +209,24 @@ class OpenAiChatCompletionsAdapter(private val media: MediaSource) {
             // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
             // when the request declares no cap of its own (every pre-0.3 caller).
             put("max_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
+            // 0.52 design §5.7: the same mapping as the legacy overload; the live path must not drift from it.
+            put("thinking", buildJsonObject {
+                put("type", thinkingType(profile, budgeted.request.tools.isNotEmpty()))
+            })
+            put("reasoning_effort", reasoningEffort(profile, budgeted.request.tools.isNotEmpty()))
+            if (budgeted.request.tools.isNotEmpty()) {
+                // 0.52 live-path repair: the budgeted overload dropped the tool table that the legacy frame overload
+                // always sent, so a live Chat tool turn reached the endpoint unable to call anything.
+                put("tools", buildJsonArray { budgeted.request.tools.forEach { add(toolDescriptor(it)) } })
+                put("tool_choice", "auto")
+            }
             put("messages", buildJsonArray {
+                // 0.52 live-path repair: the system slot was missing from the budgeted overload, so the live Chat
+                // request sent no instructions at all. Message order stays system -> history -> current turn.
+                add(buildJsonObject {
+                    put("role", "system")
+                    put("content", budgeted.request.instructions)
+                })
                 // History, including the tool round-trip the stateless endpoint needs echoed back.
                 historyToMessages(budgeted.request.history).forEach { add(it) }
                 // Current turn: text + optional image + optional audio. An empty input is a history-only continuation

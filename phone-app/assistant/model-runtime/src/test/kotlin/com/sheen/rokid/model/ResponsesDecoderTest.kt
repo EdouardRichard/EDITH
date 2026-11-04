@@ -257,7 +257,7 @@ class ResponsesDecoderTest {
             history = listOf(ModelHistoryItem.Text(MessageRole.USER, "old question"), ModelHistoryItem.Text(MessageRole.ASSISTANT, "old answer")))
         val body = Json.parseToJsonElement(DeepSeekResponsesAdapter().encode(profileFixture(),
             ContextBudgeter().prepare(profileFixture(), request)).toString(Charsets.UTF_8)).jsonObject
-        assertEquals(setOf("model", "instructions", "stream", "max_output_tokens", "input"), body.keys)
+        assertEquals(setOf("model", "instructions", "stream", "max_output_tokens", "reasoning", "input"), body.keys)
         assertEquals("fixed business constraints", body.getValue("instructions").jsonPrimitive.content)
         assertEquals(true, body.getValue("stream").jsonPrimitive.boolean)
         assertEquals(256, body.getValue("max_output_tokens").jsonPrimitive.int)

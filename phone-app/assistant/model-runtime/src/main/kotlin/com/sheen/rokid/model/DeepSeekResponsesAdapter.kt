@@ -40,9 +40,12 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             put("instructions", frame.systemText)
             put("stream", true)
             put("max_output_tokens", profile.maxOutputTokens)
+            // 0.52 design §5.7: state reasoning explicitly even when it is off — DeepSeek defaults thinking on, so an
+            // absent field is not the same request. A tool request is always `none` (measured: otherwise the
+            // deliberation is charged against the output budget and the tool call never arrives).
+            put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile, tools.isNotEmpty())) })
             if (tools.isNotEmpty()) {
                 put("tool_choice", "auto")
-                put("reasoning", buildJsonObject { put("effort", "none") })
                 put("tools", buildJsonArray { tools.forEach(::add) })
             }
             put("input", buildJsonArray {
@@ -118,12 +121,14 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
             // 0.3 design §5.2: the turn policy's cap wins; the profile's value is only the window reservation, used
             // when the request declares no cap of its own (every pre-0.3 caller).
             put("max_output_tokens", budgeted.request.maxOutputTokens ?: profile.maxOutputTokens)
+            // 0.52 design §5.7: both overloads write the same mapping, including the explicit `none` for a text-only
+            // request (DeepSeek defaults thinking on). A tool request forces `none` — see the legacy overload.
+            put("reasoning", buildJsonObject { put("effort", reasoningEffort(profile, tools.isNotEmpty())) })
             if (tools.isNotEmpty()) {
                 // Measured, not guessed (T4 + the T5 ten-step run). Without `reasoning.effort = "none"` the turn comes
                 // back `incomplete/max_output_tokens`: the deliberation is charged against the output budget and the
                 // call never arrives. `tool_choice` is `auto` only — the endpoint answered HTTP 400 to `required`.
                 put("tool_choice", "auto")
-                put("reasoning", buildJsonObject { put("effort", "none") })
                 put("tools", buildJsonArray { tools.forEach(::add) })
             }
             put("input", buildJsonArray {
@@ -205,6 +210,19 @@ class DeepSeekResponsesAdapter(private val media: MediaSource? = null) {
     private fun resolveImage(artifactId: String): ResolvedImage =
         media?.resolveImage(artifactId)
             ?: throw ContractError.CapabilityMissing("image ref unresolvable: $artifactId")
+
+    /**
+     * 0.52 design §5.7: the Responses `reasoning.effort` wire value. A tool request is always `none` (the measured
+     * tool turn needs it), and a disabled profile is stated as `none` rather than omitted because DeepSeek defaults
+     * thinking on.
+     */
+    private fun reasoningEffort(profile: ModelProfile, toolRequest: Boolean): String =
+        if (toolRequest || !profile.thinkingEnabled) "none"
+        else when (profile.thinkingEffort) {
+            ThinkingEffort.LOW -> "low"
+            ThinkingEffort.HIGH -> "high"
+            ThinkingEffort.MAX -> "max"
+        }
 
     /**
      * The flattened descriptor proven against the endpoint: `{type, name, description, parameters}` at the top level.

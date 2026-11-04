@@ -42,7 +42,7 @@ class ControlledModelClientTest {
         assertEquals(bytes.size.toString(), first.getHeader("Content-Length"))
         val json = kotlinx.serialization.json.Json.parseToJsonElement(bytes.toString(Charsets.UTF_8))
         assertEquals(kotlinx.serialization.json.Json.parseToJsonElement(
-            """{"model":"model","instructions":"synthetic instructions","stream":true,"max_output_tokens":256,"input":[{"role":"user","content":"synthetic question"}]}"""), json)
+            """{"model":"model","instructions":"synthetic instructions","stream":true,"max_output_tokens":256,"reasoning":{"effort":"none"},"input":[{"role":"user","content":"synthetic question"}]}"""), json)
     }
 
     @Test fun `injected authenticator cannot replay 401`() = Rig(authenticator = Authenticator { _, response ->

@@ -76,10 +76,10 @@ class ChatImageTest {
             ),
         )
 
-        assertEquals(5, messages.size, "user, assistant(tool_calls), tool, user image, current user: $messages")
-        assertEquals("assistant", messages[1].jsonObject.getValue("role").jsonPrimitive.content)
+        assertEquals(6, messages.size, "system, user, assistant(tool_calls), tool, user image, current user: $messages")
+        assertEquals("assistant", messages[2].jsonObject.getValue("role").jsonPrimitive.content)
 
-        val tool = messages[2].jsonObject
+        val tool = messages[3].jsonObject
         assertEquals("tool", tool.getValue("role").jsonPrimitive.content)
         assertEquals("call_shot", tool.getValue("tool_call_id").jsonPrimitive.content)
         assertTrue(
@@ -88,7 +88,7 @@ class ChatImageTest {
         )
         assertEquals("captured", tool.getValue("content").jsonPrimitive.content)
 
-        val imageMessage = messages[3].jsonObject
+        val imageMessage = messages[4].jsonObject
         assertEquals("user", imageMessage.getValue("role").jsonPrimitive.content, "the image follows in a user message")
         val imageParts = imageMessage.parts().filter {
             it.jsonObject["type"]?.jsonPrimitive?.content == "image_url"
@@ -100,7 +100,7 @@ class ChatImageTest {
         assertTrue(url.startsWith("data:image/jpeg;base64,"), "a data URL is sent: $url")
         assertContentEquals(imageBytes, decodeDataUrl(url))
 
-        assertEquals("user", messages[4].jsonObject.getValue("role").jsonPrimitive.content)
+        assertEquals("user", messages[5].jsonObject.getValue("role").jsonPrimitive.content)
     }
 
     @Test
@@ -116,16 +116,16 @@ class ChatImageTest {
             ),
         )
 
-        // user, assistant(tool_calls=[a,b]), tool a, tool b, user image, current user. The image must not be inserted
+        // system, user, assistant(tool_calls=[a,b]), tool a, tool b, user image, current user. The image must not be inserted
         // between the assistant's tool_calls and one of its tool replies (D9 §2.2 pairing rule).
         assertEquals(
-            listOf("user", "assistant", "tool", "tool", "user", "user"),
+            listOf("system", "user", "assistant", "tool", "tool", "user", "user"),
             messages.map { it.jsonObject.getValue("role").jsonPrimitive.content },
             "wire order: $messages",
         )
-        assertEquals("call_a", messages[2].jsonObject.getValue("tool_call_id").jsonPrimitive.content)
-        assertEquals("call_b", messages[3].jsonObject.getValue("tool_call_id").jsonPrimitive.content)
-        val imagePart = messages[4].jsonObject.parts().single {
+        assertEquals("call_a", messages[3].jsonObject.getValue("tool_call_id").jsonPrimitive.content)
+        assertEquals("call_b", messages[4].jsonObject.getValue("tool_call_id").jsonPrimitive.content)
+        val imagePart = messages[5].jsonObject.parts().single {
             it.jsonObject.getValue("type").jsonPrimitive.content == "image_url"
         }
         assertContentEquals(imageBytes, decodeDataUrl(imageUrlPart(imagePart).getValue("url").jsonPrimitive.content))
@@ -169,10 +169,10 @@ class ChatImageTest {
             ),
         )
 
-        // The tool message stays a string and the image message follows it, carrying a text part instead of bytes.
-        assertEquals(5, messages.size, "user, assistant(tool_calls), tool, placeholder user, current user: $messages")
-        assertEquals("tool", messages[2].jsonObject.getValue("role").jsonPrimitive.content)
-        val placeholderMessage = messages[3].jsonObject
+        // system, user, assistant(tool_calls), tool, placeholder user, current user.
+        assertEquals(6, messages.size, "system, user, assistant(tool_calls), tool, placeholder user, current user: $messages")
+        assertEquals("tool", messages[3].jsonObject.getValue("role").jsonPrimitive.content)
+        val placeholderMessage = messages[4].jsonObject
         assertEquals("user", placeholderMessage.getValue("role").jsonPrimitive.content)
         val parts = placeholderMessage.parts()
         assertEquals(1, parts.size, "no image part may be sent for a missing artifact: $parts")
