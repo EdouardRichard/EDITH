@@ -401,6 +401,14 @@ class HostCompositionRoot internal constructor(
      */
     private val modelCatalog: ModelCatalogRepository? = null,
     /**
+     * 0.52 (design §5.4): the gateway's `GET /models` source, or null for a hand-built composition.
+     *
+     * Production [create] builds a dedicated client with redirects and connection retries off and without the
+     * scripted model wire; the catalog refresh (Task 13) reads this same instance. A hand-built composition that
+     * does not wire one leaves the refresh unavailable rather than fabricating a model list.
+     */
+    val modelListSource: ModelListSource? = null,
+    /**
      * 0.5 (`D214`): starts/stops the phone-only overlay when the mode changes. The argument is the **requested**
      * mode, not a read of `detachGate.enabled`: the gate invokes the callback while the live value is still the old
      * one (it updates after the save), so a read here saw `false` on the enable transition and stopped the service
@@ -3422,6 +3430,16 @@ class HostCompositionRoot internal constructor(
                 // `P3_HTTP` line keeps telling the truth about what the client saw. Inert until armed.
                 .addInterceptor(scriptedWire)
                 .addInterceptor(ModelHttpLog(clock::nowNanos)).build()
+            // 0.52 design §5.4: `GET /models` is a plain JSON call, not the SSE model wire, so it gets its **own**
+            // client. Redirects stay off (a redirect could carry the bearer key to another origin) and so do
+            // connection retries (the caller owns repetition). No ScriptedModelWire: that wire answers POSTs, and a
+            // canned model list would make the settings page lie about the gateway.
+            val modelListHttp = OkHttpClient.Builder()
+                .followRedirects(false)
+                .followSslRedirects(false)
+                .retryOnConnectionFailure(false)
+                .build()
+            val modelListSource = ModelListClient(modelListHttp, resolver, allowLocalHttp = BuildConfig.DEBUG)
             // 0.25 Task 13 (R67/R71/R72): the one artifact store of this composition. The kernel writes a screenshot
             // into it; both model adapters read the same instance back through the one `MediaSource` the controlled
             // client holds. App-cache scratch, bounded and LRU — never the repository, never a log line.
@@ -4251,6 +4269,7 @@ class HostCompositionRoot internal constructor(
                 add(AutoCloseable {
                     timer.shutdownNow(); pluginTasks.shutdownNow()
                     http.dispatcher.executorService.shutdown(); http.connectionPool.evictAll()
+                    modelListHttp.dispatcher.executorService.shutdown(); modelListHttp.connectionPool.evictAll()
                 })
                 // 0.25 Task 10 (R42): closing the surface closes the device kernel (through the catalog's onClose) and
                 // any closeable atomic executor, so a closed composition cannot leave a device thread behind. The
@@ -4299,6 +4318,8 @@ class HostCompositionRoot internal constructor(
                 detachGate = detachGate,
                 // 0.52: the same catalog behind `profiles`, so the runtime switch reads the live projection.
                 modelCatalog = catalog,
+                // 0.52 design §5.4: the dedicated gateway list client the catalog refresh will use.
+                modelListSource = modelListSource,
                 // 0.5 (`D214`): the overlay follows the requested mode; the permission is checked by `sync`.
                 syncPhoneOnlyOverlay = { enabled -> PhoneOnlyOverlayService.sync(context, rootHolder[0], enabled) },
                 // 0.5 (`D213`): the runtime speech router/factory/holder. The factory is the same platform player the
