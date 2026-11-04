@@ -1,20 +1,25 @@
 package com.sheen.rokid.phone.settings
 
+import androidx.activity.compose.setContent
+import androidx.compose.runtime.Composable
 import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.hasClickAction
 import androidx.compose.ui.test.hasStateDescription
 import androidx.compose.ui.test.hasText
-import androidx.compose.ui.test.junit4.createComposeRule
+import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import com.sheen.rokid.phone.BuildConfig
+import com.sheen.rokid.phone.ForegroundTestActivity
 import com.sheen.rokid.phone.ui.settings.AboutScreen
 import com.sheen.rokid.phone.ui.settings.ModelStatus
 import com.sheen.rokid.phone.ui.settings.SettingsHomeModel
 import com.sheen.rokid.phone.ui.settings.SettingsHomeScreen
 import com.sheen.rokid.phone.ui.settings.SettingsRoute
+import org.junit.After
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
+import org.junit.Before
 import org.junit.Rule
 import org.junit.Test
 
@@ -25,8 +30,27 @@ import org.junit.Test
  */
 class SettingsHomeTest {
 
+    // Empty rule: the K40 aborts instrumented background Activity starts, so the rule may not launch its own host.
+    // The project harness shell-starts the real MainActivity (shell UID) and waits for RESUMED + window focus.
     @get:Rule
-    val compose = createComposeRule()
+    val compose = createEmptyComposeRule()
+
+    private lateinit var foreground: ForegroundTestActivity
+
+    @Before
+    fun launchForegroundHost() {
+        foreground = ForegroundTestActivity.launch()
+    }
+
+    @After
+    fun closeForegroundHost() {
+        if (::foreground.isInitialized) foreground.close()
+    }
+
+    /** Sets the test composition on the foreground MainActivity owned by [ForegroundTestActivity]. */
+    private fun setContent(content: @Composable () -> Unit) {
+        foreground.onActivity { activity -> activity.setContent { content() } }
+    }
 
     private fun homeModel(
         modelSummary: String = "未配置",
@@ -47,7 +71,7 @@ class SettingsHomeTest {
     // the settings home shows exactly seven entries in four groups
     @Test
     fun theSettingsHomeShowsExactlySevenEntriesInFourGroups() {
-        compose.setContent { SettingsHomeScreen(model = homeModel(), onOpen = {}) }
+        setContent { SettingsHomeScreen(model = homeModel(), onOpen = {}) }
 
         // One clickable row per entry: the home has no other clickable surface.
         compose.onAllNodes(hasClickAction()).assertCountEquals(7)
@@ -71,7 +95,7 @@ class SettingsHomeTest {
     @Test
     fun clickingTheModelServiceRowOpensThatRoute() {
         var opened: SettingsRoute? = null
-        compose.setContent {
+        setContent {
             SettingsHomeScreen(model = homeModel(), onOpen = { opened = it })
         }
 
@@ -83,7 +107,7 @@ class SettingsHomeTest {
     // the model service summary renders the unconfigured error style
     @Test
     fun theModelServiceSummaryRendersTheUnconfiguredErrorStyle() {
-        compose.setContent { SettingsHomeScreen(model = homeModel(), onOpen = {}) }
+        setContent { SettingsHomeScreen(model = homeModel(), onOpen = {}) }
 
         compose.onNode(hasText("未配置") and hasStateDescription("错误")).assertExists()
     }
@@ -92,7 +116,7 @@ class SettingsHomeTest {
     @Test
     fun theAuditRowSaysCollapsedAndNeverCallsALoader() {
         var loaderCalls = 0
-        compose.setContent {
+        setContent {
             SettingsHomeScreen(
                 model = homeModel(),
                 onOpen = {},
@@ -111,7 +135,7 @@ class SettingsHomeTest {
     @Test
     fun aboutRendersTheBuildNameAndOpensModelService() {
         var opened = false
-        compose.setContent { AboutScreen(onOpenModelService = { opened = true }) }
+        setContent { AboutScreen(onOpenModelService = { opened = true }) }
 
         compose.onNodeWithText("EDITH ${BuildConfig.VERSION_NAME}", substring = true).assertExists()
         compose.onNodeWithText(if (BuildConfig.DEBUG) "调试版" else "发布版", substring = true).assertExists()
