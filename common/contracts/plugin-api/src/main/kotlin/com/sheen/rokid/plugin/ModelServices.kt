@@ -6,6 +6,12 @@ enum class InputModality { TEXT, IMAGE, AUDIO }
 enum class OutputModality { TEXT, AUDIO }
 enum class VerificationState { Unverified, Verified, Failed }
 
+/**
+ * 0.52 design §5.7: the three reasoning levels the DeepSeek protocol exposes. The profile carries the user's choice so
+ * the adapters can map it without the catalog types (which are app-only) leaking into the contract.
+ */
+enum class ThinkingEffort { LOW, HIGH, MAX }
+
 data class CapabilityVerification(
     val profileRevision: Long,
     val operation: String,
@@ -36,6 +42,9 @@ data class ModelProfile(
     val inputs: Set<InputModality>,
     val outputs: Set<OutputModality>,
     val verifications: List<CapabilityVerification>,
+    /** 0.52 design §5.7: reasoning is off by default so a catalog projection leaves existing latency unchanged. */
+    val thinkingEnabled: Boolean = false,
+    val thinkingEffort: ThinkingEffort = ThinkingEffort.LOW,
 ) {
     init {
         require(listOf(id, name, service, baseUrl, protocolId, model, secret.id).all { it.isNotBlank() })

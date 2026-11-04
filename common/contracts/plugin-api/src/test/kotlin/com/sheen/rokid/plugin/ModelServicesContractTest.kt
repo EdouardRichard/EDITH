@@ -111,4 +111,16 @@ class ModelServicesContractTest {
         assertEquals("c", terminal.callId)
         assertNull(ModelStreamEvent.ToolCallDelta("q", "i", null, "{}").name)
     }
+
+    @Test fun `thinking defaults are off and low and stay out of toString`() {
+        val profile = profile()
+        assertFalse(profile.thinkingEnabled)
+        assertEquals(ThinkingEffort.LOW, profile.thinkingEffort)
+
+        val enabled = profile.copy(thinkingEnabled = true, thinkingEffort = ThinkingEffort.MAX)
+        assertTrue(enabled.thinkingEnabled)
+        assertEquals(ThinkingEffort.MAX, enabled.thinkingEffort)
+        assertFalse(enabled.toString().contains("thinking", ignoreCase = true))
+        assertFalse(enabled.toString().contains("MAX"))
+    }
 }
