@@ -41,6 +41,9 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
     val detached by root.detachGate.enabled.collectAsStateWithLifecycle()
     val appearance by root.phoneOnlyAppearance.collectAsStateWithLifecycle()
     val speechEnabled by root.speechEnabled.collectAsStateWithLifecycle()
+    // 0.52 fix round 1 (design §4.2): the phone-only transition's auto-on speech write is not the page's switch
+    // callback, so the host publishes its refusal separately; the shell maps it with the one central copy table.
+    val speechAutoOnFailure by root.speechAutoOnFailure.collectAsStateWithLifecycle()
     // The service publishes what it actually did (0.5.1 C12/C14); the page never infers 「运行中」 from the overlay
     // permission. `startFailure` is mapped to the short Chinese reason before it reaches the host-free page.
     val phoneOnlyRunning by PhoneOnlyOverlayService.isRunning.collectAsStateWithLifecycle()
@@ -119,6 +122,7 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
                 phoneOnlyRunning = phoneOnlyRunning,
                 startFailure = phoneOnlyStartFailure?.let(::phoneOnlyStartFailureText),
                 help = rememberHelpState(),
+                autoOnSpeechFailure = RuntimeAppearanceUi.autoOnSpeechText(speechAutoOnFailure),
             )
         },
     )

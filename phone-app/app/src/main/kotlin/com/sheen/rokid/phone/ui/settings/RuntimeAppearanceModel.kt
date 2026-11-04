@@ -57,6 +57,17 @@ internal object RuntimeAppearanceUi {
         }
 
     /**
+     * The detach auto-on speech refusal, or null when there is nothing to report (0.52 fix round 1, design §4.2).
+     *
+     * The host turns 「语音朗读」on inside the phone-only transition (`HostCompositionRoot.onDetachModeChanged`) and
+     * publishes that write's result separately from the page's own switch callback. It is still a save failure, so it
+     * goes through the same central mapping; a success answers null (nothing extra is drawn). Without this the page
+     * could show the live switch on while the refusal existed only in the `P5_TTS persisted=false` log line.
+     */
+    fun autoOnSpeechText(result: SettingsSaveResult?): String? =
+        result?.let { SettingsFeedback.saveFailedText(it) }
+
+    /**
      * The opacity save line.
      *
      * [saved] comes from `PhoneOnlyOpacityResult`; on success the line names both committed values and whether the

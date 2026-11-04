@@ -478,6 +478,19 @@ class HostCompositionRoot internal constructor(
     internal val speechEnabled: StateFlow<Boolean> = speechOn.asStateFlow()
 
     /**
+     * 0.52 fix round 1 (design §4.2): the last detach auto-on speech write that refused, or null.
+     *
+     * [onDetachModeChanged] turns 「语音朗读」on the first time the phone-only mode is enabled and the user has never
+     * made an explicit speech choice. That write is not the settings page's own switch callback, so its
+     * [SettingsSaveResult] used to be discarded: on a store that could be read but not written the refusal ended in
+     * `P5_TTS ... persisted=false` while the live switch showed on and the page showed no failure. Publishing the
+     * result here lets the page render the same mapped refusal as every other save. Null means nothing to report;
+     * the next detach clears it before re-deciding.
+     */
+    private val speechAutoOnFailureState = MutableStateFlow<SettingsSaveResult?>(null)
+    internal val speechAutoOnFailure: StateFlow<SettingsSaveResult?> = speechAutoOnFailureState.asStateFlow()
+
+    /**
      * 0.5 (`D210`/`D211`): the live appearance of the phone-only overlay. Seeded from the persisted settings in
      * [create], updated by the settings sliders (preview while dragging, persist on release) and read by the overlay
      * service, so a change is visible without restarting the App.
@@ -3215,6 +3228,8 @@ class HostCompositionRoot internal constructor(
                     else -> "close_failed"
                 },
         )
+        // 0.52 fix round 1 (design §4.2): a previous auto-on refusal is stale once the mode is enabled again.
+        speechAutoOnFailureState.value = null
         // 0.5 (`D213`): the phone-only model's first activation turns「语音朗读」on when the user has never made an
         // explicit speech choice. `speechConfigured` is the D53② same-shape guard: once the user has turned it off, a
         // later detach never re-enables it. A store that cannot be read is treated as "already configured" so an
@@ -3222,7 +3237,10 @@ class HostCompositionRoot internal constructor(
         val speechAlreadyConfigured = runCatching { storedSettings().speechConfigured }.getOrDefault(true)
         if (!speechAlreadyConfigured) {
             P3Log.line("P5_TTS state=default_on reason=phone_only")
-            setSpeechEnabled(true)
+            // The refusal must be visible on the settings page, not only in `P5_TTS ... persisted=false`: the live
+            // switch already moved, so the page is the only place that can tell the user nothing was stored.
+            val result = setSpeechEnabled(true)
+            speechAutoOnFailureState.value = if (result.saved) null else result
         }
         // 0.5 (`D214`): the ball/bubbles follow the mode; a missing overlay permission is refused visibly in the
         // settings page (the service logs `NO_OVERLAY_PERMISSION` and stops itself).

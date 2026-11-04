@@ -45,6 +45,8 @@ import kotlin.math.roundToInt
  *   once on release through `onCommitOpacity`. A refusal is visible, and the sliders stay visible with the mode off;
  *   the note says the saved values apply when the mode is next on. 「恢复默认透明度」 keeps the shipped 82/75.
  * - **speech** is a live switch; a persistence refusal is shown inline even though the live player already changed.
+ *   The phone-only transition's own auto-on write is separate from this switch, so its refusal arrives through
+ *   [autoOnSpeechFailure] and is rendered beside the switch it moved.
  *
  * Running state comes from the service's published state (never inferred from the overlay permission): the shell maps
  * `PhoneOnlyOverlayService.startFailure` to its short text and re-syncs on `ON_RESUME`, so returning from a system
@@ -63,6 +65,14 @@ internal fun RuntimeAppearanceScreen(
     phoneOnlyRunning: Boolean,
     startFailure: String?,
     help: HelpState,
+    /**
+     * 0.52 fix round 1: the host's detach auto-on speech refusal, already mapped to copy by the shell, or null.
+     *
+     * The auto-on write is not this page's switch callback, so a refusal cannot be shown by the switch result line.
+     * It is still a save failure (design §4.2), so the shell publishes it and the page renders it beside the speech
+     * switch it moved; success is null and draws nothing. Defaulted so the briefed signature stays source-compatible.
+     */
+    autoOnSpeechFailure: String? = null,
 ) {
     var detachMessage by remember { mutableStateOf<String?>(null) }
     var detachFailed by remember { mutableStateOf(false) }
@@ -211,6 +221,9 @@ internal fun RuntimeAppearanceScreen(
                 )
             }
             InlineResult(speechMessage, speechFailed)
+            // The phone-only transition can turn this switch on by itself; its write's refusal must not stay log-only
+            // while the switch shows on (design §4.2). The shell passes the already-mapped copy, null on success.
+            InlineResult(autoOnSpeechFailure, failed = true)
         }
     }
 }

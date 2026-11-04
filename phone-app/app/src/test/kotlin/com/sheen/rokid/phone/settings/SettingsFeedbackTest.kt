@@ -19,6 +19,7 @@ import com.sheen.rokid.plugin.ModelStreamEvent
 import com.sheen.rokid.storage.MemoryProfileRepository
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -50,13 +51,20 @@ class SettingsFeedbackTest {
             }
     }
 
-    /** A store that reads like an empty settings blob but refuses every write, like a full/blocked disk. */
+    /**
+     * A store that reads like an empty settings blob but refuses every write, like a full/blocked disk.
+     *
+     * [failing] is healable so the detach auto-on case can prove the next successful detach clears the reported
+     * refusal; the default keeps every existing refusal test unchanged.
+     */
     private class FailingWriteBlobs : EncryptedBlobStore {
         val delegate = TestBlobs()
+        var failing = true
 
         override fun read(id: String): ByteArray? = delegate.read(id)
         override fun write(id: String, value: ByteArray) {
-            throw IOException("synthetic write failure")
+            if (failing) throw IOException("synthetic write failure")
+            delegate.write(id, value)
         }
         override fun delete(id: String) = delegate.delete(id)
     }
@@ -140,6 +148,56 @@ class SettingsFeedbackTest {
             assertTrue(result.saved)
             assertNull(result.errorCode)
             assertEquals("已保存，立即生效", RuntimeAppearanceUi.speechText(result))
+        } finally {
+            root.close()
+        }
+    }
+
+    // ---- detach auto-on speech (fix round 1) -------------------------------------------------------------------
+
+    /** The first detach with no explicit speech choice turns speech on; its write must not fail silently. */
+    @Test
+    fun `the detach auto-on speech refusal is an observable result, not only a log`() {
+        val blobs = FailingWriteBlobs()
+        val store = SmartSettingsStore(blobs)
+        val root = composition(store)
+        try {
+            root.onDetachModeChanged(detached = true)
+
+            assertTrue("the live switch still moves before the write", root.speechEnabled.value)
+            val failure = root.speechAutoOnFailure.value
+            assertNotNull(
+                "the refusal must reach the settings page instead of ending in P5_TTS persisted=false",
+                failure,
+            )
+            assertFalse("a refused write is not a save", failure!!.saved)
+            assertEquals(SettingsSaveResult.ERROR_SAVE_FAILED, failure.errorCode)
+            assertEquals(
+                "the page renders the same central mapping as every other settings failure",
+                "保存失败：设置写入失败，未保存。",
+                RuntimeAppearanceUi.autoOnSpeechText(failure),
+            )
+            assertFalse("the refusal left nothing persisted", store.load().speechEnabled)
+            assertFalse("the refusal did not record an explicit speech choice", store.load().speechConfigured)
+        } finally {
+            root.close()
+        }
+    }
+
+    /** A later detach that can write clears the old refusal, so the page does not keep a stale failure line. */
+    @Test
+    fun `the detach auto-on speech refusal clears on the next successful detach`() {
+        val blobs = FailingWriteBlobs()
+        val root = composition(SmartSettingsStore(blobs))
+        try {
+            root.onDetachModeChanged(detached = true)
+            assertNotNull("the first detach reports its refused auto-on write", root.speechAutoOnFailure.value)
+
+            blobs.failing = false
+            root.onDetachModeChanged(detached = true)
+
+            assertNull("a successful auto-on leaves nothing to report", root.speechAutoOnFailure.value)
+            assertTrue("the second attempt persisted the speech choice", SmartSettingsStore(blobs).load().speechConfigured)
         } finally {
             root.close()
         }

@@ -87,6 +87,7 @@ class RuntimeAppearanceUiTest {
         onSpeech: (Boolean) -> SettingsSaveResult = { SettingsSaveResult(saved = true) },
         running: Boolean = false,
         startFailure: String? = null,
+        autoOnSpeechFailure: String? = null,
     ) {
         setContent {
             Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
@@ -102,6 +103,7 @@ class RuntimeAppearanceUiTest {
                     phoneOnlyRunning = running,
                     startFailure = startFailure,
                     help = rememberHelpState(),
+                    autoOnSpeechFailure = autoOnSpeechFailure,
                 )
             }
         }
@@ -152,6 +154,20 @@ class RuntimeAppearanceUiTest {
             .performClick()
 
         compose.onNodeWithText("已保存，立即生效").assertExists()
+    }
+
+    // the detach auto-on write is not the user's own switch: its refusal must still be visible on the page
+    @Test
+    fun theDetachAutoOnSpeechRefusalIsVisible() {
+        val failureText = requireNotNull(
+            RuntimeAppearanceUi.autoOnSpeechText(
+                SettingsSaveResult(saved = false, errorCode = SettingsSaveResult.ERROR_SAVE_FAILED),
+            ),
+        )
+        setPage(speechEnabled = true, autoOnSpeechFailure = failureText)
+
+        compose.onNodeWithContentDescription(RuntimeAppearanceUi.SPEECH_SWITCH).assertExists()
+        compose.onNodeWithText("保存失败：设置写入失败，未保存。").assertExists()
     }
 
     // ---- opacity -----------------------------------------------------------------------------------------------
