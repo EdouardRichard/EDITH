@@ -9,6 +9,7 @@ import com.sheen.rokid.phone.model.catalog.ModelProfileProjection
 import com.sheen.rokid.phone.model.catalog.Provider
 import com.sheen.rokid.plugin.CancellationHandle
 import com.sheen.rokid.plugin.CapabilityVerification
+import com.sheen.rokid.plugin.InputModality
 import com.sheen.rokid.plugin.SecretHandle
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -172,6 +173,41 @@ class AndroidModelCatalogRepository(
             affected = linkedSetOf<String>().apply {
                 oldModelId?.let { add(ModelProfileProjection.profileId(provider.id, it)) }
                 add(ModelProfileProjection.profileId(provider.id, modelId))
+            }
+            deliveries = changes.toList()
+        }
+        notify(affected, deliveries)
+    }
+
+    override fun setActiveProvider(providerId: String) {
+        val affected: Set<String>
+        val deliveries: List<Subscription>
+        synchronized(lock) {
+            val previous = load()
+            val provider = previous.providers.firstOrNull { it.id == providerId }
+                ?: throw ContractError.ConfigurationRejected("Model provider unavailable")
+            if (previous.activeProviderId == providerId) return
+            val selected = previous.lastSelectedModelIdByProvider[providerId]
+                ?.takeIf { id -> provider.models.any { it.id == id } }
+                ?: provider.models.firstOrNull { InputModality.IMAGE in it.inputs }?.id
+                ?: provider.models.firstOrNull()?.id
+            ModelCatalogJson.write(
+                blobs,
+                previous.copy(
+                    activeProviderId = providerId,
+                    selectedModelId = selected,
+                    lastSelectedModelIdByProvider = if (selected == null) {
+                        previous.lastSelectedModelIdByProvider - providerId
+                    } else {
+                        previous.lastSelectedModelIdByProvider + (providerId to selected)
+                    },
+                ),
+            )
+            affected = linkedSetOf<String>().apply {
+                previous.activeProviderId?.let { oldProvider ->
+                    previous.selectedModelId?.let { add(ModelProfileProjection.profileId(oldProvider, it)) }
+                }
+                selected?.let { add(ModelProfileProjection.profileId(providerId, it)) }
             }
             deliveries = changes.toList()
         }

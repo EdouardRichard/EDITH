@@ -366,4 +366,174 @@ class AndroidModelCatalogRepositoryTest {
         repository.selectModel("m-3")
         assertEquals(2, seen.size)
     }
+
+    @Test fun `switching restores the provider's last selected model`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider("p-1"), "synthetic-first-key".toCharArray())
+        repository.saveModels("p-1", listOf(entry("m-1"), entry("m-2")), "m-1")
+        repository.saveProvider(provider("p-2", name = "Second"), "synthetic-second-key".toCharArray())
+        repository.saveModels(
+            "p-2",
+            listOf(entry("m-3").copy(inputs = setOf(InputModality.TEXT)), entry("m-4")),
+            null,
+        )
+        ModelCatalogJson.write(
+            blobs,
+            repository.catalog().copy(
+                activeProviderId = "p-1",
+                selectedModelId = "m-1",
+                lastSelectedModelIdByProvider = mapOf("p-1" to "m-1", "p-2" to "m-3"),
+            ),
+        )
+
+        repository.setActiveProvider("p-2")
+
+        val catalog = repository.catalog()
+        assertEquals("p-2", catalog.activeProviderId)
+        assertEquals("m-3", catalog.selectedModelId)
+        assertEquals("m-3", catalog.lastSelectedModelIdByProvider["p-2"])
+    }
+
+    @Test fun `switching falls back to the first image capable model`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider("p-1"), "synthetic-first-key".toCharArray())
+        repository.saveModels("p-1", listOf(entry("m-1")), "m-1")
+        repository.saveProvider(provider("p-2", name = "Second"), "synthetic-second-key".toCharArray())
+        repository.saveModels(
+            "p-2",
+            listOf(
+                entry("m-3").copy(inputs = setOf(InputModality.TEXT)),
+                entry("m-4").copy(inputs = setOf(InputModality.TEXT, InputModality.IMAGE)),
+                entry("m-5").copy(inputs = setOf(InputModality.TEXT, InputModality.IMAGE)),
+            ),
+            null,
+        )
+        ModelCatalogJson.write(
+            blobs,
+            repository.catalog().copy(
+                activeProviderId = "p-1",
+                selectedModelId = "m-1",
+                lastSelectedModelIdByProvider = mapOf("p-1" to "m-1", "p-2" to "m-missing"),
+            ),
+        )
+
+        repository.setActiveProvider("p-2")
+
+        val catalog = repository.catalog()
+        assertEquals("p-2", catalog.activeProviderId)
+        assertEquals("m-4", catalog.selectedModelId)
+        assertEquals("m-4", catalog.lastSelectedModelIdByProvider["p-2"])
+    }
+
+    @Test fun `switching to a provider without models selects nothing`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider("p-1"), "synthetic-first-key".toCharArray())
+        repository.saveModels("p-1", listOf(entry("m-1")), "m-1")
+        repository.saveProvider(provider("p-2", name = "Empty"), "synthetic-second-key".toCharArray())
+        ModelCatalogJson.write(
+            blobs,
+            repository.catalog().copy(
+                activeProviderId = "p-1",
+                selectedModelId = "m-1",
+                lastSelectedModelIdByProvider = mapOf("p-1" to "m-1"),
+            ),
+        )
+
+        repository.setActiveProvider("p-2")
+
+        val catalog = repository.catalog()
+        assertEquals("p-2", catalog.activeProviderId)
+        assertNull(catalog.selectedModelId)
+    }
+
+    @Test fun `switching does not bump the revision and notifies the old and new derived ids once`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider("p-1"), "synthetic-first-key".toCharArray())
+        repository.saveModels("p-1", listOf(entry("m-1"), entry("m-2")), "m-1")
+        repository.saveProvider(provider("p-2", name = "Second"), "synthetic-second-key".toCharArray())
+        repository.saveModels("p-2", listOf(entry("m-3"), entry("m-4")), null)
+        ModelCatalogJson.write(
+            blobs,
+            repository.catalog().copy(
+                activeProviderId = "p-1",
+                selectedModelId = "m-1",
+                lastSelectedModelIdByProvider = mapOf("p-1" to "m-1", "p-2" to "m-3"),
+            ),
+        )
+        val revisions = repository.catalog().providers.associate { it.id to it.revision }
+        val notified = mutableListOf<Set<String>>()
+        val subscription = repository.listenChanges { notified += it }
+
+        repository.setActiveProvider("p-2")
+
+        assertEquals(listOf(setOf("p-1:m-1", "p-2:m-3")), notified)
+        val catalog = repository.catalog()
+        assertEquals("p-2", catalog.activeProviderId)
+        assertEquals("m-3", catalog.selectedModelId)
+        assertEquals(revisions, catalog.providers.associate { it.id to it.revision })
+        subscription.cancel()
+    }
+
+    @Test fun `switching to the already active provider changes nothing and notifies nobody`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider("p-1"), "synthetic-first-key".toCharArray())
+        repository.saveModels("p-1", listOf(entry("m-1"), entry("m-2")), "m-1")
+        ModelCatalogJson.write(
+            blobs,
+            repository.catalog().copy(
+                activeProviderId = "p-1",
+                selectedModelId = "m-1",
+                lastSelectedModelIdByProvider = mapOf("p-1" to "m-1"),
+            ),
+        )
+        val before = repository.catalog()
+        val notified = mutableListOf<Set<String>>()
+        val subscription = repository.listenChanges { notified += it }
+
+        repository.setActiveProvider("p-1")
+
+        assertTrue(notified.isEmpty())
+        assertEquals(before, repository.catalog())
+        subscription.cancel()
+    }
+
+    @Test fun `switching to an unknown provider is rejected without changing the selection`() {
+        val blobs = Blobs()
+        val credentials = Credentials()
+        val repository = AndroidModelCatalogRepository(blobs, credentials)
+        repository.saveProvider(provider("p-1"), "synthetic-first-key".toCharArray())
+        repository.saveModels("p-1", listOf(entry("m-1"), entry("m-2")), "m-1")
+        ModelCatalogJson.write(
+            blobs,
+            repository.catalog().copy(
+                activeProviderId = "p-1",
+                selectedModelId = "m-1",
+                lastSelectedModelIdByProvider = mapOf("p-1" to "m-1"),
+            ),
+        )
+        val before = repository.catalog()
+        val storedBefore = bytes(blobs, ModelCatalogJson.BLOB_ID)
+        val notified = mutableListOf<Set<String>>()
+        val subscription = repository.listenChanges { notified += it }
+
+        val error = assertThrows(ContractError.ConfigurationRejected::class.java) {
+            repository.setActiveProvider("missing")
+        }
+
+        assertEquals("Model provider unavailable", error.message)
+        assertEquals(before, repository.catalog())
+        assertEquals(storedBefore, bytes(blobs, ModelCatalogJson.BLOB_ID))
+        assertTrue(notified.isEmpty())
+        subscription.cancel()
+    }
 }

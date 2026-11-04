@@ -39,6 +39,13 @@ interface ModelCatalogRepository {
     /** Selects [modelId] inside the active provider without bumping the revision. */
     fun selectModel(modelId: String)
 
+    /**
+     * Switches the active provider without bumping any provider revision. The selection is restored from
+     * [ModelCatalog.lastSelectedModelIdByProvider] when that model still exists in the provider, otherwise the first
+     * image-capable model, otherwise the first model, otherwise nothing. Reports the old and new derived profile ids.
+     */
+    fun setActiveProvider(providerId: String)
+
     /** Appends evidence only when [result] was produced for the provider's current revision. */
     fun verify(profileId: String, result: CapabilityVerification)
 
