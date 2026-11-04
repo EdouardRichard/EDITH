@@ -1,5 +1,6 @@
 package com.sheen.rokid.phone.settings
 
+import android.view.KeyEvent
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
@@ -52,7 +53,9 @@ import org.junit.Test
  * `(?)`, and both ways out (top-left arrow and system back) asking 「放弃修改？」 only while the draft is dirty.
  *
  * Harness: `createEmptyComposeRule()` + [ForegroundTestActivity] (the K40 aborts the Compose rule's own background
- * Activity start; see `SettingsHomeTest`). Content is installed on the real foreground MainActivity.
+ * Activity start; see `SettingsHomeTest`). Content is installed on the real foreground MainActivity. The two system-back
+ * cases compose the production shape instead — the page inside the shell's `PhoneDetailPage` dialog — and inject a real
+ * BACK key so the dialog window, not the Activity dispatcher, owns the event.
  */
 class AssistantBehaviorUiTest {
 
@@ -93,13 +96,16 @@ class AssistantBehaviorUiTest {
         glassesDetached = glassesDetached,
     )
 
-    /** Composes just the page, with a scrolling host so the save control can be reached at fontScale 1. */
+    /**
+     * Composes just the page (content, badges, save and the immediate switch), with a scrolling host so the save
+     * control can be reached at fontScale 1.
+     *
+     * The dirty-back cases deliberately do not use this: they must go through [setShellPage].
+     */
     private fun setPage(
         base: SmartSettings = baseSettings(),
         save: (SmartSettings) -> SettingsSaveResult = { SettingsSaveResult(saved = true) },
         setProactive: (Boolean) -> SettingsSaveResult = { SettingsSaveResult(saved = true) },
-        requestPop: () -> Unit = {},
-        registerBackGuard: (() -> Unit) -> Unit = {},
     ) {
         setContent {
             Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState())) {
@@ -108,8 +114,6 @@ class AssistantBehaviorUiTest {
                     save = save,
                     setProactive = setProactive,
                     help = rememberHelpState(),
-                    requestPop = requestPop,
-                    registerBackGuard = registerBackGuard,
                 )
             }
         }
@@ -127,6 +131,50 @@ class AssistantBehaviorUiTest {
         auditSummary = "已收起 · 进入后加载",
         aboutSummary = "EDITH ${BuildConfig.VERSION_NAME} · 预览版",
     )
+
+    /**
+     * Composes the real shell and pushes the assistant page through the 「助手行为」 row.
+     *
+     * Production puts the page inside `SettingsShellContent`'s `PhoneDetailPage` **Dialog**, so system back must be
+     * driven there: composing the page directly on the Activity would address the Activity's back dispatcher, while
+     * the dialog window owns the back event the user actually presses.
+     */
+    private fun setShellPage(
+        base: SmartSettings = baseSettings(),
+        save: (SmartSettings) -> SettingsSaveResult = { SettingsSaveResult(saved = true) },
+        setProactive: (Boolean) -> SettingsSaveResult = { SettingsSaveResult(saved = true) },
+    ) {
+        setContent {
+            SettingsShellContent(
+                homeModel = homeModel(),
+                assistantBehavior = { requestPop, registerBackGuard ->
+                    AssistantBehaviorScreen(
+                        load = { base },
+                        save = save,
+                        setProactive = setProactive,
+                        help = rememberHelpState(),
+                        requestPop = requestPop,
+                        registerBackGuard = registerBackGuard,
+                    )
+                },
+            )
+        }
+        compose.onNodeWithText("助手行为").performClick()
+        compose.waitForIdle()
+    }
+
+    /**
+     * A real BACK key press on the window that currently has focus — after [setShellPage] that is the page's dialog.
+     *
+     * This is the same focused-window path `Espresso.pressBack()` wraps (`Instrumentation` injects the key into the
+     * input pipeline); Espresso itself is only a runtime dependency of this test APK, so the injection is used
+     * directly. Calling `MainActivity.onBackPressedDispatcher.onBackPressed()` instead addresses the Activity's
+     * dispatcher and never the dialog's own, which is the dispatcher production system back reaches.
+     */
+    private fun pressBackOnFocusedWindow() {
+        InstrumentationRegistry.getInstrumentation().sendKeyDownUpSync(KeyEvent.KEYCODE_BACK)
+        compose.waitForIdle()
+    }
 
     // ---- the page's copy and badges ---------------------------------------------------------------------------
 
@@ -289,50 +337,44 @@ class AssistantBehaviorUiTest {
         compose.onNodeWithContentDescription("返回").assertDoesNotExist()
     }
 
-    // system back takes the same dirty guard (composed outside the page dialog so the Activity dispatcher owns it)
+    // system back is a real focused-window back on the page's dialog and takes the same dirty guard
     @Test
     fun systemBackAsksBeforeDiscarding() {
-        var activity: MainActivity? = null
-        foreground.onActivity { activity = it }
-        var popped = false
-        setPage(requestPop = { popped = true })
-
+        setShellPage()
         compose.onNodeWithContentDescription("唤醒词输入").performTextReplacement("EDITH")
-
-        InstrumentationRegistry.getInstrumentation().runOnMainSync {
-            requireNotNull(activity).onBackPressedDispatcher.onBackPressed()
-        }
         compose.waitForIdle()
-        compose.onNodeWithText(AssistantBehaviorUi.DISCARD_TITLE).assertExists()
 
+        pressBackOnFocusedWindow()
+
+        compose.onNodeWithText(AssistantBehaviorUi.DISCARD_TITLE).assertExists()
         compose.onNodeWithText(AssistantBehaviorUi.DISCARD_KEEP).performClick()
         compose.waitForIdle()
-        assertFalse("继续编辑 must not leave the page", popped)
+        compose.onNodeWithText(AssistantBehaviorUi.DISCARD_TITLE).assertDoesNotExist()
+        compose.onNodeWithContentDescription("返回").assertExists("继续编辑 must keep the page open")
+        compose.onNodeWithContentDescription("唤醒词输入").assertTextContains("EDITH")
 
-        InstrumentationRegistry.getInstrumentation().runOnMainSync {
-            requireNotNull(activity).onBackPressedDispatcher.onBackPressed()
-        }
-        compose.waitForIdle()
+        pressBackOnFocusedWindow()
+
         compose.onNodeWithText(AssistantBehaviorUi.DISCARD_TITLE).assertExists()
         compose.onNodeWithText(AssistantBehaviorUi.DISCARD_CONFIRM).performClick()
         compose.waitForIdle()
-        assertTrue("放弃 must leave the page once", popped)
+        compose.onNodeWithContentDescription("返回").assertDoesNotExist()
+        compose.onNodeWithContentDescription("唤醒词输入").assertDoesNotExist()
+        // The shell is still composed on its home: 放弃 closed the page, not the Activity.
+        compose.onNodeWithText("设置").assertExists()
     }
 
-    // an untouched page leaves immediately, with no discard question
+    // an untouched page leaves immediately on system back, with no discard question
     @Test
     fun anUntouchedPageLeavesWithoutAsking() {
-        var activity: MainActivity? = null
-        foreground.onActivity { activity = it }
-        var popped = false
-        setPage(requestPop = { popped = true })
+        setShellPage()
 
-        InstrumentationRegistry.getInstrumentation().runOnMainSync {
-            requireNotNull(activity).onBackPressedDispatcher.onBackPressed()
-        }
-        compose.waitForIdle()
+        pressBackOnFocusedWindow()
 
         compose.onNodeWithText(AssistantBehaviorUi.DISCARD_TITLE).assertDoesNotExist()
-        assertTrue(popped)
+        compose.onNodeWithContentDescription("返回").assertDoesNotExist()
+        compose.onNodeWithContentDescription("唤醒词输入").assertDoesNotExist()
+        // The shell is still composed on its home: the page closed, not the Activity.
+        compose.onNodeWithText("设置").assertExists()
     }
 }
