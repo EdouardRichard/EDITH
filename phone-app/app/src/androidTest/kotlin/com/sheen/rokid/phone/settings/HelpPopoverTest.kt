@@ -6,6 +6,7 @@ import android.view.MotionEvent
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.MaterialTheme
@@ -13,11 +14,14 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalConfiguration
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.test.SemanticsNodeInteraction
 import androidx.compose.ui.test.assert
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.hasScrollAction
 import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.junit4.ComposeTestRule
 import androidx.compose.ui.test.junit4.createEmptyComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
@@ -42,9 +46,11 @@ import org.junit.Test
 /**
  * 0.52 design §4.1 / §4.5: the `(?)` help popover.
  *
- * Six behaviours are the contract: the icon carries its own description and opens the popover; a tap outside closes
- * it; back closes it; only one popover is ever open; the risk limits and the impact line are in the body; and the
- * popover is capped at ~330dp wide / 60% of the screen tall and scrolls its body.
+ * Seven behaviours are the contract: the icon carries its own description and opens the popover; a tap outside closes
+ * it; back closes it; only one popover is ever open; the risk limits and the impact line are in the body; the
+ * popover is capped at ~330dp wide / 60% of the screen tall and scrolls its body; and the card reports the side the
+ * position provider actually placed it on (`below` near the top, `above` near the bottom) so the arrow can never be
+ * flipped against the window position.
  *
  * Harness: `createEmptyComposeRule()` + [ForegroundTestActivity] (the K40 aborts the Compose rule's own background
  * Activity start; see `SettingsHomeTest`). Content is installed on the real foreground MainActivity.
@@ -248,4 +254,37 @@ class HelpPopoverTest {
         assertTrue("body width ${bodyBounds.width} exceeds $maxWidth", bodyBounds.width <= maxWidth)
         assertTrue("body height ${bodyBounds.height} exceeds $maxHeight", bodyBounds.height <= maxHeight + 1.dp)
     }
+
+    // the arrow side matches the space the position provider had
+    @Test
+    fun thePopoverSideFollowsTheAvailableSpace() {
+        val top = HelpText(title = "顶部说明", body = "顶部图标的说明正文。")
+        val bottom = HelpText(title = "底部说明", body = "底部图标的说明正文。")
+        setContent {
+            val help: HelpState = rememberHelpState()
+            Column(Modifier.fillMaxSize()) {
+                HelpIcon(top, help)
+                Spacer(Modifier.weight(1f))
+                HelpIcon(bottom, help)
+            }
+        }
+
+        // Room below the top icon: the provider must report the below side (the round-1 bug flipped it to `above`
+        // whenever the icon top was larger than the popup height, which is the common case).
+        compose.onNodeWithContentDescription("查看${top.title}说明").performClick()
+        compose.awaitPopoverSide("below")
+
+        // No room below the bottom icon: the provider flips the window above it, and the card must say `above`.
+        compose.onNodeWithContentDescription("查看${bottom.title}说明").performClick()
+        compose.awaitPopoverSide("above")
+    }
+
+    /** The side is published during the popup's own layout pass, so wait for the recomposition instead of racing it. */
+    private fun ComposeTestRule.awaitPopoverSide(side: String) {
+        waitUntil(5_000L) { onAllNodes(popoverSide(side)).fetchSemanticsNodes().isNotEmpty() }
+    }
+
+    /** The popover card publishes the side chosen by `HelpPopupPositionProvider` as its `stateDescription`. */
+    private fun popoverSide(side: String) =
+        SemanticsMatcher.expectValue(SemanticsProperties.StateDescription, side)
 }
