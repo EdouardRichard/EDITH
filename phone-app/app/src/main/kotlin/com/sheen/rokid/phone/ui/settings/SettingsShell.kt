@@ -148,6 +148,7 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
     SettingsShellContent(
         homeModel = home,
         auditLines = { root.auditLog?.lines().orEmpty() },
+        auditClear = { root.auditLog?.clear() },
         assistantBehavior = { requestPop, registerBackGuard ->
             AssistantBehaviorScreen(
                 // The page reads the persisted snapshot once (design §4.4). A store that cannot even answer gets the
@@ -193,6 +194,15 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
                 help = rememberHelpState(),
                 requestPop = requestPop,
                 registerBackGuard = registerBackGuard,
+            )
+        },
+        localCapabilities = {
+            // The page is a pure projection of the live session state (design §3.6): the same capability reasons and
+            // channel rows the 会话 panel reads, with no page-level load and therefore no second read to get stale.
+            LocalCapabilitiesScreen(
+                capabilityReasons = state.capabilityReasons,
+                channels = state.executionChannels,
+                help = rememberHelpState(),
             )
         },
     )
@@ -245,15 +255,25 @@ private fun saveThroughHost(root: HostCompositionRoot, settings: SmartSettings):
  *
  * [permissionsSecurity] is Task 11's seam for 权限与安全: like the assistant page it owns a form, so it takes the same
  * `requestPop`/`registerBackGuard` pair and the shell's one guarded exit. Null keeps Task 7's placeholder.
+ *
+ * [auditLines]/[auditClear] are Task 7's loader plus Task 12's writer. The home receives the loader but must never call
+ * it; only the 审计记录 route composes [AuditScreen], so the log is read when - and only when - that page is opened. One
+ * lambda pair is enough for the test seam: pushing the route with a counting pair proves the home leaves it untouched
+ * and the page reads once. Both default to a no-op for the compositions (T7/T9-T11 tests) that never open the page.
+ *
+ * [localCapabilities] is Task 12's seam for 本地能力: a read-only projection, so it is a plain composable with no back
+ * guard. Null keeps Task 7's placeholder for every existing call site.
  */
 @Composable
 internal fun SettingsShellContent(
     homeModel: SettingsHomeModel,
     auditLines: () -> List<String> = { emptyList() },
+    auditClear: () -> Unit = {},
     homeScrollState: ScrollState = rememberScrollState(),
     assistantBehavior: (@Composable (requestPop: () -> Unit, registerBackGuard: (() -> Unit) -> Unit) -> Unit)? = null,
     runtimeAppearance: (@Composable () -> Unit)? = null,
     permissionsSecurity: (@Composable (requestPop: () -> Unit, registerBackGuard: (() -> Unit) -> Unit) -> Unit)? = null,
+    localCapabilities: (@Composable () -> Unit)? = null,
 ) {
     val stack = remember { mutableStateListOf<SettingsRoute>() }
     var pageBackGuard by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -302,6 +322,12 @@ internal fun SettingsShellContent(
                     permissionsSecurity({ closePage() }) { guard -> pageBackGuard = guard }
                 }
             }
+            SettingsRoute.LocalCapabilities -> {
+                if (localCapabilities == null) PlaceholderPage(route) else localCapabilities()
+            }
+            // The audit page is composed only while this route is on the stack, so its `remember(revision)` read below
+            // never runs for the home or for any other route. The loader is the same lambda the home was handed.
+            SettingsRoute.Audit -> AuditScreen(loadLines = auditLines, onClear = auditClear)
             else -> PlaceholderPage(route)
         }
     }
