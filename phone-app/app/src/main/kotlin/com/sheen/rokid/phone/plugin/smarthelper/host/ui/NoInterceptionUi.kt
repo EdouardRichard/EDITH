@@ -25,6 +25,14 @@ object NoInterceptionUi {
         "开启后 L0–L4 全部工具调用不再确认，并绕过权限上限；关闭 App、被杀或重启后仍保持，只有手动关闭才退出。" +
             "卸载/清数据/删除文件等动作可能无法撤销。"
 
+    /**
+     * appendix A7: the conditional red sentence shown while the mode is on (design §3.5 keeps it).
+     *
+     * It is red and conditional but never replaces [SWITCH_SUMMARY] - the risk stays visible in both states.
+     */
+    const val ENABLED_WARNING =
+        "当前已选择开启：保存后会立即更新宿主的「不拦截」门，并在关闭 App、被杀或重启后保持。"
+
     /** The second-confirmation dialog's title. */
     const val CONFIRM_TITLE = "确认开启「不拦截」？"
 

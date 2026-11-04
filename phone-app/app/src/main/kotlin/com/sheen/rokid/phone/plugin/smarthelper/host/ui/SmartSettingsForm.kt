@@ -109,6 +109,19 @@ object SmartSettingsForm {
     ).count { it }
 
     /**
+     * How many of the 权限与安全 page's two launch-read fields changed between [before] and [after] (design §3.5).
+     *
+     * The tool-permission form restarts on exactly `maxLevel` and `whitelist`; the page's 「不拦截」 switch is the
+     * immediate one and deliberately does not count. This is a separate function from [needsRestartCount] because the
+     * two pages own different scopes: reusing the assistant count here would report four fields the permission page
+     * never edits, and merging the scopes would let one page's save claim the other page's restart needs.
+     */
+    fun permissionRestartCount(before: SmartSettings, after: SmartSettings): Int = listOf(
+        before.effectiveMaxLevel() != after.effectiveMaxLevel(),
+        before.whitelist != after.whitelist,
+    ).count { it }
+
+    /**
      * Parses one edit against [base].
      *
      * Wake words are separated by half- or full-width commas, trimmed, and de-duplicated case-insensitively in the

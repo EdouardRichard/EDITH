@@ -24,21 +24,21 @@ import com.sheen.rokid.phone.plugin.smarthelper.host.ui.SmartSettingsForm
 internal object AssistantBehaviorUi {
 
     /** The persistent note at the top of the page (0.52 design §3.3: 「需重启」 semantics in one place). */
-    const val RESTART_NOTE = "带「需重启」的项会在完全关闭并重新打开 App 后生效。"
+    const val RESTART_NOTE = SettingsPageUi.RESTART_NOTE
 
     /** The row badge on the four restart fields. */
-    const val RESTART_CHIP = "需重启"
+    const val RESTART_CHIP = SettingsPageUi.RESTART_CHIP
 
     /** The always-visible risk badge on the vision row. */
     const val SENSITIVE_BADGE = "敏感"
 
     /** The dirty-back confirmation's title and two answers (design §4.4). */
-    const val DISCARD_TITLE = "放弃修改？"
-    const val DISCARD_CONFIRM = "放弃"
-    const val DISCARD_KEEP = "继续编辑"
+    const val DISCARD_TITLE = SettingsPageUi.DISCARD_TITLE
+    const val DISCARD_CONFIRM = SettingsPageUi.DISCARD_CONFIRM
+    const val DISCARD_KEEP = SettingsPageUi.DISCARD_KEEP
 
     /** The form's explicit save button. */
-    const val SAVE = "保存"
+    const val SAVE = SettingsPageUi.SAVE
 
     /** A successful immediate write (the proactive switch) has nothing to restart. */
     const val PROACTIVE_SAVED = "已保存，立即生效"

@@ -63,6 +63,38 @@ class SmartSettingsFormTest {
         assertEquals("L2", result.settings.maxLevel)
     }
 
+    // ---- 0.52 design §3.5: the permission page's own restart scope ----------------------------------
+
+    @Test
+    fun thePermissionScopeCountsOnlyTheTwoToolPermissionFields() {
+        // 0.52 design §3.5/§4.2: the 权限与安全 form restarts on exactly `maxLevel` and `whitelist`. The count is a
+        // separate function from `needsRestartCount` (the assistant page's four fields); mixing the scopes would make
+        // one page claim another page's restart needs.
+        val base = settings(maxLevel = "L1", whitelist = listOf("launch|app"))
+
+        assertEquals("an untouched permission form needs no restart",
+            0, SmartSettingsForm.permissionRestartCount(base, base))
+        assertEquals("the level alone is one restart field",
+            1, SmartSettingsForm.permissionRestartCount(base, base.copy(maxLevel = "L3")))
+        assertEquals("the whitelist alone is one restart field",
+            1, SmartSettingsForm.permissionRestartCount(base, base.copy(whitelist = listOf("note|storage"))))
+        assertEquals("both fields are two",
+            2, SmartSettingsForm.permissionRestartCount(
+                base, base.copy(maxLevel = "L3", whitelist = listOf("note|storage"))))
+        assertEquals("the assistant page's fields are outside the permission scope",
+            0, SmartSettingsForm.permissionRestartCount(
+                base,
+                base.copy(
+                    wakeWords = listOf("小艾"),
+                    continueDialogue = false,
+                    proactiveCooldownMillis = 120_000L,
+                    proactiveSensitivity = "HIGH",
+                    visionEnabled = false,
+                    noInterception = true,
+                ),
+            ))
+    }
+
     // ---- 0.3 Phase 2 Task 10: the perception-screenshot switch ---------------------------------------
 
     @Test

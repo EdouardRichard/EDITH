@@ -1,6 +1,11 @@
 package com.sheen.rokid.phone.ui.settings
 
+import android.Manifest
+import android.content.Intent
+import android.net.Uri
 import android.provider.Settings
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ScrollState
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.material3.MaterialTheme
@@ -8,6 +13,7 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateListOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -61,6 +67,13 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
         } ?: false
     }
     val context = LocalContext.current
+    // 0.52 design §3.5/§6.1: the four system grants are not observable; returning from a system settings page
+    // recomposes nothing by itself. `grantEpoch` re-reads them on every ON_RESUME (the old page's rule) and the
+    // permission page's four rows repaint from that read.
+    var grantEpoch by remember { mutableIntStateOf(0) }
+    val requestCalendar = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) {
+        grantEpoch++
+    }
     // 0.52 design §3.4: returning from a system settings screen can change both the overlay grant and the service's
     // real state. MainActivity.onResume already syncs, but the settings page must not depend on another page having
     // done it: this observer re-reads the grant through the same policy and the published flows then repaint the page.
@@ -68,17 +81,56 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
     val lifecycleOwner = LocalLifecycleOwner.current
     DisposableEffect(lifecycleOwner, root) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) PhoneOnlyOverlayService.sync(context, root)
+            if (event == Lifecycle.Event.ON_RESUME) {
+                PhoneOnlyOverlayService.sync(context, root)
+                grantEpoch++
+            }
         }
         lifecycleOwner.lifecycle.addObserver(observer)
         onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
-    val missingPermissions = listOf(
-        root.foregroundAppSource?.isGranted == false,
-        root.notificationCategorySource?.isConnected == false,
-        root.calendarSource?.isGranted == false,
-        !Settings.canDrawOverlays(context),
-    ).count { it }
+    // One read per resume for the home's count and the page's four rows, so the two cannot disagree.
+    val grants = remember(grantEpoch) {
+        listOf(
+            root.foregroundAppSource?.isGranted == true,
+            root.notificationCategorySource?.isConnected == true,
+            root.calendarSource?.isGranted == true,
+            Settings.canDrawOverlays(context),
+        )
+    }
+    val missingPermissions = grants.count { !it }
+    val permissionStates = remember(grantEpoch) {
+        PermissionsSecurityUi.permissionStates(
+            foregroundGranted = grants[0],
+            notificationsConnected = grants[1],
+            calendarGranted = grants[2],
+            overlayGranted = grants[3],
+        ).map { state ->
+            // The page is host-free; the shell maps each row to its OS action here. Nothing on the page touches an
+            // Intent. The calendar grant is a runtime permission, the other three open their own system pages.
+            state.copy(
+                onGrant = {
+                    when (state.kind) {
+                        PermissionKind.USAGE_ACCESS -> runCatching {
+                            context.startActivity(Intent(Settings.ACTION_USAGE_ACCESS_SETTINGS))
+                        }
+                        PermissionKind.NOTIFICATION_ACCESS -> runCatching {
+                            context.startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                        }
+                        PermissionKind.CALENDAR -> requestCalendar.launch(Manifest.permission.READ_CALENDAR)
+                        PermissionKind.OVERLAY -> runCatching {
+                            context.startActivity(
+                                Intent(
+                                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                    Uri.parse("package:${context.packageName}"),
+                                ),
+                            )
+                        }
+                    }
+                },
+            )
+        }
+    }
     val unavailableCapabilities = state.capabilityReasons.size +
         state.executionChannels.count { !it.available }
 
@@ -123,6 +175,24 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
                 startFailure = phoneOnlyStartFailure?.let(::phoneOnlyStartFailureText),
                 help = rememberHelpState(),
                 autoOnSpeechFailure = RuntimeAppearanceUi.autoOnSpeechText(speechAutoOnFailure),
+            )
+        },
+        permissionsSecurity = { requestPop, registerBackGuard ->
+            PermissionsSecurityScreen(
+                // Same one-load contract as the other form page (design §4.4); a store that cannot answer gets the
+                // shipped defaults so the page renders, and a following save reports the real refusal inline.
+                load = { runCatching { root.storedSettings() }.getOrElse { SmartSettings() } },
+                save = { settings -> saveThroughHost(root, settings) },
+                // The live gate, not the stored value: after a failed safe-direction write the gate is off while the
+                // blob may still say on. The page shows and then persists the live answer.
+                noInterceptionLive = root.noInterceptionGate.enabled,
+                savePin = { pin -> root.saveLockPin(pin) },
+                clearPin = { root.clearLockPin() },
+                pinConfigured = root.lockPinConfigured,
+                permissionStates = permissionStates,
+                help = rememberHelpState(),
+                requestPop = requestPop,
+                registerBackGuard = registerBackGuard,
             )
         },
     )
@@ -172,6 +242,9 @@ private fun saveThroughHost(root: HostCompositionRoot, settings: SmartSettings):
  * [runtimeAppearance] is the same seam Task 10 adds for 运行与外观: the page needs no back guard, so the slot is a plain
  * composable that replaces Task 7's placeholder when the host supplies it. The null default keeps every existing
  * call site (including T7/T9 tests and the route stack tests) source-compatible.
+ *
+ * [permissionsSecurity] is Task 11's seam for 权限与安全: like the assistant page it owns a form, so it takes the same
+ * `requestPop`/`registerBackGuard` pair and the shell's one guarded exit. Null keeps Task 7's placeholder.
  */
 @Composable
 internal fun SettingsShellContent(
@@ -180,6 +253,7 @@ internal fun SettingsShellContent(
     homeScrollState: ScrollState = rememberScrollState(),
     assistantBehavior: (@Composable (requestPop: () -> Unit, registerBackGuard: (() -> Unit) -> Unit) -> Unit)? = null,
     runtimeAppearance: (@Composable () -> Unit)? = null,
+    permissionsSecurity: (@Composable (requestPop: () -> Unit, registerBackGuard: (() -> Unit) -> Unit) -> Unit)? = null,
 ) {
     val stack = remember { mutableStateListOf<SettingsRoute>() }
     var pageBackGuard by remember { mutableStateOf<(() -> Unit)?>(null) }
@@ -203,7 +277,9 @@ internal fun SettingsShellContent(
         // guard; a page without one (About/placeholders) closes directly.
         onBack = { pageBackGuard?.invoke() ?: closePage() },
         // A form page must not wrap its controls in the detail page's text-selection container.
-        selectionEnabled = route != SettingsRoute.AssistantBehavior && route != SettingsRoute.RuntimeAppearance,
+        selectionEnabled = route != SettingsRoute.AssistantBehavior &&
+            route != SettingsRoute.RuntimeAppearance &&
+            route != SettingsRoute.PermissionsSecurity,
     ) {
         when (route) {
             SettingsRoute.About -> AboutScreen(
@@ -218,6 +294,13 @@ internal fun SettingsShellContent(
             }
             SettingsRoute.RuntimeAppearance -> {
                 if (runtimeAppearance == null) PlaceholderPage(route) else runtimeAppearance()
+            }
+            SettingsRoute.PermissionsSecurity -> {
+                if (permissionsSecurity == null) {
+                    PlaceholderPage(route)
+                } else {
+                    permissionsSecurity({ closePage() }) { guard -> pageBackGuard = guard }
+                }
             }
             else -> PlaceholderPage(route)
         }

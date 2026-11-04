@@ -41,6 +41,16 @@ class NoInterceptionUiTest {
     }
 
     @Test
+    fun theEnabledWarningKeepsTheOriginalRedCopy() {
+        // appendix A7: the settings page keeps this sentence while the mode is on. It is red, conditional, and never
+        // replaces the always-visible risk summary.
+        assertTrue(NoInterceptionUi.ENABLED_WARNING.contains("当前已选择开启"))
+        assertTrue(NoInterceptionUi.ENABLED_WARNING.contains("「不拦截」门"))
+        assertTrue(NoInterceptionUi.ENABLED_WARNING.contains("关闭 App、被杀或重启后保持"))
+        assertFalse("the enabled warning must not be the dialog title", NoInterceptionUi.ENABLED_WARNING == NoInterceptionUi.CONFIRM_TITLE)
+    }
+
+    @Test
     fun theSwitchRowCarriesTheRiskWithoutOpeningTheDialog() {
         listOf("L0–L4", "不再确认", "重启", "手动关闭", "无法撤销").forEach { expected ->
             assertTrue("the always-visible switch copy must mention 「$expected」",
