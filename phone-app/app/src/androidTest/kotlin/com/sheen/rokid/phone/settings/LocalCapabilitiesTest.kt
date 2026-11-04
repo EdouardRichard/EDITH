@@ -20,11 +20,13 @@ import com.sheen.rokid.phone.actions.ExecutionChannelStatus
 import com.sheen.rokid.phone.actions.INTENT_CHANNEL
 import com.sheen.rokid.phone.actions.ROOT_CHANNEL
 import com.sheen.rokid.phone.actions.SHIZUKU_CHANNEL
+import com.sheen.rokid.phone.model.ModelReadiness
 import com.sheen.rokid.phone.ui.settings.LocalCapabilitiesScreen
 import com.sheen.rokid.phone.ui.settings.LocalCapabilitiesUi
 import com.sheen.rokid.phone.ui.settings.ModelStatus
 import com.sheen.rokid.phone.ui.settings.SettingsHomeModel
 import com.sheen.rokid.phone.ui.settings.SettingsShellContent
+import com.sheen.rokid.phone.ui.settings.localCapabilityReasons
 import com.sheen.rokid.phone.ui.settings.rememberHelpState
 import com.sheen.rokid.plugin.Capability
 import org.junit.After
@@ -38,6 +40,11 @@ import org.junit.Test
  * It names the two local models (决策模型/语义嵌入) and the four execution channels (指令执行/无障碍/Shizuku/Root), each
  * with 可用 or 尚不可用 plus the reason from the one central dictionary (`capabilityReasonLabel`), and it offers no save,
  * switch or other write - the page exists to tell the wearer why something is down, not to change it.
+ *
+ * Fix round 1 (design §3.6): the model rows are fed by [localCapabilityReasons], the same adapter the shell applies to
+ * the bundled-model gate (the capabilities are advertised unconditionally, so the raw map cannot report a failed
+ * bundle); and before the first session, when the host has published no channel rows, the page still names all four
+ * channels with 「尚未运行，开始会话后检测」 instead of omitting the section.
  *
  * Harness: `createEmptyComposeRule()` + [ForegroundTestActivity] (the K40 aborts the Compose rule's own background
  * Activity start; see `SettingsHomeTest`), content installed on the real foreground MainActivity.
@@ -91,6 +98,10 @@ class LocalCapabilitiesTest {
         }
     }
 
+    /** The state a first-start provisioning failure leaves behind; the adapter is what the shell applies. */
+    private fun failedReadiness() =
+        ModelReadiness().apply { markFailed("MODELS_PROVISIONING_FAILED") }.state.value
+
     /** The four channel rows the host publishes, with the real reason codes each channel reports. */
     private fun channels() = listOf(
         ExecutionChannelStatus(INTENT_CHANNEL, available = true, reason = null),
@@ -108,9 +119,11 @@ class LocalCapabilitiesTest {
     @Test
     fun localCapabilitiesListModelAndChannelReasonsWithoutASaveAction() {
         page(
-            reasons = mapOf(
-                Capability.SystemOne to "SYSTEM_ONE_MODEL_MISSING",
-                Capability.Actions to "ACTION_PROVIDER_MISSING",
+            // The failed bundle is driven through the same adapter the shell uses; the page never receives a synthetic
+            // model code production could not produce (fix round 1, design §3.6).
+            reasons = localCapabilityReasons(
+                capabilityReasons = mapOf(Capability.Actions to "ACTION_PROVIDER_MISSING"),
+                readiness = failedReadiness(),
             ),
             channels = channels(),
         )
@@ -118,8 +131,9 @@ class LocalCapabilitiesTest {
         compose.onNodeWithText(LocalCapabilitiesUi.MODELS_TITLE).assertExists()
         compose.onNodeWithText("决策模型").assertExists()
         compose.onNodeWithText("语义嵌入").assertExists()
-        // The local model codes are not in the dictionary yet; the helper's documented rule is to keep them visible.
-        compose.onNodeWithText("尚不可用（SYSTEM_ONE_MODEL_MISSING）").assertExists()
+        // Both models come from the one bundle, so both rows name the same gate refusal. The code is not in the
+        // dictionary yet; the helper's documented rule is to keep it visible rather than invent a label.
+        compose.onAllNodesWithText("尚不可用（MODELS_UNAVAILABLE）").assertCountEquals(2)
 
         compose.onNodeWithText(LocalCapabilitiesUi.CHANNELS_TITLE).assertExists()
         compose.onNodeWithText("指令执行（Intent）").assertExists()
@@ -134,10 +148,28 @@ class LocalCapabilitiesTest {
         compose.onNodeWithText("指令执行").assertExists()
         compose.onNodeWithText("尚不可用（指令执行未装配）").assertExists()
 
-        // 可用 appears for the one available model (语义嵌入 is absent from the reason map) and the one available channel.
-        compose.onAllNodesWithText(LocalCapabilitiesUi.AVAILABLE).assertCountEquals(2)
+        // 可用 appears only for the one available channel: the failed bundle turns both model rows unavailable.
+        compose.onAllNodesWithText(LocalCapabilitiesUi.AVAILABLE).assertCountEquals(1)
 
         // Read-only: no save control and no switch/toggle anywhere on the page.
+        compose.onAllNodesWithText("保存").assertCountEquals(0)
+        compose.onAllNodes(isToggleable()).assertCountEquals(0)
+    }
+
+    // before the first session the host has published no channel rows, so the page names the four as not-yet-probed
+    @Test
+    fun beforeTheFirstSessionEveryKnownChannelNamesTheUnknownReason() {
+        page(reasons = emptyMap(), channels = emptyList())
+
+        compose.onNodeWithText(LocalCapabilitiesUi.MODELS_TITLE).assertExists()
+        compose.onNodeWithText(LocalCapabilitiesUi.CHANNELS_TITLE).assertExists()
+        compose.onNodeWithText("指令执行（Intent）").assertExists()
+        compose.onNodeWithText("无障碍通道").assertExists()
+        compose.onNodeWithText("Shizuku 通道").assertExists()
+        compose.onNodeWithText("Root").assertExists()
+        // One honest unknown per row; the page must not hide the section and must not invent availability.
+        compose.onAllNodesWithText(LocalCapabilitiesUi.CHANNEL_NOT_PROBED).assertCountEquals(4)
+
         compose.onAllNodesWithText("保存").assertCountEquals(0)
         compose.onAllNodes(isToggleable()).assertCountEquals(0)
     }
@@ -150,7 +182,7 @@ class LocalCapabilitiesTest {
                 homeModel = homeModel(),
                 localCapabilities = {
                     LocalCapabilitiesScreen(
-                        capabilityReasons = mapOf(Capability.SystemOne to "SYSTEM_ONE_MODEL_MISSING"),
+                        capabilityReasons = localCapabilityReasons(emptyMap(), failedReadiness()),
                         channels = channels(),
                         help = rememberHelpState(),
                     )

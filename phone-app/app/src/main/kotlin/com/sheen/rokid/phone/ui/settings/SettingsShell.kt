@@ -66,6 +66,12 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
             )
         } ?: false
     }
+    // 0.52 fix round 1 (design §3.6): the composition advertises `Capability.SystemOne`/`Embedding` unconditionally, so
+    // `state.capabilityReasons` can never name a failed model bundle. The bundled-model gate is the real availability
+    // source; collect it so the page's model rows can report 尚不可用 with the gate's reason. Hand-built compositions
+    // without a readiness state keep the old behavior (nothing invented).
+    val readiness = root.modelReadiness
+    val provisioning = if (readiness == null) null else readiness.state.collectAsStateWithLifecycle().value
     val context = LocalContext.current
     // 0.52 design §3.5/§6.1: the four system grants are not observable; returning from a system settings page
     // recomposes nothing by itself. `grantEpoch` re-reads them on every ON_RESUME (the old page's rule) and the
@@ -197,10 +203,13 @@ internal fun SettingsShell(root: HostCompositionRoot, state: SessionUiState) {
             )
         },
         localCapabilities = {
-            // The page is a pure projection of the live session state (design §3.6): the same capability reasons and
-            // channel rows the 会话 panel reads, with no page-level load and therefore no second read to get stale.
+            // The page is a pure projection of the live session state plus the model gate (design §3.6): the same
+            // capability reasons and channel rows the 会话 panel reads, with no page-level load and therefore no second
+            // read to get stale. `localCapabilityReasons` adds the two model rows' real availability; the page's
+            // existing status path renders it, and before the first session the page names the four channels as
+            // not-yet-probed instead of hiding the section.
             LocalCapabilitiesScreen(
-                capabilityReasons = state.capabilityReasons,
+                capabilityReasons = localCapabilityReasons(state.capabilityReasons, provisioning),
                 channels = state.executionChannels,
                 help = rememberHelpState(),
             )
