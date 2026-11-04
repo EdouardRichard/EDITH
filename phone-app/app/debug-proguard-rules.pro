@@ -2,8 +2,20 @@
 # Keep facade owners and members used only by AndroidX Test or test-support.
 -keep class kotlin.** { *; }
 -keep class kotlinx.coroutines.** { *; }
-# Instrumentation invokes the Compose compiler facade from the minified app ABI.
--keep class androidx.compose.runtime.SnapshotStateKt { *; }
+
+# Compose test runtime ABI (round 4). The instrumentation `ComposeIdlingResource` calls
+# `Snapshot.hasPendingChanges()`, a method declared abstract on `Snapshot` and overridden by
+# `MutableSnapshot`. Production never calls the base declaration, so R8 kept the class and the
+# `MutableSnapshot` override but stripped the method from `Snapshot`; every Compose test then
+# died with
+# `NoSuchMethodError: No virtual method hasPendingChanges()Z in class
+# Landroidx/compose/runtime/snapshots/Snapshot;`.
+# Keep the whole Compose runtime and UI ABI in debug instead of naming one member at a time:
+# compose-ui-test reaches directly into these packages' internal ABI, so the next stripped
+# member would fail the same way. Debug-only (release rules are untouched), like the rules
+# below. The older `SnapshotStateKt` rule is subsumed by the runtime keep.
+-keep class androidx.compose.runtime.** { *; }
+-keep class androidx.compose.ui.** { *; }
 
 # Instrumentation-only Compose ABI. `AndroidComposeUiTestEnvironment` installs an
 # `InfiniteAnimationPolicy` implementation in the test coroutine context, and the Kotlin compiler
